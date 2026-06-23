@@ -1,0 +1,327 @@
+# Quarry — Tool Registry
+# Every integrated tool is documented here BEFORE it is trusted (design principle 8).
+# Fields:
+#   bin            executable name expected on PATH
+#   phase          methodology phase that uses it
+#   role           short purpose
+#   install        idempotent install command (framework-managed via `quarry install`)
+#   update         update command (`quarry update`); defaults to install if omitted
+#   version_cmd    command to capture installed version (doctor)
+#   doc            official source-of-truth reviewed
+#   keys           API keys / config required for full coverage (doctor warns, never blocks)
+#   optional       true => doctor reports missing as INFO not WARN
+#   notes          drift / safety / failure-mode notes from the methodology + flags.md
+
+go_env: &go "GOBIN ok; needs Go toolchain on PATH"
+
+tools:
+  # ── Phase 0: OSINT (apex/org/leak discovery) ────────────────────────────
+  # Most OSINT sources are in-process HTTP/whois/dig calls needing NO tool install:
+  #   azmap.dev M365 tenant, whois/RDAP registrant, DMARC pivot (dig), whoxy reverse-whois.
+  # Key-gated in-process: whoxy (~/.config/quarry/whoxy-key.txt). The one installed tool:
+  - bin: porch-pirate
+    phase: osint
+    role: search public Postman workspaces for the target's API endpoints/secrets
+    install: pipx install porch-pirate
+    update: pipx upgrade porch-pirate
+    version_cmd: porch-pirate -h
+    doc: https://github.com/MandConsultingGroup/porch-pirate
+    runtime: pipx
+    optional: true
+    notes: 'No key. porch-pirate -s <domain> --urls --dump. Public Postman recon (API leaks).'
+
+  # ── Phase 2: Horizontal discovery ───────────────────────────────────────
+  - bin: asnmap
+    phase: horizontal
+    role: ASN -> CIDR ranges (context); echo AS123 | asnmap -silent
+    install: go install github.com/projectdiscovery/asnmap/cmd/asnmap@latest
+    version_cmd: asnmap -version
+    doc: https://github.com/projectdiscovery/asnmap
+    notes: Can hang on its data source — runner enforces hard timeout.
+
+  - bin: mapcidr
+    phase: horizontal
+    role: expand/condense CIDR ranges to IPs
+    install: go install github.com/projectdiscovery/mapcidr/cmd/mapcidr@latest
+    version_cmd: mapcidr -version
+    doc: https://github.com/projectdiscovery/mapcidr
+
+  - bin: tlsx
+    phase: horizontal
+    role: TLS SAN/CN harvest on IP ranges -> in-scope hostnames
+    install: go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
+    version_cmd: tlsx -version
+    doc: https://github.com/projectdiscovery/tlsx
+    notes: Lighter local version of Caduceus. Use -san -cn -silent -p 443.
+
+  - bin: caduceus
+    phase: horizontal
+    role: ASN/CIDR -> live TLS cert scan -> real hostnames behind CDN
+    install: go install github.com/g0ldencybersec/Caduceus/cmd/caduceus@latest
+    version_cmd: caduceus -h
+    doc: https://github.com/g0ldencybersec/Caduceus
+    optional: true
+    notes: Active cert scan. Run only on owned IP space. Full cloud sweep = 2-5 days.
+
+  # ── Phase 3: Vertical subdomain discovery ───────────────────────────────
+  - bin: shosubgo
+    phase: vertical
+    role: Shodan-only subdomain discovery (narrow focus = unique hits)
+    install: go install github.com/incogbyte/shosubgo@latest
+    version_cmd: shosubgo -h
+    doc: https://github.com/incogbyte/shosubgo
+    keys: Shodan API key (-s)
+    optional: true
+
+  - bin: subfinder
+    phase: vertical
+    role: passive subdomain enum (primary); subfinder -all -recursive
+    install: go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+    version_cmd: subfinder -version
+    doc: https://github.com/projectdiscovery/subfinder
+    keys: ~/.config/subfinder/provider-config.yaml (chaos, github, shodan, securitytrails, netlas, c99, dnsdumpster, fofa, ...)
+    notes: -all enables all sources (+20 results in testing). -stats shows per-key health.
+
+  - bin: github-subdomains
+    phase: vertical
+    role: scrape GitHub for referenced subdomains (3-10% extra, unique)
+    install: go install github.com/gwen001/github-subdomains@latest
+    version_cmd: github-subdomains -h
+    doc: https://github.com/gwen001/github-subdomains
+    keys: GITHUB tokens file (-t) — use burner accounts to dodge rate limits
+    optional: true
+
+  - bin: puredns
+    phase: vertical
+    role: massdns wrapper — DNS brute + validate
+    install: go install github.com/d3mondev/puredns/v2@latest
+    version_cmd: puredns --help
+    doc: https://github.com/d3mondev/puredns
+    notes: Requires massdns on host. Needs resolvers + trusted-resolvers lists.
+
+  - bin: massdns
+    phase: vertical
+    role: high-perf stub resolver (puredns backend)
+    install: 'mkdir -p ~/.local/bin && rm -rf /tmp/_massdns && git clone -q --depth 1 https://github.com/blechschmidt/massdns /tmp/_massdns && make -C /tmp/_massdns >/dev/null && cp /tmp/_massdns/bin/massdns ~/.local/bin/ && rm -rf /tmp/_massdns'
+    version_cmd: massdns --help
+    doc: https://github.com/blechschmidt/massdns
+    runtime: source
+    deps: [build-essential, git]   # gcc + make to compile
+    notes: Built from source (gcc+make); installed to ~/.local/bin. puredns needs it at runtime.
+
+  - bin: alterx
+    phase: vertical
+    role: subdomain permutation generation (modern dnsgen)
+    install: go install github.com/projectdiscovery/alterx/cmd/alterx@latest
+    version_cmd: alterx -version
+    doc: https://github.com/projectdiscovery/alterx
+
+  - bin: dnsgen
+    phase: vertical
+    role: subdomain permutation generation (classic)
+    install: pipx install dnsgen
+    version_cmd: dnsgen -h
+    doc: https://github.com/AlephNullSK/dnsgen
+    runtime: pipx
+    optional: true
+
+  - bin: dnsx
+    phase: vertical
+    role: fast DNS resolver / PTR / record enrichment
+    install: go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+    version_cmd: dnsx -version
+    doc: https://github.com/projectdiscovery/dnsx
+
+  # ── Phase 4: Probing / fingerprint / screenshots / ports ────────────────
+  - bin: httpx
+    phase: probe
+    role: HTTP probe + fingerprint + cdn tag; json output is source of truth
+    install: go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+    version_cmd: httpx -version
+    doc: https://github.com/projectdiscovery/httpx
+    notes: >
+      Blank PORTS.HTTP uses the full methodology port set; explicit
+      profile ports narrow/override it. Keep <=15 threads / RL<=5 under WAF. On kali,
+      if it crashes remove apt python3-httpx shim.
+
+  - bin: cdncheck
+    phase: probe
+    role: tag IPs as CDN vs origin (origin = no-WAF, juicier)
+    install: go install github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest
+    version_cmd: cdncheck -version
+    doc: https://github.com/projectdiscovery/cdncheck
+
+  - bin: gowitness
+    phase: probe
+    role: screenshots
+    install: go install github.com/sensepost/gowitness@latest
+    version_cmd: gowitness version
+    doc: https://github.com/sensepost/gowitness
+    needs_chromium: true     # drives a headless chromium — needs browser + headless libs
+    notes: >
+      v3 syntax: `gowitness scan file -f <list> --screenshot-path <dir>`.
+      --chrome-args removed. Needs chromium + headless libs (installed by stage 1).
+      Verify after install: gowitness scan file with one URL -> have-screenshot=true.
+
+  - bin: naabu
+    phase: probe
+    role: fast SYN/CONNECT port scan
+    install: go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+    version_cmd: naabu -version
+    doc: https://github.com/projectdiscovery/naabu
+    deps: [libpcap-dev]      # CGO build + runtime libpcap for SYN scan
+    notes: Needs libpcap. Scan ranges only when CIDR/ASN explicitly in profile.
+
+  # ── Phase 5: Crawl + URL/archive + JS ───────────────────────────────────
+  - bin: katana
+    phase: crawl
+    role: crawler (standard + headless); batch to avoid OOM
+    install: go install github.com/projectdiscovery/katana/cmd/katana@latest
+    version_cmd: katana -version
+    doc: https://github.com/projectdiscovery/katana
+    needs_chromium: true     # -headless / -system-chrome mode
+    notes: Headless Chrome is the RAM hog — batch hosts, cap -p/-c. -kf all, -jc.
+
+  - bin: gau
+    phase: crawl
+    role: passive URL collection (wayback/otx/commoncrawl/urlscan)
+    install: go install github.com/lc/gau/v2/cmd/gau@latest
+    version_cmd: gau --version
+    doc: https://github.com/lc/gau
+
+  - bin: waymore
+    phase: crawl
+    role: archive URLs (-mode U) + archived RESPONSES (-mode R) + inline JS (-oijs)
+    install: pipx install waymore
+    update: pipx upgrade waymore
+    version_cmd: waymore -h
+    doc: https://github.com/xnl-h4ck3r/waymore
+    runtime: pipx
+    keys: ~/.config/waymore/config.yml (URLScan, VirusTotal keys raise coverage)
+    notes: 'Volume bounded by -ci d + -l (LIMITS.WAYMORE_RESPONSES) + timeout. Responses dir feeds xnLinkFinder.'
+
+  - bin: hakrawler
+    phase: crawl
+    role: fast link spider (secondary to katana)
+    install: go install github.com/hakluke/hakrawler@latest
+    version_cmd: hakrawler -h
+    doc: https://github.com/hakluke/hakrawler
+    optional: true
+
+  - bin: csprecon
+    phase: horizontal
+    role: extract related domains from Content-Security-Policy headers
+    install: go install github.com/edoardottt/csprecon/cmd/csprecon@latest
+    version_cmd: csprecon -h
+    doc: https://github.com/edoardottt/csprecon
+    optional: true
+
+  - bin: smap
+    phase: probe
+    role: passive (Shodan-backed) port scan — stealth, no packets to target
+    install: go install github.com/s0md3v/smap/cmd/smap@latest
+    version_cmd: smap -h
+    doc: https://github.com/s0md3v/smap
+    optional: true
+
+  - bin: jsluice
+    phase: crawl
+    role: extract URLs + secrets from JS via tree-sitter
+    install: go install github.com/BishopFox/jsluice/cmd/jsluice@latest
+    version_cmd: jsluice -h
+    doc: https://github.com/BishopFox/jsluice
+
+  - bin: xnLinkFinder
+    phase: crawl
+    role: links + params + secrets + wordlist from JS dir AND waymore responses (killer combo)
+    install: pipx install xnLinkFinder
+    update: pipx upgrade xnLinkFinder
+    version_cmd: xnLinkFinder -h
+    doc: https://github.com/xnl-h4ck3r/xnLinkFinder
+    runtime: pipx
+    deps: [libxml2-dev, libxslt1-dev, zlib1g-dev]   # lxml build
+    notes: 'JS dir: -inc -all -mfs 0. Responses dir: add -orig. -sp/-sf = scope files.'
+
+  - bin: js-beautify
+    phase: crawl
+    role: beautify minified JS for better extraction
+    install: pipx install jsbeautifier
+    version_cmd: js-beautify --version
+    doc: https://github.com/beautifier/js-beautify
+    runtime: pipx
+    optional: true
+
+  - bin: gitleaks
+    phase: crawl
+    role: secret scan on JS dir
+    # prebuilt binary — `go install` hits a toolchain/version-constraint conflict on new Go.
+    install: 'mkdir -p ~/.local/bin && GL=$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | grep -oE ''"tag_name": "[^"]+"'' | cut -d''"'' -f4); A=$(uname -m); case "$A" in x86_64) A=x64;; aarch64|arm64) A=arm64;; esac; curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/${GL}/gitleaks_${GL#v}_linux_${A}.tar.gz" | tar -xz -C ~/.local/bin gitleaks && chmod +x ~/.local/bin/gitleaks'
+    version_cmd: gitleaks version
+    doc: https://github.com/gitleaks/gitleaks
+    runtime: binary
+    deps: [curl]
+
+  - bin: trufflehog
+    phase: crawl
+    role: verified-secret scan on filesystem
+    install: 'curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b ~/.local/bin'
+    version_cmd: trufflehog --version
+    doc: https://github.com/trufflesecurity/trufflehog
+    runtime: binary
+    deps: [curl]
+
+  # ── Phase 6/7: Params + lightweight scanning ────────────────────────────
+  - bin: gf
+    phase: params
+    role: pattern buckets (sqli/ssrf/redirect/xss/idor...) over URL corpus
+    install: go install github.com/tomnomnom/gf@latest
+    version_cmd: gf -h
+    doc: https://github.com/tomnomnom/gf
+    notes: Needs ~/.gf patterns (gf-patterns repo). install copies them.
+    optional: true
+
+  - bin: arjun
+    phase: params
+    role: param discovery on param-less endpoints
+    install: pipx install arjun
+    version_cmd: arjun --version
+    doc: https://github.com/s0md3v/Arjun
+    runtime: pipx
+    notes: Throttle with -t 5 -d 1 to honor RoE.
+
+  - bin: nuclei
+    phase: params
+    role: non-intrusive template scan; built-in interactsh OOB
+    install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+    update: nuclei -update; nuclei -update-templates
+    version_cmd: nuclei -version
+    doc: https://github.com/projectdiscovery/nuclei
+    needs_chromium: true     # only for -headless / screenshot templates
+    notes: >
+      Exclude intrusive,fuzz,dos,brute-force. Severity-scope at RL<=5 or it runs
+      for days. -stats -si to a logfile (never /dev/null — that hides blocking).
+
+  - bin: dalfox
+    phase: params
+    role: XSS + open-redirect on reflected candidates (throttled)
+    install: go install github.com/hahwul/dalfox/v2@latest
+    version_cmd: dalfox version
+    doc: https://github.com/hahwul/dalfox
+    notes: --delay 250 -w 5 --skip-bav to stay under WAF.
+
+  - bin: interactsh-client
+    phase: params
+    role: standalone OOB/blind interaction catcher
+    install: go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
+    version_cmd: interactsh-client -version
+    doc: https://github.com/projectdiscovery/interactsh
+    optional: true
+
+  # ── Phase 8: Continuous monitoring ──────────────────────────────────────
+  - bin: gungnir
+    phase: monitor
+    role: continuous CT-log monitoring for new certs/subdomains
+    install: go install github.com/g0ldencybersec/gungnir/cmd/gungnir@latest
+    version_cmd: gungnir -h
+    doc: https://github.com/g0ldencybersec/gungnir
+    optional: true

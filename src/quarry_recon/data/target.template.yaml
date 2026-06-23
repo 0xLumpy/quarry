@@ -1,0 +1,59 @@
+# Quarry — Target Profile
+# Compiles into the scope matchers used by every phase. Empty sections skip cleanly.
+# Edit this file per engagement. NEVER commit API keys here — keys live in tool configs.
+
+TARGET: example
+
+# In-scope APEX roots. Vertical discovery is anchored to these (suffix match).
+APEX_DOMAINS:
+  - example.com
+
+# Out-of-scope patterns (regex, matched against full host). Collected passively, never actively scanned.
+OOS:
+  - '^jobs\.'
+  - '^careers\.'
+
+# In-scope IP ranges. If empty, horizontal IP/port scanning is SKIPPED.
+CIDR:
+  # - 192.0.2.0/24
+
+# Manual ASN seeds. If empty, ASN discovery only SUGGESTS candidates for review;
+# active range scanning happens only for ASNs/CIDRs explicitly listed here.
+ASN:
+  # - AS12345
+
+# Optional anchors for the OSINT pre-flight (`quarry osint`). Not used by the recon run.
+# ORG_NAMES → whoxy reverse-whois by company (finds sibling apexes). Needs whoxy key.
+# BRANDS  → reserved for future dork-based sources (parsed, not yet used).
+ORG_NAMES:
+  # - Example Inc
+BRANDS:
+  # - Example
+
+RATELIMIT:
+  # HTTP req/s for httpx/katana/nuclei/dalfox. Program RoE wins. 0 => omit -rl flag.
+  HTTP: 5
+  # DNS qps for puredns/massdns (public resolvers — VPS only, can be high). empty => tool default.
+  DNS:
+  # Port-scan packet rate for naabu. empty => tool default.
+  PORTSCAN:
+
+PORTS:
+  # HTTP probe ports. Empty => full methodology set.
+  # Populate only to narrow or override for an engagement.
+  HTTP:
+
+LIMITS:
+  # Max archived responses waymore downloads per apex (waymore -l). 0 = ALL (heavy).
+  WAYMORE_RESPONSES: 5000
+
+MODES:
+  PASSIVE_ONLY: false   # true => no active probing/scanning at all (OSINT only)
+  HEADLESS: false       # true => katana headless SPA crawl (RAM-heavy)
+  SCREENSHOTS: true
+  PORTSCAN: true        # ignored if CIDR empty and no resolved host IPs
+  TAKEOVER: true        # true => collect CNAMEs + run nuclei takeover templates
+
+# Free-text program rules for the analyst (and the run manifest).
+NOTES:
+  - Official program rate limit is 5 req/s.

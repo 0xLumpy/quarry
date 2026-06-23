@@ -1,0 +1,202 @@
+# Quarry — Bootstrap manifest (blank-VPS provisioning).
+# `quarry install` runs: system packages -> golang -> tools (tools.yaml) -> data files.
+# Anything that cannot be automated is reported with its doc link, never silently skipped.
+
+# Base OS dependencies (build toolchain + runtime libs) keyed by detected manager.
+# Per-tool extra deps are declared in tools.yaml (deps:) and merged in automatically.
+# NOTE: golang is NOT installed via the OS package manager — distro Go is usually too old
+# for ProjectDiscovery tools, so stage 2 installs current Go to /usr/local/go instead.
+system_packages:
+  apt:
+    # build toolchain (Go tools, massdns, CGO)
+    - build-essential
+    - gcc
+    - "g++"
+    - make
+    - cmake
+    - pkg-config
+    - autoconf
+    - automake
+    - libtool
+    # fetch + archive + cli utils
+    - git
+    - curl
+    - wget
+    - ca-certificates
+    - unzip
+    - zip
+    - pv
+    - jq
+    # python runtime for pipx tools (waymore/xnLinkFinder/arjun/dnsgen/jsbeautifier)
+    - python3
+    - python3-dev
+    - python3-pip
+    - python3-venv
+    - pipx
+    # native libs: naabu(libpcap), lxml(libxml2/xslt/zlib), python-crypto(ssl/ffi)
+    - libpcap-dev
+    - libxml2-dev
+    - libxslt1-dev
+    - zlib1g-dev
+    - libssl-dev
+    - libffi-dev
+    # dns + whois + xml cli used by phases (osint/horizontal)
+    - dnsutils
+    - whois
+    - libxml2-utils
+    - nmap
+  pacman:
+    - base-devel
+    - gcc
+    - make
+    - cmake
+    - pkgconf
+    - autoconf
+    - automake
+    - libtool
+    - git
+    - curl
+    - wget
+    - ca-certificates
+    - unzip
+    - zip
+    - pv
+    - jq
+    - python
+    - python-pip
+    - python-pipx
+    - libpcap
+    - libxml2
+    - libxslt
+    - zlib
+    - openssl
+    - libffi
+    - bind
+    - whois
+    - nmap
+  dnf:
+    - "@Development Tools"
+    - gcc
+    - gcc-c++
+    - make
+    - cmake
+    - pkgconfig
+    - autoconf
+    - automake
+    - libtool
+    - git
+    - curl
+    - wget
+    - ca-certificates
+    - unzip
+    - zip
+    - pv
+    - jq
+    - python3
+    - python3-devel
+    - python3-pip
+    - pipx
+    - libpcap-devel
+    - libxml2-devel
+    - libxslt-devel
+    - zlib-devel
+    - openssl-devel
+    - libffi-devel
+    - bind-utils
+    - whois
+    - nmap
+  brew:
+    - git
+    - curl
+    - wget
+    - jq
+    - pv
+    - pipx
+    - massdns
+    - nmap
+    - chromium
+
+# Headless-chromium runtime (gowitness / katana -headless / nuclei screenshot templates).
+# Installed in a SEPARATE apt call with a t64 fallback so one renamed lib can't abort the
+# whole base install. This is the set that fixes "gowitness produced 0 screenshots" on a VPS.
+chromium_packages:
+  apt:
+    primary: [chromium]
+    fallback: [chromium-browser]   # ubuntu names it chromium-browser
+    libs:
+      - libnss3
+      - libatk1.0-0
+      - libatk-bridge2.0-0
+      - libcups2
+      - libxkbcommon0
+      - libxcomposite1
+      - libxdamage1
+      - libxrandr2
+      - libxfixes3
+      - libgbm1
+      - libdrm2
+      - libpango-1.0-0
+      - libpangocairo-1.0-0
+      - libxshmfence1
+      - fonts-liberation
+    libs_fallback: [libasound2t64]   # 24.04 renamed libasound2 -> libasound2t64
+    libs_primary_extra: [libasound2]
+  pacman:
+    primary: [chromium]
+    fallback: []
+    libs: [nss, alsa-lib]
+    libs_fallback: []
+    libs_primary_extra: []
+  dnf:
+    primary: [chromium]
+    fallback: [chromium-headless]
+    libs: [nss, atk, at-spi2-atk, cups-libs, libXcomposite, libXdamage, libXrandr, mesa-libgbm, pango, alsa-lib, liberation-fonts]
+    libs_fallback: []
+    libs_primary_extra: []
+  brew:
+    primary: [chromium]
+    fallback: []
+    libs: []
+    libs_fallback: []
+    libs_primary_extra: []
+
+# Golang: installed to /usr/local/go if `go` is missing or older than min_version.
+# The installer fetches the HIGHEST STABLE version from go.dev at install time;
+# `version` is only the offline fallback. ProjectDiscovery tools need a recent Go.
+golang:
+  min_version: "1.25"
+  version: "1.26.4"   # fallback only (used if go.dev is unreachable)
+  url: "https://dl.google.com/go/{version}.{os}-{arch}.tar.gz"
+
+# Data files the framework owns (under ~/.config/quarry). Not overwritten if present
+# unless `quarry update` is run.
+data_files:
+  - name: resolvers
+    dest: ~/.config/quarry/resolvers.txt
+    url: https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt
+    update: true
+  - name: trusted-resolvers
+    dest: ~/.config/quarry/trusted-resolvers.txt
+    url: https://gist.githubusercontent.com/six2dez/ae9ed7e5c786461868abd3f2344401b6/raw/trusted_resolvers.txt
+    update: true
+    fallback: "1.1.1.1\n8.8.8.8\n9.9.9.9\n1.0.0.1\n208.67.222.222\n"
+  - name: dns-wordlist
+    dest: ~/.config/quarry/dns-wordlist.txt
+    url: https://raw.githubusercontent.com/n0kovo/n0kovo_subdomains/main/n0kovo_subdomains_huge.txt
+    update: false
+
+# Post-install extras (idempotent shell steps).
+extras:
+  - name: gf-patterns
+    test: test -d ~/.gf && ls ~/.gf/*.json >/dev/null 2>&1
+    run: >
+      mkdir -p ~/.gf &&
+      (git clone -q --depth 1 https://github.com/tomnomnom/gf /tmp/_gf && cp /tmp/_gf/examples/*.json ~/.gf/ 2>/dev/null; rm -rf /tmp/_gf) &&
+      (git clone -q --depth 1 https://github.com/1ndianl33t/Gf-Patterns /tmp/_gfp && cp /tmp/_gfp/*.json ~/.gf/ 2>/dev/null; rm -rf /tmp/_gfp)
+  - name: nuclei-templates
+    test: test -d ~/nuclei-templates
+    run: nuclei -update-templates
+    needs: nuclei
+  - name: github-tokens-stub
+    test: test -f ~/.config/quarry/github-tokens.txt
+    run: mkdir -p ~/.config/quarry && touch ~/.config/quarry/github-tokens.txt

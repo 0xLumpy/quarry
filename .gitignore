@@ -1,0 +1,19 @@
+# Python build/cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# venvs
+.venv/
+venv/
+
+# Windows copy markers
+*:Zone.Identifier
+
+# runtime output (recon runs live under $QUARRY_HOME, default ~/.quarry)
+.quarry/
+runs/
+targets/
