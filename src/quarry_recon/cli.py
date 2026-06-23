@@ -171,7 +171,8 @@ def install(dry_run, phase, only, include_optional, tools_only):
     else:
         if failed:
             click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
-            click.echo("retry: quarry install --only <tool>")
+            for b in failed:
+                click.echo(f"retry: quarry install --only {b}")
         else:
             click.echo(_c("\ninstall complete — all tools ok", "green"))
         click.echo("run  quarry doctor  to verify, then configure API keys (README.md)\n")
