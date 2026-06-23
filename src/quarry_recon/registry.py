@@ -5,11 +5,16 @@ is data (data/tools.yaml); this module is the behavior around it.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# version token, not part of a longer dotted number (excludes IPs like 127.0.0.1)
+_VER_RE = re.compile(r"(?<![\w.])v?\d+\.\d+(?:\.\d+)?(?![\w.])")
 
 import yaml
 
@@ -39,15 +44,23 @@ class Tool:
         return shutil.which(self.bin)
 
     def version(self) -> str:
+        """A clean version string ('v2.14.0', '2.2.4') — never the tool's ASCII banner.
+        Extracts the first version-like token from the output; 'installed' if none found."""
         if not self.installed or not self.version_cmd:
             return ""
         try:
             p = subprocess.run(self.version_cmd.split(), capture_output=True,
                                text=True, timeout=15)
-            out = (p.stdout + p.stderr).strip().splitlines()
-            return out[0][:80] if out else ""
         except (subprocess.SubprocessError, OSError):
             return ""
+        text = _ANSI_RE.sub("", p.stdout + p.stderr)
+        for line in text.splitlines():          # prefer a line that names a version
+            if "version" in line.lower():
+                m = _VER_RE.search(line)
+                if m:
+                    return m.group(0)
+        m = _VER_RE.search(text)
+        return m.group(0) if m else "installed"
 
 
 def load_tools() -> list[Tool]:

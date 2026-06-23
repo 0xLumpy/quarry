@@ -69,8 +69,6 @@ def doctor(phase):
             click.echo(f"      {_c('deps:', 'cyan')} {', '.join(t.deps)}")
         if t.needs_chromium and t.installed and not _chromium():
             click.echo(f"      {_c('⚠ needs chromium — not found; screenshots/headless will fail', 'red')}")
-        if t.keys and t.installed:
-            click.echo(f"      {_c('keys:', 'yellow')} {t.keys}")
 
     # environment checks
     click.echo(_c("\n[environment]", "magenta"))
@@ -82,6 +80,13 @@ def doctor(phase):
         note = "" if p.exists() else f"(optional) put at {p}"
         click.echo(f"  {mark} {label:<24} {note}")
 
+    for label, bin_ in [("go toolchain", "go"), ("chromium", "chromium"),
+                        ("pipx", "pipx")]:
+        present = shutil.which(bin_) or (bin_ == "chromium" and
+                  (shutil.which("chromium-browser") or shutil.which("google-chrome")))
+        mark = _c("✓", "green") if present else _c("✗", "red")
+        click.echo(f"  {mark} {label}")
+
     # secrets.yaml — framework-read keys (present / not set). Tool-native keys live elsewhere.
     click.echo(_c("\n[secrets]", "magenta") + f"  ({secrets.PATH})")
     for label, present in [("github tokens", bool(secrets.github_tokens())),
@@ -91,12 +96,6 @@ def doctor(phase):
         mark = _c("✓", "green") if present else _c("·", "yellow")
         click.echo(f"  {mark} {label:<24} {'' if present else '(optional) not set'}")
     click.echo(f"  {_c('ℹ', 'cyan')} tool-native: subfinder provider-config.yaml · waymore config.yml")
-    for label, bin_ in [("go toolchain", "go"), ("chromium", "chromium"),
-                        ("pipx", "pipx")]:
-        present = shutil.which(bin_) or (bin_ == "chromium" and
-                  (shutil.which("chromium-browser") or shutil.which("google-chrome")))
-        mark = _c("✓", "green") if present else _c("✗", "red")
-        click.echo(f"  {mark} {label}")
 
     click.echo(_c(f"\n{ok} installed · {miss} missing (required) · audit complete\n",
                   "green" if not miss else "yellow"))
