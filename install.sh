@@ -38,8 +38,8 @@ echo "    (so 'quarry' and the recon tools are on your PATH)"
 echo
 echo "    Then:"
 echo "      quarry doctor"
-echo "      quarry init-target acme -o targets/acme.yaml && \$EDITOR targets/acme.yaml"
-echo "      quarry run -t targets/acme.yaml"
+echo "      quarry init acme && \$EDITOR projects/acme/target.yaml"
+echo "      quarry run -t projects/acme/target.yaml"
 echo
 echo "    API keys (see README.md):"
 echo "      subfinder: ~/.config/subfinder/provider-config.yaml"

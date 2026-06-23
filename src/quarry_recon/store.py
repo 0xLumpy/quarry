@@ -1,13 +1,13 @@
 """Asset store + run manifest — structured JSONL is the source of truth (design §5).
 
-Layout (design §5):
-    <base>/runs/<run_id>/manifest.json
-    <base>/runs/<run_id>/raw/<phase>/<tool>/...
-    <base>/runs/<run_id>/normalized/<entity>.jsonl
-    <base>/runs/<run_id>/exports/
-    <base>/runs/<run_id>/reports/
-    <base>/state/current -> latest run (symlink)
-    <base>/state/history/<run_id>.json
+Layout (per-project; project dir derived from the target.yaml location):
+    <project>/recon/<run_id>/manifest.json
+    <project>/recon/<run_id>/raw/<phase>/<tool>/...
+    <project>/recon/<run_id>/normalized/<entity>.jsonl
+    <project>/recon/<run_id>/exports/
+    <project>/recon/<run_id>/reports/
+    <project>/recon/state/current -> latest run (symlink)
+    <project>/recon/state/history/<run_id>.json
 
 Every normalized entity keeps provenance back to the raw evidence that produced it.
 """
@@ -77,6 +77,7 @@ class Run:
         self.manifest_path = self.dir / "manifest.json"
         self._tool_runs: list[ToolRunRecord] = []
         self._counts_cache: dict[str, int] = {}
+        self._seen: dict[str, set] = {}   # entity -> seen keys (instance-local; no cross-run bleed)
         self.started = _utc()
         self.notes: list[str] = []
 
@@ -120,11 +121,8 @@ class Run:
         self._counts_cache[entity] = self._counts_cache.get(entity, 0) + 1
         return True
 
-    _seen: dict[str, set] = {}
-
     def _seen_keys(self, entity: str) -> set:
-        cache = self._seen.setdefault(self.run_id, {})
-        if entity not in cache:
+        if entity not in self._seen:
             keys = set()
             f = self._entity_file(entity)
             if f.exists():
@@ -134,8 +132,8 @@ class Run:
                         keys.add(str(json.loads(line).get(key_field, "")).strip().lower())
                     except json.JSONDecodeError:
                         continue
-            cache[entity] = keys
-        return cache[entity]
+            self._seen[entity] = keys
+        return self._seen[entity]
 
     def read(self, entity: str) -> list[dict]:
         f = self._entity_file(entity)

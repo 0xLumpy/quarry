@@ -1,7 +1,8 @@
-"""quarry — command surface: install · update · doctor · init-target · run · report."""
+"""quarry — command surface: install · update · doctor · init · osint · run · report."""
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from importlib import resources
 from pathlib import Path
@@ -194,6 +195,10 @@ def update(dry_run, include_optional):
 @click.option("--projects-dir", help="projects root (default ./projects or $QUARRY_PROJECTS)")
 def init(name, projects_dir):
     """Create a project: <projects>/<name>/target.yaml. osint + recon output co-locate here."""
+    # sanitize: a project name is a single path segment (domain/slug) — never a path.
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name) or ".." in name:
+        raise click.ClickException(
+            f"invalid project name {name!r}: use letters/digits/.-_ only, no path separators")
     proj = _projects_root(projects_dir) / name
     proj.mkdir(parents=True, exist_ok=True)
     tpl = resources.files("quarry_recon.data").joinpath("target.template.yaml").read_text()
@@ -342,8 +347,9 @@ def report(profile_path, run_id):
     from .config import ScopeMatcher
     scope = ScopeMatcher([], [], [], False)
     exp = exports.write_all(run_obj)
+    exports.write_delta(run_obj)
     (run_obj.reports / "HOTLIST.md").write_text(triage.build(run_obj, scope))
-    click.echo(f"regenerated {run_obj.reports / 'HOTLIST.md'}")
+    click.echo(f"regenerated {run_obj.reports / 'HOTLIST.md'} + delta.md")
     click.echo(f"exports: {', '.join(f'{k}={v}' for k, v in exp.items() if v)}")
 
 

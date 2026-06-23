@@ -8,8 +8,8 @@ It NEVER edits scope. Candidates are review-only; the human confirms and copies 
 into target.yaml (see target.suggested.yaml + docs/target-prep.md). Automated parts of the
 horizontal-OSINT methodology; manual-only sources are surfaced as a "manual to-do" list.
 
-Output:  osint/<target>/<ts>/{raw/, candidates.jsonl, intel.jsonl, osint-report.md,
-                              target.suggested.yaml, manifest.json}   + osint/<target>/latest
+Output:  <project>/osint/<ts>/{raw/, candidates.jsonl, intel.jsonl, osint-report.md,
+                              target.suggested.yaml, manifest.json}   + <project>/osint/latest
 """
 from __future__ import annotations
 
