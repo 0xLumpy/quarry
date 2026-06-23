@@ -109,9 +109,9 @@ def install(dry_run, phase, only, include_optional, tools_only):
     # ── 1. system packages + Go toolchain + data (unless --tools-only / --only / --phase) ──
     full = not (only or phase or tools_only)
     if full:
-        click.echo(_c("\n[1/5] system packages", "magenta"))
+        click.echo(_c("\n[1/6] system packages", "magenta"))
         bootstrap.install_system_packages(click.echo, dry_run)
-        click.echo(_c("[2/5] Go toolchain", "magenta"))
+        click.echo(_c("[2/6] Go toolchain", "magenta"))
         bootstrap.ensure_golang(click.echo, dry_run)
 
     # make freshly-installed Go/pipx bins visible to subsequent tool installs
@@ -129,7 +129,7 @@ def install(dry_run, phase, only, include_optional, tools_only):
     if not include_optional and not only:
         tools = [t for t in tools if not t.optional]
 
-    click.echo(_c(f"\n[3/5] tools ({len(tools)})", "magenta"))
+    click.echo(_c(f"\n[3/6] tools ({len(tools)})", "magenta"))
     failed = []
     for t in tools:
         if t.installed and not only:
@@ -147,15 +147,16 @@ def install(dry_run, phase, only, include_optional, tools_only):
         else:
             failed.append(t.bin)
             click.echo(f"      {_c('FAILED', 'red')} {tail[:100]}")
-        if t.keys:
-            click.echo(f"      {_c('keys:', 'yellow')} {t.keys}")
+        # (API-key reminders are NOT printed per-tool here — see the post-install summary)
 
-    # ── 3. data files + extras (gf patterns, nuclei templates) ──
+    # ── 3. data files + extras + cleanup ──
     if full:
-        click.echo(_c("\n[4/5] data files (resolvers, wordlists)", "magenta"))
+        click.echo(_c("\n[4/6] data files (resolvers, wordlists)", "magenta"))
         bootstrap.install_data_files(click.echo, dry_run)
-        click.echo(_c("[5/5] extras (gf patterns, nuclei templates)", "magenta"))
+        click.echo(_c("[5/6] extras (gf patterns, nuclei templates)", "magenta"))
         bootstrap.run_extras(click.echo, dry_run)
+        click.echo(_c("[6/6] cleanup (reclaim disk)", "magenta"))
+        bootstrap.cleanup(click.echo, dry_run)
 
     if dry_run:
         click.echo(_c("\n(dry-run — nothing was installed)\n", "yellow"))
@@ -203,15 +204,21 @@ def init(name, projects_dir):
     proj.mkdir(parents=True, exist_ok=True)
     tpl = resources.files("quarry_recon.data").joinpath("target.template.yaml").read_text()
     tpl = tpl.replace("TARGET: example", f"TARGET: {name}")
+    # If the name is a domain, seed APEX_DOMAINS so `quarry init target.com` is ready to run.
+    is_domain = bool(re.match(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$", name))
+    if is_domain:
+        tpl = tpl.replace("  - example.com", f"  - {name}")
     dest = proj / "target.yaml"
     if dest.exists():
         click.confirm(f"{dest} exists — overwrite?", abort=True)
     dest.write_text(tpl)
-    click.echo(f"{_c('created project', 'green')} {proj}/\n"
-               f"  profile: {dest}\n"
-               f"Edit APEX_DOMAINS / CIDR / OOS, then:\n"
-               f"  quarry osint -t {dest}     # optional pre-flight\n"
-               f"  quarry run   -t {dest}")
+    click.echo(f"{_c('created project', 'green')} {proj}/  (profile: {dest})")
+    if is_domain:
+        click.echo(f"  APEX_DOMAINS seeded with {name} — ready to run:\n"
+                   f"    quarry osint -t {dest}     # optional pre-flight\n"
+                   f"    quarry run   -t {dest}")
+    else:
+        click.echo(f"  edit APEX_DOMAINS in {dest}, then:  quarry run -t {dest}")
 
 
 # ── osint (pre-flight; separate from run) ─────────────────────────────────────

@@ -181,3 +181,23 @@ def run_extras(echo, dry: bool) -> None:
                 continue
         code, tail = _sh(ex["run"], dry, 600)
         echo(f"  {ex['name']}: {'ok' if code == 0 else 'failed — ' + tail[:60]}")
+
+
+def cleanup(echo, dry: bool) -> None:
+    """Reclaim disk after a bulk install (Go module/build caches are GBs after building ~25
+    Go tools; package-manager download caches add more). Tools keep working — only caches go."""
+    steps = []
+    if shutil.which("go"):
+        # build cache + downloaded module sources + test cache (the big ones)
+        steps.append(("go caches", "go clean -cache -modcache -testcache"))
+    steps.append(("pip cache", "rm -rf ~/.cache/pip"))
+    mgr, _ = detect_pkg_manager()
+    if mgr == "apt":                                       # clean takes no -y (older apt rejects it)
+        steps.append(("apt cache", f"{_sudo()}apt-get clean"))
+    elif mgr == "dnf":
+        steps.append(("dnf cache", f"{_sudo()}dnf clean all"))
+    elif mgr == "pacman":
+        steps.append(("pacman cache", f"{_sudo()}pacman -Sc --noconfirm"))
+    for label, cmd in steps:
+        code, _ = _sh(cmd, dry, 600)
+        echo(f"  {label}: {'cleared' if code == 0 else 'skip'}")

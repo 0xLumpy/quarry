@@ -33,13 +33,13 @@ fi
 echo
 echo "[✓] Done."
 echo
-echo "    IMPORTANT: open a new shell, or run:  source $RC"
+echo "    IMPORTANT: open a new shell, or run:  source ${RC/#$HOME/~}"
 echo "    (so 'quarry' and the recon tools are on your PATH)"
 echo
 echo "    Then:"
 echo "      quarry doctor"
-echo "      quarry init acme && \$EDITOR projects/acme/target.yaml"
-echo "      quarry run -t projects/acme/target.yaml"
+echo "      quarry init target.com"
+echo "      quarry run -t projects/target.com/target.yaml"
 echo
 echo "    API keys (see README.md):"
 echo "      subfinder: ~/.config/subfinder/provider-config.yaml"
