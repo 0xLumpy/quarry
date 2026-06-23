@@ -18,7 +18,7 @@ tools:
   # ── Phase 0: OSINT (apex/org/leak discovery) ────────────────────────────
   # Most OSINT sources are in-process HTTP/whois/dig calls needing NO tool install:
   #   azmap.dev M365 tenant, whois/RDAP registrant, DMARC pivot (dig), whoxy reverse-whois.
-  # Key-gated in-process: whoxy (~/.config/quarry/whoxy-key.txt). The one installed tool:
+  # Key-gated in-process: whoxy (secrets.yaml -> whoxy:). The one installed tool:
   - bin: porch-pirate
     phase: osint
     role: search public Postman workspaces for the target's API endpoints/secrets
@@ -70,7 +70,7 @@ tools:
     install: go install github.com/incogbyte/shosubgo@latest
     version_cmd: shosubgo -h
     doc: https://github.com/incogbyte/shosubgo
-    keys: Shodan API key (-s)
+    keys: Shodan key -> secrets.yaml (shodan:)
     optional: true
 
   - bin: subfinder
@@ -88,7 +88,7 @@ tools:
     install: go install github.com/gwen001/github-subdomains@latest
     version_cmd: github-subdomains -h
     doc: https://github.com/gwen001/github-subdomains
-    keys: GITHUB tokens file (-t) — use burner accounts to dodge rate limits
+    keys: GitHub PATs -> secrets.yaml (github:) — use burner accounts to dodge rate limits
     optional: true
 
   - bin: puredns

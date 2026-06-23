@@ -197,6 +197,3 @@ extras:
     test: test -d ~/nuclei-templates
     run: nuclei -update-templates
     needs: nuclei
-  - name: github-tokens-stub
-    test: test -f ~/.config/quarry/github-tokens.txt
-    run: mkdir -p ~/.config/quarry && touch ~/.config/quarry/github-tokens.txt

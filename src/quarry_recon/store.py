@@ -89,11 +89,14 @@ class Run:
 
     # ── tool run accounting ──
     def record(self, phase: str, result) -> None:
+        # Redact any secret values out of the recorded command/note/stderr before they ever
+        # hit the manifest (e.g. shosubgo's `-s <shodan-key>` arg). Single choke point.
+        from . import secrets
         self._tool_runs.append(ToolRunRecord(
             phase=phase, tool=result.tool, status=str(result.status.value),
             exit_code=result.exit_code, duration=round(result.duration, 2),
-            stdout_lines=result.stdout_lines, note=result.note,
-            cmd=" ".join(result.cmd), stderr_tail=result.stderr_tail,
+            stdout_lines=result.stdout_lines, note=secrets.redact(result.note),
+            cmd=secrets.redact(" ".join(result.cmd)), stderr_tail=secrets.redact(result.stderr_tail),
         ))
 
     def tool_runs(self, phase: str | None = None) -> list[ToolRunRecord]:

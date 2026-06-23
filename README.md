@@ -74,15 +74,26 @@ reported with its doc link — never silently skipped.
 
 ## API keys
 
-Never stored in profiles. Configure each tool where it expects them (`quarry doctor` prints
-the path for every key-needing tool):
+Never stored in target profiles or run manifests — secret values are redacted out of recorded
+commands and logs. Keys live in two places:
+
+**`~/.config/quarry/secrets.yaml`** (`chmod 600`, created at install) — keys the framework passes
+to tools itself. `quarry doctor` shows which are set. Back up before editing:
+`cp ~/.config/quarry/secrets.yaml ~/.config/quarry/secrets.yaml.bak`.
+
+| Key | Used by |
+|-----|---------|
+| `github` (list) | github-subdomains — use burner PATs |
+| `shodan` | shosubgo |
+| `whoxy` | osint reverse-whois |
+| `projectdiscovery` | exported as `PDCP_API_KEY` (chaos) for subfinder, asnmap, … |
+
+**Tool-native configs** — these tools read their own file; put their keys there:
 
 | Tool | Location | Keys |
 |------|----------|------|
 | subfinder | `~/.config/subfinder/provider-config.yaml` | chaos, github, shodan, securitytrails, netlas, c99, dnsdumpster |
 | waymore | `~/.config/waymore/config.yml` | URLScan, VirusTotal |
-| github-subdomains | `~/.config/quarry/github-tokens.txt` | GitHub PATs (use burners) |
-| shosubgo | `~/.config/quarry/shodan-key.txt` | Shodan |
 
 ## Target profile
 

@@ -24,7 +24,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import osint_report
+from . import osint_report, secrets
 from .runner import have, run as exec_tool, skipped
 
 # Full email (no inner capture group) — findall returns the whole address.
@@ -221,11 +221,10 @@ def _dmarc(s: OsintSession, apex: str, echo, timeout: int) -> None:
 
 def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeout: int) -> None:
     """Reverse-whois by registrant EMAIL (from whois) and by ORG_NAMES (profile anchor)."""
-    key_file = Path.home() / ".config/quarry/whoxy-key.txt"
-    if not key_file.exists():
-        s.record(skipped("whoxy", "no ~/.config/quarry/whoxy-key.txt"))
+    key = secrets.whoxy()
+    if not key:
+        s.record(skipped("whoxy", "no Whoxy key in secrets.yaml"))
         return
-    key = key_file.read_text().strip()
     # (param, value, label) queries: emails first, then org-name anchors
     queries = [("email", e, f"registrant email {e}") for e in sorted(emails)[:5]]
     queries += [("company", o, f"org name '{o}'") for o in (org_names or [])[:5]]
@@ -246,7 +245,7 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
                             f"reverse-whois on {label}", raw_ref=str(raw))
             echo(f"  whoxy[{label}]: {len(doms or [])} domains")
         except Exception as e:
-            echo(f"    whoxy[{label}]: {e}")
+            echo(secrets.redact(f"    whoxy[{label}]: {e}"))  # error may echo the key= URL
 
 
 def _asn_expand(s: OsintSession, profile, echo, timeout: int) -> None:

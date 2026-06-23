@@ -167,6 +167,18 @@ def install_data_files(echo, dry: bool, update: bool = False) -> None:
             code = 0
         echo(f"  {df['name']}: {'ok' if code == 0 else 'FAILED'} -> {dest}")
 
+    # framework secrets store — created once, chmod 600, NEVER overwritten
+    sp = Path.home() / ".config" / "quarry" / "secrets.yaml"
+    if sp.exists():
+        echo(f"  secrets.yaml: present ({sp})")
+    else:
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        if not dry:
+            tpl = resources.files("quarry_recon.data").joinpath("secrets.template.yaml").read_text()
+            sp.write_text(tpl)
+            sp.chmod(0o600)
+        echo(f"  secrets.yaml: created {sp} (chmod 600) — add your keys")
+
 
 def run_extras(echo, dry: bool) -> None:
     bs = load_bootstrap()

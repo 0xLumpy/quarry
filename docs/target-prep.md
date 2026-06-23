@@ -32,12 +32,12 @@ confirm and copy the good ones into `APEX_DOMAINS` yourself, then run recon.
 | **azmap.dev** M365 tenant | related/sibling apex domains | no | — |
 | **whois** | registrant org/email (→ whoxy seed) | no | — |
 | **DMARC** (`dig _dmarc`) | related apexes via `rua`/`ruf` (3rd-party processors flagged) | no | — |
-| **whoxy** reverse-whois | sibling apexes by registrant email | **yes** | `~/.config/quarry/whoxy-key.txt` |
+| **whoxy** reverse-whois | sibling apexes by registrant email | **yes** | `secrets.yaml` → `whoxy:` |
 | **porch-pirate** | public Postman API endpoints/secrets | no | — |
-| (vertical) **github-subdomains** / **shosubgo** | github / shodan subdomains | **yes** | `~/.config/quarry/github-tokens.txt` · `shodan-key.txt` |
+| (vertical) **github-subdomains** / **shosubgo** | github / shodan subdomains | **yes** | `secrets.yaml` → `github:` · `shodan:` |
 | (vertical) **subfinder** sources | passive subdomains | **yes (many)** | `~/.config/subfinder/provider-config.yaml` |
 
-Drop a key file in `~/.config/quarry/` and `quarry doctor` will show it as present. No key = that
+Add keys to `~/.config/quarry/secrets.yaml` and `quarry doctor` will show them as set. No key = that
 source is skipped (recorded, not silent).
 
 **Still manual** (no good automation — judgment/login/paywall; do these by hand, then add to

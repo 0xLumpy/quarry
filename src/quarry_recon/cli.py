@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from . import __version__
+from . import __version__, secrets
 from .config import ProfileError, TargetProfile
 from .registry import load_tools, run_shell, tools_by_phase
 
@@ -77,13 +77,20 @@ def doctor(phase):
     cfg = Path.home() / ".config/quarry"
     for label, p in [("resolvers", cfg / "resolvers.txt"),
                      ("trusted-resolvers", cfg / "trusted-resolvers.txt"),
-                     ("dns-wordlist", cfg / "dns-wordlist.txt"),
-                     ("github-tokens", cfg / "github-tokens.txt"),
-                     ("shodan-key", cfg / "shodan-key.txt"),
-                     ("whoxy-key", cfg / "whoxy-key.txt")]:
+                     ("dns-wordlist", cfg / "dns-wordlist.txt")]:
         mark = _c("✓", "green") if p.exists() else _c("·", "yellow")
         note = "" if p.exists() else f"(optional) put at {p}"
         click.echo(f"  {mark} {label:<24} {note}")
+
+    # secrets.yaml — framework-read keys (present / not set). Tool-native keys live elsewhere.
+    click.echo(_c("\n[secrets]", "magenta") + f"  ({secrets.PATH})")
+    for label, present in [("github tokens", bool(secrets.github_tokens())),
+                           ("shodan", bool(secrets.shodan())),
+                           ("whoxy", bool(secrets.whoxy())),
+                           ("projectdiscovery/chaos", bool(secrets.chaos()))]:
+        mark = _c("✓", "green") if present else _c("·", "yellow")
+        click.echo(f"  {mark} {label:<24} {'' if present else '(optional) not set'}")
+    click.echo(f"  {_c('ℹ', 'cyan')} tool-native: subfinder provider-config.yaml · waymore config.yml")
     for label, bin_ in [("go toolchain", "go"), ("chromium", "chromium"),
                         ("pipx", "pipx")]:
         present = shutil.which(bin_) or (bin_ == "chromium" and
@@ -244,6 +251,7 @@ def osint(profile_path, timeout):
         raise click.ClickException(str(e))
     scope = profile.scope()
     project = _project_dir(profile)
+    secrets.apply_env()   # export PDCP_API_KEY (chaos) for PD tools, if set
 
     click.echo(_c(f"\n══ Quarry osint · target={profile.target} (pre-flight, review-only) ══", "cyan"))
     click.echo(f"   project: {project}")
@@ -286,6 +294,7 @@ def run(profile_path, phases, passive, timeout):
         profile.modes["PASSIVE_ONLY"] = True
     scope = profile.scope()
     project = _project_dir(profile)
+    secrets.apply_env()   # export PDCP_API_KEY (chaos) for PD tools, if set
     run_obj = Run(project, profile.target)
     workdir = run_obj.dir / "work"
     ctx = PhaseContext(run=run_obj, profile=profile, scope=scope, workdir=workdir,

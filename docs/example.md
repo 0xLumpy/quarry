@@ -118,7 +118,7 @@ whois 0xlumpy.cc        # → raw/osint/whois/0xlumpy.cc.txt; registrant org →
 dig +short TXT _dmarc.0xlumpy.cc     # rua=mailto:..@DOMAIN → apex-candidate (3rd-party processors flagged)
 ```
 
-**0.4 whoxy reverse-whois** (only if `~/.config/quarry/whoxy-key.txt` exists) — sibling apexes
+**0.4 whoxy reverse-whois** (only if `whoxy:` is set in secrets.yaml) — sibling apexes
 by registrant email:
 ```
 GET https://api.whoxy.com/?key=<KEY>&reverse=whois&email=<registrant-email>
@@ -198,13 +198,13 @@ subfinder -dL <work>/roots.txt -all -recursive -stats -silent
 ```
 → raw `raw/vertical/subfinder/passive.txt` · in-scope → `subdomain`.
 
-**4.2 github-subdomains** (only if `~/.config/quarry/github-tokens.txt` exists), per apex:
+**4.2 github-subdomains** (only if `github:` is set in secrets.yaml), per apex:
 
 ```bash
-github-subdomains -d 0xlumpy.cc -t ~/.config/quarry/github-tokens.txt
+github-subdomains -d 0xlumpy.cc -t <tokens materialized from secrets.yaml>
 ```
 
-**4.3 shosubgo** (only if installed + `~/.config/quarry/shodan-key.txt` exists):
+**4.3 shosubgo** (only if installed + `shodan:` set in secrets.yaml):
 
 ```bash
 shosubgo -f <work>/roots.txt -s <shodan-key> -o raw/vertical/shosubgo/sho.txt

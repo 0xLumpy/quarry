@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .. import normalize
+from .. import normalize, secrets
 from ..runner import Status, have, run as exec_tool, skipped
 
 
@@ -53,29 +53,31 @@ def run(ctx) -> None:
         ctx.echo(f"  subfinder: +{n} in-scope ({r.stdout_lines} raw, {r.status.value})")
 
     # ── passive: github-subdomains (optional, needs token) ──
-    gh_token = Path.home() / ".config/quarry/github-tokens.txt"
-    if gh_token.exists():
-        gh_raw = ctx.run.raw_path("vertical", "github-subdomains", "gh.txt")
-        for d in prof.apex_domains:
-            r = exec_tool("github-subdomains",
-                    ["github-subdomains", "-d", d, "-t", str(gh_token)],
-                    raw_path=ctx.run.raw_path("vertical", "github-subdomains", f"{d}.txt"),
-                    timeout=ctx.http_timeout)
-            ctx.run.record("vertical", r)
-            if r.raw_path:
-                for e in normalize.hosts(r.raw_path.read_text(), "github-subdomains", str(r.raw_path)):
-                    if scope.in_scope(e["host"]):
-                        ctx.run.add("subdomain", e)
+    gh_token = secrets.github_tokens_file()   # 0600 temp file from secrets.yaml; None if unset
+    if gh_token:
+        try:
+            for d in prof.apex_domains:
+                r = exec_tool("github-subdomains",
+                        ["github-subdomains", "-d", d, "-t", str(gh_token)],
+                        raw_path=ctx.run.raw_path("vertical", "github-subdomains", f"{d}.txt"),
+                        timeout=ctx.http_timeout)
+                ctx.run.record("vertical", r)
+                if r.raw_path:
+                    for e in normalize.hosts(r.raw_path.read_text(), "github-subdomains", str(r.raw_path)):
+                        if scope.in_scope(e["host"]):
+                            ctx.run.add("subdomain", e)
+        finally:
+            gh_token.unlink(missing_ok=True)
     else:
         ctx.run.record("vertical", skipped("github-subdomains",
-                       "no ~/.config/quarry/github-tokens.txt"))
+                       "no GitHub token in secrets.yaml"))
 
     # ── shosubgo (Shodan subs, optional, needs key) ──
-    sho_key = Path.home() / ".config/quarry/shodan-key.txt"
-    if have("shosubgo") and sho_key.exists():
+    sho_key = secrets.shodan()
+    if have("shosubgo") and sho_key:
         sho = ctx.run.raw_path("vertical", "shosubgo", "sho.txt")
         r = exec_tool("shosubgo", ["shosubgo", "-f", str(roots_file),
-                                   "-s", sho_key.read_text().strip(), "-o", str(sho)], timeout=ctx.http_timeout)
+                                   "-s", sho_key, "-o", str(sho)], timeout=ctx.http_timeout)
         ctx.run.record("vertical", r)
         if r.raw_path:
             for e in normalize.hosts(r.raw_path.read_text(), "shosubgo", str(sho)):
