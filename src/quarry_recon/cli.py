@@ -13,10 +13,15 @@ from .config import ProfileError, TargetProfile
 from .registry import load_tools, run_shell, tools_by_phase
 
 
-def _home(home: str | None) -> Path:
-    base = Path(home or os.environ.get("QUARRY_HOME") or (Path.home() / ".quarry"))
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+def _projects_root(opt: str | None) -> Path:
+    """Where `quarry init` creates project dirs. Default ./projects (cwd)."""
+    return Path(opt or os.environ.get("QUARRY_PROJECTS") or "projects")
+
+
+def _project_dir(profile) -> Path:
+    """A profile's project dir = the directory its target.yaml lives in. Output (osint/, recon/)
+    co-locates with the profile (campaign/project model)."""
+    return (profile.path.parent if profile.path else Path(".")).resolve()
 
 
 def _c(s, color):  # tiny colorizer
@@ -183,33 +188,36 @@ def update(dry_run, include_optional):
         click.echo(_c("\n(dry-run)\n", "yellow"))
 
 
-# ── init-target ──────────────────────────────────────────────────────────────
-@cli.command(name="init-target")
+# ── init (create a project) ───────────────────────────────────────────────────
+@cli.command()
 @click.argument("name")
-@click.option("-o", "--out", help="output path (default ./targets/<name>.yaml)")
-def init_target(name, out):
-    """Create an editable target profile from the template."""
+@click.option("--projects-dir", help="projects root (default ./projects or $QUARRY_PROJECTS)")
+def init(name, projects_dir):
+    """Create a project: <projects>/<name>/target.yaml. osint + recon output co-locate here."""
+    proj = _projects_root(projects_dir) / name
+    proj.mkdir(parents=True, exist_ok=True)
     tpl = resources.files("quarry_recon.data").joinpath("target.template.yaml").read_text()
     tpl = tpl.replace("TARGET: example", f"TARGET: {name}")
-    dest = Path(out) if out else Path("targets") / f"{name}.yaml"
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest = proj / "target.yaml"
     if dest.exists():
         click.confirm(f"{dest} exists — overwrite?", abort=True)
     dest.write_text(tpl)
-    click.echo(f"{_c('created', 'green')} {dest}\nEdit APEX_DOMAINS / CIDR / OOS, then: "
-               f"quarry run -t {dest}")
+    click.echo(f"{_c('created project', 'green')} {proj}/\n"
+               f"  profile: {dest}\n"
+               f"Edit APEX_DOMAINS / CIDR / OOS, then:\n"
+               f"  quarry osint -t {dest}     # optional pre-flight\n"
+               f"  quarry run   -t {dest}")
 
 
 # ── osint (pre-flight; separate from run) ─────────────────────────────────────
 @cli.command()
 @click.option("-t", "--target", "profile_path", required=True, help="target profile YAML")
-@click.option("--home", help="state/runs base dir (default ~/.quarry or $QUARRY_HOME)")
 @click.option("--timeout", default=1800, help="per-tool timeout seconds")
-def osint(profile_path, home, timeout):
+def osint(profile_path, timeout):
     """Pre-flight OSINT: discover scope CANDIDATES + intel. Review-only — never edits scope.
 
-    Workflow: init-target → fill anchors → `quarry osint` → review report + suggested.yaml →
-    confirm into target.yaml → `quarry run`.
+    Workflow: init → fill anchors → `quarry osint` → review report + suggested.yaml →
+    confirm into target.yaml → `quarry run`. Output lands in the project's osint/ dir.
     """
     import json
     from . import osint as osint_mod
@@ -219,12 +227,13 @@ def osint(profile_path, home, timeout):
     except ProfileError as e:
         raise click.ClickException(str(e))
     scope = profile.scope()
-    base = _home(home)
+    project = _project_dir(profile)
 
     click.echo(_c(f"\n══ Quarry osint · target={profile.target} (pre-flight, review-only) ══", "cyan"))
+    click.echo(f"   project: {project}")
     click.echo(f"   anchors: apex={len(profile.apex_domains)} asn={len(profile.asn)} "
                f"org={len(profile.org_names)} brands={len(profile.brands)}\n")
-    report = osint_mod.run(profile, scope, base, echo=click.echo, timeout=timeout)
+    report = osint_mod.run(profile, scope, project, echo=click.echo, timeout=timeout)
 
     cdir = report.parent
     cfile = cdir / "candidates.jsonl"
@@ -244,12 +253,11 @@ def osint(profile_path, home, timeout):
 # ── run ──────────────────────────────────────────────────────────────────────
 @cli.command()
 @click.option("-t", "--target", "profile_path", required=True, help="target profile YAML")
-@click.option("--home", help="state/runs base dir (default ~/.quarry or $QUARRY_HOME)")
 @click.option("--phases", help="comma list (default: all). e.g. horizontal,vertical")
 @click.option("--passive", is_flag=True, help="force passive-only (override profile)")
 @click.option("--timeout", default=1800, help="per-tool timeout seconds")
-def run(profile_path, home, phases, passive, timeout):
-    """Run methodology phases against a target profile."""
+def run(profile_path, phases, passive, timeout):
+    """Run recon phases against the confirmed scope. Output lands in the project's recon/ dir."""
     from .phases import ORDER, REGISTRY, PhaseContext
     from .store import Run
     from . import checkpoint, exports, triage
@@ -261,8 +269,8 @@ def run(profile_path, home, phases, passive, timeout):
     if passive:
         profile.modes["PASSIVE_ONLY"] = True
     scope = profile.scope()
-    base = _home(home)
-    run_obj = Run(base, profile.target)
+    project = _project_dir(profile)
+    run_obj = Run(project, profile.target)
     workdir = run_obj.dir / "work"
     ctx = PhaseContext(run=run_obj, profile=profile, scope=scope, workdir=workdir,
                        echo=click.echo, http_timeout=timeout)
@@ -315,17 +323,21 @@ def run(profile_path, home, phases, passive, timeout):
 
 # ── report ───────────────────────────────────────────────────────────────────
 @cli.command()
-@click.option("--home", help="state/runs base dir")
+@click.option("-t", "--target", "profile_path", required=True, help="target profile YAML")
 @click.option("--run", "run_id", help="run id (default: latest)")
-def report(home, run_id):
-    """Regenerate hotlist + exports from a stored run (no scanning)."""
+def report(profile_path, run_id):
+    """Regenerate hotlist + exports from a stored run in the project (no scanning)."""
     from .store import Run
     from . import exports, triage
 
-    base = _home(home)
-    run_obj = Run(base, "unknown", run_id=run_id) if run_id else Run.latest(base)
+    try:
+        profile = TargetProfile.load(profile_path)
+    except ProfileError as e:
+        raise click.ClickException(str(e))
+    project = _project_dir(profile)
+    run_obj = Run(project, profile.target, run_id=run_id) if run_id else Run.latest(project)
     if run_obj is None:
-        raise click.ClickException("no runs found")
+        raise click.ClickException(f"no runs found under {project}/recon/")
     # minimal scope (report doesn't re-filter)
     from .config import ScopeMatcher
     scope = ScopeMatcher([], [], [], False)

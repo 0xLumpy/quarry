@@ -9,7 +9,7 @@ Assumptions:
 - Authorized target `0xlumpy.cc` — single apex, **no CIDR in scope** (common bug-bounty case)
 - Tools installed (`quarry install` done), API keys configured where available
 - `PATH` includes `~/go/bin` and `~/.local/bin`
-- Default home `~/.quarry` (override with `--home` / `$QUARRY_HOME`)
+- Output lands in the project dir `./projects/0xlumpy/` (profile + osint + recon together)
 - Illustrative run id: `20260620-120000`
 
 ---
@@ -30,10 +30,10 @@ quarry doctor                               # audit: tools, versions, deps, keys
 ## 1. Create the target profile
 
 ```bash
-quarry init-target 0xlumpy -o targets/0xlumpy.yaml
+quarry init 0xlumpy
 ```
 
-`targets/0xlumpy.yaml`:
+`projects/0xlumpy/target.yaml`:
 
 ```yaml
 TARGET: 0xlumpy
@@ -75,14 +75,14 @@ MODES:
 ## 2. Launch
 
 ```bash
-quarry run -t targets/0xlumpy.yaml
+quarry run -t projects/0xlumpy/target.yaml
 ```
 
 Run phases execute in order `horizontal → vertical → probe → crawl → params` (OSINT is a
 separate pre-flight — §3 — run *before* this, on the confirmed scope). Each tool call captures
 stdout/stderr/exit/duration, writes raw output under `raw/<phase>/<tool>/`, classifies the
 result, and normalizes parsed entities into `normalized/*.jsonl`. After each phase the
-checkpoint engine evaluates coverage. Run dir: `~/.quarry/runs/20260620-120000/`.
+checkpoint engine evaluates coverage. Run dir: `projects/0xlumpy/recon/20260620-120000/`.
 
 ```
 ══ Quarry run 20260620-120000 · target=0xlumpy · ACTIVE ══
@@ -94,7 +94,7 @@ checkpoint engine evaluates coverage. Run dir: `~/.quarry/runs/20260620-120000/`
 ## 3. Pre-flight — `quarry osint` (separate command, run before §2)
 
 ```bash
-quarry osint -t targets/0xlumpy.yaml      # → osint/0xlumpy/<ts>/{osint-report.md, target.suggested.yaml, …}
+quarry osint -t projects/0xlumpy/target.yaml      # → projects/0xlumpy/osint/<ts>/{osint-report.md, target.suggested.yaml, …}
 ```
 
 Apex/org/leak discovery (all passive — queries third parties, not the target). Discovered
@@ -133,7 +133,7 @@ porch-pirate -s 0xlumpy.cc --urls      # in-scope URLs → endpoint; out-of-scop
 ```
 ══ Quarry osint · target=0xlumpy (pre-flight, review-only) ══
   azmap[0xlumpy.cc]: N related domains
-══ osint done · ~/.quarry/osint/0xlumpy/<ts>
+══ osint done · projects/0xlumpy/osint/<ts>
    report:    …/osint-report.md
    suggested: …/target.suggested.yaml
    N apex candidate(s) — review, confirm scope, add to target.yaml
@@ -454,11 +454,11 @@ reports/checkpoints.md   # thin/blocked/timed-out warnings with stated causes
 manifest.json            # per-tool status taxonomy + entity counts + profile + notes
 ```
 
-State pointers: `state/current → runs/20260620-120000`, `state/history/20260620-120000.json`.
+State pointers: `recon/state/current → recon/20260620-120000`, `recon/state/history/20260620-120000.json`.
 
 ```
-══ done · ~/.quarry/runs/20260620-120000
-   HOTLIST: ~/.quarry/runs/20260620-120000/reports/HOTLIST.md
+══ done · projects/0xlumpy/recon/20260620-120000
+   HOTLIST: projects/0xlumpy/recon/20260620-120000/reports/HOTLIST.md
    exports: subdomains.txt=N, resolved.txt=N, live.txt=N, urls.txt=N, …
 ```
 
@@ -467,23 +467,28 @@ State pointers: `state/current → runs/20260620-120000`, `state/history/2026062
 ## 10. Full output tree
 
 ```
-~/.quarry/runs/20260620-120000/
-  manifest.json
-  raw/
-    horizontal/{kaeferjaeger/sni.txt, csprecon/csp.txt}
-    vertical/{subfinder/passive.txt, github-subdomains/…, puredns/{brute-*,resolved.txt},
-              alterx/perms.txt, dnsx/cnames.jsonl}
-    probe/{httpx/httpx.jsonl, nuclei/waf.jsonl, gowitness/*.jpeg+gowitness.jsonl, smap/smap.txt}
-    crawl/{katana/katana.txt, katana_resp/…, gau/gau.txt, waymore/0xlumpy.cc/…,
-           js_files/*.js, sourcemaps/candidates.txt, jsluice/{urls,secrets}.jsonl,
-           xnLinkFinder/*, gitleaks/report.json, trufflehog/out.jsonl}
-    params/{gf/*.txt, nuclei/{findings,takeover}.jsonl+nuclei.run.log, arjun/arjun.txt, dalfox/dalfox.txt}
-  normalized/
-    subdomain.jsonl  resolved.jsonl  live.jsonl  tech.jsonl  url.jsonl  js_url.jsonl
-    endpoint.jsonl   parameter.jsonl secret.jsonl review.jsonl finding.jsonl  screenshot.jsonl
-  exports/   …flat .txt views + secrets.jsonl
-  reports/   HOTLIST.md  delta.md  checkpoints.md
-  work/      …intermediate input lists (roots.txt, all_candidates.txt, …)
+projects/0xlumpy/
+  target.yaml
+  osint/<ts>/      candidates.jsonl  intel.jsonl  osint-report.md  target.suggested.yaml
+  osint/latest -> <ts>
+  recon/20260620-120000/
+    manifest.json
+    raw/
+      horizontal/{kaeferjaeger/sni.txt, csprecon/csp.txt}
+      vertical/{subfinder/passive.txt, github-subdomains/…, puredns/{brute-*,resolved.txt},
+                alterx/perms.txt, dnsx/cnames.jsonl}
+      probe/{httpx/httpx.jsonl, nuclei/waf.jsonl, gowitness/*.jpeg+gowitness.jsonl, smap/smap.txt}
+      crawl/{katana/katana.txt, katana_resp/…, gau/gau.txt, waymore/0xlumpy.cc/…,
+             js_files/*.js, sourcemaps/candidates.txt, jsluice/{urls,secrets}.jsonl,
+             xnLinkFinder/*, gitleaks/report.json, trufflehog/out.jsonl}
+      params/{gf/*.txt, nuclei/{findings,takeover}.jsonl+nuclei.run.log, arjun/arjun.txt, dalfox/dalfox.txt}
+    normalized/
+      subdomain.jsonl  resolved.jsonl  live.jsonl  tech.jsonl  url.jsonl  js_url.jsonl
+      endpoint.jsonl   parameter.jsonl secret.jsonl review.jsonl finding.jsonl  screenshot.jsonl
+    exports/   …flat .txt views + secrets.jsonl
+    reports/   HOTLIST.md  delta.md  checkpoints.md
+    work/      …intermediate input lists (roots.txt, all_candidates.txt, …)
+  recon/state/current -> recon/20260620-120000
 ```
 
 ---
@@ -493,17 +498,17 @@ State pointers: `state/current → runs/20260620-120000`, `state/history/2026062
 ```bash
 # passive only — no active probing (httpx/katana-active/nuclei/dalfox/naabu/waf skipped;
 # kaeferjaeger, subfinder, gau, waymore -mode U still run)
-quarry run -t targets/0xlumpy.yaml --passive
+quarry run -t projects/0xlumpy/target.yaml --passive
 
 # one phase at a time
-quarry run -t targets/0xlumpy.yaml --phases vertical
-quarry run -t targets/0xlumpy.yaml --phases probe
+quarry run -t projects/0xlumpy/target.yaml --phases vertical
+quarry run -t projects/0xlumpy/target.yaml --phases probe
 
 # regenerate reports/exports from the stored run, no scanning
 quarry report
 
 # detached on a VPS
-setsid nohup quarry run -t targets/0xlumpy.yaml > run.log 2>&1 & disown
+setsid nohup quarry run -t projects/0xlumpy/target.yaml > run.log 2>&1 & disown
 ```
 
 ---

@@ -57,13 +57,17 @@ class ToolRunRecord:
 
 
 class Run:
-    """One reconnaissance run: owns its directory tree, manifest, and entity store."""
+    """One reconnaissance run inside a project: owns its tree, manifest, and entity store.
 
-    def __init__(self, base: Path, target: str, run_id: str | None = None):
-        self.base = Path(base)
+    Lives at <project_dir>/recon/<run_id>/ — the project dir is derived from the target.yaml
+    location, so a run's output co-locates with its profile (campaign/project model).
+    """
+
+    def __init__(self, project_dir: Path, target: str, run_id: str | None = None):
+        self.project_dir = Path(project_dir)
         self.target = target
         self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S")
-        self.dir = self.base / "runs" / self.run_id
+        self.dir = self.project_dir / "recon" / self.run_id
         self.raw = self.dir / "raw"
         self.normalized = self.dir / "normalized"
         self.exports = self.dir / "exports"
@@ -167,8 +171,8 @@ class Run:
             "notes": self.notes,
         }
         self.manifest_path.write_text(json.dumps(manifest, indent=2))
-        # update state pointers
-        state = self.base / "state"
+        # update state pointers (per-project, under recon/)
+        state = self.project_dir / "recon" / "state"
         (state / "history").mkdir(parents=True, exist_ok=True)
         (state / "history" / f"{self.run_id}.json").write_text(
             json.dumps({"run_id": self.run_id, "target": self.target,
@@ -183,11 +187,12 @@ class Run:
             (state / "current.txt").write_text(str(self.dir.resolve()))
 
     @staticmethod
-    def latest(base: Path) -> "Run | None":
-        runs_dir = Path(base) / "runs"
+    def latest(project_dir: Path) -> "Run | None":
+        runs_dir = Path(project_dir) / "recon"
         if not runs_dir.exists():
             return None
-        candidates = sorted([d for d in runs_dir.iterdir() if d.is_dir()])
+        candidates = sorted([d for d in runs_dir.iterdir()
+                             if d.is_dir() and d.name != "state"])
         if not candidates:
             return None
         d = candidates[-1]
@@ -198,4 +203,4 @@ class Run:
                 target = json.loads(manifest.read_text()).get("target", "unknown")
             except json.JSONDecodeError:
                 pass
-        return Run(base, target, run_id=d.name)
+        return Run(project_dir, target, run_id=d.name)

@@ -64,13 +64,13 @@ def _http(url: str, timeout: int = 25) -> str:
 
 
 class OsintSession:
-    """OSINT workspace: candidates + intel + raw evidence under osint/<target>/<ts>/."""
+    """OSINT workspace: candidates + intel + raw evidence under <project>/osint/<ts>/."""
 
-    def __init__(self, base: Path, target: str, ts: str | None = None):
-        self.base = Path(base)
+    def __init__(self, project_dir: Path, target: str, ts: str | None = None):
+        self.project_dir = Path(project_dir)
         self.target = target
         self.ts = ts or time.strftime("%Y%m%d-%H%M%S")
-        self.dir = self.base / "osint" / target / self.ts
+        self.dir = self.project_dir / "osint" / self.ts
         self.raw = self.dir / "raw"
         self.raw.mkdir(parents=True, exist_ok=True)
         self.started = _utc()
@@ -143,14 +143,14 @@ class OsintSession:
         (self.dir / "osint-report.md").write_text(report)
         (self.dir / "target.suggested.yaml").write_text(
             osint_report.suggested_yaml(profile, cands))
-        # latest pointer
-        link = self.base / "osint" / self.target / "latest"
+        # latest pointer (per-project)
+        link = self.project_dir / "osint" / "latest"
         try:
             if link.is_symlink() or link.exists():
                 link.unlink()
             os.symlink(self.dir.resolve(), link)
         except OSError:
-            (self.base / "osint" / self.target / "latest.txt").write_text(str(self.dir.resolve()))
+            (self.project_dir / "osint" / "latest.txt").write_text(str(self.dir.resolve()))
         return self.dir / "osint-report.md"
 
 
@@ -282,12 +282,13 @@ def _porch_pirate(s: OsintSession, apex: str, echo, timeout: int) -> None:
             echo(f"  porch-pirate[{apex}]: {n} postman endpoints (intel)")
 
 
-def run(profile, scope, base: Path, echo=print, timeout: int = 1800) -> Path:
+def run(profile, scope, project_dir: Path, echo=print, timeout: int = 1800) -> Path:
     """Run the OSINT pre-flight. Returns the report path. Never edits scope.
 
-    `timeout` is the per-tool ceiling; fast lookups (whois/dig/HTTP) use shorter caps.
+    Output lands under <project_dir>/osint/. `timeout` is the per-tool ceiling; fast lookups
+    (whois/dig/HTTP) use shorter caps.
     """
-    sess = OsintSession(base, profile.target)
+    sess = OsintSession(project_dir, profile.target)
     emails: set[str] = set()
     for apex in profile.apex_domains:
         _azmap(sess, apex, echo, timeout)

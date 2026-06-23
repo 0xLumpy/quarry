@@ -135,12 +135,12 @@ CIDR membership) — replacing regex-in-every-script.
 ## Workflow
 
 ```bash
-quarry init-target acme -o targets/acme.yaml          # 1. profile skeleton
-$EDITOR targets/acme.yaml                            # 2. fill anchors (apex + optional asn/org/brands)
-quarry osint -t targets/acme.yaml                      # 3. pre-flight: discover scope candidates
-#   → review osint/acme/latest/osint-report.md + target.suggested.yaml
-#   → confirm ownership/scope, copy approved candidates into targets/acme.yaml
-quarry run -t targets/acme.yaml                        # 4. recon on CONFIRMED scope
+quarry init acme          # 1. profile skeleton
+$EDITOR projects/acme/target.yaml                            # 2. fill anchors (apex + optional asn/org/brands)
+quarry osint -t projects/acme/target.yaml                      # 3. pre-flight: discover scope candidates
+#   → review projects/acme/osint/latest/osint-report.md + target.suggested.yaml
+#   → confirm ownership/scope, copy approved candidates into projects/acme/target.yaml
+quarry run -t projects/acme/target.yaml                        # 4. recon on CONFIRMED scope
 ```
 
 The **`osint`** step is optional but recommended on bigger targets — it discovers related
@@ -148,16 +148,16 @@ apexes / ASNs / org context and never edits scope (candidates are review-only). 
 step:
 
 ```bash
-quarry run -t targets/acme.yaml --phases vertical    # validate one phase at a time
-quarry run -t targets/acme.yaml                       # all phases
-quarry run -t targets/acme.yaml --passive             # no active probing
-quarry report                                         # regenerate reports from a stored run
+quarry run -t projects/acme/target.yaml --phases vertical    # validate one phase at a time
+quarry run -t projects/acme/target.yaml                       # all phases
+quarry run -t projects/acme/target.yaml --passive             # no active probing
+quarry report -t projects/acme/target.yaml            # regenerate reports from a stored run
 ```
 
 Detached VPS run:
 
 ```bash
-setsid nohup quarry run -t targets/acme.yaml > run.log 2>&1 & disown
+setsid nohup quarry run -t projects/acme/target.yaml > run.log 2>&1 & disown
 ```
 
 ## Command surface
@@ -167,10 +167,10 @@ setsid nohup quarry run -t targets/acme.yaml > run.log 2>&1 & disown
 | `quarry install` | Full blank-VPS provision (system pkgs → Go → tools → wordlists/templates) |
 | `quarry update` | Update managed tools, nuclei templates, resolvers, gf patterns |
 | `quarry doctor` | Audit tools, versions, per-tool deps, API keys, resolvers, wordlists |
-| `quarry init-target <name>` | Write an editable target profile from the template |
+| `quarry init <name>` | Create a project (`projects/<name>/target.yaml`) |
 | `quarry osint -t <profile>` | **Pre-flight** OSINT — discover scope candidates + intel (review-only, never edits scope) |
 | `quarry run -t <profile>` | Run recon phases against the confirmed scope |
-| `quarry report` | Regenerate hotlist + exports + delta from a stored run (no scanning) |
+| `quarry report -t <profile>` | Regenerate hotlist + exports + delta from a stored run (no scanning) |
 
 ## Phases (methodology mapping)
 
@@ -190,18 +190,29 @@ traces back to the tool and raw file that produced it.
 
 ## Output
 
+Everything for a target lives in **one project dir** (`./projects/<target>/`) — profile,
+OSINT, and recon together. Clean to `rsync` down to your local machine for manual testing.
+
 ```text
-~/.quarry/ (default; override with --home or $QUARRY_HOME)
-  runs/<id>/manifest.json          run record + per-tool status taxonomy
-  runs/<id>/raw/<phase>/<tool>/    raw evidence (preserved before parsing)
-  runs/<id>/normalized/*.jsonl     entities with provenance (the source of truth)
-  runs/<id>/exports/*.txt          flat compat views (subdomains/resolved/live/urls/js/…)
-  runs/<id>/reports/HOTLIST.md     ranked manual-validation queues + rationale
-  runs/<id>/reports/delta.md       per-source contribution + new-since-last-run
-  runs/<id>/reports/checkpoints.md thin/blocked-output warnings with stated causes
-  state/current -> latest run
-  state/history/<id>.json
+projects/<target>/
+  target.yaml                              the profile (scope lives here)
+  osint/<ts>/                              quarry osint pre-flight
+    candidates.jsonl  intel.jsonl  osint-report.md  target.suggested.yaml
+  osint/latest -> <ts>
+  recon/<run_id>/                          quarry run output
+    manifest.json                          run record + per-tool status taxonomy
+    raw/<phase>/<tool>/                    raw evidence (preserved before parsing)
+    normalized/*.jsonl                     entities with provenance (the source of truth)
+    exports/*.txt                          flat compat views (subdomains/live/urls/js/…)
+    reports/HOTLIST.md                     ranked manual-validation queues + rationale
+    reports/delta.md                       per-source contribution + new-since-last-run
+    reports/checkpoints.md                 thin/blocked-output warnings with stated causes
+  recon/state/current -> latest run
+  recon/state/history/<run_id>.json
 ```
+
+(Projects root defaults to `./projects/`; override with `--projects-dir` / `$QUARRY_PROJECTS`
+on `quarry init`. Keys + wordlists stay global in `~/.config/quarry/`.)
 
 **HOTLIST** ranks: scanner candidates (unconfirmed), likely-origin (non-CDN) hosts,
 auth/api/admin/file buckets, IDOR/SSRF/SQLi/XSS param candidates (common-vuln lists), secrets, and

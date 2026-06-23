@@ -26,11 +26,12 @@ def write_delta(run) -> None:
     for src, n in sorted(by_src.items(), key=lambda kv: -kv[1]):
         out.append(f"- {src}: {n}")
 
-    # new-since-previous-run: diff against the most recent *other* run's export
+    # new-since-previous-run: diff against the most recent *other* run in the project
     import json
     from pathlib import Path
-    runs_dir = Path(run.base) / "runs"
-    prev = sorted([d for d in runs_dir.iterdir() if d.is_dir() and d.name != run.run_id])
+    runs_dir = Path(run.project_dir) / "recon"
+    prev = sorted([d for d in runs_dir.iterdir()
+                   if d.is_dir() and d.name not in (run.run_id, "state")])
     if prev:
         prev_subs_file = prev[-1] / "exports" / "subdomains.txt"
         if prev_subs_file.exists():

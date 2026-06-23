@@ -22,9 +22,9 @@ phases build on.
 
 ## What the `quarry osint` pre-flight automates (and the keys it needs)
 
-Run **`quarry osint -t targets/<t>.yaml`** *before* `quarry run`. It automates the parts of this
-guide that *can* be scripted and writes a review report + `target.suggested.yaml` to
-`osint/<target>/latest/`. **It never edits scope** — discovered apexes are candidates; you
+Run **`quarry osint -t projects/<t>/target.yaml`** *before* `quarry run`. It automates the parts of this
+guide that *can* be scripted and writes a review report + `target.suggested.yaml` to the project's
+`osint/latest/`. **It never edits scope** — discovered apexes are candidates; you
 confirm and copy the good ones into `APEX_DOMAINS` yourself, then run recon.
 
 | Source | What it finds | API key? | Key location |
@@ -266,7 +266,7 @@ NOTES:
 Then:
 
 ```bash
-quarry run -t targets/acme.yaml
+quarry run -t projects/acme/target.yaml
 ```
 
 With `CIDR`/`ASN` set, the horizontal phase now also runs `mapcidr`, `tlsx` SAN harvest,
