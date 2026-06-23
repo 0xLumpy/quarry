@@ -20,7 +20,13 @@ quarry install --include-optional || true   # never abort bootstrap on one item
 # ── persist PATH so `quarry` and the recon tools are found in new shells ──
 echo "[*] Persisting PATH (~/.local/bin, ~/go/bin, /usr/local/go/bin)…"
 pipx ensurepath >/dev/null 2>&1 || true
-RC="$HOME/.bashrc"; [ -f "$RC" ] || RC="$HOME/.profile"
+# pick the rc file for the user's actual shell (zsh reads ~/.zshrc, bash ~/.bashrc)
+case "${SHELL##*/}" in
+  zsh)  RC="$HOME/.zshrc" ;;
+  bash) RC="$HOME/.bashrc" ;;
+  *)    RC="$HOME/.profile" ;;
+esac
+[ -e "$RC" ] || touch "$RC"
 if ! grep -q '>>> quarry path >>>' "$RC" 2>/dev/null; then
   {
     echo ''
@@ -33,7 +39,7 @@ fi
 echo
 echo "[✓] Done."
 echo
-echo "    IMPORTANT: open a new shell, or run:  source ${RC/#$HOME/~}"
+echo "    IMPORTANT: open a new shell, or run:  source ~/${RC#"$HOME"/}"
 echo "    (so 'quarry' and the recon tools are on your PATH)"
 echo
 echo "    Then:"

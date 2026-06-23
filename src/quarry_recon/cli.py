@@ -139,14 +139,15 @@ def install(dry_run, phase, only, include_optional, tools_only):
             click.echo(f"  {_c('!', 'yellow')} {t.bin} — manual: {t.doc}")
             continue
         click.echo(f"  {_c('→', 'cyan')} {t.bin}")
-        code, tail = run_shell(t.install, dry_run)
+        code, _ = run_shell(t.install, dry_run)
         if dry_run:
             continue
         if code == 0 and t.installed:
             click.echo(f"      {_c('ok', 'green')}")
         else:
             failed.append(t.bin)
-            click.echo(f"      {_c('FAILED', 'red')} {tail[:100]}")
+            click.echo(f"      {_c('FAILED', 'red')}    Retry after install completes: "
+                       f"{_c('quarry install --only ' + t.bin, 'cyan')}")
         # (API-key reminders are NOT printed per-tool here — see the post-install summary)
 
     # ── 3. data files + extras + cleanup ──
@@ -161,8 +162,11 @@ def install(dry_run, phase, only, include_optional, tools_only):
     if dry_run:
         click.echo(_c("\n(dry-run — nothing was installed)\n", "yellow"))
     else:
-        msg = f"\ninstall complete. {len(failed)} tool(s) failed" + (f": {', '.join(failed)}" if failed else "")
-        click.echo(_c(msg, "yellow" if failed else "green"))
+        if failed:
+            click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
+            click.echo("retry: quarry install --only <tool>")
+        else:
+            click.echo(_c("\ninstall complete — all tools ok", "green"))
         click.echo("run  quarry doctor  to verify, then configure API keys (README.md)\n")
 
 

@@ -246,7 +246,10 @@ Start with `quarry doctor`. Common issues:
 - weak DNS results → check resolvers / trusted resolvers.
 - `httpx` returns nothing → check scope, rate limits, WAF blocking, tool status in manifest.
 - screenshots fail → check Chromium / headless deps (`quarry doctor` flags chromium-needing tools).
-- Go tools fail to install → installer reinstalls Go if too old; confirm `/usr/local/go`.
+- a tool fails mid-install → during large installs an individual Go or pipx tool may fail from
+  temporary network, upstream-module, or rate-limit issues. Let the install finish, set PATH,
+  then retry the failed tools individually: `quarry install --only <tool>`.
+- Go tools still fail → installer reinstalls Go if too old; confirm `/usr/local/go` on PATH.
 - waymore huge → lower `LIMITS.WAYMORE_RESPONSES` or run `--passive` first.
 
 ## Roadmap
