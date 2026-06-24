@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sys
 from importlib import resources
 from pathlib import Path
 
@@ -97,6 +98,11 @@ def doctor(phase):
         click.echo(f"  {mark} {label:<24} {'' if present else '(optional) not set'}")
     click.echo(f"  {_c('ℹ', 'cyan')} tool-native: subfinder provider-config.yaml · waymore config.yml")
 
+    from . import bootstrap
+    sys_ok, sys_line = bootstrap.meets_requirements()
+    click.echo(_c("\n[system]", "magenta"))
+    click.echo(f"  {_c('✓', 'green') if sys_ok else _c('⚠', 'yellow')} {sys_line}")
+
     click.echo(_c(f"\n{ok} installed · {miss} missing (required) · audit complete\n",
                   "green" if not miss else "yellow"))
 
@@ -108,13 +114,24 @@ def doctor(phase):
 @click.option("--only", help="install a single tool by bin name")
 @click.option("--include-optional", is_flag=True, help="also install optional tools")
 @click.option("--tools-only", is_flag=True, help="skip system packages / Go / data files")
-def install(dry_run, phase, only, include_optional, tools_only):
+@click.option("--yes", "-y", is_flag=True, help="skip the low-spec confirmation prompt")
+def install(dry_run, phase, only, include_optional, tools_only, yes):
     """Full blank-VPS install: system pkgs -> Go -> tools -> wordlists/templates."""
     from . import bootstrap
 
     # ── 1. system packages + Go toolchain + data (unless --tools-only / --only / --phase) ──
     full = not (only or phase or tools_only)
     if full:
+        # system-spec precheck — warn on low-resource hosts (long scans are CPU/RAM hungry)
+        sys_ok, sys_line = bootstrap.meets_requirements()
+        click.echo(_c("\n[*] system check", "magenta"))
+        click.echo(f"  {_c('✓', 'green') if sys_ok else _c('⚠', 'yellow')} {sys_line}")
+        if not sys_ok and not yes and not dry_run:
+            warn = "Below recommended specs — no guarantee the framework runs as intended."
+            if sys.stdin.isatty():
+                click.confirm(_c("  " + warn + " Continue at own risk?", "yellow"), abort=True)
+            else:
+                click.echo(_c("  " + warn + " Continuing (non-interactive).", "yellow"))
         click.echo(_c("\n[1/6] system packages", "magenta"))
         bootstrap.install_system_packages(click.echo, dry_run)
         click.echo(_c("[2/6] Go toolchain", "magenta"))

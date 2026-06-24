@@ -213,3 +213,35 @@ def cleanup(echo, dry: bool) -> None:
     for label, cmd in steps:
         code, _ = _sh(cmd, dry, 600)
         echo(f"  {label}: {'cleared' if code == 0 else 'skip'}")
+
+
+# Recommended baseline for a smooth run (long DNS/HTTP scans are CPU + RAM hungry).
+REC_CPU = 4
+REC_RAM_GB = 8
+
+
+def system_info() -> tuple[int, float]:
+    """(cpu_count, total_ram_GB). ram is 0.0 when it can't be determined."""
+    cpu = os.cpu_count() or 0
+    ram_gb = 0.0
+    try:
+        meminfo = Path("/proc/meminfo")
+        if meminfo.exists():
+            for line in meminfo.read_text().splitlines():
+                if line.startswith("MemTotal:"):
+                    ram_gb = int(line.split()[1]) / (1024 * 1024)   # kB -> GiB
+                    break
+        else:  # non-Linux fallback
+            ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / (1024 ** 3)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return cpu, ram_gb
+
+
+def meets_requirements() -> tuple[bool, str]:
+    """(ok, one-line status). RAM that can't be read is not held against the host."""
+    cpu, ram = system_info()
+    ram_ok = ram == 0.0 or ram >= REC_RAM_GB
+    ok = cpu >= REC_CPU and ram_ok
+    ram_s = f"{ram:.1f} GB" if ram else "unknown"
+    return ok, (f"{cpu} vCPU · {ram_s} RAM  (recommended {REC_CPU} vCPU / {REC_RAM_GB} GB)")
