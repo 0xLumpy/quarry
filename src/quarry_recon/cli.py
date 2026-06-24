@@ -31,8 +31,8 @@ def _c(s, color):  # tiny colorizer
 
 def _echo_syscheck(rep) -> None:
     marks = {"ok": _c("✓", "green"), "warn": _c("⚠", "yellow"), "abort": _c("✗", "red")}
-    for text, lvl, rec in rep["checks"]:
-        click.echo(f"  {marks[lvl]} {text}  ({rec})")
+    for text, lvl in rep["checks"]:   # thresholds live in the README, not every line
+        click.echo(f"  {marks[lvl]} {text}")
 
 
 def _chromium() -> str | None:
@@ -71,8 +71,6 @@ def doctor(phase):
         else:
             miss += 1
             click.echo(f"  {_c('✗', 'red')} {t.bin:<20} MISSING — quarry install --only {t.bin}")
-        if t.deps:
-            click.echo(f"      {_c('deps:', 'cyan')} {', '.join(t.deps)}")
         if t.needs_chromium and t.installed and not _chromium():
             click.echo(f"      {_c('⚠ needs chromium — not found; screenshots/headless will fail', 'red')}")
 
@@ -95,7 +93,7 @@ def doctor(phase):
 
     from . import bootstrap
     click.echo(_c("\n[system]", "magenta"))
-    _echo_syscheck(bootstrap.system_report())
+    _echo_syscheck(bootstrap.system_report("run"))   # post-install: only run space matters
 
     # secrets.yaml — framework-read keys (present / not set). Tool-native keys live elsewhere.
     click.echo(_c("\n[secrets]", "magenta") + f"  ({secrets.PATH})")
@@ -105,7 +103,7 @@ def doctor(phase):
                            ("projectdiscovery/chaos", bool(secrets.chaos()))]:
         mark = _c("✓", "green") if present else _c("·", "yellow")
         click.echo(f"  {mark} {label:<24} {'' if present else '(optional) not set'}")
-    click.echo(f"  {_c('ℹ', 'cyan')} tool-native: subfinder provider-config.yaml · waymore config.yml")
+    click.echo(f"  {_c('ℹ', 'cyan')} tool-native: subfinder · waymore")
 
     click.echo(_c(f"\n{ok} installed · {miss} missing (required) · audit complete\n",
                   "green" if not miss else "yellow"))
@@ -127,7 +125,7 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     full = not (only or phase or tools_only)
     if full:
         # system-spec precheck (tiered): ok = silent · warn = proceed · below minimum = abort
-        rep = bootstrap.system_report()
+        rep = bootstrap.system_report("install")
         click.echo(_c("\n[*] system check", "magenta"))
         _echo_syscheck(rep)
         if rep["level"] == "abort" and not yes and not dry_run:
@@ -138,7 +136,7 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
             click.echo(_c("  below recommended — the run may be slow or unstable; continuing.", "yellow"))
         click.echo(_c("\n[1/6] system packages", "magenta"))
         bootstrap.install_system_packages(click.echo, dry_run)
-        click.echo(_c("[2/6] Go toolchain", "magenta"))
+        click.echo(_c("\n[2/6] Go toolchain", "magenta"))
         bootstrap.ensure_golang(click.echo, dry_run)
 
     # make freshly-installed Go/pipx bins visible to subsequent tool installs
@@ -181,21 +179,20 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     if full:
         click.echo(_c("\n[4/6] data files (resolvers, wordlists)", "magenta"))
         bootstrap.install_data_files(click.echo, dry_run)
-        click.echo(_c("[5/6] extras (gf patterns, nuclei templates)", "magenta"))
+        click.echo(_c("\n[5/6] extras (gf patterns, nuclei templates)", "magenta"))
         bootstrap.run_extras(click.echo, dry_run)
-        click.echo(_c("[6/6] cleanup (reclaim disk)", "magenta"))
+        click.echo(_c("\n[6/6] cleanup (reclaim disk)", "magenta"))
         bootstrap.cleanup(click.echo, dry_run)
 
     if dry_run:
         click.echo(_c("\n(dry-run — nothing was installed)\n", "yellow"))
-    else:
-        if failed:
-            click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
-            for b in failed:
-                click.echo(f"retry: quarry install --only {b}")
-        else:
-            click.echo(_c("\ninstall complete — all tools ok", "green"))
-        click.echo("run  quarry doctor  to verify, then configure API keys (README.md)\n")
+    elif failed:
+        click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
+        for b in failed:
+            click.echo(f"retry: quarry install --only {b}")
+    elif not os.environ.get("QUARRY_FROM_INSTALLER"):
+        # install.sh prints the final banner itself; only conclude here when run standalone
+        click.echo(_c("\ninstall complete — all tools ok\nrun  quarry doctor  to verify", "green"))
 
 
 @cli.command()

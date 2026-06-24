@@ -17,9 +17,11 @@ export PATH="$HOME/.local/bin:$HOME/go/bin:/usr/local/go/bin:$PATH"
 echo "[*] Provisioning tools + data (quarry install)…"
 # individual tool failures are handled inside `quarry install`; a non-zero exit here means a
 # hard stop (e.g. host below minimum requirements) — honor it and stop the bootstrap.
-quarry install --include-optional
+# QUARRY_FROM_INSTALLER tells it to skip its own end banner — this script prints the final one.
+QUARRY_FROM_INSTALLER=1 quarry install --include-optional
 
 # ── persist PATH so `quarry` and the recon tools are found in new shells ──
+echo
 echo "[*] Persisting PATH (~/.local/bin, ~/go/bin, /usr/local/go/bin)…"
 pipx ensurepath >/dev/null 2>&1 || true
 # pick the rc file for the user's actual shell (zsh reads ~/.zshrc, bash ~/.bashrc)
@@ -40,16 +42,12 @@ fi
 
 echo
 echo "[✓] Done."
+printf '    \033[32minstall complete\033[0m\n'
 echo
 echo "    IMPORTANT: open a new shell, or run:  source ~/${RC#"$HOME"/}"
 echo "    (so 'quarry' and the recon tools are on your PATH)"
 echo
-echo "    Then:"
-echo "      quarry doctor"
-echo "      quarry init target.com"
-echo "      quarry run -t projects/target.com/target.yaml"
-echo
-echo "    API keys (see README.md):"
+echo "    Set API keys (see README.md):"
 echo "      quarry:    ~/.config/quarry/secrets.yaml"
 echo "      subfinder: ~/.config/subfinder/provider-config.yaml"
 echo "      waymore:   ~/.config/waymore/config.yml"

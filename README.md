@@ -47,10 +47,12 @@ you rate-limited or blocked. `quarry install` checks the host and tiers it:
 |----------|---------|-------------|-----|
 | CPU | 2 vCPU | 4 vCPU | parallel DNS/HTTP probing |
 | RAM | 4 GB | 8 GB | headless crawl + 3M-entry wordlists |
-| Disk (free) | 20 GB | 40 GB+ | crawl, screenshots, raw JSONL, nuclei output, repeated runs grow fast; **80 GB+** for large targets |
+| Disk (free) | 20 GB to install · 10 GB to run | 40 GB+ | crawl, screenshots, raw JSONL, nuclei output, repeated runs grow fast; **80 GB+** for large targets |
 
-Below **minimum** → install aborts (override with `--yes`). Between minimum and recommended →
-installs with a warning. OS: Debian/Ubuntu · Fedora · Arch (apt/dnf/pacman); macOS (brew) best-effort.
+Disk floor is higher for **install** (transient Go build cache, freed afterward) than for a
+**run** — so `quarry doctor` (post-install) judges disk against the lower run floor. Below
+**minimum** → install aborts (override with `--yes`); between minimum and recommended → proceeds
+with a warning. OS: Debian/Ubuntu · Fedora · Arch (apt/dnf/pacman); macOS (brew) best-effort.
 
 ## Install
 

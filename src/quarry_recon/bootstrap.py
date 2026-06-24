@@ -158,26 +158,26 @@ def install_data_files(echo, dry: bool, update: bool = False) -> None:
         dest = Path(os.path.expanduser(df["dest"]))
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists() and dest.stat().st_size > 0 and not (update and df.get("update")):
-            echo(f"  {df['name']}: present ({dest})")
+            echo(f"  {df['name']}: present")
             continue
         code, _ = _sh(f"curl -sSL '{df['url']}' -o '{dest}'", dry, 300)
         if (code != 0 or (not dry and (not dest.exists() or dest.stat().st_size == 0))) and df.get("fallback"):
             if not dry:
                 dest.write_text(df["fallback"])
             code = 0
-        echo(f"  {df['name']}: {'ok' if code == 0 else 'FAILED'} -> {dest}")
+        echo(f"  {df['name']}: {'ok' if code == 0 else 'FAILED'}")
 
     # framework secrets store — created once, chmod 600, NEVER overwritten
     sp = Path.home() / ".config" / "quarry" / "secrets.yaml"
     if sp.exists():
-        echo(f"  secrets.yaml: present ({sp})")
+        echo("  secrets.yaml: present")
     else:
         sp.parent.mkdir(parents=True, exist_ok=True)
         if not dry:
             tpl = resources.files("quarry_recon.data").joinpath("secrets.template.yaml").read_text()
             sp.write_text(tpl)
             sp.chmod(0o600)
-        echo(f"  secrets.yaml: created {sp} (chmod 600) — add your keys")
+        echo("  secrets.yaml: created")
 
 
 def run_extras(echo, dry: bool) -> None:
@@ -220,7 +220,11 @@ def cleanup(echo, dry: bool) -> None:
 REC_CPU, REC_RAM_GB = 4, 8          # recommended (documented + displayed)
 MIN_CPU, MIN_RAM_GB = 2, 4          # hard floor — below this, abort
 RAM_DRIFT = 0.95                    # MemTotal sits a little under physical (kernel reserve): 8GB→~7.8
-REC_DISK_GB, WARN_DISK_GB, MIN_DISK_GB = 40, 30, 20   # rec free · warn-below · hard floor
+# Disk-free floors differ by context: install needs transient build space (Go modcache balloons
+# mid-build, freed in the cleanup stage) PLUS run headroom; after install only run space matters.
+DISK_MIN = {"install": 20, "run": 10}    # below -> abort
+DISK_WARN = {"install": 30, "run": 20}   # below -> warn
+REC_DISK_GB = 40                         # recommended free for comfortable runs (80+ for large targets)
 
 _RANK = {"ok": 0, "warn": 1, "abort": 2}
 
@@ -251,10 +255,12 @@ def disk_free_gb(path: Path | None = None) -> float:
         return 0.0
 
 
-def system_report() -> dict:
+def system_report(context: str = "install") -> dict:
     """Assess cpu/ram + disk against the tiers. Unknown (0) values never fail.
 
-    Returns {'level': 'ok'|'warn'|'abort', 'checks': [(text, level, recommendation), ...]}.
+    `context` ('install' | 'run') only changes the disk floors — install needs transient build
+    space + run headroom; 'run' (doctor) needs only run space. Returns
+    {'level': 'ok'|'warn'|'abort', 'checks': [(text, level), ...]}.
     """
     cpu, ram = system_info()
     disk = disk_free_gb()
@@ -269,17 +275,19 @@ def system_report() -> dict:
     else:
         cr = "ok"
 
+    dmin = DISK_MIN.get(context, DISK_MIN["install"])
+    dwarn = DISK_WARN.get(context, DISK_WARN["install"])
     disk_s = f"{disk:.0f} GB free" if disk else "unknown"
-    if disk and disk < MIN_DISK_GB:
+    if disk and disk < dmin:
         dk = "abort"
-    elif disk and disk < WARN_DISK_GB:
+    elif disk and disk < dwarn:
         dk = "warn"
     else:
         dk = "ok"
 
     checks = [
-        (f"cpu/ram: {cpu_s} · {ram_s} RAM", cr, f"recommended {REC_CPU} vCPU / {REC_RAM_GB} GB, min {MIN_CPU}/{MIN_RAM_GB}"),
-        (f"disk:    {disk_s}", dk, f"recommended {REC_DISK_GB}+ GB free, 80+ for large targets, min {MIN_DISK_GB}"),
+        (f"cpu/ram: {cpu_s} · {ram_s} RAM", cr),
+        (f"disk:    {disk_s}", dk),
     ]
     level = max((c[1] for c in checks), key=lambda lv: _RANK[lv])
     return {"level": level, "checks": checks}
