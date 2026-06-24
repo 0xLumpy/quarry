@@ -89,7 +89,7 @@ def install_system_packages(echo, dry: bool) -> bool:
         echo(f"    tool deps: {', '.join(extra)}")
 
     if mgr == "apt":
-        _sh(f"{_sudo()}apt-get update -y", dry, 600)
+        _sh(f"{_sudo()}apt-get update -qq", dry, 600)
     code, tail = _sh(f"{_sudo()}{prefix} {' '.join(pkgs)}", dry, 1800)
     echo(f"  base packages: {'ok' if code == 0 else 'some failed — ' + tail[:80]}")
 

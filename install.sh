@@ -9,7 +9,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 echo "[*] Installing quarry framework (pipx)…"
 command -v pipx >/dev/null 2>&1 || {
   echo "    bootstrapping pipx"
-  sudo apt-get update -y && sudo apt-get install -y pipx || python3 -m pip install --user --break-system-packages pipx
+  # -qq keeps apt quiet; a blank VPS needs fresh lists or the pipx install fails
+  sudo apt-get update -qq && sudo apt-get install -y -qq pipx || python3 -m pip install --user --break-system-packages pipx
 }
 pipx install --force "$HERE"
 export PATH="$HOME/.local/bin:$HOME/go/bin:/usr/local/go/bin:$PATH"
