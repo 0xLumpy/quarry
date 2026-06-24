@@ -132,7 +132,8 @@ ASN:                   # empty => only SUGGESTS candidates; active scan needs ex
   # - AS12345
 
 RATELIMIT:
-  HTTP: 5              # req/s for httpx/katana/nuclei/dalfox (RoE wins). 0 => omit flag
+  HTTP:                # empty => tool defaults (fast). Set only for a program's RoE cap — a low
+                       # cap makes nuclei slow (templates x hosts). 0 => omit flag entirely
   DNS:                 # puredns/massdns qps; empty => tool default
   PORTSCAN:            # naabu rate; empty => tool default
 
@@ -150,7 +151,7 @@ MODES:
   TAKEOVER: true       # collect CNAMEs + run nuclei takeover templates
 
 NOTES:
-  - Official program rate limit is 5 req/s.
+  - Free-form reminders (e.g. "program caps requests at 5 req/s → set RATELIMIT.HTTP: 5").
 ```
 
 The profile compiles into a **scope matcher** every phase consults (apex suffix, OOS regex,

@@ -324,7 +324,7 @@ def run(profile_path, phases, passive, timeout):
     click.echo(_c(f"\n══ Quarry run {run_obj.run_id} · target={profile.target} · "
                   f"{'PASSIVE' if profile.passive_only else 'ACTIVE'} ══", "cyan"))
     click.echo(f"   apexes={len(profile.apex_domains)} cidr={len(profile.cidr)} "
-               f"ports={profile.ports} http_rl={profile.http_rl}\n")
+               f"ports={profile.ports} http_rl={profile.http_rl or 'default'}\n")
 
     all_cps = []
     for name in selected:

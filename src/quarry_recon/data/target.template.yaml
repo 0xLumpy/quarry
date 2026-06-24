@@ -31,8 +31,11 @@ BRANDS:
   # - Example
 
 RATELIMIT:
-  # HTTP req/s for httpx/katana/nuclei/dalfox. Program RoE wins. 0 => omit -rl flag.
-  HTTP: 5
+  # HTTP req/s for httpx/katana/nuclei/dalfox. EMPTY => tool defaults (fast — recommended).
+  # Set ONLY when a program's RoE caps you: a low cap (e.g. 5) makes nuclei very slow, since
+  # its work = templates x hosts (thousands of templates). Example for a 5 req/s program:
+  #   HTTP: 5
+  HTTP:
   # DNS qps for puredns/massdns (public resolvers — VPS only, can be high). empty => tool default.
   DNS:
   # Port-scan packet rate for naabu. empty => tool default.
@@ -56,4 +59,4 @@ MODES:
 
 # Free-text program rules for the analyst (and the run manifest).
 NOTES:
-  - Official program rate limit is 5 req/s.
+  # - e.g. program caps requests at 5 req/s -> set RATELIMIT.HTTP: 5

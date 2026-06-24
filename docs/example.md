@@ -49,7 +49,7 @@ CIDR:          # empty → horizontal IP/port steps SKIPPED
 ASN:           # empty → ASN only suggests candidates
 
 RATELIMIT:
-  HTTP: 5      # 5 req/s on httpx/katana/nuclei/dalfox
+  HTTP:        # empty → tool defaults (fast); set only for a program's RoE cap
   DNS:         # empty → puredns/massdns default (no --rate-limit)
   PORTSCAN:    # empty → naabu default
 
@@ -86,7 +86,7 @@ checkpoint engine evaluates coverage. Run dir: `projects/0xlumpy/recon/20260620-
 
 ```
 ══ Quarry run 20260620-120000 · target=0xlumpy · ACTIVE ══
-   apexes=1 cidr=0 ports=[80, 443, 81, 300, …  (94 ports)]  http_rl=5
+   apexes=1 cidr=0 ports=[80, 443, 81, 300, …  (94 ports)]  http_rl=default
 ```
 
 ---
@@ -261,7 +261,7 @@ dnsx -l <work>/resolved_hosts.txt -cname -json -silent
 httpx -l <work>/probe_targets.txt -json -silent \
   -ports 80,443,81,300,591,593,832,981,1010,1311,1099,2082,…  (full 94-port set) \
   -td -title -sc -cl -favicon -cdn -web-server -asn -location -ip -cname \
-  -follow-redirects -no-fallback -probe-all-ips -random-agent -t 15 -rl 5
+  -follow-redirects -no-fallback -probe-all-ips -random-agent -t 15
 ```
 → raw `raw/probe/httpx/httpx.jsonl` · → `live` entities (+ `tech` per fingerprint).
 
@@ -269,7 +269,7 @@ httpx -l <work>/probe_targets.txt -json -silent \
 host; recon-side only, no bypass):
 
 ```bash
-nuclei -l <work>/waf_targets.txt -tags waf -jsonl -o raw/probe/nuclei/waf.jsonl -rl 5
+nuclei -l <work>/waf_targets.txt -tags waf -jsonl -o raw/probe/nuclei/waf.jsonl
 ```
 → `tech` entities (`WAF:<name>`). `httpx -cdn` already tags CDN vs origin; this names the WAF.
 
@@ -310,7 +310,7 @@ smap -iL <work>/smap_targets.txt             # → raw/probe/smap/smap.txt
 
 ```bash
 katana -list <work>/crawl_targets.txt -jc -d 2 -kf all -c 4 -p 3 -timeout 15 -silent \
-  -srd raw/crawl/katana_resp -rl 5
+  -srd raw/crawl/katana_resp
 ```
 → raw `raw/crawl/katana/katana.txt` · in-scope URLs → `url` (+ `js_url` for `.js`).
 (`HEADLESS: false` → the `katana -headless -system-chrome` SPA pass is skipped.)
@@ -333,7 +333,7 @@ xnLinkFinder -i raw/crawl/waymore/0xlumpy.cc \
   -sp <work>/roots.txt -sf <work>/roots.txt \
   -o  …waymore-0xlumpy_cc_links.txt -op …params.txt -os …secrets.json -owl …wordlist.txt \
   -inc -all -mfs 0 -orig -spo \
-  -d 3 -u desktop mobile -insecure -s429 -s403 -sTO -sCE -rl 5
+  -d 3 -u desktop mobile -insecure -s429 -s403 -sTO -sCE
 ```
 
 **6.4 JS files** — download every discovered `.js` (≤2000), dedup by content hash, drop
@@ -408,7 +408,7 @@ gf interestingparams < …
 
 ```bash
 nuclei -l <work>/takeover_targets.txt -tags takeover -jsonl \
-  -o raw/params/nuclei/takeover.jsonl -rl 5
+  -o raw/params/nuclei/takeover.jsonl
 ```
 → matches → `finding` (severity high, `confirmed:false`).
 
@@ -416,7 +416,7 @@ nuclei -l <work>/takeover_targets.txt -tags takeover -jsonl \
 
 ```bash
 nuclei -l <work>/nuclei_targets.txt -jsonl -o raw/params/nuclei/findings.jsonl \
-  -etags intrusive,fuzz,dos,brute-force -s critical,high,medium -stats -si 30 -c 10 -rl 5
+  -etags intrusive,fuzz,dos,brute-force -s critical,high,medium -stats -si 30 -c 25
 ```
 → `finding` (`confirmed:false`). stderr (filtering/blocking) → `nuclei.run.log`.
 

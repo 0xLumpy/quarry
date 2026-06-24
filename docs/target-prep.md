@@ -246,7 +246,7 @@ ASN:                 # confirmed on bgp.he.net
   - AS64500
 
 RATELIMIT:
-  HTTP: 5
+  HTTP:          # empty => tool defaults (fast); set only for a program's RoE cap
 
 PORTS:
   HTTP:              # blank → full methodology port set

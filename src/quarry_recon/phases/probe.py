@@ -54,9 +54,10 @@ def run(ctx) -> None:
     if have("nuclei") and ctx.run.count("live"):
         waf_in = ctx.write_list("waf_targets.txt", ctx.run.values("live"))
         waf_out = ctx.run.raw_path("probe", "nuclei", "waf.jsonl")
-        r = exec_tool("nuclei", ["nuclei", "-l", str(waf_in), "-tags", "waf",
-                                 "-jsonl", "-o", str(waf_out), "-rl", str(prof.http_rl or 15)],
-                      timeout=ctx.http_timeout)
+        waf_cmd = ["nuclei", "-l", str(waf_in), "-tags", "waf", "-jsonl", "-o", str(waf_out)]
+        if prof.http_rl:                       # else native default (empty = fast)
+            waf_cmd += ["-rl", str(prof.http_rl)]
+        r = exec_tool("nuclei", waf_cmd, timeout=ctx.http_timeout)
         ctx.run.record("probe", r)
         if waf_out.exists():
             import json as _json

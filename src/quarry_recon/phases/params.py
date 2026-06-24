@@ -50,9 +50,10 @@ def run(ctx) -> None:
         if subs:
             tk_in = ctx.write_list("takeover_targets.txt", subs)
             tk_out = ctx.run.raw_path("params", "nuclei", "takeover.jsonl")
-            r = exec_tool("nuclei", ["nuclei", "-l", str(tk_in), "-tags", "takeover",
-                                     "-jsonl", "-o", str(tk_out), "-rl", str(prof.http_rl or 15)],
-                          timeout=ctx.http_timeout)
+            tk_cmd = ["nuclei", "-l", str(tk_in), "-tags", "takeover", "-jsonl", "-o", str(tk_out)]
+            if prof.http_rl:                       # else native default (empty = fast)
+                tk_cmd += ["-rl", str(prof.http_rl)]
+            r = exec_tool("nuclei", tk_cmd, timeout=ctx.http_timeout)
             ctx.run.record("params", r)
             if tk_out.exists():
                 import json as _json
@@ -78,7 +79,7 @@ def run(ctx) -> None:
     log = ctx.run.raw_path("params", "nuclei", "nuclei.run.log")
     cmd = ["nuclei", "-l", str(targets), "-jsonl", "-o", str(findings),
            "-etags", "intrusive,fuzz,dos,brute-force",
-           "-s", "critical,high,medium", "-stats", "-si", "30", "-c", "10"]
+           "-s", "critical,high,medium", "-stats", "-si", "30", "-c", "25"]
     if prof.http_rl:
         cmd += ["-rl", str(prof.http_rl)]
     r = exec_tool("nuclei", cmd, timeout=ctx.http_timeout)
