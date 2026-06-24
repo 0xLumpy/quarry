@@ -164,29 +164,34 @@ CIDR membership) — replacing regex-in-every-script.
 ## Workflow
 
 ```bash
-quarry init acme          # 1. profile skeleton
-$EDITOR projects/acme/target.yaml                            # 2. fill anchors (apex + optional asn/org/brands)
-quarry osint -t projects/acme/target.yaml                      # 3. pre-flight: discover scope candidates
-#   → review projects/acme/osint/latest/osint-report.md + target.suggested.yaml
-#   → confirm ownership/scope, copy approved candidates into projects/acme/target.yaml
-quarry run -t projects/acme/target.yaml                        # 4. recon on CONFIRMED scope
+quarry init acme.com                       # 1. creates projects/acme.com/target.yaml (apex auto-seeded for a domain)
+$EDITOR projects/acme.com/target.yaml      # 2. (optional) add CIDR / ASN / org
+quarry oos -t acme.com careers.acme.com    #    (optional) seed out-of-scope hosts from the CLI
+quarry osint -t acme.com                    # 3. pre-flight: discover scope candidates
+#   → review projects/acme.com/osint/latest/osint-report.md + target.suggested.yaml
+#   → confirm ownership/scope, copy approved candidates into the profile
+quarry run  -t acme.com                     # 4. recon on CONFIRMED scope
 ```
+
+`-t` takes a **project name** (`acme.com` → `projects/acme.com/target.yaml`), a project dir, or a
+full `target.yaml` path — all equivalent. Put a project somewhere else with
+`quarry init acme.com -o /data/acme`, then `quarry run -t /data/acme`.
 
 The **`osint`** step is optional but recommended on bigger targets — it discovers related
 apexes / ASNs / org context and never edits scope (candidates are review-only). The **`run`**
 step:
 
 ```bash
-quarry run -t projects/acme/target.yaml --phases vertical    # validate one phase at a time
-quarry run -t projects/acme/target.yaml                       # all phases
-quarry run -t projects/acme/target.yaml --passive             # no active probing
-quarry report -t projects/acme/target.yaml            # regenerate reports from a stored run
+quarry run -t acme.com --phases vertical    # validate one phase at a time
+quarry run -t acme.com                       # all phases
+quarry run -t acme.com --passive             # no active probing
+quarry report -t acme.com                    # regenerate reports from a stored run
 ```
 
 Detached VPS run:
 
 ```bash
-setsid nohup quarry run -t projects/acme/target.yaml > run.log 2>&1 & disown
+setsid nohup quarry run -t acme.com > run.log 2>&1 & disown
 ```
 
 ## Command surface
@@ -196,7 +201,8 @@ setsid nohup quarry run -t projects/acme/target.yaml > run.log 2>&1 & disown
 | `quarry install` | Full blank-VPS provision (system pkgs → Go → tools → wordlists/templates) |
 | `quarry update` | Update managed tools, nuclei templates, resolvers, gf patterns |
 | `quarry doctor` | Audit tools, versions, per-tool deps, API keys, resolvers, wordlists |
-| `quarry init <name>` | Create a project (`projects/<name>/target.yaml`) |
+| `quarry init <name>` | Create a project (`projects/<name>/target.yaml`); `-o <dir>` for a custom location |
+| `quarry oos -t <target> <host…>` | Add out-of-scope patterns (bare host → anchored regex; regex kept verbatim) |
 | `quarry osint -t <profile>` | **Pre-flight** OSINT — discover scope candidates + intel (review-only, never edits scope) |
 | `quarry run -t <profile>` | Run recon phases against the confirmed scope |
 | `quarry report -t <profile>` | Regenerate hotlist + exports + delta from a stored run (no scanning) |
@@ -280,6 +286,15 @@ Start with `quarry doctor`. Common issues:
   then retry the failed tools individually: `quarry install --only <tool>`.
 - Go tools still fail → installer reinstalls Go if too old; confirm `/usr/local/go` on PATH.
 - waymore huge → lower `LIMITS.WAYMORE_RESPONSES` or run `--passive` first.
+- **run killed / OOM on a big target** → headless crawl, nuclei, and large wordlists can exhaust
+  RAM on wide scopes (the kernel kills the process instantly — no in-tool warning is possible).
+  Add swap before retrying:
+  ```bash
+  sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile
+  sudo mkswap /swapfile && sudo swapon /swapfile          # make permanent: add to /etc/fstab
+  ```
+  8 GB RAM + 4 GB swap clears most targets. (Resumable runs — pick up where a crash left off —
+  are planned for a later release.)
 
 ## Roadmap
 

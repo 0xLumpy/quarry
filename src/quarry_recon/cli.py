@@ -25,6 +25,40 @@ def _project_dir(profile) -> Path:
     return (profile.path.parent if profile.path else Path(".")).resolve()
 
 
+def _resolve_profile(value: str) -> str:
+    """Accept `-t` as a target.yaml path, a project dir, or a bare project name. A name/dir
+    resolves to <projects-root>/<name>/target.yaml — so `quarry run -t 0xlumpy.cc` just works."""
+    p = Path(value).expanduser()      # so a quoted ~ still works (shell expands an unquoted one)
+    if p.is_file():
+        return str(p)
+    if p.is_dir() and (p / "target.yaml").is_file():
+        return str(p / "target.yaml")
+    cand = _projects_root(None) / value / "target.yaml"
+    if cand.is_file():
+        return str(cand)
+    raise click.ClickException(
+        f"no target profile for {value!r} — give a target.yaml path, or a project name under "
+        f"{_projects_root(None)}/ (create it with: quarry init {value})")
+
+
+# metachars (other than . and *) that signal "the user typed an actual regex"
+_OOS_REGEX_META = re.compile(r"[\^$\\+?\[\](){}|]")
+
+
+def _to_oos_pattern(value: str) -> str:
+    """Turn an OOS CLI argument into a VALID regex string (validated via re.compile):
+      - bare host        banana.acme.com -> ^banana\\.acme\\.com$   (exact)
+      - host glob `*`    *.acme.com      -> ^.*\\.acme\\.com$       (any subdomain)
+      - explicit regex   ^jobs\\.         -> kept as-is (must compile)
+    Raises re.error if the result (or an explicit regex) is invalid — caller refuses to write."""
+    if _OOS_REGEX_META.search(value):
+        re.compile(value)                                      # validate explicit regex
+        return value
+    pat = "^" + re.escape(value).replace(r"\*", ".*") + "$"    # host / glob -> anchored regex
+    re.compile(pat)
+    return pat
+
+
 def _c(s, color):  # tiny colorizer
     return click.style(s, fg=color)
 
@@ -222,14 +256,16 @@ def update(dry_run, include_optional):
 # ── init (create a project) ───────────────────────────────────────────────────
 @cli.command()
 @click.argument("name")
+@click.option("-o", "--out", help="exact project dir (default: <projects-root>/<name>)")
 @click.option("--projects-dir", help="projects root (default ./projects or $QUARRY_PROJECTS)")
-def init(name, projects_dir):
-    """Create a project: <projects>/<name>/target.yaml. osint + recon output co-locate here."""
-    # sanitize: a project name is a single path segment (domain/slug) — never a path.
+def init(name, out, projects_dir):
+    """Create a project: <projects>/<name>/target.yaml (or -o <dir>). osint + recon co-locate here."""
+    # sanitize: the NAME is the target id (a single path segment), never a path. The location
+    # can be anywhere via -o.
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name) or ".." in name:
         raise click.ClickException(
             f"invalid project name {name!r}: use letters/digits/.-_ only, no path separators")
-    proj = _projects_root(projects_dir) / name
+    proj = Path(out).expanduser() if out else _projects_root(projects_dir) / name
     proj.mkdir(parents=True, exist_ok=True)
     tpl = resources.files("quarry_recon.data").joinpath("target.template.yaml").read_text()
     tpl = tpl.replace("TARGET: example", f"TARGET: {name}")
@@ -241,18 +277,80 @@ def init(name, projects_dir):
     if dest.exists():
         click.confirm(f"{dest} exists — overwrite?", abort=True)
     dest.write_text(tpl)
+    # bare `-t <name>` only resolves under the default projects root; elsewhere point -t at the dir
+    ref = name if not (out or projects_dir) else str(proj)
     click.echo(f"{_c('created project', 'green')} {proj}/  (profile: {dest})")
     if is_domain:
         click.echo(f"  APEX_DOMAINS seeded with {name} — ready to run:\n"
-                   f"    quarry osint -t {dest}     # optional pre-flight\n"
-                   f"    quarry run   -t {dest}")
+                   f"    quarry osint -t {ref}     # optional pre-flight\n"
+                   f"    quarry run   -t {ref}")
     else:
-        click.echo(f"  edit APEX_DOMAINS in {dest}, then:  quarry run -t {dest}")
+        click.echo(f"  edit APEX_DOMAINS in {dest}, then:  quarry run -t {ref}")
+
+
+# ── oos (seed out-of-scope patterns) ──────────────────────────────────────────
+@cli.command()
+@click.option("-t", "--target", "profile_path", required=True,
+              help="project name, project dir, or target.yaml path")
+@click.argument("hosts", nargs=-1, required=True)
+def oos(profile_path, hosts):
+    """Add out-of-scope patterns to a project's target.yaml (under OOS:). A bare host becomes an
+    anchored regex, `*.x` a subdomain glob; a real regex is kept verbatim. Every pattern is
+    validated and the resulting profile must compile before anything is written."""
+    import yaml
+    path = Path(_resolve_profile(profile_path))
+    text = path.read_text()
+    lines = text.splitlines()
+    idx = next((i for i, ln in enumerate(lines) if ln.rstrip() == "OOS:"), None)
+    if idx is None:
+        raise click.ClickException(f"no OOS: section in {path}")
+
+    # validate + translate each input (bad regex -> refuse, profile stays untouched)
+    patterns = []
+    for h in hosts:
+        try:
+            patterns.append(_to_oos_pattern(h))
+        except re.error as e:
+            raise click.ClickException(f"invalid OOS pattern {h!r}: {e}")
+
+    # structural dedup against the existing OOS list (not text/quote-style dependent)
+    try:
+        existing = {str(x) for x in (yaml.safe_load(text) or {}).get("OOS") or []}
+    except yaml.YAMLError as e:
+        raise click.ClickException(f"profile is not valid YAML: {e}")
+    add, seen = [], set()
+    for p in patterns:
+        if p not in existing and p not in seen:
+            add.append(p)
+            seen.add(p)
+    if not add:
+        click.echo("nothing to add (already present)")
+        return
+
+    # safely-quoted YAML items (handles quotes/backslashes), inserted under OOS:
+    items = ["  " + yaml.safe_dump([p], default_flow_style=False, allow_unicode=True).strip()
+             for p in add]
+    lines[idx + 1:idx + 1] = items
+    new_text = "\n".join(lines) + "\n"
+
+    # write to a temp file, confirm the profile still compiles (scope/OOS regex), then atomic swap
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(new_text)
+    try:
+        TargetProfile.load(str(tmp)).scope()   # .scope() actually compiles the OOS regexes
+    except (ProfileError, Exception) as e:
+        tmp.unlink(missing_ok=True)
+        raise click.ClickException(f"refusing to write — resulting profile invalid: {e}")
+    os.replace(tmp, path)
+    click.echo(f"{_c('+OOS', 'green')} {path}")
+    for p in add:
+        click.echo(f"  {p}")
 
 
 # ── osint (pre-flight; separate from run) ─────────────────────────────────────
 @cli.command()
-@click.option("-t", "--target", "profile_path", required=True, help="target profile YAML")
+@click.option("-t", "--target", "profile_path", required=True,
+              help="project name, project dir, or target.yaml path")
 @click.option("--timeout", default=1800, help="per-tool timeout seconds")
 def osint(profile_path, timeout):
     """Pre-flight OSINT: discover scope CANDIDATES + intel. Review-only — never edits scope.
@@ -264,7 +362,7 @@ def osint(profile_path, timeout):
     from . import osint as osint_mod
 
     try:
-        profile = TargetProfile.load(profile_path)
+        profile = TargetProfile.load(_resolve_profile(profile_path))
     except ProfileError as e:
         raise click.ClickException(str(e))
     scope = profile.scope()
@@ -294,7 +392,8 @@ def osint(profile_path, timeout):
 
 # ── run ──────────────────────────────────────────────────────────────────────
 @cli.command()
-@click.option("-t", "--target", "profile_path", required=True, help="target profile YAML")
+@click.option("-t", "--target", "profile_path", required=True,
+              help="project name, project dir, or target.yaml path")
 @click.option("--phases", help="comma list (default: all). e.g. horizontal,vertical")
 @click.option("--passive", is_flag=True, help="force passive-only (override profile)")
 @click.option("--timeout", default=1800, help="per-tool timeout seconds")
@@ -305,7 +404,7 @@ def run(profile_path, phases, passive, timeout):
     from . import checkpoint, exports, triage
 
     try:
-        profile = TargetProfile.load(profile_path)
+        profile = TargetProfile.load(_resolve_profile(profile_path))
     except ProfileError as e:
         raise click.ClickException(str(e))
     if passive:
@@ -369,7 +468,8 @@ def run(profile_path, phases, passive, timeout):
 
 # ── report ───────────────────────────────────────────────────────────────────
 @cli.command()
-@click.option("-t", "--target", "profile_path", required=True, help="target profile YAML")
+@click.option("-t", "--target", "profile_path", required=True,
+              help="project name, project dir, or target.yaml path")
 @click.option("--run", "run_id", help="run id (default: latest)")
 def report(profile_path, run_id):
     """Regenerate hotlist + exports from a stored run in the project (no scanning)."""
@@ -377,7 +477,7 @@ def report(profile_path, run_id):
     from . import exports, triage
 
     try:
-        profile = TargetProfile.load(profile_path)
+        profile = TargetProfile.load(_resolve_profile(profile_path))
     except ProfileError as e:
         raise click.ClickException(str(e))
     project = _project_dir(profile)

@@ -45,8 +45,8 @@ echo
 echo "[✓] Done."
 printf '    \033[32minstall complete\033[0m\n'
 echo
-echo "    IMPORTANT: open a new shell, or run:  source ~/${RC#"$HOME"/}"
-echo "    (so 'quarry' and the recon tools are on your PATH)"
+echo "    Almost there — load quarry onto your PATH:"
+echo "      open a new shell, or run:  source ~/${RC#"$HOME"/}"
 echo
 echo "    Set API keys (see README.md):"
 echo "      quarry:    ~/.config/quarry/secrets.yaml"

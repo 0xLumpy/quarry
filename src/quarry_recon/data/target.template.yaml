@@ -9,9 +9,10 @@ APEX_DOMAINS:
   - example.com
 
 # Out-of-scope patterns (regex, matched against full host). Collected passively, never actively scanned.
+# Add with `quarry oos -t <project> <host|regex>…`, or uncomment/edit the examples below.
 OOS:
-  - '^jobs\.'
-  - '^careers\.'
+  # - '^jobs\.'
+  # - '^careers\.'
 
 # In-scope IP ranges. If empty, horizontal IP/port scanning is SKIPPED.
 CIDR:
