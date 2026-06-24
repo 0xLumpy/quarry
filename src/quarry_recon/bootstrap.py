@@ -215,9 +215,14 @@ def cleanup(echo, dry: bool) -> None:
         echo(f"  {label}: {'cleared' if code == 0 else 'skip'}")
 
 
-# Recommended baseline for a smooth run (long DNS/HTTP scans are CPU + RAM hungry).
-REC_CPU = 4
-REC_RAM_GB = 8
+# Tiered baseline (long DNS/HTTP scans are CPU/RAM hungry; crawl/screenshots/JSONL eat disk).
+# Recommended = silent ok · Minimum..Recommended = warn + proceed · below Minimum = abort.
+REC_CPU, REC_RAM_GB = 4, 8          # recommended (documented + displayed)
+MIN_CPU, MIN_RAM_GB = 2, 4          # hard floor — below this, abort
+RAM_DRIFT = 0.95                    # MemTotal sits a little under physical (kernel reserve): 8GB→~7.8
+REC_DISK_GB, WARN_DISK_GB, MIN_DISK_GB = 40, 30, 20   # rec free · warn-below · hard floor
+
+_RANK = {"ok": 0, "warn": 1, "abort": 2}
 
 
 def system_info() -> tuple[int, float]:
@@ -238,10 +243,43 @@ def system_info() -> tuple[int, float]:
     return cpu, ram_gb
 
 
-def meets_requirements() -> tuple[bool, str]:
-    """(ok, one-line status). RAM that can't be read is not held against the host."""
+def disk_free_gb(path: Path | None = None) -> float:
+    """Free space (GB) on the partition holding $HOME (where tools/wordlists/runs land). 0.0 if unknown."""
+    try:
+        return shutil.disk_usage(path or Path.home()).free / (1024 ** 3)
+    except OSError:
+        return 0.0
+
+
+def system_report() -> dict:
+    """Assess cpu/ram + disk against the tiers. Unknown (0) values never fail.
+
+    Returns {'level': 'ok'|'warn'|'abort', 'checks': [(text, level, recommendation), ...]}.
+    """
     cpu, ram = system_info()
-    ram_ok = ram == 0.0 or ram >= REC_RAM_GB
-    ok = cpu >= REC_CPU and ram_ok
+    disk = disk_free_gb()
+
+    cpu_s = f"{cpu} vCPU" if cpu else "unknown vCPU"
     ram_s = f"{ram:.1f} GB" if ram else "unknown"
-    return ok, (f"{cpu} vCPU · {ram_s} RAM  (recommended {REC_CPU} vCPU / {REC_RAM_GB} GB)")
+    # drift tolerance on RAM both tiers — a 4 GB box reports ~3.8, an 8 GB box ~7.8 (kernel reserve)
+    if (cpu and cpu < MIN_CPU) or (ram and ram < MIN_RAM_GB * RAM_DRIFT):
+        cr = "abort"
+    elif (cpu and cpu < REC_CPU) or (ram and ram < REC_RAM_GB * RAM_DRIFT):
+        cr = "warn"
+    else:
+        cr = "ok"
+
+    disk_s = f"{disk:.0f} GB free" if disk else "unknown"
+    if disk and disk < MIN_DISK_GB:
+        dk = "abort"
+    elif disk and disk < WARN_DISK_GB:
+        dk = "warn"
+    else:
+        dk = "ok"
+
+    checks = [
+        (f"cpu/ram: {cpu_s} · {ram_s} RAM", cr, f"recommended {REC_CPU} vCPU / {REC_RAM_GB} GB, min {MIN_CPU}/{MIN_RAM_GB}"),
+        (f"disk:    {disk_s}", dk, f"recommended {REC_DISK_GB}+ GB free, 80+ for large targets, min {MIN_DISK_GB}"),
+    ]
+    level = max((c[1] for c in checks), key=lambda lv: _RANK[lv])
+    return {"level": level, "checks": checks}

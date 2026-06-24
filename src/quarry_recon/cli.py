@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import sys
 from importlib import resources
 from pathlib import Path
 
@@ -28,6 +27,12 @@ def _project_dir(profile) -> Path:
 
 def _c(s, color):  # tiny colorizer
     return click.style(s, fg=color)
+
+
+def _echo_syscheck(rep) -> None:
+    marks = {"ok": _c("✓", "green"), "warn": _c("⚠", "yellow"), "abort": _c("✗", "red")}
+    for text, lvl, rec in rep["checks"]:
+        click.echo(f"  {marks[lvl]} {text}  ({rec})")
 
 
 def _chromium() -> str | None:
@@ -88,6 +93,10 @@ def doctor(phase):
         mark = _c("✓", "green") if present else _c("✗", "red")
         click.echo(f"  {mark} {label}")
 
+    from . import bootstrap
+    click.echo(_c("\n[system]", "magenta"))
+    _echo_syscheck(bootstrap.system_report())
+
     # secrets.yaml — framework-read keys (present / not set). Tool-native keys live elsewhere.
     click.echo(_c("\n[secrets]", "magenta") + f"  ({secrets.PATH})")
     for label, present in [("github tokens", bool(secrets.github_tokens())),
@@ -97,11 +106,6 @@ def doctor(phase):
         mark = _c("✓", "green") if present else _c("·", "yellow")
         click.echo(f"  {mark} {label:<24} {'' if present else '(optional) not set'}")
     click.echo(f"  {_c('ℹ', 'cyan')} tool-native: subfinder provider-config.yaml · waymore config.yml")
-
-    from . import bootstrap
-    sys_ok, sys_line = bootstrap.meets_requirements()
-    click.echo(_c("\n[system]", "magenta"))
-    click.echo(f"  {_c('✓', 'green') if sys_ok else _c('⚠', 'yellow')} {sys_line}")
 
     click.echo(_c(f"\n{ok} installed · {miss} missing (required) · audit complete\n",
                   "green" if not miss else "yellow"))
@@ -114,7 +118,7 @@ def doctor(phase):
 @click.option("--only", help="install a single tool by bin name")
 @click.option("--include-optional", is_flag=True, help="also install optional tools")
 @click.option("--tools-only", is_flag=True, help="skip system packages / Go / data files")
-@click.option("--yes", "-y", is_flag=True, help="skip the low-spec confirmation prompt")
+@click.option("--yes", "-y", is_flag=True, help="install even if the host is below minimum requirements")
 def install(dry_run, phase, only, include_optional, tools_only, yes):
     """Full blank-VPS install: system pkgs -> Go -> tools -> wordlists/templates."""
     from . import bootstrap
@@ -122,16 +126,16 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     # ── 1. system packages + Go toolchain + data (unless --tools-only / --only / --phase) ──
     full = not (only or phase or tools_only)
     if full:
-        # system-spec precheck — warn on low-resource hosts (long scans are CPU/RAM hungry)
-        sys_ok, sys_line = bootstrap.meets_requirements()
+        # system-spec precheck (tiered): ok = silent · warn = proceed · below minimum = abort
+        rep = bootstrap.system_report()
         click.echo(_c("\n[*] system check", "magenta"))
-        click.echo(f"  {_c('✓', 'green') if sys_ok else _c('⚠', 'yellow')} {sys_line}")
-        if not sys_ok and not yes and not dry_run:
-            warn = "Below recommended specs — no guarantee the framework runs as intended."
-            if sys.stdin.isatty():
-                click.confirm(_c("  " + warn + " Continue at own risk?", "yellow"), abort=True)
-            else:
-                click.echo(_c("  " + warn + " Continuing (non-interactive).", "yellow"))
+        _echo_syscheck(rep)
+        if rep["level"] == "abort" and not yes and not dry_run:
+            raise click.ClickException(
+                "host is below minimum requirements — aborting. See README → Requirements. "
+                "Override with --yes.")
+        if rep["level"] == "warn":
+            click.echo(_c("  below recommended — the run may be slow or unstable; continuing.", "yellow"))
         click.echo(_c("\n[1/6] system packages", "magenta"))
         bootstrap.install_system_packages(click.echo, dry_run)
         click.echo(_c("[2/6] Go toolchain", "magenta"))

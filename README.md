@@ -38,6 +38,20 @@ Scope stays fixed: horizontal findings on owned IP space are recorded as review 
 never auto-pivoted to new roots. BAC/IDOR object swaps, WAF bypasses, and the manual Burp
 testing of methodology Phase 9 remain human work.
 
+## Requirements
+
+Built to run on a **VPS** — recon runs are long, and heavy DNS scanning from a home IP can get
+you rate-limited or blocked. `quarry install` checks the host and tiers it:
+
+| Resource | Minimum | Recommended | Why |
+|----------|---------|-------------|-----|
+| CPU | 2 vCPU | 4 vCPU | parallel DNS/HTTP probing |
+| RAM | 4 GB | 8 GB | headless crawl + 3M-entry wordlists |
+| Disk (free) | 20 GB | 40 GB+ | crawl, screenshots, raw JSONL, nuclei output, repeated runs grow fast; **80 GB+** for large targets |
+
+Below **minimum** → install aborts (override with `--yes`). Between minimum and recommended →
+installs with a warning. OS: Debian/Ubuntu · Fedora · Arch (apt/dnf/pacman); macOS (brew) best-effort.
+
 ## Install
 
 Blank VPS → fully provisioned in one command:
@@ -59,15 +73,17 @@ quarry install --phase vertical
 quarry update                 # refresh tools + nuclei templates + resolvers
 ```
 
-`quarry install` owns the whole lifecycle and runs five stages:
+`quarry install` owns the whole lifecycle and runs six stages (preceded by the system-spec
+check — see [Requirements](#requirements); `--yes` installs even below minimum):
 
 1. **system packages** — OS-detected (apt/dnf/pacman/brew): build toolchain, `libpcap-dev`,
    chromium + headless libs, `libxml2/xslt`, `nmap`, `pipx`, … (per-tool deps merged in)
 2. **Go toolchain** — installs current Go to `/usr/local/go` if missing **or too old**
 3. **tools** — every binary in the registry (Go install / pipx / massdns from source).
    Tools already on `PATH` are recorded as external and left untouched
-4. **data files** — trickest resolvers + n0kovo 3M DNS wordlist → `~/.config/quarry/`
+4. **data files** — trickest resolvers + n0kovo 3M DNS wordlist + `secrets.yaml` → `~/.config/quarry/`
 5. **extras** — gf patterns (`~/.gf`), nuclei templates
+6. **cleanup** — reclaim disk (`go clean -cache -modcache -testcache`, pip/apt caches)
 
 Anything that can't be automated (no sudo, unsupported OS, API-key/login-gated tools) is
 reported with its doc link — never silently skipped.

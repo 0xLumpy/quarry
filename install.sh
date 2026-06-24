@@ -15,7 +15,9 @@ pipx install --force "$HERE"
 export PATH="$HOME/.local/bin:$HOME/go/bin:/usr/local/go/bin:$PATH"
 
 echo "[*] Provisioning tools + data (quarry install)…"
-quarry install --include-optional || true   # never abort bootstrap on one item
+# individual tool failures are handled inside `quarry install`; a non-zero exit here means a
+# hard stop (e.g. host below minimum requirements) — honor it and stop the bootstrap.
+quarry install --include-optional
 
 # ── persist PATH so `quarry` and the recon tools are found in new shells ──
 echo "[*] Persisting PATH (~/.local/bin, ~/go/bin, /usr/local/go/bin)…"
