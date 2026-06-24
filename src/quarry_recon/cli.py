@@ -313,8 +313,11 @@ def run(profile_path, phases, passive, timeout):
     scope = profile.scope()
     project = _project_dir(profile)
     secrets.apply_env()   # export PDCP_API_KEY (chaos) for PD tools, if set
+    from .runner import set_tool_cwd
     run_obj = Run(project, profile.target)
     workdir = run_obj.dir / "work"
+    workdir.mkdir(parents=True, exist_ok=True)
+    set_tool_cwd(workdir)   # stray tool files (gowitness db, github-subdomains txt, …) land in the run
     ctx = PhaseContext(run=run_obj, profile=profile, scope=scope, workdir=workdir,
                        echo=click.echo, http_timeout=timeout)
 

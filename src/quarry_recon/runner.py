@@ -14,6 +14,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+# Some tools write stray files to the current directory (gowitness's sqlite, github-subdomains'
+# <domain>.txt, …). Point the working directory at a per-run scratch dir so those land inside the
+# run, not wherever the user launched `quarry`. All tool I/O uses absolute paths, so this only
+# affects relative/stray output. Set once per run/osint via set_tool_cwd().
+_TOOL_CWD: str | None = None
+
+
+def set_tool_cwd(path) -> None:
+    global _TOOL_CWD
+    _TOOL_CWD = str(path) if path else None
+
 
 class Status(str, Enum):
     SUCCESS = "success"     # ran clean, produced output
@@ -117,6 +128,7 @@ def run(
             text=True,
             timeout=timeout,
             env=env,
+            cwd=_TOOL_CWD,
             **stdin_kw,
         )
     except subprocess.TimeoutExpired as e:

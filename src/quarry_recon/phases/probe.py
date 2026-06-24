@@ -82,7 +82,7 @@ def run(ctx) -> None:
         shot_dir.mkdir(parents=True, exist_ok=True)
         r = exec_tool("gowitness",
                 ["gowitness", "scan", "file", "-f", str(live_file),
-                 "--screenshot-path", str(shot_dir), "--write-db", "--write-jsonl",
+                 "--screenshot-path", str(shot_dir), "--write-jsonl",
                  "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
                 timeout=ctx.http_timeout)
         ctx.run.record("probe", r)

@@ -288,6 +288,8 @@ def run(profile, scope, project_dir: Path, echo=print, timeout: int = 1800) -> P
     (whois/dig/HTTP) use shorter caps.
     """
     sess = OsintSession(project_dir, profile.target)
+    from .runner import set_tool_cwd
+    set_tool_cwd(sess.dir)   # contain any stray tool output inside the osint session dir
     emails: set[str] = set()
     for apex in profile.apex_domains:
         _azmap(sess, apex, echo, timeout)
