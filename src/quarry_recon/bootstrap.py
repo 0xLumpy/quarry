@@ -219,7 +219,9 @@ def cleanup(echo, dry: bool) -> None:
 # Recommended = silent ok · Minimum..Recommended = warn + proceed · below Minimum = abort.
 REC_CPU, REC_RAM_GB = 4, 8          # recommended (documented + displayed)
 MIN_CPU, MIN_RAM_GB = 2, 4          # hard floor — below this, abort
-RAM_DRIFT = 0.95                    # MemTotal sits a little under physical (kernel reserve): 8GB→~7.8
+RAM_DRIFT = 0.88                    # MemTotal sits under physical (kernel/hypervisor reserve):
+                                    # an 8 GB VPS reports ~7.4–7.8 → gate at 8*0.88=7.04 clears it,
+                                    # while a true sub-8 box (~6.7) still warns. Same for the 4 GB floor.
 # Disk-free floors differ by context: install needs transient build space (Go modcache balloons
 # mid-build, freed in the cleanup stage) PLUS run headroom; after install only run space matters.
 DISK_MIN = {"install": 20, "run": 10}    # below -> abort
