@@ -21,7 +21,6 @@ very little and gives no useful reason why. Every result is:
 `v0.2` (stabilization) — command surface, installer, OSINT pre-flight, recon run, structured
 JSONL store, exports, reports, and checkpointing are wired and verified. Next milestone: prove
 the install + OSINT + full run on a clean Ubuntu VPS, then the v0.3 resume/checkpoint layer.
-See `notes/ROADMAP.md`.
 
 ## Safety and scope
 
@@ -60,8 +59,8 @@ Blank VPS → fully provisioned in one command:
 
 ```bash
 cd quarry
-./install.sh          # pipx-installs quarry, then `quarry install` provisions everything else
-quarry doctor           # audit tools, versions, deps, keys, wordlists
+bash install.sh       # pipx-installs quarry, then `quarry install` provisions everything else
+quarry doctor         # audit tools, versions, keys, wordlists, resources
 ```
 
 Common commands:

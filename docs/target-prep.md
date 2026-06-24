@@ -5,8 +5,8 @@ seeds you give it. On bigger targets, the high-value work it can't fully automat
 **horizontal** seed-gathering: deciding *which apexes, IP ranges, and ASNs are in scope and
 owned by the target*. That's judgment + OSINT.
 
-This guide maps each `target.yaml` field to where the methodology says to find the data
-(`../Methodology/`, `../notes/`). Do as much or as little as the target warrants — a single
+This guide maps each `target.yaml` field to where the methodology says to find the data.
+Do as much or as little as the target warrants — a single
 in-scope domain needs none of this; a wide program with owned infrastructure rewards all of it.
 
 > **Scope discipline first.** Only add an apex/CIDR/ASN you have **confirmed is owned by the
