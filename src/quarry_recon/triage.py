@@ -46,6 +46,40 @@ INTEREST = {
     "files": re.compile(r"/(upload|file|export|download|import|attachment|document|backup)(/|\?|$)", re.I),
 }
 
+# M2.2 tag-only classifiers — simple regex over the existing URL corpus. TAG only: no parsing,
+# no fetching, no enumeration, no analysis (those are later, separate items).
+API_DOC_RX = re.compile(r"(/swagger|/openapi|/api-docs|/graphql\b|/gql\b|swagger\.json|"
+                        r"openapi\.(?:json|ya?ml)|\.well-known/openapi)", re.I)
+OAUTH_RX = re.compile(r"(/oauth2?\b|/authorize\b|/token\b|/connect/token\b|"
+                      r"\.well-known/openid-configuration)", re.I)
+OAUTH_PARAMS = {"code", "state", "id_token", "access_token", "redirect_uri",
+                "response_type", "client_id", "scope", "nonce"}
+
+# Query-param names whose VALUES are sensitive — the digest keeps the param name + URL
+# structure but masks the value (full evidence stays in normalized/url.jsonl via raw_ref).
+SENSITIVE_PARAMS = {"access_token", "id_token", "code", "state", "redirect_uri",
+                    "client_secret", "token", "jwt", "assertion", "refresh_token"}
+
+
+def _sanitize_url(u: str) -> str:
+    if "?" not in u:
+        return u
+    base, qs = u.split("?", 1)
+    out = []
+    for kv in qs.split("&"):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            if v and k.lower() in SENSITIVE_PARAMS:
+                v = "***"
+            out.append(f"{k}={v}")
+        else:
+            out.append(kv)
+    return base + "?" + "&".join(out)
+CLOUD_RX = re.compile(r"([a-z0-9.-]+\.s3[.-][a-z0-9-]*\.amazonaws\.com|s3\.amazonaws\.com/|"
+                      r"storage\.googleapis\.com/|[a-z0-9-]+\.blob\.core\.windows\.net|"
+                      r"[a-z0-9-]+\.r2\.cloudflarestorage\.com|gcr\.io/|[a-z0-9-]+\.azurecr\.io)", re.I)
+MOBILE_RX = re.compile(r"(\.apk\b|\.ipa\b|play\.google\.com/store|apps\.apple\.com)", re.I)
+
 
 def _params_of(url: str) -> list[str]:
     q = url.split("?", 1)[1] if "?" in url else ""
@@ -163,8 +197,10 @@ def build(run, scope) -> str:
 
 def _item(type_: str, value, why: str, confidence: str, sources, raw_ref: str, tags,
           location: str | None = None) -> dict:
-    val = secrets.redact(value) if isinstance(value, str) else value
-    iid = f"{type_}:{hashlib.sha1(str(value).encode('utf-8', 'replace')).hexdigest()[:10]}"
+    val = _sanitize_url(secrets.redact(value)) if isinstance(value, str) else value
+    # hash the SANITIZED value: keeps raw tokens out of the id AND dedups the same endpoint
+    # that differs only by a one-time code/state.
+    iid = f"{type_}:{hashlib.sha1(str(val).encode('utf-8', 'replace')).hexdigest()[:10]}"
     item = {"id": iid, "type": type_, "value": val, "why": why,
             "confidence": confidence, "sources": list(sources or []),
             "raw_ref": raw_ref, "tags": [t for t in (tags or []) if t]}
@@ -206,6 +242,20 @@ def collect(run, scope) -> dict:
                 if any(p in names for p in ps):
                     add(cls, _item(cls, u, f"{cls} candidate param present", "low",
                                    src, "normalized/url.jsonl", [cls, "param"]))
+        # M2.2 tag-only classifiers (no parse/fetch/enum)
+        if API_DOC_RX.search(u):
+            add("api-doc", _item("api-doc", u, "API spec/doc endpoint (tag only — not parsed)",
+                                 "medium", src, "normalized/url.jsonl", ["api-doc"]))
+        if OAUTH_RX.search(u) or (ps and set(ps) & OAUTH_PARAMS):
+            add("oauth-jwt", _item("oauth-jwt", u,
+                "OAuth/OIDC/JWT auth-flow endpoint (tag only — never test)", "medium",
+                src, "normalized/url.jsonl", ["oauth-jwt", "auth"]))
+        if CLOUD_RX.search(u):
+            add("cloud", _item("cloud", u, "cloud-asset reference (tag only — no enumeration)",
+                               "low", src, "normalized/url.jsonl", ["cloud"]))
+        if MOBILE_RX.search(u):
+            add("mobile", _item("mobile", u, "mobile app reference (tag only)", "low",
+                                src, "normalized/url.jsonl", ["mobile"]))
 
     for r in reviews:                               # gf classes + sourcemap + takeover
         klass = r.get("klass", "other")
