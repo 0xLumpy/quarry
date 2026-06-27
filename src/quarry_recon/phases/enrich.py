@@ -71,21 +71,66 @@ def run(ctx) -> None:
     if not scope.passive_only and have("httpx") and new_resolved:
         hf = ctx.write_list("enrich_probe.txt", new_resolved)
         hx = ctx.run.raw_path("enrich", "httpx", "httpx.jsonl")
+        # methodology flag set MUST match probe.py — without -cdn (and -favicon/-asn/-location/
+        # -probe-all-ips) httpx omits CDN data and normalize defaults cdn=False, misclassifying
+        # late hosts as origin/no-WAF in the digest.
         cmd = ["httpx", "-l", str(hf), "-json", "-silent",
                "-ports", ",".join(str(p) for p in prof.ports),
-               "-td", "-title", "-sc", "-cl", "-web-server", "-ip", "-cname", "-irh",
-               "-follow-redirects", "-no-fallback", "-random-agent", "-t", "15"]
+               "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
+               "-asn", "-location", "-ip", "-cname", "-irh",
+               "-follow-redirects", "-no-fallback", "-probe-all-ips", "-random-agent", "-t", "15"]
         if prof.http_rl:
             cmd += ["-rl", str(prof.http_rl)]
         r = exec_tool("httpx", cmd, raw_path=hx, timeout=ctx.http_timeout)
         ctx.run.record("enrich", r)
+        new_live: list[str] = []
         if r.raw_path:
-            n = 0
             for e in normalize.httpx_json(r.raw_path.read_text(), "httpx", str(hx)):
                 if scope.in_scope(e.get("host") or normalize.host_of_url(e["url"])):
                     if ctx.run.add("live", e):
-                        n += 1
+                        new_live.append(e["url"])
                         for tech in e.get("tech") or []:
                             ctx.run.add("tech", {"id": f"{e['url']}|{tech}", "tech": tech,
                                                  "url": e["url"], "sources": ["httpx"]})
-            ctx.echo(f"  enrich: +{n} live (late-discovered)")
+            ctx.echo(f"  enrich: +{len(new_live)} live (late-discovered)")
+
+        # ── fingerprint the late hosts the same way probe does (probe ran before they existed) ──
+        if new_live:
+            if have("nuclei"):                          # WAF fingerprint
+                wi = ctx.write_list("enrich_waf.txt", new_live)
+                wo = ctx.run.raw_path("enrich", "nuclei", "waf.jsonl")
+                wcmd = ["nuclei", "-l", str(wi), "-tags", "waf", "-jsonl", "-o", str(wo)]
+                if prof.http_rl:
+                    wcmd += ["-rl", str(prof.http_rl)]
+                ctx.run.record("enrich", exec_tool("nuclei", wcmd, timeout=ctx.http_timeout))
+                if wo.exists():
+                    for line in wo.read_text().splitlines():
+                        try:
+                            o = _json.loads(line)
+                        except _json.JSONDecodeError:
+                            continue
+                        ex = o.get("extracted-results") or []
+                        name = (ex[0] if ex else None) or o.get("matcher-name") or "unknown"
+                        host = o.get("matched-at", o.get("host", ""))
+                        ctx.run.add("tech", {"id": f"{host}|waf:{name}", "tech": f"WAF:{name}",
+                                             "url": host, "sources": ["nuclei-waf"]})
+
+            if prof.screenshots and have("gowitness"):  # screenshots
+                lf = ctx.write_list("enrich_live.txt", new_live)
+                shot_dir = ctx.run.dir / "raw" / "enrich" / "gowitness"
+                shot_dir.mkdir(parents=True, exist_ok=True)
+                ctx.run.record("enrich", exec_tool("gowitness",
+                    ["gowitness", "scan", "file", "-f", str(lf),
+                     "--screenshot-path", str(shot_dir), "--write-jsonl",
+                     "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
+                    timeout=ctx.http_timeout))
+                for ext in ("*.jpeg", "*.png"):
+                    for img in shot_dir.glob(ext):
+                        ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
+
+            if have("smap"):                            # passive (Shodan) ports — raw, like probe
+                si = ctx.write_list("enrich_smap.txt",
+                                    [normalize.host_of_url(u) for u in new_live])
+                sm = ctx.run.raw_path("enrich", "smap", "smap.txt")
+                ctx.run.record("enrich", exec_tool("smap", ["smap", "-iL", str(si)],
+                                                   raw_path=sm, timeout=600))
