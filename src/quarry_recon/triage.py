@@ -114,7 +114,8 @@ def build(run, scope) -> str:
         A(f"## Secret candidates ({len(secrets)}) — review before any validation")
         for s in secrets[:25]:
             verified = " VERIFIED" if s.get("verified") else ""
-            A(f"- [{s.get('kind')}{verified}] {str(s.get('data'))[:100]}  (src: {','.join(s.get('sources', []))})")
+            loc = f"  @ {s.get('file')}" if s.get("file") else ""
+            A(f"- [{s.get('kind')}{verified}] {s.get('preview', '')}{loc}  (src: {','.join(s.get('sources', []))})")
         A("")
 
     # gf / sourcemap candidates (review entities)
