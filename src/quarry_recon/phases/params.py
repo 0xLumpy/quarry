@@ -44,9 +44,12 @@ def run(ctx) -> None:
         ctx.run.record("params", skipped("dalfox", "passive-only mode"))
         return
 
-    # ── subdomain takeover (nuclei takeover templates over resolved subs) ──
+    # ── subdomain takeover (nuclei takeover templates over known subs) ──
     if prof.takeover and have("nuclei"):
-        subs = scope.filter_hosts(ctx.run.values("resolved") or ctx.run.values("subdomain"))
+        # Union, not "resolved or subdomain": dangling-CNAME hosts (the takeover signal)
+        # have no A record and live only in `subdomain` — they must still be checked.
+        subs = scope.filter_hosts(sorted(set(ctx.run.values("resolved"))
+                                         | set(ctx.run.values("subdomain"))))
         if subs:
             tk_in = ctx.write_list("takeover_targets.txt", subs)
             tk_out = ctx.run.raw_path("params", "nuclei", "takeover.jsonl")
@@ -113,6 +116,29 @@ def run(ctx) -> None:
         r = exec_tool("arjun", ["arjun", "-i", str(aj_in), "-oT", str(aj_out), "-t", "5", "-d", "1"],
                       timeout=ctx.http_timeout)
         ctx.run.record("params", r)
+        # Feed arjun's output forward (each line is a URL with the discovered param(s), e.g.
+        # ".../v1/search?q=7101"). Without this the discovery was written to a file and dropped:
+        # record provenance AND hand the param-bearing URL to dalfox so a hidden reflected param
+        # actually gets XSS-tested.
+        naj = 0
+        if aj_out.exists():
+            for line in aj_out.read_text().splitlines():
+                u = line.strip()
+                if "?" not in u:
+                    continue
+                base, qs = u.split("?", 1)
+                ctx.run.add("url", {"url": u, "sources": ["arjun"]})
+                for pair in qs.split("&"):
+                    pname = pair.split("=", 1)[0]
+                    if pname:
+                        ctx.run.add("parameter", {"value": f"{base}?{pname}=",
+                                                  "sources": ["arjun"]})
+                ctx.run.add("review", {"id": f"arjun-param:{u[:100]}", "klass": "xss",
+                                       "value": u, "host": normalize.host_of_url(u),
+                                       "sources": ["arjun"]})
+                naj += 1
+        if naj:
+            ctx.echo(f"  arjun: +{naj} param-bearing URL(s) -> dalfox candidates")
     else:
         ctx.run.record("params", skipped("arjun", "no param-less API endpoints found"))
 

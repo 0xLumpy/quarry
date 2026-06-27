@@ -30,7 +30,7 @@ def run(ctx) -> None:
     cmd = ["httpx", "-l", str(hosts_file), "-json", "-silent",
            "-ports", ",".join(str(p) for p in prof.ports),
            "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
-           "-asn", "-location", "-ip", "-cname",
+           "-asn", "-location", "-ip", "-cname", "-irh",
            "-follow-redirects", "-no-fallback", "-probe-all-ips", "-random-agent",
            "-t", "15"]
     if prof.http_rl:
@@ -47,6 +47,29 @@ def run(ctx) -> None:
                         ctx.run.add("tech", {"id": f"{e['url']}|{tech}", "tech": tech,
                                              "url": e["url"], "sources": ["httpx"]})
         ctx.echo(f"  httpx: {n} live services ({r.status.value})")
+
+        # ── CSP-advertised siblings (horizontal discovery from live response headers) ──
+        # httpx -irh carries the Content-Security-Policy; in-scope hosts named there (e.g. an
+        # internal/staging host in script-src) are a real discovery channel. Parsed here over
+        # live hosts because the CSP lives on a probed host (www), not the bare apex — which is
+        # why csprecon over apex roots in horizontal found nothing.
+        import json as _json, re as _re
+        _CSP_HOST = _re.compile(r"\b(?:https?://)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})\b", _re.I)
+        csp_added = 0
+        for line in r.raw_path.read_text().splitlines():
+            try:
+                o = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            csp = (o.get("header") or {}).get("content_security_policy")
+            if not csp:
+                continue
+            for host in {m.lower() for m in _CSP_HOST.findall(csp)}:
+                if scope.in_scope(host) and ctx.run.add(
+                        "subdomain", {"host": host, "sources": ["csp"]}):
+                    csp_added += 1
+        if csp_added:
+            ctx.echo(f"  csp: +{csp_added} sibling host(s) from response headers")
 
     # ── WAF fingerprint (nuclei waf-detect templates over live hosts) ──
     # Recon-side only: identify WHICH WAF fronts each host (Cloudflare/Akamai/F5…).

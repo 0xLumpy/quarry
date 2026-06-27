@@ -170,25 +170,40 @@ def run(ctx) -> None:
 
     # ── CNAME collection for subdomain-takeover analysis (workflow 1.13) ──
     if prof.takeover and have("dnsx"):
-        res_hosts = ctx.write_list("resolved_hosts.txt",
-                                   ctx.run.values("resolved") or ctx.run.values("subdomain"))
+        # Scan the UNION of resolved + all known subdomains — not "resolved or subdomain".
+        # A dangling CNAME (host with a CNAME but no A record of its own) is exactly the
+        # takeover signal, and it lives in `subdomain`, never in `resolved`. The old
+        # short-circuit dropped every dangling host whenever any host A-resolved.
+        resolved_set = set(ctx.run.values("resolved"))
+        all_known = sorted(resolved_set | set(ctx.run.values("subdomain")))
+        res_hosts = ctx.write_list("resolved_hosts.txt", all_known)
         cn = ctx.run.raw_path("vertical", "dnsx", "cnames.jsonl")
         r = exec_tool("dnsx", ["dnsx", "-l", str(res_hosts), "-cname", "-json", "-silent"],
                       raw_path=cn, timeout=ctx.http_timeout)
         ctx.run.record("vertical", r)
         if r.raw_path:
             import json as _json
-            n = 0
+            n = ntk = 0
             for line in r.raw_path.read_text().splitlines():
                 try:
                     o = _json.loads(line)
                 except _json.JSONDecodeError:
                     continue
+                host = o.get("host")
+                # "dangling" here = host has a CNAME but was not A-resolved earlier this run.
+                # Good enough for the current store model. TODO: when the CNAME query also
+                # carries A records (dnsx -cname -a), tighten this to "has CNAME && no A in
+                # THIS DNS result" so it can't be fooled by stale/partial earlier resolution.
+                dangling = host not in resolved_set
                 for c in (o.get("cname") or []):
-                    ctx.run.add("review", {"id": f"cname:{o.get('host')}->{c}", "klass": "cname",
-                                           "value": f"{o.get('host')} -> {c}", "host": o.get("host"),
-                                           "cname": c, "sources": ["dnsx"]})
+                    ctx.run.add("review", {"id": f"cname:{host}->{c}", "klass": "cname",
+                                           "value": f"{host} -> {c}", "host": host,
+                                           "cname": c, "takeover_candidate": dangling,
+                                           "sources": ["dnsx"]})
                     n += 1
-            ctx.echo(f"  cnames: {n} (takeover analysis in params phase)")
+                    if dangling:
+                        ntk += 1
+            tk = f", {ntk} dangling → takeover candidate" if ntk else ""
+            ctx.echo(f"  cnames: {n}{tk} (takeover analysis in params phase)")
 
     ctx.echo(f"  subdomains: {ctx.run.count('subdomain')}  resolved: {ctx.run.count('resolved')}")

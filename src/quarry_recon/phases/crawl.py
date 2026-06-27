@@ -29,6 +29,12 @@ def _collect_url(ctx, raw_text, source, raw_ref):
                 n += 1
                 if e["url"].lower().split("?")[0].endswith(".js"):
                     ctx.run.add("js_url", e)
+            # Register the host itself — a host first seen via a crawl link (e.g. a link-only
+            # backup/canary host) is a real discovery. Without this it lives only in the URL
+            # corpus and never counts as a discovered subdomain (so no host-level view, and it
+            # misses the takeover/CNAME analysis). Dedups on host in the store.
+            if host:
+                ctx.run.add("subdomain", {"host": host, "sources": [source]})
     return n
 
 
