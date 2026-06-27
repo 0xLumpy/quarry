@@ -66,17 +66,25 @@ def have(bin_name: str) -> bool:
     return shutil.which(bin_name) is not None
 
 
-def _classify(exit_code: int, out: str, err: str, ok_empty: bool) -> tuple[Status, str]:
+def _classify(exit_code: int, out: str, err: str, ok_empty: bool,
+              ok_codes: tuple[int, ...] = (0,)) -> tuple[Status, str]:
     low_err = err.lower()
     blocked = any(sig in low_err for sig in BLOCK_SIGNATURES)
     has_out = bool(out.strip())
-    if exit_code != 0:
+    if exit_code not in ok_codes:
         if blocked:
             return Status.BLOCKED, "nonzero exit + block signature in stderr"
         # some tools exit nonzero with valid partial output
         if has_out:
             return Status.PARTIAL, f"exit {exit_code} but produced output"
         return Status.FAILED, f"exit {exit_code}, no output"
+    # A nonzero exit code we *accept* (e.g. gitleaks 1 = leaks found) is only trustworthy
+    # if it actually produced output. Nonzero + nothing is more likely a runtime/config
+    # error that happens to share the code — surface it, don't mask it as a clean empty.
+    if exit_code != 0 and not has_out:
+        if blocked:
+            return Status.BLOCKED, "nonzero exit + block signature in stderr"
+        return Status.FAILED, f"exit {exit_code} accepted but produced no output"
     if not has_out:
         if blocked:
             return Status.BLOCKED, "clean exit, no output, block signature in stderr"
@@ -95,11 +103,14 @@ def run(
     stdin_data: str | None = None,
     input_file: Path | None = None,
     ok_empty: bool = True,
+    ok_codes: tuple[int, ...] = (0,),
     env: dict | None = None,
 ) -> RunResult:
     """Run `cmd`, capture everything, persist raw stdout to `raw_path`, classify.
 
     `input_file`, if given, is streamed to the tool's stdin (used by jsluice/gf/etc).
+    `ok_codes` lists exit codes that are NOT failures — e.g. gitleaks exits 1 when it
+    *finds* leaks, which is success, not error.
     """
     bin_name = cmd[0]
     if not have(bin_name):
@@ -149,7 +160,7 @@ def run(
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         raw_path.write_text(out)
 
-    status, note = _classify(proc.returncode, out, err, ok_empty)
+    status, note = _classify(proc.returncode, out, err, ok_empty, ok_codes)
     err_tail = "\n".join(err.strip().splitlines()[-8:])
     return RunResult(
         tool=tool, cmd=cmd, status=status, exit_code=proc.returncode, duration=dur,

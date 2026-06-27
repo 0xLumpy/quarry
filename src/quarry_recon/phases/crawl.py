@@ -191,8 +191,12 @@ def run(ctx) -> None:
     # ── secret scanners on JS dir ──
     if js_files and have("gitleaks"):
         rep = ctx.run.raw_path("crawl", "gitleaks", "report.json")
+        # gitleaks writes the JSON report to `-r` and exits 1 when it FINDS leaks (success,
+        # not error). Route the report through stdout so the runner classifies on the actual
+        # findings, and whitelist exit 1 so a successful find isn't mislabeled "failed".
         r = exec_tool("gitleaks", ["gitleaks", "detect", "--no-git", "-s", str(js_dir),
-                                   "-r", str(rep), "-f", "json"], timeout=ctx.http_timeout)
+                                   "-r", "/dev/stdout", "-f", "json"],
+                      raw_path=rep, ok_codes=(0, 1), timeout=ctx.http_timeout)
         ctx.run.record("crawl", r)
         if rep.exists():
             try:
