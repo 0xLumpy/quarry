@@ -6,10 +6,21 @@ the manual workflow.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timezone
 
+from . import secrets
 from .normalize import host_of_url
+
+DIGEST_SCHEMA = "1.0"
+# Canonical queue keys — ALWAYS present in the contract (empty list if nothing landed) so
+# consumers can rely on a stable shape.
+CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "ssrf", "sqli",
+                    "redirect", "lfi", "rce", "ssti", "sourcemap", "takeover", "secrets", "scanner"]
+# Reserved keys — present from M2.1 so the schema is stable, filled by tag-only classifiers
+# in M2.2 (api-doc/oauth-jwt/cloud/mobile).
+PLACEHOLDER_QUEUES = ["api-doc", "oauth-jwt", "cloud", "mobile"]
 
 # Common vuln-class param lists (XSS/IDOR/SSRF/SQLi).
 VULN_PARAMS = {
@@ -142,3 +153,111 @@ def build(run, scope) -> str:
     A("\n> Every item traces to normalized/*.jsonl with provenance. Nothing here is a")
     A("> confirmed finding — these are ranked manual-validation queues.")
     return "\n".join(out) + "\n"
+
+
+# ── M2.1: structured digest contract (digest.json schema 1.0) ───────────────────────────
+# Built from the SAME existing data as the markdown HOTLIST. Every queue item carries
+# provenance (sources + raw_ref + why + confidence); values are redacted (secret previews
+# only, plus a defensive redact() of our own configured keys). The new queue types are
+# present as empty placeholder keys (filled by tag-only classifiers in M2.2).
+
+def _item(type_: str, value, why: str, confidence: str, sources, raw_ref: str, tags,
+          location: str | None = None) -> dict:
+    val = secrets.redact(value) if isinstance(value, str) else value
+    iid = f"{type_}:{hashlib.sha1(str(value).encode('utf-8', 'replace')).hexdigest()[:10]}"
+    item = {"id": iid, "type": type_, "value": val, "why": why,
+            "confidence": confidence, "sources": list(sources or []),
+            "raw_ref": raw_ref, "tags": [t for t in (tags or []) if t]}
+    if location:                          # evidence hint (e.g. the JS file a secret was in) —
+        item["location"] = location       # distinct from raw_ref (the immutable normalized store)
+    return item
+
+
+def collect(run, scope) -> dict:
+    """Structured digest model (inventory + clusters + queues) from existing entities only."""
+    live = run.read("live")
+    url_rows = run.read("url")                       # full entities → keep real provenance
+    secrets_e = run.read("secret")
+    findings = run.read("finding")
+    reviews = run.read("review")
+
+    queues: dict[str, list] = {q: [] for q in CANONICAL_QUEUES + PLACEHOLDER_QUEUES}
+    def add(q, item):
+        queues.setdefault(q, []).append(item)
+
+    for l in live:                                  # origin (non-CDN) live hosts
+        if not l.get("cdn"):
+            tags = ["origin", "no-waf"] + ([str(l["status_code"])] if l.get("status_code") else [])
+            add("origin", _item("origin", l["url"], "origin host (no CDN → likely no WAF)",
+                                "high", l.get("sources"), "normalized/live.jsonl", tags))
+
+    for row in url_rows:                             # interest buckets + vuln-class params
+        u = row.get("url", "")
+        if not u:
+            continue
+        src = row.get("sources")
+        for k, rx in INTEREST.items():
+            if rx.search(u):
+                add(k, _item(k, u, f"{k} surface (path keyword)", "medium",
+                             src, "normalized/url.jsonl", [k]))
+        ps = _params_of(u)
+        if ps:
+            for cls, names in VULN_PARAMS.items():
+                if any(p in names for p in ps):
+                    add(cls, _item(cls, u, f"{cls} candidate param present", "low",
+                                   src, "normalized/url.jsonl", [cls, "param"]))
+
+    for r in reviews:                               # gf classes + sourcemap + takeover
+        klass = r.get("klass", "other")
+        if klass == "cname" and r.get("takeover_candidate"):
+            add("takeover", _item("takeover", r.get("value"),
+                "dangling CNAME → subdomain-takeover candidate", "medium",
+                r.get("sources"), "normalized/review.jsonl", ["takeover"]))
+        elif klass == "sourcemap":
+            add("sourcemap", _item("sourcemap", r.get("value"),
+                "sourcemap → fetch .map to unminify", "medium",
+                r.get("sources"), "normalized/review.jsonl", ["sourcemap"]))
+        elif klass in ("xss", "idor", "ssrf", "sqli", "redirect", "lfi", "rce", "ssti"):
+            add(klass, _item(klass, r.get("value"), f"gf {klass} match", "low",
+                r.get("sources"), "normalized/review.jsonl", [klass, "gf"]))
+
+    for s in secrets_e:                             # secrets (redacted — preview only)
+        # preview is the redacted form; fall back to masking a legacy `data` field (pre-redaction
+        # runs) so the value is never blank AND never raw.
+        preview = s.get("preview") or secrets.mask(s.get("data", ""))
+        add("secrets", _item("secret", preview,
+            f"{s.get('kind')} secret candidate", "high" if s.get("verified") else "medium",
+            s.get("sources"), "normalized/secret.jsonl",
+            ["secret", s.get("kind", "")], location=s.get("file")))
+
+    sev_conf = {"critical": "high", "high": "high", "medium": "medium", "low": "low", "info": "low"}
+    for f in findings:                              # scanner candidates (UNCONFIRMED)
+        sev = f.get("severity", "unknown")
+        add("scanner", _item("finding", f.get("matched") or f.get("id"),
+            f"{f.get('template')} [{sev}] — UNCONFIRMED", sev_conf.get(sev, "low"),
+            f.get("sources"), "normalized/finding.jsonl", ["scanner", sev]))
+
+    for q in queues:                                # dedup by item id (keys already canonical)
+        queues[q] = list({it["id"]: it for it in queues[q]}.values())
+
+    by_apex: dict[str, set] = {}                     # simple apex clusters from live
+    for l in live:
+        h = host_of_url(l["url"])
+        apex = ".".join(h.split(".")[-2:]) if h and "." in h else (h or "?")
+        by_apex.setdefault(apex, set()).add(l["url"])
+    clusters = [{"key": apex, "type": "apex", "members": sorted(m), "signal_strength": "medium"}
+                for apex, m in sorted(by_apex.items())]
+
+    inventory = {"subdomains": run.count("subdomain"), "resolved": run.count("resolved"),
+                 "live": len(live), "urls": len(url_rows), "secrets": len(secrets_e),
+                 "findings": len(findings),
+                 "takeover_candidates": sum(1 for r in reviews
+                     if r.get("klass") == "cname" and r.get("takeover_candidate"))}
+    return {"inventory": inventory, "clusters": clusters, "queues": queues}
+
+
+def digest_json(run, scope) -> dict:
+    """The versioned, redacted recon↔attack contract (digest.json schema 1.0)."""
+    return {"digest_schema": DIGEST_SCHEMA, "target": run.target, "run_id": run.run_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            **collect(run, scope)}

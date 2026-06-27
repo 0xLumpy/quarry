@@ -450,6 +450,9 @@ def run(profile_path, phases, passive, timeout):
     exports.write_delta(run_obj)
     hot = triage.build(run_obj, scope)
     (run_obj.reports / "HOTLIST.md").write_text(hot)
+    import json as _json
+    (run_obj.reports / "digest.json").write_text(
+        _json.dumps(triage.digest_json(run_obj, scope), indent=2, ensure_ascii=False))
     if all_cps:
         (run_obj.reports / "checkpoints.md").write_text(
             "# Checkpoints\n\n" + "\n".join(f"- {c.line()}" for c in all_cps) + "\n")
@@ -490,7 +493,10 @@ def report(profile_path, run_id):
     exp = exports.write_all(run_obj)
     exports.write_delta(run_obj)
     (run_obj.reports / "HOTLIST.md").write_text(triage.build(run_obj, scope))
-    click.echo(f"regenerated {run_obj.reports / 'HOTLIST.md'} + delta.md")
+    import json as _json
+    (run_obj.reports / "digest.json").write_text(
+        _json.dumps(triage.digest_json(run_obj, scope), indent=2, ensure_ascii=False))
+    click.echo(f"regenerated {run_obj.reports / 'HOTLIST.md'} + digest.json + delta.md")
     click.echo(f"exports: {', '.join(f'{k}={v}' for k, v in exp.items() if v)}")
 
 
