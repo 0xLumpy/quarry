@@ -95,6 +95,31 @@ def redact(text: str | None) -> str | None:
     return text
 
 
+def _coerce(value) -> str:
+    if isinstance(value, str):
+        return value
+    import json as _json
+    return _json.dumps(value, sort_keys=True, default=str)
+
+
+def mask(value) -> str:
+    """Short, non-usable preview of a DISCOVERED secret (a scanner finding, not our own
+    key) — enough to recognize in a report, not enough to use. Raw evidence stays in the
+    controlled raw/ files only."""
+    s = _coerce(value).strip()
+    if not s:
+        return ""
+    if len(s) <= 12:
+        return f"…({len(s)} chars)"          # too short to show any char without leaking
+    return f"{s[:4]}…{s[-4:]} ({len(s)} chars)"
+
+
+def fingerprint(value) -> str:
+    """Stable short hash of a secret value — used as a dedup id without storing the raw."""
+    import hashlib
+    return hashlib.sha256(_coerce(value).encode("utf-8", "replace")).hexdigest()[:12]
+
+
 def apply_env() -> None:
     """Export PDCP_API_KEY so ProjectDiscovery tools (subfinder -pc, asnmap, …) pick up the
     chaos key without it ever appearing on a command line. No-op if unset or already set."""

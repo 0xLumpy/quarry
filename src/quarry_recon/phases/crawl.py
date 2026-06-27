@@ -13,7 +13,7 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from .. import normalize
+from .. import normalize, secrets
 from ..runner import Status, have, run as exec_tool, skipped
 
 KEYHOST = ("login", "auth", "sso", "saml", "oauth", "api", "account", "register",
@@ -180,6 +180,10 @@ def run(ctx) -> None:
                         ctx.run.add("endpoint", {"value": e["url"],
                                                  **{k: v for k, v in e.items() if k != "url"}})
                     else:
+                        d = e.pop("data", "")          # don't store the raw secret in normalized
+                        basis = d or f"{e.get('kind', 'secret')}|{e.get('id', '')}"
+                        e["preview"] = secrets.mask(d)
+                        e["id"] = f"jsluice:{e.get('kind', 'secret')}:{secrets.fingerprint(basis)}"
                         ctx.run.add("secret", e)
             except Exception as ex:
                 ctx.echo(f"    jsluice {sub}: {ex}")
@@ -197,21 +201,35 @@ def run(ctx) -> None:
     # ── secret scanners on JS dir ──
     if js_files and have("gitleaks"):
         rep = ctx.run.raw_path("crawl", "gitleaks", "report.json")
-        # gitleaks writes the JSON report to `-r` and exits 1 when it FINDS leaks (success,
-        # not error). Route the report through stdout so the runner classifies on the actual
-        # findings, and whitelist exit 1 so a successful find isn't mislabeled "failed".
+        # gitleaks writes its JSON report to the -r FILE and exits 1 when it FINDS leaks
+        # (success, not error). Write a REAL file and classify on its contents — `-r /dev/stdout`
+        # is non-portable (writes 0 bytes on some builds → lost findings + a bogus "failed").
+        # No raw_path here: run() must not clobber the file gitleaks wrote with empty stdout.
         r = exec_tool("gitleaks", ["gitleaks", "detect", "--no-git", "-s", str(js_dir),
-                                   "-r", "/dev/stdout", "-f", "json"],
-                      raw_path=rep, ok_codes=(0, 1), timeout=ctx.http_timeout)
-        ctx.run.record("crawl", r)
-        if rep.exists():
+                                   "-r", str(rep), "-f", "json"],
+                      ok_codes=(0, 1), timeout=ctx.http_timeout)
+        items = []
+        if rep.exists() and rep.stat().st_size:
             try:
-                for item in json.loads(rep.read_text() or "[]"):
-                    ctx.run.add("secret", {"id": f"gitleaks:{item.get('RuleID')}:{item.get('Secret','')[:40]}",
-                                           "kind": item.get("RuleID"), "data": item.get("Secret"),
-                                           "file": item.get("File"), "sources": ["gitleaks"]})
+                items = json.loads(rep.read_text() or "[]")
             except json.JSONDecodeError:
-                pass
+                items = []
+        for item in items:
+            sec = item.get("Secret", "")
+            # fingerprint from the secret; fall back to rule+file+line so an empty Secret
+            # can't collapse distinct findings to fingerprint("").
+            basis = sec or f"{item.get('RuleID')}|{item.get('File')}|{item.get('StartLine')}"
+            ctx.run.add("secret", {"id": f"gitleaks:{item.get('RuleID')}:{secrets.fingerprint(basis)}",
+                                   "kind": item.get("RuleID"), "preview": secrets.mask(sec),
+                                   "file": item.get("File"), "sources": ["gitleaks"]})
+        # status from the report (gitleaks writes findings to the file + exits 1 on a find).
+        # Keep the REAL RunResult — command / exit code / duration / stderr — for the audit
+        # trail; only override status+note when the report actually shows findings.
+        if items:
+            r.status = Status.SUCCESS
+            r.note = f"{len(items)} leak(s) found"
+            r.stdout_lines = len(items)
+        ctx.run.record("crawl", r)
 
     if js_files and have("trufflehog"):
         th = ctx.run.raw_path("crawl", "trufflehog", "out.jsonl")
@@ -225,9 +243,13 @@ def run(ctx) -> None:
                 except json.JSONDecodeError:
                     continue
                 det = o.get("DetectorName", "secret")
-                raw_s = o.get("Raw", "")[:40]
-                ctx.run.add("secret", {"id": f"trufflehog:{det}:{raw_s}", "kind": det,
-                                       "data": o.get("Redacted") or raw_s,
+                raw_s = o.get("Raw") or ""
+                red = o.get("Redacted") or ""
+                # fingerprint from Raw; if Raw is empty, fall back to detector + redacted +
+                # source context so distinct findings don't collapse to fingerprint("").
+                basis = raw_s or f"{det}|{red}|{o.get('SourceMetadata') or ''}"
+                ctx.run.add("secret", {"id": f"trufflehog:{det}:{secrets.fingerprint(basis)}",
+                                       "kind": det, "preview": red or secrets.mask(raw_s),
                                        "verified": o.get("Verified", False), "sources": ["trufflehog"]})
 
     ctx.echo(f"  urls: {ctx.run.count('url')}  js: {ctx.run.count('js_url')}  "
