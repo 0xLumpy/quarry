@@ -68,10 +68,11 @@ def render(session, profile, cands, intel, manual_todo) -> str:
         A("## Noise (ignored — e.g. 3rd-party DMARC processors)")
         A("  " + ", ".join(f"`{c['value']}`" for c in apex_noise) + "\n")
 
-    A("## Manual to-do (automation can't reach these — check by hand, then add to profile)")
-    for label, how in manual_todo:
-        A(f"- **{label}** — {how}")
-    A("")
+    A("## Manual OSINT broadening (beneficial on larger targets)")
+    A("Some sources are web-only / API-gated and can't be automated: "
+      + " · ".join(label for label, _ in manual_todo) + ".")
+    A("Steps to broaden by hand → **`docs/osint-broadening.md`**. Confirm ownership + program "
+      "scope before adding anything to the profile.\n")
 
     A("## How to apply")
     A("1. Review the candidates above; confirm ownership + program scope.")
