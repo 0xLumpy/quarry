@@ -43,7 +43,9 @@ def run(ctx) -> None:
     # a host with a CNAME but no A of its own = takeover candidate.
     if prof.takeover and have("dnsx"):
         cn = ctx.run.raw_path("enrich", "dnsx", "cnames.jsonl")
-        r = exec_tool("dnsx", ["dnsx", "-l", str(targets), "-cname", "-json", "-silent"],
+        # -a so dangling = has CNAME but no A in THIS result (enrich itself can add a no-A host
+        # to `resolved` with a:[], so resolved-set membership is not a reliable dangling signal).
+        r = exec_tool("dnsx", ["dnsx", "-l", str(targets), "-cname", "-a", "-json", "-silent"],
                       raw_path=cn, timeout=ctx.http_timeout)
         ctx.run.record("enrich", r)
         if r.raw_path:
@@ -54,7 +56,7 @@ def run(ctx) -> None:
                 except _json.JSONDecodeError:
                     continue
                 host = o.get("host")
-                dangling = host not in resolved
+                dangling = not o.get("a")          # has a CNAME (loop below) but no A record
                 for c in (o.get("cname") or []):
                     ctx.run.add("review", {"id": f"cname:{host}->{c}", "klass": "cname",
                                            "value": f"{host} -> {c}", "host": host,

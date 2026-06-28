@@ -142,13 +142,20 @@ def run(ctx) -> None:
     else:
         ctx.run.record("params", skipped("arjun", "no param-less API endpoints found"))
 
-    # ── dalfox on gf xss + redirect candidates (throttled) ──
+    # ── dalfox on gf xss + redirect candidates ──
     dalfox_in = [r["value"] for r in ctx.run.read("review") if r.get("klass") in ("xss", "redirect")]
     if dalfox_in and have("dalfox"):
         df_in = ctx.write_list("dalfox_in.txt", dalfox_in)
         df_out = ctx.run.raw_path("params", "dalfox", "dalfox.txt")
-        r = exec_tool("dalfox", ["dalfox", "file", str(df_in), "--delay", "250", "-w", "5",
-                                 "--skip-bav", "-o", str(df_out)], timeout=ctx.http_timeout)
+        # Concurrency (workers = local lanes) stays at dalfox's OWN default — not set here, so it
+        # tracks the tool/machine, not the target (rate ≠ workers; PERFORMANCE model in ROADMAP).
+        # `http_rl` controls RATE only: our installed dalfox has no `--rate-limit` flag, so emulate
+        # via a per-request delay. (Newer dalfox adds `--rate-limit` global req/s — switch to that
+        # once `quarry update` ships it; see ROADMAP.) The old -w 5 --delay 250 idled + timed out.
+        df_cmd = ["dalfox", "file", str(df_in), "--skip-bav", "-o", str(df_out)]
+        if prof.http_rl:
+            df_cmd += ["--delay", str(1000 // max(1, prof.http_rl))]
+        r = exec_tool("dalfox", df_cmd, timeout=ctx.http_timeout)
         ctx.run.record("params", r)
         if df_out.exists():
             for line in df_out.read_text().splitlines():

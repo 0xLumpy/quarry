@@ -174,11 +174,13 @@ def run(ctx) -> None:
         # A dangling CNAME (host with a CNAME but no A record of its own) is exactly the
         # takeover signal, and it lives in `subdomain`, never in `resolved`. The old
         # short-circuit dropped every dangling host whenever any host A-resolved.
-        resolved_set = set(ctx.run.values("resolved"))
-        all_known = sorted(resolved_set | set(ctx.run.values("subdomain")))
+        all_known = sorted(set(ctx.run.values("resolved")) | set(ctx.run.values("subdomain")))
         res_hosts = ctx.write_list("resolved_hosts.txt", all_known)
         cn = ctx.run.raw_path("vertical", "dnsx", "cnames.jsonl")
-        r = exec_tool("dnsx", ["dnsx", "-l", str(res_hosts), "-cname", "-json", "-silent"],
+        # -a so each result carries the host's A records: dangling = has CNAME but no A in THIS
+        # result. (Not "host not in resolved" — a no-A CNAME host can still get a `resolved`
+        # entity with a:[], which would wrongly clear the takeover flag.)
+        r = exec_tool("dnsx", ["dnsx", "-l", str(res_hosts), "-cname", "-a", "-json", "-silent"],
                       raw_path=cn, timeout=ctx.http_timeout)
         ctx.run.record("vertical", r)
         if r.raw_path:
@@ -190,11 +192,7 @@ def run(ctx) -> None:
                 except _json.JSONDecodeError:
                     continue
                 host = o.get("host")
-                # "dangling" here = host has a CNAME but was not A-resolved earlier this run.
-                # Good enough for the current store model. TODO: when the CNAME query also
-                # carries A records (dnsx -cname -a), tighten this to "has CNAME && no A in
-                # THIS DNS result" so it can't be fooled by stale/partial earlier resolution.
-                dangling = host not in resolved_set
+                dangling = not o.get("a")          # has a CNAME (loop below) but no A record
                 for c in (o.get("cname") or []):
                     ctx.run.add("review", {"id": f"cname:{host}->{c}", "klass": "cname",
                                            "value": f"{host} -> {c}", "host": host,
