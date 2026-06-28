@@ -184,6 +184,16 @@ data_files:
     dest: ~/.config/quarry/dns-wordlist.txt
     url: https://raw.githubusercontent.com/n0kovo/n0kovo_subdomains/main/n0kovo_subdomains_huge.txt
     update: false
+  # content-discovery wordlists (Phase 11 balanced/deep). BETA: SecLists raft lists for now —
+  # may swap/add more later, and a future flag will let users point at their own list.
+  - name: content-balanced
+    dest: ~/.config/quarry/wordlists/content/balanced.txt
+    url: https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt
+    update: true
+  - name: content-deep
+    dest: ~/.config/quarry/wordlists/content/deep.txt
+    url: https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-directories.txt
+    update: true
 
 # Post-install extras (idempotent shell steps).
 extras:

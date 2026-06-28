@@ -113,7 +113,9 @@ def doctor(phase):
     cfg = Path.home() / ".config/quarry"
     for label, p in [("resolvers", cfg / "resolvers.txt"),
                      ("trusted-resolvers", cfg / "trusted-resolvers.txt"),
-                     ("dns-wordlist", cfg / "dns-wordlist.txt")]:
+                     ("dns-wordlist", cfg / "dns-wordlist.txt"),
+                     ("content-wl balanced", cfg / "wordlists/content/balanced.txt"),
+                     ("content-wl deep", cfg / "wordlists/content/deep.txt")]:
         mark = _c("✓", "green") if p.exists() else _c("·", "yellow")
         note = "" if p.exists() else f"(optional) put at {p}"
         click.echo(f"  {mark} {label:<24} {note}")
