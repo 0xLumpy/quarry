@@ -44,6 +44,13 @@ def _synthetic(ctx, tool, lines, note=""):
         "stdout_lines": lines, "note": note, "cmd": [tool], "stderr_tail": ""})())
 
 
+def _safe_srcpath(name: str) -> str:
+    """Sourcemap `sources` entry -> a safe relative path (drops webpack:// etc; no traversal)."""
+    n = name.split("://", 1)[-1].replace("\\", "/")
+    parts = [p for p in n.split("/") if p not in ("", ".", "..")]
+    return "/".join(parts) or "source"
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
     roots = ctx.write_list("roots.txt", prof.apex_domains)
@@ -148,22 +155,93 @@ def run(ctx) -> None:
             except Exception:
                 pass
 
-    # ── source-map recovery (append .map, scan for sourceMappingURL refs) ──
+    # ── 9.1 source-map UNPACK: detect .map refs, fetch, recover original source ──
+    recov_dir = ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered"
+    MAX_MAP = 20 * 1024 * 1024     # 20 MB cap per sourcemap (RAM/disk guard)
     if js_files:
-        smaps = set()
-        for f in js_files:
-            txt = f.read_text(errors="replace")
-            for line in txt.splitlines():
-                if "sourceMappingURL=" in line:
-                    smaps.add(line.split("sourceMappingURL=", 1)[1].strip())
+        import base64
+        from urllib.parse import urljoin
+        map_payloads = []          # (label, json_text) — both inline-data and fetched .map
+        map_urls = set()           # in-scope http(s) .map candidates (for the review queue)
         for u in ctx.run.values("js_url"):
-            smaps.add(u.split("?")[0] + ".map")
+            dest = js_dir / (hashlib.md5(u.encode()).hexdigest()[:16] + ".js")
+            if not dest.exists():
+                continue
+            refs = [line.split("sourceMappingURL=", 1)[1].strip()
+                    for line in dest.read_text(errors="replace").splitlines()
+                    if "sourceMappingURL=" in line]
+            refs.append(u.split("?")[0] + ".map")               # conventional fallback
+            for ref in refs:
+                if ref.startswith("data:"):                     # inline base64 sourcemap
+                    try:
+                        raw = base64.b64decode(ref.split(",", 1)[1])
+                        if len(raw) <= MAX_MAP:                  # size guard
+                            map_payloads.append((u, raw.decode("utf-8", "replace")))
+                    except Exception:
+                        pass
+                else:
+                    m = urljoin(u, ref)
+                    # fetching is ACTIVE — a malicious sourceMappingURL can point off-scope.
+                    if ctx.scope.active_allowed(normalize.host_of_url(m)):
+                        map_urls.add(m)
+        for m in sorted(map_urls)[:100]:                        # bound number of fetches
+            try:
+                req = urllib.request.Request(m, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = resp.read(MAX_MAP + 1)               # bounded read
+                if len(data) > MAX_MAP:
+                    continue
+                map_payloads.append((m, data.decode("utf-8", "replace")))
+            except Exception:
+                continue
+        recovered = 0
+        for label, text in map_payloads:
+            try:
+                obj = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            # per-map subdir so two maps with the same source path don't overwrite each other
+            mh = hashlib.md5(label.encode()).hexdigest()[:10]
+            sources = obj.get("sources") or []
+            for i, content in enumerate(obj.get("sourcesContent") or []):
+                if not content:
+                    continue
+                out = recov_dir / mh / _safe_srcpath(sources[i] if i < len(sources) else f"src{i}.js")
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(content)
+                recovered += 1
         sm_raw = ctx.run.raw_path("crawl", "sourcemaps", "candidates.txt")
-        sm_raw.write_text("\n".join(sorted(smaps)) + "\n")
-        for s in smaps:
+        sm_raw.write_text("\n".join(sorted(map_urls)) + "\n")
+        for s in sorted(map_urls):
             ctx.run.add("review", {"id": f"sourcemap:{s}", "klass": "sourcemap", "value": s,
                                    "sources": ["sourcemap-scan"]})
-        ctx.echo(f"  sourcemap candidates: {len(smaps)} (fetch .map -> unminified src)")
+        ctx.echo(f"  sourcemaps: {len(map_urls)} .map candidate(s), recovered {recovered} source file(s)")
+
+    # ── re-mine recovered source (jsluice + xnLinkFinder), provenance = sourcemap ──
+    recov_files = [p for p in recov_dir.rglob("*") if p.is_file()] if recov_dir.exists() else []
+    if recov_files and have("jsluice"):
+        blob = b"\n".join(p.read_bytes() for p in recov_files)
+        for sub, parser in (("urls", normalize.jsluice_urls), ("secrets", normalize.jsluice_secrets)):
+            raw = ctx.run.raw_path("crawl", "jsluice-sourcemap", f"{sub}.jsonl")
+            try:
+                p = subprocess.run(["jsluice", sub, "-"], input=blob, capture_output=True,
+                                   timeout=ctx.http_timeout)
+                raw.write_bytes(p.stdout)
+                _synthetic(ctx, f"jsluice-sourcemap-{sub}", p.stdout.count(b"\n"))
+                for e in parser(p.stdout.decode("utf-8", "replace"), "jsluice-sourcemap", str(raw)):
+                    if sub == "urls":
+                        ctx.run.add("endpoint", {"value": e["url"],
+                                                 **{k: v for k, v in e.items() if k != "url"}})
+                    else:
+                        d = e.pop("data", "")
+                        basis = d or f"{e.get('kind', 'secret')}|{e.get('id', '')}"
+                        e["preview"] = secrets.mask(d)
+                        e["id"] = f"jsluice-sourcemap:{e.get('kind', 'secret')}:{secrets.fingerprint(basis)}"
+                        ctx.run.add("secret", e)
+            except Exception as ex:
+                ctx.echo(f"    jsluice-sourcemap {sub}: {ex}")
+    if recov_files and have("xnLinkFinder"):
+        _xnl(ctx, str(recov_dir), "sourcemap", extra=[])
 
     # ── jsluice urls + secrets ──
     if js_files and have("jsluice"):
