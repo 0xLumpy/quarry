@@ -18,9 +18,10 @@ very little and gives no useful reason why. Every result is:
 
 ## Status
 
-`v0.2` (stabilization) — command surface, installer, OSINT pre-flight, recon run, structured
-JSONL store, exports, reports, and checkpointing are wired and verified. Next milestone: prove
-the install + OSINT + full run on a clean Ubuntu VPS, then the v0.3 resume/checkpoint layer.
+`v0.2` (stabilization) — command surface, installer, OSINT pre-flight, the full recon run (six
+phases including late-host enrichment), structured JSONL store, exports, reports, a redacted
+structured **digest**, and checkpointing are wired and verified end-to-end against a
+purpose-built test range. Resumable runs and a broader OSINT / content-discovery layer come next.
 
 ## Safety and scope
 
@@ -216,9 +217,10 @@ setsid nohup quarry run -t acme.com > run.log 2>&1 & disown
 |-------|------|-----------|
 | **horizontal** | ASN/CIDR confirm, kaeferjaeger SNI dataset, tlsx SAN (443/8443/4443), reverse DNS, CSP-recon, **Caduceus ASN→cert** | mapcidr, tlsx, dnsx, asnmap, csprecon, caduceus |
 | **vertical** | passive scrape (`-stats`) + GitHub + Shodan + DNS brute + **recursive word-cloud permutation→resolve loop** (alterx `-enrich -mode both`, converges) + **CNAME collect** | subfinder, github-subdomains, shosubgo, puredns, alterx, dnsx |
-| **probe** | HTTP fingerprint (full methodology flag set), CDN/origin tag, screenshots, **naabu → nmap -sV**, passive smap | httpx, cdncheck, gowitness, naabu, nmap, smap |
-| **crawl** | active crawl (+headless SPA, stored responses), archive URLs, JS download/beautify/mine, **waymore `-mode B` + xnLinkFinder over responses** | katana, gau, waymore, jsluice, xnLinkFinder, gitleaks, trufflehog |
-| **params** | gf vuln-class buckets, param discovery, non-intrusive scan + OOB, **subdomain takeover**, reflected XSS/redirect | gf, arjun, nuclei (interactsh + takeover), dalfox |
+| **probe** | HTTP fingerprint (full methodology flag set), CDN/origin tag, **CSP-sibling discovery (response headers)**, screenshots, **naabu → nmap -sV**, passive smap | httpx, cdncheck, gowitness, naabu, nmap, smap |
+| **crawl** | active crawl (+headless SPA, stored responses), archive URLs, JS download/mine + redacted secret scan, **waymore `-mode B` + xnLinkFinder over responses**, link-discovered host promotion | katana, gau, waymore, jsluice, xnLinkFinder, gitleaks, trufflehog |
+| **enrich** | catch-up over hosts found *after* probe (crawl links, CSP siblings): resolve, **dangling-CNAME takeover**, HTTP fingerprint, WAF, screenshots, smap | dnsx, httpx, nuclei, gowitness, smap |
+| **params** | gf vuln-class buckets, param discovery (fed forward to the XSS tester), non-intrusive scan + OOB, **subdomain takeover**, reflected XSS/redirect | gf, arjun, nuclei (interactsh + takeover), dalfox |
 
 Raw tool output is preserved before parsing; normalized results keep provenance so any result
 traces back to the tool and raw file that produced it.
@@ -239,7 +241,8 @@ projects/<target>/
     raw/<phase>/<tool>/                    raw evidence (preserved before parsing)
     normalized/*.jsonl                     entities with provenance (the source of truth)
     exports/*.txt                          flat compat views (subdomains/live/urls/js/…)
-    reports/HOTLIST.md                     ranked manual-validation queues + rationale
+    reports/HOTLIST.md                     ranked manual-validation queues + rationale (human)
+    reports/digest.json                    same queues as structured, redacted JSON (provenance + raw refs)
     reports/delta.md                       per-source contribution + new-since-last-run
     reports/checkpoints.md                 thin/blocked-output warnings with stated causes
   recon/state/current -> latest run
@@ -250,8 +253,11 @@ projects/<target>/
 on `quarry init`. Keys + wordlists stay global in `~/.config/quarry/`.)
 
 **HOTLIST** ranks: scanner candidates (unconfirmed), likely-origin (non-CDN) hosts,
-auth/api/admin/file buckets, IDOR/SSRF/SQLi/XSS param candidates (common-vuln lists), secrets, and
-gf/sourcemap queues.
+auth/api/admin/file buckets, IDOR/SSRF/SQLi/XSS param candidates (common-vuln lists), secrets,
+gf/sourcemap queues, subdomain-takeover candidates, and tagged surface classes (API-docs,
+auth-flow, cloud, mobile). **`digest.json`** is the same content in structured, redacted JSON —
+every item carries provenance and a raw-evidence reference; secret values are previews only and
+sensitive URL parameters (tokens, OAuth `code`/`state`, …) are masked.
 
 ## Anti-thin-output checks
 
@@ -301,8 +307,7 @@ Start with `quarry doctor`. Common issues:
 Intentionally not first-version. Add after the core is understood on real targets:
 
 - content discovery (ffuf/gobuster/dirsearch) · 403-bypass mapping · vhost enumeration
-- COTS/known-path discovery · mobile/APK path extraction
-- confidence scoring over normalized entities
-- gungnir continuous CT monitoring
+- COTS/known-path discovery · mobile/APK path extraction · API-spec (Swagger/OpenAPI) parsing
+- resumable runs · gungnir continuous CT monitoring
 - SQLite/DuckDB query layer over the JSONL store
 - distributed / axiom-style fan-out
