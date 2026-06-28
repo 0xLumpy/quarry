@@ -32,6 +32,11 @@ class ProfileError(Exception):
     pass
 
 
+# Content-discovery recursion is capped — content discovery is deliberately conservative. Raise
+# this only for an engagement that truly needs it. Depth 4-5 warns at run time; > MAX fails loud.
+MAX_CONTENT_RECURSION = 5
+
+
 @dataclass
 class ScopeMatcher:
     """Compiled, reusable scope decisions."""
@@ -141,7 +146,7 @@ class TargetProfile:
         if v is True:
             return 1
         try:
-            return max(0, int(v))
+            return min(MAX_CONTENT_RECURSION, max(0, int(v)))   # load() already range-checks; clamp defensively
         except (TypeError, ValueError):
             return 0
 
@@ -203,6 +208,15 @@ class TargetProfile:
         cd = ("off" if cdv is False else "on" if cdv is True else str(cdv)).strip().lower()
         if cd not in ("off", "light", "balanced", "deep"):     # opt-in phase: fail loud on a typo
             raise ProfileError(f"invalid MODES.CONTENT_DISCOVERY {cd!r} (use off|light|balanced|deep)")
+        crv = (raw.get("MODES") or {}).get("CONTENT_RECURSION", 0)
+        crv = 1 if crv is True else (0 if crv is False else crv)
+        try:
+            cr_i = int(crv)
+        except (TypeError, ValueError):
+            raise ProfileError(f"invalid MODES.CONTENT_RECURSION {crv!r} (int 0-{MAX_CONTENT_RECURSION} or true)")
+        if not 0 <= cr_i <= MAX_CONTENT_RECURSION:     # caged: a typo like 20 must fail, not roar
+            raise ProfileError(
+                f"MODES.CONTENT_RECURSION {cr_i} out of range (0-{MAX_CONTENT_RECURSION}; content discovery is capped)")
         ports = [int(p) for p in (raw.get("PORTS") or {}).get("HTTP") or [] if p]
         return cls(
             target=str(raw["TARGET"]).strip(),

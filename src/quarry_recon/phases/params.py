@@ -148,10 +148,10 @@ def run(ctx) -> None:
         df_in = ctx.write_list("dalfox_in.txt", dalfox_in)
         df_out = ctx.run.raw_path("params", "dalfox", "dalfox.txt")
         # Concurrency (workers = local lanes) stays at dalfox's OWN default — not set here, so it
-        # tracks the tool/machine, not the target (rate ≠ workers; PERFORMANCE model in ROADMAP).
+        # tracks the tool/machine, not the target (rate ≠ workers — they're separate axes).
         # `http_rl` controls RATE only: our installed dalfox has no `--rate-limit` flag, so emulate
-        # via a per-request delay. (Newer dalfox adds `--rate-limit` global req/s — switch to that
-        # once `quarry update` ships it; see ROADMAP.) The old -w 5 --delay 250 idled + timed out.
+        # via a per-request delay. (Newer dalfox adds a `--rate-limit` global req/s — switch to that
+        # once it's available.) The old -w 5 --delay 250 idled + timed out.
         df_cmd = ["dalfox", "file", str(df_in), "--skip-bav", "-o", str(df_out)]
         if prof.http_rl:
             df_cmd += ["--delay", str(1000 // max(1, prof.http_rl))]

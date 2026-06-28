@@ -4,7 +4,7 @@ Intensity via MODES.CONTENT_DISCOVERY: off | light | balanced | deep (11.1 = off
 flat). Recursion (MODES.CONTENT_RECURSION) is 11.2. Guardrails: skipped in passive mode and when
 off; only live, in-scope, active-allowed hosts (origin first, capped); ffuf -ac autocalibration
 always (kills wildcard/catch-all floods); http_rl -> ffuf -rate. Map-don't-exploit: results are
-url + review candidates, never actions. Full design: notes/PHASE11-DESIGN.md.
+url + review candidates, never actions.
 """
 from __future__ import annotations
 
@@ -67,7 +67,12 @@ def run(ctx) -> None:
     if not targets:
         ctx.run.record("content", skipped("ffuf", "no active-allowed live hosts"))
         return
-    ctx.echo(f"  content discovery [{tier}]: {len(targets)} host(s), wordlist {wl.name}")
+    # recursion is a separate knob, allowed on balanced/deep only (light stays a flat sweep)
+    recurse = prof.content_recursion if tier in ("balanced", "deep") else 0
+    rec = f", recursion depth {recurse}" if recurse else ""
+    ctx.echo(f"  content discovery [{tier}]: {len(targets)} host(s), wordlist {wl.name}{rec}")
+    if recurse >= 4:
+        ctx.echo(f"  ⚠️  recursion depth {recurse} is aggressive — expect a loud / slow scan")
 
     notable = 0
     for url in targets:
@@ -78,6 +83,8 @@ def run(ctx) -> None:
                "-mc", "200,204,301,302,307,308,401,403,405", "-of", "json", "-o", str(out), "-s"]
         if prof.http_rl:
             cmd += ["-rate", str(prof.http_rl)]
+        if recurse:                                  # 11.2: balanced/deep only (gated above)
+            cmd += ["-recursion", "-recursion-depth", str(recurse)]
         ctx.run.record("content", exec_tool("ffuf", cmd, timeout=ctx.http_timeout))
         if not out.exists():
             continue
