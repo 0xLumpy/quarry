@@ -9,12 +9,37 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import urllib.request
 from pathlib import Path
 
 from .. import normalize, secrets
 from ..runner import Status, have, run as exec_tool, skipped
+
+# 9.2 deep-mine patterns over JS / recovered source — extraction only, no fetch.
+# Each findall() yields the value to store (full match or capture group).
+_WS_RX = re.compile(r"\bwss?://[A-Za-z0-9.\-_/:?=&%]+", re.I)                       # ws/wss endpoint URLs
+_APIBASE_RX = re.compile(r"(?:baseURL|base_url|api[_-]?base|apiUrl|API_BASE|API_URL)"
+                         r"\s*[:=]\s*[\"'`]([^\"'`]+)[\"'`]", re.I)                 # API base assignments
+_GQL_RX = re.compile(r"[\"'`]([^\"'`]*?/(?:graphql|gql)\b[^\"'`]*)[\"'`]", re.I)    # GraphQL endpoint paths
+
+
+def _deep_mine(ctx, files, tag: str) -> int:
+    """Extract GraphQL / WebSocket / API-base endpoints from JS / recovered source. Tag-only,
+    no fetch — these enrich the endpoint store with `kind` + provenance for later testing."""
+    n = 0
+    for f in files:
+        try:
+            txt = f.read_text(errors="replace")
+        except Exception:
+            continue
+        for kind, rx in (("websocket", _WS_RX), ("api-base", _APIBASE_RX), ("graphql", _GQL_RX)):
+            for val in {v.strip() for v in rx.findall(txt)}:
+                if val and len(val) < 2048 and ctx.run.add(
+                        "endpoint", {"value": val, "kind": kind, "sources": [f"deepmine-{tag}"]}):
+                    n += 1
+    return n
 
 KEYHOST = ("login", "auth", "sso", "saml", "oauth", "api", "account", "register",
            "portal", "admin", "my-", "profile", "upload", "file", "id.")
@@ -237,11 +262,17 @@ def run(ctx) -> None:
                         basis = d or f"{e.get('kind', 'secret')}|{e.get('id', '')}"
                         e["preview"] = secrets.mask(d)
                         e["id"] = f"jsluice-sourcemap:{e.get('kind', 'secret')}:{secrets.fingerprint(basis)}"
+                        e["location"] = "raw/crawl/sourcemaps/recovered"   # recovered-source origin hint
                         ctx.run.add("secret", e)
             except Exception as ex:
                 ctx.echo(f"    jsluice-sourcemap {sub}: {ex}")
     if recov_files and have("xnLinkFinder"):
         _xnl(ctx, str(recov_dir), "sourcemap", extra=[])
+
+    # ── 9.2 deep-mine: GraphQL / WebSocket / API-base over JS + recovered source ──
+    nd = _deep_mine(ctx, js_files, "js") + _deep_mine(ctx, recov_files, "sourcemap")
+    if nd:
+        ctx.echo(f"  deep-mine: +{nd} graphql/ws/api-base endpoint(s)")
 
     # ── jsluice urls + secrets ──
     if js_files and have("jsluice"):
