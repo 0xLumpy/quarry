@@ -22,4 +22,4 @@ quarry = "quarry_recon.cli:cli"
 where = ["src"]
 
 [tool.setuptools.package-data]
-quarry_recon = ["data/*.yaml"]
+quarry_recon = ["data/*.yaml", "data/*.txt"]

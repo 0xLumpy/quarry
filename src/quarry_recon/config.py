@@ -128,6 +128,24 @@ class TargetProfile:
         return bool(self.modes.get("TAKEOVER", True))
 
     @property
+    def content_discovery(self) -> str:
+        """Phase 11 intensity: off | light | balanced | deep. Default OFF (candidate-driven, opt-in)."""
+        v = self.modes.get("CONTENT_DISCOVERY", "off")
+        v = ("off" if v is False else "on" if v is True else str(v)).strip().lower()
+        return v if v in ("off", "light", "balanced", "deep") else "off"
+
+    @property
+    def content_recursion(self) -> int:
+        """Content-discovery recursion depth (separate knob; 0 = off). 11.2 honors it."""
+        v = self.modes.get("CONTENT_RECURSION", 0)
+        if v is True:
+            return 1
+        try:
+            return max(0, int(v))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
     def org_names(self) -> list[str]:
         # optional OSINT anchors (org/registrant names to pivot from)
         return [str(x).strip() for x in (self._raw.get("ORG_NAMES") or []) if x]
@@ -180,6 +198,11 @@ class TargetProfile:
         apexes = [str(d).strip() for d in (raw.get("APEX_DOMAINS") or []) if d]
         if not apexes:
             raise ProfileError("profile must list at least one APEX_DOMAINS entry")
+        cdv = (raw.get("MODES") or {}).get("CONTENT_DISCOVERY", "off")
+        # YAML parses bare `off`/`on` as booleans — map back before validating.
+        cd = ("off" if cdv is False else "on" if cdv is True else str(cdv)).strip().lower()
+        if cd not in ("off", "light", "balanced", "deep"):     # opt-in phase: fail loud on a typo
+            raise ProfileError(f"invalid MODES.CONTENT_DISCOVERY {cd!r} (use off|light|balanced|deep)")
         ports = [int(p) for p in (raw.get("PORTS") or {}).get("HTTP") or [] if p]
         return cls(
             target=str(raw["TARGET"]).strip(),
