@@ -9,10 +9,30 @@ from __future__ import annotations
 
 import json
 
-from .. import normalize
+from .. import evidence, normalize
 from ..runner import Status, have, run as exec_tool, skipped
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
+
+
+def _exposed_urls(ctx, scope) -> list[str]:
+    """Exposed-sensitive-file URLs to fetch: nuclei exposure hits + 200 sensitive-path URLs,
+    de-duped, in-scope + active-allowed (passive/OOS excluded via active_allowed)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    def consider(u):
+        u = (u or "").strip()
+        if not u or u in seen:
+            return
+        if evidence.SENSITIVE_FILE_RX.search(u) and scope.active_allowed(normalize.host_of_url(u)):
+            seen.add(u)
+            out.append(u)
+    for f in ctx.run.read("finding"):                 # nuclei matched-at (exposure templates)
+        consider(f.get("matched"))
+    for r in ctx.run.read("url"):                      # sensitive paths seen live (crawl/content)
+        if r.get("status") in (None, 200, "200"):      # status 200 when known; archive/crawl URLs may have no status
+            consider(r.get("url"))
+    return out
 
 
 def run(ctx) -> None:
@@ -105,6 +125,14 @@ def run(ctx) -> None:
                 "sources": ["nuclei"], "confirmed": False})
             n += 1
         ctx.echo(f"  nuclei: {n} candidate findings (UNCONFIRMED — manual validation required)")
+
+    # ── exposed-resource fetch + secret extraction (recon evidence: unauth, in-scope, GET-only) ──
+    # Map-don't-exploit line = "don't accidentally perform impact": an exposed .env/.git/config is
+    # fetched and its secret read (redacted). No payloads, no creds used, no state change.
+    exp_urls = _exposed_urls(ctx, scope)
+    if exp_urls:
+        ne = evidence.fetch_exposed(ctx, exp_urls)
+        ctx.echo(f"  exposed-fetch: {len(exp_urls)} exposed resource(s), +{ne} secret(s) extracted")
 
     # ── arjun param discovery on param-less API endpoints (throttled) ──
     api_eps = sorted({u.split("?")[0] for u in corpus
