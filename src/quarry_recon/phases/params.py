@@ -57,6 +57,32 @@ def _graphql_urls(ctx, scope) -> list[str]:
     return out
 
 
+def _actuator_bases(ctx, scope) -> list[str]:
+    """In-scope Spring Boot actuator base URLs to interrogate: any observed URL containing
+    `/actuator` collapsed to its base (`…/actuator`), de-duped. Candidate-driven — we only probe
+    an actuator we've actually seen, never guess it onto every host."""
+    seen: set[str] = set()
+    out: list[str] = []
+    def consider(u):
+        u = (u or "").strip()
+        if not u or not u.lower().startswith(("http://", "https://")):
+            return
+        m = re.match(r"(?i)(https?://[^/]+/(?:[^?#]*?/)?actuator)\b", u)
+        if not m:
+            return
+        base = m.group(1)
+        if base not in seen and scope.active_allowed(normalize.host_of_url(base)):
+            seen.add(base)
+            out.append(base)
+    for r in ctx.run.read("url"):
+        consider(r.get("url"))
+    for e in ctx.run.read("endpoint"):
+        consider(e.get("value"))
+    for f in ctx.run.read("finding"):
+        consider(f.get("matched"))
+    return out
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
 
@@ -161,6 +187,12 @@ def run(ctx) -> None:
     if gql_urls:
         ng = evidence.probe_graphql(ctx, gql_urls)
         ctx.echo(f"  graphql: {len(gql_urls)} endpoint(s) probed, {ng} with introspection enabled")
+
+    # ── Actuator sensitive sub-path interrogation (recon evidence: GET-only, non-mutating) ──
+    act_bases = _actuator_bases(ctx, scope)
+    if act_bases:
+        na = evidence.probe_actuator(ctx, act_bases)
+        ctx.echo(f"  actuator: {len(act_bases)} base(s) probed, {na} with sensitive endpoints exposed")
 
     # ── arjun param discovery on param-less API endpoints (throttled) ──
     api_eps = sorted({u.split("?")[0] for u in corpus

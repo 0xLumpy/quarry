@@ -184,3 +184,93 @@ def probe_graphql(ctx, endpoints: list[str]) -> int:
                      if introspectable else f"graphql endpoint probed; introspection off/blocked (status {status})"),
             "sources": ["graphql-introspect"]})
     return enabled_n
+
+
+# Spring Boot actuator sensitive READ endpoints that are CHEAP to GET (return immediately, generate
+# no artifact) — safe to probe directly for reachability. `shutdown`/`restart` (mutating POSTs) are
+# excluded (impact). `heapdump` is excluded too — see _ACTUATOR_HEAVY.
+ACTUATOR_SENSITIVE = ("env", "configprops", "mappings", "beans", "httptrace", "threaddump",
+                      "loggers", "metrics", "sessions")
+# Config endpoints whose 200 body can leak credentials -> worth mining for secrets.
+_ACTUATOR_MINE = ("env", "configprops")
+# HEAVY endpoints where the mere GET forces server-side work: a GET to /actuator/heapdump makes the
+# JVM run a full STW GC and write a multi-GB dump to disk BEFORE streaming — requesting it is itself
+# impact. So we NEVER GET these in default recon; we detect exposure from the /actuator index
+# `_links` (what the app advertises) and flag high-priority. Deep-evidence mode may download.
+_ACTUATOR_HEAVY = ("heapdump",)
+
+
+def _actuator_index_links(ctx, base: str, host: str) -> set[str]:
+    """GET the actuator index (cheap) and return the set of endpoint names it advertises in
+    `_links`. This is how we learn heavy endpoints are exposed WITHOUT requesting them."""
+    try:
+        req = urllib.request.Request(base, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
+        data, _final, status = _read_scoped(ctx, req, host)
+    except Exception:
+        return set()
+    if data is None or status != 200 or len(data) > MAX_BODY:
+        return set()
+    try:
+        obj = json.loads(data.decode("utf-8", "replace"))
+    except (json.JSONDecodeError, ValueError):
+        return set()
+    links = obj.get("_links") if isinstance(obj, dict) else None
+    return set(links.keys()) if isinstance(links, dict) else set()
+
+
+def probe_actuator(ctx, bases: list[str]) -> int:
+    """Interrogate a Spring Boot actuator base and classify real-vs-benign. Cheap sensitive READ
+    endpoints (`/actuator/env` etc.) are GET-probed for reachability (200 = real exposure, mine
+    env/configprops for secrets). HEAVY endpoints (heapdump) are detected from the index `_links`
+    only — never requested, since the GET itself would trigger dump generation (impact). All locked
+    / not advertised = benign (the Test-5 triage-precision case). Mutating endpoints never touched.
+    Returns the count of bases with >=1 sensitive endpoint exposed."""
+    found = 0
+    for base in bases[:MAX_FETCHES]:
+        host = normalize.host_of_url(base)
+        if not ctx.scope.active_allowed(host):
+            continue
+        advertised = _actuator_index_links(ctx, base, host)
+        # heavy endpoints: flag high-priority from the advertised link — NO request to the endpoint.
+        heavy_exposed = [h for h in _ACTUATOR_HEAVY if h in advertised]
+        for h in heavy_exposed:
+            hu = base.rstrip("/") + "/" + h
+            ctx.run.add("review", {
+                "id": f"actuator-heavy:{hu}", "klass": "actuator", "value": hu, "host": host,
+                "priority": "high",
+                "note": (f"{h} advertised EXPOSED via /actuator _links — HIGH-priority evidence "
+                         "target; NOT requested (the GET would trigger dump generation). Enable "
+                         "deep-evidence mode to download."),
+                "sources": ["actuator-probe"]})
+        # cheap sensitive endpoints: direct GET reachability + mine env/configprops.
+        exposed: list[str] = []
+        for sp in ACTUATOR_SENSITIVE:
+            u = base.rstrip("/") + "/" + sp
+            try:
+                req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
+                data, _final, status = _read_scoped(ctx, req, host)
+            except Exception:
+                continue
+            if data is None or status != 200 or len(data) > MAX_BODY:
+                continue                               # off-scope / locked / oversized -> not exposed
+            exposed.append(sp)
+            if sp in _ACTUATOR_MINE:                   # env/configprops can leak creds -> extract
+                dest = ctx.run.raw_path("params", "actuator",
+                                        f"{host}-{sp}-{hashlib.md5(u.encode()).hexdigest()[:8]}")
+                dest.write_bytes(data)
+                for kind, val, ln in mine(data.decode("utf-8", "replace")):
+                    ctx.run.add("secret", {
+                        "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{u}|{ln}')}",
+                        "kind": kind, "preview": secrets.mask(val),
+                        "file": str(dest), "location": u, "line": ln,
+                        "sources": ["actuator-probe"]})
+        reachable = exposed + [f"{h}(advertised)" for h in heavy_exposed]
+        if reachable:
+            found += 1
+        ctx.run.add("review", {
+            "id": f"actuator:{base}", "klass": "actuator", "value": base, "host": host,
+            "note": (f"actuator EXPOSED — sensitive endpoints: {', '.join(reachable)} (real)"
+                     if reachable else
+                     "actuator present; sensitive sub-paths locked/not-advertised — benign, not a vuln"),
+            "sources": ["actuator-probe"]})
+    return found
