@@ -254,8 +254,14 @@ def run(ctx) -> None:
         if df_out.exists():
             for line in df_out.read_text().splitlines():
                 if line.strip().startswith("[POC]") or "PoC" in line:
-                    ctx.run.add("finding", {"id": f"dalfox:{line[:80]}", "template": "dalfox-xss",
-                                            "severity": "medium", "matched": line.strip(),
-                                            "sources": ["dalfox"], "confirmed": False})
+                    # dalfox proves the PRIMITIVE (reflection), not an exploit. Per the boundary
+                    # ruling ("probe hit != exploit proof"), frame it as a CANDIDATE: the raw POC
+                    # line stays as evidence in `matched`, but the label says candidate + manual
+                    # validation. Escalation/impact/report-ready PoC is the attack layer.
+                    ctx.run.add("finding", {
+                        "id": f"dalfox:{line[:80]}", "template": "xss-candidate",
+                        "name": "reflected parameter — XSS/open-redirect candidate (manual validation required)",
+                        "severity": "medium", "matched": line.strip(),
+                        "sources": ["dalfox"], "confirmed": False})
     else:
         ctx.run.record("params", skipped("dalfox", "no xss/redirect candidates"))
