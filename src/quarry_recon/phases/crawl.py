@@ -307,42 +307,50 @@ def run(ctx) -> None:
 
     # (waymore response mining happens per-apex above via -mode B + xnLinkFinder)
 
-    # ── secret scanners on JS dir ──
-    if js_files and have("gitleaks"):
-        rep = ctx.run.raw_path("crawl", "gitleaks", "report.json")
+    # ── secret scanners on JS dir + sourcemap-recovered sources ──
+    # BOTH dirs must be scanned: a canary planted only in a recovered source (e.g. a stripe key in
+    # app.js.map's sourcesContent) is missed if we scan js_files/ alone (Test-5). js_files gate
+    # holds — no JS means no sourcemaps, nothing to scan.
+    scan_dirs = [d for d in (js_dir, recov_dir)
+                 if d.exists() and any(p.is_file() for p in d.rglob("*"))]
+    if scan_dirs and have("gitleaks"):
         # gitleaks writes its JSON report to the -r FILE and exits 1 when it FINDS leaks
         # (success, not error). Write a REAL file and classify on its contents — `-r /dev/stdout`
         # is non-portable (writes 0 bytes on some builds → lost findings + a bogus "failed").
-        # No raw_path here: run() must not clobber the file gitleaks wrote with empty stdout.
-        r = exec_tool("gitleaks", ["gitleaks", "detect", "--no-git", "-s", str(js_dir),
-                                   "-r", str(rep), "-f", "json"],
-                      ok_codes=(0, 1), timeout=ctx.http_timeout)
-        items = []
-        if rep.exists() and rep.stat().st_size:
-            try:
-                items = json.loads(rep.read_text() or "[]")
-            except json.JSONDecodeError:
-                items = []
-        for item in items:
-            sec = item.get("Secret", "")
-            # fingerprint from the secret; fall back to rule+file+line so an empty Secret
-            # can't collapse distinct findings to fingerprint("").
-            basis = sec or f"{item.get('RuleID')}|{item.get('File')}|{item.get('StartLine')}"
-            ctx.run.add("secret", {"id": f"gitleaks:{item.get('RuleID')}:{secrets.fingerprint(basis)}",
-                                   "kind": item.get("RuleID"), "preview": secrets.mask(sec),
-                                   "file": item.get("File"), "sources": ["gitleaks"]})
-        # status from the report (gitleaks writes findings to the file + exits 1 on a find).
-        # Keep the REAL RunResult — command / exit code / duration / stderr — for the audit
-        # trail; only override status+note when the report actually shows findings.
-        if items:
-            r.status = Status.SUCCESS
-            r.note = f"{len(items)} leak(s) found"
-            r.stdout_lines = len(items)
-        ctx.run.record("crawl", r)
+        # `-s` takes ONE source path, so scan each dir in turn (per-dir report keeps the audit trail).
+        for sd in scan_dirs:
+            rep = ctx.run.raw_path("crawl", "gitleaks",
+                                   "report.json" if sd == js_dir else "report-sourcemap.json")
+            r = exec_tool("gitleaks", ["gitleaks", "detect", "--no-git", "-s", str(sd),
+                                       "-r", str(rep), "-f", "json"],
+                          ok_codes=(0, 1), timeout=ctx.http_timeout)
+            items = []
+            if rep.exists() and rep.stat().st_size:
+                try:
+                    items = json.loads(rep.read_text() or "[]")
+                except json.JSONDecodeError:
+                    items = []
+            for item in items:
+                sec = item.get("Secret", "")
+                # fingerprint from the secret; fall back to rule+file+line so an empty Secret
+                # can't collapse distinct findings to fingerprint("").
+                basis = sec or f"{item.get('RuleID')}|{item.get('File')}|{item.get('StartLine')}"
+                ctx.run.add("secret", {"id": f"gitleaks:{item.get('RuleID')}:{secrets.fingerprint(basis)}",
+                                       "kind": item.get("RuleID"), "preview": secrets.mask(sec),
+                                       "file": item.get("File"), "sources": ["gitleaks"]})
+            # status from the report (gitleaks writes findings to the file + exits 1 on a find).
+            # Keep the REAL RunResult — command / exit code / duration / stderr — for the audit
+            # trail; only override status+note when the report actually shows findings.
+            if items:
+                r.status = Status.SUCCESS
+                r.note = f"{len(items)} leak(s) found"
+                r.stdout_lines = len(items)
+            ctx.run.record("crawl", r)
 
-    if js_files and have("trufflehog"):
+    if scan_dirs and have("trufflehog"):
+        # `filesystem` accepts multiple paths — hand it both dirs in one pass.
         th = ctx.run.raw_path("crawl", "trufflehog", "out.jsonl")
-        r = exec_tool("trufflehog", ["trufflehog", "filesystem", str(js_dir),
+        r = exec_tool("trufflehog", ["trufflehog", "filesystem", *[str(d) for d in scan_dirs],
                                      "--json", "--no-update"], raw_path=th, timeout=ctx.http_timeout)
         ctx.run.record("crawl", r)
         if r.raw_path:

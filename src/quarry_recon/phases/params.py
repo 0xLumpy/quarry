@@ -113,8 +113,14 @@ def run(ctx) -> None:
     if api_eps:
         aj_in = ctx.write_list("arjun_targets.txt", api_eps)
         aj_out = ctx.run.raw_path("params", "arjun", "arjun.txt")
-        r = exec_tool("arjun", ["arjun", "-i", str(aj_in), "-oT", str(aj_out), "-t", "5", "-d", "1"],
-                      timeout=ctx.http_timeout)
+        # `-d` is a fixed inter-request delay in SECONDS. The old `-d 1` throttled EVERY request by
+        # 1s across all targets and blew the wall timeout (Test-5, 1800s). Delay is a RATE control,
+        # not a default — apply it ONLY when the program caps us (http_rl), same model as dalfox.
+        # Concurrency (`-t`) stays put; unthrottled, arjun clears the target set inside the timeout.
+        aj_cmd = ["arjun", "-i", str(aj_in), "-oT", str(aj_out), "-t", "5"]
+        if prof.http_rl:
+            aj_cmd += ["-d", str(round(1.0 / max(1, prof.http_rl), 3))]
+        r = exec_tool("arjun", aj_cmd, timeout=ctx.http_timeout)
         ctx.run.record("params", r)
         # Feed arjun's output forward (each line is a URL with the discovered param(s), e.g.
         # ".../v1/search?q=7101"). Without this the discovery was written to a file and dropped:

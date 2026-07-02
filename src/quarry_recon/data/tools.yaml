@@ -270,6 +270,18 @@ tools:
     runtime: binary
     deps: [curl]
 
+  # ── Phase 11: Content discovery (candidate-driven path brute) ───────────
+  - bin: ffuf
+    phase: content
+    role: candidate-driven path/dir brute over live in-scope hosts (default OFF)
+    install: go install github.com/ffuf/ffuf/v2@latest
+    version_cmd: ffuf -V
+    doc: https://github.com/ffuf/ffuf
+    notes: >-
+      Content phase only runs when MODES.CONTENT_DISCOVERY != off. Always -ac (autocalibration)
+      to kill catch-all/wildcard floods; http_rl -> -rate; optional -recursion. Wordlists live in
+      ~/.config/quarry/wordlists/content/ (light ships; balanced/deep fetched by install/update).
+
   # ── Phase 6/7: Params + lightweight scanning ────────────────────────────
   - bin: gf
     phase: params
@@ -287,7 +299,7 @@ tools:
     version_cmd: arjun --version
     doc: https://github.com/s0md3v/Arjun
     runtime: pipx
-    notes: Throttle with -t 5 -d 1 to honor RoE.
+    notes: Uses -t 5 by default; -d (per-request delay) applied only when RATELIMIT.HTTP is set.
 
   - bin: nuclei
     phase: params
@@ -303,11 +315,11 @@ tools:
 
   - bin: dalfox
     phase: params
-    role: XSS + open-redirect on reflected candidates (throttled)
+    role: XSS + open-redirect on reflected candidates
     install: go install github.com/hahwul/dalfox/v2@latest
     version_cmd: dalfox version
     doc: https://github.com/hahwul/dalfox
-    notes: --delay 250 -w 5 --skip-bav to stay under WAF.
+    notes: --skip-bav; uses dalfox defaults; --delay applied only when RATELIMIT.HTTP is set.
 
   - bin: interactsh-client
     phase: params
