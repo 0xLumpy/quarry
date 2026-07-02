@@ -83,8 +83,39 @@ def _actuator_bases(ctx, scope) -> list[str]:
     return out
 
 
+_OPENAPI_RX = re.compile(
+    r"(?i)(openapi\.(?:json|ya?ml)|swagger\.(?:json|ya?ml)|/v[23]/api-docs\b|/api-docs\b|"
+    r"/swagger/v\d+/swagger\.json|/swagger\.json)")
+
+
+def _openapi_urls(ctx, scope) -> list[str]:
+    """Absolute in-scope OpenAPI/Swagger doc URLs to fetch+parse (openapi.json/yaml, swagger.json,
+    /v2|/v3/api-docs, …), de-duped, active-allowed (passive/OOS excluded)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    def consider(u):
+        u = (u or "").strip()
+        if not u or u in seen or not u.lower().startswith(("http://", "https://")):
+            return
+        if _OPENAPI_RX.search(u) and scope.active_allowed(normalize.host_of_url(u)):
+            seen.add(u)
+            out.append(u)
+    for r in ctx.run.read("url"):
+        consider(r.get("url"))
+    for e in ctx.run.read("endpoint"):
+        consider(e.get("value"))
+    return out
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
+
+    # ── OpenAPI/Swagger docs -> endpoint+param corpus (BEFORE the corpus build so gf/nuclei/arjun
+    #    see the extracted endpoints). Active fetch; active_allowed self-gates it off in passive. ──
+    oa_urls = _openapi_urls(ctx, scope)
+    if oa_urls:
+        noa = evidence.parse_openapi(ctx, oa_urls)
+        ctx.echo(f"  openapi: {len(oa_urls)} doc(s) parsed, +{noa} endpoint(s) into corpus")
 
     # in-scope URL corpus (always available from crawl, even passive)
     corpus = [u for u in ctx.run.values("url")

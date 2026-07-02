@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from urllib.parse import urljoin, urlsplit
 
 from . import fetch, normalize, secrets
 
@@ -247,3 +248,107 @@ def probe_actuator(ctx, bases: list[str]) -> int:
                      "actuator present; sensitive sub-paths locked/not-advertised — benign, not a vuln"),
             "sources": ["actuator-probe"]})
     return found
+
+
+_OPENAPI_MAX_BODY = 5 * 1024 * 1024    # 5 MB cap per doc (specs get big, still bounded)
+_OPENAPI_MAX_PATHS = 2000              # bound endpoints extracted from one doc
+
+
+def _openapi_load(text: str):
+    """Parse an OpenAPI/Swagger doc — JSON first, then YAML. Returns a dict or None."""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    try:
+        import yaml
+        obj = yaml.safe_load(text)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _openapi_bases(doc: dict, doc_url: str) -> list[str]:
+    """Resolve the API base URL(s) — OpenAPI v3 `servers`, Swagger v2 `host`+`basePath`, else the
+    doc's own origin. Relative server URLs are joined against the doc origin."""
+    sp = urlsplit(doc_url)
+    origin = f"{sp.scheme}://{sp.netloc}"
+    bases: list[str] = []
+    for s in (doc.get("servers") or []):
+        u = s.get("url") if isinstance(s, dict) else None
+        if u:
+            bases.append(u if u.startswith(("http://", "https://"))
+                         else urljoin(origin + "/", u.lstrip("/")))
+    if not bases and (doc.get("host") or doc.get("basePath")):     # swagger v2
+        scheme = (doc.get("schemes") or [sp.scheme or "https"])[0]
+        bases.append(f"{scheme}://{doc.get('host') or sp.netloc}{doc.get('basePath') or ''}")
+    return bases or [origin]
+
+
+def parse_openapi(ctx, urls: list[str]) -> int:
+    """Fetch discovered OpenAPI/Swagger docs (unauth, in-scope, non-mutating GET) and extract the
+    endpoint + query-param corpus into the store — recon evidence, no probing of the endpoints
+    themselves. Only in-scope endpoints are kept (a doc can advertise other hosts). Returns the
+    count of NEW endpoint entities added."""
+    added_ep = 0
+    for u in urls[:MAX_FETCHES]:
+        host = normalize.host_of_url(u)
+        if not ctx.scope.active_allowed(host):
+            continue
+        try:
+            data, final, status = fetch.scoped_get(ctx, u, host, max_body=_OPENAPI_MAX_BODY)
+        except Exception:
+            continue
+        if data is None:                           # off-scope redirect — record, don't parse
+            ctx.run.add("review", {
+                "id": f"openapi-redirect:{u}", "klass": "api-doc", "value": u, "host": host,
+                "location": final,
+                "note": f"redirected off-scope to {final} (status {status}); not parsed",
+                "sources": ["openapi"]})
+            continue
+        if status != 200 or len(data) > _OPENAPI_MAX_BODY:
+            continue
+        text = data.decode("utf-8", "replace")
+        doc = _openapi_load(text)
+        if not isinstance(doc, dict) or not isinstance(doc.get("paths"), dict):
+            continue
+        dest = ctx.run.raw_path("params", "openapi",
+                                f"{host}-{hashlib.md5(u.encode()).hexdigest()[:8]}.json")
+        dest.write_bytes(data)
+        bases = [b.rstrip("/") + "/" for b in _openapi_bases(doc, u)]
+        n_ep = n_pa = 0
+        for path, ops in list(doc["paths"].items())[:_OPENAPI_MAX_PATHS]:
+            if not isinstance(ops, dict):
+                continue
+            # query params for this path (path-level + per-operation), computed once
+            params = list(ops.get("parameters") or [])
+            for op in ops.values():
+                if isinstance(op, dict):
+                    params += list(op.get("parameters") or [])
+            qnames = [p["name"] for p in params
+                      if isinstance(p, dict) and p.get("name") and p.get("in") == "query"]
+            # build under EVERY declared base — a spec can list several servers and the real
+            # in-scope API may not be the first (staging/off-scope first). in-scope filter per base.
+            for base in bases:
+                full = urljoin(base, str(path).lstrip("/"))
+                if not ctx.scope.in_scope(normalize.host_of_url(full)):   # doc may list other hosts
+                    continue
+                if ctx.run.add("endpoint", {"value": full, "kind": "openapi",
+                                            "sources": ["openapi"], "raw_ref": str(dest)}):
+                    n_ep += 1
+                ctx.run.add("url", {"url": full, "sources": ["openapi"]})   # feed the corpus
+                for name in qnames:
+                    if ctx.run.add("parameter", {"value": f"{full}?{name}=",
+                                                 "sources": ["openapi"]}):
+                        n_pa += 1
+        for kind, val, ln in mine(text):           # specs sometimes embed example keys
+            ctx.run.add("secret", {
+                "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{u}|{ln}')}",
+                "kind": kind, "preview": secrets.mask(val),
+                "file": str(dest), "location": u, "line": ln, "sources": ["openapi"]})
+        added_ep += n_ep
+        ctx.run.add("review", {
+            "id": f"api-doc:{u}", "klass": "api-doc", "value": u, "host": host, "raw_ref": str(dest),
+            "note": f"OpenAPI/Swagger parsed: {n_ep} endpoint(s), {n_pa} query param(s)",
+            "sources": ["openapi"]})
+    return added_ep
