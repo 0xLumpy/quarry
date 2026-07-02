@@ -107,6 +107,21 @@ def _openapi_urls(ctx, scope) -> list[str]:
     return out
 
 
+def _ssti_targets(ctx, scope) -> list[str]:
+    """gf ssti candidate URLs that carry a query string, de-duped, active-allowed — the params to
+    confirm the SSTI primitive on."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for r in ctx.run.read("review"):
+        if r.get("klass") != "ssti":
+            continue
+        u = (r.get("value") or "").strip()
+        if u and u not in seen and "?" in u and scope.active_allowed(normalize.host_of_url(u)):
+            seen.add(u)
+            out.append(u)
+    return out
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
 
@@ -296,3 +311,12 @@ def run(ctx) -> None:
                         "sources": ["dalfox"], "confirmed": False})
     else:
         ctx.run.record("params", skipped("dalfox", "no xss/redirect candidates"))
+
+    # ── SSTI primitive-confirm probe (benign {{math}} eval; candidate output) ──
+    # gf only name-matches ssti params; nothing else probes them. Confirm the PRIMITIVE with a
+    # non-mutating math eval. (reflection/open-redirect primitives are already covered by dalfox.)
+    ssti_urls = _ssti_targets(ctx, scope)
+    if ssti_urls:
+        ns = evidence.probe_ssti(ctx, ssti_urls)
+        if ns:
+            ctx.echo(f"  ssti: +{ns} SSTI primitive candidate(s) confirmed (manual validation required)")

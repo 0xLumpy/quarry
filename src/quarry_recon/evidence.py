@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from . import fetch, normalize, secrets
 
@@ -352,3 +352,56 @@ def parse_openapi(ctx, urls: list[str]) -> int:
             "note": f"OpenAPI/Swagger parsed: {n_ep} endpoint(s), {n_pa} query param(s)",
             "sources": ["openapi"]})
     return added_ep
+
+
+# SSTI confirmation payload: a distinctive product across the common template syntaxes (Jinja2/Twig,
+# FreeMarker/JSP-EL, Ruby/JSF, ERB). A benign math EVAL — non-mutating, no impact — that upgrades a
+# gf name-match into a confirmed PRIMITIVE. `1234*5678` is distinctive enough that the computed value
+# appearing (while the literal expression does NOT) means the template engine evaluated it.
+_SSTI_PROBE = "{{1234*5678}}${1234*5678}#{1234*5678}<%=1234*5678%>"
+_SSTI_EXPECT = "7006652"
+_SSTI_LITERAL = "1234*5678"
+_SSTI_MAX_PARAMS = 10          # bound params tested per URL
+
+
+def probe_ssti(ctx, urls: list[str]) -> int:
+    """Confirm the SSTI PRIMITIVE on gf ssti candidates: inject a benign `{{math}}` polyglot into each
+    query param (GET, non-mutating) and check the template ENGINE evaluated it (computed value present,
+    literal expression absent). A hit is a CANDIDATE ("manual validation required"), not proof of
+    impact — payload tuning / exploitation is the attack layer. Returns count of confirmed primitives."""
+    found = 0
+    for u in urls[:MAX_FETCHES]:
+        host = normalize.host_of_url(u)
+        if not ctx.scope.active_allowed(host):
+            continue
+        sp = urlsplit(u)
+        qs = parse_qsl(sp.query, keep_blank_values=True)
+        if not qs:
+            continue
+        for i, (k, _v) in enumerate(qs[:_SSTI_MAX_PARAMS]):
+            newq = list(qs)
+            newq[i] = (k, _SSTI_PROBE)
+            tu = urlunsplit((sp.scheme, sp.netloc, sp.path, urlencode(newq), ""))
+            try:
+                data, _final, status = fetch.scoped_get(ctx, tu, host, max_body=MAX_BODY)
+            except Exception:
+                continue
+            if data is None or status != 200 or len(data) > MAX_BODY:
+                continue
+            body = data.decode("utf-8", "replace")
+            if _SSTI_EXPECT in body and _SSTI_LITERAL not in body:   # engine evaluated it
+                # save the response evidence (the body that contained the computed value) so the
+                # candidate is auditable / manually validatable — same evidence-rich pattern as the
+                # exposed/actuator/openapi probes.
+                dest = ctx.run.raw_path("params", "ssti",
+                                        f"{host}-{hashlib.md5(tu.encode()).hexdigest()[:8]}.http")
+                dest.write_bytes(data)
+                ctx.run.add("finding", {
+                    "id": f"ssti:{tu[:80]}", "template": "ssti-candidate",
+                    "name": (f"SSTI primitive confirmed — template expr evaluated to {_SSTI_EXPECT} "
+                             f"on param '{k}' (manual validation required)"),
+                    "severity": "high", "matched": tu, "raw_ref": str(dest),
+                    "sources": ["ssti-probe"], "confirmed": False})
+                found += 1
+                break                                 # one confirmation per URL is enough
+    return found
