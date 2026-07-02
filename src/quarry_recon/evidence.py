@@ -12,10 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import time
-import urllib.request
 
-from . import normalize, secrets
+from . import fetch, normalize, secrets
 
 # Exposed files worth fetching: secret/config stores, VCS metadata, key material, dumps.
 SENSITIVE_FILE_RX = re.compile(r"""
@@ -68,26 +66,6 @@ def mine(text: str) -> list[tuple[str, str, int]]:
     return out
 
 
-def _read_scoped(ctx, req, origin_host):
-    """Open `req`, then re-check the FINAL host after urlopen's silent redirect-follow. Single
-    choke point for (a) the off-scope guard and (b) RATELIMIT.HTTP pacing — these direct urllib
-    requests bypass the tool flags nuclei/httpx/ffuf get, so honor the profile's req/s here so a
-    rate-capped target doesn't receive the bounded set as a burst. An in-scope URL can 30x
-    OFF-scope, and we must never read such a body while thinking it's in-scope. Returns
-    (data|None, final_url, status) — data is None when the final host is off-scope (caller records
-    the redirect as context, extracts nothing)."""
-    rl = getattr(getattr(ctx, "profile", None), "http_rl", None)
-    if rl:                                     # RATELIMIT.HTTP set -> pace to rl req/s
-        time.sleep(1.0 / rl)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        final = getattr(resp, "url", None) or req.full_url
-        status = getattr(resp, "status", 200)
-        if normalize.host_of_url(final) != origin_host and not ctx.scope.active_allowed(
-                normalize.host_of_url(final)):
-            return None, final, status
-        return resp.read(MAX_BODY + 1), final, status
-
-
 def fetch_exposed(ctx, urls: list[str]) -> int:
     """GET each exposed in-scope resource (non-mutating), save the body as evidence, extract +
     store secrets (redacted) with provenance. Returns count of NEW secret entities added."""
@@ -97,8 +75,7 @@ def fetch_exposed(ctx, urls: list[str]) -> int:
         if not ctx.scope.active_allowed(host):     # in-scope + not-passive + not-OOS
             continue
         try:
-            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
-            data, final, status = _read_scoped(ctx, req, host)
+            data, final, status = fetch.scoped_get(ctx, u, host, max_body=MAX_BODY)
         except Exception:
             continue
         if data is None:                           # off-scope redirect — record, don't extract
@@ -151,11 +128,9 @@ def probe_graphql(ctx, endpoints: list[str]) -> int:
         if not ctx.scope.active_allowed(host):
             continue
         try:
-            req = urllib.request.Request(
-                u, data=_GQL_INTROSPECTION.encode(), method="POST",
-                headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json",
-                         "Accept": "application/json"})
-            data, final, status = _read_scoped(ctx, req, host)
+            data, final, status = fetch.scoped_get(
+                ctx, u, host, max_body=MAX_BODY, method="POST", data=_GQL_INTROSPECTION.encode(),
+                headers={"Content-Type": "application/json", "Accept": "application/json"})
         except Exception:
             continue
         if data is None:                           # off-scope redirect — record, don't read schema
@@ -204,8 +179,7 @@ def _actuator_index_links(ctx, base: str, host: str) -> set[str]:
     """GET the actuator index (cheap) and return the set of endpoint names it advertises in
     `_links`. This is how we learn heavy endpoints are exposed WITHOUT requesting them."""
     try:
-        req = urllib.request.Request(base, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
-        data, _final, status = _read_scoped(ctx, req, host)
+        data, _final, status = fetch.scoped_get(ctx, base, host, max_body=MAX_BODY)
     except Exception:
         return set()
     if data is None or status != 200 or len(data) > MAX_BODY:
@@ -247,8 +221,7 @@ def probe_actuator(ctx, bases: list[str]) -> int:
         for sp in ACTUATOR_SENSITIVE:
             u = base.rstrip("/") + "/" + sp
             try:
-                req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
-                data, _final, status = _read_scoped(ctx, req, host)
+                data, _final, status = fetch.scoped_get(ctx, u, host, max_body=MAX_BODY)
             except Exception:
                 continue
             if data is None or status != 200 or len(data) > MAX_BODY:

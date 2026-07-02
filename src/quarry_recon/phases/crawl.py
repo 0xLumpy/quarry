@@ -11,10 +11,9 @@ import hashlib
 import json
 import re
 import subprocess
-import urllib.request
 from pathlib import Path
 
-from .. import normalize, secrets
+from .. import fetch, normalize, secrets
 from ..runner import Status, have, run as exec_tool, skipped
 
 # 9.2 deep-mine patterns over JS / recovered source — extraction only, no fetch.
@@ -148,19 +147,22 @@ def run(ctx) -> None:
             _xnl(ctx, str(wdir), f"waymore-{d}", extra=["-orig", "-spo"], depth=3)
 
     # ── download JS, dedup, beautify ──
+    # Downloading JS is an ACTIVE fetch: gate on active_allowed (scope + OOS + passive-skip) and go
+    # through the shared choke point (rate pace + bounded read + off-scope-redirect guard).
+    MAX_JS = 15 * 1024 * 1024      # 15 MB cap per JS (RAM/disk guard; bundles are large but bounded)
     js_urls = ctx.run.values("js_url")[:2000]
     js_dir = ctx.run.dir / "raw" / "crawl" / "js_files"
     js_dir.mkdir(parents=True, exist_ok=True)
     seen_hash = set()
     for u in js_urls:
+        if not ctx.scope.active_allowed(normalize.host_of_url(u)):
+            continue
         dest = js_dir / (hashlib.md5(u.encode()).hexdigest()[:16] + ".js")
         if dest.exists():
             continue
         try:
-            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = resp.read()
-            if len(data) < 100:
+            data, _final, status = fetch.scoped_get(ctx, u, max_body=MAX_JS)
+            if data is None or status != 200 or not (100 <= len(data) <= MAX_JS):
                 continue
             h = hashlib.md5(data).hexdigest()
             if h in seen_hash:
@@ -211,10 +213,9 @@ def run(ctx) -> None:
                         map_urls.add(m)
         for m in sorted(map_urls)[:100]:                        # bound number of fetches
             try:
-                req = urllib.request.Request(m, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    data = resp.read(MAX_MAP + 1)               # bounded read
-                if len(data) > MAX_MAP:
+                # shared choke point: rate pace + bounded read + off-scope-redirect guard.
+                data, _final, status = fetch.scoped_get(ctx, m, max_body=MAX_MAP)
+                if data is None or status != 200 or len(data) > MAX_MAP:
                     continue
                 map_payloads.append((m, data.decode("utf-8", "replace")))
             except Exception:
