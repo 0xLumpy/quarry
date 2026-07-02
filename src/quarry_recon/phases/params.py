@@ -8,6 +8,7 @@ confirmation (design §7) — entities carry confirmed:false.
 from __future__ import annotations
 
 import json
+import re
 
 from .. import evidence, normalize
 from ..runner import Status, have, run as exec_tool, skipped
@@ -32,6 +33,27 @@ def _exposed_urls(ctx, scope) -> list[str]:
     for r in ctx.run.read("url"):                      # sensitive paths seen live (crawl/content)
         if r.get("status") in (None, 200, "200"):      # status 200 when known; archive/crawl URLs may have no status
             consider(r.get("url"))
+    return out
+
+
+def _graphql_urls(ctx, scope) -> list[str]:
+    """Absolute in-scope GraphQL endpoint URLs to introspect: deep-mine `endpoint` kind=graphql +
+    any /graphql|/gql URL. Relative values (no host, e.g. bare '/graphql' from JS) are skipped —
+    introspection needs a concrete host, and active_allowed gates scope/OOS/passive."""
+    seen: set[str] = set()
+    out: list[str] = []
+    def consider(u):
+        u = (u or "").strip()
+        if not u or u in seen or not u.lower().startswith(("http://", "https://")):
+            return
+        if re.search(r"/(?:graphql|gql)\b", u, re.I) and scope.active_allowed(normalize.host_of_url(u)):
+            seen.add(u)
+            out.append(u)
+    for e in ctx.run.read("endpoint"):
+        if e.get("kind") == "graphql":
+            consider(e.get("value"))
+    for r in ctx.run.read("url"):
+        consider(r.get("url"))
     return out
 
 
@@ -133,6 +155,12 @@ def run(ctx) -> None:
     if exp_urls:
         ne = evidence.fetch_exposed(ctx, exp_urls)
         ctx.echo(f"  exposed-fetch: {len(exp_urls)} exposed resource(s), +{ne} secret(s) extracted")
+
+    # ── GraphQL introspection probe (recon evidence: non-mutating read query, in-scope) ──
+    gql_urls = _graphql_urls(ctx, scope)
+    if gql_urls:
+        ng = evidence.probe_graphql(ctx, gql_urls)
+        ctx.echo(f"  graphql: {len(gql_urls)} endpoint(s) probed, {ng} with introspection enabled")
 
     # ── arjun param discovery on param-less API endpoints (throttled) ──
     api_eps = sorted({u.split("?")[0] for u in corpus

@@ -10,7 +10,9 @@ the found credentials, change state, bypass controls, or prove exploit impact �
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import time
 import urllib.request
 
 from . import normalize, secrets
@@ -66,6 +68,26 @@ def mine(text: str) -> list[tuple[str, str, int]]:
     return out
 
 
+def _read_scoped(ctx, req, origin_host):
+    """Open `req`, then re-check the FINAL host after urlopen's silent redirect-follow. Single
+    choke point for (a) the off-scope guard and (b) RATELIMIT.HTTP pacing — these direct urllib
+    requests bypass the tool flags nuclei/httpx/ffuf get, so honor the profile's req/s here so a
+    rate-capped target doesn't receive the bounded set as a burst. An in-scope URL can 30x
+    OFF-scope, and we must never read such a body while thinking it's in-scope. Returns
+    (data|None, final_url, status) — data is None when the final host is off-scope (caller records
+    the redirect as context, extracts nothing)."""
+    rl = getattr(getattr(ctx, "profile", None), "http_rl", None)
+    if rl:                                     # RATELIMIT.HTTP set -> pace to rl req/s
+        time.sleep(1.0 / rl)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        final = getattr(resp, "url", None) or req.full_url
+        status = getattr(resp, "status", 200)
+        if normalize.host_of_url(final) != origin_host and not ctx.scope.active_allowed(
+                normalize.host_of_url(final)):
+            return None, final, status
+        return resp.read(MAX_BODY + 1), final, status
+
+
 def fetch_exposed(ctx, urls: list[str]) -> int:
     """GET each exposed in-scope resource (non-mutating), save the body as evidence, extract +
     store secrets (redacted) with provenance. Returns count of NEW secret entities added."""
@@ -76,26 +98,17 @@ def fetch_exposed(ctx, urls: list[str]) -> int:
             continue
         try:
             req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                final = getattr(resp, "url", None) or u
-                status = getattr(resp, "status", 200)
-                # urlopen follows redirects silently — an in-scope URL can land OFF-scope. Re-check
-                # the FINAL host before reading the body, so we never extract an off-scope resource
-                # while thinking it's in-scope. Redirects are useful recon data: record, don't hide.
-                final_host = normalize.host_of_url(final)
-                if final_host != host and not ctx.scope.active_allowed(final_host):
-                    ctx.run.add("review", {
-                        "id": f"exposed-redirect:{u}", "klass": "exposure", "value": u, "host": host,
-                        "location": final,
-                        "note": f"redirected off-scope to {final} (status {status}); body NOT extracted",
-                        "sources": ["exposed-fetch"]})
-                    continue
-                if status != 200:
-                    continue
-                data = resp.read(MAX_BODY + 1)
+            data, final, status = _read_scoped(ctx, req, host)
         except Exception:
             continue
-        if len(data) > MAX_BODY:
+        if data is None:                           # off-scope redirect — record, don't extract
+            ctx.run.add("review", {
+                "id": f"exposed-redirect:{u}", "klass": "exposure", "value": u, "host": host,
+                "location": final,
+                "note": f"redirected off-scope to {final} (status {status}); body NOT extracted",
+                "sources": ["exposed-fetch"]})
+            continue
+        if status != 200 or len(data) > MAX_BODY:
             continue
         text = data.decode("utf-8", "replace")
         fname = f"{host}-{hashlib.md5(u.encode()).hexdigest()[:8]}"
@@ -118,3 +131,56 @@ def fetch_exposed(ctx, urls: list[str]) -> int:
             "note": f"{len(hits)} secret(s) extracted" if hits else "fetched; no secret pattern",
             "sources": ["exposed-fetch"]})
     return added
+
+
+# Minimal introspection query — a READ (non-mutating) per the GraphQL spec. We ask only for the
+# schema's type/field names (enough to prove introspection is enabled + dump the shape as evidence).
+_GQL_INTROSPECTION = json.dumps({"query":
+    "query{__schema{queryType{name} mutationType{name} "
+    "types{name kind fields{name}}}}"})
+
+
+def probe_graphql(ctx, endpoints: list[str]) -> int:
+    """Send an introspection query to each discovered in-scope GraphQL endpoint. Introspection is a
+    non-mutating READ (no attack payload, no mutation, no creds) — recon evidence. When enabled,
+    the schema is dumped to raw + a review is raised (hand-off to the attack layer). Returns the
+    count of endpoints with introspection ENABLED."""
+    enabled_n = 0
+    for u in endpoints[:MAX_FETCHES]:
+        host = normalize.host_of_url(u)
+        if not ctx.scope.active_allowed(host):
+            continue
+        try:
+            req = urllib.request.Request(
+                u, data=_GQL_INTROSPECTION.encode(), method="POST",
+                headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json",
+                         "Accept": "application/json"})
+            data, final, status = _read_scoped(ctx, req, host)
+        except Exception:
+            continue
+        if data is None:                           # off-scope redirect — record, don't read schema
+            ctx.run.add("review", {
+                "id": f"graphql-redirect:{u}", "klass": "graphql", "value": u, "host": host,
+                "location": final,
+                "note": f"redirected off-scope to {final} (status {status}); not introspected",
+                "sources": ["graphql-introspect"]})
+            continue
+        if len(data) > MAX_BODY:
+            continue
+        try:
+            obj = json.loads(data.decode("utf-8", "replace"))
+        except (json.JSONDecodeError, ValueError):
+            obj = None
+        introspectable = bool(isinstance(obj, dict)
+                              and isinstance(obj.get("data"), dict)
+                              and obj["data"].get("__schema"))
+        dest = ctx.run.raw_path("params", "graphql", f"{host}-{hashlib.md5(u.encode()).hexdigest()[:8]}.json")
+        dest.write_bytes(data)
+        if introspectable:
+            enabled_n += 1
+        ctx.run.add("review", {
+            "id": f"graphql:{u}", "klass": "graphql", "value": u, "host": host, "raw_ref": str(dest),
+            "note": ("introspection ENABLED — schema dumped (attack-layer target)"
+                     if introspectable else f"graphql endpoint probed; introspection off/blocked (status {status})"),
+            "sources": ["graphql-introspect"]})
+    return enabled_n
