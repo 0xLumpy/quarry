@@ -58,28 +58,36 @@ def _graphql_urls(ctx, scope) -> list[str]:
 
 
 def _actuator_bases(ctx, scope) -> list[str]:
-    """In-scope Spring Boot actuator base URLs to interrogate: any observed URL containing
-    `/actuator` collapsed to its base (`…/actuator`), de-duped. Candidate-driven — we only probe
-    an actuator we've actually seen, never guess it onto every host."""
+    """In-scope Spring Boot actuator base URLs to interrogate. Two candidate sources:
+    (a) any observed URL containing `/actuator`, collapsed to its base; and
+    (b) live hosts httpx fingerprints as Spring/Spring-Boot — `/actuator` is almost never linked, so
+        the tech fingerprint IS the candidate signal (Test-6: mgmt was Spring but had no /actuator
+        URL, so the probe never ran). Still candidate-driven — never blind onto every host."""
     seen: set[str] = set()
     out: list[str] = []
-    def consider(u):
+    def add_base(base: str):
+        if base and base not in seen and scope.active_allowed(normalize.host_of_url(base)):
+            seen.add(base)
+            out.append(base)
+    def consider_url(u):
         u = (u or "").strip()
         if not u or not u.lower().startswith(("http://", "https://")):
             return
         m = re.match(r"(?i)(https?://[^/]+/(?:[^?#]*?/)?actuator)\b", u)
-        if not m:
-            return
-        base = m.group(1)
-        if base not in seen and scope.active_allowed(normalize.host_of_url(base)):
-            seen.add(base)
-            out.append(base)
+        if m:
+            add_base(m.group(1))
     for r in ctx.run.read("url"):
-        consider(r.get("url"))
+        consider_url(r.get("url"))
     for e in ctx.run.read("endpoint"):
-        consider(e.get("value"))
+        consider_url(e.get("value"))
     for f in ctx.run.read("finding"):
-        consider(f.get("matched"))
+        consider_url(f.get("matched"))
+    # (b) Spring/Boot-fingerprinted live hosts -> probe <origin>/actuator
+    for t in ctx.run.read("tech"):
+        if "spring" in str(t.get("tech", "")).lower():
+            u = (t.get("url") or "").strip()
+            if u.lower().startswith(("http://", "https://")):
+                add_base(u.rstrip("/") + "/actuator")
     return out
 
 
