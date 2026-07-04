@@ -45,6 +45,15 @@ _TOKEN_RX = [
 _DOTENV_RX = re.compile(r"""(?m)^\s*(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*[=:]\s*['"]?([^'"\r\n#]{6,}?)['"]?\s*$""")
 _SECRETISH_KEY = re.compile(r"(?i)(key|secret|token|pass|pwd|api|auth|cred|private|access)")
 
+# JSON config assignment on a secret-looking KEY: `"x.password": "val"` and the actuator/env wrap
+# `"x.password": {"value": "val"}`. Catches Spring actuator /env + /configprops style secrets that
+# aren't provider-shaped tokens (a plain DB password, a signing key).
+_JSON_SECRET_RX = re.compile(
+    r'"([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|signing[_-]?key|api[_-]?key|apikey|'
+    r'access[_-]?key|private[_-]?key|token|credential)[A-Za-z0-9_.\-]*)"'
+    r'\s*:\s*(?:\{\s*"value"\s*:\s*)?"([^"]{4,})"', re.I)
+_MASKED_RX = re.compile(r"^[*•]+$")             # actuator sanitizes sensitive values to ******
+
 MAX_BODY = 2 * 1024 * 1024    # 2 MB cap per exposed resource (RAM/disk guard)
 MAX_FETCHES = 50              # bound how many exposed resources we fetch
 
@@ -64,6 +73,12 @@ def mine(text: str) -> list[tuple[str, str, int]]:
         if _SECRETISH_KEY.search(key) and val not in seen_vals:   # already caught as a typed token
             seen_vals.add(val)
             out.append((f"dotenv:{key}", val, text.count("\n", 0, m.start()) + 1))
+    for m in _JSON_SECRET_RX.finditer(text):                      # JSON config (actuator env/configprops)
+        key, val = m.group(1), m.group(2)
+        if (val not in seen_vals and not _MASKED_RX.match(val)
+                and val.lower() not in ("null", "true", "false")):
+            seen_vals.add(val)
+            out.append((f"json:{key}", val, text.count("\n", 0, m.start()) + 1))
     return out
 
 
