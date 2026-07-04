@@ -47,14 +47,20 @@ _OOS_REGEX_META = re.compile(r"[\^$\\+?\[\](){}|]")
 
 def _to_oos_pattern(value: str) -> str:
     """Turn an OOS CLI argument into a VALID regex string (validated via re.compile):
-      - bare host        banana.acme.com -> ^banana\\.acme\\.com$   (exact)
-      - host glob `*`    *.acme.com      -> ^.*\\.acme\\.com$       (any subdomain)
+      - bare label       jobs            -> ^jobs\\.              (any host under the `jobs.` label)
+      - bare FQDN        banana.acme.com -> ^banana\\.acme\\.com$  (exact, apex-scoped)
+      - host glob `*`    *.acme.com      -> ^.*\\.acme\\.com$      (any subdomain)
       - explicit regex   ^jobs\\.         -> kept as-is (must compile)
     Raises re.error if the result (or an explicit regex) is invalid — caller refuses to write."""
     if _OOS_REGEX_META.search(value):
         re.compile(value)                                      # validate explicit regex
         return value
-    pat = "^" + re.escape(value).replace(r"\*", ".*") + "$"    # host / glob -> anchored regex
+    if "." not in value:                                       # bare label -> subdomain-prefix
+        # `jobs` means "any host under the `jobs.` label" (matches the template's ^jobs\.). The old
+        # `^jobs$` never matched via .search() against a FQDN, so a bare label was a silent no-op.
+        pat = "^" + re.escape(value) + r"\."
+    else:
+        pat = "^" + re.escape(value).replace(r"\*", ".*") + "$"    # FQDN / glob -> anchored regex
     re.compile(pat)
     return pat
 
