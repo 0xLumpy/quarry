@@ -17,7 +17,9 @@ DIGEST_SCHEMA = "1.0"
 # Canonical queue keys — ALWAYS present in the contract (empty list if nothing landed) so
 # consumers can rely on a stable shape.
 CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "ssrf", "sqli",
-                    "redirect", "lfi", "rce", "ssti", "sourcemap", "takeover", "secrets", "scanner"]
+                    "redirect", "lfi", "rce", "ssti", "sourcemap", "takeover", "secrets", "scanner",
+                    # evidence-probe surfaces (additive, same as the placeholder pattern):
+                    "graphql", "actuator", "websocket", "api-base"]
 # Reserved keys — present from M2.1 so the schema is stable, filled by tag-only classifiers
 # in M2.2 (api-doc/oauth-jwt/cloud/mobile).
 PLACEHOLDER_QUEUES = ["api-doc", "oauth-jwt", "cloud", "mobile"]
@@ -257,6 +259,14 @@ def collect(run, scope) -> dict:
             add("mobile", _item("mobile", u, "mobile app reference (tag only)", "low",
                                 src, "normalized/url.jsonl", ["mobile"]))
 
+    # deep-mine kinds FIRST → a richer review (e.g. graphql introspection-ENABLED) for the same URL
+    # then wins on the id-dedup below (dedup keeps the last-added item).
+    for ep in run.read("endpoint"):
+        kind = ep.get("kind")
+        if kind in ("graphql", "websocket", "api-base"):
+            add(kind, _item(kind, ep.get("value"), f"{kind} endpoint (deep-mine)", "medium",
+                ep.get("sources"), "normalized/endpoint.jsonl", [kind, "deep-mine"]))
+
     for r in reviews:                               # gf classes + sourcemap + takeover
         klass = r.get("klass", "other")
         if klass == "cname" and r.get("takeover_candidate"):
@@ -270,6 +280,17 @@ def collect(run, scope) -> dict:
         elif klass in ("xss", "idor", "ssrf", "sqli", "redirect", "lfi", "rce", "ssti"):
             add(klass, _item(klass, r.get("value"), f"gf {klass} match", "low",
                 r.get("sources"), "normalized/review.jsonl", [klass, "gf"]))
+        elif klass == "graphql":                        # introspection probe result
+            enabled = "ENABLED" in (r.get("note") or "")
+            add("graphql", _item("graphql", r.get("value"), r.get("note") or "graphql endpoint",
+                "high" if enabled else "low", r.get("sources"), "normalized/review.jsonl",
+                ["graphql"] + (["introspection-enabled"] if enabled else [])))
+        elif klass == "actuator":                       # actuator interrogation result
+            note = r.get("note") or ""
+            hot = r.get("priority") == "high" or "EXPOSED" in note
+            add("actuator", _item("actuator", r.get("value"), note or "actuator endpoint",
+                "high" if hot else "low", r.get("sources"), "normalized/review.jsonl",
+                ["actuator"] + (["exposed"] if hot else ["benign"])))
 
     for s in secrets_e:                             # secrets (redacted — preview only)
         # preview is the redacted form; fall back to masking a legacy `data` field (pre-redaction
