@@ -413,6 +413,22 @@ def run(profile_path, phases, passive, timeout):
         profile.modes["PASSIVE_ONLY"] = True
     scope = profile.scope()
     project = _project_dir(profile)
+
+    # pre-run disk gate on the ACTUAL project filesystem (output growth is the real driver).
+    # Runs BEFORE the run folder is created so a low-disk abort leaves no empty recon/<run_id>/.
+    try:
+        free_gb = shutil.disk_usage(str(project)).free / (1024 ** 3)
+    except OSError:
+        free_gb = None
+    if free_gb is not None:
+        if free_gb < 2:
+            raise click.ClickException(
+                f"only {free_gb:.1f} GB free on {project} — a run needs ≥2 GB (output growth). "
+                "Free space and retry.")
+        if free_gb < 5:
+            click.echo(_c(f"⚠ low disk: {free_gb:.1f} GB free on {project} "
+                          "(recommend ≥5 GB for big targets)", "yellow"))
+
     secrets.apply_env()   # export PDCP_API_KEY (chaos) for PD tools, if set
     from .runner import set_tool_cwd
     run_obj = Run(project, profile.target)
@@ -440,7 +456,8 @@ def run(profile_path, phases, passive, timeout):
         try:
             fn(ctx)
         except Exception as e:  # never let one phase kill the run
-            run_obj.notes.append(f"{name}: EXCEPTION {e}")
+            # redact: an exception message can carry a URL with a key/token — keep it out of notes.
+            run_obj.notes.append(f"{name}: EXCEPTION {secrets.redact(str(e))}")
             click.echo(_c(f"   ! {name} raised {e}", "red"))
         cps = checkpoint.evaluate(run_obj, name)
         all_cps += cps
@@ -469,6 +486,11 @@ def run(profile_path, phases, passive, timeout):
     click.echo(f"   exports: {', '.join(f'{k}={v}' for k, v in exp.items() if v)}")
     if all_cps:
         click.echo(_c(f"   {len(all_cps)} checkpoint(s) raised — see reports/checkpoints.md", "yellow"))
+    fails = [r for r in run_obj.tool_runs() if r.status == "failed"]
+    if fails:
+        shown = ", ".join(sorted({r.tool for r in fails})[:6])
+        click.echo(_c(f"   ⚠ {len(fails)} tool run(s) failed ({shown}) — see manifest.json "
+                      "'summary.failures'", "yellow"))
 
 
 # ── report ───────────────────────────────────────────────────────────────────

@@ -158,7 +158,25 @@ class Run:
         return [str(r.get(key_field, "")) for r in self.read(entity) if r.get(key_field)]
 
     # ── manifest ──
+    def _run_summary(self) -> dict:
+        """Per-run reliability rollup for the manifest: tool status counts + the 'what failed'
+        list (phase/tool/why) + phase-level exceptions pulled from notes. Cheap, read-only.
+        `note`/`stderr_tail` were already redacted by record(); phase_exceptions are redacted here
+        so no free-text bypasses the manifest secret choke point."""
+        from . import secrets
+        status_counts: dict[str, int] = {}
+        failures = []
+        for r in self._tool_runs:
+            status_counts[r.status] = status_counts.get(r.status, 0) + 1
+            if r.status == "failed":
+                failures.append({"phase": r.phase, "tool": r.tool,
+                                 "why": r.note or r.stderr_tail or f"exit {r.exit_code}"})
+        phase_exceptions = [secrets.redact(n) for n in self.notes if "EXCEPTION" in n]
+        return {"tool_status": status_counts, "tools_failed": len(failures),
+                "failures": failures, "phase_exceptions": phase_exceptions}
+
     def write_manifest(self, profile_summary: dict, phases_run: list[str]) -> None:
+        from . import secrets
         manifest = {
             "run_id": self.run_id,
             "target": self.target,
@@ -169,7 +187,8 @@ class Run:
             "tool_runs": [asdict(r) for r in self._tool_runs],
             "entity_counts": {e: self.count(e) for e in ENTITY_KEYS
                               if self._entity_file(e).exists()},
-            "notes": self.notes,
+            "notes": [secrets.redact(n) for n in self.notes],
+            "summary": self._run_summary(),
         }
         self.manifest_path.write_text(json.dumps(manifest, indent=2))
         # update state pointers (per-project, under recon/)
