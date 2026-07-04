@@ -67,47 +67,75 @@ def mine(text: str) -> list[tuple[str, str, int]]:
     return out
 
 
+def fetch_and_extract(ctx, url: str, *, source: str, subdir: str) -> dict:
+    """General recon fetch→parse→extract: GET an in-scope resource (bounded, guarded, non-mutating),
+    save the body as evidence, and extract secrets + in-scope links into the store (redacted, with
+    provenance + raw_ref). The reusable layer — exposed-file / config / debug fetches are instances;
+    callers add their own review framing. Returns a result dict:
+      {ok, off_scope, final, status, dest, secrets, links}.
+    `ok` False = not fetched (out of scope / non-200 / oversized / error). `off_scope` = the FINAL
+    host (after redirect) was off-scope, so nothing was read."""
+    host = normalize.host_of_url(url)
+    res = {"ok": False, "off_scope": False, "final": url, "status": None,
+           "dest": None, "secrets": 0, "links": 0}
+    if not ctx.scope.active_allowed(host):         # in-scope + not-passive + not-OOS
+        return res
+    try:
+        data, final, status = fetch.scoped_get(ctx, url, host, max_body=MAX_BODY)
+    except Exception:
+        return res
+    res["final"], res["status"] = final, status
+    if data is None:                               # off-scope redirect — caller records context
+        res["off_scope"] = True
+        return res
+    if status != 200 or len(data) > MAX_BODY:
+        return res
+    text = data.decode("utf-8", "replace")
+    dest = ctx.run.raw_path("params", subdir,
+                            f"{host}-{hashlib.md5(url.encode()).hexdigest()[:8]}")
+    dest.write_bytes(data)
+    res["dest"] = str(dest)
+    res["ok"] = True
+    for kind, val, ln in mine(text):               # secrets (redacted, provenance, raw_ref)
+        if ctx.run.add("secret", {
+                "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{url}|{ln}')}",
+                "kind": kind, "preview": secrets.mask(val),
+                "file": str(dest), "location": url, "line": ln, "sources": [source]}):
+            res["secrets"] += 1
+    for e in normalize.urls(text, source, str(dest)):   # in-scope absolute links → corpus
+        lu = e.get("url", "")
+        lh = normalize.host_of_url(lu)
+        if lu and ctx.scope.in_scope(lh) and not ctx.scope.is_oos(lh):
+            if ctx.run.add("url", e):                    # keep normalize's full provenance (raw_ref)
+                res["links"] += 1
+    return res
+
+
 def fetch_exposed(ctx, urls: list[str]) -> int:
-    """GET each exposed in-scope resource (non-mutating), save the body as evidence, extract +
-    store secrets (redacted) with provenance. Returns count of NEW secret entities added."""
+    """GET each exposed in-scope resource (an instance of fetch_and_extract), extract its secrets +
+    links, and raise a reviewable exposure marker. Returns count of NEW secret entities added."""
     added = 0
     for u in urls[:MAX_FETCHES]:
-        host = normalize.host_of_url(u)
-        if not ctx.scope.active_allowed(host):     # in-scope + not-passive + not-OOS
-            continue
-        try:
-            data, final, status = fetch.scoped_get(ctx, u, host, max_body=MAX_BODY)
-        except Exception:
-            continue
-        if data is None:                           # off-scope redirect — record, don't extract
+        r = fetch_and_extract(ctx, u, source="exposed-fetch", subdir="exposed")
+        if r["off_scope"]:                         # off-scope redirect — record, no extraction
             ctx.run.add("review", {
-                "id": f"exposed-redirect:{u}", "klass": "exposure", "value": u, "host": host,
-                "location": final,
-                "note": f"redirected off-scope to {final} (status {status}); body NOT extracted",
+                "id": f"exposed-redirect:{u}", "klass": "exposure", "value": u,
+                "host": normalize.host_of_url(u), "location": r["final"],
+                "note": f"redirected off-scope to {r['final']} (status {r['status']}); body NOT extracted",
                 "sources": ["exposed-fetch"]})
             continue
-        if status != 200 or len(data) > MAX_BODY:
+        if not r["ok"]:
             continue
-        text = data.decode("utf-8", "replace")
-        fname = f"{host}-{hashlib.md5(u.encode()).hexdigest()[:8]}"
-        dest = ctx.run.raw_path("params", "exposed", fname)
-        dest.write_bytes(data)
-        hits = mine(text)
-        for kind, val, ln in hits:
-            basis = val or f"{kind}|{u}|{ln}"
-            if ctx.run.add("secret", {
-                    "id": f"exposed:{kind}:{secrets.fingerprint(basis)}",
-                    "kind": kind, "preview": secrets.mask(val),
-                    "file": str(dest), "location": u, "line": ln,
-                    "sources": ["exposed-fetch"]}):
-                added += 1
-        # The exposure itself as reviewable evidence (raw_ref -> saved body). confirmed:false —
+        added += r["secrets"]
+        note = f"{r['secrets']} secret(s) extracted" if r["secrets"] else "fetched; no secret pattern"
+        if r["links"]:
+            note += f", {r['links']} in-scope link(s)"
+        # The exposure itself as reviewable evidence (raw_ref → saved body). confirmed:false —
         # collected evidence, still human-reviewed; NO impact performed.
         ctx.run.add("review", {
-            "id": f"exposed:{u}", "klass": "exposure", "value": u, "host": host,
-            "raw_ref": str(dest),
-            "note": f"{len(hits)} secret(s) extracted" if hits else "fetched; no secret pattern",
-            "sources": ["exposed-fetch"]})
+            "id": f"exposed:{u}", "klass": "exposure", "value": u,
+            "host": normalize.host_of_url(u), "raw_ref": r["dest"],
+            "note": note, "sources": ["exposed-fetch"]})
     return added
 
 
