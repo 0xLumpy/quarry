@@ -10,10 +10,23 @@ from __future__ import annotations
 import json
 import re
 
-from .. import evidence, normalize
+from .. import evidence, normalize, secrets
 from ..runner import Status, have, run as exec_tool, skipped
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
+
+
+def _apply_nuclei_oob(cmd: list[str]) -> list[str]:
+    """Append self-hosted interactsh flags to a nuclei command (else nuclei's built-in public
+    server). Shared by EVERY nuclei invocation so they all use the same OOB endpoint — no drift
+    where one nuclei call silently uses the public server. `secrets.oob()` is the single source of
+    truth for OOB config (future OOB consumers read it too)."""
+    oob = secrets.oob()
+    if oob.get("interactsh_server"):
+        cmd += ["-iserver", str(oob["interactsh_server"])]
+        if oob.get("interactsh_token"):
+            cmd += ["-itoken", str(oob["interactsh_token"])]
+    return cmd
 
 
 def _exposed_urls(ctx, scope) -> list[str]:
@@ -178,6 +191,7 @@ def run(ctx) -> None:
             tk_cmd = ["nuclei", "-l", str(tk_in), "-tags", "takeover", "-jsonl", "-o", str(tk_out)]
             if prof.http_rl:                       # else native default (empty = fast)
                 tk_cmd += ["-rl", str(prof.http_rl)]
+            _apply_nuclei_oob(tk_cmd)              # same OOB endpoint as the main scan (no drift)
             r = exec_tool("nuclei", tk_cmd, timeout=ctx.http_timeout)
             ctx.run.record("params", r)
             if tk_out.exists():
@@ -207,6 +221,7 @@ def run(ctx) -> None:
            "-s", "critical,high,medium", "-stats", "-si", "30", "-c", "25"]
     if prof.http_rl:
         cmd += ["-rl", str(prof.http_rl)]
+    _apply_nuclei_oob(cmd)                          # self-hosted interactsh (else nuclei's public default)
     r = exec_tool("nuclei", cmd, timeout=ctx.http_timeout)
     if r.stderr_tail:
         log.write_text(r.stderr_tail)

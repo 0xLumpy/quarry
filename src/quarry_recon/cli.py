@@ -182,6 +182,17 @@ def doctor(phase):
     else:
         click.echo(f"  {_c('·', 'yellow')} not configured")
 
+    # oob — out-of-band server (self-hosted interactsh for nuclei; else the built-in public one)
+    ob = secrets.oob()
+    click.echo(_c("\n[oob]", "magenta") + "  (out-of-band interaction; optional)")
+    if ob.get("interactsh_server"):
+        tok = " +token" if ob.get("interactsh_token") else " (no token)"
+        click.echo(f"  {_c('✓', 'green')} interactsh: {ob['interactsh_server']}{tok}")
+    else:
+        click.echo(f"  {_c('·', 'yellow')} interactsh: nuclei's built-in public server (set oob.interactsh_server for self-host)")
+    if ob.get("blind_xss_url"):
+        click.echo(f"  {_c('✓', 'green')} blind-xss collector configured (reserved for the attack layer)")
+
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
     scope_note = f" for phase {phase}" if phase else ""
     if miss:

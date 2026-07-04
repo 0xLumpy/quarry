@@ -62,6 +62,14 @@ def chaos() -> str | None:
     return _scalar(load().get("projectdiscovery"))
 
 
+def oob() -> dict:
+    """Out-of-band config (optional): a SELF-HOSTED interactsh server for nuclei
+    (`interactsh_server` + optional `interactsh_token`), and a reserved `blind_xss_url` collector
+    for the attack layer. Empty => nuclei uses its built-in public interactsh."""
+    o = load().get("oob")
+    return o if isinstance(o, dict) else {}
+
+
 def github_tokens_file() -> Path | None:
     """Materialize a 0600 temp file of the GitHub tokens for tools that take `-t <file>`
     (github-subdomains). Returns None if no tokens. Caller unlinks when done."""
@@ -91,6 +99,11 @@ def values() -> list[str]:
         tg = nc.get("telegram")
         if isinstance(tg, dict) and tg.get("token"):
             vals.append(str(tg["token"]))
+    ob = load().get("oob")                          # interactsh token + blind-xss collector are secret
+    if isinstance(ob, dict):
+        for k in ("interactsh_token", "blind_xss_url"):
+            if isinstance(ob.get(k), str):
+                vals.append(ob[k])
     return [v for v in vals if v and len(v) >= 6]
 
 
