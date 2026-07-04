@@ -28,10 +28,6 @@ v3/api-docs
 graphql
 graphiql
 actuator
-actuator/health
-actuator/env
-actuator/mappings
-actuator/heapdump
 admin
 admin/login
 administrator
