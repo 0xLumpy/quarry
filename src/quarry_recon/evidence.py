@@ -217,6 +217,7 @@ _ACTUATOR_MINE = ("env", "configprops")
 # impact. So we NEVER GET these in default recon; we detect exposure from the /actuator index
 # `_links` (what the app advertises) and flag high-priority. Deep-evidence mode may download.
 _ACTUATOR_HEAVY = ("heapdump",)
+_DEEP_MAX_BODY = 64 * 1024 * 1024          # 64 MB cap when deep-evidence downloads a heavy artifact
 
 
 def _actuator_index_links(ctx, base: str, host: str) -> set[str]:
@@ -236,6 +237,43 @@ def _actuator_index_links(ctx, base: str, host: str) -> set[str]:
     return set(links.keys()) if isinstance(links, dict) else set()
 
 
+def _deep_download(ctx, url: str, host: str, kind: str) -> bool:
+    """Deep-evidence (opt-in): download a heavy artifact (bounded), save the raw bytes, and mine it
+    for secrets (ASCII secrets survive inside a binary heap dump). Adds its own high-priority review.
+    Returns True on a recorded download, False on failure (caller falls back to detect-only)."""
+    try:
+        data, _final, status = fetch.scoped_get(ctx, url, host, max_body=_DEEP_MAX_BODY)
+    except Exception:
+        return False
+    if data is None or status != 200:
+        return False                               # off-scope/absent → caller does detect-only fallback
+    if len(data) > _DEEP_MAX_BODY:
+        # fetched (so NOT "not requested") but over the cap — don't save a truncated/partial dump.
+        ctx.run.add("review", {
+            "id": f"actuator-heavy:{url}", "klass": "actuator", "value": url, "host": host,
+            "priority": "high",
+            "note": (f"{kind} exposed + fetched but exceeds the {_DEEP_MAX_BODY // 1024 // 1024} MB "
+                     "deep-evidence cap — not saved/mined (raise the cap to pull it)"),
+            "sources": ["deep-evidence"]})
+        return True                                # handled — skip the misleading "NOT requested" review
+    dest = ctx.run.raw_path("params", "actuator",
+                            f"{host}-{kind}-{hashlib.md5(url.encode()).hexdigest()[:8]}.bin")
+    dest.write_bytes(data)
+    nsec = 0
+    for k, val, ln in mine(data.decode("utf-8", "replace")):
+        if ctx.run.add("secret", {
+                "id": f"exposed:{k}:{secrets.fingerprint(val or f'{k}|{url}|{ln}')}",
+                "kind": k, "preview": secrets.mask(val),
+                "file": str(dest), "location": url, "sources": ["deep-evidence"]}):
+            nsec += 1
+    ctx.run.add("review", {
+        "id": f"actuator-heavy:{url}", "klass": "actuator", "value": url, "host": host,
+        "priority": "high", "raw_ref": str(dest),
+        "note": f"{kind} DOWNLOADED via deep-evidence ({len(data) // 1024} KB) — {nsec} secret(s) mined",
+        "sources": ["deep-evidence"]})
+    return True
+
+
 def probe_actuator(ctx, bases: list[str]) -> int:
     """Interrogate a Spring Boot actuator base and classify real-vs-benign. Cheap sensitive READ
     endpoints (`/actuator/env` etc.) are GET-probed for reachability (200 = real exposure, mine
@@ -249,10 +287,15 @@ def probe_actuator(ctx, bases: list[str]) -> int:
         if not ctx.scope.active_allowed(host):
             continue
         advertised = _actuator_index_links(ctx, base, host)
-        # heavy endpoints: flag high-priority from the advertised link — NO request to the endpoint.
+        deep = getattr(getattr(ctx, "profile", None), "deep_evidence", False)
+        # heavy endpoints: default = flag high-priority from the advertised link, NO request. Deep-
+        # evidence mode (opt-in) = download + mine the artifact (a GET to /actuator/heapdump forces
+        # server-side dump generation — done only because the operator turned DEEP_EVIDENCE on).
         heavy_exposed = [h for h in _ACTUATOR_HEAVY if h in advertised]
         for h in heavy_exposed:
             hu = base.rstrip("/") + "/" + h
+            if deep and _deep_download(ctx, hu, host, h):
+                continue                               # downloaded + mined; review added inside
             ctx.run.add("review", {
                 "id": f"actuator-heavy:{hu}", "klass": "actuator", "value": hu, "host": host,
                 "priority": "high",

@@ -151,6 +151,16 @@ class TargetProfile:
             return 0
 
     @property
+    def deep_evidence(self) -> bool:
+        """Opt-in DOWNLOAD of heavy artifacts (actuator heapdump/threaddump/DB dump). OFF by default:
+        a GET to a heapdump forces server-side generation, so pulling it is DELIBERATE human intent.
+        When off, heavy exposures are detected + flagged (never fetched)."""
+        v = self.modes.get("DEEP_EVIDENCE", False)
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("on", "true", "yes", "1", "deep")
+
+    @property
     def org_names(self) -> list[str]:
         # optional OSINT anchors (org/registrant names to pivot from)
         return [str(x).strip() for x in (self._raw.get("ORG_NAMES") or []) if x]

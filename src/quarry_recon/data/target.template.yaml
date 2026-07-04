@@ -59,6 +59,8 @@ MODES:
   TAKEOVER: true        # true => collect CNAMEs + run nuclei takeover templates
   CONTENT_DISCOVERY: "off"  # off | light | balanced | deep — candidate-driven path brute (default off)
   CONTENT_RECURSION: 0    # recursion depth for content discovery (0 = off; pairs with balanced/deep)
+  DEEP_EVIDENCE: false    # true => DOWNLOAD + mine heavy artifacts (actuator heapdump) instead of just
+                          # flagging them. A heapdump GET triggers server-side generation — opt-in only.
 
 # Free-text program rules for the analyst (and the run manifest).
 NOTES:
