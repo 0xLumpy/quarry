@@ -175,7 +175,8 @@ class Run:
         return {"tool_status": status_counts, "tools_failed": len(failures),
                 "failures": failures, "phase_exceptions": phase_exceptions}
 
-    def write_manifest(self, profile_summary: dict, phases_run: list[str]) -> None:
+    def write_manifest(self, profile_summary: dict, phases_run: list[str],
+                       metrics: dict | None = None) -> None:
         from . import secrets
         manifest = {
             "run_id": self.run_id,
@@ -190,6 +191,8 @@ class Run:
             "notes": [secrets.redact(n) for n in self.notes],
             "summary": self._run_summary(),
         }
+        if metrics:                                 # pointer + headline totals for the telemetry artifact
+            manifest["metrics"] = metrics
         self.manifest_path.write_text(json.dumps(manifest, indent=2))
         # update state pointers (per-project, under recon/)
         state = self.project_dir / "recon" / "state"

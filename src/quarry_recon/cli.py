@@ -520,6 +520,14 @@ def run(profile_path, phases, passive, timeout):
                       f"({', '.join(missing_req[:8])}) — those steps will be skipped. "
                       "Run `quarry doctor`.\n", "yellow"))
 
+    # runtime telemetry (data beats vibes): per-phase wall + child CPU + inventory-at-phase.
+    import time as _time
+    from . import metrics
+    _INV = ("subdomain", "resolved", "live", "url", "endpoint", "secret", "finding")
+    run_t0 = _time.perf_counter()
+    run_cpu0 = metrics.rusage()[0]
+    phase_metrics: list[dict] = []
+
     all_cps = []
     for name in selected:
         fn, label, needs_active = REGISTRY[name]
@@ -527,6 +535,8 @@ def run(profile_path, phases, passive, timeout):
             click.echo(_c(f"▸ {label} — skipped (passive-only)", "yellow"))
             continue
         click.echo(_c(f"▸ {label}", "magenta"))
+        p_t0 = _time.perf_counter()
+        p_cpu0 = metrics.rusage()[0]
         try:
             fn(ctx)
         except Exception as e:  # never let one phase kill the run
@@ -537,6 +547,9 @@ def run(profile_path, phases, passive, timeout):
             click.echo(_c(f"   ! {name} raised {err}", "red"))
             from . import notify
             notify.send("error", f"Quarry {run_obj.run_id} · {profile.target}: {name} phase raised", err)
+        phase_metrics.append({"phase": name, "wall_s": round(_time.perf_counter() - p_t0, 2),
+                              "cpu_s": round(metrics.rusage()[0] - p_cpu0, 2),
+                              "size": {e: run_obj.count(e) for e in _INV}})
         cps = checkpoint.evaluate(run_obj, name)
         all_cps += cps
         for cp in cps:
@@ -554,10 +567,19 @@ def run(profile_path, phases, passive, timeout):
         (run_obj.reports / "checkpoints.md").write_text(
             "# Checkpoints\n\n" + "\n".join(f"- {c.line()}" for c in all_cps) + "\n")
         run_obj.notes += [c.line() for c in all_cps]
+
+    # runtime telemetry → metrics/summary.json, written BEFORE the manifest so the manifest (the run
+    # index) points at it and carries the headline totals.
+    run_wall = _time.perf_counter() - run_t0
+    run_cpu, peak_rss_kb = metrics.rusage()
+    tel = metrics.write(run_obj, phase_metrics, run_wall, run_cpu - run_cpu0, peak_rss_kb / 1024)
+    metrics_summary = {"artifact": "metrics/summary.json", **tel["totals"],
+                       "slowest_tool": tel["long_poles"]["tools"][0] if tel["long_poles"]["tools"] else None}
+
     run_obj.write_manifest(
         profile_summary={"apex_domains": profile.apex_domains, "cidr": profile.cidr,
                          "passive_only": profile.passive_only, "ports": profile.ports},
-        phases_run=selected)
+        phases_run=selected, metrics=metrics_summary)
 
     click.echo(_c(f"\n══ done · {run_obj.dir}", "green"))
     click.echo(f"   HOTLIST: {run_obj.reports / 'HOTLIST.md'}")
@@ -569,6 +591,11 @@ def run(profile_path, phases, passive, timeout):
         shown = ", ".join(sorted({r.tool for r in fails})[:6])
         click.echo(_c(f"   ⚠ {len(fails)} tool run(s) failed ({shown}) — see manifest.json "
                       "'summary.failures'", "yellow"))
+
+    if tel["long_poles"]["tools"]:
+        lp = tel["long_poles"]["tools"][0]
+        click.echo(f"   ⏱ {round(run_wall)}s total · slowest tool: {lp['tool']} {lp['wall_s']}s "
+                   f"· metrics/summary.json")
 
     # opt-in notifications (no-op unless configured in secrets.yaml notify:)
     from . import notify
