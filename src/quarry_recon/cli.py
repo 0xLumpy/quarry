@@ -89,6 +89,28 @@ def cli():
     """Quarry — methodology-driven reconnaissance automation."""
 
 
+def _missing_required(phase_filter=None) -> list[str]:
+    """Required (non-optional) tools that are NOT installed, optionally limited to a set of phases.
+    The readiness signal for doctor's verdict + the pre-run gate. Quarry-owned only — tool-native
+    source keys (subfinder/amass configs) are the tool's concern, documented in install/docs."""
+    return sorted({t.bin for t in load_tools()
+                   if not t.optional and not t.installed
+                   and (phase_filter is None or t.phase in phase_filter)})
+
+
+def _effective_phases(selected, profile) -> set:
+    """Phases that will ACTUALLY do work under the profile's modes — so the readiness warn doesn't
+    flag tools for phases that self-skip: passive mode drops needs_active phases, and
+    CONTENT_DISCOVERY: off drops content (missing ffuf shouldn't warn when content is off)."""
+    from .phases import REGISTRY
+    eff = {p for p in selected if p in REGISTRY}
+    if profile.passive_only:
+        eff = {p for p in eff if not REGISTRY[p][2]}          # index 2 = needs_active
+    if getattr(profile, "content_discovery", None) == "off":
+        eff.discard("content")
+    return eff
+
+
 # ── doctor ──────────────────────────────────────────────────────────────────
 @cli.command()
 @click.option("--phase", help="only audit tools for this phase")
@@ -137,18 +159,26 @@ def doctor(phase):
     click.echo(_c("\n[system]", "magenta"))
     _echo_syscheck(bootstrap.system_report("run"))   # post-install: only run space matters
 
-    # secrets.yaml — framework-read keys (present / not set). Tool-native keys live elsewhere.
+    # secrets.yaml — framework-read keys (present / not set). Quarry-owned keys only; tool-native
+    # source keys (subfinder/amass) live in each tool's own config (documented in install + docs).
     click.echo(_c("\n[secrets]", "magenta") + f"  ({secrets.PATH})")
-    for label, present in [("github tokens", bool(secrets.github_tokens())),
-                           ("shodan", bool(secrets.shodan())),
-                           ("whoxy", bool(secrets.whoxy())),
-                           ("projectdiscovery/chaos", bool(secrets.chaos()))]:
+    n_gh = len(secrets.github_tokens())
+    rows = [("github tokens", bool(n_gh), f"{n_gh} token(s)" if n_gh else ""),
+            ("shodan", bool(secrets.shodan()), ""),
+            ("whoxy", bool(secrets.whoxy()), ""),
+            ("projectdiscovery/chaos", bool(secrets.chaos()), "")]
+    for label, present, extra in rows:
         mark = _c("✓", "green") if present else _c("·", "yellow")
-        click.echo(f"  {mark} {label:<24} {'' if present else '(optional) not set'}")
-    click.echo(f"  {_c('ℹ', 'cyan')} tool-native: subfinder · waymore")
+        click.echo(f"  {mark} {label:<24} {extra or ('' if present else '(optional) not set')}")
 
-    click.echo(_c(f"\n{ok} installed · {miss} missing (required) · audit complete\n",
-                  "green" if not miss else "yellow"))
+    # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
+    scope_note = f" for phase {phase}" if phase else ""
+    if miss:
+        verdict = _c(f"✗ NOT READY — {miss} required tool(s) missing{scope_note}", "red") + \
+            "  → quarry install"
+    else:
+        verdict = _c("✓ READY", "green") + f" — {ok} tools installed, all required present{scope_note}"
+    click.echo(f"\n{verdict}\n")
 
 
 # ── install / update ─────────────────────────────────────────────────────────
@@ -451,6 +481,14 @@ def run(profile_path, phases, passive, timeout):
                   f"{'PASSIVE' if profile.passive_only else 'ACTIVE'} ══", "cyan"))
     click.echo(f"   apexes={len(profile.apex_domains)} cidr={len(profile.cidr)} "
                f"ports={profile.ports} http_rl={profile.http_rl or 'default'}\n")
+
+    # readiness gate: warn (don't block) if a REQUIRED tool for the phases that will ACTUALLY run
+    # (mode-gating applied) is missing — better to know before a long run than in the manifest.
+    missing_req = _missing_required(_effective_phases(selected, profile))
+    if missing_req:
+        click.echo(_c(f"   ⚠ {len(missing_req)} required tool(s) missing for selected phases "
+                      f"({', '.join(missing_req[:8])}) — those steps will be skipped. "
+                      "Run `quarry doctor`.\n", "yellow"))
 
     all_cps = []
     for name in selected:
