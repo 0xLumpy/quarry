@@ -18,10 +18,14 @@ very little and gives no useful reason why. Every result is:
 
 ## Status
 
-`v0.2` (stabilization) — command surface, installer, OSINT pre-flight, the full recon run (six
-phases including late-host enrichment), structured JSONL store, exports, reports, a redacted
-structured **digest**, and checkpointing are wired and verified end-to-end against a
-purpose-built test range. Resumable runs and a broader OSINT / content-discovery layer come next.
+`v0.2.9` (milestone — methodology + evidence + production-readiness) — command surface, installer,
+OSINT pre-flight, the full recon run (**seven phases** including late-host enrichment and
+candidate-driven content discovery), active **evidence extraction** (exposed-file secret pull,
+GraphQL introspection, actuator interrogation, OpenAPI parsing, SSTI confirmation), a structured
+JSONL store, exports, reports, a redacted structured **digest** with first-class evidence queues,
+runtime telemetry, `doctor` readiness + opt-in notifications, and checkpointing — all wired and
+verified end-to-end against a purpose-built test range. Scale/reliability (resumable/parallel runs)
+and the attack/AI layer come next.
 
 ## Safety and scope
 
@@ -47,12 +51,13 @@ you rate-limited or blocked. `quarry install` checks the host and tiers it:
 |----------|---------|-------------|-----|
 | CPU | 2 vCPU | 4 vCPU | parallel DNS/HTTP probing |
 | RAM | 4 GB | 8 GB | headless crawl + 3M-entry wordlists |
-| Disk (free) | 20 GB to install · 10 GB to run | 40 GB+ | crawl, screenshots, raw JSONL, nuclei output, repeated runs grow fast; **80 GB+** for large targets |
+| Disk (free) | 5 GB to install · 10 GB to run | 40 GB+ | crawl, screenshots, raw JSONL, nuclei output, repeated runs grow fast; **80 GB+** for large targets |
 
-Disk floor is higher for **install** (transient Go build cache, freed afterward) than for a
-**run** — so `quarry doctor` (post-install) judges disk against the lower run floor. Below
-**minimum** → install aborts (override with `--yes`); between minimum and recommended → proceeds
-with a warning. OS: Debian/Ubuntu · Fedora · Arch (apt/dnf/pacman); macOS (brew) best-effort.
+Install needs little (a full provision measured ~4 GB — the Go build cache is transient, freed
+afterward); a **run** needs more headroom as output grows (crawl, screenshots, JSONL, nuclei), and
+`quarry run` does its own pre-run free-space check. Below **minimum** → install aborts (override
+with `--yes`); between minimum and recommended → proceeds with a warning. OS: Debian/Ubuntu ·
+Fedora · Arch (apt/dnf/pacman); macOS (brew) best-effort.
 
 ## Install
 
@@ -105,6 +110,8 @@ to tools itself. `quarry doctor` shows which are set. Back up before editing:
 | `shodan` | shosubgo |
 | `whoxy` | osint reverse-whois |
 | `projectdiscovery` | exported as `PDCP_API_KEY` (chaos) for subfinder, asnmap, … |
+| `notify` | opt-in run notifications (Slack/Discord/Telegram/webhook) — off by default; `quarry notify --test` |
+| `oob` | self-hosted interactsh for nuclei (`interactsh_server`/`_token`); else the built-in public server |
 
 **Tool-native configs** — these tools read their own file; put their keys there:
 
@@ -150,6 +157,9 @@ MODES:
   SCREENSHOTS: true
   PORTSCAN: true       # ignored if CIDR empty
   TAKEOVER: true       # collect CNAMEs + run nuclei takeover templates
+  CONTENT_DISCOVERY: "off"  # off | light | balanced | deep — candidate-driven path brute (default off)
+  CONTENT_RECURSION: 0      # recursion depth for content discovery (0 = off; pairs with balanced/deep)
+  DEEP_EVIDENCE: false      # true => DOWNLOAD + mine heavy artifacts (actuator heapdump) vs just flagging
 
 NOTES:
   - Free-form reminders (e.g. "program caps requests at 5 req/s → set RATELIMIT.HTTP: 5").
@@ -201,12 +211,13 @@ setsid nohup quarry run -t acme.com > run.log 2>&1 & disown
 |---------|---------|
 | `quarry install` | Full blank-VPS provision (system pkgs → Go → tools → wordlists/templates) |
 | `quarry update` | Update managed tools, nuclei templates, resolvers, gf patterns |
-| `quarry doctor` | Audit tools, versions, per-tool deps, API keys, resolvers, wordlists |
+| `quarry doctor` | Audit tools, versions, per-tool deps, API keys, resolvers, wordlists — ends with a readiness verdict |
 | `quarry init <name>` | Create a project (`projects/<name>/target.yaml`); `-o <dir>` for a custom location |
-| `quarry oos -t <target> <host…>` | Add out-of-scope patterns (bare host → anchored regex; regex kept verbatim) |
+| `quarry oos -t <target> <host…>` | Add out-of-scope patterns (bare label → subdomain-prefix; FQDN → apex-scoped; regex kept verbatim) |
 | `quarry osint -t <profile>` | **Pre-flight** OSINT — discover scope candidates + intel (review-only, never edits scope) |
 | `quarry run -t <profile>` | Run recon phases against the confirmed scope |
 | `quarry report -t <profile>` | Regenerate hotlist + exports + delta from a stored run (no scanning) |
+| `quarry notify --test` | Validate opt-in run notifications (secrets.yaml `notify:`) |
 
 ## Phases (methodology mapping)
 
@@ -220,7 +231,8 @@ setsid nohup quarry run -t acme.com > run.log 2>&1 & disown
 | **probe** | HTTP fingerprint (full methodology flag set), CDN/origin tag, **CSP-sibling discovery (response headers)**, screenshots, **naabu → nmap -sV**, passive smap | httpx, cdncheck, gowitness, naabu, nmap, smap |
 | **crawl** | active crawl (+headless SPA, stored responses), archive URLs, JS download/mine + redacted secret scan, **waymore `-mode B` + xnLinkFinder over responses**, link-discovered host promotion | katana, gau, waymore, jsluice, xnLinkFinder, gitleaks, trufflehog |
 | **enrich** | catch-up over hosts found *after* probe (crawl links, CSP siblings): resolve, **dangling-CNAME takeover**, HTTP fingerprint, WAF, screenshots, smap | dnsx, httpx, nuclei, gowitness, smap |
-| **params** | gf vuln-class buckets, param discovery (fed forward to the XSS tester), non-intrusive scan + OOB, **subdomain takeover**, reflected XSS/redirect | gf, arjun, nuclei (interactsh + takeover), dalfox |
+| **content** | candidate-driven path/dir discovery (**off by default**; light/balanced/deep + capped recursion) over live in-scope hosts, autocalibrated against catch-alls | ffuf |
+| **params** | gf vuln-class buckets, param discovery, non-intrusive scan + OOB, **subdomain takeover**, reflected XSS/redirect, and **evidence extraction** (fetch exposed files → secrets, GraphQL introspection, actuator interrogation, OpenAPI parse, SSTI confirm) | gf, arjun, nuclei (interactsh + takeover), dalfox |
 
 Raw tool output is preserved before parsing; normalized results keep provenance so any result
 traces back to the tool and raw file that produced it.
@@ -237,10 +249,11 @@ projects/<target>/
     candidates.jsonl  intel.jsonl  osint-report.md  target.suggested.yaml
   osint/latest -> <ts>
   recon/<run_id>/                          quarry run output
-    manifest.json                          run record + per-tool status taxonomy
+    manifest.json                          run record + per-tool status taxonomy + failure summary + metrics pointer
     raw/<phase>/<tool>/                    raw evidence (preserved before parsing)
     normalized/*.jsonl                     entities with provenance (the source of truth)
     exports/*.txt                          flat compat views (subdomains/live/urls/js/…)
+    metrics/summary.json                   runtime telemetry (per-phase/tool timing, long poles)
     reports/HOTLIST.md                     ranked manual-validation queues + rationale (human)
     reports/digest.json                    same queues as structured, redacted JSON (provenance + raw refs)
     reports/delta.md                       per-source contribution + new-since-last-run
@@ -254,10 +267,11 @@ on `quarry init`. Keys + wordlists stay global in `~/.config/quarry/`.)
 
 **HOTLIST** ranks: scanner candidates (unconfirmed), likely-origin (non-CDN) hosts,
 auth/api/admin/file buckets, IDOR/SSRF/SQLi/XSS param candidates (common-vuln lists), secrets,
-gf/sourcemap queues, subdomain-takeover candidates, and tagged surface classes (API-docs,
-auth-flow, cloud, mobile). **`digest.json`** is the same content in structured, redacted JSON —
-every item carries provenance and a raw-evidence reference; secret values are previews only and
-sensitive URL parameters (tokens, OAuth `code`/`state`, …) are masked.
+gf/sourcemap queues, subdomain-takeover candidates, and tagged surface classes. **`digest.json`**
+is the same content in structured, redacted JSON with first-class **evidence queues** (graphql
+introspection, actuator exposure, websocket/api-base endpoints, SSTI, api-doc, auth-flow) — every
+item carries provenance and a raw-evidence reference; secret values are previews only and sensitive
+URL parameters (tokens, OAuth `code`/`state`, …) are masked.
 
 ## Anti-thin-output checks
 
@@ -304,10 +318,10 @@ Start with `quarry doctor`. Common issues:
 
 ## Roadmap
 
-Intentionally not first-version. Add after the core is understood on real targets:
+Shipped since first version: content discovery, OpenAPI/Swagger parsing, the evidence-extraction
+layer, the redacted digest contract, runtime telemetry, and `doctor` readiness. Next:
 
-- content discovery (ffuf/gobuster/dirsearch) · 403-bypass mapping · vhost enumeration
-- COTS/known-path discovery · mobile/APK path extraction · API-spec (Swagger/OpenAPI) parsing
-- resumable runs · gungnir continuous CT monitoring
-- SQLite/DuckDB query layer over the JSONL store
-- distributed / axiom-style fan-out
+- scale / reliability — resumable runs · selective retry · parallel workers · per-tool job state
+- the attack/AI layer — consume the digest, prove primitives (human-in-loop)
+- code-host intelligence (scan-at-depth, no clone) · 403-bypass mapping · vhost enumeration
+- SQLite/DuckDB query layer over the JSONL store · gungnir continuous CT monitoring
