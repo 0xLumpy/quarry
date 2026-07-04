@@ -224,8 +224,12 @@ RAM_DRIFT = 0.88                    # MemTotal sits under physical (kernel/hyper
                                     # while a true sub-8 box (~6.7) still warns. Same for the 4 GB floor.
 # Disk-free floors differ by context: install needs transient build space (Go modcache balloons
 # mid-build, freed in the cleanup stage) PLUS run headroom; after install only run space matters.
-DISK_MIN = {"install": 20, "run": 10}    # below -> abort
-DISK_WARN = {"install": 30, "run": 20}   # below -> warn
+# Install floors loosened 2026-07-04: a clean VPS git-clone + full install measured ~3.6 GB used
+# (go build/module caches balloon transiently, then bootstrap.cleanup reclaims them). The old
+# 20/30 GB install floors were far too conservative. RUN floors stay — run-time output growth on
+# big targets (crawl/screenshots/JSONL) is the real disk driver.
+DISK_MIN = {"install": 5, "run": 10}     # below -> abort
+DISK_WARN = {"install": 10, "run": 20}   # below -> warn
 REC_DISK_GB = 40                         # recommended free for comfortable runs (80+ for large targets)
 
 _RANK = {"ok": 0, "warn": 1, "abort": 2}
