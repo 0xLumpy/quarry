@@ -171,6 +171,17 @@ def doctor(phase):
         mark = _c("✓", "green") if present else _c("·", "yellow")
         click.echo(f"  {mark} {label:<24} {extra or ('' if present else '(optional) not set')}")
 
+    # notify — opt-in run notifications (off unless secrets.yaml notify: is set)
+    from . import notify as _notify
+    nch, nev = _notify.channels(), _notify.enabled_events()
+    click.echo(_c("\n[notify]", "magenta") + "  (opt-in, off by default)")
+    if nch:
+        ev_txt = ", ".join(sorted(nev)) if nev else _c("(no events — nothing will send)", "yellow")
+        click.echo(f"  {_c('✓', 'green')} channels: {', '.join(nch)} · events: {ev_txt}")
+        click.echo(f"  {_c('ℹ', 'cyan')} verify with: quarry notify --test")
+    else:
+        click.echo(f"  {_c('·', 'yellow')} not configured")
+
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
     scope_note = f" for phase {phase}" if phase else ""
     if miss:
@@ -179,6 +190,25 @@ def doctor(phase):
     else:
         verdict = _c("✓ READY", "green") + f" — {ok} tools installed, all required present{scope_note}"
     click.echo(f"\n{verdict}\n")
+
+
+# ── notify ───────────────────────────────────────────────────────────────────
+@cli.command("notify")
+@click.option("--test", is_flag=True, help="send a test message to all configured channels")
+def notify_cmd(test):
+    """Show / validate opt-in run notifications (configured in secrets.yaml under `notify:`)."""
+    from . import notify
+    ch, ev = notify.channels(), notify.enabled_events()
+    if not ch:
+        click.echo("no notify channels configured — add a `notify:` block to "
+                   f"{secrets.PATH} (slack/discord/telegram/webhook).")
+        return
+    click.echo(f"channels: {', '.join(ch)} · events: {', '.join(sorted(ev)) or '(none set)'}")
+    if test:
+        n = notify.send_test()
+        click.echo(_c(f"sent test to {n}/{len(ch)} channel(s)", "green" if n == len(ch) else "yellow"))
+    else:
+        click.echo("run `quarry notify --test` to send a test message.")
 
 
 # ── install / update ─────────────────────────────────────────────────────────
@@ -500,9 +530,13 @@ def run(profile_path, phases, passive, timeout):
         try:
             fn(ctx)
         except Exception as e:  # never let one phase kill the run
-            # redact: an exception message can carry a URL with a key/token — keep it out of notes.
-            run_obj.notes.append(f"{name}: EXCEPTION {secrets.redact(str(e))}")
-            click.echo(_c(f"   ! {name} raised {e}", "red"))
+            # redact ONCE: an exception message can carry a URL with a key/token — keep it out of the
+            # notes, the terminal/runtime.log echo, AND the notification.
+            err = secrets.redact(str(e)) or ""
+            run_obj.notes.append(f"{name}: EXCEPTION {err}")
+            click.echo(_c(f"   ! {name} raised {err}", "red"))
+            from . import notify
+            notify.send("error", f"Quarry {run_obj.run_id} · {profile.target}: {name} phase raised", err)
         cps = checkpoint.evaluate(run_obj, name)
         all_cps += cps
         for cp in cps:
@@ -535,6 +569,18 @@ def run(profile_path, phases, passive, timeout):
         shown = ", ".join(sorted({r.tool for r in fails})[:6])
         click.echo(_c(f"   ⚠ {len(fails)} tool run(s) failed ({shown}) — see manifest.json "
                       "'summary.failures'", "yellow"))
+
+    # opt-in notifications (no-op unless configured in secrets.yaml notify:)
+    from . import notify
+    if notify.configured():
+        n_sec, n_fnd = run_obj.count("secret"), run_obj.count("finding")
+        summary = (f"live={len(run_obj.read('live'))} urls={run_obj.count('url')} "
+                   f"secrets={n_sec} findings={n_fnd} failed_tools={len(fails)}")
+        notify.send("complete", f"Quarry {run_obj.run_id} · {profile.target} done", summary)
+        leads = n_sec + sum(1 for f in run_obj.read("finding")
+                            if f.get("severity") in ("critical", "high"))
+        if leads:
+            notify.send("lead", f"Quarry {profile.target}: {leads} promising lead(s)", summary)
 
 
 # ── report ───────────────────────────────────────────────────────────────────

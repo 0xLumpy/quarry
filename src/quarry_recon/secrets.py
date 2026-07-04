@@ -83,6 +83,14 @@ def values() -> list[str]:
         v = getter()
         if v:
             vals.append(v)
+    nc = load().get("notify")                      # notify webhook URLs / telegram token are secret
+    if isinstance(nc, dict):
+        for k in ("slack", "discord", "webhook"):
+            if isinstance(nc.get(k), str):
+                vals.append(nc[k])
+        tg = nc.get("telegram")
+        if isinstance(tg, dict) and tg.get("token"):
+            vals.append(str(tg["token"]))
     return [v for v in vals if v and len(v) >= 6]
 
 
