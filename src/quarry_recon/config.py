@@ -182,6 +182,12 @@ class TargetProfile:
             return self.http_ports
         return list(FULL_HTTP_PORTS)
 
+    @property
+    def ports_are_default(self) -> bool:
+        """True when using the built-in full HTTP set (no explicit PORTS.HTTP) — lets the banner
+        collapse the ~93-port dump to `default (N)` instead of enumerating it."""
+        return not self.http_ports
+
     def scope(self) -> ScopeMatcher:
         pats = []
         for raw in self.oos:

@@ -328,6 +328,7 @@ def update(dry_run, include_optional):
     click.echo(_c("refreshing data files + templates", "magenta"))
     bootstrap.install_data_files(click.echo, dry_run, update=True)
     bootstrap.run_extras(click.echo, dry_run)
+    bootstrap.cleanup(click.echo, dry_run)   # re-running tool installs refills go caches — clean them (install already does)
     if dry_run:
         click.echo(_c("\n(dry-run)\n", "yellow"))
 
@@ -520,8 +521,10 @@ def run(profile_path, phases, passive, timeout):
 
     click.echo(_c(f"\n══ Quarry run {run_obj.run_id} · target={profile.target} · "
                   f"{'PASSIVE' if profile.passive_only else 'ACTIVE'} ══", "cyan"))
+    ports_disp = (f"default ({len(profile.ports)})" if profile.ports_are_default
+                  else str(profile.ports))
     click.echo(f"   apexes={len(profile.apex_domains)} cidr={len(profile.cidr)} "
-               f"ports={profile.ports} http_rl={profile.http_rl or 'default'}\n")
+               f"ports={ports_disp} http_rl={profile.http_rl or 'default'}\n")
 
     # readiness gate: warn (don't block) if a REQUIRED tool for the phases that will ACTUALLY run
     # (mode-gating applied) is missing — better to know before a long run than in the manifest.
