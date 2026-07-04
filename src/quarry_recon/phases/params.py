@@ -228,20 +228,27 @@ def run(ctx) -> None:
     ctx.run.record("params", r)
     if findings.exists():
         n = 0
+        sev = {"critical": 0, "high": 0, "medium": 0}
         for line in findings.read_text().splitlines():
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
             tid = obj.get("template-id", "?")
+            severity = (obj.get("info") or {}).get("severity", "unknown")
             ctx.run.add("finding", {
                 "id": f"{tid}|{obj.get('matched-at', obj.get('host',''))}",
-                "template": tid, "severity": (obj.get("info") or {}).get("severity", "unknown"),
+                "template": tid, "severity": severity,
                 "name": (obj.get("info") or {}).get("name"),
                 "matched": obj.get("matched-at", obj.get("host", "")),
                 "sources": ["nuclei"], "confirmed": False})
+            if severity in sev:
+                sev[severity] += 1
             n += 1
-        ctx.echo(f"  nuclei: {n} candidate findings (UNCONFIRMED — manual validation required)")
+        # terser than the old unconfirmed-validation note — the HOTLIST/digest already carry that
+        # framing; here a severity breakdown is more useful at a glance.
+        ctx.echo(f"  nuclei: {n} candidate findings · "
+                 f"crit:{sev['critical']} high:{sev['high']} med:{sev['medium']}")
 
     # ── exposed-resource fetch + secret extraction (recon evidence: unauth, in-scope, GET-only) ──
     # Map-don't-exploit line = "don't accidentally perform impact": an exposed .env/.git/config is

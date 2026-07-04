@@ -237,6 +237,10 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     # ── 1. system packages + Go toolchain + data (unless --tools-only / --only / --phase) ──
     full = not (only or phase or tools_only)
     if full:
+        click.echo(_c("\n  ◤ QUARRY — methodology-driven recon automation", "cyan"))
+        if not dry_run:
+            click.echo(_c("  ⏳ Full install builds ~25 Go tools + fetches wordlists/templates — this "
+                          "takes several minutes.\n     It is not stuck; grab a coffee.", "yellow"))
         # system-spec precheck (tiered): ok = silent · warn = proceed · below minimum = abort
         rep = bootstrap.system_report("install")
         click.echo(_c("\n[*] system check", "magenta"))
@@ -561,9 +565,13 @@ def run(profile_path, phases, passive, timeout):
             click.echo(_c(f"   ! {name} raised {err}", "red"))
             from . import notify
             notify.send("error", f"Quarry {run_obj.run_id} · {profile.target}: {name} phase raised", err)
-        phase_metrics.append({"phase": name, "wall_s": round(_time.perf_counter() - p_t0, 2),
+        p_wall = round(_time.perf_counter() - p_t0, 1)
+        phase_metrics.append({"phase": name, "wall_s": p_wall,
                               "cpu_s": round(metrics.rusage()[0] - p_cpu0, 2),
                               "size": {e: run_obj.count(e) for e in _INV}})
+        # log-safe section timer (reconftw-style, our style) — a per-phase elapsed footer. No spinner
+        # / control chars, so tmux + runtime.log stay clean. The live in-tool spinner is separate.
+        click.echo(_c(f"   ⏱ {name} · {p_wall}s", "cyan"))
         cps = checkpoint.evaluate(run_obj, name)
         all_cps += cps
         for cp in cps:
