@@ -27,7 +27,27 @@ CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "s
                     # framework debug/admin endpoints reachable (tech-conditional probe):
                     "debug",
                     # serialized-object / token format fingerprints (deser attack surface):
-                    "deser"]
+                    "deser",
+                    # framework CVE/primitive reference for fingerprinted tech (attack-layer handoff):
+                    "tech-intel"]
+
+_FW_CVE: dict | None = None
+
+
+def _framework_cve() -> dict:
+    """Load + cache the framework → CVE/primitive REFERENCE map (data/framework-cve.yaml). Best-effort:
+    missing/malformed yields {} (no tech-intel annotations). Recon fires nothing from this — it is
+    pure context for the attack/AI layer."""
+    global _FW_CVE
+    if _FW_CVE is None:
+        import yaml
+        from pathlib import Path
+        p = Path(__file__).resolve().parent / "data" / "framework-cve.yaml"
+        try:
+            _FW_CVE = yaml.safe_load(p.read_text()) or {}
+        except Exception:
+            _FW_CVE = {}
+    return _FW_CVE
 
 # Notable DNS record types to surface (mail/provider/cert/network context); plain a/aaaa/cname/soa
 # are excluded — a/cname already live in resolved/review, aaaa/soa are low signal for a queue.
@@ -387,6 +407,20 @@ def collect(run, scope) -> dict:
             add("deser", _item("deser", r.get("value"), r.get("note") or "deserialization surface",
                 "medium", r.get("sources"), "normalized/review.jsonl",
                 [t for t in ("deser", r.get("format"), "attack-surface") if t]))
+
+    # framework CVE/primitive REFERENCE annotation — recon fires NOTHING from this; it hands the
+    # attack/AI layer "this tech is present → here's what's known to try" (provenance = the interface).
+    techblob = " ".join(str(t.get("tech", "")).lower() for t in run.read("tech"))
+    if techblob:
+        for name, spec in _framework_cve().items():
+            if not isinstance(spec, dict) or not any(
+                    str(m).lower() in techblob for m in (spec.get("match") or [])):
+                continue
+            intel = [str(x) for x in (spec.get("intel") or [])]
+            add("tech-intel", _item("tech-intel", name,
+                "known primitives (attack-layer reference): " + "; ".join(intel[:6]),
+                "low", ["framework-fingerprint"], "normalized/tech.jsonl",
+                ["tech-intel", name, "reference"]))
 
     for d in run.read("dns_record"):                # notable DNS context (mail/provider/cert/network)
         t = d.get("type")

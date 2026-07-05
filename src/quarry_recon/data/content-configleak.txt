@@ -1,0 +1,65 @@
+# Curated high-signal config / secret / VCS / dangerous-endpoint paths — ALWAYS merged into the
+# content-discovery fuzz (any tier) so these are checked even on a `light` sweep. Bare paths (no
+# leading slash — ffuf fuzzes {url}/FUZZ). A 200 here is picked up by the exposed-file fetch+mine
+# chain in the params phase. Map-don't-exploit: discovery only. Source: TBHM cheatsheet §7 + §10.
+# env / secrets
+.env
+.env.local
+.env.production
+.env.dev
+.env.staging
+.env.backup
+.env.example
+config/master.key
+config/credentials.yml.enc
+config/database.yml
+config/secrets.yml
+storage/logs/laravel.log
+application.properties
+application.yml
+application-prod.yml
+bootstrap.yml
+appsettings.json
+appsettings.Production.json
+appsettings.Development.json
+web.config
+settings.py
+local_settings.py
+config.php
+wp-config.php
+wp-config.php.bak
+configuration.php
+sites/default/settings.php
+# VCS / build / backup leaks
+.git/config
+.git/HEAD
+.git/index
+.git/logs/HEAD
+.svn/entries
+.svn/wc.db
+.hg/hgrc
+.DS_Store
+.npmrc
+.pypirc
+.dockerignore
+Dockerfile
+docker-compose.yml
+.vscode/settings.json
+.idea/workspace.xml
+backup.zip
+backup.sql
+backup.tar.gz
+dump.sql
+db.sql
+database.sql
+.bash_history
+id_rsa
+# api schema / docs
+swagger.json
+openapi.json
+openapi.yaml
+v3/api-docs
+api-docs
+swagger/v1/swagger.json
+graphql
+graphiql

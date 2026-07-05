@@ -44,6 +44,33 @@ def _wordlist(ctx, tier: str) -> Path | None:
     return None
 
 
+def _configleak_words() -> list[str]:
+    """Shipped curated high-signal config/secret/VCS/dangerous-endpoint paths (bare, ffuf FUZZ)."""
+    try:
+        data = resources.files("quarry_recon.data").joinpath("content-configleak.txt").read_text()
+    except Exception:
+        return []
+    return [w.strip() for w in data.splitlines() if w.strip() and not w.startswith("#")]
+
+
+def _merged_wordlist(ctx, wl: Path) -> Path:
+    """Union the tier wordlist with the always-on config-leak list (dedup, order-preserving), so the
+    high-signal secret/config paths are checked on EVERY content run regardless of tier."""
+    extra = _configleak_words()
+    if not extra:
+        return wl
+    seen: set[str] = set()
+    words: list[str] = []
+    for w in extra + wl.read_text().splitlines():        # config-leak first (checked even if capped)
+        w = w.strip()
+        if w and not w.startswith("#") and w not in seen:
+            seen.add(w)
+            words.append(w)
+    merged = ctx.tmp("content-fuzz.txt")
+    merged.write_text("\n".join(words) + "\n")
+    return merged
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
     tier = prof.content_discovery
@@ -58,6 +85,7 @@ def run(ctx) -> None:
         ctx.run.record("content", skipped(
             "ffuf", f"no '{tier}' wordlist (~/.config/quarry/wordlists/content/{tier}.txt)"))
         return
+    wl = _merged_wordlist(ctx, wl)                        # +config-leak quick-hunt (always merged)
 
     # candidates: live + in-scope + active-allowed; origin (non-CDN) first; capped
     cand = [l for l in ctx.run.read("live")

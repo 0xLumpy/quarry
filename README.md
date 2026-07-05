@@ -233,11 +233,11 @@ setsid nohup quarry run -t acme.com > run.log 2>&1 & disown
 | **horizontal** | ASN/CIDR confirm, kaeferjaeger SNI dataset, tlsx SAN (443/8443/4443), reverse DNS, CSP-recon, **Caduceus ASN→cert**, **S3/GCS cloud-bucket candidates (verify-ownership)** | mapcidr, tlsx, dnsx, asnmap, csprecon, caduceus |
 | **vertical** | passive scrape (`-stats`) + GitHub + Shodan + **direct CT logs (crt.sh + certspotter + Censys)** + DNS brute + **recursive word-cloud permutation→resolve loop** (alterx `-enrich -mode both`, converges) + **CNAME collect** | subfinder, github-subdomains, shosubgo, crt.sh, certspotter, censys, puredns, alterx, dnsx |
 | **dns** | DNS-record enrichment over resolved in-scope hosts — **A/AAAA/CNAME/MX/NS/TXT/SOA/CAA + ASN/CDN** as first-class `dns_record` entities (context, not re-discovery; puredns kept for brute/validate) | dnsx |
-| **probe** | HTTP fingerprint (full methodology flag set), CDN/origin tag, **CSP-sibling discovery (response headers)**, **tlsx cert SAN harvest (sibling hosts) + `certificate` context**, **Shodan favicon-hash + cert-fingerprint pivots (related hosts)**, **vhost enumeration (ffuf Host-fuzz over origin IPs)**, screenshots, **naabu → nmap -sV**, passive smap | httpx, tlsx, ffuf, cdncheck, gowitness, naabu, nmap, smap |
+| **probe** | HTTP fingerprint (full methodology flag set), CDN/origin tag, **CSP-sibling discovery (response headers)**, **tlsx cert SAN harvest (sibling hosts) + `certificate` context**, **Shodan favicon-hash + cert-fingerprint pivots (related hosts)**, **vhost enumeration (ffuf Host-fuzz over origin IPs)**, **deserialization/token fingerprint (Set-Cookie + headers)**, screenshots, **naabu → nmap -sV**, passive smap | httpx, tlsx, ffuf, cdncheck, gowitness, naabu, nmap, smap |
 | **crawl** | active crawl (+headless SPA, stored responses), archive URLs, JS download/mine + redacted secret scan, **waymore `-mode B` + xnLinkFinder over responses**, link-discovered host promotion | katana, gau, waymore, jsluice, xnLinkFinder, gitleaks, trufflehog |
 | **enrich** | catch-up over hosts found *after* probe (crawl links, CSP siblings): resolve, **dangling-CNAME takeover**, HTTP fingerprint, WAF, screenshots, smap | dnsx, httpx, nuclei, gowitness, smap |
-| **content** | candidate-driven path/dir discovery (**off by default**; light/balanced/deep + capped recursion) over live in-scope hosts, autocalibrated against catch-alls | ffuf |
-| **params** | gf vuln-class buckets, param discovery, non-intrusive scan + OOB, **subdomain takeover**, reflected XSS/redirect, and **evidence extraction** (fetch exposed files → secrets, GraphQL introspection, actuator interrogation, OpenAPI parse, SSTI confirm) | gf, arjun, nuclei (interactsh + takeover), dalfox |
+| **content** | candidate-driven path/dir discovery (**off by default**; light/balanced/deep + capped recursion) over live in-scope hosts, autocalibrated against catch-alls, **always merges a curated config-leak/secret-path quick-hunt list** | ffuf |
+| **params** | gf vuln-class buckets, param discovery, non-intrusive scan + OOB, **subdomain takeover**, reflected XSS/redirect, and **evidence extraction** (fetch exposed files → secrets, GraphQL introspection, actuator interrogation, **tech-conditional framework debug/admin endpoint probe**, OpenAPI parse, SSTI confirm) | gf, arjun, nuclei (interactsh + takeover), dalfox |
 
 Raw tool output is preserved before parsing; normalized results keep provenance so any result
 traces back to the tool and raw file that produced it.
@@ -274,9 +274,11 @@ on `quarry init`. Keys + wordlists stay global in `~/.config/quarry/`.)
 auth/api/admin/file buckets, IDOR/SSRF/SQLi/XSS param candidates (common-vuln lists), secrets,
 gf/sourcemap queues, subdomain-takeover candidates, and tagged surface classes. **`digest.json`**
 is the same content in structured, redacted JSON with first-class **evidence queues** (graphql
-introspection, actuator exposure, websocket/api-base endpoints, SSTI, api-doc, auth-flow) — every
-item carries provenance and a raw-evidence reference; secret values are previews only and sensitive
-URL parameters (tokens, OAuth `code`/`state`, …) are masked.
+introspection, actuator exposure, websocket/api-base endpoints, SSTI, api-doc, auth-flow, framework
+**debug**-endpoint exposure, **deser**ialization/token fingerprints, **vhost** candidates, and a
+**tech-intel** reference of known CVEs/primitives per fingerprinted framework — the attack-layer
+handoff) — every item carries provenance and a raw-evidence reference; secret values are previews
+only and sensitive URL parameters (tokens, OAuth `code`/`state`, …) are masked.
 
 ## Anti-thin-output checks
 

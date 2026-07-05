@@ -1,0 +1,94 @@
+# Framework → notable CVEs / bug-class primitives.
+#
+# REFERENCE data for the attack + AI layers. When a framework is fingerprinted on a target, recon
+# ANNOTATES it in the digest (`tech-intel` queue) so the attack layer knows what to try. Recon itself
+# fires NOTHING from this file — it is pure context/provenance (the recon↔attack interface).
+#
+# `match` = case-insensitive substrings tested against the host's httpx tech fingerprints.
+# Source: TBHM Framework Cheatsheet §1-9 (docs/reference/framework-cheatsheet.html).
+
+spring:
+  match: [spring]
+  intel:
+    - "CVE-2022-22965 Spring4Shell — data-binding + SpEL RCE"
+    - "CVE-2022-22963 Spring Cloud Function SpEL RCE"
+    - "CVE-2021-44228 Log4Shell"
+    - "exposed H2 console = RCE; /actuator/env→/refresh property-override RCE chain"
+    - "Jackson polymorphic deserialization gadgets"
+
+laravel:
+  match: [laravel]
+  intel:
+    - "CVE-2021-3129 Ignition <2.5.2 RCE (debug mode)"
+    - "CVE-2018-15133 unserialize via APP_KEY leak = RCE"
+    - "APP_KEY leak → session forgery + RCE; .env exposure rampant"
+    - "DB::raw()/whereRaw() SQLi; Telescope/Debugbar exposed in prod"
+
+django:
+  match: [django]
+  intel:
+    - "CVE-2022-34265 SQLi via Trunc/Extract; CVE-2021-35042 order_by SQLi"
+    - "CVE-2019-19844 account takeover via password reset"
+    - "DEBUG=True exposes SECRET_KEY/settings; pickle session + SECRET_KEY leak = RCE"
+
+flask:
+  match: [flask, werkzeug]
+  intel:
+    - "Werkzeug debugger PIN bypass (predict from /etc/machine-id, uid, mac)"
+    - "Jinja2 SSTI via render_template_string(user_input)"
+    - "SECRET_KEY leak = session forgery; pickle session backend + key leak = RCE"
+
+rails:
+  match: [ruby on rails, rails]
+  intel:
+    - "CVE-2019-5418 file content disclosure via Accept header"
+    - "CVE-2013-0156 XML/YAML param parsing RCE; CVE-2022-32224 Marshal session"
+    - "mass assignment; YAML.load/Marshal.load RCE; config/master.key = full decrypt"
+    - "ActiveRecord raw SQLi in .where/.order/.find_by_sql; ERB.new(input).result SSTI"
+
+nextjs:
+  match: [next.js, nextjs]
+  intel:
+    - "CVE-2025-29927 middleware auth bypass via x-middleware-subrequest header"
+    - "CVE-2024-34351 SSRF via Server Actions; CVE-2020-5284 path traversal"
+    - "/_next/image SSRF; NEXT_PUBLIC_* env leak to client"
+
+aspnet:
+  match: [asp.net, kestrel]
+  intel:
+    - "CVE-2023-36558 Razor auth bypass"
+    - "ViewState/BinaryFormatter deserialization RCE (MAC-disabled)"
+    - "CORS AllowAnyOrigin+AllowCredentials; missing [Authorize] on endpoints"
+
+fastapi:
+  match: [fastapi, uvicorn]
+  intel:
+    - "no built-in CSRF (cookie-auth vulnerable); missing Depends(auth) per route"
+    - "JWT bugs (alg:none, weak secret); raw SQL via SQLAlchemy text(); async SSRF via httpx"
+
+symfony:
+  match: [symfony]
+  intel:
+    - "exposed /_profiler/ in prod = full compromise"
+    - "CVE-2021-21424 request smuggling; CVE-2019-10912 PhpBridge deserialization"
+    - "Twig SSTI; /_fragment with _controller (unsigned) = RCE"
+
+struts:
+  match: [struts, apache struts]
+  intel:
+    - "CVE-2017-5638 (Equifax) Content-Type OGNL RCE; CVE-2018-11776 namespace OGNL RCE"
+    - "CVE-2017-9805 REST plugin XStream deserialization; CVE-2023-50164 upload path-traversal RCE"
+    - "OGNL injection is the signature vuln — param names/Content-Type/namespace vectors"
+
+coldfusion:
+  match: [coldfusion]
+  intel:
+    - "CVE-2023-26360 access-control bypass + RCE; CVE-2013-0632 admin API auth bypass"
+    - "CVE-2010-2861 admin LFI → password disclosure (null byte)"
+    - "SSRF via <cfhttp>; SQLi via <cfquery> (cfqueryparam is opt-in)"
+
+nuxt:
+  match: [nuxt]
+  intel:
+    - "runtimeConfig.public leak of sensitive values; SSR SSRF via server/api/*"
+    - "CSRF on server routes (no default protection); @nuxt/content query injection"
