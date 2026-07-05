@@ -102,6 +102,29 @@ def dnsx_records(raw: str, source: str, raw_ref: str | None = None) -> Iterator[
                    "value": str(cdn), **_prov(source, raw_ref)}
 
 
+def tlsx_certs(raw: str, source: str, raw_ref: str | None = None) -> Iterator[dict]:
+    """tlsx -json lines -> certificate entities (host/cn/san/issuer/expiry/serial/wildcard)."""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        host = (o.get("host") or "").lower().rstrip(".")
+        if not host:
+            continue
+        san = [s.lower().rstrip(".") for s in (o.get("subject_an") or []) if s]
+        port = str(o.get("port") or "443")
+        yield {"id": f"{host}:{port}", "host": host, "port": port,
+               "cn": o.get("subject_cn"), "san": san,
+               "issuer": o.get("issuer_cn"), "issuer_org": o.get("issuer_org") or [],
+               "not_after": o.get("not_after"), "serial": o.get("serial"),
+               "wildcard": any(s.startswith("*.") for s in san),
+               **_prov(source, raw_ref)}
+
+
 def httpx_json(raw: str, source: str, raw_ref: str | None = None) -> Iterator[dict]:
     """httpx -json lines -> live service entities (the probe source of truth)."""
     for line in raw.splitlines():

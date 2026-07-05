@@ -71,6 +71,38 @@ def run(ctx) -> None:
         if csp_added:
             ctx.echo(f"  csp: +{csp_added} sibling host(s) from response headers")
 
+    # ── tlsx over in-scope hosts — cert SAN harvest (new sibling hostnames) + cert context ──
+    # tlsx is used in horizontal over IP RANGES; here it runs over the resolved HOST set: cert SANs
+    # reveal sibling hostnames we'd otherwise miss (coverage → enrich resolves/probes them), and the
+    # cert (cn/issuer/expiry/wildcard) is stored as first-class context (the `certificate` entity).
+    if have("tlsx"):
+        thosts = sorted(h for h in set(ctx.run.values("resolved"))
+                        if h and scope.in_scope(h) and not scope.is_oos(h))
+        if thosts:
+            tf = ctx.write_list("tls_targets.txt", thosts)
+            tr = ctx.run.raw_path("probe", "tlsx", "certs.jsonl")
+            r = exec_tool("tlsx", ["tlsx", "-l", str(tf), "-p", "443,8443,4443",
+                                   "-json", "-silent"], raw_path=tr, timeout=ctx.http_timeout)
+            ctx.run.record("probe", r)
+            san_new = 0
+            if r.raw_path and r.raw_path.exists():
+                for c in normalize.tlsx_certs(r.raw_path.read_text(), "tlsx", str(tr)):
+                    all_san = c.get("san") or []
+                    # scope-safe normalized entity: keep only in-scope SANs (shared/CDN/vendor certs
+                    # carry unrelated names). Full SAN list stays in raw via raw_ref. Context counts.
+                    in_scope_san = [s for s in all_san if scope.in_scope(s) and not scope.is_oos(s)]
+                    c["san"] = in_scope_san
+                    c["san_count"] = len(all_san)
+                    c["oos_san_count"] = len(all_san) - len(in_scope_san)
+                    c["has_oos_sans"] = c["oos_san_count"] > 0
+                    ctx.run.add("certificate", c)
+                    for s in in_scope_san:                     # in-scope SANs → new hosts (coverage)
+                        if not s.startswith("*.") and ctx.run.add(
+                                "subdomain", {"host": s, "sources": ["tlsx-san"]}):
+                            san_new += 1
+            if san_new:
+                ctx.echo(f"  tlsx: +{san_new} sibling host(s) from cert SANs")
+
     # ── WAF fingerprint (nuclei waf-detect templates over live hosts) ──
     # Recon-side only: identify WHICH WAF fronts each host (Cloudflare/Akamai/F5…).
     # Bypass tooling (nomore403/nowafpls/NewTowner) stays human/Burp work.
