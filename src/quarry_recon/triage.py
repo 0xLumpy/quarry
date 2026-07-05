@@ -37,17 +37,41 @@ def _dns_preview(value: str) -> str:
     return value if len(value) <= _DNS_PREVIEW_MAX else value[:_DNS_PREVIEW_MAX] + "…"
 
 
-def _txt_tags(value: str) -> list[str]:
+# TXT intelligence — map a needle in the TXT value to the org's provider/vendor (SPF includes +
+# domain-verification tokens). OSINT pivots: which SaaS/mail/cloud a target actually uses.
+_TXT_PROVIDERS = [
+    ("_spf.google.com", "google-workspace"), ("google-site-verification", "google"),
+    ("spf.protection.outlook.com", "microsoft-365"), ("ms=", "microsoft"),
+    ("amazonses.com", "amazon-ses"), ("_amazonses", "amazon-ses"),
+    ("sendgrid.net", "sendgrid"), ("mailgun.org", "mailgun"), ("spf.mandrillapp.com", "mailchimp"),
+    ("_spf.salesforce.com", "salesforce"), ("zoho.com", "zoho"), ("pardot", "pardot"),
+    ("facebook-domain-verification", "facebook"), ("atlassian-domain-verification", "atlassian"),
+    ("stripe-verification", "stripe"), ("adobe-idp-site-verification", "adobe"),
+    ("docusign", "docusign"), ("apple-domain-verification", "apple"),
+    ("cisco-ci-domain-verification", "cisco"), ("citrix-verification-code", "citrix"),
+]
+
+
+def _txt_intel(value: str) -> list[str]:
+    """Structured OSINT tags from a TXT record: mail-auth (spf/dmarc + policy), dkim, verification,
+    and provider/vendor pivots (from SPF includes + verification tokens)."""
     v = value.lower()
+    tags: list[str] = []
     if v.startswith("v=spf"):
-        return ["spf"]
+        tags.append("spf")
     if v.startswith("v=dmarc"):
-        return ["dmarc"]
+        tags.append("dmarc")
+        m = re.search(r"\bp=(none|quarantine|reject)\b", v)
+        if m:
+            tags.append(f"dmarc-policy:{m.group(1)}")
     if "domainkey" in v or "dkim" in v:
-        return ["dkim"]
+        tags.append("dkim")
     if "site-verification" in v or "verification=" in v or "-verification" in v:
-        return ["verification"]
-    return []
+        tags.append("verification")
+    for needle, prov in _TXT_PROVIDERS:
+        if needle in v:
+            tags.append(f"provider:{prov}")
+    return list(dict.fromkeys(tags))               # dedup, keep order
 # Reserved keys — present from M2.1 so the schema is stable, filled by tag-only classifiers
 # in M2.2 (api-doc/oauth-jwt/cloud/mobile).
 PLACEHOLDER_QUEUES = ["api-doc", "oauth-jwt", "cloud", "mobile"]
@@ -339,7 +363,7 @@ def collect(run, scope) -> dict:
         if t not in NOTABLE_DNS_TYPES:
             continue
         val = str(d.get("value", ""))
-        tags = ["dns", t] + (_txt_tags(val) if t == "txt" else [])   # tag from the FULL value
+        tags = ["dns", t] + (_txt_intel(val) if t == "txt" else [])   # tag from the FULL value
         add("dns", _item("dns", f"{d.get('host')} · {t}={_dns_preview(val)}", f"{t} record (DNS context)",
             "low", d.get("sources"), "normalized/dns_record.jsonl", tags))
 
