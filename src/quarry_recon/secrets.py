@@ -100,7 +100,7 @@ def github_tokens_file() -> Path | None:
 def values() -> list[str]:
     """Every secret value, for redaction. Only values long enough to be real keys."""
     vals = list(github_tokens())
-    for getter in (shodan, whoxy, chaos):
+    for getter in (shodan, whoxy, chaos, certspotter):
         v = getter()
         if v:
             vals.append(v)
