@@ -34,7 +34,7 @@ confirm and copy the good ones into `APEX_DOMAINS` yourself, then run recon.
 | **DMARC** (`dig _dmarc`) | related apexes via `rua`/`ruf` (3rd-party processors flagged) | no | — |
 | **whoxy** reverse-whois | sibling apexes by registrant email | **yes** | `secrets.yaml` → `whoxy:` |
 | **porch-pirate** | public Postman API endpoints/secrets | no | — |
-| (vertical) **github-subdomains** / **shosubgo** | github / shodan subdomains | **yes** | `secrets.yaml` → `github:` · `shodan:` |
+| (vertical) **github-subdomains** / **shosubgo** | github subdomains · shodan (shosubgo + probe favicon-hash pivot) | **yes** | `secrets.yaml` → `github:` · `shodan:` |
 | (vertical) **subfinder** sources | passive subdomains | **yes (many)** | `~/.config/subfinder/provider-config.yaml` |
 
 Add keys to `~/.config/quarry/secrets.yaml` and `quarry doctor` will show them as set. No key = that
