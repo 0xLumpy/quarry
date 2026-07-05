@@ -22,7 +22,7 @@ very little and gives no useful reason why. Every result is:
 OSINT pre-flight, the full recon run (**eight phases** including DNS-record enrichment, late-host
 enrichment, and candidate-driven content discovery), active **evidence extraction** (exposed-file secret pull,
 GraphQL introspection, actuator interrogation, OpenAPI parsing, SSTI confirmation), enrichment
-across the pipeline (**DNS records, TLS certs/SANs, CT logs, favicon-hash + cloud-bucket candidates**),
+across the pipeline (**DNS records, TLS certs/SANs, CT logs, favicon + cert-fingerprint pivots, cloud-bucket + vhost candidates**),
 a structured JSONL store, exports, reports, a redacted structured **digest** with first-class evidence queues,
 runtime telemetry, `doctor` readiness + opt-in notifications, and checkpointing — all wired and
 verified end-to-end against a purpose-built test range. Scale/reliability (resumable/parallel runs)
@@ -37,7 +37,7 @@ where a human should look harder:
 - auth / API / admin / upload / file / export surfaces
 - IDOR / SSRF / SQLi / XSS / redirect / SSTI parameter queues
 - source-map candidates · JavaScript endpoints and secrets
-- DNS context (MX/NS/TXT-SPF/DMARC/CAA/ASN) · cert SANs · cloud-bucket + related-host candidates (**verify-ownership**)
+- DNS context (MX/NS/TXT-SPF/DMARC/CAA/ASN) · cert SANs · cloud-bucket + related-host + vhost candidates (**verify-ownership**)
 - scanner candidates — always marked **unconfirmed**
 
 Scope stays fixed: horizontal findings on owned IP space are recorded as review candidates,
@@ -109,8 +109,9 @@ to tools itself. `quarry doctor` shows which are set. Back up before editing:
 | Key | Used by |
 |-----|---------|
 | `github` (list) | github-subdomains — use burner PATs |
-| `shodan` | shosubgo, favicon-hash pivot |
+| `shodan` | shosubgo, favicon-hash + cert-fingerprint pivots |
 | `certspotter` | extra CT-log subdomains (optional — free tier keyless) |
+| `censys` | extra CT-log subdomains via Censys Platform (advanced/optional — silent unless `token`+`org` set) |
 | `whoxy` | osint reverse-whois |
 | `projectdiscovery` | exported as `PDCP_API_KEY` (chaos) for subfinder, asnmap, … |
 | `notify` | opt-in run notifications (Slack/Discord/Telegram/webhook) — off by default; `quarry notify --test` |
@@ -230,9 +231,9 @@ setsid nohup quarry run -t acme.com > run.log 2>&1 & disown
 | Phase | Does | Key tools |
 |-------|------|-----------|
 | **horizontal** | ASN/CIDR confirm, kaeferjaeger SNI dataset, tlsx SAN (443/8443/4443), reverse DNS, CSP-recon, **Caduceus ASN→cert**, **S3/GCS cloud-bucket candidates (verify-ownership)** | mapcidr, tlsx, dnsx, asnmap, csprecon, caduceus |
-| **vertical** | passive scrape (`-stats`) + GitHub + Shodan + **direct CT logs (crt.sh + certspotter)** + DNS brute + **recursive word-cloud permutation→resolve loop** (alterx `-enrich -mode both`, converges) + **CNAME collect** | subfinder, github-subdomains, shosubgo, crt.sh, certspotter, puredns, alterx, dnsx |
+| **vertical** | passive scrape (`-stats`) + GitHub + Shodan + **direct CT logs (crt.sh + certspotter + Censys)** + DNS brute + **recursive word-cloud permutation→resolve loop** (alterx `-enrich -mode both`, converges) + **CNAME collect** | subfinder, github-subdomains, shosubgo, crt.sh, certspotter, censys, puredns, alterx, dnsx |
 | **dns** | DNS-record enrichment over resolved in-scope hosts — **A/AAAA/CNAME/MX/NS/TXT/SOA/CAA + ASN/CDN** as first-class `dns_record` entities (context, not re-discovery; puredns kept for brute/validate) | dnsx |
-| **probe** | HTTP fingerprint (full methodology flag set), CDN/origin tag, **CSP-sibling discovery (response headers)**, **tlsx cert SAN harvest (sibling hosts) + `certificate` context**, **Shodan favicon-hash pivot (related hosts)**, screenshots, **naabu → nmap -sV**, passive smap | httpx, tlsx, cdncheck, gowitness, naabu, nmap, smap |
+| **probe** | HTTP fingerprint (full methodology flag set), CDN/origin tag, **CSP-sibling discovery (response headers)**, **tlsx cert SAN harvest (sibling hosts) + `certificate` context**, **Shodan favicon-hash + cert-fingerprint pivots (related hosts)**, **vhost enumeration (ffuf Host-fuzz over origin IPs)**, screenshots, **naabu → nmap -sV**, passive smap | httpx, tlsx, ffuf, cdncheck, gowitness, naabu, nmap, smap |
 | **crawl** | active crawl (+headless SPA, stored responses), archive URLs, JS download/mine + redacted secret scan, **waymore `-mode B` + xnLinkFinder over responses**, link-discovered host promotion | katana, gau, waymore, jsluice, xnLinkFinder, gitleaks, trufflehog |
 | **enrich** | catch-up over hosts found *after* probe (crawl links, CSP siblings): resolve, **dangling-CNAME takeover**, HTTP fingerprint, WAF, screenshots, smap | dnsx, httpx, nuclei, gowitness, smap |
 | **content** | candidate-driven path/dir discovery (**off by default**; light/balanced/deep + capped recursion) over live in-scope hosts, autocalibrated against catch-alls | ffuf |
@@ -323,9 +324,10 @@ Start with `quarry doctor`. Common issues:
 ## Roadmap
 
 Shipped since first version: content discovery, OpenAPI/Swagger parsing, the evidence-extraction
-layer, the redacted digest contract, runtime telemetry, and `doctor` readiness. Next:
+layer, the redacted digest contract, runtime telemetry, `doctor` readiness, vhost enumeration, and
+Censys / cert-fingerprint pivots. Next:
 
 - scale / reliability — resumable runs · selective retry · parallel workers · per-tool job state
 - the attack/AI layer — consume the digest, prove primitives (human-in-loop)
-- code-host intelligence (scan-at-depth, no clone) · 403-bypass mapping · vhost enumeration
+- code-host intelligence (scan-at-depth, no clone) · 403-bypass mapping
 - SQLite/DuckDB query layer over the JSONL store · gungnir continuous CT monitoring

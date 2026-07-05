@@ -34,11 +34,12 @@ confirm and copy the good ones into `APEX_DOMAINS` yourself, then run recon.
 | **DMARC** (`dig _dmarc`) | related apexes via `rua`/`ruf` (3rd-party processors flagged) | no | — |
 | **whoxy** reverse-whois | sibling apexes by registrant email | **yes** | `secrets.yaml` → `whoxy:` |
 | **porch-pirate** | public Postman API endpoints/secrets | no | — |
-| (vertical) **github-subdomains** / **shosubgo** | github subdomains · shodan (shosubgo + probe favicon-hash pivot) | **yes** | `secrets.yaml` → `github:` · `shodan:` |
+| (vertical) **github-subdomains** / **shosubgo** | github subdomains · shodan (shosubgo + probe favicon-hash + cert-fingerprint pivots) | **yes** | `secrets.yaml` → `github:` · `shodan:` |
 | (vertical) **subfinder** sources | passive subdomains | **yes (many)** | `~/.config/subfinder/provider-config.yaml` |
 
-Add keys to `~/.config/quarry/secrets.yaml` and `quarry doctor` will show them as set. No key = that
-source is skipped (recorded, not silent).
+Add keys to `~/.config/quarry/secrets.yaml` and `quarry doctor` will show them as set. No key =
+normal sources are skipped and **recorded** (visible, not silent); advanced opt-ins (Censys,
+OpenINTEL) are **silent** when unset by design — no skip line, no doctor entry until configured.
 
 **Still manual** (no good automation — judgment/login/paywall; do these by hand, then add to
 the profile): bgp.he.net ASN search, ARIN/RIPE full-text, Crunchbase/Tracxn/Pitchbook/OCCRP
@@ -87,6 +88,8 @@ but manual passes find more on big orgs.)
   ```
 - Caduceus (ASN/CIDR → live cert scan): `github.com/g0ldencybersec/Caduceus`
 - https://www.merklemap.com (CT search engine; has a CLI + live-domains API)
+- https://platform.censys.io (Censys Platform cert search — the framework can query this in the
+  vertical phase; set `censys: {token, org}` in `secrets.yaml`, advanced/optional)
 
 **6. DMARC, reverse-IP, ad/analytics, CSP.**
 - DMARC shared records: https://dmarcly.com/tools/dmarc-checker + `github.com/Tedixx/dmarc-subdomains`

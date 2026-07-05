@@ -177,6 +177,10 @@ def doctor(phase):
         ok_oi = (shutil.which(oi["binary"]) or Path(oi["binary"]).is_file()) and Path(oi["db"]).is_file()
         click.echo(f"  {_c('✓' if ok_oi else '✗', 'green' if ok_oi else 'red')} "
                    f"openintel-subs (advanced) {oi['db']}")
+    # Censys Platform — ADVANCED opt-in; shown ONLY when configured (silent otherwise, by design)
+    cen = secrets.censys()
+    if cen.get("token") and cen.get("org"):
+        click.echo(f"  {_c('✓', 'green')} censys (advanced)          Platform cert search")
 
     # notify — opt-in run notifications (off unless secrets.yaml notify: is set)
     from . import notify as _notify

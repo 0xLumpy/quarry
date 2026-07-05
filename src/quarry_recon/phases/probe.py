@@ -8,35 +8,34 @@ optional smap passive (Shodan-backed) port scan.
 from __future__ import annotations
 
 import json as _json
+import re as _re
+import urllib.parse
 import urllib.request
 
 from .. import normalize, secrets
 from ..runner import Status, have, run as exec_tool, skipped
 
 
-def _favicon_pivot(ctx) -> None:
-    """Shodan favicon-hash pivot: httpx already computed each live host's favicon mmh3 hash; search
-    Shodan `http.favicon.hash:<h>` for hosts serving the SAME favicon → related infrastructure.
-    In-scope matches become subdomains (coverage); off-scope matches are related-host candidates
-    (verify-ownership). Key-gated (silent without a shodan key); generic favicons (huge result count)
-    are skipped to avoid collision noise. Passive OSINT query — no target contact."""
-    key = secrets.shodan()
-    if not key:
-        return
+def _shodan_pivot(ctx, key, values, facet, source, label, note) -> int:
+    """Generic Shodan search pivot: for each value, query `<facet>:<value>` and turn the matching
+    hosts' hostnames into in-scope subdomains (coverage) or bounded off-scope related-host review
+    candidates (verify-ownership). Generic collisions (huge result count) are skipped as noise, and
+    each pivot is bounded. `label`/`note` are `{}`-formatted with the value for provenance/context.
+    Returns the count of new in-scope subdomains. Passive OSINT query — no target contact."""
     scope = ctx.scope
-    hashes = sorted({str(l.get("favicon")) for l in ctx.run.read("live") if l.get("favicon")})[:20]
     new_sub = 0
-    for h in hashes:
+    for v in sorted({str(x) for x in values if x})[:20]:
         try:
-            url = f"https://api.shodan.io/shodan/host/search?key={key}&query=http.favicon.hash:{h}"
+            url = (f"https://api.shodan.io/shodan/host/search?key={key}"
+                   f"&query={urllib.parse.quote(f'{facet}:{v}')}")
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = _json.loads(r.read(4 * 1024 * 1024).decode("utf-8", "replace"))
         except Exception:
             continue
-        if (data.get("total") or 0) > 200:              # too-generic favicon → skip (collision noise)
+        if (data.get("total") or 0) > 200:              # too-generic → skip (collision noise)
             continue
-        raw = ctx.run.raw_path("probe", "favicon", f"{h}.json")
+        raw = ctx.run.raw_path("probe", label, f"{_re.sub(r'[^A-Za-z0-9]', '_', v)[:32]}.json")
         raw.write_text(_json.dumps(data.get("matches") or [])[:2 * 1024 * 1024])
         oos = 0
         for m in (data.get("matches") or [])[:100]:
@@ -45,16 +44,113 @@ def _favicon_pivot(ctx) -> None:
                 if not hn or "." not in hn:
                     continue
                 if scope.in_scope(hn) and not scope.is_oos(hn):
-                    if ctx.run.add("subdomain", {"host": hn, "sources": ["favicon-shodan"],
+                    if ctx.run.add("subdomain", {"host": hn, "sources": [source],
                                                  "raw_ref": str(raw)}):
                         new_sub += 1
                 elif oos < 15:                          # bounded off-scope related-host candidates
-                    if ctx.run.add("review", {"id": f"favicon:{h}:{hn}", "klass": "related-host",
-                            "value": hn, "note": f"same favicon (hash {h}) as an in-scope host — VERIFY OWNERSHIP",
-                            "sources": ["favicon-shodan"], "raw_ref": str(raw)}):
+                    if ctx.run.add("review", {"id": f"{label}:{v}:{hn}", "klass": "related-host",
+                            "value": hn, "note": note.format(v), "sources": [source],
+                            "raw_ref": str(raw)}):
                         oos += 1
-    if new_sub:
-        ctx.echo(f"  favicon: +{new_sub} in-scope host(s) via Shodan favicon-hash pivot")
+    return new_sub
+
+
+def _favicon_pivot(ctx) -> None:
+    """Shodan favicon-hash pivot: httpx already computed each live host's favicon mmh3 hash; search
+    Shodan `http.favicon.hash:<h>` for hosts serving the SAME favicon → related infrastructure.
+    Key-gated (silent without a shodan key)."""
+    key = secrets.shodan()
+    if not key:
+        return
+    n = _shodan_pivot(ctx, key,
+                      (l.get("favicon") for l in ctx.run.read("live") if l.get("favicon")),
+                      "http.favicon.hash", "favicon-shodan", "favicon",
+                      "same favicon (hash {}) as an in-scope host — VERIFY OWNERSHIP")
+    if n:
+        ctx.echo(f"  favicon: +{n} in-scope host(s) via Shodan favicon-hash pivot")
+
+
+def _cert_pivot(ctx) -> None:
+    """Shodan cert-fingerprint pivot (karma-style): tlsx recorded each cert's SHA1 fingerprint;
+    search Shodan `ssl.cert.fingerprint:<sha1>` for hosts presenting the SAME leaf certificate →
+    shared/related infrastructure. Key-gated (silent without a shodan key)."""
+    key = secrets.shodan()
+    if not key:
+        return
+    n = _shodan_pivot(ctx, key,
+                      (c.get("sha1") for c in ctx.run.read("certificate") if c.get("sha1")),
+                      "ssl.cert.fingerprint", "cert-shodan", "cert",
+                      "same TLS cert (sha1 {}) as an in-scope host — VERIFY OWNERSHIP")
+    if n:
+        ctx.echo(f"  cert: +{n} in-scope host(s) via Shodan cert-fingerprint pivot")
+
+
+def _vhost_wordlist():
+    """Locate a DEDICATED vhost wordlist (small, label-per-line). We deliberately do NOT fall back to
+    the big DNS brute list — vhost fuzzing is IPs×apexes×words, so an unbounded list is a footgun.
+    None → the step records a skip (opt-in by dropping a list at one of these paths)."""
+    from pathlib import Path
+    home = Path.home()
+    for p in (home / ".config/quarry/vhost-wordlist.txt",
+              home / "wordlists/vhosts.txt", home / "wordlists/subdomains-top1million-5000.txt"):
+        if p.exists():
+            return p
+    return None
+
+
+def _vhost_enum(ctx) -> None:
+    """Virtual-host enumeration (ffuf `-H 'Host: FUZZ.<apex>'`): a single origin IP frequently serves
+    name-based vhosts that DON'T resolve in public DNS (staging/internal/legacy/pre-prod). For each
+    in-scope **origin** IP (from live services NOT behind a CDN — fuzzing a shared CDN edge is noise),
+    fuzz Host headers against `http://<ip>/`, autocalibrated (`-ac`) to drop the catch-all/default
+    response. Hits are hostnames the origin answers for → `vhost` review candidates (a 200 isn't proof
+    the name exists in DNS or is owned — human verifies). Active; needs ffuf + a dedicated vhost list."""
+    if not have("ffuf"):
+        return
+    wl = _vhost_wordlist()
+    if wl is None:
+        ctx.run.record("probe", skipped("ffuf-vhost",
+                       "no vhost wordlist (~/.config/quarry/vhost-wordlist.txt) — vhost enum skipped"))
+        return
+    scope, prof = ctx.scope, ctx.profile
+    # origin IPs: from live services not fronted by a CDN, in-scope only, bounded
+    origins = sorted({ip for l in ctx.run.read("live") if not l.get("cdn")
+                      for ip in (l.get("a") or []) if ip})[:25]
+    if not origins:
+        ctx.run.record("probe", skipped("ffuf-vhost", "no non-CDN origin IPs to fuzz"))
+        return
+    apexes = [a for a in prof.apex_domains if scope.in_scope(a)]
+    found = 0
+    for ip in origins:
+        for apex in apexes:
+            out = ctx.run.raw_path("probe", "ffuf-vhost", f"{ip}_{apex}.json")
+            cmd = ["ffuf", "-w", f"{wl}:FUZZ", "-H", f"Host: FUZZ.{apex}",
+                   "-u", f"http://{ip}/", "-ac", "-t", "40", "-s",
+                   "-mc", "200,204,301,302,307,401,403,405,500",
+                   "-o", str(out), "-of", "json"]
+            if prof.http_rl:
+                cmd += ["-rate", str(prof.http_rl)]
+            r = exec_tool("ffuf", cmd, timeout=ctx.http_timeout)
+            ctx.run.record("probe", r)
+            if not out.exists():
+                continue
+            try:
+                res = _json.loads(out.read_text()).get("results") or []
+            except Exception:
+                continue
+            for hit in res:
+                word = (hit.get("input") or {}).get("FUZZ") or ""
+                host = f"{word.lower().strip('.')}.{apex}" if word else ""
+                if not host or "." not in host or not scope.in_scope(host):
+                    continue
+                if ctx.run.add("review", {"id": f"vhost:{ip}:{host}", "klass": "vhost",
+                        "value": host, "host": host, "ip": ip,
+                        "status_code": hit.get("status"),
+                        "note": f"origin {ip} serves vhost {host} (may not resolve in DNS) — VERIFY",
+                        "sources": ["ffuf-vhost"], "raw_ref": str(out)}):
+                    found += 1
+    if found:
+        ctx.echo(f"  vhost: {found} name-based vhost candidate(s) on origin IPs (ffuf)")
 
 
 def run(ctx) -> None:
@@ -149,8 +245,12 @@ def run(ctx) -> None:
             if san_new:
                 ctx.echo(f"  tlsx: +{san_new} sibling host(s) from cert SANs")
 
-    # ── favicon-hash pivot (Shodan) — related hosts serving the same favicon (key-gated, silent) ──
+    # ── Shodan pivots (key-gated, silent): same favicon + same TLS cert fingerprint → related hosts ──
     _favicon_pivot(ctx)
+    _cert_pivot(ctx)
+
+    # ── virtual-host enumeration (ffuf Host-header fuzz over origin IPs; needs a vhost wordlist) ──
+    _vhost_enum(ctx)
 
     # ── WAF fingerprint (nuclei waf-detect templates over live hosts) ──
     # Recon-side only: identify WHICH WAF fronts each host (Cloudflare/Akamai/F5…).

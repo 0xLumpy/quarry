@@ -75,6 +75,14 @@ def openintel() -> dict:
     return o if isinstance(o, dict) else {}
 
 
+def censys() -> dict:
+    """OPTIONAL Censys Platform API creds — `{token: <PAT>, org: <organization-id>}`. Returns {} unless
+    a `censys:` block is set. Silent opt-in (like openintel): install/update/doctor ignore it and the
+    vertical Censys source is skipped without noise unless BOTH `token` and `org` are configured."""
+    c = load().get("censys")
+    return c if isinstance(c, dict) else {}
+
+
 def oob() -> dict:
     """Out-of-band config (optional): a SELF-HOSTED interactsh server for nuclei
     (`interactsh_server` + optional `interactsh_token`), and a reserved `blind_xss_url` collector
@@ -117,6 +125,9 @@ def values() -> list[str]:
         for k in ("interactsh_token", "blind_xss_url"):
             if isinstance(ob.get(k), str):
                 vals.append(ob[k])
+    cy = load().get("censys")                        # censys Platform PAT is secret (org id is not)
+    if isinstance(cy, dict) and isinstance(cy.get("token"), str):
+        vals.append(cy["token"])
     return [v for v in vals if v and len(v) >= 6]
 
 

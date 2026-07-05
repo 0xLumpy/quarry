@@ -121,6 +121,7 @@ def tlsx_certs(raw: str, source: str, raw_ref: str | None = None) -> Iterator[di
                "cn": o.get("subject_cn"), "san": san,
                "issuer": o.get("issuer_cn"), "issuer_org": o.get("issuer_org") or [],
                "not_after": o.get("not_after"), "serial": o.get("serial"),
+               "sha1": (o.get("fingerprint_hash") or {}).get("sha1"),
                "wildcard": any(s.startswith("*.") for s in san),
                **_prov(source, raw_ref)}
 

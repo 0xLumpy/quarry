@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json as _json
 import os
+import re as _re
 import shutil
 import subprocess
 import urllib.request
@@ -35,6 +36,28 @@ def _openintel(cfg: dict, apex: str, timeout: int = 180) -> set:
         return set()
     return {h for h in (line.strip().lower().rstrip(".") for line in out.splitlines())
             if h and "." in h}
+
+
+def _censys(cfg: dict, apex: str, timeout: int = 30) -> set:
+    """OPTIONAL Censys Platform API cert search for `apex` → subdomain set. Returns an empty set
+    (SILENT) unless both a PAT `token` and `org` id are configured. Defensive parse: extracts every
+    hostname under the apex from the raw JSON response, so it survives Platform response-schema drift
+    (no dependency on an exact `matched_services[...]` path). Best-effort — failure returns empty."""
+    token, org = cfg.get("token"), cfg.get("org")
+    if not token or not org:
+        return set()
+    body = _json.dumps({"query": f"cert.parsed.names: {apex}", "page_size": 100}).encode()
+    req = urllib.request.Request(
+        "https://api.platform.censys.io/v3/global/search/query", data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}", "X-Organization-ID": str(org),
+                 "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(8 * 1024 * 1024).decode("utf-8", "replace")
+    except Exception:
+        return set()
+    pat = _re.compile(r"[a-z0-9](?:[a-z0-9._-]*)?\." + _re.escape(apex) + r"\b", _re.I)
+    return {m.lower().lstrip("*.").rstrip(".") for m in pat.findall(raw) if "." in m}
 
 
 def _crtsh(apex: str, timeout: int = 30) -> set:
@@ -151,6 +174,20 @@ def run(ctx) -> None:
                     for h in oi_hosts if scope.in_scope(h) and not scope.is_oos(h))
             if n:
                 ctx.echo(f"  openintel: +{n} in-scope (local top1M subs DB)")
+
+    # ── passive: Censys Platform cert search (OPTIONAL — SILENT unless secrets.yaml `censys:` set) ──
+    cen = secrets.censys()
+    if cen.get("token") and cen.get("org"):
+        cen_hosts = set()
+        for apex in prof.apex_domains:
+            cen_hosts |= _censys(cen, apex)
+        if cen_hosts:
+            raw = ctx.run.raw_path("vertical", "censys", "hosts.txt")
+            raw.write_text("\n".join(sorted(cen_hosts)) + "\n")
+            n = sum(ctx.run.add("subdomain", {"host": h, "sources": ["censys"], "raw_ref": str(raw)})
+                    for h in cen_hosts if scope.in_scope(h) and not scope.is_oos(h))
+            if n:
+                ctx.echo(f"  censys: +{n} in-scope (Platform cert search)")
 
     # ── passive: github-subdomains (optional, needs token) ──
     gh_token = secrets.github_tokens_file()   # 0600 temp file from secrets.yaml; None if unset

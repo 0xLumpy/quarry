@@ -21,7 +21,9 @@ CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "s
                     # evidence-probe surfaces (additive, same as the placeholder pattern):
                     "graphql", "actuator", "websocket", "api-base",
                     # DNS-record context (notable records only — a/cname excluded as noise):
-                    "dns"]
+                    "dns",
+                    # name-based virtual hosts served by an origin IP (may not resolve in DNS):
+                    "vhost"]
 
 # Notable DNS record types to surface (mail/provider/cert/network context); plain a/aaaa/cname/soa
 # are excluded — a/cname already live in resolved/review, aaaa/soa are low signal for a queue.
@@ -368,6 +370,10 @@ def collect(run, scope) -> dict:
             add("cloud", _item("cloud", r.get("value"), r.get("note") or "cloud bucket candidate",
                 "low", r.get("sources"), "normalized/review.jsonl",
                 [t for t in ("cloud", r.get("provider"), r.get("access"), "verify-ownership") if t]))
+        elif klass == "vhost":                          # name-based vhost on an origin IP (verify)
+            add("vhost", _item("vhost", r.get("value"), r.get("note") or "vhost candidate",
+                "low", r.get("sources"), "normalized/review.jsonl",
+                [t for t in ("vhost", r.get("ip"), str(r.get("status_code") or ""), "verify") if t]))
 
     for d in run.read("dns_record"):                # notable DNS context (mail/provider/cert/network)
         t = d.get("type")
