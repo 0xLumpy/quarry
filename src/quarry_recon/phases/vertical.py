@@ -6,10 +6,33 @@ a human can spot "one source found many another missed" (methodology day1).
 """
 from __future__ import annotations
 
+import json as _json
+import urllib.request
 from pathlib import Path
 
 from .. import normalize, secrets
 from ..runner import Status, have, run as exec_tool, skipped
+
+
+def _crtsh(apex: str, timeout: int = 30) -> set:
+    """Direct crt.sh CT-log pull for `%.apex` → set of hostnames (SANs, wildcards stripped).
+    Best-effort + no key: complements subfinder's CT sources (coverage) and is a fallback when
+    passive is thin (resilience). A failure returns an empty set — never breaks the run."""
+    url = f"https://crt.sh/?q=%25.{apex}&output=json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read(8 * 1024 * 1024)          # bounded read
+        rows = _json.loads(data.decode("utf-8", "replace"))
+    except Exception:
+        return set()
+    hosts = set()
+    for row in rows if isinstance(rows, list) else []:
+        for nv in str(row.get("name_value", "")).splitlines():
+            h = nv.strip().lower().lstrip("*.").rstrip(".")
+            if h and "." in h:
+                hosts.add(h)
+    return hosts
 
 
 def _resolvers(ctx) -> tuple[Path | None, Path | None]:
@@ -51,6 +74,17 @@ def run(ctx) -> None:
                 normalize.hosts(r.raw_path.read_text(), "subfinder", str(sf_raw))
                 if scope.in_scope(e["host"]))
         ctx.echo(f"  subfinder: +{n} in-scope ({r.stdout_lines} raw, {r.status.value})")
+
+    # ── passive: crt.sh CT logs (direct pull — coverage/resilience over subfinder's CT sources) ──
+    ct_hosts = set()
+    for apex in prof.apex_domains:
+        ct_hosts |= _crtsh(apex)
+    if ct_hosts:
+        ct_raw = ctx.run.raw_path("vertical", "crtsh", "hosts.txt")
+        ct_raw.write_text("\n".join(sorted(ct_hosts)) + "\n")
+        n = sum(ctx.run.add("subdomain", {"host": h, "sources": ["crtsh"], "raw_ref": str(ct_raw)})
+                for h in ct_hosts if scope.in_scope(h) and not scope.is_oos(h))
+        ctx.echo(f"  crt.sh: +{n} in-scope (CT logs)")
 
     # ── passive: github-subdomains (optional, needs token) ──
     gh_token = secrets.github_tokens_file()   # 0600 temp file from secrets.yaml; None if unset
