@@ -31,13 +31,14 @@ class PhaseContext:
 # phase name -> (callable, human label, requires_active)
 # OSINT is NOT here — it's a separate pre-flight command (`quarry osint`). The recon run acts
 # only on the human-confirmed scope in target.yaml.
-from . import horizontal, vertical, probe, crawl, enrich, content, params  # noqa: E402
+from . import horizontal, vertical, dns, probe, crawl, enrich, content, params  # noqa: E402
 
 # needs_active=True => whole phase skipped in passive mode. Phases with passive value
 # (crawl: gau/waymore-U; params: gf over corpus) self-gate instead.
 REGISTRY = {
     "horizontal": (horizontal.run, "Horizontal discovery (ASN/CIDR/cert/SAN)", False),
     "vertical": (vertical.run, "Vertical subdomain discovery", False),
+    "dns": (dns.run, "DNS-record enrichment (dnsx: A/AAAA/MX/NS/TXT/SOA/CAA/ASN)", True),
     "probe": (probe.run, "Probe / fingerprint / screenshots / ports", True),
     "crawl": (crawl.run, "Crawl + URL/archive + JS mining", False),
     "enrich": (enrich.run, "Enrich late-discovered hosts (resolve/takeover/probe)", True),
@@ -45,4 +46,4 @@ REGISTRY = {
     "params": (params.run, "Params + lightweight scanning (nuclei OOB)", False),
 }
 
-ORDER = ["horizontal", "vertical", "probe", "crawl", "enrich", "content", "params"]
+ORDER = ["horizontal", "vertical", "dns", "probe", "crawl", "enrich", "content", "params"]

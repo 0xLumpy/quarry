@@ -49,6 +49,59 @@ def dnsx_resolved(raw: str, source: str, raw_ref: str | None = None) -> Iterator
                    "cname": obj.get("cname", []) or [], **_prov(source, raw_ref)}
 
 
+_DNS_STR_TYPES = ("a", "aaaa", "cname", "ns", "mx", "txt", "caa")
+
+
+def _aslist(v):
+    """Coerce a dnsx field to a list — dnsx may emit a scalar or a dict (e.g. `soa`) instead of a
+    list; iterating those directly would yield chars / dict-keys, not records."""
+    if v is None:
+        return []
+    if isinstance(v, (str, dict)):
+        return [v]
+    return list(v) if isinstance(v, (list, tuple)) else [v]
+
+
+def dnsx_records(raw: str, source: str, raw_ref: str | None = None) -> Iterator[dict]:
+    """dnsx -json lines -> one dns_record per (host, type, value) across a/aaaa/cname/ns/mx/txt/caa,
+    plus soa (object → its primary NS / compact JSON), asn (as_number, + as_name), and cdn_name."""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        host = (obj.get("host") or "").lower().rstrip(".")
+        if not host:
+            continue
+        for t in _DNS_STR_TYPES:
+            for v in _aslist(obj.get(t)):
+                if v:
+                    yield {"id": f"{host}|{t}|{v}", "host": host, "type": t,
+                           "value": str(v), **_prov(source, raw_ref)}
+        for s in _aslist(obj.get("soa")):
+            if isinstance(s, dict):
+                v = s.get("ns") or json.dumps(s, separators=(",", ":"))
+            else:
+                v = s
+            if v:
+                yield {"id": f"{host}|soa|{v}", "host": host, "type": "soa",
+                       "value": str(v), **_prov(source, raw_ref)}
+        asn = obj.get("asn")
+        if isinstance(asn, dict) and asn.get("as_number"):
+            rec = {"id": f"{host}|asn|{asn['as_number']}", "host": host, "type": "asn",
+                   "value": str(asn["as_number"]), **_prov(source, raw_ref)}
+            if asn.get("as_name"):
+                rec["asn_name"] = asn["as_name"]
+            yield rec
+        cdn = obj.get("cdn_name") or (obj.get("cdn") if isinstance(obj.get("cdn"), str) else None)
+        if cdn:
+            yield {"id": f"{host}|cdn|{cdn}", "host": host, "type": "cdn",
+                   "value": str(cdn), **_prov(source, raw_ref)}
+
+
 def httpx_json(raw: str, source: str, raw_ref: str | None = None) -> Iterator[dict]:
     """httpx -json lines -> live service entities (the probe source of truth)."""
     for line in raw.splitlines():

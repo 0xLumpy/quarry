@@ -19,8 +19,8 @@ very little and gives no useful reason why. Every result is:
 ## Status
 
 `v0.2.9` (milestone — methodology + evidence + production-readiness) — command surface, installer,
-OSINT pre-flight, the full recon run (**seven phases** including late-host enrichment and
-candidate-driven content discovery), active **evidence extraction** (exposed-file secret pull,
+OSINT pre-flight, the full recon run (**eight phases** including DNS-record enrichment, late-host
+enrichment, and candidate-driven content discovery), active **evidence extraction** (exposed-file secret pull,
 GraphQL introspection, actuator interrogation, OpenAPI parsing, SSTI confirmation), a structured
 JSONL store, exports, reports, a redacted structured **digest** with first-class evidence queues,
 runtime telemetry, `doctor` readiness + opt-in notifications, and checkpointing — all wired and
@@ -228,6 +228,7 @@ setsid nohup quarry run -t acme.com > run.log 2>&1 & disown
 |-------|------|-----------|
 | **horizontal** | ASN/CIDR confirm, kaeferjaeger SNI dataset, tlsx SAN (443/8443/4443), reverse DNS, CSP-recon, **Caduceus ASN→cert** | mapcidr, tlsx, dnsx, asnmap, csprecon, caduceus |
 | **vertical** | passive scrape (`-stats`) + GitHub + Shodan + DNS brute + **recursive word-cloud permutation→resolve loop** (alterx `-enrich -mode both`, converges) + **CNAME collect** | subfinder, github-subdomains, shosubgo, puredns, alterx, dnsx |
+| **dns** | DNS-record enrichment over resolved in-scope hosts — **A/AAAA/CNAME/MX/NS/TXT/SOA/CAA + ASN/CDN** as first-class `dns_record` entities (context, not re-discovery; puredns kept for brute/validate) | dnsx |
 | **probe** | HTTP fingerprint (full methodology flag set), CDN/origin tag, **CSP-sibling discovery (response headers)**, screenshots, **naabu → nmap -sV**, passive smap | httpx, cdncheck, gowitness, naabu, nmap, smap |
 | **crawl** | active crawl (+headless SPA, stored responses), archive URLs, JS download/mine + redacted secret scan, **waymore `-mode B` + xnLinkFinder over responses**, link-discovered host promotion | katana, gau, waymore, jsluice, xnLinkFinder, gitleaks, trufflehog |
 | **enrich** | catch-up over hosts found *after* probe (crawl links, CSP siblings): resolve, **dangling-CNAME takeover**, HTTP fingerprint, WAF, screenshots, smap | dnsx, httpx, nuclei, gowitness, smap |

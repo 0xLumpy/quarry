@@ -23,6 +23,7 @@ from pathlib import Path
 ENTITY_KEYS = {
     "subdomain": "host",
     "resolved": "host",
+    "dns_record": "id",
     "live": "url",
     "url": "url",
     "js_url": "url",
