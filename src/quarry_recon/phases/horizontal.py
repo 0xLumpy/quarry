@@ -61,6 +61,14 @@ def run(ctx) -> None:
                     added += 1
             ctx.echo(f"  csprecon: +{added} in-scope hosts from CSP")
 
+    # cloud-asset candidates: S3/GCS bucket enum from apex/org (non-mutating detect, verify-ownership).
+    # ABOVE the CIDR early-return — it's apex/org-derived and must run for domain-only profiles too.
+    if not scope.passive_only:
+        from .. import cloud
+        nc = cloud.discover(ctx)
+        if nc:
+            ctx.echo(f"  cloud: +{nc} bucket candidate(s) — VERIFY OWNERSHIP")
+
     if not prof.cidr:
         ctx.echo("  no CIDR in profile — skipping ASN/range/tls-SAN/revdns steps")
         ctx.run.notes.append("horizontal: CIDR empty, IP-based steps skipped")

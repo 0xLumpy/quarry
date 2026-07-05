@@ -357,6 +357,10 @@ def collect(run, scope) -> dict:
             add("actuator", _item("actuator", r.get("value"), note or "actuator endpoint",
                 "high" if hot else "low", r.get("sources"), "normalized/review.jsonl",
                 ["actuator"] + (["exposed"] if hot else ["benign"])))
+        elif klass == "cloud":                          # enumerated cloud bucket (verify-ownership)
+            add("cloud", _item("cloud", r.get("value"), r.get("note") or "cloud bucket candidate",
+                "low", r.get("sources"), "normalized/review.jsonl",
+                [t for t in ("cloud", r.get("provider"), r.get("access"), "verify-ownership") if t]))
 
     for d in run.read("dns_record"):                # notable DNS context (mail/provider/cert/network)
         t = d.get("type")
