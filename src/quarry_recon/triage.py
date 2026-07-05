@@ -19,7 +19,35 @@ DIGEST_SCHEMA = "1.0"
 CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "ssrf", "sqli",
                     "redirect", "lfi", "rce", "ssti", "sourcemap", "takeover", "secrets", "scanner",
                     # evidence-probe surfaces (additive, same as the placeholder pattern):
-                    "graphql", "actuator", "websocket", "api-base"]
+                    "graphql", "actuator", "websocket", "api-base",
+                    # DNS-record context (notable records only — a/cname excluded as noise):
+                    "dns"]
+
+# Notable DNS record types to surface (mail/provider/cert/network context); plain a/aaaa/cname/soa
+# are excluded — a/cname already live in resolved/review, aaaa/soa are low signal for a queue.
+NOTABLE_DNS_TYPES = ("mx", "ns", "txt", "caa", "asn", "cdn")
+
+
+_DNS_PREVIEW_MAX = 200      # TXT (DKIM keys/SPF chains/verification blobs) can be long → preview only
+
+
+def _dns_preview(value: str) -> str:
+    """Cap a DNS value for the digest/HOTLIST display — the full value stays in
+    normalized/dns_record.jsonl (raw_ref)."""
+    return value if len(value) <= _DNS_PREVIEW_MAX else value[:_DNS_PREVIEW_MAX] + "…"
+
+
+def _txt_tags(value: str) -> list[str]:
+    v = value.lower()
+    if v.startswith("v=spf"):
+        return ["spf"]
+    if v.startswith("v=dmarc"):
+        return ["dmarc"]
+    if "domainkey" in v or "dkim" in v:
+        return ["dkim"]
+    if "site-verification" in v or "verification=" in v or "-verification" in v:
+        return ["verification"]
+    return []
 # Reserved keys — present from M2.1 so the schema is stable, filled by tag-only classifiers
 # in M2.2 (api-doc/oauth-jwt/cloud/mobile).
 PLACEHOLDER_QUEUES = ["api-doc", "oauth-jwt", "cloud", "mobile"]
@@ -165,6 +193,20 @@ def build(run, scope) -> str:
             A(f"- [{s.get('kind')}{verified}] {s.get('preview', '')}{loc}  (src: {','.join(s.get('sources', []))})")
         A("")
 
+    dns_recs = [d for d in run.read("dns_record") if d.get("type") in NOTABLE_DNS_TYPES]
+    if dns_recs:
+        A(f"## DNS context ({len(dns_recs)} notable records — MX/NS/TXT/CAA/ASN/CDN)")
+        by_t: dict[str, list] = {}
+        for d in dns_recs:
+            by_t.setdefault(d["type"], []).append(d)
+        for t in NOTABLE_DNS_TYPES:
+            items = by_t.get(t)
+            if items:
+                A(f"### {t.upper()}  ({len(items)})")
+                for d in items[:12]:
+                    A(f"- {d.get('host')} → {_dns_preview(str(d.get('value', '')))}")
+                A("")
+
     # gf / sourcemap candidates (review entities)
     reviews = run.read("review")
     by_klass: dict[str, list[str]] = {}
@@ -291,6 +333,15 @@ def collect(run, scope) -> dict:
             add("actuator", _item("actuator", r.get("value"), note or "actuator endpoint",
                 "high" if hot else "low", r.get("sources"), "normalized/review.jsonl",
                 ["actuator"] + (["exposed"] if hot else ["benign"])))
+
+    for d in run.read("dns_record"):                # notable DNS context (mail/provider/cert/network)
+        t = d.get("type")
+        if t not in NOTABLE_DNS_TYPES:
+            continue
+        val = str(d.get("value", ""))
+        tags = ["dns", t] + (_txt_tags(val) if t == "txt" else [])   # tag from the FULL value
+        add("dns", _item("dns", f"{d.get('host')} · {t}={_dns_preview(val)}", f"{t} record (DNS context)",
+            "low", d.get("sources"), "normalized/dns_record.jsonl", tags))
 
     for s in secrets_e:                             # secrets (redacted — preview only)
         # preview is the redacted form; fall back to masking a legacy `data` field (pre-redaction
