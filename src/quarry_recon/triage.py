@@ -64,6 +64,13 @@ def _txt_intel(value: str) -> list[str]:
         m = re.search(r"\bp=(none|quarantine|reject)\b", v)
         if m:
             tags.append(f"dmarc-policy:{m.group(1)}")
+        # rua/ruf report-address domains = org/vendor pivots (a shared rua across domains implies
+        # the same org — a lightweight slice of reverse-DMARC; the full reverse index is deferred).
+        for rm in re.finditer(r"(?:rua|ruf)=([^;]+)", v):
+            for addr in rm.group(1).split(","):
+                dom = addr.strip().replace("mailto:", "").split("@")[-1].strip().rstrip(".")
+                if dom and "." in dom:
+                    tags.append(f"rua:{dom}")
     if "domainkey" in v or "dkim" in v:
         tags.append("dkim")
     if "site-verification" in v or "verification=" in v or "-verification" in v:
