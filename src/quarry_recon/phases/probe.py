@@ -7,8 +7,54 @@ optional smap passive (Shodan-backed) port scan.
 """
 from __future__ import annotations
 
-from .. import normalize
+import json as _json
+import urllib.request
+
+from .. import normalize, secrets
 from ..runner import Status, have, run as exec_tool, skipped
+
+
+def _favicon_pivot(ctx) -> None:
+    """Shodan favicon-hash pivot: httpx already computed each live host's favicon mmh3 hash; search
+    Shodan `http.favicon.hash:<h>` for hosts serving the SAME favicon → related infrastructure.
+    In-scope matches become subdomains (coverage); off-scope matches are related-host candidates
+    (verify-ownership). Key-gated (silent without a shodan key); generic favicons (huge result count)
+    are skipped to avoid collision noise. Passive OSINT query — no target contact."""
+    key = secrets.shodan()
+    if not key:
+        return
+    scope = ctx.scope
+    hashes = sorted({str(l.get("favicon")) for l in ctx.run.read("live") if l.get("favicon")})[:20]
+    new_sub = 0
+    for h in hashes:
+        try:
+            url = f"https://api.shodan.io/shodan/host/search?key={key}&query=http.favicon.hash:{h}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = _json.loads(r.read(4 * 1024 * 1024).decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if (data.get("total") or 0) > 200:              # too-generic favicon → skip (collision noise)
+            continue
+        raw = ctx.run.raw_path("probe", "favicon", f"{h}.json")
+        raw.write_text(_json.dumps(data.get("matches") or [])[:2 * 1024 * 1024])
+        oos = 0
+        for m in (data.get("matches") or [])[:100]:
+            for hn in (m.get("hostnames") or []):
+                hn = str(hn).lower().rstrip(".")
+                if not hn or "." not in hn:
+                    continue
+                if scope.in_scope(hn) and not scope.is_oos(hn):
+                    if ctx.run.add("subdomain", {"host": hn, "sources": ["favicon-shodan"],
+                                                 "raw_ref": str(raw)}):
+                        new_sub += 1
+                elif oos < 15:                          # bounded off-scope related-host candidates
+                    if ctx.run.add("review", {"id": f"favicon:{h}:{hn}", "klass": "related-host",
+                            "value": hn, "note": f"same favicon (hash {h}) as an in-scope host — VERIFY OWNERSHIP",
+                            "sources": ["favicon-shodan"], "raw_ref": str(raw)}):
+                        oos += 1
+    if new_sub:
+        ctx.echo(f"  favicon: +{new_sub} in-scope host(s) via Shodan favicon-hash pivot")
 
 
 def run(ctx) -> None:
@@ -102,6 +148,9 @@ def run(ctx) -> None:
                             san_new += 1
             if san_new:
                 ctx.echo(f"  tlsx: +{san_new} sibling host(s) from cert SANs")
+
+    # ── favicon-hash pivot (Shodan) — related hosts serving the same favicon (key-gated, silent) ──
+    _favicon_pivot(ctx)
 
     # ── WAF fingerprint (nuclei waf-detect templates over live hosts) ──
     # Recon-side only: identify WHICH WAF fronts each host (Cloudflare/Akamai/F5…).
