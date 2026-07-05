@@ -62,6 +62,19 @@ def chaos() -> str | None:
     return _scalar(load().get("projectdiscovery"))
 
 
+def certspotter() -> str | None:
+    """SSLMate certspotter API token (optional — the free tier works keyless at a low rate)."""
+    return _scalar(load().get("certspotter"))
+
+
+def openintel() -> dict:
+    """ADVANCED optional passive source (openintel-subs binary + local subs.db). Returns {} unless
+    the user set an `openintel:` block. Deliberately NOT a registered tool — install/update/doctor
+    ignore it entirely, and it's SILENTLY unused unless BOTH `binary` and `db` are configured."""
+    o = load().get("openintel")
+    return o if isinstance(o, dict) else {}
+
+
 def oob() -> dict:
     """Out-of-band config (optional): a SELF-HOSTED interactsh server for nuclei
     (`interactsh_server` + optional `interactsh_token`), and a reserved `blind_xss_url` collector

@@ -7,11 +7,34 @@ a human can spot "one source found many another missed" (methodology day1).
 from __future__ import annotations
 
 import json as _json
+import os
+import shutil
+import subprocess
 import urllib.request
 from pathlib import Path
 
 from .. import normalize, secrets
 from ..runner import Status, have, run as exec_tool, skipped
+
+
+def _openintel(cfg: dict, apex: str, timeout: int = 180) -> set:
+    """ADVANCED optional passive source: query a local openintel-subs binary + subs.db for `apex`.
+    Returns an empty set (SILENT) unless both paths are configured AND present — no noise otherwise.
+    Best-effort: any failure returns an empty set and never breaks the run."""
+    binary, db = cfg.get("binary"), cfg.get("db")
+    if not binary or not db:
+        return set()
+    exe = shutil.which(binary) or (binary if os.path.isfile(binary) and os.access(binary, os.X_OK) else None)
+    if not exe or not os.path.isfile(db):
+        return set()
+    try:
+        p = subprocess.run([exe, "query", "-d", apex, "-s", "-b", db],
+                           capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        out = p.stdout.decode("utf-8", "replace")
+    except Exception:
+        return set()
+    return {h for h in (line.strip().lower().rstrip(".") for line in out.splitlines())
+            if h and "." in h}
 
 
 def _crtsh(apex: str, timeout: int = 30) -> set:
@@ -30,6 +53,29 @@ def _crtsh(apex: str, timeout: int = 30) -> set:
     for row in rows if isinstance(rows, list) else []:
         for nv in str(row.get("name_value", "")).splitlines():
             h = nv.strip().lower().lstrip("*.").rstrip(".")
+            if h and "." in h:
+                hosts.add(h)
+    return hosts
+
+
+def _certspotter(apex: str, token: str | None = None, timeout: int = 30) -> set:
+    """certspotter CT-log issuances for `apex` (+subdomains) → set of hostnames. Free tier is
+    keyless (rate-limited); a token raises the limit. Best-effort — failure returns an empty set."""
+    url = (f"https://api.certspotter.com/v1/issuances?domain={apex}"
+           "&include_subdomains=true&expand=dns_names")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            rows = _json.loads(r.read(8 * 1024 * 1024).decode("utf-8", "replace"))
+    except Exception:
+        return set()
+    hosts = set()
+    for row in rows if isinstance(rows, list) else []:
+        for h in (row.get("dns_names") or []):
+            h = str(h).strip().lower().lstrip("*.").rstrip(".")
             if h and "." in h:
                 hosts.add(h)
     return hosts
@@ -75,16 +121,36 @@ def run(ctx) -> None:
                 if scope.in_scope(e["host"]))
         ctx.echo(f"  subfinder: +{n} in-scope ({r.stdout_lines} raw, {r.status.value})")
 
-    # ── passive: crt.sh CT logs (direct pull — coverage/resilience over subfinder's CT sources) ──
-    ct_hosts = set()
-    for apex in prof.apex_domains:
-        ct_hosts |= _crtsh(apex)
-    if ct_hosts:
-        ct_raw = ctx.run.raw_path("vertical", "crtsh", "hosts.txt")
-        ct_raw.write_text("\n".join(sorted(ct_hosts)) + "\n")
-        n = sum(ctx.run.add("subdomain", {"host": h, "sources": ["crtsh"], "raw_ref": str(ct_raw)})
-                for h in ct_hosts if scope.in_scope(h) and not scope.is_oos(h))
-        ctx.echo(f"  crt.sh: +{n} in-scope (CT logs)")
+    # ── passive: CT-log sources (crt.sh free + certspotter) — coverage/resilience over subfinder ──
+    cs_token = secrets.certspotter()
+    ct_new = 0
+    for src, fn in (("crtsh", lambda a: _crtsh(a)),
+                    ("certspotter", lambda a: _certspotter(a, cs_token))):
+        hosts = set()
+        for apex in prof.apex_domains:
+            hosts |= fn(apex)
+        if not hosts:
+            continue
+        raw = ctx.run.raw_path("vertical", src, "hosts.txt")
+        raw.write_text("\n".join(sorted(hosts)) + "\n")
+        ct_new += sum(ctx.run.add("subdomain", {"host": h, "sources": [src], "raw_ref": str(raw)})
+                      for h in hosts if scope.in_scope(h) and not scope.is_oos(h))
+    if ct_new:
+        ctx.echo(f"  CT logs (crt.sh + certspotter): +{ct_new} in-scope")
+
+    # ── passive: openintel-subs (ADVANCED — SILENT unless secrets.yaml `openintel:` is configured) ──
+    oi = secrets.openintel()
+    if oi.get("binary") and oi.get("db"):
+        oi_hosts = set()
+        for apex in prof.apex_domains:
+            oi_hosts |= _openintel(oi, apex)
+        if oi_hosts:
+            raw = ctx.run.raw_path("vertical", "openintel", "hosts.txt")
+            raw.write_text("\n".join(sorted(oi_hosts)) + "\n")
+            n = sum(ctx.run.add("subdomain", {"host": h, "sources": ["openintel"], "raw_ref": str(raw)})
+                    for h in oi_hosts if scope.in_scope(h) and not scope.is_oos(h))
+            if n:
+                ctx.echo(f"  openintel: +{n} in-scope (local top1M subs DB)")
 
     # ── passive: github-subdomains (optional, needs token) ──
     gh_token = secrets.github_tokens_file()   # 0600 temp file from secrets.yaml; None if unset

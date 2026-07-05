@@ -166,10 +166,17 @@ def doctor(phase):
     rows = [("github tokens", bool(n_gh), f"{n_gh} token(s)" if n_gh else ""),
             ("shodan", bool(secrets.shodan()), ""),
             ("whoxy", bool(secrets.whoxy()), ""),
-            ("projectdiscovery/chaos", bool(secrets.chaos()), "")]
+            ("projectdiscovery/chaos", bool(secrets.chaos()), ""),
+            ("certspotter", bool(secrets.certspotter()), "CT (optional; free tier keyless)")]
     for label, present, extra in rows:
         mark = _c("✓", "green") if present else _c("·", "yellow")
         click.echo(f"  {mark} {label:<24} {extra or ('' if present else '(optional) not set')}")
+    # openintel-subs is an ADVANCED opt-in — shown ONLY when configured (silent otherwise, by design)
+    oi = secrets.openintel()
+    if oi.get("binary") and oi.get("db"):
+        ok_oi = (shutil.which(oi["binary"]) or Path(oi["binary"]).is_file()) and Path(oi["db"]).is_file()
+        click.echo(f"  {_c('✓' if ok_oi else '✗', 'green' if ok_oi else 'red')} "
+                   f"openintel-subs (advanced) {oi['db']}")
 
     # notify — opt-in run notifications (off unless secrets.yaml notify: is set)
     from . import notify as _notify
