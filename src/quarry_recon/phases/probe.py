@@ -15,6 +15,18 @@ import urllib.request
 from .. import normalize, secrets
 from ..runner import Status, have, run as exec_tool, skipped
 
+# Serialized-object / token markers that surface in Set-Cookie + response headers. Spotting the
+# FORMAT is PASSIVE recon evidence (a hand-off to the attack layer), never exploitation. Only
+# distinctive markers are used — pickle (`gAR`) / Ruby-Marshal (`BAg`) base64 prefixes are too
+# collision-prone from a raw header string to include without noise. Source: TBHM cheatsheet §9.
+_DESER_MARKERS = (
+    ("java-serialized", "rO0AB"),            # ObjectOutputStream AC ED 00 05 → base64
+    ("dotnet-binaryformatter", "AAEAAAD"),   # 00 01 00 00 00 FF FF FF FF → base64 AAEAAAD/////
+    ("node-serialize", "_$$ND_FUNC$$_"),     # node-serialize function marker
+)
+_PHP_OBJ_RX = _re.compile(r'O:\d+:"[A-Za-z0-9_\\]+":')          # PHP serialize() object in a cookie
+_JWT_RX = _re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")
+
 
 def _shodan_pivot(ctx, key, values, facet, source, label, note) -> int:
     """Generic Shodan search pivot: for each value, query `<facet>:<value>` and turn the matching
@@ -195,15 +207,35 @@ def run(ctx) -> None:
         # internal/staging host in script-src) are a real discovery channel. Parsed here over
         # live hosts because the CSP lives on a probed host (www), not the bare apex — which is
         # why csprecon over apex roots in horizontal found nothing.
-        import json as _json, re as _re
         _CSP_HOST = _re.compile(r"\b(?:https?://)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})\b", _re.I)
-        csp_added = 0
+        csp_added = deser_n = 0
         for line in r.raw_path.read_text().splitlines():
             try:
                 o = _json.loads(line)
             except _json.JSONDecodeError:
                 continue
-            csp = (o.get("header") or {}).get("content_security_policy")
+            hdr = o.get("header") or {}
+            rhost = (o.get("input") or o.get("host") or "").lower().rstrip(".")
+            # ── deserialization / token FORMAT fingerprint (passive: Set-Cookie + response headers) ──
+            if hdr and rhost and scope.in_scope(rhost):
+                blob = " ".join(str(v) for v in hdr.values())
+                fmts = [f for f, marker in _DESER_MARKERS if marker in blob]
+                if _PHP_OBJ_RX.search(blob):
+                    fmts.append("php-serialized")
+                if _JWT_RX.search(blob):
+                    fmts.append("jwt")
+                for fmt in fmts:
+                    hint = ("check alg:none / weak HS256 secret / RS256→HS256 confusion"
+                            if fmt == "jwt" else "untrusted-deserialization surface")
+                    if ctx.run.add("review", {
+                            "id": f"deser:{rhost}:{fmt}", "klass": "deser", "value": rhost,
+                            "host": rhost, "format": fmt,
+                            "note": f"{fmt} marker in response headers/cookies — {hint} "
+                                    "(attack-layer target; verify)",
+                            "sources": ["deser-fingerprint"]}):
+                        deser_n += 1
+            # ── CSP-advertised siblings ──
+            csp = hdr.get("content_security_policy")
             if not csp:
                 continue
             for host in {m.lower() for m in _CSP_HOST.findall(csp)}:
@@ -212,6 +244,8 @@ def run(ctx) -> None:
                     csp_added += 1
         if csp_added:
             ctx.echo(f"  csp: +{csp_added} sibling host(s) from response headers")
+        if deser_n:
+            ctx.echo(f"  deser: {deser_n} serialization/token fingerprint(s) in headers/cookies")
 
     # ── tlsx over in-scope hosts — cert SAN harvest (new sibling hostnames) + cert context ──
     # tlsx is used in horizontal over IP RANGES; here it runs over the resolved HOST set: cert SANs

