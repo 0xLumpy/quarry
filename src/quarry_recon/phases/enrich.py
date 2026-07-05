@@ -70,6 +70,15 @@ def run(ctx) -> None:
     # 3. probe the newly-resolved hosts (live + tech), so link/CSP-only hosts get fingerprinted
     new_set = set(new)
     new_resolved = sorted(h for h in resolved if h in new_set)
+
+    # DNS-record catch-up: late hosts (crawl/CSP) resolved here missed the `dns` phase, so run the
+    # same wildcard-filtered dnsx enrichment over just these (deferred "dns incremental catch-up").
+    if new_resolved and have("dnsx"):
+        from . import dns as _dns
+        nd = _dns.enrich_hosts(ctx, new_resolved, "enrich")
+        if nd:
+            ctx.echo(f"  dns-enrich (late): +{nd} record(s) over {len(new_resolved)} host(s)")
+
     if not scope.passive_only and have("httpx") and new_resolved:
         hf = ctx.write_list("enrich_probe.txt", new_resolved)
         hx = ctx.run.raw_path("enrich", "httpx", "httpx.jsonl")
