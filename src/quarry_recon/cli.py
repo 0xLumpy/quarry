@@ -181,6 +181,19 @@ def doctor(phase):
     cen = secrets.censys()
     if cen.get("token") and cen.get("org"):
         click.echo(f"  {_c('✓', 'green')} censys (advanced)          Platform cert search")
+    # template drift: the shipped template can gain new optional keys, but bootstrap NEVER overwrites
+    # an existing secrets.yaml (so it can't clobber your keys) — so surface any key the template has
+    # that your file predates, since it won't appear on its own.
+    try:
+        import yaml as _yaml
+        tpl = _yaml.safe_load(
+            resources.files("quarry_recon.data").joinpath("secrets.template.yaml").read_text()) or {}
+        drift = [k for k in tpl if k not in secrets.load()]
+        if drift:
+            click.echo(f"  {_c('ℹ', 'cyan')} template adds optional key(s) your secrets.yaml predates: "
+                       f"{', '.join(drift)} — add manually (update never overwrites your file)")
+    except Exception:
+        pass
 
     # notify — opt-in run notifications (off unless secrets.yaml notify: is set)
     from . import notify as _notify

@@ -194,6 +194,13 @@ data_files:
     dest: ~/.config/quarry/wordlists/content/deep.txt
     url: https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-directories.txt
     update: true
+  # vhost enumeration wordlist (probe phase — ffuf Host-header fuzz). A SMALL label list on purpose:
+  # vhost fuzzing is IPs×apexes×words, so the big DNS brute list would be a footgun. Lands at the
+  # first path _vhost_wordlist() checks, so vhost enum works out-of-box after install.
+  - name: vhost-wordlist
+    dest: ~/.config/quarry/vhost-wordlist.txt
+    url: https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt
+    update: false
 
 # Post-install extras (idempotent shell steps).
 extras:
