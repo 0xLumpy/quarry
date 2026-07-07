@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 
-from .. import evidence, normalize, secrets
+from .. import evidence, normalize, secrets, settings
 from ..runner import Status, have, nuclei_timeout, run as exec_tool, skipped
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
@@ -254,7 +254,8 @@ def run(ctx) -> None:
     log = ctx.run.raw_path("params", "nuclei", "nuclei.run.log")
     cmd = ["nuclei", "-l", str(targets), "-jsonl", "-o", str(findings),
            "-etags", "intrusive,fuzz,dos,brute-force",
-           "-s", "critical,high,medium", "-stats", "-si", "30", "-c", "25"]
+           "-s", "critical,high,medium", "-stats", "-si", "30",
+           "-c", str(settings.workers("nuclei", 25))]     # H2: core-scaled concurrency (rate stays separate)
     if prof.http_rl:
         cmd += ["-rl", str(prof.http_rl)]
     _apply_nuclei_oob(cmd)                          # self-hosted interactsh (else nuclei's public default)

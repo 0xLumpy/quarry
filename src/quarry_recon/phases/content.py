@@ -13,7 +13,7 @@ import json as _json
 from importlib import resources
 from pathlib import Path
 
-from .. import normalize
+from .. import normalize, settings
 from ..runner import have, run as exec_tool, skipped
 
 MAX_HOSTS = 25                     # cap candidate hosts so a wide scope can't explode
@@ -108,6 +108,7 @@ def run(ctx) -> None:
         # include a url hash so http/https/:8443 on the same host don't overwrite each other's raw
         out = ctx.run.raw_path("content", "ffuf", f"{host}-{hashlib.md5(url.encode()).hexdigest()[:8]}.json")
         cmd = ["ffuf", "-u", f"{url.rstrip('/')}/FUZZ", "-w", str(wl), "-ac",
+               "-t", str(settings.workers("ffuf", 40)),   # H2: core-scaled concurrency
                "-mc", "200,204,301,302,307,308,401,403,405", "-of", "json", "-o", str(out), "-s"]
         if prof.http_rl:
             cmd += ["-rate", str(prof.http_rl)]

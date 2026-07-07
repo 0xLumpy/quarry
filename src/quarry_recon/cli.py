@@ -213,6 +213,8 @@ def doctor(phase):
         click.echo(f"  {_c('·', 'yellow')} config.yaml not found — `quarry install` creates it "
                    f"(safe defaults apply until it exists)")
     click.echo(f"  {_c('✓', 'green')} performance profile     {settings.profile()}")
+    _w = " · ".join(f"{t} {settings.workers(t, d)}" for t, d in (("nuclei", 25), ("httpx", 15), ("ffuf", 40)))
+    click.echo(f"  {_c('ℹ', 'cyan')} workers ({os.cpu_count() or '?'} cores)      {_w}")
     oi = settings.openintel()   # advanced opt-in (config.yaml, or legacy secrets.yaml) — shown only if set
     if oi.get("binary") and oi.get("db"):
         ok_oi = (shutil.which(oi["binary"]) or Path(oi["binary"]).is_file()) and Path(oi["db"]).is_file()

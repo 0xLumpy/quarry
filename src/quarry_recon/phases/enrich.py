@@ -12,6 +12,7 @@ from __future__ import annotations
 import json as _json
 
 from .. import normalize
+from .. import settings
 from ..runner import have, nuclei_timeout, run as exec_tool, skipped
 
 
@@ -89,7 +90,8 @@ def run(ctx) -> None:
                "-ports", ",".join(str(p) for p in prof.ports),
                "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
                "-asn", "-location", "-ip", "-cname", "-irh",
-               "-follow-redirects", "-no-fallback", "-probe-all-ips", "-random-agent", "-t", "15"]
+               "-follow-redirects", "-no-fallback", "-probe-all-ips", "-random-agent",
+               "-t", str(settings.workers("httpx", 15))]     # H2: core-scaled concurrency
         if prof.http_rl:
             cmd += ["-rl", str(prof.http_rl)]
         r = exec_tool("httpx", cmd, raw_path=hx, timeout=ctx.http_timeout)

@@ -10,6 +10,8 @@
 # push past the target's rate budget; the two are tuned independently.
 PERFORMANCE:
   PROFILE: auto        # auto (scale workers from CPU cores) | safe | balanced | aggressive
+  # auto/balanced/aggressive only ADD lanes on bigger boxes — they never drop below the tool's
+  # proven default, so a small VPS keeps the old behavior. Only `safe` throttles below defaults.
   # optional explicit per-tool overrides (blank = profile / tool default):
   NUCLEI_CONCURRENCY:
   HTTPX_THREADS:

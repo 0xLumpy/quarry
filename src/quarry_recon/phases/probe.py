@@ -12,7 +12,7 @@ import re as _re
 import urllib.parse
 import urllib.request
 
-from .. import normalize, secrets
+from .. import normalize, secrets, settings
 from ..runner import Status, have, nuclei_timeout, run as exec_tool, skipped
 
 # Serialized-object / token markers that surface in Set-Cookie + response headers. Spotting the
@@ -169,7 +169,7 @@ def _vhost_enum(ctx) -> None:
             # serve that Host, so it isn't a vhost. -ac drops the catch-all baseline; -r follows a
             # redirect to classify on the final response (odd ports/presentations still caught).
             cmd = ["ffuf", "-w", f"{wl}:FUZZ", "-H", f"Host: FUZZ.{apex}",
-                   "-u", f"{base}/", "-ac", "-r", "-t", "40", "-s",
+                   "-u", f"{base}/", "-ac", "-r", "-t", str(settings.workers("ffuf", 40)), "-s",
                    "-mc", "200-299,301,302,303,307,308,401,403",
                    "-o", str(out), "-of", "json"]
             if prof.http_rl:
@@ -218,7 +218,7 @@ def run(ctx) -> None:
            "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
            "-asn", "-location", "-ip", "-cname", "-irh",
            "-follow-redirects", "-no-fallback", "-probe-all-ips", "-random-agent",
-           "-t", "15"]
+           "-t", str(settings.workers("httpx", 15))]      # H2: core-scaled concurrency
     if prof.http_rl:
         cmd += ["-rl", str(prof.http_rl)]
     r = exec_tool("httpx", cmd, raw_path=hx, timeout=ctx.http_timeout)
