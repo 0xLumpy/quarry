@@ -215,7 +215,7 @@ setsid nohup quarry run -t acme.com > run.log 2>&1 & disown
 |---------|---------|
 | `quarry install` | Full blank-VPS provision (system pkgs → Go → tools → wordlists/templates) |
 | `quarry update` | Update managed tools, nuclei templates, resolvers, gf patterns |
-| `quarry doctor` | Audit tools, versions, per-tool deps, API keys, resolvers, wordlists — ends with a readiness verdict |
+| `quarry doctor` | Audit tools & versions, API keys (`[secrets]`), resolvers, wordlists, disk (`[system]`) — ends with a readiness verdict |
 | `quarry init <name>` | Create a project (`projects/<name>/target.yaml`); `-o <dir>` for a custom location |
 | `quarry oos -t <target> <host…>` | Add out-of-scope patterns (bare label → subdomain-prefix; FQDN → apex-scoped; regex kept verbatim) |
 | `quarry osint -t <profile>` | **Pre-flight** OSINT — discover scope candidates + intel (review-only, never edits scope) |

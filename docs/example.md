@@ -9,7 +9,7 @@ Assumptions:
 - Authorized target `0xlumpy.cc` — single apex, **no CIDR in scope** (common bug-bounty case)
 - Tools installed (`quarry install` done), API keys configured where available
 - `PATH` includes `~/go/bin` and `~/.local/bin`
-- Output lands in the project dir `./projects/0xlumpy/` (profile + osint + recon together)
+- Output lands in the project dir `~/projects/0xlumpy/` (profile + osint + recon together)
 - Illustrative run id: `20260620-120000`
 
 ---
