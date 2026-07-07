@@ -90,12 +90,28 @@ check — see [Requirements](#requirements); `--yes` installs even below minimum
 2. **Go toolchain** — installs current Go to `/usr/local/go` if missing **or too old**
 3. **tools** — every binary in the registry (Go install / pipx / massdns from source).
    Tools already on `PATH` are recorded as external and left untouched
-4. **data files** — trickest resolvers + n0kovo 3M DNS wordlist + `secrets.yaml` → `~/.config/quarry/`
+4. **data files** — trickest resolvers + n0kovo 3M DNS wordlist (`~/.config/quarry/wordlists/`) +
+   `secrets.yaml` and `config.yaml` → `~/.config/quarry/` (both created once, never overwritten)
 5. **extras** — gf patterns (`~/.gf`), nuclei templates
 6. **cleanup** — reclaim disk (`go clean -cache -modcache -testcache`, pip/apt caches)
 
 Anything that can't be automated (no sudo, unsupported OS, API-key/login-gated tools) is
 reported with its doc link — never silently skipped.
+
+## Configuration — three stores, three jobs
+
+Settings are split by *what kind of thing they are*, so each lives in one obvious place:
+
+| Store | Scope | Holds |
+|-------|-------|-------|
+| `projects/<t>/target.yaml` | the **engagement** | scope (apexes/OOS/CIDR), `RATELIMIT` = pressure on the *target*, modes |
+| `~/.config/quarry/config.yaml` | the **machine** | `PERFORMANCE` (concurrency profile + per-tool worker overrides), advanced local tool paths (openintel) |
+| `~/.config/quarry/secrets.yaml` | **credentials** | API keys / tokens / webhooks only (redacted from all logs + manifests) |
+
+The line that matters: **rate ≠ concurrency**. *Rate* (how hard we hit the target) is an engagement
+property and stays in `target.yaml`; *concurrency* (how many local lanes a tool uses) is a machine
+property and lives in `config.yaml`. `config.yaml` is optional — unset = safe defaults; `quarry
+doctor` shows the active profile under `[config]`.
 
 ## API keys
 

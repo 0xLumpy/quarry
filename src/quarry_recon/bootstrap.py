@@ -179,6 +179,17 @@ def install_data_files(echo, dry: bool, update: bool = False) -> None:
             sp.chmod(0o600)
         echo("  secrets.yaml: created")
 
+    # non-secret runtime config (PERFORMANCE / local paths) — created once, NEVER overwritten
+    cp = Path.home() / ".config" / "quarry" / "config.yaml"
+    if cp.exists():
+        echo("  config.yaml: present")
+    else:
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        if not dry:
+            tpl = resources.files("quarry_recon.data").joinpath("config.template.yaml").read_text()
+            cp.write_text(tpl)
+        echo("  config.yaml: created")
+
 
 def run_extras(echo, dry: bool) -> None:
     bs = load_bootstrap()

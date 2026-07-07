@@ -186,12 +186,6 @@ def doctor(phase):
     for label, present, extra in rows:
         mark = _c("✓", "green") if present else _c("·", "yellow")
         click.echo(f"  {mark} {label:<24} {extra or ('' if present else '(optional) not set')}")
-    # openintel-subs is an ADVANCED opt-in — shown ONLY when configured (silent otherwise, by design)
-    oi = secrets.openintel()
-    if oi.get("binary") and oi.get("db"):
-        ok_oi = (shutil.which(oi["binary"]) or Path(oi["binary"]).is_file()) and Path(oi["db"]).is_file()
-        click.echo(f"  {_c('✓' if ok_oi else '✗', 'green' if ok_oi else 'red')} "
-                   f"openintel-subs (advanced) {oi['db']}")
     # Censys Platform — ADVANCED opt-in; shown ONLY when configured (silent otherwise, by design)
     cen = secrets.censys()
     if cen.get("token") and cen.get("org"):
@@ -211,6 +205,19 @@ def doctor(phase):
                            f"{', '.join(drift)} — add manually (update never overwrites your file)")
         except Exception:
             pass
+
+    # config.yaml — machine-scoped runtime settings (non-secret: performance/concurrency + local paths)
+    from . import settings
+    click.echo(_c("\n[config]", "magenta") + f"  ({settings.PATH})")
+    if not settings.PATH.exists():
+        click.echo(f"  {_c('·', 'yellow')} config.yaml not found — `quarry install` creates it "
+                   f"(safe defaults apply until it exists)")
+    click.echo(f"  {_c('✓', 'green')} performance profile     {settings.profile()}")
+    oi = settings.openintel()   # advanced opt-in (config.yaml, or legacy secrets.yaml) — shown only if set
+    if oi.get("binary") and oi.get("db"):
+        ok_oi = (shutil.which(oi["binary"]) or Path(oi["binary"]).is_file()) and Path(oi["db"]).is_file()
+        click.echo(f"  {_c('✓' if ok_oi else '✗', 'green' if ok_oi else 'red')} "
+                   f"openintel-subs (advanced) {oi['db']}")
 
     # notify — opt-in run notifications (off unless secrets.yaml notify: is set)
     from . import notify as _notify

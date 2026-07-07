@@ -1,0 +1,26 @@
+# Quarry — non-secret runtime config (~/.config/quarry/config.yaml).
+#
+# Machine-scoped knobs that are NOT credentials and NOT per-engagement. secrets.yaml stays
+# credentials-only; target.yaml stays the engagement (scope + RATELIMIT). Everything here is
+# optional — unset = safe defaults. Created once; `quarry install` never overwrites it.
+
+# ── Performance / concurrency ────────────────────────────────────────────────────────────────
+# CONCURRENCY = how many LOCAL lanes a tool uses (a machine property). This is separate from RATE
+# (pressure on the TARGET) — RATE stays in target.yaml → RATELIMIT. Pushing concurrency must NOT
+# push past the target's rate budget; the two are tuned independently.
+PERFORMANCE:
+  PROFILE: auto        # auto (scale workers from CPU cores) | safe | balanced | aggressive
+  # optional explicit per-tool overrides (blank = profile / tool default):
+  NUCLEI_CONCURRENCY:
+  HTTPX_THREADS:
+  FFUF_THREADS:
+  DALFOX_WORKERS:
+
+# ── Advanced local tool paths (NOT credentials — paths, so they live here, not in secrets.yaml) ──
+# openintel-subs: extra PASSIVE subdomain source, silently unused unless BOTH paths are set AND
+# present. You provide the binary + local subs.db. See notes/OPENINTEL-OPTIONAL.md.
+# (Legacy: an `openintel:` block in secrets.yaml is still read for back-compat, but config.yaml is
+#  its proper home — this is a path pair, not a credential.)
+# openintel:
+#   binary: /opt/openintel-subs/openintel-subs-linux
+#   db:     /opt/openintel-subs/subs.db

@@ -14,7 +14,7 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from .. import normalize, secrets
+from .. import normalize, secrets, settings
 from ..runner import Status, have, run as exec_tool, skipped
 
 
@@ -162,8 +162,8 @@ def run(ctx) -> None:
     if ct_new:
         ctx.echo(f"  CT logs (crt.sh + certspotter): +{ct_new} in-scope")
 
-    # ── passive: openintel-subs (ADVANCED — SILENT unless secrets.yaml `openintel:` is configured) ──
-    oi = secrets.openintel()
+    # ── passive: openintel-subs (ADVANCED — SILENT unless config.yaml `openintel:` set; secrets.yaml legacy) ──
+    oi = settings.openintel()   # config.yaml (proper home) with secrets.yaml back-compat
     if oi.get("binary") and oi.get("db"):
         oi_hosts = set()
         for apex in prof.apex_domains:
