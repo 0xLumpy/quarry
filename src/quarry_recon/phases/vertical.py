@@ -321,7 +321,6 @@ def run(ctx) -> None:
                       raw_path=cn, timeout=ctx.http_timeout)
         ctx.run.record("vertical", r)
         if r.raw_path:
-            import json as _json
             n = ntk = 0
             for line in r.raw_path.read_text().splitlines():
                 try:

@@ -298,7 +298,6 @@ def run(ctx) -> None:
         r = exec_tool("nuclei", waf_cmd, timeout=ctx.http_timeout)
         ctx.run.record("probe", r)
         if waf_out.exists():
-            import json as _json
             n = 0
             for line in waf_out.read_text().splitlines():
                 try:
