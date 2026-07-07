@@ -244,7 +244,7 @@ traces back to the tool and raw file that produced it.
 
 ## Output
 
-Everything for a target lives in **one project dir** (`./projects/<target>/`) — profile,
+Everything for a target lives in **one project dir** (`~/projects/<target>/`) — profile,
 OSINT, and recon together. Clean to `rsync` down to your local machine for manual testing.
 
 ```text
@@ -267,8 +267,9 @@ projects/<target>/
   recon/state/history/<run_id>.json
 ```
 
-(Projects root defaults to `./projects/`; override with `--projects-dir` / `$QUARRY_PROJECTS`
-on `quarry init`. Keys + wordlists stay global in `~/.config/quarry/`.)
+(Projects root defaults to `~/projects/` (home-anchored, so runs don't depend on your cwd); override
+with `--projects-dir` / `$QUARRY_PROJECTS` on `quarry init`. Keys stay global in `~/.config/quarry/`;
+wordlists in `~/.config/quarry/wordlists/`.)
 
 **HOTLIST** ranks: scanner candidates (unconfirmed), likely-origin (non-CDN) hosts,
 auth/api/admin/file buckets, IDOR/SSRF/SQLi/XSS param candidates (common-vuln lists), secrets,
@@ -304,7 +305,7 @@ Each phase reruns independently; the install/update lifecycle is owned by the to
 Start with `quarry doctor`. Common issues:
 
 - `subfinder` finds little → configure provider API keys (run shows `-stats` per source).
-- `puredns` skipped → add `~/.config/quarry/dns-wordlist.txt`.
+- `puredns` skipped → add `~/.config/quarry/wordlists/dns.txt`.
 - weak DNS results → check resolvers / trusted resolvers.
 - `httpx` returns nothing → check scope, rate limits, WAF blocking, tool status in manifest.
 - screenshots fail → check Chromium / headless deps (`quarry doctor` flags chromium-needing tools).

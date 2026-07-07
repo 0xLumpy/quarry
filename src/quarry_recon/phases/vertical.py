@@ -120,7 +120,8 @@ def _resolvers(ctx) -> tuple[Path | None, Path | None]:
 
 def _wordlist(ctx) -> Path | None:
     home = Path.home()
-    for p in (home / ".config/quarry/dns-wordlist.txt",
+    for p in (home / ".config/quarry/wordlists/dns.txt",       # canonical (clean layout)
+              home / ".config/quarry/dns-wordlist.txt",        # back-compat (pre-reorg installs)
               home / "wordlists/best-dns-wordlist.txt",
               home / "wordlists/subdomains.txt"):
         if p.exists():
@@ -228,7 +229,7 @@ def run(ctx) -> None:
         ctx.run.record("vertical", skipped("puredns", "passive-only mode"))
     elif wl is None:
         ctx.run.record("vertical", skipped("puredns",
-                       "no DNS wordlist (~/.config/quarry/dns-wordlist.txt) — brute skipped"))
+                       "no DNS wordlist (~/.config/quarry/wordlists/dns.txt) — brute skipped"))
         ctx.run.notes.append("vertical: DNS brute skipped, no wordlist")
     else:
         for d in prof.apex_domains:

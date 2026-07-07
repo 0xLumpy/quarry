@@ -180,8 +180,9 @@ data_files:
     url: https://gist.githubusercontent.com/six2dez/ae9ed7e5c786461868abd3f2344401b6/raw/trusted_resolvers.txt
     update: true
     fallback: "1.1.1.1\n8.8.8.8\n9.9.9.9\n1.0.0.1\n208.67.222.222\n"
+  # all wordlists live under wordlists/ for a clean config dir (resolvers + secrets stay at the root).
   - name: dns-wordlist
-    dest: ~/.config/quarry/dns-wordlist.txt
+    dest: ~/.config/quarry/wordlists/dns.txt
     url: https://raw.githubusercontent.com/n0kovo/n0kovo_subdomains/main/n0kovo_subdomains_huge.txt
     update: false
   # content-discovery wordlists (Phase 11 balanced/deep). BETA: SecLists raft lists for now —
@@ -198,7 +199,7 @@ data_files:
   # vhost fuzzing is IPs×apexes×words, so the big DNS brute list would be a footgun. Lands at the
   # first path _vhost_wordlist() checks, so vhost enum works out-of-box after install.
   - name: vhost-wordlist
-    dest: ~/.config/quarry/vhost-wordlist.txt
+    dest: ~/.config/quarry/wordlists/vhost.txt
     url: https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt
     update: false
 

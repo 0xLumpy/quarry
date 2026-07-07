@@ -15,8 +15,10 @@ from .registry import load_tools, run_shell, tools_by_phase
 
 
 def _projects_root(opt: str | None) -> Path:
-    """Where `quarry init` creates project dirs. Default ./projects (cwd)."""
-    return Path(opt or os.environ.get("QUARRY_PROJECTS") or "projects")
+    """Where `quarry init` creates project dirs. Home-anchored default (~/projects) so a run doesn't
+    depend on the cwd — a project is found the same way no matter where you invoke quarry from.
+    Override explicitly with --projects-dir or $QUARRY_PROJECTS (e.g. to keep them in the cwd)."""
+    return Path(opt or os.environ.get("QUARRY_PROJECTS") or (Path.home() / "projects"))
 
 
 def _project_dir(profile) -> Path:
@@ -139,14 +141,23 @@ def doctor(phase):
     # environment checks
     click.echo(_c("\n[environment]", "magenta"))
     cfg = Path.home() / ".config/quarry"
-    for label, p in [("resolvers", cfg / "resolvers.txt"),
-                     ("trusted-resolvers", cfg / "trusted-resolvers.txt"),
-                     ("dns-wordlist", cfg / "dns-wordlist.txt"),
-                     ("content-wl balanced", cfg / "wordlists/content/balanced.txt"),
-                     ("content-wl deep", cfg / "wordlists/content/deep.txt")]:
-        mark = _c("✓", "green") if p.exists() else _c("·", "yellow")
-        note = "" if p.exists() else f"(optional) put at {p}"
-        click.echo(f"  {mark} {label:<24} {note}")
+    # Resolvers + wordlists are NOT optional (unlike API keys) — they're standard install artifacts,
+    # and without them core steps can't run (no DNS wordlist → brute skips, no vhost list → vhost enum
+    # skips, etc.). So a missing one is a WARNING with the fix, not a soft "(optional)". wordlists live
+    # under wordlists/ (clean layout); older installs kept them at the config root — check the canonical
+    # path first, then the back-compat one, and show whichever exists.
+    for label, cands in [("resolvers", [cfg / "resolvers.txt"]),
+                         ("trusted-resolvers", [cfg / "trusted-resolvers.txt"]),
+                         ("dns wordlist", [cfg / "wordlists/dns.txt", cfg / "dns-wordlist.txt"]),
+                         ("vhost wordlist", [cfg / "wordlists/vhost.txt", cfg / "vhost-wordlist.txt"]),
+                         ("content-wl balanced", [cfg / "wordlists/content/balanced.txt"]),
+                         ("content-wl deep", [cfg / "wordlists/content/deep.txt"])]:
+        hit = next((c for c in cands if c.exists()), None)
+        if hit:
+            click.echo(f"  {_c('✓', 'green')} {label:<24} {hit}")
+        else:
+            click.echo(f"  {_c('⚠', 'yellow')} {label:<24} "
+                       f"MISSING — run `quarry install` (expected at {cands[0]})")
 
     for label, bin_ in [("go toolchain", "go"), ("chromium", "chromium"),
                         ("pipx", "pipx")]:
@@ -162,6 +173,10 @@ def doctor(phase):
     # secrets.yaml — framework-read keys (present / not set). Quarry-owned keys only; tool-native
     # source keys (subfinder/amass) live in each tool's own config (documented in install + docs).
     click.echo(_c("\n[secrets]", "magenta") + f"  ({secrets.PATH})")
+    secrets_present = secrets.PATH.exists()
+    if not secrets_present:
+        click.echo(f"  {_c('✗', 'red')} secrets.yaml NOT FOUND — run `quarry install` to recreate it "
+                   f"from the template (or restore a backup); keys read as unset until it exists")
     n_gh = len(secrets.github_tokens())
     rows = [("github tokens", bool(n_gh), f"{n_gh} token(s)" if n_gh else ""),
             ("shodan", bool(secrets.shodan()), ""),
@@ -183,17 +198,19 @@ def doctor(phase):
         click.echo(f"  {_c('✓', 'green')} censys (advanced)          Platform cert search")
     # template drift: the shipped template can gain new optional keys, but bootstrap NEVER overwrites
     # an existing secrets.yaml (so it can't clobber your keys) — so surface any key the template has
-    # that your file predates, since it won't appear on its own.
-    try:
-        import yaml as _yaml
-        tpl = _yaml.safe_load(
-            resources.files("quarry_recon.data").joinpath("secrets.template.yaml").read_text()) or {}
-        drift = [k for k in tpl if k not in secrets.load()]
-        if drift:
-            click.echo(f"  {_c('ℹ', 'cyan')} template adds optional key(s) your secrets.yaml predates: "
-                       f"{', '.join(drift)} — add manually (update never overwrites your file)")
-    except Exception:
-        pass
+    # that your file predates. ONLY when the file exists: a missing file isn't "drift" (every key
+    # would falsely look predated), it's the NOT-FOUND case handled above.
+    if secrets_present:
+        try:
+            import yaml as _yaml
+            tpl = _yaml.safe_load(
+                resources.files("quarry_recon.data").joinpath("secrets.template.yaml").read_text()) or {}
+            drift = [k for k in tpl if k not in secrets.load()]
+            if drift:
+                click.echo(f"  {_c('ℹ', 'cyan')} template adds optional key(s) your secrets.yaml predates: "
+                           f"{', '.join(drift)} — add manually (update never overwrites your file)")
+        except Exception:
+            pass
 
     # notify — opt-in run notifications (off unless secrets.yaml notify: is set)
     from . import notify as _notify
@@ -365,7 +382,7 @@ def update(dry_run, include_optional):
 @cli.command()
 @click.argument("name")
 @click.option("-o", "--out", help="exact project dir (default: <projects-root>/<name>)")
-@click.option("--projects-dir", help="projects root (default ./projects or $QUARRY_PROJECTS)")
+@click.option("--projects-dir", help="projects root (default ~/projects or $QUARRY_PROJECTS)")
 def init(name, out, projects_dir):
     """Create a project: <projects>/<name>/target.yaml (or -o <dir>). osint + recon co-locate here."""
     # sanitize: the NAME is the target id (a single path segment), never a path. The location

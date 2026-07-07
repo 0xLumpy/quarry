@@ -103,7 +103,8 @@ def _vhost_wordlist():
     None → the step records a skip (opt-in by dropping a list at one of these paths)."""
     from pathlib import Path
     home = Path.home()
-    for p in (home / ".config/quarry/vhost-wordlist.txt",
+    for p in (home / ".config/quarry/wordlists/vhost.txt",     # canonical (clean layout)
+              home / ".config/quarry/vhost-wordlist.txt",      # back-compat (pre-reorg installs)
               home / "wordlists/vhosts.txt", home / "wordlists/subdomains-top1million-5000.txt"):
         if p.exists():
             return p
@@ -122,7 +123,7 @@ def _vhost_enum(ctx) -> None:
     wl = _vhost_wordlist()
     if wl is None:
         ctx.run.record("probe", skipped("ffuf-vhost",
-                       "no vhost wordlist (~/.config/quarry/vhost-wordlist.txt) — vhost enum skipped"))
+                       "no vhost wordlist (~/.config/quarry/wordlists/vhost.txt) — vhost enum skipped"))
         return
     scope, prof = ctx.scope, ctx.profile
     # origin IPs: from live services not fronted by a CDN, in-scope only, bounded

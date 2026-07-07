@@ -23,7 +23,7 @@ quarry doctor                               # audit: tools, versions, deps, keys
 ```
 
 `doctor` confirms recon tools on `PATH`, chromium present (gowitness needs it), and
-`~/.config/quarry/{resolvers.txt,trusted-resolvers.txt,dns-wordlist.txt}` exist.
+`~/.config/quarry/{resolvers.txt,trusted-resolvers.txt} and ~/.config/quarry/wordlists/dns.txt` exist.
 
 ---
 
@@ -214,7 +214,7 @@ shosubgo -f <work>/roots.txt -s <shodan-key> -o raw/vertical/shosubgo/sho.txt
 if present; no `--rate-limit` since `DNS` blank), per apex:
 
 ```bash
-puredns bruteforce ~/.config/quarry/dns-wordlist.txt 0xlumpy.cc \
+puredns bruteforce ~/.config/quarry/wordlists/dns.txt 0xlumpy.cc \
   --resolvers-trusted ~/.config/quarry/trusted-resolvers.txt \
   -r ~/.config/quarry/resolvers.txt -q
 ```
