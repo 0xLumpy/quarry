@@ -112,12 +112,20 @@ def _vhost_wordlist():
 
 
 def _vhost_enum(ctx) -> None:
-    """Virtual-host enumeration (ffuf `-H 'Host: FUZZ.<apex>'`): a single origin IP frequently serves
-    name-based vhosts that DON'T resolve in public DNS (staging/internal/legacy/pre-prod). For each
-    in-scope **origin** IP (from live services NOT behind a CDN — fuzzing a shared CDN edge is noise),
-    fuzz Host headers against `http://<ip>/`, autocalibrated (`-ac`) to drop the catch-all/default
-    response. Hits are hostnames the origin answers for → `vhost` review candidates (a 200 isn't proof
-    the name exists in DNS or is owned — human verifies). Active; needs ffuf + a dedicated vhost list."""
+    """Virtual-host enumeration (ffuf `-H 'Host: FUZZ.<apex>'`): an origin frequently serves name-based
+    vhosts that DON'T resolve in public DNS (staging/internal/legacy/pre-prod). We fuzz the Host header
+    against a REPRESENTATIVE live URL of each non-CDN origin — NOT `http://<ip>/`. A bare-IP request
+    fails on HTTPS/redirecting origins: Caddy/CDN answers port 80 with a uniform redirect that `-ac`
+    folds to nothing, and a bare-IP TLS handshake fails SNI. Connecting via a real live host (valid
+    scheme + SNI + cert) still reaches the same origin, and the overridden Host header surfaces the
+    DNS-invisible vhosts. `-ac` drops the catch-all so a distinct response stands out. Hits are `vhost`
+    review candidates (a 200 isn't proof the name resolves/is owned — human verifies). Active; needs
+    ffuf + a vhost wordlist. Origins de-duped by IP so each is fuzzed once.
+
+    Matching is `-mc all` + `-ac` (not a fixed status allowlist): ports/presentations vary, so a fixed
+    200/301/403 list would miss a vhost that answers with an odd code — instead `-ac` drops the
+    catch-all baseline and whatever differs remains. `-r` follows redirects so a vhost that 30x's to
+    real content is classified on its FINAL response, not the hop."""
     if not have("ffuf"):
         return
     wl = _vhost_wordlist()
@@ -126,20 +134,30 @@ def _vhost_enum(ctx) -> None:
                        "no vhost wordlist (~/.config/quarry/wordlists/vhost.txt) — vhost enum skipped"))
         return
     scope, prof = ctx.scope, ctx.profile
-    # origin IPs: from live services not fronted by a CDN, in-scope only, bounded
-    origins = sorted({ip for l in ctx.run.read("live") if not l.get("cdn")
-                      for ip in (l.get("a") or []) if ip})[:25]
+    # one representative live URL per non-CDN origin (keyed by IP so co-hosted names fuzz once). The
+    # live URL is the connection point (correct scheme + a valid SNI host); the Host header is fuzzed.
+    origins: dict[str, str] = {}
+    for l in ctx.run.read("live"):
+        if l.get("cdn"):
+            continue
+        url = (l.get("url") or "").strip()
+        m = _re.match(r"(?i)(https?://[^/]+)", url)
+        host = normalize.host_of_url(url)
+        if not m or not scope.active_allowed(host):
+            continue
+        key = (l.get("a") or [None])[0] or host       # origin identity (IP preferred, else host)
+        origins.setdefault(str(key), m.group(1))
+    origins = dict(list(origins.items())[:25])
     if not origins:
-        ctx.run.record("probe", skipped("ffuf-vhost", "no non-CDN origin IPs to fuzz"))
+        ctx.run.record("probe", skipped("ffuf-vhost", "no non-CDN origin live hosts to fuzz"))
         return
     apexes = [a for a in prof.apex_domains if scope.in_scope(a)]
     found = 0
-    for ip in origins:
+    for origin, base in origins.items():
         for apex in apexes:
-            out = ctx.run.raw_path("probe", "ffuf-vhost", f"{ip}_{apex}.json")
+            out = ctx.run.raw_path("probe", "ffuf-vhost", f"{origin}_{apex}.json")
             cmd = ["ffuf", "-w", f"{wl}:FUZZ", "-H", f"Host: FUZZ.{apex}",
-                   "-u", f"http://{ip}/", "-ac", "-t", "40", "-s",
-                   "-mc", "200,204,301,302,307,401,403,405,500",
+                   "-u", f"{base}/", "-ac", "-r", "-mc", "all", "-t", "40", "-s",
                    "-o", str(out), "-of", "json"]
             if prof.http_rl:
                 cmd += ["-rate", str(prof.http_rl)]
@@ -156,14 +174,14 @@ def _vhost_enum(ctx) -> None:
                 host = f"{word.lower().strip('.')}.{apex}" if word else ""
                 if not host or "." not in host or not scope.in_scope(host):
                     continue
-                if ctx.run.add("review", {"id": f"vhost:{ip}:{host}", "klass": "vhost",
-                        "value": host, "host": host, "ip": ip,
+                if ctx.run.add("review", {"id": f"vhost:{origin}:{host}", "klass": "vhost",
+                        "value": host, "host": host, "ip": origin,
                         "status_code": hit.get("status"),
-                        "note": f"origin {ip} serves vhost {host} (may not resolve in DNS) — VERIFY",
+                        "note": f"origin {origin} serves vhost {host} (may not resolve in DNS) — VERIFY",
                         "sources": ["ffuf-vhost"], "raw_ref": str(out)}):
                     found += 1
     if found:
-        ctx.echo(f"  vhost: {found} name-based vhost candidate(s) on origin IPs (ffuf)")
+        ctx.echo(f"  vhost: {found} name-based vhost candidate(s) via Host-header fuzz (ffuf)")
 
 
 def run(ctx) -> None:
