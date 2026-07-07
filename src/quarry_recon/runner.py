@@ -32,7 +32,12 @@ def nuclei_timeout(n_targets: int, floor: int, per_target: int = 90) -> int:
     is partial" checkpoint. Here `floor` (the base `--timeout`) is the minimum for small scopes, and
     the budget grows ~`per_target` seconds per target — so a large program (thousands of live hosts /
     endpoints) gets the time it needs. NO upper cap by design: scope size must never truncate coverage.
-    The computed (large) ceiling still bounds a genuinely-hung process."""
+    The computed (large) ceiling still bounds a genuinely-hung process.
+
+    `floor <= 0` (i.e. `--timeout 0`) means FULLY UNBOUNDED — no wall-clock kill at all (reconftw's
+    `PARALLEL_JOB_TIMEOUT_SECONDS=0` semantics), for RoE-driven runs where a cut is unacceptable."""
+    if floor <= 0:
+        return 0                                  # unbounded — exec_tool maps 0 -> no timeout
     return max(int(floor), per_target * max(int(n_targets), 1))
 
 
@@ -147,7 +152,7 @@ def run(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            timeout=timeout or None,      # 0 (or None) => no wall-clock kill (RoE-driven long runs)
             env=env,
             cwd=_TOOL_CWD,
             **stdin_kw,
