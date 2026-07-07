@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 
 from .. import normalize, secrets
-from ..runner import Status, have, run as exec_tool, skipped
+from ..runner import Status, have, nuclei_timeout, run as exec_tool, skipped
 
 # Serialized-object / token markers that surface in Set-Cookie + response headers. Spotting the
 # FORMAT is PASSIVE recon evidence (a hand-off to the attack layer), never exploitation. Only
@@ -295,7 +295,8 @@ def run(ctx) -> None:
         waf_cmd = ["nuclei", "-l", str(waf_in), "-tags", "waf", "-jsonl", "-o", str(waf_out)]
         if prof.http_rl:                       # else native default (empty = fast)
             waf_cmd += ["-rl", str(prof.http_rl)]
-        r = exec_tool("nuclei", waf_cmd, timeout=ctx.http_timeout)
+        r = exec_tool("nuclei", waf_cmd,
+                      timeout=nuclei_timeout(ctx.run.count("live"), ctx.http_timeout))
         ctx.run.record("probe", r)
         if waf_out.exists():
             n = 0

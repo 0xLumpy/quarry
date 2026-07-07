@@ -26,6 +26,16 @@ def set_tool_cwd(path) -> None:
     _TOOL_CWD = str(path) if path else None
 
 
+def nuclei_timeout(n_targets: int, floor: int, per_target: int = 90) -> int:
+    """Scale a nuclei run's timeout by workload. nuclei runtime grows with target count (roughly
+    templates × targets), so a flat per-tool ceiling kills big scans mid-run and yields the "coverage
+    is partial" checkpoint. Here `floor` (the base `--timeout`) is the minimum for small scopes, and
+    the budget grows ~`per_target` seconds per target — so a large program (thousands of live hosts /
+    endpoints) gets the time it needs. NO upper cap by design: scope size must never truncate coverage.
+    The computed (large) ceiling still bounds a genuinely-hung process."""
+    return max(int(floor), per_target * max(int(n_targets), 1))
+
+
 class Status(str, Enum):
     SUCCESS = "success"     # ran clean, produced output
     EMPTY = "empty"         # ran clean, zero output (genuine nothing-found)

@@ -12,7 +12,7 @@ from __future__ import annotations
 import json as _json
 
 from .. import normalize
-from ..runner import have, run as exec_tool, skipped
+from ..runner import have, nuclei_timeout, run as exec_tool, skipped
 
 
 def run(ctx) -> None:
@@ -113,7 +113,8 @@ def run(ctx) -> None:
                 wcmd = ["nuclei", "-l", str(wi), "-tags", "waf", "-jsonl", "-o", str(wo)]
                 if prof.http_rl:
                     wcmd += ["-rl", str(prof.http_rl)]
-                ctx.run.record("enrich", exec_tool("nuclei", wcmd, timeout=ctx.http_timeout))
+                ctx.run.record("enrich", exec_tool(
+                    "nuclei", wcmd, timeout=nuclei_timeout(len(new_live), ctx.http_timeout)))
                 if wo.exists():
                     for line in wo.read_text().splitlines():
                         try:

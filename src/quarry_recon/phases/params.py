@@ -11,7 +11,7 @@ import json
 import re
 
 from .. import evidence, normalize, secrets
-from ..runner import Status, have, run as exec_tool, skipped
+from ..runner import Status, have, nuclei_timeout, run as exec_tool, skipped
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
 
@@ -228,7 +228,7 @@ def run(ctx) -> None:
             if prof.http_rl:                       # else native default (empty = fast)
                 tk_cmd += ["-rl", str(prof.http_rl)]
             _apply_nuclei_oob(tk_cmd)              # same OOB endpoint as the main scan (no drift)
-            r = exec_tool("nuclei", tk_cmd, timeout=ctx.http_timeout)
+            r = exec_tool("nuclei", tk_cmd, timeout=nuclei_timeout(len(subs), ctx.http_timeout))
             ctx.run.record("params", r)
             if tk_out.exists():
                 import json as _json
@@ -258,7 +258,11 @@ def run(ctx) -> None:
     if prof.http_rl:
         cmd += ["-rl", str(prof.http_rl)]
     _apply_nuclei_oob(cmd)                          # self-hosted interactsh (else nuclei's public default)
-    r = exec_tool("nuclei", cmd, timeout=ctx.http_timeout)
+    # nuclei is the long-pole: scale its ceiling by live-host count so a big scope isn't killed
+    # mid-scan (the "coverage is partial" checkpoint). Small scopes still get the base --timeout.
+    nt = nuclei_timeout(len(live), ctx.http_timeout)
+    ctx.echo(f"  nuclei: scanning {len(live)} host(s), budget {nt // 60}m (scaled from {ctx.http_timeout // 60}m base)")
+    r = exec_tool("nuclei", cmd, timeout=nt)
     if r.stderr_tail:
         log.write_text(r.stderr_tail)
     ctx.run.record("params", r)
