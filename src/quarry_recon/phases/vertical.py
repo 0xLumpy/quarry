@@ -160,8 +160,13 @@ def _wildcard_differentiate(ctx, zones: set) -> int:
         cf = ctx.write_list(f"wc_cand_{zone.replace('.', '_')}.txt",
                             [f"{w}.{zone}" for w in words] + bogus)
         hx = ctx.run.raw_path("vertical", "wildcard", f"{zone}.jsonl")
-        r = exec_tool("httpx", ["httpx", "-l", str(cf), "-json", "-silent", "-sc", "-cl",
-                                "-title", "-favicon", "-t", str(settings.workers("httpx", 15))],
+        # -follow-redirects so the signature is the FINAL response, not a bare redirect: without it a
+        # candidate httpx probes on http gets the wildcard's uniform 308→https (status 308, len 0) —
+        # which "differs" from the 200 baseline and floods false positives. Following it collapses
+        # every noise candidate back onto the real baseline, leaving only the genuinely-distinct vhosts.
+        r = exec_tool("httpx", ["httpx", "-l", str(cf), "-json", "-silent", "-sc", "-cl", "-title",
+                                "-favicon", "-follow-redirects",
+                                "-t", str(settings.workers("httpx", 15))],
                       raw_path=hx, timeout=ctx.http_timeout)
         ctx.run.record("vertical", r)
         if not (r.raw_path and r.raw_path.exists()):
@@ -178,6 +183,8 @@ def _wildcard_differentiate(ctx, zones: set) -> int:
         for o in rows:
             host = (o.get("input") or o.get("host") or "").lower().rstrip(".")
             if not host or host in bogus or not scope.in_scope(host) or scope.is_oos(host):
+                continue
+            if (o.get("status_code") or 0) // 100 == 3:   # un-followed redirect = infra noise, not a vhost
                 continue
             if _sig(o) not in base:             # differs from the wildcard baseline → a REAL vhost
                 if ctx.run.add("subdomain", {"host": host, "sources": ["wildcard-http"],
