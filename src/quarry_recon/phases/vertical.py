@@ -143,6 +143,7 @@ def _wildcard_differentiate(ctx, zones: set) -> int:
     zones = sorted(z for z in zones if scope.in_scope(z) and not scope.is_oos(z))[:5]
     if not zones or scope.passive_only or not have("httpx"):
         return 0
+    from .probe import _vhost_wordlist          # small label list (lives in probe); DNS list is fallback
     wl = _vhost_wordlist() or _wordlist(ctx)
     if wl is None:
         return 0
