@@ -7,12 +7,56 @@ a failure/block/timeout as a genuine "nothing found" (design §3).
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
+try:
+    import resource                              # unix-only; per-tool child CPU via getrusage delta
+except ImportError:                              # pragma: no cover — non-unix fallback
+    resource = None
+
+
+def _rss_tree_mb(root_pid: int) -> float:
+    """Peak-sample helper: sum RSS (MB) of `root_pid` + all its descendants from /proc (Linux).
+    Best-effort — returns 0.0 on any error / non-/proc platform. Uses /proc/<pid>/status (clean
+    `VmRSS:` + `PPid:` lines) rather than parsing stat's paren-comm field."""
+    try:
+        info: dict[int, tuple[int, int]] = {}    # pid -> (ppid, rss_kb)
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                ppid = rss = 0
+                with open(f"/proc/{name}/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            rss = int(line.split()[1])
+                        elif line.startswith("PPid:"):
+                            ppid = int(line.split()[1])
+                info[int(name)] = (ppid, rss)
+            except (OSError, ValueError):
+                continue
+        children: dict[int, list[int]] = {}
+        for pid, (ppid, _) in info.items():
+            children.setdefault(ppid, []).append(pid)
+        total = 0
+        stack, seen = [root_pid], set()
+        while stack:
+            p = stack.pop()
+            if p in seen or p not in info:
+                continue
+            seen.add(p)
+            total += info[p][1]
+            stack.extend(children.get(p, []))
+        return total / 1024.0
+    except Exception:
+        return 0.0
 
 # Some tools write stray files to the current directory (gowitness's sqlite, github-subdomains'
 # <domain>.txt, …). Point the working directory at a per-run scratch dir so those land inside the
@@ -75,6 +119,8 @@ class RunResult:
     stdout_lines: int
     stderr_tail: str = ""
     note: str = ""
+    cpu_s: float = 0.0                 # child CPU seconds for THIS tool (getrusage delta)
+    peak_rss_mb: float = 0.0           # peak RSS of this tool's process tree (/proc sampling)
     meta: dict = field(default_factory=dict)
 
     @property
@@ -147,35 +193,55 @@ def run(
     # When we are NOT feeding stdin, hand the tool /dev/null. ProjectDiscovery tools
     # (dnsx/httpx/naabu/katana...) read stdin when it is a non-TTY pipe; an inherited
     # open-but-empty stdin makes them block until EOF (manifests as a full timeout).
-    stdin_kw = {}
-    if stdin_data is None:
-        stdin_kw["stdin"] = subprocess.DEVNULL
+    stdin_kw = {"stdin": subprocess.DEVNULL if stdin_data is None else subprocess.PIPE}
+    # Popen (not subprocess.run) so we hold the pid + can SAMPLE the process tree's RSS during the
+    # run (a daemon thread polling /proc). CPU comes from a getrusage(CHILDREN) delta — tools run
+    # sequentially, so the delta cleanly attributes child CPU to THIS tool. communicate(input=,
+    # timeout=) is behavior-equivalent to the old run(): same 0/None = no-wall-clock-kill semantics.
+    cpu0 = (resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None)
+    cpu_base = (cpu0.ru_utime + cpu0.ru_stime) if cpu0 else 0.0
+    peak_rss = [0.0]
+    stop = threading.Event()
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=env, cwd=_TOOL_CWD, **stdin_kw)
+
+    def _sample():
+        while not stop.wait(0.3):
+            r = _rss_tree_mb(proc.pid)
+            if r > peak_rss[0]:
+                peak_rss[0] = r
+    sampler = threading.Thread(target=_sample, daemon=True)
+    sampler.start()
+
+    timed_out = False
     try:
-        proc = subprocess.run(
-            cmd,
-            input=stdin_data if stdin_data is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout or None,      # 0 (or None) => no wall-clock kill (RoE-driven long runs)
-            env=env,
-            cwd=_TOOL_CWD,
-            **stdin_kw,
-        )
-    except subprocess.TimeoutExpired as e:
-        dur = time.monotonic() - start
-        out = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        out, err = proc.communicate(input=stdin_data if stdin_data is not None else None,
+                                    timeout=timeout or None)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()             # reap + drain whatever the tool buffered
+        timed_out = True
+    finally:
+        stop.set()
+        sampler.join(timeout=1)
+
+    dur = time.monotonic() - start
+    cpu1 = (resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None)
+    cpu_s = round((cpu1.ru_utime + cpu1.ru_stime) - cpu_base, 2) if cpu1 else 0.0
+    rss_mb = round(peak_rss[0], 1)
+    out, err = out or "", err or ""
+
+    if timed_out:
         wrote = False
         if raw_path and out:
             raw_path.parent.mkdir(parents=True, exist_ok=True)
             raw_path.write_text(out)
             wrote = True
-        return RunResult(tool, cmd, Status.TIMED_OUT, None, dur,
-                         raw_path if wrote else None,
-                         len(out.splitlines()), note=f"timed out after {timeout}s")
-    dur = time.monotonic() - start
+        return RunResult(tool, cmd, Status.TIMED_OUT, None, dur, raw_path if wrote else None,
+                         len(out.splitlines()), note=f"timed out after {timeout}s",
+                         cpu_s=cpu_s, peak_rss_mb=rss_mb)
 
-    out, err = proc.stdout or "", proc.stderr or ""
     if raw_path is not None:
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         raw_path.write_text(out)
@@ -185,7 +251,7 @@ def run(
     return RunResult(
         tool=tool, cmd=cmd, status=status, exit_code=proc.returncode, duration=dur,
         raw_path=raw_path if out else None, stdout_lines=len(out.splitlines()),
-        stderr_tail=err_tail, note=note,
+        stderr_tail=err_tail, note=note, cpu_s=cpu_s, peak_rss_mb=rss_mb,
     )
 
 

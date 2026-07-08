@@ -55,6 +55,8 @@ class ToolRunRecord:
     note: str
     cmd: str
     stderr_tail: str = ""
+    cpu_s: float = 0.0                 # per-tool child CPU seconds (H3 telemetry)
+    peak_rss_mb: float = 0.0           # per-tool peak RSS (MB) of the process tree (H3 telemetry)
 
 
 class Run:
@@ -98,6 +100,7 @@ class Run:
             exit_code=result.exit_code, duration=round(result.duration, 2),
             stdout_lines=result.stdout_lines, note=secrets.redact(result.note),
             cmd=secrets.redact(" ".join(result.cmd)), stderr_tail=secrets.redact(result.stderr_tail),
+            cpu_s=getattr(result, "cpu_s", 0.0), peak_rss_mb=getattr(result, "peak_rss_mb", 0.0),
         ))
 
     def tool_runs(self, phase: str | None = None) -> list[ToolRunRecord]:
