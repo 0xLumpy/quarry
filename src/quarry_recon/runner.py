@@ -26,13 +26,18 @@ def set_tool_cwd(path) -> None:
     _TOOL_CWD = str(path) if path else None
 
 
-def nuclei_timeout(n_targets: int, floor: int, per_target: int = 90) -> int:
+def nuclei_timeout(n_targets: int, floor: int, per_target: int = 240) -> int:
     """Scale a nuclei run's timeout by workload. nuclei runtime grows with target count (roughly
-    templates × targets), so a flat per-tool ceiling kills big scans mid-run and yields the "coverage
-    is partial" checkpoint. Here `floor` (the base `--timeout`) is the minimum for small scopes, and
-    the budget grows ~`per_target` seconds per target — so a large program (thousands of live hosts /
-    endpoints) gets the time it needs. NO upper cap by design: scope size must never truncate coverage.
-    The computed (large) ceiling still bounds a genuinely-hung process.
+    templates × targets / concurrency), so a flat per-tool ceiling kills big scans mid-run and yields
+    the "coverage is partial" checkpoint. Here `floor` (the base `--timeout`) is the minimum for small
+    scopes, and the budget grows ~`per_target` seconds per target — so a large program (thousands of
+    live hosts / endpoints) gets the time it needs. NO upper cap by design: scope size must never
+    truncate coverage. The computed (large) ceiling still bounds a genuinely-hung process.
+
+    `per_target` is a CEILING, not a duration: nuclei exits when it finishes, so a generous value only
+    lets a slow run complete — it never slows a fast one. Bumped 90→240s after a 34-host range run hit
+    the 90s/host ceiling still partial (the always-responsive test range engages far more templates
+    per host than a real target; a real host's mostly-404 responses finish well inside this).
 
     `floor <= 0` (i.e. `--timeout 0`) means FULLY UNBOUNDED — no wall-clock kill at all (reconftw's
     `PARALLEL_JOB_TIMEOUT_SECONDS=0` semantics), for RoE-driven runs where a cut is unacceptable."""
