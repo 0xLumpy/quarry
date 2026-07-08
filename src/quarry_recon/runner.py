@@ -23,40 +23,60 @@ except ImportError:                              # pragma: no cover — non-unix
 
 
 def _rss_tree_mb(root_pid: int) -> float:
-    """Peak-sample helper: sum RSS (MB) of `root_pid` + all its descendants from /proc (Linux).
-    Best-effort — returns 0.0 on any error / non-/proc platform. Uses /proc/<pid>/status (clean
-    `VmRSS:` + `PPid:` lines) rather than parsing stat's paren-comm field."""
+    """Peak-sample helper: PROPORTIONAL physical RAM (MB) of `root_pid` + all its descendants.
+
+    Uses PSS (Proportional Set Size) from `/proc/<pid>/smaps_rollup` — a shared page is divided among
+    its sharers, so summing a tree of copy-on-write processes (chromium's child procs, forked workers)
+    gives the TRUE physical footprint. A naive VmRSS *sum* counts shared pages once per process and can
+    inflate a tool's RAM manyfold (measured: a dalfox tree read ~8 GB by VmRSS-sum vs a 664 MB true
+    peak). Falls back to VmRSS when smaps_rollup is unavailable. Best-effort; 0.0 on error/non-Linux."""
     try:
-        info: dict[int, tuple[int, int]] = {}    # pid -> (ppid, rss_kb)
+        parents: dict[int, int] = {}
         for name in os.listdir("/proc"):
             if not name.isdigit():
                 continue
             try:
-                ppid = rss = 0
                 with open(f"/proc/{name}/status") as f:
                     for line in f:
-                        if line.startswith("VmRSS:"):
-                            rss = int(line.split()[1])
-                        elif line.startswith("PPid:"):
-                            ppid = int(line.split()[1])
-                info[int(name)] = (ppid, rss)
+                        if line.startswith("PPid:"):
+                            parents[int(name)] = int(line.split()[1])
+                            break
             except (OSError, ValueError):
                 continue
         children: dict[int, list[int]] = {}
-        for pid, (ppid, _) in info.items():
+        for pid, ppid in parents.items():
             children.setdefault(ppid, []).append(pid)
-        total = 0
+        total_kb = 0
         stack, seen = [root_pid], set()
         while stack:
             p = stack.pop()
-            if p in seen or p not in info:
+            if p in seen or p not in parents:
                 continue
             seen.add(p)
-            total += info[p][1]
+            total_kb += _proc_mem_kb(p)
             stack.extend(children.get(p, []))
-        return total / 1024.0
+        return total_kb / 1024.0
     except Exception:
         return 0.0
+
+
+def _proc_mem_kb(pid: int) -> int:
+    """A process's proportional RAM in kB: PSS from smaps_rollup (shared-aware), else VmRSS."""
+    try:
+        with open(f"/proc/{pid}/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return 0
 
 # Some tools write stray files to the current directory (gowitness's sqlite, github-subdomains'
 # <domain>.txt, …). Point the working directory at a per-run scratch dir so those land inside the
