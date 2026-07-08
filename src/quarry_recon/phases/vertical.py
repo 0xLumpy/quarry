@@ -57,7 +57,7 @@ def _censys(cfg: dict, apex: str, timeout: int = 30) -> set:
     except Exception:
         return set()
     pat = _re.compile(r"[a-z0-9](?:[a-z0-9._-]*)?\." + _re.escape(apex) + r"\b", _re.I)
-    return {m.lower().lstrip("*.").rstrip(".") for m in pat.findall(raw) if "." in m}
+    return {m.lower().strip(".") for m in pat.findall(raw) if "." in m}
 
 
 def _crtsh(apex: str, timeout: int = 30) -> set:
@@ -75,7 +75,7 @@ def _crtsh(apex: str, timeout: int = 30) -> set:
     hosts = set()
     for row in rows if isinstance(rows, list) else []:
         for nv in str(row.get("name_value", "")).splitlines():
-            h = nv.strip().lower().lstrip("*.").rstrip(".")
+            h = nv.strip().lower().strip(".")
             if h and "." in h:
                 hosts.add(h)
     return hosts
@@ -98,7 +98,7 @@ def _certspotter(apex: str, token: str | None = None, timeout: int = 30) -> set:
     hosts = set()
     for row in rows if isinstance(rows, list) else []:
         for h in (row.get("dns_names") or []):
-            h = str(h).strip().lower().lstrip("*.").rstrip(".")
+            h = str(h).strip().lower().strip(".")
             if h and "." in h:
                 hosts.add(h)
     return hosts
@@ -129,6 +129,66 @@ def _wordlist(ctx) -> Path | None:
     return None
 
 
+def _wildcard_differentiate(ctx, zones: set) -> int:
+    """A1 — recover the distinct vhosts hidden behind a wildcard zone. A `*.zone` cert makes every
+    `<word>.zone` resolve to one IP, so a DNS-gated pipeline strips them all as noise and loses the
+    real hosts (CDN / k8s ingress / SaaS). Instead: brute `<word>.zone` + a couple of guaranteed-bogus
+    baseline names, HTTP-probe them all, capture the wildcard's HTTP baseline (the bogus responses'
+    status/length/title/favicon), and keep the candidates whose response DIFFERS from it — the real
+    vhosts. Active + bounded (needs httpx + a wordlist). A non-wildcard zone yields no baseline response
+    → nothing kept. Uses the label wordlist; the target-specific wordlist (A1d) folds in later."""
+    import json as _json
+    import uuid as _uuid
+    scope = ctx.scope
+    zones = sorted(z for z in zones if scope.in_scope(z) and not scope.is_oos(z))[:5]
+    if not zones or scope.passive_only or not have("httpx"):
+        return 0
+    wl = _vhost_wordlist() or _wordlist(ctx)
+    if wl is None:
+        return 0
+    words = [w.strip() for w in wl.read_text().splitlines()
+             if w.strip() and not w.startswith("#")][:5000]
+
+    def _sig(o):
+        return (o.get("status_code"), o.get("content_length"),
+                (o.get("title") or "").strip(), o.get("favicon"))
+
+    found = 0
+    for zone in zones:
+        bogus = [f"quarry-wc-{_uuid.uuid4().hex[:10]}.{zone}" for _ in range(2)]
+        cf = ctx.write_list(f"wc_cand_{zone.replace('.', '_')}.txt",
+                            [f"{w}.{zone}" for w in words] + bogus)
+        hx = ctx.run.raw_path("vertical", "wildcard", f"{zone}.jsonl")
+        r = exec_tool("httpx", ["httpx", "-l", str(cf), "-json", "-silent", "-sc", "-cl",
+                                "-title", "-favicon", "-t", str(settings.workers("httpx", 15))],
+                      raw_path=hx, timeout=ctx.http_timeout)
+        ctx.run.record("vertical", r)
+        if not (r.raw_path and r.raw_path.exists()):
+            continue
+        rows = []
+        for line in r.raw_path.read_text().splitlines():
+            try:
+                rows.append(_json.loads(line))
+            except _json.JSONDecodeError:
+                continue
+        base = {_sig(o) for o in rows if (o.get("input") or o.get("host") or "") in bogus}
+        if not base:                            # bogus didn't respond → not a live wildcard → skip
+            continue
+        for o in rows:
+            host = (o.get("input") or o.get("host") or "").lower().rstrip(".")
+            if not host or host in bogus or not scope.in_scope(host) or scope.is_oos(host):
+                continue
+            if _sig(o) not in base:             # differs from the wildcard baseline → a REAL vhost
+                if ctx.run.add("subdomain", {"host": host, "sources": ["wildcard-http"],
+                                             "raw_ref": str(hx)}):
+                    ctx.run.add("resolved", {"host": host, "a": o.get("a") or [],
+                                             "sources": ["wildcard-http"], "raw_ref": str(hx)})
+                    found += 1
+    if found:
+        ctx.echo(f"  wildcard: +{found} distinct vhost(s) recovered via HTTP-differentiation (A1)")
+    return found
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
     roots_file = ctx.write_list("roots.txt", prof.apex_domains)
@@ -146,6 +206,10 @@ def run(ctx) -> None:
         ctx.echo(f"  subfinder: +{n} in-scope ({r.stdout_lines} raw, {r.status.value})")
 
     # ── passive: CT-log sources (crt.sh free + certspotter) — coverage/resilience over subfinder ──
+    # A `*.X.apex` wildcard cert name → register `X.apex` as a WILDCARD BRUTE-ZONE candidate (A1):
+    # a DNS-gated pipeline resolves every `<word>.X.apex` to one IP and strips them as noise; A1
+    # brutes the zone + HTTP-differentiates instead. wildcard_zones is fed by CT + censys below.
+    wildcard_zones: set[str] = set()
     cs_token = secrets.certspotter()
     ct_new = 0
     for src, fn in (("crtsh", lambda a: _crtsh(a)),
@@ -157,8 +221,14 @@ def run(ctx) -> None:
             continue
         raw = ctx.run.raw_path("vertical", src, "hosts.txt")
         raw.write_text("\n".join(sorted(hosts)) + "\n")
-        ct_new += sum(ctx.run.add("subdomain", {"host": h, "sources": [src], "raw_ref": str(raw)})
-                      for h in hosts if scope.in_scope(h) and not scope.is_oos(h))
+        for h in hosts:
+            name = h[2:] if h.startswith("*.") else h        # `*.X.apex` → derived zone `X.apex`
+            if not name or "." not in name or not scope.in_scope(name) or scope.is_oos(name):
+                continue
+            if h.startswith("*."):
+                wildcard_zones.add(name)
+            if ctx.run.add("subdomain", {"host": name, "sources": [src], "raw_ref": str(raw)}):
+                ct_new += 1
     if ct_new:
         ctx.echo(f"  CT logs (crt.sh + certspotter): +{ct_new} in-scope")
 
@@ -185,8 +255,15 @@ def run(ctx) -> None:
         if cen_hosts:
             raw = ctx.run.raw_path("vertical", "censys", "hosts.txt")
             raw.write_text("\n".join(sorted(cen_hosts)) + "\n")
-            n = sum(ctx.run.add("subdomain", {"host": h, "sources": ["censys"], "raw_ref": str(raw)})
-                    for h in cen_hosts if scope.in_scope(h) and not scope.is_oos(h))
+            n = 0
+            for h in cen_hosts:
+                name = h[2:] if h.startswith("*.") else h
+                if not name or "." not in name or not scope.in_scope(name) or scope.is_oos(name):
+                    continue
+                if h.startswith("*."):
+                    wildcard_zones.add(name)                  # A1: censys wildcard cert → brute-zone
+                if ctx.run.add("subdomain", {"host": name, "sources": ["censys"], "raw_ref": str(raw)}):
+                    n += 1
             if n:
                 ctx.echo(f"  censys: +{n} in-scope (Platform cert search)")
 
@@ -305,6 +382,10 @@ def run(ctx) -> None:
         prev = cur
         if scope.passive_only:
             break          # no permutation growth without active alterx
+
+    # ── A1: wildcard-zone brute + HTTP-differentiation (recover distinct vhosts a wildcard hides) ──
+    # Runs before the CNAME/takeover pass so recovered vhosts get takeover analysis too.
+    _wildcard_differentiate(ctx, wildcard_zones)
 
     # ── CNAME collection for subdomain-takeover analysis (workflow 1.13) ──
     if prof.takeover and have("dnsx"):
