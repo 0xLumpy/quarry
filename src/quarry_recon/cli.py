@@ -241,7 +241,7 @@ def doctor(phase):
     else:
         click.echo(f"  {_c('·', 'yellow')} interactsh: nuclei's built-in public server (set oob.interactsh_server for self-host)")
     if ob.get("blind_xss_url"):
-        click.echo(f"  {_c('✓', 'green')} blind-xss collector configured (reserved for the attack layer)")
+        click.echo(f"  {_c('✓', 'green')} blind-xss collector → dalfox -b (out-of-band XSS beacons)")
 
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
     scope_note = f" for phase {phase}" if phase else ""

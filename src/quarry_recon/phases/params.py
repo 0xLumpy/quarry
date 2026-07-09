@@ -370,6 +370,13 @@ def run(ctx) -> None:
         # via a per-request delay. (Newer dalfox adds a `--rate-limit` global req/s — switch to that
         # once it's available.) The old -w 5 --delay 250 idled + timed out.
         df_cmd = ["dalfox", "file", str(df_in), "--skip-bav", "-o", str(df_out)]
+        # BLIND XSS: fire out-of-band beacons at the configured collector so a STORED/blind XSS that
+        # never reflects in the response still calls home — parity with reconftw's XSS_SERVER → dalfox
+        # -b. Opt-in via secrets.yaml `oob.blind_xss_url` (an interactsh-client URL or XSSHunter
+        # collector); the interaction is caught in the operator's own listener, not dalfox's output.
+        bx = secrets.oob().get("blind_xss_url")
+        if bx:
+            df_cmd += ["-b", str(bx)]
         if prof.http_rl:
             df_cmd += ["--delay", str(1000 // max(1, prof.http_rl))]
         r = exec_tool("dalfox", df_cmd, timeout=ctx.http_timeout)

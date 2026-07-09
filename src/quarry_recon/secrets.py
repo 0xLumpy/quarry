@@ -85,8 +85,9 @@ def censys() -> dict:
 
 def oob() -> dict:
     """Out-of-band config (optional): a SELF-HOSTED interactsh server for nuclei
-    (`interactsh_server` + optional `interactsh_token`), and a reserved `blind_xss_url` collector
-    for the attack layer. Empty => nuclei uses its built-in public interactsh."""
+    (`interactsh_server` + optional `interactsh_token`), and a `blind_xss_url` collector wired to
+    dalfox -b for blind/stored-XSS beacons. Empty => nuclei uses its built-in public interactsh and
+    dalfox runs reflected-only."""
     o = load().get("oob")
     return o if isinstance(o, dict) else {}
 
