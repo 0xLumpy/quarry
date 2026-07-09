@@ -630,6 +630,15 @@ def run(profile_path, phases, passive, timeout):
         phase_metrics.append({"phase": name, "wall_s": p_wall,
                               "cpu_s": round(metrics.rusage()[0] - p_cpu0, 2),
                               "size": {e: run_obj.count(e) for e in _INV}})
+        # incremental flush → a killed / timed-out run KEEPS its telemetry. metrics were previously
+        # written only at run end, so a mid-run kill (exactly when tuning data matters most) lost every
+        # per-tool cpu/RAM sample. Best-effort: a flush failure must never break the run.
+        try:
+            _rc, _rss = metrics.rusage()
+            metrics.write(run_obj, phase_metrics, _time.perf_counter() - run_t0,
+                          _rc - run_cpu0, _rss / 1024)
+        except Exception:
+            pass
         # log-safe section timer (reconftw-style, our style) — a per-phase elapsed footer. No spinner
         # / control chars, so tmux + runtime.log stay clean. The live in-tool spinner is separate.
         click.echo(_c(f"   ⏱ {name} · {p_wall}s", "cyan"))

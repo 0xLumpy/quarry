@@ -13,7 +13,8 @@ import urllib.parse
 import urllib.request
 
 from .. import normalize, secrets, settings
-from ..runner import Status, have, nuclei_timeout, run as exec_tool, skipped
+from ..runner import (Status, have, nuclei_timeout, reclassify_from_files, run as exec_tool,
+                      scaled_timeout, skipped)
 
 # Serialized-object / token markers that surface in Set-Cookie + response headers. Spotting the
 # FORMAT is PASSIVE recon evidence (a hand-off to the attack layer), never exploitation. Only
@@ -162,6 +163,10 @@ def _vhost_enum(ctx) -> None:
     known = set(ctx.run.values("subdomain")) | set(ctx.run.values("resolved"))
     apexes = [a for a in prof.apex_domains if scope.in_scope(a)]
     found = 0
+    # per-call ceiling scaled by wordlist size (each ffuf fuzzes one origin×apex over the vhost list);
+    # the flat 1800s cut a big-wordlist run. Higher -t (I/O-bound concurrency) makes each call faster.
+    wl_n = sum(1 for _ in wl.open())
+    ffuf_to = scaled_timeout(wl_n, ctx.http_timeout, per_unit=0.4)
     for origin, base in origins.items():
         for apex in apexes:
             out = ctx.run.raw_path("probe", "ffuf-vhost", f"{origin}_{apex}.json")
@@ -174,7 +179,7 @@ def _vhost_enum(ctx) -> None:
                    "-o", str(out), "-of", "json"]
             if prof.http_rl:
                 cmd += ["-rate", str(prof.http_rl)]
-            r = exec_tool("ffuf", cmd, timeout=ctx.http_timeout)
+            r = exec_tool("ffuf", cmd, timeout=ffuf_to)
             ctx.run.record("probe", r)
             if not out.exists():
                 continue
@@ -221,7 +226,10 @@ def run(ctx) -> None:
            "-t", str(settings.workers("httpx", 15))]      # H2: core-scaled concurrency
     if prof.http_rl:
         cmd += ["-rl", str(prof.http_rl)]
-    r = exec_tool("httpx", cmd, raw_path=hx, timeout=ctx.http_timeout)
+    # workload-scaled ceiling: the flat 1800s cut this probe mid-run on a 567-host × 94-port target.
+    # per-host budget scales with the port matrix so a big host×port scope gets the time it needs.
+    hx_to = scaled_timeout(len(hosts), ctx.http_timeout, per_unit=max(6, len(prof.ports) // 12))
+    r = exec_tool("httpx", cmd, raw_path=hx, timeout=hx_to)
     ctx.run.record("probe", r)
     if r.raw_path:
         n = 0
@@ -355,6 +363,10 @@ def run(ctx) -> None:
                  "--screenshot-path", str(shot_dir), "--write-jsonl",
                  "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
                 timeout=ctx.http_timeout)
+        # gowitness writes to FILES, not stdout → the runner mislabels it BLOCKED on a stderr WAF line
+        # even when it screenshotted most hosts (observed 43/51). Reclassify from shots on disk.
+        shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
+        reclassify_from_files(r, shots, "screenshot")
         ctx.run.record("probe", r)
         for img in shot_dir.glob("*.jpeg"):
             ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
@@ -368,7 +380,10 @@ def run(ctx) -> None:
         if prof.portscan_rate:
             cmd += ["-rate", str(prof.portscan_rate)]
         pr = ctx.run.raw_path("probe", "naabu", "ranges.txt")
-        r = exec_tool("naabu", cmd, raw_path=pr, timeout=ctx.http_timeout)
+        # naabu concurrency is RATE-based (portscan_rate), not thread-based — but a big CIDR can still
+        # wall the flat timeout, so scale the ceiling by range count.
+        naabu_to = scaled_timeout(len(prof.cidr), ctx.http_timeout, per_unit=300)
+        r = exec_tool("naabu", cmd, raw_path=pr, timeout=naabu_to)
         ctx.run.record("probe", r)
         open_ports = {}
         if r.raw_path:
@@ -384,7 +399,8 @@ def run(ctx) -> None:
             ports_csv = ",".join(sorted({p for ps in open_ports.values() for p in ps}, key=int))
             nm = ctx.run.raw_path("probe", "nmap", "service.txt")
             r = exec_tool("nmap", ["nmap", "-sV", "-Pn", "-T4", "-iL", str(ips_file),
-                                   "-p", ports_csv, "-oN", str(nm)], timeout=ctx.http_timeout)
+                                   "-p", ports_csv, "-oN", str(nm)],
+                          timeout=scaled_timeout(len(open_ports), ctx.http_timeout, per_unit=30))
             ctx.run.record("probe", r)
     elif prof.portscan:
         ctx.run.record("probe", skipped("naabu", "no in-scope CIDR — port scan skipped"))

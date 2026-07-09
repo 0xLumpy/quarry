@@ -13,7 +13,8 @@ import json as _json
 
 from .. import normalize
 from .. import settings
-from ..runner import have, nuclei_timeout, run as exec_tool, skipped
+from ..runner import (have, nuclei_timeout, reclassify_from_files, run as exec_tool,
+                      scaled_timeout, skipped)
 
 
 def _a1d_recursive_brute(ctx) -> set[str]:
@@ -153,7 +154,10 @@ def run(ctx) -> None:
                "-t", str(settings.workers("httpx", 15))]     # H2: core-scaled concurrency
         if prof.http_rl:
             cmd += ["-rl", str(prof.http_rl)]
-        r = exec_tool("httpx", cmd, raw_path=hx, timeout=ctx.http_timeout)
+        # late hosts (A1d re-brute / crawl / CSP) can be large → scale like the probe httpx (port-weighted)
+        r = exec_tool("httpx", cmd, raw_path=hx,
+                      timeout=scaled_timeout(len(new_resolved), ctx.http_timeout,
+                                             per_unit=max(6, len(prof.ports) // 12)))
         ctx.run.record("enrich", r)
         new_live: list[str] = []
         if r.raw_path:
@@ -192,11 +196,15 @@ def run(ctx) -> None:
                 lf = ctx.write_list("enrich_live.txt", new_live)
                 shot_dir = ctx.run.dir / "raw" / "enrich" / "gowitness"
                 shot_dir.mkdir(parents=True, exist_ok=True)
-                ctx.run.record("enrich", exec_tool("gowitness",
+                gr = exec_tool("gowitness",
                     ["gowitness", "scan", "file", "-f", str(lf),
                      "--screenshot-path", str(shot_dir), "--write-jsonl",
                      "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
-                    timeout=ctx.http_timeout))
+                    timeout=ctx.http_timeout)
+                # same file-output reclassification as probe (BLOCKED-on-empty-stdout is a mislabel)
+                shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
+                reclassify_from_files(gr, shots, "screenshot")
+                ctx.run.record("enrich", gr)
                 for ext in ("*.jpeg", "*.png"):
                     for img in shot_dir.glob(ext):
                         ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})

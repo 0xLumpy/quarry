@@ -14,7 +14,7 @@ from importlib import resources
 from pathlib import Path
 
 from .. import normalize, settings
-from ..runner import have, run as exec_tool, skipped
+from ..runner import have, run as exec_tool, scaled_timeout, skipped
 
 MAX_HOSTS = 25                     # cap candidate hosts so a wide scope can't explode
 MAX_RESULTS_PER_HOST = 500         # safety cap if autocalibration misses a wildcard
@@ -103,6 +103,11 @@ def run(ctx) -> None:
         ctx.echo(f"  ⚠️  recursion depth {recurse} is aggressive — expect a loud / slow scan")
 
     notable = 0
+    # workload-scaled ceiling per host: content brute is the balanced/deep+recursion path, so on a real
+    # target it hits the same flat-1800s wall the vhost/probe ffuf did. Scale by wordlist size × recursion
+    # depth (recursion multiplies the paths fuzzed). Merged wordlist counted once.
+    wl_n = sum(1 for _ in wl.open())
+    ct_to = scaled_timeout(wl_n * (recurse + 1), ctx.http_timeout, per_unit=0.4)
     for url in targets:
         host = normalize.host_of_url(url)
         # include a url hash so http/https/:8443 on the same host don't overwrite each other's raw
@@ -120,7 +125,7 @@ def run(ctx) -> None:
             cmd += ["-rate", str(prof.http_rl)]
         if recurse:                                  # 11.2: balanced/deep only (gated above)
             cmd += ["-recursion", "-recursion-depth", str(recurse)]
-        ctx.run.record("content", exec_tool("ffuf", cmd, timeout=ctx.http_timeout))
+        ctx.run.record("content", exec_tool("ffuf", cmd, timeout=ct_to))
         if not out.exists():
             continue
         try:

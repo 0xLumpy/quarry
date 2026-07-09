@@ -71,8 +71,14 @@ _CORE_FACTOR = {"nuclei": 10, "httpx": 12, "ffuf": 12}        # workers per core
 #   PRECISE factors wait on per-tool CPU/RAM telemetry + a bigger-target run (the range under-stresses
 #   cores). Higher nuclei -c also finishes faster → eases the timeout on multi-core boxes.
 _PROFILE_MULT = {"safe": 0.5, "balanced": 1.0, "auto": 1.0, "aggressive": 1.75}
-_CAP = {"nuclei": 100, "httpx": 150, "ffuf": 200}
+_CAP = {"nuclei": 100, "httpx": 300, "ffuf": 300}
 _FLOOR = 4
+# Network-I/O-bound tools: their concurrency tracks network round-trips, not CPU cores. Core-scaling
+# ALONE starves them on small-core boxes — a 4-core VPS got httpx -t 48, and a 567-host × 94-port probe
+# timed out at 1800s. Give these a core-INDEPENDENT base (profile-scaled), and take the max with the
+# core-scaled value so a big box can still go higher. Initial estimates (well within each tool's async
+# limits, conservative); the next big-target run's per-tool telemetry (H3, now flushed per-phase) refines.
+_IO_BASE = {"httpx": 150, "ffuf": 120}
 
 
 def workers(tool: str, default: int) -> int:
@@ -94,7 +100,12 @@ def workers(tool: str, default: int) -> int:
         return default
     cores = os.cpu_count() or 2
     prof = profile()
-    scaled = min(round(cores * factor * _PROFILE_MULT.get(prof, 1.0)), _CAP.get(tool, 200))
+    mult = _PROFILE_MULT.get(prof, 1.0)
+    scaled = round(cores * factor * mult)
+    io = _IO_BASE.get(tool)
+    if io is not None:                      # I/O-bound: a low core count must not cap network concurrency
+        scaled = max(scaled, round(io * mult))
+    scaled = min(scaled, _CAP.get(tool, 200))
     # `safe` = the user opted to throttle → may drop below the tool's baseline (floored at _FLOOR).
     # auto/balanced/aggressive NEVER go below the proven `default` — scaling only ADDS lanes on bigger
     # boxes, so a small VPS keeps the old behavior and `auto` never surprise-slows an existing setup.

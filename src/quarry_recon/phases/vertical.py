@@ -104,6 +104,22 @@ def _certspotter(apex: str, token: str | None = None, timeout: int = 30) -> set:
     return hosts
 
 
+def _massdns_a(path: Path) -> dict[str, list[str]]:
+    """Parse puredns' massdns simple output (`host. A 1.2.3.4`) → {host: [A records]}. Best-effort:
+    a missing/garbled file yields {} (resolved just falls back to a:[])."""
+    out: dict[str, list[str]] = {}
+    try:
+        for line in path.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] == "A":
+                host = parts[0].rstrip(".").lower()
+                if host:
+                    out.setdefault(host, []).append(parts[2])
+    except OSError:
+        pass
+    return out
+
+
 def _resolvers(ctx) -> tuple[Path | None, Path | None]:
     """Locate resolver lists. Framework-managed under ~/.config/quarry, else None."""
     home = Path.home()
@@ -409,7 +425,12 @@ def run(ctx) -> None:
                         ctx.run.add("subdomain", {"host": e["host"], "sources": ["dnsx-resolved"]})
         else:
             res = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.txt")
-            cmd = ["puredns", "resolve", str(candidates), "--resolvers-trusted", str(trusted), "-q"]
+            # --write-massdns captures the A records so `resolved` carries its IPs (was a:[] — puredns
+            # -q emits hostnames only, leaving the host→IP edge to live solely in dns_record; the digest
+            # and the v0.4 relationship layer both want it on `resolved`).
+            md = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.massdns")
+            cmd = ["puredns", "resolve", str(candidates), "--resolvers-trusted", str(trusted),
+                   "--write-massdns", str(md), "-q"]
             if resolvers:
                 cmd += ["-r", str(resolvers)]
             if prof.dns_rate:
@@ -417,9 +438,10 @@ def run(ctx) -> None:
             r = exec_tool("puredns", cmd, raw_path=res, timeout=ctx.http_timeout)
             ctx.run.record("vertical", r)
             if r.raw_path:
+                ips = _massdns_a(md)                # host -> [A records]
                 for e in normalize.hosts(r.raw_path.read_text(), "puredns-resolve", str(res)):
                     if scope.in_scope(e["host"]):
-                        ctx.run.add("resolved", {"host": e["host"], "a": [],
+                        ctx.run.add("resolved", {"host": e["host"], "a": ips.get(e["host"], []),
                                                  "sources": ["puredns-resolve"], "raw_ref": str(res)})
                         # newly-resolved permutations are new subdomains → seed next iteration
                         ctx.run.add("subdomain", {"host": e["host"], "sources": ["puredns-resolve"]})

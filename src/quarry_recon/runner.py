@@ -90,6 +90,33 @@ def set_tool_cwd(path) -> None:
     _TOOL_CWD = str(path) if path else None
 
 
+def reclassify_from_files(r: "RunResult", produced: int, note_word: str = "item") -> "RunResult":
+    """Fix the status of a tool that writes results to FILES (gowitness screenshots, …). The runner
+    classifies on stdout, which is empty for such tools, so a WAF/error line in stderr mislabels the
+    whole run BLOCKED/FAILED even when it produced real output. Reclassify from the actual artifact
+    count: >0 => SUCCESS, or PARTIAL if it was flagged blocked (some hosts genuinely WAF'd)."""
+    if produced > 0:
+        if r.status == Status.BLOCKED:
+            r.status = Status.PARTIAL
+        elif r.status in (Status.EMPTY, Status.FAILED):
+            r.status = Status.SUCCESS
+        r.note = f"{produced} {note_word}(s)" + (" (some hosts blocked)" if r.status == Status.PARTIAL else "")
+        r.stdout_lines = produced
+    return r
+
+
+def scaled_timeout(n_units: int, floor: int, per_unit: float) -> int:
+    """Workload-scaled wall-clock CEILING (not a duration). The tool exits when it finishes, so a
+    generous ceiling only lets a big job COMPLETE — it never slows a small one. Budget grows `per_unit`
+    seconds per unit of work above `floor`; NO upper cap (scope size must never truncate coverage). Used
+    by nuclei (per target), httpx (per host, port-weighted) and ffuf (per wordlist entry) so a large
+    scope can't wall out mid-run — a flat 1800s cut a 567-host × 94-port httpx probe at partial coverage.
+    `floor <= 0` => fully unbounded (no kill at all)."""
+    if floor <= 0:
+        return 0
+    return max(int(floor), int(per_unit * max(int(n_units), 1)))
+
+
 def nuclei_timeout(n_targets: int, floor: int, per_target: int = 240) -> int:
     """Scale a nuclei run's timeout by workload. nuclei runtime grows with target count (roughly
     templates × targets / concurrency), so a flat per-tool ceiling kills big scans mid-run and yields
@@ -105,9 +132,7 @@ def nuclei_timeout(n_targets: int, floor: int, per_target: int = 240) -> int:
 
     `floor <= 0` (i.e. `--timeout 0`) means FULLY UNBOUNDED — no wall-clock kill at all (reconftw's
     `PARALLEL_JOB_TIMEOUT_SECONDS=0` semantics), for RoE-driven runs where a cut is unacceptable."""
-    if floor <= 0:
-        return 0                                  # unbounded — exec_tool maps 0 -> no timeout
-    return max(int(floor), per_target * max(int(n_targets), 1))
+    return scaled_timeout(n_targets, floor, per_target)   # nuclei-specific alias (kept for the rationale)
 
 
 class Status(str, Enum):
