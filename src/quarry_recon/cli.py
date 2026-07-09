@@ -146,18 +146,18 @@ def doctor(phase):
     # skips, etc.). So a missing one is a WARNING with the fix, not a soft "(optional)". wordlists live
     # under wordlists/ (clean layout); older installs kept them at the config root — check the canonical
     # path first, then the back-compat one, and show whichever exists.
-    for label, cands in [("resolvers", [cfg / "resolvers.txt"]),
-                         ("trusted-resolvers", [cfg / "trusted-resolvers.txt"]),
-                         ("dns wordlist", [cfg / "wordlists/dns.txt", cfg / "dns-wordlist.txt"]),
-                         ("vhost wordlist", [cfg / "wordlists/vhost.txt", cfg / "vhost-wordlist.txt"]),
-                         ("content-wl balanced", [cfg / "wordlists/content/balanced.txt"]),
-                         ("content-wl deep", [cfg / "wordlists/content/deep.txt"])]:
+    for label, name, cands in [("resolvers", "resolvers", [cfg / "resolvers.txt"]),
+                         ("trusted-resolvers", "trusted-resolvers", [cfg / "trusted-resolvers.txt"]),
+                         ("dns wordlist", "dns-wordlist", [cfg / "wordlists/dns.txt", cfg / "dns-wordlist.txt"]),
+                         ("vhost wordlist", "vhost-wordlist", [cfg / "wordlists/vhost.txt", cfg / "vhost-wordlist.txt"]),
+                         ("content-wl balanced", "content-balanced", [cfg / "wordlists/content/balanced.txt"]),
+                         ("content-wl deep", "content-deep", [cfg / "wordlists/content/deep.txt"])]:
         hit = next((c for c in cands if c.exists()), None)
         if hit:
             click.echo(f"  {_c('✓', 'green')} {label:<24} {hit}")
         else:
             click.echo(f"  {_c('⚠', 'yellow')} {label:<24} "
-                       f"MISSING — run `quarry install` (expected at {cands[0]})")
+                       f"MISSING — run `quarry set {name}` (expected at {cands[0]})")
 
     for label, bin_ in [("go toolchain", "go"), ("chromium", "chromium"),
                         ("pipx", "pipx")]:
@@ -270,6 +270,17 @@ def notify_cmd(test):
         click.echo(_c(f"sent test to {n}/{len(ch)} channel(s)", "green" if n == len(ch) else "yellow"))
     else:
         click.echo("run `quarry notify --test` to send a test message.")
+
+
+@cli.command("set")
+@click.argument("name")
+@click.option("--url", help="override the source URL (the name still fixes the destination)")
+def set_cmd(name, url):
+    """Fetch/refresh a SINGLE data file by name (resolvers, dns-wordlist, vhost-wordlist,
+    content-balanced, content-deep, trusted-resolvers) — granular alternative to a full install."""
+    from . import bootstrap
+    if not bootstrap.set_data_file(name, url, click.echo):
+        raise click.ClickException(f"could not set '{name}' — see the message above")
 
 
 # ── install / update ─────────────────────────────────────────────────────────

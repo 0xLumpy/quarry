@@ -13,22 +13,32 @@ from .. import normalize
 from ..runner import Status, have, run as exec_tool, skipped
 
 
+# Per-provider download cap. The kaeferjaeger SNI files are hundreds of MB each — reading one in full
+# (r.read()) pulled the whole thing into RAM (measured ~1 GB across the 5 providers) before truncation,
+# a latent OOM on a small VPS. Cap the READ at the source so RAM is bounded regardless of file size.
+# (M2 decision 2026-07-09: KEEP kaeferjaeger as bounded best-effort — it's a distinct coverage channel
+# vs CT logs [cloud-IP SNI, not just CT] — but it's IP-dependent: kaeferjaeger.gay 403s some VPS egress,
+# in which case it's a graceful no-op and CT logs carry discovery. A self-serve cero/tlsx-over-cloud-CIDR
+# replacement is deferred to a later cycle, when a real target shows CT actually misses cloud hosts.)
+_KJ_CAP = 5_000_000
+
+
 def _kaeferjaeger(ctx) -> int:
-    """Passive: grep cloud-provider SNI cert dataset for in-scope hosts."""
+    """Passive: grep cloud-provider SNI cert dataset for in-scope hosts. Bounded read (see _KJ_CAP)."""
     added = 0
     raw_all = []
     for prov in ("amazon", "google", "microsoft", "oracle", "digitalocean"):
         url = f"https://kaeferjaeger.gay/sni-ip-ranges/{prov}/ipv4_merged_sni.txt"
         try:
             with urllib.request.urlopen(url, timeout=120) as r:
-                raw_all.append(r.read().decode("utf-8", "replace"))
+                raw_all.append(r.read(_KJ_CAP).decode("utf-8", "replace"))   # bounded — never the full file
         except Exception as e:  # network optional
             ctx.echo(f"    kaeferjaeger {prov}: {e}")
     if not raw_all:
         return 0
     blob = "\n".join(raw_all)
     raw_path = ctx.run.raw_path("horizontal", "kaeferjaeger", "sni.txt")
-    raw_path.write_text(blob[:5_000_000])
+    raw_path.write_text(blob[:_KJ_CAP])
     # cert lines contain many hostnames; extract scope matches
     import re
     for m in re.findall(r"[a-z0-9_.-]+\.[a-z]{2,}", blob, re.IGNORECASE):

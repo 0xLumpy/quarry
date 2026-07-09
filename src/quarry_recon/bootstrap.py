@@ -54,6 +54,21 @@ def _sh(cmd: str, dry: bool, timeout: int = 1800) -> tuple[int, str]:
         return 1, str(e)
 
 
+def _curl_to(url: str, dest: Path, dry: bool, timeout: int = 300) -> tuple[int, str]:
+    """Download `url` → `dest` via argv (NO shell). `quarry set --url <src>` is user input, so a
+    shell-string `curl '...'` is injectable (a single quote in the URL breaks out). subprocess.run
+    with a list passes the URL as one opaque argv element — nothing to escape, nothing to inject."""
+    if dry:
+        return 0, "(dry-run)"
+    try:
+        p = subprocess.run(["curl", "-sSL", url, "-o", str(dest)],
+                           capture_output=True, text=True, timeout=timeout)
+        tail = "\n".join((p.stdout + p.stderr).strip().splitlines()[-3:])
+        return p.returncode, tail
+    except subprocess.SubprocessError as e:
+        return 1, str(e)
+
+
 def _tool_deps(mgr: str) -> list[str]:
     """Union of per-tool `deps:` from tools.yaml (apt names). Other managers: best-effort
     name-map for the few that differ."""
@@ -160,7 +175,7 @@ def install_data_files(echo, dry: bool, update: bool = False) -> None:
         if dest.exists() and dest.stat().st_size > 0 and not (update and df.get("update")):
             echo(f"  {df['name']}: present")
             continue
-        code, _ = _sh(f"curl -sSL '{df['url']}' -o '{dest}'", dry, 300)
+        code, _ = _curl_to(df["url"], dest, dry)
         if (code != 0 or (not dry and (not dest.exists() or dest.stat().st_size == 0))) and df.get("fallback"):
             if not dry:
                 dest.write_text(df["fallback"])
@@ -189,6 +204,34 @@ def install_data_files(echo, dry: bool, update: bool = False) -> None:
             tpl = resources.files("quarry_recon.data").joinpath("config.template.yaml").read_text()
             cp.write_text(tpl)
         echo("  config.yaml: created")
+
+
+def set_data_file(name: str, url: str | None, echo, dry: bool = False) -> bool:
+    """Fetch/refresh ONE data file by name — the granular alternative to a full `quarry install`.
+
+    The NAME (from bootstrap.yaml `data_files`) always determines the destination; `url` only
+    overrides the SOURCE (e.g. point resolvers at a fresher list). Overwrites unconditionally — the
+    whole point is to refresh a single file. Robust on failure: falls back to the bundled default when
+    one exists (and no custom url was given), else reports the failure and returns False."""
+    bs = load_bootstrap()
+    df = next((d for d in bs.get("data_files", []) if d["name"] == name), None)
+    if df is None:
+        names = ", ".join(d["name"] for d in bs.get("data_files", []))
+        echo(f"  unknown data file '{name}'. valid names: {names}")
+        return False
+    dest = Path(os.path.expanduser(df["dest"]))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    src = url or df["url"]
+    code, tail = _curl_to(src, dest, dry)
+    if not dry and (code != 0 or not dest.exists() or dest.stat().st_size == 0):
+        if df.get("fallback") and not url:                      # custom url = user's problem, no fallback
+            dest.write_text(df["fallback"])
+            echo(f"  {name}: fetch failed — wrote bundled fallback → {dest}")
+            return True
+        echo(f"  {name}: FAILED ({tail[:100] or 'empty output'})")
+        return False
+    echo(f"  {name}: ok → {dest}")
+    return True
 
 
 def run_extras(echo, dry: bool) -> None:
