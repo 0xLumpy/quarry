@@ -107,6 +107,12 @@ def run(ctx) -> None:
         host = normalize.host_of_url(url)
         # include a url hash so http/https/:8443 on the same host don't overwrite each other's raw
         out = ctx.run.raw_path("content", "ffuf", f"{host}-{hashlib.md5(url.encode()).hexdigest()[:8]}.json")
+        # Redirect policy (DELIBERATE exception to the follow-redirects rule the classify-probes obey):
+        # content discovery RECORDS what exists at a path — a path that returns 301/302/307/308 IS a
+        # finding (`/admin`→`/login`, `/.git`→redirect: the path exists + where it goes is intel). So we
+        # MATCH 3xx (-mc) instead of following (-r): following would classify many distinct paths onto one
+        # login/home page → -ac/dedup would then drop them → the "this path exists" signal is lost. -ac
+        # autocalibration already neutralises the redirect-everything catch-all. (ISC-16, v0.3.)
         cmd = ["ffuf", "-u", f"{url.rstrip('/')}/FUZZ", "-w", str(wl), "-ac",
                "-t", str(settings.workers("ffuf", 40)),   # H2: core-scaled concurrency
                "-mc", "200,204,301,302,307,308,401,403,405", "-of", "json", "-o", str(out), "-s"]

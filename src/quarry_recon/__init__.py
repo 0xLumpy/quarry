@@ -1,3 +1,3 @@
 """Quarry — methodology-driven reconnaissance automation framework."""
 
-__version__ = "0.2.9.3"
+__version__ = "0.3.0"
