@@ -496,7 +496,7 @@ def oos(profile_path, hosts):
 @cli.command()
 @click.option("-t", "--target", "profile_path", required=True,
               help="project name, project dir, or target.yaml path")
-@click.option("--timeout", default=1800, help="per-tool timeout seconds (nuclei scales above this; 0 = unbounded, no wall-clock kill)")
+@click.option("--timeout", default=1800, help="per-tool timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests)")
 def osint(profile_path, timeout):
     """Pre-flight OSINT: discover scope CANDIDATES + intel. Review-only — never edits scope.
 
@@ -541,7 +541,7 @@ def osint(profile_path, timeout):
               help="project name, project dir, or target.yaml path")
 @click.option("--phases", help="comma list (default: all). e.g. horizontal,vertical")
 @click.option("--passive", is_flag=True, help="force passive-only (override profile)")
-@click.option("--timeout", default=1800, help="per-tool timeout seconds (nuclei scales above this; 0 = unbounded, no wall-clock kill)")
+@click.option("--timeout", default=1800, help="per-tool timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests)")
 def run(profile_path, phases, passive, timeout):
     """Run recon phases against the confirmed scope. Output lands in the project's recon/ dir."""
     from .phases import ORDER, REGISTRY, PhaseContext
