@@ -327,6 +327,11 @@ def collect(run, scope) -> dict:
             tags = ["origin", "no-waf"] + ([str(l["status_code"])] if l.get("status_code") else [])
             add("origin", _item("origin", l["url"], "origin host (no CDN → likely no WAF)",
                                 "high", l.get("sources"), "normalized/live.jsonl", tags))
+        else:                                        # CDN/WAF-fronted host — tag it as such (A2)
+            cn = l.get("cdn_name") or "cdn"
+            add("origin", _item("origin", l["url"], f"CDN/WAF-fronted host ({cn}) — origin hidden",
+                                "low", l.get("sources"), "normalized/live.jsonl",
+                                [t for t in ("cdn-fronted", cn, "waf") if t]))
 
     for row in url_rows:                             # interest buckets + vuln-class params
         u = row.get("url", "")
@@ -407,6 +412,10 @@ def collect(run, scope) -> dict:
             add("deser", _item("deser", r.get("value"), r.get("note") or "deserialization surface",
                 "medium", r.get("sources"), "normalized/review.jsonl",
                 [t for t in ("deser", r.get("format"), "attack-surface") if t]))
+        elif klass == "origin-ip":                      # A2 candidate origin IP behind a CDN (verify)
+            add("origin", _item("origin", r.get("value"), r.get("note") or "candidate origin IP",
+                "medium", r.get("sources"), "normalized/review.jsonl",
+                [t for t in ("origin-ip", r.get("channel"), "verify-ownership") if t]))
 
     # framework CVE/primitive REFERENCE annotation — recon fires NOTHING from this; it hands the
     # attack/AI layer "this tech is present → here's what's known to try" (provenance = the interface).

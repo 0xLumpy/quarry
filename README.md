@@ -19,8 +19,8 @@ very little and gives no useful reason why. Every result is:
 ## Status
 
 `v0.2.9` (milestone — methodology + evidence + production-readiness) — command surface, installer,
-OSINT pre-flight, the full recon run (**eight phases** including DNS-record enrichment, late-host
-enrichment, and candidate-driven content discovery), active **evidence extraction** (exposed-file secret pull,
+OSINT pre-flight, the full recon run (**nine phases** including DNS-record enrichment, late-host
+enrichment, CDN origin-IP correlation, and candidate-driven content discovery), active **evidence extraction** (exposed-file secret pull,
 GraphQL introspection, actuator interrogation, OpenAPI parsing, SSTI confirmation), enrichment
 across the pipeline (**DNS records, TLS certs/SANs, CT logs, favicon + cert-fingerprint pivots, cloud-bucket + vhost candidates**),
 a structured JSONL store, exports, reports, a redacted structured **digest** with first-class evidence queues,
@@ -251,7 +251,8 @@ setsid nohup quarry run -t acme.com > run.log 2>&1 & disown
 | **dns** | DNS-record enrichment over resolved in-scope hosts — **A/AAAA/CNAME/MX/NS/TXT/SOA/CAA + ASN/CDN** as first-class `dns_record` entities (context, not re-discovery; puredns kept for brute/validate) | dnsx |
 | **probe** | HTTP fingerprint (full methodology flag set), CDN/origin tag, **CSP-sibling discovery (response headers)**, **tlsx cert SAN harvest (sibling hosts) + `certificate` context**, **Shodan favicon-hash + cert-fingerprint pivots (related hosts)**, **vhost enumeration (ffuf Host-fuzz over origin IPs)**, **deserialization/token fingerprint (Set-Cookie + headers)**, screenshots, **naabu → nmap -sV**, passive smap | httpx, tlsx, ffuf, cdncheck, gowitness, naabu, nmap, smap |
 | **crawl** | active crawl (+headless SPA, stored responses), archive URLs, JS download/mine + redacted secret scan, **waymore `-mode B` + xnLinkFinder over responses**, link-discovered host promotion | katana, gau, waymore, jsluice, xnLinkFinder, gitleaks, trufflehog |
-| **enrich** | catch-up over hosts found *after* probe (crawl links, CSP siblings): resolve, **dangling-CNAME takeover**, HTTP fingerprint, WAF, screenshots, smap | dnsx, httpx, nuclei, gowitness, smap |
+| **enrich** | catch-up over hosts found *after* probe (crawl links, CSP siblings): resolve, **dangling-CNAME takeover**, HTTP fingerprint, WAF, screenshots, smap; **target-specific wordlist re-brute** (crawl-mined vocabulary fed back into apex + wildcard-zone brute — "teach the target") | dnsx, httpx, puredns, nuclei, gowitness, smap |
+| **origin** | **CDN/origin-IP correlation (map-only)** — for CDN/WAF-fronted hosts, propose candidate origin IPs by favicon-hash twin + cert-sha1 twin + cert-SAN match against non-CDN hosts; emitted as `verify-ownership` review leads, never scanned | (correlation over `live`/`certificate`) |
 | **content** | candidate-driven path/dir discovery (**off by default**; light/balanced/deep + capped recursion) over live in-scope hosts, autocalibrated against catch-alls, **always merges a curated config-leak/secret-path quick-hunt list** | ffuf |
 | **params** | gf vuln-class buckets, param discovery, non-intrusive scan + OOB, **subdomain takeover**, reflected XSS/redirect, and **evidence extraction** (fetch exposed files → secrets, GraphQL introspection, actuator interrogation, **tech-conditional framework debug/admin endpoint probe**, OpenAPI parse, SSTI confirm) | gf, arjun, nuclei (interactsh + takeover), dalfox |
 
