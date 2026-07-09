@@ -143,15 +143,15 @@ def run(ctx) -> None:
     if not scope.passive_only and have("httpx") and new_resolved:
         hf = ctx.write_list("enrich_probe.txt", new_resolved)
         hx = ctx.run.raw_path("enrich", "httpx", "httpx.jsonl")
-        # methodology flag set MUST match probe.py — without -cdn (and -favicon/-asn/-location/
-        # -probe-all-ips) httpx omits CDN data and normalize defaults cdn=False, misclassifying
-        # late hosts as origin/no-WAF in the digest.
+        # methodology flag set MUST match probe.py (incl. the v0.3.4 matrix fix: drop the -probe-all-ips
+        # / -no-fallback multipliers + bound -timeout so filtered ports fail fast). -cdn/-favicon/-asn
+        # stay — they're response-derived (cost only on hosts that answer) + feed the CDN/origin digest.
         cmd = ["httpx", "-l", str(hf), "-json", "-silent",
                "-ports", ",".join(str(p) for p in prof.ports),
                "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
                "-asn", "-location", "-ip", "-cname", "-irh",
-               "-follow-redirects", "-no-fallback", "-probe-all-ips", "-random-agent",
-               "-t", str(settings.workers("httpx", 15))]     # H2: core-scaled concurrency
+               "-follow-redirects", "-random-agent", "-timeout", "7", "-retries", "0",
+               "-t", str(settings.workers("httpx", 15))]     # H2: core-scaled concurrency (timeout: see probe.py)
         if prof.http_rl:
             cmd += ["-rl", str(prof.http_rl)]
         # late hosts (A1d re-brute / crawl / CSP) can be large → scale like the probe httpx (port-weighted)

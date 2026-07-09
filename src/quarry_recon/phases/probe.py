@@ -218,12 +218,23 @@ def run(ctx) -> None:
 
     # ── httpx full fingerprint -> live services (methodology flag set) ──
     hx = ctx.run.raw_path("probe", "httpx", "httpx.jsonl")
+    # Big host×port matrices die on two hidden MULTIPLIERS + the slow filtered-port fail, NOT the port
+    # count (reconftw probes the same uncommon-port set fine): `-probe-all-ips` fans every port across
+    # EVERY IP of a host, and `-no-fallback` probes BOTH http+https per port — each multiplies the whole
+    # matrix, INCLUDING firewall-DROPPED ports that just hang to httpx's 10s default. Drop both for the
+    # bulk probe + bound `-timeout` so a filtered port fails fast. The response-derived flags
+    # (favicon/asn/cname/irh/cdn) only cost on hosts that actually answer, so they stay — full fingerprint
+    # kept, matrix cost removed. (v0.3.4, from the otc-service 567-host × 94-port timeout.)
     cmd = ["httpx", "-l", str(hosts_file), "-json", "-silent",
            "-ports", ",".join(str(p) for p in prof.ports),
            "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
            "-asn", "-location", "-ip", "-cname", "-irh",
-           "-follow-redirects", "-no-fallback", "-probe-all-ips", "-random-agent",
+           "-follow-redirects", "-random-agent", "-timeout", "7", "-retries", "0",
            "-t", str(settings.workers("httpx", 15))]      # H2: core-scaled concurrency
+    # timeout 7 = a MIDDLE: below httpx's 10s default (faster filtered-port fail) but not so low it drops
+    # a slow-but-alive server (WAF challenge / loaded backend). retries 0 (not reconftw's 2 / bbot's 1)
+    # because retries DOUBLE the filtered-port cost on this DIRECT probe — worth adding only once we adopt
+    # bbot's model (SYN-scan first → httpx on OPEN ports only), where httpx never touches a filtered port.
     if prof.http_rl:
         cmd += ["-rl", str(prof.http_rl)]
     # workload-scaled ceiling: the flat 1800s cut this probe mid-run on a 567-host × 94-port target.
