@@ -17,6 +17,12 @@ PERFORMANCE:
   HTTPX_THREADS:
   FFUF_THREADS:
   DALFOX_WORKERS:
+  # v0.3.5 web-port SYN prefilter: before the bulk httpx, naabu SYN-checks each host's PUBLIC IP(s) on
+  # the HTTP port set and httpx then probes ONLY open host:ports (bbot-style — never wastes httpx time
+  # on filtered ports). Fewer packets + fewer HTTP requests than direct httpx over all ports. Default on;
+  # falls back to direct httpx if naabu is missing/fails. NOT the infra portscan (MODES.PORTSCAN).
+  WEB_PORT_PREFILTER: true   # false = direct-httpx over ALL ports, no SYN prefilter (debugging).
+                             # the private/reserved-only-host SKIP still applies either way (safety rail).
 
 # ── Advanced local tool paths (NOT credentials — paths, so they live here, not in secrets.yaml) ──
 # openintel-subs: extra PASSIVE subdomain source, silently unused unless BOTH paths are set AND

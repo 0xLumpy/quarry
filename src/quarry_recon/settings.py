@@ -46,6 +46,17 @@ def profile() -> str:
     return prof if prof in PROFILES else "auto"
 
 
+def web_port_prefilter() -> bool:
+    """v0.3.5: SYN web-port prefilter before the bulk httpx (naabu over host IPs × the HTTP port set →
+    httpx only on OPEN host:ports, bbot-style). Default ON. `false` restores direct-httpx over ALL
+    configured ports (no SYN prefilter) — but the private/reserved-only-host SKIP still applies (that's a
+    safety rail, not part of the prefilter). Separate from MODES.PORTSCAN (infra scan)."""
+    v = performance().get("WEB_PORT_PREFILTER")
+    if v is None:
+        return True
+    return str(v).strip().lower() not in ("false", "no", "0", "off")
+
+
 def concurrency(key: str, default: int) -> int:
     """An explicit per-tool concurrency override from PERFORMANCE (e.g. `NUCLEI_CONCURRENCY`,
     `HTTPX_THREADS`), else `default`. This is the explicit-override floor; the auto/core-scaling

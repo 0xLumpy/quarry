@@ -141,34 +141,19 @@ def run(ctx) -> None:
             ctx.echo(f"  dns-enrich (late): +{nd} record(s) over {len(new_resolved)} host(s)")
 
     if not scope.passive_only and have("httpx") and new_resolved:
-        hf = ctx.write_list("enrich_probe.txt", new_resolved)
-        hx = ctx.run.raw_path("enrich", "httpx", "httpx.jsonl")
-        # methodology flag set MUST match probe.py (incl. the v0.3.4 matrix fix: drop the -probe-all-ips
-        # / -no-fallback multipliers + bound -timeout so filtered ports fail fast). -cdn/-favicon/-asn
-        # stay — they're response-derived (cost only on hosts that answer) + feed the CDN/origin digest.
-        cmd = ["httpx", "-l", str(hf), "-json", "-silent",
-               "-ports", ",".join(str(p) for p in prof.ports),
-               "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
-               "-asn", "-location", "-ip", "-cname", "-irh",
-               "-follow-redirects", "-random-agent", "-timeout", "7", "-retries", "0",
-               "-t", str(settings.workers("httpx", 15))]     # H2: core-scaled concurrency (timeout: see probe.py)
-        if prof.http_rl:
-            cmd += ["-rl", str(prof.http_rl)]
-        # late hosts (A1d re-brute / crawl / CSP) can be large → scale like the probe httpx (port-weighted)
-        r = exec_tool("httpx", cmd, raw_path=hx,
-                      timeout=scaled_timeout(len(new_resolved), ctx.http_timeout,
-                                             per_unit=max(6, len(prof.ports) // 12)))
-        ctx.run.record("enrich", r)
+        # v0.3.5: share probe's fingerprint path — SYN web-port prefilter → httpx on open ports only,
+        # same fallback discipline. Late A1d/crawl/CSP hosts don't fall back to the slow direct behavior.
+        from .probe import fingerprint_hosts
         new_live: list[str] = []
-        if r.raw_path:
-            for e in normalize.httpx_json(r.raw_path.read_text(), "httpx", str(hx)):
+        for raw_ref, glines in fingerprint_hosts(ctx, new_resolved, "enrich"):   # per-group raw provenance
+            for e in normalize.httpx_json("\n".join(glines), "httpx", raw_ref):
                 if scope.in_scope(e.get("host") or normalize.host_of_url(e["url"])):
                     if ctx.run.add("live", e):
                         new_live.append(e["url"])
                         for tech in e.get("tech") or []:
                             ctx.run.add("tech", {"id": f"{e['url']}|{tech}", "tech": tech,
                                                  "url": e["url"], "sources": ["httpx"]})
-            ctx.echo(f"  enrich: +{len(new_live)} live (late-discovered)")
+        ctx.echo(f"  enrich: +{len(new_live)} live (late-discovered)")
 
         # ── fingerprint the late hosts the same way probe does (probe ran before they existed) ──
         if new_live:

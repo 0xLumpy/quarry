@@ -7,6 +7,7 @@ optional smap passive (Shodan-backed) port scan.
 """
 from __future__ import annotations
 
+import ipaddress as _ipaddr
 import json as _json
 import re as _re
 import urllib.parse
@@ -174,7 +175,8 @@ def _vhost_enum(ctx) -> None:
             # serve that Host, so it isn't a vhost. -ac drops the catch-all baseline; -r follows a
             # redirect to classify on the final response (odd ports/presentations still caught).
             cmd = ["ffuf", "-w", f"{wl}:FUZZ", "-H", f"Host: FUZZ.{apex}",
-                   "-u", f"{base}/", "-ac", "-r", "-t", str(settings.workers("ffuf", 40)), "-s",
+                   "-u", f"{base}/", "-ac", "-r", "-timeout", "7",
+                   "-t", str(settings.workers("ffuf", 40)), "-s",
                    "-mc", "200-299,301,302,303,307,308,401,403",
                    "-o", str(out), "-of", "json"]
             if prof.http_rl:
@@ -202,6 +204,174 @@ def _vhost_enum(ctx) -> None:
         ctx.echo(f"  vhost: {found} name-based vhost candidate(s) via Host-header fuzz (ffuf)")
 
 
+def _httpx_probe_cmd(hosts_file, ports, http_rl) -> list[str]:
+    """The shared httpx fingerprint command (v0.3.4 discipline: NO -probe-all-ips / -no-fallback
+    multipliers, bounded -timeout/-retries; rich response-derived flags kept — they cost only on hosts
+    that answer). Used by the bulk probe, every prefilter port-group, the direct fallback, and enrich."""
+    cmd = ["httpx", "-l", str(hosts_file), "-json", "-silent",
+           "-ports", ",".join(str(p) for p in ports),
+           "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
+           "-asn", "-location", "-ip", "-cname", "-irh",
+           "-follow-redirects", "-random-agent", "-timeout", "7", "-retries", "0",
+           "-t", str(settings.workers("httpx", 15))]
+    if http_rl:
+        cmd += ["-rl", str(http_rl)]
+    return cmd
+
+
+def _run_httpx(ctx, hosts, ports, phase, tag):
+    """Probe `hosts` on `ports` (hostnames, so Host/SNI/cert/CDN stay correct) → record + return
+    (raw_ref, lines) so each live entity keeps its OWN immutable raw evidence file (per httpx call).
+    Timeout scales with host × port-weight."""
+    hf = ctx.write_list(f"{tag}_targets.txt", sorted(set(hosts)))
+    hx = ctx.run.raw_path(phase, "httpx", f"{tag}.jsonl")
+    cmd = _httpx_probe_cmd(hf, ports, ctx.profile.http_rl)
+    to = scaled_timeout(len(hosts), ctx.http_timeout, per_unit=max(6, len(ports) // 12))
+    r = exec_tool("httpx", cmd, raw_path=hx, timeout=to)
+    ctx.run.record(phase, r)
+    return str(hx), (r.raw_path.read_text().splitlines() if r.raw_path else [])
+
+
+def _host_public_ip_map(ctx, hosts):
+    """Returns (pubmap, a_known). pubmap = {host: [global PUBLIC A-record IPs]} from resolved.a +
+    dns_record A (private/loopback/link-local/multicast/reserved dropped via is_global). a_known = set of
+    hosts that had ANY A record at all. The caller MUST distinguish 'no A data known' (unknown IP → probe
+    by hostname) from 'A data but all private' (an internal host → NOT a scan target, skip)."""
+    want = set(hosts)
+    a_by_host: dict[str, set] = {}
+    for r in ctx.run.read("resolved"):
+        h = r.get("host")
+        if h in want and r.get("a"):
+            a_by_host.setdefault(h, set()).update(r["a"])
+    for d in ctx.run.read("dns_record"):
+        if d.get("type") == "a" and d.get("host") in want and d.get("value"):
+            a_by_host.setdefault(d["host"], set()).add(d["value"])
+    a_known = set(a_by_host)
+    pubmap: dict[str, list] = {}
+    for h in hosts:
+        pub = []
+        for ip in a_by_host.get(h, ()):
+            try:
+                if ip and _ipaddr.ip_address(ip).is_global:
+                    pub.append(ip)
+            except ValueError:
+                continue
+        pubmap[h] = sorted(set(pub))
+    return pubmap, a_known
+
+
+def _web_port_prefilter(ctx, hosts, phase, pubmap):
+    """v0.3.5 SYN web-port prefilter (bbot-style, NOT the infra portscan). `hosts` are PUBLIC-IP hosts
+    only (private-only ones already dropped by the caller). naabu SYN over their public IPs × prof.ports
+    (never top-1000/CIDR/nmap) → open ip:ports → mapped back to hosts → {host:[open ports]}. Returns None
+    to signal FULL fallback to direct-httpx. Only a CLEAN naabu completion is trusted — a truncated scan
+    (timeout / block / error / partial) falls back so a few ports found mid-failure can't silently
+    suppress the rest. Stores web_port evidence + echoes the matrix."""
+    if not have("naabu"):
+        return None
+    prof = ctx.profile
+    ip_to_hosts: dict[str, list] = {}
+    for h in hosts:
+        for ip in pubmap.get(h, ()):
+            ip_to_hosts.setdefault(ip, []).append(h)
+    unique_ips = sorted(ip_to_hosts)
+    if not unique_ips:
+        return None
+    ips_file = ctx.write_list(f"{phase}_webports_ips.txt", unique_ips)
+    raw = ctx.run.raw_path(phase, "naabu-web", "open.json")
+    cmd = ["naabu", "-list", str(ips_file), "-p", ",".join(str(p) for p in prof.ports),
+           "-json", "-scan-type", "s", "-Pn", "-silent", "-o", str(raw)]   # SYN, no host-disco, web ports only
+    if prof.portscan_rate:
+        cmd += ["-rate", str(prof.portscan_rate)]
+    to = scaled_timeout(len(unique_ips) * len(prof.ports), ctx.http_timeout, per_unit=0.02)
+    res = exec_tool("naabu", cmd, timeout=to)
+    raw_status = res.status
+    # naabu writes findings to the -o FILE (empty stdout) → parse it FIRST, then fix the audit status
+    # (same file-output mislabel class as gowitness) BEFORE recording.
+    open_by_ip: dict[str, set] = {}
+    if raw.exists():
+        for line in raw.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            ip = port = None
+            try:
+                o = _json.loads(line)
+                ip, port = o.get("ip") or o.get("host"), o.get("port")
+            except _json.JSONDecodeError:
+                if ":" in line:
+                    ip, _, port = line.rpartition(":")
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                continue
+            if ip:
+                open_by_ip.setdefault(ip, set()).add(port)
+    n_open = sum(len(v) for v in open_by_ip.values())
+    if n_open and raw_status == Status.EMPTY:            # clean run, findings in file, empty-stdout mislabel
+        res.status = Status.SUCCESS
+        res.note = f"{n_open} open port(s)"
+        res.stdout_lines = n_open
+    ctx.run.record(phase, res)
+    # HIGH 2: trust the prefilter ONLY on a clean completion. A truncated/errored scan (TIMED_OUT /
+    # BLOCKED / FAILED / PARTIAL) → FULL fallback, even if some ports were found — never thin coverage.
+    if raw_status not in (Status.SUCCESS, Status.EMPTY):
+        return None
+    if n_open == 0:
+        return None                                     # zero open (or clean-empty) -> don't trust, fall back
+    host_ports: dict[str, set] = {}
+    for ip, ports in open_by_ip.items():
+        for h in ip_to_hosts.get(ip, []):
+            host_ports.setdefault(h, set()).update(ports)
+            for p in sorted(ports):
+                ctx.run.add("web_port", {"id": f"{h}|{ip}|{p}", "host": h, "ip": ip, "port": p,
+                                         "sources": ["naabu-web"], "raw_ref": str(raw)})
+    host_ports = {h: sorted(ps) for h, ps in host_ports.items()}
+    n_targets = sum(len(ps) for ps in host_ports.values())
+    ctx.echo(f"  web-port prefilter: {len(unique_ips)} public IPs × {len(prof.ports)} ports -> "
+             f"{n_open} open ip:ports -> {n_targets} host:port probes")
+    ctx.run.notes.append(f"{phase} web-port prefilter: public_ips={len(unique_ips)} "
+                         f"ports={len(prof.ports)} ip_port_checks={len(unique_ips) * len(prof.ports)} "
+                         f"open_ip_ports={n_open} httpx_host_port_targets={n_targets}")
+    return host_ports
+
+
+def fingerprint_hosts(ctx, hosts, phase):
+    """Fingerprint `hosts` → list of (raw_ref, json_lines) per httpx call (callers parse each with its
+    REAL raw file for per-entity provenance). v0.3.5: SYN-prefilter → httpx only on OPEN host:ports
+    (grouped by open-port set); hosts with NO known IP → direct-httpx by hostname. SAFETY RAILS:
+    - private/reserved-only hosts (A data but no public IP) are NOT scan targets → skipped + noted.
+    - FALLBACK-SAFE: prefilter off / naabu missing / truncated / zero-open → v0.3.4 direct-httpx over the
+      public + unknown-IP hosts (never private-only, never a thin run). Shared by probe + enrich."""
+    prof = ctx.profile
+    pubmap, a_known = _host_public_ip_map(ctx, hosts)
+    private_only = [h for h in hosts if h in a_known and not pubmap[h]]   # HIGH 1: internal, not a target
+    public_hosts = [h for h in hosts if pubmap[h]]
+    no_ip = [h for h in hosts if h not in a_known]                        # unknown IP → probe by hostname
+    if private_only:
+        ctx.echo(f"  web-port: {len(private_only)} host(s) resolve only to private/reserved IPs — "
+                 f"skipped (not scan targets)")
+        ctx.run.notes.append(f"{phase}: {len(private_only)} private-only host(s) skipped (not scan targets)")
+
+    def _direct(targets):
+        return [_run_httpx(ctx, targets, prof.ports, phase, "httpx")] if targets else []
+
+    if not settings.web_port_prefilter():
+        return _direct(public_hosts + no_ip)                             # v0.3.4 direct (still skips private-only)
+    host_ports = _web_port_prefilter(ctx, public_hosts, phase, pubmap) if public_hosts else None
+    if host_ports is None:
+        return _direct(public_hosts + no_ip)                             # fallback: full direct, never private-only
+    results = []
+    groups: dict[tuple, list] = {}
+    for h, ps in host_ports.items():
+        groups.setdefault(tuple(ps), []).append(h)
+    for i, (ps, hs) in enumerate(sorted(groups.items())):
+        results.append(_run_httpx(ctx, hs, list(ps), phase, f"httpx-g{i}"))   # httpx on OPEN ports only
+    if no_ip:
+        results.append(_run_httpx(ctx, no_ip, prof.ports, phase, "httpx-direct"))
+    return results
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
     if scope.passive_only:
@@ -214,44 +384,21 @@ def run(ctx) -> None:
         ctx.run.record("probe", skipped("httpx", "no in-scope hosts to probe"))
         ctx.run.notes.append("probe: no hosts (run vertical first)")
         return
-    hosts_file = ctx.write_list("probe_targets.txt", hosts)
 
-    # ── httpx full fingerprint -> live services (methodology flag set) ──
-    hx = ctx.run.raw_path("probe", "httpx", "httpx.jsonl")
-    # Big host×port matrices die on two hidden MULTIPLIERS + the slow filtered-port fail, NOT the port
-    # count (reconftw probes the same uncommon-port set fine): `-probe-all-ips` fans every port across
-    # EVERY IP of a host, and `-no-fallback` probes BOTH http+https per port — each multiplies the whole
-    # matrix, INCLUDING firewall-DROPPED ports that just hang to httpx's 10s default. Drop both for the
-    # bulk probe + bound `-timeout` so a filtered port fails fast. The response-derived flags
-    # (favicon/asn/cname/irh/cdn) only cost on hosts that actually answer, so they stay — full fingerprint
-    # kept, matrix cost removed. (v0.3.4, from the otc-service 567-host × 94-port timeout.)
-    cmd = ["httpx", "-l", str(hosts_file), "-json", "-silent",
-           "-ports", ",".join(str(p) for p in prof.ports),
-           "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
-           "-asn", "-location", "-ip", "-cname", "-irh",
-           "-follow-redirects", "-random-agent", "-timeout", "7", "-retries", "0",
-           "-t", str(settings.workers("httpx", 15))]      # H2: core-scaled concurrency
-    # timeout 7 = a MIDDLE: below httpx's 10s default (faster filtered-port fail) but not so low it drops
-    # a slow-but-alive server (WAF challenge / loaded backend). retries 0 (not reconftw's 2 / bbot's 1)
-    # because retries DOUBLE the filtered-port cost on this DIRECT probe — worth adding only once we adopt
-    # bbot's model (SYN-scan first → httpx on OPEN ports only), where httpx never touches a filtered port.
-    if prof.http_rl:
-        cmd += ["-rl", str(prof.http_rl)]
-    # workload-scaled ceiling: the flat 1800s cut this probe mid-run on a 567-host × 94-port target.
-    # per-host budget scales with the port matrix so a big host×port scope gets the time it needs.
-    hx_to = scaled_timeout(len(hosts), ctx.http_timeout, per_unit=max(6, len(prof.ports) // 12))
-    r = exec_tool("httpx", cmd, raw_path=hx, timeout=hx_to)
-    ctx.run.record("probe", r)
-    if r.raw_path:
+    # ── httpx full fingerprint -> live services (v0.3.5: SYN-prefilter → httpx on open ports only) ──
+    groups = fingerprint_hosts(ctx, hosts, "probe")     # [(raw_ref, json_lines)] per httpx call
+    lines = [ln for _ref, gl in groups for ln in gl]    # combined, for the CSP/deser pass below
+    if groups:
         n = 0
-        for e in normalize.httpx_json(r.raw_path.read_text(), "httpx", str(hx)):
-            if scope.in_scope(e.get("host") or normalize.host_of_url(e["url"])):
-                if ctx.run.add("live", e):
-                    n += 1
-                    for tech in e.get("tech") or []:
-                        ctx.run.add("tech", {"id": f"{e['url']}|{tech}", "tech": tech,
-                                             "url": e["url"], "sources": ["httpx"]})
-        ctx.echo(f"  httpx: {n} live services ({r.status.value})")
+        for raw_ref, glines in groups:                  # parse each group with its OWN raw file (provenance)
+            for e in normalize.httpx_json("\n".join(glines), "httpx", raw_ref):
+                if scope.in_scope(e.get("host") or normalize.host_of_url(e["url"])):
+                    if ctx.run.add("live", e):
+                        n += 1
+                        for tech in e.get("tech") or []:
+                            ctx.run.add("tech", {"id": f"{e['url']}|{tech}", "tech": tech,
+                                                 "url": e["url"], "sources": ["httpx"]})
+        ctx.echo(f"  httpx: {n} live services")
 
         # ── CSP-advertised siblings (horizontal discovery from live response headers) ──
         # httpx -irh carries the Content-Security-Policy; in-scope hosts named there (e.g. an
@@ -260,7 +407,7 @@ def run(ctx) -> None:
         # why csprecon over apex roots in horizontal found nothing.
         _CSP_HOST = _re.compile(r"\b(?:https?://)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})\b", _re.I)
         csp_added = deser_n = 0
-        for line in r.raw_path.read_text().splitlines():
+        for line in lines:
             try:
                 o = _json.loads(line)
             except _json.JSONDecodeError:

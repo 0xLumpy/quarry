@@ -118,7 +118,7 @@ def run(ctx) -> None:
         # MATCH 3xx (-mc) instead of following (-r): following would classify many distinct paths onto one
         # login/home page → -ac/dedup would then drop them → the "this path exists" signal is lost. -ac
         # autocalibration already neutralises the redirect-everything catch-all. (ISC-16, v0.3.)
-        cmd = ["ffuf", "-u", f"{url.rstrip('/')}/FUZZ", "-w", str(wl), "-ac",
+        cmd = ["ffuf", "-u", f"{url.rstrip('/')}/FUZZ", "-w", str(wl), "-ac", "-timeout", "7",
                "-t", str(settings.workers("ffuf", 40)),   # H2: core-scaled concurrency
                "-mc", "200,204,301,302,307,308,401,403,405", "-of", "json", "-o", str(out), "-s"]
         if prof.http_rl:
