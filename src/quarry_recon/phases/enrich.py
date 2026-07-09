@@ -16,16 +16,75 @@ from .. import settings
 from ..runner import have, nuclei_timeout, run as exec_tool, skipped
 
 
+def _a1d_recursive_brute(ctx) -> set[str]:
+    """A1d — recursion: feed the target-specific wordlist mined during the crawl back into the brute.
+
+    "Teach Quarry how the target functions." The crawl phase (which runs AFTER vertical) mines the
+    target's own naming vocabulary via xnLinkFinder over waymore/JS. Here — the first phase after
+    crawl — we harvest that vocabulary and re-brute with it: apexes (puredns) + any wildcard zones
+    vertical discovered (the A1 HTTP-differentiator, with the target words folded in). Bounded: the
+    target wordlist is capped and deduped against the base dictionary, so this can't explode the
+    brute. Returns the set of hosts discovered so run() can force them into the enrich catch-up set."""
+    prof, scope = ctx.profile, ctx.scope
+    if scope.passive_only:
+        return set()
+    from .vertical import _target_wordlist, _wildcard_differentiate, _resolvers, _wordlist
+    base_wl = _wordlist(ctx)
+    base_words = {w.strip().lower() for w in base_wl.read_text().splitlines()
+                  if w.strip() and not w.startswith("#")} if base_wl else set()
+    twords = _target_wordlist(ctx, base_words)
+    if not twords:
+        ctx.run.record("enrich", skipped("a1d", "no target-specific words mined from crawl"))
+        return set()
+    twl = ctx.write_list("a1d_target_words.txt", twords)
+    ctx.echo(f"  A1d: {len(twords)} target-specific word(s) mined from crawl → recursive re-brute")
+    discovered: set[str] = set()
+
+    # apex brute with the target wordlist (same puredns invocation as vertical's brute)
+    if have("puredns"):
+        resolvers, trusted = _resolvers(ctx)
+        for d in prof.apex_domains:
+            cmd = ["puredns", "bruteforce", str(twl), d, "--resolvers-trusted", str(trusted), "-q"]
+            if resolvers:
+                cmd += ["-r", str(resolvers)]
+            if prof.dns_rate:
+                cmd += ["--rate-limit", str(prof.dns_rate)]
+            br = ctx.run.raw_path("enrich", "puredns", f"a1d-brute-{d}.txt")
+            r = exec_tool("puredns", cmd, raw_path=br, timeout=ctx.http_timeout)
+            ctx.run.record("enrich", r)
+            if r.raw_path:
+                for e in normalize.hosts(r.raw_path.read_text(), "target-wordlist", str(br)):
+                    if scope.in_scope(e["host"]) and not scope.is_oos(e["host"]):
+                        ctx.run.add("subdomain", e)
+                        discovered.add(e["host"])
+
+    # wildcard-zone differ with the target words folded in (zones persisted by vertical)
+    zones = set(ctx.run.values("wildcard_zone"))
+    if zones:
+        discovered.update(_wildcard_differentiate(ctx, zones, extra_words=twords, phase="enrich",
+                                                  label="wildcard-a1d", source="wildcard-http-a1d"))
+    if discovered:
+        ctx.echo(f"  A1d: +{len(discovered)} host(s) via target-specific recursive re-brute")
+    return discovered
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
+    # A1d recursion FIRST — its discoveries then flow through the resolve/probe/takeover pass below.
+    a1d_hosts = _a1d_recursive_brute(ctx)
     resolved = set(ctx.run.values("resolved"))
-    # hosts known (subdomain) but never resolved → the crawl/CSP-discovered ones
-    new = sorted(h for h in set(ctx.run.values("subdomain"))
-                 if h and h not in resolved and scope.in_scope(h) and not scope.is_oos(h))
+    # hosts known (subdomain) but never resolved → the crawl/CSP-discovered ones.
+    # A1d's wildcard-differentiator adds its hits to `resolved` too (it needs its own httpx pass),
+    # which would exclude them from this catch-up — force them back in so they still get the full
+    # enrich treatment (dns-record, CNAME/takeover, rich httpx fingerprint, screenshots/WAF/smap).
+    new = sorted({h for h in set(ctx.run.values("subdomain"))
+                  if h and h not in resolved and scope.in_scope(h) and not scope.is_oos(h)}
+                 | {h for h in a1d_hosts if scope.in_scope(h) and not scope.is_oos(h)})
     if not new:
         ctx.run.record("enrich", skipped("enrich", "no late-discovered hosts to enrich"))
         return
-    ctx.echo(f"  enriching {len(new)} late-discovered host(s) (crawl/CSP)")
+    ctx.echo(f"  enriching {len(new)} late-discovered host(s) "
+             f"({'crawl/CSP/A1d' if a1d_hosts else 'crawl/CSP'})")
     targets = ctx.write_list("enrich_hosts.txt", new)
 
     # 1. resolve (A) — pull the late hosts into `resolved`

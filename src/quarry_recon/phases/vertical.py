@@ -129,7 +129,44 @@ def _wordlist(ctx) -> Path | None:
     return None
 
 
-def _wildcard_differentiate(ctx, zones: set) -> int:
+_LABEL_RX = _re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
+
+
+def _target_wordlist(ctx, base_words: set, cap: int = 2000) -> list[str]:
+    """A1d — build a TARGET-SPECIFIC label wordlist from what the crawl already mined.
+
+    xnLinkFinder (run in the crawl phase over waymore responses + JS + recovered source) writes a
+    `-owl` wordlist per input dir. Those files are the target's OWN vocabulary — product names,
+    internal service names, path segments — the exact words a generic dictionary misses. Here we
+    harvest every `*_wordlist.txt` xnLinkFinder produced, tokenize each entry into DNS-label pieces,
+    keep only plausible labels (has a letter, len>=3, valid label chars — drops `v1`/`api`-vs-nothing
+    noise and pure-numeric junk that would explode a brute), drop anything already in the base
+    wordlist (no point re-brute-forcing dictionary words), dedup, and cap. Bounded by construction so
+    the recursive brute load can't blow up. Empty when the crawl mined nothing."""
+    wl_dir = ctx.run.dir / "raw" / "crawl" / "xnLinkFinder"
+    if not wl_dir.exists():
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for f in sorted(wl_dir.glob("*_wordlist.txt")):
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            for piece in _LABEL_RX.findall(line.strip().lower()):
+                if (len(piece) >= 3 and any(c.isalpha() for c in piece)
+                        and piece not in base_words and piece not in seen):
+                    seen.add(piece)
+                    out.append(piece)
+                    if len(out) >= cap:
+                        return sorted(out)
+    return sorted(out)
+
+
+def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
+                            phase: str = "vertical", label: str = "wildcard",
+                            source: str = "wildcard-http") -> set[str]:
     """A1 — recover the distinct vhosts hidden behind a wildcard zone. A `*.zone` cert makes every
     `<word>.zone` resolve to one IP, so a DNS-gated pipeline strips them all as noise and loses the
     real hosts (CDN / k8s ingress / SaaS). Instead: brute `<word>.zone` + a couple of guaranteed-bogus
@@ -142,24 +179,29 @@ def _wildcard_differentiate(ctx, zones: set) -> int:
     scope = ctx.scope
     zones = sorted(z for z in zones if scope.in_scope(z) and not scope.is_oos(z))[:5]
     if not zones or scope.passive_only or not have("httpx"):
-        return 0
+        return set()
     from .probe import _vhost_wordlist          # small label list (lives in probe); DNS list is fallback
     wl = _vhost_wordlist() or _wordlist(ctx)
     if wl is None:
-        return 0
+        return set()
     words = [w.strip() for w in wl.read_text().splitlines()
-             if w.strip() and not w.startswith("#")][:5000]
+             if w.strip() and not w.startswith("#")]
+    # A1d: fold the target-specific words (mined from the crawl) IN FRONT so the target's own
+    # naming vocabulary is tried first, then dedup + cap so brute load stays bounded.
+    if extra_words:
+        words = list(dict.fromkeys([w for w in extra_words if w] + words))
+    words = words[:5000]
 
     def _sig(o):
         return (o.get("status_code"), o.get("content_length"),
                 (o.get("title") or "").strip(), o.get("favicon"))
 
-    found = 0
+    kept: set[str] = set()
     for zone in zones:
         bogus = [f"quarry-wc-{_uuid.uuid4().hex[:10]}.{zone}" for _ in range(2)]
-        cf = ctx.write_list(f"wc_cand_{zone.replace('.', '_')}.txt",
+        cf = ctx.write_list(f"{label}_cand_{zone.replace('.', '_')}.txt",
                             [f"{w}.{zone}" for w in words] + bogus)
-        hx = ctx.run.raw_path("vertical", "wildcard", f"{zone}.jsonl")
+        hx = ctx.run.raw_path(phase, label, f"{zone}.jsonl")
         # -follow-redirects so the signature is the FINAL response, not a bare redirect: without it a
         # candidate httpx probes on http gets the wildcard's uniform 308→https (status 308, len 0) —
         # which "differs" from the 200 baseline and floods false positives. Following it collapses
@@ -168,7 +210,7 @@ def _wildcard_differentiate(ctx, zones: set) -> int:
                                 "-favicon", "-follow-redirects",
                                 "-t", str(settings.workers("httpx", 15))],
                       raw_path=hx, timeout=ctx.http_timeout)
-        ctx.run.record("vertical", r)
+        ctx.run.record(phase, r)
         if not (r.raw_path and r.raw_path.exists()):
             continue
         rows = []
@@ -187,14 +229,14 @@ def _wildcard_differentiate(ctx, zones: set) -> int:
             if (o.get("status_code") or 0) // 100 == 3:   # un-followed redirect = infra noise, not a vhost
                 continue
             if _sig(o) not in base:             # differs from the wildcard baseline → a REAL vhost
-                if ctx.run.add("subdomain", {"host": host, "sources": ["wildcard-http"],
+                if ctx.run.add("subdomain", {"host": host, "sources": [source],
                                              "raw_ref": str(hx)}):
                     ctx.run.add("resolved", {"host": host, "a": o.get("a") or [],
-                                             "sources": ["wildcard-http"], "raw_ref": str(hx)})
-                    found += 1
-    if found:
-        ctx.echo(f"  wildcard: +{found} distinct vhost(s) recovered via HTTP-differentiation (A1)")
-    return found
+                                             "sources": [source], "raw_ref": str(hx)})
+                    kept.add(host)
+    if kept:
+        ctx.echo(f"  wildcard: +{len(kept)} distinct vhost(s) recovered via HTTP-differentiation ({label})")
+    return kept
 
 
 def run(ctx) -> None:
@@ -393,6 +435,10 @@ def run(ctx) -> None:
 
     # ── A1: wildcard-zone brute + HTTP-differentiation (recover distinct vhosts a wildcard hides) ──
     # Runs before the CNAME/takeover pass so recovered vhosts get takeover analysis too.
+    # Persist the derived zones so the post-crawl A1d recursion (enrich) can re-brute them with the
+    # target-specific wordlist — enrich runs after crawl, where the target vocabulary is mined.
+    for _z in sorted(wildcard_zones):
+        ctx.run.add("wildcard_zone", {"value": _z})
     _wildcard_differentiate(ctx, wildcard_zones)
 
     # ── CNAME collection for subdomain-takeover analysis (workflow 1.13) ──

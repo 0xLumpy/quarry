@@ -37,6 +37,7 @@ ENTITY_KEYS = {
     "screenshot": "url",
     "tech": "id",
     "review": "id",
+    "wildcard_zone": "value",   # A1: cert-derived *.X.apex brute-zones (persisted vertical→enrich for A1d)
 }
 
 
