@@ -13,14 +13,17 @@ from .. import normalize
 from ..runner import Status, have, run as exec_tool, skipped
 
 
-# Per-provider download cap. The kaeferjaeger SNI files are hundreds of MB each — reading one in full
-# (r.read()) pulled the whole thing into RAM (measured ~1 GB across the 5 providers) before truncation,
-# a latent OOM on a small VPS. Cap the READ at the source so RAM is bounded regardless of file size.
-# (M2 decision 2026-07-09: KEEP kaeferjaeger as bounded best-effort — it's a distinct coverage channel
-# vs CT logs [cloud-IP SNI, not just CT] — but it's IP-dependent: kaeferjaeger.gay 403s some VPS egress,
-# in which case it's a graceful no-op and CT logs carry discovery. A self-serve cero/tlsx-over-cloud-CIDR
-# replacement is deferred to a later cycle, when a real target shows CT actually misses cloud hosts.)
+# Per-provider download cap. The kaeferjaeger SNI files are hundreds of MB each (~885 MB for amazon) —
+# reading one in full (r.read()) pulled the whole thing into RAM before truncation, a latent OOM. Cap the
+# READ at the source so RAM is bounded regardless of file size.
+#   NOTE the cap means we only see the FIRST 5 MB of an IP-sorted 885 MB file — a tiny, non-representative
+#   slice, so kaeferjaeger's practical name coverage here is low. Full coverage would need streaming the
+#   whole ~4 GB (5 providers) and grepping line-by-line — heavy for a name channel that overlaps
+#   subfinder + CT. Kept as bounded best-effort; the reconftw diff decides if it earns its keep.
+# 403 FIX (2026-07-09): the earlier "403s the VPS egress" read was WRONG — kaeferjaeger.gay anti-bots the
+# default `Python-urllib` User-Agent (verified: browser UA → 200, urllib UA → 403). Send a browser UA.
 _KJ_CAP = 5_000_000
+_KJ_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 
 def _kaeferjaeger(ctx) -> tuple[int, int]:
@@ -34,7 +37,8 @@ def _kaeferjaeger(ctx) -> tuple[int, int]:
     for prov in ("amazon", "google", "microsoft", "oracle", "digitalocean"):
         url = f"https://kaeferjaeger.gay/sni-ip-ranges/{prov}/ipv4_merged_sni.txt"
         try:
-            with urllib.request.urlopen(url, timeout=120) as r:
+            req = urllib.request.Request(url, headers={"User-Agent": _KJ_UA})   # urllib UA is 403'd (anti-bot)
+            with urllib.request.urlopen(req, timeout=120) as r:
                 raw_all.append(r.read(_KJ_CAP).decode("utf-8", "replace"))   # bounded — never the full file
         except Exception as e:  # network optional — quiet, it's best-effort
             blocked += 1
@@ -64,7 +68,7 @@ def run(ctx) -> None:
     if n:
         ctx.echo(f"  kaeferjaeger: +{n} in-scope hosts")
     elif blocked:
-        ctx.echo(f"  kaeferjaeger: unavailable from this egress ({blocked} provider(s) blocked) — skipped")
+        ctx.echo(f"  kaeferjaeger: source unavailable ({blocked} provider(s) failed) — skipped")
 
     # csprecon: related domains from Content-Security-Policy headers (light HTTP; active)
     if not scope.passive_only and have("csprecon"):
