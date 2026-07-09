@@ -23,19 +23,24 @@ from ..runner import Status, have, run as exec_tool, skipped
 _KJ_CAP = 5_000_000
 
 
-def _kaeferjaeger(ctx) -> int:
-    """Passive: grep cloud-provider SNI cert dataset for in-scope hosts. Bounded read (see _KJ_CAP)."""
+def _kaeferjaeger(ctx) -> tuple[int, int]:
+    """Passive: grep cloud-provider SNI cert dataset for in-scope hosts. Bounded read (see _KJ_CAP).
+    Returns (added, blocked) — per-provider errors go QUIETLY to run notes (manifest/run.log), never
+    the console: kaeferjaeger.gay 403s some VPS egress on every provider, and 5 error lines + a `+0`
+    per run is pure noise. The caller emits at most ONE concise line."""
     added = 0
     raw_all = []
+    blocked = 0
     for prov in ("amazon", "google", "microsoft", "oracle", "digitalocean"):
         url = f"https://kaeferjaeger.gay/sni-ip-ranges/{prov}/ipv4_merged_sni.txt"
         try:
             with urllib.request.urlopen(url, timeout=120) as r:
                 raw_all.append(r.read(_KJ_CAP).decode("utf-8", "replace"))   # bounded — never the full file
-        except Exception as e:  # network optional
-            ctx.echo(f"    kaeferjaeger {prov}: {e}")
+        except Exception as e:  # network optional — quiet, it's best-effort
+            blocked += 1
+            ctx.run.notes.append(f"kaeferjaeger {prov}: {e}")
     if not raw_all:
-        return 0
+        return 0, blocked
     blob = "\n".join(raw_all)
     raw_path = ctx.run.raw_path("horizontal", "kaeferjaeger", "sni.txt")
     raw_path.write_text(blob[:_KJ_CAP])
@@ -47,15 +52,19 @@ def _kaeferjaeger(ctx) -> int:
             if ctx.run.add("subdomain", {"host": h, "sources": ["kaeferjaeger"],
                                          "raw_ref": str(raw_path)}):
                 added += 1
-    return added
+    return added, 0
 
 
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
 
-    # kaeferjaeger is passive OSINT — always allowed (even passive-only mode)
-    n = _kaeferjaeger(ctx)
-    ctx.echo(f"  kaeferjaeger: +{n} in-scope hosts")
+    # kaeferjaeger is passive OSINT — always allowed (even passive-only mode). ONE concise line max:
+    # hits if any, else a single "blocked" note (not 5 × 403), else silent.
+    n, blocked = _kaeferjaeger(ctx)
+    if n:
+        ctx.echo(f"  kaeferjaeger: +{n} in-scope hosts")
+    elif blocked:
+        ctx.echo(f"  kaeferjaeger: unavailable from this egress ({blocked} provider(s) blocked) — skipped")
 
     # csprecon: related domains from Content-Security-Policy headers (light HTTP; active)
     if not scope.passive_only and have("csprecon"):
