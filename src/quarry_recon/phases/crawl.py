@@ -250,7 +250,9 @@ def run(ctx) -> None:
         for sub, parser in (("urls", normalize.jsluice_urls), ("secrets", normalize.jsluice_secrets)):
             raw = ctx.run.raw_path("crawl", "jsluice-sourcemap", f"{sub}.jsonl")
             try:
-                p = subprocess.run(["jsluice", sub, "-"], input=blob, capture_output=True,
+                # jsluice reads stdin via -j/--raw-input; a bare "-" is opened as a FILE named "-"
+                # (errors, mines nothing). This was silently yielding zero urls/secrets.
+                p = subprocess.run(["jsluice", sub, "-j"], input=blob, capture_output=True,
                                    timeout=ctx.http_timeout)
                 raw.write_bytes(p.stdout)
                 _synthetic(ctx, f"jsluice-sourcemap-{sub}", p.stdout.count(b"\n"))
@@ -281,7 +283,9 @@ def run(ctx) -> None:
         for sub, parser in (("urls", normalize.jsluice_urls), ("secrets", normalize.jsluice_secrets)):
             raw = ctx.run.raw_path("crawl", "jsluice", f"{sub}.jsonl")
             try:
-                p = subprocess.run(["jsluice", sub, "-"], input=blob, capture_output=True,
+                # jsluice reads stdin via -j/--raw-input; a bare "-" is opened as a FILE named "-"
+                # (errors, mines nothing). This was silently yielding zero urls/secrets.
+                p = subprocess.run(["jsluice", sub, "-j"], input=blob, capture_output=True,
                                    timeout=ctx.http_timeout)
                 raw.write_bytes(p.stdout)
                 _synthetic(ctx, f"jsluice-{sub}", p.stdout.count(b"\n"))
