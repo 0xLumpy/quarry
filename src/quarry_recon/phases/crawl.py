@@ -13,7 +13,8 @@ import re
 import subprocess
 from pathlib import Path
 
-from .. import fetch, normalize, secrets
+from .. import events, fetch, normalize, secrets
+from ..contract import run_contract
 from ..runner import Status, have, run as exec_tool, skipped
 
 # 9.2 deep-mine patterns over JS / recovered source — extraction only, no fetch.
@@ -66,6 +67,19 @@ def _synthetic(ctx, tool, lines, note=""):
     ctx.run.record("crawl", type("R", (), {
         "tool": tool, "status": Status.SUCCESS, "exit_code": 0, "duration": 0.0,
         "stdout_lines": lines, "note": note, "cmd": [tool], "stderr_tail": ""})())
+
+
+def _jsluice_run(ctx, sub, blob, files, raw, origin):
+    """Run `jsluice <sub> -j` through run_contract (step 4.1). Replaces a raw subprocess.run whose
+    `timeout=ctx.http_timeout` treated 0 as an immediate kill; runner.run maps 0→None (unbounded), so
+    the contract path inherits the correct semantics + emits events. Returns the decoded stdout text
+    ('' on failure). Behavior-equivalent: same blob to stdin (-j/--raw-input), same raw file; the
+    caller parses it exactly as before."""
+    run_contract(f"crawl.jsluice_{sub}", ["jsluice", sub, "-j"],
+                 raw_path=raw, timeout=ctx.http_timeout,
+                 stdin_data=blob.decode("utf-8", "replace"),
+                 input_total=len(files), discovery_context=origin)
+    return raw.read_text(encoding="utf-8", errors="replace") if raw.exists() else ""
 
 
 def _safe_srcpath(name: str) -> str:
@@ -250,13 +264,10 @@ def run(ctx) -> None:
         for sub, parser in (("urls", normalize.jsluice_urls), ("secrets", normalize.jsluice_secrets)):
             raw = ctx.run.raw_path("crawl", "jsluice-sourcemap", f"{sub}.jsonl")
             try:
-                # jsluice reads stdin via -j/--raw-input; a bare "-" is opened as a FILE named "-"
-                # (errors, mines nothing). This was silently yielding zero urls/secrets.
-                p = subprocess.run(["jsluice", sub, "-j"], input=blob, capture_output=True,
-                                   timeout=ctx.http_timeout)
-                raw.write_bytes(p.stdout)
-                _synthetic(ctx, f"jsluice-sourcemap-{sub}", p.stdout.count(b"\n"))
-                for e in parser(p.stdout.decode("utf-8", "replace"), "jsluice-sourcemap", str(raw)):
+                out = _jsluice_run(ctx, sub, blob, recov_files, raw, "sourcemap")
+                _synthetic(ctx, f"jsluice-sourcemap-{sub}", out.count("\n"))
+                produced = 0
+                for e in parser(out, "jsluice-sourcemap", str(raw)):
                     if sub == "urls":
                         ctx.run.add("endpoint", {"value": e["url"],
                                                  **{k: v for k, v in e.items() if k != "url"}})
@@ -267,6 +278,9 @@ def run(ctx) -> None:
                         e["id"] = f"jsluice-sourcemap:{e.get('kind', 'secret')}:{secrets.fingerprint(basis)}"
                         e["location"] = "raw/crawl/sourcemaps/recovered"   # recovered-source origin hint
                         ctx.run.add("secret", e)
+                    produced += 1
+                events.ledger(f"crawl.jsluice_{sub}",
+                              produced={sub: produced}, consumed={"js_file": len(recov_files)})
             except Exception as ex:
                 ctx.echo(f"    jsluice-sourcemap {sub}: {ex}")
     if recov_files and have("xnLinkFinder"):
@@ -283,13 +297,10 @@ def run(ctx) -> None:
         for sub, parser in (("urls", normalize.jsluice_urls), ("secrets", normalize.jsluice_secrets)):
             raw = ctx.run.raw_path("crawl", "jsluice", f"{sub}.jsonl")
             try:
-                # jsluice reads stdin via -j/--raw-input; a bare "-" is opened as a FILE named "-"
-                # (errors, mines nothing). This was silently yielding zero urls/secrets.
-                p = subprocess.run(["jsluice", sub, "-j"], input=blob, capture_output=True,
-                                   timeout=ctx.http_timeout)
-                raw.write_bytes(p.stdout)
-                _synthetic(ctx, f"jsluice-{sub}", p.stdout.count(b"\n"))
-                for e in parser(p.stdout.decode("utf-8", "replace"), "jsluice", str(raw)):
+                out = _jsluice_run(ctx, sub, blob, js_files, raw, "js")
+                _synthetic(ctx, f"jsluice-{sub}", out.count("\n"))
+                produced = 0
+                for e in parser(out, "jsluice", str(raw)):
                     if sub == "urls":
                         ctx.run.add("endpoint", {"value": e["url"],
                                                  **{k: v for k, v in e.items() if k != "url"}})
@@ -299,6 +310,9 @@ def run(ctx) -> None:
                         e["preview"] = secrets.mask(d)
                         e["id"] = f"jsluice:{e.get('kind', 'secret')}:{secrets.fingerprint(basis)}"
                         ctx.run.add("secret", e)
+                    produced += 1
+                events.ledger(f"crawl.jsluice_{sub}",
+                              produced={sub: produced}, consumed={"js_file": len(js_files)})
             except Exception as ex:
                 ctx.echo(f"    jsluice {sub}: {ex}")
 
