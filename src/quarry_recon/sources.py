@@ -35,7 +35,10 @@ _BOOL_DEFAULT = {True: "on", False: "off"}
 def _load() -> dict:
     global _cache
     if _cache is None:
-        raw = yaml.safe_load(resources.files("quarry_recon.data").joinpath("sources.yaml").read_text())
+        # explicit utf-8: the registry carries UTF-8 symbols (arrows/× in reasons), and Windows
+        # defaults read_text to the locale codepage → UnicodeDecodeError before anything renders.
+        raw = yaml.safe_load(
+            resources.files("quarry_recon.data").joinpath("sources.yaml").read_text(encoding="utf-8"))
         srcs = (raw or {}).get("sources", {}) if isinstance(raw, dict) else {}
         for s in srcs.values():
             if isinstance(s, dict) and isinstance(s.get("default"), bool):

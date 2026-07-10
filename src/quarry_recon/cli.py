@@ -733,5 +733,34 @@ def report(profile_path, run_id):
     click.echo(f"exports: {', '.join(f'{k}={v}' for k, v in exp.items() if v)}")
 
 
+@cli.command()
+def plan():
+    """Static dry-run: explain what WOULD run (registry + machine settings). No scanning."""
+    from . import views
+    for line in views.plan_lines():
+        click.echo(line)
+
+
+@cli.command()
+@click.option("-t", "--target", "profile_path", required=True,
+              help="project name, project dir, or target.yaml path")
+@click.option("--run", "run_id", help="run id (default: latest)")
+def status(profile_path, run_id):
+    """Render current/last-known per-source state from a run's events.jsonl (no scanning)."""
+    from .store import Run
+    from . import views
+
+    try:
+        profile = TargetProfile.load(_resolve_profile(profile_path))
+    except ProfileError as e:
+        raise click.ClickException(str(e))
+    project = _project_dir(profile)
+    run_obj = Run(project, profile.target, run_id=run_id) if run_id else Run.latest(project)
+    if run_obj is None:
+        raise click.ClickException(f"no runs found under {project}/recon/")
+    for line in views.status_lines(run_obj.dir / "events.jsonl"):
+        click.echo(line)
+
+
 if __name__ == "__main__":
     cli()

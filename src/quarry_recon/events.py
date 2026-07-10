@@ -75,8 +75,9 @@ def emit(event: str, source_id: str, **fields) -> dict:
             rec[k] = _redact(val)
     if _sink is not None:
         try:
-            with _sink.open("a") as fh:
-                fh.write(json.dumps(rec, default=str) + "\n")
+            # explicit utf-8 (events carry redacted UTF-8 payloads; Windows would else default to cp)
+            with _sink.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, default=str, ensure_ascii=False) + "\n")
         except Exception:
             pass  # a log failure must never break a recon run
     return rec
