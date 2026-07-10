@@ -1,0 +1,197 @@
+# Quarry source registry — the control-plane single source of truth (v0.3 stabilization, step 1).
+#
+# Keyed by SOURCE_ID (`phase.source`), NOT tool — one tool backs several sources with different policy
+# (crawl.waymore_urls vs crawl.waymore_responses; probe.katana_standard vs crawl.katana_headless).
+# This file makes tier / class / default / failure / log policy live in ONE place instead of scattered
+# across phase code + comments. NO behavior change yet: the registry is declarative until run_contract()
+# (step 2) and the danger-tool conversion (step 4) wire it.
+#
+# Fields per entry:
+#   tool     backing binary / mechanism           tier    core | optional | heavy | experimental
+#   phase    which phase                           class   passive | active | deep | attack
+#   default  on | off | key (on iff key/condition present)
+#
+# ══ GOVERNING PRINCIPLE — RUNTIME IS NOT A KNOB (Lumpy) ══════════════════════════════════════════════
+# Quarry is a PRECISION recon tool; methodology is the key. NEVER disable a source for being slow.
+# Runtime must be EXPLAINED BY WORKLOAD — nuclei over 1500+ hosts running a day can be CORRECT.
+# The problem we fix is BAD CONTROL, not duration: bad wiring / batching / candidate explosion / worker
+# use / missing plan-visibility / missing chunking-resume / subprocess drift. "Took long → deep/off" is
+# the WRONG knob.
+#   `tier`(weight) and `class`(scope) are BOTH orthogonal to `default`(enablement).
+#   default-OFF requires a NON-RUNTIME reason (`reason:` field): setup | infra-lane | user-intent |
+#     resource-opt-in | keyed. Off ONLY for: kaeferjaeger/openintel (dataset setup) · infra naabu/nmap
+#     (separate weeks-long lane) · content discovery (user intent) · headless (resource opt-in) · keyed.
+#   Normal recon intelligence stays default-ON even if slow (waymore_responses+xnLinkFinder · katana_standard
+#     · JS mining · nuclei recon (scoped) · dalfox (split)). Expensive normal sources carry `bounded:
+#     planned` — quarry plan WARNS (long-pole) + the contract controls timeout/progress/chunking. NOT off.
+#   input    what it consumes        output   normalized entity(ies)
+#   workers  concurrency model (MACHINE)           rate    target-rate model (RoE)
+#   timeout  model (scaled/fixed/0=unbounded)       failure quiet-warn | silent-skip | partial-ok
+#   fallback declared behavior on miss/fail/timeout parser  normalize.<fn> / internal
+#   log      silent | one-line | delta | warn-policy
+#   notes    intent / decisions
+
+meta:
+  tiers:   [core, optional, heavy, experimental]
+  classes: [passive, active, deep, attack]
+  version: 1
+
+sources:
+
+  # ── horizontal ──────────────────────────────────────────────────────────────────────
+  horizontal.kaeferjaeger:   {tool: kaeferjaeger, phase: horizontal, tier: heavy, class: passive, default: off, reason: "setup (bulk dataset, opt-in/local-cache)",
+    input: apex_scope, output: subdomain, workers: n/a, rate: n/a, timeout: fixed-120s-per-provider,
+    failure: silent-skip, fallback: "none (CT/subfinder carry the names)", parser: hostname-grep, log: silent-unless-opted-in,
+    notes: "403 was a UA block (fixed); ~4GB bulk, overlaps CT — OUT of default remote run, opt-in / local-cache (openintel-style)."}
+  horizontal.csprecon:       {tool: csprecon, phase: horizontal, tier: core, class: active, default: on,
+    input: apex_roots, output: subdomain, workers: n/a, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.hosts, log: delta}
+  horizontal.cloud_buckets:  {tool: internal, phase: horizontal, tier: core, class: passive, default: on,
+    input: apex_org, output: review, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
+  horizontal.tlsx_san:       {tool: tlsx, phase: horizontal, tier: core, class: active, default: on,
+    input: cidr, output: subdomain+certificate, workers: fixed, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.tlsx_certs, log: delta,
+    notes: "runs only when CIDR present"}
+  horizontal.asnmap:         {tool: asnmap, phase: horizontal, tier: optional, class: active, default: on,
+    input: asn_or_org, output: cidr, workers: n/a, rate: n/a, timeout: http, failure: silent-skip, fallback: skip, parser: internal, log: one-line}
+  horizontal.mapcidr:        {tool: mapcidr, phase: horizontal, tier: optional, class: active, default: on,
+    input: cidr, output: ip, workers: n/a, rate: n/a, timeout: fixed, failure: silent-skip, fallback: skip, parser: internal, log: one-line}
+  horizontal.caduceus:       {tool: caduceus, phase: horizontal, tier: optional, class: active, default: on,
+    input: asn, output: certificate, workers: n/a, rate: n/a, timeout: http, failure: silent-skip, fallback: skip, parser: internal, log: one-line}
+  horizontal.revdns:         {tool: dnsx, phase: horizontal, tier: core, class: active, default: on,
+    input: cidr_ips, output: subdomain, workers: dnsx, rate: dns_rate, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.hosts, log: delta,
+    notes: "reverse DNS over CIDR; runs only when CIDR present"}
+
+  # ── vertical ────────────────────────────────────────────────────────────────────────
+  vertical.subfinder:        {tool: subfinder, phase: vertical, tier: core, class: passive, default: on,
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.hosts, log: delta}
+  vertical.github_subs:      {tool: github-subdomains, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (GitHub PAT)",
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: http, failure: silent-skip, fallback: skip, parser: normalize.hosts, log: one-line,
+    notes: "needs GitHub PAT; silent if absent"}
+  vertical.shosubgo:         {tool: shosubgo, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (Shodan)",
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: http, failure: silent-skip, fallback: skip, parser: normalize.hosts, log: one-line, notes: "needs Shodan key"}
+  vertical.crtsh:            {tool: crt.sh, phase: vertical, tier: core, class: passive, default: on,
+    input: apex, output: subdomain+cert-wildcard, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
+  vertical.certspotter:      {tool: certspotter, phase: vertical, tier: core, class: passive, default: on,
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
+  vertical.censys:           {tool: censys, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (Censys)",
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: silent-skip, fallback: skip, parser: internal, log: one-line, notes: "needs Censys key"}
+  vertical.openintel:        {tool: openintel-subs, phase: vertical, tier: optional, class: passive, default: key, reason: "setup (local DB, manual)",
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: silent-skip, fallback: skip, parser: internal, log: one-line, notes: "local DB; silent if unconfigured"}
+  vertical.puredns_brute:    {tool: puredns, phase: vertical, tier: core, class: active, default: on,
+    input: wordlist+apex, output: subdomain, workers: resolvers, rate: dns_rate, timeout: scaled, failure: quiet-warn, fallback: "skip+note (no wordlist)", parser: normalize.hosts, log: delta}
+  vertical.alterx_permute:   {tool: alterx, phase: vertical, tier: core, class: active, default: on,
+    input: known_hosts, output: candidate_hosts, workers: n/a, rate: n/a, timeout: fixed-600, failure: quiet-warn, fallback: skip, parser: raw, log: delta}
+  vertical.puredns_resolve:  {tool: puredns, phase: vertical, tier: core, class: active, default: on,
+    input: candidates, output: resolved, workers: resolvers, rate: dns_rate, timeout: scaled, failure: quiet-warn, fallback: skip, parser: "normalize.hosts + massdns A", log: delta}
+  vertical.wildcard_http:    {tool: httpx, phase: vertical, tier: core, class: active, default: on,
+    input: wildcard_zone, output: subdomain(wildcard-http), workers: httpx, rate: http_rl, timeout: scaled, failure: quiet-warn, fallback: skip, parser: internal-differ, log: delta,
+    notes: "A1 wildcard HTTP differentiation"}
+
+  # ── dns ─────────────────────────────────────────────────────────────────────────────
+  dns.dnsx_records:          {tool: dnsx, phase: dns, tier: core, class: active, default: on,
+    input: resolved, output: dns_record, workers: dnsx, rate: dns_rate, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.dns_records, log: delta}
+
+  # ── probe ───────────────────────────────────────────────────────────────────────────
+  probe.httpx:               {tool: httpx, phase: probe, tier: core, class: active, default: on,
+    input: hosts+ports, output: live+tech, workers: "settings.workers(httpx)", rate: http_rl, timeout: "scaled(hosts×port_weight)", failure: partial-ok, fallback: "(prefilter → direct)", parser: normalize.httpx_json, log: delta}
+  probe.naabu_web:           {tool: naabu, phase: probe, tier: core, class: active, default: on,
+    input: public_ips×ports, output: web_port, workers: rate, rate: portscan_rate, timeout: "scaled(ips×ports)", failure: "clean-only-trusted → else direct-httpx", fallback: direct-httpx, parser: internal, log: matrix-line,
+    notes: "SYN web-port prefilter (bbot-style); NOT the infra portscan"}
+  probe.ffuf_vhost:          {tool: ffuf, phase: probe, tier: core, class: active, default: on,
+    input: origins, output: review(vhost), workers: "settings.workers(ffuf)", rate: http_rl, timeout: "scaled(wordlist)", failure: "per-origin isolate (not phase BLOCKED)", fallback: skip, parser: internal, log: delta}
+  probe.tlsx_certs:          {tool: tlsx, phase: probe, tier: core, class: active, default: on,
+    input: live_hosts, output: certificate, workers: fixed, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.tlsx_certs, log: delta}
+  probe.gowitness:           {tool: gowitness, phase: probe, tier: core, class: active, default: on,
+    input: live, output: screenshot, workers: fixed, rate: http_rl, timeout: http, failure: "reclassify-from-files (not stdout)", fallback: skip, parser: file-count, log: delta}
+  probe.smap:                {tool: smap, phase: probe, tier: optional, class: passive, default: on, reason: "passive-optional",
+    input: live, output: port(passive), workers: n/a, rate: n/a, timeout: fixed-600, failure: silent-skip, fallback: skip, parser: raw, log: one-line, notes: "Shodan-backed, no packets"}
+  probe.naabu_infra:         {tool: naabu, phase: probe, tier: heavy, class: deep, default: off, reason: "infra-lane (separate weeks-long portscan methodology)",
+    input: cidr, output: port, workers: rate, rate: portscan_rate, timeout: scaled, failure: quiet-warn, fallback: skip, parser: internal, log: one-line,
+    notes: "INFRA portscan (top-ports × CIDR) — the weeks-long time bomb; side-stream, gated on prof.portscan + CIDR"}
+  probe.nmap_service:        {tool: nmap, phase: probe, tier: heavy, class: deep, default: off, reason: "infra-lane (service detection, infra portscan)",
+    input: open_ports, output: port(service), workers: n/a, rate: n/a, timeout: scaled, failure: quiet-warn, fallback: skip, parser: internal, log: one-line, notes: "nmap -sV only on naabu-open ports; infra side-stream"}
+
+  # ── crawl ───────────────────────────────────────────────────────────────────────────
+  crawl.katana_standard:     {tool: katana, phase: crawl, tier: core, class: active, default: on,
+    input: live_urls, output: url, workers: "settings.workers(katana) + KATANA_PARALLELISM", rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
+  crawl.katana_headless:     {tool: katana, phase: crawl, tier: heavy, class: deep, default: off, reason: "resource-opt-in (chromium)",
+    input: spa_hosts, output: url, workers: fixed-low, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: one-line, notes: "chromium (RAM/CPU hog); gated on MODES.HEADLESS"}
+  crawl.gau:                 {tool: gau, phase: crawl, tier: core, class: passive, default: on,
+    input: apex, output: url, workers: fixed, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.urls, log: delta}
+  crawl.waymore_urls:        {tool: waymore, phase: crawl, tier: optional, class: passive, default: on,
+    input: apex, output: url, workers: n/a, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.urls, log: delta}
+  crawl.waymore_responses:   {tool: waymore, phase: crawl, tier: heavy, class: passive, default: on, bounded: planned,
+    input: apex, output: "raw responses → xnLinkFinder", workers: n/a, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
+    notes: "waymore -mode B downloads archived RESPONSES → the xnLinkFinder 'killer combo'. NORMAL crawl
+      intelligence — heavy (a plan long-pole) but DEFAULT-ON. bounded by waymore_limit."}
+  crawl.jsluice_urls:        {tool: jsluice, phase: crawl, tier: core, class: active, default: on,
+    input: js_blob, output: endpoint, workers: n/a, rate: n/a, timeout: "MUST honor 0=unbounded (bug: raw subprocess.run treated 0 as 0s → timed out)", failure: quiet-warn, fallback: skip, parser: normalize.jsluice_urls, log: delta,
+    notes: "PRIORITY: pull under run_contract() — the --timeout 0 silent-break bug (OTC) is the proof-of-need"}
+  crawl.jsluice_secrets:     {tool: jsluice, phase: crawl, tier: core, class: active, default: on,
+    input: js_blob, output: secret, workers: n/a, rate: n/a, timeout: "MUST honor 0=unbounded", failure: quiet-warn, fallback: skip, parser: normalize.jsluice_secrets, log: delta,
+    notes: "same --timeout 0 subprocess bug as jsluice_urls"}
+  crawl.js_beautify:         {tool: js-beautify, phase: crawl, tier: core, class: active, default: on,
+    input: js_files, output: "(in-place beautify)", workers: n/a, rate: n/a, timeout: "fixed-60 (raw subprocess — also needs 0-handling)", failure: silent-skip, fallback: "use raw JS", parser: none, log: silent}
+  crawl.xnlinkfinder:        {tool: xnLinkFinder, phase: crawl, tier: core, class: active, default: on,
+    input: js_and_response_dirs, output: endpoint+parameter+wordlist, workers: n/a, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
+  crawl.gitleaks:            {tool: gitleaks, phase: crawl, tier: core, class: active, default: on,
+    input: js+sourcemap_dirs, output: secret, workers: n/a, rate: n/a, timeout: http, failure: "ok_codes(0,1); status from report file", fallback: skip, parser: internal, log: delta}
+  crawl.trufflehog:          {tool: trufflehog, phase: crawl, tier: core, class: active, default: on,
+    input: js+sourcemap_dirs, output: secret, workers: n/a, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
+
+  # ── enrich (late-host catch-up) ───────────────────────────────────────────────────────
+  enrich.httpx:              {tool: httpx, phase: enrich, tier: core, class: active, default: on,
+    input: late_hosts, output: live+tech, workers: "settings.workers(httpx)", rate: http_rl, timeout: "scaled(hosts×port_weight)", failure: partial-ok, fallback: "(shares probe fingerprint path)", parser: normalize.httpx_json, log: delta}
+  enrich.dnsx_resolve:       {tool: dnsx, phase: enrich, tier: core, class: active, default: on,
+    input: late_hosts, output: resolved, workers: dnsx, rate: dns_rate, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.dnsx_resolved, log: delta}
+  enrich.dnsx_cname:         {tool: dnsx, phase: enrich, tier: core, class: active, default: on,
+    input: late_hosts, output: review(cname/takeover), workers: dnsx, rate: dns_rate, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
+  enrich.nuclei_waf:         {tool: nuclei, phase: enrich, tier: core, class: active, default: on,
+    input: new_live, output: tech(WAF), workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout(hosts)", failure: partial-ok, fallback: skip, parser: internal, log: delta}
+  enrich.gowitness:          {tool: gowitness, phase: enrich, tier: core, class: active, default: on,
+    input: new_live, output: screenshot, workers: fixed, rate: http_rl, timeout: http, failure: reclassify-from-files, fallback: skip, parser: file-count, log: delta}
+  enrich.smap:               {tool: smap, phase: enrich, tier: optional, class: passive, default: on, reason: "passive-optional",
+    input: new_live, output: port(passive), workers: n/a, rate: n/a, timeout: fixed-600, failure: silent-skip, fallback: skip, parser: raw, log: one-line}
+
+  # ── origin (correlation, no external tool) ─────────────────────────────────────────────
+  origin.correlation:        {tool: internal, phase: origin, tier: core, class: active, default: on,
+    input: "live + certificate stores", output: review(origin-ip), workers: n/a, rate: n/a, timeout: n/a, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
+    notes: "A2 CDN origin-IP correlation; sends NO packets — map-only"}
+
+  # ── content (candidate-driven path discovery; off by default) ──────────────────────────
+  content.ffuf:              {tool: ffuf, phase: content, tier: optional, class: deep, default: off, reason: "user-intent (content discovery, operator-enabled)",
+    input: live_urls+wordlist, output: url+review(content), workers: "settings.workers(ffuf)", rate: http_rl, timeout: "scaled(wordlist×recursion)", failure: quiet-warn, fallback: skip, parser: internal, log: delta,
+    notes: "off|light|balanced|deep; MATCHES 3xx (ISC-16), no -r"}
+
+  # ── params (vuln triage — the 15.6h; the first painful contract batch) ─────────────────
+  params.gf:                 {tool: gf, phase: params, tier: core, class: active, default: on,
+    input: url_corpus, output: review(vuln-class), workers: n/a, rate: n/a, timeout: n/a, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
+    notes: "the review-4992 noise source — needs CANONICALIZATION (host,path,param-set) + digest ranking"}
+  params.arjun:              {tool: arjun, phase: params, tier: core, class: active, default: on,
+    input: param-less_endpoints, output: url+parameter, workers: "settings.workers(arjun)", rate: http_rl(delay), timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
+  params.nuclei_scan:        {tool: nuclei, phase: params, tier: heavy, class: active, default: on, bounded: planned,
+    input: live, output: finding, workers: "settings.workers(nuclei) + NUCLEI_BULK_SIZE", rate: http_rl, timeout: "nuclei_timeout(hosts)", failure: partial-ok, fallback: "coverage-partial (not empty)", parser: internal, log: delta,
+    notes: "OTC: 7h41, ~5.08M requests = CO-TIMEKILLER. DEFAULT-ON (normal recon); FIX by SPEED — scope
+      templates, -bs/-c, chunk+state — NOT by gating off. quarry plan MUST declare it a long pole."}
+  params.nuclei_takeover:    {tool: nuclei, phase: params, tier: core, class: active, default: on,
+    input: cname_subs, output: finding(takeover), workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout(subs)", failure: partial-ok, fallback: skip, parser: internal, log: delta}
+  params.nuclei_oast:        {tool: nuclei, phase: params, tier: core, class: active, default: on,
+    input: live, output: finding(oob), workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout(hosts)", failure: partial-ok, fallback: skip, parser: internal, log: delta,
+    notes: "nuclei internal Interactsh OAST; keep as findings (see OOB substrate design)"}
+  params.dalfox:             {tool: dalfox, phase: params, tier: heavy, class: active, default: on, bounded: planned,
+    input: xss+redirect_candidates, output: finding(xss-candidate), workers: "1 (--max-cpu default!)", rate: http_rl(delay), timeout: http, failure: partial-ok, fallback: skip, parser: internal, log: delta,
+    notes: "OTC: 7.6h single-core mixed sink = THE timekiller. DEFAULT-ON; FIX by SPEED — SPLIT
+      (DALFOX-PRIMITIVE-SPLIT-DESIGN) → dalfox_xss_fast/redirect_confirm/oob_probe, canonicalize,
+      --mass --max-cpu. NOT gated off."}
+  # split targets (declared now; wired in the conversion batch):
+  params.dalfox_xss_fast:    {tool: dalfox, phase: params, tier: heavy, class: active, default: on, bounded: planned,
+    input: xss_candidates(canonicalized), output: finding(xss-candidate), workers: "governor (--mass --mass-worker --max-cpu)", rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: internal, log: delta,
+    notes: "flags --skip-bav --skip-mining-all --skip-headless --format json; chunked+state"}
+  params.redirect_confirm:   {tool: internal, phase: params, tier: core, class: active, default: on,
+    input: redirect_candidates, output: finding(open-redirect-candidate), workers: n/a, rate: http_rl, timeout: short, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
+    notes: "native 1-request Location check; NO dalfox"}
+  params.oob_probe:          {tool: nuclei+oob, phase: params, tier: core, class: active, default: on,
+    input: ssrf/blind_candidates, output: oob_interaction, workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout", failure: partial-ok, fallback: skip, parser: internal, log: delta,
+    notes: "routes to the OOB evidence substrate; correlated only in OOB Phase 2"}
+  params.blind_xss:          {tool: dalfox, phase: params, tier: optional, class: deep, default: key, reason: "keyed (needs oob.blind_xss_url collector)",
+    input: worthy_xss_candidates, output: "oob_interaction (operator-observed until imported)", workers: governor, rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: "OOB import", log: one-line,
+    notes: "dalfox -b → oob.blind_xss_url; only for candidate classes worth blind testing, not every reflection"}
