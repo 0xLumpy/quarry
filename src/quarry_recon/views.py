@@ -30,7 +30,7 @@ def plan_lines() -> list[str]:
     ``workers`` prefers the source's contract value, else the machine-scaled ``settings.workers``;
     ``rate`` (per-target RoE) and ``timeout`` come from the contract when declared."""
     srcs = sources.all_sources()
-    run = off = key = 0
+    run = off = key = pend = 0
     lines = ["quarry plan — static (registry + machine settings; nothing is executed)"]
     phases = sorted({s.get("phase", "?") for s in srcs.values()}, key=_phase_rank)
     for ph in phases:
@@ -42,23 +42,29 @@ def plan_lines() -> list[str]:
         for sid in ids:
             s = srcs[sid]
             d = s.get("default", "off")
-            if d == "on":
+            pending = s.get("pending")
+            if pending:
+                pend += 1; mark = "◔"     # ◔ planned but NOT wired yet — plan must not claim it runs
+                note = f"  (pending: {pending})"
+            elif d == "on":
                 run += 1; mark = "▶"      # ▶ will run
+                note = ""
             elif d == "key":
                 key += 1; mark = "◆"      # ◆ needs key
+                note = f"  ({s['reason']})" if s.get("reason") else ""
             else:
                 off += 1; mark = "·"      # · off
+                note = f"  ({s['reason']})" if s.get("reason") else ""
             tool = s.get("tool", "?")
             w = s.get("workers") or settings.workers(tool, 0) or "-"
             rate = s.get("rate", "-")
             to = s.get("timeout", "-")
-            longpole = "  ⏳bounded" if s.get("bounded") == "planned" else ""
-            reason = f"  ({s['reason']})" if d != "on" and s.get("reason") else ""
+            longpole = "  ⏳bounded" if s.get("bounded") == "planned" and not pending else ""
             name = sid.split(".", 1)[-1]
             lines.append(f"  {mark} {name:<22} {s.get('tier','?'):<12} {s.get('class','?'):<8} "
-                         f"w={str(w):<4} rate={str(rate):<5} to={str(to):<6}{longpole}{reason}")
+                         f"w={str(w):<4} rate={str(rate):<5} to={str(to):<6}{longpole}{note}")
     lines.append("")
-    lines.append(f"summary: {run} will run · {off} off · {key} need key   "
+    lines.append(f"summary: {run} will run · {pend} pending (not wired) · {off} off · {key} need key   "
                  "(default-on includes bounded long-poles; off = setup/lane/intent, never runtime)")
     return lines
 

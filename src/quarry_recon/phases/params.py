@@ -280,10 +280,11 @@ def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
     shapes: dict = {}
     for u in urls:
         s = urlsplit(u)
-        # keep_blank_values: a blank redirect/XSS param (?next= / ?url=) is a REAL, distinct sink —
-        # parse_qs() would drop it and silently collapse ?next=, ?url=, ?returnTo= into one shape.
+        # ORIGIN-aware key: scheme is part of the identity — http://h/p?x= and https://h/p?x= can be
+        # different services / redirect chains, so they must NOT collapse. keep_blank_values: a blank
+        # redirect/XSS param (?next= / ?url=) is a REAL distinct sink parse_qs() would silently drop.
         names = tuple(sorted({k for k, _ in parse_qsl(s.query, keep_blank_values=True)}))
-        key = (s.netloc, s.path, names)
+        key = (s.scheme.lower(), s.netloc.lower(), s.path, names)
         shapes.setdefault(key, {"url": u, "count": 0})["count"] += 1
     reps = [v["url"] for v in shapes.values()]
     raw, canon = len(urls), len(reps)
@@ -292,7 +293,7 @@ def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
         "raw_candidates": raw,
         "canonical_candidates": canon,
         "reduction_percent": round(100 * (1 - canon / raw), 1) if raw else 0.0,
-        "top_collapsed": [{"shape": f"{k[0]}{k[1]}?{'&'.join(k[2])}", "count": v["count"]}
+        "top_collapsed": [{"shape": f"{k[0]}://{k[1]}{k[2]}?{'&'.join(k[3])}", "count": v["count"]}
                           for k, v in top if v["count"] > 1],
     }
     return reps, stats
