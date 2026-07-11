@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import re
 
-from .. import evidence, normalize, secrets, settings
+from .. import events, evidence, normalize, secrets, settings
+from ..contract import run_contract
 from ..runner import Status, have, nuclei_timeout, run as exec_tool, skipped
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
@@ -264,7 +265,9 @@ def run(ctx) -> None:
     # mid-scan (the "coverage is partial" checkpoint). Small scopes still get the base --timeout.
     nt = nuclei_timeout(len(live), ctx.http_timeout)
     ctx.echo(f"  nuclei: scanning {len(live)} host(s), budget {nt // 60}m (scaled from {ctx.http_timeout // 60}m base)")
-    r = exec_tool("nuclei", cmd, timeout=nt)
+    # step 4.2: main scan under the contract (behavior-equivalent — same cmd + nuclei_timeout). Emits
+    # tool_start/tool_finish; a timeout is surfaced as coverage_partial, not a false empty. Ledger below.
+    r = run_contract("params.nuclei_scan", cmd, timeout=nt, input_total=len(live))
     if r.stderr_tail:
         log.write_text(r.stderr_tail)
     ctx.run.record("params", r)
@@ -291,6 +294,8 @@ def run(ctx) -> None:
         # framing; here a severity breakdown is more useful at a glance.
         ctx.echo(f"  nuclei: {n} candidate findings · "
                  f"crit:{sev['critical']} high:{sev['high']} med:{sev['medium']}")
+        events.ledger("params.nuclei_scan",
+                      produced={"finding": n, **sev}, consumed={"target": len(live)})
 
     # ── exposed-resource fetch + secret extraction (recon evidence: unauth, in-scope, GET-only) ──
     # Map-don't-exploit line = "don't accidentally perform impact": an exposed .env/.git/config is
