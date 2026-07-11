@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from . import __version__, secrets
+from . import __version__, events, secrets
 from .config import ProfileError, TargetProfile
 from .registry import load_tools, run_shell, tools_by_phase
 
@@ -575,6 +575,7 @@ def run(profile_path, phases, passive, timeout):
     secrets.apply_env()   # export PDCP_API_KEY (chaos) for PD tools, if set
     from .runner import set_tool_cwd
     run_obj = Run(project, profile.target)
+    events.configure(run_obj.dir)   # persist runtime events to <run>/events.jsonl (quarry status reads it)
     workdir = run_obj.dir / "work"
     workdir.mkdir(parents=True, exist_ok=True)
     set_tool_cwd(workdir)   # stray tool files (gowitness db, github-subdomains txt, …) land in the run

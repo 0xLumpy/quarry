@@ -63,9 +63,9 @@ def _collect_url(ctx, raw_text, source, raw_ref):
     return n
 
 
-def _synthetic(ctx, tool, lines, note=""):
+def _synthetic(ctx, tool, lines, note="", status=Status.SUCCESS):
     ctx.run.record("crawl", type("R", (), {
-        "tool": tool, "status": Status.SUCCESS, "exit_code": 0, "duration": 0.0,
+        "tool": tool, "status": status, "exit_code": 0, "duration": 0.0,
         "stdout_lines": lines, "note": note, "cmd": [tool], "stderr_tail": ""})())
 
 
@@ -75,33 +75,36 @@ def _jsluice_run(ctx, sub, files, raw, origin):
     we emit tool_progress (current_index/input_total) across files. Each per-file run goes through
     runner.run (exec_tool) — same wrapper Commit A introduced, so the timeout-0→None semantics carry
     over. Source-level tool_start/tool_finish bracket the per-file chunks; the caller emits the ledger
-    after parsing. Returns the concatenated stdout text — the caller parses it exactly as before (same
-    entities, better isolation + progress)."""
+    after parsing. Returns (concatenated stdout text, overall Status). A chunk is 'degraded' if it ended
+    in ANY non-clean status (FAILED/BLOCKED/PARTIAL/TIMED_OUT/SKIPPED); genuine EMPTY (a file with
+    nothing to mine) is NOT degraded. Any degraded chunk makes the source PARTIAL — a failed chunk must
+    never be reported as success."""
     sid = f"crawl.jsluice_{sub}"
     raw.parent.mkdir(parents=True, exist_ok=True)
     scratch = raw.with_suffix(".part")            # runner.run needs a file target; reused per chunk
     events.tool_start(sid, cmd=["jsluice", sub, "-j"], input_total=len(files), discovery_context=origin)
     t0 = time.monotonic()
-    timed_out = 0
+    degraded = 0
     with raw.open("w", encoding="utf-8") as fh:
         for i, f in enumerate(files, 1):
             res = exec_tool("jsluice", ["jsluice", sub, "-j"], raw_path=scratch,
                             timeout=ctx.http_timeout,
                             stdin_data=f.read_bytes().decode("utf-8", "replace"))
-            if res.status == Status.TIMED_OUT:
-                timed_out += 1
-                events.coverage_partial(sid, reason=f"{f.name} timed out")
+            if res.status not in (Status.SUCCESS, Status.EMPTY):
+                degraded += 1
+                events.coverage_partial(sid, reason=f"{f.name}: {res.status.value}")
             if res.raw_path and scratch.exists():
                 fh.write(scratch.read_text(encoding="utf-8", errors="replace"))
             events.tool_progress(sid, current_index=i, input_total=len(files),
                                  artifact_size=raw.stat().st_size)
     scratch.unlink(missing_ok=True)
     size = raw.stat().st_size if raw.exists() else None
-    events.tool_finish(sid, status=("partial" if timed_out else "success"),
-                       reason=(f"{timed_out} file(s) timed out" if timed_out else None),
+    status = Status.PARTIAL if degraded else Status.SUCCESS
+    events.tool_finish(sid, status=status.value,
+                       reason=(f"{degraded}/{len(files)} file(s) degraded" if degraded else None),
                        duration=round(time.monotonic() - t0, 2),
                        raw_ref=str(raw), artifact_size=size, discovery_context=origin)
-    return raw.read_text(encoding="utf-8", errors="replace") if raw.exists() else ""
+    return (raw.read_text(encoding="utf-8", errors="replace") if raw.exists() else ""), status
 
 
 def _safe_srcpath(name: str) -> str:
@@ -290,8 +293,8 @@ def run(ctx) -> None:
         for sub, parser in (("urls", normalize.jsluice_urls), ("secrets", normalize.jsluice_secrets)):
             raw = ctx.run.raw_path("crawl", "jsluice-sourcemap", f"{sub}.jsonl")
             try:
-                out = _jsluice_run(ctx, sub, recov_files, raw, "sourcemap")
-                _synthetic(ctx, f"jsluice-sourcemap-{sub}", out.count("\n"))
+                out, jstatus = _jsluice_run(ctx, sub, recov_files, raw, "sourcemap")
+                _synthetic(ctx, f"jsluice-sourcemap-{sub}", out.count("\n"), status=jstatus)
                 produced = 0
                 for e in parser(out, "jsluice-sourcemap", str(raw)):
                     if sub == "urls":
@@ -322,8 +325,8 @@ def run(ctx) -> None:
         for sub, parser in (("urls", normalize.jsluice_urls), ("secrets", normalize.jsluice_secrets)):
             raw = ctx.run.raw_path("crawl", "jsluice", f"{sub}.jsonl")
             try:
-                out = _jsluice_run(ctx, sub, js_files, raw, "js")
-                _synthetic(ctx, f"jsluice-{sub}", out.count("\n"))
+                out, jstatus = _jsluice_run(ctx, sub, js_files, raw, "js")
+                _synthetic(ctx, f"jsluice-{sub}", out.count("\n"), status=jstatus)
                 produced = 0
                 for e in parser(out, "jsluice", str(raw)):
                     if sub == "urls":
