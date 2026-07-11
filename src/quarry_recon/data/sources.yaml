@@ -177,18 +177,16 @@ sources:
   params.nuclei_oast:        {tool: nuclei, phase: params, tier: core, class: active, default: on,
     input: live, output: finding(oob), workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout(hosts)", failure: partial-ok, fallback: skip, parser: internal, log: delta,
     notes: "nuclei internal Interactsh OAST; keep as findings (see OOB substrate design)"}
-  params.dalfox:             {tool: dalfox, phase: params, tier: heavy, class: active, default: on, bounded: planned,
-    input: xss+redirect_candidates, output: finding(xss-candidate), workers: "1 (--max-cpu default!)", rate: http_rl(delay), timeout: http, failure: partial-ok, fallback: skip, parser: internal, log: delta,
-    notes: "OTC: 7.6h single-core mixed sink = THE timekiller. DEFAULT-ON; FIX by SPEED — SPLIT
-      (DALFOX-PRIMITIVE-SPLIT-DESIGN) → dalfox_xss_fast/redirect_confirm/oob_probe, canonicalize,
-      --mass --max-cpu. NOT gated off."}
+  params.dalfox:             {tool: dalfox, phase: params, tier: heavy, class: active, default: off, retired: "4.3.C — the mixed single-core sink is fully SPLIT: XSS -> params.dalfox_xss_fast (4.3.B), open-redirect -> params.redirect_confirm (4.3.C, native). No code routes through params.dalfox anymore.",
+    input: xss+redirect_candidates, output: finding(xss-candidate), workers: n/a, rate: n/a, timeout: n/a, failure: n/a, fallback: n/a, parser: internal, log: delta,
+    notes: "RETIRED. was OTC 7.6h single-core mixed sink = THE timekiller; canonicalize (4.3.A) + split (4.3.B/C) replaced it. Kept for lineage/history."}
   # split targets (declared now; wired in the conversion batch):
   params.dalfox_xss_fast:    {tool: dalfox, phase: params, tier: heavy, class: active, default: on, bounded: planned,
     input: xss_candidates(canonicalized), output: finding(xss-candidate), workers: "governor: -w + --max-cpu (DALFOX_MAX_CPU=4, DALFOX_CHUNK=40)", rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: internal, log: delta,
     notes: "WIRED 4.3.B. flags --skip-bav --skip-mining-all --skip-headless --max-cpu -w (plain output + [POC] parse); chunked + input-hashed state; blind -b rides here until 4.3.D"}
-  params.redirect_confirm:   {tool: internal, phase: params, tier: core, class: active, default: on, pending: "4.3.C — NOT wired yet; open-redirect is currently handled by the legacy params.dalfox pass",
+  params.redirect_confirm:   {tool: internal, phase: params, tier: core, class: active, default: on,
     input: redirect_candidates, output: finding(open-redirect-candidate), workers: n/a, rate: http_rl, timeout: short, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
-    notes: "native 1-request Location check; NO dalfox"}
+    notes: "WIRED 4.3.C. native single-request Location probe (inject canary into redirect param, read Location WITHOUT following); confirmed only when the Location host is the canary; NO dalfox"}
   params.oob_probe:          {tool: nuclei+oob, phase: params, tier: core, class: active, default: on, pending: "4.3.D — NOT wired yet; needs OOB evidence substrate Phase 1",
     input: ssrf/blind_candidates, output: oob_interaction, workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout", failure: partial-ok, fallback: skip, parser: internal, log: delta,
     notes: "routes to the OOB evidence substrate; correlated only in OOB Phase 2"}

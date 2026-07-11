@@ -12,7 +12,7 @@ import json
 import re
 import time
 
-from .. import events, evidence, normalize, secrets, settings
+from .. import events, evidence, fetch, normalize, secrets, settings
 from ..runner import RunResult, Status, have, nuclei_timeout, run as exec_tool, scaled_timeout, skipped
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
@@ -380,6 +380,62 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                      note=f"{len(batches)} chunk(s), {produced} candidate(s), {degraded} degraded")
 
 
+_REDIR_PARAMS = {"url", "redirect", "redirect_url", "redirecturl", "redir", "redirect_uri", "return",
+                 "returnto", "return_url", "returnurl", "next", "dest", "destination", "continue",
+                 "goto", "target", "to", "out", "view", "u", "r", "link", "go", "checkout_url",
+                 "login_url", "image_url", "window", "callback", "redirect_to"}
+_REDIR_CANARY = "quarry-redirect-canary.example"   # reserved TLD; never followed/resolved
+
+
+def _redirect_confirm(ctx, cands, prof) -> RunResult:
+    """params.redirect_confirm (step 4.3.C): native open-redirect probe — NO dalfox, NO chromium. For
+    each canonical candidate, inject a canary host into the redirect-ish param(s) and read the Location
+    header WITHOUT following it (one scoped, rate-paced, non-mutating request each via
+    fetch.redirect_location). If the app would send us to the canary HOST, it's an open-redirect
+    CANDIDATE (confirmed:false — primitive, not impact). A relative/same-host Location is NOT a finding.
+    Emits source-level events; returns a RunResult (stdout_lines = confirmed count) for the caller's
+    ledger."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
+    sid = "params.redirect_confirm"
+    canary_url = f"https://{_REDIR_CANARY}/rc"
+    events.tool_start(sid, cmd=["<native redirect probe>", "--no-follow"], input_total=len(cands))
+    t0 = time.monotonic()
+    confirmed = probed = degraded = 0
+    for i, u in enumerate(cands, 1):
+        host = normalize.host_of_url(u)
+        if not ctx.scope.active_allowed(host):        # scoped: in-scope, not passive, not OOS
+            continue
+        s = urlsplit(u)
+        pairs = parse_qsl(s.query, keep_blank_values=True)
+        if not any(k.lower() in _REDIR_PARAMS for k, _ in pairs):
+            continue
+        newq = [(k, canary_url if k.lower() in _REDIR_PARAMS else v) for k, v in pairs]
+        probe = urlunsplit((s.scheme, s.netloc, s.path, urlencode(newq), ""))
+        probed += 1
+        try:
+            loc, _status = fetch.redirect_location(ctx, probe, host)
+        except Exception:
+            degraded += 1
+            continue
+        # urljoin resolves relative/protocol-relative Locations against the origin, so a same-host
+        # redirect stays on-host (not a finding); only a Location whose HOST is our canary confirms.
+        if loc and normalize.host_of_url(urljoin(probe, loc)) == _REDIR_CANARY:
+            confirmed += 1
+            ctx.run.add("finding", {
+                "id": f"open-redirect:{u[:90]}", "template": "open-redirect-candidate",
+                "name": "open-redirect candidate — param redirects off-host (manual validation required)",
+                "severity": "medium", "matched": f"{probe} -> Location: {loc}",
+                "sources": ["redirect_confirm"], "confirmed": False})
+        events.tool_progress(sid, current_index=i, input_total=len(cands))
+    status = Status.PARTIAL if degraded else Status.SUCCESS
+    events.tool_finish(sid, status=status.value,
+                       reason=(f"{degraded} probe error(s)" if degraded else None),
+                       duration=round(time.monotonic() - t0, 2), discovery_context="params")
+    return RunResult("redirect_confirm", ["<native redirect probe>"], status, 0,
+                     round(time.monotonic() - t0, 2), None, confirmed,
+                     note=f"{probed} probed, {confirmed} open-redirect candidate(s)")
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
 
@@ -554,49 +610,36 @@ def run(ctx) -> None:
     else:
         ctx.run.record("params", skipped("arjun", "no param-less API endpoints found"))
 
-    # ── dalfox — SPLIT by primitive (step 4.3.B) over the 4.3.A CANONICALIZED shapes ──
-    # XSS reflection -> params.dalfox_xss_fast (fast flags + chunk/resume). Open-redirect stays on a
-    # legacy single dalfox pass until 4.3.C replaces it with a native Location probe. Blind XSS `-b`
-    # rides the XSS fast path (kept — dropping it would be silent coverage loss; 4.3.D gates it).
+    # ── vuln-primitive probes over the 4.3.A CANONICALIZED shapes, SPLIT by primitive ──
+    # XSS reflection -> params.dalfox_xss_fast (dalfox, 4.3.B). Open-redirect -> params.redirect_confirm
+    # (native Location probe, NO dalfox, 4.3.C). dalfox is no longer responsible for redirect at all.
     xss_raw = [r["value"] for r in ctx.run.read("review") if r.get("klass") == "xss"]
     redir_raw = [r["value"] for r in ctx.run.read("review") if r.get("klass") == "redirect"]
     xss_cands, xss_canon = _canonicalize_candidates(xss_raw)
     redir_cands, redir_canon = _canonicalize_candidates(redir_raw)
-    if xss_cands or redir_cands:
-        if not have("dalfox"):
-            ctx.run.record("params", skipped("dalfox", "dalfox not installed"))
-        else:
-            if xss_cands:
-                ctx.echo(f"  dalfox xss: {xss_canon['raw_candidates']} raw -> "
-                         f"{xss_canon['canonical_candidates']} shape(s) "
-                         f"({xss_canon['reduction_percent']}% collapsed)")
-                ctx.run.record("params", _dalfox_xss_fast(ctx, xss_cands, prof))
-            if redir_cands:
-                # LEGACY open-redirect pass (canonicalized) — replaced by native redirect_confirm in 4.3.C
-                ctx.echo(f"  dalfox redirect (legacy, pre-4.3.C): {redir_canon['raw_candidates']} raw -> "
-                         f"{redir_canon['canonical_candidates']} shape(s)")
-                df_in = ctx.write_list("dalfox_redirect_in.txt", redir_cands)
-                df_out = ctx.run.raw_path("params", "dalfox", "dalfox_redirect.txt")
-                df_cmd = ["dalfox", "file", str(df_in), "--skip-bav", "-o", str(df_out)]
-                if prof.http_rl:
-                    df_cmd += ["--delay", str(1000 // max(1, prof.http_rl))]
-                r = exec_tool("dalfox", df_cmd, timeout=ctx.http_timeout)
-                ctx.run.record("params", r)
-                if df_out.exists():
-                    for line in df_out.read_text().splitlines():
-                        if line.strip().startswith("[POC]") or "PoC" in line:
-                            ctx.run.add("finding", {
-                                "id": f"dalfox:{line[:80]}", "template": "open-redirect-candidate",
-                                "name": "open-redirect candidate (manual validation required)",
-                                "severity": "medium", "matched": line.strip(),
-                                "sources": ["dalfox"], "confirmed": False})
-                events.ledger("params.dalfox",
-                              produced={"canonical_candidates": redir_canon["canonical_candidates"]},
-                              consumed={"raw_candidates": redir_canon["raw_candidates"]},
-                              reduction_percent=redir_canon["reduction_percent"],
-                              top_collapsed=redir_canon["top_collapsed"])
-    else:
+    if not xss_cands and not redir_cands:
         ctx.run.record("params", skipped("dalfox", "no xss/redirect candidates"))
+    # XSS reflection — dalfox fast path (needs dalfox)
+    if xss_cands:
+        if have("dalfox"):
+            ctx.echo(f"  dalfox xss: {xss_canon['raw_candidates']} raw -> "
+                     f"{xss_canon['canonical_candidates']} shape(s) "
+                     f"({xss_canon['reduction_percent']}% collapsed)")
+            ctx.run.record("params", _dalfox_xss_fast(ctx, xss_cands, prof))
+        else:
+            ctx.run.record("params", skipped("dalfox", "dalfox not installed"))
+    # open-redirect — native single-request Location probe (4.3.C), no dalfox
+    if redir_cands:
+        r = _redirect_confirm(ctx, redir_cands, prof)
+        ctx.echo(f"  redirect_confirm: {redir_canon['raw_candidates']} raw -> "
+                 f"{redir_canon['canonical_candidates']} shape(s) -> {r.stdout_lines} confirmed candidate(s)")
+        ctx.run.record("params", r)
+        # ledger: raw redirect candidates -> canonical shapes -> confirmed open-redirect candidates
+        events.ledger("params.redirect_confirm",
+                      produced={"open_redirect_candidate": r.stdout_lines},
+                      consumed={"raw_candidates": redir_canon["raw_candidates"],
+                                "canonical_candidates": redir_canon["canonical_candidates"]},
+                      reduction_percent=redir_canon["reduction_percent"])
 
     # ── SSTI primitive-confirm probe (benign {{math}} eval; candidate output) ──
     # gf only name-matches ssti params; nothing else probes them. Confirm the PRIMITIVE with a

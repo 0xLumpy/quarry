@@ -11,12 +11,37 @@ in-scope, non-mutating, rate-safe.
 from __future__ import annotations
 
 import time
+import urllib.error
 import urllib.request
 
 from . import normalize
 
 UA = "Mozilla/5.0"
 DEFAULT_MAX_BODY = 2 * 1024 * 1024      # 2 MB default cap
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):     # never follow — return None so the 30x is handed back
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def redirect_location(ctx, url, origin_host=None, *, timeout=20):
+    """ONE scoped request to `url` WITHOUT following redirects; returns (location_header|None, status).
+    Rate-paced like scoped_get. For open-redirect probing: read WHERE the app would send us (the
+    Location header) without ever fetching the attacker-controlled target — non-mutating, safe. The
+    caller MUST have scope-gated the origin host already (this only touches the in-scope target)."""
+    rl = getattr(getattr(ctx, "profile", None), "http_rl", None)
+    if rl:                                   # RATELIMIT.HTTP -> pace to rl req/s
+        time.sleep(1.0 / rl)
+    req = urllib.request.Request(url, headers={"User-Agent": UA}, method="GET")
+    try:
+        with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
+            return resp.headers.get("Location"), getattr(resp, "status", 200)
+    except urllib.error.HTTPError as e:       # a 4xx/5xx (or a 30x surfaced as error) still carries headers
+        return e.headers.get("Location"), e.code
 
 
 def scoped_get(ctx, url, origin_host=None, *, max_body=DEFAULT_MAX_BODY, timeout=20,

@@ -30,7 +30,7 @@ def plan_lines() -> list[str]:
     ``workers`` prefers the source's contract value, else the machine-scaled ``settings.workers``;
     ``rate`` (per-target RoE) and ``timeout`` come from the contract when declared."""
     srcs = sources.all_sources()
-    run = off = key = pend = 0
+    run = off = key = pend = ret = 0
     lines = ["quarry plan — static (registry + machine settings; nothing is executed)"]
     phases = sorted({s.get("phase", "?") for s in srcs.values()}, key=_phase_rank)
     for ph in phases:
@@ -43,7 +43,11 @@ def plan_lines() -> list[str]:
             s = srcs[sid]
             d = s.get("default", "off")
             pending = s.get("pending")
-            if pending:
+            retired = s.get("retired")
+            if retired:
+                ret += 1; mark = "⊘"      # ⊘ retired — split/replaced; no code routes through it
+                note = f"  (retired: {retired})"
+            elif pending:
                 pend += 1; mark = "◔"     # ◔ planned but NOT wired yet — plan must not claim it runs
                 note = f"  (pending: {pending})"
             elif d == "on":
@@ -59,13 +63,13 @@ def plan_lines() -> list[str]:
             w = s.get("workers") or settings.workers(tool, 0) or "-"
             rate = s.get("rate", "-")
             to = s.get("timeout", "-")
-            longpole = "  ⏳bounded" if s.get("bounded") == "planned" and not pending else ""
+            longpole = "  ⏳bounded" if s.get("bounded") == "planned" and not (pending or retired) else ""
             name = sid.split(".", 1)[-1]
             lines.append(f"  {mark} {name:<22} {s.get('tier','?'):<12} {s.get('class','?'):<8} "
                          f"w={str(w):<4} rate={str(rate):<5} to={str(to):<6}{longpole}{note}")
     lines.append("")
-    lines.append(f"summary: {run} will run · {pend} pending (not wired) · {off} off · {key} need key   "
-                 "(default-on includes bounded long-poles; off = setup/lane/intent, never runtime)")
+    lines.append(f"summary: {run} will run · {pend} pending (not wired) · {ret} retired · {off} off · "
+                 f"{key} need key   (default-on includes bounded long-poles; off = setup/lane/intent)")
     return lines
 
 
