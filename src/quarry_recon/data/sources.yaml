@@ -189,7 +189,7 @@ sources:
   params.redirect_confirm:   {tool: internal, phase: params, tier: core, class: active, default: on,
     input: redirect_candidates, output: finding(open-redirect-candidate), workers: n/a, rate: http_rl, timeout: short, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "WIRED 4.3.C. native single-request Location probe (inject canary into redirect param, read Location WITHOUT following); confirmed only when the Location host is the canary; NO dalfox"}
-  params.oob_probe:          {tool: nuclei+oob, phase: params, tier: core, class: active, default: on, pending: "needs OOB substrate (4.3.D)",
+  params.oob_probe:          {tool: nuclei+oob, phase: params, tier: core, class: active, default: on, pending: "needs OOB Phase 2 (owned session + token correlation; Phase 1 import is wired)",
     input: ssrf/blind_candidates, output: oob_interaction, workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout", failure: partial-ok, fallback: skip, parser: internal, log: delta,
     notes: "routes to the OOB evidence substrate; correlated only in OOB Phase 2"}
   params.blind_xss:          {tool: dalfox, phase: params, tier: optional, class: deep, default: key, reason: "keyed (blind_xss_url collector)",
