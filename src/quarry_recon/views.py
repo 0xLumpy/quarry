@@ -30,7 +30,7 @@ def plan_lines() -> list[str]:
     ``workers`` prefers the source's contract value, else the machine-scaled ``settings.workers``;
     ``rate`` (per-target RoE) and ``timeout`` come from the contract when declared."""
     srcs = sources.all_sources()
-    run = off = key = pend = ret = 0
+    run = off = key = pend = ret = dbt = 0
     lines = ["quarry plan — static (registry + machine settings; nothing is executed)"]
     phases = sorted({s.get("phase", "?") for s in srcs.values()}, key=_phase_rank)
     for ph in phases:
@@ -64,12 +64,17 @@ def plan_lines() -> list[str]:
             rate = s.get("rate", "-")
             to = s.get("timeout", "-")
             longpole = "  ⏳bounded" if s.get("bounded") == "planned" and not (pending or retired) else ""
+            debt = s.get("debt")
+            if debt:
+                dbt += 1
+                note = f"{note}  ⚠debt: {debt}"     # control-debt on a running source — surface it, don't bury
             name = sid.split(".", 1)[-1]
             lines.append(f"  {mark} {name:<22} {s.get('tier','?'):<12} {s.get('class','?'):<8} "
                          f"w={str(w):<4} rate={str(rate):<5} to={str(to):<6}{longpole}{note}")
     lines.append("")
+    dbt_txt = f" · {dbt} control-debt" if dbt else ""
     lines.append(f"summary: {run} will run · {pend} pending (not wired) · {ret} retired · {off} off · "
-                 f"{key} need key   (default-on includes bounded long-poles; off = setup/lane/intent)")
+                 f"{key} need key{dbt_txt}   (default-on includes bounded long-poles; off = setup/lane/intent)")
     return lines
 
 
