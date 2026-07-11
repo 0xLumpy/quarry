@@ -413,13 +413,16 @@ def _redirect_confirm(ctx, cands, prof) -> RunResult:
         probe = urlunsplit((s.scheme, s.netloc, s.path, urlencode(newq), ""))
         probed += 1
         try:
-            loc, _status = fetch.redirect_location(ctx, probe, host)
+            loc, status_code = fetch.redirect_location(ctx, probe, host)
         except Exception:
             degraded += 1
             continue
-        # urljoin resolves relative/protocol-relative Locations against the origin, so a same-host
-        # redirect stays on-host (not a finding); only a Location whose HOST is our canary confirms.
-        if loc and normalize.host_of_url(urljoin(probe, loc)) == _REDIR_CANARY:
+        # A Location header only redirects on a 3xx — a 200/201 that happens to echo one is NOT an open
+        # redirect. urljoin resolves relative/protocol-relative Locations against the origin, so a
+        # same-host redirect stays on-host (not a finding); only a 3xx whose Location HOST is our canary
+        # confirms.
+        if loc and 300 <= int(status_code or 0) < 400 \
+                and normalize.host_of_url(urljoin(probe, loc)) == _REDIR_CANARY:
             confirmed += 1
             ctx.run.add("finding", {
                 "id": f"open-redirect:{u[:90]}", "template": "open-redirect-candidate",
