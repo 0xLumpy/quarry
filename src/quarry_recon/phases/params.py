@@ -276,11 +276,14 @@ def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
     The real problem was never 'dalfox is slow' — it was feeding it the same shape ~10x (measured on OTC:
     993 raw -> 106 shapes, 89.3% collapsed). Returns (representatives, stats) where stats =
     {raw_candidates, canonical_candidates, reduction_percent, top_collapsed}."""
-    from urllib.parse import urlsplit, parse_qs
+    from urllib.parse import urlsplit, parse_qsl
     shapes: dict = {}
     for u in urls:
         s = urlsplit(u)
-        key = (s.netloc, s.path, tuple(sorted(parse_qs(s.query).keys())))
+        # keep_blank_values: a blank redirect/XSS param (?next= / ?url=) is a REAL, distinct sink —
+        # parse_qs() would drop it and silently collapse ?next=, ?url=, ?returnTo= into one shape.
+        names = tuple(sorted({k for k, _ in parse_qsl(s.query, keep_blank_values=True)}))
+        key = (s.netloc, s.path, names)
         shapes.setdefault(key, {"url": u, "count": 0})["count"] += 1
     reps = [v["url"] for v in shapes.values()]
     raw, canon = len(urls), len(reps)
@@ -517,6 +520,8 @@ def run(ctx) -> None:
                       consumed={"raw_candidates": canon["raw_candidates"]},
                       reduction_percent=canon["reduction_percent"],
                       top_collapsed=canon["top_collapsed"])
+    elif dalfox_in:
+        ctx.run.record("params", skipped("dalfox", "dalfox not installed"))
     else:
         ctx.run.record("params", skipped("dalfox", "no xss/redirect candidates"))
 
