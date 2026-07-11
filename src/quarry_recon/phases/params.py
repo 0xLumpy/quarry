@@ -13,7 +13,7 @@ import re
 import time
 
 from .. import events, evidence, normalize, secrets, settings
-from ..runner import RunResult, Status, have, nuclei_timeout, run as exec_tool, skipped
+from ..runner import RunResult, Status, have, nuclei_timeout, run as exec_tool, scaled_timeout, skipped
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
 
@@ -298,6 +298,87 @@ def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
     return reps, stats
 
 
+def _dalfox_cmd(batch_file, out_file, prof) -> list[str]:
+    """dalfox FAST flags for the XSS reflection pass. The defaults were the timekiller: --max-cpu 1
+    (single core) + param mining ON + headless ON. Quarry already discovers params (arjun/gf), so mining
+    is redundant; headless (chromium per candidate) is the big cost. Bump --max-cpu off 1 (governor),
+    keep -w, keep blind -b when configured (blind XSS coverage stays until 4.3.D gates it)."""
+    cmd = ["dalfox", "file", str(batch_file), "-o", str(out_file),
+           "--skip-bav", "--skip-mining-all", "--skip-headless",
+           "--max-cpu", str(max(1, settings.concurrency("DALFOX_MAX_CPU", 4))),
+           "-w", str(settings.workers("dalfox", 100))]
+    bx = secrets.oob().get("blind_xss_url")
+    if bx:
+        cmd += ["-b", str(bx)]                             # blind/stored XSS OOB beacon (kept; 4.3.D gates)
+    if prof.http_rl:
+        cmd += ["--delay", str(1000 // max(1, prof.http_rl))]   # rate (RoE) — separate axis from workers
+    return cmd
+
+
+def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
+    """params.dalfox_xss_fast (step 4.3.B): reflected-XSS scan over the CANONICALIZED xss candidates with
+    the fast flags, in resumable chunks. Mirrors _nuclei_scan: input-hashed chunk state, mark done ONLY
+    on clean completion (failed batch stays retryable), source-level tool_start/tool_progress/tool_finish
+    + ledger. dalfox proves the reflection PRIMITIVE only -> finding klass xss-candidate, confirmed:false
+    (the map-don't-exploit boundary holds). Findings go straight to the store (deduped by id)."""
+    sid = "params.dalfox_xss_fast"
+    chunk_n = max(1, settings.concurrency("DALFOX_CHUNK", 40))
+    batches = [cands[i:i + chunk_n] for i in range(0, len(cands), chunk_n)]
+    state_f = ctx.run.raw_path("params", "dalfox", "chunks.state.json")
+    input_hash = hashlib.sha256(("\n".join(cands) + f"|{chunk_n}").encode("utf-8")).hexdigest()[:16]
+    done: set[int] = set()
+    if state_f.exists():
+        try:
+            prev = json.loads(state_f.read_text())
+            if prev.get("input_hash") == input_hash and prev.get("chunk_size") == chunk_n:
+                done = {int(x) for x in prev.get("done_chunks", [])}
+        except Exception:
+            done = set()
+
+    def _save():
+        state_f.write_text(json.dumps(
+            {"input_hash": input_hash, "chunk_size": chunk_n, "done_chunks": sorted(done)}))
+
+    events.tool_start(sid, cmd=["dalfox", "file", "<chunk>", "--skip-mining-all", "--skip-headless"],
+                      input_total=len(cands))
+    t0 = time.monotonic()
+    degraded = produced = 0
+    for ci, batch in enumerate(batches):
+        seen = min((ci + 1) * chunk_n, len(cands))
+        if ci in done:                                    # resume: already CLEAN
+            events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen)
+            continue
+        bf = ctx.write_list(f"dalfox_xss_{ci}.txt", batch)
+        cf = ctx.run.raw_path("params", "dalfox", f"dalfox_xss_{ci}.txt")
+        res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof),
+                        timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
+        if res.status in (Status.SUCCESS, Status.EMPTY):
+            if cf.exists():
+                for line in cf.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.strip().startswith("[POC]") or "PoC" in line:
+                        # reflection primitive = CANDIDATE, not impact (attack layer proves impact)
+                        if ctx.run.add("finding", {
+                                "id": f"dalfox:{line[:80]}", "template": "xss-candidate",
+                                "name": "reflected parameter — XSS candidate (manual validation required)",
+                                "severity": "medium", "matched": line.strip(),
+                                "sources": ["dalfox"], "confirmed": False}):
+                            produced += 1
+            done.add(ci)
+            _save()
+        else:
+            degraded += 1
+            events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
+        events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen)
+    status = Status.PARTIAL if degraded else Status.SUCCESS
+    events.tool_finish(sid, status=status.value,
+                       reason=(f"{degraded}/{len(batches)} chunk(s) degraded" if degraded else None),
+                       duration=round(time.monotonic() - t0, 2), discovery_context="params")
+    events.ledger(sid, produced={"xss_candidate": produced}, consumed={"shape": len(cands)})
+    return RunResult("dalfox", ["dalfox", "file", "<chunked-xss-fast>"], status, 0,
+                     round(time.monotonic() - t0, 2), None, produced,
+                     note=f"{len(batches)} chunk(s), {produced} candidate(s), {degraded} degraded")
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
 
@@ -472,56 +553,47 @@ def run(ctx) -> None:
     else:
         ctx.run.record("params", skipped("arjun", "no param-less API endpoints found"))
 
-    # ── dalfox on gf xss + redirect candidates — CANONICALIZED first (step 4.3.A) ──
-    # The measured problem was NOT "dalfox is slow" — it was feeding it the same (host,path,param-set)
-    # shape ~10x. Collapse to unique shapes BEFORE the tool sees them (OTC: 993 -> 106, 89.3%). No
-    # dalfox behavior change yet (flags unchanged); the split/fast-flags are 4.3.B.
-    dalfox_raw = [r["value"] for r in ctx.run.read("review") if r.get("klass") in ("xss", "redirect")]
-    dalfox_in, canon = _canonicalize_candidates(dalfox_raw)
-    if dalfox_in and have("dalfox"):
-        ctx.echo(f"  dalfox: {canon['raw_candidates']} raw candidate(s) -> "
-                 f"{canon['canonical_candidates']} canonical shape(s) "
-                 f"({canon['reduction_percent']}% collapsed)")
-        df_in = ctx.write_list("dalfox_in.txt", dalfox_in)
-        df_out = ctx.run.raw_path("params", "dalfox", "dalfox.txt")
-        # Concurrency (workers = local lanes) stays at dalfox's OWN default — not set here, so it
-        # tracks the tool/machine, not the target (rate ≠ workers — they're separate axes).
-        # `http_rl` controls RATE only: our installed dalfox has no `--rate-limit` flag, so emulate
-        # via a per-request delay. (Newer dalfox adds a `--rate-limit` global req/s — switch to that
-        # once it's available.) The old -w 5 --delay 250 idled + timed out.
-        df_cmd = ["dalfox", "file", str(df_in), "--skip-bav", "-o", str(df_out)]
-        # BLIND XSS: fire out-of-band beacons at the configured collector so a STORED/blind XSS that
-        # never reflects in the response still calls home — parity with reconftw's XSS_SERVER → dalfox
-        # -b. Opt-in via secrets.yaml `oob.blind_xss_url` (an interactsh-client URL or XSSHunter
-        # collector); the interaction is caught in the operator's own listener, not dalfox's output.
-        bx = secrets.oob().get("blind_xss_url")
-        if bx:
-            df_cmd += ["-b", str(bx)]
-        if prof.http_rl:
-            df_cmd += ["--delay", str(1000 // max(1, prof.http_rl))]
-        r = exec_tool("dalfox", df_cmd, timeout=ctx.http_timeout)
-        ctx.run.record("params", r)
-        if df_out.exists():
-            for line in df_out.read_text().splitlines():
-                if line.strip().startswith("[POC]") or "PoC" in line:
-                    # dalfox proves the PRIMITIVE (reflection), not an exploit. Per the boundary
-                    # ruling ("probe hit != exploit proof"), frame it as a CANDIDATE: the raw POC
-                    # line stays as evidence in `matched`, but the label says candidate + manual
-                    # validation. Escalation/impact/report-ready PoC is the attack layer.
-                    ctx.run.add("finding", {
-                        "id": f"dalfox:{line[:80]}", "template": "xss-candidate",
-                        "name": "reflected parameter — XSS/open-redirect candidate (manual validation required)",
-                        "severity": "medium", "matched": line.strip(),
-                        "sources": ["dalfox"], "confirmed": False})
-        # 4.3.A ledger — the numbers matter more than the code here: make the input reduction explicit
-        # so a reviewer sees dalfox scanned shapes, not duplicate URL-variants.
-        events.ledger("params.dalfox",
-                      produced={"canonical_candidates": canon["canonical_candidates"]},
-                      consumed={"raw_candidates": canon["raw_candidates"]},
-                      reduction_percent=canon["reduction_percent"],
-                      top_collapsed=canon["top_collapsed"])
-    elif dalfox_in:
-        ctx.run.record("params", skipped("dalfox", "dalfox not installed"))
+    # ── dalfox — SPLIT by primitive (step 4.3.B) over the 4.3.A CANONICALIZED shapes ──
+    # XSS reflection -> params.dalfox_xss_fast (fast flags + chunk/resume). Open-redirect stays on a
+    # legacy single dalfox pass until 4.3.C replaces it with a native Location probe. Blind XSS `-b`
+    # rides the XSS fast path (kept — dropping it would be silent coverage loss; 4.3.D gates it).
+    xss_raw = [r["value"] for r in ctx.run.read("review") if r.get("klass") == "xss"]
+    redir_raw = [r["value"] for r in ctx.run.read("review") if r.get("klass") == "redirect"]
+    xss_cands, xss_canon = _canonicalize_candidates(xss_raw)
+    redir_cands, redir_canon = _canonicalize_candidates(redir_raw)
+    if xss_cands or redir_cands:
+        if not have("dalfox"):
+            ctx.run.record("params", skipped("dalfox", "dalfox not installed"))
+        else:
+            if xss_cands:
+                ctx.echo(f"  dalfox xss: {xss_canon['raw_candidates']} raw -> "
+                         f"{xss_canon['canonical_candidates']} shape(s) "
+                         f"({xss_canon['reduction_percent']}% collapsed)")
+                ctx.run.record("params", _dalfox_xss_fast(ctx, xss_cands, prof))
+            if redir_cands:
+                # LEGACY open-redirect pass (canonicalized) — replaced by native redirect_confirm in 4.3.C
+                ctx.echo(f"  dalfox redirect (legacy, pre-4.3.C): {redir_canon['raw_candidates']} raw -> "
+                         f"{redir_canon['canonical_candidates']} shape(s)")
+                df_in = ctx.write_list("dalfox_redirect_in.txt", redir_cands)
+                df_out = ctx.run.raw_path("params", "dalfox", "dalfox_redirect.txt")
+                df_cmd = ["dalfox", "file", str(df_in), "--skip-bav", "-o", str(df_out)]
+                if prof.http_rl:
+                    df_cmd += ["--delay", str(1000 // max(1, prof.http_rl))]
+                r = exec_tool("dalfox", df_cmd, timeout=ctx.http_timeout)
+                ctx.run.record("params", r)
+                if df_out.exists():
+                    for line in df_out.read_text().splitlines():
+                        if line.strip().startswith("[POC]") or "PoC" in line:
+                            ctx.run.add("finding", {
+                                "id": f"dalfox:{line[:80]}", "template": "open-redirect-candidate",
+                                "name": "open-redirect candidate (manual validation required)",
+                                "severity": "medium", "matched": line.strip(),
+                                "sources": ["dalfox"], "confirmed": False})
+                events.ledger("params.dalfox",
+                              produced={"canonical_candidates": redir_canon["canonical_candidates"]},
+                              consumed={"raw_candidates": redir_canon["raw_candidates"]},
+                              reduction_percent=redir_canon["reduction_percent"],
+                              top_collapsed=redir_canon["top_collapsed"])
     else:
         ctx.run.record("params", skipped("dalfox", "no xss/redirect candidates"))
 

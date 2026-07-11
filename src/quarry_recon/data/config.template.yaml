@@ -22,6 +22,8 @@ PERFORMANCE:
   ARJUN_THREADS:             # arjun -t (was hard-coded 5 → now I/O-scaled)
   NUCLEI_BULK_SIZE:          # nuclei -bs, hosts per template batch (default 25) — raise for many-host scopes
   NUCLEI_CHUNK_HOSTS:        # nuclei hosts per resumable batch (default 50; smaller = finer resume/progress, more template reloads)
+  DALFOX_MAX_CPU:            # dalfox --max-cpu for the XSS fast path (default 4; dalfox's own default 1 = single-core timekiller)
+  DALFOX_CHUNK:              # dalfox xss candidate shapes per resumable batch (default 40)
   # v0.3.5 web-port SYN prefilter: before the bulk httpx, naabu SYN-checks each host's PUBLIC IP(s) on
   # the HTTP port set and httpx then probes ONLY open host:ports (bbot-style — never wastes httpx time
   # on filtered ports). Fewer packets + fewer HTTP requests than direct httpx over all ports. Default on;
