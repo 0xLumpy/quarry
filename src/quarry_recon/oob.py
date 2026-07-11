@@ -63,7 +63,11 @@ def import_file(run, path) -> dict:
     ``{parsed, added, by_protocol}``; each row's ``raw_ref`` points at the stored raw file."""
     src = Path(path)
     text = src.read_text(encoding="utf-8", errors="replace")
-    raw = run.raw_path("oob", "import", src.name)
+    # content-hash prefix: two DIFFERENT files sharing a name (e.g. interact.jsonl) must not clobber
+    # each other's raw evidence — otherwise earlier oob_interaction.raw_ref rows point at the wrong
+    # file. Identical content re-import maps to the same raw file (raw_ref stays stable).
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+    raw = run.raw_path("oob", "import", f"{digest}-{src.name}")
     raw.write_text(text, encoding="utf-8")
     rows = parse_interactsh(text)
     added = 0

@@ -27,6 +27,18 @@ def _project_dir(profile) -> Path:
     return (profile.path.parent if profile.path else Path(".")).resolve()
 
 
+def _existing_run(project, target, run_id):
+    """Resolve a run for read/import commands. An explicit --run must ALREADY exist — Run() mkdirs, so
+    a typo would silently create a ghost run (and, for import, write evidence under it). Fail loud
+    instead. No run_id -> the latest run (or None)."""
+    from .store import Run
+    if run_id:
+        if not (Path(project) / "recon" / run_id).is_dir():
+            raise click.ClickException(f"run {run_id!r} not found under {Path(project) / 'recon'}")
+        return Run(project, target, run_id=run_id)
+    return Run.latest(project)
+
+
 def _resolve_profile(value: str) -> str:
     """Accept `-t` as a target.yaml path, a project dir, or a bare project name. A name/dir
     resolves to <projects-root>/<name>/target.yaml — so `quarry run -t 0xlumpy.cc` just works."""
@@ -779,7 +791,6 @@ def oob_import(src_file, profile_path, run_id):
     Phase 1 records callbacks as EVIDENCE without attributing a source — Quarry doesn't own the token
     namespace yet (that's Phase 2). Raw import is kept under raw/oob/.
     """
-    from .store import Run
     from . import oob as oobmod
 
     try:
@@ -787,7 +798,7 @@ def oob_import(src_file, profile_path, run_id):
     except ProfileError as e:
         raise click.ClickException(str(e))
     project = _project_dir(profile)
-    run_obj = Run(project, profile.target, run_id=run_id) if run_id else Run.latest(project)
+    run_obj = _existing_run(project, profile.target, run_id)
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
     res = oobmod.import_file(run_obj, src_file)
