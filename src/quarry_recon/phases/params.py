@@ -7,6 +7,7 @@ confirmation (design §7) — entities carry confirmed:false.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -49,23 +50,41 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     batches and scan SEQUENTIALLY — rate is target-wide (RoE), so parallel batches would blow the
     budget; chunking buys resume + progress + per-batch isolation, NOT speed (work is rate-bound and
     fixed: OTC = 448 hosts / 5.08M req / 7h41 @ 183rps, died at 93%). Each batch gets its own
-    nuclei_timeout, so one slow batch -> coverage_partial instead of a whole-run kill. A completed-chunk
-    state file (chunks.done) makes it RESUMABLE: on a re-run of the same run dir, finished batches are
-    skipped and their findings are already appended to findings.jsonl. Emits source-level tool_start /
-    tool_progress(chunk_index/chunk_total) / tool_finish; returns a RunResult for the manifest."""
+    nuclei_timeout, so one slow batch -> coverage_partial instead of a whole-run kill. RESUME: a chunk
+    is recorded done ONLY on clean completion (SUCCESS/EMPTY); a failed/timed-out/blocked batch is left
+    retryable (not marked, not appended) so a killed run genuinely continues. The state is tied to the
+    INPUT (hash of the ordered live list + chunk size) so a changed host set / chunk size invalidates it
+    instead of skipping the wrong hosts. Emits source-level tool_start / tool_progress / tool_finish;
+    returns a RunResult for the manifest."""
     sid = "params.nuclei_scan"
     chunk_n = max(1, settings.concurrency("NUCLEI_CHUNK_HOSTS", 50))
     batches = [live[i:i + chunk_n] for i in range(0, len(live), chunk_n)]
-    state_f = ctx.run.raw_path("params", "nuclei", "chunks.done")
-    done = {int(x) for x in state_f.read_text().split()} if state_f.exists() else set()
+    state_f = ctx.run.raw_path("params", "nuclei", "chunks.state.json")
+    # State is tied to the INPUT: a bare index is meaningless if the host list or chunk size changed
+    # (chunk 0 would no longer be the same hosts). Hash the ordered live list + chunk size; a mismatch
+    # ignores the stale state and starts fresh.
+    input_hash = hashlib.sha256(("\n".join(live) + f"|{chunk_n}").encode("utf-8")).hexdigest()[:16]
+    done: set[int] = set()
+    if state_f.exists():
+        try:
+            prev = json.loads(state_f.read_text())
+            if prev.get("input_hash") == input_hash and prev.get("chunk_size") == chunk_n:
+                done = {int(x) for x in prev.get("done_chunks", [])}
+        except Exception:
+            done = set()
+
+    def _save():
+        state_f.write_text(json.dumps(
+            {"input_hash": input_hash, "chunk_size": chunk_n, "done_chunks": sorted(done)}))
+
     if not done:
-        findings.write_text("")                           # fresh run: start the accumulator empty
+        findings.write_text("")                           # fresh (or invalidated) run: empty accumulator
     events.tool_start(sid, cmd=["nuclei", "-l", "<chunk>", "-jsonl"], input_total=len(live))
     t0 = time.monotonic()
     degraded = 0
     for ci, batch in enumerate(batches):
         seen = min((ci + 1) * chunk_n, len(live))
-        if ci in done:                                    # resume: already scanned, findings on disk
+        if ci in done:                                    # resume: already CLEAN, findings on disk
             events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen)
             continue
         bf = ctx.write_list(f"nuclei_targets_{ci}.txt", batch)
@@ -75,14 +94,18 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
         if res.stderr_tail:
             with log.open("a", encoding="utf-8") as lf:
                 lf.write(res.stderr_tail + "\n")
-        if res.status not in (Status.SUCCESS, Status.EMPTY):
+        if res.status in (Status.SUCCESS, Status.EMPTY):
+            # ONLY clean chunks are durable: append their output ONCE, then mark done. A degraded chunk
+            # is never appended (would duplicate on retry) and never marked done (stays retryable).
+            if cf.exists():
+                with findings.open("a", encoding="utf-8") as fh:
+                    fh.write(cf.read_text(encoding="utf-8", errors="replace"))
+            done.add(ci)
+            _save()
+        else:
             degraded += 1
             events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
-        if cf.exists():
-            with findings.open("a", encoding="utf-8") as fh:
-                fh.write(cf.read_text(encoding="utf-8", errors="replace"))
-        done.add(ci)
-        state_f.write_text("\n".join(map(str, sorted(done))))
+            # cf left on disk for inspection; not appended, not marked done -> retried on next resume
         events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen)
     status = Status.PARTIAL if degraded else Status.SUCCESS
     size = findings.stat().st_size if findings.exists() else None
