@@ -269,6 +269,32 @@ def _ssti_targets(ctx, scope) -> list[str]:
     return out
 
 
+def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
+    """Collapse XSS/redirect candidate URLs to unique (host, path, sorted param-NAMES) shapes, keeping
+    ONE representative URL per shape. dalfox's reflected-XSS selection depends on the param SHAPE, not
+    the specific values, so scanning one URL per shape covers the same surface at a fraction of the cost.
+    The real problem was never 'dalfox is slow' — it was feeding it the same shape ~10x (measured on OTC:
+    993 raw -> 106 shapes, 89.3% collapsed). Returns (representatives, stats) where stats =
+    {raw_candidates, canonical_candidates, reduction_percent, top_collapsed}."""
+    from urllib.parse import urlsplit, parse_qs
+    shapes: dict = {}
+    for u in urls:
+        s = urlsplit(u)
+        key = (s.netloc, s.path, tuple(sorted(parse_qs(s.query).keys())))
+        shapes.setdefault(key, {"url": u, "count": 0})["count"] += 1
+    reps = [v["url"] for v in shapes.values()]
+    raw, canon = len(urls), len(reps)
+    top = sorted(shapes.items(), key=lambda kv: -kv[1]["count"])[:5]
+    stats = {
+        "raw_candidates": raw,
+        "canonical_candidates": canon,
+        "reduction_percent": round(100 * (1 - canon / raw), 1) if raw else 0.0,
+        "top_collapsed": [{"shape": f"{k[0]}{k[1]}?{'&'.join(k[2])}", "count": v["count"]}
+                          for k, v in top if v["count"] > 1],
+    }
+    return reps, stats
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
 
@@ -443,9 +469,16 @@ def run(ctx) -> None:
     else:
         ctx.run.record("params", skipped("arjun", "no param-less API endpoints found"))
 
-    # ── dalfox on gf xss + redirect candidates ──
-    dalfox_in = [r["value"] for r in ctx.run.read("review") if r.get("klass") in ("xss", "redirect")]
+    # ── dalfox on gf xss + redirect candidates — CANONICALIZED first (step 4.3.A) ──
+    # The measured problem was NOT "dalfox is slow" — it was feeding it the same (host,path,param-set)
+    # shape ~10x. Collapse to unique shapes BEFORE the tool sees them (OTC: 993 -> 106, 89.3%). No
+    # dalfox behavior change yet (flags unchanged); the split/fast-flags are 4.3.B.
+    dalfox_raw = [r["value"] for r in ctx.run.read("review") if r.get("klass") in ("xss", "redirect")]
+    dalfox_in, canon = _canonicalize_candidates(dalfox_raw)
     if dalfox_in and have("dalfox"):
+        ctx.echo(f"  dalfox: {canon['raw_candidates']} raw candidate(s) -> "
+                 f"{canon['canonical_candidates']} canonical shape(s) "
+                 f"({canon['reduction_percent']}% collapsed)")
         df_in = ctx.write_list("dalfox_in.txt", dalfox_in)
         df_out = ctx.run.raw_path("params", "dalfox", "dalfox.txt")
         # Concurrency (workers = local lanes) stays at dalfox's OWN default — not set here, so it
@@ -477,6 +510,13 @@ def run(ctx) -> None:
                         "name": "reflected parameter — XSS/open-redirect candidate (manual validation required)",
                         "severity": "medium", "matched": line.strip(),
                         "sources": ["dalfox"], "confirmed": False})
+        # 4.3.A ledger — the numbers matter more than the code here: make the input reduction explicit
+        # so a reviewer sees dalfox scanned shapes, not duplicate URL-variants.
+        events.ledger("params.dalfox",
+                      produced={"canonical_candidates": canon["canonical_candidates"]},
+                      consumed={"raw_candidates": canon["raw_candidates"]},
+                      reduction_percent=canon["reduction_percent"],
+                      top_collapsed=canon["top_collapsed"])
     else:
         ctx.run.record("params", skipped("dalfox", "no xss/redirect candidates"))
 

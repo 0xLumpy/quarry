@@ -138,8 +138,10 @@ def tool_blocked(source_id, *, reason=None) -> dict:
     return emit(TOOL_BLOCKED, source_id, reason=reason)
 
 
-def ledger(source_id, *, produced=None, consumed=None) -> dict:
+def ledger(source_id, *, produced=None, consumed=None, **extra) -> dict:
     """Report REAL produced/consumed counts from the parser/store layer (BBOT scan-stats analog =
     the review-4992 answer). Counts come from the caller's parse/store step, NEVER from stdout.
-    Emitted as a tool_finish-class update tagged ``ledger`` so a scan-stats view can aggregate it."""
-    return emit(TOOL_FINISH, source_id, produced=produced, consumed=consumed, ledger=True)
+    Emitted as a tool_finish-class update tagged ``ledger`` so a scan-stats view can aggregate it.
+    ``extra`` keyword fields (e.g. 4.3.A's reduction_percent / top_collapsed) ride along on the same
+    ledger event so the reduction stays one clear record."""
+    return emit(TOOL_FINISH, source_id, produced=produced, consumed=consumed, ledger=True, **extra)
