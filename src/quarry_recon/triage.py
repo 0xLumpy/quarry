@@ -20,6 +20,8 @@ CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "s
                     "redirect", "lfi", "rce", "ssti", "sourcemap", "takeover", "secrets", "scanner",
                     # evidence-probe surfaces (additive, same as the placeholder pattern):
                     "graphql", "actuator", "websocket", "api-base",
+                    # out-of-band callbacks imported from interactsh (OOB.3; uncorrelated in Phase 1):
+                    "oob",
                     # DNS-record context (notable records only — a/cname excluded as noise):
                     "dns",
                     # name-based virtual hosts served by an origin IP (may not resolve in DNS):
@@ -250,6 +252,19 @@ def build(run, scope) -> str:
             A(f"- [{s.get('kind')}{verified}] {s.get('preview', '')}{loc}  (src: {','.join(s.get('sources', []))})")
         A("")
 
+    oob_rows = run.read("oob_interaction")
+    if oob_rows:
+        by_proto: dict[str, int] = {}
+        for o in oob_rows:
+            by_proto[o.get("protocol", "?")] = by_proto.get(o.get("protocol", "?"), 0) + 1
+        proto = ", ".join(f"{k}:{v}" for k, v in sorted(by_proto.items()))
+        A(f"## OOB interactions ({len(oob_rows)}) — imported callbacks, UNCORRELATED  [{proto}]")
+        A("> evidence only: a callback reached the collector; NO source attribution until Quarry owns the token (Phase 2)")
+        for o in oob_rows[:25]:
+            dom = o.get("interaction_domain") or o.get("correlation_id") or o.get("id")
+            A(f"- [{o.get('protocol')}] {dom}  from {o.get('remote_address', '?')}  @ {o.get('timestamp', '')}")
+        A("")
+
     dns_recs = [d for d in run.read("dns_record") if d.get("type") in NOTABLE_DNS_TYPES]
     if dns_recs:
         A(f"## DNS context ({len(dns_recs)} notable records — MX/NS/TXT/CAA/ASN/CDN)")
@@ -455,6 +470,15 @@ def collect(run, scope) -> dict:
         add("scanner", _item("finding", f.get("matched") or f.get("id"),
             f"{f.get('template')} [{sev}] — UNCONFIRMED", sev_conf.get(sev, "low"),
             f.get("sources"), "normalized/finding.jsonl", ["scanner", sev]))
+
+    for o in run.read("oob_interaction"):           # OOB.3: imported callbacks — Phase 1 UNCORRELATED
+        proto = o.get("protocol", "?")
+        dom = o.get("interaction_domain") or o.get("correlation_id") or o.get("id")
+        add("oob", _item("oob_interaction", f"{proto} · {dom} · from {o.get('remote_address', '?')}",
+            "out-of-band interaction — UNCORRELATED (no source attribution until Quarry owns the token / Phase 2)",
+            "candidate", o.get("sources"), "normalized/oob_interaction.jsonl",
+            ["oob", proto, "unknown-oob", "external-service-interaction", "uncorrelated"],
+            location=o.get("raw_ref")))
 
     for q in queues:                                # dedup by item id (keys already canonical)
         queues[q] = list({it["id"]: it for it in queues[q]}.values())
