@@ -194,4 +194,4 @@ sources:
     notes: "routes to the OOB evidence substrate; correlated only in OOB Phase 2"}
   params.blind_xss:          {tool: dalfox, phase: params, tier: optional, class: deep, default: key, reason: "keyed (blind_xss_url collector)",
     input: worthy_xss_candidates, output: "oob_interaction (operator-observed until imported)", workers: governor, rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: "OOB import", log: one-line,
-    notes: "4.3.B TEMPORARY: dalfox -b currently RIDES params.dalfox_xss_fast when oob.blind_xss_url is set (kept for coverage). 4.3.D moves it here, gated to candidate classes worth blind testing — not every reflection"}
+    notes: "4.3.B TEMPORARY: dalfox -b rides params.dalfox_xss_fast when oob.blind_xss_url is set; beacons are OPERATOR-OBSERVED until `quarry oob import` records them as oob_interaction evidence. 4.3.D moves this here, gated to candidate classes worth blind testing — not every reflection"}

@@ -131,7 +131,7 @@ to tools itself. `quarry doctor` shows which are set. Back up before editing:
 | `whoxy` | osint reverse-whois |
 | `projectdiscovery` | exported as `PDCP_API_KEY` (chaos) for subfinder, asnmap, … |
 | `notify` | opt-in run notifications (Slack/Discord/Telegram/webhook) — off by default; `quarry notify --test` |
-| `oob` | self-hosted interactsh for nuclei (`interactsh_server`/`_token`); else the built-in public server |
+| `oob` | out-of-band, 3 channels: **nuclei OAST** (`interactsh_server`/`_token`; else built-in public), **dalfox blind XSS** (`blind_xss_url` → `-b`, operator-observed until imported), **evidence substrate** (`quarry oob import <interactsh -json> -t <target>` records callbacks as uncorrelated `oob_interaction` evidence) |
 
 **Tool-native configs** — these tools read their own file; put their keys there:
 

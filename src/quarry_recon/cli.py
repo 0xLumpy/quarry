@@ -246,14 +246,24 @@ def doctor(phase):
 
     # oob — out-of-band server (self-hosted interactsh for nuclei; else the built-in public one)
     ob = secrets.oob()
-    click.echo(_c("\n[oob]", "magenta") + "  (out-of-band interaction; optional)")
+    click.echo(_c("\n[oob]", "magenta") + "  (out-of-band interaction; 3 channels, all optional)")
+    # 1) nuclei OAST — nuclei's own interactsh (public default, or self-hosted)
     if ob.get("interactsh_server"):
         tok = " +token" if ob.get("interactsh_token") else " (no token)"
-        click.echo(f"  {_c('✓', 'green')} interactsh: {ob['interactsh_server']}{tok}")
+        click.echo(f"  {_c('✓', 'green')} nuclei OAST: self-hosted interactsh {ob['interactsh_server']}{tok}")
     else:
-        click.echo(f"  {_c('·', 'yellow')} interactsh: nuclei's built-in public server (set oob.interactsh_server for self-host)")
+        click.echo(f"  {_c('·', 'yellow')} nuclei OAST: built-in public interactsh (set oob.interactsh_server to self-host)")
+    # 2) dalfox blind XSS — beacons to the operator's collector; operator-observed until imported
     if ob.get("blind_xss_url"):
-        click.echo(f"  {_c('✓', 'green')} blind-xss collector → dalfox -b (out-of-band XSS beacons)")
+        click.echo(f"  {_c('✓', 'green')} blind XSS: collector → dalfox -b (operator-observed until `quarry oob import`)")
+    else:
+        click.echo(f"  {_c('·', 'yellow')} blind XSS: unset (set oob.blind_xss_url for dalfox -b beacons)")
+    # 3) Quarry evidence substrate — import interactsh callbacks as (uncorrelated) evidence
+    _have_ic = shutil.which("interactsh-client") is not None
+    click.echo(f"  {_c('✓', 'green') if _have_ic else _c('·', 'yellow')} evidence substrate: "
+               f"quarry oob import <interactsh -json>  "
+               f"({'interactsh-client present' if _have_ic else 'interactsh-client not installed'}) — "
+               f"records callbacks as uncorrelated evidence (Phase 1)")
 
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
     scope_note = f" for phase {phase}" if phase else ""
