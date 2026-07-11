@@ -255,7 +255,8 @@ def run(ctx) -> None:
     cmd = ["nuclei", "-l", str(targets), "-jsonl", "-o", str(findings),
            "-etags", "intrusive,fuzz,dos,brute-force",
            "-s", "critical,high,medium", "-stats", "-si", "30",
-           "-c", str(settings.workers("nuclei", 25))]     # H2: core-scaled concurrency (rate stays separate)
+           "-c", str(settings.workers("nuclei", 25)),      # H2: core-scaled concurrency (rate stays separate)
+           "-bs", str(settings.concurrency("NUCLEI_BULK_SIZE", 25))]   # hosts/template batch (was nuclei default; feeds many-host scopes)
     if prof.http_rl:
         cmd += ["-rl", str(prof.http_rl)]
     _apply_nuclei_oob(cmd)                          # self-hosted interactsh (else nuclei's public default)
@@ -328,7 +329,8 @@ def run(ctx) -> None:
         # 1s across all targets and blew the wall timeout (Test-5, 1800s). Delay is a RATE control,
         # not a default — apply it ONLY when the program caps us (http_rl), same model as dalfox.
         # Concurrency (`-t`) stays put; unthrottled, arjun clears the target set inside the timeout.
-        aj_cmd = ["arjun", "-i", str(aj_in), "-oT", str(aj_out), "-t", "5"]
+        aj_cmd = ["arjun", "-i", str(aj_in), "-oT", str(aj_out),
+                  "-t", str(settings.workers("arjun", 5))]   # was hard-coded -t 5; I/O-scaled + config-tunable
         if prof.http_rl:
             aj_cmd += ["-d", str(round(1.0 / max(1, prof.http_rl), 3))]
         r = exec_tool("arjun", aj_cmd, timeout=ctx.http_timeout)

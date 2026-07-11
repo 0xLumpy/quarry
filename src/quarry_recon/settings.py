@@ -76,20 +76,22 @@ def concurrency(key: str, default: int) -> int:
 # pushing workers must stay within the rate budget. reconftw scales threads by cores the same way;
 # we cap + profile-gate it. Tools with no factor (dalfox — rate-sensitive) are override-only.
 _OVERRIDE_KEY = {"nuclei": "NUCLEI_CONCURRENCY", "httpx": "HTTPX_THREADS",
-                 "ffuf": "FFUF_THREADS", "dalfox": "DALFOX_WORKERS"}
-_CORE_FACTOR = {"nuclei": 10, "httpx": 12, "ffuf": 12}        # workers per core (auto-scaled tools);
+                 "ffuf": "FFUF_THREADS", "dalfox": "DALFOX_WORKERS",
+                 "katana": "KATANA_CONCURRENCY", "arjun": "ARJUN_THREADS"}
+_CORE_FACTOR = {"nuclei": 10, "httpx": 12, "ffuf": 12, "katana": 6, "arjun": 6}   # workers per core;
 #   interim bump from 6/8/10 — eyeballed per-tool RAM is modest (all <1.5 GB), so there's headroom.
 #   PRECISE factors wait on per-tool CPU/RAM telemetry + a bigger-target run (the range under-stresses
 #   cores). Higher nuclei -c also finishes faster → eases the timeout on multi-core boxes.
 _PROFILE_MULT = {"safe": 0.5, "balanced": 1.0, "auto": 1.0, "aggressive": 1.75}
-_CAP = {"nuclei": 100, "httpx": 300, "ffuf": 300}
+_CAP = {"nuclei": 100, "httpx": 300, "ffuf": 300, "katana": 50, "arjun": 40}
 _FLOOR = 4
 # Network-I/O-bound tools: their concurrency tracks network round-trips, not CPU cores. Core-scaling
 # ALONE starves them on small-core boxes — a 4-core VPS got httpx -t 48, and a 567-host × 94-port probe
 # timed out at 1800s. Give these a core-INDEPENDENT base (profile-scaled), and take the max with the
 # core-scaled value so a big box can still go higher. Initial estimates (well within each tool's async
 # limits, conservative); the next big-target run's per-tool telemetry (H3, now flushed per-phase) refines.
-_IO_BASE = {"httpx": 150, "ffuf": 120}
+_IO_BASE = {"httpx": 150, "ffuf": 120, "katana": 25, "arjun": 20}   # katana/arjun are network-bound too;
+# the hard-coded lows (katana -c 4, arjun -t 5) left a multi-core VPS idle. I/O-scaled now, config-tunable.
 
 
 def workers(tool: str, default: int) -> int:

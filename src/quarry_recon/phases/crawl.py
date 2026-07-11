@@ -14,7 +14,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .. import events, fetch, normalize, secrets
+from .. import events, fetch, normalize, secrets, settings
 from ..runner import Status, have, run as exec_tool, skipped
 
 # 9.2 deep-mine patterns over JS / recovered source — extraction only, no fetch.
@@ -124,8 +124,13 @@ def run(ctx) -> None:
     if not scope.passive_only and targets.stat().st_size:
         kat = ctx.run.raw_path("crawl", "katana", "katana.txt")
         kat_resp.mkdir(parents=True, exist_ok=True)
+        # katana is network-bound — the old hard-coded `-c 4 -p 3` left a multi-core box idle. Scale the
+        # crawl concurrency (-c) + parallel-host count (-p) via settings (I/O-based, config-tunable via
+        # KATANA_CONCURRENCY / KATANA_PARALLELISM). (Headless SPA pass below stays low — it spawns chromium.)
         cmd = ["katana", "-list", str(targets), "-jc", "-d", "2", "-kf", "all",
-               "-c", "4", "-p", "3", "-timeout", "15", "-silent",
+               "-c", str(settings.workers("katana", 10)),
+               "-p", str(settings.concurrency("KATANA_PARALLELISM", 10)),
+               "-timeout", "15", "-silent",
                "-srd", str(kat_resp)]   # store response dir -> mine with xnLinkFinder
         if prof.http_rl:
             cmd += ["-rl", str(prof.http_rl)]
