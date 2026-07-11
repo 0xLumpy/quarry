@@ -11,10 +11,10 @@ import hashlib
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from .. import events, fetch, normalize, secrets
-from ..contract import run_contract
 from ..runner import Status, have, run as exec_tool, skipped
 
 # 9.2 deep-mine patterns over JS / recovered source — extraction only, no fetch.
@@ -69,16 +69,38 @@ def _synthetic(ctx, tool, lines, note=""):
         "stdout_lines": lines, "note": note, "cmd": [tool], "stderr_tail": ""})())
 
 
-def _jsluice_run(ctx, sub, blob, files, raw, origin):
-    """Run `jsluice <sub> -j` through run_contract (step 4.1). Replaces a raw subprocess.run whose
-    `timeout=ctx.http_timeout` treated 0 as an immediate kill; runner.run maps 0→None (unbounded), so
-    the contract path inherits the correct semantics + emits events. Returns the decoded stdout text
-    ('' on failure). Behavior-equivalent: same blob to stdin (-j/--raw-input), same raw file; the
-    caller parses it exactly as before."""
-    run_contract(f"crawl.jsluice_{sub}", ["jsluice", sub, "-j"],
-                 raw_path=raw, timeout=ctx.http_timeout,
-                 stdin_data=blob.decode("utf-8", "replace"),
-                 input_total=len(files), discovery_context=origin)
+def _jsluice_run(ctx, sub, files, raw, origin):
+    """Chunked jsluice (step 4.1 Commit B): run `jsluice <sub> -j` PER FILE through the runner, so one
+    huge/slow JS file times out ONLY itself (coverage_partial) instead of killing the whole batch, and
+    we emit tool_progress (current_index/input_total) across files. Each per-file run goes through
+    runner.run (exec_tool) — same wrapper Commit A introduced, so the timeout-0→None semantics carry
+    over. Source-level tool_start/tool_finish bracket the per-file chunks; the caller emits the ledger
+    after parsing. Returns the concatenated stdout text — the caller parses it exactly as before (same
+    entities, better isolation + progress)."""
+    sid = f"crawl.jsluice_{sub}"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    scratch = raw.with_suffix(".part")            # runner.run needs a file target; reused per chunk
+    events.tool_start(sid, cmd=["jsluice", sub, "-j"], input_total=len(files), discovery_context=origin)
+    t0 = time.monotonic()
+    timed_out = 0
+    with raw.open("w", encoding="utf-8") as fh:
+        for i, f in enumerate(files, 1):
+            res = exec_tool("jsluice", ["jsluice", sub, "-j"], raw_path=scratch,
+                            timeout=ctx.http_timeout,
+                            stdin_data=f.read_bytes().decode("utf-8", "replace"))
+            if res.status == Status.TIMED_OUT:
+                timed_out += 1
+                events.coverage_partial(sid, reason=f"{f.name} timed out")
+            if res.raw_path and scratch.exists():
+                fh.write(scratch.read_text(encoding="utf-8", errors="replace"))
+            events.tool_progress(sid, current_index=i, input_total=len(files),
+                                 artifact_size=raw.stat().st_size)
+    scratch.unlink(missing_ok=True)
+    size = raw.stat().st_size if raw.exists() else None
+    events.tool_finish(sid, status=("partial" if timed_out else "success"),
+                       reason=(f"{timed_out} file(s) timed out" if timed_out else None),
+                       duration=round(time.monotonic() - t0, 2),
+                       raw_ref=str(raw), artifact_size=size, discovery_context=origin)
     return raw.read_text(encoding="utf-8", errors="replace") if raw.exists() else ""
 
 
@@ -260,11 +282,10 @@ def run(ctx) -> None:
     # ── re-mine recovered source (jsluice + xnLinkFinder), provenance = sourcemap ──
     recov_files = [p for p in recov_dir.rglob("*") if p.is_file()] if recov_dir.exists() else []
     if recov_files and have("jsluice"):
-        blob = b"\n".join(p.read_bytes() for p in recov_files)
         for sub, parser in (("urls", normalize.jsluice_urls), ("secrets", normalize.jsluice_secrets)):
             raw = ctx.run.raw_path("crawl", "jsluice-sourcemap", f"{sub}.jsonl")
             try:
-                out = _jsluice_run(ctx, sub, blob, recov_files, raw, "sourcemap")
+                out = _jsluice_run(ctx, sub, recov_files, raw, "sourcemap")
                 _synthetic(ctx, f"jsluice-sourcemap-{sub}", out.count("\n"))
                 produced = 0
                 for e in parser(out, "jsluice-sourcemap", str(raw)):
@@ -293,11 +314,10 @@ def run(ctx) -> None:
 
     # ── jsluice urls + secrets ──
     if js_files and have("jsluice"):
-        blob = b"\n".join(f.read_bytes() for f in js_files)
         for sub, parser in (("urls", normalize.jsluice_urls), ("secrets", normalize.jsluice_secrets)):
             raw = ctx.run.raw_path("crawl", "jsluice", f"{sub}.jsonl")
             try:
-                out = _jsluice_run(ctx, sub, blob, js_files, raw, "js")
+                out = _jsluice_run(ctx, sub, js_files, raw, "js")
                 _synthetic(ctx, f"jsluice-{sub}", out.count("\n"))
                 produced = 0
                 for e in parser(out, "jsluice", str(raw)):
