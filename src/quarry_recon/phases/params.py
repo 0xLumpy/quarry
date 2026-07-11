@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 from .. import events, evidence, normalize, secrets, settings
-from ..contract import run_contract
-from ..runner import Status, have, nuclei_timeout, run as exec_tool, skipped
+from ..runner import RunResult, Status, have, nuclei_timeout, run as exec_tool, skipped
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
 
@@ -28,6 +28,72 @@ def _apply_nuclei_oob(cmd: list[str]) -> list[str]:
         if oob.get("interactsh_token"):
             cmd += ["-itoken", str(oob["interactsh_token"])]
     return cmd
+
+
+def _nuclei_cmd(targets_file, out_file, prof) -> list[str]:
+    """The nuclei main-scan command for one target file — identical flags for every chunk, only -l/-o
+    differ (non-intrusive, severity-scoped, governor-scaled -c/-bs, shared OOB endpoint)."""
+    cmd = ["nuclei", "-l", str(targets_file), "-jsonl", "-o", str(out_file),
+           "-etags", "intrusive,fuzz,dos,brute-force",
+           "-s", "critical,high,medium", "-stats", "-si", "30",
+           "-c", str(settings.workers("nuclei", 25)),      # H2: core-scaled concurrency (rate stays separate)
+           "-bs", str(settings.concurrency("NUCLEI_BULK_SIZE", 25))]   # hosts/template batch
+    if prof.http_rl:
+        cmd += ["-rl", str(prof.http_rl)]
+    _apply_nuclei_oob(cmd)                                 # self-hosted interactsh (else public default)
+    return cmd
+
+
+def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
+    """Chunked nuclei main scan (step 4.2 Commit B). Split live hosts into NUCLEI_CHUNK_HOSTS-sized
+    batches and scan SEQUENTIALLY — rate is target-wide (RoE), so parallel batches would blow the
+    budget; chunking buys resume + progress + per-batch isolation, NOT speed (work is rate-bound and
+    fixed: OTC = 448 hosts / 5.08M req / 7h41 @ 183rps, died at 93%). Each batch gets its own
+    nuclei_timeout, so one slow batch -> coverage_partial instead of a whole-run kill. A completed-chunk
+    state file (chunks.done) makes it RESUMABLE: on a re-run of the same run dir, finished batches are
+    skipped and their findings are already appended to findings.jsonl. Emits source-level tool_start /
+    tool_progress(chunk_index/chunk_total) / tool_finish; returns a RunResult for the manifest."""
+    sid = "params.nuclei_scan"
+    chunk_n = max(1, settings.concurrency("NUCLEI_CHUNK_HOSTS", 50))
+    batches = [live[i:i + chunk_n] for i in range(0, len(live), chunk_n)]
+    state_f = ctx.run.raw_path("params", "nuclei", "chunks.done")
+    done = {int(x) for x in state_f.read_text().split()} if state_f.exists() else set()
+    if not done:
+        findings.write_text("")                           # fresh run: start the accumulator empty
+    events.tool_start(sid, cmd=["nuclei", "-l", "<chunk>", "-jsonl"], input_total=len(live))
+    t0 = time.monotonic()
+    degraded = 0
+    for ci, batch in enumerate(batches):
+        seen = min((ci + 1) * chunk_n, len(live))
+        if ci in done:                                    # resume: already scanned, findings on disk
+            events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen)
+            continue
+        bf = ctx.write_list(f"nuclei_targets_{ci}.txt", batch)
+        cf = ctx.run.raw_path("params", "nuclei", f"findings_{ci}.jsonl")
+        res = exec_tool("nuclei", _nuclei_cmd(bf, cf, prof),
+                        timeout=nuclei_timeout(len(batch), ctx.http_timeout))
+        if res.stderr_tail:
+            with log.open("a", encoding="utf-8") as lf:
+                lf.write(res.stderr_tail + "\n")
+        if res.status not in (Status.SUCCESS, Status.EMPTY):
+            degraded += 1
+            events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
+        if cf.exists():
+            with findings.open("a", encoding="utf-8") as fh:
+                fh.write(cf.read_text(encoding="utf-8", errors="replace"))
+        done.add(ci)
+        state_f.write_text("\n".join(map(str, sorted(done))))
+        events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen)
+    status = Status.PARTIAL if degraded else Status.SUCCESS
+    size = findings.stat().st_size if findings.exists() else None
+    events.tool_finish(sid, status=status.value,
+                       reason=(f"{degraded}/{len(batches)} chunk(s) degraded" if degraded else None),
+                       duration=round(time.monotonic() - t0, 2),
+                       raw_ref=str(findings), artifact_size=size, discovery_context="params")
+    lines = len(findings.read_text().splitlines()) if findings.exists() else 0
+    return RunResult("nuclei", ["nuclei", "-l", "<chunked>"], status, 0,
+                     round(time.monotonic() - t0, 2), findings if findings.exists() else None,
+                     lines, note=f"{len(batches)} chunk(s), {degraded} degraded")
 
 
 def _exposed_urls(ctx, scope) -> list[str]:
@@ -248,28 +314,16 @@ def run(ctx) -> None:
     if not live:
         ctx.run.record("params", skipped("nuclei", "no active-allowed live hosts"))
         return
-    targets = ctx.write_list("nuclei_targets.txt", live)
-
-    # ── nuclei (non-intrusive, OOB interactsh, severity-scoped) ──
+    # ── nuclei (non-intrusive, OOB interactsh, severity-scoped) — chunked + resumable (step 4.2 B) ──
+    # The long-pole: OTC = 448 hosts / 5.08M req / 7h41 @ 183rps, died at 93%. Work is rate-bound, so we
+    # do NOT gate templates or parallelize batches (would blow the RoE) — we chunk hosts for resume,
+    # progress and per-batch isolation. See _nuclei_scan.
     findings = ctx.run.raw_path("params", "nuclei", "findings.jsonl")
     log = ctx.run.raw_path("params", "nuclei", "nuclei.run.log")
-    cmd = ["nuclei", "-l", str(targets), "-jsonl", "-o", str(findings),
-           "-etags", "intrusive,fuzz,dos,brute-force",
-           "-s", "critical,high,medium", "-stats", "-si", "30",
-           "-c", str(settings.workers("nuclei", 25)),      # H2: core-scaled concurrency (rate stays separate)
-           "-bs", str(settings.concurrency("NUCLEI_BULK_SIZE", 25))]   # hosts/template batch (was nuclei default; feeds many-host scopes)
-    if prof.http_rl:
-        cmd += ["-rl", str(prof.http_rl)]
-    _apply_nuclei_oob(cmd)                          # self-hosted interactsh (else nuclei's public default)
-    # nuclei is the long-pole: scale its ceiling by live-host count so a big scope isn't killed
-    # mid-scan (the "coverage is partial" checkpoint). Small scopes still get the base --timeout.
-    nt = nuclei_timeout(len(live), ctx.http_timeout)
-    ctx.echo(f"  nuclei: scanning {len(live)} host(s), budget {nt // 60}m (scaled from {ctx.http_timeout // 60}m base)")
-    # step 4.2: main scan under the contract (behavior-equivalent — same cmd + nuclei_timeout). Emits
-    # tool_start/tool_finish; a timeout is surfaced as coverage_partial, not a false empty. Ledger below.
-    r = run_contract("params.nuclei_scan", cmd, timeout=nt, input_total=len(live))
-    if r.stderr_tail:
-        log.write_text(r.stderr_tail)
+    ck = max(1, settings.concurrency("NUCLEI_CHUNK_HOSTS", 50))
+    ctx.echo(f"  nuclei: {len(live)} host(s) in chunks of {ck} (resumable · per-chunk budget "
+             f"{nuclei_timeout(min(ck, len(live)), ctx.http_timeout) // 60}m · rate-bound, sequential)")
+    r = _nuclei_scan(ctx, live, findings, log, prof)
     ctx.run.record("params", r)
     if findings.exists():
         n = 0
