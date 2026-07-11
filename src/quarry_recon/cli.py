@@ -722,7 +722,6 @@ def run(profile_path, phases, passive, timeout):
 @click.option("--run", "run_id", help="run id (default: latest)")
 def report(profile_path, run_id):
     """Regenerate hotlist + exports from a stored run in the project (no scanning)."""
-    from .store import Run
     from . import exports, triage
 
     try:
@@ -730,7 +729,7 @@ def report(profile_path, run_id):
     except ProfileError as e:
         raise click.ClickException(str(e))
     project = _project_dir(profile)
-    run_obj = Run(project, profile.target, run_id=run_id) if run_id else Run.latest(project)
+    run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist (no ghost run)
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
     # minimal scope (report doesn't re-filter)
@@ -760,7 +759,6 @@ def plan():
 @click.option("--run", "run_id", help="run id (default: latest)")
 def status(profile_path, run_id):
     """Render current/last-known per-source state from a run's events.jsonl (no scanning)."""
-    from .store import Run
     from . import views
 
     try:
@@ -768,7 +766,7 @@ def status(profile_path, run_id):
     except ProfileError as e:
         raise click.ClickException(str(e))
     project = _project_dir(profile)
-    run_obj = Run(project, profile.target, run_id=run_id) if run_id else Run.latest(project)
+    run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist (no ghost run)
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
     for line in views.status_lines(run_obj.dir / "events.jsonl"):
