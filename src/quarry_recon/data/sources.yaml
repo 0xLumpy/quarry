@@ -39,7 +39,7 @@ meta:
 sources:
 
   # ── horizontal ──────────────────────────────────────────────────────────────────────
-  horizontal.kaeferjaeger:   {tool: kaeferjaeger, phase: horizontal, tier: optional, class: passive, default: off, reason: "setup — OpenIntel model: optional local-cache / user-provided dataset; silent skip when unset, NO default remote fetch (not off for runtime)",
+  horizontal.kaeferjaeger:   {tool: kaeferjaeger, phase: horizontal, tier: optional, class: passive, default: off, reason: "setup (local dataset, manual)",
     input: apex_scope, output: subdomain, workers: n/a, rate: n/a, timeout: fixed-120s-per-provider,
     failure: silent-skip, fallback: "none (CT/subfinder carry the names)", parser: hostname-grep, log: silent-unless-opted-in,
     notes: "403 was a UA block (fixed); ~4GB bulk, overlaps CT — OUT of default remote run, opt-in / local-cache (openintel-style)."}
@@ -105,10 +105,10 @@ sources:
     input: live, output: screenshot, workers: fixed, rate: http_rl, timeout: http, failure: "reclassify-from-files (not stdout)", fallback: skip, parser: file-count, log: delta}
   probe.smap:                {tool: smap, phase: probe, tier: optional, class: passive, default: on, reason: "passive-optional",
     input: live, output: port(passive), workers: n/a, rate: n/a, timeout: fixed-600, failure: silent-skip, fallback: skip, parser: raw, log: one-line, notes: "Shodan-backed, no packets"}
-  probe.naabu_infra:         {tool: naabu, phase: probe, tier: heavy, class: deep, default: off, reason: "infra-lane (separate weeks-long portscan methodology)",
+  probe.naabu_infra:         {tool: naabu, phase: probe, tier: heavy, class: deep, default: off, reason: "infra-lane (separate portscan mode)",
     input: cidr, output: port, workers: rate, rate: portscan_rate, timeout: scaled, failure: quiet-warn, fallback: skip, parser: internal, log: one-line,
     notes: "INFRA portscan (top-ports × CIDR) — the weeks-long time bomb; side-stream, gated on prof.portscan + CIDR"}
-  probe.nmap_service:        {tool: nmap, phase: probe, tier: heavy, class: deep, default: off, reason: "infra-lane (service detection, infra portscan)",
+  probe.nmap_service:        {tool: nmap, phase: probe, tier: heavy, class: deep, default: off, reason: "infra-lane (service detection)",
     input: open_ports, output: port(service), workers: n/a, rate: n/a, timeout: scaled, failure: quiet-warn, fallback: skip, parser: internal, log: one-line, notes: "nmap -sV only on naabu-open ports; infra side-stream"}
 
   # ── crawl ───────────────────────────────────────────────────────────────────────────
@@ -130,8 +130,9 @@ sources:
   crawl.jsluice_secrets:     {tool: jsluice, phase: crawl, tier: core, class: active, default: on,
     input: js_files, output: secret, workers: n/a, rate: n/a, timeout: "runner-managed (0=unbounded); per-file", failure: quiet-warn, fallback: skip, parser: normalize.jsluice_secrets, log: delta,
     notes: "WIRED 4.1 alongside jsluice_urls (per-file chunked, -j, events + ledger)"}
-  crawl.js_beautify:         {tool: js-beautify, phase: crawl, tier: core, class: active, default: on, debt: "raw subprocess.run (crawl.py:186) — NOT under run_contract/events yet; control-debt, convert later",
-    input: js_files, output: "(in-place beautify)", workers: n/a, rate: n/a, timeout: "fixed-60", failure: silent-skip, fallback: "use raw JS", parser: none, log: silent}
+  crawl.js_beautify:         {tool: js-beautify, phase: crawl, tier: core, class: active, default: on, debt: "raw subprocess (not yet under contract)",
+    input: js_files, output: "(in-place beautify)", workers: n/a, rate: n/a, timeout: "fixed-60", failure: silent-skip, fallback: "use raw JS", parser: none, log: silent,
+    notes: "still a raw subprocess.run at crawl.py:186 — convert to run_contract/events later"}
   crawl.xnlinkfinder:        {tool: xnLinkFinder, phase: crawl, tier: core, class: active, default: on,
     input: js_and_response_dirs, output: endpoint+parameter+wordlist, workers: n/a, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
   crawl.gitleaks:            {tool: gitleaks, phase: crawl, tier: core, class: active, default: on,
@@ -159,7 +160,7 @@ sources:
     notes: "A2 CDN origin-IP correlation; sends NO packets — map-only"}
 
   # ── content (candidate-driven path discovery; off by default) ──────────────────────────
-  content.ffuf:              {tool: ffuf, phase: content, tier: optional, class: active, default: off, reason: "user-intent — content discovery, operator-enabled via CONTENT_DISCOVERY (active, not deep-for-runtime)",
+  content.ffuf:              {tool: ffuf, phase: content, tier: optional, class: active, default: off, reason: "user-intent (content discovery)",
     input: live_urls+wordlist, output: url+review(content), workers: "settings.workers(ffuf)", rate: http_rl, timeout: "scaled(wordlist×recursion)", failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "off|light|balanced|deep; MATCHES 3xx (ISC-16), no -r"}
 
@@ -178,19 +179,19 @@ sources:
   params.nuclei_oast:        {tool: nuclei, phase: params, tier: core, class: active, default: on,
     input: live, output: finding(oob), workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout(hosts)", failure: partial-ok, fallback: skip, parser: internal, log: delta,
     notes: "nuclei internal Interactsh OAST; keep as findings (see OOB substrate design)"}
-  params.dalfox:             {tool: dalfox, phase: params, tier: heavy, class: active, default: off, retired: "4.3.C — the mixed single-core sink is fully SPLIT: XSS -> params.dalfox_xss_fast (4.3.B), open-redirect -> params.redirect_confirm (4.3.C, native). No code routes through params.dalfox anymore.",
+  params.dalfox:             {tool: dalfox, phase: params, tier: heavy, class: active, default: off, retired: "split → dalfox_xss_fast + redirect_confirm",
     input: xss+redirect_candidates, output: finding(xss-candidate), workers: n/a, rate: n/a, timeout: n/a, failure: n/a, fallback: n/a, parser: internal, log: delta,
     notes: "RETIRED. was OTC 7.6h single-core mixed sink = THE timekiller; canonicalize (4.3.A) + split (4.3.B/C) replaced it. Kept for lineage/history."}
   # split targets (declared now; wired in the conversion batch):
   params.dalfox_xss_fast:    {tool: dalfox, phase: params, tier: heavy, class: active, default: on, bounded: planned,
-    input: xss_candidates(canonicalized), output: finding(xss-candidate), workers: "governor: -w + --max-cpu (DALFOX_MAX_CPU=4, DALFOX_CHUNK=40)", rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: internal, log: delta,
+    input: xss_candidates(canonicalized), output: finding(xss-candidate), workers: "governor (-w, --max-cpu)", rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: internal, log: delta,
     notes: "WIRED 4.3.B. flags --skip-bav --skip-mining-all --skip-headless --max-cpu -w (plain output + [POC] parse); chunked + input-hashed state; blind -b rides here until 4.3.D"}
   params.redirect_confirm:   {tool: internal, phase: params, tier: core, class: active, default: on,
     input: redirect_candidates, output: finding(open-redirect-candidate), workers: n/a, rate: http_rl, timeout: short, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "WIRED 4.3.C. native single-request Location probe (inject canary into redirect param, read Location WITHOUT following); confirmed only when the Location host is the canary; NO dalfox"}
-  params.oob_probe:          {tool: nuclei+oob, phase: params, tier: core, class: active, default: on, pending: "4.3.D — NOT wired yet; needs OOB evidence substrate Phase 1",
+  params.oob_probe:          {tool: nuclei+oob, phase: params, tier: core, class: active, default: on, pending: "needs OOB substrate (4.3.D)",
     input: ssrf/blind_candidates, output: oob_interaction, workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout", failure: partial-ok, fallback: skip, parser: internal, log: delta,
     notes: "routes to the OOB evidence substrate; correlated only in OOB Phase 2"}
-  params.blind_xss:          {tool: dalfox, phase: params, tier: optional, class: deep, default: key, reason: "keyed (needs oob.blind_xss_url collector)",
+  params.blind_xss:          {tool: dalfox, phase: params, tier: optional, class: deep, default: key, reason: "keyed (blind_xss_url collector)",
     input: worthy_xss_candidates, output: "oob_interaction (operator-observed until imported)", workers: governor, rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: "OOB import", log: one-line,
     notes: "4.3.B TEMPORARY: dalfox -b currently RIDES params.dalfox_xss_fast when oob.blind_xss_url is set (kept for coverage). 4.3.D moves it here, gated to candidate classes worth blind testing — not every reflection"}
