@@ -763,5 +763,38 @@ def status(profile_path, run_id):
         click.echo(line)
 
 
+@cli.group()
+def oob():
+    """Out-of-band (OOB) evidence — the callback substrate (Phase 1: import)."""
+
+
+@oob.command("import")
+@click.argument("src_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("-t", "--target", "profile_path", required=True,
+              help="project name, project dir, or target.yaml path")
+@click.option("--run", "run_id", help="run id (default: latest)")
+def oob_import(src_file, profile_path, run_id):
+    """Import interactsh-client -json (JSONL) callbacks into a run as oob_interaction rows (uncorrelated).
+
+    Phase 1 records callbacks as EVIDENCE without attributing a source — Quarry doesn't own the token
+    namespace yet (that's Phase 2). Raw import is kept under raw/oob/.
+    """
+    from .store import Run
+    from . import oob as oobmod
+
+    try:
+        profile = TargetProfile.load(_resolve_profile(profile_path))
+    except ProfileError as e:
+        raise click.ClickException(str(e))
+    project = _project_dir(profile)
+    run_obj = Run(project, profile.target, run_id=run_id) if run_id else Run.latest(project)
+    if run_obj is None:
+        raise click.ClickException(f"no runs found under {project}/recon/")
+    res = oobmod.import_file(run_obj, src_file)
+    proto = ", ".join(f"{k}={v}" for k, v in sorted(res["by_protocol"].items())) or "(none)"
+    click.echo(f"oob import: {res['parsed']} parsed · {res['added']} new oob_interaction(s) [{proto}] "
+               f"· uncorrelated (Phase 1) -> {run_obj.dir / 'normalized' / 'oob_interaction.jsonl'}")
+
+
 if __name__ == "__main__":
     cli()
