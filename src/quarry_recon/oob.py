@@ -109,12 +109,20 @@ def _strip_ansi(s: str) -> str:
 
 
 def _server_host(server) -> str:
-    """First server of a (comma-list) config value, reduced to a bare lowercase hostname — drops scheme,
-    path, and port, so `https://oob.example.com:443/x` matches a registered `sess.oob.example.com`."""
+    """A single server value reduced to a bare lowercase hostname — drops scheme, path, and port
+    (`https://oob.example.com:443/x` -> `oob.example.com`)."""
     if not server:
         return ""
-    s = str(server).split(",")[0].strip().split("://", 1)[-1]
+    s = str(server).strip().split("://", 1)[-1]
     return s.split("/", 1)[0].split(":", 1)[0].strip().lower()
+
+
+def _server_hosts(server) -> list[str]:
+    """All hosts from a (comma-list) server config, normalized. interactsh-client `-server a,b,c` can
+    register under ANY of them, so the parser accepts a domain-BOUNDARY match against any."""
+    if not server:
+        return []
+    return [h for h in (_server_host(x) for x in str(server).split(",")) if h]
 
 
 def _parse_registered(text: str, server=None):
@@ -125,14 +133,15 @@ def _parse_registered(text: str, server=None):
     line OR a following one (startup formats drift). When `server` is configured, prefer a host under it
     (scheme/port-tolerant). Returns None until the host is printed."""
     lines = _strip_ansi(text).splitlines()
-    srv0 = _server_host(server)
+    srv_hosts = _server_hosts(server)
     marker = _REG_MARKER.lower()
     for i, ln in enumerate(lines):
         if marker in ln.lower():
             for cand in [ln] + lines[i + 1:]:       # host may be on the marker line OR a later one
                 for m in _HOST_RE.finditer(cand):
                     host = m.group(1)
-                    if srv0 and not host.endswith(srv0):
+                    # domain-BOUNDARY match — plain endswith would accept e.g. evil-oob.example.com
+                    if srv_hosts and not any(host == s or host.endswith("." + s) for s in srv_hosts):
                         continue          # a configured server must match the registered host
                     return host, host.split(".")[0]
     return None
