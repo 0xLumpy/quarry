@@ -244,30 +244,21 @@ def doctor(phase):
     else:
         click.echo(f"  {_c('·', 'yellow')} not configured")
 
-    # oob — ONE Quarry-owned OOB layer. Quarry manages interactsh-client internally; the only user
-    # choice is the BACKEND (default public, or override with a private server). Not "channels".
+    # oob — readiness only: is the tool present + which backend. (The OOB model lives in README, not here.)
     ob = secrets.oob()
     _have_ic = shutil.which("interactsh-client") is not None
-    click.echo(_c("\n[oob]", "magenta") + "  (one Quarry-owned OOB layer; interactsh-client managed internally)")
-    # backend: default built-in public interactsh, OR the operator's private server (override, not a channel)
+    click.echo(_c("\n[oob]", "magenta") + "  (out-of-band interaction)")
+    if _have_ic:
+        click.echo(f"  {_c('✓', 'green')} interactsh-client present (probes + poll)")
+    else:
+        click.echo(f"  {_c('✗', 'red')} interactsh-client MISSING — quarry install --only interactsh-client")
     if ob.get("interactsh_server"):
         tok = " +token" if ob.get("interactsh_token") else " (no token)"
-        click.echo(f"  {_c('✓', 'green')} backend: self-hosted interactsh {ob['interactsh_server']}{tok} (override)")
+        click.echo(f"  {_c('✓', 'green')} backend: self-hosted {ob['interactsh_server']}{tok}")
     else:
-        click.echo(f"  {_c('·', 'yellow')} backend: built-in public interactsh (default — set oob.interactsh_server to override)")
-    # Quarry-owned probes: issue token -> callback -> poll -> correlate to source_tool/target/param
-    click.echo(f"  {_c('✓', 'green') if _have_ic else _c('·', 'yellow')} owned probes: "
-               f"params.oob_probe issues correlated callbacks; `quarry oob poll -t <target>` pulls DELAYED ones "
-               f"back to their source  ({'interactsh-client present' if _have_ic else 'interactsh-client NOT installed'})")
-    # import: compatibility only — external/stray callback logs, uncorrelated unless a Quarry token matches
-    click.echo(f"  {_c('·', 'blue')} import (compat): `quarry oob import <interactsh -json> -t <target>` — "
-               f"external logs (Burp Collaborator / XSSHunter / manual interactsh / old dalfox -b), uncorrelated")
-    # nuclei: tool-native OAST — Quarry records its findings, does NOT re-own its internal tokens
-    click.echo(f"  {_c('·', 'blue')} nuclei: uses its own native OAST/correlation (tool-owned); Quarry records findings, "
-               f"passes the same backend when set")
-    # blind XSS: operator collector via dalfox -b for now; folds into the owned layer later (4.3.D)
+        click.echo(f"  {_c('·', 'yellow')} backend: public interactsh (set oob.interactsh_server to self-host)")
     if ob.get("blind_xss_url"):
-        click.echo(f"  {_c('✓', 'green')} blind XSS: dalfox -b -> {ob['blind_xss_url']} (operator collector; owned-layer later)")
+        click.echo(f"  {_c('✓', 'green')} blind XSS: dalfox -b → {ob['blind_xss_url']}")
 
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
     scope_note = f" for phase {phase}" if phase else ""
