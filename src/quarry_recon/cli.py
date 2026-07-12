@@ -258,12 +258,15 @@ def doctor(phase):
         click.echo(f"  {_c('✓', 'green')} blind XSS: collector → dalfox -b (operator-observed until `quarry oob import`)")
     else:
         click.echo(f"  {_c('·', 'yellow')} blind XSS: unset (set oob.blind_xss_url for dalfox -b beacons)")
-    # 3) Quarry evidence substrate — import interactsh callbacks as (uncorrelated) evidence
+    # 3) Quarry evidence substrate — two modes: import (uncorrelated, P1) + owned session (correlated, P2)
     _have_ic = shutil.which("interactsh-client") is not None
+    _icstate = 'interactsh-client present' if _have_ic else 'interactsh-client not installed'
     click.echo(f"  {_c('✓', 'green') if _have_ic else _c('·', 'yellow')} evidence substrate: "
-               f"quarry oob import <interactsh -json>  "
-               f"({'interactsh-client present' if _have_ic else 'interactsh-client not installed'}) — "
+               f"quarry oob import <interactsh -json>  ({_icstate}) — "
                f"records callbacks as uncorrelated evidence (Phase 1)")
+    click.echo(f"  {_c('✓', 'green') if _have_ic else _c('·', 'yellow')} owned session: "
+               f"params.oob_probe issues correlated callbacks; quarry oob poll -t <target> pulls DELAYED "
+               f"ones back to their source (Phase 2)")
 
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
     scope_note = f" for phase {phase}" if phase else ""
@@ -785,7 +788,12 @@ def status(profile_path, run_id):
 
 @cli.group()
 def oob():
-    """Out-of-band (OOB) evidence — the callback substrate (Phase 1: import)."""
+    """Out-of-band (OOB) evidence — the callback substrate.
+
+    import = ingest external interactsh callbacks as UNCORRELATED evidence (Phase 1).
+    poll   = resume a run's Quarry-OWNED session and pull DELAYED callbacks that correlate back
+             to their source (params.oob_probe, Phase 2).
+    """
 
 
 @oob.command("import")
@@ -796,8 +804,8 @@ def oob():
 def oob_import(src_file, profile_path, run_id):
     """Import interactsh-client -json (JSONL) callbacks into a run as oob_interaction rows (uncorrelated).
 
-    Phase 1 records callbacks as EVIDENCE without attributing a source — Quarry doesn't own the token
-    namespace yet (that's Phase 2). Raw import is kept under raw/oob/.
+    Import records EXTERNAL callbacks as evidence WITHOUT attribution (Quarry didn't issue their tokens).
+    Quarry-owned callbacks are correlated separately via `quarry oob poll`. Raw import kept under raw/oob/.
     """
     from . import oob as oobmod
 
@@ -813,6 +821,51 @@ def oob_import(src_file, profile_path, run_id):
     proto = ", ".join(f"{k}={v}" for k, v in sorted(res["by_protocol"].items())) or "(none)"
     click.echo(f"oob import: {res['parsed']} parsed · {res['added']} new oob_interaction(s) [{proto}] "
                f"· uncorrelated (Phase 1) -> {run_obj.dir / 'normalized' / 'oob_interaction.jsonl'}")
+
+
+@oob.command("poll")
+@click.option("-t", "--target", "profile_path", required=True,
+              help="project name, project dir, or target.yaml path")
+@click.option("--run", "run_id", help="run id (default: latest)")
+@click.option("--wait", type=click.IntRange(min=0), default=8, show_default=True,
+              help="seconds to let the resumed client fetch buffered callbacks")
+def oob_poll(profile_path, run_id, wait):
+    """Resume a run's OWNED interactsh session and poll for DELAYED callbacks (P2.4).
+
+    SSRF/blind callbacks often arrive after the scan closes the first client. This re-opens the SAME
+    session (via its -session-file, token_map preserved) so late interactions correlate back to their
+    source. Adds any new (correlated) oob_interaction rows to the run.
+    """
+    import time as _time
+    from . import oob as oobmod
+
+    try:
+        profile = TargetProfile.load(_resolve_profile(profile_path))
+    except ProfileError as e:
+        raise click.ClickException(str(e))
+    project = _project_dir(profile)
+    run_obj = _existing_run(project, profile.target, run_id)
+    if run_obj is None:
+        raise click.ClickException(f"no runs found under {project}/recon/")
+    # carry the configured token so a self-hosted/protected collector can resume (secrets, not persisted)
+    resumed = oobmod.resume_session(run_obj, token=secrets.oob().get("interactsh_token"))
+    if resumed is None:
+        raise click.ClickException("no resumable OOB session for this run "
+                                   "(session.json missing, interactsh-client absent, or domain mismatch)")
+    session, proc = resumed
+    added = correlated = 0
+    try:
+        if wait:
+            _time.sleep(wait)                       # let the resumed client fetch buffered callbacks
+        for row in oobmod.poll_session(run_obj, session):
+            row.setdefault("raw_ref", session.get("log"))
+            if run_obj.add("oob_interaction", row):
+                added += 1
+                correlated += 1 if row.get("correlation") == "correlated" else 0
+    finally:
+        oobmod.close_session(proc)
+    click.echo(f"oob poll: +{added} new interaction(s) ({correlated} correlated) "
+               f"-> {run_obj.dir / 'normalized' / 'oob_interaction.jsonl'}")
 
 
 if __name__ == "__main__":

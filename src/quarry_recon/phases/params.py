@@ -449,7 +449,7 @@ def _oob_probe(ctx, scope, prof):
     """params.oob_probe (P2.3): Quarry-OWNED out-of-band probe. Opens an interactsh session, injects a
     per-(target,param) callback URL into the SSRF-ish params of the gf `ssrf` candidates (SCOPED +
     rate-paced + non-mutating GET via the shared fetch guard), polls the owned session, and records
-    CORRELATED oob_interaction rows (source=oob_probe, target/param filled). A callback proves the
+    CORRELATED oob_interaction rows (source=params.oob_probe, target/param filled). A callback proves the
     SSRF / external-load PRIMITIVE reached out-of-band -> candidate, NOT impact (attack layer's job).
     Skips when passive-only / no interactsh-client / no SSRF-param candidates. Delayed callbacks are
     common — re-poll later with `quarry oob poll` (P2.4). Returns a RunResult or None."""

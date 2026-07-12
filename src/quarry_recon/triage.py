@@ -258,11 +258,16 @@ def build(run, scope) -> str:
         for o in oob_rows:
             by_proto[o.get("protocol", "?")] = by_proto.get(o.get("protocol", "?"), 0) + 1
         proto = ", ".join(f"{k}:{v}" for k, v in sorted(by_proto.items()))
-        A(f"## OOB interactions ({len(oob_rows)}) — imported callbacks, UNCORRELATED  [{proto}]")
-        A("> evidence only: a callback reached the collector; NO source attribution until Quarry owns the token (Phase 2)")
+        ncorr = sum(1 for o in oob_rows if o.get("correlation") == "correlated")
+        A(f"## OOB interactions ({len(oob_rows)}) — {ncorr} correlated, {len(oob_rows) - ncorr} uncorrelated  [{proto}]")
+        A("> correlated = a Quarry-issued callback named its source/param; uncorrelated = imported/stray evidence (no attribution)")
         for o in oob_rows[:25]:
-            dom = o.get("interaction_domain") or o.get("correlation_id") or o.get("id")
-            A(f"- [{o.get('protocol')}] {dom}  from {o.get('remote_address', '?')}  @ {o.get('timestamp', '')}")
+            if o.get("correlation") == "correlated":
+                A(f"- [{o.get('protocol')}] CORRELATED {o.get('payload_class')} <- {o.get('source_tool')} "
+                  f"(param {o.get('param')} on {o.get('target_url')})")
+            else:
+                dom = o.get("interaction_domain") or o.get("correlation_id") or o.get("id")
+                A(f"- [{o.get('protocol')}] {dom}  from {o.get('remote_address', '?')}  (uncorrelated)")
         A("")
 
     dns_recs = [d for d in run.read("dns_record") if d.get("type") in NOTABLE_DNS_TYPES]
@@ -471,13 +476,19 @@ def collect(run, scope) -> dict:
             f"{f.get('template')} [{sev}] — UNCONFIRMED", sev_conf.get(sev, "low"),
             f.get("sources"), "normalized/finding.jsonl", ["scanner", sev]))
 
-    for o in run.read("oob_interaction"):           # OOB.3: imported callbacks — Phase 1 UNCORRELATED
+    for o in run.read("oob_interaction"):           # OOB callbacks — CORRELATED (P2) or UNCORRELATED (P1)
         proto = o.get("protocol", "?")
         dom = o.get("interaction_domain") or o.get("correlation_id") or o.get("id")
+        if o.get("correlation") == "correlated":    # Quarry-issued token named the source -> specific tags
+            pc = o.get("payload_class") or "oob"
+            why = (f"out-of-band interaction — CORRELATED to {o.get('source_tool')} "
+                   f"(param {o.get('param') or '?'} on {o.get('target_url') or '?'})")
+            tags = [t for t in ["oob", proto, pc, "correlated", o.get("source_tool")] if t]
+        else:                                       # Phase-1 import / stray callback — no attribution
+            why = "out-of-band interaction — UNCORRELATED (no source attribution until a Quarry-issued token matches)"
+            tags = ["oob", proto, "unknown-oob", "external-service-interaction", "uncorrelated"]
         add("oob", _item("oob_interaction", f"{proto} · {dom} · from {o.get('remote_address', '?')}",
-            "out-of-band interaction — UNCORRELATED (no source attribution until Quarry owns the token / Phase 2)",
-            "candidate", o.get("sources"), "normalized/oob_interaction.jsonl",
-            ["oob", proto, "unknown-oob", "external-service-interaction", "uncorrelated"],
+            why, "candidate", o.get("sources"), "normalized/oob_interaction.jsonl", tags,
             location=o.get("raw_ref")))
 
     for q in queues:                                # dedup by item id (keys already canonical)

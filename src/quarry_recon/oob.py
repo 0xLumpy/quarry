@@ -286,6 +286,10 @@ def correlate(rows: list[dict], session: dict) -> list[dict]:
             r["target_url"] = m.get("target_url")
             r["param"] = m.get("param")
             r["payload_class"] = m.get("payload_class", r.get("payload_class"))
+            # provenance: parse_interactsh stamps every row ["oob-import"]; a correlated hit came in
+            # over the Quarry-OWNED session, issued by source_tool — fix sources to reflect that, not import.
+            src = [s for s in ("oob-owned-session", m.get("source_tool")) if s]
+            r["sources"] = src or r.get("sources")
     return rows
 
 
