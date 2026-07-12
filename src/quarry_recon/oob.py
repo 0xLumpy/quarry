@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import re
 import shutil
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,20 +94,37 @@ def import_file(run, path) -> dict:
 # `.<unique-id>` stripped. token_map{token -> source/target/param} then names the source. P2.1 owns the
 # session lifecycle + the correlate hook; P2.2 mints/injects tokens; P2.3 wires params.oob_probe.
 
-_REGISTERED_RE = re.compile(r"([a-z0-9]{20,})\.oast\.[a-z]+", re.I)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_HOST_RE = re.compile(r"\b([a-z0-9][a-z0-9-]{0,62}(?:\.[a-z0-9-]{1,63})+)\b", re.I)
+_REG_MARKER = "payload for OOB Testing"      # interactsh-client prints the registered host after this
 
 
 def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_registered(text: str):
-    """Extract (domain, unique_id) from interactsh-client startup output. The client prints its
-    registered payload as `<unique-id>.oast.<tld>`. Returns None if not found."""
-    m = _REGISTERED_RE.search(text or "")
-    if not m:
-        return None
-    return m.group(0), m.group(1)
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s or "")
+
+
+def _parse_registered(text: str, server=None):
+    """Extract (registered_host, unique_id) from interactsh-client startup output — GENERIC: works for
+    the public oast.* servers AND a self-hosted/private collector (no `oast` baked in). The client
+    prints the registered payload host on the line right after the 'payload for OOB Testing' marker;
+    unique_id = its first label (the session id). When `server` is configured, prefer a host under it.
+    Returns None until the host is printed."""
+    lines = _strip_ansi(text).splitlines()
+    srv0 = str(server).split(",")[0].strip() if server else ""
+    for i, ln in enumerate(lines):
+        if _REG_MARKER in ln:
+            for nxt in lines[i + 1:]:
+                m = _HOST_RE.search(nxt)
+                if m:
+                    host = m.group(1)
+                    if srv0 and not host.endswith(srv0):
+                        continue          # a configured server must match the registered host
+                    return host, host.split(".")[0]
+    return None
 
 
 def session_path(run) -> Path:
@@ -123,34 +142,55 @@ def load_session(run) -> dict | None:
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
 
 
-def open_session(run, server=None, wait: int = 10):
-    """Start a Quarry-owned interactsh-client session (shelled). Reads the startup output to capture the
-    registered domain + unique-id, persists raw/oob/session.json (token_map empty until P2.2), and
-    returns (session_dict, proc). Returns None if interactsh-client is missing or never registers.
-    `server` = a self-hosted interactsh (oob.interactsh_server) else the client's default public server.
-    The live process is the caller's to poll (poll_session) and close (close_session)."""
+def _drain(stream, q: "queue.Queue") -> None:
+    """Read a subprocess stream line-by-line into a queue; sentinel None on EOF. Runs in a daemon
+    thread so a blocking readline can never hang the caller (which waits on the queue with a timeout)."""
+    try:
+        for line in iter(stream.readline, ""):
+            q.put(line)
+    except Exception:
+        pass
+    q.put(None)
+
+
+def open_session(run, server=None, token=None, wait: int = 12):
+    """Start a Quarry-owned interactsh-client session (shelled). Captures the registered host +
+    unique-id from the startup output, persists raw/oob/session.json (token_map empty until P2.2), and
+    returns (session_dict, proc). Returns None if interactsh-client is missing or does not register
+    within `wait` seconds — it CANNOT hang (stdout is drained in a daemon thread, the wait is a hard
+    deadline). `server`/`token` = a self-hosted interactsh + its auth token (interactsh-client -server
+    / -token); unset -> the client's default public servers. The live process is the caller's to poll
+    (poll_session) and close (close_session)."""
     if not shutil.which("interactsh-client"):
         return None
     log = run.raw_path("oob", "session", "interactions.jsonl")
     cmd = ["interactsh-client", "-json", "-o", str(log)]
     if server:
         cmd += ["-server", str(server)]
+    if token:
+        cmd += ["-token", str(token)]           # auth for a protected/self-hosted interactsh
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    domain = uid = None
+    q: "queue.Queue" = queue.Queue()
+    threading.Thread(target=_drain, args=(proc.stdout, q), daemon=True).start()
+
+    parsed = None
+    buf: list[str] = []
     deadline = time.monotonic() + wait
-    while time.monotonic() < deadline:
-        line = proc.stdout.readline() if proc.stdout else ""
-        if not line:
+    while time.monotonic() < deadline and parsed is None:
+        try:
+            line = q.get(timeout=0.3)           # bounded wait — never blocks indefinitely
+        except queue.Empty:
             if proc.poll() is not None:
                 break
             continue
-        got = _parse_registered(line)
-        if got:
-            domain, uid = got
+        if line is None:                        # EOF (client exited)
             break
-    if not domain:
+        buf.append(line)
+        parsed = _parse_registered("".join(buf), server)
+    if parsed is None:
         close_session(proc)
         return None
+    domain, uid = parsed
     session = {"domain": domain, "unique_id": uid, "token_map": {},
                "started": _utc(), "log": str(log), "server": server}
     save_session(run, session)
