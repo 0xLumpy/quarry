@@ -454,7 +454,11 @@ def _oob_probe(ctx, scope, prof):
     Skips when passive-only / no interactsh-client / no SSRF-param candidates. Delayed callbacks are
     common — re-poll later with `quarry oob poll` (P2.4). Returns a RunResult or None."""
     from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
-    if scope.passive_only or not have("interactsh-client"):
+    if scope.passive_only:                          # record honest skips — the source is wired/default-on
+        ctx.run.record("params", skipped("oob_probe", "passive-only mode"))
+        return None
+    if not have("interactsh-client"):
+        ctx.run.record("params", skipped("oob_probe", "interactsh-client not installed"))
         return None
     raw = [r["value"] for r in ctx.run.read("review")
            if r.get("klass") == "ssrf" and scope.active_allowed(normalize.host_of_url(r.get("value", "")))]
@@ -467,6 +471,7 @@ def _oob_probe(ctx, scope, prof):
             if k.lower() in _OOB_PARAMS:
                 probes.append((u, s, pairs, k))
     if not probes:
+        ctx.run.record("params", skipped("oob_probe", "no SSRF-param candidates"))
         return None
     opened = oob.open_session(ctx.run, server=secrets.oob().get("interactsh_server"),
                               token=secrets.oob().get("interactsh_token"))

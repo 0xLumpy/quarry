@@ -178,6 +178,28 @@ def _drain(stream, q: "queue.Queue") -> None:
     q.put(None)
 
 
+def _await_register(proc, server, wait):
+    """Read the client's stdout (via a daemon-drained queue, never blocks) until it prints its
+    registered host or `wait` elapses. Returns (host, unique_id) or None. Shared by open + resume."""
+    q: "queue.Queue" = queue.Queue()
+    threading.Thread(target=_drain, args=(proc.stdout, q), daemon=True).start()
+    parsed = None
+    buf: list[str] = []
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline and parsed is None:
+        try:
+            line = q.get(timeout=0.3)
+        except queue.Empty:
+            if proc.poll() is not None:
+                break
+            continue
+        if line is None:
+            break
+        buf.append(line)
+        parsed = _parse_registered("".join(buf), server)
+    return parsed
+
+
 def open_session(run, server=None, token=None, wait: int = 12):
     """Start a Quarry-owned interactsh-client session (shelled). Captures the registered host +
     unique-id from the startup output, persists raw/oob/session.json (token_map empty until P2.2), and
@@ -199,23 +221,7 @@ def open_session(run, server=None, token=None, wait: int = 12):
     if token:
         cmd += ["-token", str(token)]           # auth for a protected/self-hosted interactsh
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    q: "queue.Queue" = queue.Queue()
-    threading.Thread(target=_drain, args=(proc.stdout, q), daemon=True).start()
-
-    parsed = None
-    buf: list[str] = []
-    deadline = time.monotonic() + wait
-    while time.monotonic() < deadline and parsed is None:
-        try:
-            line = q.get(timeout=0.3)           # bounded wait — never blocks indefinitely
-        except queue.Empty:
-            if proc.poll() is not None:
-                break
-            continue
-        if line is None:                        # EOF (client exited)
-            break
-        buf.append(line)
-        parsed = _parse_registered("".join(buf), server)
+    parsed = _await_register(proc, server, wait)
     if parsed is None:
         close_session(proc)
         return None
@@ -224,6 +230,30 @@ def open_session(run, server=None, token=None, wait: int = 12):
                "log": str(log), "session_file": str(sf), "server": server}
     save_session(run, session)
     return session, proc
+
+
+def resume_session(run, token=None, wait: int = 12):
+    """Re-open the run's OWNED session to poll DELAYED callbacks — WITHOUT clobbering the token_map.
+    Loads the persisted session.json (with its token_map), re-launches interactsh-client on the SAME
+    -session-file (so it resumes the SAME correlation id + registered domain), verifies the re-registered
+    domain MATCHES the saved one, and returns (session, proc) with the ORIGINAL token_map intact. Returns
+    None if there is no saved session, no interactsh-client, or the resume registers a different domain.
+    (open_session mints a FRESH session; this is the resume/poll path — it NEVER overwrites token_map.)"""
+    prev = load_session(run)
+    if not prev or not prev.get("session_file") or not shutil.which("interactsh-client"):
+        return None
+    log = prev.get("log") or str(run.raw_path("oob", "session", "interactions.jsonl"))
+    cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(prev["session_file"])]
+    if prev.get("server"):
+        cmd += ["-server", str(prev["server"])]
+    if token:
+        cmd += ["-token", str(token)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    parsed = _await_register(proc, prev.get("server"), wait)
+    if parsed is None or parsed[0] != prev.get("domain"):   # must resume the SAME registered domain
+        close_session(proc)
+        return None
+    return prev, proc                            # keep prev — token_map is NEVER rebuilt/overwritten
 
 
 def close_session(proc) -> None:
