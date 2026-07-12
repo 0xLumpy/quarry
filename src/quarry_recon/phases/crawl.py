@@ -192,7 +192,9 @@ def _katana_scope_flags(scope) -> list[str]:
         # would ESCAPE the exclusion — the excluded host would still be crawled).
         if pat.endswith("$") and not pat.endswith("\\$"):
             pat = pat[:-1] + r"(?:[:/?#]|$)"
-        flags += ["-cos", pat]
+        # Quarry compiles OOS with re.IGNORECASE (config.py) — hosts are case-insensitive; carry that into
+        # RE2 with `(?i)` so JOBS.example.com is excluded exactly as jobs.example.com is.
+        flags += ["-cos", "(?i)" + pat]
     return flags
 
 
