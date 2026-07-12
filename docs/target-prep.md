@@ -257,7 +257,8 @@ PORTS:
 MODES:
   PASSIVE_ONLY: false
   SCREENSHOTS: true
-  PORTSCAN: true
+  PORTSCAN: true       # opt-in for the infra CIDR→nmap scan (default false); needs CIDR set.
+                       # The web-port SYN prefilter is separate and always on.
   TAKEOVER: true
 
 NOTES:

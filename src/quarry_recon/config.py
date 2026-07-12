@@ -126,7 +126,11 @@ class TargetProfile:
 
     @property
     def portscan(self) -> bool:
-        return bool(self.modes.get("PORTSCAN", True))
+        # Gates ONLY the INFRA port scan (naabu top-1000 over CIDR -> nmap -sV) — the weeks-long
+        # side-stream. Default OFF: it must be a deliberate opt-in, so adding CIDR scope can't silently
+        # arm it. Does NOT gate the web-port SYN prefilter (probe._web_port_prefilter over resolved host
+        # IPs -> httpx-on-open-only), which is main-river and always on when naabu is present.
+        return bool(self.modes.get("PORTSCAN", False))
 
     @property
     def takeover(self) -> bool:

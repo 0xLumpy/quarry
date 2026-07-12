@@ -175,7 +175,8 @@ MODES:
   PASSIVE_ONLY: false  # true => no active probing/scanning at all
   HEADLESS: false      # true => katana headless SPA crawl (RAM-heavy)
   SCREENSHOTS: true
-  PORTSCAN: true       # ignored if CIDR empty
+  PORTSCAN: false      # INFRA scan only (naabu top-1000 CIDR -> nmap): opt-in, needs true + CIDR.
+                       # The fast web-port SYN prefilter is separate + always on (see note below).
   TAKEOVER: true       # collect CNAMEs + run nuclei takeover templates
   CONTENT_DISCOVERY: "off"  # off | light | balanced | deep — candidate-driven path brute (default off)
   CONTENT_RECURSION: 0      # recursion depth for content discovery (0 = off; pairs with balanced/deep)
@@ -187,6 +188,14 @@ NOTES:
 
 The profile compiles into a **scope matcher** every phase consults (apex suffix, OOS regex,
 CIDR membership) — replacing regex-in-every-script.
+
+> **Two independent port-scan lanes — don't confuse them.** Quarry runs a fast **web-port SYN
+> prefilter** (naabu SYN over each live host's *resolved public IPs* × the HTTP ports, then httpx
+> probes only the open ones) on every active run — it's main-river and always on when `naabu` is
+> installed, and is **not** controlled by `MODES.PORTSCAN`. Separately, `MODES.PORTSCAN` gates the
+> **infra port scan** (naabu `top-1000` over `CIDR` → `nmap -sV`) — the slow, potentially days-long
+> side-stream. It is **off by default**: set `PORTSCAN: true` *and* provide `CIDR` to opt in. So
+> adding CIDR scope alone never arms the infra scan.
 
 > On bigger targets, see **`docs/target-prep.md`** — an OSINT guide mapping each profile
 > field (apexes, OOS, CIDR, ASN, acquisitions, cloud ranges) to where to find the data. For a

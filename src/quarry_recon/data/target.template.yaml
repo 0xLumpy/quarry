@@ -55,7 +55,10 @@ MODES:
   PASSIVE_ONLY: false   # true => no active probing/scanning at all (OSINT only)
   HEADLESS: false       # true => katana headless SPA crawl (RAM-heavy)
   SCREENSHOTS: true
-  PORTSCAN: true        # ignored if CIDR empty and no resolved host IPs
+  PORTSCAN: false       # INFRA port scan ONLY: naabu top-1000 over CIDR -> nmap -sV (the slow, weeks-long
+                        # side-stream). OFF by default — set true AND provide CIDR to opt in deliberately.
+                        # Does NOT control the fast web-port SYN prefilter (naabu over resolved host IPs
+                        # -> httpx on open ports only): that is main-river and always on when naabu exists.
   TAKEOVER: true        # true => collect CNAMEs + run nuclei takeover templates
   CONTENT_DISCOVERY: "off"  # off | light | balanced | deep — candidate-driven path brute (default off)
   CONTENT_RECURSION: 0    # recursion depth for content discovery (0 = off; pairs with balanced/deep)

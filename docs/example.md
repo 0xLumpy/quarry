@@ -63,7 +63,8 @@ MODES:
   PASSIVE_ONLY: false
   HEADLESS: false
   SCREENSHOTS: true
-  PORTSCAN: true
+  PORTSCAN: true       # opt-in: this walkthrough has CIDR, so it runs the infra naabu→nmap lane.
+                       # Default is false; the fast web-port SYN prefilter runs regardless of this flag.
   TAKEOVER: true
 ```
 
