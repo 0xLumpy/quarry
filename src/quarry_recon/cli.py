@@ -824,8 +824,13 @@ def oob_import(src_file, profile_path, run_id):
         raise click.ClickException(f"no runs found under {project}/recon/")
     res = oobmod.import_file(run_obj, src_file)
     proto = ", ".join(f"{k}={v}" for k, v in sorted(res["by_protocol"].items())) or "(none)"
+    ncorr = res.get("correlated", 0)
+    # correlated only when the imported log carried a Quarry-issued token (owned session on this run);
+    # otherwise every new row is external/stray -> uncorrelated. Report honestly, never claim attribution.
+    attr = (f"{ncorr} correlated to a Quarry token, {res['added'] - ncorr} uncorrelated"
+            if ncorr else "uncorrelated (no matching Quarry-issued token)")
     click.echo(f"oob import: {res['parsed']} parsed · {res['added']} new oob_interaction(s) [{proto}] "
-               f"· uncorrelated (Phase 1) -> {run_obj.dir / 'normalized' / 'oob_interaction.jsonl'}")
+               f"· {attr} -> {run_obj.dir / 'normalized' / 'oob_interaction.jsonl'}")
 
 
 @oob.command("poll")

@@ -68,7 +68,12 @@ def parse_interactsh(text: str) -> list[dict]:
 
 def import_file(run, path) -> dict:
     """Copy the raw import to ``raw/oob/``, parse it, add oob_interaction rows to the store. Returns
-    ``{parsed, added, by_protocol}``; each row's ``raw_ref`` points at the stored raw file."""
+    ``{parsed, added, by_protocol, correlated}``; each row's ``raw_ref`` points at the stored raw file.
+
+    Rows are UNCORRELATED by default (external/stray callbacks Quarry didn't issue). But if this run has a
+    Quarry-owned session (session.json with a token_map), imported rows are run through ``correlate()``
+    first — an imported log that happens to contain a Quarry-issued token is attributed to its source,
+    exactly what the CLI help promises. Rows without a matching token stay uncorrelated (never fabricated)."""
     src = Path(path)
     text = src.read_text(encoding="utf-8", errors="replace")
     # content-hash prefix: two DIFFERENT files sharing a name (e.g. interact.jsonl) must not clobber
@@ -78,14 +83,20 @@ def import_file(run, path) -> dict:
     raw = run.raw_path("oob", "import", f"{digest}-{src.name}")
     raw.write_text(text, encoding="utf-8")
     rows = parse_interactsh(text)
+    session = load_session(run)                 # None if this run never opened a Quarry-owned session
+    if session and session.get("token_map"):
+        correlate(rows, session)                # upgrade rows whose token matches; others untouched
     added = 0
+    correlated = 0
     by_protocol: dict[str, int] = {}
     for row in rows:
         row["raw_ref"] = str(raw)
         if run.add("oob_interaction", row):
             added += 1
             by_protocol[row["protocol"]] = by_protocol.get(row["protocol"], 0) + 1
-    return {"parsed": len(rows), "added": added, "by_protocol": by_protocol}
+            if row.get("correlation") == "correlated":
+                correlated += 1
+    return {"parsed": len(rows), "added": added, "by_protocol": by_protocol, "correlated": correlated}
 
 
 # ── Phase 2 / P2.1: Quarry-OWNED interactsh session ──────────────────────────────────────────────
@@ -216,8 +227,11 @@ def open_session(run, server=None, token=None, wait: int = 12):
     # the same file re-opens the SAME correlation id and picks up DELAYED callbacks. So closing the
     # client after the immediate poll is fine — late interactions aren't lost.
     cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(sf)]
-    if server:
-        cmd += ["-server", str(server)]
+    # interactsh-client -server wants bare server domains (e.g. `oob.example.com`), NOT a URL — nuclei's
+    # -iserver takes the full URL, so the SAME oob.interactsh_server config is normalized PER CONSUMER here.
+    srv = ",".join(_server_hosts(server)) if server else ""
+    if srv:
+        cmd += ["-server", srv]
     if token:
         cmd += ["-token", str(token)]           # auth for a protected/self-hosted interactsh
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -244,8 +258,9 @@ def resume_session(run, token=None, wait: int = 12):
         return None
     log = prev.get("log") or str(run.raw_path("oob", "session", "interactions.jsonl"))
     cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(prev["session_file"])]
-    if prev.get("server"):
-        cmd += ["-server", str(prev["server"])]
+    srv = ",".join(_server_hosts(prev.get("server"))) if prev.get("server") else ""   # bare domains for -server
+    if srv:
+        cmd += ["-server", srv]
     if token:
         cmd += ["-token", str(token)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

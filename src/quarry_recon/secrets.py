@@ -84,10 +84,11 @@ def censys() -> dict:
 
 
 def oob() -> dict:
-    """Out-of-band config (optional): a SELF-HOSTED interactsh server for nuclei
-    (`interactsh_server` + optional `interactsh_token`), and a `blind_xss_url` collector wired to
-    dalfox -b for blind/stored-XSS beacons. Empty => nuclei uses its built-in public interactsh and
-    dalfox runs reflected-only."""
+    """Out-of-band config (optional) for Quarry's ONE owned OOB layer. `interactsh_server`
+    (+ optional `interactsh_token`) OVERRIDES the callback backend — used by Quarry's owned session
+    (interactsh-client -server, normalized to a bare host) AND passed to nuclei (-iserver, full URL).
+    Empty => the built-in public interactsh backend (no setup needed). `blind_xss_url` is a legacy/compat
+    operator collector wired to dalfox -b (not the owned layer yet). All optional."""
     o = load().get("oob")
     return o if isinstance(o, dict) else {}
 

@@ -323,11 +323,13 @@ tools:
 
   - bin: interactsh-client
     phase: params
-    role: standalone OOB/blind interaction catcher
+    role: Quarry-owned OOB callback backend (params.oob_probe issues+correlates; quarry oob poll)
     install: go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
     version_cmd: interactsh-client -version
     doc: https://github.com/projectdiscovery/interactsh
-    optional: true
+    notes: >
+      REQUIRED — backs the default-on params.oob_probe source (like dalfox/nuclei back theirs). Default
+      backend is interactsh-client's built-in public server; oob.interactsh_server overrides it.
 
   # ── Phase 8: Continuous monitoring ──────────────────────────────────────
   - bin: gungnir
