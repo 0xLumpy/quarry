@@ -258,3 +258,37 @@ def poll_session(run, session: dict) -> list[dict]:
     if not log.exists():
         return []
     return correlate(parse_interactsh(log.read_text(encoding="utf-8", errors="replace")), session)
+
+
+# ── Phase 2 / P2.2: token issuance (the source side of correlation) ───────────────────────────────
+# A Quarry OOB probe mints a token, injects `<token>.<registered-host>` into the target param, and
+# records token -> (source_tool, target_url, param, payload_class) in the session's token_map. On a
+# callback, interactsh reports full-id `<token>.<unique-id>`, which correlate() maps straight back.
+# The token is the whole handle Quarry controls — that's why Quarry-issued probes get FULL correlation.
+
+def issue_token(session: dict, source_tool: str, target_url=None, param=None,
+                payload_class: str = "oob") -> str:
+    """Mint a unique, DNS-label-safe callback token and record it in the session's token_map so a later
+    interaction correlates back to (source_tool, target_url, param, payload_class). Returns the token.
+    The caller injects callback_url(session, token) / callback_host(session, token) into the probe and
+    persists the session (save_session) so correlation survives the run + a later poll/import."""
+    tmap = session.setdefault("token_map", {})
+    token = f"q{len(tmap)}"                       # short, opaque, unique-per-session (append-only map)
+    tmap[token] = {"source_tool": source_tool, "target_url": target_url,
+                   "param": param, "payload_class": payload_class}
+    return token
+
+
+def callback_host(session: dict, token: str) -> str:
+    """The callback hostname to inject: `<token>.<registered-host>`. On a hit interactsh reports full-id
+    `<token>.<unique-id>` (server suffix stripped), which correlate() maps back via the token_map.
+    DNS-only probes (SSRF/DNS-rebind) can use this host alone."""
+    return f"{token}.{session.get('domain', '')}"
+
+
+def callback_url(session: dict, token: str, scheme: str = "http", path: str = "") -> str:
+    """A full callback URL `scheme://<token>.<registered-host>[/<path>]` for probes that need a URL
+    (SSRF/open-redirect/webhook params)."""
+    host = callback_host(session, token)
+    tail = ("/" + path.lstrip("/")) if path else ""
+    return f"{scheme}://{host}{tail}"
