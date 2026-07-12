@@ -8,6 +8,7 @@ a failure/block/timeout as a genuine "nothing found" (design §3).
 from __future__ import annotations
 
 import os
+import signal
 import shutil
 import subprocess
 import threading
@@ -205,6 +206,49 @@ def _classify(exit_code: int, out: str, err: str, ok_empty: bool,
     return Status.SUCCESS, ""
 
 
+_TERM_GRACE = 3.0        # seconds between SIGTERM and the hard SIGKILL of a tool's process group
+_POSIX = (os.name == "posix")
+
+
+def terminate_group(proc, grace: float = _TERM_GRACE) -> None:
+    """Kill a tool's ENTIRE process group — SIGTERM, bounded grace, then SIGKILL — so a tool that spawned
+    children (chromium under katana/dalfox, subshells) leaves NO orphan behind (the 'tool killed, Quarry
+    stuck' class). Relies on the process being a session/group leader (Popen start_new_session=True).
+    Best-effort + race-safe: a process or group that already exited is never an error. On non-POSIX (no
+    process groups) it falls back to a single-process terminate→kill. Shared by the runner (timeout /
+    Ctrl-C) and any other owned long-lived Popen (e.g. the OOB interactsh session)."""
+    if _POSIX:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            return                                     # already reaped / no such process
+        def _sig(sig):
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, OSError):
+                pass                                   # group already gone — fine
+        _sig(signal.SIGTERM)
+        try:
+            proc.wait(timeout=grace)                   # let the group exit gracefully on TERM
+        except subprocess.TimeoutExpired:
+            pass
+        except (ProcessLookupError, OSError):
+            pass
+        _sig(signal.SIGKILL)                           # reap any survivor in the group (no-op if empty)
+        return
+    # non-POSIX: no process groups — best-effort single-process TERM -> KILL
+    try:
+        proc.terminate()
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+    except (ProcessLookupError, OSError):
+        pass
+
+
 def run(
     tool: str,
     cmd: list[str],
@@ -248,8 +292,12 @@ def run(
     peak_rss = [0.0]
     stop = threading.Event()
 
+    # start_new_session: the tool becomes its OWN process-group/session leader, so terminate_group can
+    # kill the WHOLE tree (tool + any children) on timeout/interrupt — no orphaned chromium/subshell.
+    # It also detaches the tool from Quarry's controlling terminal, so a Ctrl-C hits Quarry (not the tool
+    # directly) and we do the cleanup deterministically here.
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            env=env, cwd=_TOOL_CWD, **stdin_kw)
+                            env=env, cwd=_TOOL_CWD, start_new_session=True, **stdin_kw)
 
     def _sample():
         while not stop.wait(0.3):
@@ -264,11 +312,20 @@ def run(
         out, err = proc.communicate(input=stdin_data if stdin_data is not None else None,
                                     timeout=timeout or None)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        terminate_group(proc)                     # kill the whole group, not just the leader
         out, err = proc.communicate()             # reap + drain whatever the tool buffered
         timed_out = True
+    except KeyboardInterrupt:
+        # operator cancellation: tear the tool's group down, drain/reap, then RE-RAISE — never report a
+        # cancel as a tool FAILED/TIMED_OUT.
+        terminate_group(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise
     finally:
-        stop.set()
+        stop.set()                                # sampler shutdown ALWAYS, incl. interrupt/cleanup paths
         sampler.join(timeout=1)
 
     dur = time.monotonic() - start

@@ -24,6 +24,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import runner
+
 
 def _interaction_id(rec: dict) -> str:
     """Stable dedup id for one interaction (same session can produce many; distinguish by full-id +
@@ -234,7 +236,8 @@ def open_session(run, server=None, token=None, wait: int = 12):
         cmd += ["-server", srv]
     if token:
         cmd += ["-token", str(token)]           # auth for a protected/self-hosted interactsh
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            start_new_session=True)   # own process group -> terminate_group kills the tree
     parsed = _await_register(proc, server, wait)
     if parsed is None:
         close_session(proc)
@@ -263,7 +266,8 @@ def resume_session(run, token=None, wait: int = 12):
         cmd += ["-server", srv]
     if token:
         cmd += ["-token", str(token)]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            start_new_session=True)   # own process group -> terminate_group kills the tree
     parsed = _await_register(proc, prev.get("server"), wait)
     if parsed is None or parsed[0] != prev.get("domain"):   # must resume the SAME registered domain
         close_session(proc)
@@ -272,15 +276,9 @@ def resume_session(run, token=None, wait: int = 12):
 
 
 def close_session(proc) -> None:
-    """Stop the interactsh-client session process (best-effort)."""
-    try:
-        proc.terminate()
-        proc.wait(timeout=5)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+    """Stop the interactsh-client session — its WHOLE process group (best-effort), via the shared runner
+    helper, so no interactsh child is left behind."""
+    runner.terminate_group(proc)
 
 
 def correlate(rows: list[dict], session: dict) -> list[dict]:
