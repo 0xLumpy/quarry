@@ -12,7 +12,7 @@ import json
 import re
 import time
 
-from .. import events, evidence, fetch, normalize, secrets, settings
+from .. import events, evidence, fetch, normalize, oob, secrets, settings
 from ..runner import RunResult, Status, have, nuclei_timeout, run as exec_tool, scaled_timeout, skipped
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
@@ -439,6 +439,75 @@ def _redirect_confirm(ctx, cands, prof) -> RunResult:
                      note=f"{probed} probed, {confirmed} open-redirect candidate(s)")
 
 
+_OOB_PARAMS = {"url", "uri", "dest", "destination", "redirect", "redirect_uri", "next", "continue",
+               "return", "callback", "webhook", "target", "proxy", "fetch", "load", "site", "host",
+               "domain", "feed", "image_url", "imageurl", "link", "out", "to", "u", "path", "file",
+               "port", "open", "window", "data", "source", "src", "remote"}
+
+
+def _oob_probe(ctx, scope, prof):
+    """params.oob_probe (P2.3): Quarry-OWNED out-of-band probe. Opens an interactsh session, injects a
+    per-(target,param) callback URL into the SSRF-ish params of the gf `ssrf` candidates (SCOPED +
+    rate-paced + non-mutating GET via the shared fetch guard), polls the owned session, and records
+    CORRELATED oob_interaction rows (source=oob_probe, target/param filled). A callback proves the
+    SSRF / external-load PRIMITIVE reached out-of-band -> candidate, NOT impact (attack layer's job).
+    Skips when passive-only / no interactsh-client / no SSRF-param candidates. Delayed callbacks are
+    common — re-poll later with `quarry oob poll` (P2.4). Returns a RunResult or None."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    if scope.passive_only or not have("interactsh-client"):
+        return None
+    raw = [r["value"] for r in ctx.run.read("review")
+           if r.get("klass") == "ssrf" and scope.active_allowed(normalize.host_of_url(r.get("value", "")))]
+    cands, _canon = _canonicalize_candidates(raw)
+    probes = []                                    # (url, split, pairs, ssrf-param) — one token per param
+    for u in cands:
+        s = urlsplit(u)
+        pairs = parse_qsl(s.query, keep_blank_values=True)
+        for k, _v in pairs:
+            if k.lower() in _OOB_PARAMS:
+                probes.append((u, s, pairs, k))
+    if not probes:
+        return None
+    opened = oob.open_session(ctx.run, server=secrets.oob().get("interactsh_server"),
+                              token=secrets.oob().get("interactsh_token"))
+    if opened is None:
+        ctx.run.record("params", skipped("oob_probe", "interactsh session did not open"))
+        return None
+    session, proc = opened
+    sid = "params.oob_probe"
+    events.tool_start(sid, cmd=["<oob probe>", "interactsh"], input_total=len(probes))
+    t0 = time.monotonic()
+    issued = added = correlated = 0
+    try:
+        for i, (u, s, pairs, k) in enumerate(probes, 1):
+            # persist the mapping BEFORE the probe leaves (crash-safe: a later callback still correlates)
+            token = oob.issue_token(session, "oob_probe", u, k, "ssrf-callback", run=ctx.run)
+            cb = oob.callback_url(session, token, scheme="http")
+            probe_url = urlunsplit((s.scheme, s.netloc, s.path,
+                                    urlencode([(kk, cb if kk == k else vv) for kk, vv in pairs]), ""))
+            issued += 1
+            try:
+                fetch.scoped_get(ctx, probe_url, normalize.host_of_url(probe_url), timeout=10)
+            except Exception:
+                pass                               # a target that doesn't SSRF-fetch is the common case
+            events.tool_progress(sid, current_index=i, input_total=len(probes))
+        time.sleep(3)                              # brief window for a server-side callback to arrive
+        for row in oob.poll_session(ctx.run, session):
+            row.setdefault("raw_ref", session.get("log"))
+            if ctx.run.add("oob_interaction", row):
+                added += 1
+                correlated += 1 if row.get("correlation") == "correlated" else 0
+    finally:
+        oob.close_session(proc)
+    events.tool_finish(sid, status=Status.SUCCESS.value, duration=round(time.monotonic() - t0, 2),
+                       discovery_context="params")
+    events.ledger(sid, produced={"oob_interaction": added, "correlated": correlated},
+                  consumed={"probe": issued})
+    ctx.echo(f"  oob_probe: {issued} callback probe(s) -> {added} interaction(s) ({correlated} correlated)")
+    return RunResult("oob_probe", ["<oob probe>"], Status.SUCCESS, 0, round(time.monotonic() - t0, 2),
+                     None, added, note=f"{issued} probe(s), {added} interaction(s), {correlated} correlated")
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
 
@@ -652,3 +721,8 @@ def run(ctx) -> None:
         ns = evidence.probe_ssti(ctx, ssti_urls)
         if ns:
             ctx.echo(f"  ssti: +{ns} SSTI primitive candidate(s) confirmed (manual validation required)")
+
+    # ── OOB probe (P2.3): Quarry-owned interactsh callback on SSRF-ish params (correlated evidence) ──
+    oob_r = _oob_probe(ctx, scope, prof)
+    if oob_r is not None:
+        ctx.run.record("params", oob_r)

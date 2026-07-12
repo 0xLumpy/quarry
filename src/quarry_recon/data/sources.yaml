@@ -189,9 +189,9 @@ sources:
   params.redirect_confirm:   {tool: internal, phase: params, tier: core, class: active, default: on,
     input: redirect_candidates, output: finding(open-redirect-candidate), workers: n/a, rate: http_rl, timeout: short, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "WIRED 4.3.C. native single-request Location probe (inject canary into redirect param, read Location WITHOUT following); confirmed only when the Location host is the canary; NO dalfox"}
-  params.oob_probe:          {tool: nuclei+oob, phase: params, tier: core, class: active, default: on, pending: "needs OOB Phase 2 (owned session + token correlation; Phase 1 import is wired)",
-    input: ssrf/blind_candidates, output: oob_interaction, workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout", failure: partial-ok, fallback: skip, parser: internal, log: delta,
-    notes: "routes to the OOB evidence substrate; correlated only in OOB Phase 2"}
+  params.oob_probe:          {tool: interactsh-client, phase: params, tier: core, class: active, default: on,
+    input: ssrf_candidates, output: oob_interaction(correlated), workers: n/a, rate: http_rl, timeout: fixed, failure: partial-ok, fallback: skip, parser: internal, log: delta,
+    notes: "WIRED P2.3: Quarry-owned interactsh session injects a per-(target,param) callback into SSRF-ish params; a callback correlates back to source/target/param. Skips if interactsh-client missing / passive / no candidates. Delayed callbacks: quarry oob poll (P2.4)"}
   params.blind_xss:          {tool: dalfox, phase: params, tier: optional, class: deep, default: key, reason: "keyed (blind_xss_url collector)",
     input: worthy_xss_candidates, output: "oob_interaction (operator-observed until imported)", workers: governor, rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: "OOB import", log: one-line,
     notes: "4.3.B TEMPORARY: dalfox -b rides params.dalfox_xss_fast when oob.blind_xss_url is set; beacons are OPERATOR-OBSERVED until `quarry oob import` records them as oob_interaction evidence. 4.3.D moves this here, gated to candidate classes worth blind testing — not every reflection"}
