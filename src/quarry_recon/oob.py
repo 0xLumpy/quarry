@@ -114,7 +114,7 @@ def _server_host(server) -> str:
     if not server:
         return ""
     s = str(server).strip().split("://", 1)[-1]
-    return s.split("/", 1)[0].split(":", 1)[0].strip().lower()
+    return s.split("/", 1)[0].split(":", 1)[0].strip().lower().rstrip(".")
 
 
 def _server_hosts(server) -> list[str]:
@@ -139,7 +139,7 @@ def _parse_registered(text: str, server=None):
         if marker in ln.lower():
             for cand in [ln] + lines[i + 1:]:       # host may be on the marker line OR a later one
                 for m in _HOST_RE.finditer(cand):
-                    host = m.group(1)
+                    host = m.group(1).lower().rstrip(".")   # normalize captured host (case + trailing dot)
                     # domain-BOUNDARY match — plain endswith would accept e.g. evil-oob.example.com
                     if srv_hosts and not any(host == s or host.endswith("." + s) for s in srv_hosts):
                         continue          # a configured server must match the registered host
