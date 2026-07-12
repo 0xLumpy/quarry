@@ -173,6 +173,23 @@ def _beautify_run(ctx, files):
     return ok, degraded, status
 
 
+def _katana_scope_flags(scope) -> list[str]:
+    """Translate Quarry's OOS host patterns into katana `-cos` (out-of-scope) URL regexes so katana never
+    CRAWLS an excluded host. Katana defaults to registered-domain scope (`-fs rdn`) — it would otherwise
+    follow a link to an OOS sibling and CONTACT it before Quarry's post-crawl `is_oos` filter drops the
+    URLs. OOS is a HOST regex (`.search`'d on the host) while `-cos` matches the URL, so a leading `^`
+    (anchored at host start) is re-anchored to the host position (`://`); unanchored patterns pass through
+    (they may also match into the path, which only EXCLUDES more — it never causes contact)."""
+    flags: list[str] = []
+    for p in getattr(scope, "oos_patterns", ()):
+        pat = getattr(p, "pattern", "")
+        if not pat:
+            continue
+        url_pat = ("://" + pat[1:]) if pat.startswith("^") else pat
+        flags += ["-cos", url_pat]
+    return flags
+
+
 def _safe_srcpath(name: str) -> str:
     """Sourcemap `sources` entry -> a safe relative path (drops webpack:// etc; no traversal)."""
     n = name.split("://", 1)[-1].replace("\\", "/")
@@ -201,6 +218,7 @@ def run(ctx) -> None:
                "-p", str(settings.concurrency("KATANA_PARALLELISM", 10)),
                "-timeout", "15", "-silent",
                "-srd", str(kat_resp)]   # store response dir -> mine with xnLinkFinder
+        cmd += _katana_scope_flags(scope)   # never crawl an OOS sibling (rdn scope would otherwise reach it)
         if prof.http_rl:
             cmd += ["-rl", str(prof.http_rl)]
         r = exec_tool("katana", cmd, raw_path=kat, timeout=ctx.http_timeout)
@@ -219,6 +237,7 @@ def run(ctx) -> None:
                 r = exec_tool("katana", ["katana", "-list", str(spa_f), "-headless",
                                          "-system-chrome", "-jc", "-d", "2", "-c", "2", "-p", "1",
                                          "-timeout", "20", "-silent"] +
+                                        _katana_scope_flags(scope) +   # same OOS exclusion on the headless pass
                                         (["-rl", str(prof.http_rl)] if prof.http_rl else []),
                               raw_path=kh, timeout=ctx.http_timeout)
                 ctx.run.record("crawl", r)
