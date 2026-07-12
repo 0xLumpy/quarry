@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import queue
 import re
 import shutil
@@ -234,11 +235,11 @@ def correlate(rows: list[dict], session: dict) -> list[dict]:
     `<token>.<unique-id>`; strip the trailing `.<unique-id>` to recover the token, look it up in the
     session's token_map. Unknown/absent token -> stays UNCORRELATED (never fabricate). Mutates + returns
     rows. (P2.1 provides the hook; P2.2 populates token_map so this actually correlates.)"""
-    uid = session.get("unique_id", "") or ""
+    uid = (session.get("unique_id", "") or "").lower()
     tmap = session.get("token_map") or {}
     suffix = "." + uid
     for r in rows:
-        fid = r.get("interaction_domain") or ""
+        fid = (r.get("interaction_domain") or "").lower().rstrip(".")   # normalize (case + trailing dot)
         token = fid[:-len(suffix)] if (uid and fid.endswith(suffix)) else None
         m = tmap.get(token) if token else None
         if m:
@@ -267,15 +268,21 @@ def poll_session(run, session: dict) -> list[dict]:
 # The token is the whole handle Quarry controls — that's why Quarry-issued probes get FULL correlation.
 
 def issue_token(session: dict, source_tool: str, target_url=None, param=None,
-                payload_class: str = "oob") -> str:
-    """Mint a unique, DNS-label-safe callback token and record it in the session's token_map so a later
-    interaction correlates back to (source_tool, target_url, param, payload_class). Returns the token.
-    The caller injects callback_url(session, token) / callback_host(session, token) into the probe and
-    persists the session (save_session) so correlation survives the run + a later poll/import."""
+                payload_class: str = "oob", run=None) -> str:
+    """Mint a unique, DNS-label-safe callback token and record token -> (source_tool, target_url, param,
+    payload_class) in the session's token_map. Returns the token. The token is RANDOM and collision-
+    checked, so a sparse/restored token_map can never overwrite an existing mapping (which would
+    misattribute a callback). If `run` is given the session is persisted immediately (save_session) so a
+    crash after injecting a probe can't lose the mapping — a later callback still correlates."""
     tmap = session.setdefault("token_map", {})
-    token = f"q{len(tmap)}"                       # short, opaque, unique-per-session (append-only map)
+    while True:
+        token = "q" + os.urandom(4).hex()        # q + 8 hex chars: DNS-label-safe, ~4e9 space
+        if token not in tmap:
+            break
     tmap[token] = {"source_tool": source_tool, "target_url": target_url,
                    "param": param, "payload_class": payload_class}
+    if run is not None:
+        save_session(run, session)               # persist atomically — never lose a mapping on a crash
     return token
 
 
@@ -283,7 +290,10 @@ def callback_host(session: dict, token: str) -> str:
     """The callback hostname to inject: `<token>.<registered-host>`. On a hit interactsh reports full-id
     `<token>.<unique-id>` (server suffix stripped), which correlate() maps back via the token_map.
     DNS-only probes (SSRF/DNS-rebind) can use this host alone."""
-    return f"{token}.{session.get('domain', '')}"
+    domain = session.get("domain")
+    if not domain:
+        raise ValueError("OOB session has no registered domain (open_session must succeed first)")
+    return f"{token}.{domain}"
 
 
 def callback_url(session: dict, token: str, scheme: str = "http", path: str = "") -> str:
