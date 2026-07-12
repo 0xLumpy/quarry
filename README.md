@@ -131,7 +131,7 @@ to tools itself. `quarry doctor` shows which are set. Back up before editing:
 | `whoxy` | osint reverse-whois |
 | `projectdiscovery` | exported as `PDCP_API_KEY` (chaos) for subfinder, asnmap, … |
 | `notify` | opt-in run notifications (Slack/Discord/Telegram/webhook) — off by default; `quarry notify --test` |
-| `oob` | out-of-band, 3 channels: **nuclei OAST** (`interactsh_server`/`_token`; else built-in public), **dalfox blind XSS** (`blind_xss_url` → `-b`, operator-observed until imported), **Quarry substrate** — imported (uncorrelated) via `quarry oob import <interactsh -json> -t <target>`, or **correlated** via a Quarry-owned session: `params.oob_probe` issues per-source callbacks and `quarry oob poll -t <target>` pulls delayed ones back to their source (Phase 2) |
+| `oob` | out-of-band — **one Quarry-owned layer** (interactsh-client managed internally). **Backend**: default built-in public interactsh, or override with a private server via `interactsh_server`/`interactsh_token` (replaces the backend, not a separate channel). Quarry-owned probes (`params.oob_probe`) issue per-source callbacks correlated to source/target/param; `quarry oob poll -t <target>` pulls delayed ones. `quarry oob import` is **compatibility-only** for external logs (Burp/XSSHunter/manual/old dalfox `-b`), uncorrelated unless a token matches. `blind_xss_url` → dalfox `-b` (operator collector; folds into the owned layer later). nuclei keeps its own native OAST (tool-owned). |
 
 **Tool-native configs** — these tools read their own file; put their keys there:
 

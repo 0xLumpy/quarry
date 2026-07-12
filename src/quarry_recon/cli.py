@@ -244,29 +244,30 @@ def doctor(phase):
     else:
         click.echo(f"  {_c('·', 'yellow')} not configured")
 
-    # oob — out-of-band server (self-hosted interactsh for nuclei; else the built-in public one)
+    # oob — ONE Quarry-owned OOB layer. Quarry manages interactsh-client internally; the only user
+    # choice is the BACKEND (default public, or override with a private server). Not "channels".
     ob = secrets.oob()
-    click.echo(_c("\n[oob]", "magenta") + "  (out-of-band interaction; 3 channels, all optional)")
-    # 1) nuclei OAST — nuclei's own interactsh (public default, or self-hosted)
+    _have_ic = shutil.which("interactsh-client") is not None
+    click.echo(_c("\n[oob]", "magenta") + "  (one Quarry-owned OOB layer; interactsh-client managed internally)")
+    # backend: default built-in public interactsh, OR the operator's private server (override, not a channel)
     if ob.get("interactsh_server"):
         tok = " +token" if ob.get("interactsh_token") else " (no token)"
-        click.echo(f"  {_c('✓', 'green')} nuclei OAST: self-hosted interactsh {ob['interactsh_server']}{tok}")
+        click.echo(f"  {_c('✓', 'green')} backend: self-hosted interactsh {ob['interactsh_server']}{tok} (override)")
     else:
-        click.echo(f"  {_c('·', 'yellow')} nuclei OAST: built-in public interactsh (set oob.interactsh_server to self-host)")
-    # 2) dalfox blind XSS — beacons to the operator's collector; operator-observed until imported
+        click.echo(f"  {_c('·', 'yellow')} backend: built-in public interactsh (default — set oob.interactsh_server to override)")
+    # Quarry-owned probes: issue token -> callback -> poll -> correlate to source_tool/target/param
+    click.echo(f"  {_c('✓', 'green') if _have_ic else _c('·', 'yellow')} owned probes: "
+               f"params.oob_probe issues correlated callbacks; `quarry oob poll -t <target>` pulls DELAYED ones "
+               f"back to their source  ({'interactsh-client present' if _have_ic else 'interactsh-client NOT installed'})")
+    # import: compatibility only — external/stray callback logs, uncorrelated unless a Quarry token matches
+    click.echo(f"  {_c('·', 'blue')} import (compat): `quarry oob import <interactsh -json> -t <target>` — "
+               f"external logs (Burp Collaborator / XSSHunter / manual interactsh / old dalfox -b), uncorrelated")
+    # nuclei: tool-native OAST — Quarry records its findings, does NOT re-own its internal tokens
+    click.echo(f"  {_c('·', 'blue')} nuclei: uses its own native OAST/correlation (tool-owned); Quarry records findings, "
+               f"passes the same backend when set")
+    # blind XSS: operator collector via dalfox -b for now; folds into the owned layer later (4.3.D)
     if ob.get("blind_xss_url"):
-        click.echo(f"  {_c('✓', 'green')} blind XSS: collector → dalfox -b (operator-observed until `quarry oob import`)")
-    else:
-        click.echo(f"  {_c('·', 'yellow')} blind XSS: unset (set oob.blind_xss_url for dalfox -b beacons)")
-    # 3) Quarry evidence substrate — two modes: import (uncorrelated, P1) + owned session (correlated, P2)
-    _have_ic = shutil.which("interactsh-client") is not None
-    _icstate = 'interactsh-client present' if _have_ic else 'interactsh-client not installed'
-    click.echo(f"  {_c('✓', 'green') if _have_ic else _c('·', 'yellow')} evidence substrate: "
-               f"quarry oob import <interactsh -json>  ({_icstate}) — "
-               f"records callbacks as uncorrelated evidence (Phase 1)")
-    click.echo(f"  {_c('✓', 'green') if _have_ic else _c('·', 'yellow')} owned session: "
-               f"params.oob_probe issues correlated callbacks; quarry oob poll -t <target> pulls DELAYED "
-               f"ones back to their source (Phase 2)")
+        click.echo(f"  {_c('✓', 'green')} blind XSS: dalfox -b -> {ob['blind_xss_url']} (operator collector; owned-layer later)")
 
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
     scope_note = f" for phase {phase}" if phase else ""
@@ -788,11 +789,13 @@ def status(profile_path, run_id):
 
 @cli.group()
 def oob():
-    """Out-of-band (OOB) evidence — the callback substrate.
+    """Out-of-band (OOB) interaction — one Quarry-owned callback layer.
 
-    import = ingest external interactsh callbacks as UNCORRELATED evidence (Phase 1).
-    poll   = resume a run's Quarry-OWNED session and pull DELAYED callbacks that correlate back
-             to their source (params.oob_probe, Phase 2).
+    Quarry manages interactsh-client internally (default public backend, or override oob.interactsh_server).
+    poll   = resume a run's owned session and pull DELAYED callbacks, correlated to their source
+             (params.oob_probe).
+    import = compatibility only — ingest EXTERNAL callback logs (Burp/XSSHunter/manual), uncorrelated
+             unless a row matches a Quarry-issued token.
     """
 
 
@@ -802,10 +805,12 @@ def oob():
               help="project name, project dir, or target.yaml path")
 @click.option("--run", "run_id", help="run id (default: latest)")
 def oob_import(src_file, profile_path, run_id):
-    """Import interactsh-client -json (JSONL) callbacks into a run as oob_interaction rows (uncorrelated).
+    """Import EXTERNAL interactsh -json (JSONL) callback logs into a run as oob_interaction rows.
 
-    Import records EXTERNAL callbacks as evidence WITHOUT attribution (Quarry didn't issue their tokens).
-    Quarry-owned callbacks are correlated separately via `quarry oob poll`. Raw import kept under raw/oob/.
+    Compatibility path only — for callbacks Quarry did NOT issue (Burp Collaborator, XSSHunter, a manual
+    interactsh-client, old dalfox -b logs). Recorded as evidence WITHOUT attribution; a row correlates
+    only if it matches a Quarry-issued token. Quarry-owned probes are correlated live via the OOB layer
+    (params.oob_probe / `quarry oob poll`). Raw import kept under raw/oob/.
     """
     from . import oob as oobmod
 
