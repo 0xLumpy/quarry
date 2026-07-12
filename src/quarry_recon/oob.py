@@ -277,8 +277,13 @@ def resume_session(run, token=None, wait: int = 12):
 
 def close_session(proc) -> None:
     """Stop the interactsh-client session — its WHOLE process group (best-effort), via the shared runner
-    helper, so no interactsh child is left behind."""
+    helper (which reaps after SIGKILL so no zombie), then close its stdout pipe to release the fd."""
     runner.terminate_group(proc)
+    try:
+        if proc.stdout:
+            proc.stdout.close()
+    except Exception:
+        pass
 
 
 def correlate(rows: list[dict], session: dict) -> list[dict]:

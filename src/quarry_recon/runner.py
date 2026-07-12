@@ -213,16 +213,16 @@ _POSIX = (os.name == "posix")
 def terminate_group(proc, grace: float = _TERM_GRACE) -> None:
     """Kill a tool's ENTIRE process group — SIGTERM, bounded grace, then SIGKILL — so a tool that spawned
     children (chromium under katana/dalfox, subshells) leaves NO orphan behind (the 'tool killed, Quarry
-    stuck' class). Relies on the process being a session/group leader (Popen start_new_session=True).
-    Best-effort + race-safe: a process or group that already exited is never an error. On non-POSIX (no
-    process groups) it falls back to a single-process terminate→kill. Shared by the runner (timeout /
-    Ctrl-C) and any other owned long-lived Popen (e.g. the OOB interactsh session)."""
+    stuck' class). CALLERS MUST launch with Popen start_new_session=True, which makes the tool a
+    session/group leader with pgid == pid. We use `proc.pid` as the PGID DIRECTLY (not os.getpgid, which
+    fails once the leader itself has exited — a leader can die while a child still holds the pipe): the
+    group id stays valid + signalable as long as any member lives. Reaps after SIGKILL so no zombie is
+    left for a caller that doesn't communicate(). Best-effort + race-safe (already-gone == not an error).
+    Non-POSIX falls back to single-process terminate→kill. Shared by the runner (timeout / Ctrl-C) and the
+    OOB interactsh session."""
     if _POSIX:
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, OSError):
-            return                                     # already reaped / no such process
-        def _sig(sig):
+        pgid = proc.pid                                # start_new_session=True => pid == pgid; valid even
+        def _sig(sig):                                 # after the leader exits, while children remain
             try:
                 os.killpg(pgid, sig)
             except (ProcessLookupError, OSError):
@@ -230,20 +230,23 @@ def terminate_group(proc, grace: float = _TERM_GRACE) -> None:
         _sig(signal.SIGTERM)
         try:
             proc.wait(timeout=grace)                   # let the group exit gracefully on TERM
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
             pass
-        except (ProcessLookupError, OSError):
+        _sig(signal.SIGKILL)                           # hard-kill any survivor in the group
+        try:
+            proc.wait(timeout=grace)                   # reap the leader after the kill (no zombie)
+        except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
             pass
-        _sig(signal.SIGKILL)                           # reap any survivor in the group (no-op if empty)
         return
-    # non-POSIX: no process groups — best-effort single-process TERM -> KILL
+    # non-POSIX: no process groups — best-effort single-process TERM -> KILL, reaping after each
     try:
         proc.terminate()
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         try:
             proc.kill()
-        except (ProcessLookupError, OSError):
+            proc.wait(timeout=grace)
+        except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
             pass
     except (ProcessLookupError, OSError):
         pass

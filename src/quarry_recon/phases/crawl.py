@@ -185,8 +185,14 @@ def _katana_scope_flags(scope) -> list[str]:
         pat = getattr(p, "pattern", "")
         if not pat:
             continue
-        url_pat = ("://" + pat[1:]) if pat.startswith("^") else pat
-        flags += ["-cos", url_pat]
+        if pat.startswith("^"):                     # host-start anchor -> right after scheme `://`
+            pat = "://" + pat[1:]
+        # a trailing `$` anchors the HOST end; in a URL the host ends at :/?# or end-of-string, so turn it
+        # into a host-terminator (else `$` would demand the URL end at the hostname and a path/port/query
+        # would ESCAPE the exclusion — the excluded host would still be crawled).
+        if pat.endswith("$") and not pat.endswith("\\$"):
+            pat = pat[:-1] + r"(?:[:/?#]|$)"
+        flags += ["-cos", pat]
     return flags
 
 
