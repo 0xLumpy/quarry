@@ -76,7 +76,8 @@ sources:
   vertical.censys:           {tool: censys, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (Censys)",
     input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: silent-skip, fallback: skip, parser: internal, log: one-line, notes: "needs Censys key"}
   vertical.openintel:        {tool: openintel-subs, phase: vertical, tier: optional, class: passive, default: key, reason: "setup (local DB, manual)",
-    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: silent-skip, fallback: skip, parser: internal, log: one-line, notes: "local DB; silent if unconfigured"}
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: one-line,
+    notes: "local DB; SILENT if unconfigured; when configured runs via the runner + records its result (empty vs timeout vs broken-binary is observable in the manifest, not swallowed)"}
   vertical.puredns_brute:    {tool: puredns, phase: vertical, tier: core, class: active, default: on,
     input: wordlist+apex, output: subdomain, workers: resolvers, rate: dns_rate, timeout: scaled, failure: quiet-warn, fallback: "skip+note (no wordlist)", parser: normalize.hosts, log: delta}
   vertical.alterx_permute:   {tool: alterx, phase: vertical, tier: core, class: active, default: on,
@@ -130,9 +131,9 @@ sources:
   crawl.jsluice_secrets:     {tool: jsluice, phase: crawl, tier: core, class: active, default: on,
     input: js_files, output: secret, workers: n/a, rate: n/a, timeout: "runner-managed (0=unbounded); per-file", failure: quiet-warn, fallback: skip, parser: normalize.jsluice_secrets, log: delta,
     notes: "WIRED 4.1 alongside jsluice_urls (per-file chunked, -j, events + ledger)"}
-  crawl.js_beautify:         {tool: js-beautify, phase: crawl, tier: core, class: active, default: on, debt: "raw subprocess (not yet under contract)",
-    input: js_files, output: "(in-place beautify)", workers: n/a, rate: n/a, timeout: "fixed-60", failure: silent-skip, fallback: "use raw JS", parser: none, log: silent,
-    notes: "still a raw subprocess.run at crawl.py:186 — convert to run_contract/events later"}
+  crawl.js_beautify:         {tool: js-beautify, phase: crawl, tier: core, class: active, default: on,
+    input: js_files, output: "(in-place beautify)", workers: n/a, rate: n/a, timeout: fixed-60, failure: partial-ok, fallback: "raw JS", parser: none, log: delta,
+    notes: "WIRED: js-beautify -r per-file via runner (source-level events + coverage_partial + ledger); one slow/huge file times out only itself, not the batch"}
   crawl.xnlinkfinder:        {tool: xnLinkFinder, phase: crawl, tier: core, class: active, default: on,
     input: js_and_response_dirs, output: endpoint+parameter+wordlist, workers: n/a, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
   crawl.gitleaks:            {tool: gitleaks, phase: crawl, tier: core, class: active, default: on,

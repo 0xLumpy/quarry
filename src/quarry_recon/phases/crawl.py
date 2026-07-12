@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import subprocess
 import time
 from pathlib import Path
 
@@ -105,6 +104,73 @@ def _jsluice_run(ctx, sub, files, raw, origin):
                        duration=round(time.monotonic() - t0, 2),
                        raw_ref=str(raw), artifact_size=size, discovery_context=origin)
     return (raw.read_text(encoding="utf-8", errors="replace") if raw.exists() else ""), status
+
+
+JS_BEAUTIFY_TIMEOUT = 60          # per-file cap (local reformat) — preserves the pre-contract behavior
+
+
+def _beautify_run(ctx, files):
+    """Beautify JS UNDER CONTRACT (closes the last acceptance-bar debt: the last un-contracted reformat in
+    phases). Mirrors _jsluice_run: `js-beautify -r <copy>` runs PER FILE through the runner (exec_tool), so
+    one huge/slow minified file times out ONLY itself (coverage_partial) instead of stalling the loop;
+    tool_progress is emitted across files.
+
+    ORIGINAL-SAFE (fix): js-beautify rewrites its target in place, so a timeout mid-write would TRUNCATE
+    the only downloaded copy and hand downstream a damaged file. We beautify a TEMP COPY and atomically
+    replace the original only on SUCCESS/EMPTY; on ANY degradation the temp is deleted and the untouched
+    original is kept — that is what makes the declared 'fallback: raw JS' real.
+
+    OBSERVABLE (fix): each per-file RunResult's telemetry is aggregated (child CPU seconds, peak RSS,
+    wall) and recorded ONCE via ctx.run.record, so manifest.json / metrics can explain js-beautify's
+    resource use + degradation like any other contracted tool.
+
+    Returns (beautified_ok, degraded, overall Status). A file is 'degraded' on ANY non-clean status
+    (FAILED/BLOCKED/PARTIAL/TIMED_OUT/SKIPPED) — a failed reformat is never reported as success."""
+    sid = "crawl.js_beautify"
+    scratch = ctx.run.raw_path("crawl", "js_beautify", "run.log")   # discard stdout; -r mutates the file
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    events.tool_start(sid, cmd=["js-beautify", "-r"], input_total=len(files), discovery_context="js")
+    t0 = time.monotonic()
+    degraded = ok = 0
+    cpu_total = 0.0
+    rss_peak = 0.0
+    for i, f in enumerate(files, 1):
+        tmp = f.with_suffix(f.suffix + ".beauty")          # beautify a COPY, never the only original
+        try:
+            tmp.write_bytes(f.read_bytes())
+            res = exec_tool("js-beautify", ["js-beautify", "-r", str(tmp)],
+                            raw_path=scratch, timeout=JS_BEAUTIFY_TIMEOUT)
+        except Exception:
+            res = None
+        cpu_total += getattr(res, "cpu_s", 0.0) or 0.0
+        rss_peak = max(rss_peak, getattr(res, "peak_rss_mb", 0.0) or 0.0)
+        swapped = False
+        if res is not None and res.status in (Status.SUCCESS, Status.EMPTY) and tmp.exists():
+            try:
+                tmp.replace(f)                              # atomic swap-in only after a clean run
+                swapped = True
+                ok += 1
+            except Exception:
+                pass                                        # swap failed -> fall through to degraded/original-kept
+        if not swapped:
+            tmp.unlink(missing_ok=True)                     # degraded -> keep the untouched original
+            degraded += 1
+            reason = res.status.value if res is not None else "exception"
+            events.coverage_partial(sid, reason=f"{f.name}: {reason}")
+        events.tool_progress(sid, current_index=i, input_total=len(files))
+    scratch.unlink(missing_ok=True)
+    status = Status.PARTIAL if degraded else Status.SUCCESS
+    dur = round(time.monotonic() - t0, 2)
+    events.tool_finish(sid, status=status.value,
+                       reason=(f"{degraded}/{len(files)} file(s) degraded" if degraded else None),
+                       duration=dur, discovery_context="js")
+    # record an aggregate result so the manifest/metrics can explain resource use + degradation
+    ctx.run.record("crawl", type("R", (), {
+        "tool": "js-beautify", "status": status, "exit_code": None, "duration": dur,  # synthetic multi-proc: no single exit code
+        "stdout_lines": ok, "cmd": ["js-beautify", "-r"], "stderr_tail": "",
+        "note": f"{ok}/{len(files)} beautified" + (f", {degraded} degraded" if degraded else ""),
+        "cpu_s": round(cpu_total, 2), "peak_rss_mb": round(rss_peak, 1)})())
+    return ok, degraded, status
 
 
 def _safe_srcpath(name: str) -> str:
@@ -218,13 +284,14 @@ def run(ctx) -> None:
     js_files = list(js_dir.glob("*.js"))
     ctx.echo(f"  JS files downloaded: {len(js_files)}")
 
-    # beautify in place (better extraction)
+    # beautify in place (better extraction) — UNDER CONTRACT (per-file via runner, source-level events)
     if js_files and have("js-beautify"):
-        for f in js_files:
-            try:
-                subprocess.run(["js-beautify", "-r", str(f)], capture_output=True, timeout=60)
-            except Exception:
-                pass
+        try:
+            ok, degraded, bstatus = _beautify_run(ctx, js_files)
+            events.ledger("crawl.js_beautify", beautified=ok, degraded=degraded,
+                          input_total=len(js_files), status=bstatus.value)
+        except Exception as ex:
+            ctx.echo(f"    js-beautify: {ex}")
 
     # ── 9.1 source-map UNPACK: detect .map refs, fetch, recover original source ──
     recov_dir = ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered"

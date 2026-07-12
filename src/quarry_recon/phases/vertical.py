@@ -10,7 +10,6 @@ import json as _json
 import os
 import re as _re
 import shutil
-import subprocess
 import urllib.request
 from pathlib import Path
 
@@ -18,22 +17,27 @@ from .. import normalize, secrets, settings
 from ..runner import Status, have, run as exec_tool, skipped
 
 
-def _openintel(cfg: dict, apex: str, timeout: int = 180) -> set:
+def _openintel(ctx, cfg: dict, apex: str, timeout: int = 180) -> set:
     """ADVANCED optional passive source: query a local openintel-subs binary + subs.db for `apex`.
-    Returns an empty set (SILENT) unless both paths are configured AND present — no noise otherwise.
-    Best-effort: any failure returns an empty set and never breaks the run."""
+    SILENT when unconfigured (the caller guards on binary+db). When configured it runs THROUGH THE RUNNER
+    and its RunResult is recorded, so the manifest can distinguish 'DB had no matches' (EMPTY) from
+    timeout / broken binary / corrupt DB / CLI drift (FAILED/TIMED_OUT) — a configured failure must be
+    OBSERVABLE, not swallowed (Lumpy 2026-07-12). Console stays quiet; a failure surfaces in the manifest.
+    Returns the in-DB host set (empty on any non-clean result — best-effort, never breaks the run)."""
     binary, db = cfg.get("binary"), cfg.get("db")
-    if not binary or not db:
-        return set()
-    exe = shutil.which(binary) or (binary if os.path.isfile(binary) and os.access(binary, os.X_OK) else None)
+    exe = shutil.which(binary) or (binary if binary and os.path.isfile(binary)
+                                   and os.access(binary, os.X_OK) else None)
     if not exe or not os.path.isfile(db):
+        # caller already checked binary+db are SET, so this is 'configured but broken' -> a recordable skip
+        ctx.run.record("vertical", skipped("openintel-subs", "configured binary or db not found"))
         return set()
-    try:
-        p = subprocess.run([exe, "query", "-d", apex, "-s", "-b", db],
-                           capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
-        out = p.stdout.decode("utf-8", "replace")
-    except Exception:
+    raw = ctx.run.raw_path("vertical", "openintel", f"{apex}.txt")
+    r = exec_tool("openintel-subs", [exe, "query", "-d", apex, "-s", "-b", db],
+                  raw_path=raw, timeout=timeout)
+    ctx.run.record("vertical", r)                           # observable: empty vs timeout vs broken
+    if r.status not in (Status.SUCCESS, Status.EMPTY) or not (r.raw_path and Path(r.raw_path).exists()):
         return set()
+    out = Path(r.raw_path).read_text(encoding="utf-8", errors="replace")
     return {h for h in (line.strip().lower().rstrip(".") for line in out.splitlines())
             if h and "." in h}
 
@@ -303,7 +307,7 @@ def run(ctx) -> None:
     if oi.get("binary") and oi.get("db"):
         oi_hosts = set()
         for apex in prof.apex_domains:
-            oi_hosts |= _openintel(oi, apex)
+            oi_hosts |= _openintel(ctx, oi, apex)
         if oi_hosts:
             raw = ctx.run.raw_path("vertical", "openintel", "hosts.txt")
             raw.write_text("\n".join(sorted(oi_hosts)) + "\n")
