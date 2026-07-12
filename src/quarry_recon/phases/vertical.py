@@ -415,40 +415,35 @@ def run(ctx) -> None:
             if perms.exists():
                 cand += perms.read_text().splitlines()
 
-        candidates = ctx.write_list(f"all_candidates_{it}.txt", cand)
-
         if scope.passive_only:
-            res = ctx.run.raw_path("vertical", "dnsx", f"resolved_{it}.txt")
-            r = exec_tool("dnsx", ["dnsx", "-l", str(candidates), "-a", "-resp", "-json",
-                                   "-silent"], raw_path=res, timeout=ctx.http_timeout)
-            ctx.run.record("vertical", r)
-            if r.raw_path:
-                for e in normalize.dnsx_resolved(r.raw_path.read_text(), "dnsx", str(res)):
-                    if scope.in_scope(e["host"]):
-                        ctx.run.add("resolved", e)
-                        ctx.run.add("subdomain", {"host": e["host"], "sources": ["dnsx-resolved"]})
-        else:
-            res = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.txt")
-            # --write-massdns captures the A records so `resolved` carries its IPs (was a:[] — puredns
-            # -q emits hostnames only, leaving the host→IP edge to live solely in dns_record; the digest
-            # and the v0.4 relationship layer both want it on `resolved`).
-            md = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.massdns")
-            cmd = ["puredns", "resolve", str(candidates), "--resolvers-trusted", str(trusted),
-                   "--write-massdns", str(md), "-q"]
-            if resolvers:
-                cmd += ["-r", str(resolvers)]
-            if prof.dns_rate:
-                cmd += ["--rate-limit", str(prof.dns_rate)]
-            r = exec_tool("puredns", cmd, raw_path=res, timeout=ctx.http_timeout)
-            ctx.run.record("vertical", r)
-            if r.raw_path:
-                ips = _massdns_a(md)                # host -> [A records]
-                for e in normalize.hosts(r.raw_path.read_text(), "puredns-resolve", str(res)):
-                    if scope.in_scope(e["host"]):
-                        ctx.run.add("resolved", {"host": e["host"], "a": ips.get(e["host"], []),
-                                                 "sources": ["puredns-resolve"], "raw_ref": str(res)})
-                        # newly-resolved permutations are new subdomains → seed next iteration
-                        ctx.run.add("subdomain", {"host": e["host"], "sources": ["puredns-resolve"]})
+            # PASSIVE = no target contact. `dnsx -a` resolves candidates against the target's DNS, so it
+            # is skipped: passively-discovered subdomain names are already stored (CT/subfinder/etc above);
+            # we simply don't resolve them to A records here. Honest skip, then stop (no active growth).
+            ctx.run.record("vertical", skipped("dnsx", "passive-only mode — no recursive DNS resolution"))
+            break
+
+        candidates = ctx.write_list(f"all_candidates_{it}.txt", cand)
+        res = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.txt")
+        # --write-massdns captures the A records so `resolved` carries its IPs (was a:[] — puredns
+        # -q emits hostnames only, leaving the host→IP edge to live solely in dns_record; the digest
+        # and the v0.4 relationship layer both want it on `resolved`).
+        md = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.massdns")
+        cmd = ["puredns", "resolve", str(candidates), "--resolvers-trusted", str(trusted),
+               "--write-massdns", str(md), "-q"]
+        if resolvers:
+            cmd += ["-r", str(resolvers)]
+        if prof.dns_rate:
+            cmd += ["--rate-limit", str(prof.dns_rate)]
+        r = exec_tool("puredns", cmd, raw_path=res, timeout=ctx.http_timeout)
+        ctx.run.record("vertical", r)
+        if r.raw_path:
+            ips = _massdns_a(md)                # host -> [A records]
+            for e in normalize.hosts(r.raw_path.read_text(), "puredns-resolve", str(res)):
+                if scope.in_scope(e["host"]):
+                    ctx.run.add("resolved", {"host": e["host"], "a": ips.get(e["host"], []),
+                                             "sources": ["puredns-resolve"], "raw_ref": str(res)})
+                    # newly-resolved permutations are new subdomains → seed next iteration
+                    ctx.run.add("subdomain", {"host": e["host"], "sources": ["puredns-resolve"]})
 
         cur = ctx.run.count("resolved")
         ctx.echo(f"  recursion iter {it}: resolved={cur}"
@@ -456,8 +451,6 @@ def run(ctx) -> None:
         if prev >= 0 and cur == prev:
             break          # converged — nothing new this iteration
         prev = cur
-        if scope.passive_only:
-            break          # no permutation growth without active alterx
 
     # ── A1: wildcard-zone brute + HTTP-differentiation (recover distinct vhosts a wildcard hides) ──
     # Runs before the CNAME/takeover pass so recovered vhosts get takeover analysis too.
@@ -468,7 +461,10 @@ def run(ctx) -> None:
     _wildcard_differentiate(ctx, wildcard_zones)
 
     # ── CNAME collection for subdomain-takeover analysis (workflow 1.13) ──
-    if prof.takeover and have("dnsx"):
+    if prof.takeover and scope.passive_only:
+        # `dnsx -cname -a` resolves against the target's DNS — target contact, so skip in passive mode.
+        ctx.run.record("vertical", skipped("dnsx", "passive-only mode — CNAME/takeover resolution skipped"))
+    elif prof.takeover and have("dnsx"):
         # Scan the UNION of resolved + all known subdomains — not "resolved or subdomain".
         # A dangling CNAME (host with a CNAME but no A record of its own) is exactly the
         # takeover signal, and it lives in `subdomain`, never in `resolved`. The old
