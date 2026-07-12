@@ -227,7 +227,7 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         # which "differs" from the 200 baseline and floods false positives. Following it collapses
         # every noise candidate back onto the real baseline, leaving only the genuinely-distinct vhosts.
         r = exec_tool("httpx", ["httpx", "-l", str(cf), "-json", "-silent", "-sc", "-cl", "-title",
-                                "-favicon", "-follow-redirects",
+                                "-favicon", "-follow-host-redirects",   # same-host only (http->https collapse), never off-scope
                                 "-t", str(settings.workers("httpx", 15))],
                       raw_path=hx, timeout=ctx.http_timeout)
         ctx.run.record(phase, r)

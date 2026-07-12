@@ -1,7 +1,7 @@
 """Phase 4: Probe / fingerprint / screenshots / ports.
 
 httpx json (source of truth for live services) with the methodology's full flag set
-(follow-redirects, asn, location, random-agent) at RoE rate limit + full-monty ports;
+(follow-host-redirects, asn, location, random-agent) at RoE rate limit + full-monty ports;
 gowitness screenshots; naabu ports → nmap -sV service detection (only on in-scope CIDR);
 optional smap passive (Shodan-backed) port scan.
 """
@@ -128,8 +128,9 @@ def _vhost_enum(ctx) -> None:
     signal is names that DON'T resolve). Base URL is chosen HTTPS-first + subdomain-first (the apex is
     often a separate static site). Matching is the "served/exists" set (2xx/3xx/401/403) + `-ac` (drops
     the catch-all baseline) — broader than a bare 200/301, but a 404/5xx means the Host isn't served so
-    it's excluded. `-r` follows redirects so a vhost that 30x's to real content is classified on its
-    FINAL response (odd ports/presentations still caught)."""
+    it's excluded. Redirects are NOT followed (no `-r`): a vhost that 30x's is already a hit via `-mc`
+    (3xx matched) and `-ac` folds a uniform catch-all by response SIZE whether or not we follow — so we
+    classify on the 3xx itself and never chase a Location cross-host / off-scope."""
     if not have("ffuf"):
         return
     wl = _vhost_wordlist()
@@ -172,10 +173,11 @@ def _vhost_enum(ctx) -> None:
         for apex in apexes:
             out = ctx.run.raw_path("probe", "ffuf-vhost", f"{origin}_{apex}.json")
             # -mc = "served/exists" (2xx/3xx/401/403), NOT `all`: a 404/5xx means the origin does NOT
-            # serve that Host, so it isn't a vhost. -ac drops the catch-all baseline; -r follows a
-            # redirect to classify on the final response (odd ports/presentations still caught).
+            # serve that Host, so it isn't a vhost. -ac drops the catch-all baseline. NO -r: a redirecting
+            # vhost is matched on its 3xx (in -mc) and -ac folds a uniform catch-all by size regardless —
+            # so we never follow a Location to another (possibly off-scope) host.
             cmd = ["ffuf", "-w", f"{wl}:FUZZ", "-H", f"Host: FUZZ.{apex}",
-                   "-u", f"{base}/", "-ac", "-r", "-timeout", "7",
+                   "-u", f"{base}/", "-ac", "-timeout", "7",
                    "-t", str(settings.workers("ffuf", 40)), "-s",
                    "-mc", "200-299,301,302,303,307,308,401,403",
                    "-o", str(out), "-of", "json"]
@@ -212,7 +214,10 @@ def _httpx_probe_cmd(hosts_file, ports, http_rl) -> list[str]:
            "-ports", ",".join(str(p) for p in ports),
            "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
            "-asn", "-location", "-ip", "-cname", "-irh",
-           "-follow-redirects", "-random-agent", "-timeout", "7", "-retries", "0",
+           # -follow-host-redirects (NOT -follow-redirects): follow only SAME-HOST 30x (http->https on the
+           # same host), never cross-host/off-scope — an in-scope host that 30x's off-scope is not fetched.
+           # `-location` still records the Location for cross-host redirects (intel without following).
+           "-follow-host-redirects", "-random-agent", "-timeout", "7", "-retries", "0",
            "-t", str(settings.workers("httpx", 15))]
     if http_rl:
         cmd += ["-rl", str(http_rl)]
