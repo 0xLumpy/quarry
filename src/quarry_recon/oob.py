@@ -189,7 +189,11 @@ def open_session(run, server=None, token=None, wait: int = 12):
     if not shutil.which("interactsh-client"):
         return None
     log = run.raw_path("oob", "session", "interactions.jsonl")
-    cmd = ["interactsh-client", "-json", "-o", str(log)]
+    sf = run.raw_path("oob", "session", "interactsh.session")
+    # -session-file makes the session RESUMABLE: a later interactsh-client (quarry oob poll, P2.4) with
+    # the same file re-opens the SAME correlation id and picks up DELAYED callbacks. So closing the
+    # client after the immediate poll is fine — late interactions aren't lost.
+    cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(sf)]
     if server:
         cmd += ["-server", str(server)]
     if token:
@@ -216,8 +220,8 @@ def open_session(run, server=None, token=None, wait: int = 12):
         close_session(proc)
         return None
     domain, uid = parsed
-    session = {"domain": domain, "unique_id": uid, "token_map": {},
-               "started": _utc(), "log": str(log), "server": server}
+    session = {"domain": domain, "unique_id": uid, "token_map": {}, "started": _utc(),
+               "log": str(log), "session_file": str(sf), "server": server}
     save_session(run, session)
     return session, proc
 

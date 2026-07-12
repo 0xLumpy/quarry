@@ -481,13 +481,16 @@ def _oob_probe(ctx, scope, prof):
     try:
         for i, (u, s, pairs, k) in enumerate(probes, 1):
             # persist the mapping BEFORE the probe leaves (crash-safe: a later callback still correlates)
-            token = oob.issue_token(session, "oob_probe", u, k, "ssrf-callback", run=ctx.run)
+            token = oob.issue_token(session, sid, u, k, "ssrf-callback", run=ctx.run)
             cb = oob.callback_url(session, token, scheme="http")
             probe_url = urlunsplit((s.scheme, s.netloc, s.path,
                                     urlencode([(kk, cb if kk == k else vv) for kk, vv in pairs]), ""))
             issued += 1
             try:
-                fetch.scoped_get(ctx, probe_url, normalize.host_of_url(probe_url), timeout=10)
+                # NO-FOLLOW + header-only: if the target 302s to Location: <our-callback>, we must NOT
+                # follow it — Quarry would fetch its OWN collector and fake an SSRF hit. The server-side
+                # SSRF (if any) still fires from the request itself; we just don't self-trigger.
+                fetch.redirect_location(ctx, probe_url, normalize.host_of_url(probe_url), timeout=10)
             except Exception:
                 pass                               # a target that doesn't SSRF-fetch is the common case
             events.tool_progress(sid, current_index=i, input_total=len(probes))
