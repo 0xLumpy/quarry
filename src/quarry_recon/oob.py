@@ -153,8 +153,12 @@ def session_path(run) -> Path:
 
 
 def save_session(run, session: dict) -> Path:
+    """Persist the session to raw/oob/session.json ATOMICALLY (temp write + os.replace) — a crash
+    mid-write must not corrupt the file the token_map's crash-safety depends on."""
     p = session_path(run)
-    p.write_text(json.dumps(session, indent=2), encoding="utf-8")
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(session, indent=2), encoding="utf-8")
+    os.replace(tmp, p)                            # atomic on POSIX — no torn session.json
     return p
 
 
