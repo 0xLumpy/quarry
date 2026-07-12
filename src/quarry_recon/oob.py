@@ -88,8 +88,9 @@ def import_file(run, path) -> dict:
 
 
 # ── Phase 2 / P2.1: Quarry-OWNED interactsh session ──────────────────────────────────────────────
-# The correlation engine (confirmed from a live session): interactsh registers `<unique-id>.oast.<tld>`
-# and every record's full-id is `<prefix-label>.<unique-id>`. Quarry issues `<token>.<unique-id>` as the
+# The correlation engine (confirmed from a live session): interactsh registers a callback host
+# `<unique-id>.<registered-host>` (public oast.* OR a self-hosted/private collector) and every record's
+# full-id is `<prefix-label>.<unique-id>`. Quarry issues `<token>.<unique-id>` as the
 # callback (P2.2 mints the token), so on interaction the token is full-id with the trailing
 # `.<unique-id>` stripped. token_map{token -> source/target/param} then names the source. P2.1 owns the
 # session lifecycle + the correlate hook; P2.2 mints/injects tokens; P2.3 wires params.oob_probe.
@@ -107,19 +108,29 @@ def _strip_ansi(s: str) -> str:
     return _ANSI_RE.sub("", s or "")
 
 
+def _server_host(server) -> str:
+    """First server of a (comma-list) config value, reduced to a bare lowercase hostname — drops scheme,
+    path, and port, so `https://oob.example.com:443/x` matches a registered `sess.oob.example.com`."""
+    if not server:
+        return ""
+    s = str(server).split(",")[0].strip().split("://", 1)[-1]
+    return s.split("/", 1)[0].split(":", 1)[0].strip().lower()
+
+
 def _parse_registered(text: str, server=None):
     """Extract (registered_host, unique_id) from interactsh-client startup output — GENERIC: works for
     the public oast.* servers AND a self-hosted/private collector (no `oast` baked in). The client
-    prints the registered payload host on the line right after the 'payload for OOB Testing' marker;
-    unique_id = its first label (the session id). When `server` is configured, prefer a host under it.
-    Returns None until the host is printed."""
+    prints the registered callback host at/after a 'payload for OOB Testing' marker; unique_id = its
+    first label (the session id). Marker match is CASE-INSENSITIVE and the host may sit on the marker
+    line OR a following one (startup formats drift). When `server` is configured, prefer a host under it
+    (scheme/port-tolerant). Returns None until the host is printed."""
     lines = _strip_ansi(text).splitlines()
-    srv0 = str(server).split(",")[0].strip() if server else ""
+    srv0 = _server_host(server)
+    marker = _REG_MARKER.lower()
     for i, ln in enumerate(lines):
-        if _REG_MARKER in ln:
-            for nxt in lines[i + 1:]:
-                m = _HOST_RE.search(nxt)
-                if m:
+        if marker in ln.lower():
+            for cand in [ln] + lines[i + 1:]:       # host may be on the marker line OR a later one
+                for m in _HOST_RE.finditer(cand):
                     host = m.group(1)
                     if srv0 and not host.endswith(srv0):
                         continue          # a configured server must match the registered host
