@@ -558,9 +558,14 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
             if written < XNL_MAX_INPUT:
                 bf.write(b"\n")
                 written += 1
+    # xnLinkFinder APPENDS to existing output files (dedup) unless -ow — clear the per-tag outputs and pass
+    # -ow so a re-run is DETERMINISTIC (a stale artifact from an earlier invocation can't inflate the count).
+    for _o in (out_links, out_params, out_secrets, out_wl):
+        _o.unlink(missing_ok=True)
     # -orig ("LINK [ORIGIN]") is useless in stdin mode — origin is always "<stdin>" and would CORRUPT the
-    # endpoint value — so strip it from the flags (we also defensively strip a trailing " [..]" on ingest).
-    cmd = ["xnLinkFinder", "-sp", str(roots), "-sf", str(roots),
+    # endpoint value — so strip it from the flags. (We do NOT post-strip a trailing "[..]": with -orig gone
+    # xnLinkFinder never appends one, and a strip would mangle legitimate route templates like /users/[id].)
+    cmd = ["xnLinkFinder", "-sp", str(roots), "-sf", str(roots), "-ow",
            "-o", str(out_links), "-op", str(out_params), "-all", "-mfs", "0"] + [e for e in extra if e != "-orig"]
     # -owl (wordlist permutations) + -os (secrets regex) are TIMEKILLERS on large input (a 74 MB blob hangs
     # xnLinkFinder for minutes after links are written). Request them only for SMALL input; a large dir gets
@@ -582,11 +587,11 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: input capped at {XNL_MAX_INPUT // (1024*1024)}MB (dir larger)")
 
-    # ── endpoints: strip a trailing " [origin]" that -orig/stdin can append; scope already applied ──
+    # ── endpoints: ingest as-is (scope already applied by xnLinkFinder; no -orig -> no origin suffix) ──
     n_endpoints = 0
     if out_links.exists():
         for line in out_links.read_text(errors="replace").splitlines():
-            v = re.sub(r"\s*\[[^\]]*\]\s*$", "", line.strip())    # drop " [<stdin>]" / " [origin]"
+            v = line.strip()
             if v and ctx.run.add("endpoint", {"value": v, "sources": [f"xnLinkFinder-{tag}"]}):
                 n_endpoints += 1
 
