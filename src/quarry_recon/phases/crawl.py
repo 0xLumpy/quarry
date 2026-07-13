@@ -515,6 +515,9 @@ def run(ctx) -> None:
              f"secrets: {ctx.run.count('secret')}")
 
 
+XNL_MAX_INPUT = 200 * 1024 * 1024      # cap the stdin blob so a huge dir can't blow RAM
+
+
 def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     roots = ctx.write_list("roots.txt", ctx.profile.apex_domains)
     safe_tag = tag.replace("/", "_").replace(".", "_")
@@ -522,22 +525,54 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     out_params = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_params.txt")
     out_secrets = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_secrets.json")
     out_wl = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_wordlist.txt")
-    cmd = ["xnLinkFinder", "-i", indir, "-sp", str(roots), "-sf", str(roots),
+    # xnLinkFinder v8.2: `-i <dir>` silently yields NOTHING (exit 0) and `-i <file>` is treated as a file
+    # of DOMAINS to crawl — only STDIN parses file CONTENT offline (this silently produced 0 links/params
+    # on every run). Concatenate the dir's files into a bounded blob and stream it via stdin (no -i).
+    blob = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_input.txt")
+    nbytes = 0
+    capped = False
+    with blob.open("w", encoding="utf-8", errors="replace") as bf:
+        for f in sorted(Path(indir).rglob("*")):
+            if not f.is_file():
+                continue
+            if nbytes >= XNL_MAX_INPUT:
+                capped = True
+                break
+            try:
+                data = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            bf.write(data)
+            bf.write("\n")
+            nbytes += len(data)
+    cmd = ["xnLinkFinder", "-sp", str(roots), "-sf", str(roots),
            "-o", str(out_links), "-op", str(out_params), "-os", str(out_secrets),
-           "-owl", str(out_wl), "-inc", "-all", "-mfs", "0"] + list(extra)
-    # depth>0 makes xnLinkFinder actually request found links — add UA spread, rate limit,
-    # and stop-on-block flags (author's documented recommendation for deep dir crawls).
+           "-owl", str(out_wl), "-all", "-mfs", "0"] + list(extra)
+    # depth>0 makes xnLinkFinder actually request the found links — add UA spread, rate limit, and
+    # stop-on-block flags (author's documented recommendation for deep crawls).
     if depth > 0:
         cmd += ["-d", str(depth), "-u", "desktop", "mobile", "-insecure",
                 "-s429", "-s403", "-sTO", "-sCE"]
         if ctx.profile.http_rl:
             cmd += ["-rl", str(ctx.profile.http_rl)]
-    r = exec_tool("xnLinkFinder", cmd, timeout=ctx.http_timeout)
+    r = exec_tool("xnLinkFinder", cmd, timeout=ctx.http_timeout, input_file=blob)
     ctx.run.record("crawl", r)
+    if capped:
+        events.coverage_partial("crawl.xnlinkfinder",
+                                reason=f"{tag}: input capped at {XNL_MAX_INPUT // (1024*1024)}MB (dir larger)")
+    # SUSPICIOUS-EMPTY: real input but zero links AND zero params -> likely tool/version drift, not a
+    # genuine empty. Flag it as partial coverage with the preserved input for diagnosis (v8.2 -i-dir bug).
+    got = ((out_links.stat().st_size if out_links.exists() else 0)
+           + (out_params.stat().st_size if out_params.exists() else 0))
+    if nbytes > 512 and got == 0:
+        events.coverage_partial("crawl.xnlinkfinder",
+                                reason=f"{tag}: {nbytes}B input -> 0 links/params (capability drift? "
+                                       f"input kept: {blob.name})")
     if out_params.exists():
         for line in out_params.read_text().splitlines():
-            if line.strip():
-                ctx.run.add("parameter", {"value": line.strip(), "sources": [f"xnLinkFinder-{tag}"]})
+            v = line.strip()
+            if v and v != "<stdin>":                       # drop the stdin-source noise token
+                ctx.run.add("parameter", {"value": v, "sources": [f"xnLinkFinder-{tag}"]})
     if out_links.exists():
         for line in out_links.read_text().splitlines():
             if line.strip():
