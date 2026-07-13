@@ -691,25 +691,29 @@ def run(profile_path, phases, passive, timeout):
                          "passive_only": profile.passive_only, "ports": profile.ports},
         phases_run=selected, metrics=metrics_summary)
 
-    # honest run verdict: a partial/blocked/timed_out source is a GAP, not a clean finish
-    fails = [r for r in run_obj.tool_runs() if r.status == "failed"]
-    gaps = [r for r in run_obj.tool_runs() if r.status in ("partial", "blocked", "timed_out")]
-    if fails or gaps:
-        click.echo(_c(f"\n══ complete WITH GAPS · {run_obj.dir}", "yellow"))
-    else:
+    # honest run verdict — read the ONE canonical summary (same logic the manifest stores), never recompute
+    summ = run_obj._run_summary()
+    verdict, fails, gaps, pexc = (summ["verdict"], summ["failures"], summ["gaps"], summ["phase_exceptions"])
+    if verdict == "complete":
         click.echo(_c(f"\n══ complete · {run_obj.dir}", "green"))
+    else:
+        click.echo(_c(f"\n══ complete WITH GAPS · {run_obj.dir}", "yellow"))
     click.echo(f"   HOTLIST: {run_obj.reports / 'HOTLIST.md'}")
     click.echo(f"   exports: {', '.join(f'{k}={v}' for k, v in exp.items() if v)}")
     if all_cps:
         click.echo(_c(f"   {len(all_cps)} checkpoint(s) raised — see reports/checkpoints.md", "yellow"))
     if fails:
-        shown = ", ".join(sorted({r.tool for r in fails})[:6])
+        shown = ", ".join(sorted({g['tool'] for g in fails})[:6])
         click.echo(_c(f"   ⚠ {len(fails)} tool run(s) failed ({shown}) — see manifest.json "
                       "'summary.failures'", "yellow"))
     if gaps:
-        shown = ", ".join(sorted({f"{r.tool}:{r.status}" for r in gaps})[:6])
-        click.echo(_c(f"   ⚠ {len(gaps)} source(s) partial/blocked ({shown}) — evidence preserved, "
-                      "see manifest.json 'summary.gaps'", "yellow"))
+        tools = sorted({f"{g['tool']}:{g['status']}" for g in gaps})   # DISTINCT tools (repeated ffuf origins != many sources)
+        click.echo(_c(f"   ⚠ {len(gaps)} degraded run(s) across {len(tools)} tool(s) "
+                      f"({', '.join(tools[:6])}) — evidence preserved, see manifest.json 'summary.gaps'",
+                      "yellow"))
+    if pexc:
+        click.echo(_c(f"   ⚠ {len(pexc)} phase exception(s) — see manifest.json 'summary.phase_exceptions'",
+                      "yellow"))
 
     if tel["long_poles"]["tools"]:
         lp = tel["long_poles"]["tools"][0]
@@ -723,11 +727,10 @@ def run(profile_path, phases, passive, timeout):
         n_sec = run_obj.count("secret")
         n_conf = sum(1 for f in _fnds if f.get("confirmed"))
         n_cand = len(_fnds) - n_conf
-        _verdict = "complete_with_gaps" if (fails or gaps) else "complete"
-        summary = (f"{_verdict} · live={len(run_obj.read('live'))} urls={run_obj.count('url')} "
+        summary = (f"{verdict} · live={len(run_obj.read('live'))} urls={run_obj.count('url')} "
                    f"secrets={n_sec} confirmed={n_conf} candidates={n_cand} "
                    f"gaps={len(gaps)} failed_tools={len(fails)}")
-        notify.send("complete", f"Quarry {run_obj.run_id} · {profile.target} {_verdict}", summary)
+        notify.send("complete", f"Quarry {run_obj.run_id} · {profile.target} {verdict}", summary)
         leads = n_sec + sum(1 for f in run_obj.read("finding")
                             if f.get("severity") in ("critical", "high"))
         if leads:

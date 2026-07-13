@@ -176,20 +176,32 @@ class Run:
         free-text bypasses the manifest secret choke point."""
         from . import secrets
         _DEGRADED = ("partial", "blocked", "timed_out")
+        _MISSING = ("not on path", "not installed", "not found")   # skip reason == the tool is absent
+        # a REQUIRED (non-optional) tool skipped because it is MISSING is a coverage gap; an optional /
+        # setup-disabled / passive skip is intentional and fine. (output_lines is stdout only — NOT
+        # proof of evidence; a -o tool preserves an artifact with zero stdout — hence the honest name.)
+        try:
+            from .registry import load_tools
+            _required = {t.bin for t in load_tools() if not t.optional}
+        except Exception:
+            _required = set()
         status_counts: dict[str, int] = {}
         failures = []
         gaps = []
         for r in self._tool_runs:
             status_counts[r.status] = status_counts.get(r.status, 0) + 1
+            why = r.note or r.stderr_tail or f"exit {r.exit_code}"
             if r.status == "failed":
-                failures.append({"phase": r.phase, "tool": r.tool,
-                                 "why": r.note or r.stderr_tail or f"exit {r.exit_code}"})
+                failures.append({"phase": r.phase, "tool": r.tool, "why": why})
             elif r.status in _DEGRADED:
                 gaps.append({"phase": r.phase, "tool": r.tool, "status": r.status,
-                             "why": r.note or r.stderr_tail or f"exit {r.exit_code}",
-                             "evidence_lines": r.stdout_lines})   # what it DID preserve despite degrading
+                             "why": why, "output_lines": r.stdout_lines})
+            elif (r.status == "skipped" and r.tool in _required
+                  and any(m in why.lower() for m in _MISSING)):
+                gaps.append({"phase": r.phase, "tool": r.tool, "status": "missing",
+                             "why": why, "output_lines": 0})       # required tool absent -> coverage gap
         phase_exceptions = [secrets.redact(n) for n in self.notes if "EXCEPTION" in n]
-        verdict = "complete_with_gaps" if (failures or gaps) else "complete"
+        verdict = ("complete_with_gaps" if (failures or gaps or phase_exceptions) else "complete")
         return {"verdict": verdict, "tool_status": status_counts, "tools_failed": len(failures),
                 "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions}
 
