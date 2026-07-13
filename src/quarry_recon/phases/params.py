@@ -52,7 +52,9 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     fixed: OTC = 448 hosts / 5.08M req / 7h41 @ 183rps, died at 93%). Each batch gets its own
     nuclei_timeout, so one slow batch -> coverage_partial instead of a whole-run kill. RESUME: a chunk
     is recorded done ONLY on clean completion (SUCCESS/EMPTY); a failed/timed-out/blocked batch is left
-    retryable (not marked, not appended) so a killed run genuinely continues. The state is tied to the
+    retryable so a killed run genuinely continues. Its OUTPUT is still KEPT — the aggregate is rebuilt
+    idempotently from every per-chunk artifact (findings_<ci>.jsonl), so a WAF/timeout-degraded chunk's
+    real findings are never discarded and a re-scan can't duplicate. The state is tied to the
     INPUT (hash of the ordered live list + chunk size) so a changed host set / chunk size invalidates it
     instead of skipping the wrong hosts. Emits source-level tool_start / tool_progress / tool_finish;
     returns a RunResult for the manifest."""
@@ -79,6 +81,8 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
 
     if not done:
         findings.write_text("")                           # fresh (or invalidated) run: empty accumulator
+        for _old in state_f.parent.glob("findings_*.jsonl"):
+            _old.unlink(missing_ok=True)                   # drop stale per-chunk artifacts from a prior input
     events.tool_start(sid, cmd=["nuclei", "-l", "<chunk>", "-jsonl"], input_total=len(live))
     t0 = time.monotonic()
     degraded = 0
@@ -94,19 +98,24 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
         if res.stderr_tail:
             with log.open("a", encoding="utf-8") as lf:
                 lf.write(res.stderr_tail + "\n")
+        # KEEP a chunk's findings regardless of status — they are REAL even if the chunk was WAF/timeout-
+        # degraded (the old clean-only append silently DISCARDED valid records: a WAF-degraded run lost 6
+        # findings sitting in findings_*.jsonl). Mark DONE only on a clean status; a degraded chunk stays
+        # retryable for COVERAGE. The aggregate is rebuilt from the per-chunk artifacts below, so it's
+        # idempotent — a re-scan overwrites its own findings_<ci>.jsonl and can't duplicate.
         if res.status in (Status.SUCCESS, Status.EMPTY):
-            # ONLY clean chunks are durable: append their output ONCE, then mark done. A degraded chunk
-            # is never appended (would duplicate on retry) and never marked done (stays retryable).
-            if cf.exists():
-                with findings.open("a", encoding="utf-8") as fh:
-                    fh.write(cf.read_text(encoding="utf-8", errors="replace"))
             done.add(ci)
             _save()
         else:
             degraded += 1
             events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
-            # cf left on disk for inspection; not appended, not marked done -> retried on next resume
         events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen)
+    # rebuild the aggregate IDEMPOTENTLY from every chunk artifact that produced output (clean OR degraded)
+    with findings.open("w", encoding="utf-8") as fh:
+        for ci in range(len(batches)):
+            cf = ctx.run.raw_path("params", "nuclei", f"findings_{ci}.jsonl")
+            if cf.exists() and cf.stat().st_size > 0:
+                fh.write(cf.read_text(encoding="utf-8", errors="replace"))
     status = Status.PARTIAL if degraded else Status.SUCCESS
     size = findings.stat().st_size if findings.exists() else None
     events.tool_finish(sid, status=status.value,
