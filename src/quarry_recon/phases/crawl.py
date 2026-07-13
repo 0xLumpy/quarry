@@ -517,6 +517,8 @@ def run(ctx) -> None:
 
 XNL_MAX_INPUT = 200 * 1024 * 1024      # cap the stdin blob so a huge dir can't blow RAM
 XNL_WORDLIST_LIMIT = 10 * 1024 * 1024  # -owl/-os are permutation timekillers on big input -> small only
+XNL_PARAM_CAP = 2000                   # xnLinkFinder emits POTENTIAL params (noisy) -> cap per call
+XNL_WORDLIST_DERIVE_CAP = 5000         # bounded vocabulary derived from links/params when -owl is skipped
 
 
 def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
@@ -556,12 +558,14 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
             if written < XNL_MAX_INPUT:
                 bf.write(b"\n")
                 written += 1
+    # -orig ("LINK [ORIGIN]") is useless in stdin mode — origin is always "<stdin>" and would CORRUPT the
+    # endpoint value — so strip it from the flags (we also defensively strip a trailing " [..]" on ingest).
     cmd = ["xnLinkFinder", "-sp", str(roots), "-sf", str(roots),
-           "-o", str(out_links), "-op", str(out_params), "-all", "-mfs", "0"] + list(extra)
-    # links+params are the core + fast. -owl (wordlist) builds token permutations and -os (secrets) runs
-    # regex over everything — both are TIMEKILLERS on large input (a 74 MB blob hangs xnLinkFinder for
-    # many minutes after links are already written). Request them only for SMALL inputs; a large dir gets
-    # links+params only (a coverage note records the skip).
+           "-o", str(out_links), "-op", str(out_params), "-all", "-mfs", "0"] + [e for e in extra if e != "-orig"]
+    # -owl (wordlist permutations) + -os (secrets regex) are TIMEKILLERS on large input (a 74 MB blob hangs
+    # xnLinkFinder for minutes after links are written). Request them only for SMALL input; a large dir gets
+    # links+params fast, a DERIVED wordlist (below) so A1d still has vocabulary, and -os skipped (secrets are
+    # covered by trufflehog/gitleaks/jsluice).
     small = written < XNL_WORDLIST_LIMIT
     if small:
         cmd += ["-owl", str(out_wl), "-os", str(out_secrets)]
@@ -577,18 +581,57 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     if capped:
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: input capped at {XNL_MAX_INPUT // (1024*1024)}MB (dir larger)")
-    if not small:
-        events.coverage_partial("crawl.xnlinkfinder",
-                                reason=f"{tag}: wordlist/secrets skipped ({written // (1024*1024)}MB input "
-                                       f"— permutation timekiller; links+params still extracted)")
 
-    # count ALL FOUR artifacts independently — a run that yields only a wordlist or secrets is still useful.
+    # ── endpoints: strip a trailing " [origin]" that -orig/stdin can append; scope already applied ──
+    n_endpoints = 0
+    if out_links.exists():
+        for line in out_links.read_text(errors="replace").splitlines():
+            v = re.sub(r"\s*\[[^\]]*\]\s*$", "", line.strip())    # drop " [<stdin>]" / " [origin]"
+            if v and ctx.run.add("endpoint", {"value": v, "sources": [f"xnLinkFinder-{tag}"]}):
+                n_endpoints += 1
+
+    # ── params: xnLinkFinder emits POTENTIAL params (path words / JSON keys / JS vars / input names / meta)
+    #    — NOT confirmed request params. Store as CANDIDATES (kind=potential) with a per-call CAP so a 52k
+    #    dump can't flood the inventory / downstream arjun. Drop the <stdin> noise token. ──
+    n_params_seen = n_params_added = 0
+    if out_params.exists():
+        for line in out_params.read_text(errors="replace").splitlines():
+            v = line.strip()
+            if not v or v == "<stdin>":
+                continue
+            n_params_seen += 1
+            if n_params_added < XNL_PARAM_CAP and ctx.run.add(
+                    "parameter", {"value": v, "kind": "potential", "sources": [f"xnLinkFinder-{tag}"]}):
+                n_params_added += 1
+    if n_params_seen > XNL_PARAM_CAP:
+        events.coverage_partial("crawl.xnlinkfinder",
+                                reason=f"{tag}: {n_params_seen} POTENTIAL params -> capped at {XNL_PARAM_CAP} "
+                                       f"candidates (path words/JSON keys/JS vars — not all request params)")
+
+    # ── A1d vocabulary: if -owl was skipped (large), DERIVE a bounded target wordlist from the mined
+    #    links+params (path segments + param names are exactly the useful brute words) so A1d isn't starved;
+    #    record the -owl/-os skip. ──
+    if not small:
+        words = set()
+        for p in (out_links, out_params):
+            if not (p.exists() and len(words) < XNL_WORDLIST_DERIVE_CAP):
+                continue
+            for ln in p.read_text(errors="replace").splitlines():
+                for w in re.split(r"[^A-Za-z0-9]+", ln.lower()):
+                    if 3 <= len(w) <= 30 and not w.isdigit():
+                        words.add(w)
+                if len(words) >= XNL_WORDLIST_DERIVE_CAP:
+                    break
+        out_wl.write_text("\n".join(sorted(words)[:XNL_WORDLIST_DERIVE_CAP]) + "\n")
+        events.coverage_partial("crawl.xnlinkfinder",
+                                reason=f"{tag}: -owl skipped ({written // (1024*1024)}MB input, timekiller) — "
+                                       f"wordlist DERIVED from links/params ({len(words)}); -os skipped "
+                                       f"(secrets covered by trufflehog/gitleaks/jsluice)")
+
+    # ── ledger over all four artifacts + suspicious-empty (real input, none produced) ──
     def _lines(p):
         return len([ln for ln in p.read_text(errors="replace").splitlines() if ln.strip()]) if p.exists() else 0
-    n_links, n_words = _lines(out_links), _lines(out_wl)
-    # params exclude the <stdin> source-noise token, so the ledger count matches what actually gets ingested
-    n_params = (len([ln for ln in out_params.read_text(errors="replace").splitlines()
-                     if ln.strip() and ln.strip() != "<stdin>"]) if out_params.exists() else 0)
+    n_words = _lines(out_wl)
     n_secrets = 0
     if out_secrets.exists():
         try:
@@ -597,19 +640,9 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
         except Exception:
             n_secrets = 0
     events.ledger("crawl.xnlinkfinder",
-                  produced={"links": n_links, "params": n_params, "wordlist": n_words, "secrets": n_secrets})
-    # SUSPICIOUS-EMPTY: real input but NONE of the four artifacts produced -> likely tool/version drift
-    # (v8.2 -i-dir bug), not a genuine empty. Flag partial coverage, keep the input for diagnosis.
-    if written > 512 and not (n_links or n_params or n_words or n_secrets):
+                  produced={"endpoints": n_endpoints, "potential_params": n_params_seen,
+                            "params_kept": n_params_added, "wordlist": n_words, "secrets": n_secrets})
+    if written > 512 and not (n_endpoints or n_params_seen or n_words or n_secrets):
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: {written}B input -> 0 links/params/words/secrets "
                                        f"(capability drift? input kept: {blob.name})")
-    if out_params.exists():
-        for line in out_params.read_text().splitlines():
-            v = line.strip()
-            if v and v != "<stdin>":                       # drop the stdin-source noise token
-                ctx.run.add("parameter", {"value": v, "sources": [f"xnLinkFinder-{tag}"]})
-    if out_links.exists():
-        for line in out_links.read_text().splitlines():
-            if line.strip():
-                ctx.run.add("endpoint", {"value": line.strip(), "sources": [f"xnLinkFinder-{tag}"]})
