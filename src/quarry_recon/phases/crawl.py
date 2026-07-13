@@ -528,23 +528,33 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     # xnLinkFinder v8.2: `-i <dir>` silently yields NOTHING (exit 0) and `-i <file>` is treated as a file
     # of DOMAINS to crawl — only STDIN parses file CONTENT offline (this silently produced 0 links/params
     # on every run). Concatenate the dir's files into a bounded blob and stream it via stdin (no -i).
+    # Build the stdin blob with BYTE-ACCURATE bounding: chunked binary copy that stops EXACTLY at the cap
+    # (a single 600 MB file can't blow it), and `capped` is set whenever any bytes/files were omitted.
     blob = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_input.txt")
-    nbytes = 0
+    written = 0
     capped = False
-    with blob.open("w", encoding="utf-8", errors="replace") as bf:
-        for f in sorted(Path(indir).rglob("*")):
-            if not f.is_file():
-                continue
-            if nbytes >= XNL_MAX_INPUT:
-                capped = True
+    files = [f for f in sorted(Path(indir).rglob("*")) if f.is_file()]
+    with blob.open("wb") as bf:
+        for i, f in enumerate(files):
+            if written >= XNL_MAX_INPUT:
+                capped = True                            # remaining files omitted
                 break
             try:
-                data = f.read_text(encoding="utf-8", errors="replace")
+                with f.open("rb") as src:
+                    while written < XNL_MAX_INPUT:
+                        chunk = src.read(min(1 << 20, XNL_MAX_INPUT - written))
+                        if not chunk:
+                            break
+                        bf.write(chunk)
+                        written += len(chunk)
+                    else:
+                        if src.read(1):                  # hit the cap mid-file -> more remained
+                            capped = True
             except Exception:
                 continue
-            bf.write(data)
-            bf.write("\n")
-            nbytes += len(data)
+            if written < XNL_MAX_INPUT:
+                bf.write(b"\n")
+                written += 1
     cmd = ["xnLinkFinder", "-sp", str(roots), "-sf", str(roots),
            "-o", str(out_links), "-op", str(out_params), "-os", str(out_secrets),
            "-owl", str(out_wl), "-all", "-mfs", "0"] + list(extra)
@@ -560,14 +570,29 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     if capped:
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: input capped at {XNL_MAX_INPUT // (1024*1024)}MB (dir larger)")
-    # SUSPICIOUS-EMPTY: real input but zero links AND zero params -> likely tool/version drift, not a
-    # genuine empty. Flag it as partial coverage with the preserved input for diagnosis (v8.2 -i-dir bug).
-    got = ((out_links.stat().st_size if out_links.exists() else 0)
-           + (out_params.stat().st_size if out_params.exists() else 0))
-    if nbytes > 512 and got == 0:
+
+    # count ALL FOUR artifacts independently — a run that yields only a wordlist or secrets is still useful.
+    def _lines(p):
+        return len([ln for ln in p.read_text(errors="replace").splitlines() if ln.strip()]) if p.exists() else 0
+    n_links, n_words = _lines(out_links), _lines(out_wl)
+    # params exclude the <stdin> source-noise token, so the ledger count matches what actually gets ingested
+    n_params = (len([ln for ln in out_params.read_text(errors="replace").splitlines()
+                     if ln.strip() and ln.strip() != "<stdin>"]) if out_params.exists() else 0)
+    n_secrets = 0
+    if out_secrets.exists():
+        try:
+            sd = json.loads(out_secrets.read_text() or "[]")
+            n_secrets = len(sd) if isinstance(sd, (list, dict)) else 0
+        except Exception:
+            n_secrets = 0
+    events.ledger("crawl.xnlinkfinder",
+                  produced={"links": n_links, "params": n_params, "wordlist": n_words, "secrets": n_secrets})
+    # SUSPICIOUS-EMPTY: real input but NONE of the four artifacts produced -> likely tool/version drift
+    # (v8.2 -i-dir bug), not a genuine empty. Flag partial coverage, keep the input for diagnosis.
+    if written > 512 and not (n_links or n_params or n_words or n_secrets):
         events.coverage_partial("crawl.xnlinkfinder",
-                                reason=f"{tag}: {nbytes}B input -> 0 links/params (capability drift? "
-                                       f"input kept: {blob.name})")
+                                reason=f"{tag}: {written}B input -> 0 links/params/words/secrets "
+                                       f"(capability drift? input kept: {blob.name})")
     if out_params.exists():
         for line in out_params.read_text().splitlines():
             v = line.strip()

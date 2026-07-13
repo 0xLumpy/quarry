@@ -266,7 +266,8 @@ def run(
 ) -> RunResult:
     """Run `cmd`, capture everything, persist raw stdout to `raw_path`, classify.
 
-    `input_file`, if given, is streamed to the tool's stdin (used by jsluice/gf/etc).
+    `input_file`, if given, is read into a BOUNDED string and fed to the tool's stdin over a pipe (see
+    the stdin note below — fd-streaming breaks xnLinkFinder; callers cap the file size).
     `ok_codes` lists exit codes that are NOT failures — e.g. gitleaks exits 1 when it
     *finds* leaks, which is success, not error.
     """
@@ -275,17 +276,17 @@ def run(
         return RunResult(tool, cmd, Status.SKIPPED, None, 0.0, None, 0,
                          note=f"{bin_name} not on PATH")
 
-    stdin_src = None
-    if input_file is not None:
-        stdin_data = Path(input_file).read_text(errors="replace")
-    if stdin_data is not None:
-        stdin_src = subprocess.PIPE
+    # stdin source: input_file or stdin_data is fed over a PIPE via communicate(); otherwise /dev/null.
+    # input_file is read into a string here — deliberately, not fd-streamed: a raw file-fd stdin and a
+    # chunked writer-thread BOTH break xnLinkFinder (it probes stdin readiness once and needs the pipe
+    # primed/complete, so it races an incremental feeder and ignores a regular-file fd). The string is
+    # BOUNDED by the caller (gf corpus is tiny; xnLinkFinder caps its blob at XNL_MAX_INPUT), so the load
+    # is capped. ProjectDiscovery tools block on an inherited empty stdin, hence DEVNULL when nothing fed.
+    if input_file is not None and stdin_data is None:
+        stdin_data = Path(input_file).read_text(encoding="utf-8", errors="replace")
+    stdin_kw = {"stdin": subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL}
 
     start = time.monotonic()
-    # When we are NOT feeding stdin, hand the tool /dev/null. ProjectDiscovery tools
-    # (dnsx/httpx/naabu/katana...) read stdin when it is a non-TTY pipe; an inherited
-    # open-but-empty stdin makes them block until EOF (manifests as a full timeout).
-    stdin_kw = {"stdin": subprocess.DEVNULL if stdin_data is None else subprocess.PIPE}
     # Popen (not subprocess.run) so we hold the pid + can SAMPLE the process tree's RSS during the
     # run (a daemon thread polling /proc). CPU comes from a getrusage(CHILDREN) delta — tools run
     # sequentially, so the delta cleanly attributes child CPU to THIS tool. communicate(input=,
