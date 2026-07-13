@@ -691,16 +691,25 @@ def run(profile_path, phases, passive, timeout):
                          "passive_only": profile.passive_only, "ports": profile.ports},
         phases_run=selected, metrics=metrics_summary)
 
-    click.echo(_c(f"\n══ done · {run_obj.dir}", "green"))
+    # honest run verdict: a partial/blocked/timed_out source is a GAP, not a clean finish
+    fails = [r for r in run_obj.tool_runs() if r.status == "failed"]
+    gaps = [r for r in run_obj.tool_runs() if r.status in ("partial", "blocked", "timed_out")]
+    if fails or gaps:
+        click.echo(_c(f"\n══ complete WITH GAPS · {run_obj.dir}", "yellow"))
+    else:
+        click.echo(_c(f"\n══ complete · {run_obj.dir}", "green"))
     click.echo(f"   HOTLIST: {run_obj.reports / 'HOTLIST.md'}")
     click.echo(f"   exports: {', '.join(f'{k}={v}' for k, v in exp.items() if v)}")
     if all_cps:
         click.echo(_c(f"   {len(all_cps)} checkpoint(s) raised — see reports/checkpoints.md", "yellow"))
-    fails = [r for r in run_obj.tool_runs() if r.status == "failed"]
     if fails:
         shown = ", ".join(sorted({r.tool for r in fails})[:6])
         click.echo(_c(f"   ⚠ {len(fails)} tool run(s) failed ({shown}) — see manifest.json "
                       "'summary.failures'", "yellow"))
+    if gaps:
+        shown = ", ".join(sorted({f"{r.tool}:{r.status}" for r in gaps})[:6])
+        click.echo(_c(f"   ⚠ {len(gaps)} source(s) partial/blocked ({shown}) — evidence preserved, "
+                      "see manifest.json 'summary.gaps'", "yellow"))
 
     if tel["long_poles"]["tools"]:
         lp = tel["long_poles"]["tools"][0]
@@ -710,10 +719,15 @@ def run(profile_path, phases, passive, timeout):
     # opt-in notifications (no-op unless configured in secrets.yaml notify:)
     from . import notify
     if notify.configured():
-        n_sec, n_fnd = run_obj.count("secret"), run_obj.count("finding")
-        summary = (f"live={len(run_obj.read('live'))} urls={run_obj.count('url')} "
-                   f"secrets={n_sec} findings={n_fnd} failed_tools={len(fails)}")
-        notify.send("complete", f"Quarry {run_obj.run_id} · {profile.target} done", summary)
+        _fnds = run_obj.read("finding")
+        n_sec = run_obj.count("secret")
+        n_conf = sum(1 for f in _fnds if f.get("confirmed"))
+        n_cand = len(_fnds) - n_conf
+        _verdict = "complete_with_gaps" if (fails or gaps) else "complete"
+        summary = (f"{_verdict} · live={len(run_obj.read('live'))} urls={run_obj.count('url')} "
+                   f"secrets={n_sec} confirmed={n_conf} candidates={n_cand} "
+                   f"gaps={len(gaps)} failed_tools={len(fails)}")
+        notify.send("complete", f"Quarry {run_obj.run_id} · {profile.target} {_verdict}", summary)
         leads = n_sec + sum(1 for f in run_obj.read("finding")
                             if f.get("severity") in ("critical", "high"))
         if leads:

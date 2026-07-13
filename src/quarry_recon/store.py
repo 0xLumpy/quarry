@@ -167,21 +167,31 @@ class Run:
 
     # ── manifest ──
     def _run_summary(self) -> dict:
-        """Per-run reliability rollup for the manifest: tool status counts + the 'what failed'
-        list (phase/tool/why) + phase-level exceptions pulled from notes. Cheap, read-only.
-        `note`/`stderr_tail` were already redacted by record(); phase_exceptions are redacted here
-        so no free-text bypasses the manifest secret choke point."""
+        """Per-run reliability rollup for the manifest: tool status counts + the 'what failed' list + a
+        run VERDICT and a GAPS list. A degraded run must NEVER read as a clean success — `tools_failed`
+        only counts hard FAILED, so partial/blocked/timed_out sources were invisible in the headline.
+        `gaps` names every such source with its preserved-evidence line count (a blocked chunk still kept
+        real output), and `verdict` is `complete_with_gaps` whenever any source failed OR degraded.
+        `note`/`stderr_tail` were already redacted by record(); phase_exceptions are redacted here so no
+        free-text bypasses the manifest secret choke point."""
         from . import secrets
+        _DEGRADED = ("partial", "blocked", "timed_out")
         status_counts: dict[str, int] = {}
         failures = []
+        gaps = []
         for r in self._tool_runs:
             status_counts[r.status] = status_counts.get(r.status, 0) + 1
             if r.status == "failed":
                 failures.append({"phase": r.phase, "tool": r.tool,
                                  "why": r.note or r.stderr_tail or f"exit {r.exit_code}"})
+            elif r.status in _DEGRADED:
+                gaps.append({"phase": r.phase, "tool": r.tool, "status": r.status,
+                             "why": r.note or r.stderr_tail or f"exit {r.exit_code}",
+                             "evidence_lines": r.stdout_lines})   # what it DID preserve despite degrading
         phase_exceptions = [secrets.redact(n) for n in self.notes if "EXCEPTION" in n]
-        return {"tool_status": status_counts, "tools_failed": len(failures),
-                "failures": failures, "phase_exceptions": phase_exceptions}
+        verdict = "complete_with_gaps" if (failures or gaps) else "complete"
+        return {"verdict": verdict, "tool_status": status_counts, "tools_failed": len(failures),
+                "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions}
 
     def write_manifest(self, profile_summary: dict, phases_run: list[str],
                        metrics: dict | None = None) -> None:

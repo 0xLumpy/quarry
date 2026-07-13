@@ -213,7 +213,11 @@ def build(run, scope) -> str:
     if findings:
         sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
         findings.sort(key=lambda f: sev_rank.get(f.get("severity", "unknown"), 5))
-        A(f"## Scanner candidates ({len(findings)}) — UNCONFIRMED, manual validation required")
+        _conf = sum(1 for f in findings if f.get("confirmed"))
+        _hdr = (f"## Scanner findings — {_conf} confirmed · {len(findings) - _conf} candidate (UNCONFIRMED, "
+                f"manual validation required)" if _conf else
+                f"## Scanner candidates ({len(findings)}) — UNCONFIRMED, manual validation required")
+        A(_hdr)
         for f in findings[:30]:
             A(f"- [{f.get('severity')}] {f.get('template')} @ {f.get('matched')}  (src: {','.join(f.get('sources', []))})")
         A("")
@@ -502,9 +506,14 @@ def collect(run, scope) -> dict:
     clusters = [{"key": apex, "type": "apex", "members": sorted(m), "signal_strength": "medium"}
                 for apex, m in sorted(by_apex.items())]
 
+    # findings are scanner output: split confirmed vs candidate so a bare "findings" number never presents
+    # UNCONFIRMED scanner candidates (all confirmed:false today) as if they were confirmed findings.
+    _confirmed = sum(1 for f in findings if f.get("confirmed"))
     inventory = {"subdomains": run.count("subdomain"), "resolved": run.count("resolved"),
                  "live": len(live), "urls": len(url_rows), "secrets": len(secrets_e),
-                 "findings": len(findings),
+                 "confirmed_findings": _confirmed,
+                 "scanner_candidates": len(findings) - _confirmed,
+                 "findings_total": len(findings),
                  "takeover_candidates": sum(1 for r in reviews
                      if r.get("klass") == "cname" and r.get("takeover_candidate"))}
     return {"inventory": inventory, "clusters": clusters, "queues": queues}
