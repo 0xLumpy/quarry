@@ -598,16 +598,15 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     # ── params: xnLinkFinder emits POTENTIAL params (path words / JSON keys / JS vars / input names / meta)
     #    — NOT confirmed request params. Store as CANDIDATES (kind=potential) with a per-call CAP so a 52k
     #    dump can't flood the inventory / downstream arjun. Drop the <stdin> noise token. ──
-    n_params_seen = n_params_added = 0
-    if out_params.exists():
-        for line in out_params.read_text(errors="replace").splitlines():
-            v = line.strip()
-            if not v or v == "<stdin>":
-                continue
-            n_params_seen += 1
-            if n_params_added < XNL_PARAM_CAP and ctx.run.add(
-                    "parameter", {"value": v, "kind": "potential", "sources": [f"xnLinkFinder-{tag}"]}):
-                n_params_added += 1
+    n_params_added = 0
+    cand = sorted({ln.strip() for ln in out_params.read_text(errors="replace").splitlines()
+                   if ln.strip() and ln.strip() != "<stdin>"}) if out_params.exists() else []
+    n_params_seen = len(cand)
+    # cap a DETERMINISTIC subset: sort first, then keep the first N — so a re-run keeps the SAME candidates
+    # (xnLinkFinder's -op file order is set-derived / unstable; capping the raw order was non-idempotent).
+    for v in cand[:XNL_PARAM_CAP]:
+        if ctx.run.add("parameter", {"value": v, "kind": "potential", "sources": [f"xnLinkFinder-{tag}"]}):
+            n_params_added += 1
     if n_params_seen > XNL_PARAM_CAP:
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: {n_params_seen} POTENTIAL params -> capped at {XNL_PARAM_CAP} "
