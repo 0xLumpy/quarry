@@ -707,10 +707,11 @@ def run(profile_path, phases, passive, timeout):
         click.echo(_c(f"   ⚠ {len(fails)} tool run(s) failed ({shown}) — see manifest.json "
                       "'summary.failures'", "yellow"))
     if gaps:
-        tools = sorted({f"{g['tool']}:{g['status']}" for g in gaps})   # DISTINCT tools (repeated ffuf origins != many sources)
-        click.echo(_c(f"   ⚠ {len(gaps)} degraded run(s) across {len(tools)} tool(s) "
-                      f"({', '.join(tools[:6])}) — evidence preserved, see manifest.json 'summary.gaps'",
-                      "yellow"))
+        tool_names = sorted({g['tool'] for g in gaps})                 # DISTINCT tools (a tool with both a
+        detail = sorted({f"{g['tool']}:{g['status']}" for g in gaps})  # partial and blocked run counts once)
+        click.echo(_c(f"   ⚠ {len(gaps)} degraded run(s) across {len(tool_names)} tool(s) "
+                      f"({', '.join(detail[:6])}) — coverage incomplete; preserved output remains "
+                      "available where present, see manifest.json 'summary.gaps'", "yellow"))
     if pexc:
         click.echo(_c(f"   ⚠ {len(pexc)} phase exception(s) — see manifest.json 'summary.phase_exceptions'",
                       "yellow"))
@@ -729,7 +730,7 @@ def run(profile_path, phases, passive, timeout):
         n_cand = len(_fnds) - n_conf
         summary = (f"{verdict} · live={len(run_obj.read('live'))} urls={run_obj.count('url')} "
                    f"secrets={n_sec} confirmed={n_conf} candidates={n_cand} "
-                   f"gaps={len(gaps)} failed_tools={len(fails)}")
+                   f"gaps={len(gaps)} phase_exceptions={len(pexc)} failed_tools={len(fails)}")
         notify.send("complete", f"Quarry {run_obj.run_id} · {profile.target} {verdict}", summary)
         leads = n_sec + sum(1 for f in run_obj.read("finding")
                             if f.get("severity") in ("critical", "high"))

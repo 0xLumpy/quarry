@@ -170,8 +170,9 @@ class Run:
         """Per-run reliability rollup for the manifest: tool status counts + the 'what failed' list + a
         run VERDICT and a GAPS list. A degraded run must NEVER read as a clean success — `tools_failed`
         only counts hard FAILED, so partial/blocked/timed_out sources were invisible in the headline.
-        `gaps` names every such source with its preserved-evidence line count (a blocked chunk still kept
-        real output), and `verdict` is `complete_with_gaps` whenever any source failed OR degraded.
+        `gaps` names every such source with its `output_lines` (stdout line count — NOT proof of evidence;
+        a -o tool preserves an artifact with zero stdout), and `verdict` is `complete_with_gaps` whenever
+        any source failed OR degraded OR a phase raised OR a required tool was missing.
         `note`/`stderr_tail` were already redacted by record(); phase_exceptions are redacted here so no
         free-text bypasses the manifest secret choke point."""
         from . import secrets
