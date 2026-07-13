@@ -575,3 +575,22 @@ def run(ctx) -> None:
         sm = ctx.run.raw_path("probe", "smap", "smap.txt")
         r = exec_tool("smap", ["smap", "-iL", str(sm_in)], raw_path=sm, timeout=600)
         ctx.run.record("probe", r)
+        # smap emits nmap-style text; parse open ports into `port` entities — it was recorded raw ONLY
+        # (505 lines, 0 entities on the OTC run). Block: "Nmap scan report for <host> (<ip>)" then
+        # "<n>/tcp open <service>". Passive (Shodan-backed), so no packets to the target.
+        if r.raw_path and r.raw_path.exists():
+            host = ip = None
+            smn = 0
+            for line in r.raw_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                hm = _re.match(r"Nmap scan report for (\S+)(?:\s+\(([\d.]+)\))?", line)
+                if hm:
+                    host, ip = hm.group(1), (hm.group(2) or hm.group(1))
+                    continue
+                pm = _re.match(r"(\d+)/tcp\s+open\s+(\S+)?", line)
+                if pm and ip and host and ctx.scope.in_scope(host) and not ctx.scope.is_oos(host):
+                    if ctx.run.add("port", {"id": f"{ip}:{pm.group(1)}", "host": host,
+                                            "port": int(pm.group(1)), "service": pm.group(2) or "",
+                                            "sources": ["smap"], "raw_ref": str(sm)}):
+                        smn += 1
+            if smn:
+                ctx.echo(f"  smap: +{smn} passive port(s) (Shodan-backed, no packets to target)")

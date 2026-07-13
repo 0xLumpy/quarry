@@ -364,8 +364,10 @@ def run(ctx) -> None:
         r = exec_tool("shosubgo", ["shosubgo", "-f", str(roots_file),
                                    "-s", sho_key, "-o", str(sho)], timeout=ctx.http_timeout)
         ctx.run.record("vertical", r)
-        if r.raw_path:
-            for e in normalize.hosts(r.raw_path.read_text(), "shosubgo", str(sho)):
+        # shosubgo writes its results to the -o FILE, not stdout — so r.raw_path (stdout capture) is None
+        # and the names were being silently dropped (392 lost on the OTC run). Read the -o file directly.
+        if sho.exists():
+            for e in normalize.hosts(sho.read_text(encoding="utf-8", errors="replace"), "shosubgo", str(sho)):
                 if scope.in_scope(e["host"]):
                     ctx.run.add("subdomain", e)
 
