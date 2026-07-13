@@ -331,6 +331,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     on clean completion (failed batch stays retryable), source-level tool_start/tool_progress/tool_finish
     + ledger. dalfox proves the reflection PRIMITIVE only -> finding klass xss-candidate, confirmed:false
     (the map-don't-exploit boundary holds). Findings go straight to the store (deduped by id)."""
+    from urllib.parse import urlsplit, parse_qsl
     sid = "params.dalfox_xss_fast"
     chunk_n = max(1, settings.concurrency("DALFOX_CHUNK", 40))
     batches = [cands[i:i + chunk_n] for i in range(0, len(cands), chunk_n)]
@@ -369,15 +370,24 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             for line in cf.read_text(encoding="utf-8", errors="replace").splitlines():
                 if line.strip().startswith("[POC]") or "PoC" in line:
                     s = line.strip()
-                    # reflection primitive = CANDIDATE, not impact (attack layer proves impact). id hashes
-                    # the FULL line (was the first 80 chars, which collapsed distinct POCs sharing a long
-                    # URL prefix — 30 real POCs collapsed to 2 on the OTC run).
+                    # reflection = a CANDIDATE, not impact (attack layer proves impact) — and the UNIT is
+                    # the SINK, not the payload. dalfox emits one POC per payload variant; canonicalize to
+                    # (host, non-empty query-param names) so N payloads on one route collapse to ONE
+                    # xss-candidate (raw chunk file keeps every variant as evidence). Neither the old
+                    # first-80-chars (collapsed distinct sinks) nor a full-line hash (one finding per
+                    # payload — 30 variants of one sink) is honest.
+                    url = s.split("] ", 1)[-1].split(" ", 1)[0] if "] " in s else s
+                    try:
+                        u = urlsplit(url)
+                        names = ",".join(sorted({k for k, _ in parse_qsl(u.query, keep_blank_values=True) if k}))
+                        sink = f"{u.hostname or url}|{names}"
+                    except Exception:
+                        sink = s
                     if ctx.run.add("finding", {
-                            "id": f"dalfox:{hashlib.sha256(s.encode('utf-8', 'replace')).hexdigest()[:16]}",
-                            "template": "xss-candidate",
+                            "id": f"xss-candidate:{sink}", "template": "xss-candidate",
                             "name": "reflected parameter — XSS candidate (manual validation required)",
-                            "severity": "medium", "matched": s,
-                            "sources": ["dalfox"], "confirmed": False}):
+                            "severity": "medium", "matched": s, "confidence": "candidate",
+                            "sources": ["dalfox"], "confirmed": False, "raw_ref": str(cf)}):
                         produced += 1
         if res.status in (Status.SUCCESS, Status.EMPTY):
             done.add(ci)
