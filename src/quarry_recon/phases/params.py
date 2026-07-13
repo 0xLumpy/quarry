@@ -362,17 +362,24 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         cf = ctx.run.raw_path("params", "dalfox", f"dalfox_xss_{ci}.txt")
         res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof),
                         timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
+        # KEEP a chunk's POCs regardless of status — a WAF/timeout-DEGRADED chunk still found real
+        # reflections (the OTC run discarded 30 POC lines this way). Findings go straight to the store,
+        # deduped on id, so re-scanning a degraded chunk on resume can't duplicate.
+        if cf.exists():
+            for line in cf.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.strip().startswith("[POC]") or "PoC" in line:
+                    s = line.strip()
+                    # reflection primitive = CANDIDATE, not impact (attack layer proves impact). id hashes
+                    # the FULL line (was the first 80 chars, which collapsed distinct POCs sharing a long
+                    # URL prefix — 30 real POCs collapsed to 2 on the OTC run).
+                    if ctx.run.add("finding", {
+                            "id": f"dalfox:{hashlib.sha256(s.encode('utf-8', 'replace')).hexdigest()[:16]}",
+                            "template": "xss-candidate",
+                            "name": "reflected parameter — XSS candidate (manual validation required)",
+                            "severity": "medium", "matched": s,
+                            "sources": ["dalfox"], "confirmed": False}):
+                        produced += 1
         if res.status in (Status.SUCCESS, Status.EMPTY):
-            if cf.exists():
-                for line in cf.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if line.strip().startswith("[POC]") or "PoC" in line:
-                        # reflection primitive = CANDIDATE, not impact (attack layer proves impact)
-                        if ctx.run.add("finding", {
-                                "id": f"dalfox:{line[:80]}", "template": "xss-candidate",
-                                "name": "reflected parameter — XSS candidate (manual validation required)",
-                                "severity": "medium", "matched": line.strip(),
-                                "sources": ["dalfox"], "confirmed": False}):
-                            produced += 1
             done.add(ci)
             _save()
         else:
