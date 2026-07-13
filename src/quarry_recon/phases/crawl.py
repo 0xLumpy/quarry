@@ -516,6 +516,7 @@ def run(ctx) -> None:
 
 
 XNL_MAX_INPUT = 200 * 1024 * 1024      # cap the stdin blob so a huge dir can't blow RAM
+XNL_WORDLIST_LIMIT = 10 * 1024 * 1024  # -owl/-os are permutation timekillers on big input -> small only
 
 
 def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
@@ -556,8 +557,14 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
                 bf.write(b"\n")
                 written += 1
     cmd = ["xnLinkFinder", "-sp", str(roots), "-sf", str(roots),
-           "-o", str(out_links), "-op", str(out_params), "-os", str(out_secrets),
-           "-owl", str(out_wl), "-all", "-mfs", "0"] + list(extra)
+           "-o", str(out_links), "-op", str(out_params), "-all", "-mfs", "0"] + list(extra)
+    # links+params are the core + fast. -owl (wordlist) builds token permutations and -os (secrets) runs
+    # regex over everything — both are TIMEKILLERS on large input (a 74 MB blob hangs xnLinkFinder for
+    # many minutes after links are already written). Request them only for SMALL inputs; a large dir gets
+    # links+params only (a coverage note records the skip).
+    small = written < XNL_WORDLIST_LIMIT
+    if small:
+        cmd += ["-owl", str(out_wl), "-os", str(out_secrets)]
     # depth>0 makes xnLinkFinder actually request the found links — add UA spread, rate limit, and
     # stop-on-block flags (author's documented recommendation for deep crawls).
     if depth > 0:
@@ -570,6 +577,10 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     if capped:
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: input capped at {XNL_MAX_INPUT // (1024*1024)}MB (dir larger)")
+    if not small:
+        events.coverage_partial("crawl.xnlinkfinder",
+                                reason=f"{tag}: wordlist/secrets skipped ({written // (1024*1024)}MB input "
+                                       f"— permutation timekiller; links+params still extracted)")
 
     # count ALL FOUR artifacts independently — a run that yields only a wordlist or secrets is still useful.
     def _lines(p):
