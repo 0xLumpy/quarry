@@ -13,7 +13,7 @@ import re as _re
 import urllib.parse
 import urllib.request
 
-from .. import normalize, secrets, settings
+from .. import events, normalize, secrets, settings
 from ..runner import (Status, have, nuclei_timeout, reclassify_from_files, run as exec_tool,
                       scaled_timeout, skipped)
 
@@ -156,7 +156,12 @@ def _vhost_enum(ctx) -> None:
         key = str((l.get("a") or [None])[0] or host)   # origin identity (IP preferred, else host)
         if key not in best or score > best[key][0]:
             best[key] = (score, m.group(1))
-    origins = {k: v[1] for k, v in list(best.items())[:25]}
+    VHOST_CAP = 25
+    origins = {k: v[1] for k, v in list(best.items())[:VHOST_CAP]}
+    _n_best = len(best)         # emit every run (omitted=0 clears a prior cap gap on rerun)
+    events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_CAP, measure="origins",
+                            eligible=_n_best, tested=min(_n_best, VHOST_CAP), omitted=max(0, _n_best - VHOST_CAP),
+                            reason=f"vhost origins {min(_n_best, VHOST_CAP)}/{_n_best} non-CDN (cap {VHOST_CAP})")
     if not origins:
         ctx.run.record("probe", skipped("ffuf-vhost", "no non-CDN origin live hosts to fuzz"))
         return

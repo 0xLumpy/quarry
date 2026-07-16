@@ -79,9 +79,11 @@ def plan_lines() -> list[str]:
 
 
 # event-only states (no terminal status carried) → a human state for the status surface.
+# NB: coverage_partial / coverage_reset are NOT here — coverage is telemetry, not lifecycle, so it must
+# never set a source's status (a fully-covered omitted=0 observation would else read as "partial"). The
+# coverage TRUTH lives in the manifest summary.coverage / verdict, not the status surface.
 _HUMAN = {"tool_start": "running", "tool_progress": "running",
-          "tool_blocked": "blocked", "coverage_partial": "partial",
-          "artifact_written": "running", "tool_finish": "done"}
+          "tool_blocked": "blocked", "artifact_written": "running", "tool_finish": "done"}
 
 
 def _fold_events(path: Path) -> dict:
@@ -101,6 +103,8 @@ def _fold_events(path: Path) -> dict:
         sid = e.get("source_id")
         if not sid:
             continue
+        if e.get("event") in ("coverage_partial", "coverage_reset"):
+            continue                       # coverage is telemetry, not lifecycle — never overrides tool status
         st = state.setdefault(sid, {})
         st["last_event"] = e.get("event", st.get("last_event"))
         if e.get("ts") is not None:

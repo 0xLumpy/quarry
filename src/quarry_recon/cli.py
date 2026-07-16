@@ -696,6 +696,8 @@ def run(profile_path, phases, passive, timeout):
     verdict, fails, gaps, pexc = (summ["verdict"], summ["failures"], summ["gaps"], summ["phase_exceptions"])
     if verdict == "complete":
         click.echo(_c(f"\n══ complete · {run_obj.dir}", "green"))
+    elif verdict == "complete_with_limits":
+        click.echo(_c(f"\n══ complete WITH LIMITS · {run_obj.dir}", "cyan"))    # operator-chosen samples only
     else:
         click.echo(_c(f"\n══ complete WITH GAPS · {run_obj.dir}", "yellow"))
     click.echo(f"   HOTLIST: {run_obj.reports / 'HOTLIST.md'}")
@@ -715,6 +717,16 @@ def run(profile_path, phases, passive, timeout):
     if pexc:
         click.echo(_c(f"   ⚠ {len(pexc)} phase exception(s) — see manifest.json 'summary.phase_exceptions'",
                       "yellow"))
+    cov = [c for c in (summ.get("coverage") or []) if c["omitted"] > 0 or not c["valid"]]
+    if cov:   # only sources that actually omitted input (or reported inconsistent counters)
+        def _lbl(c):
+            name = f"{c['source_id']}.{c['measure']}"          # e.g. crawl.xnlinkfinder.files vs .potential_params
+            if not c["valid"]:
+                return f"{name} UNKNOWN"
+            kinds = "/".join(sorted(k for k, v in c["by_kind"].items() if v["omitted"] > 0)) or "cap"
+            return f"{name} {c['tested']}/{c['eligible']} (−{c['omitted']} {kinds})"
+        parts = [_lbl(c) for c in sorted(cov, key=lambda c: -c["omitted"])]
+        click.echo(_c(f"   ▤ coverage: {', '.join(parts[:6])} — see manifest.json 'summary.coverage'", "cyan"))
 
     if tel["long_poles"]["tools"]:
         lp = tel["long_poles"]["tools"][0]

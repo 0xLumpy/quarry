@@ -13,7 +13,7 @@ import shutil
 import urllib.request
 from pathlib import Path
 
-from .. import normalize, secrets, settings
+from .. import events, normalize, secrets, settings
 from ..runner import Status, have, run as exec_tool, skipped
 
 
@@ -197,13 +197,20 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
     import json as _json
     import uuid as _uuid
     scope = ctx.scope
-    zones = sorted(z for z in zones if scope.in_scope(z) and not scope.is_oos(z))[:5]
+    ZONE_CAP = 5
+    _zones_all = sorted(z for z in zones if scope.in_scope(z) and not scope.is_oos(z))
+    zones = _zones_all[:ZONE_CAP]
     if not zones or scope.passive_only or not have("httpx"):
-        return set()
+        return set()                               # passive/no-httpx: no active pass -> no coverage counter
     from .probe import _vhost_wordlist          # small label list (lives in probe); DNS list is fallback
     wl = _vhost_wordlist() or _wordlist(ctx)
     if wl is None:
-        return set()
+        return set()                               # no wordlist -> zero zones actually attempted; no counter
+    # emit AFTER prereqs (httpx + wordlist confirmed) so `tested` reflects zones actually ATTEMPTED, not
+    # merely selected; emit every run (omitted=0 clears a prior cap on rerun).
+    events.coverage_partial("vertical.wildcard_http", kind=events.COVERAGE_CAP, measure="zones",
+                            eligible=len(_zones_all), tested=len(zones), omitted=max(0, len(_zones_all) - len(zones)),
+                            reason=f"wildcard vhost zones {len(zones)}/{len(_zones_all)} attempted (cap {ZONE_CAP})")
     words = [w.strip() for w in wl.read_text().splitlines()
              if w.strip() and not w.startswith("#")]
     # A1d: fold the target-specific words (mined from the crawl) IN FRONT so the target's own

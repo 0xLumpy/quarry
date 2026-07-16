@@ -674,9 +674,15 @@ def run(ctx) -> None:
         ctx.echo(f"  framework-endpoints: {len(fw_cands)} candidate(s) probed, {nf} exposed (200)")
 
     # ── arjun param discovery on param-less API endpoints (throttled) ──
-    api_eps = sorted({u.split("?")[0] for u in corpus
-                      if "?" not in u and any(s in u.lower() for s in
-                      ("/api", "/rest", "/account", "/profile", "/search", "/user", "/order"))})[:40]
+    ARJUN_CAP = 40
+    _api_all = sorted({u.split("?")[0] for u in corpus
+                       if "?" not in u and any(s in u.lower() for s in
+                       ("/api", "/rest", "/account", "/profile", "/search", "/user", "/order"))})
+    api_eps = _api_all[:ARJUN_CAP]
+    _n_api = len(_api_all)          # emit every run (omitted=0 clears a prior cap gap on rerun)
+    events.coverage_partial("params.arjun", kind=events.COVERAGE_CAP, measure="api_endpoints",
+                            eligible=_n_api, tested=min(_n_api, ARJUN_CAP), omitted=max(0, _n_api - ARJUN_CAP),
+                            reason=f"arjun targets {min(_n_api, ARJUN_CAP)}/{_n_api} API endpoints (cap {ARJUN_CAP})")
     if api_eps:
         aj_in = ctx.write_list("arjun_targets.txt", api_eps)
         aj_out = ctx.run.raw_path("params", "arjun", "arjun.txt")

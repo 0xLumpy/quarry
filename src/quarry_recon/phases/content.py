@@ -13,7 +13,7 @@ import json as _json
 from importlib import resources
 from pathlib import Path
 
-from .. import normalize, settings
+from .. import events, normalize, settings
 from ..runner import have, run as exec_tool, scaled_timeout, skipped
 
 MAX_HOSTS = 25                     # cap candidate hosts so a wide scope can't explode
@@ -91,7 +91,13 @@ def run(ctx) -> None:
     cand = [l for l in ctx.run.read("live")
             if scope.active_allowed(normalize.host_of_url(l.get("url", "")))]
     cand.sort(key=lambda l: 1 if l.get("cdn") else 0)
-    targets = [l["url"] for l in cand[:MAX_HOSTS] if l.get("url")]
+    _cand_urls = [l["url"] for l in cand if l.get("url")]     # eligible = active-allowed live hosts w/ url
+    targets = _cand_urls[:MAX_HOSTS]
+    # emit every run (omitted=0 when uncapped clears a prior gap). OTC's 25/491 case surfaces here.
+    _n_cand = len(_cand_urls)
+    events.coverage_partial("content.ffuf", kind=events.COVERAGE_CAP, unit="hosts", measure="hosts",
+                            eligible=_n_cand, tested=min(_n_cand, MAX_HOSTS), omitted=max(0, _n_cand - MAX_HOSTS),
+                            reason=f"content ffuf hosts {min(_n_cand, MAX_HOSTS)}/{_n_cand} active-allowed (cap {MAX_HOSTS})")
     if not targets:
         ctx.run.record("content", skipped("ffuf", "no active-allowed live hosts"))
         return
@@ -129,9 +135,25 @@ def run(ctx) -> None:
         if not out.exists():
             continue
         try:
-            results = (_json.loads(out.read_text() or "{}").get("results") or [])[:MAX_RESULTS_PER_HOST]
+            _all_res = _json.loads(out.read_text() or "{}").get("results") or []
         except _json.JSONDecodeError:
             continue
+        results = _all_res[:MAX_RESULTS_PER_HOST]
+        # STRUCTURED per-host result coverage (unit=results:host, under the registered content.ffuf source).
+        # Emit EVERY host every run (omitted=0 clears a prior flood on rerun). >500 results is LIKELY (not
+        # certain) a wildcard/autocalibration flood — we don't assume the omitted rows are noise: count them
+        # as an honest cap and flag the probable-flood in the reason.
+        _n_res = len(_all_res)
+        # unit = the SERVICE identity (host + url hash), same as the raw artifact — http/https/:port on one
+        # host are DISTINCT services and must not overwrite each other's coverage. measure=result_rows so this
+        # is never summed with the host-count measure.
+        _svc = f"{host}-{hashlib.md5(url.encode()).hexdigest()[:8]}"
+        events.coverage_partial("content.ffuf", kind=events.COVERAGE_CAP, unit=f"results:{_svc}",
+                                measure="result_rows",
+                                eligible=_n_res, tested=min(_n_res, MAX_RESULTS_PER_HOST),
+                                omitted=max(0, _n_res - MAX_RESULTS_PER_HOST),
+                                reason=f"{host}: ingested {min(_n_res, MAX_RESULTS_PER_HOST)}/{_n_res} ffuf results "
+                                       f"(cap {MAX_RESULTS_PER_HOST}; >cap likely a wildcard/-ac flood)")
         for res in results:
             u, st = res.get("url"), res.get("status")
             if not u or not scope.in_scope(normalize.host_of_url(u)):

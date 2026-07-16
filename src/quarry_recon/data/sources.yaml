@@ -125,6 +125,12 @@ sources:
     input: apex, output: "raw responses → xnLinkFinder", workers: n/a, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "waymore -mode B downloads archived RESPONSES → the xnLinkFinder 'killer combo'. NORMAL crawl
       intelligence — heavy (a plan long-pole) but DEFAULT-ON. bounded by waymore_limit."}
+  crawl.js_fetch:            {tool: internal, phase: crawl, tier: core, class: active, default: on,
+    input: js_urls, output: "js_files (downloaded, deduped, beautified)", workers: n/a, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: none, log: delta,
+    notes: "internal JS downloader (scoped_get); ACTIVE-ALLOWED only (eligible counted after gating); capped at 2000 → coverage_partial(cap)"}
+  crawl.sourcemaps:          {tool: internal, phase: crawl, tier: core, class: active, default: on,
+    input: js_sourceMappingURL, output: "recovered sources → sourcemaps dir", workers: n/a, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
+    notes: "internal sourcemap fetcher (scoped_get); off-scope map-URL guarded; fetch capped at 100 → coverage_partial(cap)"}
   crawl.jsluice_urls:        {tool: jsluice, phase: crawl, tier: core, class: active, default: on,
     input: js_files, output: endpoint, workers: n/a, rate: n/a, timeout: "runner-managed (0=unbounded); per-file", failure: quiet-warn, fallback: skip, parser: normalize.jsluice_urls, log: delta,
     notes: "WIRED 4.1: per-file chunked via runner.run (-j raw-input), source-level events + tool_progress + ledger; --timeout-0 drift fixed"}

@@ -236,9 +236,17 @@ def run(ctx) -> None:
 
         # headless SPA pass on JS-heavy / app hosts (RAM-heavy; opt-in via MODES.HEADLESS)
         if prof.headless:
-            spa = sorted({u for u in targets.read_text().splitlines()
-                          if any(k in u.lower() for k in
-                          ("app", "portal", "dashboard", "account", "my-", "/app"))})[:10]
+            SPA_CAP = 10
+            _spa_all = sorted({u for u in targets.read_text().splitlines()
+                               if any(k in u.lower() for k in
+                               ("app", "portal", "dashboard", "account", "my-", "/app"))})
+            spa = _spa_all[:SPA_CAP]
+            # MODES.HEADLESS enables headless crawling; it does NOT request "first 10 only" — so the 10-cap is a
+            # HIDDEN CAP (gates when it drops hosts), not an operator-chosen sample. Emit every run (clears prior).
+            _n_spa = len(_spa_all)
+            events.coverage_partial("crawl.katana_headless", kind=events.COVERAGE_CAP, measure="spa_hosts",
+                                    eligible=_n_spa, tested=min(_n_spa, SPA_CAP), omitted=max(0, _n_spa - SPA_CAP),
+                                    reason=f"headless SPA {min(_n_spa, SPA_CAP)}/{_n_spa} app-like hosts (cap {SPA_CAP})")
             if spa:
                 spa_f = ctx.write_list("spa_targets.txt", spa)
                 kh = ctx.run.raw_path("crawl", "katana", "headless.txt")
@@ -287,7 +295,17 @@ def run(ctx) -> None:
     # Downloading JS is an ACTIVE fetch: gate on active_allowed (scope + OOS + passive-skip) and go
     # through the shared choke point (rate pace + bounded read + off-scope-redirect guard).
     MAX_JS = 15 * 1024 * 1024      # 15 MB cap per JS (RAM/disk guard; bundles are large but bounded)
-    js_urls = ctx.run.values("js_url")[:2000]
+    JS_CAP = 2000
+    # eligible = ACTIVE-ALLOWED JS only (count AFTER gating, not before): in passive mode active_allowed is
+    # empty, so eligible collapses to 0 and we never report a phantom tested=2000 for URLs we won't fetch.
+    _js_eligible = [u for u in ctx.run.values("js_url")
+                    if ctx.scope.active_allowed(normalize.host_of_url(u))]
+    js_urls = _js_eligible[:JS_CAP]
+    # emit EVERY run (omitted=0 when uncapped) so a later uncapped rerun CLEARS a prior cap gap (latest-per-unit)
+    _n_js = len(_js_eligible)
+    events.coverage_partial("crawl.js_fetch", kind=events.COVERAGE_CAP, measure="js_urls",
+                            eligible=_n_js, tested=min(_n_js, JS_CAP), omitted=max(0, _n_js - JS_CAP),
+                            reason=f"JS download {min(_n_js, JS_CAP)}/{_n_js} active-allowed (cap {JS_CAP})")
     js_dir = ctx.run.dir / "raw" / "crawl" / "js_files"
     js_dir.mkdir(parents=True, exist_ok=True)
     seen_hash = set()
@@ -349,7 +367,13 @@ def run(ctx) -> None:
                     # fetching is ACTIVE — a malicious sourceMappingURL can point off-scope.
                     if ctx.scope.active_allowed(normalize.host_of_url(m)):
                         map_urls.add(m)
-        for m in sorted(map_urls)[:100]:                        # bound number of fetches
+        MAP_CAP = 100
+        _maps = sorted(map_urls)
+        _n_map = len(_maps)                                     # emit every run (omitted=0 clears prior cap)
+        events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_CAP, measure="sourcemaps",
+                                eligible=_n_map, tested=min(_n_map, MAP_CAP), omitted=max(0, _n_map - MAP_CAP),
+                                reason=f"sourcemap fetch {min(_n_map, MAP_CAP)}/{_n_map} referenced (cap {MAP_CAP})")
+        for m in _maps[:MAP_CAP]:                               # bound number of fetches
             try:
                 # shared choke point: rate pace + bounded read + off-scope-redirect guard.
                 data, _final, status = fetch.scoped_get(ctx, m, max_body=MAX_MAP)
@@ -380,6 +404,11 @@ def run(ctx) -> None:
             ctx.run.add("review", {"id": f"sourcemap:{s}", "klass": "sourcemap", "value": s,
                                    "sources": ["sourcemap-scan"]})
         ctx.echo(f"  sourcemaps: {len(map_urls)} .map candidate(s), recovered {recovered} source file(s)")
+    else:
+        # no JS this run -> zero eligible sourcemaps. Emit a zero observation anyway so the structured auto-reset
+        # opens a fresh generation and a PRIOR sourcemap cap doesn't linger as a stale gap.
+        events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_CAP, measure="sourcemaps",
+                                eligible=0, tested=0, omitted=0, reason="no JS files this run -> 0 sourcemaps")
 
     # ── re-mine recovered source (jsluice + xnLinkFinder), provenance = sourcemap ──
     recov_files = [p for p in recov_dir.rglob("*") if p.is_file()] if recov_dir.exists() else []
@@ -536,6 +565,9 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     blob = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_input.txt")
     written = 0
     capped = False
+    files_completed = 0                              # files read to EOF (honest `tested`)
+    partial_files = 0                                # files cut off mid-body by the byte cap (NOT counted tested)
+    unreadable = 0                                   # files that raised on open/read (NOT counted tested)
     files = [f for f in sorted(Path(indir).rglob("*")) if f.is_file()]
     with blob.open("wb") as bf:
         # FORCE offline-content mode. xnLinkFinder classifies stdin by its FIRST line: one starting with
@@ -550,19 +582,27 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
             if written >= XNL_MAX_INPUT:
                 capped = True                            # remaining files omitted
                 break
+            eof = False
             try:
                 with f.open("rb") as src:
                     while written < XNL_MAX_INPUT:
                         chunk = src.read(min(1 << 20, XNL_MAX_INPUT - written))
                         if not chunk:
+                            eof = True                   # read the whole file
                             break
                         bf.write(chunk)
                         written += len(chunk)
                     else:
                         if src.read(1):                  # hit the cap mid-file -> more remained
                             capped = True
+                            partial_files += 1           # NOT fully tested — this file is (partly) omitted
+                        else:
+                            eof = True                   # ended exactly at the cap boundary
             except Exception:
+                unreadable += 1                          # NOT tested (and not a silent success)
                 continue
+            if eof:
+                files_completed += 1                     # only a fully-read file counts as tested
             if written < XNL_MAX_INPUT:
                 bf.write(b"\n")
                 written += 1
@@ -598,9 +638,16 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     r = exec_tool("xnLinkFinder", cmd, timeout=ctx.http_timeout, input_file=blob,
                   env={"PYTHONHASHSEED": "0"})
     ctx.run.record("crawl", r)
-    if capped:
-        events.coverage_partial("crawl.xnlinkfinder",
-                                reason=f"{tag}: input capped at {XNL_MAX_INPUT // (1024*1024)}MB (dir larger)")
+    # STRUCTURED input coverage per tag (emit every run so an uncapped rerun clears). tested = files read to
+    # EOF ONLY; a file cut off by the 200MB cap (partial) or that raised (unreadable) is NOT counted tested —
+    # it is honestly part of `omitted`. measure=files so this is never summed with the param-candidate measure.
+    _n_files = len(files)
+    events.coverage_partial("crawl.xnlinkfinder", kind=events.COVERAGE_CAP, unit=f"{tag}:input",
+                            measure="files", eligible=_n_files, tested=files_completed,
+                            omitted=max(0, _n_files - files_completed),
+                            reason=f"{tag}: {files_completed}/{_n_files} files fully read "
+                                   f"({partial_files} partial, {unreadable} unreadable; input cap "
+                                   f"{XNL_MAX_INPUT // (1024*1024)}MB)")
 
     # ── endpoints: ingest as-is (scope already applied by xnLinkFinder; no -orig -> no origin suffix) ──
     n_endpoints = 0
@@ -622,10 +669,16 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     for v in cand[:XNL_PARAM_CAP]:
         if ctx.run.add("parameter", {"value": v, "kind": "potential", "sources": [f"xnLinkFinder-{tag}"]}):
             n_params_added += 1
-    if n_params_seen > XNL_PARAM_CAP:
-        events.coverage_partial("crawl.xnlinkfinder",
-                                reason=f"{tag}: {n_params_seen} POTENTIAL params -> capped at {XNL_PARAM_CAP} "
-                                       f"candidates (path words/JSON keys/JS vars — not all request params)")
+    # STRUCTURED param coverage per tag (emit every run): eligible = distinct POTENTIAL params xnLinkFinder
+    # produced, tested = kept under the cap, omitted = dropped. These are candidates (path words/JSON keys/JS
+    # vars — not all request params) but a dropped candidate is still un-mined surface, so this is honestly a
+    # gap; priority follows the generic 10%/100 rule (a large omission is `major`, like any other cap).
+    events.coverage_partial("crawl.xnlinkfinder", kind=events.COVERAGE_CAP, unit=f"{tag}:params",
+                            measure="potential_params",
+                            eligible=n_params_seen, tested=min(n_params_seen, XNL_PARAM_CAP),
+                            omitted=max(0, n_params_seen - XNL_PARAM_CAP),
+                            reason=f"{tag}: {min(n_params_seen, XNL_PARAM_CAP)}/{n_params_seen} potential params "
+                                   f"(cap {XNL_PARAM_CAP})")
 
     # ── A1d vocabulary: if -owl was skipped (large), DERIVE a bounded target wordlist from the mined
     #    links+params (path segments + param names are exactly the useful brute words) so A1d isn't starved;

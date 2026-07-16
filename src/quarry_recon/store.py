@@ -20,6 +20,19 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+# PRIORITY thresholds (NOT a gate): any cap/timeout with omitted>0 is already a gap — truth is not a
+# fraction. These only label a gap `major` vs `minor` for operator triage: omitted >= 10% OR >= 100 absolute
+# is `major` (a big-fraction small set AND a small-fraction huge set both count). Boundaries are inclusive.
+COVERAGE_GAP_FRACTION = 0.10
+COVERAGE_GAP_ABSOLUTE = 100
+
+
+def _coverage_gates(frac: float, omitted: int) -> bool:
+    """Priority label: True == `major` (material under-coverage), False == `minor`. Does NOT decide gating —
+    a cap/timeout with omitted>0 is always a gap regardless of this."""
+    return frac >= COVERAGE_GAP_FRACTION or omitted >= COVERAGE_GAP_ABSOLUTE
+
+
 ENTITY_KEYS = {
     "subdomain": "host",
     "resolved": "host",
@@ -175,7 +188,7 @@ class Run:
         any source failed OR degraded OR a phase raised OR a required tool was missing.
         `note`/`stderr_tail` were already redacted by record(); phase_exceptions are redacted here so no
         free-text bypasses the manifest secret choke point."""
-        from . import secrets
+        from . import events, secrets
         _DEGRADED = ("partial", "blocked", "timed_out")
         _MISSING = ("not on path", "not installed", "not found")   # skip reason == the tool is absent
         # a REQUIRED (non-optional) tool skipped because it is MISSING is a coverage gap; an optional /
@@ -202,9 +215,115 @@ class Run:
                 gaps.append({"phase": r.phase, "tool": r.tool, "status": "missing",
                              "why": why, "output_lines": 0})       # required tool absent -> coverage gap
         phase_exceptions = [secrets.redact(n) for n in self.notes if "EXCEPTION" in n]
-        verdict = ("complete_with_gaps" if (failures or gaps or phase_exceptions) else "complete")
+        # ── coverage counters: reconcile event-level input omissions into the verdict ──────────────
+        # A cap/timeout SITE records tool-level success yet may truncate eligible input; its coverage_partial
+        # event carries eligible/tested/omitted/kind/unit. TRUTH policy (not a threshold): dropping eligible
+        # methodology means the run is NOT clean —
+        #   · a CAP or TIMEOUT with omitted>0 is a GAP (complete_with_gaps), regardless of fraction;
+        #   · an operator-selected SAMPLE with omitted>0 is a soft LIMIT (complete_with_limits, not a gap);
+        #   · an INCONSISTENT triple is coverage:unknown (a gap — never fabricated completion).
+        # The 10%/100 rule is retained ONLY as a `priority` label (major/minor) for triage, NOT to gate.
+        # by_kind is kept so a mixed source is reported honestly (sample counts stay sample, timeouts gate).
+        coverage = self._read_coverage()
+        coverage_limits = []
+        for cov in coverage:
+            sid = cov["source_id"]
+            base = {"phase": sid.split(".", 1)[0], "tool": sid, "measure": cov["measure"], "why": cov["reason"]}
+            if not cov["valid"]:
+                gaps.append({**base, "status": "coverage:unknown", "output_lines": cov["tested"],
+                             "eligible": cov["eligible"], "omitted": cov["omitted"]})
+                continue
+            for kind, c in cov["by_kind"].items():
+                if c["omitted"] <= 0:
+                    continue                                          # fully covered this run — no gap/limit
+                frac = round(c["omitted"] / c["eligible"], 3) if c["eligible"] else 0.0
+                entry = {**base, "status": f"coverage:{kind}", "output_lines": c["tested"],
+                         "eligible": c["eligible"], "omitted": c["omitted"], "omitted_fraction": frac,
+                         "priority": "major" if _coverage_gates(frac, c["omitted"]) else "minor"}
+                if kind == events.COVERAGE_SAMPLE:
+                    coverage_limits.append(entry)                     # operator-chosen subset -> soft limit
+                else:
+                    gaps.append(entry)                                # cap/timeout with omitted>0 -> gap
+        verdict = ("complete_with_gaps" if (failures or gaps or phase_exceptions)
+                   else "complete_with_limits" if coverage_limits else "complete")
         return {"verdict": verdict, "tool_status": status_counts, "tools_failed": len(failures),
-                "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions}
+                "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions,
+                "coverage": coverage, "coverage_limits": coverage_limits}
+
+    def _read_coverage(self) -> list[dict]:
+        """Aggregate STRUCTURED coverage_partial events (those carrying eligible/tested/omitted) from
+        events.jsonl into a per-source_id rollup, rerun/resume-safe:
+          1. keep only the LATEST record per (source_id, unit) — a repeated phase re-emits the SAME unit
+             every run (including with omitted=0 when it no longer caps), so latest-per-unit lets an
+             uncapped rerun CLEAR a prior cap. Summing raw appends would double-count and never clear.
+          2. aggregate surviving units per source_id, keeping a `by_kind` breakdown so a mixed source
+             reports honestly (sample counts stay sample; timeout counts gate) — no relabeling.
+          3. counters are coerced defensively; a unit with a non-numeric / inconsistent triple flags the
+             source ``valid=False`` and its garbage numbers are NOT summed (verdict treats it as unknown,
+             and manifest generation can never crash on a bad value).
+        Legacy per-item events (no structured counters) are ignored — already covered by degraded tool_runs.
+        Best-effort: a missing/garbled log yields []."""
+        from . import events
+
+        def _int(x):
+            try:
+                return int(x)
+            except (TypeError, ValueError):
+                return None
+
+        ev = self.dir / "events.jsonl"
+        if not ev.exists():
+            return []
+        # Process the log IN LINE ORDER (append order = happened order): a coverage_reset for a source DROPS
+        # that source's accumulated units; the lines after it are the new generation. No timestamp math, so a
+        # unit sharing the reset's millisecond can't survive, and a vanished unit is cleared by its reset.
+        live: dict[str, dict] = {}                                 # source_id -> {unit: latest rec} (current gen)
+        try:
+            for line in ev.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                et = rec.get("event")
+                sid = rec.get("source_id", "?")
+                if et == events.COVERAGE_RESET:
+                    live.pop(sid, None)                            # new generation: prior units gone
+                elif et == events.COVERAGE_PARTIAL and rec.get("eligible") is not None:
+                    live.setdefault(sid, {})[rec.get("unit", sid)] = rec   # latest per unit, this generation
+        except Exception:
+            pass
+        # aggregate per (source_id, MEASURE) — files and params (different measures) are NEVER summed; each
+        # rollup has one homogeneous denominator. by_kind is kept so a mixed source reports each kind honestly,
+        # and per-unit summaries are retained so a multi-unit rollup keeps HONEST attribution (not just the
+        # first unit's reason).
+        agg: dict[tuple, dict] = {}
+        for sid, units in live.items():
+            for rec in units.values():
+                measure = rec.get("measure") or "items"
+                kind = rec.get("kind") or events.COVERAGE_TIMEOUT
+                elig, tst, omt = _int(rec.get("eligible")), _int(rec.get("tested")), _int(rec.get("omitted"))
+                a = agg.setdefault((sid, measure),
+                                   {"source_id": sid, "measure": measure, "eligible": 0, "tested": 0,
+                                    "omitted": 0, "reason": None, "valid": True, "by_kind": {}, "units": []})
+                unit_valid = (rec.get("coverage_valid") is not False and None not in (elig, tst, omt)
+                              and elig >= 0 and tst >= 0 and omt >= 0 and tst + omt == elig)
+                if not unit_valid:
+                    a["valid"] = False                            # do NOT sum garbage -> no += on a str
+                    continue
+                a["eligible"] += elig; a["tested"] += tst; a["omitted"] += omt
+                a["units"].append({"unit": rec.get("unit", sid), "eligible": elig, "tested": tst,
+                                   "omitted": omt, "kind": kind, "reason": rec.get("reason")})
+                bk = a["by_kind"].setdefault(kind, {"eligible": 0, "tested": 0, "omitted": 0})
+                bk["eligible"] += elig; bk["tested"] += tst; bk["omitted"] += omt
+        for a in agg.values():                                    # honest aggregate reason (attribution kept in `units`)
+            limited = [u for u in a["units"] if u["omitted"] > 0]
+            if len(limited) == 1:
+                a["reason"] = limited[0]["reason"]
+            elif len(limited) > 1:
+                a["reason"] = f"{len(limited)} unit(s) limited; {a['omitted']} {a['measure']} omitted"
+            elif a["units"]:
+                a["reason"] = a["units"][0]["reason"]             # fully covered — carry a representative note
+        return list(agg.values())
 
     def write_manifest(self, profile_summary: dict, phases_run: list[str],
                        metrics: dict | None = None) -> None:
