@@ -296,12 +296,16 @@ def run(
     peak_rss = [0.0]
     stop = threading.Event()
 
+    # env is MERGED over the inherited environment (not a replacement): callers pass only overrides, e.g.
+    # {"PYTHONHASHSEED": "0"} to make a Python tool's set-ordering reproducible, without dropping PATH etc.
+    proc_env = {**os.environ, **env} if env else None
+
     # start_new_session: the tool becomes its OWN process-group/session leader, so terminate_group can
     # kill the WHOLE tree (tool + any children) on timeout/interrupt — no orphaned chromium/subshell.
     # It also detaches the tool from Quarry's controlling terminal, so a Ctrl-C hits Quarry (not the tool
     # directly) and we do the cleanup deterministically here.
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            env=env, cwd=_TOOL_CWD, start_new_session=True, **stdin_kw)
+                            env=proc_env, cwd=_TOOL_CWD, start_new_session=True, **stdin_kw)
 
     def _sample():
         while not stop.wait(0.3):

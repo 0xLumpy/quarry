@@ -538,6 +538,14 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     capped = False
     files = [f for f in sorted(Path(indir).rglob("*")) if f.is_file()]
     with blob.open("wb") as bf:
+        # FORCE offline-content mode. xnLinkFinder classifies stdin by its FIRST line: one starting with
+        # "http" or "//" makes stdin a URL LIST and the tool CRAWLS those URLs (network contact + timing-
+        # dependent, NON-deterministic output) instead of extracting links from the file bytes. A single
+        # leading blank line makes firstLine == "" -> fileContent mode: offline, deterministic, -p irrelevant.
+        # Verified on a sourcemap blob: URL-mode = 138s / 0 endpoints WITH target contact; content-mode =
+        # 10s / 1071 endpoints offline, byte-identical across -p 1/4/8/25 and across repeats.
+        bf.write(b"\n")
+        written += 1
         for i, f in enumerate(files):
             if written >= XNL_MAX_INPUT:
                 capped = True                            # remaining files omitted
@@ -581,7 +589,14 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
                 "-s429", "-s403", "-sTO", "-sCE"]
         if ctx.profile.http_rl:
             cmd += ["-rl", str(ctx.profile.http_rl)]
-    r = exec_tool("xnLinkFinder", cmd, timeout=ctx.http_timeout, input_file=blob)
+    else:
+        cmd += ["-d", "0"]   # explicit offline: never crawl (belt-and-suspenders if a blob slipped into URL mode)
+    # PYTHONHASHSEED=0: xnLinkFinder dedups via list(set(...)) whose iteration order is hash-seed-randomized;
+    # on large/link-dense input that randomness makes the extracted SET vary run-to-run (verified: waymore
+    # swung 2693..9858 endpoints at a FIXED -p, offline, no timeout — pinning the seed gives a stable 7259,
+    # byte-identical across -p 1/25 and repeats). Deterministic recon needs a fixed seed.
+    r = exec_tool("xnLinkFinder", cmd, timeout=ctx.http_timeout, input_file=blob,
+                  env={"PYTHONHASHSEED": "0"})
     ctx.run.record("crawl", r)
     if capped:
         events.coverage_partial("crawl.xnlinkfinder",
