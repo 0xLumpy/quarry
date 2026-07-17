@@ -13,7 +13,7 @@ import shutil
 import urllib.request
 from pathlib import Path
 
-from .. import events, normalize, secrets, settings
+from .. import events, netguard, normalize, secrets, settings
 from ..runner import Status, have, run as exec_tool, skipped
 
 
@@ -206,11 +206,7 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
     wl = _vhost_wordlist() or _wordlist(ctx)
     if wl is None:
         return set()                               # no wordlist -> zero zones actually attempted; no counter
-    # emit AFTER prereqs (httpx + wordlist confirmed) so `tested` reflects zones actually ATTEMPTED, not
-    # merely selected; emit every run (omitted=0 clears a prior cap on rerun).
-    events.coverage_partial("vertical.wildcard_http", kind=events.COVERAGE_CAP, measure="zones",
-                            eligible=len(_zones_all), tested=len(zones), omitted=max(0, len(_zones_all) - len(zones)),
-                            reason=f"wildcard vhost zones {len(zones)}/{len(_zones_all)} attempted (cap {ZONE_CAP})")
+    block_private = netguard._block_private(ctx)
     words = [w.strip() for w in wl.read_text().splitlines()
              if w.strip() and not w.startswith("#")]
     # A1d: fold the target-specific words (mined from the crawl) IN FRONT so the target's own
@@ -224,7 +220,17 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
                 (o.get("title") or "").strip(), o.get("favicon"))
 
     kept: set[str] = set()
+    zones_probed = 0
     for zone in zones:
+        # self-attack guard: if the wildcard resolves to the SCAN BOX / metadata, don't vhost-scan the zone
+        # (record it as intel). A private wildcard is CONTACTED by default (recorded either way).
+        _wstate, _wdeny, _wintel = netguard.contact_state(f"quarry-wc-guard-{_uuid.uuid4().hex[:8]}.{zone}",
+                                                          block_private=block_private)
+        if _wintel:
+            netguard.record_internal(ctx, f"*.{zone}", _wintel)
+        if _wstate in ("self", "private_blocked"):
+            continue
+        zones_probed += 1
         bogus = [f"quarry-wc-{_uuid.uuid4().hex[:10]}.{zone}" for _ in range(2)]
         cf = ctx.write_list(f"{label}_cand_{zone.replace('.', '_')}.txt",
                             [f"{w}.{zone}" for w in words] + bogus)
@@ -233,10 +239,13 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         # candidate httpx probes on http gets the wildcard's uniform 308→https (status 308, len 0) —
         # which "differs" from the 200 baseline and floods false positives. Following it collapses
         # every noise candidate back onto the real baseline, leaving only the genuinely-distinct vhosts.
-        r = exec_tool("httpx", ["httpx", "-l", str(cf), "-json", "-silent", "-sc", "-cl", "-title",
-                                "-favicon", "-follow-host-redirects",   # same-host only (http->https collapse), never off-scope
-                                "-t", str(settings.workers("httpx", 15))],
-                      raw_path=hx, timeout=ctx.http_timeout)
+        hx_cmd = ["httpx", "-l", str(cf), "-json", "-silent", "-sc", "-cl", "-title",
+                  "-favicon", "-follow-host-redirects",   # same-host only (http->https collapse), never off-scope
+                  "-deny", netguard.self_deny_list(),     # never hit the scan box / metadata (private is contacted)
+                  "-t", str(settings.workers("httpx", 15))]
+        if ctx.profile.http_rl:                           # honor a configured HTTP rate
+            hx_cmd += ["-rl", str(ctx.profile.http_rl)]
+        r = exec_tool("httpx", hx_cmd, raw_path=hx, timeout=ctx.http_timeout)
         ctx.run.record(phase, r)
         if not (r.raw_path and r.raw_path.exists()):
             continue
@@ -261,6 +270,13 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
                     ctx.run.add("resolved", {"host": host, "a": o.get("a") or [],
                                              "sources": [source], "raw_ref": str(hx)})
                     kept.add(host)
+    # coverage AFTER filtering (audit #5): `tested` = zones ACTUALLY probed (safe candidates existed), so a
+    # zone skipped for being internal / dnsx-missing is honestly counted as omitted, not tested.
+    events.coverage_partial("vertical.wildcard_http", kind=events.COVERAGE_CAP, measure="zones",
+                            eligible=len(_zones_all), tested=zones_probed,
+                            omitted=max(0, len(_zones_all) - zones_probed),
+                            reason=f"wildcard vhost zones {zones_probed}/{len(_zones_all)} probed "
+                                   f"(cap {ZONE_CAP}; internal/unresolved zones skipped)")
     if kept:
         ctx.echo(f"  wildcard: +{len(kept)} distinct vhost(s) recovered via HTTP-differentiation ({label})")
     return kept

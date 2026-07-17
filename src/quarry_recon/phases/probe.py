@@ -7,13 +7,12 @@ optional smap passive (Shodan-backed) port scan.
 """
 from __future__ import annotations
 
-import ipaddress as _ipaddr
 import json as _json
 import re as _re
 import urllib.parse
 import urllib.request
 
-from .. import events, normalize, secrets, settings
+from .. import events, netguard, normalize, secrets, settings
 from ..runner import (Status, have, nuclei_timeout, reclassify_from_files, run as exec_tool,
                       scaled_timeout, skipped)
 
@@ -223,6 +222,8 @@ def _httpx_probe_cmd(hosts_file, ports, http_rl) -> list[str]:
            # same host), never cross-host/off-scope — an in-scope host that 30x's off-scope is not fetched.
            # `-location` still records the Location for cross-host redirects (intel without following).
            "-follow-host-redirects", "-random-agent", "-timeout", "7", "-retries", "0",
+           # never connect to the SCAN BOX itself / cloud metadata (small deny; private targets are contacted)
+           "-deny", netguard.self_deny_list(),
            "-t", str(settings.workers("httpx", 15))]
     if http_rl:
         cmd += ["-rl", str(http_rl)]
@@ -244,9 +245,9 @@ def _run_httpx(ctx, hosts, ports, phase, tag):
 
 def _host_public_ip_map(ctx, hosts):
     """Returns (pubmap, a_known). pubmap = {host: [global PUBLIC A-record IPs]} from resolved.a +
-    dns_record A (private/loopback/link-local/multicast/reserved dropped via is_global). a_known = set of
-    hosts that had ANY A record at all. The caller MUST distinguish 'no A data known' (unknown IP → probe
-    by hostname) from 'A data but all private' (an internal host → NOT a scan target, skip)."""
+    dns_record A — used ONLY to give naabu concrete IPv4 targets for the SYN prefilter. a_known = hosts
+    with ANY A record. The BLOCK/unresolved decision is NOT made here — netguard.guard_hosts (A+AAAA +
+    guard_hosts) already recorded intel + withheld the scan-box/metadata self-hits before this is called."""
     want = set(hosts)
     a_by_host: dict[str, set] = {}
     for r in ctx.run.read("resolved"):
@@ -257,22 +258,16 @@ def _host_public_ip_map(ctx, hosts):
         if d.get("type") == "a" and d.get("host") in want and d.get("value"):
             a_by_host.setdefault(d["host"], set()).add(d["value"])
     a_known = set(a_by_host)
-    pubmap: dict[str, list] = {}
-    for h in hosts:
-        pub = []
-        for ip in a_by_host.get(h, ()):
-            try:
-                if ip and _ipaddr.ip_address(ip).is_global:
-                    pub.append(ip)
-            except ValueError:
-                continue
-        pubmap[h] = sorted(set(pub))
+    _bp = netguard._block_private(ctx)
+    pubmap = {h: sorted({ip for ip in a_by_host.get(h, ()) if netguard.is_contactable_ip(ip, block_private=_bp)})
+              for h in hosts}
     return pubmap, a_known
 
 
 def _web_port_prefilter(ctx, hosts, phase, pubmap):
-    """v0.3.5 SYN web-port prefilter (bbot-style, NOT the infra portscan). `hosts` are PUBLIC-IP hosts
-    only (private-only ones already dropped by the caller). naabu SYN over their public IPs × prof.ports
+    """v0.3.5 SYN web-port prefilter (bbot-style, NOT the infra portscan). `hosts` carry a CONTACTABLE IP
+    (scan-box/metadata self-hits already withheld by netguard; private IS scanned by default). naabu SYN
+    over their contactable IPs × prof.ports
     (never top-1000/CIDR/nmap) → open ip:ports → mapped back to hosts → {host:[open ports]}. Returns None
     to signal FULL fallback to direct-httpx. Only a CLEAN naabu completion is trusted — a truncated scan
     (timeout / block / error / partial) falls back so a few ports found mid-failure can't silently
@@ -350,18 +345,19 @@ def fingerprint_hosts(ctx, hosts, phase):
     """Fingerprint `hosts` → list of (raw_ref, json_lines) per httpx call (callers parse each with its
     REAL raw file for per-entity provenance). v0.3.5: SYN-prefilter → httpx only on OPEN host:ports
     (grouped by open-port set); hosts with NO known IP → direct-httpx by hostname. SAFETY RAILS:
-    - private/reserved-only hosts (A data but no public IP) are NOT scan targets → skipped + noted.
+    - hosts whose CURRENT answer is a scan-box/metadata self-hit are withheld by netguard; private IS scanned.
     - FALLBACK-SAFE: prefilter off / naabu missing / truncated / zero-open → v0.3.4 direct-httpx over the
       public + unknown-IP hosts (never private-only, never a thin run). Shared by probe + enrich."""
     prof = ctx.profile
-    pubmap, a_known = _host_public_ip_map(ctx, hosts)
-    private_only = [h for h in hosts if h in a_known and not pubmap[h]]   # HIGH 1: internal, not a target
-    public_hosts = [h for h in hosts if pubmap[h]]
-    no_ip = [h for h in hosts if h not in a_known]                        # unknown IP → probe by hostname
-    if private_only:
-        ctx.echo(f"  web-port: {len(private_only)} host(s) resolve only to private/reserved IPs — "
-                 f"skipped (not scan targets)")
-        ctx.run.notes.append(f"{phase}: {len(private_only)} private-only host(s) skipped (not scan targets)")
+    # self-attack guard (contact-by-default): RECORD every private/self-resolving host as internal-resolution
+    # intel, WITHHOLD only the scan-box/metadata self-hits (private space is scanned — it's a lead). Every
+    # downstream active tool derives from what this produces, so the gate lives here.
+    hosts = netguard.guard_hosts(ctx, hosts, phase=phase)
+    if not hosts:
+        return []
+    pubmap, a_known = _host_public_ip_map(ctx, hosts)                     # all `hosts` are now global-resolving
+    public_hosts = [h for h in hosts if pubmap[h]]                        # has a public IPv4 → naabu SYN prefilter
+    no_ip = [h for h in hosts if not pubmap[h]]                           # global but no stored public-A → httpx by name
 
     def _direct(targets):
         return [_run_httpx(ctx, targets, prof.ports, phase, "httpx")] if targets else []

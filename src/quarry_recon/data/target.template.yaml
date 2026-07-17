@@ -60,6 +60,10 @@ MODES:
                         # Does NOT control the fast web-port SYN prefilter (naabu over resolved host IPs
                         # -> httpx on open ports only): that is main-river and always on when naabu exists.
   TAKEOVER: true        # true => collect CNAMEs + run nuclei takeover templates
+  BLOCK_PRIVATE_TARGETS: false  # default false: a name resolving to RFC1918/CGNAT/ULA is a LEAD — RECORDED
+                        # as a finding AND contacted (offensive; evidence validates ownership). Set true for a
+                        # conservative VPS-external posture (don't touch private space). The scan box itself +
+                        # cloud metadata (169.254.169.254 etc) are ALWAYS withheld from contact regardless.
   CONTENT_DISCOVERY: "off"  # off | light | balanced | deep — candidate-driven path brute (default off)
   CONTENT_RECURSION: 0    # recursion depth for content discovery (0 = off; pairs with balanced/deep)
   DEEP_EVIDENCE: false    # true => DOWNLOAD + mine heavy artifacts (actuator heapdump) instead of just

@@ -255,7 +255,7 @@ setsid nohup quarry run -t acme.com > run.log 2>&1 & disown
 
 | Phase | Does | Key tools |
 |-------|------|-----------|
-| **horizontal** | ASN/CIDR confirm, kaeferjaeger SNI dataset, tlsx SAN (443/8443/4443), reverse DNS, CSP-recon, **Caduceus ASN→cert**, **S3/GCS cloud-bucket candidates (verify-ownership)** | mapcidr, tlsx, dnsx, asnmap, csprecon, caduceus |
+| **horizontal** | ASN/CIDR confirm, kaeferjaeger SNI dataset, tlsx SAN (443/8443/4443), reverse DNS, native CSP fetch (guarded, no redirect-follow), **Caduceus ASN→cert**, **S3/GCS cloud-bucket candidates (verify-ownership)** | mapcidr, tlsx, dnsx, asnmap, caduceus |
 | **vertical** | passive scrape (`-stats`) + GitHub + Shodan + **direct CT logs (crt.sh + certspotter + Censys)** + DNS brute + **recursive word-cloud permutation→resolve loop** (alterx `-enrich -mode both`, converges) + **CNAME collect** | subfinder, github-subdomains, shosubgo, crt.sh, certspotter, censys, puredns, alterx, dnsx |
 | **dns** | DNS-record enrichment over resolved in-scope hosts — **A/AAAA/CNAME/MX/NS/TXT/SOA/CAA + ASN/CDN** as first-class `dns_record` entities (context, not re-discovery; puredns kept for brute/validate) | dnsx |
 | **probe** | HTTP fingerprint (full methodology flag set), CDN/origin tag, **CSP-sibling discovery (response headers)**, **tlsx cert SAN harvest (sibling hosts) + `certificate` context**, **Shodan favicon-hash + cert-fingerprint pivots (related hosts)**, **vhost enumeration (ffuf Host-fuzz over origin IPs)**, **deserialization/token fingerprint (Set-Cookie + headers)**, screenshots, **naabu → nmap -sV**, passive smap | httpx, tlsx, ffuf, cdncheck, gowitness, naabu, nmap, smap |

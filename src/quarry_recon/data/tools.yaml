@@ -208,13 +208,9 @@ tools:
     doc: https://github.com/hakluke/hakrawler
     optional: true
 
-  - bin: csprecon
-    phase: horizontal
-    role: extract related domains from Content-Security-Policy headers
-    install: go install github.com/edoardottt/csprecon/cmd/csprecon@latest
-    version_cmd: csprecon -h
-    doc: https://github.com/edoardottt/csprecon
-    optional: true
+  # csprecon removed 2026-07-17 (audit #1/#2): it auto-follows redirects (a public apex can 30x to a
+  # private/off-scope host) and can't be run no-follow. Replaced by fetch.scoped_headers (horizontal.csp) —
+  # a native, per-hop resolve+scope-guarded CSP fetch that reads the same headers + <meta http-equiv>.
 
   - bin: smap
     phase: probe

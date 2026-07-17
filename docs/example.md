@@ -162,12 +162,10 @@ GET https://kaeferjaeger.gay/sni-ip-ranges/digitalocean/ipv4_merged_sni.txt
 ```
 → raw `raw/horizontal/kaeferjaeger/sni.txt` · in-scope hosts → `subdomain`.
 
-**3.2 csprecon** (only if installed; light HTTP, reads CSP headers):
-
-```bash
-csprecon -l <work>/roots.txt -s
-```
-→ raw `raw/horizontal/csprecon/csp.txt` · in-scope CSP domains → `subdomain`.
+**3.2 native CSP fetch** (guarded, no external tool): fetch each apex root's CSP via `fetch.scoped_headers`
+(per-hop resolve+scope guarded, never auto-follows a redirect off-scope), read all CSP header variants +
+`<meta http-equiv>`:
+→ raw `raw/horizontal/csp/csp.txt` · in-scope CSP domains → `subdomain`.
 
 **Skipped** (no CIDR): `mapcidr`, `tlsx` SAN, `dnsx -ptr`, `caduceus`, `asnmap` — each
 recorded `skipped` with a reason in the manifest.
@@ -184,7 +182,7 @@ recorded `skipped` with a reason in the manifest.
 ```
 ▸ Horizontal discovery (ASN/CIDR/cert/SAN)
   kaeferjaeger: +N in-scope hosts
-  csprecon: +N in-scope hosts from CSP
+  csp: +N in-scope host(s) from apex Content-Security-Policy
   no CIDR in profile — skipping ASN/range/tls-SAN/revdns steps
 ```
 
@@ -475,7 +473,7 @@ projects/0xlumpy/
   recon/20260620-120000/
     manifest.json
     raw/
-      horizontal/{kaeferjaeger/sni.txt, csprecon/csp.txt}
+      horizontal/{kaeferjaeger/sni.txt, csp/csp.txt}
       vertical/{subfinder/passive.txt, github-subdomains/…, puredns/{brute-*,resolved.txt},
                 alterx/perms.txt, dnsx/cnames.jsonl}
       probe/{httpx/httpx.jsonl, nuclei/waf.jsonl, gowitness/*.jpeg+gowitness.jsonl, smap/smap.txt}

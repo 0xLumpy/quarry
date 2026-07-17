@@ -12,7 +12,7 @@ import json
 import re
 import time
 
-from .. import events, evidence, fetch, normalize, oob, secrets, settings
+from .. import events, evidence, fetch, netguard, normalize, oob, secrets, settings
 from ..runner import RunResult, Status, have, nuclei_timeout, run as exec_tool, scaled_timeout, skipped
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
@@ -584,10 +584,16 @@ def run(ctx) -> None:
         # have no A record and live only in `subdomain` — they must still be checked.
         subs = scope.filter_hosts(sorted(set(ctx.run.values("resolved"))
                                          | set(ctx.run.values("subdomain"))))
+        # netguard fresh-resolves these subs: RECORDS private/self leads, WITHHOLDS only scan-box/metadata
+        # self-hits (private is scanned), and KEEPS authoritative-NXDOMAIN dangling hosts (allow_dangling) —
+        # exactly the takeover signal — while a transient-indeterminate host still passes through.
+        subs = netguard.guard_hosts(ctx, subs, phase="params.takeover", allow_dangling=True)
         if subs:
             tk_in = ctx.write_list("takeover_targets.txt", subs)
             tk_out = ctx.run.raw_path("params", "nuclei", "takeover.jsonl")
             tk_cmd = ["nuclei", "-l", str(tk_in), "-tags", "takeover", "-jsonl", "-o", str(tk_out)]
+            # NB: nuclei has no connect-time IP deny (-eh excludes INPUT entries, not resolved IPs); the
+            # scan-box/metadata protection for these subs is netguard.guard_hosts' fresh-resolve above.
             if prof.http_rl:                       # else native default (empty = fast)
                 tk_cmd += ["-rl", str(prof.http_rl)]
             _apply_nuclei_oob(tk_cmd)              # same OOB endpoint as the main scan (no drift)
@@ -607,6 +613,10 @@ def run(ctx) -> None:
                                             "sources": ["nuclei-takeover"], "confirmed": False})
 
     live = [u for u in ctx.run.values("live") if scope.active_allowed(normalize.host_of_url(u))]
+    # FRESH self-attack guard right before the scan: `live` was resolved back in the probe phase (possibly
+    # hours + a crawl/content phase ago), so re-check current resolution — a host that now points to the scan
+    # box / metadata never reaches a nuclei chunk. Private targets stay allowed (recorded as leads).
+    live = netguard.guard_urls(ctx, live, phase="params.nuclei_scan")
     if not live:
         ctx.run.record("params", skipped("nuclei", "no active-allowed live hosts"))
         return
@@ -678,6 +688,7 @@ def run(ctx) -> None:
     _api_all = sorted({u.split("?")[0] for u in corpus
                        if "?" not in u and any(s in u.lower() for s in
                        ("/api", "/rest", "/account", "/profile", "/search", "/user", "/order"))})
+    _api_all = netguard.guard_urls(ctx, _api_all, phase="params.arjun")   # fresh-resolve: withhold scan-box/metadata, contact private
     api_eps = _api_all[:ARJUN_CAP]
     _n_api = len(_api_all)          # emit every run (omitted=0 clears a prior cap gap on rerun)
     events.coverage_partial("params.arjun", kind=events.COVERAGE_CAP, measure="api_endpoints",
@@ -729,6 +740,9 @@ def run(ctx) -> None:
     redir_raw = [r["value"] for r in ctx.run.read("review") if r.get("klass") == "redirect"]
     xss_cands, xss_canon = _canonicalize_candidates(xss_raw)
     redir_cands, redir_canon = _canonicalize_candidates(redir_raw)
+    # audit #1: dalfox is an external tool that CONTACTS these URLs — drop any whose host resolves internal /
+    # can't be resolved. (redir_cands go through fetch.redirect_location, which resolve-guards each origin.)
+    xss_cands = netguard.guard_urls(ctx, xss_cands, phase="params.dalfox")
     if not xss_cands and not redir_cands:
         ctx.run.record("params", skipped("dalfox", "no xss/redirect candidates"))
     # XSS reflection — dalfox fast path (needs dalfox)

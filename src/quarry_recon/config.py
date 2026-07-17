@@ -117,6 +117,14 @@ class TargetProfile:
         return bool(self.modes.get("PASSIVE_ONLY", False))
 
     @property
+    def block_private_targets(self) -> bool:
+        """Conservative opt-in: DON'T contact private (RFC1918/CGNAT/ULA) targets. Default False —
+        Quarry is offensive, a private-resolving in-scope name is a LEAD (recorded either way) and the
+        reachable service is tested to validate ownership. Set true for a paranoid VPS-external posture.
+        Scan-box/cloud-metadata destinations are ALWAYS withheld regardless of this flag."""
+        return bool(self.modes.get("BLOCK_PRIVATE_TARGETS", False))
+
+    @property
     def headless(self) -> bool:
         return bool(self.modes.get("HEADLESS", False))
 

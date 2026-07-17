@@ -9,8 +9,28 @@ from __future__ import annotations
 
 import urllib.request
 
-from .. import normalize
-from ..runner import Status, have, run as exec_tool, skipped
+import re as _re
+
+from .. import fetch, netguard, normalize
+
+# in-scope hostnames named in a Content-Security-Policy (script-src / connect-src / …) — same shape probe
+# uses on live-host CSP headers, here on the apex's CSP fetched safely (no csprecon auto-follow).
+_CSP_HOST = _re.compile(r"\b(?:https?://)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})\b", _re.I)
+# CSP via <meta http-equiv="Content-Security-Policy" content="..."> — ANY attribute order (audit #7).
+_META_TAG = _re.compile(r"<meta\b[^>]*>", _re.I)
+_META_HTTPEQUIV = _re.compile(r"""http-equiv\s*=\s*["']?content-security-policy""", _re.I)
+_META_CONTENT = _re.compile(r"""content\s*=\s*["']([^"']*)["']""", _re.I)
+
+
+def _meta_csp(html: str) -> list[str]:
+    out = []
+    for tag in _META_TAG.findall(html):
+        if _META_HTTPEQUIV.search(tag):
+            m = _META_CONTENT.search(tag)
+            if m:
+                out.append(m.group(1))
+    return out
+from ..runner import RunResult, Status, have, run as exec_tool, skipped
 
 
 # Per-provider download cap. The kaeferjaeger SNI files are hundreds of MB each (~885 MB for amazon) —
@@ -70,19 +90,44 @@ def run(ctx) -> None:
     elif blocked:
         ctx.echo(f"  kaeferjaeger: source unavailable ({blocked} provider(s) failed) — skipped")
 
-    # csprecon: related domains from Content-Security-Policy headers (light HTTP; active)
-    if not scope.passive_only and have("csprecon"):
-        roots_f = ctx.write_list("roots.txt", prof.apex_domains)
-        csp = ctx.run.raw_path("horizontal", "csprecon", "csp.txt")
-        r = exec_tool("csprecon", ["csprecon", "-l", str(roots_f), "-s"],
-                      raw_path=csp, timeout=ctx.http_timeout)
-        ctx.run.record("horizontal", r)
-        if r.raw_path:
-            added = 0
-            for ent in normalize.hosts(r.raw_path.read_text(), "csprecon", str(csp)):
-                if scope.in_scope(ent["host"]) and ctx.run.add("subdomain", ent):
-                    added += 1
-            ctx.echo(f"  csprecon: +{added} in-scope hosts from CSP")
+    # CSP siblings: related in-scope domains named in the apex's Content-Security-Policy. csprecon is NOT
+    # used — it is an active HTTP requester that AUTO-FOLLOWS redirects (a public apex can 30x to a private/
+    # off-scope host, audit #2). Quarry fetches the CSP itself via fetch.scoped_headers: the apex roots are
+    # resolve-guarded, every hop is scope+IP-guarded, and it paces to a configured http_rl (audit #1/#5).
+    if not scope.passive_only:
+        roots = netguard.guard_hosts(ctx, prof.apex_domains, phase="horizontal.csp")
+        raw = ctx.run.raw_path("horizontal", "csp", "csp.txt")
+        added = responses = failed = 0
+        dump = []
+        for apex in roots:
+            for scheme in ("https", "http"):
+                # transport-safe (audit #2) + self-signed OK (insecure): a bad request never aborts the phase.
+                hdrs, body, final, st = fetch.scoped_headers(ctx, f"{scheme}://{apex}/", insecure=True)
+                if hdrs is None:                          # transport failure OR off-scope redirect -> NOT a usable fetch
+                    failed += 1
+                    continue
+                responses += 1
+                csp = " ".join(str(hdrs.get(k) or "") for k in    # all CSP header variants + <meta http-equiv>
+                               ("Content-Security-Policy", "Content-Security-Policy-Report-Only",
+                                "X-Content-Security-Policy", "X-WebKit-CSP"))
+                csp = (csp + " " + " ".join(_meta_csp(body.decode("utf-8", "replace")))).strip()
+                if csp:
+                    dump.append(f"# {final} (status {st})\n{csp}")
+                for m in _CSP_HOST.findall(csp):
+                    h = m.lower().strip(".")
+                    if scope.in_scope(h) and ctx.run.add(
+                            "subdomain", {"host": h, "sources": ["csp"], "raw_ref": str(raw)}):
+                        added += 1
+        raw.write_text("\n".join(dump))
+        # honest source-level status (audit #6): FAILED only if NOTHING answered; PARTIAL if some fetches
+        # failed; EMPTY if everything answered but no CSP; SUCCESS only when CSP was actually found.
+        _st = (Status.SKIPPED if not roots else Status.FAILED if responses == 0 else
+               Status.PARTIAL if failed else Status.SUCCESS if (dump or added) else Status.EMPTY)
+        ctx.run.record("horizontal", RunResult("csp", ["<native scoped CSP fetch>"], _st, 0, 0.0,
+                                               raw if dump else None, len(dump),
+                                               note=f"{responses} responded, {failed} failed, +{added} host(s)"))
+        if added:
+            ctx.echo(f"  csp: +{added} in-scope host(s) from apex Content-Security-Policy")
 
     # cloud-asset candidates: S3/GCS bucket enum from apex/org (non-mutating detect, verify-ownership).
     # ABOVE the CIDR early-return — it's apex/org-derived and must run for domain-only profiles too.

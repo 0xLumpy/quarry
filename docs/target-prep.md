@@ -14,7 +14,7 @@ in-scope domain needs none of this; a wide program with owned infrastructure rew
 > (tlsx, Caduceus, naabu→nmap). Out-of-scope = out.
 
 What the framework already does for you (so you don't have to do it by hand):
-`kaeferjaeger` SNI dumps, `csprecon`, `subfinder` passive sources, and — if you provide
+`kaeferjaeger` SNI dumps, a native guarded CSP fetch, `subfinder` passive sources, and — if you provide
 `CIDR` — `tlsx`/`Caduceus`/reverse-DNS. The manual work below produces the **seeds** those
 phases build on.
 
@@ -95,7 +95,7 @@ but manual passes find more on big orgs.)
 - DMARC shared records: https://dmarcly.com/tools/dmarc-checker + `github.com/Tedixx/dmarc-subdomains`
 - reverse IP / virtual hosts: https://host.io/<domain>
 - ad/analytics relationships (shared GA/NewRelic codes): https://builtwith.com → **Relationships** tab
-- CSP `connect-src`/`script-src` domains: `csprecon` (framework runs this in horizontal too)
+- CSP `connect-src`/`script-src` domains: `csprecon` (the framework does its own guarded CSP fetch in horizontal — this is for manual OSINT)
 
 **7. Dorks.**
 - `"© <YEAR> <Company Name>" inurl:<target>` — related hosts by copyright string
