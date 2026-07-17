@@ -9,12 +9,11 @@ url + review candidates, never actions.
 from __future__ import annotations
 
 import hashlib
-import json as _json
 from importlib import resources
 from pathlib import Path
 
 from .. import events, normalize, settings
-from ..runner import have, run as exec_tool, scaled_timeout, skipped
+from ..runner import Status, ffuf_results, have, reclassify_ffuf, run as exec_tool, scaled_timeout, skipped
 
 MAX_HOSTS = 25                     # cap candidate hosts so a wide scope can't explode
 MAX_RESULTS_PER_HOST = 500         # safety cap if autocalibration misses a wildcard
@@ -109,6 +108,7 @@ def run(ctx) -> None:
         ctx.echo(f"  ⚠️  recursion depth {recurse} is aggressive — expect a loud / slow scan")
 
     notable = 0
+    ff_clean = ff_partial = ff_blocked = ff_errors = 0
     # workload-scaled ceiling per host: content brute is the balanced/deep+recursion path, so on a real
     # target it hits the same flat-1800s wall the vhost/probe ffuf did. Scale by wordlist size × recursion
     # depth (recursion multiplies the paths fuzzed). Merged wordlist counted once.
@@ -118,6 +118,7 @@ def run(ctx) -> None:
         host = normalize.host_of_url(url)
         # include a url hash so http/https/:8443 on the same host don't overwrite each other's raw
         out = ctx.run.raw_path("content", "ffuf", f"{host}-{hashlib.md5(url.encode()).hexdigest()[:8]}.json")
+        out.unlink(missing_ok=True)                          # clear stale artifact: a prior run must not fake completion
         # Redirect policy (DELIBERATE exception to the follow-redirects rule the classify-probes obey):
         # content discovery RECORDS what exists at a path — a path that returns 301/302/307/308 IS a
         # finding (`/admin`→`/login`, `/.git`→redirect: the path exists + where it goes is intel). So we
@@ -131,12 +132,21 @@ def run(ctx) -> None:
             cmd += ["-rate", str(prof.http_rl)]
         if recurse:                                  # 11.2: balanced/deep only (gated above)
             cmd += ["-recursion", "-recursion-depth", str(recurse)]
-        ctx.run.record("content", exec_tool("ffuf", cmd, timeout=ct_to))
-        if not out.exists():
-            continue
-        try:
-            _all_res = _json.loads(out.read_text() or "{}").get("results") or []
-        except _json.JSONDecodeError:
+        r = reclassify_ffuf(exec_tool("ffuf", cmd, timeout=ct_to), out)   # refine status from the -o artifact
+        ctx.run.record("content", r)
+        if r.status == Status.BLOCKED:
+            ff_blocked += 1
+            events.coverage_partial("content.ffuf", reason=f"{host}: blocked — {r.note}")
+        elif r.status == Status.PARTIAL:
+            ff_partial += 1
+            events.coverage_partial("content.ffuf", reason=f"{host}: partial — {r.note}")
+        elif r.status in (Status.SUCCESS, Status.EMPTY):
+            ff_clean += 1                                    # ONLY a completed run counts as clean coverage
+        else:
+            ff_errors += 1                                   # FAILED / TIMED_OUT / SKIPPED — coverage did NOT happen
+            events.coverage_partial("content.ffuf", reason=f"{host}: {r.status.value} — {r.note}")
+        _all_res = ffuf_results(out)                         # None -> no valid current artifact
+        if _all_res is None:
             continue
         results = _all_res[:MAX_RESULTS_PER_HOST]
         # STRUCTURED per-host result coverage (unit=results:host, under the registered content.ffuf source).
@@ -164,4 +174,5 @@ def run(ctx) -> None:
                                        "value": f"[{st}] {u}", "host": host,
                                        "sources": ["ffuf"], "raw_ref": str(out)})
                 notable += 1
-    ctx.echo(f"  content: {notable} notable path(s) (200/401/403)")
+    ctx.echo(f"  content ffuf: {ff_clean}/{len(targets)} clean · {ff_partial} partial · "
+             f"{ff_blocked} blocked · {ff_errors} error · {notable} notable path(s) (200/401/403)")

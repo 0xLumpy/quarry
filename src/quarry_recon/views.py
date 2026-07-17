@@ -134,11 +134,15 @@ def status_lines(events_path) -> list[str]:
         # so the surface never leaks internals like 'tool_progress'/'tool_blocked'.
         status = st.get("status") or _HUMAN.get(st.get("last_event"), st.get("last_event") or "?")
         # progress: counted inputs (dalfox 12/765) or chunks, when the source reported them
+        # a chunked source (nuclei/dalfox) reports BOTH chunk_index/total + input_total/current_index —
+        # show the chunk AND the completed-host count (`chunk 4/10 · 150/491 complete`), not just one.
         prog = ""
-        if st.get("input_total") is not None:
-            prog = f"{st.get('current_index', '?')}/{st['input_total']}"
-        elif st.get("chunk_total") is not None:
+        if st.get("chunk_total") is not None:
             prog = f"chunk {st.get('chunk_index', '?')}/{st['chunk_total']}"
+            if st.get("input_total") is not None:
+                prog += f" · {st.get('current_index', '?')}/{st['input_total']} complete"
+        elif st.get("input_total") is not None:
+            prog = f"{st.get('current_index', '?')}/{st['input_total']}"
         dur = st.get("duration")
         detail = prog or (f"{dur}s" if dur is not None else "-")
         parts = [f"{k}={st[k]}" for k in ("produced", "consumed") if st.get(k) is not None]

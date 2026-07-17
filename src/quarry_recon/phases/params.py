@@ -86,10 +86,15 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     events.tool_start(sid, cmd=["nuclei", "-l", "<chunk>", "-jsonl"], input_total=len(live))
     t0 = time.monotonic()
     degraded = 0
+
+    def _completed_hosts():                               # UX #4: hosts in CLEANLY-done chunks only (NOT attempted)
+        return sum(len(batches[j]) for j in done if j < len(batches))
+
     for ci, batch in enumerate(batches):
-        seen = min((ci + 1) * chunk_n, len(live))
+        # UX #2: emit progress BEFORE the chunk runs — status shows we're STARTING chunk ci+1, with the
+        # count of hosts CLEANLY completed so far (a degraded chunk never bumps `current_index`).
+        events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=_completed_hosts())
         if ci in done:                                    # resume: already CLEAN, findings on disk
-            events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen)
             continue
         bf = ctx.write_list(f"nuclei_targets_{ci}.txt", batch)
         cf = ctx.run.raw_path("params", "nuclei", f"findings_{ci}.jsonl")
@@ -109,7 +114,8 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
         else:
             degraded += 1
             events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
-        events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen)
+    events.tool_progress(sid, chunk_index=len(batches), chunk_total=len(batches),
+                         current_index=_completed_hosts())        # final: hosts cleanly completed
     # rebuild the aggregate IDEMPOTENTLY from every chunk artifact that produced output (clean OR degraded)
     with findings.open("w", encoding="utf-8") as fh:
         for ci in range(len(batches)):
@@ -627,8 +633,22 @@ def run(ctx) -> None:
     findings = ctx.run.raw_path("params", "nuclei", "findings.jsonl")
     log = ctx.run.raw_path("params", "nuclei", "nuclei.run.log")
     ck = max(1, settings.concurrency("NUCLEI_CHUNK_HOSTS", 50))
-    ctx.echo(f"  nuclei: {len(live)} host(s) in chunks of {ck} (resumable · per-chunk budget "
-             f"{nuclei_timeout(min(ck, len(live)), ctx.http_timeout) // 60}m · rate-bound, sequential)")
+    _nchunks = (len(live) + ck - 1) // ck
+    _budget = nuclei_timeout(min(ck, len(live)), ctx.http_timeout)
+    # UX #1: 0 means unbounded (not "0m"). A sub-minute / non-round budget must not truncate to "0m"/whole
+    # minutes — render exact m/s so a 45s or 90s ceiling reads honestly.
+    if not _budget:
+        _budget_txt = "unbounded"
+    elif _budget < 60:
+        _budget_txt = f"{_budget}s"
+    elif _budget % 60:
+        _budget_txt = f"{_budget // 60}m{_budget % 60}s"
+    else:
+        _budget_txt = f"{_budget // 60}m"
+    _final = len(live) - (_nchunks - 1) * ck if _nchunks else 0
+    ctx.echo(f"  nuclei: {len(live)} host(s) · {_nchunks} sequential chunk(s) of {ck}"
+             + (f" (final {_final})" if _nchunks > 1 and _final != ck else "")
+             + f" · per-chunk budget {_budget_txt} · checkpointed")   # UX #5: 'checkpointed' (no operator --resume yet)
     r = _nuclei_scan(ctx, live, findings, log, prof)
     ctx.run.record("params", r)
     if findings.exists():

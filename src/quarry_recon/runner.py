@@ -106,6 +106,79 @@ def reclassify_from_files(r: "RunResult", produced: int, note_word: str = "item"
     return r
 
 
+def ffuf_results(out_file) -> "list | None":
+    """Parse an ffuf `-o` JSON artifact into its results list. Returns None when there is NO valid current
+    artifact — missing / unreadable / JSON root not an object / `results` not a list — so a caller can
+    distinguish "ffuf completed and served this" from "no trustworthy artifact, trust the classifier".
+    Central so probe/content and reclassify all validate the root the same way (a bare `[]` root must not
+    AttributeError)."""
+    import json as _json
+    from pathlib import Path as _Path
+    try:
+        data = _json.loads(_Path(out_file).read_text() or "{}")
+    except (OSError, _json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    results = data.get("results")
+    if not isinstance(results, list):
+        return None
+    # drop malformed rows centrally: a row must be an object, else a caller's `.get()` crashes on it
+    # (e.g. `{"results":[null]}`). Filtering here keeps every ingest site (probe/content) row-safe.
+    return [row for row in results if isinstance(row, dict)]
+
+
+def reclassify_ffuf(r: "RunResult", out_file) -> "RunResult":
+    """ffuf artifact adapter (audit): ffuf writes hits to `-o` JSON while `-s` keeps stdout empty, so the
+    generic classifier (stdout + stderr only) can't see the real result and a transport line mislabels the
+    run. A VALID artifact (dict root + list `results`) means ffuf reached completion; refine on it:
+      - SKIPPED                -> stay SKIPPED (never ran; nothing to refine)
+      - FAILED / TIMED_OUT     -> hard stop: findings upgrade to PARTIAL (coverage incomplete), never SUCCESS;
+                                  0 findings keeps the hard state
+      - BLOCKED + hits         -> PARTIAL (blocked-but-some-served; any exit code — findings are evidence)
+      - BLOCKED + 0, exit 0    -> PARTIAL "block observed, 0 candidates (completed)" (clean exit proves ffuf
+                                  finished — a block hit some request, not the whole job)
+      - BLOCKED + 0, exit != 0 -> stay BLOCKED (block-associated hard stop: nonzero exit + nothing served)
+                                  — as does a missing/invalid artifact (real block before write)
+      - PARTIAL (transport)    -> hits => stay PARTIAL (degraded coverage); 0 => stay PARTIAL (uncertain)
+      - clean                  -> hits => SUCCESS; 0 => EMPTY
+    A missing / invalid `-o` (hard error / real block before write) keeps the classifier verdict.
+    Callers MUST clear `out_file` before invoking ffuf so a stale prior-run artifact can't fake completion.
+    Sets stdout_lines to the result count. Returns the mutated RunResult."""
+    if r.status == Status.SKIPPED:
+        return r                                             # never ran -> no artifact refinement
+    results = ffuf_results(out_file)
+    if results is None:
+        return r                                             # no valid artifact -> trust the classifier
+    n = len(results)
+    r.stdout_lines = n
+    # ffuf hard states: ffuf errored / was killed. It may have left a partial artifact, but the run did
+    # NOT complete — findings may upgrade to PARTIAL, but NEVER to SUCCESS/EMPTY.
+    if r.status in (Status.FAILED, Status.TIMED_OUT):
+        # ffuf errored / was killed; a partial artifact can only lift this to PARTIAL, never SUCCESS.
+        if n > 0:
+            r.status, r.note = Status.PARTIAL, f"ffuf: {n} result(s) ({r.status.value}; coverage incomplete)"
+        return r                                             # 0 findings -> keep the hard state
+    if r.status == Status.BLOCKED:
+        # findings prove ffuf served some paths despite the block -> PARTIAL (evidence, incomplete).
+        if n > 0:
+            r.status, r.note = Status.PARTIAL, f"ffuf: {n} result(s) (some blocked)"
+        # 0 findings: only a CLEAN exit proves the job COMPLETED (block hit some request, not the whole run)
+        # -> PARTIAL. A nonzero exit + 0 findings is a block-associated hard stop -> stay fully BLOCKED.
+        elif r.exit_code == 0:
+            r.status, r.note = Status.PARTIAL, "ffuf: block observed, 0 candidates (completed)"
+        return r
+    degraded = r.status == Status.PARTIAL                    # transport degradation (not a block)
+    if n > 0:
+        r.status = Status.PARTIAL if degraded else Status.SUCCESS
+        r.note = f"ffuf: {n} result(s)" + (" (degraded coverage)" if degraded else "")
+    else:
+        r.note = ("ffuf: 0 results, transport-degraded (completion uncertain)" if degraded
+                  else "ffuf: 0 results (clean)")
+        r.status = Status.PARTIAL if degraded else Status.EMPTY
+    return r
+
+
 def scaled_timeout(n_units: int, floor: int, per_unit: float) -> int:
     """Workload-scaled wall-clock CEILING (not a duration). The tool exits when it finishes, so a
     generous ceiling only lets a big job COMPLETE — it never slows a small one. Budget grows `per_unit`
@@ -146,11 +219,17 @@ class Status(str, Enum):
     SKIPPED = "skipped"     # not run (scope/mode/missing tool/no input)
 
 
-# stderr signatures that mean "we were stopped", not "nothing exists".
+# stderr signatures of a real DENIAL — the target STOPPED us (WAF/rate-limit/forbidden), not "nothing exists".
 BLOCK_SIGNATURES = (
     "403 forbidden", "429", "too many requests", "rate limit", "rate-limit",
-    "access denied", "blocked", "captcha", "cloudflare", "akamai",
-    "connection reset", "i/o timeout", "context deadline exceeded",
+    "access denied", "captcha", "cloudflare", "akamai", "web application firewall", " waf ",
+)
+# stderr signatures of TRANSPORT degradation — the connection failed/timed out, the tool kept going. This is
+# DEGRADED COVERAGE, not a block: a transport error must NOT read as "WAF blocked" (audit: ffuf autocal
+# `context deadline exceeded` was mislabeled BLOCKED). Downgrades a clean run to PARTIAL, never to BLOCKED.
+TRANSPORT_SIGNATURES = (
+    "connection reset", "i/o timeout", "context deadline exceeded", "deadline exceeded",
+    "connection refused", "no such host", "tls handshake", "timeout awaiting", "eof",
 )
 
 
@@ -182,6 +261,7 @@ def _classify(exit_code: int, out: str, err: str, ok_empty: bool,
               ok_codes: tuple[int, ...] = (0,)) -> tuple[Status, str]:
     low_err = err.lower()
     blocked = any(sig in low_err for sig in BLOCK_SIGNATURES)
+    transport = any(sig in low_err for sig in TRANSPORT_SIGNATURES)   # degraded, NOT a block
     has_out = bool(out.strip())
     if exit_code not in ok_codes:
         if blocked:
@@ -197,12 +277,18 @@ def _classify(exit_code: int, out: str, err: str, ok_empty: bool,
         if blocked:
             return Status.BLOCKED, "nonzero exit + block signature in stderr"
         return Status.FAILED, f"exit {exit_code} accepted but produced no output"
+    # CLEAN exit paths: a block signature means the target stopped us; a TRANSPORT error means degraded
+    # coverage (the tool ran but some requests failed) -> PARTIAL, never BLOCKED, never a trustworthy EMPTY.
     if not has_out:
         if blocked:
             return Status.BLOCKED, "clean exit, no output, block signature in stderr"
+        if transport:
+            return Status.PARTIAL, "clean exit, no stdout, transport error — degraded coverage (completion uncertain)"
         return Status.EMPTY, "clean exit, zero output"
     if blocked:
         return Status.PARTIAL, "produced output but block signature in stderr"
+    if transport:
+        return Status.PARTIAL, "produced output + transport errors — degraded coverage"
     return Status.SUCCESS, ""
 
 

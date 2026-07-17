@@ -13,8 +13,8 @@ import urllib.parse
 import urllib.request
 
 from .. import events, netguard, normalize, secrets, settings
-from ..runner import (Status, have, nuclei_timeout, reclassify_from_files, run as exec_tool,
-                      scaled_timeout, skipped)
+from ..runner import (Status, ffuf_results, have, nuclei_timeout, reclassify_ffuf,
+                      reclassify_from_files, run as exec_tool, scaled_timeout, skipped)
 
 # Serialized-object / token markers that surface in Set-Cookie + response headers. Spotting the
 # FORMAT is PASSIVE recon evidence (a hand-off to the attack layer), never exploitation. Only
@@ -173,9 +173,11 @@ def _vhost_enum(ctx) -> None:
     # the flat 1800s cut a big-wordlist run. Higher -t (I/O-bound concurrency) makes each call faster.
     wl_n = sum(1 for _ in wl.open())
     ffuf_to = scaled_timeout(wl_n, ctx.http_timeout, per_unit=0.4)
+    ffuf_clean = ffuf_partial = ffuf_blocked = ffuf_errors = ffuf_total = 0
     for origin, base in origins.items():
         for apex in apexes:
             out = ctx.run.raw_path("probe", "ffuf-vhost", f"{origin}_{apex}.json")
+            out.unlink(missing_ok=True)                 # clear any stale artifact: a prior run must not fake completion
             # -mc = "served/exists" (2xx/3xx/401/403), NOT `all`: a 404/5xx means the origin does NOT
             # serve that Host, so it isn't a vhost. -ac drops the catch-all baseline. NO -r: a redirecting
             # vhost is matched on its 3xx (in -mc) and -ac folds a uniform catch-all by size regardless —
@@ -187,16 +189,26 @@ def _vhost_enum(ctx) -> None:
                    "-o", str(out), "-of", "json"]
             if prof.http_rl:
                 cmd += ["-rate", str(prof.http_rl)]
-            r = exec_tool("ffuf", cmd, timeout=ffuf_to)
+            r = reclassify_ffuf(exec_tool("ffuf", cmd, timeout=ffuf_to), out)   # refine status from the -o artifact
             ctx.run.record("probe", r)
-            if not out.exists():
-                continue
-            try:
-                res = _json.loads(out.read_text()).get("results") or []
-            except Exception:
-                continue
+            ffuf_total += 1
+            # per-origin: rollup counters + a coverage_partial event ONLY for a degraded/blocked origin
+            # (console stays one concise line; the origin detail lives in events/manifest, never 25 lines).
+            if r.status == Status.BLOCKED:
+                ffuf_blocked += 1
+                events.coverage_partial("probe.ffuf_vhost", reason=f"{origin}/{apex}: blocked — {r.note}")
+            elif r.status == Status.PARTIAL:
+                ffuf_partial += 1
+                events.coverage_partial("probe.ffuf_vhost", reason=f"{origin}/{apex}: partial — {r.note}")
+            elif r.status in (Status.SUCCESS, Status.EMPTY):
+                ffuf_clean += 1                        # ONLY a completed run counts as clean coverage
+            else:
+                ffuf_errors += 1                       # FAILED / TIMED_OUT / SKIPPED — coverage did NOT happen
+                events.coverage_partial("probe.ffuf_vhost", reason=f"{origin}/{apex}: {r.status.value} — {r.note}")
+            res = ffuf_results(out) or []              # None (no valid artifact) or non-list -> no rows to ingest
             for hit in res:
-                word = (hit.get("input") or {}).get("FUZZ") or ""
+                inp = hit.get("input")
+                word = (inp.get("FUZZ") if isinstance(inp, dict) else "") or ""
                 host = f"{word.lower().strip('.')}.{apex}" if word else ""
                 if not host or "." not in host or not scope.in_scope(host) or host in known:
                     continue                           # skip junk + already-known subs (DNS-invisible only)
@@ -206,8 +218,9 @@ def _vhost_enum(ctx) -> None:
                         "note": f"origin {origin} serves vhost {host} (may not resolve in DNS) — VERIFY",
                         "sources": ["ffuf-vhost"], "raw_ref": str(out)}):
                     found += 1
-    if found:
-        ctx.echo(f"  vhost: {found} name-based vhost candidate(s) via Host-header fuzz (ffuf)")
+    if ffuf_total:
+        ctx.echo(f"  vhost ffuf: {ffuf_clean}/{ffuf_total} clean · {ffuf_partial} partial · "
+                 f"{ffuf_blocked} blocked · {ffuf_errors} error · {found} candidate(s)")
 
 
 def _httpx_probe_cmd(hosts_file, ports, http_rl) -> list[str]:
