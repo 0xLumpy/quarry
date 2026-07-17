@@ -7,8 +7,6 @@ kaeferjaeger SNI dataset, tlsx SAN harvest, reverse DNS.
 """
 from __future__ import annotations
 
-import urllib.request
-
 import re as _re
 
 from .. import fetch, netguard, normalize
@@ -33,62 +31,77 @@ def _meta_csp(html: str) -> list[str]:
 from ..runner import RunResult, Status, have, run as exec_tool, skipped
 
 
-# Per-provider download cap. The kaeferjaeger SNI files are hundreds of MB each (~885 MB for amazon) —
-# reading one in full (r.read()) pulled the whole thing into RAM before truncation, a latent OOM. Cap the
-# READ at the source so RAM is bounded regardless of file size.
-#   NOTE the cap means we only see the FIRST 5 MB of an IP-sorted 885 MB file — a tiny, non-representative
-#   slice, so kaeferjaeger's practical name coverage here is low. Full coverage would need streaming the
-#   whole ~4 GB (5 providers) and grepping line-by-line — heavy for a name channel that overlaps
-#   subfinder + CT. Kept as bounded best-effort; the reconftw diff decides if it earns its keep.
-# 403 FIX (2026-07-09): the earlier "403s the VPS egress" read was WRONG — kaeferjaeger.gay anti-bots the
-# default `Python-urllib` User-Agent (verified: browser UA → 200, urllib UA → 403). Send a browser UA.
-_KJ_CAP = 5_000_000
-_KJ_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+# kaeferjaeger cloud-SNI name harvest reads an OPERATOR-PROVIDED LOCAL dataset — NEVER a remote fetch
+# (audit #3: the registry declares this source `default: off, setup (local dataset, manual)`, but the code
+# used to urlopen ~4 GB of provider SNI dumps on EVERY horizontal run — a plan/registry lie + a VPS-egress
+# footgun). Same model as openintel's local DB: the operator downloads the provider `*_sni.txt` files they
+# want (kaeferjaeger.gay/sni-ip-ranges/<provider>/…) ONCE to ~/.config/quarry/kaeferjaeger/, and we STREAM
+# whatever is there LINE-BY-LINE (bounded RAM, but the COMPLETE file — never a nonrepresentative prefix) for
+# in-scope hosts. Absent dataset -> quiet recorded skip.
+_KJ_HOST_RX = _re.compile(r"[a-z0-9_.-]+\.[a-z]{2,}", _re.I)
 
 
-def _kaeferjaeger(ctx) -> tuple[int, int]:
-    """Passive: grep cloud-provider SNI cert dataset for in-scope hosts. Bounded read (see _KJ_CAP).
-    Returns (added, blocked) — per-provider errors go QUIETLY to run notes (manifest/run.log), never
-    the console: kaeferjaeger.gay 403s some VPS egress on every provider, and 5 error lines + a `+0`
-    per run is pure noise. The caller emits at most ONE concise line."""
-    added = 0
-    raw_all = []
-    blocked = 0
-    for prov in ("amazon", "google", "microsoft", "oracle", "digitalocean"):
-        url = f"https://kaeferjaeger.gay/sni-ip-ranges/{prov}/ipv4_merged_sni.txt"
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": _KJ_UA})   # urllib UA is 403'd (anti-bot)
-            with urllib.request.urlopen(req, timeout=120) as r:
-                raw_all.append(r.read(_KJ_CAP).decode("utf-8", "replace"))   # bounded — never the full file
-        except Exception as e:  # network optional — quiet, it's best-effort
-            blocked += 1
-            ctx.run.notes.append(f"kaeferjaeger {prov}: {e}")
-    if not raw_all:
-        return 0, blocked
-    blob = "\n".join(raw_all)
-    raw_path = ctx.run.raw_path("horizontal", "kaeferjaeger", "sni.txt")
-    raw_path.write_text(blob[:_KJ_CAP])
-    # cert lines contain many hostnames; extract scope matches
-    import re
-    for m in re.findall(r"[a-z0-9_.-]+\.[a-z]{2,}", blob, re.IGNORECASE):
-        h = m.lower().rstrip(".")
-        if ctx.scope.in_scope(h):
-            if ctx.run.add("subdomain", {"host": h, "sources": ["kaeferjaeger"],
-                                         "raw_ref": str(raw_path)}):
-                added += 1
-    return added, 0
+def _kaeferjaeger_dir():
+    from pathlib import Path
+    return Path.home() / ".config/quarry/kaeferjaeger"
+
+
+def _kaeferjaeger(ctx) -> int:
+    """Passive cloud-SNI name harvest from the operator's LOCAL dataset — NO remote fetch. STREAMS every
+    `*.txt` under ~/.config/quarry/kaeferjaeger/ line-by-line (bounded RAM, complete file) for in-scope
+    hostnames; each match keeps `host<TAB>file:lineno` provenance. Honest status: FAILED if NO file could be
+    read, PARTIAL if some failed, SUCCESS/EMPTY only after every file was fully processed. Returns count."""
+    import time
+    ddir = _kaeferjaeger_dir()
+    files = sorted(ddir.glob("*.txt")) if ddir.is_dir() else []
+    if not files:
+        ctx.run.record("horizontal", skipped(
+            "kaeferjaeger", "no local SNI dataset — optional setup: download provider *_sni.txt to "
+            "~/.config/quarry/kaeferjaeger/"))
+        return 0
+    t0 = time.monotonic()
+    raw_path = ctx.run.raw_path("horizontal", "kaeferjaeger", "matches.txt")
+    # matched = every unique in-scope host THIS source found (drives status + raw_path — a rerun where the
+    # entities already exist is still a real match, NOT empty). added = new store entities. provenance is
+    # written once per (host, file) so a host appearing in two provider dumps keeps BOTH sources.
+    matched, added, prov_seen, add_seen, read_files, failed = set(), 0, set(), set(), 0, 0
+    with raw_path.open("w", encoding="utf-8") as out:
+        for f in files:
+            try:
+                with f.open("r", encoding="utf-8", errors="replace") as fh:
+                    for lineno, line in enumerate(fh, 1):        # STREAM: RAM bounded to a line, whole file read
+                        for m in _KJ_HOST_RX.findall(line):
+                            h = m.lower().rstrip(".")
+                            if not ctx.scope.in_scope(h):
+                                continue
+                            matched.add(h)
+                            if (h, f.name) not in prov_seen:
+                                prov_seen.add((h, f.name))
+                                out.write(f"{h}\t{f.name}:{lineno}\n")   # first occ per (host, file)
+                            if h not in add_seen:
+                                add_seen.add(h)
+                                if ctx.run.add("subdomain", {"host": h, "sources": ["kaeferjaeger"],
+                                                             "raw_ref": str(raw_path)}):
+                                    added += 1
+                read_files += 1
+            except OSError as e:
+                failed += 1
+                ctx.run.notes.append(f"kaeferjaeger: {f.name} unreadable: {e}")
+    status = (Status.FAILED if read_files == 0 else Status.PARTIAL if failed
+              else Status.SUCCESS if matched else Status.EMPTY)
+    ctx.run.record("horizontal", RunResult("kaeferjaeger", ["<local SNI dataset>"], status, 0,
+                   round(time.monotonic() - t0, 2), raw_path if matched else None, len(matched),
+                   note=f"{read_files}/{len(files)} file(s) read, {failed} failed, {len(matched)} matched, +{added} added"))
+    return len(matched)
 
 
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
 
-    # kaeferjaeger is passive OSINT — always allowed (even passive-only mode). ONE concise line max:
-    # hits if any, else a single "blocked" note (not 5 × 403), else silent.
-    n, blocked = _kaeferjaeger(ctx)
+    # kaeferjaeger = passive OSINT over the operator's LOCAL SNI dataset (no remote fetch). One line if hits.
+    n = _kaeferjaeger(ctx)
     if n:
-        ctx.echo(f"  kaeferjaeger: +{n} in-scope hosts")
-    elif blocked:
-        ctx.echo(f"  kaeferjaeger: source unavailable ({blocked} provider(s) failed) — skipped")
+        ctx.echo(f"  kaeferjaeger: {n} in-scope host(s) matched in local SNI dataset")
 
     # CSP siblings: related in-scope domains named in the apex's Content-Security-Policy. csprecon is NOT
     # used — it is an active HTTP requester that AUTO-FOLLOWS redirects (a public apex can 30x to a private/

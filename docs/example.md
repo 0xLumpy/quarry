@@ -150,17 +150,11 @@ porch-pirate -s 0xlumpy.cc --urls      # in-scope URLs → endpoint; out-of-scop
 
 No CIDR → all IP-range steps skip. Two things run:
 
-**3.1 kaeferjaeger SNI dataset** (passive, in-process HTTP — not a shelled tool). Downloads
-each provider's cert dump, greps for `0xlumpy.cc`:
-
-```
-GET https://kaeferjaeger.gay/sni-ip-ranges/amazon/ipv4_merged_sni.txt
-GET https://kaeferjaeger.gay/sni-ip-ranges/google/ipv4_merged_sni.txt
-GET https://kaeferjaeger.gay/sni-ip-ranges/microsoft/ipv4_merged_sni.txt
-GET https://kaeferjaeger.gay/sni-ip-ranges/oracle/ipv4_merged_sni.txt
-GET https://kaeferjaeger.gay/sni-ip-ranges/digitalocean/ipv4_merged_sni.txt
-```
-→ raw `raw/horizontal/kaeferjaeger/sni.txt` · in-scope hosts → `subdomain`.
+**3.1 kaeferjaeger SNI dataset** (passive, **operator-provided LOCAL files — NO remote fetch**). Optional
+one-time setup: download the provider SNI dumps you want to `~/.config/quarry/kaeferjaeger/`, e.g.
+`mkdir -p ~/.config/quarry/kaeferjaeger && curl -fSL --output-dir ~/.config/quarry/kaeferjaeger -o amazon.txt.part https://kaeferjaeger.gay/sni-ip-ranges/amazon/ipv4_merged_sni.txt && mv ~/.config/quarry/kaeferjaeger/amazon.txt{.part,}` (`-f` fails loud on an HTTP error page; `.part`→rename so a failed download never becomes a dataset).
+Each run streams whatever `*.txt` is there line-by-line (complete file, bounded RAM) for `0xlumpy.cc`. No dataset → recorded skip.
+→ raw `raw/horizontal/kaeferjaeger/matches.txt` · in-scope hosts → `subdomain`.
 
 **3.2 native CSP fetch** (guarded, no external tool): fetch each apex root's CSP via `fetch.scoped_headers`
 (per-hop resolve+scope guarded, never auto-follows a redirect off-scope), read all CSP header variants +
@@ -473,7 +467,7 @@ projects/0xlumpy/
   recon/20260620-120000/
     manifest.json
     raw/
-      horizontal/{kaeferjaeger/sni.txt, csp/csp.txt}
+      horizontal/{kaeferjaeger/matches.txt, csp/csp.txt}
       vertical/{subfinder/passive.txt, github-subdomains/…, puredns/{brute-*,resolved.txt},
                 alterx/perms.txt, dnsx/cnames.jsonl}
       probe/{httpx/httpx.jsonl, nuclei/waf.jsonl, gowitness/*.jpeg+gowitness.jsonl, smap/smap.txt}

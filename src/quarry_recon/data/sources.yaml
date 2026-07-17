@@ -39,10 +39,10 @@ meta:
 sources:
 
   # ── horizontal ──────────────────────────────────────────────────────────────────────
-  horizontal.kaeferjaeger:   {tool: kaeferjaeger, phase: horizontal, tier: optional, class: passive, default: off, reason: "setup (local dataset, manual)",
-    input: apex_scope, output: subdomain, workers: n/a, rate: n/a, timeout: fixed-120s-per-provider,
+  horizontal.kaeferjaeger:   {tool: internal, phase: horizontal, tier: optional, class: passive, default: off, reason: "setup (local dataset, manual)",
+    input: "local *.txt under ~/.config/quarry/kaeferjaeger/", output: subdomain, workers: n/a, rate: n/a, timeout: n/a,
     failure: silent-skip, fallback: "none (CT/subfinder carry the names)", parser: hostname-grep, log: silent-unless-opted-in,
-    notes: "403 was a UA block (fixed); ~4GB bulk, overlaps CT — OUT of default remote run, opt-in / local-cache (openintel-style)."}
+    notes: "NO remote fetch (batch-2 2026-07-17, audit #3): reads operator-downloaded provider SNI dumps from a local dir (openintel-style opt-in); absent dataset -> recorded skip. Prev code urlopen'd ~4GB on every run — the registry/plan lie is closed."}
   horizontal.csp:            {tool: internal, phase: horizontal, tier: core, class: active, default: on,
     input: apex_roots, output: subdomain, workers: n/a, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "native scoped CSP fetch (fetch.scoped_headers): per-hop resolve+scope guarded, NO redirect auto-follow (csprecon followed redirects off-scope). Reads all CSP header variants + <meta http-equiv>; replaced tool:csprecon 2026-07-17 (audit #1/#2)."}
