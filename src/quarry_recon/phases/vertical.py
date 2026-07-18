@@ -467,11 +467,22 @@ def run(ctx) -> None:
                         ctx.run.add("subdomain", e)
 
     # ── recursive permute → resolve loop (word-cloud mutations) ──
-    # Recursive enumeration: each iteration enriches + mines target-specific
-    # permutation patterns (alterx -enrich -mode both) from the GROWING known set, resolves,
-    # and feeds newly-resolved hosts back as seeds. Stops when an iteration finds nothing new.
+    # Recursive enumeration: each iteration enriches + mines target-specific permutation patterns
+    # (alterx -enrich -mode both) from the GROWING known set, resolves, and feeds newly-resolved hosts back
+    # as seeds. Stops when an iteration finds nothing new.
+    # C20 (T2.3) frontier-only RESOLVE: resolve a candidate only until it is SETTLED, not once per iteration.
+    # The old loop re-resolved the ENTIRE candidate set every iteration (OTC: ~9.9M candidate lines / 10M
+    # massdns rows for 8 net additions) — mostly re-resolution of already-settled names. Here a candidate is
+    # settled (added to `seen_candidates`, never re-submitted) only after a CLEAN puredns batch resolves the
+    # batch it was in; a DEGRADED batch settles just its confirmed-resolved names and RE-SUBMITS the rest
+    # next iteration (bounded by MAX_ITERS). NOTE: the resolved-union equality with the old blanket
+    # re-resolution rests on the assumption that a CLEAN puredns batch has no transient false-negatives that
+    # would flip on a re-submit — this is validated by benchmark (measure-don't-guess), not set arithmetic.
+    # alterx STILL runs over the full known set (its -enrich word cloud is mined from ALL observed names —
+    # feeding it only the frontier would shrink the vocabulary and LOSE cross-pollinated permutations).
     MAX_ITERS = 3
     prev = -1
+    seen_candidates: set[str] = set()
     for it in range(1, MAX_ITERS + 1):
         seed = sorted(set(ctx.run.values("subdomain") + prof.apex_domains
                           + ctx.run.values("resolved")))
@@ -479,7 +490,7 @@ def run(ctx) -> None:
         cand = list(seed)
 
         # word-cloud permutations (active only): -enrich extracts words from observed names,
-        # -mode both adds default + target-mined patterns.
+        # -mode both adds default + target-mined patterns. Runs over the FULL known set (word cloud).
         if not scope.passive_only and have("alterx"):
             perms = ctx.run.raw_path("vertical", "alterx", f"perms_{it}.txt")
             r = exec_tool("alterx", ["alterx", "-l", str(known), "-enrich", "-mode", "both",
@@ -495,7 +506,13 @@ def run(ctx) -> None:
             ctx.run.record("vertical", skipped("dnsx", "passive-only mode — no recursive DNS resolution"))
             break
 
-        candidates = ctx.write_list(f"all_candidates_{it}.txt", cand)
+        # frontier-only: resolve only candidates NOT already ATTEMPTED-AND-SETTLED (dedup, first-seen order).
+        new_cand = [c for c in dict.fromkeys(cand) if c and c not in seen_candidates]
+        _n_all, _n_new = len(set(filter(None, cand))), len(new_cand)
+        if not new_cand:
+            ctx.echo(f"  recursion iter {it}: no new candidates — converged")
+            break
+        candidates = ctx.write_list(f"all_candidates_{it}.txt", new_cand)
         res = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.txt")
         # --write-massdns captures the A records so `resolved` carries its IPs (was a:[] — puredns
         # -q emits hostnames only, leaving the host→IP edge to live solely in dns_record; the digest
@@ -508,15 +525,33 @@ def run(ctx) -> None:
         if prof.dns_rate:
             cmd += ["--rate-limit", str(prof.dns_rate)]
         r = exec_tool("puredns", cmd, raw_path=res, timeout=ctx.http_timeout)
+        if _n_all != _n_new:                              # dedup SAVINGS is optimization telemetry, NOT a gap
+            r.note = (f"frontier: {_n_new} new candidate(s), {_n_all - _n_new} already-settled skipped; "
+                      f"{r.note or ''}").strip()
         ctx.run.record("vertical", r)
+        resolved_now: set[str] = set()
         if r.raw_path:
             ips = _massdns_a(md)                # host -> [A records]
             for e in normalize.hosts(r.raw_path.read_text(), "puredns-resolve", str(res)):
+                resolved_now.add(e["host"])     # every resolved name (in/out of scope) is settled
                 if scope.in_scope(e["host"]):
                     ctx.run.add("resolved", {"host": e["host"], "a": ips.get(e["host"], []),
                                              "sources": ["puredns-resolve"], "raw_ref": str(res)})
                     # newly-resolved permutations are new subdomains → seed next iteration
                     ctx.run.add("subdomain", {"host": e["host"], "sources": ["puredns-resolve"]})
+        # SETTLE candidates only when the batch is trustworthy: a CLEAN puredns run resolves every attempted
+        # candidate (an unresolved name won't resolve later within the run), so mark ALL new_cand seen. A
+        # DEGRADED batch (timeout/error/partial) settles ONLY the confirmed-resolved names — its UNRESOLVED
+        # candidates stay retryable so a transient resolver failure is re-attempted next iteration (bounded
+        # by MAX_ITERS). This preserves set-equality of the RESOLVED union with the old blanket re-resolution.
+        if r.status in (Status.SUCCESS, Status.EMPTY):
+            seen_candidates.update(new_cand)
+        else:
+            seen_candidates.update(resolved_now)
+            retryable = len(set(new_cand) - resolved_now)
+            _budget = "retry budget exhausted (final iteration)" if it == MAX_ITERS else "retryable next iteration"
+            events.coverage_partial("vertical.puredns_resolve", reason=f"iter {it}: puredns {r.status.value} — "
+                                    f"{retryable} candidate(s) unresolved, {_budget}")
 
         cur = ctx.run.count("resolved")
         ctx.echo(f"  recursion iter {it}: resolved={cur}"
