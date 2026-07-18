@@ -97,8 +97,8 @@ sources:
   probe.httpx:               {tool: httpx, phase: probe, tier: core, class: active, default: on,
     input: hosts+ports, output: live+tech, workers: "settings.workers(httpx)", rate: http_rl, timeout: "scaled(hosts×port_weight)", failure: partial-ok, fallback: "(prefilter → direct)", parser: normalize.httpx_json, log: delta}
   probe.naabu_web:           {tool: naabu, phase: probe, tier: core, class: active, default: on,
-    input: public_ips×ports, output: web_port, workers: rate, rate: portscan_rate, timeout: "scaled(ips×ports)", failure: "clean-only-trusted → else direct-httpx", fallback: direct-httpx, parser: internal, log: matrix-line,
-    notes: "SYN web-port prefilter (bbot-style); NOT the infra portscan"}
+    input: syn_eligible_ips×ports, output: web_port, workers: rate, rate: portscan_rate, timeout: "scaled(ips×ports)", failure: "clean-only-trusted → else direct-httpx", fallback: direct-httpx, parser: internal, log: matrix-line,
+    notes: "SYN web-port prefilter (bbot-style); NOT infra portscan. CDN/WAF edge excluded via offline cdncheck (T0.3, no contact); any-CDN host + zero-open host → direct-httpx (never dropped)"}
   probe.ffuf_vhost:          {tool: ffuf, phase: probe, tier: core, class: active, default: on,
     input: origins, output: review(vhost), workers: "settings.workers(ffuf)", rate: http_rl, timeout: "scaled(wordlist)", failure: "per-origin isolate (not phase BLOCKED)", fallback: skip, parser: internal, log: delta}
   probe.tlsx_certs:          {tool: tlsx, phase: probe, tier: core, class: active, default: on,

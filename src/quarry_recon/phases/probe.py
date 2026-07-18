@@ -257,10 +257,12 @@ def _run_httpx(ctx, hosts, ports, phase, tag):
 
 
 def _host_public_ip_map(ctx, hosts):
-    """Returns (pubmap, a_known). pubmap = {host: [global PUBLIC A-record IPs]} from resolved.a +
-    dns_record A — used ONLY to give naabu concrete IPv4 targets for the SYN prefilter. a_known = hosts
-    with ANY A record. The BLOCK/unresolved decision is NOT made here — netguard.guard_hosts (A+AAAA +
-    guard_hosts) already recorded intel + withheld the scan-box/metadata self-hits before this is called."""
+    """Returns (contactmap, a_known). contactmap = {host: [CONTACTABLE A-record IPs]} from resolved.a +
+    dns_record A — used ONLY to give naabu concrete IPv4 targets for the SYN prefilter. CONTACTABLE = the
+    offensive default: private (RFC1918/CGNAT/ULA) IS included unless MODES.BLOCK_PRIVATE_TARGETS; only the
+    scan-box/cloud-metadata self-hits are dropped (is_contactable_ip). a_known = hosts with ANY A record.
+    The BLOCK/unresolved decision is NOT made here — netguard.guard_hosts already recorded intel + withheld
+    the scan-box/metadata self-hits before this is called."""
     want = set(hosts)
     a_by_host: dict[str, set] = {}
     for r in ctx.run.read("resolved"):
@@ -275,6 +277,51 @@ def _host_public_ip_map(ctx, hosts):
     pubmap = {h: sorted({ip for ip in a_by_host.get(h, ()) if netguard.is_contactable_ip(ip, block_private=_bp)})
               for h in hosts}
     return pubmap, a_known
+
+
+def _cdn_shared_ips(ctx, ips):
+    """Offline-classify `ips`; return the subset sitting on SHARED third-party edge — CDN or WAF — which
+    raw SYN must avoid (multi-tenant infra, and not the origin anyway). Uses cdncheck: a LOCAL IP-range
+    dataset, NO target contact. CLOUD (aws/gcp/azure) is deliberately NOT excluded — cloud classification
+    alone does not prove shared infrastructure (the IP may be the target's own dedicated instance), and
+    excluding it would suppress coverage of the target's real servers. Returns a set of shared IPs, or None
+    when classification was NOT trustworthy (cdncheck missing / errored / any malformed or schema-invalid
+    row) so the caller fails CLOSED — decline to SYN un-vetted IPs rather than packet-scan shared infra.
+    This gate NEVER drops a host: a CDN/WAF host is still probed by name. cdncheck emits one JSONL row PER
+    classified IP with an `ip` key and cdn/waf/cloud booleans; unclassified IPs are simply absent, so an
+    empty valid artifact is a legitimate 'none shared' result — but a malformed row is not."""
+    if not ips or not have("cdncheck"):
+        return None                                          # cannot vet -> caller withholds SYN (httpx by name)
+    ipf = ctx.write_list("cdncheck_ips.txt", ips)
+    out = ctx.run.raw_path("probe", "cdncheck", "classified.jsonl")
+    out.unlink(missing_ok=True)                              # stale artifact must not influence this run's decision
+    r = exec_tool("cdncheck", ["cdncheck", "-i", str(ipf), "-jsonl", "-silent", "-duc", "-o", str(out)],
+                  timeout=scaled_timeout(len(ips), ctx.http_timeout, per_unit=0.02))
+    ctx.run.record("probe", r)
+    if r.status not in (Status.SUCCESS, Status.EMPTY) or not out.exists():
+        return None                                          # errored/truncated -> treat as un-vetted (no SYN)
+    want = set(ips)
+    try:
+        raw_lines = out.read_text().splitlines()
+    except (OSError, UnicodeError):
+        return None                                          # unreadable artifact -> fail CLOSED
+    shared: set = set()
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = _json.loads(line)
+        except (_json.JSONDecodeError, ValueError):
+            return None                                      # malformed row -> classification untrustworthy, fail CLOSED
+        if not isinstance(o, dict):                          # [], null, "text", 5 are valid JSON but not a row
+            return None                                      # -> fail CLOSED (a shared IP could hide behind a bad line)
+        ip = o.get("ip") or o.get("input")
+        if not isinstance(ip, str) or ip not in want:        # missing / non-str (e.g. list) / unexpected ip
+            return None                                      # -> fail CLOSED (never .add() a non-hashable / stray ip)
+        if o.get("cdn") or o.get("waf"):                     # cloud NOT excluded (not proof of shared infra)
+            shared.add(ip)
+    return shared
 
 
 def _web_port_prefilter(ctx, hosts, phase, pubmap):
@@ -346,9 +393,9 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
                                          "sources": ["naabu-web"], "raw_ref": str(raw)})
     host_ports = {h: sorted(ps) for h, ps in host_ports.items()}
     n_targets = sum(len(ps) for ps in host_ports.values())
-    ctx.echo(f"  web-port prefilter: {len(unique_ips)} public IPs × {len(prof.ports)} ports -> "
+    ctx.echo(f"  web-port prefilter: {len(unique_ips)} SYN-eligible IPs × {len(prof.ports)} ports -> "
              f"{n_open} open ip:ports -> {n_targets} host:port probes")
-    ctx.run.notes.append(f"{phase} web-port prefilter: public_ips={len(unique_ips)} "
+    ctx.run.notes.append(f"{phase} web-port prefilter: syn_eligible_ips={len(unique_ips)} "
                          f"ports={len(prof.ports)} ip_port_checks={len(unique_ips) * len(prof.ports)} "
                          f"open_ip_ports={n_open} httpx_host_port_targets={n_targets}")
     return host_ports
@@ -360,7 +407,7 @@ def fingerprint_hosts(ctx, hosts, phase):
     (grouped by open-port set); hosts with NO known IP → direct-httpx by hostname. SAFETY RAILS:
     - hosts whose CURRENT answer is a scan-box/metadata self-hit are withheld by netguard; private IS scanned.
     - FALLBACK-SAFE: prefilter off / naabu missing / truncated / zero-open → v0.3.4 direct-httpx over the
-      public + unknown-IP hosts (never private-only, never a thin run). Shared by probe + enrich."""
+      contactable + unknown-IP hosts (private included by default; never a thin run). Shared by probe + enrich."""
     prof = ctx.profile
     # self-attack guard (contact-by-default): RECORD every private/self-resolving host as internal-resolution
     # intel, WITHHOLD only the scan-box/metadata self-hits (private space is scanned — it's a lead). Every
@@ -368,26 +415,51 @@ def fingerprint_hosts(ctx, hosts, phase):
     hosts = netguard.guard_hosts(ctx, hosts, phase=phase)
     if not hosts:
         return []
-    pubmap, a_known = _host_public_ip_map(ctx, hosts)                     # all `hosts` are now global-resolving
-    public_hosts = [h for h in hosts if pubmap[h]]                        # has a public IPv4 → naabu SYN prefilter
-    no_ip = [h for h in hosts if not pubmap[h]]                           # global but no stored public-A → httpx by name
+    pubmap, a_known = _host_public_ip_map(ctx, hosts)                     # {host: contactable A IPs} (private incl. by default)
+    prefilter_on = settings.web_port_prefilter()
+    # CDN-aware SYN gate (T0.3): raw SYN must not hit SHARED third-party edge (CDN/WAF) — multi-tenant infra
+    # that isn't the origin anyway. Classify offline (cdncheck, no target contact) and drop CDN/WAF IPs from
+    # the SYN target set only; CLOUD + unclassified IPs are still scanned (unclassified is NOT proof of a
+    # dedicated origin, but it isn't shared edge either). A host left with no SYN-eligible IP is NOT dropped
+    # — it falls to direct httpx-by-name (zero coverage loss).
+    shared: set = set()
+    if prefilter_on:
+        all_ips = sorted({ip for ips in pubmap.values() for ip in ips})
+        cls = _cdn_shared_ips(ctx, all_ips)
+        # None => could not vet (cdncheck missing/errored): withhold SYN for un-vetted IPs rather than
+        # packet-scan possible shared infra — httpx by name still probes every host (no discovery lost).
+        shared = set(all_ips) if cls is None else cls
+        if cls:
+            ctx.run.notes.append(f"{phase} cdn-aware SYN gate: {len(cls)}/{len(all_ips)} contactable IPs are "
+                                 f"CDN/WAF edge — excluded from SYN, hosts probed by name")
+    # A host is SYN-eligible only when ALL its contactable IPs are non-shared. If ANY answer is CDN/WAF, the
+    # whole hostname goes direct: httpx probes BY NAME, whose DNS answer may be the CDN IP, so ports found on
+    # a non-CDN sibling IP wouldn't match what httpx-by-name actually hits (partial-prefilter mismatch).
+    syn_map = {h: ([] if any(ip in shared for ip in ips) else ips) for h, ips in pubmap.items()}
+    public_hosts = [h for h in hosts if syn_map[h]]                      # ALL contactable IPs non-shared -> SYN-eligible
+    no_ip = [h for h in hosts if not syn_map[h]]                         # any shared IP / no IP -> httpx by name
 
     def _direct(targets):
         return [_run_httpx(ctx, targets, prof.ports, phase, "httpx")] if targets else []
 
-    if not settings.web_port_prefilter():
-        return _direct(public_hosts + no_ip)                             # v0.3.4 direct (still skips private-only)
-    host_ports = _web_port_prefilter(ctx, public_hosts, phase, pubmap) if public_hosts else None
+    if not prefilter_on:
+        return _direct(public_hosts + no_ip)                             # v0.3.4 direct (contactable incl. private)
+    host_ports = _web_port_prefilter(ctx, public_hosts, phase, syn_map) if public_hosts else None
     if host_ports is None:
-        return _direct(public_hosts + no_ip)                             # fallback: full direct, never private-only
+        return _direct(public_hosts + no_ip)                             # fallback: full direct over every guarded host
     results = []
     groups: dict[tuple, list] = {}
     for h, ps in host_ports.items():
         groups.setdefault(tuple(ps), []).append(h)
     for i, (ps, hs) in enumerate(sorted(groups.items())):
         results.append(_run_httpx(ctx, hs, list(ps), phase, f"httpx-g{i}"))   # httpx on OPEN ports only
-    if no_ip:
-        results.append(_run_httpx(ctx, no_ip, prof.ports, phase, "httpx-direct"))
+    # A SYN-eligible host that came back with ZERO open ports is NOT dropped: SYN can false-negative
+    # (filtered/rate-limited/packet loss), so probe it directly over the full port set. A host's outcome
+    # must never depend on another host's scan — only on its own evidence. Union with the by-name hosts.
+    covered = set(host_ports)
+    direct_targets = no_ip + [h for h in public_hosts if h not in covered]
+    if direct_targets:
+        results.append(_run_httpx(ctx, direct_targets, prof.ports, phase, "httpx-direct"))
     return results
 
 

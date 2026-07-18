@@ -146,7 +146,7 @@ tools:
 
   - bin: cdncheck
     phase: probe
-    role: tag IPs as CDN vs origin (origin = no-WAF, juicier)
+    role: offline CDN/WAF/cloud IP classifier — gates the naabu SYN prefilter off shared CDN/WAF edge (T0.3)
     install: go install github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest
     version_cmd: cdncheck -version
     doc: https://github.com/projectdiscovery/cdncheck
