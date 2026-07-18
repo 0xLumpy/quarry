@@ -327,11 +327,16 @@ def _cdn_shared_ips(ctx, ips):
 def _web_port_prefilter(ctx, hosts, phase, pubmap):
     """v0.3.5 SYN web-port prefilter (bbot-style, NOT the infra portscan). `hosts` carry a CONTACTABLE IP
     (scan-box/metadata self-hits already withheld by netguard; private IS scanned by default). naabu SYN
-    over their contactable IPs × prof.ports
-    (never top-1000/CIDR/nmap) → open ip:ports → mapped back to hosts → {host:[open ports]}. Returns None
-    to signal FULL fallback to direct-httpx. Only a CLEAN naabu completion is trusted — a truncated scan
-    (timeout / block / error / partial) falls back so a few ports found mid-failure can't silently
-    suppress the rest. Stores web_port evidence + echoes the matrix."""
+    over their contactable IPs × prof.ports (never top-1000/CIDR/nmap) → open ip:ports → mapped back to
+    hosts → {host:[open ports]}. TRI-STATE (T1.1), for honest coverage:
+      - dict of open host:ports  → usable_with_ports (httpx on the open ports)
+      - {} (empty dict)          → usable_empty: CLEAN scan, nothing open. The caller STILL direct-probes
+                                   these hosts (a clean SYN 0-open is never trusted to DROP a host — SYN
+                                   false-negatives from filtering/rate-limit/loss); it is only a recorded
+                                   coverage state, not a reason to skip.
+      - None                     → unusable: truncated/timeout/block/error → full direct fallback, so a
+                                   few ports found mid-failure can't silently thin coverage.
+    Only a CLEAN completion is trusted. Stores web_port evidence + records the coverage state."""
     if not have("naabu"):
         return None
     prof = ctx.profile
@@ -344,6 +349,7 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
         return None
     ips_file = ctx.write_list(f"{phase}_webports_ips.txt", unique_ips)
     raw = ctx.run.raw_path(phase, "naabu-web", "open.json")
+    raw.unlink(missing_ok=True)                          # clear stale artifact: a prior run must not narrow this one
     cmd = ["naabu", "-list", str(ips_file), "-p", ",".join(str(p) for p in prof.ports),
            "-json", "-scan-type", "s", "-Pn", "-silent", "-o", str(raw)]   # SYN, no host-disco, web ports only
     if prof.portscan_rate:
@@ -351,39 +357,63 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
     to = scaled_timeout(len(unique_ips) * len(prof.ports), ctx.http_timeout, per_unit=0.02)
     res = exec_tool("naabu", cmd, timeout=to)
     raw_status = res.status
-    # naabu writes findings to the -o FILE (empty stdout) → parse it FIRST, then fix the audit status
-    # (same file-output mislabel class as gowitness) BEFORE recording.
+    # naabu writes findings to the -o FILE (empty stdout, -json). Parse it FAIL-CLOSED: any malformed row,
+    # non-object, unparseable port, unexpected IP (not one we scanned), or out-of-profile port makes the
+    # WHOLE scan UNUSABLE (full fallback) — narrowing httpx to a subset off a stale/garbled artifact would
+    # silently drop coverage. A missing/empty file is NOT malformed (just no open ports).
+    want_ips = set(unique_ips)
+    want_ports = set(prof.ports)
     open_by_ip: dict[str, set] = {}
+    parse_ok = True
     if raw.exists():
-        for line in raw.read_text().splitlines():
+        try:
+            raw_lines = raw.read_text().splitlines()
+        except (OSError, UnicodeError):
+            raw_lines = []; parse_ok = False            # unreadable/invalid-encoding artifact -> unusable
+        for line in raw_lines:
             line = line.strip()
             if not line:
                 continue
-            ip = port = None
             try:
                 o = _json.loads(line)
-                ip, port = o.get("ip") or o.get("host"), o.get("port")
-            except _json.JSONDecodeError:
-                if ":" in line:
-                    ip, _, port = line.rpartition(":")
+            except (_json.JSONDecodeError, ValueError):
+                parse_ok = False; break                 # malformed row -> untrust the whole scan
+            if not isinstance(o, dict):
+                parse_ok = False; break
+            ip = o.get("ip") or o.get("host")
+            pr = o.get("port")
+            if isinstance(pr, bool):                    # JSON true/false is not a port (bool is an int subclass)
+                parse_ok = False; break
             try:
-                port = int(port)
+                port = int(pr)
             except (TypeError, ValueError):
-                continue
-            if ip:
-                open_by_ip.setdefault(ip, set()).add(port)
+                parse_ok = False; break
+            if not isinstance(ip, str) or ip not in want_ips or port not in want_ports:  # list/dict ip, stale, oob port
+                parse_ok = False; break
+            open_by_ip.setdefault(ip, set()).add(port)
     n_open = sum(len(v) for v in open_by_ip.values())
-    if n_open and raw_status == Status.EMPTY:            # clean run, findings in file, empty-stdout mislabel
-        res.status = Status.SUCCESS
-        res.note = f"{n_open} open port(s)"
+    # TRI-STATE (T1.1): the state is recorded in RunResult.note (per-source truth). NON-hit outcomes behave
+    # IDENTICALLY for routing — both send their hosts to direct httpx via the caller (a clean SYN 0-open is
+    # NEVER trusted to DROP a host). usable_empty is a normal clean result (note only, no coverage event);
+    # unusable is a degraded execution (truncated/error/garbled → full fallback) and DOES flag an event.
+    clean = raw_status in (Status.SUCCESS, Status.EMPTY) and parse_ok
+    if not clean:
+        state = "unusable"
+    elif n_open == 0:
+        state = "usable_empty"
+    else:
+        state = "usable_with_ports"
+    if state == "usable_with_ports" and raw_status == Status.EMPTY:   # empty-stdout mislabel: CLEAN findings in file
+        res.status = Status.SUCCESS                                   # NOT promoted when a later row was malformed
         res.stdout_lines = n_open
+    res.note = f"prefilter {state}: {n_open} open ip:port(s) over {len(unique_ips)} IP(s)"
     ctx.run.record(phase, res)
-    # HIGH 2: trust the prefilter ONLY on a clean completion. A truncated/errored scan (TIMED_OUT /
-    # BLOCKED / FAILED / PARTIAL) → FULL fallback, even if some ports were found — never thin coverage.
-    if raw_status not in (Status.SUCCESS, Status.EMPTY):
-        return None
-    if n_open == 0:
-        return None                                     # zero open (or clean-empty) -> don't trust, fall back
+    if state == "unusable":
+        events.coverage_partial("probe.naabu_web", reason=f"naabu UNUSABLE ({raw_status.value}, "
+                                f"parse_ok={parse_ok}) over {len(unique_ips)} IP(s) — full direct-httpx fallback")
+        return None                                     # truncated/error/garbled -> caller full-fallback
+    if state == "usable_empty":
+        return {}                                       # clean, nothing open — hosts still probed direct (note carries it)
     host_ports: dict[str, set] = {}
     for ip, ports in open_by_ip.items():
         for h in ip_to_hosts.get(ip, []):
