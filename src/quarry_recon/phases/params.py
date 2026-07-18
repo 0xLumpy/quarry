@@ -327,7 +327,16 @@ def _dalfox_cmd(batch_file, out_file, prof) -> list[str]:
     if bx:
         cmd += ["-b", str(bx)]                             # blind/stored XSS OOB beacon (kept; 4.3.D gates)
     if prof.http_rl:
-        cmd += ["--delay", str(1000 // max(1, prof.http_rl))]   # rate (RoE) — separate axis from workers
+        # RoE rate. dalfox has no global-rate flag, but -w does NOT multiply a host's request rate:
+        # file mode is SEQUENTIAL (runSingleMode — we set neither --mass nor --multicast) and the rate
+        # limiter is per-host + mutex-serialized (every payload worker calls rl.Block(host)), so the
+        # PAYLOAD stream to a host is paced to 1 request per --delay regardless of worker count. --delay is
+        # therefore the RoE period; ceil(1000/rl) (not floor, which overshot) bounds that payload stream to
+        # ≤ rl req/s. NOT a strict process-wide ceiling: dalfox recreates the limiter per target and fires
+        # one bootstrap client.Do() before the limiter, so small bursts at target start/boundaries are
+        # possible — strict aggregate enforcement needs a future outer/shared rate plane (C24). (Verified:
+        # dalfox v2 cmd/file.go, pkg/scanning/{scan,scanning,ratelimit}.go.)
+        cmd += ["--delay", str(-(-1000 // prof.http_rl))]   # -(-a//b) = ceil(a/b), no import
     return cmd
 
 
@@ -717,14 +726,14 @@ def run(ctx) -> None:
     if api_eps:
         aj_in = ctx.write_list("arjun_targets.txt", api_eps)
         aj_out = ctx.run.raw_path("params", "arjun", "arjun.txt")
-        # `-d` is a fixed inter-request delay in SECONDS. The old `-d 1` throttled EVERY request by
-        # 1s across all targets and blew the wall timeout (Test-5, 1800s). Delay is a RATE control,
-        # not a default — apply it ONLY when the program caps us (http_rl), same model as dalfox.
-        # Concurrency (`-t`) stays put; unthrottled, arjun clears the target set inside the timeout.
+        # RoE rate. The old `-d 1/rl` was NOT a breach: arjun forces threads=1 whenever a delay is set
+        # (verified arjun __main__.py), so it paced correctly but SERIALLY. `--rate-limit` (verified -h)
+        # is the better control — a global RPS cap that does NOT collapse threads, so concurrency (`-t`)
+        # is preserved under the ceiling. Applied only when the operator sets http_rl. Coverage unchanged.
         aj_cmd = ["arjun", "-i", str(aj_in), "-oT", str(aj_out),
                   "-t", str(settings.workers("arjun", 5))]   # was hard-coded -t 5; I/O-scaled + config-tunable
         if prof.http_rl:
-            aj_cmd += ["-d", str(round(1.0 / max(1, prof.http_rl), 3))]
+            aj_cmd += ["--rate-limit", str(prof.http_rl)]   # global RPS cap; keeps -t concurrency (unlike -d)
         r = exec_tool("arjun", aj_cmd, timeout=ctx.http_timeout)
         ctx.run.record("params", r)
         # Feed arjun's output forward (each line is a URL with the discovered param(s), e.g.
