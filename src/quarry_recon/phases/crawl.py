@@ -24,6 +24,39 @@ _APIBASE_RX = re.compile(r"(?:baseURL|base_url|api[_-]?base|apiUrl|API_BASE|API_
 _GQL_RX = re.compile(r"[\"'`]([^\"'`]*?/(?:graphql|gql)\b[^\"'`]*)[\"'`]", re.I)    # GraphQL endpoint paths
 
 
+def _gitleaks_status(r, rep):
+    """gitleaks -f json file-output adapter (T1.3), mirroring runner.reclassify_ffuf. Validates the report
+    and sets r.status by the matrix; returns the validated findings (list[dict]) or None when there is NO
+    trustworthy report. Never crashes (bad read/JSON/root/row -> None), never launders a degraded run:
+      - SKIPPED                     -> unchanged (never ran)
+      - clean (SUCCESS/EMPTY) only:  findings -> SUCCESS · [] -> EMPTY · missing/malformed -> PARTIAL
+      - degraded (FAILED/TIMED_OUT/BLOCKED/PARTIAL): findings -> PARTIAL (evidence, incomplete);
+        zero findings / no report -> KEEP the original status (an empty report proves nothing preserved).
+    'clean' is strictly SUCCESS/EMPTY so a PARTIAL/BLOCKED run with findings can't become SUCCESS."""
+    if r.status == Status.SKIPPED:
+        return None                                        # never ran -> nothing to refine
+    items = None
+    try:                                                   # read/parse fail-safe: OSError/UnicodeError too
+        if rep.exists() and rep.stat().st_size:
+            data = json.loads(rep.read_text() or "[]")
+            if isinstance(data, list) and all(isinstance(x, dict) for x in data):
+                items = data
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        items = None
+    clean = r.status in (Status.SUCCESS, Status.EMPTY)
+    if items is not None:
+        r.stdout_lines = len(items)
+    if items and len(items) > 0:
+        r.status = Status.SUCCESS if clean else Status.PARTIAL
+        r.note = f"gitleaks: {len(items)} finding(s)" + ("" if clean else " (degraded — scan did not complete)")
+    elif clean and items is not None:                      # clean + valid [] -> genuine EMPTY
+        r.status, r.note = Status.EMPTY, "gitleaks: 0 findings (clean)"
+    elif clean:                                            # clean but missing/malformed report -> uncertain
+        r.status, r.note = Status.PARTIAL, "gitleaks: report missing/malformed — completion uncertain"
+    # else: degraded + zero-findings/no-report -> KEEP the original (hard) status; nothing was preserved
+    return items
+
+
 def _deep_mine(ctx, files, tag: str) -> int:
     """Extract GraphQL / WebSocket / API-base endpoints from JS / recovered source. Tag-only,
     no fetch — these enrich the endpoint store with `kind` + provenance for later testing."""
@@ -484,23 +517,22 @@ def run(ctx) -> None:
     scan_dirs = [d for d in (js_dir, recov_dir)
                  if d.exists() and any(p.is_file() for p in d.rglob("*"))]
     if scan_dirs and have("gitleaks"):
-        # gitleaks writes its JSON report to the -r FILE and exits 1 when it FINDS leaks
-        # (success, not error). Write a REAL file and classify on its contents — `-r /dev/stdout`
-        # is non-portable (writes 0 bytes on some builds → lost findings + a bogus "failed").
-        # `-s` takes ONE source path, so scan each dir in turn (per-dir report keeps the audit trail).
+        # `gitleaks dir <path>` (T1.3 drift fix): the old `detect --no-git -s <path>` is deprecated —
+        # current gitleaks uses the `dir` subcommand with a POSITIONAL path (filesystem scan, no-git is
+        # implicit; verified `gitleaks dir --help`: usage `gitleaks dir [flags] [path]`, no -s/--no-git).
+        # It writes its JSON report to the -r FILE and exits 1 when it FINDS leaks (success, not error);
+        # write a REAL file and classify on its contents — `-r /dev/stdout` is non-portable (0 bytes on
+        # some builds). One path per invocation, so scan each dir in turn (per-dir report = audit trail).
+        # (Report redaction + version pinning are separate items — C15 secret-hygiene / C08 install-lock.)
         for sd in scan_dirs:
             rep = ctx.run.raw_path("crawl", "gitleaks",
                                    "report.json" if sd == js_dir else "report-sourcemap.json")
-            r = exec_tool("gitleaks", ["gitleaks", "detect", "--no-git", "-s", str(sd),
+            rep.unlink(missing_ok=True)                    # stale report must not fabricate findings/success
+            r = exec_tool("gitleaks", ["gitleaks", "dir", str(sd),
                                        "-r", str(rep), "-f", "json"],
                           ok_codes=(0, 1), timeout=ctx.http_timeout)
-            items = []
-            if rep.exists() and rep.stat().st_size:
-                try:
-                    items = json.loads(rep.read_text() or "[]")
-                except json.JSONDecodeError:
-                    items = []
-            for item in items:
+            items = _gitleaks_status(r, rep)               # validates the -f json report + sets the file-output status
+            for item in (items or []):
                 sec = item.get("Secret", "")
                 # fingerprint from the secret; fall back to rule+file+line so an empty Secret
                 # can't collapse distinct findings to fingerprint("").
@@ -508,13 +540,6 @@ def run(ctx) -> None:
                 ctx.run.add("secret", {"id": f"gitleaks:{item.get('RuleID')}:{secrets.fingerprint(basis)}",
                                        "kind": item.get("RuleID"), "preview": secrets.mask(sec),
                                        "file": item.get("File"), "sources": ["gitleaks"]})
-            # status from the report (gitleaks writes findings to the file + exits 1 on a find).
-            # Keep the REAL RunResult — command / exit code / duration / stderr — for the audit
-            # trail; only override status+note when the report actually shows findings.
-            if items:
-                r.status = Status.SUCCESS
-                r.note = f"{len(items)} leak(s) found"
-                r.stdout_lines = len(items)
             ctx.run.record("crawl", r)
 
     if scan_dirs and have("trufflehog"):
