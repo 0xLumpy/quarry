@@ -125,14 +125,21 @@ def run(ctx) -> None:
         # MATCH 3xx (-mc) instead of following (-r): following would classify many distinct paths onto one
         # login/home page → -ac/dedup would then drop them → the "this path exists" signal is lost. -ac
         # autocalibration already neutralises the redirect-everything catch-all. (ISC-16, v0.3.)
+        # -maxtime: GRACEFUL whole-run ceiling (bounds the call incl. recursion sub-jobs) so a slow origin
+        # writes its partial -o instead of a hard SIGKILL-empty; exec_tool timeout is the hard backstop.
+        # -noninteractive: batch hygiene (no keybinding console). (T2.2)
         cmd = ["ffuf", "-u", f"{url.rstrip('/')}/FUZZ", "-w", str(wl), "-ac", "-timeout", "7",
+               "-noninteractive",
                "-t", str(settings.workers("ffuf", 40)),   # H2: core-scaled concurrency
                "-mc", "200,204,301,302,307,308,401,403,405", "-of", "json", "-o", str(out), "-s"]
+        if ct_to:                                    # 0 = fully unbounded (RoE no-cut) -> no ceiling at all
+            cmd += ["-maxtime", str(ct_to)]
         if prof.http_rl:
             cmd += ["-rate", str(prof.http_rl)]
         if recurse:                                  # 11.2: balanced/deep only (gated above)
             cmd += ["-recursion", "-recursion-depth", str(recurse)]
-        r = reclassify_ffuf(exec_tool("ffuf", cmd, timeout=ct_to), out)   # refine status from the -o artifact
+        hard = ct_to + 60 if ct_to else 0            # backstop when bounded; stays UNBOUNDED (0) when ct_to==0
+        r = reclassify_ffuf(exec_tool("ffuf", cmd, timeout=hard), out)   # graceful -maxtime, exec_tool = hard backstop
         ctx.run.record("content", r)
         if r.status == Status.BLOCKED:
             ff_blocked += 1

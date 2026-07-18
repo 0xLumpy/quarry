@@ -192,6 +192,11 @@ def reclassify_ffuf(r: "RunResult", out_file) -> "RunResult":
     Sets stdout_lines to the result count. Returns the mutated RunResult."""
     if r.status == Status.SKIPPED:
         return r                                             # never ran -> no artifact refinement
+    # ffuf hit its native -maxtime ceiling: it STOPS mid-wordlist, finalizes the artifact, then exits
+    # CLEAN (exit 0) — so the generic classifier reads SUCCESS/EMPTY even though the run was TRUNCATED.
+    # Demote to PARTIAL first (a degraded state) so the matrix below never launders it into SUCCESS/EMPTY.
+    if r.status in (Status.SUCCESS, Status.EMPTY) and "maximum running time" in (r.stderr_tail or "").lower():
+        r.status = Status.PARTIAL
     results = ffuf_results(out_file)
     if results is None:
         return r                                             # no valid artifact -> trust the classifier

@@ -184,14 +184,22 @@ def _vhost_enum(ctx) -> None:
             # serve that Host, so it isn't a vhost. -ac drops the catch-all baseline. NO -r: a redirecting
             # vhost is matched on its 3xx (in -mc) and -ac folds a uniform catch-all by size regardless —
             # so we never follow a Location to another (possibly off-scope) host.
+            # -maxtime: ffuf GRACEFULLY stops the run at the ceiling (writing its partial -o), so a
+            # slow/calibration-stuck origin yields real partial results instead of a hard SIGKILL that
+            # loses the buffered artifact. exec_tool's timeout is now the hard BACKSTOP (ceiling + margin).
+            # -noninteractive: no interactive keybinding console (batch hygiene). -ach not needed — one
+            # origin per ffuf call, so -ac already calibrates per-origin. (T2.2)
             cmd = ["ffuf", "-w", f"{wl}:FUZZ", "-H", f"Host: FUZZ.{apex}",
-                   "-u", f"{base}/", "-ac", "-timeout", "7",
+                   "-u", f"{base}/", "-ac", "-timeout", "7", "-noninteractive",
                    "-t", str(settings.workers("ffuf", 40)), "-s",
                    "-mc", "200-299,301,302,303,307,308,401,403",
                    "-o", str(out), "-of", "json"]
+            if ffuf_to:                                  # 0 = fully unbounded (RoE no-cut) -> no ceiling at all
+                cmd += ["-maxtime", str(ffuf_to)]
             if prof.http_rl:
                 cmd += ["-rate", str(prof.http_rl)]
-            r = reclassify_ffuf(exec_tool("ffuf", cmd, timeout=ffuf_to), out)   # refine status from the -o artifact
+            hard = ffuf_to + 60 if ffuf_to else 0        # backstop when bounded; stays UNBOUNDED (0) when ffuf_to==0
+            r = reclassify_ffuf(exec_tool("ffuf", cmd, timeout=hard), out)   # graceful -maxtime, exec_tool = hard backstop
             ctx.run.record("probe", r)
             ffuf_total += 1
             # per-origin: rollup counters + a coverage_partial event ONLY for a degraded/blocked origin
