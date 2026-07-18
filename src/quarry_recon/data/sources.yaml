@@ -106,7 +106,7 @@ sources:
   probe.gowitness:           {tool: gowitness, phase: probe, tier: core, class: active, default: on,
     input: live, output: screenshot, workers: fixed, rate: http_rl, timeout: http, failure: "reclassify-from-files (not stdout)", fallback: skip, parser: file-count, log: delta}
   probe.smap:                {tool: smap, phase: probe, tier: optional, class: passive, default: on, reason: "passive-optional",
-    input: live, output: port(passive), workers: n/a, rate: n/a, timeout: fixed-600, failure: silent-skip, fallback: skip, parser: raw, log: one-line, notes: "Shodan-backed, no packets"}
+    input: live, output: port(passive), workers: n/a, rate: n/a, timeout: fixed-600, failure: "reclassify from -oJ (malformed/unreadable → PARTIAL/keep-hard); can't prove per-target completion (omits no-data IPs) → returned/eligible in note, not forced PARTIAL", fallback: skip, parser: "-oJ JSON, fail-closed schema", log: one-line, notes: "Shodan InternetDB, no packets; aged passive intel"}
   probe.naabu_infra:         {tool: naabu, phase: probe, tier: heavy, class: deep, default: off, reason: "infra-lane (separate portscan mode)",
     input: cidr, output: port, workers: rate, rate: portscan_rate, timeout: scaled, failure: quiet-warn, fallback: skip, parser: internal, log: one-line,
     notes: "INFRA portscan (top-ports × CIDR) — the weeks-long time bomb; side-stream, gated on prof.portscan + CIDR"}
@@ -160,7 +160,7 @@ sources:
   enrich.gowitness:          {tool: gowitness, phase: enrich, tier: core, class: active, default: on,
     input: new_live, output: screenshot, workers: fixed, rate: http_rl, timeout: http, failure: reclassify-from-files, fallback: skip, parser: file-count, log: delta}
   enrich.smap:               {tool: smap, phase: enrich, tier: optional, class: passive, default: on, reason: "passive-optional",
-    input: new_live, output: port(passive), workers: n/a, rate: n/a, timeout: fixed-600, failure: silent-skip, fallback: skip, parser: raw, log: one-line}
+    input: new_live, output: port(passive), workers: n/a, rate: n/a, timeout: fixed-600, failure: "reclassify from -oJ (malformed/unreadable → PARTIAL/keep-hard); returned/eligible in note, not forced PARTIAL", fallback: skip, parser: "-oJ JSON, fail-closed schema (shared with probe)", log: one-line}
 
   # ── origin (correlation, no external tool) ─────────────────────────────────────────────
   origin.correlation:        {tool: internal, phase: origin, tier: core, class: passive, default: on,

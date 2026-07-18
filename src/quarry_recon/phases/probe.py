@@ -8,13 +8,15 @@ optional smap passive (Shodan-backed) port scan.
 from __future__ import annotations
 
 import json as _json
+import ipaddress as _ipaddress
 import re as _re
 import urllib.parse
 import urllib.request
 
 from .. import events, netguard, normalize, secrets, settings
 from ..runner import (Status, ffuf_results, fresh_artifact_dir, have, nuclei_timeout, reclassify_ffuf,
-                      reclassify_from_files, run as exec_tool, scaled_timeout, skipped)
+                      reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
+                      skipped)
 
 # Serialized-object / token markers that surface in Set-Cookie + response headers. Spotting the
 # FORMAT is PASSIVE recon evidence (a hand-off to the attack layer), never exploitation. Only
@@ -322,6 +324,105 @@ def _cdn_shared_ips(ctx, ips):
         if o.get("cdn") or o.get("waf"):                     # cloud NOT excluded (not proof of shared infra)
             shared.add(ip)
     return shared
+
+
+def _valid_ip(s) -> bool:
+    try:
+        _ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _smap_records(path):
+    """Parse smap's -oJ JSON — a list of per-IP records {ip, user_hostname, hostnames:[...],
+    ports:[{port,service,...}]}. Returns (records, complete):
+      - records = validated [(ip, user_hostname|None, [shodan_hostname,...], [(port,service),...]), ...].
+        VALID evidence is KEPT even when other rows/ports are malformed — a strict parse must not suppress
+        good findings.
+      - complete = True only when EVERY record + port was well-formed; any malformed record (non-dict, bad
+        ip, non-list ports) or bad port (non-int, out of 1..65535) sets it False (caller -> PARTIAL).
+    Returns (None, False) only when there is NO salvageable evidence: missing / unreadable / invalid UTF-8 /
+    malformed JSON / non-list root. smap OMITS no-data IPs, so record-count < input-count is NORMAL."""
+    if not path or not path.exists():
+        return None, False
+    try:
+        data = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, _json.JSONDecodeError, ValueError):
+        return None, False
+    if not isinstance(data, list):
+        return None, False
+    records, complete = [], True
+    for rec in data:
+        if not isinstance(rec, dict):
+            complete = False; continue
+        ip = rec.get("ip")
+        if not isinstance(ip, str) or not _valid_ip(ip):     # semantic IP validity, not just str
+            complete = False; continue
+        ports_raw = rec.get("ports")
+        if not isinstance(ports_raw, list):
+            complete = False; continue
+        rp = []
+        for p in ports_raw:
+            pn = p.get("port") if isinstance(p, dict) else None
+            if isinstance(pn, bool) or not isinstance(pn, int) or not (1 <= pn <= 65535):
+                complete = False; continue                   # bad port -> drop that port, keep the rest
+            svc = p.get("service")
+            rp.append((pn, svc if isinstance(svc, str) else ""))
+        uh = rec.get("user_hostname")
+        uh = uh.lower().rstrip(".") if isinstance(uh, str) else None
+        hn = rec.get("hostnames")
+        hn = [h.lower().rstrip(".") for h in hn if isinstance(h, str)] if isinstance(hn, list) else []
+        records.append((ip, uh, hn, rp))
+    return records, complete
+
+
+def _smap_ingest(ctx, r, sm, phase, targets):
+    """Shared smap file-output handling for BOTH probe and enrich (enrich previously ran smap but never
+    parsed it — its passive port yield was lost, C12). Parse -oJ, reclassify the run status from the port
+    YIELD via the shared adapter (clean+ports -> SUCCESS, clean+0 -> EMPTY, degraded stays degraded,
+    unreadable/malformed-root -> hard/PARTIAL); a partially-malformed artifact -> PARTIAL while KEEPING the
+    valid records. Attribute each record's ports to the exact submitted `user_hostname` (priority), else our
+    stored resolved ip->host map, else Shodan's hostnames. smap is passive (Shodan-backed, no packets) and
+    CANNOT prove per-target completion (omits a no-data IP the same as a swallowed failure), so
+    returned/eligible is a VISIBILITY note, never forced to PARTIAL. Returns the in-scope port count."""
+    records, complete = _smap_records(sm)
+    reclassify_from_artifact(r, None if records is None else sum(len(rp) for *_, rp in records), label="smap")
+    if records is not None and not complete and r.status in (Status.SUCCESS, Status.EMPTY):
+        r.status = Status.PARTIAL                            # malformed rows -> completion uncertain (valid kept)
+    if records is not None:
+        r.note = (f"smap: {len(records)}/{len(set(targets))} target IP(s) had InternetDB records"
+                  f"{' (malformed rows dropped)' if not complete else ''}; {r.note or ''}").strip()
+    ctx.run.record(phase, r)
+    if not records:
+        return 0
+    target_set = set(targets)
+    ip_to_hosts: dict[str, set] = {}
+    for rec in ctx.run.read("resolved"):
+        h = rec.get("host")
+        if h in target_set and ctx.scope.in_scope(h) and not ctx.scope.is_oos(h):
+            for ip in (rec.get("a") or []):
+                ip_to_hosts.setdefault(ip, set()).add(h)
+    def _inscope(h):
+        return bool(h) and ctx.scope.in_scope(h) and not ctx.scope.is_oos(h)
+    n = 0
+    for ip, uh, hostnames, rp in records:
+        # attribution priority: exact submitted user_hostname > our resolved ip->host map > Shodan hostnames
+        host = None
+        if _inscope(uh):
+            host = uh
+        elif ip_to_hosts.get(ip):
+            host = sorted(ip_to_hosts[ip])[0]
+        else:
+            insc = sorted(h for h in hostnames if _inscope(h))
+            host = insc[0] if insc else None
+        if not host:
+            continue
+        for port, svc in rp:
+            if ctx.run.add("port", {"id": f"{ip}:{port}", "host": host, "port": port,
+                                    "service": svc, "sources": ["smap"], "raw_ref": str(sm)}):
+                n += 1
+    return n
 
 
 def _web_port_prefilter(ctx, hosts, phase, pubmap):
@@ -687,27 +788,13 @@ def run(ctx) -> None:
 
     # ── smap: passive (Shodan-backed) port scan, no packets to target (optional) ──
     if have("smap") and ctx.run.count("live"):
-        sm_in = ctx.write_list("smap_targets.txt",
-                               [normalize.host_of_url(u) for u in ctx.run.values("live")])
-        sm = ctx.run.raw_path("probe", "smap", "smap.txt")
-        r = exec_tool("smap", ["smap", "-iL", str(sm_in)], raw_path=sm, timeout=600)
-        ctx.run.record("probe", r)
-        # smap emits nmap-style text; parse open ports into `port` entities — it was recorded raw ONLY
-        # (505 lines, 0 entities on the OTC run). Block: "Nmap scan report for <host> (<ip>)" then
-        # "<n>/tcp open <service>". Passive (Shodan-backed), so no packets to the target.
-        if r.raw_path and r.raw_path.exists():
-            host = ip = None
-            smn = 0
-            for line in r.raw_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                hm = _re.match(r"Nmap scan report for (\S+)(?:\s+\(([\d.]+)\))?", line)
-                if hm:
-                    host, ip = hm.group(1), (hm.group(2) or hm.group(1))
-                    continue
-                pm = _re.match(r"(\d+)/tcp\s+open\s+(\S+)?", line)
-                if pm and ip and host and ctx.scope.in_scope(host) and not ctx.scope.is_oos(host):
-                    if ctx.run.add("port", {"id": f"{ip}:{pm.group(1)}", "host": host,
-                                            "port": int(pm.group(1)), "service": pm.group(2) or "",
-                                            "sources": ["smap"], "raw_ref": str(sm)}):
-                        smn += 1
-            if smn:
-                ctx.echo(f"  smap: +{smn} passive port(s) (Shodan-backed, no packets to target)")
+        sm_targets = [normalize.host_of_url(u) for u in ctx.run.values("live")]
+        sm_in = ctx.write_list("smap_targets.txt", sm_targets)
+        sm = ctx.run.raw_path("probe", "smap", "smap.json")
+        sm.unlink(missing_ok=True)                          # -o file: clear stale before the run
+        # -oJ structured output (verified schema) instead of scraping nmap-text; parse + reclassify + ingest
+        # via the shared helper (it was recorded raw ONLY: 505 lines, 0 entities on the OTC run).
+        r = exec_tool("smap", ["smap", "-iL", str(sm_in), "-oJ", str(sm)], timeout=600)
+        smn = _smap_ingest(ctx, r, sm, "probe", sm_targets)
+        if smn:
+            ctx.echo(f"  smap: +{smn} passive port(s) (Shodan-backed, no packets to target)")

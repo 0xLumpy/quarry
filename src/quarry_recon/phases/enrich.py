@@ -194,9 +194,13 @@ def run(ctx) -> None:
                     for img in shot_dir.glob(ext):
                         ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
 
-            if have("smap"):                            # passive (Shodan) ports — raw, like probe
-                si = ctx.write_list("enrich_smap.txt",
-                                    [normalize.host_of_url(u) for u in new_live])
-                sm = ctx.run.raw_path("enrich", "smap", "smap.txt")
-                ctx.run.record("enrich", exec_tool("smap", ["smap", "-iL", str(si)],
-                                                   raw_path=sm, timeout=600))
+            if have("smap"):                            # passive (Shodan) ports — parse like probe (C12)
+                sm_targets = [normalize.host_of_url(u) for u in new_live]
+                si = ctx.write_list("enrich_smap.txt", sm_targets)
+                sm = ctx.run.raw_path("enrich", "smap", "smap.json")
+                sm.unlink(missing_ok=True)              # -o file: clear stale before the run
+                sr = exec_tool("smap", ["smap", "-iL", str(si), "-oJ", str(sm)], timeout=600)
+                # was recorded raw-only — enrich's passive port yield was lost (C12). Parse + reclassify +
+                # ingest via the SAME shared helper probe uses (-oJ structured; status reflects yield).
+                from .probe import _smap_ingest
+                _smap_ingest(ctx, sr, sm, "enrich", sm_targets)
