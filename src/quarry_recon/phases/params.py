@@ -13,9 +13,24 @@ import re
 import time
 
 from .. import events, evidence, fetch, netguard, normalize, oob, secrets, settings
-from ..runner import RunResult, Status, have, nuclei_timeout, run as exec_tool, scaled_timeout, skipped
+from ..runner import (RunResult, Status, have, nuclei_timeout, reclassify_from_artifact, run as exec_tool,
+                      scaled_timeout, skipped)
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
+
+
+def _arjun_urls(path):
+    """FAIL-CLOSED read of arjun's -oT output (one param-bearing URL per line, e.g. `.../search?q=7101`).
+    Returns the list of query-bearing URLs (the completion signal for the file-output adapter), or None
+    when the file is missing/unreadable — so a chatty arjun stdout can't mask a missing/empty -oT as
+    SUCCESS (the OTC false-success: 3954 stdout lines, no arjun.txt, 0 params)."""
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return [ln.strip() for ln in text.splitlines() if ln.strip() and "?" in ln]
 
 
 def _apply_nuclei_oob(cmd: list[str]) -> list[str]:
@@ -726,6 +741,7 @@ def run(ctx) -> None:
     if api_eps:
         aj_in = ctx.write_list("arjun_targets.txt", api_eps)
         aj_out = ctx.run.raw_path("params", "arjun", "arjun.txt")
+        aj_out.unlink(missing_ok=True)                     # stale -oT must not fake completion
         # RoE rate. The old `-d 1/rl` was NOT a breach: arjun forces threads=1 whenever a delay is set
         # (verified arjun __main__.py), so it paced correctly but SERIALLY. `--rate-limit` (verified -h)
         # is the better control — a global RPS cap that does NOT collapse threads, so concurrency (`-t`)
@@ -735,28 +751,28 @@ def run(ctx) -> None:
         if prof.http_rl:
             aj_cmd += ["--rate-limit", str(prof.http_rl)]   # global RPS cap; keeps -t concurrency (unlike -d)
         r = exec_tool("arjun", aj_cmd, timeout=ctx.http_timeout)
+        # arjun is a FILE-output tool (-oT); its status must come from the artifact, not its chatty stdout.
+        # The OTC false-success: exit 0 + 3954 stdout lines but NO arjun.txt -> classified SUCCESS with 0
+        # params. Reclassify from the parsed -oT via the shared adapter (0 params -> EMPTY, absent/unreadable
+        # -> PARTIAL/keep-hard). Each -oT line is a param-bearing URL (e.g. ".../v1/search?q=7101").
+        urls = _arjun_urls(aj_out)
+        reclassify_from_artifact(r, None if urls is None else len(urls), label="arjun")
         ctx.run.record("params", r)
-        # Feed arjun's output forward (each line is a URL with the discovered param(s), e.g.
-        # ".../v1/search?q=7101"). Without this the discovery was written to a file and dropped:
-        # record provenance AND hand the param-bearing URL to dalfox so a hidden reflected param
-        # actually gets XSS-tested.
+        # Feed arjun's output forward — record provenance AND hand the param-bearing URL to dalfox so a
+        # hidden reflected param actually gets XSS-tested (without this it was written to a file + dropped).
         naj = 0
-        if aj_out.exists():
-            for line in aj_out.read_text().splitlines():
-                u = line.strip()
-                if "?" not in u:
-                    continue
-                base, qs = u.split("?", 1)
-                ctx.run.add("url", {"url": u, "sources": ["arjun"]})
-                for pair in qs.split("&"):
-                    pname = pair.split("=", 1)[0]
-                    if pname:
-                        ctx.run.add("parameter", {"value": f"{base}?{pname}=",
-                                                  "sources": ["arjun"]})
-                ctx.run.add("review", {"id": f"arjun-param:{u[:100]}", "klass": "xss",
-                                       "value": u, "host": normalize.host_of_url(u),
-                                       "sources": ["arjun"]})
-                naj += 1
+        for u in (urls or []):
+            base, qs = u.split("?", 1)
+            ctx.run.add("url", {"url": u, "sources": ["arjun"]})
+            for pair in qs.split("&"):
+                pname = pair.split("=", 1)[0]
+                if pname:
+                    ctx.run.add("parameter", {"value": f"{base}?{pname}=",
+                                              "sources": ["arjun"]})
+            ctx.run.add("review", {"id": f"arjun-param:{u[:100]}", "klass": "xss",
+                                   "value": u, "host": normalize.host_of_url(u),
+                                   "sources": ["arjun"]})
+            naj += 1
         if naj:
             ctx.echo(f"  arjun: +{naj} param-bearing URL(s) -> dalfox candidates")
     else:
