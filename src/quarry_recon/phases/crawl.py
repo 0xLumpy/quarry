@@ -289,8 +289,12 @@ def run(ctx) -> None:
 
     # ── passive urls (gau) ──
     gau_raw = ctx.run.raw_path("crawl", "gau", "gau.txt")
+    # gau reads domains from POSITIONAL ARGS or stdin, never both — args take precedence and stdin is
+    # ignored when args are present (verified upstream cmd/gau/main.go: `if len(domains)>0 {...} else
+    # {read stdin}`). We pass the apexes as args, so the old stdin_data was DEAD input (not a duplicate
+    # request — gau never read it — just misleading); dropped (T1.4). Coverage unchanged.
     r = exec_tool("gau", ["gau", "--subs", "--threads", "5"] + prof.apex_domains,
-                  stdin_data="\n".join(prof.apex_domains), raw_path=gau_raw, timeout=ctx.http_timeout)
+                  raw_path=gau_raw, timeout=ctx.http_timeout)
     ctx.run.record("crawl", r)
     if r.raw_path:
         ctx.echo(f"  gau: +{_collect_url(ctx, r.raw_path.read_text(), 'gau', str(gau_raw))} urls")
