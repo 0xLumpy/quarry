@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 
 from .. import events, netguard, normalize, secrets, settings
-from ..runner import (Status, ffuf_results, have, nuclei_timeout, reclassify_ffuf,
+from ..runner import (Status, ffuf_results, fresh_artifact_dir, have, nuclei_timeout, reclassify_ffuf,
                       reclassify_from_files, run as exec_tool, scaled_timeout, skipped)
 
 # Serialized-object / token markers that surface in Set-Cookie + response headers. Spotting the
@@ -635,15 +635,16 @@ def run(ctx) -> None:
     # ── screenshots (write structured jsonl too for the asset DB) ──
     if prof.screenshots and ctx.run.count("live"):
         live_file = ctx.write_list("live.txt", ctx.run.values("live"))
-        shot_dir = ctx.run.dir / "raw" / "probe" / "gowitness"
-        shot_dir.mkdir(parents=True, exist_ok=True)
+        shot_dir = fresh_artifact_dir(ctx.run.dir / "raw" / "probe" / "gowitness")   # FRESH per invocation
         r = exec_tool("gowitness",
                 ["gowitness", "scan", "file", "-f", str(live_file),
                  "--screenshot-path", str(shot_dir), "--write-jsonl",
                  "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
                 timeout=ctx.http_timeout)
         # gowitness writes to FILES, not stdout → the runner mislabels it BLOCKED on a stderr WAF line
-        # even when it screenshotted most hosts (observed 43/51). Reclassify from shots on disk.
+        # even when it screenshotted most hosts (observed 43/51). Reclassify from shots in THIS attempt's
+        # dir only — a reused/pre-populated dir must not let old screenshots inflate the count (T1.6 core
+        # precondition: the artifact must be fresh).
         shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
         reclassify_from_files(r, shots, "screenshot")
         ctx.run.record("probe", r)

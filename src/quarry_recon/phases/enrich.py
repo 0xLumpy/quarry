@@ -13,7 +13,7 @@ import json as _json
 
 from .. import normalize
 from .. import settings
-from ..runner import (have, nuclei_timeout, reclassify_from_files, run as exec_tool,
+from ..runner import (fresh_artifact_dir, have, nuclei_timeout, reclassify_from_files, run as exec_tool,
                       scaled_timeout, skipped)
 
 
@@ -179,14 +179,14 @@ def run(ctx) -> None:
 
             if prof.screenshots and have("gowitness"):  # screenshots
                 lf = ctx.write_list("enrich_live.txt", new_live)
-                shot_dir = ctx.run.dir / "raw" / "enrich" / "gowitness"
-                shot_dir.mkdir(parents=True, exist_ok=True)
+                shot_dir = fresh_artifact_dir(ctx.run.dir / "raw" / "enrich" / "gowitness")   # FRESH per invocation
                 gr = exec_tool("gowitness",
                     ["gowitness", "scan", "file", "-f", str(lf),
                      "--screenshot-path", str(shot_dir), "--write-jsonl",
                      "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
                     timeout=ctx.http_timeout)
-                # same file-output reclassification as probe (BLOCKED-on-empty-stdout is a mislabel)
+                # same file-output reclassification as probe — count THIS attempt's dir only (a reused/
+                # pre-populated dir must not inflate the count; T1.6 core precondition: fresh artifact)
                 shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
                 reclassify_from_files(gr, shots, "screenshot")
                 ctx.run.record("enrich", gr)

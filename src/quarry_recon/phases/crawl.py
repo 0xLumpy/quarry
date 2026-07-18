@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from .. import events, fetch, normalize, secrets, settings
-from ..runner import Status, have, run as exec_tool, skipped
+from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
 # 9.2 deep-mine patterns over JS / recovered source — extraction only, no fetch.
 # Each findall() yields the value to store (full match or capture group).
@@ -24,36 +24,28 @@ _APIBASE_RX = re.compile(r"(?:baseURL|base_url|api[_-]?base|apiUrl|API_BASE|API_
 _GQL_RX = re.compile(r"[\"'`]([^\"'`]*?/(?:graphql|gql)\b[^\"'`]*)[\"'`]", re.I)    # GraphQL endpoint paths
 
 
-def _gitleaks_status(r, rep):
-    """gitleaks -f json file-output adapter (T1.3), mirroring runner.reclassify_ffuf. Validates the report
-    and sets r.status by the matrix; returns the validated findings (list[dict]) or None when there is NO
-    trustworthy report. Never crashes (bad read/JSON/root/row -> None), never launders a degraded run:
-      - SKIPPED                     -> unchanged (never ran)
-      - clean (SUCCESS/EMPTY) only:  findings -> SUCCESS · [] -> EMPTY · missing/malformed -> PARTIAL
-      - degraded (FAILED/TIMED_OUT/BLOCKED/PARTIAL): findings -> PARTIAL (evidence, incomplete);
-        zero findings / no report -> KEEP the original status (an empty report proves nothing preserved).
-    'clean' is strictly SUCCESS/EMPTY so a PARTIAL/BLOCKED run with findings can't become SUCCESS."""
-    if r.status == Status.SKIPPED:
-        return None                                        # never ran -> nothing to refine
-    items = None
-    try:                                                   # read/parse fail-safe: OSError/UnicodeError too
+def _gitleaks_report(rep):
+    """FAIL-CLOSED parse of a gitleaks -f json report: returns list[dict] of findings for a VALID artifact,
+    or None when there is NO trustworthy report (missing / unreadable / malformed / non-list root / non-dict
+    row) — never .get()s a bad row, never raises (OSError/UnicodeError/JSON error all -> None)."""
+    try:
         if rep.exists() and rep.stat().st_size:
             data = json.loads(rep.read_text() or "[]")
             if isinstance(data, list) and all(isinstance(x, dict) for x in data):
-                items = data
+                return data
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-        items = None
-    clean = r.status in (Status.SUCCESS, Status.EMPTY)
-    if items is not None:
-        r.stdout_lines = len(items)
-    if items and len(items) > 0:
-        r.status = Status.SUCCESS if clean else Status.PARTIAL
-        r.note = f"gitleaks: {len(items)} finding(s)" + ("" if clean else " (degraded — scan did not complete)")
-    elif clean and items is not None:                      # clean + valid [] -> genuine EMPTY
-        r.status, r.note = Status.EMPTY, "gitleaks: 0 findings (clean)"
-    elif clean:                                            # clean but missing/malformed report -> uncertain
-        r.status, r.note = Status.PARTIAL, "gitleaks: report missing/malformed — completion uncertain"
-    # else: degraded + zero-findings/no-report -> KEEP the original (hard) status; nothing was preserved
+        return None
+    return None
+
+
+def _gitleaks_status(r, rep):
+    """gitleaks file-output adapter (T1.3): validate the report, set r.status via the shared matrix
+    (runner.reclassify_from_artifact — clean=SUCCESS/EMPTY only; degraded never laundered), return the
+    validated findings or None."""
+    if r.status == Status.SKIPPED:
+        return None                                        # never ran -> no report to ingest
+    items = _gitleaks_report(rep)
+    reclassify_from_artifact(r, None if items is None else len(items), label="gitleaks")
     return items
 
 

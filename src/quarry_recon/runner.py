@@ -91,19 +91,64 @@ def set_tool_cwd(path) -> None:
     _TOOL_CWD = str(path) if path else None
 
 
-def reclassify_from_files(r: "RunResult", produced: int, note_word: str = "item") -> "RunResult":
-    """Fix the status of a tool that writes results to FILES (gowitness screenshots, …). The runner
-    classifies on stdout, which is empty for such tools, so a WAF/error line in stderr mislabels the
-    whole run BLOCKED/FAILED even when it produced real output. Reclassify from the actual artifact
-    count: >0 => SUCCESS, or PARTIAL if it was flagged blocked (some hosts genuinely WAF'd)."""
-    if produced > 0:
-        if r.status == Status.BLOCKED:
-            r.status = Status.PARTIAL
-        elif r.status in (Status.EMPTY, Status.FAILED):
-            r.status = Status.SUCCESS
-        r.note = f"{produced} {note_word}(s)" + (" (some hosts blocked)" if r.status == Status.PARTIAL else "")
-        r.stdout_lines = produced
+def fresh_artifact_dir(base) -> "Path":
+    """A FRESH per-invocation subdirectory `base/attempt-N` — the first N whose name is free — created
+    ATOMICALLY (mkdir exist_ok=False). For file-output tools whose result count is derived by globbing a
+    directory (gowitness): a reused / pre-populated directory would let a PRIOR run's artifacts inflate this
+    attempt's count (and launder a failed/empty run). Counting existing dirs is unsafe (gaps like attempt-0
+    + attempt-2 would reopen the occupied attempt-2), so we probe upward and let the atomic create claim the
+    first free slot — this fills gaps, skips any name already taken by a file or dir, and stops two
+    concurrent callers sharing an attempt. Prior attempts are PRESERVED as evidence — never deleted."""
+    base = Path(base)
+    base.mkdir(parents=True, exist_ok=True)
+    n = 0
+    while True:
+        d = base / f"attempt-{n}"
+        try:
+            d.mkdir(exist_ok=False)                        # atomic: raises if the name is taken -> next slot
+            return d
+        except FileExistsError:
+            n += 1
+
+
+def reclassify_from_artifact(r: "RunResult", n: "int | None", *, label: str = "tool") -> "RunResult":
+    """Shared file-output status matrix (the pattern hardened across reclassify_ffuf / _gitleaks_status /
+    the naabu prefilter). A file-output tool leaves an empty stdout, so the generic classifier mislabels it
+    from a stderr line; the ARTIFACT is authoritative. `n` = count of VALIDATED results (>=0) when the
+    artifact is a trustworthy complete result, or None when there is NO trustworthy artifact (missing /
+    unreadable / malformed). The CALLER owns the format-specific FAIL-CLOSED parse and MUST clear the stale
+    artifact before running the tool (a stale file must not fake completion). Matrix:
+      - SKIPPED                     -> unchanged (never ran)
+      - clean (SUCCESS/EMPTY only):  n>0 -> SUCCESS · n==0 -> EMPTY · None -> PARTIAL (completion uncertain)
+      - degraded (anything else — FAILED/TIMED_OUT/BLOCKED/PARTIAL): n>0 -> PARTIAL (evidence, incomplete);
+        n==0 or None -> KEEP the original status (an empty/absent artifact preserves nothing, so a hard
+        run is NEVER laundered into SUCCESS/EMPTY)."""
+    if r.status == Status.SKIPPED:
+        return r
+    # enforce the count contract: only a real int >= 0 is a trustworthy count. bool (a truthy int
+    # subclass), float, str, or a negative -> None (no trustworthy artifact), so a bad count fails CLOSED
+    # instead of laundering (e.g. -1 / True would otherwise be truthy and read as a successful result).
+    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 0):
+        n = None
+    clean = r.status in (Status.SUCCESS, Status.EMPTY)
+    if n is not None:
+        r.stdout_lines = n
+    if n:                                              # n > 0
+        r.status = Status.SUCCESS if clean else Status.PARTIAL
+        r.note = f"{label}: {n} result(s)" + ("" if clean else " (degraded — scan did not complete)")
+    elif clean and n is not None:                      # clean + 0 valid results
+        r.status, r.note = Status.EMPTY, f"{label}: 0 results (clean)"
+    elif clean:                                        # clean but no trustworthy artifact
+        r.status, r.note = Status.PARTIAL, f"{label}: artifact missing/malformed — completion uncertain"
+    # else: degraded + empty/absent -> keep the original (hard) status
     return r
+
+
+def reclassify_from_files(r: "RunResult", produced: int, note_word: str = "item") -> "RunResult":
+    """Count-based file-output adapter (gowitness screenshots, …): `produced` = artifact COUNT. Thin
+    wrapper over reclassify_from_artifact so a non-empty count on a DEGRADED run is PARTIAL, never
+    laundered to SUCCESS (the old behavior turned FAILED+output into SUCCESS)."""
+    return reclassify_from_artifact(r, produced, label=note_word)
 
 
 def ffuf_results(out_file) -> "list | None":
