@@ -125,6 +125,19 @@ class TargetProfile:
         return bool(self.modes.get("BLOCK_PRIVATE_TARGETS", False))
 
     @property
+    def verify_secrets(self) -> bool:
+        """Opt-in authorized lane: actively VERIFY discovered secrets. Default False — trufflehog's
+        default verification sends discovered TARGET credentials to their THIRD-PARTY provider APIs
+        (github/aws/etc.), turning offline secret mining into active credential use against a third party
+        (an RoE/legal concern). This is a DIFFERENT axis from target contact-by-default and does NOT
+        suppress discovery: every secret is still found and reported (as unverified) either way. Set true
+        only when the engagement explicitly authorizes credential verification — which arms verification
+        across ALL detected providers (a per-provider allowlist can be a later refinement).
+        Strict `is True` (not bool()): an arming flag must NOT fail open on quoted YAML (`"false"` ->
+        disabled); general MODES type-validation arrives in T1.7."""
+        return self.modes.get("SECRET_VERIFICATION", False) is True
+
+    @property
     def headless(self) -> bool:
         return bool(self.modes.get("HEADLESS", False))
 

@@ -64,6 +64,11 @@ MODES:
                         # as a finding AND contacted (offensive; evidence validates ownership). Set true for a
                         # conservative VPS-external posture (don't touch private space). The scan box itself +
                         # cloud metadata (169.254.169.254 etc) are ALWAYS withheld from contact regardless.
+  SECRET_VERIFICATION: false  # default false: discovered secrets are reported UNVERIFIED. trufflehog's
+                        # default verification sends found TARGET credentials to their THIRD-PARTY provider
+                        # APIs (active credential use against a third party — RoE/legal concern). Discovery
+                        # is unaffected either way (every secret is still found/reported). Set true only when
+                        # the engagement explicitly authorizes credential verification.
   CONTENT_DISCOVERY: "off"  # off | light | balanced | deep — candidate-driven path brute (default off)
   CONTENT_RECURSION: 0    # recursion depth for content discovery (0 = off; pairs with balanced/deep)
   DEEP_EVIDENCE: false    # true => DOWNLOAD + mine heavy artifacts (actuator heapdump) instead of just

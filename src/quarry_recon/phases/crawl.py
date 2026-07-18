@@ -520,8 +520,15 @@ def run(ctx) -> None:
     if scan_dirs and have("trufflehog"):
         # `filesystem` accepts multiple paths — hand it both dirs in one pass.
         th = ctx.run.raw_path("crawl", "trufflehog", "out.jsonl")
-        r = exec_tool("trufflehog", ["trufflehog", "filesystem", *[str(d) for d in scan_dirs],
-                                     "--json", "--no-update"], raw_path=th, timeout=ctx.http_timeout)
+        # SAFETY: trufflehog VERIFIES by default — it sends discovered TARGET credentials to their
+        # THIRD-PARTY provider APIs, turning offline secret mining into active credential use against a
+        # third party (RoE/legal concern). Default `--no-verification`; verification is an explicit
+        # authorized lane (MODES.SECRET_VERIFICATION). Discovery is UNAFFECTED — every secret is still
+        # found and reported (as unverified) either way; only the active provider round-trip is gated.
+        th_cmd = ["trufflehog", "filesystem", *[str(d) for d in scan_dirs], "--json", "--no-update"]
+        if not prof.verify_secrets:
+            th_cmd.append("--no-verification")
+        r = exec_tool("trufflehog", th_cmd, raw_path=th, timeout=ctx.http_timeout)
         ctx.run.record("crawl", r)
         if r.raw_path:
             for line in r.raw_path.read_text().splitlines():
@@ -535,9 +542,19 @@ def run(ctx) -> None:
                 # fingerprint from Raw; if Raw is empty, fall back to detector + redacted +
                 # source context so distinct findings don't collapse to fingerprint("").
                 basis = raw_s or f"{det}|{red}|{o.get('SourceMetadata') or ''}"
+                # verification is TRI-state. `verified`: True/False mean attempted (valid/invalid);
+                # None means NOT attempted (lane off) — so a not-checked secret never reads as
+                # "checked and invalid" (False). `verification` carries the same truth as a string.
+                if prof.verify_secrets:
+                    verified = bool(o.get("Verified", False))
+                    verification = "verified" if verified else "unverified"
+                else:
+                    verified = None
+                    verification = "not_checked"
                 ctx.run.add("secret", {"id": f"trufflehog:{det}:{secrets.fingerprint(basis)}",
                                        "kind": det, "preview": red or secrets.mask(raw_s),
-                                       "verified": o.get("Verified", False), "sources": ["trufflehog"]})
+                                       "verified": verified, "verification": verification,
+                                       "sources": ["trufflehog"]})
 
     ctx.echo(f"  urls: {ctx.run.count('url')}  js: {ctx.run.count('js_url')}  "
              f"endpoints: {ctx.run.count('endpoint')}  params: {ctx.run.count('parameter')}  "
