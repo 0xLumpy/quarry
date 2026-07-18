@@ -1,6 +1,6 @@
 """Phase 3: Vertical subdomain discovery.
 
-passive (subfinder -all -recursive) + github-subdomains -> brute (puredns) ->
+passive (subfinder -all, all sources) + github-subdomains -> brute (puredns) ->
 permutations (alterx/dnsgen) -> trusted-resolver validation. Records source deltas so
 a human can spot "one source found many another missed" (methodology day1).
 """
@@ -288,8 +288,14 @@ def run(ctx) -> None:
 
     # ── passive: subfinder ──
     sf_raw = ctx.run.raw_path("vertical", "subfinder", "passive.txt")
-    # -stats prints per-source/API-key health to stderr (captured in stderr_tail)
-    r = exec_tool("subfinder", ["subfinder", "-dL", str(roots_file), "-all", "-recursive",
+    # `-all` = every configured source. NO `-recursive`: upstream defines it as "use ONLY sources that can
+    # handle subdomains recursively" (verified subfinder v2.14.0 -h), so `-all -recursive` RESTRICTS to the
+    # recursive-capable SUBSET and silently drops the other providers — a coverage loss (T1.2). Dropping it
+    # runs all sources: the selected provider SET is a superset of the old recursive-only subset (observed
+    # results can still vary run-to-run, as passive APIs do). A separate recursive pass seeded from NS/delegation
+    # evidence is a later enhancement (needs the dns phase's records; running -recursive blind over all
+    # roots adds nothing over -all). -stats prints per-source/API-key health to stderr (kept; captured).
+    r = exec_tool("subfinder", ["subfinder", "-dL", str(roots_file), "-all",
                                 "-stats", "-silent"], raw_path=sf_raw, timeout=ctx.http_timeout)
     ctx.run.record("vertical", r)
     if r.raw_path:
