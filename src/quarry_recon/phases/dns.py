@@ -30,11 +30,15 @@ _WILDCARD_PROBE_FLAGS = ["-a", "-aaaa", "-cname", "-txt"]   # baseline only need
 
 
 def _apex_of(host: str, apexes) -> str:
+    # LONGEST matching apex, not the first — with both example.com and dev.example.com in scope,
+    # x.dev.example.com must attribute to dev.example.com (order-independent), else its wildcard baseline
+    # is computed against the wrong root.
     h = host.lower().rstrip(".")
+    best = None
     for a in apexes:
-        if h == a or h.endswith("." + a):
-            return a
-    return ".".join(h.split(".")[-2:])
+        if (h == a or h.endswith("." + a)) and (best is None or len(a) > len(best)):
+            best = a
+    return best or ".".join(h.split(".")[-2:])
 
 
 def _dnsx_cmd(ctx, list_file, flags=None):

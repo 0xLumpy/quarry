@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+import idna as _idna                                       # IDNA2008 / UTS-46 (correct domain identity)
 import yaml
 
 # HTTP probe set from the proven manual workflow. Empty PORTS.HTTP means use this full set;
@@ -35,6 +36,83 @@ class ProfileError(Exception):
 # Content-discovery recursion is capped — content discovery is deliberately conservative. Raise
 # this only for an engagement that truly needs it. Depth 4-5 warns at run time; > MAX fails loud.
 MAX_CONTENT_RECURSION = 5
+
+# ── profile-input validation (T1.7 / C04) — conservative hardening of MALFORMED/DANGEROUS input only;
+# it never narrows WHAT can be targeted, only rejects garbage that would otherwise misfire silently. ──
+_TRUE_STRS = {"true", "yes", "on", "1"}
+_FALSE_STRS = {"false", "no", "off", "0", ""}
+
+
+def _flag(raw, default: bool) -> bool:
+    """Strict boolean coercion for MODES. YAML native `true`/`false` pass through; a QUOTED string is
+    PARSED (`"false"` -> False, not `bool("false")` == True — the footgun that could silently flip
+    PASSIVE_ONLY on and suppress the whole active scan). `None` -> `default`. Anything ambiguous fails
+    LOUD (never fail-open). Does NOT govern arming flags with their own stricter rule (SECRET_VERIFICATION
+    stays `is True`)."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int):                    # YAML 1/0 ONLY (already-bool handled above); 2/-1 are typos
+        if raw in (0, 1):
+            return raw == 1
+        raise ProfileError(f"invalid boolean {raw!r} (use true/false or 0/1)")
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in _TRUE_STRS:
+            return True
+        if s in _FALSE_STRS:
+            return False
+    raise ProfileError(f"invalid boolean {raw!r} (use true/false)")
+
+
+def _strict_int(v, ctx: str) -> int:
+    """Integer coercion that does NOT quietly truncate/coerce: rejects bool (a truthy int subclass) and
+    float (`80.9`), accepts a real int or a signed-digit string. Prevents `true`->1 / `80.9`->80 slipping
+    into a port/rate."""
+    if isinstance(v, bool):
+        raise ProfileError(f"{ctx} must be an integer, got boolean {v!r}")
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and re.fullmatch(r"[+-]?\d+", v.strip()):
+        return int(v.strip())
+    raise ProfileError(f"{ctx} must be an integer, got {v!r}")
+
+
+def _looks_like_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+# one DNS label: 1-63 chars, letters/digits/hyphen, no leading/trailing hyphen. Allow a SINGLE-label
+# internal zone (e.g. `corp`) — 2+ labels was too strict and narrowed internal-engagement scope.
+_LABEL = r"(?!-)[a-z0-9-]{1,63}(?<!-)"
+_DOMAIN_RE = re.compile(rf"^{_LABEL}(?:\.{_LABEL})*$")
+
+
+def _canon_domain(d: str) -> str:
+    """Validate + canonicalize an APEX_DOMAINS entry to a hostname ROOT. A leading `*.` wildcard is
+    STRIPPED to its root — Quarry's scope model is root-based (the root matches the bare apex AND every
+    subdomain), so `*.example.com` and `example.com` are the same anchor here. Unicode is IDNA2008 / UTS-46
+    non-transitional (`faß.de` -> `xn--fa-hia.de`, NOT the builtin codec's transitional `fass.de`, which
+    would contact a DIFFERENT domain). Accepts a single-label internal zone; rejects IP literals, path/
+    traversal (`/`, `..`), whitespace, and empty labels — also closing the apex->filename path escape.
+    Never narrows a legitimate target — only rejects input that could not be a real domain."""
+    s = str(d).strip().rstrip(".").lower()
+    if s.startswith("*."):
+        s = s[2:]                                          # wildcard -> root (already covers subs + bare apex)
+    if not s:
+        raise ProfileError(f"invalid APEX_DOMAINS entry {d!r} (empty)")
+    try:
+        core = _idna.encode(s, uts46=True, transitional=False).decode("ascii")
+    except (_idna.IDNAError, UnicodeError, ValueError):
+        raise ProfileError(f"invalid domain in APEX_DOMAINS: {d!r}")
+    if not _DOMAIN_RE.match(core) or _looks_like_ip(core):
+        raise ProfileError(f"invalid domain in APEX_DOMAINS: {d!r} (not a hostname)")
+    return core
 
 
 @dataclass
@@ -114,7 +192,7 @@ class TargetProfile:
 
     @property
     def passive_only(self) -> bool:
-        return bool(self.modes.get("PASSIVE_ONLY", False))
+        return _flag(self.modes.get("PASSIVE_ONLY"), False)
 
     @property
     def block_private_targets(self) -> bool:
@@ -122,7 +200,7 @@ class TargetProfile:
         Quarry is offensive, a private-resolving in-scope name is a LEAD (recorded either way) and the
         reachable service is tested to validate ownership. Set true for a paranoid VPS-external posture.
         Scan-box/cloud-metadata destinations are ALWAYS withheld regardless of this flag."""
-        return bool(self.modes.get("BLOCK_PRIVATE_TARGETS", False))
+        return _flag(self.modes.get("BLOCK_PRIVATE_TARGETS"), False)
 
     @property
     def verify_secrets(self) -> bool:
@@ -134,16 +212,16 @@ class TargetProfile:
         only when the engagement explicitly authorizes credential verification — which arms verification
         across ALL detected providers (a per-provider allowlist can be a later refinement).
         Strict `is True` (not bool()): an arming flag must NOT fail open on quoted YAML (`"false"` ->
-        disabled); general MODES type-validation arrives in T1.7."""
+        disabled) — stricter than the general MODES `_flag` parser (T1.7) which the other booleans use."""
         return self.modes.get("SECRET_VERIFICATION", False) is True
 
     @property
     def headless(self) -> bool:
-        return bool(self.modes.get("HEADLESS", False))
+        return _flag(self.modes.get("HEADLESS"), False)
 
     @property
     def screenshots(self) -> bool:
-        return bool(self.modes.get("SCREENSHOTS", True))
+        return _flag(self.modes.get("SCREENSHOTS"), True)
 
     @property
     def portscan(self) -> bool:
@@ -151,11 +229,11 @@ class TargetProfile:
         # side-stream. Default OFF: it must be a deliberate opt-in, so adding CIDR scope can't silently
         # arm it. Does NOT gate the web-port SYN prefilter (probe._web_port_prefilter over resolved host
         # IPs -> httpx-on-open-only), which is main-river and always on when naabu is present.
-        return bool(self.modes.get("PORTSCAN", False))
+        return _flag(self.modes.get("PORTSCAN"), False)
 
     @property
     def takeover(self) -> bool:
-        return bool(self.modes.get("TAKEOVER", True))
+        return _flag(self.modes.get("TAKEOVER"), True)
 
     @property
     def content_discovery(self) -> str:
@@ -241,7 +319,9 @@ class TargetProfile:
         raw = yaml.safe_load(path.read_text()) or {}
         if not raw.get("TARGET"):
             raise ProfileError("profile missing required field: TARGET")
-        apexes = [str(d).strip() for d in (raw.get("APEX_DOMAINS") or []) if d]
+        # canonicalize + validate every apex (rejects path/traversal/garbage — also closes the
+        # apex->filename path escape). Never narrows a legitimate target; only rejects non-domains.
+        apexes = [_canon_domain(d) for d in (raw.get("APEX_DOMAINS") or []) if str(d).strip()]
         if not apexes:
             raise ProfileError("profile must list at least one APEX_DOMAINS entry")
         cdv = (raw.get("MODES") or {}).get("CONTENT_DISCOVERY", "off")
@@ -258,16 +338,49 @@ class TargetProfile:
         if not 0 <= cr_i <= MAX_CONTENT_RECURSION:     # caged: a typo like 20 must fail, not roar
             raise ProfileError(
                 f"MODES.CONTENT_RECURSION {cr_i} out of range (0-{MAX_CONTENT_RECURSION}; content discovery is capped)")
-        ports = [int(p) for p in (raw.get("PORTS") or {}).get("HTTP") or [] if p]
+        # ports: strict int + valid range (1..65535) — a typo'd 99999 / 0 / -1 must fail loud, not be
+        # silently handed to a scanner as a nonsense target.
+        ports = []
+        for p in (raw.get("PORTS") or {}).get("HTTP") or []:
+            if p in (None, ""):
+                continue
+            pi = _strict_int(p, f"PORTS.HTTP entry {p!r}")   # rejects bool/float (no true->1 / 80.9->80)
+            if not (1 <= pi <= 65535):
+                raise ProfileError(f"PORTS.HTTP port {pi} out of range (1-65535)")
+            ports.append(pi)
+        # rate limits: a present RATELIMIT must be a POSITIVE integer — a 0/negative/garbage rate is a
+        # footgun (a per-target RoE cap of 0 or a crash mid-run), so fail loud at load.
+        rl = raw.get("RATELIMIT") or {}
+        for k in ("HTTP", "DNS", "PORTSCAN"):
+            v = rl.get(k)
+            if v in (None, ""):
+                continue
+            if _strict_int(v, f"RATELIMIT.{k}") <= 0:
+                raise ProfileError(f"RATELIMIT.{k} must be > 0, got {v!r}")
+        # boolean MODES: validate the known flags parse now (fail loud BEFORE side effects) — a quoted
+        # `"false"` must not silently become True, and a typo like `maybe` must not silently pick a default.
+        modes = raw.get("MODES") or {}
+        for k in ("PASSIVE_ONLY", "BLOCK_PRIVATE_TARGETS", "HEADLESS", "SCREENSHOTS", "PORTSCAN", "TAKEOVER"):
+            if k in modes:
+                _flag(modes[k], False)          # raises ProfileError on an ambiguous value
+        # ARMING flags (danger lanes): a PRESENT value must be an explicit bare boolean — a quoted string
+        # like "true"/"maybe" must fail loud, never silently leave the lane DISABLED against operator intent.
+        if "SECRET_VERIFICATION" in modes and not isinstance(modes["SECRET_VERIFICATION"], bool):
+            raise ProfileError(f"MODES.SECRET_VERIFICATION must be a bare boolean true/false "
+                               f"(got {modes['SECRET_VERIFICATION']!r})")
+        if "DEEP_EVIDENCE" in modes:
+            dv = modes["DEEP_EVIDENCE"]
+            if not (isinstance(dv, bool) or str(dv).strip().lower() in _TRUE_STRS | _FALSE_STRS | {"deep"}):
+                raise ProfileError(f"MODES.DEEP_EVIDENCE invalid value {dv!r} (use true/false)")
         return cls(
             target=str(raw["TARGET"]).strip(),
             apex_domains=apexes,
             oos=[str(p) for p in (raw.get("OOS") or []) if p],
             cidr=[str(c) for c in (raw.get("CIDR") or []) if c],
             asn=[str(a).strip() for a in (raw.get("ASN") or []) if a],
-            ratelimit=raw.get("RATELIMIT") or {},
+            ratelimit=rl,
             http_ports=ports,
-            modes=raw.get("MODES") or {},
+            modes=modes,
             notes=[str(n) for n in (raw.get("NOTES") or []) if n],
             path=path,
             _raw=raw,

@@ -13,6 +13,7 @@ authors = [{ name = "0xlumpy" }]
 dependencies = [
     "click>=8.1",
     "pyyaml>=6.0",
+    "idna>=3.4",                 # IDNA2008/UTS-46 domain canonicalization (correct target identity)
 ]
 
 [project.scripts]

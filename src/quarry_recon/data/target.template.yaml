@@ -32,7 +32,8 @@ BRANDS:
   # - Example
 
 RATELIMIT:
-  # HTTP req/s for httpx/katana/nuclei/dalfox. EMPTY => tool defaults (fast — recommended).
+  # HTTP req/s for httpx/katana/nuclei/dalfox. EMPTY => tool defaults (fast — recommended). When set it
+  # must be a POSITIVE integer (a 0/negative/non-integer rate is rejected at load, not silently applied).
   # Set ONLY when a program's RoE caps you: a low cap (e.g. 5) makes nuclei very slow, since
   # its work = templates x hosts (thousands of templates). Example for a 5 req/s program:
   #   HTTP: 5
