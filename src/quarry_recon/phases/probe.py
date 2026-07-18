@@ -326,6 +326,56 @@ def _cdn_shared_ips(ctx, ips):
     return shared
 
 
+def _nmap_services(path):
+    """Parse nmap -oX XML. Returns (services, complete):
+      - services = [(ip, port, proto, service, product, version) for OPEN ports]. VALID rows are kept even
+        when other rows are malformed.
+      - complete = True ONLY when the XML parsed AND nmap reported clean completion
+        (<runstats><finished exit="success">) AND no malformed row was seen. A malformed host/port (missing
+        address, missing <state>, non-int / out-of-range portid) keeps valid rows but sets complete False;
+        an errored/absent <finished exit="success"> also sets it False (the caller -> PARTIAL). A closed or
+        filtered port is NORMAL, not malformed.
+    Returns (None, False) only when there is NO salvageable artifact: missing / unreadable / malformed XML /
+    non-<nmaprun> root."""
+    if not path or not path.exists():
+        return None, False
+    import xml.etree.ElementTree as _ET
+    try:
+        root = _ET.parse(str(path)).getroot()
+    except (OSError, _ET.ParseError, ValueError):
+        return None, False
+    if root is None or root.tag != "nmaprun":
+        return None, False
+    out, complete = [], True
+    for host in root.findall("host"):
+        addr = None
+        for a in host.findall("address"):
+            if a.get("addrtype") in ("ipv4", "ipv6") and a.get("addr"):
+                addr = a.get("addr"); break
+        if not addr:
+            complete = False; continue                       # malformed: host with no usable address
+        for port in host.findall("./ports/port"):
+            st = port.find("state")
+            state = st.get("state") if st is not None else None
+            if state is None:
+                complete = False; continue                   # malformed: a port with no <state>
+            if state != "open":
+                continue                                     # closed/filtered = normal, not malformed
+            try:
+                pn = int(port.get("portid"))
+            except (TypeError, ValueError):
+                complete = False; continue                   # malformed portid
+            if not (1 <= pn <= 65535):
+                complete = False; continue
+            svc = port.find("service")
+            g = (lambda k: (svc.get(k) or "") if svc is not None else "")
+            out.append((addr, pn, port.get("protocol") or "tcp", g("name"), g("product"), g("version")))
+    fin = root.find("runstats/finished")                     # nmap DTD: runstats/finished is the completion marker
+    if fin is None or fin.get("exit") != "success":
+        complete = False                                     # nmap did not report clean completion
+    return out, complete
+
+
 def _valid_ip(s) -> bool:
     try:
         _ipaddress.ip_address(s)
@@ -771,18 +821,38 @@ def run(ctx) -> None:
             for line in r.raw_path.read_text().splitlines():
                 line = line.strip()
                 if ":" in line:
-                    ctx.run.add("port", {"id": line, "sources": ["naabu"]})
                     ip, _, port = line.rpartition(":")
                     open_ports.setdefault(ip, set()).add(port)
-        # nmap -sV only on the ports naabu found open (methodology: don't full-scan)
+        # nmap -sV only on the ports naabu found open (methodology: don't full-scan). Group IPs by their
+        # EXACT open-port set → one nmap call per group on JUST those ports, not the Cartesian union of every
+        # port over every IP (which probed host:port pairs naabu never found — C12). -oX structured so the
+        # service yield is parsed (was previously recorded raw, never ingested). nmap ingests BEFORE the
+        # naabu-bare fill below, so its richer service entity wins the shared {ip}:{port} id.
         if open_ports and have("nmap"):
-            ips_file = ctx.write_list("naabu_ips.txt", list(open_ports))
-            ports_csv = ",".join(sorted({p for ps in open_ports.values() for p in ps}, key=int))
-            nm = ctx.run.raw_path("probe", "nmap", "service.txt")
-            r = exec_tool("nmap", ["nmap", "-sV", "-Pn", "-T4", "-iL", str(ips_file),
-                                   "-p", ports_csv, "-oN", str(nm)],
-                          timeout=scaled_timeout(len(open_ports), ctx.http_timeout, per_unit=30))
-            ctx.run.record("probe", r)
+            groups: dict[tuple, list] = {}
+            for ip, ports in open_ports.items():
+                groups.setdefault(tuple(sorted(ports, key=int)), []).append(ip)
+            for gi, (ptup, ips) in enumerate(sorted(groups.items())):
+                g_ips = ctx.write_list(f"nmap_ips_{gi}.txt", sorted(ips))
+                nm = ctx.run.raw_path("probe", "nmap", f"service_{gi}.xml")
+                nm.unlink(missing_ok=True)                   # -oX file: clear stale before the run
+                nr = exec_tool("nmap", ["nmap", "-sV", "-Pn", "-T4", "-iL", str(g_ips),
+                                        "-p", ",".join(ptup), "-oX", str(nm)],
+                               timeout=scaled_timeout(len(ips) * len(ptup), ctx.http_timeout, per_unit=30))
+                svcs, complete = _nmap_services(nm)
+                reclassify_from_artifact(nr, None if svcs is None else len(svcs), label="nmap")
+                if svcs is not None and not complete and nr.status in (Status.SUCCESS, Status.EMPTY):
+                    nr.status = Status.PARTIAL               # malformed rows / no clean finish -> uncertain (valid kept)
+                ctx.run.record("probe", nr)
+                for sip, sport, proto, service, product, version in (svcs or []):
+                    # naabu OBSERVED the open port (triggering nmap); nmap ENRICHED it — carry both sources.
+                    ctx.run.add("port", {"id": f"{sip}:{sport}", "ip": sip, "port": sport, "proto": proto,
+                                         "service": service, "product": product, "version": version,
+                                         "sources": ["naabu", "nmap"], "raw_ref": str(nm)})
+        # naabu bare ports — fills any ip:port nmap didn't enrich (dedup: skipped where nmap already added)
+        for ip, ports in open_ports.items():
+            for port in ports:
+                ctx.run.add("port", {"id": f"{ip}:{port}", "sources": ["naabu"]})
     elif prof.portscan:
         ctx.run.record("probe", skipped("naabu", "no in-scope CIDR — port scan skipped"))
 

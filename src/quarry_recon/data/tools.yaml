@@ -172,6 +172,15 @@ tools:
     deps: [libpcap-dev]      # CGO build + runtime libpcap for SYN scan
     notes: Needs libpcap. Scan ranges only when CIDR/ASN explicitly in profile.
 
+  - bin: nmap
+    phase: probe
+    role: service/version detection (-sV) on naabu-found ports; opt-in infra lane (was invoked but unregistered)
+    install: sudo apt-get install -y nmap
+    version_cmd: nmap --version
+    doc: https://nmap.org/book/output-formats-xml-output.html
+    optional: true
+    notes: Infra lane only (PORTSCAN + CIDR). -oX XML parsed into port(service) entities; IPs grouped by open-port set (no Cartesian).
+
   # ── Phase 5: Crawl + URL/archive + JS ───────────────────────────────────
   - bin: katana
     phase: crawl
