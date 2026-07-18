@@ -14,7 +14,38 @@ import urllib.request
 from pathlib import Path
 
 from .. import events, netguard, normalize, secrets, settings
-from ..runner import Status, have, run as exec_tool, skipped
+from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
+
+
+def _shosubgo_read(path):
+    """FAIL-CLOSED read of shosubgo's -o host-per-line file. Returns (hosts, artifact_ok):
+      - hosts = validated host provenance dicts to INGEST — valid evidence is NEVER suppressed;
+      - artifact_ok = True only when the file decoded as clean UTF-8 AND every non-blank line was a valid
+        host. Any malformed line or invalid UTF-8 makes it False, so the caller can mark completion PARTIAL
+        (not a clean SUCCESS/EMPTY) while still keeping the valid hosts.
+    Returns (None, False) when there is no trustworthy artifact at all (missing / unreadable — OSError)."""
+    if not path.exists():
+        return None, False
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, False
+    try:
+        text = raw.decode("utf-8")
+        artifact_ok = True
+    except UnicodeDecodeError:
+        text, artifact_ok = raw.decode("utf-8", "replace"), False    # invalid UTF-8 -> not a clean artifact
+    hosts = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        parsed = list(normalize.hosts(s, "shosubgo", str(path)))
+        if parsed:
+            hosts.extend(parsed)                                     # keep the valid host
+        else:
+            artifact_ok = False                                     # a non-blank NON-host line -> malformed artifact
+    return hosts, artifact_ok
 
 
 def _openintel(ctx, cfg: dict, apex: str, timeout: int = 180) -> set:
@@ -390,15 +421,26 @@ def run(ctx) -> None:
     sho_key = secrets.shodan()
     if have("shosubgo") and sho_key:
         sho = ctx.run.raw_path("vertical", "shosubgo", "sho.txt")
+        sho.unlink(missing_ok=True)                    # stale artifact must not fake completion
+        # `-fail` (verified upstream main.go): exit 1 on ANY API error (invalid/rate-limited key). WITHOUT
+        # it, an auth error just prints to stderr and the run exits 0 -> looks like a clean-empty result
+        # (false-negative). With it, the error surfaces as FAILED and the file-output adapter keeps it hard.
         r = exec_tool("shosubgo", ["shosubgo", "-f", str(roots_file),
-                                   "-s", sho_key, "-o", str(sho)], timeout=ctx.http_timeout)
+                                   "-s", sho_key, "-o", str(sho), "-fail"], timeout=ctx.http_timeout)
+        # shosubgo writes to the -o FILE, not stdout (r.raw_path is None). Parse fail-closed + reclassify via
+        # the shared adapter so a hard/auth failure is never laundered into a clean-empty (392 names were
+        # silently dropped on the OTC run when the file went unread).
+        hosts, artifact_ok = _shosubgo_read(sho)
+        reclassify_from_artifact(r, None if hosts is None else len(hosts), label="shosubgo")
+        # a clean-EXIT run whose artifact had malformed lines / bad UTF-8 is NOT a trustworthy clean result:
+        # downgrade to PARTIAL (completion uncertain) while KEEPING the valid hosts (evidence not suppressed).
+        if not artifact_ok and r.status in (Status.SUCCESS, Status.EMPTY):
+            r.status = Status.PARTIAL
+            r.note = f"shosubgo: {len(hosts or [])} host(s) — artifact had malformed lines, completion uncertain"
         ctx.run.record("vertical", r)
-        # shosubgo writes its results to the -o FILE, not stdout — so r.raw_path (stdout capture) is None
-        # and the names were being silently dropped (392 lost on the OTC run). Read the -o file directly.
-        if sho.exists():
-            for e in normalize.hosts(sho.read_text(encoding="utf-8", errors="replace"), "shosubgo", str(sho)):
-                if scope.in_scope(e["host"]):
-                    ctx.run.add("subdomain", e)
+        for e in (hosts or []):
+            if scope.in_scope(e["host"]):
+                ctx.run.add("subdomain", e)
 
     # ── brute force (puredns) ──
     resolvers, trusted = _resolvers(ctx)
