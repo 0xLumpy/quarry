@@ -92,6 +92,7 @@ def _canon_url(u: str) -> str:
     try:
         s = urlsplit(u)
         host = s.hostname                                  # may raise ValueError on a malformed authority
+        port = s.port                                       # review#9: .port ALSO raises ValueError (e.g. :99999, :abc)
     except ValueError:
         return u                                            # unparseable -> preserve (never crash Run.add)
     if not s.scheme and not s.netloc:
@@ -100,8 +101,8 @@ def _canon_url(u: str) -> str:
     if ":" in canon_host:                                   # IPv6 literal -> re-bracket for a valid netloc
         canon_host = f"[{canon_host}]"
     netloc = canon_host
-    if s.port is not None:
-        netloc += f":{s.port}"
+    if port is not None:
+        netloc += f":{port}"
     if s.username is not None:                              # userinfo PRESERVED verbatim (case-sensitive creds)
         userinfo = s.username + (f":{s.password}" if s.password is not None else "")
         netloc = f"{userinfo}@{netloc}"
@@ -130,16 +131,23 @@ def _subsumed(base: dict, incoming: dict) -> bool:
     """True when `incoming` carries NOTHING the merged `base` doesn't already hold exactly — a pure
     duplicate. A new list element, a previously-empty field now filled, OR a CONFLICTING scalar (a different
     non-empty value) all make it False → the observation is novel and must be logged (never discarded)."""
+    _a = base.get("_alt")                                   # review#9: alternates we've ALREADY logged per field
+    alt = _a if isinstance(_a, dict) else {}                # review#8: tolerate a corrupt/crafted non-dict _alt
     for k, v in incoming.items():
-        if k in ("first_seen", "last_seen") or v in (None, "", [], {}):
+        if k in ("first_seen", "last_seen", "_alt") or v in (None, "", [], {}):
             continue
         cur = base.get(k)
         if isinstance(v, list):
             curl = cur if isinstance(cur, list) else ([cur] if cur not in (None, "") else [])
             if any(x not in curl for x in v):
                 return False
-        elif cur != v:                                      # new value for an empty field OR a conflict
-            return False
+        elif cur in (None, "", [], {}):
+            return False                                    # fills a previously-empty field — novel
+        else:
+            _seen = alt.get(k)                              # review#4: a corrupt non-list entry (e.g. int) -> []
+            if cur != v and v not in (_seen if isinstance(_seen, list) else []):
+                return False                                # a CONFLICT we have NOT logged before — novel
+        # else: cur==v (dup) OR a conflict whose value is already in the log (_alt) → nothing new
     return True
 
 
@@ -148,9 +156,11 @@ def _merge_record(base: dict, incoming: dict) -> dict:
     NEVER overwrite a non-empty scalar (a conflicting value stays in the immutable observation log). Symmetric
     provenance: `sources`, `raw_refs`, tags, IPs, and any list field are unioned order-preserving."""
     merged = dict(base)
+    _a = base.get("_alt")                                   # review#9: per-field conflicting alternates already logged
+    alt = dict(_a) if isinstance(_a, dict) else {}          # review#8: tolerate a corrupt/crafted non-dict _alt
     for k, v in incoming.items():
-        if k in ("raw_ref", "raw_refs", "first_seen", "last_seen"):
-            continue                                        # refs handled below; timestamps below
+        if k in ("raw_ref", "raw_refs", "first_seen", "last_seen", "_alt"):
+            continue                                        # refs handled below; timestamps below; _alt is internal
         cur = merged.get(k)
         if isinstance(cur, list) or isinstance(v, list):    # union lists (either side), order-preserving
             out = list(cur) if isinstance(cur, list) else ([cur] if cur not in (None, "") else [])
@@ -160,8 +170,15 @@ def _merge_record(base: dict, incoming: dict) -> dict:
             merged[k] = out
         elif cur in (None, "", [], {}):
             merged[k] = v                                   # fill a previously-empty enrichment field
-        # else: base has a non-empty scalar → KEEP it (first non-empty wins; the conflicting value is
-        # preserved in the append-only observation log, never silently discarded)
+        elif cur != v:                                      # a CONFLICT: KEEP first value (first non-empty wins),
+            seen = alt.get(k)                               # but REMEMBER the alternate so a repeat is subsumed
+            if not isinstance(seen, list):                  # review#4: normalize a corrupt/non-list entry
+                seen = []
+            if v not in seen:                               # (else an unchanged conflict re-appends forever)
+                alt[k] = seen + [v]
+        # else: cur==v → nothing to do
+    if alt:
+        merged["_alt"] = alt                                # conflicting values, preserved in the merged view too
     refs = _all_refs(base)
     for x in _all_refs(incoming):
         if x not in refs:
@@ -173,6 +190,11 @@ def _merge_record(base: dict, incoming: dict) -> dict:
     fs = [t for t in (base.get("first_seen"), incoming.get("first_seen")) if t]
     if fs:
         merged["first_seen"] = min(fs)
+    # review#8: keep the LATEST last_seen across observations — persisted (stamped on each appended obs), so a
+    # reopened run recovers it from the log instead of losing an in-memory-only value.
+    ls = [t for t in (base.get("last_seen"), incoming.get("last_seen")) if t]
+    if ls:
+        merged["last_seen"] = max(ls)
     return merged
 
 
@@ -195,6 +217,16 @@ def canonical_key(entity: str, record: dict) -> str:
 
 def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _read_started(path: Path):
+    """The recorded `started` timestamp from a run.json / manifest.json, or None if absent/unreadable —
+    so open() can recover the real start without fabricating one."""
+    try:
+        v = json.loads(path.read_text())
+        return v.get("started") if isinstance(v, dict) else None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -239,18 +271,21 @@ class Run:
         for d in (self.raw, self.normalized, self.exports, self.reports):
             d.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.dir / "manifest.json"
+        self.meta_path = self.dir / "run.json"            # IMMUTABLE creation record (started/run_id/target)
         self._tool_runs: list[ToolRunRecord] = []
         self._counts_cache: dict[str, int] = {}
         self._records: dict[str, dict] = {}   # entity -> {canonical_key: MERGED record} (C09b; instance-local)
-        # C10a: OPENING an existing run must NOT fabricate a fresh start time (a ghost) — it reads the
-        # recorded `started` from the manifest. CREATE / default stamps now.
-        started = None
-        if load_started and self.manifest_path.exists():
-            try:
-                started = json.loads(self.manifest_path.read_text()).get("started")
-            except (json.JSONDecodeError, OSError):
-                started = None
-        self.started = started or _utc()
+        # C10a/review#7: OPENING an existing run must NOT fabricate a fresh start time (a ghost). It reads
+        # `started` from the IMMUTABLE run.json written at CREATE — which survives a crash even when the final
+        # manifest was never written (the exact resume situation). Manifest is only a fallback; a fresh
+        # CREATE stamps now and persists run.json so a later open() can never invent a start.
+        if load_started:
+            self.started = _read_started(self.meta_path) or _read_started(self.manifest_path) or _utc()
+        else:
+            self.started = _utc()
+            if not self.meta_path.exists():
+                _atomic_write(self.meta_path, json.dumps(
+                    {"run_id": self.run_id, "target": target, "started": self.started}))
         self.notes: list[str] = []
 
     # ── C10a lifecycle ──
@@ -278,10 +313,16 @@ class Run:
     @classmethod
     def open(cls, project_dir, target, run_id) -> "Run":
         """Attach to an EXISTING run — must already exist (never fabricate a ghost dir / start time).
-        Reads the recorded `started` from the manifest."""
+        Reads the recorded `started` from run.json (manifest fallback).
+
+        review#5: VALIDATE the recorded start BEFORE the constructor mutates the tree (it creates raw/…
+        subdirs). A run with neither a readable run.json NOR a readable manifest is corrupt — raise instead of
+        silently inventing a fresh `started` (a ghost) and half-materializing a directory for it."""
         d = Path(project_dir) / "recon" / run_id
         if not d.is_dir():
             raise FileNotFoundError(f"run {run_id!r} not found under {d.parent}")
+        if _read_started(d / "run.json") is None and _read_started(d / "manifest.json") is None:
+            raise ValueError(f"run {run_id!r} has no readable run.json/manifest — refusing to fabricate a start")
         return cls(project_dir, target, run_id=run_id, load_started=True)
 
     # ── raw evidence ──
@@ -321,22 +362,29 @@ class Run:
         the merged view (sources / raw_refs / tags / IPs / list evidence unioned; previously-empty
         enrichment filled; a conflicting non-empty scalar keeps the first value, and every observation is
         still appended to the immutable JSONL log, so nothing is lost). Only a VALUE-ADDING observation is
-        appended (a pure duplicate that changes nothing is a no-op), which bounds file growth."""
+        appended (a pure duplicate that changes nothing is a no-op), which bounds file growth.
+
+        review#3: consequently `last_seen` means the time of the last observation that ADDED something (new
+        evidence / a conflicting value) — NOT the last time the entity was seen at all. A pure-duplicate
+        re-sighting is deliberately not appended (growth-bounding), so it does not advance `last_seen`. This
+        narrower "last value-changing observation" semantic is intentional; `first_seen` is exact."""
         key = canonical_key(entity, record)
         if not key:
             return False
         records = self._records_for(entity)
-        record = dict(record)
+        # review#8: `_alt` is RESERVED internal merge metadata — strip it from caller/source input so external
+        # data can never inject a value that later crashes or corrupts the conflict tracking.
+        record = {k: v for k, v in dict(record).items() if k != "_alt"}
+        now = _utc()
+        record.setdefault("first_seen", now)
+        record["last_seen"] = now       # review#8: on the APPENDED obs -> durable; review#3: = last VALUE-ADDING obs
         if key not in records:
-            record.setdefault("first_seen", _utc())
             records[key] = record
             self._append_obs(entity, record)
             return True
         if not _subsumed(records[key], record):             # novel: new evidence OR a conflicting value
             self._append_obs(entity, record)                # keep the raw observation in the immutable log
-            merged = _merge_record(records[key], record)
-            merged["last_seen"] = _utc()
-            records[key] = merged
+            records[key] = _merge_record(records[key], record)   # folds max(last_seen) durably
         return False                                        # not a NEW entity (counting semantics preserved)
 
     def _append_obs(self, entity: str, record: dict) -> None:
@@ -549,6 +597,7 @@ class Run:
         od = _events.observability_degraded()
         if od:
             manifest["observability_degraded"] = od
+        _events.persist_degraded()                  # review#6: survive to the next resume (accumulates)
         # C10a: atomic write (temp + os.replace) so a crash mid-write never leaves a truncated manifest.
         _atomic_write(self.manifest_path, json.dumps(manifest, indent=2))
         # update state pointers (per-project, under recon/)
@@ -580,11 +629,16 @@ class Run:
         if not candidates:
             return None
         d = candidates[-1]
-        manifest = d / "manifest.json"
+        # review#5: recover target from run.json when there is no manifest (a CRASHED run has run.json but no
+        # final manifest) — else `latest()` mislabels a resumable run as target "unknown".
         target = "unknown"
-        if manifest.exists():
-            try:
-                target = json.loads(manifest.read_text()).get("target", "unknown")
-            except json.JSONDecodeError:
-                pass
+        for meta in (d / "manifest.json", d / "run.json"):   # manifest first (richer), run.json fallback
+            if meta.exists():
+                try:
+                    t = json.loads(meta.read_text()).get("target")
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if t:
+                    target = t
+                    break
         return Run.open(project_dir, target, d.name)        # C10a: OPEN (load started), never fabricate

@@ -33,7 +33,14 @@ def _emit_terminal(source_id, src, res, *, work_unit, parent_id, scope_distance,
                            discovery_context=discovery_context)
         return
     raw_ref = str(res.raw_path) if res.raw_path else None
-    artifact_size = res.raw_path.stat().st_size if (res.raw_path and res.raw_path.exists()) else None
+    # review#8: this runs in run_contract's finally — the terminal guarantee. stat() can raise (TOCTOU race,
+    # permission, vanished file); a throw here would defeat the guarantee (or mask the real exception). Guard it.
+    artifact_size = None
+    if res.raw_path:
+        try:
+            artifact_size = res.raw_path.stat().st_size
+        except OSError:
+            artifact_size = None
     if res.status == Status.BLOCKED:
         events.tool_blocked(source_id, reason=res.note or "blocked")
     elif res.status in _PARTIAL:
@@ -49,25 +56,32 @@ def _emit_terminal(source_id, src, res, *, work_unit, parent_id, scope_distance,
 
 def run_provider(source_id, fn, *, work_unit=None, input_total=None):
     """Contract bracket for an IN-PROCESS provider (native HTTP, not a subprocess): emit tool_start before,
-    tool_finish ALWAYS after (try/finally), returning ``fn()``'s result UNCHANGED. status/produced derive
-    from the result's length. Unknown source_id emits tool_blocked (a registry typo is surfaced) but the
-    provider STILL runs — losing a passive CT source to a missing registry row would cost coverage. The
-    error-vs-empty distinction (a swallowed HTTP failure vs a genuine 0) is C06, not here."""
+    tool_finish ALWAYS after. Registry-AUTHORITATIVE (review#3): an unknown source_id is NOT executed
+    (tool_blocked + return None), same as run_contract. The provider must NOT swallow its own errors — this
+    bracket catches them so a failure is recorded as a FAILED terminal, NOT a clean EMPTY (review#2: else
+    C10b could skip a provider after an auth/transport/quota/parse failure). Best-effort is preserved: on a
+    failure the phase still continues (returns None). Returns fn()'s result on success. Finer error
+    CLASSIFICATION (auth vs quota vs transport vs parse) is C06."""
     if sources.get(source_id) is None:
-        events.tool_blocked(source_id, reason=f"unknown source_id {source_id!r} — not in registry")
+        events.tool_blocked(source_id, reason=f"unknown source_id {source_id!r} — not in registry; not executed")
+        return None
     events.tool_start(source_id, input_total=input_total, work_unit=work_unit)
     result = None
+    status = Status.FAILED.value                             # default: covers a raise BEFORE a result is computed
+    reason = n = None
     try:
         result = fn()
-        return result
+        n = len(result) if hasattr(result, "__len__") else None
+        status = Status.SUCCESS.value if n else Status.EMPTY.value
+    except Exception as e:                                   # ordinary provider error — record FAILED, don't crash phase
+        reason, result = f"{type(e).__name__}: {e}", None
     finally:
-        if result is None:
-            status, n = Status.FAILED.value, None            # fn raised (providers normally swallow -> set())
-        else:
-            n = len(result) if hasattr(result, "__len__") else None
-            status = Status.SUCCESS.value if n else Status.EMPTY.value
+        # review#7: emit from a finally so a terminal ALSO fires on KeyboardInterrupt/SystemExit (which are NOT
+        # `Exception`) — the BaseException then re-raises past this finally, cancelling the run, but the
+        # provider is no longer left permanently 'started'. Status stays FAILED for the cancellation case.
         events.tool_finish(source_id, status=status, work_unit=work_unit,
-                           produced={"host": n} if n is not None else None)
+                           reason=reason, produced={"host": n} if n is not None else None)
+    return result                                            # None on failure — caller guards (best-effort)
 
 
 def run_contract(source_id, cmd, *, input_total=None, env=None, reclassify=None, work_unit=None,

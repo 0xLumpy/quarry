@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from . import secrets
 # completed units. Target identity ALONE is insufficient: a completed unit must NOT be skipped after a
 # coverage-affecting change (a wider wordlist, a new rate, a changed input file, a parser upgrade). So the
 # unit is a hash over a VERSIONED CANONICAL ENVELOPE binding all of those — change any, get a new unit.
-_WORKUNIT_ENVELOPE_VERSION = 1
+_WORKUNIT_ENVELOPE_VERSION = 2       # review#10: v2 widens the key to 128-bit (see work_unit truncation)
 
 
 def file_digest(path) -> str:
@@ -67,7 +68,10 @@ def work_unit(source_id, *, inputs=None, config=None, file_digests=None, schema_
         "schema": schema_version,
     }
     blob = json.dumps(envelope, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    # review#10: 128-bit, not 64-bit. This is a resume key across EVERY lane — a collision makes C10b skip
+    # DIFFERENT work as already-done. 64 bits (16 hex) hits a ~2^32 birthday bound; 128 bits (32 hex) is
+    # collision-free for any realistic unit count, and the full digest is free to compute.
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
 
 # The event types. LEDGER is its OWN type (was a tool_finish-class update, which gave a source TWO
 # terminal-shaped events and broke the exactly-one-terminal invariant); coverage_reset marks a coverage
@@ -95,17 +99,51 @@ def _fresh_degraded() -> dict:
     return {"writes_failed": 0, "first_error": None}
 
 
+def _degraded_path() -> "Path | None":
+    return (_sink.parent / "events.degraded.json") if _sink is not None else None
+
+
+def _load_degraded() -> dict:
+    """Load the ACCUMULATED degradation record persisted by a prior session (so a resume inherits it).
+    Fresh {writes_failed:0} when absent/unreadable."""
+    p = _degraded_path()
+    if p and p.exists():
+        try:
+            v = json.loads(p.read_text())
+            if isinstance(v, dict) and "writes_failed" in v:
+                return {"writes_failed": int(v["writes_failed"]), "first_error": v.get("first_error")}
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            pass
+    return _fresh_degraded()
+
+
+def persist_degraded() -> None:
+    """ATOMICALLY write the accumulated degradation record so the NEXT resume inherits it (review#6). Called
+    from emit() the instant a write first fails (review#4: crash-durable — not deferred to manifest time) AND
+    at manifest time. Best-effort — if this write fails, the in-memory record still reflects the session."""
+    p = _degraded_path()
+    if p is None:
+        return
+    try:
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(_degraded))
+        os.replace(tmp, p)                                  # atomic: a crash mid-write can't leave a torn file
+    except OSError:
+        pass
+
+
 def configure(run_dir) -> Path:
     """Point the sink at ``<run_dir>/events.jsonl`` (created if missing). Idempotent; returns path.
     Clears the per-session coverage-snapshot guard so this process's first coverage unit per source opens a
     FRESH generation — a resume (new process APPENDING to the same events.jsonl) thereby supersedes the prior
-    run's units, so a capped unit that DISAPPEARS on rerun no longer leaves a stale gap. Resets the C11
-    degraded counter (per-session)."""
+    run's units, so a capped unit that DISAPPEARS on rerun no longer leaves a stale gap. LOADS the persisted
+    degradation record (review#6: a resume ACCUMULATES it, so a run whose prior session lost events can never
+    be recorded clean)."""
     global _sink, _coverage_seen, _degraded
     _sink = Path(run_dir) / "events.jsonl"
     _sink.parent.mkdir(parents=True, exist_ok=True)
     _coverage_seen = set()
-    _degraded = _fresh_degraded()
+    _degraded = _load_degraded()
     return _sink
 
 
@@ -154,6 +192,7 @@ def emit(event: str, source_id: str, **fields) -> dict:
             _degraded["writes_failed"] += 1
             if _degraded["first_error"] is None:
                 _degraded["first_error"] = f"{type(e).__name__}: {e}"
+            persist_degraded()   # review#4: crash-durable — persist the marker NOW, not only at manifest time
     return rec
 
 

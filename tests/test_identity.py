@@ -68,6 +68,12 @@ class TestUrlKeyed:
         # urlsplit raises ValueError on a broken authority — must be preserved, never abort Run.add
         assert canonical_key("url", {"url": "http://[::1"}) == "http://[::1"
 
+    @pytest.mark.parametrize("bad", ["http://h:99999/x", "http://h:abc/x", "http://h:-1/"])
+    def test_malformed_port_does_not_crash(self, bad):
+        # review#9: urlsplit().port raises ValueError on an out-of-range/non-numeric port — must be
+        # preserved verbatim, never abort Run.add (the .port access was outside the earlier guard).
+        assert canonical_key("url", {"url": bad}) == bad
+
     def test_ipv6_host_rebracketed(self):
         assert canonical_key("url", {"url": "https://[2001:DB8::1]:8443/x"}) == "https://[2001:db8::1]:8443/x"
 
@@ -125,6 +131,61 @@ class TestStoreDedupAndReplay:
         assert r2.add("url", {"url": "https://h/API"}) is False
         assert r2.add("endpoint", {"value": "/Admin"}) is False
         assert r2.add("endpoint", {"value": "/admin"}) is True      # case-distinct → still addable
+
+    def test_conflicting_scalar_logged_once_not_re_appended(self, tmp_path):
+        # review#9: a conflicting scalar (status 200 -> 500) is novel the FIRST time (logged), but a REPEAT
+        # of the same conflict must be subsumed — else the merged base keeps 200 forever and every repeat of
+        # 500 re-appends, growing the log unbounded.
+        run = self._run(tmp_path)
+        run.add("url", {"url": "https://h/x", "status": 200})
+        run.add("url", {"url": "https://h/x", "status": 500})       # conflict → logged
+        run.add("url", {"url": "https://h/x", "status": 500})       # same conflict → subsumed (no-op)
+        run.add("url", {"url": "https://h/x", "status": 500})
+        lines = run._entity_file("url").read_text().splitlines()
+        assert len(lines) == 2                                      # 200 + one 500, not four
+        rec = run.read("url")[0]
+        assert rec["status"] == 200 and 500 in rec["_alt"]["status"]   # first wins; conflict preserved in view
+
+    def test_new_conflicting_value_still_logged(self, tmp_path):
+        # a DIFFERENT conflicting value is still novel — only exact repeats are subsumed
+        run = self._run(tmp_path)
+        run.add("url", {"url": "https://h/x", "status": 200})
+        run.add("url", {"url": "https://h/x", "status": 500})
+        run.add("url", {"url": "https://h/x", "status": 403})       # a new alternate → logged
+        assert len(run._entity_file("url").read_text().splitlines()) == 3
+        assert set(run.read("url")[0]["_alt"]["status"]) == {500, 403}
+
+    def test_last_seen_survives_reopen(self, tmp_path):
+        # review#8: last_seen was stamped only in-memory and vanished on reopen. It must be persisted on the
+        # appended observation and recovered by the fold.
+        r1 = self._run(tmp_path)
+        r1.add("url", {"url": "https://h/x", "status": 200})
+        r1.add("url", {"url": "https://h/x", "status": 500})       # a second (conflicting) observation
+        r2 = self._run(tmp_path)                                   # reopen -> rebuild from the log
+        rec = r2.read("url")[0]
+        assert rec.get("last_seen") and rec.get("first_seen")     # both durable across reopen
+
+    def test_input_record_with_reserved_alt_does_not_crash(self, tmp_path):
+        # review#8: `_alt` is reserved internal metadata — a caller/source record carrying it (even a non-dict)
+        # must be stripped, never corrupt the merge or crash _subsumed/_merge_record.
+        run = self._run(tmp_path)
+        assert run.add("url", {"url": "https://h/y", "status": 200, "_alt": "attacker-controlled"}) is True
+        assert run.add("url", {"url": "https://h/y", "status": 500, "_alt": ["also", "bad"]}) is False
+        rec = run.read("url")[0]
+        assert rec["status"] == 200 and isinstance(rec.get("_alt"), dict)   # internal _alt is ours, a dict
+
+    def test_replayed_corrupt_nested_alt_does_not_crash(self, tmp_path):
+        # review#4: a persisted/tampered log line whose `_alt` maps a field to a NON-list (e.g. an int) must
+        # not crash replay or a subsequent merge (`v not in <int>` would raise TypeError).
+        run = self._run(tmp_path)
+        f = run._entity_file("url")
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text('{"url": "https://h/z", "status": 200, "_alt": {"status": 500}}\n')   # 500 is NOT a list
+        r2 = self._run(tmp_path)
+        assert r2.count("url") == 1                                # replay tolerated the corrupt _alt
+        # a further conflicting observation must merge without raising
+        assert r2.add("url", {"url": "https://h/z", "status": 403}) is False
+        assert isinstance(r2.read("url")[0].get("_alt"), dict)
 
     def test_reload_ignores_non_object_and_keyless_rows(self, tmp_path):
         # a JSONL file with null/[]/keyless rows must not crash reload nor inflate count()

@@ -54,6 +54,20 @@ class TestOpen:
         r2 = Run.open(tmp_path, "t", r1.run_id)
         assert r2.started == recorded                       # reads the recorded start, no ghost timestamp
 
+    def test_create_writes_immutable_run_meta(self, tmp_path):
+        r = Run.create(tmp_path, "t")
+        meta = json.loads(r.meta_path.read_text())
+        assert meta["run_id"] == r.run_id and meta["started"] == r.started
+
+    def test_open_crashed_run_recovers_started_from_meta_not_manifest(self, tmp_path):
+        # review#7: a CRASHED run has run.json but NO final manifest -> open must recover the real start,
+        # not fabricate a new one.
+        r1 = Run.create(tmp_path, "t")
+        assert r1.meta_path.exists() and not r1.manifest_path.exists()   # crash: no manifest written
+        recorded = r1.started
+        r2 = Run.open(tmp_path, "t", r1.run_id)
+        assert r2.started == recorded                       # recovered from run.json, not a ghost
+
     def test_open_never_creates_ghost_dir(self, tmp_path):
         # a typo run id must not silently materialize a directory
         with pytest.raises(FileNotFoundError):
@@ -65,6 +79,23 @@ class TestOpen:
         r1.add("subdomain", {"host": "h.example.com", "sources": ["a"]})
         r2 = Run.open(tmp_path, "t", r1.run_id)
         assert r2.count("subdomain") == 1
+
+    def test_open_corrupt_metadata_raises_before_mutating(self, tmp_path):
+        # review#5: a run dir with NEITHER a readable run.json NOR manifest is corrupt — open() must raise
+        # (never fabricate a ghost start) and must not have materialized subdirs for it.
+        d = tmp_path / "recon" / "corrupt-run"
+        d.mkdir(parents=True)
+        (d / "run.json").write_text("{not json")             # unreadable
+        with pytest.raises(ValueError):
+            Run.open(tmp_path, "t", "corrupt-run")
+        assert not (d / "raw").exists()                      # constructor never ran -> no ghost subdirs
+
+    def test_latest_recovers_target_from_run_json_when_no_manifest(self, tmp_path):
+        # review#5: a CRASHED run has run.json but no manifest — latest() must recover the real target, not "unknown"
+        r1 = Run.create(tmp_path, "acme.com")
+        assert not r1.manifest_path.exists()
+        latest = Run.latest(tmp_path)
+        assert latest.run_id == r1.run_id and latest.target == "acme.com"
 
 
 class TestAtomicWrite:

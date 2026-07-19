@@ -104,19 +104,73 @@ class TestRunProvider:
         fin = [e for e in _events(tmp_path) if e["event"] == "tool_finish"][0]
         assert fin["status"] == "success" and fin["produced"] == {"host": 3}
 
-    def test_terminal_fires_even_if_provider_raises(self, tmp_path):
+    def test_provider_error_is_failed_terminal_not_clean_empty(self, tmp_path):
+        # review#2: a raising provider must NOT be recorded as a clean EMPTY (C10b would skip it after an
+        # auth/transport/quota/parse failure). The bracket catches, records FAILED, returns None (best-effort).
         from quarry_recon.contract import run_provider
         def boom():
             raise RuntimeError("http died")
-        with pytest.raises(RuntimeError):
-            run_provider("vertical.crtsh", boom)
+        assert run_provider("vertical.crtsh", boom) is None            # caller guards; phase continues
         fin = [e for e in _events(tmp_path) if e["event"] == "tool_finish"]
-        assert len(fin) == 1 and fin[0]["status"] == "failed"
+        assert len(fin) == 1 and fin[0]["status"] == "failed"          # NOT empty
+        assert "RuntimeError" in (fin[0].get("reason") or "")
 
-    def test_unknown_source_still_runs_but_blocked_emitted(self, tmp_path):
+    def test_unknown_source_not_executed(self, tmp_path):
+        # review#3: registry-authoritative — an unknown source_id is NOT executed (matches run_contract).
         from quarry_recon.contract import run_provider
-        assert run_provider("not.a.provider", lambda: {"x"}) == {"x"}   # coverage not lost to a registry typo
+        called = []
+        assert run_provider("not.a.provider", lambda: called.append(1) or {"x"}) is None
+        assert not called                                              # fn never invoked
         assert any(e["event"] == "tool_blocked" for e in _events(tmp_path))
+        assert not any(e["event"] == "tool_finish" for e in _events(tmp_path))
+
+    def test_terminal_fires_on_cancellation_and_reraises(self, tmp_path):
+        # review#7: KeyboardInterrupt/SystemExit are NOT `Exception` — they must still emit a terminal (from a
+        # finally) and then PROPAGATE (cancel the run), never leave the provider permanently 'started'.
+        from quarry_recon.contract import run_provider
+        def cancel():
+            raise KeyboardInterrupt("ctrl-c mid-provider")
+        with pytest.raises(KeyboardInterrupt):
+            run_provider("vertical.crtsh", cancel)
+        fin = [e for e in _events(tmp_path) if e["event"] == "tool_finish"]
+        assert len(fin) == 1 and fin[0]["status"] == "failed"          # terminal recorded before re-raise
+
+
+class TestProviderSchemaDrift:
+    """review#3: a 200 with an error/schema-drift body must RAISE (-> run_provider FAILED), never be laundered
+    into a clean EMPTY that C10b would skip after a real failure."""
+
+    class _Resp:
+        def __init__(self, body): self._b = body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, n=None): return self._b
+
+    def _patch(self, monkeypatch, body):
+        import urllib.request
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=30: self._Resp(body))
+        return vertical
+
+    def test_crtsh_non_list_root_raises(self, monkeypatch):
+        v = self._patch(monkeypatch, b'{"error": "rate limited"}')      # dict, not the success array
+        with pytest.raises(ValueError):
+            v._crtsh("acme.com")
+
+    def test_certspotter_non_list_root_raises(self, monkeypatch):
+        v = self._patch(monkeypatch, b'{"message": "rate limited"}')
+        with pytest.raises(ValueError):
+            v._certspotter("acme.com")
+
+    def test_censys_bad_envelope_raises(self, monkeypatch):
+        v = self._patch(monkeypatch, b'{"error": {"code": 401}}')       # no "result" -> not a valid empty
+        with pytest.raises(ValueError):
+            v._censys({"token": "t", "org": "o"}, "acme.com")
+
+    def test_crtsh_valid_array_parses(self, monkeypatch):
+        import json as _j
+        v = self._patch(monkeypatch, _j.dumps([{"name_value": "a.acme.com"}]).encode())
+        assert v._crtsh("acme.com") == {"a.acme.com"}
 
 
 class TestLanesMigrated:
@@ -155,6 +209,22 @@ class TestLanesMigrated:
         import inspect
         src = inspect.getsource(importlib.import_module(module))
         assert "events.work_unit(" in src and "work_unit=wu" in src   # a stable resume key is computed + passed
+
+    # review#4: single-shot lanes were migrated to run_contract but passed NO work_unit — C10b could not
+    # resume them. Each now computes a work_unit and passes it (source_id -> a distinguishing suffix in code).
+    SINGLE_SHOT_WU = [
+        ("quarry_recon.phases.vertical", "sf_wu"), ("quarry_recon.phases.vertical", "sho_wu"),
+        ("quarry_recon.phases.crawl", "kat_wu"), ("quarry_recon.phases.crawl", "kh_wu"),
+        ("quarry_recon.phases.crawl", "gau_wu"), ("quarry_recon.phases.crawl", "gl_wu"),
+        ("quarry_recon.phases.probe", "tls_wu"), ("quarry_recon.phases.probe", "gw_wu"),
+    ]
+
+    @pytest.mark.parametrize("module,wuvar", SINGLE_SHOT_WU)
+    def test_single_shot_lane_computes_and_passes_work_unit(self, module, wuvar):
+        import importlib
+        import inspect
+        src = inspect.getsource(importlib.import_module(module))
+        assert f"{wuvar} = events.work_unit(" in src and f"work_unit={wuvar}" in src
 
     @pytest.mark.parametrize("sid", [m[1] for m in MIGRATED] + [d[1] for d in DYNAMIC])
     def test_migrated_source_ids_are_registered(self, sid):

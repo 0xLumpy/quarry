@@ -271,7 +271,10 @@ def _run_httpx(ctx, hosts, ports, phase, tag):
     to = scaled_timeout(len(hosts), ctx.http_timeout, per_unit=max(6, len(ports) // 12))
     # C07 inc3: this httpx GROUP's work_unit = its exact host set + port set (a resumable unit); a changed
     # group (different hosts/ports) is a different unit. source_id is phase-scoped (probe/enrich .httpx).
-    wu = events.work_unit(f"{phase}.httpx", inputs={"hosts": sorted(set(hosts)), "ports": sorted(ports)})
+    # review#10: fold the EFFECTIVE probe config (rate + a flag-profile marker) so a probe-flag/rate change
+    # invalidates the unit — not just the host/port set. Bump "flags" when _httpx_probe_cmd's flags change.
+    wu = events.work_unit(f"{phase}.httpx", inputs={"hosts": sorted(set(hosts)), "ports": sorted(ports)},
+                          config={"flags": "v0.3.4-probe", "rl": ctx.profile.http_rl})
     r = run_contract(f"{phase}.httpx", cmd, work_unit=wu, raw_path=hx, timeout=to)
     ctx.run.record(phase, r)
     return str(hx), (r.raw_path.read_text().splitlines() if r.raw_path else [])
@@ -746,8 +749,11 @@ def run(ctx) -> None:
         if thosts:
             tf = ctx.write_list("tls_targets.txt", thosts)
             tr = ctx.run.raw_path("probe", "tlsx", "certs.jsonl")
+            # C10b resume: work_unit = the resolved-host set + probed ports. A changed host set is a new unit.
+            tls_wu = events.work_unit("probe.tlsx_certs", inputs={"hosts": thosts},
+                                      config={"ports": "443,8443,4443"})
             r = run_contract("probe.tlsx_certs", ["tlsx", "-l", str(tf), "-p", "443,8443,4443",
-                                   "-json", "-silent"], raw_path=tr, timeout=ctx.http_timeout)
+                                   "-json", "-silent"], work_unit=tls_wu, raw_path=tr, timeout=ctx.http_timeout)
             ctx.run.record("probe", r)
             san_new = 0
             if r.raw_path and r.raw_path.exists():
@@ -812,11 +818,13 @@ def run(ctx) -> None:
         def _gw_reclassify(res):
             shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
             return reclassify_from_files(res, shots, "screenshot")
+        # C10b resume: work_unit = the live-host set being screenshotted. A changed live set is a new unit.
+        gw_wu = events.work_unit("probe.gowitness", inputs={"live": sorted(ctx.run.values("live"))})
         r = run_contract("probe.gowitness",
                 ["gowitness", "scan", "file", "-f", str(live_file),
                  "--screenshot-path", str(shot_dir), "--write-jsonl",
                  "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
-                reclassify=_gw_reclassify, timeout=ctx.http_timeout)
+                work_unit=gw_wu, reclassify=_gw_reclassify, timeout=ctx.http_timeout)
         ctx.run.record("probe", r)
         for img in shot_dir.glob("*.jpeg"):
             ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
@@ -863,7 +871,9 @@ def run(ctx) -> None:
                     if svcs is not None and not complete and res.status in (Status.SUCCESS, Status.EMPTY):
                         res.status = Status.PARTIAL          # malformed rows / no clean finish -> uncertain (valid kept)
                     return res
-                wu = events.work_unit("probe.nmap_service", inputs={"ports": list(ptup), "ips": sorted(ips)})
+                # review#10: fold the nmap scan config (flags decide coverage) so a flag change flips the unit.
+                wu = events.work_unit("probe.nmap_service", inputs={"ports": list(ptup), "ips": sorted(ips)},
+                                      config={"flags": "sV-Pn-T4"})
                 nr = run_contract("probe.nmap_service",
                                   ["nmap", "-sV", "-Pn", "-T4", "-iL", str(g_ips),
                                    "-p", ",".join(ptup), "-oX", str(nm)],

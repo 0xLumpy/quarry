@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
+from pathlib import Path
 
 from .. import events, evidence, fetch, netguard, normalize, oob, secrets, settings
 from ..runner import (RunResult, Status, have, nuclei_timeout, reclassify_from_artifact, run as exec_tool,
@@ -44,6 +46,42 @@ def _apply_nuclei_oob(cmd: list[str]) -> list[str]:
         if oob.get("interactsh_token"):
             cmd += ["-itoken", str(oob["interactsh_token"])]
     return cmd
+
+
+def _chunk_terminal(sid, chunk_wu, res, cf, *, status) -> None:
+    """review#1: emit a chunk's TERMINAL event from a finally so a chunk NEVER stays 'started'. `status` is the
+    chunk OUTCOME the caller promotes to the tool's status ONLY after ALL per-chunk bookkeeping (logging, state
+    save, artifact parse, run.add) succeeded — it stays FAILED when execution OR any post-execution step raised,
+    so a chunk whose processing was incomplete is never recorded SUCCESS."""
+    reason = None
+    if status == Status.FAILED.value:
+        reason = (res.note if (res and res.note) else "chunk raised before completing bookkeeping")
+    elif res:
+        reason = res.note or None
+    events.tool_finish(sid, work_unit=chunk_wu, status=status, reason=reason,
+                       duration=round(res.duration, 2) if res else None,
+                       raw_ref=str(cf) if cf.exists() else None)
+
+
+def _nuclei_templates_fp() -> str | None:
+    """review#6/#10: a coverage-affecting fingerprint of the INSTALLED nuclei template set, so a templates
+    update (new/changed detections) invalidates the resume work_unit — else C10b would skip a chunk that a
+    fresh template set would now flag differently. nuclei records its templates state in its config dir; read
+    it (honoring NUCLEI_CONFIG / XDG / ~/.config) and fold the COMPLETE effective state — version AND the
+    ignore-hash (a changed .nuclei-ignore alters which templates run even at the same version). Returns a
+    stable JSON string of every present field, or None when the state cannot be read (the caller then makes
+    the unit NON-RESUMABLE — an unknown template set must never be treated as unchanged)."""
+    base = (os.environ.get("NUCLEI_CONFIG")
+            or os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "nuclei"))
+    cfg = Path(base) / ".templates-config.json"
+    try:
+        data = json.loads(cfg.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    parts = {k: str(data[k]) for k in
+             ("nuclei-templates-version", "nuclei-templates-latest-version", "nuclei-ignore-hash")
+             if isinstance(data, dict) and data.get(k)}
+    return json.dumps(parts, sort_keys=True) if parts else None
 
 
 def _nuclei_cmd(targets_file, out_file, prof) -> list[str]:
@@ -81,31 +119,101 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     # tags + chunk size), not just the host list. The old input_hash keyed on hosts+chunk_size ALONE, so a
     # template-scope change (a different severity/etags) would wrongly RESUME done chunks — the same
     # skip-after-settings-change bug fixed for ffuf. Any coverage-affecting change now invalidates the state.
-    _cfg = {"severity": "critical,high,medium", "etags": "intrusive,fuzz,dos,brute-force", "chunk": chunk_n}
+    _tpl = _nuclei_templates_fp()                           # review#10: template SET is coverage-affecting
+    _cfg = {"severity": "critical,high,medium", "etags": "intrusive,fuzz,dos,brute-force", "chunk": chunk_n,
+            "templates": _tpl if _tpl is not None else "unknown"}
+    if _tpl is None:
+        # review#6: template state UNKNOWN -> non-resumable. A per-run nonce makes scan_wu/chunk_wu differ every
+        # run, so resume NEVER skips a chunk we cannot prove ran against the same templates (re-scan is a safe
+        # superset; silently skipping on an unverifiable set is not).
+        _cfg["_nonce"] = os.urandom(8).hex()
     scan_wu = events.work_unit(sid, inputs={"hosts": live}, config=_cfg)
-    done: set[int] = set()
-    if state_f.exists():
+    # review#4: a work_unit is NOT an execution attempt. Layout is wu_<scan_wu>/attempt_<attempt_id>/, and the
+    # state maps each DONE chunk to the ARTIFACT PATH that produced it. A same-work-unit RETRY writes to a FRESH
+    # attempt dir, so it can NEVER overwrite a prior attempt's chunk evidence; done chunks are read back from
+    # their recorded paths. Raw attempt dirs are RETAINED (pruning is a separate explicit GC, never part of
+    # publishing an aggregate — a publish must not delete raw evidence).
+    wu_dir = state_f.parent / f"wu_{scan_wu}"
+    wu_root = wu_dir.resolve()
+    attempt_id = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(4).hex()   # UNIQUE per execution attempt
+    attempt_dir = wu_dir / f"attempt_{attempt_id}"        # created lazily, only if a chunk actually runs
+
+    def _valid_entry(ci_str, rel) -> bool:
+        """review#1/#2: a loaded state entry is trusted to skip/aggregate a chunk ONLY if it is fully valid — a
+        non-negative in-range index, and a RELATIVE path with no absolute/`..` escape that resolves INSIDE THIS
+        work_unit's dir (review#2: not merely the nuclei dir — a corrupt path must not borrow ANOTHER work unit's
+        artifact) AND whose filename is exactly this chunk's `findings_<ci>.jsonl`, pointing at a readable file.
+        Anything else is dropped so the chunk RE-RUNS (an invalid/foreign artifact is never a silent skip)."""
+        if not (isinstance(ci_str, str) and ci_str.isdigit() and 0 <= int(ci_str) < len(batches)):
+            return False
+        if not isinstance(rel, str) or not rel or os.path.isabs(rel) or ".." in Path(rel).parts:
+            return False
+        if Path(rel).name != f"findings_{int(ci_str)}.jsonl":   # must be THIS chunk's artifact, not another's
+            return False
+        p = state_f.parent / rel
+        try:
+            if not p.resolve().is_relative_to(wu_root):      # containment: under the CURRENT work-unit dir only
+                return False
+            if not p.is_file():                              # missing artifact -> NOT done (re-run)
+                return False
+            with open(p, "rb"):                              # readability
+                pass
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _prev():
+        if not state_f.exists():
+            return None
         try:
             prev = json.loads(state_f.read_text())
-            if prev.get("work_unit") == scan_wu:            # config-inclusive key: mismatch → fresh
-                done = {int(x) for x in prev.get("done_chunks", [])}
-        except Exception:
-            done = set()
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(prev, dict):                       # review#7: [], null, or a scalar -> reject (rerun all)
+            return None
+        return prev if prev.get("work_unit") == scan_wu else None   # config-inclusive key: mismatch → fresh
+
+    def _load_map(prev) -> dict:                              # {ci: rel} — validated
+        m = (prev or {}).get("chunks")
+        if not isinstance(m, dict):
+            return {}
+        return {str(k): str(v) for k, v in m.items() if _valid_entry(str(k), v)}
+
+    def _load_evidence(prev) -> dict:                        # review#1: {ci: [rel, ...]} — a LIST, each validated
+        m = (prev or {}).get("evidence")
+        out: dict[str, list[str]] = {}
+        if isinstance(m, dict):
+            for k, v in m.items():
+                vals = v if isinstance(v, list) else [v]     # tolerate a legacy scalar
+                kept = [str(x) for x in vals if _valid_entry(str(k), x)]
+                if kept:
+                    out[str(k)] = kept
+        return out
+
+    # done_map: CLEAN chunks -> artifact (controls SKIP). evidence_map: for EVERY chunk that produced output
+    # (clean OR degraded), the LIST of every preserved artifact across attempts (controls AGGREGATION). review#1:
+    # a list, not a single pointer — PARTIAL(A) then PARTIAL(B) must keep BOTH, aggregate + dedup all evidence.
+    _p = _prev()
+    done_map: dict[str, str] = _load_map(_p)
+    evidence_map: dict[str, list[str]] = _load_evidence(_p)
+
+    def _add_evidence(ci_str, rel):                          # append-only, unique, per chunk
+        lst = evidence_map.setdefault(ci_str, [])
+        if rel not in lst:
+            lst.append(rel)
+
+    for _ci, _rel in done_map.items():                       # a clean chunk's artifact is always also evidence
+        _add_evidence(_ci, _rel)
 
     def _save():
         state_f.write_text(json.dumps(
-            {"work_unit": scan_wu, "chunk_size": chunk_n, "done_chunks": sorted(done)}))
-
-    if not done:
-        findings.write_text("")                           # fresh (or invalidated) run: empty accumulator
-        for _old in state_f.parent.glob("findings_*.jsonl"):
-            _old.unlink(missing_ok=True)                   # drop stale per-chunk artifacts from a prior input
+            {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": done_map, "evidence": evidence_map}))
     events.tool_start(sid, cmd=["nuclei", "-l", "<chunk>", "-jsonl"], input_total=len(live), work_unit=scan_wu)
     t0 = time.monotonic()
     degraded = 0
 
     def _completed_hosts():                               # UX #4: hosts in CLEANLY-done chunks only (NOT attempted)
-        return sum(len(batches[j]) for j in done if j < len(batches))
+        return sum(len(batches[j]) for j in (int(k) for k in done_map) if j < len(batches))
 
     # C07 inc4: a source terminal ALWAYS fires (try/finally) even if the loop raises. status starts FAILED
     # (an exception mid-loop must NOT emit a scan-level success) and is set to SUCCESS/PARTIAL only after the
@@ -119,39 +227,70 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             # host count; the per-chunk work_unit is the stable unit id (resume/audit key).
             events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches),
                                  current_index=_completed_hosts(), work_unit=chunk_wu)
-            if ci in done:                                # resume: already CLEAN (its start/finish are in the log
-                continue                                  # from the prior session; do not re-emit)
+            if str(ci) in done_map:                       # resume: already CLEAN in a prior attempt (its artifact
+                continue                                  # is recorded + preserved; do not re-run or re-emit)
+            attempt_dir.mkdir(parents=True, exist_ok=True)   # lazy: only create the attempt dir if a chunk runs
             bf = ctx.write_list(f"nuclei_targets_{ci}.txt", batch)
-            cf = ctx.run.raw_path("params", "nuclei", f"findings_{ci}.jsonl")
+            cf = attempt_dir / f"findings_{ci}.jsonl"        # review#4: THIS attempt's artifact (never overwrites a prior)
+            rel = f"wu_{scan_wu}/attempt_{attempt_id}/findings_{ci}.jsonl"   # recorded in state, relative to the state dir
             events.tool_start(sid, work_unit=chunk_wu, input_total=len(batch))   # this chunk's own lifecycle
-            res = exec_tool("nuclei", _nuclei_cmd(bf, cf, prof),
-                            timeout=nuclei_timeout(len(batch), ctx.http_timeout))
-            if res.stderr_tail:
-                with log.open("a", encoding="utf-8") as lf:
-                    lf.write(res.stderr_tail + "\n")
-            # KEEP a chunk's findings regardless of status — real even if WAF/timeout-degraded. Mark DONE
-            # only on a clean status; a degraded chunk stays retryable. The aggregate is rebuilt below from
-            # per-chunk artifacts (idempotent — a re-scan overwrites its own findings_<ci>.jsonl).
-            if res.status in (Status.SUCCESS, Status.EMPTY):
-                done.add(ci)
-                _save()
-            else:
-                degraded += 1
-                events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
-            events.tool_finish(sid, work_unit=chunk_wu, status=res.status.value, reason=res.note or None,
-                               duration=round(res.duration, 2),
-                               raw_ref=str(cf) if cf.exists() else None)   # this chunk's terminal
-        # rebuild the aggregate IDEMPOTENTLY from every chunk artifact that produced output (clean OR degraded)
-        with findings.open("w", encoding="utf-8") as fh:
+            res = None
+            chunk_status = Status.FAILED.value               # review#1: promoted ONLY after ALL bookkeeping below
+            try:                                             # review#1: chunk terminal ALWAYS fires (finally)
+                res = exec_tool("nuclei", _nuclei_cmd(bf, cf, prof),
+                                timeout=nuclei_timeout(len(batch), ctx.http_timeout))
+                if res.stderr_tail:
+                    with log.open("a", encoding="utf-8") as lf:
+                        lf.write(res.stderr_tail + "\n")
+                # KEEP a chunk's findings regardless of status — real even if WAF/timeout-degraded. Mark DONE
+                # only on a clean status; a degraded chunk stays retryable (re-run into a NEW attempt, its prior
+                # artifact preserved). Aggregate reads from evidence_map (clean OR degraded-with-output).
+                if res.status in (Status.SUCCESS, Status.EMPTY):
+                    if not cf.exists():
+                        cf.touch()                           # review#1: explicit zero-byte artifact for a clean-EMPTY
+                    done_map[str(ci)] = rel                  # clean -> controls SKIP
+                    _add_evidence(str(ci), rel)              # ...and joins this chunk's evidence history
+                    _save()
+                else:
+                    degraded += 1
+                    events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
+                    # review#1: a DEGRADED chunk that produced real output APPENDS to this chunk's evidence list
+                    # (PARTIAL(A) then PARTIAL(B) keeps BOTH). A degraded/failed retry with NO output appends
+                    # nothing, so an earlier attempt's findings are never erased.
+                    if cf.exists() and cf.stat().st_size > 0:
+                        _add_evidence(str(ci), rel)
+                        _save()
+                chunk_status = res.status.value              # bookkeeping complete -> now trust the tool's status
+            finally:
+                _chunk_terminal(sid, chunk_wu, res, cf, status=chunk_status)   # FAILED if exec OR bookkeeping raised
+        # review#1/#2/#4: rebuild the aggregate into a TEMP file, then swap ATOMICALLY — the prior findings.jsonl
+        # is only replaced once the new one is fully written, so a crash mid-rebuild leaves the old aggregate
+        # intact. For each chunk, read EVERY preserved evidence artifact (all attempts, clean OR degraded — so a
+        # later degraded/failed retry can't drop an earlier attempt's findings) and DEDUPLICATE lines. Falls back
+        # to THIS attempt's file for a chunk just run but not yet recorded. Prior attempt dirs are RETAINED — NO
+        # pruning here (a publish must never delete raw evidence; attempt-dir GC is a separate operation).
+        tmp = findings.with_name(findings.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
             for ci in range(len(batches)):
-                cf = ctx.run.raw_path("params", "nuclei", f"findings_{ci}.jsonl")
-                if cf.exists() and cf.stat().st_size > 0:
-                    fh.write(cf.read_text(encoding="utf-8", errors="replace"))
+                rels = list(evidence_map.get(str(ci)) or [])
+                paths = [state_f.parent / r for r in rels] or [attempt_dir / f"findings_{ci}.jsonl"]
+                seen_lines: set[str] = set()                  # dedup PER CHUNK (across its attempts) — never across
+                for p in paths:                               # chunks, whose identical-looking lines are distinct hosts
+                    if not (p.exists() and p.stat().st_size > 0):
+                        continue
+                    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                        if line and line not in seen_lines:
+                            seen_lines.add(line)
+                            fh.write(line + "\n")
+        os.replace(tmp, findings)
         status = Status.PARTIAL if degraded else Status.SUCCESS
     finally:
         events.tool_progress(sid, chunk_index=len(batches), chunk_total=len(batches),
                              current_index=_completed_hosts(), work_unit=scan_wu)   # final: cleanly completed
-        size = findings.stat().st_size if findings.exists() else None
+        try:                                                 # review#1: a stat() raise must NOT defeat the scan terminal
+            size = findings.stat().st_size
+        except OSError:
+            size = None
         events.tool_finish(sid, status=status.value, work_unit=scan_wu,
                            reason=(f"{degraded}/{len(batches)} chunk(s) degraded" if degraded else None),
                            duration=round(time.monotonic() - t0, 2),
@@ -412,43 +551,46 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         bf = ctx.write_list(f"dalfox_xss_{ci}.txt", batch)
         cf = ctx.run.raw_path("params", "dalfox", f"dalfox_xss_{ci}.txt")
         events.tool_start(sid, work_unit=chunk_wu, input_total=len(batch))   # this chunk's own lifecycle
-        res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof),
-                        timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
-        # KEEP a chunk's POCs regardless of status — a WAF/timeout-DEGRADED chunk still found real
-        # reflections (the OTC run discarded 30 POC lines this way). Findings go straight to the store,
-        # deduped on id, so re-scanning a degraded chunk on resume can't duplicate.
-        if cf.exists():
-            for line in cf.read_text(encoding="utf-8", errors="replace").splitlines():
-                if line.strip().startswith("[POC]") or "PoC" in line:
-                    s = line.strip()
-                    # reflection = a CANDIDATE, not impact (attack layer proves impact) — and the UNIT is
-                    # the SINK, not the payload. dalfox emits one POC per payload variant; canonicalize to
-                    # (host, non-empty query-param names) so N payloads on one route collapse to ONE
-                    # xss-candidate (raw chunk file keeps every variant as evidence). Neither the old
-                    # first-80-chars (collapsed distinct sinks) nor a full-line hash (one finding per
-                    # payload — 30 variants of one sink) is honest.
-                    url = s.split("] ", 1)[-1].split(" ", 1)[0] if "] " in s else s
-                    try:
-                        u = urlsplit(url)
-                        names = ",".join(sorted({k for k, _ in parse_qsl(u.query, keep_blank_values=True) if k}))
-                        sink = f"{u.hostname or url}|{names}"
-                    except Exception:
-                        sink = s
-                    if ctx.run.add("finding", {
-                            "id": f"xss-candidate:{sink}", "template": "xss-candidate",
-                            "name": "reflected parameter — XSS candidate (manual validation required)",
-                            "severity": "medium", "matched": s, "confidence": "candidate",
-                            "sources": ["dalfox"], "confirmed": False, "raw_ref": str(cf)}):
-                        produced += 1
-        if res.status in (Status.SUCCESS, Status.EMPTY):
-            done.add(ci)
-            _save()
-        else:
-            degraded += 1
-            events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
-        events.tool_finish(sid, work_unit=chunk_wu, status=res.status.value, reason=res.note or None,
-                           duration=round(res.duration, 2),
-                           raw_ref=str(cf) if cf.exists() else None)   # this chunk's terminal
+        res = None
+        chunk_status = Status.FAILED.value                   # review#1: promoted ONLY after ALL bookkeeping below
+        try:                                                 # review#1: chunk terminal ALWAYS fires (finally)
+            res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof),
+                            timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
+            # KEEP a chunk's POCs regardless of status — a WAF/timeout-DEGRADED chunk still found real
+            # reflections (the OTC run discarded 30 POC lines this way). Findings go straight to the store,
+            # deduped on id, so re-scanning a degraded chunk on resume can't duplicate.
+            if cf.exists():
+                for line in cf.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.strip().startswith("[POC]") or "PoC" in line:
+                        s = line.strip()
+                        # reflection = a CANDIDATE, not impact (attack layer proves impact) — and the UNIT is
+                        # the SINK, not the payload. dalfox emits one POC per payload variant; canonicalize to
+                        # (host, non-empty query-param names) so N payloads on one route collapse to ONE
+                        # xss-candidate (raw chunk file keeps every variant as evidence). Neither the old
+                        # first-80-chars (collapsed distinct sinks) nor a full-line hash (one finding per
+                        # payload — 30 variants of one sink) is honest.
+                        url = s.split("] ", 1)[-1].split(" ", 1)[0] if "] " in s else s
+                        try:
+                            u = urlsplit(url)
+                            names = ",".join(sorted({k for k, _ in parse_qsl(u.query, keep_blank_values=True) if k}))
+                            sink = f"{u.hostname or url}|{names}"
+                        except Exception:
+                            sink = s
+                        if ctx.run.add("finding", {
+                                "id": f"xss-candidate:{sink}", "template": "xss-candidate",
+                                "name": "reflected parameter — XSS candidate (manual validation required)",
+                                "severity": "medium", "matched": s, "confidence": "candidate",
+                                "sources": ["dalfox"], "confirmed": False, "raw_ref": str(cf)}):
+                            produced += 1
+            if res.status in (Status.SUCCESS, Status.EMPTY):
+                done.add(ci)
+                _save()
+            else:
+                degraded += 1
+                events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
+            chunk_status = res.status.value                  # bookkeeping (incl. run.add ingestion) complete
+        finally:
+            _chunk_terminal(sid, chunk_wu, res, cf, status=chunk_status)   # FAILED if exec OR bookkeeping raised
       status = Status.PARTIAL if degraded else Status.SUCCESS
     finally:
         # C07 inc4: source terminal ALWAYS fires (even if the loop raised) — one source lifecycle, no dup.

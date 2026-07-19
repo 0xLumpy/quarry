@@ -81,17 +81,21 @@ def _censys(cfg: dict, apex: str, timeout: int = 30) -> set:
     (no dependency on an exact `matched_services[...]` path). Best-effort — failure returns empty."""
     token, org = cfg.get("token"), cfg.get("org")
     if not token or not org:
-        return set()
+        return set()                                        # not configured — a genuine "not applicable" empty
     body = _json.dumps({"query": f"cert.parsed.names: {apex}", "page_size": 100}).encode()
     req = urllib.request.Request(
         "https://api.platform.censys.io/v3/global/search/query", data=body, method="POST",
         headers={"Authorization": f"Bearer {token}", "X-Organization-ID": str(org),
                  "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read(8 * 1024 * 1024).decode("utf-8", "replace")
-    except Exception:
-        return set()
+    # review#2: do NOT swallow HTTP/transport errors — let them propagate to contract.run_provider so a
+    # failure is a FAILED terminal, not a clean EMPTY that C10b would skip. (The phase still continues.)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read(8 * 1024 * 1024).decode("utf-8", "replace")
+    # review#3: a 200 with an error/schema-drift body must NOT become clean-empty work. Validate the Platform
+    # envelope (a success carries a `result`); anything else raises into run_provider -> FAILED, not EMPTY.
+    doc = _json.loads(raw)
+    if not (isinstance(doc, dict) and "result" in doc):
+        raise ValueError("censys: unexpected response envelope (no 'result') — not a valid empty result")
     pat = _re.compile(r"[a-z0-9](?:[a-z0-9._-]*)?\." + _re.escape(apex) + r"\b", _re.I)
     return {m.lower().strip(".") for m in pat.findall(raw) if "." in m}
 
@@ -101,15 +105,17 @@ def _crtsh(apex: str, timeout: int = 30) -> set:
     Best-effort + no key: complements subfinder's CT sources (coverage) and is a fallback when
     passive is thin (resilience). A failure returns an empty set — never breaks the run."""
     url = f"https://crt.sh/?q=%25.{apex}&output=json"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = r.read(8 * 1024 * 1024)          # bounded read
-        rows = _json.loads(data.decode("utf-8", "replace"))
-    except Exception:
-        return set()
+    # review#2: errors propagate to run_provider (FAILED terminal, not fake-empty).
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read(8 * 1024 * 1024)              # bounded read
+    rows = _json.loads(data.decode("utf-8", "replace"))
+    # review#3: crt.sh's success shape is a JSON ARRAY. A non-list root (error page / schema drift) is NOT
+    # zero results — raise into run_provider (FAILED), never launder it to a clean EMPTY.
+    if not isinstance(rows, list):
+        raise ValueError("crt.sh: non-list JSON root — not a valid empty result")
     hosts = set()
-    for row in rows if isinstance(rows, list) else []:
+    for row in rows:
         for nv in str(row.get("name_value", "")).splitlines():
             h = nv.strip().lower().strip(".")
             if h and "." in h:
@@ -125,14 +131,16 @@ def _certspotter(apex: str, token: str | None = None, timeout: int = 30) -> set:
     headers = {"User-Agent": "Mozilla/5.0"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            rows = _json.loads(r.read(8 * 1024 * 1024).decode("utf-8", "replace"))
-    except Exception:
-        return set()
+    # review#2: errors propagate to run_provider (FAILED terminal, not fake-empty).
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        rows = _json.loads(r.read(8 * 1024 * 1024).decode("utf-8", "replace"))
+    # review#3: certspotter's success shape is a JSON ARRAY of issuances. A dict (e.g. {"message": "rate
+    # limited"}) or other non-list root is an error, NOT zero results — raise into run_provider (FAILED).
+    if not isinstance(rows, list):
+        raise ValueError("certspotter: non-list JSON root — not a valid empty result")
     hosts = set()
-    for row in rows if isinstance(rows, list) else []:
+    for row in rows:
         for h in (row.get("dns_names") or []):
             h = str(h).strip().lower().strip(".")
             if h and "." in h:
@@ -329,8 +337,12 @@ def run(ctx) -> None:
     # roots adds nothing over -all). -stats prints per-source/API-key health to stderr (kept; captured).
     # C07: run under the authoritative contract (stable source_id + start/terminal events). The event layer
     # is additive — we still record the RunResult to the manifest below.
+    # C10b resume: work_unit = the apex-root set + source scope (`-all`). A changed root set is a new unit.
+    sf_wu = events.work_unit("vertical.subfinder", inputs={"roots": sorted(prof.apex_domains)},
+                             config={"sources": "all"})
     r = run_contract("vertical.subfinder", ["subfinder", "-dL", str(roots_file), "-all",
-                                            "-stats", "-silent"], raw_path=sf_raw, timeout=ctx.http_timeout)
+                                            "-stats", "-silent"], work_unit=sf_wu,
+                     raw_path=sf_raw, timeout=ctx.http_timeout)
     ctx.run.record("vertical", r)
     if r.raw_path:
         n = sum(ctx.run.add("subdomain", e) for e in
@@ -345,16 +357,21 @@ def run(ctx) -> None:
     wildcard_zones: set[str] = set()
     cs_token = secrets.certspotter()
     ct_new = 0
-    def _union_apex(per_apex):                              # aggregate an in-process provider across apexes
+    def _provider_over_apexes(src_id, per_apex):
+        """review#2: run each (provider, apex) as its OWN work unit. A single apex's failure becomes a FAILED
+        terminal for THAT unit only — every OTHER apex's successful discovery is still unioned (best-effort,
+        no all-or-nothing). This also gives the providers a per-apex work_unit (the C10b resume key)."""
         h = set()
         for apex in prof.apex_domains:
-            h |= per_apex(apex)
+            wu = events.work_unit(src_id, inputs={"apex": apex})
+            r = run_provider(src_id, lambda a=apex: per_apex(a), work_unit=wu, input_total=1)
+            if r:                                            # None on failure (that apex's terminal is FAILED)
+                h |= r
         return h
     for src, fn in (("crtsh", lambda a: _crtsh(a)),
                     ("certspotter", lambda a: _certspotter(a, cs_token))):
-        # C07 inc5: bracket the in-process CT provider (native HTTP) with a source lifecycle (tool_start/
-        # tool_finish). One bracket per source, covering all apexes; produced = host count.
-        hosts = run_provider(f"vertical.{src}", lambda fn=fn: _union_apex(fn))
+        # C07 inc5: bracket the in-process CT provider (native HTTP) with a per-apex source lifecycle.
+        hosts = _provider_over_apexes(f"vertical.{src}", fn)
         if not hosts:
             continue
         raw = ctx.run.raw_path("vertical", src, "hosts.txt")
@@ -387,7 +404,7 @@ def run(ctx) -> None:
     # ── passive: Censys Platform cert search (OPTIONAL — SILENT unless secrets.yaml `censys:` set) ──
     cen = secrets.censys()
     if cen.get("token") and cen.get("org"):
-        cen_hosts = run_provider("vertical.censys", lambda: _union_apex(lambda a: _censys(cen, a)))
+        cen_hosts = _provider_over_apexes("vertical.censys", lambda a: _censys(cen, a))
         if cen_hosts:
             raw = ctx.run.raw_path("vertical", "censys", "hosts.txt")
             raw.write_text("\n".join(sorted(cen_hosts)) + "\n")
@@ -442,9 +459,12 @@ def run(ctx) -> None:
                 res.status = Status.PARTIAL
                 res.note = f"shosubgo: {len(hosts or [])} host(s) — artifact had malformed lines, completion uncertain"
             return res
+        # C10b resume: work_unit = the apex-root set (the shosubgo query surface). API key is not folded (a
+        # rotated key is the same coverage intent), but a changed root set is a new unit.
+        sho_wu = events.work_unit("vertical.shosubgo", inputs={"roots": sorted(prof.apex_domains)})
         r = run_contract("vertical.shosubgo", ["shosubgo", "-f", str(roots_file),
                                                "-s", sho_key, "-o", str(sho), "-fail"],
-                         reclassify=_sho_reclassify, timeout=ctx.http_timeout)
+                         work_unit=sho_wu, reclassify=_sho_reclassify, timeout=ctx.http_timeout)
         ctx.run.record("vertical", r)
         hosts, _ = _shosubgo_read(sho)                  # re-read for ingest (392 names were dropped when unread)
         for e in (hosts or []):

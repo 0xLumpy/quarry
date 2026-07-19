@@ -255,7 +255,12 @@ def run(ctx) -> None:
         cmd += _katana_scope_flags(scope)   # never crawl an OOS sibling (rdn scope would otherwise reach it)
         if prof.http_rl:
             cmd += ["-rl", str(prof.http_rl)]
-        r = run_contract("crawl.katana_standard", cmd, raw_path=kat, timeout=ctx.http_timeout)
+        # C10b resume: work_unit = the target-list digest + crawl config (depth, form-fill, scope). A changed
+        # target set or crawl depth is a new unit.
+        kat_wu = events.work_unit("crawl.katana_standard",
+                                  file_digests={"targets": events.file_digest(targets)},
+                                  config={"depth": 2, "jc": True, "kf": "all"})
+        r = run_contract("crawl.katana_standard", cmd, work_unit=kat_wu, raw_path=kat, timeout=ctx.http_timeout)
         ctx.run.record("crawl", r)
         if r.raw_path:
             ctx.echo(f"  katana: +{_collect_url(ctx, r.raw_path.read_text(), 'katana', str(kat))} urls")
@@ -276,13 +281,16 @@ def run(ctx) -> None:
             if spa:
                 spa_f = ctx.write_list("spa_targets.txt", spa)
                 kh = ctx.run.raw_path("crawl", "katana", "headless.txt")
+                # C10b resume: the headless pass is its own unit — the SPA host set + headless crawl config.
+                kh_wu = events.work_unit("crawl.katana_headless", inputs={"spa_hosts": spa},
+                                         config={"depth": 2, "headless": True, "jc": True})
                 r = run_contract("crawl.katana_headless",
                               ["katana", "-list", str(spa_f), "-headless",
                                          "-system-chrome", "-jc", "-d", "2", "-c", "2", "-p", "1",
                                          "-timeout", "20", "-silent"] +
                                         _katana_scope_flags(scope) +   # same OOS exclusion on the headless pass
                                         (["-rl", str(prof.http_rl)] if prof.http_rl else []),
-                              raw_path=kh, timeout=ctx.http_timeout)
+                              work_unit=kh_wu, raw_path=kh, timeout=ctx.http_timeout)
                 ctx.run.record("crawl", r)
                 if r.raw_path:
                     ctx.echo(f"  katana headless SPA: +{_collect_url(ctx, r.raw_path.read_text(), 'katana-headless', str(kh))} urls")
@@ -295,8 +303,10 @@ def run(ctx) -> None:
     # ignored when args are present (verified upstream cmd/gau/main.go: `if len(domains)>0 {...} else
     # {read stdin}`). We pass the apexes as args, so the old stdin_data was DEAD input (not a duplicate
     # request — gau never read it — just misleading); dropped (T1.4). Coverage unchanged.
+    # C10b resume: work_unit = apex set + gau config (--subs). A changed apex set is a new unit.
+    gau_wu = events.work_unit("crawl.gau", inputs={"apexes": sorted(prof.apex_domains)}, config={"subs": True})
     r = run_contract("crawl.gau", ["gau", "--subs", "--threads", "5"] + prof.apex_domains,
-                     raw_path=gau_raw, timeout=ctx.http_timeout)
+                     work_unit=gau_wu, raw_path=gau_raw, timeout=ctx.http_timeout)
     ctx.run.record("crawl", r)
     if r.raw_path:
         ctx.echo(f"  gau: +{_collect_url(ctx, r.raw_path.read_text(), 'gau', str(gau_raw))} urls")
@@ -531,9 +541,22 @@ def run(ctx) -> None:
             rep = ctx.run.raw_path("crawl", "gitleaks",
                                    "report.json" if sd == js_dir else "report-sourcemap.json")
             rep.unlink(missing_ok=True)                    # stale report must not fabricate findings/success
+            # review#4/#6: gitleaks runs TWICE under one source_id (js_dir + sourcemap dir). Each invocation
+            # needs its OWN work_unit so C10b tracks them separately AND re-scans a dir whose CONTENT changed.
+            # Keyed on the dir name + a per-file CONTENT digest (not path+size — a same-size edit MUST re-scan;
+            # a size-only key would skip a canary swapped into an equal-length secret).
+            digests = {}
+            for p in sorted(sd.rglob("*")):
+                try:
+                    if p.is_file():
+                        digests[str(p.relative_to(sd))] = events.file_digest(p)
+                except OSError:
+                    continue
+            gl_wu = events.work_unit("crawl.gitleaks", inputs={"dir": sd.name}, file_digests=digests)
             # C07: run under the authoritative contract; reclassify (status-only) inside it so the terminal
             # event carries the FINAL file-output status. Ingest below re-reads the report (fail-closed).
             r = run_contract("crawl.gitleaks", ["gitleaks", "dir", str(sd), "-r", str(rep), "-f", "json"],
+                             work_unit=gl_wu,
                              reclassify=lambda res: (_gitleaks_status(res, rep), res)[1],
                              ok_codes=(0, 1), timeout=ctx.http_timeout)
             items = _gitleaks_report(rep)                  # validated findings for ingest (status already set)

@@ -60,6 +60,52 @@ class TestReopenSafeAppend:
         assert len(lines) == 2 and json.loads(lines[0])["event"] == "a"
 
 
+class TestDegradationDurableAcrossResume:
+    """review#6: a resume must INHERIT the prior session's degradation — a run whose events were lost can
+    never be recorded clean just because a later session wrote a fresh manifest."""
+
+    def _break_sink(self, tmp_path):
+        # make events.jsonl a DIRECTORY so emit's open("a") fails, while _sink (and thus the degraded-file
+        # location) stays correct — the realistic "event log unwritable" case.
+        ej = tmp_path / "events.jsonl"
+        if not ej.is_dir():
+            ej.mkdir()
+
+    def test_persisted_degradation_reloaded_on_reconfigure(self, tmp_path):
+        events.configure(tmp_path)
+        self._break_sink(tmp_path)
+        events.emit("t", "src.x")
+        assert events.observability_degraded()["writes_failed"] == 1
+        events.persist_degraded()                           # write_manifest does this
+        # session 2 (resume): a NEW configure on the same run dir must LOAD the prior degradation
+        events.reset()
+        events.configure(tmp_path)
+        deg = events.observability_degraded()
+        assert deg is not None and deg["writes_failed"] == 1   # inherited, not reset to clean
+
+    def test_degradation_persisted_at_failure_time_without_manual_persist(self, tmp_path):
+        # review#4: emit() must persist the marker the INSTANT a write fails (crash-durable) — NOT only when
+        # write_manifest later calls persist_degraded(). Simulate a crash: emit, then a fresh configure with no
+        # persist_degraded() call in between.
+        events.configure(tmp_path)
+        self._break_sink(tmp_path)
+        events.emit("t", "src.x")                            # write fails -> must persist NOW (no manual call)
+        assert (tmp_path / "events.degraded.json").exists()  # durable on disk already
+        events.reset()
+        events.configure(tmp_path)                           # "resume" after a crash
+        deg = events.observability_degraded()
+        assert deg is not None and deg["writes_failed"] == 1  # inherited without any manual persist_degraded()
+
+    def test_resumed_session_accumulates(self, tmp_path):
+        events.configure(tmp_path)
+        self._break_sink(tmp_path)
+        events.emit("t", "s"); events.persist_degraded()
+        events.reset(); events.configure(tmp_path)          # resume
+        self._break_sink(tmp_path)
+        events.emit("t", "s")                               # +1 this session
+        assert events.observability_degraded()["writes_failed"] == 2
+
+
 class TestManifestSurfacesDegraded:
     def test_manifest_records_degradation(self, tmp_path, monkeypatch):
         from quarry_recon.store import Run
