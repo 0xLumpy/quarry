@@ -18,6 +18,8 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+
+import idna as _idna                                        # IDNA2008/UTS-46 host canonicalization (C09a)
 from pathlib import Path
 
 # PRIORITY thresholds (NOT a gate): any cap/timeout with omitted>0 is already a gap — truth is not a
@@ -55,6 +57,81 @@ ENTITY_KEYS = {
     "oob_interaction": "id",    # OOB.1: imported out-of-band callbacks (interactsh); raw in raw/oob/,
                                 # uncorrelated by default until Quarry owns the token namespace (Phase 2)
 }
+
+# ── C09a identity contract — canonical dedup key per entity type ──────────────────────────────────────
+# The OLD key was `str(value).strip().lower()` for EVERY entity, which collapsed case-DISTINCT offensive
+# surface (e.g. `/API` and `/api`, a case-sensitive endpoint/parameter/fingerprint). The contract below
+# lowercases ONLY the case-INSENSITIVE components (DNS names; a URL's scheme+host) and PRESERVES everything
+# case-sensitive (path, query, parameter names, composite ids, secret/cert fingerprints). Same function is
+# used to WRITE and to RELOAD keys so dedup is stable across a reopened run.
+_HOST_KEYED = {"subdomain", "resolved"}                     # key = DNS name (case-insensitive)
+_URL_KEYED = {"live", "url", "js_url", "screenshot"}        # key = URL (scheme+host insensitive; path/query NOT)
+_IP_KEYED = {"ip"}                                          # key = IP literal (normalize; case-insensitive)
+# every other entity is id/value-keyed → case is PRESERVED (path/param/fingerprint/composite id carry case)
+
+
+def _canon_host(h: str) -> str:
+    """DNS-name canonicalization: lower, strip trailing dot, IDNA2008/UTS-46 non-transitional (so `faß.de`
+    and `xn--fa-hia.de` share one key). Best-effort — a non-domain host (IP literal, wildcard, odd label)
+    that IDNA can't encode falls back to the lowered/dot-stripped form rather than raising."""
+    h = h.strip().lower().rstrip(".")
+    if not h:
+        return h
+    try:
+        return _idna.encode(h, uts46=True, transitional=False).decode("ascii")
+    except Exception:
+        return h
+
+
+def _canon_url(u: str) -> str:
+    """Canonicalize a URL's scheme + HOSTNAME only (lower + IDNA + trailing-dot strip); PRESERVE path,
+    query, fragment, AND userinfo (a credential-bearing lead) exactly, so `/API` != `/api` and
+    `Admin:SeCrEt@h` != `admin:secret@h`. Unparseable URL (e.g. `http://[::1`) -> preserved verbatim."""
+    from urllib.parse import urlsplit, urlunsplit
+    u = u.strip()
+    try:
+        s = urlsplit(u)
+        host = s.hostname                                  # may raise ValueError on a malformed authority
+    except ValueError:
+        return u                                            # unparseable -> preserve (never crash Run.add)
+    if not s.scheme and not s.netloc:
+        return u                                            # not a URL shape — preserve verbatim
+    canon_host = _canon_host(host or "")
+    if ":" in canon_host:                                   # IPv6 literal -> re-bracket for a valid netloc
+        canon_host = f"[{canon_host}]"
+    netloc = canon_host
+    if s.port is not None:
+        netloc += f":{s.port}"
+    if s.username is not None:                              # userinfo PRESERVED verbatim (case-sensitive creds)
+        userinfo = s.username + (f":{s.password}" if s.password is not None else "")
+        netloc = f"{userinfo}@{netloc}"
+    return urlunsplit((s.scheme.lower(), netloc, s.path, s.query, s.fragment))
+
+
+def _canon_ip(ip: str) -> str:
+    import ipaddress
+    ip = ip.strip()
+    try:
+        return str(ipaddress.ip_address(ip))                # compressed canonical form (IPv6 case-insensitive)
+    except ValueError:
+        return ip.lower()
+
+
+def canonical_key(entity: str, record: dict) -> str:
+    """The dedup identity for a normalized entity — case-correct per the contract above. Empty when the
+    record is not an object or the key field is absent/blank (the record is then not addable)."""
+    if not isinstance(record, dict):
+        return ""                                           # a non-object JSONL row (null/[]/scalar) is not an entity
+    raw = str(record.get(ENTITY_KEYS.get(entity, "value"), "")).strip()
+    if not raw:
+        return ""
+    if entity in _HOST_KEYED:
+        return _canon_host(raw)
+    if entity in _URL_KEYED:
+        return _canon_url(raw)
+    if entity in _IP_KEYED:
+        return _canon_ip(raw)
+    return raw                                              # id/value: case-PRESERVING (strip only)
 
 
 def _utc() -> str:
@@ -130,9 +207,10 @@ class Run:
         return self.normalized / f"{entity}.jsonl"
 
     def add(self, entity: str, record: dict) -> bool:
-        """Append a normalized entity if its natural key is new. Returns True if added."""
-        key_field = ENTITY_KEYS.get(entity, "value")
-        key = str(record.get(key_field, "")).strip().lower()
+        """Append a normalized entity if its natural key is new. Returns True if added.
+        Identity is case-CORRECT per the C09a contract (canonical_key): case-distinct offensive surface
+        (`/API` vs `/api`) stays distinct; only DNS names + a URL's scheme/host are case-folded."""
+        key = canonical_key(entity, record)
         if not key:
             return False
         existing = self._seen_keys(entity)
@@ -150,12 +228,13 @@ class Run:
             keys = set()
             f = self._entity_file(entity)
             if f.exists():
-                key_field = ENTITY_KEYS.get(entity, "value")
                 for line in f.read_text().splitlines():
                     try:
-                        keys.add(str(json.loads(line).get(key_field, "")).strip().lower())
+                        k = canonical_key(entity, json.loads(line))   # SAME contract on reload; dict-safe
                     except json.JSONDecodeError:
                         continue
+                    if k:                                             # skip empty/keyless rows (don't inflate count)
+                        keys.add(k)
             self._seen[entity] = keys
         return self._seen[entity]
 
