@@ -13,6 +13,7 @@ from importlib import resources
 from pathlib import Path
 
 from .. import events, normalize, settings
+from ..contract import run_contract
 from ..runner import Status, ffuf_results, have, reclassify_ffuf, run as exec_tool, scaled_timeout, skipped
 
 MAX_HOSTS = 25                     # cap candidate hosts so a wide scope can't explode
@@ -114,6 +115,7 @@ def run(ctx) -> None:
     # depth (recursion multiplies the paths fuzzed). Merged wordlist counted once.
     wl_n = sum(1 for _ in wl.open())
     ct_to = scaled_timeout(wl_n * (recurse + 1), ctx.http_timeout, per_unit=0.4)
+    wl_digest = events.file_digest(wl)                       # C07 inc3: wordlist change → new work_unit
     for url in targets:
         host = normalize.host_of_url(url)
         # include a url hash so http/https/:8443 on the same host don't overwrite each other's raw
@@ -139,7 +141,14 @@ def run(ctx) -> None:
         if recurse:                                  # 11.2: balanced/deep only (gated above)
             cmd += ["-recursion", "-recursion-depth", str(recurse)]
         hard = ct_to + 60 if ct_to else 0            # backstop when bounded; stays UNBOUNDED (0) when ct_to==0
-        r = reclassify_ffuf(exec_tool("ffuf", cmd, timeout=hard), out)   # graceful -maxtime, exec_tool = hard backstop
+        # C07 inc3: per-TARGET work_unit (content.ffuf is per-target, NOT single-shot) binds the target URL +
+        # coverage config (match codes, recursion depth, wordlist) + wordlist digest → re-run on any change.
+        wu = events.work_unit("content.ffuf", inputs={"url": url},
+                              config={"mc": "200,204,301,302,307,308,401,403,405",
+                                      "recursion": recurse, "wordlist": wl.name},
+                              file_digests={"wordlist": wl_digest})
+        r = run_contract("content.ffuf", cmd, work_unit=wu, timeout=hard,
+                         reclassify=lambda res, o=out: reclassify_ffuf(res, o))   # graceful -maxtime; hard backstop
         ctx.run.record("content", r)
         if r.status == Status.BLOCKED:
             ff_blocked += 1

@@ -256,10 +256,10 @@ class Run:
     # ── C10a lifecycle ──
     @staticmethod
     def _mint_run_id() -> str:
-        """Collision-resistant run id: sortable UTC timestamp + random suffix. Second-precision alone
-        collided (two runs in the same second reused one directory); the 6-hex suffix makes a clash
-        ~1 in 16M within a single second, and Run.create() claims the dir atomically to eliminate even that."""
-        return time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+        """Collision-resistant run id: sortable UTC timestamp + 8-hex random suffix. Second-precision alone
+        collided (two runs in the same second reused one directory); the 4-byte suffix (4.3B space) makes a
+        same-second clash negligible, and Run.create() claims the dir atomically to eliminate even that."""
+        return time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(4).hex()
 
     @classmethod
     def create(cls, project_dir, target) -> "Run":

@@ -78,7 +78,7 @@ class TestUnknownSourceFailsLoud:
 
 
 class TestLanesMigrated:
-    # increment 1 (single-shot) + increment 2 (single-shot)
+    # increment 1+2 (single-shot) + increment 3 (work-unit'd looped/grouped lanes)
     MIGRATED = [
         ("quarry_recon.phases.vertical", "vertical.subfinder"),
         ("quarry_recon.phases.vertical", "vertical.shosubgo"),
@@ -88,7 +88,17 @@ class TestLanesMigrated:
         ("quarry_recon.phases.crawl", "crawl.katana_standard"),
         ("quarry_recon.phases.crawl", "crawl.katana_headless"),
         ("quarry_recon.phases.crawl", "crawl.gau"),
+        ("quarry_recon.phases.probe", "probe.ffuf_vhost"),
+        ("quarry_recon.phases.content", "content.ffuf"),
+        ("quarry_recon.phases.probe", "probe.nmap_service"),
     ]
+    # dynamic-source_id lanes (f-string / variable) — source_id can't be literal-grepped
+    DYNAMIC = [
+        ("quarry_recon.phases.probe", "probe.httpx"),               # run_contract(f"{phase}.httpx", ...)
+        ("quarry_recon.phases.crawl", "crawl.waymore_urls"),        # run_contract(sid, ...) via mode
+    ]
+    # lanes that must key events on a stable work_unit (looped/grouped — the C10b resume key)
+    WORKUNIT_MODULES = ["quarry_recon.phases.probe", "quarry_recon.phases.content"]
 
     @pytest.mark.parametrize("module,sid", MIGRATED)
     def test_lane_uses_run_contract(self, module, sid):
@@ -97,7 +107,14 @@ class TestLanesMigrated:
         src = inspect.getsource(importlib.import_module(module))
         assert f'run_contract("{sid}"' in src
 
-    @pytest.mark.parametrize("sid", [m[1] for m in MIGRATED])
+    @pytest.mark.parametrize("module", WORKUNIT_MODULES)
+    def test_grouped_lanes_pass_work_unit(self, module):
+        import importlib
+        import inspect
+        src = inspect.getsource(importlib.import_module(module))
+        assert "events.work_unit(" in src and "work_unit=wu" in src   # a stable resume key is computed + passed
+
+    @pytest.mark.parametrize("sid", [m[1] for m in MIGRATED] + [d[1] for d in DYNAMIC])
     def test_migrated_source_ids_are_registered(self, sid):
         from quarry_recon import sources
         assert sources.get(sid) is not None                         # contract would else fail loud

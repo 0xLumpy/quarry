@@ -314,7 +314,12 @@ def run(ctx) -> None:
         cmd = ["waymore", "-i", d, "-mode", mode, "-oU", str(wm), "-f", "-ci", "d", "-p", "3"]
         if mode == "B":
             cmd += ["-oR", str(wdir), "-oijs", "-l", str(prof.waymore_limit)]
-        r = exec_tool("waymore", cmd, timeout=ctx.http_timeout)
+        # C07 inc3: per-apex work_unit; source_id reflects the mode (URLs vs responses). config binds the
+        # coverage-affecting mode + response limit so a wider-limit re-run is a new unit.
+        sid = "crawl.waymore_responses" if mode == "B" else "crawl.waymore_urls"
+        wu = events.work_unit(sid, inputs={"apex": d, "mode": mode},
+                              config={"limit": prof.waymore_limit if mode == "B" else None, "ci": "d"})
+        r = run_contract(sid, cmd, work_unit=wu, timeout=ctx.http_timeout)
         ctx.run.record("crawl", r)
         if wm.exists():
             _collect_url(ctx, wm.read_text(), "waymore", str(wm))

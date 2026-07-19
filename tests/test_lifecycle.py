@@ -19,9 +19,8 @@ class TestRunId:
 
     def test_id_is_timestamp_sortable_prefixed(self):
         rid = Run._mint_run_id()
-        ts, _, suffix = rid.partition("-")
-        # actually the timestamp itself has a dash (YYYYmmdd-HHMMSS); check the trailing hex suffix
-        assert rid[:8].isdigit() and len(rid.rsplit("-", 1)[1]) == 6
+        # timestamp prefix (YYYYmmdd) is digits → lexical sort orders by time; trailing hex suffix
+        assert rid[:8].isdigit() and len(rid.rsplit("-", 1)[1]) == 8
 
 
 class TestCreate:

@@ -20,11 +20,54 @@ Design rules encoded here:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
 
 from . import secrets
+
+
+# ── C07 increment 3: stable work-unit identity (the resume key) ───────────────────────────────────────
+# A work_unit identifies ONE unit of a source's work across runs so C10b resume can skip only genuinely
+# completed units. Target identity ALONE is insufficient: a completed unit must NOT be skipped after a
+# coverage-affecting change (a wider wordlist, a new rate, a changed input file, a parser upgrade). So the
+# unit is a hash over a VERSIONED CANONICAL ENVELOPE binding all of those — change any, get a new unit.
+_WORKUNIT_ENVELOPE_VERSION = 1
+
+
+def file_digest(path) -> str:
+    """sha256 of a coverage-affecting INPUT FILE (wordlist, target list) so a changed file yields a
+    different work_unit. Streamed; '' when the file is missing/unreadable (a missing input is itself a
+    distinct state, folded into the envelope)."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def work_unit(source_id, *, inputs=None, config=None, file_digests=None, schema_version=1) -> str:
+    """Stable work-unit id = short sha256 over a versioned canonical envelope:
+      - source_id      — the lane
+      - inputs         — normalized SEMANTIC inputs (origin URL, apex, sorted host/port set) — NOT loop index
+      - config         — coverage-affecting configuration (wordlist name, ports, recursion depth, mode, rate)
+      - file_digests   — {label: sha256} of coverage-affecting input files (see file_digest)
+      - schema_version — the adapter's output-schema version (a parser change invalidates old units)
+    Deterministic across runs; any coverage-affecting change flips the id so resume can't skip stale work."""
+    envelope = {
+        "v": _WORKUNIT_ENVELOPE_VERSION,
+        "source_id": source_id,
+        "inputs": inputs,
+        "config": config,
+        "file_digests": file_digests or {},
+        "schema": schema_version,
+    }
+    blob = json.dumps(envelope, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 # The event types (the ledger rides on a tool_finish-class update, see ledger(); coverage_reset marks a
 # coverage generation boundary).
@@ -112,19 +155,20 @@ def emit(event: str, source_id: str, **fields) -> dict:
     return rec
 
 
-def tool_start(source_id, *, cmd=None, env=None, input_total=None,
+def tool_start(source_id, *, cmd=None, env=None, input_total=None, work_unit=None,
                workers=None, rate=None, timeout=None,
                parent_id=None, scope_distance=None, discovery_context=None) -> dict:
     """Emitted before a source runs. cmd/env (like all fields) are redacted at the sink; workers/rate/
-    timeout are the PLANNED contract values (from the registry). Provenance rides along for v0.4."""
+    timeout are the PLANNED contract values (from the registry). ``work_unit`` (C07 inc 3) is the stable
+    resume key for a looped/grouped lane. Provenance rides along for v0.4."""
     return emit(TOOL_START, source_id,
                 cmd=list(cmd) if cmd is not None else None,
                 env=dict(env) if env else None,
-                input_total=input_total, workers=workers, rate=rate, timeout=timeout,
+                input_total=input_total, work_unit=work_unit, workers=workers, rate=rate, timeout=timeout,
                 parent_id=parent_id, scope_distance=scope_distance, discovery_context=discovery_context)
 
 
-def tool_progress(source_id, *, input_total=None, current_index=None,
+def tool_progress(source_id, *, input_total=None, current_index=None, work_unit=None,
                   chunk_index=None, chunk_total=None,
                   elapsed=None, rss=None, artifact_size=None, last_output_at=None,
                   queued=None, running=None, done=None) -> dict:
@@ -133,20 +177,22 @@ def tool_progress(source_id, *, input_total=None, current_index=None,
     elapsed/rss/artifact_size/last_output_at (opaque long-runners) · queued/running/done (true queues).
     Do NOT invent a queue triple for a tool that has none."""
     return emit(TOOL_PROGRESS, source_id,
-                input_total=input_total, current_index=current_index,
+                input_total=input_total, current_index=current_index, work_unit=work_unit,
                 chunk_index=chunk_index, chunk_total=chunk_total,
                 elapsed=elapsed, rss=rss, artifact_size=artifact_size, last_output_at=last_output_at,
                 queued=queued, running=running, done=done)
 
 
-def tool_finish(source_id, *, status=None, reason=None, duration=None, exit_code=None,
+def tool_finish(source_id, *, status=None, reason=None, duration=None, exit_code=None, work_unit=None,
                 rss=None, cpu_s=None, raw_ref=None, artifact_size=None,
                 produced=None, consumed=None, fallback=None,
                 parent_id=None, scope_distance=None, discovery_context=None) -> dict:
     """Emitted after a source finishes. produced/consumed are absent unless the caller passes REAL
-    parser/store counts (never guessed here). raw_ref/artifact_size point at the persisted output."""
+    parser/store counts (never guessed here). raw_ref/artifact_size point at the persisted output.
+    ``work_unit`` (C07 inc 3) ties this terminal to the same stable unit as its tool_start (resume key)."""
     return emit(TOOL_FINISH, source_id, status=status, reason=reason, duration=duration,
-                exit_code=exit_code, rss=rss, cpu_s=cpu_s, raw_ref=raw_ref, artifact_size=artifact_size,
+                exit_code=exit_code, work_unit=work_unit, rss=rss, cpu_s=cpu_s,
+                raw_ref=raw_ref, artifact_size=artifact_size,
                 produced=produced, consumed=consumed, fallback=fallback,
                 parent_id=parent_id, scope_distance=scope_distance, discovery_context=discovery_context)
 

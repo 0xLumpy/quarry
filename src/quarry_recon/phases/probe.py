@@ -176,6 +176,7 @@ def _vhost_enum(ctx) -> None:
     # the flat 1800s cut a big-wordlist run. Higher -t (I/O-bound concurrency) makes each call faster.
     wl_n = sum(1 for _ in wl.open())
     ffuf_to = scaled_timeout(wl_n, ctx.http_timeout, per_unit=0.4)
+    wl_digest = events.file_digest(wl)                       # C07 inc3: wordlist change → new work_unit (no wrong skip)
     ffuf_clean = ffuf_partial = ffuf_blocked = ffuf_errors = ffuf_total = 0
     for origin, base in origins.items():
         for apex in apexes:
@@ -200,7 +201,13 @@ def _vhost_enum(ctx) -> None:
             if prof.http_rl:
                 cmd += ["-rate", str(prof.http_rl)]
             hard = ffuf_to + 60 if ffuf_to else 0        # backstop when bounded; stays UNBOUNDED (0) when ffuf_to==0
-            r = reclassify_ffuf(exec_tool("ffuf", cmd, timeout=hard), out)   # graceful -maxtime, exec_tool = hard backstop
+            # C07 inc3: per-origin×apex work_unit binds the semantic inputs + coverage-affecting config
+            # (match codes, wordlist) + the wordlist digest, so a completed origin is re-run if any change.
+            wu = events.work_unit("probe.ffuf_vhost", inputs={"origin": origin, "apex": apex},
+                                  config={"mc": "200-299,301,302,303,307,308,401,403", "wordlist": wl.name},
+                                  file_digests={"wordlist": wl_digest})
+            r = run_contract("probe.ffuf_vhost", cmd, work_unit=wu, timeout=hard,
+                             reclassify=lambda res, o=out: reclassify_ffuf(res, o))   # graceful -maxtime; hard backstop
             ctx.run.record("probe", r)
             ffuf_total += 1
             # per-origin: rollup counters + a coverage_partial event ONLY for a degraded/blocked origin
@@ -262,7 +269,10 @@ def _run_httpx(ctx, hosts, ports, phase, tag):
     hx = ctx.run.raw_path(phase, "httpx", f"{tag}.jsonl")
     cmd = _httpx_probe_cmd(hf, ports, ctx.profile.http_rl)
     to = scaled_timeout(len(hosts), ctx.http_timeout, per_unit=max(6, len(ports) // 12))
-    r = exec_tool("httpx", cmd, raw_path=hx, timeout=to)
+    # C07 inc3: this httpx GROUP's work_unit = its exact host set + port set (a resumable unit); a changed
+    # group (different hosts/ports) is a different unit. source_id is phase-scoped (probe/enrich .httpx).
+    wu = events.work_unit(f"{phase}.httpx", inputs={"hosts": sorted(set(hosts)), "ports": sorted(ports)})
+    r = run_contract(f"{phase}.httpx", cmd, work_unit=wu, raw_path=hx, timeout=to)
     ctx.run.record(phase, r)
     return str(hx), (r.raw_path.read_text().splitlines() if r.raw_path else [])
 
@@ -845,14 +855,22 @@ def run(ctx) -> None:
                 g_ips = ctx.write_list(f"nmap_ips_{gi}.txt", sorted(ips))
                 nm = ctx.run.raw_path("probe", "nmap", f"service_{gi}.xml")
                 nm.unlink(missing_ok=True)                   # -oX file: clear stale before the run
-                nr = exec_tool("nmap", ["nmap", "-sV", "-Pn", "-T4", "-iL", str(g_ips),
-                                        "-p", ",".join(ptup), "-oX", str(nm)],
-                               timeout=scaled_timeout(len(ips) * len(ptup), ctx.http_timeout, per_unit=30))
-                svcs, complete = _nmap_services(nm)
-                reclassify_from_artifact(nr, None if svcs is None else len(svcs), label="nmap")
-                if svcs is not None and not complete and nr.status in (Status.SUCCESS, Status.EMPTY):
-                    nr.status = Status.PARTIAL               # malformed rows / no clean finish -> uncertain (valid kept)
+                # C07 inc3: reclassify (status-only) inside the contract so the terminal event has the final
+                # nmap status; re-read below for ingest. work_unit = this port-group's ports + its IP set.
+                def _nmap_reclassify(res, xml=nm):
+                    svcs, complete = _nmap_services(xml)
+                    reclassify_from_artifact(res, None if svcs is None else len(svcs), label="nmap")
+                    if svcs is not None and not complete and res.status in (Status.SUCCESS, Status.EMPTY):
+                        res.status = Status.PARTIAL          # malformed rows / no clean finish -> uncertain (valid kept)
+                    return res
+                wu = events.work_unit("probe.nmap_service", inputs={"ports": list(ptup), "ips": sorted(ips)})
+                nr = run_contract("probe.nmap_service",
+                                  ["nmap", "-sV", "-Pn", "-T4", "-iL", str(g_ips),
+                                   "-p", ",".join(ptup), "-oX", str(nm)],
+                                  work_unit=wu, reclassify=_nmap_reclassify,
+                                  timeout=scaled_timeout(len(ips) * len(ptup), ctx.http_timeout, per_unit=30))
                 ctx.run.record("probe", nr)
+                svcs, _ = _nmap_services(nm)                 # re-read for ingest (status already set)
                 for sip, sport, proto, service, product, version in (svcs or []):
                     # naabu OBSERVED the open port (triggering nmap); nmap ENRICHED it — carry both sources.
                     ctx.run.add("port", {"id": f"{sip}:{sport}", "ip": sip, "port": sport, "proto": proto,
