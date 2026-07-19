@@ -40,25 +40,43 @@ EVENT_TYPES = (TOOL_START, TOOL_PROGRESS, TOOL_FINISH,
 
 _sink: Path | None = None
 _coverage_seen: set = set()             # source_ids that emitted a coverage unit THIS session (for the snapshot)
+# C11: in-memory record of event-sink write failures THIS session. Best-effort is preserved (a log-write
+# failure never crashes the run), but the loss is no longer SILENT — it's surfaced in the manifest as
+# `observability_degraded` so a run built on an incomplete events.jsonl is a recorded fact, not a clean lie.
+_degraded: dict = {"writes_failed": 0, "first_error": None}
+
+
+def _fresh_degraded() -> dict:
+    return {"writes_failed": 0, "first_error": None}
 
 
 def configure(run_dir) -> Path:
     """Point the sink at ``<run_dir>/events.jsonl`` (created if missing). Idempotent; returns path.
     Clears the per-session coverage-snapshot guard so this process's first coverage unit per source opens a
-    FRESH generation — a resume (new process appending to the same events.jsonl) thereby supersedes the prior
-    run's units, so a capped unit that DISAPPEARS on rerun no longer leaves a stale gap."""
-    global _sink, _coverage_seen
+    FRESH generation — a resume (new process APPENDING to the same events.jsonl) thereby supersedes the prior
+    run's units, so a capped unit that DISAPPEARS on rerun no longer leaves a stale gap. Resets the C11
+    degraded counter (per-session)."""
+    global _sink, _coverage_seen, _degraded
     _sink = Path(run_dir) / "events.jsonl"
     _sink.parent.mkdir(parents=True, exist_ok=True)
     _coverage_seen = set()
+    _degraded = _fresh_degraded()
     return _sink
 
 
 def reset() -> None:
     """Detach the sink (tests / between runs). emit() then returns records without persisting."""
-    global _sink, _coverage_seen
+    global _sink, _coverage_seen, _degraded
     _sink = None
     _coverage_seen = set()
+    _degraded = _fresh_degraded()
+
+
+def observability_degraded() -> dict | None:
+    """C11: non-None when >=1 event write FAILED this session — the events.jsonl is INCOMPLETE, so any
+    coverage/verdict folded from it is provisional. Returns {writes_failed, first_error}; None when clean.
+    The manifest reads this so a silent telemetry loss becomes a recorded fact."""
+    return dict(_degraded) if _degraded["writes_failed"] else None
 
 
 def _redact(v):
@@ -86,8 +104,11 @@ def emit(event: str, source_id: str, **fields) -> dict:
             # explicit utf-8 (events carry redacted UTF-8 payloads; Windows would else default to cp)
             with _sink.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, default=str, ensure_ascii=False) + "\n")
-        except Exception:
-            pass  # a log failure must never break a recon run
+        except Exception as e:
+            # C11: best-effort — never break a recon run — but RECORD the loss (was silently swallowed).
+            _degraded["writes_failed"] += 1
+            if _degraded["first_error"] is None:
+                _degraded["first_error"] = f"{type(e).__name__}: {e}"
     return rec
 
 

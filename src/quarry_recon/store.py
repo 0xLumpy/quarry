@@ -543,6 +543,12 @@ class Run:
         }
         if metrics:                                 # pointer + headline totals for the telemetry artifact
             manifest["metrics"] = metrics
+        # C11: if any event-sink write FAILED this session, events.jsonl is incomplete — record that fact so
+        # a coverage/verdict folded from it is not read as clean truth (the run itself never crashed on it).
+        from . import events as _events
+        od = _events.observability_degraded()
+        if od:
+            manifest["observability_degraded"] = od
         # C10a: atomic write (temp + os.replace) so a crash mid-write never leaves a truncated manifest.
         _atomic_write(self.manifest_path, json.dumps(manifest, indent=2))
         # update state pointers (per-project, under recon/)
