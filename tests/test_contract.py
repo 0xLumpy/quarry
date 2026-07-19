@@ -77,6 +77,48 @@ class TestUnknownSourceFailsLoud:
         assert out.status == Status.SUCCESS
 
 
+class TestRunProvider:
+    """C07 inc5 — in-process HTTP providers get a source lifecycle bracket (tool_start/tool_finish),
+    without run_contract (they are native urllib, not a subprocess)."""
+
+    def test_start_and_finish_bracketed(self, tmp_path):
+        from quarry_recon.contract import run_provider
+        res = run_provider("vertical.crtsh", lambda: {"a.example.com", "b.example.com"})
+        assert res == {"a.example.com", "b.example.com"}
+        evs = [e["event"] for e in _events(tmp_path)]
+        assert "tool_start" in evs and "tool_finish" in evs
+
+    def test_result_returned_unchanged(self, tmp_path):
+        from quarry_recon.contract import run_provider
+        assert run_provider("vertical.crtsh", lambda: {"x"}) == {"x"}
+
+    def test_empty_result_is_empty_status(self, tmp_path):
+        from quarry_recon.contract import run_provider
+        run_provider("vertical.crtsh", lambda: set())
+        fin = [e for e in _events(tmp_path) if e["event"] == "tool_finish"][0]
+        assert fin["status"] == "empty"
+
+    def test_nonempty_result_is_success_with_produced(self, tmp_path):
+        from quarry_recon.contract import run_provider
+        run_provider("vertical.certspotter", lambda: {"a", "b", "c"})
+        fin = [e for e in _events(tmp_path) if e["event"] == "tool_finish"][0]
+        assert fin["status"] == "success" and fin["produced"] == {"host": 3}
+
+    def test_terminal_fires_even_if_provider_raises(self, tmp_path):
+        from quarry_recon.contract import run_provider
+        def boom():
+            raise RuntimeError("http died")
+        with pytest.raises(RuntimeError):
+            run_provider("vertical.crtsh", boom)
+        fin = [e for e in _events(tmp_path) if e["event"] == "tool_finish"]
+        assert len(fin) == 1 and fin[0]["status"] == "failed"
+
+    def test_unknown_source_still_runs_but_blocked_emitted(self, tmp_path):
+        from quarry_recon.contract import run_provider
+        assert run_provider("not.a.provider", lambda: {"x"}) == {"x"}   # coverage not lost to a registry typo
+        assert any(e["event"] == "tool_blocked" for e in _events(tmp_path))
+
+
 class TestLanesMigrated:
     # increment 1+2 (single-shot) + increment 3 (work-unit'd looped/grouped lanes)
     MIGRATED = [

@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 
 from .. import events, netguard, normalize, secrets, settings
-from ..contract import run_contract
+from ..contract import run_contract, run_provider
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
 
@@ -345,11 +345,16 @@ def run(ctx) -> None:
     wildcard_zones: set[str] = set()
     cs_token = secrets.certspotter()
     ct_new = 0
+    def _union_apex(per_apex):                              # aggregate an in-process provider across apexes
+        h = set()
+        for apex in prof.apex_domains:
+            h |= per_apex(apex)
+        return h
     for src, fn in (("crtsh", lambda a: _crtsh(a)),
                     ("certspotter", lambda a: _certspotter(a, cs_token))):
-        hosts = set()
-        for apex in prof.apex_domains:
-            hosts |= fn(apex)
+        # C07 inc5: bracket the in-process CT provider (native HTTP) with a source lifecycle (tool_start/
+        # tool_finish). One bracket per source, covering all apexes; produced = host count.
+        hosts = run_provider(f"vertical.{src}", lambda fn=fn: _union_apex(fn))
         if not hosts:
             continue
         raw = ctx.run.raw_path("vertical", src, "hosts.txt")
@@ -382,9 +387,7 @@ def run(ctx) -> None:
     # ── passive: Censys Platform cert search (OPTIONAL — SILENT unless secrets.yaml `censys:` set) ──
     cen = secrets.censys()
     if cen.get("token") and cen.get("org"):
-        cen_hosts = set()
-        for apex in prof.apex_domains:
-            cen_hosts |= _censys(cen, apex)
+        cen_hosts = run_provider("vertical.censys", lambda: _union_apex(lambda a: _censys(cen, a)))
         if cen_hosts:
             raw = ctx.run.raw_path("vertical", "censys", "hosts.txt")
             raw.write_text("\n".join(sorted(cen_hosts)) + "\n")

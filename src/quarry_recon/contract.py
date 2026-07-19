@@ -47,6 +47,29 @@ def _emit_terminal(source_id, src, res, *, work_unit, parent_id, scope_distance,
                        discovery_context=discovery_context)
 
 
+def run_provider(source_id, fn, *, work_unit=None, input_total=None):
+    """Contract bracket for an IN-PROCESS provider (native HTTP, not a subprocess): emit tool_start before,
+    tool_finish ALWAYS after (try/finally), returning ``fn()``'s result UNCHANGED. status/produced derive
+    from the result's length. Unknown source_id emits tool_blocked (a registry typo is surfaced) but the
+    provider STILL runs — losing a passive CT source to a missing registry row would cost coverage. The
+    error-vs-empty distinction (a swallowed HTTP failure vs a genuine 0) is C06, not here."""
+    if sources.get(source_id) is None:
+        events.tool_blocked(source_id, reason=f"unknown source_id {source_id!r} — not in registry")
+    events.tool_start(source_id, input_total=input_total, work_unit=work_unit)
+    result = None
+    try:
+        result = fn()
+        return result
+    finally:
+        if result is None:
+            status, n = Status.FAILED.value, None            # fn raised (providers normally swallow -> set())
+        else:
+            n = len(result) if hasattr(result, "__len__") else None
+            status = Status.SUCCESS.value if n else Status.EMPTY.value
+        events.tool_finish(source_id, status=status, work_unit=work_unit,
+                           produced={"host": n} if n is not None else None)
+
+
 def run_contract(source_id, cmd, *, input_total=None, env=None, reclassify=None, work_unit=None,
                  parent_id=None, scope_distance=None, discovery_context=None,
                  **run_kwargs):
