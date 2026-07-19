@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 
 from .. import events, netguard, normalize, secrets, settings
+from ..contract import run_contract
 from ..runner import (Status, ffuf_results, fresh_artifact_dir, have, nuclei_timeout, reclassify_ffuf,
                       reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
                       skipped)
@@ -735,7 +736,7 @@ def run(ctx) -> None:
         if thosts:
             tf = ctx.write_list("tls_targets.txt", thosts)
             tr = ctx.run.raw_path("probe", "tlsx", "certs.jsonl")
-            r = exec_tool("tlsx", ["tlsx", "-l", str(tf), "-p", "443,8443,4443",
+            r = run_contract("probe.tlsx_certs", ["tlsx", "-l", str(tf), "-p", "443,8443,4443",
                                    "-json", "-silent"], raw_path=tr, timeout=ctx.http_timeout)
             ctx.run.record("probe", r)
             san_new = 0
@@ -795,17 +796,17 @@ def run(ctx) -> None:
     if prof.screenshots and ctx.run.count("live"):
         live_file = ctx.write_list("live.txt", ctx.run.values("live"))
         shot_dir = fresh_artifact_dir(ctx.run.dir / "raw" / "probe" / "gowitness")   # FRESH per invocation
-        r = exec_tool("gowitness",
+        # gowitness writes to FILES, not stdout → the runner mislabels it BLOCKED on a stderr WAF line even
+        # when it screenshotted most hosts. Reclassify from shots in THIS attempt's fresh dir (a reused dir
+        # must not inflate the count). Done inside the contract so the terminal event has the FINAL status.
+        def _gw_reclassify(res):
+            shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
+            return reclassify_from_files(res, shots, "screenshot")
+        r = run_contract("probe.gowitness",
                 ["gowitness", "scan", "file", "-f", str(live_file),
                  "--screenshot-path", str(shot_dir), "--write-jsonl",
                  "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
-                timeout=ctx.http_timeout)
-        # gowitness writes to FILES, not stdout → the runner mislabels it BLOCKED on a stderr WAF line
-        # even when it screenshotted most hosts (observed 43/51). Reclassify from shots in THIS attempt's
-        # dir only — a reused/pre-populated dir must not let old screenshots inflate the count (T1.6 core
-        # precondition: the artifact must be fresh).
-        shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
-        reclassify_from_files(r, shots, "screenshot")
+                reclassify=_gw_reclassify, timeout=ctx.http_timeout)
         ctx.run.record("probe", r)
         for img in shot_dir.glob("*.jpeg"):
             ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})

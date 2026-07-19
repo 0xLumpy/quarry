@@ -78,18 +78,26 @@ class TestUnknownSourceFailsLoud:
 
 
 class TestLanesMigrated:
-    @pytest.mark.parametrize("module,sid", [
-        ("quarry_recon.phases.vertical", '"vertical.subfinder"'),
-        ("quarry_recon.phases.vertical", '"vertical.shosubgo"'),
-        ("quarry_recon.phases.crawl", '"crawl.gitleaks"'),
-    ])
+    # increment 1 (single-shot) + increment 2 (single-shot)
+    MIGRATED = [
+        ("quarry_recon.phases.vertical", "vertical.subfinder"),
+        ("quarry_recon.phases.vertical", "vertical.shosubgo"),
+        ("quarry_recon.phases.crawl", "crawl.gitleaks"),
+        ("quarry_recon.phases.probe", "probe.tlsx_certs"),
+        ("quarry_recon.phases.probe", "probe.gowitness"),
+        ("quarry_recon.phases.crawl", "crawl.katana_standard"),
+        ("quarry_recon.phases.crawl", "crawl.katana_headless"),
+        ("quarry_recon.phases.crawl", "crawl.gau"),
+    ]
+
+    @pytest.mark.parametrize("module,sid", MIGRATED)
     def test_lane_uses_run_contract(self, module, sid):
         import importlib
         import inspect
         src = inspect.getsource(importlib.import_module(module))
-        assert f"run_contract({sid}" in src
+        assert f'run_contract("{sid}"' in src
 
-    @pytest.mark.parametrize("sid", ["vertical.subfinder", "vertical.shosubgo", "crawl.gitleaks"])
+    @pytest.mark.parametrize("sid", [m[1] for m in MIGRATED])
     def test_migrated_source_ids_are_registered(self, sid):
         from quarry_recon import sources
         assert sources.get(sid) is not None                         # contract would else fail loud

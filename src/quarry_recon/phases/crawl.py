@@ -255,7 +255,7 @@ def run(ctx) -> None:
         cmd += _katana_scope_flags(scope)   # never crawl an OOS sibling (rdn scope would otherwise reach it)
         if prof.http_rl:
             cmd += ["-rl", str(prof.http_rl)]
-        r = exec_tool("katana", cmd, raw_path=kat, timeout=ctx.http_timeout)
+        r = run_contract("crawl.katana_standard", cmd, raw_path=kat, timeout=ctx.http_timeout)
         ctx.run.record("crawl", r)
         if r.raw_path:
             ctx.echo(f"  katana: +{_collect_url(ctx, r.raw_path.read_text(), 'katana', str(kat))} urls")
@@ -276,7 +276,8 @@ def run(ctx) -> None:
             if spa:
                 spa_f = ctx.write_list("spa_targets.txt", spa)
                 kh = ctx.run.raw_path("crawl", "katana", "headless.txt")
-                r = exec_tool("katana", ["katana", "-list", str(spa_f), "-headless",
+                r = run_contract("crawl.katana_headless",
+                              ["katana", "-list", str(spa_f), "-headless",
                                          "-system-chrome", "-jc", "-d", "2", "-c", "2", "-p", "1",
                                          "-timeout", "20", "-silent"] +
                                         _katana_scope_flags(scope) +   # same OOS exclusion on the headless pass
@@ -294,8 +295,8 @@ def run(ctx) -> None:
     # ignored when args are present (verified upstream cmd/gau/main.go: `if len(domains)>0 {...} else
     # {read stdin}`). We pass the apexes as args, so the old stdin_data was DEAD input (not a duplicate
     # request — gau never read it — just misleading); dropped (T1.4). Coverage unchanged.
-    r = exec_tool("gau", ["gau", "--subs", "--threads", "5"] + prof.apex_domains,
-                  raw_path=gau_raw, timeout=ctx.http_timeout)
+    r = run_contract("crawl.gau", ["gau", "--subs", "--threads", "5"] + prof.apex_domains,
+                     raw_path=gau_raw, timeout=ctx.http_timeout)
     ctx.run.record("crawl", r)
     if r.raw_path:
         ctx.echo(f"  gau: +{_collect_url(ctx, r.raw_path.read_text(), 'gau', str(gau_raw))} urls")
