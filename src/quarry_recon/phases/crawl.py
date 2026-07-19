@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from .. import events, fetch, normalize, secrets, settings
+from ..contract import run_contract
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
 # 9.2 deep-mine patterns over JS / recovered source — extraction only, no fetch.
@@ -524,10 +525,12 @@ def run(ctx) -> None:
             rep = ctx.run.raw_path("crawl", "gitleaks",
                                    "report.json" if sd == js_dir else "report-sourcemap.json")
             rep.unlink(missing_ok=True)                    # stale report must not fabricate findings/success
-            r = exec_tool("gitleaks", ["gitleaks", "dir", str(sd),
-                                       "-r", str(rep), "-f", "json"],
-                          ok_codes=(0, 1), timeout=ctx.http_timeout)
-            items = _gitleaks_status(r, rep)               # validates the -f json report + sets the file-output status
+            # C07: run under the authoritative contract; reclassify (status-only) inside it so the terminal
+            # event carries the FINAL file-output status. Ingest below re-reads the report (fail-closed).
+            r = run_contract("crawl.gitleaks", ["gitleaks", "dir", str(sd), "-r", str(rep), "-f", "json"],
+                             reclassify=lambda res: (_gitleaks_status(res, rep), res)[1],
+                             ok_codes=(0, 1), timeout=ctx.http_timeout)
+            items = _gitleaks_report(rep)                  # validated findings for ingest (status already set)
             for item in (items or []):
                 sec = item.get("Secret", "")
                 # fingerprint from the secret; fall back to rule+file+line so an empty Secret

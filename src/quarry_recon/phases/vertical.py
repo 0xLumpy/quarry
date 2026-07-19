@@ -14,6 +14,7 @@ import urllib.request
 from pathlib import Path
 
 from .. import events, netguard, normalize, secrets, settings
+from ..contract import run_contract
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
 
@@ -326,8 +327,10 @@ def run(ctx) -> None:
     # results can still vary run-to-run, as passive APIs do). A separate recursive pass seeded from NS/delegation
     # evidence is a later enhancement (needs the dns phase's records; running -recursive blind over all
     # roots adds nothing over -all). -stats prints per-source/API-key health to stderr (kept; captured).
-    r = exec_tool("subfinder", ["subfinder", "-dL", str(roots_file), "-all",
-                                "-stats", "-silent"], raw_path=sf_raw, timeout=ctx.http_timeout)
+    # C07: run under the authoritative contract (stable source_id + start/terminal events). The event layer
+    # is additive — we still record the RunResult to the manifest below.
+    r = run_contract("vertical.subfinder", ["subfinder", "-dL", str(roots_file), "-all",
+                                            "-stats", "-silent"], raw_path=sf_raw, timeout=ctx.http_timeout)
     ctx.run.record("vertical", r)
     if r.raw_path:
         n = sum(ctx.run.add("subdomain", e) for e in
@@ -425,19 +428,22 @@ def run(ctx) -> None:
         # `-fail` (verified upstream main.go): exit 1 on ANY API error (invalid/rate-limited key). WITHOUT
         # it, an auth error just prints to stderr and the run exits 0 -> looks like a clean-empty result
         # (false-negative). With it, the error surfaces as FAILED and the file-output adapter keeps it hard.
-        r = exec_tool("shosubgo", ["shosubgo", "-f", str(roots_file),
-                                   "-s", sho_key, "-o", str(sho), "-fail"], timeout=ctx.http_timeout)
-        # shosubgo writes to the -o FILE, not stdout (r.raw_path is None). Parse fail-closed + reclassify via
-        # the shared adapter so a hard/auth failure is never laundered into a clean-empty (392 names were
-        # silently dropped on the OTC run when the file went unread).
-        hosts, artifact_ok = _shosubgo_read(sho)
-        reclassify_from_artifact(r, None if hosts is None else len(hosts), label="shosubgo")
-        # a clean-EXIT run whose artifact had malformed lines / bad UTF-8 is NOT a trustworthy clean result:
-        # downgrade to PARTIAL (completion uncertain) while KEEPING the valid hosts (evidence not suppressed).
-        if not artifact_ok and r.status in (Status.SUCCESS, Status.EMPTY):
-            r.status = Status.PARTIAL
-            r.note = f"shosubgo: {len(hosts or [])} host(s) — artifact had malformed lines, completion uncertain"
+        # shosubgo writes to the -o FILE, not stdout. Reclassify (status-only) INSIDE the contract so the
+        # terminal event carries the FINAL status; the ingest below re-reads the file (fail-closed, cheap).
+        def _sho_reclassify(res):
+            hosts, artifact_ok = _shosubgo_read(sho)
+            reclassify_from_artifact(res, None if hosts is None else len(hosts), label="shosubgo")
+            # a clean-EXIT run whose artifact had malformed lines / bad UTF-8 is NOT a trustworthy clean
+            # result: downgrade to PARTIAL (completion uncertain) while KEEPING the valid hosts.
+            if not artifact_ok and res.status in (Status.SUCCESS, Status.EMPTY):
+                res.status = Status.PARTIAL
+                res.note = f"shosubgo: {len(hosts or [])} host(s) — artifact had malformed lines, completion uncertain"
+            return res
+        r = run_contract("vertical.shosubgo", ["shosubgo", "-f", str(roots_file),
+                                               "-s", sho_key, "-o", str(sho), "-fail"],
+                         reclassify=_sho_reclassify, timeout=ctx.http_timeout)
         ctx.run.record("vertical", r)
+        hosts, _ = _shosubgo_read(sho)                  # re-read for ingest (392 names were dropped when unread)
         for e in (hosts or []):
             if scope.in_scope(e["host"]):
                 ctx.run.add("subdomain", e)
