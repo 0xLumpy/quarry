@@ -117,6 +117,65 @@ def _canon_ip(ip: str) -> str:
         return ip.lower()
 
 
+def _all_refs(record: dict) -> list:
+    """Every raw-evidence reference on a record — the scalar `raw_ref` folded into the `raw_refs` list."""
+    refs = list(record.get("raw_refs") or [])
+    rr = record.get("raw_ref")
+    if rr and rr not in refs:
+        refs.append(rr)
+    return refs
+
+
+def _subsumed(base: dict, incoming: dict) -> bool:
+    """True when `incoming` carries NOTHING the merged `base` doesn't already hold exactly — a pure
+    duplicate. A new list element, a previously-empty field now filled, OR a CONFLICTING scalar (a different
+    non-empty value) all make it False → the observation is novel and must be logged (never discarded)."""
+    for k, v in incoming.items():
+        if k in ("first_seen", "last_seen") or v in (None, "", [], {}):
+            continue
+        cur = base.get(k)
+        if isinstance(v, list):
+            curl = cur if isinstance(cur, list) else ([cur] if cur not in (None, "") else [])
+            if any(x not in curl for x in v):
+                return False
+        elif cur != v:                                      # new value for an empty field OR a conflict
+            return False
+    return True
+
+
+def _merge_record(base: dict, incoming: dict) -> dict:
+    """C09b provenance merge: union list-valued evidence, fill previously-empty enrichment fields, and
+    NEVER overwrite a non-empty scalar (a conflicting value stays in the immutable observation log). Symmetric
+    provenance: `sources`, `raw_refs`, tags, IPs, and any list field are unioned order-preserving."""
+    merged = dict(base)
+    for k, v in incoming.items():
+        if k in ("raw_ref", "raw_refs", "first_seen", "last_seen"):
+            continue                                        # refs handled below; timestamps below
+        cur = merged.get(k)
+        if isinstance(cur, list) or isinstance(v, list):    # union lists (either side), order-preserving
+            out = list(cur) if isinstance(cur, list) else ([cur] if cur not in (None, "") else [])
+            for x in (v if isinstance(v, list) else [v]):
+                if x not in out:
+                    out.append(x)
+            merged[k] = out
+        elif cur in (None, "", [], {}):
+            merged[k] = v                                   # fill a previously-empty enrichment field
+        # else: base has a non-empty scalar → KEEP it (first non-empty wins; the conflicting value is
+        # preserved in the append-only observation log, never silently discarded)
+    refs = _all_refs(base)
+    for x in _all_refs(incoming):
+        if x not in refs:
+            refs.append(x)
+    if refs:
+        merged["raw_refs"] = refs
+        merged["raw_ref"] = refs[0]                         # back-compat scalar = first evidence
+    # keep the EARLIEST first_seen across observations
+    fs = [t for t in (base.get("first_seen"), incoming.get("first_seen")) if t]
+    if fs:
+        merged["first_seen"] = min(fs)
+    return merged
+
+
 def canonical_key(entity: str, record: dict) -> str:
     """The dedup identity for a normalized entity — case-correct per the contract above. Empty when the
     record is not an object or the key field is absent/blank (the record is then not addable)."""
@@ -174,7 +233,7 @@ class Run:
         self.manifest_path = self.dir / "manifest.json"
         self._tool_runs: list[ToolRunRecord] = []
         self._counts_cache: dict[str, int] = {}
-        self._seen: dict[str, set] = {}   # entity -> seen keys (instance-local; no cross-run bleed)
+        self._records: dict[str, dict] = {}   # entity -> {canonical_key: MERGED record} (C09b; instance-local)
         self.started = _utc()
         self.notes: list[str] = []
 
@@ -207,51 +266,66 @@ class Run:
         return self.normalized / f"{entity}.jsonl"
 
     def add(self, entity: str, record: dict) -> bool:
-        """Append a normalized entity if its natural key is new. Returns True if added.
-        Identity is case-CORRECT per the C09a contract (canonical_key): case-distinct offensive surface
-        (`/API` vs `/api`) stays distinct; only DNS names + a URL's scheme/host are case-folded."""
+        """Record an observation of a normalized entity. Returns True iff its natural key is NEW (so the
+        `sum(add(...))`/`if add(...)` counting semantics across phases are unchanged).
+
+        C09a: identity is case-CORRECT (canonical_key) — `/API` != `/api`.
+        C09b: provenance is MERGED, never discarded. A repeat observation of an existing key is UNIONed into
+        the merged view (sources / raw_refs / tags / IPs / list evidence unioned; previously-empty
+        enrichment filled; a conflicting non-empty scalar keeps the first value, and every observation is
+        still appended to the immutable JSONL log, so nothing is lost). Only a VALUE-ADDING observation is
+        appended (a pure duplicate that changes nothing is a no-op), which bounds file growth."""
         key = canonical_key(entity, record)
         if not key:
             return False
-        existing = self._seen_keys(entity)
-        if key in existing:
-            return False
-        record.setdefault("first_seen", _utc())
+        records = self._records_for(entity)
+        record = dict(record)
+        if key not in records:
+            record.setdefault("first_seen", _utc())
+            records[key] = record
+            self._append_obs(entity, record)
+            return True
+        if not _subsumed(records[key], record):             # novel: new evidence OR a conflicting value
+            self._append_obs(entity, record)                # keep the raw observation in the immutable log
+            merged = _merge_record(records[key], record)
+            merged["last_seen"] = _utc()
+            records[key] = merged
+        return False                                        # not a NEW entity (counting semantics preserved)
+
+    def _append_obs(self, entity: str, record: dict) -> None:
         with self._entity_file(entity).open("a") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        existing.add(key)
-        self._counts_cache[entity] = self._counts_cache.get(entity, 0) + 1
-        return True
 
-    def _seen_keys(self, entity: str) -> set:
-        if entity not in self._seen:
-            keys = set()
+    def _records_for(self, entity: str) -> dict:
+        """Lazily materialize the MERGED view {key: record} for an entity by folding its append-only JSONL
+        observation log (so a reopened run recovers the same merged state). Dict-safe + skips keyless rows."""
+        if entity not in self._records:
+            merged: dict[str, dict] = {}
             f = self._entity_file(entity)
             if f.exists():
                 for line in f.read_text().splitlines():
                     try:
-                        k = canonical_key(entity, json.loads(line))   # SAME contract on reload; dict-safe
+                        rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if k:                                             # skip empty/keyless rows (don't inflate count)
-                        keys.add(k)
-            self._seen[entity] = keys
-        return self._seen[entity]
+                    if not isinstance(rec, dict):
+                        continue
+                    k = canonical_key(entity, rec)
+                    if not k:
+                        continue
+                    merged[k] = _merge_record(merged[k], rec) if k in merged else rec
+            self._records[entity] = merged
+        return self._records[entity]
+
+    def _seen_keys(self, entity: str) -> set:
+        return set(self._records_for(entity))
 
     def read(self, entity: str) -> list[dict]:
-        f = self._entity_file(entity)
-        if not f.exists():
-            return []
-        out = []
-        for line in f.read_text().splitlines():
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return out
+        """The MERGED entities (one per canonical key, provenance unioned) — not the raw observation lines."""
+        return list(self._records_for(entity).values())
 
     def count(self, entity: str) -> int:
-        return len(self._seen_keys(entity))
+        return len(self._records_for(entity))
 
     def values(self, entity: str) -> list[str]:
         key_field = ENTITY_KEYS.get(entity, "value")
