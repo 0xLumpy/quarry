@@ -19,8 +19,26 @@ dependencies = [
 [project.scripts]
 quarry = "quarry_recon.cli:cli"
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 quarry_recon = ["data/*.yaml", "data/*.txt"]
+
+[tool.pytest.ini_options]
+# Default run is OFFLINE and hermetic: the conftest network-deny fixture blocks every socket for any test
+# NOT marked `live`/`integration`, so `pytest` alone can never touch a target. Opt into the others
+# explicitly (`-m live` / `-m integration`). CI runs `-m "offline"`.
+testpaths = ["tests"]
+markers = [
+    "offline: hermetic — no network, no external binary (the CI gate; network is hard-denied)",
+    "requires_tool: needs a real external binary on PATH (skips when absent)",
+    "integration: runs a real external binary against fixtures (no live target)",
+    "live: contacts the live range/network (never in offline CI)",
+]
+# Default run EXCLUDES live/integration/requires_tool — they are opt-in only (explicit `-m live` etc.).
+# So plain `pytest` is hermetic; CI uses `-m offline` (positive selection) which overrides this.
+addopts = "--strict-markers -ra -m 'not live and not integration and not requires_tool'"

@@ -1,0 +1,27 @@
+name: offline-ci
+
+# The C18 gate: hermetic, network-free tests on every push/PR. Only `-m offline` runs here — the
+# conftest network-deny fixture hard-blocks sockets for these, so a regression that reaches for the
+# network fails the build. `integration`/`live` suites (real tools / the range) are deliberately excluded.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (package + dev)
+        run: pip install -e ".[dev]"
+      - name: Offline tests (no network)
+        env:
+          QUARRY_OFFLINE_CI: "1"     # arms the session-wide guard (covers import-time network too)
+        run: pytest -m offline
