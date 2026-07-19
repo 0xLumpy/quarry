@@ -69,8 +69,9 @@ def work_unit(source_id, *, inputs=None, config=None, file_digests=None, schema_
     blob = json.dumps(envelope, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
-# The event types (the ledger rides on a tool_finish-class update, see ledger(); coverage_reset marks a
-# coverage generation boundary).
+# The event types. LEDGER is its OWN type (was a tool_finish-class update, which gave a source TWO
+# terminal-shaped events and broke the exactly-one-terminal invariant); coverage_reset marks a coverage
+# generation boundary.
 TOOL_START = "tool_start"
 TOOL_PROGRESS = "tool_progress"
 TOOL_FINISH = "tool_finish"
@@ -78,8 +79,9 @@ ARTIFACT_WRITTEN = "artifact_written"
 COVERAGE_PARTIAL = "coverage_partial"
 TOOL_BLOCKED = "tool_blocked"
 COVERAGE_RESET = "coverage_reset"       # generation boundary: units of a source before it are a STALE snapshot
+LEDGER = "ledger"                       # REAL produced/consumed counts — NOT a terminal (one per source lifecycle)
 EVENT_TYPES = (TOOL_START, TOOL_PROGRESS, TOOL_FINISH,
-               ARTIFACT_WRITTEN, COVERAGE_PARTIAL, TOOL_BLOCKED, COVERAGE_RESET)
+               ARTIFACT_WRITTEN, COVERAGE_PARTIAL, TOOL_BLOCKED, COVERAGE_RESET, LEDGER)
 
 _sink: Path | None = None
 _coverage_seen: set = set()             # source_ids that emitted a coverage unit THIS session (for the snapshot)
@@ -270,5 +272,6 @@ def ledger(source_id, *, produced=None, consumed=None, **extra) -> dict:
     the review-4992 answer). Counts come from the caller's parse/store step, NEVER from stdout.
     Emitted as a tool_finish-class update tagged ``ledger`` so a scan-stats view can aggregate it.
     ``extra`` keyword fields (e.g. 4.3.A's reduction_percent / top_collapsed) ride along on the same
-    ledger event so the reduction stays one clear record."""
-    return emit(TOOL_FINISH, source_id, produced=produced, consumed=consumed, ledger=True, **extra)
+    ledger event so the reduction stays one clear record. Emitted as its OWN LEDGER event (NOT a second
+    tool_finish) so a source has exactly one terminal."""
+    return emit(LEDGER, source_id, produced=produced, consumed=consumed, **extra)

@@ -107,10 +107,11 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     def _completed_hosts():                               # UX #4: hosts in CLEANLY-done chunks only (NOT attempted)
         return sum(len(batches[j]) for j in done if j < len(batches))
 
-    # C07 inc4: a source terminal ALWAYS fires (try/finally) even if the loop raises — the source lifecycle
-    # (tool_start/tool_finish) is emitted here, per-CHUNK events carry a stable chunk work_unit (not the
-    # loop index), and the resume record is chunks.state.json (keyed on scan_wu). No duplicate events.
-    status = Status.SUCCESS
+    # C07 inc4: a source terminal ALWAYS fires (try/finally) even if the loop raises. status starts FAILED
+    # (an exception mid-loop must NOT emit a scan-level success) and is set to SUCCESS/PARTIAL only after the
+    # loop + aggregate complete. Each executed chunk gets its OWN start+terminal (keyed on chunk_wu), and the
+    # resume record is chunks.state.json (keyed on scan_wu). The source lifecycle is scan_wu; no duplicates.
+    status = Status.FAILED
     try:
         for ci, batch in enumerate(batches):
             chunk_wu = events.work_unit(sid, inputs={"hosts": batch}, config=_cfg)
@@ -118,10 +119,11 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             # host count; the per-chunk work_unit is the stable unit id (resume/audit key).
             events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches),
                                  current_index=_completed_hosts(), work_unit=chunk_wu)
-            if ci in done:                                # resume: already CLEAN, findings on disk
-                continue
+            if ci in done:                                # resume: already CLEAN (its start/finish are in the log
+                continue                                  # from the prior session; do not re-emit)
             bf = ctx.write_list(f"nuclei_targets_{ci}.txt", batch)
             cf = ctx.run.raw_path("params", "nuclei", f"findings_{ci}.jsonl")
+            events.tool_start(sid, work_unit=chunk_wu, input_total=len(batch))   # this chunk's own lifecycle
             res = exec_tool("nuclei", _nuclei_cmd(bf, cf, prof),
                             timeout=nuclei_timeout(len(batch), ctx.http_timeout))
             if res.stderr_tail:
@@ -136,6 +138,9 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             else:
                 degraded += 1
                 events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
+            events.tool_finish(sid, work_unit=chunk_wu, status=res.status.value, reason=res.note or None,
+                               duration=round(res.duration, 2),
+                               raw_ref=str(cf) if cf.exists() else None)   # this chunk's terminal
         # rebuild the aggregate IDEMPOTENTLY from every chunk artifact that produced output (clean OR degraded)
         with findings.open("w", encoding="utf-8") as fh:
             for ci in range(len(batches)):
@@ -395,17 +400,18 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                       input_total=len(cands), work_unit=scan_wu)
     t0 = time.monotonic()
     degraded = produced = 0
-    status = Status.SUCCESS
+    status = Status.FAILED                                 # exception mid-loop must NOT emit scan-level success
     try:
       for ci, batch in enumerate(batches):
         chunk_wu = events.work_unit(sid, inputs={"cands": batch}, config=_cfg)
         seen = min((ci + 1) * chunk_n, len(cands))
-        if ci in done:                                    # resume: already CLEAN
-            events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen,
-                                 work_unit=chunk_wu)
+        events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen,
+                             work_unit=chunk_wu)
+        if ci in done:                                    # resume: already CLEAN (start/finish in prior log)
             continue
         bf = ctx.write_list(f"dalfox_xss_{ci}.txt", batch)
         cf = ctx.run.raw_path("params", "dalfox", f"dalfox_xss_{ci}.txt")
+        events.tool_start(sid, work_unit=chunk_wu, input_total=len(batch))   # this chunk's own lifecycle
         res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof),
                         timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
         # KEEP a chunk's POCs regardless of status — a WAF/timeout-DEGRADED chunk still found real
@@ -440,8 +446,9 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         else:
             degraded += 1
             events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
-        events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen,
-                             work_unit=chunk_wu)
+        events.tool_finish(sid, work_unit=chunk_wu, status=res.status.value, reason=res.note or None,
+                           duration=round(res.duration, 2),
+                           raw_ref=str(cf) if cf.exists() else None)   # this chunk's terminal
       status = Status.PARTIAL if degraded else Status.SUCCESS
     finally:
         # C07 inc4: source terminal ALWAYS fires (even if the loop raised) — one source lifecycle, no dup.

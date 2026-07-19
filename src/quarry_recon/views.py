@@ -106,6 +106,11 @@ def _fold_events(path: Path) -> dict:
         if e.get("event") in ("coverage_partial", "coverage_reset"):
             continue                       # coverage is telemetry, not lifecycle — never overrides tool status
         st = state.setdefault(sid, {})
+        if e.get("event") == "ledger":     # LEDGER carries produced/consumed but is NOT the lifecycle terminal
+            for k in ("produced", "consumed"):
+                if e.get(k) is not None:
+                    st[k] = e[k]
+            continue                       # do NOT set last_event -> the real tool_finish stays the terminal
         st["last_event"] = e.get("event", st.get("last_event"))
         if e.get("ts") is not None:
             st["ts"] = e["ts"]

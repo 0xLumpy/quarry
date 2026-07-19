@@ -56,3 +56,104 @@ class TestSourceStructure:
         src = inspect.getsource(fn)
         assert "try:" in src and "finally:" in src           # source tool_finish fires even if the loop raises
         assert "events.tool_finish(sid" in src and "work_unit=scan_wu" in src
+
+
+class _Ctx:
+    """Minimal ctx for executing a chunked scan against a fake exec_tool."""
+    def __init__(self, d):
+        self._d = d
+        self.http_timeout = 60
+        self.run = self
+        self.dir = d
+
+    def raw_path(self, ph, tl, nm):
+        p = self._d / "raw" / ph / tl / nm
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def write_list(self, nm, it):
+        p = self._d / "work" / nm
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("\n".join(it))
+        return p
+
+    def add(self, *a, **k):
+        return True
+
+
+class TestChunkedLifecycleBehavior:
+    """Execute the scan and assert the emitted EVENTS (not source strings) — the behavioral gap Codex flagged."""
+
+    def _events(self, d):
+        import json
+        p = d / "events.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+
+    def _run_nuclei(self, tmp_path, monkeypatch, exec_fn):
+        from quarry_recon import events, settings
+        from types import SimpleNamespace
+        events.reset(); events.configure(tmp_path)
+        monkeypatch.setattr(settings, "concurrency", lambda k, d=None: 2 if k == "NUCLEI_CHUNK_HOSTS" else d)
+        monkeypatch.setattr(settings, "workers", lambda t, d: d)
+        monkeypatch.setattr(params, "exec_tool", exec_fn)
+        ctx = _Ctx(tmp_path)
+        f = ctx.raw_path("params", "nuclei", "findings.jsonl")
+        lg = ctx.raw_path("params", "nuclei", "nuclei.run.log")
+        return params._nuclei_scan(ctx, [f"h{i}" for i in range(5)], f, lg, SimpleNamespace(http_rl=0))
+
+    def test_exactly_one_source_terminal_and_per_chunk_lifecycle(self, tmp_path, monkeypatch):
+        from quarry_recon.runner import RunResult, Status
+
+        def ok(tool, cmd, timeout=None, **k):
+            cf = __import__("pathlib").Path(cmd[cmd.index("-o") + 1]); cf.write_text('{"x":1}\n')
+            return RunResult("nuclei", cmd, Status.SUCCESS, 0, 0.1, cf, 1)
+        self._run_nuclei(tmp_path, monkeypatch, ok)
+        evs = self._events(tmp_path)
+        finishes = [e for e in evs if e["event"] == "tool_finish"]
+        starts = [e for e in evs if e["event"] == "tool_start"]
+        # 3 chunks: 1 source lifecycle + 3 chunk lifecycles = 4 starts, 4 finishes
+        assert len(starts) == 4 and len(finishes) == 4
+        # exactly ONE terminal carries the scan work_unit; the other 3 carry distinct chunk work_units
+        scan_finishes = [e for e in finishes if e.get("work_unit") == starts[0]["work_unit"]]
+        assert len(scan_finishes) == 1                       # exactly-one source terminal
+        assert len({e["work_unit"] for e in finishes}) == 4  # 4 distinct units (1 scan + 3 chunks)
+
+    def test_exception_midloop_emits_failed_source_terminal_not_success(self, tmp_path, monkeypatch):
+        from quarry_recon.runner import RunResult, Status
+
+        calls = {"n": 0}
+        def boom(tool, cmd, timeout=None, **k):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("nuclei blew up on chunk 2")
+            cf = __import__("pathlib").Path(cmd[cmd.index("-o") + 1]); cf.write_text('{"x":1}\n')
+            return RunResult("nuclei", cmd, Status.SUCCESS, 0, 0.1, cf, 1)
+        with pytest.raises(RuntimeError):
+            self._run_nuclei(tmp_path, monkeypatch, boom)
+        finishes = [e for e in self._events(tmp_path) if e["event"] == "tool_finish"]
+        # the SOURCE terminal (last finish) must be failed — status started FAILED, loop never reset it
+        assert finishes[-1]["status"] == "failed"
+
+    def test_ledger_is_own_event_not_second_terminal(self, tmp_path, monkeypatch):
+        # dalfox emits a ledger — it must be a LEDGER event, so the source keeps exactly one tool_finish
+        from quarry_recon import events, settings
+        from types import SimpleNamespace
+        from quarry_recon.runner import RunResult, Status
+        events.reset(); events.configure(tmp_path)
+        monkeypatch.setattr(settings, "concurrency", lambda k, d=None: 2 if k == "DALFOX_CHUNK" else d)
+        monkeypatch.setattr(settings, "workers", lambda t, d: d)
+
+        def ok(tool, cmd, timeout=None, **k):
+            return RunResult("dalfox", cmd, Status.SUCCESS, 0, 0.1, None, 0)
+        monkeypatch.setattr(params, "exec_tool", ok)
+        import quarry_recon.secrets as sec
+        monkeypatch.setattr(sec, "oob", lambda: {})
+        ctx = _Ctx(tmp_path)
+        params._dalfox_xss_fast(ctx, [f"https://h/{i}?q=1" for i in range(3)], SimpleNamespace(http_rl=0))
+        evs = self._events(tmp_path)
+        ledgers = [e for e in evs if e["event"] == "ledger"]
+        source_terminals = [e for e in evs if e["event"] == "tool_finish"
+                            and e.get("work_unit") and e["work_unit"] not in
+                            {ev["work_unit"] for ev in evs if ev["event"] == "tool_start" and ev.get("input_total")}]
+        assert len(ledgers) == 1 and ledgers[0].get("produced")   # ledger is its own event with counts
+        assert all(e["event"] != "tool_finish" or "ledger" not in e for e in evs)   # no tool_finish tagged ledger
