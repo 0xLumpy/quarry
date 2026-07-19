@@ -33,9 +33,10 @@ def _existing_run(project, target, run_id):
     instead. No run_id -> the latest run (or None)."""
     from .store import Run
     if run_id:
-        if not (Path(project) / "recon" / run_id).is_dir():
+        try:
+            return Run.open(project, target, run_id)    # C10a: OPEN (never fabricate a ghost dir/start time)
+        except FileNotFoundError:
             raise click.ClickException(f"run {run_id!r} not found under {Path(project) / 'recon'}")
-        return Run(project, target, run_id=run_id)
     return Run.latest(project)
 
 
@@ -591,7 +592,7 @@ def run(profile_path, phases, passive, timeout):
 
     secrets.apply_env()   # export PDCP_API_KEY (chaos) for PD tools, if set
     from .runner import set_tool_cwd
-    run_obj = Run(project, profile.target)
+    run_obj = Run.create(project, profile.target)   # C10a: collision-resistant id, atomically-claimed dir
     events.configure(run_obj.dir)   # persist runtime events to <run>/events.jsonl (quarry status reads it)
     workdir = run_obj.dir / "work"
     workdir.mkdir(parents=True, exist_ok=True)

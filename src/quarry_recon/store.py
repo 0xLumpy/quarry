@@ -197,6 +197,14 @@ def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a same-directory temp + os.replace so a reader never sees a half-written file and a
+    crash mid-write leaves the previous version intact (C10a)."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 @dataclass
 class ToolRunRecord:
     phase: str
@@ -219,10 +227,10 @@ class Run:
     location, so a run's output co-locates with its profile (campaign/project model).
     """
 
-    def __init__(self, project_dir: Path, target: str, run_id: str | None = None):
+    def __init__(self, project_dir: Path, target: str, run_id: str | None = None, *, load_started: bool = False):
         self.project_dir = Path(project_dir)
         self.target = target
-        self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S")
+        self.run_id = run_id or self._mint_run_id()
         self.dir = self.project_dir / "recon" / self.run_id
         self.raw = self.dir / "raw"
         self.normalized = self.dir / "normalized"
@@ -234,8 +242,47 @@ class Run:
         self._tool_runs: list[ToolRunRecord] = []
         self._counts_cache: dict[str, int] = {}
         self._records: dict[str, dict] = {}   # entity -> {canonical_key: MERGED record} (C09b; instance-local)
-        self.started = _utc()
+        # C10a: OPENING an existing run must NOT fabricate a fresh start time (a ghost) — it reads the
+        # recorded `started` from the manifest. CREATE / default stamps now.
+        started = None
+        if load_started and self.manifest_path.exists():
+            try:
+                started = json.loads(self.manifest_path.read_text()).get("started")
+            except (json.JSONDecodeError, OSError):
+                started = None
+        self.started = started or _utc()
         self.notes: list[str] = []
+
+    # ── C10a lifecycle ──
+    @staticmethod
+    def _mint_run_id() -> str:
+        """Collision-resistant run id: sortable UTC timestamp + random suffix. Second-precision alone
+        collided (two runs in the same second reused one directory); the 6-hex suffix makes a clash
+        ~1 in 16M within a single second, and Run.create() claims the dir atomically to eliminate even that."""
+        return time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+
+    @classmethod
+    def create(cls, project_dir, target) -> "Run":
+        """Start a NEW run — mint a unique id and CLAIM its directory atomically (mkdir exist_ok=False),
+        retrying on the astronomically-unlikely clash. `started` = now."""
+        project_dir = Path(project_dir)
+        for _ in range(16):
+            rid = cls._mint_run_id()
+            try:
+                (project_dir / "recon" / rid).mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                continue
+            return cls(project_dir, target, run_id=rid)
+        raise RuntimeError("could not mint a unique run id after 16 attempts")
+
+    @classmethod
+    def open(cls, project_dir, target, run_id) -> "Run":
+        """Attach to an EXISTING run — must already exist (never fabricate a ghost dir / start time).
+        Reads the recorded `started` from the manifest."""
+        d = Path(project_dir) / "recon" / run_id
+        if not d.is_dir():
+            raise FileNotFoundError(f"run {run_id!r} not found under {d.parent}")
+        return cls(project_dir, target, run_id=run_id, load_started=True)
 
     # ── raw evidence ──
     def raw_path(self, phase: str, tool: str, name: str) -> Path:
@@ -496,21 +543,26 @@ class Run:
         }
         if metrics:                                 # pointer + headline totals for the telemetry artifact
             manifest["metrics"] = metrics
-        self.manifest_path.write_text(json.dumps(manifest, indent=2))
+        # C10a: atomic write (temp + os.replace) so a crash mid-write never leaves a truncated manifest.
+        _atomic_write(self.manifest_path, json.dumps(manifest, indent=2))
         # update state pointers (per-project, under recon/)
         state = self.project_dir / "recon" / "state"
         (state / "history").mkdir(parents=True, exist_ok=True)
-        (state / "history" / f"{self.run_id}.json").write_text(
-            json.dumps({"run_id": self.run_id, "target": self.target,
-                        "finished": manifest["finished"],
-                        "entity_counts": manifest["entity_counts"]}, indent=2))
+        _atomic_write(state / "history" / f"{self.run_id}.json",
+                      json.dumps({"run_id": self.run_id, "target": self.target,
+                                  "finished": manifest["finished"],
+                                  "entity_counts": manifest["entity_counts"]}, indent=2))
+        # `current` pointer: swap ATOMICALLY (temp symlink + os.replace) so a concurrent reader never sees
+        # it briefly missing between unlink and re-create.
         cur = state / "current"
         try:
-            if cur.is_symlink() or cur.exists():
-                cur.unlink()
-            os.symlink(self.dir.resolve(), cur)
+            tmp = state / f".current.{os.getpid()}.tmp"
+            if tmp.is_symlink() or tmp.exists():
+                tmp.unlink()
+            os.symlink(self.dir.resolve(), tmp)
+            os.replace(tmp, cur)
         except OSError:
-            (state / "current.txt").write_text(str(self.dir.resolve()))
+            _atomic_write(state / "current.txt", str(self.dir.resolve()))
 
     @staticmethod
     def latest(project_dir: Path) -> "Run | None":
@@ -529,4 +581,4 @@ class Run:
                 target = json.loads(manifest.read_text()).get("target", "unknown")
             except json.JSONDecodeError:
                 pass
-        return Run(project_dir, target, run_id=d.name)
+        return Run.open(project_dir, target, d.name)        # C10a: OPEN (load started), never fabricate
