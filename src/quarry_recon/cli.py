@@ -126,6 +126,39 @@ def _effective_phases(selected, profile) -> set:
     return eff
 
 
+# ── lock (C08 compatibility lock) ─────────────────────────────────────────────
+@cli.command()
+@click.option("--drift-only", is_flag=True, help="only print tools whose installed version DRIFTS from the pin")
+def lock(drift_only):
+    """C08: capture the INSTALLED tool versions on THIS host as a reviewable pin set. Run on a VALIDATED host
+    (the VPS where everything works) — the emitted `version:` lines are copy-pasted into data/tools.yaml so the
+    install becomes reproducible. Also flags DRIFT (installed != pin) and UNPINNED tools."""
+    from .registry import capture_lock
+    rows = capture_lock()
+    drifts = [r for r in rows if r["drift"] == "DRIFT"]
+    unpinned = [r for r in rows if r["drift"] == "unpinned"]
+    if drift_only:
+        for r in drifts:
+            click.echo(_c(f"  DRIFT  {r['bin']:<20} installed={r['installed']}  pin={r['pin']}", "red"))
+        click.echo(_c(f"\n{len(drifts)} tool(s) drift from the pin", "red" if drifts else "green"))
+        return
+    unknown = [r for r in rows if r["drift"] == "version-unknown"]
+    # emit a reviewable YAML pin block from what's installed here (the known-good versions)
+    click.echo(_c("\n# C08 pin capture — installed versions on this host (paste `version:` into data/tools.yaml)\n", "cyan"))
+    for r in rows:
+        if r["installed"]:
+            mark = {"DRIFT": _c("DRIFT", "red"), "ok": _c("ok", "green"),
+                    "unpinned": _c("new", "yellow")}.get(r["drift"], r["drift"])
+            click.echo(f"  {r['bin']:<20} version: {r['installed']:<12} [{mark}]"
+                       + (f"  (pin={r['pin']})" if r["pin"] and r["drift"] == "DRIFT" else ""))
+        elif r["drift"] == "version-unknown":
+            click.echo(_c(f"  {r['bin']:<20} installed but VERSION UNKNOWN — cannot capture a pin", "red"))
+        else:
+            click.echo(_c(f"  {r['bin']:<20} (not installed — cannot capture)", "yellow"))
+    click.echo(_c(f"\n{len(rows)} tools · {len(unpinned)} unpinned · {len(drifts)} drift · "
+                  f"{len(unknown)} version-unknown", "cyan"))
+
+
 # ── doctor ──────────────────────────────────────────────────────────────────
 @cli.command()
 @click.option("--phase", help="only audit tools for this phase")
@@ -141,7 +174,7 @@ def doctor(phase):
             click.echo(_c(f"[{cur_phase}]", "magenta"))
         if t.installed:
             ok += 1
-            ver = t.version()
+            ver = t.version() or _c("version unknown", "yellow")   # C08.1#1: empty = unparseable, not a pin
             click.echo(f"  {_c('✓', 'green')} {t.bin:<20} {ver}")
         elif t.optional:
             click.echo(f"  {_c('·', 'yellow')} {t.bin:<20} optional, not installed")
