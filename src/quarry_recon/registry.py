@@ -5,6 +5,7 @@ is data (data/tools.yaml); this module is the behavior around it.
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # version token, not part of a longer dotted number (excludes IPs like 127.0.0.1)
 _VER_RE = re.compile(r"(?<![\w.])v?\d+\.\d+(?:\.\d+)?(?![\w.])")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")             # C08 lock: a valid sha256 digest
+_SENTINEL_PINS = {"installed", "latest", "main", "master", "head"}   # floating refs — NEVER a valid pin
 
 
 class LockError(ValueError):
@@ -28,8 +30,30 @@ def _validate_lock(bin_: str, t: dict) -> None:
     def _bad(msg):
         raise LockError(f"{bin_}: {msg}")
     v = t.get("version")
-    if v is not None and (not isinstance(v, str) or not v.strip()):
-        _bad(f"version must be a non-empty string, got {v!r}")      # a numeric YAML version would crash .strip()
+    if v is not None:
+        if not isinstance(v, str) or not v.strip():
+            _bad(f"version must be a non-empty string, got {v!r}")  # a numeric YAML version would crash .strip()
+        if v.strip().lower() in _SENTINEL_PINS:
+            _bad(f"version {v!r} is a floating sentinel (installed/latest/…) — pin an exact release")
+        # review-C08.2: cross-field strategy — a BINARY download pinned to a version MUST carry per-platform
+        # artifacts (a version tag alone doesn't fix the bytes; go/pipx verify their own hashes so they don't).
+        if t.get("runtime") == "binary" and not t.get("artifacts"):
+            _bad("a binary tool with a version pin must declare per-platform `artifacts` (url + sha256)")
+        # review-C08.2r6#2: a pinned GO tool's install must yield a parseable module — else installed_identity
+        # can't prove the built module and would (now, fail-closed) reject a correctly-installed binary forever.
+        if t.get("runtime", "go") == "go" and not re.search(r"go install\s+(\S+?)@", t.get("install") or ""):
+            _bad("a pinned go tool needs a parseable `go install <module>@…` install command")
+    ref = t.get("ref")
+    if ref is not None:
+        if not str(ref).strip():
+            _bad("source `ref` must be a non-empty commit/tag")
+        if str(ref).strip().lower() in _SENTINEL_PINS:      # review-C08.2r4#6: `ref: main` is a FLOATING ref
+            _bad(f"ref {ref!r} is a floating sentinel — pin an exact commit/tag")
+    cc = t.get("cap_codes")
+    if cc is not None:                                       # review-C08.2r3/r4#6: unique STRICT ints (not bool!) 0..255
+        if (not isinstance(cc, list) or not cc or len(cc) != len(set(cc))
+                or not all(type(x) is int and 0 <= x <= 255 for x in cc)):   # bool is an int subclass -> type() is
+            _bad(f"cap_codes must be a non-empty list of unique ints (not bools) in 0..255, got {cc!r}")
     for key in ("ref", "policy", "capability"):
         val = t.get(key)
         if val is not None and (not isinstance(val, str) or not val.strip()):
@@ -78,6 +102,11 @@ class Tool:
     ref: str | None = None                 # exact source commit/tag (source runtime)
     policy: str | None = None              # e.g. "distro" — pinning delegated (apt)
     capability: str | None = None
+    cap_codes: list | None = None          # accepted capability exit codes (default [0]); explicit per tool
+    # `repo` = the upstream "owner/name" for binary/source tools — the UPSTREAM IDENTITY a future automated
+    # `quarry lock --refresh` reads to discover release/commit candidates via the GitHub API (go/pipx identities
+    # are parseable from the install string, so they don't need it). Structured so refresh stays one-command.
+    repo: str | None = None
 
     @property
     def installed(self) -> bool:
@@ -88,25 +117,36 @@ class Tool:
         return shutil.which(self.bin)
 
     def version(self) -> str:
-        """A clean version string ('v2.14.0', '2.2.4') — never the tool's ASCII banner. Extracts the first
-        version-like token from the output. review-C08.1#1: returns "" (UNKNOWN) when no version token is
-        found — an unparseable version is UNCAPTURABLE and must never become a trusted pin (the old 'installed'
-        sentinel let version_eq('installed','installed') accept a fake pin)."""
+        """A clean version string ('v2.14.0', '2.2.4') — never the tool's ASCII banner. review-C08.1#1: "" when
+        no version token parses (UNCAPTURABLE — never a trusted pin)."""
         if not self.installed or not self.version_cmd:
             return ""
-        try:
-            p = subprocess.run(self.version_cmd.split(), capture_output=True,
-                               text=True, timeout=15)
-        except (subprocess.SubprocessError, OSError):
-            return ""
-        text = _ANSI_RE.sub("", p.stdout + p.stderr)
-        for line in text.splitlines():          # prefer a line that names a version
-            if "version" in line.lower():
-                m = _VER_RE.search(line)
-                if m:
-                    return m.group(0)
-        m = _VER_RE.search(text)
-        return m.group(0) if m else ""          # no parseable version -> UNKNOWN (never a pin)
+        return _parse_version(_probe(self.version_cmd)[1])
+
+
+_PROBE_NOT_RUN = -1     # review-C08.2r3#1: a DISTINCT "not executed / timed out" state — never an accepted cap code
+
+
+def _probe(cmd: str, timeout: int = 15) -> tuple[int, str]:
+    """Run a version/capability probe (shell) → (returncode, ANSI-stripped stdout+stderr). review-C08.2r3#1: a
+    TIMEOUT or LAUNCH FAILURE returns _PROBE_NOT_RUN (-1), NOT exit 1 — otherwise a tool that accepts `[0,1]`
+    would classify a hung/failed probe as 'working'. -1 is never a valid cap_code (those are 0..255)."""
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, _ANSI_RE.sub("", p.stdout + p.stderr)
+    except (subprocess.SubprocessError, OSError):
+        return _PROBE_NOT_RUN, ""
+
+
+def _parse_version(text: str) -> str:
+    """First version-like token from probe output (prefer a line that names a version); "" if none."""
+    for line in (text or "").splitlines():
+        if "version" in line.lower():
+            m = _VER_RE.search(line)
+            if m:
+                return m.group(0)
+    m = _VER_RE.search(text or "")
+    return m.group(0) if m else ""
 
 
 def load_tools() -> list[Tool]:
@@ -122,7 +162,8 @@ def load_tools() -> list[Tool]:
             notes=t.get("notes"), runtime=t.get("runtime", "go"),
             deps=t.get("deps") or [], needs_chromium=bool(t.get("needs_chromium", False)),
             pin=t.get("version"), artifacts=t.get("artifacts"), ref=t.get("ref"),
-            policy=t.get("policy"), capability=t.get("capability"),
+            policy=t.get("policy"), capability=t.get("capability"), cap_codes=t.get("cap_codes"),
+            repo=t.get("repo"),
         ))
     return tools
 
@@ -140,35 +181,325 @@ def version_eq(a: str | None, b: str | None) -> bool:
     return bool(na) and na == nb
 
 
-def _drift_status(installed: bool, iv: str, pin: str | None) -> str:
-    """C08 pin status from the ALREADY-PROBED installed version `iv` (probe once — review-C08.1#3):
-    'not-installed' | 'version-unknown' | 'unpinned' | 'ok' | 'DRIFT'. An UNKNOWN installed version (empty) is
-    UNCAPTURABLE — never 'ok' and never a pin (review-C08.1#1)."""
+def _go_mod_and_version(path: str) -> tuple[str, str]:
+    """review-C08.2#3/r4#4: the Go MODULE PATH + version embedded in a built binary (`go version -m`) — the
+    AUTHORITATIVE installed identity. Returns (module, version); ('', '') if unreadable. The module path proves
+    the binary is the INTENDED tool (not a same-named binary from a different module)."""
+    if not path:
+        return "", ""
+    try:
+        p = subprocess.run(["go", "version", "-m", path], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    for line in p.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "mod":
+            return parts[1], parts[2]                       # "mod <module> <version>"
+    return "", ""
+
+
+def _expected_go_module(t: "Tool") -> str:
+    """The module path a go tool SHOULD be built from — parsed from its `go install <path>@ver` (the `/cmd/...`
+    command suffix stripped). Used to prove the installed binary is the intended module (review-C08.2r4#4)."""
+    m = re.search(r"go install\s+(\S+?)@", t.install or "")
+    return re.sub(r"/cmd/.*$", "", m.group(1)) if m else ""
+
+
+def _pipx_pkg(t: "Tool") -> str:
+    m = re.search(r"pipx install\s+(\S+)", t.install or "")
+    return m.group(1) if m else t.bin
+
+
+def _norm_pkg(name: str) -> str:
+    """PEP 503 name normalization — pipx stores venvs under the normalized package name (xnLinkFinder ->
+    xnlinkfinder), so a case/underscore/dot difference must not miss the metadata (review-C08.2r2#3)."""
+    return re.sub(r"[-_.]+", "-", (name or "").strip().lower())
+
+
+def _pipx_meta(pkg: str) -> tuple[str, list]:
+    """review-C08.2#3/r5: the installed pipx package (version, app_paths) from `pipx list --json` — matched on
+    the NORMALIZED name. `app_paths` are the venv-internal executables the PIPX_BIN symlinks point at, used to
+    TIE the identity to the actual resolved binary (a shadow won't resolve to one of these). Root-shape safe
+    (review-C08.2r5#4: a non-dict JSON root is ('', []), never a crash)."""
+    try:
+        import json
+        p = subprocess.run(["pipx", "list", "--json"], capture_output=True, text=True, timeout=25)
+        root = json.loads(p.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "", []
+    if not isinstance(root, dict) or not isinstance(root.get("venvs"), dict):
+        return "", []
+    want = _norm_pkg(pkg)
+    for k, v in root["venvs"].items():
+        if not isinstance(v, dict):
+            continue
+        meta = v.get("metadata") if isinstance(v.get("metadata"), dict) else {}
+        mp = meta.get("main_package") if isinstance(meta.get("main_package"), dict) else {}
+        if _norm_pkg(k) == want or _norm_pkg(str(mp.get("package", ""))) == want:
+            raw = mp.get("app_paths") or []
+            paths = [a.get("__Path__", "") if isinstance(a, dict) else str(a) for a in raw if a]
+            return str(mp.get("package_version", "") or ""), [p for p in paths if p]
+    return "", []
+
+
+def _receipt_path(bin_: str):
+    return Path.home() / ".local" / "bin" / f".{bin_}.lock"      # C08 source receipt (records ref + activated sha256)
+
+
+def _file_sha256(path) -> str:
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def _read_receipt(bin_: str) -> dict:
+    try:
+        import json
+        rp = _receipt_path(bin_)
+        rec = json.loads(rp.read_text()) if rp.exists() else {}
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}            # review-C08.2r4#5: a list/scalar receipt is not usable
+
+
+def _write_receipt(bin_: str, ident: str, sha: str) -> None:
+    """C08 receipt: {ident, sha256} — `ident` is the pin (binary) or ref (source), `sha256` the ACTIVATED
+    binary's digest. Proves both what was intended AND the exact live bytes."""
+    import json
+    _receipt_path(bin_).write_text(json.dumps({"ident": ident, "sha256": sha}))
+
+
+def installed_identity(t: "Tool") -> str:
+    """review-C08.2#3: the installed version by RUNTIME-SPECIFIC identity (never a fragile CLI banner):
+      go     -> `go version -m` module version   · pipx -> pipx list metadata
+      binary -> version_cmd (release binaries report a clean version)
+      source -> a RECEIPT file written at install time (massdns exposes no version)
+      distro -> 'distro' (not version-checked — pinning is the distro's job)."""
+    if not t.installed:
+        return ""
+    if t.policy == "distro":
+        return "distro"
+    # review-C08.2r4#4: identity is of the executable that RESOLVES on PATH — a tool that doesn't resolve (or a
+    # shadow) can't be the proven one. (binary/source shadowing is enforced at activation in install_one.)
+    which = shutil.which(t.bin)
+    if t.runtime in ("go", "pipx") and not which:
+        return ""
+    if t.runtime == "go":
+        mod, ver = _go_mod_and_version(which)               # the RESOLVED binary, not just t.path
+        exp = _expected_go_module(t)
+        # review-C08.2r5#3/r6#2: EXACT module. An UNPARSEABLE expected module (exp == "") is fail-CLOSED —
+        # an unknown target must never accept whatever module the binary happens to embed.
+        if not mod or not exp or mod != exp:
+            return ""
+        return ver
+    if t.runtime == "pipx":
+        # review-C08.2r5#1/r6#1: TIE the version to the RESOLVED executable — an out-of-pipx shadow (e.g.
+        # /usr/local/bin/arjun earlier on PATH) must not borrow the pipx env's version. An EMPTY app_paths list
+        # proves nothing -> fail-closed (require a non-empty list AND membership).
+        ver, app_paths = _pipx_meta(_pipx_pkg(t))
+        if not ver:
+            return ""
+        if not app_paths or Path(which).resolve() not in {Path(a).resolve() for a in app_paths}:
+            return ""                                       # resolved binary isn't the pipx-installed one
+        return ver
+    if t.runtime in ("binary", "source"):
+        # review-C08.2r3#2/r5#2: a RECEIPT proves the exact activated binary (its sha256) for BINARY tools too —
+        # a pre-C08 (unverified) binary has no receipt -> unknown identity -> reinstall (so the checksum-verified
+        # download actually runs). A replaced binary's sha no longer matches -> drift.
+        rec = _read_receipt(t.bin)
+        ident, sha = rec.get("ident"), rec.get("sha256")
+        if not ident or not sha or _file_sha256(which or t.path) != sha:
+            return ""
+        return str(ident)
+    return t.version()
+
+
+def _drift_status(t: "Tool", installed: bool, iv: str) -> str:
+    """C08 pin status from the ALREADY-PROBED runtime identity `iv` (probe once — review-C08.1#3):
+    'not-installed' | 'distro' | 'version-unknown' | 'unpinned' | 'ok' | 'DRIFT'. An UNKNOWN identity is
+    UNCAPTURABLE — never 'ok' and never a pin. A source `ref` matches EXACTLY (a commit is not version-like);
+    versions compare tolerantly."""
     if not installed:
         return "not-installed"
+    if t.policy == "distro":
+        return "distro"                                     # distro-managed — pinning delegated, not drift-checked
+    expected = t.pin or t.ref
     if not iv:
-        return "version-unknown"                            # can't determine -> can't pin
-    if not pin:
+        return "version-unknown"
+    if not expected:
         return "unpinned"
-    return "ok" if version_eq(iv, pin) else "DRIFT"
+    if t.runtime == "source":
+        return "ok" if iv == expected else "DRIFT"          # exact commit match
+    return "ok" if version_eq(iv, expected) else "DRIFT"
 
 
 def drift(t: Tool) -> str:
-    return _drift_status(t.installed, t.version() if t.installed else "", t.pin)
+    return _drift_status(t, t.installed, installed_identity(t) if t.installed else "")
 
 
 def capture_lock() -> list[dict]:
-    """C08 capture: each managed tool's INSTALLED version on THIS host (the known-good target when run on a
-    validated host) vs its PINNED version in tools.yaml, with the drift status. `quarry lock` emits this as a
-    reviewable pin set; doctor/install use it to flag pin drift. Probes each version EXACTLY ONCE."""
+    """C08 capture: each managed tool's INSTALLED identity on THIS host (runtime-specific — review-C08.2#3) vs
+    its PIN/ref, with the drift status. `quarry lock` emits this as a reviewable pin set; doctor/install use it
+    to flag drift. Probes each identity EXACTLY ONCE."""
     rows = []
     for t in load_tools():
         installed = t.installed
-        iv = t.version() if installed else ""               # probe ONCE, reuse for the status
-        rows.append({"bin": t.bin, "installed": iv or None, "pin": t.pin,
+        iv = installed_identity(t) if installed else ""     # runtime-specific, probe ONCE
+        rows.append({"bin": t.bin, "installed": iv or None, "pin": t.pin or t.ref,
                      "runtime": t.runtime, "optional": t.optional,
-                     "drift": _drift_status(installed, iv, t.pin)})
+                     "drift": _drift_status(t, installed, iv)})
     return rows
+
+
+def current_platform() -> str:
+    """The install host's platform key ('linux/amd64' | 'linux/arm64' …) used to select a binary artifact.
+    Quarry targets Linux; the arch is normalized from platform.machine()."""
+    import platform as _p
+    m = _p.machine().lower()
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(m, m)
+    return f"linux/{arch}"
+
+
+def pinned_install(t: Tool) -> str | None:
+    """C08.2: the version-LOCKED install command for a tool. go: `@latest`->`@<pin>`; pipx: `pipx install
+    <pkg>`->`pipx install <pkg>==<pin>`; binary: fill the install template with THIS host's artifact url+sha256
+    (a checksum-verified download); source: fill in the pinned `ref`. Returns None when a binary tool has no
+    artifact for this platform (uninstallable here — the caller reports it), and the install UNCHANGED when a
+    tool is unpinned. A sentinel pin never reaches here (load rejects it)."""
+    cmd = t.install
+    if not cmd:
+        return cmd
+    if t.runtime == "go" and t.pin:
+        return cmd.replace("@latest", "@" + t.pin)
+    if t.runtime == "pipx" and t.pin:
+        # review-C08.2r2#1: `pipx install pkg==ver` LEAVES an existing env unchanged — the pin (incl. a
+        # downgrade) only reliably applies with --force (a clean reinstall at the exact version).
+        return re.sub(r"pipx install\s+(\S+).*",
+                      lambda m: f'pipx install --force "{m.group(1)}=={t.pin}"', cmd, count=1)
+    if t.runtime == "binary" and t.artifacts:
+        art = t.artifacts.get(current_platform())
+        if not art:
+            return None                                     # no artifact for this platform -> can't install here
+        return cmd.format(url=art["url"], sha256=art["sha256"], bin=t.bin)
+    if t.runtime == "source" and t.ref:
+        return cmd.format(ref=t.ref, bin=t.bin)
+    return cmd
+
+
+def _capability_ok(rc: int, accepted=None) -> bool:
+    """review-C08.2r2#2: a capability probe passes ONLY on the ACCEPTED exit codes — default exactly {0}, so an
+    ordinary error / dependency failure / invalid command / traceback (rc 1..125) is NOT laundered into success.
+    A tool whose probe legitimately exits non-zero declares its codes explicitly via `cap_codes`."""
+    return rc in (accepted or {0})
+
+
+def verify_installed(t: Tool) -> bool:
+    """review-C08.2r4#1: is an ALREADY-installed tool HEALTHY? Its identity must verify (drift 'ok', or 'distro'
+    for a distro-managed tool) AND its capability probe pass. `install` uses this to decide whether a present
+    tool may be left as-is — a failed prior update that left a wrong binary no longer reads as healthy."""
+    d = drift(t)
+    if d not in ("ok", "distro"):
+        return False
+    probe = t.capability or t.version_cmd
+    if probe and not _capability_ok(_probe(probe)[0], set(t.cap_codes) if t.cap_codes else None):
+        return False
+    return True
+
+
+def install_one(t: Tool, echo, dry_run: bool = False) -> bool:
+    """review-C08.2: the ONE install path shared by `quarry install` and `quarry update`. ALWAYS runs the
+    version-LOCKED command (never @latest / pipx upgrade). binary/source stage to ~/.local/bin/.stage, are
+    capability-verified there, then ATOMICALLY activated — a bad build never destroys the working binary
+    (review#5). go/pipx install in place, then verify runtime identity (DRIFT = fail, review#4) + capability
+    (review#2). An unsupported platform returns False, never a crash (review#6). Returns True on success."""
+    cmd = pinned_install(t)
+    if cmd is None:                                        # binary with no artifact for this platform
+        echo(f"unsupported platform ({current_platform()}) — no {t.bin} artifact")
+        return False
+    if not cmd:                                           # no install command (manual)
+        echo(f"{t.bin}: manual install — {t.doc}")
+        return False
+    if dry_run:
+        echo(f"{t.bin} @ {t.pin or t.ref or t.policy or 'installed'}")
+        return True
+
+    accepted = set(t.cap_codes) if t.cap_codes else None
+
+    if t.runtime in ("binary", "source"):
+        stage = Path.home() / ".local" / "bin" / ".stage" / t.bin
+        stage.parent.mkdir(parents=True, exist_ok=True)
+        if stage.exists():
+            stage.unlink()
+        code, _ = run_shell(cmd, False)
+        if code != 0 or not stage.exists():
+            echo(f"{t.bin}: install/stage FAILED (checksum or build)")
+            return False
+        # verify the STAGED binary BEFORE replacing the working one (review#5)
+        if t.capability or t.version_cmd:
+            capcmd = (t.capability or t.version_cmd).replace(t.bin, str(stage), 1)
+            if not _capability_ok(_probe(capcmd)[0], accepted):         # review#2: strict exit code
+                stage.unlink(missing_ok=True)
+                echo(f"{t.bin}: CAPABILITY FAILED on staged binary — existing binary kept")
+                return False
+        # review-C08.2r2#4: a WORKING binary from the WRONG release must not pass — parse the staged binary's
+        # version and require it to match the pin (binary tools; source uses the receipt below).
+        if t.pin and t.runtime == "binary" and t.version_cmd:
+            sv = _parse_version(_probe(t.version_cmd.replace(t.bin, str(stage), 1))[1])
+            if not version_eq(sv, t.pin):
+                stage.unlink(missing_ok=True)
+                echo(f"{t.bin}: staged version {sv!r} != pin {t.pin} — wrong release, NOT activated")
+                return False
+        dest = Path.home() / ".local" / "bin" / t.bin
+        os.replace(str(stage), str(dest))                    # atomic activate
+        # review-C08.2r3#2/r4#4: the ACTIVATED binary must be the one that RESOLVES — it must be on PATH AND not
+        # shadowed by an older /usr/local/bin copy (else the run would use the wrong, unmanaged binary).
+        which = shutil.which(t.bin)
+        if not which:
+            echo(f"{t.bin}: activated but does NOT resolve on PATH (~/.local/bin not on PATH?)")
+            return False
+        if Path(which).resolve() != dest.resolve():
+            echo(f"{t.bin}: SHADOWED — {which} resolves before the managed {dest}")
+            return False
+        # review-C08.2r4#2/r5#2: write the receipt AFTER activation for BINARY AND source, keyed to the sha256 of
+        # the NOW-ACTIVE binary — so the receipt always describes the live binary AND a pre-C08 (receipt-less)
+        # binary is treated as unverified next run (reinstalled, so the checksum download actually runs). A crash
+        # before this leaves a missing receipt -> version-unknown -> reinstall (recoverable), never new-receipt +
+        # old-binary.
+        # review-C08.2r6#3: a receipt is only meaningful with a VALID digest — _file_sha256 returns "" on a read
+        # failure, and writing that would report success while leaving the binary unverified next run. Fail-closed.
+        dest_sha = _file_sha256(dest)
+        if not _SHA256_RE.fullmatch(dest_sha):
+            echo(f"{t.bin}: activated but could not hash the binary for its receipt — reinstall to verify")
+            return False
+        try:
+            _write_receipt(t.bin, t.ref or t.pin, dest_sha)
+        except OSError as e:
+            echo(f"{t.bin}: activated but could not write receipt ({e}) — reinstall to verify")
+            return False
+        echo(f"{t.bin}: ok ({t.pin or t.ref})")
+        return True
+
+    # go / pipx — install in place, then verify identity + capability
+    code, _ = run_shell(cmd, False)
+    if code != 0 or not t.installed:
+        echo(f"{t.bin}: install FAILED")
+        return False
+    if (t.pin or t.ref) and drift(t) != "ok":             # review-r2#3: a locked tool MUST verify 'ok' (a DRIFT
+        echo(f"{t.bin}: identity NOT VERIFIED ({drift(t)}) "     # OR an unknown identity is a failure, not 'ok')
+             f"installed={installed_identity(t)!r} != pin {t.pin or t.ref!r}")
+        return False
+    probe = t.capability or t.version_cmd
+    if probe and not _capability_ok(_probe(probe)[0], accepted):   # review#2: strict smoke test
+        echo(f"{t.bin}: CAPABILITY FAILED")
+        return False
+    echo(f"{t.bin}: ok ({installed_identity(t) or t.pin})")
+    return True
 
 
 def run_shell(cmd: str, dry_run: bool) -> tuple[int, str]:

@@ -20,11 +20,13 @@ tools:
   #   azmap.dev M365 tenant, whois/RDAP registrant, DMARC pivot (dig), whoxy reverse-whois.
   # Key-gated in-process: whoxy (secrets.yaml -> whoxy:). The one installed tool:
   - bin: porch-pirate
+    version: "0.0.1"
     phase: osint
     role: search public Postman workspaces for the target's API endpoints/secrets
     install: pipx install porch-pirate
     update: pipx upgrade porch-pirate
     version_cmd: porch-pirate -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/MandConsultingGroup/porch-pirate
     runtime: pipx
     optional: true
@@ -32,6 +34,7 @@ tools:
 
   # ── Phase 2: Horizontal discovery ───────────────────────────────────────
   - bin: asnmap
+    version: "v1.1.1"
     phase: horizontal
     role: ASN -> CIDR ranges (context); echo AS123 | asnmap -silent
     install: go install github.com/projectdiscovery/asnmap/cmd/asnmap@latest
@@ -40,6 +43,7 @@ tools:
     notes: Can hang on its data source — runner enforces hard timeout.
 
   - bin: mapcidr
+    version: "v1.1.97"
     phase: horizontal
     role: expand/condense CIDR ranges to IPs
     install: go install github.com/projectdiscovery/mapcidr/cmd/mapcidr@latest
@@ -47,6 +51,7 @@ tools:
     doc: https://github.com/projectdiscovery/mapcidr
 
   - bin: tlsx
+    version: "v1.2.2"
     phase: horizontal
     role: TLS SAN/CN harvest on IP ranges -> in-scope hostnames
     install: go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
@@ -55,25 +60,30 @@ tools:
     notes: Lighter local version of Caduceus. Use -san -cn -silent -p 443.
 
   - bin: caduceus
+    version: "v1.0.5"
     phase: horizontal
     role: ASN/CIDR -> live TLS cert scan -> real hostnames behind CDN
     install: go install github.com/g0ldencybersec/Caduceus/cmd/caduceus@latest
     version_cmd: caduceus -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/g0ldencybersec/Caduceus
     optional: true
     notes: Active cert scan. Run only on owned IP space. Full cloud sweep = 2-5 days.
 
   # ── Phase 3: Vertical subdomain discovery ───────────────────────────────
   - bin: shosubgo
+    version: "v0.0.0-20250901210855-ccb6dc7bf0ef"
     phase: vertical
     role: Shodan-only subdomain discovery (narrow focus = unique hits)
     install: go install github.com/incogbyte/shosubgo@latest
     version_cmd: shosubgo -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/incogbyte/shosubgo
     keys: Shodan key -> secrets.yaml (shodan:)
     optional: true
 
   - bin: subfinder
+    version: "v2.14.0"
     phase: vertical
     role: passive subdomain enum (primary); subfinder -all -recursive
     install: go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
@@ -83,33 +93,43 @@ tools:
     notes: -all enables all sources (+20 results in testing). -stats shows per-key health.
 
   - bin: github-subdomains
+    version: "v1.2.2"
     phase: vertical
     role: scrape GitHub for referenced subdomains (3-10% extra, unique)
     install: go install github.com/gwen001/github-subdomains@latest
     version_cmd: github-subdomains -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/gwen001/github-subdomains
     keys: GitHub PATs -> secrets.yaml (github:) — use burner accounts to dodge rate limits
     optional: true
 
   - bin: puredns
+    version: "v2.1.1"
     phase: vertical
     role: massdns wrapper — DNS brute + validate
     install: go install github.com/d3mondev/puredns/v2@latest
     version_cmd: puredns --help
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/d3mondev/puredns
     notes: Requires massdns on host. Needs resolvers + trusted-resolvers lists.
 
   - bin: massdns
     phase: vertical
     role: high-perf stub resolver (puredns backend)
-    install: 'mkdir -p ~/.local/bin && rm -rf /tmp/_massdns && git clone -q --depth 1 https://github.com/blechschmidt/massdns /tmp/_massdns && make -C /tmp/_massdns >/dev/null && cp /tmp/_massdns/bin/massdns ~/.local/bin/ && rm -rf /tmp/_massdns'
-    version_cmd: massdns --help
-    doc: https://github.com/blechschmidt/massdns
+    # C08.2b: pinned to an EXACT commit (massdns publishes no release/version) — clone then checkout the ref, so
+    # a source build is reproducible instead of `--depth 1` latest-HEAD.
+    ref: 6bfa47197d78e68b79041d494e280174cb2d6ae1
+    repo: blechschmidt/massdns
     runtime: source
+    install: 'mkdir -p ~/.local/bin/.stage && rm -rf /tmp/_massdns && git clone -q https://github.com/blechschmidt/massdns /tmp/_massdns && git -C /tmp/_massdns checkout -q {ref} && make -C /tmp/_massdns >/dev/null && cp /tmp/_massdns/bin/{bin} ~/.local/bin/.stage/{bin} && rm -rf /tmp/_massdns'
+    version_cmd: massdns --help
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
+    doc: https://github.com/blechschmidt/massdns
     deps: [build-essential, git]   # gcc + make to compile
-    notes: Built from source (gcc+make); installed to ~/.local/bin. puredns needs it at runtime.
+    notes: Built from source (gcc+make) at a pinned commit; installed to ~/.local/bin. puredns needs it at runtime.
 
   - bin: alterx
+    version: "v0.1.0"
     phase: vertical
     role: subdomain permutation generation (modern dnsgen)
     install: go install github.com/projectdiscovery/alterx/cmd/alterx@latest
@@ -117,15 +137,18 @@ tools:
     doc: https://github.com/projectdiscovery/alterx
 
   - bin: dnsgen
+    version: "1.0.4"
     phase: vertical
     role: subdomain permutation generation (classic)
     install: pipx install dnsgen
     version_cmd: dnsgen -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/AlephNullSK/dnsgen
     runtime: pipx
     optional: true
 
   - bin: dnsx
+    version: "v1.3.0"
     phase: vertical
     role: fast DNS resolver / PTR / record enrichment
     install: go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
@@ -134,6 +157,7 @@ tools:
 
   # ── Phase 4: Probing / fingerprint / screenshots / ports ────────────────
   - bin: httpx
+    version: "v1.10.0"
     phase: probe
     role: HTTP probe + fingerprint + cdn tag; json output is source of truth
     install: go install github.com/projectdiscovery/httpx/cmd/httpx@latest
@@ -145,6 +169,7 @@ tools:
       if it crashes remove apt python3-httpx shim.
 
   - bin: cdncheck
+    version: "v1.2.45"
     phase: probe
     role: offline CDN/WAF/cloud IP classifier — gates the naabu SYN prefilter off shared CDN/WAF edge (T0.3)
     install: go install github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest
@@ -152,6 +177,7 @@ tools:
     doc: https://github.com/projectdiscovery/cdncheck
 
   - bin: gowitness
+    version: "v0.0.0-20260422172756-4f562901bc23"
     phase: probe
     role: screenshots
     install: go install github.com/sensepost/gowitness@latest
@@ -164,6 +190,7 @@ tools:
       Verify after install: gowitness scan file with one URL -> have-screenshot=true.
 
   - bin: naabu
+    version: "v2.6.1"
     phase: probe
     role: fast SYN/CONNECT port scan
     install: go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
@@ -173,6 +200,7 @@ tools:
     notes: Needs libpcap. Scan ranges only when CIDR/ASN explicitly in profile.
 
   - bin: nmap
+    policy: distro
     phase: probe
     role: service/version detection (-sV) on naabu-found ports; opt-in infra lane (was invoked but unregistered)
     install: sudo apt-get install -y nmap
@@ -183,6 +211,7 @@ tools:
 
   # ── Phase 5: Crawl + URL/archive + JS ───────────────────────────────────
   - bin: katana
+    version: "v1.6.1"
     phase: crawl
     role: crawler (standard + headless); batch to avoid OOM
     install: go install github.com/projectdiscovery/katana/cmd/katana@latest
@@ -192,6 +221,7 @@ tools:
     notes: Headless Chrome is the RAM hog — batch hosts, cap -p/-c. -kf all, -jc.
 
   - bin: gau
+    version: "v2.2.4"
     phase: crawl
     role: passive URL collection (wayback/otx/commoncrawl/urlscan)
     install: go install github.com/lc/gau/v2/cmd/gau@latest
@@ -199,21 +229,25 @@ tools:
     doc: https://github.com/lc/gau
 
   - bin: waymore
+    version: "8.9"
     phase: crawl
     role: archive URLs (-mode U) + archived RESPONSES (-mode R) + inline JS (-oijs)
     install: pipx install waymore
     update: pipx upgrade waymore
     version_cmd: waymore -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/xnl-h4ck3r/waymore
     runtime: pipx
     keys: ~/.config/waymore/config.yml (URLScan, VirusTotal keys raise coverage)
     notes: 'Volume bounded by -ci d + -l (LIMITS.WAYMORE_RESPONSES) + timeout. Responses dir feeds xnLinkFinder.'
 
   - bin: hakrawler
+    version: "v0.0.0-20241221204001-76152559a809"
     phase: crawl
     role: fast link spider (secondary to katana)
     install: go install github.com/hakluke/hakrawler@latest
     version_cmd: hakrawler -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/hakluke/hakrawler
     optional: true
 
@@ -222,32 +256,39 @@ tools:
   # a native, per-hop resolve+scope-guarded CSP fetch that reads the same headers + <meta http-equiv>.
 
   - bin: smap
+    version: "v0.0.0-20260413080749-42808b9bbbee"
     phase: probe
     role: passive (Shodan-backed) port scan — stealth, no packets to target
     install: go install github.com/s0md3v/smap/cmd/smap@latest
     version_cmd: smap -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/s0md3v/smap
     optional: true
 
   - bin: jsluice
+    version: "v0.0.0-20240110145140-0ddfab153e06"
     phase: crawl
     role: extract URLs + secrets from JS via tree-sitter
     install: go install github.com/BishopFox/jsluice/cmd/jsluice@latest
     version_cmd: jsluice -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/BishopFox/jsluice
 
   - bin: xnLinkFinder
+    version: "8.2"
     phase: crawl
     role: links + params + secrets + wordlist from JS dir AND waymore responses (killer combo)
     install: pipx install xnLinkFinder
     update: pipx upgrade xnLinkFinder
     version_cmd: xnLinkFinder -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/xnl-h4ck3r/xnLinkFinder
     runtime: pipx
     deps: [libxml2-dev, libxslt1-dev, zlib1g-dev]   # lxml build
     notes: 'JS dir: -inc -all -mfs 0. Responses dir: add -orig. -sp/-sf = scope files.'
 
   - bin: js-beautify
+    version: "2.0.1"
     phase: crawl
     role: beautify minified JS for better extraction
     install: pipx install jsbeautifier
@@ -259,24 +300,37 @@ tools:
   - bin: gitleaks
     phase: crawl
     role: secret scan on JS dir
-    # prebuilt binary — `go install` hits a toolchain/version-constraint conflict on new Go.
-    install: 'mkdir -p ~/.local/bin && GL=$(curl -fsSL https://api.github.com/repos/gitleaks/gitleaks/releases/latest | grep -oE ''"tag_name": "[^"]+"'' | cut -d''"'' -f4); A=$(uname -m); case "$A" in x86_64) A=x64;; aarch64|arm64) A=arm64;; esac; curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/${GL}/gitleaks_${GL#v}_linux_${A}.tar.gz" | tar -xz -C ~/.local/bin gitleaks && chmod +x ~/.local/bin/gitleaks'
+    # prebuilt binary — `go install` hits a toolchain/version-constraint conflict on new Go. C08.2b: pinned
+    # release + per-platform sha256 artifacts; install downloads the platform artifact, VERIFIES the hash, extracts.
+    version: "v8.30.1"
+    repo: gitleaks/gitleaks
+    runtime: binary
+    artifacts:
+      linux/amd64: {url: "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz",   sha256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"}
+      linux/arm64: {url: "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_arm64.tar.gz", sha256: "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"}
+    install: 'mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o /tmp/{bin}.tgz && echo "{sha256}  /tmp/{bin}.tgz" | sha256sum -c - && tar -xzf /tmp/{bin}.tgz -C ~/.local/bin/.stage {bin} && chmod +x ~/.local/bin/.stage/{bin} && rm -f /tmp/{bin}.tgz'
     version_cmd: gitleaks version
     doc: https://github.com/gitleaks/gitleaks
-    runtime: binary
     deps: [curl]
 
   - bin: trufflehog
     phase: crawl
     role: filesystem secret detection (verification is an opt-in authorized lane; default --no-verification)
-    install: 'curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b ~/.local/bin'
+    # C08.2b: replaced `curl install.sh | sh` (unpinned, unverified) with a pinned release + sha256-verified download.
+    version: "v3.95.9"
+    repo: trufflesecurity/trufflehog
+    runtime: binary
+    artifacts:
+      linux/amd64: {url: "https://github.com/trufflesecurity/trufflehog/releases/download/v3.95.9/trufflehog_3.95.9_linux_amd64.tar.gz", sha256: "f6d1106b85107d79527ed7a5b98b592beadd8b770dc3c9e8c1ad99e1b2cf127e"}
+      linux/arm64: {url: "https://github.com/trufflesecurity/trufflehog/releases/download/v3.95.9/trufflehog_3.95.9_linux_arm64.tar.gz", sha256: "9d9c2ec4ea36a089a9c5aaafe1969d176013ddf9f44d68e8cd75291aed8c83ed"}
+    install: 'mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o /tmp/{bin}.tgz && echo "{sha256}  /tmp/{bin}.tgz" | sha256sum -c - && tar -xzf /tmp/{bin}.tgz -C ~/.local/bin/.stage {bin} && chmod +x ~/.local/bin/.stage/{bin} && rm -f /tmp/{bin}.tgz'
     version_cmd: trufflehog --version
     doc: https://github.com/trufflesecurity/trufflehog
-    runtime: binary
     deps: [curl]
 
   # ── Phase 11: Content discovery (candidate-driven path brute) ───────────
   - bin: ffuf
+    version: "v2.2.1"
     phase: content
     role: candidate-driven path/dir brute over live in-scope hosts (default OFF)
     install: go install github.com/ffuf/ffuf/v2@latest
@@ -289,15 +343,18 @@ tools:
 
   # ── Phase 6/7: Params + lightweight scanning ────────────────────────────
   - bin: gf
+    version: "v0.0.0-20200618134122-dcd4c361f9f5"
     phase: params
     role: pattern buckets (sqli/ssrf/redirect/xss/idor...) over URL corpus
     install: go install github.com/tomnomnom/gf@latest
     version_cmd: gf -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/tomnomnom/gf
     notes: Needs ~/.gf patterns (gf-patterns repo). install copies them.
     optional: true
 
   - bin: arjun
+    version: "2.2.7"
     phase: params
     role: param discovery on param-less endpoints
     install: pipx install arjun
@@ -307,6 +364,7 @@ tools:
     notes: Uses -t 5 by default; -d (per-request delay) applied only when RATELIMIT.HTTP is set.
 
   - bin: nuclei
+    version: "v3.11.0"
     phase: params
     role: non-intrusive template scan; built-in interactsh OOB
     install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
@@ -319,6 +377,7 @@ tools:
       for days. -stats -si to a logfile (never /dev/null — that hides blocking).
 
   - bin: dalfox
+    version: "v2.13.0"
     phase: params
     role: XSS + open-redirect on reflected candidates
     install: go install github.com/hahwul/dalfox/v2@latest
@@ -327,6 +386,7 @@ tools:
     notes: --skip-bav; uses dalfox defaults; --delay applied only when RATELIMIT.HTTP is set.
 
   - bin: interactsh-client
+    version: "v1.3.1"
     phase: params
     role: Quarry-owned OOB callback backend (params.oob_probe issues+correlates; quarry oob poll)
     install: go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
@@ -338,9 +398,11 @@ tools:
 
   # ── Phase 8: Continuous monitoring ──────────────────────────────────────
   - bin: gungnir
+    version: "v1.4.0"
     phase: monitor
     role: continuous CT-log monitoring for new certs/subdomains
     install: go install github.com/g0ldencybersec/gungnir/cmd/gungnir@latest
     version_cmd: gungnir -h
+    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/g0ldencybersec/gungnir
     optional: true

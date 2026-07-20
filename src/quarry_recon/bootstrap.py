@@ -125,19 +125,6 @@ def install_system_packages(echo, dry: bool) -> bool:
     return code == 0
 
 
-def _latest_go(fallback: str) -> str:
-    """Highest stable Go version per go.dev (e.g. '1.26.4'); fallback if offline."""
-    try:
-        p = subprocess.run(["curl", "-fsSL", "https://go.dev/VERSION?m=text"],
-                           capture_output=True, text=True, timeout=15)
-        m = re.search(r"go([0-9]+(?:\.[0-9]+)+)", p.stdout)
-        if m:
-            return m.group(1)
-    except (subprocess.SubprocessError, OSError):
-        pass
-    return fallback
-
-
 def ensure_golang(echo, dry: bool) -> bool:
     bs = load_bootstrap()["golang"]
     min_version = tuple(int(p) for p in str(bs.get("min_version", "0")).split("."))
@@ -154,12 +141,24 @@ def ensure_golang(echo, dry: bool) -> bool:
         except subprocess.SubprocessError:
             pass
     arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64",
-            "arm64": "arm64"}.get(platform.machine().lower(), "amd64")
+            "arm64": "arm64"}.get(platform.machine().lower())
+    if arch is None:                                        # review-C08.2r4#7: an unknown arch must FAIL LOUD, not
+        echo(f"  unsupported CPU architecture {platform.machine()!r} — cannot install a verified Go toolchain")
+        return False                                       # silently installing an amd64 archive would be unusable
     osname = "darwin" if platform.system() == "Darwin" else "linux"
-    target = _latest_go(bs["version"])   # always install the highest stable Go
+    # review-C08.2r3#3 (Go toolchain policy): the Go compiler is a BUILD TOOLCHAIN — policy is min_version (keep
+    # an adequate existing/distro Go, kept as-is above). When absent/too old we install the DECLARED `version`
+    # (not floating latest) AND VERIFY the archive sha256 before replacing /usr/local/go (C08 supply-chain).
+    target = bs["version"]
+    plat = f"{osname}/{arch}"
+    sha = (bs.get("sha256") or {}).get(plat)
+    if not (isinstance(sha, str) and re.fullmatch(r"[a-f0-9]{64}", sha)):
+        echo(f"  Go archive sha256 not pinned for {plat} — refusing an UNVERIFIED /usr/local/go replacement (C08)")
+        return False
     url = bs["url"].format(version=f"go{target}", os=osname, arch=arch)
-    echo(f"  installing Go {target} ({osname}-{arch}) [latest stable]")
-    cmd = (f"wget -q {url} -O /tmp/go.tgz && {_sudo()}rm -rf /usr/local/go && "
+    echo(f"  installing Go {target} ({osname}-{arch}) [declared version, sha256-verified; min {bs['min_version']}]")
+    cmd = (f"wget -q {url} -O /tmp/go.tgz && echo '{sha}  /tmp/go.tgz' | sha256sum -c - && "
+           f"{_sudo()}rm -rf /usr/local/go && "
            f"{_sudo()}tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz && "
            f"{_sudo()}ln -sf /usr/local/go/bin/go /usr/local/bin/go")
     code, tail = _sh(cmd, dry, 600)

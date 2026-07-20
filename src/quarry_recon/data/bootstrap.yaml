@@ -161,12 +161,16 @@ chromium_packages:
     libs_primary_extra: []
 
 # Golang: installed to /usr/local/go if `go` is missing or older than min_version.
-# The installer fetches the HIGHEST STABLE version from go.dev at install time;
-# `version` is only the offline fallback. ProjectDiscovery tools need a recent Go.
+# The installer fetches the EXACT `version` below (sha256-verified) — never a floating
+# "latest" from go.dev. ProjectDiscovery tools need a recent Go.
 golang:
-  min_version: "1.25"
-  version: "1.26.4"   # fallback only (used if go.dev is unreachable)
+  min_version: "1.25"   # policy: keep an adequate existing/distro Go; bootstrap only when absent/too old
+  version: "1.26.4"     # the DECLARED version installed when Go is absent/too old (NOT floating latest)
   url: "https://dl.google.com/go/{version}.{os}-{arch}.tar.gz"
+  sha256:               # C08 supply-chain: per-platform archive digest, VERIFIED before replacing /usr/local/go.
+    # go1.26.4 linux tarball digests (https://go.dev/dl/). Refresh when `version` bumps.
+    linux/amd64: "1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f"
+    linux/arm64: "ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768"
 
 # Data files the framework owns (under ~/.config/quarry). Not overwritten if present
 # unless `quarry update` is run.

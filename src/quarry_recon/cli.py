@@ -11,7 +11,7 @@ import click
 
 from . import __version__, events, secrets
 from .config import ProfileError, TargetProfile
-from .registry import load_tools, run_shell, tools_by_phase
+from .registry import install_one, load_tools, tools_by_phase, verify_installed
 
 
 def _projects_root(opt: str | None) -> Path:
@@ -138,9 +138,15 @@ def lock(drift_only):
     drifts = [r for r in rows if r["drift"] == "DRIFT"]
     unpinned = [r for r in rows if r["drift"] == "unpinned"]
     if drift_only:
-        for r in drifts:
-            click.echo(_c(f"  DRIFT  {r['bin']:<20} installed={r['installed']}  pin={r['pin']}", "red"))
-        click.echo(_c(f"\n{len(drifts)} tool(s) drift from the pin", "red" if drifts else "green"))
+        # review-C08.2r4#3: the monthly verification must report EVERY lock violation (DRIFT and version-unknown)
+        # and EXIT NONZERO — a silent green would mask a wrong/unverifiable binary.
+        violations = [r for r in rows if r["drift"] in ("DRIFT", "version-unknown")]
+        for r in violations:
+            click.echo(_c(f"  {r['drift']:<15} {r['bin']:<20} installed={r['installed']}  pin={r['pin']}", "red"))
+        if violations:
+            click.echo(_c(f"\n{len(violations)} lock violation(s)", "red"))
+            raise SystemExit(1)
+        click.echo(_c("\nall installed tools verify against the lock", "green"))
         return
     unknown = [r for r in rows if r["drift"] == "version-unknown"]
     # emit a reviewable YAML pin block from what's installed here (the known-good versions)
@@ -386,23 +392,18 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     click.echo(_c(f"\n[3/6] tools ({len(tools)})", "magenta"))
     failed = []
     for t in tools:
-        if t.installed and not only:
-            click.echo(f"  {_c('✓', 'green')} {t.bin} present ({t.path}) — left as-is")
-            continue
-        if not t.install:
-            click.echo(f"  {_c('!', 'yellow')} {t.bin} — manual: {t.doc}")
-            continue
-        click.echo(f"  {_c('→', 'cyan')} {t.bin}")
-        code, _ = run_shell(t.install, dry_run)
-        if dry_run:
-            continue
-        if code == 0 and t.installed:
-            click.echo(f"      {_c('ok', 'green')}")
-        else:
+        if t.installed and not only and not dry_run:
+            # review-C08.2r4#1: a PRESENT tool is left as-is ONLY if it VERIFIES (identity + capability); a wrong
+            # binary from a failed prior update no longer passes — it is reinstalled to the pin.
+            if verify_installed(t):
+                click.echo(f"  {_c('✓', 'green')} {t.bin} present + verified ({t.pin or t.ref or 'distro'})")
+                continue
+            click.echo(f"  {_c('⚠', 'yellow')} {t.bin} present but FAILED verification — reinstalling pin")
+        pin_note = f" @ {t.pin or t.ref}" if (t.pin or t.ref) else _c(" (unpinned)", "yellow")
+        click.echo(f"  {_c('→', 'cyan')} {t.bin}{pin_note}")
+        # C08.2: the ONE shared, version-LOCKED install path (identity + capability verified; atomic staging).
+        if not install_one(t, lambda m: click.echo(f"      {m}"), dry_run):
             failed.append(t.bin)
-            click.echo(f"      {_c('FAILED', 'red')}    Retry after install completes: "
-                       f"{_c('quarry install --only ' + t.bin, 'cyan')}")
-        # (API-key reminders are NOT printed per-tool here — see the post-install summary)
 
     # ── 3. data files + extras + cleanup ──
     if full:
@@ -419,6 +420,7 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
         click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
         for b in failed:
             click.echo(f"retry: quarry install --only {b}")
+        raise SystemExit(1)                              # review-C08.2#6: failures propagate a non-zero exit
     elif not os.environ.get("QUARRY_FROM_INSTALLER"):
         # install.sh prints the final banner itself; only conclude here when run standalone
         click.echo(_c("\ninstall complete — all tools ok\nrun  quarry doctor  to verify", "green"))
@@ -428,25 +430,29 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
 @click.option("--dry-run", is_flag=True)
 @click.option("--include-optional", is_flag=True)
 def update(dry_run, include_optional):
-    """Update installed managed tools, nuclei templates, resolvers, gf patterns."""
+    """Reinstall installed tools at their PINNED lock (reproducible), + refresh nuclei templates, resolvers, gf
+    patterns. review-C08.2#1: `update` NEVER floats to @latest / pipx upgrade — bumping a pin is the reviewed
+    `quarry lock` refresh workflow, not a silent update."""
     from . import bootstrap
 
     tools = [t for t in load_tools() if t.installed]
     if not include_optional:
         tools = [t for t in tools if not t.optional]
-    click.echo(_c(f"updating {len(tools)} tools", "magenta"))
+    click.echo(_c(f"updating {len(tools)} tools (to their pins)", "magenta"))
+    failed = []
     for t in tools:
-        cmd = t.update or t.install
-        if not cmd:
-            continue
-        click.echo(f"  {_c('↻', 'cyan')} {t.bin}")
-        run_shell(cmd, dry_run)
+        click.echo(f"  {_c('↻', 'cyan')} {t.bin} @ {t.pin or t.ref or t.policy or 'installed'}")
+        if not install_one(t, lambda m: click.echo(f"      {m}"), dry_run):   # the SAME locked path as install
+            failed.append(t.bin)
     click.echo(_c("refreshing data files + templates", "magenta"))
     bootstrap.install_data_files(click.echo, dry_run, update=True)
     bootstrap.run_extras(click.echo, dry_run)
     bootstrap.cleanup(click.echo, dry_run)   # re-running tool installs refills go caches — clean them (install already does)
     if dry_run:
         click.echo(_c("\n(dry-run)\n", "yellow"))
+    elif failed:
+        click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
+        raise SystemExit(1)                              # review-C08.2#6
 
 
 # ── init (create a project) ───────────────────────────────────────────────────
