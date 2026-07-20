@@ -10,11 +10,12 @@ import json as _json
 import os
 import re as _re
 import shutil
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from .. import events, netguard, normalize, secrets, settings
-from ..contract import run_contract, run_provider
+from ..contract import ProviderResult, classify_provider_error, run_contract, run_provider
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
 
@@ -74,30 +75,99 @@ def _openintel(ctx, cfg: dict, apex: str, timeout: int = 180) -> set:
             if h and "." in h}
 
 
-def _censys(cfg: dict, apex: str, timeout: int = 30) -> set:
-    """OPTIONAL Censys Platform API cert search for `apex` → subdomain set. Returns an empty set
-    (SILENT) unless both a PAT `token` and `org` id are configured. Defensive parse: extracts every
-    hostname under the apex from the raw JSON response, so it survives Platform response-schema drift
-    (no dependency on an exact `matched_services[...]` path). Best-effort — failure returns empty."""
+def _censys_hit_names(hit: dict) -> list:
+    """review-r6#2/r7#1: the cert-names list from the EXACT current Censys hit path
+    ``certificate_v1.resource.names`` — no fallbacks (a `resource.names` / top-level `names` fallback reopened
+    fail-open parsing: a drift hit became clean-EMPTY and a foreign `names` became a phantom host). The path's
+    absence, or a non-list value, is a SCHEMA FAILURE — raised, never a silent skip."""
+    res = hit.get("certificate_v1")
+    res = res.get("resource") if isinstance(res, dict) else None
+    names = res.get("names") if isinstance(res, dict) else None
+    if not isinstance(names, list):
+        raise ValueError("censys: hit missing certificate_v1.resource.names list — schema failure")
+    return names
+
+
+def _censys_next_token(doc: dict) -> str | None:
+    """C06: extract the Platform v3 'next page' token DEFENSIVELY (schema drift-tolerant) — the documented
+    field is a page token; try its known locations (result.links.next / result.next_page_token /
+    next_page_token), returning a non-empty string or None. Sent back as `page_token` on the next request."""
+    res = doc.get("result") if isinstance(doc.get("result"), dict) else {}
+    links = res.get("links") if isinstance(res.get("links"), dict) else {}
+    for v in (links.get("next"), res.get("next_page_token"), doc.get("next_page_token")):
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
+def _censys(cfg: dict, apex: str, timeout: int = 30, max_pages: int = 5) -> set:
+    """OPTIONAL Censys Platform v3 global-search cert query for `apex` → subdomain set. Returns an empty set
+    (SILENT) unless both a PAT `token` and `org` id are configured. Query is CenQL `cert.names: "<apex>"` (the
+    current field; NOT the legacy `cert.parsed.names`), requesting only `fields: ["cert.names"]`. FAIL-CLOSED
+    structured parse: names come from the EXACT hit path `certificate_v1.resource.names` (no fallbacks, no regex
+    over the hit body) and are filtered to the queried apex — a missing path / non-list / non-string is a schema
+    failure (raises), never a clean-EMPTY or a phantom host. C06: follows the `page_token` cursor (the v3 request
+    field) up to `max_pages` (bounded, configurable), stops on a missing/repeat token; hitting the cap with a
+    live token returns a PARTIAL ProviderResult (truncated); a later-page failure keeps earlier pages as PARTIAL.
+    Errors propagate to run_provider."""
     token, org = cfg.get("token"), cfg.get("org")
     if not token or not org:
         return set()                                        # not configured — a genuine "not applicable" empty
-    body = _json.dumps({"query": f"cert.parsed.names: {apex}", "page_size": 100}).encode()
-    req = urllib.request.Request(
-        "https://api.platform.censys.io/v3/global/search/query", data=body, method="POST",
-        headers={"Authorization": f"Bearer {token}", "X-Organization-ID": str(org),
-                 "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
-    # review#2: do NOT swallow HTTP/transport errors — let them propagate to contract.run_provider so a
-    # failure is a FAILED terminal, not a clean EMPTY that C10b would skip. (The phase still continues.)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read(8 * 1024 * 1024).decode("utf-8", "replace")
-    # review#3: a 200 with an error/schema-drift body must NOT become clean-empty work. Validate the Platform
-    # envelope (a success carries a `result`); anything else raises into run_provider -> FAILED, not EMPTY.
-    doc = _json.loads(raw)
-    if not (isinstance(doc, dict) and "result" in doc):
-        raise ValueError("censys: unexpected response envelope (no 'result') — not a valid empty result")
-    pat = _re.compile(r"[a-z0-9](?:[a-z0-9._-]*)?\." + _re.escape(apex) + r"\b", _re.I)
-    return {m.lower().strip(".") for m in pat.findall(raw) if "." in m}
+    hosts: set = set()
+    page_token = None
+    pages = 0
+    truncated = False
+    for i in range(max(1, max_pages)):
+        pages = i + 1
+        # P2: QUOTE the apex — a valid numeric-leading domain is not a valid UNQUOTED CenQL string literal.
+        # review-r7#1: request ONLY `cert.names` so the response carries exactly the field we parse (minimal
+        # surface — no stray text that could yield a phantom host).
+        payload = {"query": f'cert.names: "{apex}"', "page_size": 100, "fields": ["cert.names"]}
+        if page_token:
+            payload["page_token"] = page_token              # v3 pagination field (NOT `cursor`)
+        req = urllib.request.Request(
+            "https://api.platform.censys.io/v3/global/search/query", data=_json.dumps(payload).encode(),
+            method="POST",
+            headers={"Authorization": f"Bearer {token}", "X-Organization-ID": str(org),
+                     "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+        try:
+            # review#2/r3#2: fetch AND validate/extract inside ONE protected block — do NOT swallow HTTP/transport
+            # errors, and a later-page SCHEMA/parse error must ALSO preserve earlier pages (not propagate + lose).
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read(8 * 1024 * 1024).decode("utf-8", "replace")
+            doc = _json.loads(raw)
+            # review#3 + P2 + r4#5: a success carries a `result` OBJECT whose `hits` is a LIST — anything else
+            # (a bare object, a non-list hits) is malformed, an error, NOT a clean-EMPTY.
+            if not (isinstance(doc, dict) and isinstance(doc.get("result"), dict)
+                    and isinstance(doc["result"].get("hits"), list)):
+                raise ValueError("censys: unexpected response envelope (no 'result.hits' list) — not a valid empty result")
+            hits = doc["result"]["hits"]
+            page_hosts = set()
+            for hit in hits:
+                if not isinstance(hit, dict):                # review-r5#3: `hits:[null]` / scalar rows are malformed
+                    raise ValueError("censys: non-object hit row")
+                # review-r6#2/r7#1: parse the EXACT cert-names list (certificate_v1.resource.names) — NOT a
+                # regex over the hit JSON, and NO fallbacks. A missing path raises (schema failure), so a drift
+                # hit can neither become a clean-EMPTY nor a phantom host.
+                for nm in _censys_hit_names(hit):
+                    if not isinstance(nm, str):
+                        raise ValueError("censys: hit name is not a string")
+                    nm = nm.lower().strip(".")
+                    if nm == apex or nm.endswith("." + apex):   # keep names UNDER the queried apex (subs + `*.`)
+                        page_hosts.add(nm)
+            nxt = _censys_next_token(doc)
+        except Exception as e:
+            if i == 0:                                       # first-page failure -> FAILED (propagate)
+                raise
+            return ProviderResult(hosts, partial=True, cursor=page_token, pages=i,   # later page: KEEP earlier hosts
+                                  error_class=classify_provider_error(e))
+        hosts |= page_hosts                                  # merge only a FULLY-validated page
+        if not nxt or nxt == page_token:                     # no next page (or a non-advancing token) — done
+            break
+        page_token = nxt
+    else:
+        truncated = True                                     # ran all max_pages with a live token — more remain
+    return ProviderResult(hosts, partial=truncated, cursor=page_token, pages=pages)   # ALWAYS PR (complete clears)
 
 
 def _crtsh(apex: str, timeout: int = 30) -> set:
@@ -116,6 +186,8 @@ def _crtsh(apex: str, timeout: int = 30) -> set:
         raise ValueError("crt.sh: non-list JSON root — not a valid empty result")
     hosts = set()
     for row in rows:
+        if not isinstance(row, dict):                        # review-r3#3: FAIL-CLOSED — a non-object row is corruption
+            raise ValueError("crt.sh: non-object row")
         for nv in str(row.get("name_value", "")).splitlines():
             h = nv.strip().lower().strip(".")
             if h and "." in h:
@@ -123,29 +195,68 @@ def _crtsh(apex: str, timeout: int = 30) -> set:
     return hosts
 
 
-def _certspotter(apex: str, token: str | None = None, timeout: int = 30) -> set:
-    """certspotter CT-log issuances for `apex` (+subdomains) → set of hostnames. Free tier is
-    keyless (rate-limited); a token raises the limit. Best-effort — failure returns an empty set."""
-    url = (f"https://api.certspotter.com/v1/issuances?domain={apex}"
-           "&include_subdomains=true&expand=dns_names")
+def _certspotter(apex: str, token: str | None = None, timeout: int = 30, max_pages: int = 5) -> set:
+    """certspotter (SSLMate CT Search API v1) issuances for `apex` (+subdomains) → set of hostnames. Free tier
+    is keyless (rate-limited); a token raises the limit. C06: PAGINATES via `after=<last issuance id>` — the
+    API documents NO `limit` and terminates on an EMPTY array, so we follow the cursor until an empty page (or
+    a non-advancing cursor) and NEVER treat a short page as terminal. Bounded to `max_pages`; hitting the cap
+    with a live cursor returns a PARTIAL ProviderResult (truncated). Errors propagate to run_provider (FAILED)."""
+    base = (f"https://api.certspotter.com/v1/issuances?domain={apex}"
+            "&include_subdomains=true&expand=dns_names")
     headers = {"User-Agent": "Mozilla/5.0"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    # review#2: errors propagate to run_provider (FAILED terminal, not fake-empty).
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        rows = _json.loads(r.read(8 * 1024 * 1024).decode("utf-8", "replace"))
-    # review#3: certspotter's success shape is a JSON ARRAY of issuances. A dict (e.g. {"message": "rate
-    # limited"}) or other non-list root is an error, NOT zero results — raise into run_provider (FAILED).
-    if not isinstance(rows, list):
-        raise ValueError("certspotter: non-list JSON root — not a valid empty result")
-    hosts = set()
-    for row in rows:
-        for h in (row.get("dns_names") or []):
-            h = str(h).strip().lower().strip(".")
-            if h and "." in h:
-                hosts.add(h)
-    return hosts
+    hosts: set = set()
+    after = None
+    pages = 0
+    truncated = False
+    for i in range(max(1, max_pages)):
+        pages = i + 1
+        url = base + (f"&after={urllib.parse.quote(after)}" if after else "")   # P2: encode the opaque cursor id
+        try:
+            # review-r3#2: fetch AND validate/extract inside ONE protected block — a later-page SCHEMA/parse
+            # error (not just network) must ALSO preserve earlier pages, not propagate and discard them.
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                rows = _json.loads(r.read(8 * 1024 * 1024).decode("utf-8", "replace"))
+            # review#3: certspotter's success shape is a JSON ARRAY of issuances; a non-list root is an error.
+            if not isinstance(rows, list):
+                raise ValueError("certspotter: non-list JSON root — not a valid empty result")
+            page_hosts = set()
+            for row in rows:
+                if not isinstance(row, dict):                # review-r3#3: FAIL-CLOSED — a non-object row is
+                    raise ValueError("certspotter: non-object issuance row")   # corruption, not silently skipped
+                # review-r4#5/r5#4: we requested expand=dns_names, so each row MUST carry a list of STRINGS —
+                # a missing/null field or a non-string element is malformed (fail-closed), not silently coerced.
+                dns_names = row.get("dns_names")
+                if not isinstance(dns_names, list) or not all(isinstance(x, str) for x in dns_names):
+                    raise ValueError("certspotter: dns_names is not a list of strings")
+                for h in dns_names:
+                    h = h.strip().lower().strip(".")
+                    if h and "." in h:
+                        page_hosts.add(h)
+            if rows:                                         # review-r4#5: the cursor id must be a scalar (str/int)
+                _id = rows[-1].get("id")
+                if _id is not None and not isinstance(_id, (str, int)):
+                    raise ValueError(f"certspotter: cursor id not a scalar ({type(_id).__name__})")
+                nxt = str(_id or "")
+            else:
+                nxt = ""
+        except Exception as e:
+            # review-r2#4/r3#2: a LATER-page failure (network OR schema/parse) keeps earlier pages as PARTIAL
+            # with the error class; only a FIRST-page failure propagates (-> FAILED, no result).
+            if i == 0:
+                raise
+            return ProviderResult(hosts, partial=True, cursor=after, pages=i, error_class=classify_provider_error(e))
+        hosts |= page_hosts                                  # merge only a FULLY-validated page
+        if not rows:
+            break                                            # EMPTY array = the documented end of pagination
+        if not nxt or nxt == after:                          # no cursor / non-advancing — done
+            break
+        after = nxt
+    else:
+        truncated = True                                     # ran all max_pages without an empty page — more remain
+    return ProviderResult(hosts, partial=truncated, cursor=after, pages=pages)   # ALWAYS PR (complete clears the gap)
 
 
 def _massdns_a(path: Path) -> dict[str, list[str]]:
@@ -356,22 +467,28 @@ def run(ctx) -> None:
     # brutes the zone + HTTP-differentiates instead. wildcard_zones is fed by CT + censys below.
     wildcard_zones: set[str] = set()
     cs_token = secrets.certspotter()
+    _max_pages = settings.concurrency("PROVIDER_MAX_PAGES", 5)   # C06: bounded cursor pagination (configurable)
     ct_new = 0
-    def _provider_over_apexes(src_id, per_apex):
+    def _provider_over_apexes(src_id, per_apex, acct=None):
         """review#2: run each (provider, apex) as its OWN work unit. A single apex's failure becomes a FAILED
         terminal for THAT unit only — every OTHER apex's successful discovery is still unioned (best-effort,
         no all-or-nothing). This also gives the providers a per-apex work_unit (the C10b resume key)."""
         h = set()
         for apex in prof.apex_domains:
-            wu = events.work_unit(src_id, inputs={"apex": apex})
+            # review-r4#4: fold the coverage-affecting page budget; review-r5#5: fold non-secret ACCOUNT SCOPE +
+            # a credential FINGERPRINT (never the credential) — a changed account/org sees different data, so it
+            # must be a different resume identity.
+            cfg = {"max_pages": _max_pages, **(acct or {})}
+            wu = events.work_unit(src_id, inputs={"apex": apex}, config=cfg)
             r = run_provider(src_id, lambda a=apex: per_apex(a), work_unit=wu, input_total=1)
             if r:                                            # None on failure (that apex's terminal is FAILED)
                 h |= r
         return h
-    for src, fn in (("crtsh", lambda a: _crtsh(a)),
-                    ("certspotter", lambda a: _certspotter(a, cs_token))):
+    _cs_acct = {"cred_fp": secrets.fingerprint(cs_token)} if cs_token else None   # certspotter token identity
+    for src, fn, acct in (("crtsh", lambda a: _crtsh(a), None),
+                          ("certspotter", lambda a: _certspotter(a, cs_token, max_pages=_max_pages), _cs_acct)):
         # C07 inc5: bracket the in-process CT provider (native HTTP) with a per-apex source lifecycle.
-        hosts = _provider_over_apexes(f"vertical.{src}", fn)
+        hosts = _provider_over_apexes(f"vertical.{src}", fn, acct)
         if not hosts:
             continue
         raw = ctx.run.raw_path("vertical", src, "hosts.txt")
@@ -404,7 +521,10 @@ def run(ctx) -> None:
     # ── passive: Censys Platform cert search (OPTIONAL — SILENT unless secrets.yaml `censys:` set) ──
     cen = secrets.censys()
     if cen.get("token") and cen.get("org"):
-        cen_hosts = _provider_over_apexes("vertical.censys", lambda a: _censys(cen, a))
+        # review-r5#5: org id (non-secret) + a token FINGERPRINT (never the token) — a different account/org
+        # sees different data, so the resume identity must change with it.
+        cen_acct = {"org": str(cen["org"]), "cred_fp": secrets.fingerprint(cen["token"])}
+        cen_hosts = _provider_over_apexes("vertical.censys", lambda a: _censys(cen, a, max_pages=_max_pages), cen_acct)
         if cen_hosts:
             raw = ctx.run.raw_path("vertical", "censys", "hosts.txt")
             raw.write_text("\n".join(sorted(cen_hosts)) + "\n")
@@ -421,6 +541,10 @@ def run(ctx) -> None:
                 ctx.echo(f"  censys: +{n} in-scope (Platform cert search)")
 
     # ── passive: github-subdomains (optional, needs token) ──
+    # C06 disposition: github-subdomains is an EXTERNAL tool that paginates the GitHub code-search API
+    # INTERNALLY (walks all result pages, honors the token's rate limit) — pagination is the tool's
+    # responsibility, not ours. It runs on the contract (exec_tool → recorded), so an auth/rate failure
+    # surfaces as a FAILED tool_run (fail-closed), not a silent empty. No in-process pagination is owed here.
     gh_token = secrets.github_tokens_file()   # 0600 temp file from secrets.yaml; None if unset
     if gh_token:
         try:

@@ -89,6 +89,7 @@ EVENT_TYPES = (TOOL_START, TOOL_PROGRESS, TOOL_FINISH,
 
 _sink: Path | None = None
 _coverage_seen: set = set()             # source_ids that emitted a coverage unit THIS session (for the snapshot)
+_provider_seen: set = set()             # source_ids whose provider terminal opened a generation THIS session
 # C11: in-memory record of event-sink write failures THIS session. Best-effort is preserved (a log-write
 # failure never crashes the run), but the loss is no longer SILENT — it's surfaced in the manifest as
 # `observability_degraded` so a run built on an incomplete events.jsonl is a recorded fact, not a clean lie.
@@ -139,19 +140,21 @@ def configure(run_dir) -> Path:
     run's units, so a capped unit that DISAPPEARS on rerun no longer leaves a stale gap. LOADS the persisted
     degradation record (review#6: a resume ACCUMULATES it, so a run whose prior session lost events can never
     be recorded clean)."""
-    global _sink, _coverage_seen, _degraded
+    global _sink, _coverage_seen, _provider_seen, _degraded
     _sink = Path(run_dir) / "events.jsonl"
     _sink.parent.mkdir(parents=True, exist_ok=True)
     _coverage_seen = set()
+    _provider_seen = set()
     _degraded = _load_degraded()
     return _sink
 
 
 def reset() -> None:
     """Detach the sink (tests / between runs). emit() then returns records without persisting."""
-    global _sink, _coverage_seen, _degraded
+    global _sink, _coverage_seen, _provider_seen, _degraded
     _sink = None
     _coverage_seen = set()
+    _provider_seen = set()
     _degraded = _fresh_degraded()
 
 
@@ -197,15 +200,19 @@ def emit(event: str, source_id: str, **fields) -> dict:
 
 
 def tool_start(source_id, *, cmd=None, env=None, input_total=None, work_unit=None,
-               workers=None, rate=None, timeout=None,
+               workers=None, rate=None, timeout=None, provider=None, reset_generation=None,
                parent_id=None, scope_distance=None, discovery_context=None) -> dict:
     """Emitted before a source runs. cmd/env (like all fields) are redacted at the sink; workers/rate/
     timeout are the PLANNED contract values (from the registry). ``work_unit`` (C07 inc 3) is the stable
-    resume key for a looped/grouped lane. Provenance rides along for v0.4."""
+    resume key for a looped/grouped lane. ``provider``/``reset_generation`` (review-r5#1): an in-process
+    provider stamps its generation reset on the START (persisted BEFORE execution) so a crash between start and
+    terminal still supersedes the prior generation — and a start with no matching terminal reads as INCOMPLETE
+    (a gap), never the prior generation's success. Provenance rides along for v0.4."""
     return emit(TOOL_START, source_id,
                 cmd=list(cmd) if cmd is not None else None,
                 env=dict(env) if env else None,
                 input_total=input_total, work_unit=work_unit, workers=workers, rate=rate, timeout=timeout,
+                provider=provider, reset_generation=reset_generation,
                 parent_id=parent_id, scope_distance=scope_distance, discovery_context=discovery_context)
 
 
@@ -226,16 +233,23 @@ def tool_progress(source_id, *, input_total=None, current_index=None, work_unit=
 
 def tool_finish(source_id, *, status=None, reason=None, duration=None, exit_code=None, work_unit=None,
                 rss=None, cpu_s=None, raw_ref=None, artifact_size=None,
-                produced=None, consumed=None, fallback=None,
-                parent_id=None, scope_distance=None, discovery_context=None) -> dict:
+                produced=None, consumed=None, fallback=None, error_class=None, provider=None,
+                reset_generation=None, parent_id=None, scope_distance=None, discovery_context=None) -> dict:
     """Emitted after a source finishes. produced/consumed are absent unless the caller passes REAL
     parser/store counts (never guessed here). raw_ref/artifact_size point at the persisted output.
-    ``work_unit`` (C07 inc 3) ties this terminal to the same stable unit as its tool_start (resume key)."""
+    ``work_unit`` (C07 inc 3) ties this terminal to the same stable unit as its tool_start (resume key).
+    ``error_class`` (C06) tags a FAILED terminal as auth/quota/transport/parse/server/error so a consumer can
+    tell a real failure from 'nothing found' and pick retry/backoff — never guessed, only set on a failure.
+    ``provider`` (C06) marks an IN-PROCESS provider terminal (run_provider) — providers never hit _tool_runs,
+    so the verdict reads their terminals from the event log; the flag lets it fold them without double-counting
+    a subprocess lane's tool_finish."""
     return emit(TOOL_FINISH, source_id, status=status, reason=reason, duration=duration,
                 exit_code=exit_code, work_unit=work_unit, rss=rss, cpu_s=cpu_s,
                 raw_ref=raw_ref, artifact_size=artifact_size,
-                produced=produced, consumed=consumed, fallback=fallback,
-                parent_id=parent_id, scope_distance=scope_distance, discovery_context=discovery_context)
+                produced=produced, consumed=consumed, fallback=fallback, error_class=error_class,
+                provider=provider, reset_generation=reset_generation,
+                parent_id=parent_id, scope_distance=scope_distance,
+                discovery_context=discovery_context)
 
 
 def artifact_written(source_id, *, path=None, count=None, artifact_size=None) -> dict:
@@ -248,6 +262,17 @@ def artifact_written(source_id, *, path=None, count=None, artifact_size=None) ->
 COVERAGE_SAMPLE = "sample"    # operator-CHOSEN subset: a soft LIMIT (complete_with_limits), never a gap
 COVERAGE_CAP = "cap"          # a hard ceiling truncated eligible input: a gap whenever omitted>0 (10%/100 = priority only)
 COVERAGE_TIMEOUT = "timeout"  # per-item timeout/deps-fail skipped input: ALWAYS feeds the verdict
+
+
+def mark_provider_generation(source_id) -> bool:
+    """review-r4#3: True the FIRST time a provider terminal is emitted for `source_id` THIS session. run_provider
+    stamps that terminal reset_generation=True so the verdict supersedes this source's PRIOR-session terminals
+    (a changed work_unit / retry no longer leaves a stale failure gating the run) — the terminal analog of a
+    coverage generation. Cleared by configure()/reset()."""
+    if source_id in _provider_seen:
+        return False
+    _provider_seen.add(source_id)
+    return True
 
 
 def coverage_reset(source_id) -> dict:

@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 
 from .. import events, netguard, normalize, secrets, settings
-from ..contract import run_contract
+from ..contract import ProviderResult, classify_provider_error, run_contract, run_provider
 from ..runner import (Status, ffuf_results, fresh_artifact_dir, have, nuclei_timeout, reclassify_ffuf,
                       reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
                       skipped)
@@ -32,43 +32,154 @@ _PHP_OBJ_RX = _re.compile(r'O:\d+:"[A-Za-z0-9_\\]+":')          # PHP serialize(
 _JWT_RX = _re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")
 
 
-def _shodan_pivot(ctx, key, values, facet, source, label, note) -> int:
-    """Generic Shodan search pivot: for each value, query `<facet>:<value>` and turn the matching
-    hosts' hostnames into in-scope subdomains (coverage) or bounded off-scope related-host review
-    candidates (verify-ownership). Generic collisions (huge result count) are skipped as noise, and
-    each pivot is bounded. `label`/`note` are `{}`-formatted with the value for provenance/context.
-    Returns the count of new in-scope subdomains. Passive OSINT query — no target contact."""
-    scope = ctx.scope
-    new_sub = 0
-    for v in sorted({str(x) for x in values if x})[:20]:
+_SHODAN_PAGE = 100                                          # Shodan host/search returns up to 100 matches/page
+
+
+def _shodan_search(key, facet, v, max_pages):
+    """One Shodan pivot query with CREDIT-AWARE bounded pagination. Shodan charges a query credit PER PAGE, so
+    `max_pages` defaults to 1 (credit-conservative) and is opt-in higher. Returns (matches, total, pages_read,
+    page_error). review-r4#1: a FIRST-page failure propagates (raise — no evidence). A LATER-page failure does
+    NOT discard earlier pages: it returns the accumulated matches with `page_error` set, so the caller ingests
+    and preserves them and still records the degradation."""
+    matches: list = []
+    total = 0
+    pages = 0
+    for page in range(1, max(1, max_pages) + 1):
+        url = (f"https://api.shodan.io/shodan/host/search?key={key}"
+               f"&query={urllib.parse.quote(f'{facet}:{v}')}&page={page}")
         try:
-            url = (f"https://api.shodan.io/shodan/host/search?key={key}"
-                   f"&query={urllib.parse.quote(f'{facet}:{v}')}")
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = _json.loads(r.read(4 * 1024 * 1024).decode("utf-8", "replace"))
-        except Exception:
+            # review-r2#5/r3#3: FULLY FAIL-CLOSED — a non-object body, a non-int/negative `total`, a non-list
+            # `matches`, a NON-DICT row, or a NON-LIST `hostnames` is an ERROR (NOT laundered to a clean empty
+            # and never crashing outside the classified boundary). `{"total":1,"matches":[null]}` therefore FAILS.
+            if not isinstance(data, dict):
+                raise ValueError("shodan: non-object response — not a valid empty result")
+            page_total = data.get("total")
+            if not isinstance(page_total, int) or page_total < 0:
+                raise ValueError(f"shodan: invalid total {page_total!r}")
+            page_matches = data.get("matches")
+            if not isinstance(page_matches, list):
+                raise ValueError("shodan: matches is not a list")
+            page_rows = []
+            for m in page_matches:
+                if not isinstance(m, dict):                   # a null/scalar row is corruption, not empty
+                    raise ValueError("shodan: non-object match row")
+                hns = m.get("hostnames")
+                if hns is not None and not isinstance(hns, list):   # a non-list hostnames would crash/silent-drop
+                    raise ValueError(f"shodan: non-list hostnames {type(hns).__name__}")
+                page_rows.append(m)
+        except Exception as e:
+            # review-r4#1: first-page failure -> no evidence -> propagate (FAILED). Later page -> KEEP earlier
+            # pages' matches and report the error, so the caller ingests + preserves them.
+            if page == 1:
+                raise
+            return matches, total, pages, e
+        total = page_total
+        matches.extend(page_rows)                             # only a FULLY-validated page
+        pages = page
+        if len(page_matches) < _SHODAN_PAGE or len(matches) >= total:   # short/last page — done
+            break
+    return matches, total, pages, None
+
+
+_SHODAN_PIVOT_CAP = 20                                      # max distinct pivot values per lane (credit budget)
+_SHODAN_OOS_CAP = 15                                        # max off-scope related-host review candidates per pivot
+
+
+def _shodan_pivot(ctx, key, values, facet, source, sid, note):
+    """Generic Shodan search pivot: for each value, query `<facet>:<value>` and turn the matching hosts'
+    hostnames into in-scope subdomains (coverage) or bounded off-scope related-host review candidates. `sid` is
+    the REGISTERED source_id (literal from the caller — review-r3#6: no constructed id that bypasses the
+    registry scan). C06: errors are CLASSIFIED and counted, not swallowed; pagination is credit-aware
+    (SHODAN_MAX_PAGES, default 1). review-r2#3: in-scope matches are ALWAYS ingested (only off-scope review
+    noise is bounded); the pivot cap + truncations are STRUCTURED coverage every run.
+
+    review-r3#4 terminal truth: returns a plain set (SUCCESS/EMPTY) when NO pivot failed; a PARTIAL
+    ProviderResult (with the dominant error class) when SOME failed; and RAISES the last error when ALL pivots
+    failed with no results (-> run_provider FAILED + classified) — never a silent clean EMPTY on total failure.
+
+    NB credit accounting: `SHODAN_MAX_PAGES` is PER PIVOT — a filtered search costs a credit and each extra
+    page another, so a lane may spend ~ (pivots × pages) credits (two 20-pivot lanes ≈ 40 at the default). A
+    true cross-lane credit budget is a scheduler concern (C24), out of scope here."""
+    import collections
+    scope = ctx.scope
+    label = sid.split(".", 1)[-1]                           # e.g. "probe.favicon" -> "favicon" (raw dir / review id)
+    max_pages = settings.concurrency("SHODAN_MAX_PAGES", 1)
+    all_vals = sorted({str(x) for x in values if x})
+    vals = all_vals[:_SHODAN_PIVOT_CAP]
+    found: set = set()
+    err_classes: collections.Counter = collections.Counter()   # ALL error classes (first-page + later-page)
+    first_page_failures = 0                                 # pivots that yielded NOTHING (first-page failure)
+    degraded = 0                                            # pivots that got SOME pages then a later page failed
+    truncated = 0
+    last_exc = None
+    for v in vals:
+        try:
+            matches, total, _pages, page_err = _shodan_search(key, facet, v, max_pages)
+        except Exception as e:                             # first-page failure -> no evidence (do NOT swallow)
+            err_classes[classify_provider_error(e)] += 1
+            first_page_failures += 1
+            last_exc = e
             continue
-        if (data.get("total") or 0) > 200:              # too-generic → skip (collision noise)
-            continue
-        raw = ctx.run.raw_path("probe", label, f"{_re.sub(r'[^A-Za-z0-9]', '_', v)[:32]}.json")
-        raw.write_text(_json.dumps(data.get("matches") or [])[:2 * 1024 * 1024])
+        if page_err is not None:                           # review-r4#1: later page failed — KEEP earlier matches
+            err_classes[classify_provider_error(page_err)] += 1
+            degraded += 1
+            last_exc = page_err
+        elif total > len(matches):                         # complete-but-more-than-paged (credit budget) — truncated
+            truncated += 1
+        raw = ctx.run.raw_path("probe", label, f"{_re.sub(r'[^A-Za-z0-9]', '_', v)[:32]}.jsonl")
+        # review-r6#3/r7#2: write the COMPLETE evidence as valid JSONL (one match per line). No size cap — a
+        # truncated artifact left ingested entities pointing at a `raw_ref` that DIDN'T contain their evidence
+        # (false provenance). Collection is already bounded (max_pages × 100 rows / 4 MiB per-page read), so the
+        # file is small; every ingested host's evidence is therefore actually present in its raw_ref.
+        with raw.open("w", encoding="utf-8") as fh:
+            for m in matches:
+                fh.write(_json.dumps(m, ensure_ascii=False) + "\n")
         oos = 0
-        for m in (data.get("matches") or [])[:100]:
+        for m in matches:                                  # ALWAYS ingest in-scope; only off-scope noise is bounded
             for hn in (m.get("hostnames") or []):
                 hn = str(hn).lower().rstrip(".")
                 if not hn or "." not in hn:
                     continue
                 if scope.in_scope(hn) and not scope.is_oos(hn):
-                    if ctx.run.add("subdomain", {"host": hn, "sources": [source],
-                                                 "raw_ref": str(raw)}):
-                        new_sub += 1
-                elif oos < 15:                          # bounded off-scope related-host candidates
+                    # review-r6#1: the response HAD this in-scope host — it belongs in `found` REGARDLESS of
+                    # whether the store already had it (dedup is a storage concern, NOT presence). Gating found
+                    # on Run.add()'s new-key return made a clean rerun collapse to a false EMPTY.
+                    found.add(hn)
+                    ctx.run.add("subdomain", {"host": hn, "sources": [source], "raw_ref": str(raw)})
+                elif oos < _SHODAN_OOS_CAP:                # bounded off-scope related-host candidates
                     if ctx.run.add("review", {"id": f"{label}:{v}:{hn}", "klass": "related-host",
                             "value": hn, "note": note.format(v), "sources": [source],
                             "raw_ref": str(raw)}):
                         oos += 1
-    return new_sub
+    errored = first_page_failures + degraded               # pivots with ANY error (no-evidence OR partial)
+    incomplete_results = truncated + degraded              # result sets KNOWN incomplete (paged-cap OR later-page fail)
+    # review#5/r2#3/r4#2: STRUCTURED coverage EVERY run (omitted=0 clears a prior gap), even with zero pivots.
+    # review-r5#2: `shodan_pivots.omitted` = WHOLLY-omitted pivots only (first-page failures — no evidence). A
+    # DEGRADED pivot got page-1 data, so it is TESTED here; its incompleteness is counted in shodan_results.
+    events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_pivots", unit=f"{label}.failed",
+                            eligible=len(vals), tested=len(vals) - first_page_failures, omitted=first_page_failures,
+                            reason=(f"{first_page_failures} shodan pivot(s) fully failed by class {dict(err_classes)}"
+                                    if first_page_failures else "all shodan pivots yielded data"))
+    events.coverage_partial(sid, kind=events.COVERAGE_CAP, measure="shodan_results", unit=f"{label}.incomplete",
+                            eligible=len(vals), tested=len(vals) - incomplete_results, omitted=incomplete_results,
+                            reason=(f"{incomplete_results}/{len(vals)} pivot(s) with an INCOMPLETE result set "
+                                    f"({truncated} credit-truncated, {degraded} later-page failure)"
+                                    if incomplete_results else "no pivot result set truncated"))
+    events.coverage_partial(sid, kind=events.COVERAGE_CAP, measure="shodan_pivot_values", unit=f"{label}.pivot_cap",
+                            eligible=len(all_vals), tested=len(vals), omitted=len(all_vals) - len(vals),
+                            reason=f"pivot values {len(vals)}/{len(all_vals)} queried (cap {_SHODAN_PIVOT_CAP})")
+    # review-r3#4: honest terminal — every pivot failed with NOTHING found -> FAILED; ANY error (no-result OR
+    # partial) with some evidence -> a GENERIC degraded PARTIAL (partial_kind=degraded, NOT pagination truncation).
+    if len(vals) and first_page_failures == len(vals) and not found:
+        raise last_exc
+    if errored:
+        dominant = err_classes.most_common(1)[0][0]
+        return ProviderResult(found, partial=True, partial_kind="degraded", error_class=dominant,
+                              partial_reason=f"{errored}/{len(vals)} shodan pivot(s) errored ({dominant}) — evidence KEPT")
+    return found
 
 
 def _favicon_pivot(ctx) -> None:
@@ -78,12 +189,19 @@ def _favicon_pivot(ctx) -> None:
     key = secrets.shodan()
     if not key:
         return
-    n = _shodan_pivot(ctx, key,
-                      (l.get("favicon") for l in ctx.run.read("live") if l.get("favicon")),
-                      "http.favicon.hash", "favicon-shodan", "favicon",
-                      "same favicon (hash {}) as an in-scope host — VERIFY OWNERSHIP")
-    if n:
-        ctx.echo(f"  favicon: +{n} in-scope host(s) via Shodan favicon-hash pivot")
+    vals = [l.get("favicon") for l in ctx.run.read("live") if l.get("favicon")]
+    # review-r2#2: run through the provider contract (registered source_id -> tool_start/tool_finish lifecycle).
+    # review-r3#5: a stable work_unit from the bounded inputs (the pivot hash set) + effective config (facet,
+    # page budget) — the C07/C10 resume key.
+    wu = events.work_unit("probe.favicon", inputs={"hashes": sorted({str(x) for x in vals if x})},
+                          config={"facet": "http.favicon.hash", "max_pages": settings.concurrency("SHODAN_MAX_PAGES", 1),
+                                  "pivot_cap": _SHODAN_PIVOT_CAP, "oos_cap": _SHODAN_OOS_CAP,
+                                  "cred_fp": secrets.fingerprint(key)})   # review-r4#4 + r5#5 (account scope)
+    hosts = run_provider("probe.favicon", lambda: _shodan_pivot(
+        ctx, key, vals, "http.favicon.hash", "favicon-shodan", "probe.favicon",
+        "same favicon (hash {}) as an in-scope host — VERIFY OWNERSHIP"), work_unit=wu)
+    if hosts:
+        ctx.echo(f"  favicon: +{len(hosts)} in-scope host(s) via Shodan favicon-hash pivot")
 
 
 def _cert_pivot(ctx) -> None:
@@ -93,12 +211,16 @@ def _cert_pivot(ctx) -> None:
     key = secrets.shodan()
     if not key:
         return
-    n = _shodan_pivot(ctx, key,
-                      (c.get("sha1") for c in ctx.run.read("certificate") if c.get("sha1")),
-                      "ssl.cert.fingerprint", "cert-shodan", "cert",
-                      "same TLS cert (sha1 {}) as an in-scope host — VERIFY OWNERSHIP")
-    if n:
-        ctx.echo(f"  cert: +{n} in-scope host(s) via Shodan cert-fingerprint pivot")
+    vals = [c.get("sha1") for c in ctx.run.read("certificate") if c.get("sha1")]
+    wu = events.work_unit("probe.cert", inputs={"sha1": sorted({str(x) for x in vals if x})},
+                          config={"facet": "ssl.cert.fingerprint", "max_pages": settings.concurrency("SHODAN_MAX_PAGES", 1),
+                                  "pivot_cap": _SHODAN_PIVOT_CAP, "oos_cap": _SHODAN_OOS_CAP,
+                                  "cred_fp": secrets.fingerprint(key)})   # review-r4#4 + r5#5 (account scope)
+    hosts = run_provider("probe.cert", lambda: _shodan_pivot(
+        ctx, key, vals, "ssl.cert.fingerprint", "cert-shodan", "probe.cert",
+        "same TLS cert (sha1 {}) as an in-scope host — VERIFY OWNERSHIP"), work_unit=wu)
+    if hosts:
+        ctx.echo(f"  cert: +{len(hosts)} in-scope host(s) via Shodan cert-fingerprint pivot")
 
 
 def _vhost_wordlist():

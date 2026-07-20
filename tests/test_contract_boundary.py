@@ -185,6 +185,42 @@ class TestRegistryAuthoritative:
         events.reset()
 
 
+class TestEventSourceIdsRegistered:
+    """review-r2#2: every LITERAL source_id a phase/cloud module emits — through the contract (run_provider /
+    run_contract) OR an events.* call — must exist in sources.yaml. This catches a lane emitting under an
+    unregistered id (cloud's old `cloud.bucket_enum`, Shodan's unbracketed `probe.favicon`), which would run
+    outside the authoritative registry. Dynamic (f-string/variable) ids are validated at runtime by the
+    contract itself (unknown -> tool_blocked)."""
+    EVENT_FNS = {"tool_start", "tool_finish", "tool_progress", "coverage_partial", "tool_blocked",
+                 "ledger", "coverage_reset", "artifact_written"}
+    CONTRACT_FNS = {"run_provider", "run_contract"}
+
+    def _literal_source_ids(self):
+        import pathlib
+        import quarry_recon.phases as pkg
+        files = list(pathlib.Path(pkg.__file__).parent.glob("*.py"))
+        files.append(pathlib.Path(inspect.getsourcefile(importlib.import_module("quarry_recon.cloud"))))
+        out = {}
+        for f in files:
+            if f.stem == "__init__":
+                continue
+            for node in ast.walk(ast.parse(f.read_text())):
+                if not (isinstance(node, ast.Call) and node.args):
+                    continue
+                fn = (node.func.id if isinstance(node.func, ast.Name) and node.func.id in self.CONTRACT_FNS else
+                      node.func.attr if isinstance(node.func, ast.Attribute) and node.func.attr in self.EVENT_FNS
+                      else None)
+                if fn and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    out.setdefault(node.args[0].value, set()).add(f.stem)
+        return out
+
+    def test_all_literal_event_source_ids_are_registered(self):
+        from quarry_recon import sources
+        reg = set(sources.all_sources())
+        unregistered = {sid: sorted(mods) for sid, mods in self._literal_source_ids().items() if sid not in reg}
+        assert not unregistered, f"event/contract source_ids not in sources.yaml: {unregistered}"
+
+
 class TestOneStableLifecycle:
     def _events(self, tmp_path):
         p = tmp_path / "events.jsonl"

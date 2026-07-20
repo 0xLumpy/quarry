@@ -462,6 +462,24 @@ class Run:
                   and any(m in why.lower() for m in _MISSING)):
                 gaps.append({"phase": r.phase, "tool": r.tool, "status": "missing",
                              "why": why, "output_lines": 0})       # required tool absent -> coverage gap
+        # review-r3#1/r4#6: in-process provider terminals (run_provider) never hit _tool_runs — fold them here
+        # so a FAILED/PARTIAL provider feeds the verdict AND every provider terminal (incl. clean) increments
+        # tool_status (a `tools_failed` count without a matching status count is a lie). Keyed by
+        # (source_id, work_unit), latest per current generation.
+        for term in self._read_provider_terminals():
+            sid = term.get("source_id", "?")
+            st = term.get("status")
+            status_counts[st] = status_counts.get(st, 0) + 1     # providers count toward tool_status too
+            if st not in ("failed", "partial", "incomplete"):
+                continue
+            why = term.get("reason") or term.get("error_class") or st
+            entry = {"phase": sid.split(".", 1)[0], "tool": sid, "why": why}
+            if term.get("error_class"):
+                entry["error_class"] = term["error_class"]
+            if st == "failed":
+                failures.append(entry)
+            else:                                                 # partial / incomplete (crash) -> a coverage gap
+                gaps.append({**entry, "status": st, "output_lines": 0})
         phase_exceptions = [secrets.redact(n) for n in self.notes if "EXCEPTION" in n]
         # ── coverage counters: reconcile event-level input omissions into the verdict ──────────────
         # A cap/timeout SITE records tool-level success yet may truncate eligible input; its coverage_partial
@@ -572,6 +590,44 @@ class Run:
             elif a["units"]:
                 a["reason"] = a["units"][0]["reason"]             # fully covered — carry a representative note
         return list(agg.values())
+
+    def _read_provider_terminals(self) -> list[dict]:
+        """review-r3#1/r4#6: fold IN-PROCESS provider terminals (run_provider, marked provider=True) into the
+        verdict — they never hit _tool_runs, so a FAILED/PARTIAL provider would otherwise leave the run looking
+        complete, and clean providers would be invisible to the status counts. Returns ALL current-generation
+        terminals (the caller counts every status and gates on failed/partial). GENERATION (review-r4#3): a
+        terminal marked reset_generation supersedes this source's PRIOR terminals (all work_units) — processed in
+        LINE ORDER so a resume/config-change clears stale failures, keeping the LATEST per (source_id, work_unit)
+        within the current generation. The `provider` flag prevents double-counting a subprocess lane."""
+        from . import events
+        ev = self.dir / "events.jsonl"
+        if not ev.exists():
+            return []
+        latest: dict[tuple, dict] = {}
+        try:
+            for line in ev.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                et = rec.get("event")
+                if not rec.get("provider") or et not in (events.TOOL_START, events.TOOL_FINISH):
+                    continue
+                sid = rec.get("source_id", "?")
+                key = (sid, rec.get("work_unit"))
+                if et == events.TOOL_START:
+                    if rec.get("reset_generation"):               # review-r5#1: reset persisted BEFORE execution
+                        for k in [k for k in latest if k[0] == sid]:   # new generation: drop this source's prior units
+                            del latest[k]
+                    # record the START as INCOMPLETE — replaced when the matching terminal arrives; a start with
+                    # NO terminal (crash mid-provider) stays incomplete and gates the verdict.
+                    latest[key] = {"source_id": sid, "work_unit": rec.get("work_unit"),
+                                   "status": "incomplete", "reason": "provider started but never finished (crash?)"}
+                else:                                             # TOOL_FINISH — terminal supersedes the start
+                    latest[key] = rec
+        except Exception:
+            return []
+        return list(latest.values())
 
     def write_manifest(self, profile_summary: dict, phases_run: list[str],
                        metrics: dict | None = None) -> None:
