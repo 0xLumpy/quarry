@@ -501,23 +501,67 @@ class TestGoArchiveChecksum:
         assert "sha256sum -c" in cmds[0] and ("a" * 64) in cmds[0]              # the archive is checksum-verified
 
 
+def _health_env(monkeypatch, *, installed=True, identity="v1", cap_rc=0):
+    # the REAL health seams (identity probed once + capability probe) — not the drift() wrapper
+    monkeypatch.setattr(Tool, "installed", property(lambda self: installed))
+    monkeypatch.setattr(registry, "installed_identity", lambda t: identity)
+    monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (cap_rc, ""))
+
+
 class TestVerifyInstalled:
     def test_ok_tool_with_passing_capability_verifies(self, monkeypatch):
-        monkeypatch.setattr(registry, "drift", lambda t: "ok")
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, ""))
+        _health_env(monkeypatch, identity="v1")
         assert registry.verify_installed(_tool(pin="v1", version_cmd="x -version")) is True
 
-    @pytest.mark.parametrize("d", ["DRIFT", "version-unknown", "not-installed"])
-    def test_bad_identity_fails_verification(self, monkeypatch, d):
+    @pytest.mark.parametrize("identity", ["v2", ""])            # DRIFT (v2!=v1) · version-unknown ("")
+    def test_bad_identity_fails_verification(self, monkeypatch, identity):
         # review-C08.2r4#1: a present tool with unverified identity is NOT healthy (would be reinstalled)
-        monkeypatch.setattr(registry, "drift", lambda t: d)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, ""))
+        _health_env(monkeypatch, identity=identity)
+        assert registry.verify_installed(_tool(pin="v1", version_cmd="x -version")) is False
+
+    def test_not_installed_fails_verification(self, monkeypatch):
+        _health_env(monkeypatch, installed=False)
         assert registry.verify_installed(_tool(pin="v1", version_cmd="x -version")) is False
 
     def test_capability_failure_fails_verification(self, monkeypatch):
-        monkeypatch.setattr(registry, "drift", lambda t: "ok")
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (127, ""))
+        _health_env(monkeypatch, identity="v1", cap_rc=127)
         assert registry.verify_installed(_tool(pin="v1", version_cmd="x -version")) is False
+
+
+class TestHealth:
+    def test_ok_snapshot(self, monkeypatch):
+        _health_env(monkeypatch, identity="v1")
+        h = registry.health(_tool(pin="v1", version_cmd="x -version"))
+        assert h["ok"] and h["drift"] == "ok" and h["identity"] == "v1" and h["capability"] is True
+
+    def test_drift_is_not_ok(self, monkeypatch):
+        _health_env(monkeypatch, identity="v2")
+        h = registry.health(_tool(pin="v1", version_cmd="x -version"))
+        assert not h["ok"] and h["drift"] == "DRIFT" and h["identity"] == "v2"
+
+    def test_identity_unknown_is_not_ok(self, monkeypatch):
+        _health_env(monkeypatch, identity="")
+        h = registry.health(_tool(pin="v1", version_cmd="x -version"))
+        assert not h["ok"] and h["drift"] == "version-unknown"
+
+    def test_capability_failure_is_not_ok_even_when_drift_ok(self, monkeypatch):
+        _health_env(monkeypatch, identity="v1", cap_rc=127)
+        h = registry.health(_tool(pin="v1", version_cmd="x -version"))
+        assert not h["ok"] and h["drift"] == "ok" and h["capability"] is False
+
+    def test_no_probe_capability_is_none(self, monkeypatch):
+        _health_env(monkeypatch, identity="v1")
+        h = registry.health(_tool(pin="v1"))                   # no version_cmd/capability
+        assert h["ok"] and h["capability"] is None
+
+    def test_probes_identity_exactly_once(self, monkeypatch):
+        calls = {"n": 0}
+        monkeypatch.setattr(Tool, "installed", property(lambda self: True))
+        monkeypatch.setattr(registry, "installed_identity",
+                            lambda t: (calls.__setitem__("n", calls["n"] + 1), "v1")[1])
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, ""))
+        registry.health(_tool(pin="v1", version_cmd="x -version"))
+        assert calls["n"] == 1                                 # NOT re-probed for display + verdict
 
 
 class TestShapeGuards:
@@ -661,3 +705,61 @@ class TestIdentityR6:
         assert registry.install_one(t, msgs.append) is False
         assert not (tmp_path / ".local" / "bin" / ".gitleaks.lock").exists()   # no receipt written
         assert any("hash" in m for m in msgs)
+
+
+class TestDoctorVersion:
+    def _v(self, monkeypatch, ident, banner=""):
+        from quarry_recon import cli
+        monkeypatch.setattr(Tool, "version", lambda self: banner)
+        return cli._doctor_version(_tool(bin="x", runtime="go"), ident)
+
+    def test_identity_shown_when_present(self, monkeypatch):
+        assert self._v(monkeypatch, "v2.14.0") == "v2.14.0"        # agrees with install source
+
+    def test_empty_identity_falls_back_to_banner(self, monkeypatch):
+        assert self._v(monkeypatch, "", banner="v9.9.9") == "v9.9.9"
+
+    def test_empty_identity_no_banner_is_unknown(self, monkeypatch):
+        assert "version unknown" in self._v(monkeypatch, "", banner="")
+
+    def test_distro_prefers_banner(self, monkeypatch):
+        assert self._v(monkeypatch, "distro", banner="7.94") == "7.94"
+
+    def test_distro_without_banner_shows_distro(self, monkeypatch):
+        assert "distro" in self._v(monkeypatch, "distro", banner="")
+
+    def test_long_source_ref_is_shortened(self, monkeypatch):
+        ref = "6bfa47197d78e68b79041d494e280174cb2d6ae1"           # 40-hex commit
+        assert self._v(monkeypatch, ref) == ref[:12]
+
+    def test_pseudo_version_not_treated_as_hex(self, monkeypatch):
+        pv = "v0.0.0-20260422172756-4f562901bc23"                  # has non-hex chars -> shown whole
+        assert self._v(monkeypatch, pv) == pv
+
+
+class TestDoctorRender:
+    # Codex P1: a present-but-unverified tool must render ⚠ unverified (+reason), never ✓ — even with a banner.
+    def test_reason_drift(self):
+        from quarry_recon import cli
+        r = cli._health_reason({"drift": "DRIFT", "identity": "v2", "capability": None}, _tool(pin="v1"))
+        assert "drift" in r and "v2" in r and "v1" in r
+
+    def test_reason_identity_unknown(self):
+        from quarry_recon import cli
+        r = cli._health_reason({"drift": "version-unknown", "identity": "", "capability": None}, _tool(pin="v1"))
+        assert "identity unproven" in r
+
+    def test_reason_capability(self):
+        from quarry_recon import cli
+        r = cli._health_reason({"drift": "ok", "identity": "v1", "capability": False}, _tool(pin="v1"))
+        assert "capability" in r
+
+    def test_identity_unknown_with_valid_banner_still_unverified(self, monkeypatch):
+        # the shadowed/unproven case: version() has a banner, but health.ok is False -> ⚠ not ✓
+        from quarry_recon import cli
+        _health_env(monkeypatch, identity="")                      # unproven identity
+        t = _tool(pin="v1", version_cmd="x -version")
+        monkeypatch.setattr(Tool, "version", lambda self: "v9.9.9")
+        h = registry.health(t)
+        assert h["ok"] is False                                    # verdict: unverified
+        assert cli._doctor_version(t, h["identity"]) == "v9.9.9"   # banner still DISPLAYED (info only)

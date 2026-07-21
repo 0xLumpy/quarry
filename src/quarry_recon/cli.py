@@ -11,7 +11,7 @@ import click
 
 from . import __version__, events, secrets
 from .config import ProfileError, TargetProfile
-from .registry import install_one, load_tools, tools_by_phase, verify_installed
+from .registry import health, install_one, load_tools, tools_by_phase, verify_installed
 
 
 def _projects_root(opt: str | None) -> Path:
@@ -165,6 +165,34 @@ def lock(drift_only):
                   f"{len(unknown)} version-unknown", "cyan"))
 
 
+def _doctor_version(t, ident: str) -> str:
+    """Doctor's version string from the ALREADY-PROBED runtime identity (go module · pipx meta · binary/source
+    receipt) — so doctor AGREES with install and pipx/source tools stop showing a false "version unknown" just
+    because they lack a --version flag. distro tools prefer their real CLI banner over the "distro" sentinel; a
+    long source-ref identity is shortened. Falls back to the banner (display-only, NOT proof of health — the ✓/⚠
+    verdict is separate), then an honest "version unknown"."""
+    if ident == "distro":
+        return t.version() or _c("distro", "cyan")
+    if ident:
+        return ident[:12] if len(ident) > 20 and all(c in "0123456789abcdef" for c in ident.lower()) else ident
+    return t.version() or _c("version unknown", "yellow")   # C08.1#1: empty = unparseable, not a pin
+
+
+def _health_reason(h: dict, t) -> str:
+    """Why a PRESENT tool is unverified (drift/identity/capability) — the same failure the install path would
+    act on (reinstall). Identity problems take precedence over the capability probe."""
+    d = h["drift"]
+    if d == "DRIFT":
+        return f"drift — installed {h['identity'] or '?'} != pin {t.pin or t.ref}"
+    if d == "version-unknown":
+        return "identity unproven — shadowed PATH copy, missing/bad receipt, or unparseable"
+    if d == "unpinned":
+        return "unpinned — present but no pin/ref to verify against"
+    if h["capability"] is False:
+        return "capability probe failed"
+    return d
+
+
 # ── doctor ──────────────────────────────────────────────────────────────────
 @cli.command()
 @click.option("--phase", help="only audit tools for this phase")
@@ -179,9 +207,15 @@ def doctor(phase):
             cur_phase = t.phase
             click.echo(_c(f"[{cur_phase}]", "magenta"))
         if t.installed:
-            ok += 1
-            ver = t.version() or _c("version unknown", "yellow")   # C08.1#1: empty = unparseable, not a pin
-            click.echo(f"  {_c('✓', 'green')} {t.bin:<20} {ver}")
+            h = health(t)                                        # verify-grade verdict, identity probed once
+            ver = _doctor_version(t, h["identity"])
+            if h["ok"]:
+                ok += 1
+                click.echo(f"  {_c('✓', 'green')} {t.bin:<20} {ver}")
+            else:
+                warn += 1                                        # present but UNVERIFIED — ✓ would be a lie
+                click.echo(f"  {_c('⚠', 'yellow')} {t.bin:<20} {ver}  "
+                           f"{_c('unverified: ' + _health_reason(h, t), 'yellow')}")
         elif t.optional:
             click.echo(f"  {_c('·', 'yellow')} {t.bin:<20} optional, not installed")
         else:
@@ -305,8 +339,11 @@ def doctor(phase):
     if miss:
         verdict = _c(f"✗ NOT READY — {miss} required tool(s) missing{scope_note}", "red") + \
             "  → quarry install"
+    elif warn:
+        verdict = _c(f"⚠ DEGRADED — {warn} present but UNVERIFIED (drift/identity/capability){scope_note}", "yellow") + \
+            "  → quarry install  (reinstalls to the pin)"
     else:
-        verdict = _c("✓ READY", "green") + f" — {ok} tools installed, all required present{scope_note}"
+        verdict = _c("✓ READY", "green") + f" — {ok} tools installed + verified, all required present{scope_note}"
     click.echo(f"\n{verdict}\n")
 
 

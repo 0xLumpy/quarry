@@ -399,17 +399,29 @@ def _capability_ok(rc: int, accepted=None) -> bool:
     return rc in (accepted or {0})
 
 
+def health(t: Tool) -> dict:
+    """The SINGLE-probe health snapshot shared by `verify_installed` (install) and `doctor` (audit) — so
+    doctor's ✓ means EXACTLY what install's verify means (identity drift 'ok'/'distro' AND capability pass),
+    never merely 'present on PATH'. Probes the runtime identity ONCE and reuses it for both the verdict and the
+    displayed version. `capability` is None when the tool declares no probe (nothing to fail); `ok` is the
+    verify verdict. Keys: installed · identity · drift · capability · ok."""
+    if not t.installed:
+        return {"installed": False, "identity": "", "drift": "not-installed", "capability": None, "ok": False}
+    iv = installed_identity(t)                               # probe ONCE, reuse for drift + display
+    d = _drift_status(t, True, iv)
+    cap = None
+    probe = t.capability or t.version_cmd
+    if probe:
+        cap = _capability_ok(_probe(probe)[0], set(t.cap_codes) if t.cap_codes else None)
+    return {"installed": True, "identity": iv, "drift": d, "capability": cap,
+            "ok": d in ("ok", "distro") and cap is not False}
+
+
 def verify_installed(t: Tool) -> bool:
     """review-C08.2r4#1: is an ALREADY-installed tool HEALTHY? Its identity must verify (drift 'ok', or 'distro'
     for a distro-managed tool) AND its capability probe pass. `install` uses this to decide whether a present
     tool may be left as-is — a failed prior update that left a wrong binary no longer reads as healthy."""
-    d = drift(t)
-    if d not in ("ok", "distro"):
-        return False
-    probe = t.capability or t.version_cmd
-    if probe and not _capability_ok(_probe(probe)[0], set(t.cap_codes) if t.cap_codes else None):
-        return False
-    return True
+    return health(t)["ok"]
 
 
 def install_one(t: Tool, echo, dry_run: bool = False) -> bool:

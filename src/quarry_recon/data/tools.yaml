@@ -358,7 +358,9 @@ tools:
     phase: params
     role: param discovery on param-less endpoints
     install: pipx install arjun
-    version_cmd: arjun --version
+    # arjun has NO version flag (`arjun --version` -> argparse rc 2). Its version comes from the pipx
+    # identity, not a CLI banner; `arjun -h` (rc 0) is the capability smoke test.
+    capability: arjun -h
     doc: https://github.com/s0md3v/Arjun
     runtime: pipx
     notes: Uses -t 5 by default; -d (per-request delay) applied only when RATELIMIT.HTTP is set.
