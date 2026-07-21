@@ -379,13 +379,23 @@ tools:
       for days. -stats -si to a logfile (never /dev/null — that hides blocking).
 
   - bin: dalfox
-    version: "v2.13.0"
     phase: params
-    role: XSS + open-redirect on reflected candidates
-    install: go install github.com/hahwul/dalfox/v2@latest
-    version_cmd: dalfox version
+    role: reflected-XSS candidate scan (v3 Rust; JSONL output, static AST DOM analysis)
+    # v0.3.8: dalfox v2 (go install) -> v3 (Rust rewrite). Distributed as a prebuilt musl-STATIC release binary
+    # (no glibc/Rust dep at runtime, cross-distro) with per-platform sha256 artifacts -> C08 `binary` runtime; go
+    # install no longer applies. The tarball nests the binary under a versioned dir, so the stage step strips it
+    # (--strip-components=1 --wildcards "*/{bin}"). v3 flags + JSONL parse live in params.py (_dalfox_cmd + _parse_dalfox_jsonl).
+    version: "v3.1.2"
+    repo: hahwul/dalfox
+    runtime: binary
+    artifacts:
+      linux/amd64: {url: "https://github.com/hahwul/dalfox/releases/download/v3.1.2/dalfox-v3.1.2-linux-x86_64-musl.tar.gz",  sha256: "0818b75082bf8527c5c4b6f4ed0f745f393290637328335788c9eadfea6cf0b2"}
+      linux/arm64: {url: "https://github.com/hahwul/dalfox/releases/download/v3.1.2/dalfox-v3.1.2-linux-aarch64-musl.tar.gz", sha256: "d21f541038a40d8dd5c4b655fb88159a4b9a75c63f61c3e244647326a5199bc2"}
+    install: 'mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o /tmp/{bin}.tgz && echo "{sha256}  /tmp/{bin}.tgz" | sha256sum -c - && tar -xzf /tmp/{bin}.tgz -C ~/.local/bin/.stage --strip-components=1 --wildcards "*/{bin}" && chmod +x ~/.local/bin/.stage/{bin} && rm -f /tmp/{bin}.tgz'
+    version_cmd: dalfox --version
     doc: https://github.com/hahwul/dalfox
-    notes: --skip-bav; uses dalfox defaults; --delay applied only when RATELIMIT.HTTP is set.
+    deps: [curl]
+    notes: v3 flags + JSONL parse handled in params.py (step 2); RoE rate via global --rate-limit.
 
   - bin: interactsh-client
     version: "v1.3.1"

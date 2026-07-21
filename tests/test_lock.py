@@ -359,6 +359,7 @@ class TestInstallOne:
         # review-C08.2r3#2: after activation, an older PATH copy that shadows the managed binary is a failure
         t, stage, dest = self._binary(monkeypatch, tmp_path)
         monkeypatch.setattr(registry.shutil, "which", lambda b: "/usr/local/bin/gitleaks")   # shadow
+        monkeypatch.setattr(registry, "_go_bin_dir", lambda: None)   # non-go shadow -> not reclaimable
         assert registry.install_one(t, lambda m: None) is False
 
     def test_unsupported_platform_returns_false_not_crash(self, monkeypatch):
@@ -763,3 +764,108 @@ class TestDoctorRender:
         h = registry.health(t)
         assert h["ok"] is False                                    # verdict: unverified
         assert cli._doctor_version(t, h["identity"]) == "v9.9.9"   # banner still DISPLAYED (info only)
+
+
+class TestGoBinaryMigration:
+    # review-C08.2r7: a go->binary runtime migration (dalfox v2 go -> v3 binary) must reclaim a legacy
+    # ~/go/bin copy that would shadow the newly-activated managed binary — else the upgrade silently keeps v2.
+    def _setup(self, monkeypatch, tmp_path, *, stage_ok=True):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(registry, "current_platform", lambda: "linux/amd64")
+        gobin = tmp_path / "go" / "bin"; gobin.mkdir(parents=True)
+        legacy = gobin / "dalfox"; legacy.write_text("V2-OLD")             # the shadowing go-install binary
+        stage = tmp_path / ".local" / "bin" / ".stage" / "dalfox"
+        dest = tmp_path / ".local" / "bin" / "dalfox"; dest.parent.mkdir(parents=True, exist_ok=True)
+
+        def rs(c, d):
+            if "curl" in c and stage_ok:
+                stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text("V3-NEW")
+            return (0, "") if stage_ok else (1, "")
+        monkeypatch.setattr(registry, "run_shell", rs)
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, "v3.1.2"))
+        monkeypatch.setattr(registry, "_go_bin_dir", lambda: gobin)
+        # PATH resolves the legacy go copy FIRST while it exists; only after relocation does dest win
+        monkeypatch.setattr(registry.shutil, "which",
+                            lambda b: str(legacy) if legacy.exists() else (str(dest) if dest.exists() else None))
+        t = _tool(bin="dalfox", runtime="binary", pin="v3.1.2", version_cmd="dalfox --version",
+                  artifacts={"linux/amd64": {"url": "https://x/d.tgz", "sha256": _VALID_SHA}},
+                  install="curl {url} ... {bin}")
+        return t, legacy, dest, gobin
+
+    def test_migration_reclaims_legacy_and_resolves_managed_v3(self, monkeypatch, tmp_path):
+        t, legacy, dest, gobin = self._setup(monkeypatch, tmp_path)
+        msgs = []
+        assert registry.install_one(t, msgs.append) is True
+        assert dest.read_text() == "V3-NEW"                                # managed v3 activated + resolves
+        assert not legacy.exists()                                         # legacy no longer shadows
+        baks = list(gobin.glob("dalfox.quarry-replaced-*"))
+        assert baks and baks[0].read_text() == "V2-OLD"                    # relocated as ROLLBACK EVIDENCE, not deleted
+        assert any("relocated legacy" in m for m in msgs)
+
+    def test_failed_v3_install_leaves_v2_intact(self, monkeypatch, tmp_path):
+        t, legacy, dest, gobin = self._setup(monkeypatch, tmp_path, stage_ok=False)
+        assert registry.install_one(t, lambda m: None) is False
+        assert legacy.read_text() == "V2-OLD"                              # staging failed BEFORE touching v2
+        assert not dest.exists()                                           # nothing activated
+        assert not list(gobin.glob("dalfox.quarry-replaced-*"))           # no relocation on a failed install
+
+    def test_shadow_outside_go_bin_is_not_touched(self, monkeypatch, tmp_path):
+        t, legacy, dest, gobin = self._setup(monkeypatch, tmp_path)
+        sysdir = tmp_path / "usr" / "local" / "bin"; sysdir.mkdir(parents=True)
+        sysshadow = sysdir / "dalfox"; sysshadow.write_text("SYS")         # a shadow we do NOT own
+        monkeypatch.setattr(registry.shutil, "which", lambda b: str(sysshadow))
+        assert registry.install_one(t, lambda m: None) is False           # cannot reclaim a non-go shadow -> fail loud
+        assert sysshadow.read_text() == "SYS"                             # untouched
+        assert not list(gobin.glob("dalfox.quarry-replaced-*"))
+
+
+class TestReclaimTransactional:
+    # review-r8#3: the receipt is written BEFORE any legacy copy is touched, and a failed migration restores v2.
+    def _mig(self, monkeypatch, tmp_path, *, which_after_reclaim="dest"):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(registry, "current_platform", lambda: "linux/amd64")
+        gobin = tmp_path / "go" / "bin"; gobin.mkdir(parents=True)
+        legacy = gobin / "dalfox"; legacy.write_text("V2-OLD")
+        stage = tmp_path / ".local" / "bin" / ".stage" / "dalfox"
+        dest = tmp_path / ".local" / "bin" / "dalfox"; dest.parent.mkdir(parents=True, exist_ok=True)
+
+        def rs(c, d):
+            if "curl" in c:
+                stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text("V3-NEW")
+            return (0, "")
+        monkeypatch.setattr(registry, "run_shell", rs)
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, "v3.1.2"))
+        monkeypatch.setattr(registry, "_go_bin_dir", lambda: gobin)
+        # while legacy exists it shadows; after reclaim, either dest resolves ("dest") or nothing does ("none")
+        def which(b):
+            if legacy.exists():
+                return str(legacy)
+            return str(dest) if (which_after_reclaim == "dest" and dest.exists()) else None
+        monkeypatch.setattr(registry.shutil, "which", which)
+        t = _tool(bin="dalfox", runtime="binary", pin="v3.1.2", version_cmd="dalfox --version",
+                  artifacts={"linux/amd64": {"url": "https://x/d.tgz", "sha256": _VALID_SHA}},
+                  install="curl {url} ... {bin}")
+        return t, legacy, dest, gobin
+
+    def test_hash_failure_leaves_legacy_intact(self, monkeypatch, tmp_path):
+        t, legacy, dest, gobin = self._mig(monkeypatch, tmp_path)
+        monkeypatch.setattr(registry, "_file_sha256", lambda p: "")     # unhashable -> fail BEFORE reclaim
+        assert registry.install_one(t, lambda m: None) is False
+        assert legacy.read_text() == "V2-OLD"                           # legacy untouched (transactional)
+        assert not list(gobin.glob("dalfox.quarry-replaced-*"))
+
+    def test_receipt_failure_leaves_legacy_intact(self, monkeypatch, tmp_path):
+        t, legacy, dest, gobin = self._mig(monkeypatch, tmp_path)
+        def boom(*a, **k):
+            raise OSError("receipt write denied")
+        monkeypatch.setattr(registry, "_write_receipt", boom)           # fail BEFORE reclaim
+        assert registry.install_one(t, lambda m: None) is False
+        assert legacy.read_text() == "V2-OLD"
+        assert not list(gobin.glob("dalfox.quarry-replaced-*"))
+
+    def test_unresolvable_dest_after_reclaim_restores_legacy(self, monkeypatch, tmp_path):
+        # reclaim succeeds but the managed binary still doesn't resolve (~/.local/bin not on PATH) -> restore v2
+        t, legacy, dest, gobin = self._mig(monkeypatch, tmp_path, which_after_reclaim="none")
+        assert registry.install_one(t, lambda m: None) is False
+        assert legacy.exists() and legacy.read_text() == "V2-OLD"       # legacy RESTORED (host keeps a working tool)
+        assert not list(gobin.glob("dalfox.quarry-replaced-*"))         # relocation reverted

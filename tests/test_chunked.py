@@ -180,28 +180,29 @@ class TestChunkedLifecycleBehavior:
         monkeypatch.setattr(settings, "workers", lambda t, d: d)
         import quarry_recon.secrets as sec
         monkeypatch.setattr(sec, "oob", lambda: {})
+        monkeypatch.setattr(params, "_dalfox_engine_id", lambda: "test-engine")   # no registry.health probe offline
 
+        from pathlib import Path
         def ok_with_poc(tool, cmd, timeout=None, **k):
-            return RunResult("dalfox", cmd, Status.SUCCESS, 0, 0.1, None, 0)
+            # dalfox writes the JSONL to its -o FILE during exec — one valid finding, clean (exit 1 + finding)
+            cf = Path(cmd[cmd.index("-o") + 1])
+            cf.write_text('{"meta":{"findings_count":1}}\n'
+                          '{"type":"R","param":"q","data":"https://h/x?q=1","severity":"Medium",'
+                          '"message_str":"reflected q","method":"GET","location":"Query"}\n')
+            return RunResult("dalfox", cmd, Status.SUCCESS, 1, 0.1, None, 0)
         monkeypatch.setattr(params, "exec_tool", ok_with_poc)
 
         class _RaisingCtx(_Ctx):
             def add(self, *a, **k):
                 raise RuntimeError("store write failed mid-ingestion")
-        # write a POC line into the chunk output file so the ingestion loop runs and hits add()
+        # ingestion now happens in the SOURCE-level aggregate; a store-write raise must PROPAGATE and leave the
+        # SOURCE terminal FAILED (never a silent success)
         ctx = _RaisingCtx(tmp_path)
-        real_raw = ctx.raw_path
-        def raw_with_poc(ph, tl, nm):
-            p = real_raw(ph, tl, nm)
-            if "dalfox_xss_" in nm:
-                p.write_text("[POC] https://h/x?q=1\n")
-            return p
-        ctx.raw_path = raw_with_poc
         with pytest.raises(RuntimeError):
             params._dalfox_xss_fast(ctx, [f"https://h/{i}?q=1" for i in range(3)], SimpleNamespace(http_rl=0))
-        chunk_finishes = [e for e in self._events(tmp_path)
-                          if e["event"] == "tool_finish" and not e.get("discovery_context")]
-        assert chunk_finishes and chunk_finishes[0]["status"] == "failed"
+        src_finish = [e for e in self._events(tmp_path)
+                      if e["event"] == "tool_finish" and e.get("discovery_context")]
+        assert src_finish and src_finish[0]["status"] == "failed"
 
     def test_nonresumable_rerun_does_not_destroy_prior_findings(self, tmp_path, monkeypatch):
         # review#2: unknown template state -> a nonce'd (different) work_unit each run. A CANCELLED rerun must

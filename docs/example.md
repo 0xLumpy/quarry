@@ -419,12 +419,16 @@ nuclei -l <work>/nuclei_targets.txt -jsonl -o raw/params/nuclei/findings.jsonl \
 arjun -i <work>/arjun_targets.txt -oT raw/params/arjun/arjun.txt -t 5 -d 1
 ```
 
-**7.5 dalfox** on the gf xss + redirect candidates (throttled):
+**7.5 dalfox v3** on the canonicalized xss candidates (rate-capped), structured JSONL output:
 
 ```bash
-dalfox file <work>/dalfox_in.txt --delay 250 -w 5 --skip-bav -o raw/params/dalfox/dalfox.txt
+dalfox scan -i file <work>/dalfox_in.txt -f jsonl -S --skip-mining \
+       --workers 30 --max-concurrent-targets 4 --rate-limit <http_rl> \
+       -o raw/params/dalfox/dalfox_xss_<chunk>.jsonl
 ```
-→ PoC lines → `finding` (`confirmed:false`).
+→ JSONL findings (meta row skipped; fail-closed parse) tiered by dalfox's verdict —
+`V`→`xss-verified`, `R`→`xss-candidate`, `A`→`dom-xss-static` — all `confirmed:false`
+(Quarry-owned impact validation is separate). Exit code: 0=no findings, 1=findings, ≥2=error.
 
 ```
 ▸ Params + lightweight scanning (nuclei OOB)

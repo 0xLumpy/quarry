@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -392,6 +393,39 @@ def pinned_install(t: Tool) -> str | None:
     return cmd
 
 
+def _go_bin_dir() -> "Path | None":
+    """The go-install OUTPUT dir (`GOBIN`, else `GOPATH/bin`, else ~/go/bin) — the ONLY location a go→binary
+    runtime migration is allowed to reclaim a shadowing legacy copy from (Quarry itself put it there when the
+    tool was a `go install` tool). Never a system dir. Returns None when it can't be resolved / doesn't exist."""
+    for var in ("GOBIN", "GOPATH"):
+        try:
+            out = subprocess.run(["go", "env", var], capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        if out:
+            d = Path(out) if var == "GOBIN" else Path(out) / "bin"
+            return d
+    d = Path.home() / "go" / "bin"
+    return d if d.exists() else None
+
+
+def _reclaim_go_shadow(bin_: str, shadow: "Path") -> "Path | None":
+    """review-C08.2r7 (dalfox v2 go → v3 binary): a legacy `go install` binary at ~/go/bin can sit EARLIER in
+    PATH than the newly-activated managed binary and shadow it — so the upgrade would silently keep running the
+    OLD tool. RECLAIM it, but ONLY when it lives in the go-install output dir (a copy Quarry owns): relocate it as
+    rollback EVIDENCE (`<bin>.quarry-replaced-<ts>`), never delete, never touch a path outside that dir. Returns
+    the relocation path on success, else None (caller then fails loud — a shadow we may not touch)."""
+    gb = _go_bin_dir()
+    try:
+        if not gb or shadow.resolve().parent != gb.resolve():
+            return None                                     # shadow isn't the go-install dir -> hands off
+        bak = shadow.with_name(f"{bin_}.quarry-replaced-{int(time.time())}")
+        os.replace(str(shadow), str(bak))                   # rename within the dir — relocate, not delete
+        return bak
+    except OSError:
+        return None
+
+
 def _capability_ok(rc: int, accepted=None) -> bool:
     """review-C08.2r2#2: a capability probe passes ONLY on the ACCEPTED exit codes — default exactly {0}, so an
     ordinary error / dependency failure / invalid command / traceback (rc 1..125) is NOT laundered into success.
@@ -469,22 +503,10 @@ def install_one(t: Tool, echo, dry_run: bool = False) -> bool:
                 return False
         dest = Path.home() / ".local" / "bin" / t.bin
         os.replace(str(stage), str(dest))                    # atomic activate
-        # review-C08.2r3#2/r4#4: the ACTIVATED binary must be the one that RESOLVES — it must be on PATH AND not
-        # shadowed by an older /usr/local/bin copy (else the run would use the wrong, unmanaged binary).
-        which = shutil.which(t.bin)
-        if not which:
-            echo(f"{t.bin}: activated but does NOT resolve on PATH (~/.local/bin not on PATH?)")
-            return False
-        if Path(which).resolve() != dest.resolve():
-            echo(f"{t.bin}: SHADOWED — {which} resolves before the managed {dest}")
-            return False
-        # review-C08.2r4#2/r5#2: write the receipt AFTER activation for BINARY AND source, keyed to the sha256 of
-        # the NOW-ACTIVE binary — so the receipt always describes the live binary AND a pre-C08 (receipt-less)
-        # binary is treated as unverified next run (reinstalled, so the checksum download actually runs). A crash
-        # before this leaves a missing receipt -> version-unknown -> reinstall (recoverable), never new-receipt +
-        # old-binary.
-        # review-C08.2r6#3: a receipt is only meaningful with a VALID digest — _file_sha256 returns "" on a read
-        # failure, and writing that would report success while leaving the binary unverified next run. Fail-closed.
+        # review-C08.2r4#2/r5#2/r6#3: record the receipt for the NOW-ACTIVE binary (sha256) FIRST — before any
+        # legacy copy is touched. So (a) the receipt always describes the live binary, a pre-C08 receipt-less
+        # binary is reinstalled next run; and (b, review-r8#3) a hash/receipt FAILURE returns False while the
+        # legacy binary is still UNtouched — the migration is transactional, it hasn't displaced anything yet.
         dest_sha = _file_sha256(dest)
         if not _SHA256_RE.fullmatch(dest_sha):
             echo(f"{t.bin}: activated but could not hash the binary for its receipt — reinstall to verify")
@@ -494,6 +516,28 @@ def install_one(t: Tool, echo, dry_run: bool = False) -> bool:
         except OSError as e:
             echo(f"{t.bin}: activated but could not write receipt ({e}) — reinstall to verify")
             return False
+        # review-C08.2r3#2/r4#4: the ACTIVATED binary must be the one that RESOLVES — on PATH AND not shadowed.
+        which = shutil.which(t.bin)
+        if not which:
+            echo(f"{t.bin}: activated but does NOT resolve on PATH (~/.local/bin not on PATH?)")
+            return False
+        if Path(which).resolve() != dest.resolve():
+            # review-C08.2r7: a copy earlier in PATH shadows the managed binary. If it's a legacy go-install
+            # binary (a go→binary runtime migration, e.g. dalfox v2→v3), reclaim it as rollback evidence so the
+            # managed v3 resolves; a shadow anywhere ELSE (system dir) we must NOT touch — fail loud.
+            shadow_orig = Path(which)
+            relocated = _reclaim_go_shadow(t.bin, shadow_orig)
+            if relocated:
+                echo(f"{t.bin}: relocated legacy go binary {which} -> {relocated} (runtime migration)")
+                which = shutil.which(t.bin)
+            if not which or Path(which).resolve() != dest.resolve():
+                if relocated:                                # review-r8#3: migration didn't take -> RESTORE the
+                    try:                                     # legacy binary so the host isn't left with neither
+                        os.replace(str(relocated), str(shadow_orig))
+                    except OSError:
+                        pass
+                echo(f"{t.bin}: SHADOWED — {which} resolves before the managed {dest}")
+                return False
         echo(f"{t.bin}: ok ({t.pin or t.ref})")
         return True
 

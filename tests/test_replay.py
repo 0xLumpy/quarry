@@ -40,30 +40,28 @@ class TestDalfoxCanonicalization:
 
 
 class TestRoERateControl:
-    """T0.1 (source-verified): dalfox --delay is the per-host RoE period (file mode is sequential + the
-    limiter is per-host mutex-serialized), set to ceil(1000/rl) so the payload rate never EXCEEDS rl;
-    arjun uses its global --rate-limit (keeps -t concurrency), not the per-thread -d."""
+    """v0.3.8: dalfox v3 has a REAL global --rate-limit (req/s, shared across workers AND targets) set directly
+    to http_rl — this SUPERSEDES v2's per-host --delay ceil(1000/rl) model (and its per-target-limiter caveat).
+    arjun uses its own global --rate-limit (keeps -t concurrency), not the per-thread -d."""
 
     class _Prof:
         def __init__(self, rl):
             self.http_rl = rl
 
-    def test_dalfox_delay_is_ceil_and_bounds_rate(self):
+    def test_dalfox_uses_global_rate_limit(self):
         cmd = params._dalfox_cmd("b", "o", self._Prof(3))
-        delay = int(cmd[cmd.index("--delay") + 1])
-        assert delay == -(-1000 // 3)                        # ceil(1000/3) = 334ms
-        assert 1000.0 / delay <= 3 + 1e-9                    # host payload rate never exceeds http_rl
+        assert cmd[cmd.index("--rate-limit") + 1] == "3"     # global rps cap == the RoE rate, no delay math
+        assert "--delay" not in cmd                          # v2 per-host delay model retired
 
-    def test_dalfox_delay_independent_of_workers(self):
-        # -w does NOT multiply the per-host rate → the delay is NOT worker-scaled (the wrong model)
-        cmd = params._dalfox_cmd("b", "o", self._Prof(10))
-        w = int(cmd[cmd.index("-w") + 1])
-        delay = int(cmd[cmd.index("--delay") + 1])
-        assert delay == -(-1000 // 10) and delay != round(1000 * w / 10)
+    def test_no_rate_no_rate_limit(self):
+        # no RoE cap set → no pacing flag at all (tool default speed, bounded by governed concurrency)
+        assert "--rate-limit" not in params._dalfox_cmd("b", "o", self._Prof(None))
 
-    def test_no_rate_no_delay(self):
-        # no RoE cap set → no pacing at all (tool default speed)
-        assert "--delay" not in params._dalfox_cmd("b", "o", self._Prof(None))
+    def test_dalfox_concurrency_is_2d_and_not_v2_hundred(self):
+        # v3 concurrency is 2D (--workers per-target × --max-concurrent-targets); v2's -w 100 / --max-cpu are gone
+        cmd = params._dalfox_cmd("b", "o", self._Prof(None))
+        assert "--workers" in cmd and "--max-concurrent-targets" in cmd
+        assert "-w" not in cmd and "--max-cpu" not in cmd
 
     def test_arjun_uses_global_rate_limit_not_per_thread_delay(self):
         import inspect

@@ -198,8 +198,8 @@ sources:
     notes: "RETIRED. was OTC 7.6h single-core mixed sink = THE timekiller; canonicalize (4.3.A) + split (4.3.B/C) replaced it. Kept for lineage/history."}
   # split targets (declared now; wired in the conversion batch):
   params.dalfox_xss_fast:    {tool: dalfox, phase: params, tier: heavy, class: active, default: on, bounded: planned,
-    input: xss_candidates(canonicalized), output: finding(xss-candidate), workers: "governor (-w, --max-cpu)", rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: internal, log: delta,
-    notes: "WIRED 4.3.B. flags --skip-bav --skip-mining-all --skip-headless --max-cpu -w (plain output + [POC] parse); chunked + input-hashed state; blind -b rides here until 4.3.D"}
+    input: xss_candidates(canonicalized), output: "finding(xss-verified|xss-candidate|dom-xss-static)", workers: "governor (--workers, --max-concurrent-targets)", rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: internal, log: delta,
+    notes: "WIRED 4.3.B; v3 (Rust) v0.3.8. flags scan -i file -f jsonl -S --skip-mining --workers --max-concurrent-targets --rate-limit; fail-closed JSONL parse, tiered V/R/A (all confirmed:false); chunk+resume; blind -b rides here until 4.3.D"}
   params.redirect_confirm:   {tool: internal, phase: params, tier: core, class: active, default: on,
     input: redirect_candidates, output: finding(open-redirect-candidate), workers: n/a, rate: http_rl, timeout: short, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "WIRED 4.3.C. native single-request Location probe (inject canary into redirect param, read Location WITHOUT following); confirmed only when the Location host is the canary; NO dalfox"}

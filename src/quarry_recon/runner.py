@@ -29,8 +29,8 @@ def _rss_tree_mb(root_pid: int) -> float:
     Uses PSS (Proportional Set Size) from `/proc/<pid>/smaps_rollup` — a shared page is divided among
     its sharers, so summing a tree of copy-on-write processes (chromium's child procs, forked workers)
     gives the TRUE physical footprint. A naive VmRSS *sum* counts shared pages once per process and can
-    inflate a tool's RAM manyfold (measured: a dalfox tree read ~8 GB by VmRSS-sum vs a 664 MB true
-    peak). Falls back to VmRSS when smaps_rollup is unavailable. Best-effort; 0.0 on error/non-Linux."""
+    inflate a tool's RAM manyfold (measured: a v2 dalfox+chromium tree read ~8 GB by VmRSS-sum vs a 664 MB
+    true peak). Falls back to VmRSS when smaps_rollup is unavailable. Best-effort; 0.0 on error/non-Linux."""
     try:
         parents: dict[int, int] = {}
         for name in os.listdir("/proc"):
@@ -348,7 +348,7 @@ _POSIX = (os.name == "posix")
 
 def terminate_group(proc, grace: float = _TERM_GRACE) -> None:
     """Kill a tool's ENTIRE process group — SIGTERM, bounded grace, then SIGKILL — so a tool that spawned
-    children (chromium under katana/dalfox, subshells) leaves NO orphan behind (the 'tool killed, Quarry
+    children (chromium under katana, subshells) leaves NO orphan behind (the 'tool killed, Quarry
     stuck' class). CALLERS MUST launch with Popen start_new_session=True, which makes the tool a
     session/group leader with pgid == pid. We use `proc.pid` as the PGID DIRECTLY (not os.getpgid, which
     fails once the leader itself has exited — a leader can die while a child still holds the pipe): the

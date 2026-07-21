@@ -13,6 +13,7 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .. import events, evidence, fetch, netguard, normalize, oob, secrets, settings
 from ..runner import (RunResult, Status, have, nuclei_timeout, reclassify_from_artifact, run as exec_tool,
@@ -482,63 +483,326 @@ def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
 
 
 def _dalfox_cmd(batch_file, out_file, prof) -> list[str]:
-    """dalfox FAST flags for the XSS reflection pass. The defaults were the timekiller: --max-cpu 1
-    (single core) + param mining ON + headless ON. Quarry already discovers params (arjun/gf), so mining
-    is redundant; headless (chromium per candidate) is the big cost. Bump --max-cpu off 1 (governor),
-    keep -w, keep blind -b when configured (blind XSS coverage stays until 4.3.D gates it)."""
-    cmd = ["dalfox", "file", str(batch_file), "-o", str(out_file),
-           "--skip-bav", "--skip-mining-all", "--skip-headless",
-           "--max-cpu", str(max(1, settings.concurrency("DALFOX_MAX_CPU", 4))),
-           "-w", str(settings.workers("dalfox", 100))]
+    """dalfox v3 (Rust) reflected-XSS scan (v0.3.8). v3 replaced the headless browser with static AST DOM
+    analysis, so v2's --skip-headless timekiller is GONE; params are pre-discovered (arjun/gf), so --skip-mining
+    stays. Output is structured JSONL to the -o file; -S keeps captured output minimal (status is read from the
+    EXIT CODE, not stdout — see the scan loop). Concurrency is 2-DIMENSIONAL in v3: --workers is PER TARGET,
+    --max-concurrent-targets is target parallelism — carrying v2's -w 100 forward would explode a 40-target
+    chunk's fan-out, so BOTH are governed with CONSERVATIVE defaults (roughly v2's per-host blast radius, more
+    hosts sequential) pending OTC measurement, and the global --rate-limit caps the aggregate rps when RoE is set."""
+    cmd = ["dalfox", "scan", "-i", "file", str(batch_file), "-o", str(out_file),
+           "-f", "jsonl", "-S", "--skip-mining",
+           "--workers", str(max(1, settings.workers("dalfox", 30))),          # per-target; v2 -w 100 NOT carried
+           "--max-concurrent-targets", str(max(1, settings.concurrency("DALFOX_TARGETS", 4)))]  # OTC-tunable
     bx = secrets.oob().get("blind_xss_url")
     if bx:
         cmd += ["-b", str(bx)]                             # blind/stored XSS OOB beacon (kept; 4.3.D gates)
     if prof.http_rl:
-        # RoE rate. dalfox has no global-rate flag, but -w does NOT multiply a host's request rate:
-        # file mode is SEQUENTIAL (runSingleMode — we set neither --mass nor --multicast) and the rate
-        # limiter is per-host + mutex-serialized (every payload worker calls rl.Block(host)), so the
-        # PAYLOAD stream to a host is paced to 1 request per --delay regardless of worker count. --delay is
-        # therefore the RoE period; ceil(1000/rl) (not floor, which overshot) bounds that payload stream to
-        # ≤ rl req/s. NOT a strict process-wide ceiling: dalfox recreates the limiter per target and fires
-        # one bootstrap client.Do() before the limiter, so small bursts at target start/boundaries are
-        # possible — strict aggregate enforcement needs a future outer/shared rate plane (C24). (Verified:
-        # dalfox v2 cmd/file.go, pkg/scanning/{scan,scanning,ratelimit}.go.)
-        cmd += ["--delay", str(-(-1000 // prof.http_rl))]   # -(-a//b) = ceil(a/b), no import
+        # v3 has a REAL global rate cap (req/s, shared across workers AND targets) — supersedes v2's per-host
+        # --delay math and its per-target-limiter caveat. Bound the aggregate stream directly to the RoE rate.
+        cmd += ["--rate-limit", str(prof.http_rl)]
     return cmd
+
+
+# dalfox v3 finding TYPE -> (store klass, confidence tier, display name). Kept DISTINCT (Lumpy): a Dalfox-verified
+# hit (V) is higher-confidence than a reflection (R), and an AST-DOM static finding (A) is its own static-analysis
+# evidence — none collapses into another. `confirmed` stays False for all (Quarry-owned impact validation only);
+# "Dalfox-verified" (not "DOM-verified") — V is dalfox's own verdict, which doesn't always establish DOM execution.
+_DALFOX_TIER = {
+    "V": ("xss-verified", "verified", "XSS — Dalfox-verified (Quarry impact validation pending)"),
+    "R": ("xss-candidate", "candidate", "reflected parameter — XSS candidate (manual validation required)"),
+    "A": ("dom-xss-static", "dom-static", "DOM XSS (static AST, needs runtime confirmation)"),
+}
+_DALFOX_SRC_SINK = re.compile(r"\(Source:\s*(.*?),\s*Sink:\s*(.*?)\)")
+_DALFOX_LINECOL = re.compile(r":(\d+):(\d+)\s*-\s")
+
+
+def _dalfox_engine_id() -> str:
+    """The VERIFIED identity of the dalfox binary that will ACTUALLY run (registry health) — folded into the
+    resume work unit so a drifted / shadowed / manually-upgraded binary can't reuse another engine's chunks
+    (review-r9#4). An unverified/unknown engine returns a per-run NONCE -> that run is NON-resumable (a re-scan
+    is a safe superset; silently skipping chunks we can't prove ran on the same binary is not)."""
+    try:
+        from ..registry import load_tools, health
+        t = next((x for x in load_tools() if x.bin == "dalfox"), None)
+        if t is not None:
+            h = health(t)
+            if h.get("ok") and h.get("identity"):
+                return str(h["identity"])
+    except Exception:
+        pass
+    return "unverified-" + os.urandom(8).hex()
+
+
+def _dstr(v) -> str:
+    """A JSON field coerced to a stripped string ONLY if it is a scalar string — a list/dict/number returns ''
+    (never str([...])). review-r9#3: essential fields are scalar-string validated, not blindly str()'d."""
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _dalfox_identity(ftype: str, obj: dict) -> "str | None":
+    """A canonical identity per finding so DISTINCT routes never collapse (review-r8#2). V/R key on
+    scheme://host:port/path + location:param + method — /search?q and /admin?q are DISTINCT. A (AST-DOM) has no
+    real param (dalfox writes param '-'), so it keys on its SOURCE/SINK + line:col (two sinks on one URL are
+    distinct). Returns None (row rejected, never raises — review-r9#3) when a needed field is missing/non-scalar
+    or the PoC URL is unparseable (incl. a bad :port that only raises on attribute access)."""
+    poc = _dstr(obj.get("data"))
+    if not poc:
+        return None
+    try:
+        u = urlsplit(poc)
+        host = (u.hostname or "").lower()
+        port = u.port                                          # a bad port raises HERE (not at urlsplit) — guarded
+    except ValueError:
+        return None
+    if not host:
+        return None
+    h = f"[{host}]" if ":" in host else host                   # review-r10#2: bracket IPv6 so [::1]:80 != [::1:80]
+    base = f"{(u.scheme or 'http').lower()}://{h}{f':{port}' if port else ''}{u.path or '/'}"
+    method = (_dstr(obj.get("method")) or "GET").upper()
+    if ftype == "A":
+        ev = _dstr(obj.get("evidence"))
+        m, lc = _DALFOX_SRC_SINK.search(ev), _DALFOX_LINECOL.search(ev)
+        if m:
+            loc = f"{lc.group(1)}:{lc.group(2)}" if lc else ""
+            disc = f"{loc}|{m.group(1).strip()}->{m.group(2).strip()}"
+        else:
+            disc = (ev or _dstr(obj.get("message_str")))[:120]
+        return f"{base}|dom|{disc}|{method}" if disc else None
+    param = _dstr(obj.get("param"))
+    if param in ("", "-"):                                     # '-' is dalfox's no-param placeholder
+        return None                                            # a V/R finding with no param is malformed
+    return f"{base}|{_dstr(obj.get('location'))}:{param}|{method}"
+
+
+def _dalfox_finding(obj) -> "dict | None":
+    """Validate + build ONE finding record, or None if malformed. `type` must be a scalar string in {V,R,A}
+    (unknown/non-scalar REJECTED, never silently reclassified as R); null JSON fields never become the string
+    'None'; dalfox's own type/payload/evidence/PoC are preserved. `raw_ref` is added by the caller."""
+    if not isinstance(obj, dict):
+        return None
+    ftype = _dstr(obj.get("type")).upper()
+    if ftype not in _DALFOX_TIER:                              # V/R/A only (scalar string)
+        return None
+    ident = _dalfox_identity(ftype, obj)
+    if ident is None:
+        return None
+    klass, confidence, name = _DALFOX_TIER[ftype]
+    param = _dstr(obj.get("param"))
+    param = None if param in ("", "-") else param
+    poc = _dstr(obj.get("data")) or None
+    return {"id": f"{klass}:{ident}", "template": klass, "name": name,
+            "severity": (_dstr(obj.get("severity")) or "medium").lower(),
+            "matched": _dstr(obj.get("message_str")) or poc or ident,
+            "confidence": confidence, "sources": ["dalfox"], "confirmed": False,
+            "dalfox_type": ftype, "param": param, "payload": obj.get("payload") if isinstance(obj.get("payload"), str) else None,
+            "location": _dstr(obj.get("location")) or _dstr(obj.get("inject_type")) or None,
+            "evidence": _dstr(obj.get("evidence")) or None, "poc": poc,
+            "cwe": _dstr(obj.get("cwe")) or None}
+
+
+def _parse_dalfox_jsonl(cf) -> "tuple[list, bool]":
+    """FAIL-CLOSED parse of a dalfox v3 JSONL artifact -> (valid_findings, artifact_ok). Keeps every VALID
+    finding as evidence, but artifact_ok is False on ANY inconsistency: missing/unreadable file, a decode error,
+    a meta row NOT in first position or MORE than one, a non-int/negative/bool findings_count (review-r10#3:
+    bool subclasses int, so `type(x) is int`), finding-count != meta count, a torn/non-object line, an unknown
+    type, or a row missing its identity fields. The caller ingests the valid findings but marks a not-ok chunk
+    PARTIAL/retryable (never 'done'), so incomplete work can't be permanently skipped on resume."""
+    if not cf.exists():
+        return [], False
+    try:
+        raw = cf.read_text(encoding="utf-8")                  # strict decode: a bad byte = malformed, not silent
+    except (OSError, UnicodeError):
+        return [], False
+    findings, ok, meta_rows, meta_count, row_idx = [], True, 0, None, 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            ok = False; row_idx += 1; continue                # torn line -> not trustworthy
+        if not isinstance(obj, dict):
+            ok = False; row_idx += 1; continue
+        if "meta" in obj:
+            meta_rows += 1
+            if row_idx != 0:                                  # review-r10#3: meta must be the FIRST row
+                ok = False
+            m = obj.get("meta")
+            c = m.get("findings_count") if isinstance(m, dict) else None
+            if type(c) is int and c >= 0:                     # STRICT int (not bool), non-negative
+                meta_count = c
+            else:
+                ok = False
+            row_idx += 1
+            continue
+        try:
+            rec = _dalfox_finding(obj)
+        except Exception:
+            rec = None                                        # defensive: a row can NEVER abort the whole parse
+        if rec is None:
+            ok = False                                        # malformed/unknown row -> chunk not trustworthy
+        else:
+            findings.append(rec)
+        row_idx += 1
+    if meta_rows != 1:                                        # review-r10#3: EXACTLY one meta summary row
+        ok = False
+    if meta_count is not None and meta_count != len(findings):
+        ok = False                                            # count mismatch -> torn/partial artifact
+    return findings, ok
+
+
+def _sha256_file(p) -> str:
+    """sha256 of a file, streamed. Used to prove a recorded completion artifact is UNCHANGED before a resume
+    trusts it to SKIP its chunk (review-r11#1)."""
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(65536), b""):
+            h.update(b)
+    return h.hexdigest()
 
 
 def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     """params.dalfox_xss_fast (step 4.3.B): reflected-XSS scan over the CANONICALIZED xss candidates with
     the fast flags, in resumable chunks. Mirrors _nuclei_scan: input-hashed chunk state, mark done ONLY
     on clean completion (failed batch stays retryable), source-level tool_start/tool_progress/tool_finish
-    + ledger. dalfox proves the reflection PRIMITIVE only -> finding klass xss-candidate, confirmed:false
-    (the map-don't-exploit boundary holds). Findings go straight to the store (deduped by id)."""
-    from urllib.parse import urlsplit, parse_qsl
+    + ledger. dalfox v3 emits structured JSONL (parsed below): findings are tiered by dalfox's own verdict
+    (V verified / R reflected / A AST-DOM) into confidence, but stay confirmed:false — the map-don't-exploit
+    boundary holds (Quarry-owned impact validation is separate). Findings go straight to the store (deduped by id)."""
     sid = "params.dalfox_xss_fast"
     chunk_n = max(1, settings.concurrency("DALFOX_CHUNK", 40))
     batches = [cands[i:i + chunk_n] for i in range(0, len(cands), chunk_n)]
     state_f = ctx.run.raw_path("params", "dalfox", "chunks.state.json")
-    # C07 inc4: resume validity folds coverage-affecting config (scan mode + whether blind-XSS is armed +
-    # chunk size), not just the candidate list — a change (e.g. blind -b now configured) re-runs done chunks.
-    _cfg = {"mode": "fast-reflected", "blind": bool(secrets.oob().get("blind_xss_url")), "chunk": chunk_n}
+    # C07 inc4 + review-r8#4/r9#4: resume validity folds EVERY coverage-affecting knob — the effective v3
+    # contract: the VERIFIED EXECUTED engine identity (not just the configured pin — a drifted/shadowed binary
+    # must not reuse old chunks; an unverified engine carries a nonce -> non-resumable), workers + target
+    # concurrency + rate-limit (fan-out/pacing), a FINGERPRINT of the blind collector (never the raw URL), and
+    # chunk size. `mode` v3-fast invalidates any in-progress v2 state.
+    bx = secrets.oob().get("blind_xss_url")
+    _cfg = {"mode": "v3-fast-reflected", "engine": _dalfox_engine_id(),
+            "workers": settings.workers("dalfox", 30),
+            "targets": settings.concurrency("DALFOX_TARGETS", 4),
+            "rate_limit": prof.http_rl,
+            "blind": secrets.fingerprint(bx) if bx else None,
+            "chunk": chunk_n}
     scan_wu = events.work_unit(sid, inputs={"cands": cands}, config=_cfg)
-    done: set[int] = set()
-    if state_f.exists():
+    # review-r9#1/r10#1: nuclei's proven resume contract (not just its dir layout). Immutable per-attempt
+    # artifacts wu_<scan_wu>/attempt_<id>/findings_<ci>.jsonl; a COMPLETION map (clean chunk -> validated
+    # artifact path, controls SKIP) is kept separate from an append-only EVIDENCE map (every attempt's artifact
+    # that produced output, controls AGGREGATION). A chunk is skipped ONLY if its recorded artifact still
+    # validates (index in range · relative · no `..` · exact filename · resolves INSIDE this work_unit · readable
+    # · re-parses); the source verdict + `matched` are derived from the RETAINED EVIDENCE (all attempts, deduped
+    # by finding id), so a finding kept in a degraded attempt is never lost when a later retry comes back empty.
+    wu_dir = state_f.parent / f"wu_{scan_wu}"
+    wu_root = wu_dir.resolve()
+    attempt_id = time.strftime('%Y%m%d-%H%M%S') + "-" + os.urandom(4).hex()
+    attempt_dir = wu_dir / f"attempt_{attempt_id}"
+
+    def _valid_entry(ci_str, rel) -> bool:
+        if not (isinstance(ci_str, str) and ci_str.isdigit() and 0 <= int(ci_str) < len(batches)):
+            return False
+        if not isinstance(rel, str) or not rel or os.path.isabs(rel) or ".." in Path(rel).parts:
+            return False
+        if Path(rel).name != f"findings_{int(ci_str)}.jsonl":
+            return False
+        p = state_f.parent / rel
+        try:
+            if not p.resolve().is_relative_to(wu_root):      # containment: THIS work-unit's dir only
+                return False
+            if not p.is_file():
+                return False
+            with open(p, "rb"):
+                pass
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _prev():
+        if not state_f.exists():
+            return None
         try:
             prev = json.loads(state_f.read_text())
-            if prev.get("work_unit") == scan_wu:            # config-inclusive key: mismatch → fresh
-                done = {int(x) for x in prev.get("done_chunks", [])}
-        except Exception:
-            done = set()
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(prev, dict):
+            return None
+        return prev if prev.get("work_unit") == scan_wu else None   # config-inclusive key: mismatch → fresh
+
+    def _valid_completion(ci_str, entry) -> bool:
+        # review-r11#1: a completion is trusted to SKIP a chunk only if its artifact is structurally valid AND
+        # UNCHANGED (sha256 matches what we recorded) AND still PARSES CLEAN AND still AGREES with the recorded
+        # outcome (EMPTY = no findings, SUCCESS = >=1). A completed artifact that later went missing/malformed/
+        # tampered is dropped -> the chunk RE-RUNS (never a silent skip on stale evidence).
+        if not isinstance(entry, dict):
+            return False
+        rel, outcome, sha = entry.get("rel"), entry.get("outcome"), entry.get("sha256")
+        if outcome not in ("EMPTY", "SUCCESS") or not _valid_entry(ci_str, rel):
+            return False
+        p = state_f.parent / rel
+        try:
+            if _sha256_file(p) != sha:                       # unchanged since recorded
+                return False
+        except OSError:
+            return False
+        fnds, ok = _parse_dalfox_jsonl(p)                    # re-parses (as the comment promises)
+        return ok and ((outcome == "EMPTY" and not fnds) or (outcome == "SUCCESS" and bool(fnds)))
+
+    def _load_completion(prev) -> dict:                      # {ci: {rel, outcome, sha256}} — each FULLY validated
+        m = (prev or {}).get("chunks"); out: dict[str, dict] = {}
+        if isinstance(m, dict):
+            for k, v in m.items():
+                if _valid_completion(str(k), v):
+                    out[str(k)] = {"rel": str(v["rel"]), "outcome": v["outcome"], "sha256": v["sha256"]}
+        return out
+
+    def _valid_evidence(ci_str, entry) -> bool:
+        # review-r12: an evidence artifact is aggregated only if structurally valid AND UNCHANGED (its recorded
+        # sha256 still matches). A rejected/tampered artifact whose completion failed the digest must not sneak
+        # its rows in through the evidence map. Valid rows from an ORIGINALLY malformed/degraded artifact are
+        # still retained — as long as its bytes have not changed since we recorded it.
+        if not isinstance(entry, dict):
+            return False
+        rel, sha = entry.get("rel"), entry.get("sha256")
+        if not _valid_entry(ci_str, rel):
+            return False
+        p = state_f.parent / rel
+        try:
+            return _sha256_file(p) == sha
+        except OSError:
+            return False
+
+    def _load_evidence(prev) -> dict:                        # {ci: [{rel, sha256}, ...]} — each digest-validated
+        m = (prev or {}).get("evidence"); out: dict[str, list[dict]] = {}
+        if isinstance(m, dict):
+            for k, v in m.items():
+                kept = [{"rel": str(e["rel"]), "sha256": e["sha256"]}
+                        for e in (v if isinstance(v, list) else [v]) if _valid_evidence(str(k), e)]
+                if kept:
+                    out[str(k)] = kept
+        return out
+
+    _pv = _prev()
+    completion: dict[str, dict] = _load_completion(_pv)      # controls SKIP (revalidated each run)
+    evidence_map: dict[str, list[dict]] = _load_evidence(_pv)
+
+    def _add_evidence(ci_str, rel, sha):                     # append-only, unique-by-rel, per chunk; digest recorded
+        lst = evidence_map.setdefault(ci_str, [])
+        if not any(e["rel"] == rel for e in lst):
+            lst.append({"rel": rel, "sha256": sha})
+
+    for _ci, _e in completion.items():                       # a clean chunk's artifact is always also evidence
+        _add_evidence(_ci, _e["rel"], _e["sha256"])
 
     def _save():
         state_f.write_text(json.dumps(
-            {"work_unit": scan_wu, "chunk_size": chunk_n, "done_chunks": sorted(done)}))
+            {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": completion, "evidence": evidence_map}))
 
-    events.tool_start(sid, cmd=["dalfox", "file", "<chunk>", "--skip-mining-all", "--skip-headless"],
+    events.tool_start(sid, cmd=["dalfox", "scan", "-i", "file", "<chunk>", "-f", "jsonl", "--skip-mining"],
                       input_total=len(cands), work_unit=scan_wu)
     t0 = time.monotonic()
-    degraded = produced = 0
+    degraded = produced = matched = 0                      # defined up-front: the finally ledger must not NameError
+    tiers = {"xss-verified": 0, "xss-candidate": 0, "dom-xss-static": 0}   # if the loop raises before the aggregate
     status = Status.FAILED                                 # exception mid-loop must NOT emit scan-level success
     try:
       for ci, batch in enumerate(batches):
@@ -546,61 +810,81 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         seen = min((ci + 1) * chunk_n, len(cands))
         events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches), current_index=seen,
                              work_unit=chunk_wu)
-        if ci in done:                                    # resume: already CLEAN (start/finish in prior log)
+        if str(ci) in completion:                         # resume: CLEAN in a prior attempt (revalidated on load)
             continue
         bf = ctx.write_list(f"dalfox_xss_{ci}.txt", batch)
-        cf = ctx.run.raw_path("params", "dalfox", f"dalfox_xss_{ci}.txt")
+        attempt_dir.mkdir(parents=True, exist_ok=True)     # created lazily, only if a chunk actually runs
+        cf = attempt_dir / f"findings_{ci}.jsonl"          # IMMUTABLE per-attempt artifact (never overwritten)
+        rel = f"wu_{scan_wu}/attempt_{attempt_id}/findings_{ci}.jsonl"
         events.tool_start(sid, work_unit=chunk_wu, input_total=len(batch))   # this chunk's own lifecycle
         res = None
         chunk_status = Status.FAILED.value                   # review#1: promoted ONLY after ALL bookkeeping below
         try:                                                 # review#1: chunk terminal ALWAYS fires (finally)
-            res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof),
+            res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof), ok_codes=(0, 1),
                             timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
-            # KEEP a chunk's POCs regardless of status — a WAF/timeout-DEGRADED chunk still found real
-            # reflections (the OTC run discarded 30 POC lines this way). Findings go straight to the store,
-            # deduped on id, so re-scanning a degraded chunk on resume can't duplicate.
-            if cf.exists():
-                for line in cf.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if line.strip().startswith("[POC]") or "PoC" in line:
-                        s = line.strip()
-                        # reflection = a CANDIDATE, not impact (attack layer proves impact) — and the UNIT is
-                        # the SINK, not the payload. dalfox emits one POC per payload variant; canonicalize to
-                        # (host, non-empty query-param names) so N payloads on one route collapse to ONE
-                        # xss-candidate (raw chunk file keeps every variant as evidence). Neither the old
-                        # first-80-chars (collapsed distinct sinks) nor a full-line hash (one finding per
-                        # payload — 30 variants of one sink) is honest.
-                        url = s.split("] ", 1)[-1].split(" ", 1)[0] if "] " in s else s
-                        try:
-                            u = urlsplit(url)
-                            names = ",".join(sorted({k for k, _ in parse_qsl(u.query, keep_blank_values=True) if k}))
-                            sink = f"{u.hostname or url}|{names}"
-                        except Exception:
-                            sink = s
-                        if ctx.run.add("finding", {
-                                "id": f"xss-candidate:{sink}", "template": "xss-candidate",
-                                "name": "reflected parameter — XSS candidate (manual validation required)",
-                                "severity": "medium", "matched": s, "confidence": "candidate",
-                                "sources": ["dalfox"], "confirmed": False, "raw_ref": str(cf)}):
-                            produced += 1
-            if res.status in (Status.SUCCESS, Status.EMPTY):
-                done.add(ci)
+            # dalfox v3 EXIT CONTRACT (measured): 0 = clean/no-findings, 1 = clean/WITH-findings, >=2 = error.
+            # review-r9#2: exit code and parsed artifact must AGREE — CLEAN only for (0 + valid empty) or
+            # (1 + valid findings). Any disagreement / hard exit / malformed artifact -> PARTIAL, retryable.
+            findings, artifact_ok = _parse_dalfox_jsonl(cf)
+            rc = res.exit_code
+            clean = artifact_ok and ((rc == 0 and not findings) or (rc == 1 and bool(findings)))
+            cf_sha = _sha256_file(cf) if cf.exists() else None
+            if clean:
+                completion[str(ci)] = {"rel": rel, "outcome": "SUCCESS" if findings else "EMPTY",
+                                       "sha256": cf_sha}      # outcome + digest -> revalidated on resume
+                _add_evidence(str(ci), rel, cf_sha)          # ...and joins this chunk's evidence history
                 _save()
             else:
                 degraded += 1
-                events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
-            chunk_status = res.status.value                  # bookkeeping (incl. run.add ingestion) complete
+                why = (f"exit {rc}" if rc not in (0, 1) else
+                       "artifact malformed/mismatched" if not artifact_ok else
+                       f"exit {rc} disagrees with {len(findings)} finding(s)")
+                events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {why}")
+                if cf.exists() and cf.stat().st_size > 0:    # a degraded chunk WITH output keeps its evidence
+                    _add_evidence(str(ci), rel, cf_sha); _save()   # (PARTIAL(A) then empty retry never erases A)
+            chunk_status = (Status.SUCCESS if clean and findings
+                            else Status.EMPTY if clean else Status.PARTIAL).value
         finally:
             _chunk_terminal(sid, chunk_wu, res, cf, status=chunk_status)   # FAILED if exec OR bookkeeping raised
-      status = Status.PARTIAL if degraded else Status.SUCCESS
+      # review-r10#1/r11#2: DERIVE the verdict + telemetry from the RETAINED EVIDENCE (all attempts), not the
+      # last per-chunk label. EVERY observation goes through Run.add() so C09 merges raw_refs / reconciles
+      # conflicts across attempts (a later clean attempt's provenance must reach the store, not be dropped by a
+      # pre-add dedup). A separate GLOBAL id set drives only the `matched` (distinct findings) counter; `produced`
+      # counts NEW entities (Run.add True). Falls back to THIS attempt's file for a chunk just run but not yet
+      # recorded. Verdict: any degraded this run -> PARTIAL; else any distinct finding -> SUCCESS; else EMPTY.
+      produced = matched = 0
+      tiers = {"xss-verified": 0, "xss-candidate": 0, "dom-xss-static": 0}
+      seen_ids: set[str] = set()                            # GLOBAL — for the matched counter ONLY (not dedup)
+      for ci in range(len(batches)):
+        entries = list(evidence_map.get(str(ci)) or [])       # each already digest-validated on load
+        # fall back to THIS run's just-written attempt file (trusted — we wrote it) for a chunk run but not recorded
+        paths = [state_f.parent / e["rel"] for e in entries] or [attempt_dir / f"findings_{ci}.jsonl"]
+        for p in paths:
+            if not (p.exists() and p.stat().st_size > 0):
+                continue
+            fnds, _ok = _parse_dalfox_jsonl(p)
+            for rec in fnds:
+                rec["raw_ref"] = str(p)
+                if rec["id"] not in seen_ids:
+                    seen_ids.add(rec["id"]); matched += 1    # distinct finding first-seen
+                if ctx.run.add("finding", rec):              # ALWAYS add -> provenance merge (raw_refs union)
+                    produced += 1
+                    tiers[rec["template"]] = tiers.get(rec["template"], 0) + 1
+      status = Status.PARTIAL if degraded else (Status.SUCCESS if matched else Status.EMPTY)
     finally:
         # C07 inc4: source terminal ALWAYS fires (even if the loop raised) — one source lifecycle, no dup.
         events.tool_finish(sid, status=status.value, work_unit=scan_wu,
                            reason=(f"{degraded}/{len(batches)} chunk(s) degraded" if degraded else None),
                            duration=round(time.monotonic() - t0, 2), discovery_context="params")
-        events.ledger(sid, produced={"xss_candidate": produced}, consumed={"shape": len(cands)})
-    return RunResult("dalfox", ["dalfox", "file", "<chunked-xss-fast>"], status, 0,
+        # ledger: NEW entities by tier (verified/candidate/dom-static kept distinct, review-r8#5) + matched
+        # (all valid findings across retained evidence) tracked separately from produced (newly added).
+        events.ledger(sid, produced={"xss_verified": tiers["xss-verified"],
+                                     "xss_candidate": tiers["xss-candidate"],
+                                     "dom_xss_static": tiers["dom-xss-static"], "matched": matched},
+                      consumed={"shape": len(cands)})
+    return RunResult("dalfox", ["dalfox", "scan", "-i", "file", "<chunked-xss-fast>"], status, 0,
                      round(time.monotonic() - t0, 2), None, produced,
-                     note=f"{len(batches)} chunk(s), {produced} candidate(s), {degraded} degraded")
+                     note=f"{len(batches)} chunk(s), {produced} new / {matched} matched, {degraded} degraded")
 
 
 _REDIR_PARAMS = {"url", "redirect", "redirect_url", "redirecturl", "redir", "redirect_uri", "return",
