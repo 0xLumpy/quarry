@@ -129,11 +129,33 @@ def _effective_phases(selected, profile) -> set:
 # ── lock (C08 compatibility lock) ─────────────────────────────────────────────
 @cli.command()
 @click.option("--drift-only", is_flag=True, help="only print tools whose installed version DRIFTS from the pin")
-def lock(drift_only):
+@click.option("--maintenance", is_flag=True, help="refresh-policy view: tools grouped by maintenance state")
+def lock(drift_only, maintenance):
     """C08: capture the INSTALLED tool versions on THIS host as a reviewable pin set. Run on a VALIDATED host
     (the VPS where everything works) — the emitted `version:` lines are copy-pasted into data/tools.yaml so the
     install becomes reproducible. Also flags DRIFT (installed != pin) and UNPINNED tools."""
-    from .registry import capture_lock
+    from .registry import capture_lock, load_tools
+    if maintenance:
+        # v0.3.9 refresh-policy snapshot — how often `quarry lock --refresh` (v0.4) should check each tool
+        # upstream. PLANNING ONLY: it NEVER gates verify/drift/install/runtime, so it does NOT probe installed
+        # tools (review-r13#1) — it reads the static registry. `release` shows only when it differs from the pin.
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for t in load_tools():
+            groups[t.maintenance_state or "unset"].append(t)
+        click.echo(_c("\n# refresh-policy view — maintenance state (planning only; never gates verify/runtime)\n", "cyan"))
+        for st in ("active", "monitor", "frozen", "distro", "unset"):
+            g = groups.get(st) or []
+            if not g:
+                continue
+            click.echo(_c(f"[{st}]  {len(g)}", "magenta"))
+            for t in sorted(g, key=lambda x: x.bin):
+                pinref = t.pin or t.ref
+                tag = f"  (release {t.release})" if t.release else ""
+                click.echo(f"  {t.bin:<20} {str(pinref or '—'):<42}{tag}")
+        click.echo(_c(f"\n{sum(len(v) for v in groups.values())} tools · active {len(groups['active'])} · "
+                      f"monitor {len(groups['monitor'])} · frozen {len(groups['frozen'])} · distro {len(groups['distro'])}", "cyan"))
+        return
     rows = capture_lock()
     drifts = [r for r in rows if r["drift"] == "DRIFT"]
     unpinned = [r for r in rows if r["drift"] == "unpinned"]

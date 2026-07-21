@@ -134,6 +134,16 @@ class TestLockValidation:
         {"bin": "t", "cap_codes": [0, True]},
         {"bin": "t", "version": "v1", "install": "curl -o t https://x/t"},  # review-r6#2: go pin, no parseable module
         {"bin": "t", "version": "v1"},                                # review-r6#2: go pin, no install at all
+        {"bin": "t", "maintenance_state": "bogus"},                   # v0.3.9: not a known refresh class
+        {"bin": "t", "maintenance_state": 3},                         # v0.3.9: non-string
+        {"bin": "t", "release": ""},                                  # v0.3.9: empty release tag
+        {"bin": "t", "release": 5},                                   # v0.3.9: non-string release
+        {"bin": "t", "release": "latest", "ref": "abc123"},           # r13#2: release is a floating sentinel
+        {"bin": "t", "release": "3.1.1"},                             # r13#2: release with no pin/ref to differ from
+        {"bin": "t", "release": "v2.14.0", "version": "v2.14.0", "install": "go install x/cmd/x@latest"},  # ==pin
+        {"bin": "t", "maintenance_state": "distro"},                  # r13#2: distro state without policy: distro
+        {"bin": "t", "policy": "distro", "maintenance_state": "active"},  # r13#2: policy distro but state != distro
+        {"bin": "t", "policy": "distro"},                             # r14: policy distro with NO maintenance_state
     ])
     def test_malformed_lock_fails_loud(self, bad):
         with pytest.raises(LockError):
@@ -145,7 +155,11 @@ class TestLockValidation:
         {"bin": "t", "version": "8.9", "runtime": "pipx", "install": "pipx install t"},   # pipx pin, no go install
         {"bin": "t", "artifacts": {"linux/amd64": {"url": "u", "sha256": _VALID_SHA},
                                    "linux/arm64": {"url": "u2", "sha256": "b" * 64}}},   # multi-arch
-        {"bin": "t", "ref": "abc123", "policy": "distro"},
+        {"bin": "t", "ref": "abc123", "policy": "distro", "maintenance_state": "distro"},   # distro agrees
+        {"bin": "t", "maintenance_state": "active"},                  # v0.3.9: valid refresh classes
+        {"bin": "t", "maintenance_state": "frozen", "release": "2.1",  # release DIFFERS from a pseudo-version pin
+         "version": "v0.0.0-abc", "install": "go install x/cmd/x@latest"},
+        {"bin": "t", "policy": "distro", "maintenance_state": "distro"},   # distro state + policy agree
     ])
     def test_valid_lock_passes(self, ok):
         _validate_lock(ok["bin"], ok)                                 # no raise
@@ -869,3 +883,43 @@ class TestReclaimTransactional:
         assert registry.install_one(t, lambda m: None) is False
         assert legacy.exists() and legacy.read_text() == "V2-OLD"       # legacy RESTORED (host keeps a working tool)
         assert not list(gobin.glob("dalfox.quarry-replaced-*"))         # relocation reverted
+
+
+class TestMaintenanceSchema:
+    def test_tool_carries_refresh_metadata(self):
+        t = _tool(maintenance_state="frozen", release="2.1")
+        assert t.maintenance_state == "frozen" and t.release == "2.1"
+
+    def test_every_registry_tool_has_a_valid_maintenance_state(self):
+        # v0.3.9: the snapshot is COMPLETE — every tool is classified into a known refresh class
+        states = registry._MAINTENANCE_STATES
+        missing = [t.bin for t in registry.load_tools() if t.maintenance_state not in states]
+        assert not missing, f"tools with no/invalid maintenance_state: {missing}"
+
+    def test_release_recorded_only_when_it_differs_from_a_pseudo_pin(self):
+        # a `release` is meaningful only where the pin is a pseudo-version/commit (its human tag differs)
+        for t in registry.load_tools():
+            if t.release:
+                assert t.release != (t.pin or t.ref), f"{t.bin}: release == pin (redundant)"
+
+    def test_capture_lock_exposes_maintenance_and_release(self, monkeypatch):
+        fake = [_tool(bin="gowitness", pin="v0.0.0-abc", maintenance_state="active", release="3.1.1"),
+                _tool(bin="subfinder", pin="v2.14.0", maintenance_state="active")]
+        monkeypatch.setattr(registry, "load_tools", lambda: fake)
+        monkeypatch.setattr(Tool, "installed", property(lambda self: True))
+        monkeypatch.setattr(registry, "installed_identity", lambda t: "x")
+        rows = {r["bin"]: r for r in registry.capture_lock()}
+        assert rows["gowitness"]["maintenance"] == "active" and rows["gowitness"]["release"] == "3.1.1"
+        assert rows["subfinder"]["release"] == "v2.14.0"   # falls back to the pin when no distinct release
+
+
+class TestMaintenanceView:
+    def test_maintenance_view_never_probes_installed_tools(self, monkeypatch):
+        # review-r13#1: the planning view reads the static registry; it must NOT probe (no installed_identity)
+        from click.testing import CliRunner
+        from quarry_recon.cli import cli
+        probed = []
+        monkeypatch.setattr(registry, "installed_identity", lambda t: probed.append(t.bin) or "")
+        monkeypatch.setattr(registry, "capture_lock", lambda: (_ for _ in ()).throw(AssertionError("must not capture")))
+        r = CliRunner().invoke(cli, ["lock", "--maintenance"])
+        assert r.exit_code == 0 and not probed and "refresh-policy view" in r.output

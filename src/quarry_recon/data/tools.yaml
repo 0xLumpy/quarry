@@ -20,6 +20,7 @@ tools:
   #   azmap.dev M365 tenant, whois/RDAP registrant, DMARC pivot (dig), whoxy reverse-whois.
   # Key-gated in-process: whoxy (secrets.yaml -> whoxy:). The one installed tool:
   - bin: porch-pirate
+    maintenance_state: frozen
     version: "0.0.1"
     phase: osint
     role: search public Postman workspaces for the target's API endpoints/secrets
@@ -27,13 +28,16 @@ tools:
     update: pipx upgrade porch-pirate
     version_cmd: porch-pirate -h
     cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
-    doc: https://github.com/MandConsultingGroup/porch-pirate
+    # v0.3.9: repo moved MandConsultingGroup -> WatchDogSecurity (old 301-redirects). PyPI pkg unchanged (frozen).
+    doc: https://github.com/WatchDogSecurity/porch-pirate
+    repo: WatchDogSecurity/porch-pirate
     runtime: pipx
     optional: true
     notes: 'No key. porch-pirate -s <domain> --urls --dump. Public Postman recon (API leaks).'
 
   # ── Phase 2: Horizontal discovery ───────────────────────────────────────
   - bin: asnmap
+    maintenance_state: monitor
     version: "v1.1.1"
     phase: horizontal
     role: ASN -> CIDR ranges (context); echo AS123 | asnmap -silent
@@ -43,6 +47,7 @@ tools:
     notes: Can hang on its data source — runner enforces hard timeout.
 
   - bin: mapcidr
+    maintenance_state: active
     version: "v1.1.97"
     phase: horizontal
     role: expand/condense CIDR ranges to IPs
@@ -51,6 +56,7 @@ tools:
     doc: https://github.com/projectdiscovery/mapcidr
 
   - bin: tlsx
+    maintenance_state: active
     version: "v1.2.2"
     phase: horizontal
     role: TLS SAN/CN harvest on IP ranges -> in-scope hostnames
@@ -60,6 +66,7 @@ tools:
     notes: Lighter local version of Caduceus. Use -san -cn -silent -p 443.
 
   - bin: caduceus
+    maintenance_state: frozen
     version: "v1.0.5"
     phase: horizontal
     role: ASN/CIDR -> live TLS cert scan -> real hostnames behind CDN
@@ -72,6 +79,8 @@ tools:
 
   # ── Phase 3: Vertical subdomain discovery ───────────────────────────────
   - bin: shosubgo
+    maintenance_state: monitor
+    release: "5.0"
     version: "v0.0.0-20250901210855-ccb6dc7bf0ef"
     phase: vertical
     role: Shodan-only subdomain discovery (narrow focus = unique hits)
@@ -83,6 +92,7 @@ tools:
     optional: true
 
   - bin: subfinder
+    maintenance_state: active
     version: "v2.14.0"
     phase: vertical
     role: passive subdomain enum (primary); subfinder -all -recursive
@@ -93,6 +103,7 @@ tools:
     notes: -all enables all sources (+20 results in testing). -stats shows per-key health.
 
   - bin: github-subdomains
+    maintenance_state: frozen
     version: "v1.2.2"
     phase: vertical
     role: scrape GitHub for referenced subdomains (3-10% extra, unique)
@@ -104,6 +115,7 @@ tools:
     optional: true
 
   - bin: puredns
+    maintenance_state: frozen
     version: "v2.1.1"
     phase: vertical
     role: massdns wrapper — DNS brute + validate
@@ -114,6 +126,8 @@ tools:
     notes: Requires massdns on host. Needs resolvers + trusted-resolvers lists.
 
   - bin: massdns
+    maintenance_state: monitor
+    release: "1.1.0"
     phase: vertical
     role: high-perf stub resolver (puredns backend)
     # C08.2b: pinned to an EXACT commit (massdns publishes no release/version) — clone then checkout the ref, so
@@ -129,6 +143,7 @@ tools:
     notes: Built from source (gcc+make) at a pinned commit; installed to ~/.local/bin. puredns needs it at runtime.
 
   - bin: alterx
+    maintenance_state: active
     version: "v0.1.0"
     phase: vertical
     role: subdomain permutation generation (modern dnsgen)
@@ -137,6 +152,7 @@ tools:
     doc: https://github.com/projectdiscovery/alterx
 
   - bin: dnsgen
+    maintenance_state: frozen
     version: "1.0.4"
     phase: vertical
     role: subdomain permutation generation (classic)
@@ -148,6 +164,7 @@ tools:
     optional: true
 
   - bin: dnsx
+    maintenance_state: active
     version: "v1.3.0"
     phase: vertical
     role: fast DNS resolver / PTR / record enrichment
@@ -157,6 +174,7 @@ tools:
 
   # ── Phase 4: Probing / fingerprint / screenshots / ports ────────────────
   - bin: httpx
+    maintenance_state: active
     version: "v1.10.0"
     phase: probe
     role: HTTP probe + fingerprint + cdn tag; json output is source of truth
@@ -169,6 +187,7 @@ tools:
       if it crashes remove apt python3-httpx shim.
 
   - bin: cdncheck
+    maintenance_state: active
     version: "v1.2.45"
     phase: probe
     role: offline CDN/WAF/cloud IP classifier — gates the naabu SYN prefilter off shared CDN/WAF edge (T0.3)
@@ -177,6 +196,8 @@ tools:
     doc: https://github.com/projectdiscovery/cdncheck
 
   - bin: gowitness
+    maintenance_state: active
+    release: "3.1.1"
     version: "v0.0.0-20260422172756-4f562901bc23"
     phase: probe
     role: screenshots
@@ -190,6 +211,7 @@ tools:
       Verify after install: gowitness scan file with one URL -> have-screenshot=true.
 
   - bin: naabu
+    maintenance_state: active
     version: "v2.6.1"
     phase: probe
     role: fast SYN/CONNECT port scan
@@ -200,6 +222,7 @@ tools:
     notes: Needs libpcap. Scan ranges only when CIDR/ASN explicitly in profile.
 
   - bin: nmap
+    maintenance_state: distro
     policy: distro
     phase: probe
     role: service/version detection (-sV) on naabu-found ports; opt-in infra lane (was invoked but unregistered)
@@ -211,6 +234,7 @@ tools:
 
   # ── Phase 5: Crawl + URL/archive + JS ───────────────────────────────────
   - bin: katana
+    maintenance_state: active
     version: "v1.6.1"
     phase: crawl
     role: crawler (standard + headless); batch to avoid OOM
@@ -221,6 +245,7 @@ tools:
     notes: Headless Chrome is the RAM hog — batch hosts, cap -p/-c. -kf all, -jc.
 
   - bin: gau
+    maintenance_state: monitor
     version: "v2.2.4"
     phase: crawl
     role: passive URL collection (wayback/otx/commoncrawl/urlscan)
@@ -229,6 +254,7 @@ tools:
     doc: https://github.com/lc/gau
 
   - bin: waymore
+    maintenance_state: active
     version: "8.9"
     phase: crawl
     role: archive URLs (-mode U) + archived RESPONSES (-mode R) + inline JS (-oijs)
@@ -242,6 +268,8 @@ tools:
     notes: 'Volume bounded by -ci d + -l (LIMITS.WAYMORE_RESPONSES) + timeout. Responses dir feeds xnLinkFinder.'
 
   - bin: hakrawler
+    maintenance_state: monitor
+    release: "2.1"
     version: "v0.0.0-20241221204001-76152559a809"
     phase: crawl
     role: fast link spider (secondary to katana)
@@ -256,6 +284,8 @@ tools:
   # a native, per-hop resolve+scope-guarded CSP fetch that reads the same headers + <meta http-equiv>.
 
   - bin: smap
+    maintenance_state: monitor
+    release: "0.2.0"
     version: "v0.0.0-20260413080749-42808b9bbbee"
     phase: probe
     role: passive (Shodan-backed) port scan — stealth, no packets to target
@@ -266,6 +296,7 @@ tools:
     optional: true
 
   - bin: jsluice
+    maintenance_state: frozen
     version: "v0.0.0-20240110145140-0ddfab153e06"
     phase: crawl
     role: extract URLs + secrets from JS via tree-sitter
@@ -275,6 +306,7 @@ tools:
     doc: https://github.com/BishopFox/jsluice
 
   - bin: xnLinkFinder
+    maintenance_state: active
     version: "8.2"
     phase: crawl
     role: links + params + secrets + wordlist from JS dir AND waymore responses (killer combo)
@@ -288,7 +320,8 @@ tools:
     notes: 'JS dir: -inc -all -mfs 0. Responses dir: add -orig. -sp/-sf = scope files.'
 
   - bin: js-beautify
-    version: "2.0.1"
+    maintenance_state: active
+    version: "2.0.3"
     phase: crawl
     role: beautify minified JS for better extraction
     install: pipx install jsbeautifier
@@ -298,6 +331,7 @@ tools:
     optional: true
 
   - bin: gitleaks
+    maintenance_state: active
     phase: crawl
     role: secret scan on JS dir
     # prebuilt binary — `go install` hits a toolchain/version-constraint conflict on new Go. C08.2b: pinned
@@ -314,6 +348,7 @@ tools:
     deps: [curl]
 
   - bin: trufflehog
+    maintenance_state: active
     phase: crawl
     role: filesystem secret detection (verification is an opt-in authorized lane; default --no-verification)
     # C08.2b: replaced `curl install.sh | sh` (unpinned, unverified) with a pinned release + sha256-verified download.
@@ -330,6 +365,7 @@ tools:
 
   # ── Phase 11: Content discovery (candidate-driven path brute) ───────────
   - bin: ffuf
+    maintenance_state: active
     version: "v2.2.1"
     phase: content
     role: candidate-driven path/dir brute over live in-scope hosts (default OFF)
@@ -343,6 +379,7 @@ tools:
 
   # ── Phase 6/7: Params + lightweight scanning ────────────────────────────
   - bin: gf
+    maintenance_state: frozen
     version: "v0.0.0-20200618134122-dcd4c361f9f5"
     phase: params
     role: pattern buckets (sqli/ssrf/redirect/xss/idor...) over URL corpus
@@ -354,6 +391,7 @@ tools:
     optional: true
 
   - bin: arjun
+    maintenance_state: monitor
     version: "2.2.7"
     phase: params
     role: param discovery on param-less endpoints
@@ -366,6 +404,7 @@ tools:
     notes: Uses -t 5 by default; -d (per-request delay) applied only when RATELIMIT.HTTP is set.
 
   - bin: nuclei
+    maintenance_state: active
     version: "v3.11.0"
     phase: params
     role: non-intrusive template scan; built-in interactsh OOB
@@ -379,6 +418,7 @@ tools:
       for days. -stats -si to a logfile (never /dev/null — that hides blocking).
 
   - bin: dalfox
+    maintenance_state: active
     phase: params
     role: reflected-XSS candidate scan (v3 Rust; JSONL output, static AST DOM analysis)
     # v0.3.8: dalfox v2 (go install) -> v3 (Rust rewrite). Distributed as a prebuilt musl-STATIC release binary
@@ -398,6 +438,7 @@ tools:
     notes: v3 flags + JSONL parse handled in params.py (step 2); RoE rate via global --rate-limit.
 
   - bin: interactsh-client
+    maintenance_state: active
     version: "v1.3.1"
     phase: params
     role: Quarry-owned OOB callback backend (params.oob_probe issues+correlates; quarry oob poll)
@@ -410,6 +451,7 @@ tools:
 
   # ── Phase 8: Continuous monitoring ──────────────────────────────────────
   - bin: gungnir
+    maintenance_state: active
     version: "v1.4.0"
     phase: monitor
     role: continuous CT-log monitoring for new certs/subdomains

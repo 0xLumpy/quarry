@@ -19,6 +19,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _VER_RE = re.compile(r"(?<![\w.])v?\d+\.\d+(?:\.\d+)?(?![\w.])")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")             # C08 lock: a valid sha256 digest
 _SENTINEL_PINS = {"installed", "latest", "main", "master", "head"}   # floating refs — NEVER a valid pin
+_MAINTENANCE_STATES = {"active", "monitor", "frozen", "distro"}      # v0.3.9 refresh-cadence classes (planning only)
 
 
 class LockError(ValueError):
@@ -55,10 +56,28 @@ def _validate_lock(bin_: str, t: dict) -> None:
         if (not isinstance(cc, list) or not cc or len(cc) != len(set(cc))
                 or not all(type(x) is int and 0 <= x <= 255 for x in cc)):   # bool is an int subclass -> type() is
             _bad(f"cap_codes must be a non-empty list of unique ints (not bools) in 0..255, got {cc!r}")
-    for key in ("ref", "policy", "capability"):
+    for key in ("ref", "policy", "capability", "release"):
         val = t.get(key)
         if val is not None and (not isinstance(val, str) or not val.strip()):
             _bad(f"{key} must be a non-empty string, got {val!r}")
+    ms = t.get("maintenance_state")                          # v0.3.9: refresh-policy metadata (planning only)
+    if ms is not None and ms not in _MAINTENANCE_STATES:
+        _bad(f"maintenance_state must be one of {sorted(_MAINTENANCE_STATES)}, got {ms!r}")
+    # review-r13#2/r14: 'distro' refresh state and `policy: distro` must AGREE (both or neither) — a distro-
+    # managed tool's refresh IS the distro, and only such a tool is state 'distro'. Checked UNCONDITIONALLY, so
+    # `policy: distro` with no maintenance_state (or vice versa) is rejected, not silently accepted.
+    if (ms == "distro") != (t.get("policy") == "distro"):
+        _bad("maintenance_state 'distro' and policy: distro must agree (set both or neither)")
+    rel = t.get("release")                                    # review-r13#2: the human release tag, kept SEPARATE
+    if rel is not None:                                       # from a pseudo-version/commit pin — it MUST differ
+        if str(rel).strip().lower() in _SENTINEL_PINS:
+            _bad(f"release {rel!r} is a floating sentinel — a release is an EXACT human tag")
+        pinref = t.get("version") or t.get("ref")
+        if not pinref:
+            _bad("release requires a pin (version) or ref to differ from")
+        # a plain normalized compare (NOT the runtime version_eq) — validation is a pure data check
+        elif str(rel).strip().lstrip("vV") == str(pinref).strip().lstrip("vV"):
+            _bad(f"release {rel!r} == pin {pinref!r} — record `release` ONLY when it differs (a pseudo-version pin)")
     arts = t.get("artifacts")
     if arts is not None:
         if not isinstance(arts, dict) or not arts:
@@ -108,6 +127,15 @@ class Tool:
     # `quarry lock --refresh` reads to discover release/commit candidates via the GitHub API (go/pipx identities
     # are parseable from the install string, so they don't need it). Structured so refresh stays one-command.
     repo: str | None = None
+    # v0.3.9 REFRESH-POLICY metadata (planning only — NEVER affects verify/drift/install/runtime, per
+    # [[quarry-runtime-is-not-a-knob]]). `maintenance_state` tells a future `quarry lock --refresh` how often to
+    # check upstream: active (fast cadence) · monitor (low cadence) · frozen (rarely/never updated) · distro
+    # (delegated to the OS). `release` is the HUMAN release tag, kept SEPARATE from the reproducible `pin`/`ref`
+    # — for a tool pinned to a go pseudo-version / commit (gowitness, smap, hakrawler, jsluice, gf, shosubgo,
+    # massdns) the pin is NOT its release number, so refresh must compare releases without "upgrading" it to an
+    # OLDER tagged build. A tool whose pin already IS its release omits it.
+    maintenance_state: str | None = None
+    release: str | None = None
 
     @property
     def installed(self) -> bool:
@@ -164,7 +192,7 @@ def load_tools() -> list[Tool]:
             deps=t.get("deps") or [], needs_chromium=bool(t.get("needs_chromium", False)),
             pin=t.get("version"), artifacts=t.get("artifacts"), ref=t.get("ref"),
             policy=t.get("policy"), capability=t.get("capability"), cap_codes=t.get("cap_codes"),
-            repo=t.get("repo"),
+            repo=t.get("repo"), maintenance_state=t.get("maintenance_state"), release=t.get("release"),
         ))
     return tools
 
@@ -354,7 +382,10 @@ def capture_lock() -> list[dict]:
         iv = installed_identity(t) if installed else ""     # runtime-specific, probe ONCE
         rows.append({"bin": t.bin, "installed": iv or None, "pin": t.pin or t.ref,
                      "runtime": t.runtime, "optional": t.optional,
-                     "drift": _drift_status(t, installed, iv)})
+                     "drift": _drift_status(t, installed, iv),
+                     # v0.3.9 refresh-policy metadata (planning only) — `release` is the human tag when it differs
+                     # from a pseudo-version/commit pin, so a future `lock --refresh` compares the right numbers.
+                     "maintenance": t.maintenance_state, "release": t.release or t.pin or t.ref})
     return rows
 
 
