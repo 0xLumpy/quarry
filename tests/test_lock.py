@@ -486,6 +486,34 @@ class TestCliNoFloat:
         res = CliRunner().invoke(cli_mod.cli, ["install", "--only", "subfinder", "--yes"])
         assert res.exit_code != 0
 
+    def _full_bootstrap_env(self, monkeypatch, tmp_path):
+        from quarry_recon import cli as cli_mod, bootstrap
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(Tool, "installed", property(lambda self: False))
+        monkeypatch.setattr(bootstrap, "system_report", lambda who: {"level": "ok"})
+        monkeypatch.setattr(cli_mod, "_echo_syscheck", lambda rep: None)
+        for fn in ("install_system_packages", "ensure_golang", "install_data_files", "run_extras", "cleanup"):
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: True)
+        # install_one: REQUIRED tools succeed, OPTIONAL tools fail
+        monkeypatch.setattr(cli_mod, "install_one", lambda t, echo, dry_run=False: not t.optional)
+        return cli_mod
+
+    def test_optional_failure_nonfatal_in_full_bootstrap(self, monkeypatch, tmp_path):
+        # fresh-install#1: in the FULL bootstrap (--include-optional, no narrowing) an optional tool failing is
+        # best-effort — exit 0 so install.sh can persist PATH.
+        from click.testing import CliRunner
+        cli_mod = self._full_bootstrap_env(monkeypatch, tmp_path)
+        res = CliRunner().invoke(cli_mod.cli, ["install", "--include-optional", "--yes"])
+        assert res.exit_code == 0 and "optional tool failed" in res.output
+
+    def test_targeted_only_failure_is_fatal_even_if_optional(self, monkeypatch, tmp_path):
+        # fresh-install#1: a NARROWED retry (`quarry install --only dnsgen`) must exit NON-zero when it fails —
+        # it must not report success while the requested tool is still broken.
+        from click.testing import CliRunner
+        cli_mod = self._full_bootstrap_env(monkeypatch, tmp_path)
+        res = CliRunner().invoke(cli_mod.cli, ["install", "--only", "dnsgen", "--yes"])
+        assert res.exit_code != 0
+
 
 class TestGoArchiveChecksum:
     def _bs(self, sha):

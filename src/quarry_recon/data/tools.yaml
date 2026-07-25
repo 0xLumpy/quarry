@@ -157,8 +157,9 @@ tools:
     phase: vertical
     role: subdomain permutation generation (classic)
     install: pipx install dnsgen
-    version_cmd: dnsgen -h
-    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
+    # dnsgen (click) has NO version flag, and `-h` is a usage ERROR (exit 2) — `--help` (exit 0) is the smoke
+    # test. Version comes from the pipx identity, not a CLI banner.
+    capability: dnsgen --help
     doc: https://github.com/AlephNullSK/dnsgen
     runtime: pipx
     optional: true
@@ -274,8 +275,9 @@ tools:
     phase: crawl
     role: fast link spider (secondary to katana)
     install: go install github.com/hakluke/hakrawler@latest
-    version_cmd: hakrawler -h
-    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
+    # hakrawler has NO version/help flag — `-h` is the HEADERS flag (exit 2). It reads URLs from stdin, so the
+    # smoke test feeds it EMPTY stdin (exit 0, no network). Version comes from the go-module identity.
+    capability: printf '' | hakrawler
     doc: https://github.com/hakluke/hakrawler
     optional: true
 

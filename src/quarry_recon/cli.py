@@ -462,7 +462,7 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
         click.echo(f"  {_c('→', 'cyan')} {t.bin}{pin_note}")
         # C08.2: the ONE shared, version-LOCKED install path (identity + capability verified; atomic staging).
         if not install_one(t, lambda m: click.echo(f"      {m}"), dry_run):
-            failed.append(t.bin)
+            failed.append(t)
 
     # ── 3. data files + extras + cleanup ──
     if full:
@@ -475,14 +475,24 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
 
     if dry_run:
         click.echo(_c("\n(dry-run — nothing was installed)\n", "yellow"))
-    elif failed:
-        click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
-        for b in failed:
+        return
+    # An optional tool failing is best-effort (nonfatal) ONLY in the FULL bootstrap (install.sh: no --only/
+    # --phase/--tools-only) — there it must not abort before PATH is persisted. Any NARROWED/targeted run
+    # (--only, --phase, --tools-only) fails hard on ANY selected tool: the operator asked for exactly those, so
+    # the printed `--only` retry must NOT report success while the tool is still broken (review fresh-install#1).
+    soft = [t.bin for t in failed if full and include_optional and t.optional]
+    fatal = [t.bin for t in failed if t.bin not in soft]
+    for b in soft:
+        click.echo(_c(f"  optional tool failed: {b} — retry: quarry install --only {b}", "yellow"))
+    if fatal:
+        click.echo(_c(f"\n{len(fatal)} tool(s) failed: {', '.join(fatal)}", "yellow"))
+        for b in fatal:
             click.echo(f"retry: quarry install --only {b}")
         raise SystemExit(1)                              # review-C08.2#6: failures propagate a non-zero exit
     elif not os.environ.get("QUARRY_FROM_INSTALLER"):
         # install.sh prints the final banner itself; only conclude here when run standalone
-        click.echo(_c("\ninstall complete — all tools ok\nrun  quarry doctor  to verify", "green"))
+        tail = "" if not soft else f" ({len(soft)} optional failed — see above)"
+        click.echo(_c(f"\ninstall complete — required tools ok{tail}\nrun  quarry doctor  to verify", "green"))
 
 
 @cli.command()
