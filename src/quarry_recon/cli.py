@@ -657,7 +657,7 @@ def oos(profile_path, hosts):
 @cli.command()
 @click.option("-t", "--target", "profile_path", required=True,
               help="project name, project dir, or target.yaml path")
-@click.option("--timeout", default=1800, help="per-tool timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests)")
+@click.option("--timeout", default=1800, help="per-lookup ceiling (seconds) for the OSINT HTTP/whois/dig lookups — each also has its own shorter default, so this only TIGHTENS them. Must be > 0 (osint has no unbounded mode; 0 would collapse every lookup to a 0-second timeout)")
 def osint(profile_path, timeout):
     """Pre-flight OSINT: discover scope CANDIDATES + intel. Review-only — never edits scope.
 
@@ -667,6 +667,8 @@ def osint(profile_path, timeout):
     import json
     from . import osint as osint_mod
 
+    if timeout <= 0:      # osint bounds each lookup with min(timeout, N); 0/neg would make every lookup fail instantly
+        raise click.ClickException("osint --timeout must be > 0 (it's a per-lookup ceiling; there is no unbounded osint)")
     try:
         profile = TargetProfile.load(_resolve_profile(profile_path))
     except ProfileError as e:
@@ -702,7 +704,7 @@ def osint(profile_path, timeout):
               help="project name, project dir, or target.yaml path")
 @click.option("--phases", help="comma list (default: all). e.g. horizontal,vertical")
 @click.option("--passive", is_flag=True, help="force passive-only (override profile)")
-@click.option("--timeout", default=1800, help="per-tool timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests)")
+@click.option("--timeout", default=1800, help="per-tool OUTER timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests). subfinder is separate: it self-bounds via its own -max-time budget (10m/apex), NOT this flag")
 def run(profile_path, phases, passive, timeout):
     """Run recon phases against the confirmed scope. Output lands in the project's recon/ dir."""
     from .phases import ORDER, REGISTRY, PhaseContext

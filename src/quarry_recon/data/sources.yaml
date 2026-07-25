@@ -70,7 +70,9 @@ sources:
 
   # ── vertical ────────────────────────────────────────────────────────────────────────
   vertical.subfinder:        {tool: subfinder, phase: vertical, tier: core, class: passive, default: on,
-    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.hosts, log: delta}
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: "per-apex: -max-time 10m (native budget) + 660s outer backstop; NOT --timeout",
+    failure: quiet-warn, fallback: skip, parser: normalize.hosts, log: delta,
+    notes: "run ONCE PER APEX (subfinder's -max-time is per-domain); hitting the 10m ceiling -> PARTIAL (capped coverage, results kept). -all sources; provider-config + PDCP key fingerprinted into the resume work_unit"}
   vertical.github_subs:      {tool: github-subdomains, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (GitHub PAT)",
     input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: http, failure: silent-skip, fallback: skip, parser: normalize.hosts, log: one-line,
     notes: "needs GitHub PAT; silent if absent"}

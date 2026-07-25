@@ -321,7 +321,10 @@ class TargetProfile:
             raise ProfileError("profile missing required field: TARGET")
         # canonicalize + validate every apex (rejects path/traversal/garbage — also closes the
         # apex->filename path escape). Never narrows a legitimate target; only rejects non-domains.
-        apexes = [_canon_domain(d) for d in (raw.get("APEX_DOMAINS") or []) if str(d).strip()]
+        # DEDUP after canonicalization — `example.com` and `*.example.com` both canonicalize to the same root, so
+        # keep it once (else a per-apex loop double-runs it and overwrites its evidence). dict.fromkeys preserves
+        # first-seen order.
+        apexes = list(dict.fromkeys(_canon_domain(d) for d in (raw.get("APEX_DOMAINS") or []) if str(d).strip()))
         if not apexes:
             raise ProfileError("profile must list at least one APEX_DOMAINS entry")
         cdv = (raw.get("MODES") or {}).get("CONTENT_DISCOVERY", "off")

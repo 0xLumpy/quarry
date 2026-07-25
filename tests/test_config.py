@@ -61,6 +61,12 @@ class TestProfileLoad:
         assert p.apex_domains == ["example.com"]
         assert p.scope().in_scope("www.example.com") and p.scope().in_scope("example.com")
 
+    def test_duplicate_canonical_apex_is_deduped(self, profile):
+        # review-r3#1: example.com and *.example.com canonicalize to the same root — kept ONCE (else a per-apex
+        # loop double-runs it and overwrites its evidence)
+        p = profile(apex='example.com\n  - "*.example.com"\n  - Example.COM.')
+        assert p.apex_domains == ["example.com"]
+
     def test_passive_only_quoted_false_footgun(self, profile):
         assert profile('MODES:\n  PASSIVE_ONLY: "false"\n').passive_only is False
 

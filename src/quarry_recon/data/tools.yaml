@@ -95,12 +95,14 @@ tools:
     maintenance_state: active
     version: "v2.14.0"
     phase: vertical
-    role: passive subdomain enum (primary); subfinder -all -recursive
+    role: passive subdomain enum (primary); subfinder -all (no -recursive — it RESTRICTS sources)
     install: go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
     version_cmd: subfinder -version
     doc: https://github.com/projectdiscovery/subfinder
     keys: ~/.config/subfinder/provider-config.yaml (chaos, github, shodan, securitytrails, netlas, c99, dnsdumpster, fofa, ...)
-    notes: -all enables all sources (+20 results in testing). -stats shows per-key health.
+    notes: -all enables all sources (+20 results in testing); -recursive would RESTRICT to the recursive-capable
+      subset (coverage loss, T1.2). -max-time 10m is its native collection ceiling — hitting it = PARTIAL (capped),
+      not a clean SUCCESS (vertical.py reclassify). -stats shows per-key health.
 
   - bin: github-subdomains
     maintenance_state: frozen

@@ -1047,3 +1047,13 @@ class TestInstallOutput:
         res = CliRunner().invoke(cli_mod.cli, ["install", "--include-optional", "--dry-run"])
         nmap_line = next(l for l in res.output.splitlines() if l.strip().startswith("→ nmap"))
         assert "(distro)" in nmap_line and "(unpinned)" not in nmap_line
+
+
+class TestOsintTimeout:
+    def test_osint_rejects_zero_timeout(self):
+        # review-r3#3: osint bounds each lookup with min(timeout, N); 0 would collapse every lookup to 0s. It has
+        # no unbounded mode (unlike `run`), so 0/neg is rejected up front (before profile resolution).
+        from click.testing import CliRunner
+        from quarry_recon import cli as cli_mod
+        res = CliRunner().invoke(cli_mod.cli, ["osint", "-t", "no-such-project-xyz", "--timeout", "0"])
+        assert res.exit_code != 0 and "must be > 0" in res.output

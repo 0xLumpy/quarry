@@ -12,11 +12,89 @@ import re as _re
 import shutil
 import urllib.parse
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 
 from .. import events, netguard, normalize, secrets, settings
 from ..contract import ProviderResult, classify_provider_error, run_contract, run_provider
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
+
+_SUBFINDER_MAX_MIN = 10                     # subfinder's -max-time (minutes) — its native collection ceiling
+_SUBFINDER_MAX_S = _SUBFINDER_MAX_MIN * 60
+
+
+def _subfinder_reclassify(res):
+    """subfinder's -max-time cap stops collection GRACEFULLY (exit 0) — but coverage is then CAPPED, not
+    complete. A clean SUCCESS/EMPTY whose wall-clock reached the ceiling is really PARTIAL (more subdomains may
+    exist); the results already gathered are still kept + ingested. A run that finished BEFORE the ceiling is an
+    honest SUCCESS/EMPTY. NO tolerance below the ceiling: Quarry starts timing BEFORE subfinder arms its internal
+    timer, so a capped run's measured duration is always >= the ceiling — a sub-ceiling duration means it finished
+    on its own (review-r2#P2)."""
+    if res.status in (Status.SUCCESS, Status.EMPTY) and res.duration >= _SUBFINDER_MAX_S:
+        return replace(res, status=Status.PARTIAL,
+                       note=f"hit subfinder -max-time {_SUBFINDER_MAX_MIN}m ceiling — coverage capped (results kept)")
+    return res
+
+
+def _subfinder_config_paths() -> "tuple[Path, Path]":
+    """The EFFECTIVE (provider-config, config) file paths subfinder will actually read (review-r4#1): the
+    `SUBFINDER_PROVIDER_CONFIG` / `SUBFINDER_CONFIG` env overrides win, else `<XDG_CONFIG_HOME or ~/.config>/
+    subfinder/{provider-config,config}.yaml`. BOTH affect `-all` coverage (config.yaml selects sources;
+    provider-config.yaml holds keys)."""
+    cfg_dir = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "subfinder"
+    provider = Path(os.environ.get("SUBFINDER_PROVIDER_CONFIG") or (cfg_dir / "provider-config.yaml"))
+    config = Path(os.environ.get("SUBFINDER_CONFIG") or (cfg_dir / "config.yaml"))
+    return provider, config
+
+
+def _subfinder_provider_fp() -> str:
+    """Fingerprint of subfinder's EFFECTIVE configuration — both config files' CONTENTS (resolved via env
+    overrides + XDG) + the effective PDCP env key — folded into the resume work_unit (review-r3#2). Coverage from
+    `-all` depends on these, so a change (e.g. ADDING a key) must invalidate resume instead of skipping the wider
+    run as 'already complete'. Domain-separated + length-prefixed framing; FULL sha256 (256-bit — no truncation
+    that would discard entropy before the work_unit folds it, review-r4#2). NEVER a raw secret (the key is
+    sha256-fingerprinted)."""
+    import hashlib
+    provider, config = _subfinder_config_paths()
+    h = hashlib.sha256()
+    for label, p in (("provider-config", provider), ("config", config)):
+        try:
+            data = p.read_bytes()
+        except OSError:
+            data = b"\x00<absent>"                            # a real file is never this (length-framed below)
+        h.update(label.encode() + b"\x00" + len(data).to_bytes(8, "big") + data)   # unambiguous framing
+    key = (os.environ.get("PDCP_API_KEY") or "").encode()
+    h.update(b"pdcp-key\x00" + hashlib.sha256(key).digest())  # key FINGERPRINT (full sha256), never the raw key
+    return h.hexdigest()                                      # full 256-bit hex
+
+
+def _run_subfinder(ctx, prof, scope) -> None:
+    """Passive subfinder — run ONCE PER APEX (review-r2#P1). subfinder applies `-max-time` PER DOMAIN (it
+    enumerates `-dL` domains SEQUENTIALLY, each with its OWN ceiling), so a single `-dL` batch would compare a
+    SUMMED multi-apex duration against one 600s cap — false-PARTIAL for apexes that each finished cleanly, and a
+    fixed outer timeout could SIGKILL mid-batch on several apexes. Per apex we get an honest work_unit / raw
+    artifact / classification / ingestion and independent resume. Flags: `-all` = every source; NO `-recursive`
+    (upstream: it RESTRICTS to the recursive-capable subset — a coverage loss, T1.2). subfinder's collection
+    budget is its OWN `-max-time` — a POSITIVE value (10m), SEPARATE from Quarry's `--timeout` outer kill
+    (`-max-time 0` would cancel immediately via context.WithTimeout, so subfinder is never truly "unbounded").
+    The per-apex outer subprocess backstop sits just ABOVE that ceiling so subfinder caps ITSELF gracefully
+    (exit 0, results written) rather than being SIGKILLed. -stats -> per-source/API-key health (captured)."""
+    providers = _subfinder_provider_fp()                     # coverage-affecting: fold into resume (review-r3#2)
+    for apex in sorted(set(prof.apex_domains)):              # defensive: never run a canonical apex twice
+        sf_raw = ctx.run.raw_path("vertical", "subfinder", f"passive_{apex}.txt")
+        sf_wu = events.work_unit("vertical.subfinder", inputs={"root": apex},
+                                 config={"sources": "all", "max_time_min": _SUBFINDER_MAX_MIN,
+                                         "providers": providers})
+        r = run_contract("vertical.subfinder",
+                         ["subfinder", "-d", apex, "-all", "-max-time", str(_SUBFINDER_MAX_MIN),
+                          "-stats", "-silent"], work_unit=sf_wu, raw_path=sf_raw,
+                         reclassify=_subfinder_reclassify, timeout=_SUBFINDER_MAX_S + 60)
+        ctx.run.record("vertical", r)
+        if r.raw_path:
+            n = sum(ctx.run.add("subdomain", e) for e in
+                    normalize.hosts(r.raw_path.read_text(), "subfinder", str(sf_raw))
+                    if scope.in_scope(e["host"]))
+            ctx.echo(f"  subfinder [{apex}]: +{n} in-scope ({r.stdout_lines} raw, {r.status.value})")
 
 
 def _shosubgo_read(path):
@@ -437,29 +515,8 @@ def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
     roots_file = ctx.write_list("roots.txt", prof.apex_domains)
 
-    # ── passive: subfinder ──
-    sf_raw = ctx.run.raw_path("vertical", "subfinder", "passive.txt")
-    # `-all` = every configured source. NO `-recursive`: upstream defines it as "use ONLY sources that can
-    # handle subdomains recursively" (verified subfinder v2.14.0 -h), so `-all -recursive` RESTRICTS to the
-    # recursive-capable SUBSET and silently drops the other providers — a coverage loss (T1.2). Dropping it
-    # runs all sources: the selected provider SET is a superset of the old recursive-only subset (observed
-    # results can still vary run-to-run, as passive APIs do). A separate recursive pass seeded from NS/delegation
-    # evidence is a later enhancement (needs the dns phase's records; running -recursive blind over all
-    # roots adds nothing over -all). -stats prints per-source/API-key health to stderr (kept; captured).
-    # C07: run under the authoritative contract (stable source_id + start/terminal events). The event layer
-    # is additive — we still record the RunResult to the manifest below.
-    # C10b resume: work_unit = the apex-root set + source scope (`-all`). A changed root set is a new unit.
-    sf_wu = events.work_unit("vertical.subfinder", inputs={"roots": sorted(prof.apex_domains)},
-                             config={"sources": "all"})
-    r = run_contract("vertical.subfinder", ["subfinder", "-dL", str(roots_file), "-all",
-                                            "-stats", "-silent"], work_unit=sf_wu,
-                     raw_path=sf_raw, timeout=ctx.http_timeout)
-    ctx.run.record("vertical", r)
-    if r.raw_path:
-        n = sum(ctx.run.add("subdomain", e) for e in
-                normalize.hosts(r.raw_path.read_text(), "subfinder", str(sf_raw))
-                if scope.in_scope(e["host"]))
-        ctx.echo(f"  subfinder: +{n} in-scope ({r.stdout_lines} raw, {r.status.value})")
+    # ── passive: subfinder (per APEX) ──
+    _run_subfinder(ctx, prof, scope)
 
     # ── passive: CT-log sources (crt.sh free + certspotter) — coverage/resilience over subfinder ──
     # A `*.X.apex` wildcard cert name → register `X.apex` as a WILDCARD BRUTE-ZONE candidate (A1):
