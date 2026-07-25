@@ -704,7 +704,8 @@ def osint(profile_path, timeout):
               help="project name, project dir, or target.yaml path")
 @click.option("--phases", help="comma list (default: all). e.g. horizontal,vertical")
 @click.option("--passive", is_flag=True, help="force passive-only (override profile)")
-@click.option("--timeout", default=1800, help="per-tool OUTER timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests). subfinder is separate: it self-bounds via its own -max-time budget (10m/apex), NOT this flag")
+@click.option("--timeout", default=1800, type=click.IntRange(min=0),
+              help="per-tool OUTER timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests; NEGATIVE is rejected, as it would collapse every tool to an instant timeout). subfinder is separate: it self-bounds via its own -max-time budget per apex (PERFORMANCE.SUBFINDER_MAX_TIME minutes, default 60; 0 or --timeout 0 -> practically unbounded), NOT this flag")
 def run(profile_path, phases, passive, timeout):
     """Run recon phases against the confirmed scope. Output lands in the project's recon/ dir."""
     from .phases import ORDER, REGISTRY, PhaseContext

@@ -70,9 +70,9 @@ sources:
 
   # ── vertical ────────────────────────────────────────────────────────────────────────
   vertical.subfinder:        {tool: subfinder, phase: vertical, tier: core, class: passive, default: on,
-    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: "per-apex: -max-time 10m (native budget) + 660s outer backstop; NOT --timeout",
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: "per-apex: -max-time = PERFORMANCE.SUBFINDER_MAX_TIME min (default 60; 0 or --timeout 0 -> ~unbounded 1440m) + outer backstop budget+60s (0 when --timeout 0); NOT --timeout otherwise",
     failure: quiet-warn, fallback: skip, parser: normalize.hosts, log: delta,
-    notes: "run ONCE PER APEX (subfinder's -max-time is per-domain); hitting the 10m ceiling -> PARTIAL (capped coverage, results kept). -all sources; provider-config + PDCP key fingerprinted into the resume work_unit"}
+    notes: "run ONCE PER APEX (subfinder's -max-time is per-domain); reaching the effective budget -> PARTIAL (capped, results kept), natural finish -> SUCCESS. -all sources; effective config (both files, env+XDG) + PDCP key + effective budget fingerprinted into the resume work_unit"}
   vertical.github_subs:      {tool: github-subdomains, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (GitHub PAT)",
     input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: http, failure: silent-skip, fallback: skip, parser: normalize.hosts, log: one-line,
     notes: "needs GitHub PAT; silent if absent"}

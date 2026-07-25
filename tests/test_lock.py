@@ -1057,3 +1057,11 @@ class TestOsintTimeout:
         from quarry_recon import cli as cli_mod
         res = CliRunner().invoke(cli_mod.cli, ["osint", "-t", "no-such-project-xyz", "--timeout", "0"])
         assert res.exit_code != 0 and "must be > 0" in res.output
+
+    def test_run_rejects_negative_timeout_at_parse(self):
+        # review-r3: `run --timeout -1` would reach communicate(timeout=-1) = instant timeout. IntRange(min=0)
+        # rejects it at PARSE (exit 2) — before profile resolution or any run dir is created. 0 stays valid.
+        from click.testing import CliRunner
+        from quarry_recon import cli as cli_mod
+        res = CliRunner().invoke(cli_mod.cli, ["run", "-t", "no-such-project-xyz", "--timeout", "-1"])
+        assert res.exit_code == 2 and "timeout" in res.output.lower()   # click usage error, body never ran

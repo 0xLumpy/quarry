@@ -19,21 +19,45 @@ from .. import events, netguard, normalize, secrets, settings
 from ..contract import ProviderResult, classify_provider_error, run_contract, run_provider
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
-_SUBFINDER_MAX_MIN = 10                     # subfinder's -max-time (minutes) — its native collection ceiling
-_SUBFINDER_MAX_S = _SUBFINDER_MAX_MIN * 60
+_SUBFINDER_DEFAULT_MIN = 60                  # default -max-time budget (minutes) for a normal bounded run
+_SUBFINDER_UNBOUNDED_MIN = 1440             # Quarry's "0 = practically unbounded" -> 24h (subfinder can't take 0:
+#                                             upstream feeds -max-time into context.WithTimeout, so 0 cancels)
 
 
-def _subfinder_reclassify(res):
-    """subfinder's -max-time cap stops collection GRACEFULLY (exit 0) — but coverage is then CAPPED, not
-    complete. A clean SUCCESS/EMPTY whose wall-clock reached the ceiling is really PARTIAL (more subdomains may
-    exist); the results already gathered are still kept + ingested. A run that finished BEFORE the ceiling is an
-    honest SUCCESS/EMPTY. NO tolerance below the ceiling: Quarry starts timing BEFORE subfinder arms its internal
-    timer, so a capped run's measured duration is always >= the ceiling — a sub-ceiling duration means it finished
-    on its own (review-r2#P2)."""
-    if res.status in (Status.SUCCESS, Status.EMPTY) and res.duration >= _SUBFINDER_MAX_S:
-        return replace(res, status=Status.PARTIAL,
-                       note=f"hit subfinder -max-time {_SUBFINDER_MAX_MIN}m ceiling — coverage capped (results kept)")
-    return res
+def _subfinder_budget_min(http_timeout) -> int:
+    """The EFFECTIVE subfinder -max-time budget (minutes). PERFORMANCE.SUBFINDER_MAX_TIME sets it (default 60).
+    STRICT parse (review-r2#1): an EXACT integer (or clean integer string) in 0..1440 only — a bool / float /
+    negative / oversized / garbage value falls back to 60 (never a silent 1-min cap from `true`, a 24h run from
+    `false`/negatives, or a Go duration overflow). Quarry's 0 = 'practically unbounded' -> 1440m (NEVER 0 to
+    subfinder, which would cancel); `quarry run --timeout 0` likewise forces the practical-unbounded budget."""
+    raw = settings.performance().get("SUBFINDER_MAX_TIME")
+    knob = _SUBFINDER_DEFAULT_MIN
+    if isinstance(raw, bool):                                # bool is an int subclass — reject explicitly
+        knob = _SUBFINDER_DEFAULT_MIN
+    elif isinstance(raw, int):
+        knob = raw if 0 <= raw <= _SUBFINDER_UNBOUNDED_MIN else _SUBFINDER_DEFAULT_MIN
+    elif isinstance(raw, str) and raw.strip().isdigit():     # a clean NON-negative integer string (no float/sign)
+        v = int(raw.strip())
+        knob = v if 0 <= v <= _SUBFINDER_UNBOUNDED_MIN else _SUBFINDER_DEFAULT_MIN
+    # else (None/""/float/garbage): keep the 60m default
+    if knob <= 0 or http_timeout == 0:                       # 0 (or unbounded outer) -> practically unbounded
+        return _SUBFINDER_UNBOUNDED_MIN
+    return knob
+
+
+def _subfinder_reclassifier(budget_min: int):
+    """Build the reclassify callback for the EFFECTIVE budget: a clean SUCCESS/EMPTY whose wall-clock reached the
+    budget stopped at the -max-time ceiling -> coverage CAPPED -> PARTIAL (results kept + ingested). A natural
+    finish BELOW the budget is an honest SUCCESS/EMPTY. NO tolerance below: Quarry starts timing before subfinder
+    arms its internal timer, so a capped run always measures >= the budget."""
+    budget_s = budget_min * 60
+
+    def _reclassify(res):
+        if res.status in (Status.SUCCESS, Status.EMPTY) and res.duration >= budget_s:
+            return replace(res, status=Status.PARTIAL,
+                           note=f"hit subfinder -max-time {budget_min}m ceiling — coverage capped (results kept)")
+        return res
+    return _reclassify
 
 
 def _subfinder_config_paths() -> "tuple[Path, Path]":
@@ -75,20 +99,23 @@ def _run_subfinder(ctx, prof, scope) -> None:
     fixed outer timeout could SIGKILL mid-batch on several apexes. Per apex we get an honest work_unit / raw
     artifact / classification / ingestion and independent resume. Flags: `-all` = every source; NO `-recursive`
     (upstream: it RESTRICTS to the recursive-capable subset — a coverage loss, T1.2). subfinder's collection
-    budget is its OWN `-max-time` — a POSITIVE value (10m), SEPARATE from Quarry's `--timeout` outer kill
-    (`-max-time 0` would cancel immediately via context.WithTimeout, so subfinder is never truly "unbounded").
-    The per-apex outer subprocess backstop sits just ABOVE that ceiling so subfinder caps ITSELF gracefully
-    (exit 0, results written) rather than being SIGKILLed. -stats -> per-source/API-key health (captured)."""
+    budget is its OWN `-max-time` (PERFORMANCE.SUBFINDER_MAX_TIME minutes, default 60; Quarry's 0 -> practically
+    unbounded 1440m — NEVER 0 to subfinder, which would cancel), SEPARATE from Quarry's `--timeout` outer kill.
+    The per-apex outer subprocess backstop = budget + 60s so subfinder caps ITSELF gracefully (exit 0, results
+    written) rather than being SIGKILLed — EXCEPT `quarry run --timeout 0` (unbounded) which also passes the
+    outer timeout 0 (no kill). The reclassify uses the EFFECTIVE budget. -stats -> per-source health (captured)."""
+    budget_min = _subfinder_budget_min(ctx.http_timeout)     # effective budget (minutes); folded into resume below
+    reclassify = _subfinder_reclassifier(budget_min)
+    outer = 0 if ctx.http_timeout == 0 else budget_min * 60 + 60   # --timeout 0 -> no outer kill; else budget+60s
     providers = _subfinder_provider_fp()                     # coverage-affecting: fold into resume (review-r3#2)
     for apex in sorted(set(prof.apex_domains)):              # defensive: never run a canonical apex twice
         sf_raw = ctx.run.raw_path("vertical", "subfinder", f"passive_{apex}.txt")
         sf_wu = events.work_unit("vertical.subfinder", inputs={"root": apex},
-                                 config={"sources": "all", "max_time_min": _SUBFINDER_MAX_MIN,
-                                         "providers": providers})
+                                 config={"sources": "all", "max_time_min": budget_min, "providers": providers})
         r = run_contract("vertical.subfinder",
-                         ["subfinder", "-d", apex, "-all", "-max-time", str(_SUBFINDER_MAX_MIN),
+                         ["subfinder", "-d", apex, "-all", "-max-time", str(budget_min),
                           "-stats", "-silent"], work_unit=sf_wu, raw_path=sf_raw,
-                         reclassify=_subfinder_reclassify, timeout=_SUBFINDER_MAX_S + 60)
+                         reclassify=reclassify, timeout=outer)
         ctx.run.record("vertical", r)
         if r.raw_path:
             n = sum(ctx.run.add("subdomain", e) for e in

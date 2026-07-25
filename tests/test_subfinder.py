@@ -3,11 +3,15 @@ is PARTIAL, not clean SUCCESS; results always kept) AND per-APEX execution (the 
 single -dL batch would misclassify multi-apex runs). Pure/offline (run_contract is mocked)."""
 import pytest
 
+from quarry_recon import settings
 from quarry_recon.phases import vertical
-from quarry_recon.phases.vertical import _run_subfinder, _subfinder_reclassify, _SUBFINDER_MAX_S
+from quarry_recon.phases.vertical import (_run_subfinder, _subfinder_budget_min, _subfinder_reclassifier,
+                                          _SUBFINDER_DEFAULT_MIN, _SUBFINDER_UNBOUNDED_MIN)
 from quarry_recon.runner import RunResult, Status
 
 pytestmark = pytest.mark.offline
+
+_NOKEY = object()   # sentinel: PERFORMANCE has no SUBFINDER_MAX_TIME key at all
 
 
 def _res(status, duration):
@@ -15,45 +19,76 @@ def _res(status, duration):
 
 
 class TestSubfinderCeiling:
+    _R = staticmethod(_subfinder_reclassifier(60))       # a 60-minute budget -> 3600s ceiling
+    _S = 3600
+
     def test_early_completion_stays_success(self):
-        assert _subfinder_reclassify(_res(Status.SUCCESS, _SUBFINDER_MAX_S - 120)).status == Status.SUCCESS
+        assert self._R(_res(Status.SUCCESS, self._S - 120)).status == Status.SUCCESS
 
     def test_just_under_ceiling_stays_clean(self):
-        # review-r2#P2: no tolerance below the ceiling — 599.9s means it finished on its own, an honest SUCCESS
-        r = _subfinder_reclassify(_res(Status.SUCCESS, _SUBFINDER_MAX_S - 0.1))
+        # review-r2#P2: no tolerance below the ceiling — finishing just under means it finished on its own
+        r = self._R(_res(Status.SUCCESS, self._S - 0.1))
         assert r.status == Status.SUCCESS and not r.note
 
     def test_exactly_at_ceiling_is_partial(self):
-        assert _subfinder_reclassify(_res(Status.SUCCESS, _SUBFINDER_MAX_S)).status == Status.PARTIAL
+        assert self._R(_res(Status.SUCCESS, self._S)).status == Status.PARTIAL
 
-    def test_ceiling_with_results_is_partial(self):
-        r = _subfinder_reclassify(_res(Status.SUCCESS, _SUBFINDER_MAX_S + 0.19))  # the observed 600.19s
-        assert r.status == Status.PARTIAL and "ceiling" in r.note and "capped" in r.note
+    def test_over_ceiling_with_results_is_partial(self):
+        r = self._R(_res(Status.SUCCESS, self._S + 5))
+        assert r.status == Status.PARTIAL and "ceiling" in r.note and "capped" in r.note and "60m" in r.note
 
     def test_ceiling_with_zero_is_partial(self):
-        assert _subfinder_reclassify(_res(Status.EMPTY, _SUBFINDER_MAX_S + 1)).status == Status.PARTIAL
+        assert self._R(_res(Status.EMPTY, self._S + 1)).status == Status.PARTIAL
 
     def test_nonclean_status_at_ceiling_unchanged(self):
-        # a real timeout/error (already non-clean) is never flipped — only clean SUCCESS/EMPTY reclassify
-        assert _subfinder_reclassify(_res(Status.PARTIAL, _SUBFINDER_MAX_S + 5)).status == Status.PARTIAL
+        assert self._R(_res(Status.PARTIAL, self._S + 5)).status == Status.PARTIAL
+
+
+class TestSubfinderBudget:
+    # PERFORMANCE.SUBFINDER_MAX_TIME (minutes); Quarry's 0 = practically unbounded; --timeout 0 -> unbounded too.
+    # STRICT parse (review-r2#1): only an exact int / clean int-string in 0..1440; everything else -> 60.
+    def _perf(self, monkeypatch, val):
+        monkeypatch.setattr(settings, "performance",
+                            lambda: {} if val is _NOKEY else {"SUBFINDER_MAX_TIME": val})
+
+    @pytest.mark.parametrize("raw,expect", [
+        (_NOKEY, 60), (None, 60), (60, 60), (30, 30), (1, 1),        # default / valid ints
+        (1440, 1440),                                                 # max valid (24h, NOT the 0-sentinel)
+        (0, _SUBFINDER_UNBOUNDED_MIN),                                # 0 -> practically unbounded
+        (True, 60), (False, 60),                                      # bool rejected (not 1-min / not 24h)
+        (-5, 60), (1441, 60), (99999, 60),                           # negative / oversized -> default
+        (60.5, 60),                                                   # float -> default
+        ("60", 60), ("30", 30), ("0", _SUBFINDER_UNBOUNDED_MIN),      # clean int strings accepted
+        ("abc", 60), ("60.5", 60), ("-5", 60), ("  ", 60),           # garbage -> default
+    ])
+    def test_budget_parsing_is_strict_and_bounded(self, monkeypatch, raw, expect):
+        self._perf(monkeypatch, raw)
+        assert _subfinder_budget_min(1800) == expect                 # bounded outer, so the knob decides
+
+    def test_outer_timeout_zero_forces_unbounded_budget(self, monkeypatch):
+        self._perf(monkeypatch, 30)
+        assert _subfinder_budget_min(0) == _SUBFINDER_UNBOUNDED_MIN   # --timeout 0 -> unbounded regardless of knob
+
+    def test_never_zero_to_subfinder(self, monkeypatch):
+        self._perf(monkeypatch, 0)
+        assert _subfinder_budget_min(0) > 0                          # never 0 (subfinder would cancel)
 
 
 class TestSubfinderPerApex:
-    def test_per_apex_wiring_classification_and_ingestion(self, monkeypatch, tmp_path):
+    def _wire(self, monkeypatch, tmp_path, http_timeout, dur_for):
         calls, recorded, added = [], [], []
 
         def fake_rc(sid, cmd, *, work_unit=None, raw_path=None, reclassify=None, timeout=None, **k):
             apex = cmd[cmd.index("-d") + 1]
             raw_path.parent.mkdir(parents=True, exist_ok=True)
             raw_path.write_text(f"www.{apex}\n")                       # one in-scope host per apex
-            dur = 601.0 if apex == "a.com" else 12.0                   # a.com HITS the per-domain ceiling
-            res = RunResult("subfinder", cmd, Status.SUCCESS, 0, dur, raw_path, 1)
+            res = RunResult("subfinder", cmd, Status.SUCCESS, 0, dur_for(apex), raw_path, 1)
             if reclassify:                                            # run_contract applies it before the terminal
                 res = reclassify(res)
-            calls.append({"cmd": cmd, "wu": work_unit, "raw": raw_path.name,
-                          "timeout": timeout, "reclassify": reclassify, "status": res.status})
+            calls.append({"cmd": cmd, "wu": work_unit, "raw": raw_path.name, "timeout": timeout, "status": res.status})
             return res
         monkeypatch.setattr(vertical, "run_contract", fake_rc)
+        monkeypatch.setattr(settings, "performance", lambda: {})      # default 60m budget
 
         class _Run:
             def raw_path(self, ph, tl, nm):
@@ -62,24 +97,32 @@ class TestSubfinderPerApex:
             def add(self, kind, e): added.append(e["host"]); return True
         prof = type("P", (), {"apex_domains": ["b.com", "a.com"]})()
         scope = type("S", (), {"in_scope": staticmethod(lambda h: True)})()
-        ctx = type("C", (), {"run": _Run(), "http_timeout": 0, "echo": staticmethod(lambda m: None)})()
-
+        ctx = type("C", (), {"run": _Run(), "http_timeout": http_timeout, "echo": staticmethod(lambda m: None)})()
         _run_subfinder(ctx, prof, scope)
+        return calls, recorded, added
 
-        # ONE subfinder call per apex, sorted, each single-domain (-d, never -dL) with the explicit 10m budget
+    def test_per_apex_wiring_classification_and_ingestion(self, monkeypatch, tmp_path):
+        # bounded run (default 60m budget -> 3600s ceiling): a.com hits it, b.com finishes early
+        calls, recorded, added = self._wire(monkeypatch, tmp_path, 1800,
+                                            lambda a: 3601.0 if a == "a.com" else 12.0)
         assert [c["cmd"][c["cmd"].index("-d") + 1] for c in calls] == ["a.com", "b.com"]
         for c in calls:
             assert "-dL" not in c["cmd"]
-            assert c["cmd"][c["cmd"].index("-max-time") + 1] == "10"
-            assert c["timeout"] == _SUBFINDER_MAX_S + 60               # outer backstop above the ceiling
-            assert c["reclassify"] is _subfinder_reclassify
+            assert c["cmd"][c["cmd"].index("-max-time") + 1] == "60"   # effective budget minutes
+            assert c["timeout"] == 60 * 60 + 60                        # outer backstop = budget + 60s
         assert calls[0]["wu"] != calls[1]["wu"]                       # per-apex work_units
         assert {c["raw"] for c in calls} == {"passive_a.com.txt", "passive_b.com.txt"}   # per-apex artifacts
-        # per-apex classification: a.com (601s) -> PARTIAL, b.com (12s) -> honest SUCCESS
         st = {c["cmd"][c["cmd"].index("-d") + 1]: c["status"] for c in calls}
-        assert st == {"a.com": Status.PARTIAL, "b.com": Status.SUCCESS}
-        # ingestion RETAINED for BOTH apexes, including the capped one
-        assert set(added) == {"www.a.com", "www.b.com"} and len(recorded) == 2
+        assert st == {"a.com": Status.PARTIAL, "b.com": Status.SUCCESS}   # capped vs honest finish
+        assert set(added) == {"www.a.com", "www.b.com"} and len(recorded) == 2   # ingestion retained
+
+    def test_unbounded_outer_gives_unbounded_budget_and_no_outer_kill(self, monkeypatch, tmp_path):
+        # --timeout 0 -> subfinder budget 1440m + outer subprocess timeout 0 (no kill)
+        calls, _, _ = self._wire(monkeypatch, tmp_path, 0, lambda a: 12.0)
+        for c in calls:
+            assert c["cmd"][c["cmd"].index("-max-time") + 1] == str(_SUBFINDER_UNBOUNDED_MIN)   # 1440
+            assert c["timeout"] == 0                                   # no outer kill under --timeout 0
+        assert all(c["status"] == Status.SUCCESS for c in calls)      # 12s << 1440m -> honest SUCCESS
 
 
 class TestSubfinderProviderFP:
