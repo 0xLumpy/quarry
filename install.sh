@@ -74,7 +74,6 @@ echo "    Set API keys:"
 echo "      quarry:    ~/.config/quarry/secrets.yaml"
 echo "      subfinder: ~/.config/subfinder/provider-config.yaml"
 echo "      waymore:   ~/.config/waymore/config.yml"
-echo "    (subfinder/waymore create their config on first use — e.g. after 'quarry doctor'.)"
 
 # honor a REQUIRED-tool / host-requirement failure so automation sees it — PATH is already persisted above
 exit "$rc"

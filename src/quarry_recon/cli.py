@@ -457,35 +457,42 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
             # review-C08.2r4#1: a PRESENT tool is left as-is ONLY if it VERIFIES (identity + capability); a wrong
             # binary from a failed prior update no longer passes — it is reinstalled to the pin.
             if verify_installed(t):
-                # unified one-line format (→ … ✓), same as a fresh install below
-                click.echo(f"  {_c('→', 'cyan')} {t.bin} present + verified "
-                           f"({t.pin or t.ref or 'distro'}) {_c('✓', 'green')}")
+                # user-facing install output omits the version (noise here — it lives in `doctor`/`lock`); keep
+                # the distro tag (an explicit policy/state, not the absence of a pin).
+                distro = " (distro)" if t.policy == "distro" else ""
+                click.echo(f"  {_c('→', 'cyan')} {t.bin} present + verified{distro} {_c('✓', 'green')}")
                 continue
             click.echo(f"  {_c('⚠', 'yellow')} {t.bin} present but FAILED verification — reinstalling pin")
-        pin_note = f" @ {t.pin or t.ref}" if (t.pin or t.ref) else _c(" (unpinned)", "yellow")
-        click.echo(f"  {_c('→', 'cyan')} {t.bin}{pin_note}", nl=False)   # ONE line; ✓/✗ appended when done
-        # C08.2: the ONE shared, version-LOCKED install path. Buffer its progress/diagnostics: a clean install is
-        # a single `→ tool @ pin ✓` line. On SUCCESS suppress only the routine "<bin>: ok (...)" line but KEEP
-        # exceptional notes (e.g. a legacy-binary relocation); on FAILURE show everything. dry-run is neutral —
-        # `install_one` returns True there without installing, so it must NOT render as a success.
+        # distro-managed (nmap) is an explicit policy, NOT the absence of a pin — a genuinely unpinned tool is
+        # still "(unpinned)", never mislabeled "(distro)".
+        if t.policy == "distro":
+            pin_note = _c(" (distro)", "cyan")
+        elif t.pin or t.ref:
+            pin_note = f" @ {t.pin or t.ref}"
+        else:
+            pin_note = _c(" (unpinned)", "yellow")
+        click.echo(f"  {_c('→', 'cyan')} {t.bin}", nl=False)   # NAME only; the pin is appended below only on
+        # C08.2: the ONE shared, version-LOCKED install path. Buffer its progress/diagnostics. A clean install is
+        # a single `→ tool ✓` line — the VERSION is omitted here (user-facing noise; it lives in `doctor`/`lock`).
+        # A FAILURE / dry-run shows the attempted `@ pin` so the reason is actionable. On success suppress only
+        # the routine "<bin>: ok (...)" line but KEEP exceptional notes (e.g. a legacy-binary relocation).
         buf = []
         ok = install_one(t, buf.append, dry_run)
         if dry_run:
-            # install_one can still return False in dry-run BEFORE its dry-run path (unsupported platform /
-            # manual-only tool) — surface that reason instead of a misleading (dry-run).
+            # install_one can still return False in dry-run (unsupported platform / manual-only) — surface it
             if ok:
-                click.echo(_c(" (dry-run)", "yellow"))
+                click.echo(f"{pin_note} {_c('(dry-run)', 'yellow')}")
             else:
-                click.echo(_c(" ⊘ unavailable", "yellow"))
+                click.echo(f"{pin_note} {_c('⊘ unavailable', 'yellow')}")
                 for m in buf:
                     click.echo(f"      {m}")
         elif ok:
-            click.echo(_c(" ✓", "green"))
+            click.echo(_c(" ✓", "green"))               # `→ tool ✓` — NAME only, no version
             for m in buf:
                 if not m.startswith(f"{t.bin}: ok"):     # routine success line only; exceptional notes stay
                     click.echo(f"      {m}")
         else:
-            click.echo(_c(" ✗", "red"))
+            click.echo(f"{pin_note} {_c('✗', 'red')}")   # FAILURE shows the attempted pin
             for m in buf:
                 click.echo(f"      {m}")
             failed.append(t)

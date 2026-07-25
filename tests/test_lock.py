@@ -965,14 +965,15 @@ class TestInstallOutput:
         return cli_mod
 
     def test_success_is_one_clean_line_diagnostics_suppressed(self, monkeypatch, tmp_path):
-        # collapse: a clean install is `→ tool @ pin ✓` — install_one's progress lines are buffered + discarded
+        # collapse: a clean install is a NAME-only `→ tool ✓` (no version) — install_one's progress is buffered
         from click.testing import CliRunner
         cli_mod = self._full_env(monkeypatch, tmp_path)
         monkeypatch.setattr(cli_mod, "install_one",
                             lambda t, echo, dry_run=False: (echo(f"{t.bin}: ok (noise)"), True)[1])
         res = CliRunner().invoke(cli_mod.cli, ["install", "--include-optional", "--yes"])
         assert res.exit_code == 0
-        assert "→ subfinder @ v2.14.0 ✓" in res.output          # single clean line
+        assert "→ subfinder ✓" in res.output                     # NAME only — no version in install output
+        assert "@ v2.14.0" not in res.output                     # version omitted (it lives in doctor/lock)
         assert "subfinder: ok (noise)" not in res.output         # buffered diagnostic suppressed on success
 
     def test_failure_shows_marker_and_buffered_diagnostics(self, monkeypatch, tmp_path):
@@ -981,7 +982,8 @@ class TestInstallOutput:
         monkeypatch.setattr(cli_mod, "install_one",
                             lambda t, echo, dry_run=False: (echo("CAPABILITY FAILED"), False)[1])
         res = CliRunner().invoke(cli_mod.cli, ["install", "--only", "subfinder", "--yes"])
-        assert res.exit_code != 0 and "✗" in res.output and "CAPABILITY FAILED" in res.output
+        # a FAILURE shows the attempted pin + diagnostics (unlike the name-only success line)
+        assert res.exit_code != 0 and "✗" in res.output and "@ v2.14.0" in res.output and "CAPABILITY FAILED" in res.output
 
     def test_dry_run_marker_is_neutral_not_success(self, monkeypatch, tmp_path):
         # review polish-r2#1: install_one returns True in dry-run WITHOUT installing — must render (dry-run), not ✓
@@ -1020,3 +1022,12 @@ class TestInstallOutput:
         res = CliRunner().invoke(cli_mod.cli, ["install", "--include-optional", "--dry-run"])
         assert res.exit_code == 0
         assert "unsupported platform" in res.output and "⊘ unavailable" in res.output
+
+    def test_distro_tool_not_labeled_unpinned_in_dry_run(self, monkeypatch, tmp_path):
+        # review polish-r4: nmap is policy:distro — dry-run/failure must show (distro), never (unpinned) [P3]
+        from click.testing import CliRunner
+        cli_mod = self._full_env(monkeypatch, tmp_path)
+        monkeypatch.setattr(cli_mod, "install_one", lambda t, echo, dry_run=False: True)
+        res = CliRunner().invoke(cli_mod.cli, ["install", "--include-optional", "--dry-run"])
+        nmap_line = next(l for l in res.output.splitlines() if l.strip().startswith("→ nmap"))
+        assert "(distro)" in nmap_line and "(unpinned)" not in nmap_line
