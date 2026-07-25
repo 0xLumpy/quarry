@@ -352,7 +352,7 @@ def doctor(phase):
         tok = " +token" if ob.get("interactsh_token") else " (no token)"
         click.echo(f"  {_c('✓', 'green')} backend: self-hosted {ob['interactsh_server']}{tok}")
     else:
-        click.echo(f"  {_c('·', 'yellow')} backend: public interactsh (set oob.interactsh_server to self-host)")
+        click.echo(f"  {_c('·', 'yellow')} backend: public interactsh (set oob.interactsh_server to use your own)")
     if ob.get("blind_xss_url"):
         click.echo(f"  {_c('✓', 'green')} blind XSS: dalfox -b → {ob['blind_xss_url']}")
 
@@ -414,10 +414,12 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     # ── 1. system packages + Go toolchain + data (unless --tools-only / --only / --phase) ──
     full = not (only or phase or tools_only)
     if full:
-        click.echo(_c("\n  ◤ QUARRY — methodology-driven recon automation", "cyan"))
-        if not dry_run:
-            click.echo(_c("  ⏳ Full install builds ~25 Go tools + fetches wordlists/templates — this "
-                          "takes several minutes.\n     It is not stuck; grab a coffee.", "yellow"))
+        # install.sh prints this banner FIRST (before the quiet dependency install), so don't duplicate it there
+        if not os.environ.get("QUARRY_FROM_INSTALLER"):
+            click.echo(_c("\n  ◤ QUARRY — methodology-driven recon automation", "cyan"))
+            if not dry_run:
+                click.echo(_c("  ⏳ Full install builds ~25 Go tools + fetches wordlists/templates — this "
+                              "takes several minutes.\n     It is not stuck; grab a coffee.", "yellow"))
         # system-spec precheck (tiered): ok = silent · warn = proceed · below minimum = abort
         rep = bootstrap.system_report("install")
         click.echo(_c("\n[*] system check", "magenta"))
@@ -455,13 +457,37 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
             # review-C08.2r4#1: a PRESENT tool is left as-is ONLY if it VERIFIES (identity + capability); a wrong
             # binary from a failed prior update no longer passes — it is reinstalled to the pin.
             if verify_installed(t):
-                click.echo(f"  {_c('✓', 'green')} {t.bin} present + verified ({t.pin or t.ref or 'distro'})")
+                # unified one-line format (→ … ✓), same as a fresh install below
+                click.echo(f"  {_c('→', 'cyan')} {t.bin} present + verified "
+                           f"({t.pin or t.ref or 'distro'}) {_c('✓', 'green')}")
                 continue
             click.echo(f"  {_c('⚠', 'yellow')} {t.bin} present but FAILED verification — reinstalling pin")
         pin_note = f" @ {t.pin or t.ref}" if (t.pin or t.ref) else _c(" (unpinned)", "yellow")
-        click.echo(f"  {_c('→', 'cyan')} {t.bin}{pin_note}")
-        # C08.2: the ONE shared, version-LOCKED install path (identity + capability verified; atomic staging).
-        if not install_one(t, lambda m: click.echo(f"      {m}"), dry_run):
+        click.echo(f"  {_c('→', 'cyan')} {t.bin}{pin_note}", nl=False)   # ONE line; ✓/✗ appended when done
+        # C08.2: the ONE shared, version-LOCKED install path. Buffer its progress/diagnostics: a clean install is
+        # a single `→ tool @ pin ✓` line. On SUCCESS suppress only the routine "<bin>: ok (...)" line but KEEP
+        # exceptional notes (e.g. a legacy-binary relocation); on FAILURE show everything. dry-run is neutral —
+        # `install_one` returns True there without installing, so it must NOT render as a success.
+        buf = []
+        ok = install_one(t, buf.append, dry_run)
+        if dry_run:
+            # install_one can still return False in dry-run BEFORE its dry-run path (unsupported platform /
+            # manual-only tool) — surface that reason instead of a misleading (dry-run).
+            if ok:
+                click.echo(_c(" (dry-run)", "yellow"))
+            else:
+                click.echo(_c(" ⊘ unavailable", "yellow"))
+                for m in buf:
+                    click.echo(f"      {m}")
+        elif ok:
+            click.echo(_c(" ✓", "green"))
+            for m in buf:
+                if not m.startswith(f"{t.bin}: ok"):     # routine success line only; exceptional notes stay
+                    click.echo(f"      {m}")
+        else:
+            click.echo(_c(" ✗", "red"))
+            for m in buf:
+                click.echo(f"      {m}")
             failed.append(t)
 
     # ── 3. data files + extras + cleanup ──

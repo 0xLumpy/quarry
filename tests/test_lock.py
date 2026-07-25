@@ -951,3 +951,72 @@ class TestMaintenanceView:
         monkeypatch.setattr(registry, "capture_lock", lambda: (_ for _ in ()).throw(AssertionError("must not capture")))
         r = CliRunner().invoke(cli, ["lock", "--maintenance"])
         assert r.exit_code == 0 and not probed and "refresh-policy view" in r.output
+
+
+class TestInstallOutput:
+    def _full_env(self, monkeypatch, tmp_path):
+        from quarry_recon import cli as cli_mod, bootstrap
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(Tool, "installed", property(lambda self: False))
+        monkeypatch.setattr(bootstrap, "system_report", lambda w: {"level": "ok"})
+        monkeypatch.setattr(cli_mod, "_echo_syscheck", lambda r: None)
+        for fn in ("install_system_packages", "ensure_golang", "install_data_files", "run_extras", "cleanup"):
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: True)
+        return cli_mod
+
+    def test_success_is_one_clean_line_diagnostics_suppressed(self, monkeypatch, tmp_path):
+        # collapse: a clean install is `→ tool @ pin ✓` — install_one's progress lines are buffered + discarded
+        from click.testing import CliRunner
+        cli_mod = self._full_env(monkeypatch, tmp_path)
+        monkeypatch.setattr(cli_mod, "install_one",
+                            lambda t, echo, dry_run=False: (echo(f"{t.bin}: ok (noise)"), True)[1])
+        res = CliRunner().invoke(cli_mod.cli, ["install", "--include-optional", "--yes"])
+        assert res.exit_code == 0
+        assert "→ subfinder @ v2.14.0 ✓" in res.output          # single clean line
+        assert "subfinder: ok (noise)" not in res.output         # buffered diagnostic suppressed on success
+
+    def test_failure_shows_marker_and_buffered_diagnostics(self, monkeypatch, tmp_path):
+        from click.testing import CliRunner
+        cli_mod = self._full_env(monkeypatch, tmp_path)
+        monkeypatch.setattr(cli_mod, "install_one",
+                            lambda t, echo, dry_run=False: (echo("CAPABILITY FAILED"), False)[1])
+        res = CliRunner().invoke(cli_mod.cli, ["install", "--only", "subfinder", "--yes"])
+        assert res.exit_code != 0 and "✗" in res.output and "CAPABILITY FAILED" in res.output
+
+    def test_dry_run_marker_is_neutral_not_success(self, monkeypatch, tmp_path):
+        # review polish-r2#1: install_one returns True in dry-run WITHOUT installing — must render (dry-run), not ✓
+        from click.testing import CliRunner
+        cli_mod = self._full_env(monkeypatch, tmp_path)
+        monkeypatch.setattr(cli_mod, "install_one", lambda t, echo, dry_run=False: True)
+        res = CliRunner().invoke(cli_mod.cli, ["install", "--include-optional", "--dry-run"])
+        assert res.exit_code == 0 and "(dry-run)" in res.output and "✓" not in res.output
+
+    def test_success_keeps_exceptional_migration_note(self, monkeypatch, tmp_path):
+        # review polish-r2#2: suppress only the routine "<bin>: ok" line; a legacy-relocation note stays
+        from click.testing import CliRunner
+        cli_mod = self._full_env(monkeypatch, tmp_path)
+        def io(t, echo, dry_run=False):
+            if t.bin == "dalfox":
+                echo(f"{t.bin}: relocated legacy go binary /old -> /old.bak (runtime migration)")
+            echo(f"{t.bin}: ok (x)")
+            return True
+        monkeypatch.setattr(cli_mod, "install_one", io)
+        res = CliRunner().invoke(cli_mod.cli, ["install", "--include-optional", "--yes"])
+        assert res.exit_code == 0
+        assert "relocated legacy go binary" in res.output   # exceptional note KEPT
+        assert "dalfox: ok (x)" not in res.output            # routine ok line suppressed
+
+    def test_dry_run_unavailable_shows_reason_not_false_success(self, monkeypatch, tmp_path):
+        # review polish-r3: install_one can return False in dry-run (unsupported platform / manual-only) — that
+        # must render an unavailable marker + the reason, NOT a misleading (dry-run)
+        from click.testing import CliRunner
+        cli_mod = self._full_env(monkeypatch, tmp_path)
+        def io(t, echo, dry_run=False):
+            if t.bin == "dalfox":
+                echo("unsupported platform (linux/riscv64) — no dalfox artifact")
+                return False
+            return True
+        monkeypatch.setattr(cli_mod, "install_one", io)
+        res = CliRunner().invoke(cli_mod.cli, ["install", "--include-optional", "--dry-run"])
+        assert res.exit_code == 0
+        assert "unsupported platform" in res.output and "⊘ unavailable" in res.output

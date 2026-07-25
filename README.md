@@ -133,7 +133,9 @@ to tools itself. `quarry doctor` shows which are set. Back up before editing:
 | `notify` | opt-in run notifications (Slack/Discord/Telegram/webhook) — off by default; `quarry notify --test` |
 | `oob` | out-of-band — **one Quarry-owned layer** (interactsh-client managed internally). **Backend**: default built-in public interactsh, or override with a private server via `interactsh_server`/`interactsh_token` (replaces the backend, not a separate channel). Quarry-owned probes (`params.oob_probe`) issue per-source callbacks correlated to source/target/param; `quarry oob poll -t <target>` pulls delayed ones. `quarry oob import` is **compatibility-only** for external logs (Burp/XSSHunter/manual/old dalfox `-b`), uncorrelated unless a token matches. `blind_xss_url` → dalfox `-b` (operator collector; folds into the owned layer later). nuclei keeps its own native OAST (tool-owned). |
 
-**Tool-native configs** — these tools read their own file; put their keys there:
+**Tool-native configs** — these tools read their own file; put their keys there. Each file is created by
+the tool itself on **first use** (e.g. the version probes `quarry doctor` runs), so it may not exist
+immediately after install — run `quarry doctor` once, then edit:
 
 | Tool | Location | Keys |
 |------|----------|------|
