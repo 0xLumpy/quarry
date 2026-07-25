@@ -468,11 +468,27 @@ class TestCliNoFloat:
         return CliRunner().invoke(cli_mod.cli, argv), cmds
 
     def test_update_never_runs_latest_or_pipx_upgrade(self, monkeypatch, tmp_path):
-        res, cmds = self._run(monkeypatch, tmp_path, ["update", "--include-optional"])
+        res, cmds = self._run(monkeypatch, tmp_path, ["update"])   # update now covers ALL installed tools
         assert res.exit_code == 0, res.output
         joined = "\n".join(cmds)
         assert "@latest" not in joined and "pipx upgrade" not in joined and "releases/latest" not in joined
         assert any("@v2.14.0" in c for c in cmds)                           # pins used instead
+
+    def test_update_covers_installed_optional_tools(self, monkeypatch, tmp_path):
+        # js-beautify drift fix: `update` must sync an INSTALLED optional tool (was skipped) — and use the
+        # shared one-line `↻ tool ✓` output
+        from click.testing import CliRunner
+        from quarry_recon import cli as cli_mod, bootstrap
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(Tool, "installed", property(lambda self: True))   # everything installed
+        updated = []
+        monkeypatch.setattr(cli_mod, "install_one",
+                            lambda t, echo, dry_run=False: (updated.append(t.bin), True)[1])
+        for fn in ("install_data_files", "run_extras", "cleanup"):
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: None)
+        res = CliRunner().invoke(cli_mod.cli, ["update"])
+        assert res.exit_code == 0
+        assert "js-beautify" in updated and "↻ js-beautify ✓" in res.output   # optional+installed synced, 1 line
 
     def test_install_failure_exits_nonzero(self, monkeypatch, tmp_path):
         # a failing tool must propagate a non-zero exit (review-C08.2#6)

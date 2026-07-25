@@ -400,6 +400,41 @@ def set_cmd(name, url):
 
 
 # ── install / update ─────────────────────────────────────────────────────────
+def _run_tool(t, marker, dry_run) -> bool:
+    """Install/update ONE tool through the shared version-LOCKED path, rendering ONE line — SHARED by `install`
+    and `update` so their output can't drift apart. Success is a NAME-only `<marker> tool ✓` (the version is
+    install-time noise; it lives in `doctor`/`lock`); a FAILURE / dry-run shows the attempted `@ pin` so it's
+    actionable. distro is tagged from `policy`, not the absence of a pin. install_one's progress is buffered:
+    on success only the routine `<bin>: ok (...)` line is dropped (exceptional notes like a legacy relocation
+    stay); on failure everything shows. Returns install_one's ok."""
+    if t.policy == "distro":
+        pin_note = _c(" (distro)", "cyan")
+    elif t.pin or t.ref:
+        pin_note = f" @ {t.pin or t.ref}"
+    else:
+        pin_note = _c(" (unpinned)", "yellow")
+    click.echo(f"  {_c(marker, 'cyan')} {t.bin}", nl=False)
+    buf = []
+    ok = install_one(t, buf.append, dry_run)
+    if dry_run:
+        if ok:
+            click.echo(f"{pin_note} {_c('(dry-run)', 'yellow')}")
+        else:
+            click.echo(f"{pin_note} {_c('⊘ unavailable', 'yellow')}")
+            for m in buf:
+                click.echo(f"      {m}")
+    elif ok:
+        click.echo(_c(" ✓", "green"))
+        for m in buf:
+            if not m.startswith(f"{t.bin}: ok"):
+                click.echo(f"      {m}")
+    else:
+        click.echo(f"{pin_note} {_c('✗', 'red')}")
+        for m in buf:
+            click.echo(f"      {m}")
+    return ok
+
+
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="show what would be installed, do nothing")
 @click.option("--phase", help="only install tools for this phase")
@@ -463,38 +498,7 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
                 click.echo(f"  {_c('→', 'cyan')} {t.bin} present + verified{distro} {_c('✓', 'green')}")
                 continue
             click.echo(f"  {_c('⚠', 'yellow')} {t.bin} present but FAILED verification — reinstalling pin")
-        # distro-managed (nmap) is an explicit policy, NOT the absence of a pin — a genuinely unpinned tool is
-        # still "(unpinned)", never mislabeled "(distro)".
-        if t.policy == "distro":
-            pin_note = _c(" (distro)", "cyan")
-        elif t.pin or t.ref:
-            pin_note = f" @ {t.pin or t.ref}"
-        else:
-            pin_note = _c(" (unpinned)", "yellow")
-        click.echo(f"  {_c('→', 'cyan')} {t.bin}", nl=False)   # NAME only; the pin is appended below only on
-        # C08.2: the ONE shared, version-LOCKED install path. Buffer its progress/diagnostics. A clean install is
-        # a single `→ tool ✓` line — the VERSION is omitted here (user-facing noise; it lives in `doctor`/`lock`).
-        # A FAILURE / dry-run shows the attempted `@ pin` so the reason is actionable. On success suppress only
-        # the routine "<bin>: ok (...)" line but KEEP exceptional notes (e.g. a legacy-binary relocation).
-        buf = []
-        ok = install_one(t, buf.append, dry_run)
-        if dry_run:
-            # install_one can still return False in dry-run (unsupported platform / manual-only) — surface it
-            if ok:
-                click.echo(f"{pin_note} {_c('(dry-run)', 'yellow')}")
-            else:
-                click.echo(f"{pin_note} {_c('⊘ unavailable', 'yellow')}")
-                for m in buf:
-                    click.echo(f"      {m}")
-        elif ok:
-            click.echo(_c(" ✓", "green"))               # `→ tool ✓` — NAME only, no version
-            for m in buf:
-                if not m.startswith(f"{t.bin}: ok"):     # routine success line only; exceptional notes stay
-                    click.echo(f"      {m}")
-        else:
-            click.echo(f"{pin_note} {_c('✗', 'red')}")   # FAILURE shows the attempted pin
-            for m in buf:
-                click.echo(f"      {m}")
+        if not _run_tool(t, "→", dry_run):
             failed.append(t)
 
     # ── 3. data files + extras + cleanup ──
@@ -530,21 +534,19 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
 
 @cli.command()
 @click.option("--dry-run", is_flag=True)
-@click.option("--include-optional", is_flag=True)
-def update(dry_run, include_optional):
-    """Reinstall installed tools at their PINNED lock (reproducible), + refresh nuclei templates, resolvers, gf
+def update(dry_run):
+    """Reinstall INSTALLED tools at their PINNED lock (reproducible), + refresh nuclei templates, resolvers, gf
     patterns. review-C08.2#1: `update` NEVER floats to @latest / pipx upgrade — bumping a pin is the reviewed
     `quarry lock` refresh workflow, not a silent update."""
     from . import bootstrap
 
+    # every INSTALLED tool syncs to its pin — optional or not (the `installed` gate already excludes tools the
+    # host never installed). Skipping installed-optional tools was hiding their drift (e.g. js-beautify).
     tools = [t for t in load_tools() if t.installed]
-    if not include_optional:
-        tools = [t for t in tools if not t.optional]
     click.echo(_c(f"updating {len(tools)} tools (to their pins)", "magenta"))
     failed = []
     for t in tools:
-        click.echo(f"  {_c('↻', 'cyan')} {t.bin} @ {t.pin or t.ref or t.policy or 'installed'}")
-        if not install_one(t, lambda m: click.echo(f"      {m}"), dry_run):   # the SAME locked path as install
+        if not _run_tool(t, "↻", dry_run):               # SAME locked path + one-line output as install
             failed.append(t.bin)
     click.echo(_c("refreshing data files + templates", "magenta"))
     bootstrap.install_data_files(click.echo, dry_run, update=True)
