@@ -189,7 +189,14 @@ sources:
   params.nuclei_scan:        {tool: nuclei, phase: params, tier: heavy, class: active, default: on, bounded: planned,
     input: live, output: finding, workers: "settings.workers(nuclei) + NUCLEI_BULK_SIZE", rate: http_rl, timeout: "nuclei_timeout(hosts)", failure: partial-ok, fallback: "coverage-partial (not empty)", parser: internal, log: delta,
     notes: "OTC: 7h41, ~5.08M requests = CO-TIMEKILLER. DEFAULT-ON (normal recon); FIX by SPEED — scope
-      templates, -bs/-c, chunk+state — NOT by gating off. quarry plan MUST declare it a long pole."}
+      templates, -bs/-c, chunk+state — NOT by gating off. quarry plan MUST declare it a long pole.
+      status = EXECUTION (nuclei's own `Scan completed in` line + exit 0 -> chunk done/resumable);
+      COVERAGE = separate request counters (measure: requests, per-chunk unit) from nuclei -stats.
+      unmeasurable coverage -> coverage:unknown (a GAP), never assumed complete; recorded chunk artifacts
+      are sha256-bound, so an edited artifact re-runs instead of being trusted.
+      host-error policy: -mhe = PERFORMANCE.NUCLEI_MAX_HOST_ERROR, DEFAULT 0 = -nmhe FULL DEPTH
+      (coverage-first; nuclei-native default 30 silently drops erroring hosts — cost 459k requests on OTC),
+      folded into the resume work_unit."}
   params.nuclei_takeover:    {tool: nuclei, phase: params, tier: core, class: active, default: on,
     input: cname_subs, output: finding(takeover), workers: "settings.workers(nuclei)", rate: http_rl, timeout: "nuclei_timeout(subs)", failure: partial-ok, fallback: skip, parser: internal, log: delta}
   params.nuclei_oast:        {tool: nuclei, phase: params, tier: core, class: active, default: on,

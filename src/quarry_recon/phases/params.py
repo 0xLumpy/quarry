@@ -85,14 +85,87 @@ def _nuclei_templates_fp() -> str | None:
     return json.dumps(parts, sort_keys=True) if parts else None
 
 
-def _nuclei_cmd(targets_file, out_file, prof) -> list[str]:
+_NUCLEI_MHE_DEFAULT = 0        # FULL DEPTH (-nmhe). nuclei's own default is 30, which SILENTLY drops a host
+_NUCLEI_MHE_MAX = 100_000      # after 30 request errors — on the OTC run that cost 459,930 unsent requests.
+_ANSI_RX = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _nuclei_mhe() -> int:
+    """`PERFORMANCE.NUCLEI_MAX_HOST_ERROR` — errors tolerated per host before nuclei SKIPS it (`-mhe`).
+    Quarry's 0 means FULL DEPTH: no host is ever dropped for erroring (`-nmhe`), and that is the DEFAULT.
+    Quarry is coverage-first — a host that errors is exactly the kind of host worth finishing, and nuclei's
+    own default of 30 quietly turns a flaky target into an unscanned one. A nonzero value is an EXPLICITLY
+    bounded coverage policy the operator opted into, never Quarry's normal behaviour.
+
+    This is a COVERAGE policy, not a runtime knob — it decides which hosts get scanned at all, so it is
+    folded into the resume fingerprint and a change re-scans rather than silently resuming a shallower
+    generation. (It does cost wall-clock: the requests `-mhe` was suppressing now actually go out.)
+
+    STRICT parse (mirrors SUBFINDER_MAX_TIME): an exact int (never a bool) or a clean int-string in
+    0.._NUCLEI_MHE_MAX; anything else — bool, float, negative, oversized, garbage — falls back to the
+    default rather than inventing a policy from a typo."""
+    raw = settings.performance().get("NUCLEI_MAX_HOST_ERROR")
+    if isinstance(raw, bool):
+        return _NUCLEI_MHE_DEFAULT
+    if isinstance(raw, int):
+        return raw if 0 <= raw <= _NUCLEI_MHE_MAX else _NUCLEI_MHE_DEFAULT
+    if isinstance(raw, str) and raw.strip().isdigit():
+        v = int(raw.strip())
+        return v if 0 <= v <= _NUCLEI_MHE_MAX else _NUCLEI_MHE_DEFAULT
+    return _NUCLEI_MHE_DEFAULT
+
+
+def _nuclei_progress(text: str) -> dict:
+    """Read nuclei's OWN stderr for what only nuclei can tell us (the OTC 20260725 lesson: a generic stderr
+    signature conflates execution with coverage and gets BOTH wrong).
+
+      1. `planned` / `requests` / `errors` — how much of the planned request budget it actually COVERED, from
+         the LAST `-stats` line. This is the ONLY coverage oracle; absent, coverage is UNKNOWN. nuclei skips a
+         host after `-mhe` errors, so a finished scan can still leave requests unsent — a COVERAGE gap, never
+         an execution one.
+      2. `completed` — whether nuclei's own terminal line `Scan completed in <dur>.` (with either
+         `N matches found.` or `No results found.`) was recognized. review#P1.4: this is CORROBORATING
+         TELEMETRY ONLY. It must never gate resumability — execution completion is `exit_code == 0`, full stop.
+         Requiring this sentence meant a nuclei release that reworded only its terminal (while keeping the stats
+         JSON) would mark every chunk retryable forever.
+
+    stderr is ANSI-coloured, so strip escapes before matching. Counters are returned RAW (not clamped): an
+    impossible triple must reach events.coverage_partial's validator and surface as coverage UNKNOWN rather
+    than be quietly repaired into a plausible-looking lie."""
+    completed, planned, requests, errors = False, None, None, None
+    for line in (text or "").splitlines():
+        s = _ANSI_RX.sub("", line).strip()
+        if not s:
+            continue
+        if "scan completed in" in s.lower():
+            completed = True
+            continue
+        if not (s.startswith("{") and s.endswith("}")):
+            continue
+        try:
+            d = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not (isinstance(d, dict) and "requests" in d and "total" in d):
+            continue
+        try:                                       # nuclei emits these as STRINGS; last valid line wins
+            planned, requests = int(d["total"]), int(d["requests"])
+            errors = int(d["errors"]) if str(d.get("errors", "")).lstrip("-").isdigit() else None
+        except (TypeError, ValueError):
+            continue
+    return {"completed": completed, "planned": planned, "requests": requests, "errors": errors}
+
+
+def _nuclei_cmd(targets_file, out_file, prof, mhe: int) -> list[str]:
     """The nuclei main-scan command for one target file — identical flags for every chunk, only -l/-o
-    differ (non-intrusive, severity-scoped, governor-scaled -c/-bs, shared OOB endpoint)."""
+    differ (non-intrusive, severity-scoped, governor-scaled -c/-bs, explicit host-error policy, shared
+    OOB endpoint)."""
     cmd = ["nuclei", "-l", str(targets_file), "-jsonl", "-o", str(out_file),
            "-etags", "intrusive,fuzz,dos,brute-force",
            "-s", "critical,high,medium", "-stats", "-si", "30",
            "-c", str(settings.workers("nuclei", 25)),      # H2: core-scaled concurrency (rate stays separate)
            "-bs", str(settings.concurrency("NUCLEI_BULK_SIZE", 25))]   # hosts/template batch
+    cmd += ["-nmhe"] if mhe == 0 else ["-mhe", str(mhe)]   # 0 = full depth: never drop an erroring host
     if prof.http_rl:
         cmd += ["-rl", str(prof.http_rl)]
     _apply_nuclei_oob(cmd)                                 # self-hosted interactsh (else public default)
@@ -104,9 +177,18 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     batches and scan SEQUENTIALLY — rate is target-wide (RoE), so parallel batches would blow the
     budget; chunking buys resume + progress + per-batch isolation, NOT speed (work is rate-bound and
     fixed: OTC = 448 hosts / 5.08M req / 7h41 @ 183rps, died at 93%). Each batch gets its own
-    nuclei_timeout, so one slow batch -> coverage_partial instead of a whole-run kill. RESUME: a chunk
-    is recorded done ONLY on clean completion (SUCCESS/EMPTY); a failed/timed-out/blocked batch is left
-    retryable so a killed run genuinely continues. Its OUTPUT is still KEPT — the aggregate is rebuilt
+    nuclei_timeout, so one slow batch -> coverage_partial instead of a whole-run kill.
+
+    RESUME is keyed on EXECUTION COMPLETION, not on a clean status — the two are independent facts. A chunk is
+    done when the process EXITED 0 (it reached its own end; a kill leaves exit_code None, a crash nonzero).
+    Degraded COVERAGE (host-error skips, WAF-blocked requests) is reported separately as structured request
+    counters and does NOT make the chunk retryable; unmeasurable coverage is reported as coverage:unknown, never
+    as complete. nuclei's `Scan completed in …` line is corroborating telemetry only — gating on it would let a
+    reworded terminal lock resumability forever. The OTC 20260725 run proved why: at ~610k requests/chunk a generic stderr
+    signature ALWAYS matched (one `i/o timeout` line is inevitable), so every chunk read PARTIAL, no chunk
+    was ever recorded done, and `chunks` stayed `{}` — a resume would have repeated all 8.5 hours while the
+    real gap (92.44% of planned requests sent, 459,930 skipped by `-mhe`) went unmeasured. A chunk that did
+    NOT complete stays retryable. Its OUTPUT is still KEPT — the aggregate is rebuilt
     idempotently from every per-chunk artifact (findings_<ci>.jsonl), so a WAF/timeout-degraded chunk's
     real findings are never discarded and a re-scan can't duplicate. The state is tied to the
     INPUT (hash of the ordered live list + chunk size) so a changed host set / chunk size invalidates it
@@ -121,8 +203,9 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     # template-scope change (a different severity/etags) would wrongly RESUME done chunks — the same
     # skip-after-settings-change bug fixed for ffuf. Any coverage-affecting change now invalidates the state.
     _tpl = _nuclei_templates_fp()                           # review#10: template SET is coverage-affecting
+    mhe = _nuclei_mhe()                                     # host-error policy = WHICH hosts get scanned at all
     _cfg = {"severity": "critical,high,medium", "etags": "intrusive,fuzz,dos,brute-force", "chunk": chunk_n,
-            "templates": _tpl if _tpl is not None else "unknown"}
+            "templates": _tpl if _tpl is not None else "unknown", "mhe": mhe}
     if _tpl is None:
         # review#6: template state UNKNOWN -> non-resumable. A per-run nonce makes scan_wu/chunk_wu differ every
         # run, so resume NEVER skips a chunk we cannot prove ran against the same templates (re-scan is a safe
@@ -139,12 +222,18 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     attempt_id = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(4).hex()   # UNIQUE per execution attempt
     attempt_dir = wu_dir / f"attempt_{attempt_id}"        # created lazily, only if a chunk actually runs
 
-    def _valid_entry(ci_str, rel) -> bool:
+    def _valid_entry(ci_str, rel, digests=None) -> bool:
         """review#1/#2: a loaded state entry is trusted to skip/aggregate a chunk ONLY if it is fully valid — a
         non-negative in-range index, and a RELATIVE path with no absolute/`..` escape that resolves INSIDE THIS
         work_unit's dir (review#2: not merely the nuclei dir — a corrupt path must not borrow ANOTHER work unit's
         artifact) AND whose filename is exactly this chunk's `findings_<ci>.jsonl`, pointing at a readable file.
-        Anything else is dropped so the chunk RE-RUNS (an invalid/foreign artifact is never a silent skip)."""
+        Anything else is dropped so the chunk RE-RUNS (an invalid/foreign artifact is never a silent skip).
+
+        review#P3: path validity is not CONTENT validity. An artifact recorded as done, then truncated/edited/
+        replaced on disk, satisfied every path check and was still trusted — so a resume skipped the chunk and
+        aggregated whatever the file now says. Each recorded artifact therefore carries its sha256 and must
+        still match. A state file with no digest for an entry (written by an older Quarry) fails CLOSED: the
+        chunk re-runs. Re-running costs time; trusting an unverifiable artifact costs silent surface."""
         if not (isinstance(ci_str, str) and ci_str.isdigit() and 0 <= int(ci_str) < len(batches)):
             return False
         if not isinstance(rel, str) or not rel or os.path.isabs(rel) or ".." in Path(rel).parts:
@@ -161,6 +250,14 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                 pass
         except (OSError, ValueError):
             return False
+        want = (digests or {}).get(rel)
+        if not isinstance(want, str) or not want:
+            return False                                     # no recorded digest -> unverifiable -> re-run
+        try:
+            if events.file_digest(p) != want:                # content changed since it was recorded
+                return False
+        except OSError:
+            return False
         return True
 
     def _prev():
@@ -174,46 +271,114 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             return None
         return prev if prev.get("work_unit") == scan_wu else None   # config-inclusive key: mismatch → fresh
 
-    def _load_map(prev) -> dict:                              # {ci: rel} — validated
+    def _load_digests(prev) -> dict:                          # {rel: sha256} — content binding for every artifact
+        m = (prev or {}).get("digests")
+        if not isinstance(m, dict):
+            return {}
+        return {str(k): str(v) for k, v in m.items() if isinstance(k, str) and isinstance(v, str) and v}
+
+    def _load_map(prev, digests) -> dict:                     # {ci: rel} — validated + digest-bound
         m = (prev or {}).get("chunks")
         if not isinstance(m, dict):
             return {}
-        return {str(k): str(v) for k, v in m.items() if _valid_entry(str(k), v)}
+        return {str(k): str(v) for k, v in m.items() if _valid_entry(str(k), v, digests)}
 
-    def _load_evidence(prev) -> dict:                        # review#1: {ci: [rel, ...]} — a LIST, each validated
+    def _load_evidence(prev, digests) -> dict:               # review#1: {ci: [rel, ...]} — a LIST, each validated
         m = (prev or {}).get("evidence")
         out: dict[str, list[str]] = {}
         if isinstance(m, dict):
             for k, v in m.items():
                 vals = v if isinstance(v, list) else [v]     # tolerate a legacy scalar
-                kept = [str(x) for x in vals if _valid_entry(str(k), x)]
+                kept = [str(x) for x in vals if _valid_entry(str(k), x, digests)]
                 if kept:
                     out[str(k)] = kept
         return out
 
-    # done_map: CLEAN chunks -> artifact (controls SKIP). evidence_map: for EVERY chunk that produced output
-    # (clean OR degraded), the LIST of every preserved artifact across attempts (controls AGGREGATION). review#1:
-    # a list, not a single pointer — PARTIAL(A) then PARTIAL(B) must keep BOTH, aggregate + dedup all evidence.
+    def _load_coverage(prev, done: dict) -> dict:
+        """{ci: {"planned": int, "requests": int}} — the request coverage a DONE chunk reported, persisted so a
+        RESUME can re-emit it. Without this a resumed run re-emits counters only for the chunks it actually ran
+        and the skipped ones read as zero-eligible, understating the run's real gap. Validated: an in-range
+        index and two non-negative ints (an impossible pair is dropped, not repaired)."""
+        m = (prev or {}).get("coverage")
+        out: dict[str, dict] = {}
+        if not isinstance(m, dict):
+            return out
+        for k, v in m.items():
+            if not (isinstance(k, str) and k.isdigit() and 0 <= int(k) < len(batches)):
+                continue
+            if not isinstance(v, dict):
+                continue
+            p, r = v.get("planned"), v.get("requests")
+            if all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in (p, r)):
+                out[k] = {"planned": p, "requests": r}
+        # A coverage record is only meaningful for a chunk that COMPLETED — an entry for a chunk we are about
+        # to RE-RUN is stale by definition, and keeping it would let last attempt's numbers stand in for this
+        # one if the re-run finishes without a parseable stats line.
+        return {k: v for k, v in out.items() if k in done}
+
+    # done_map: chunks whose EXECUTION COMPLETED -> artifact (controls SKIP). evidence_map: for EVERY chunk that
+    # produced output (complete OR not), the LIST of every preserved artifact across attempts (controls
+    # AGGREGATION). review#1: a list, not a single pointer — PARTIAL(A) then PARTIAL(B) must keep BOTH, aggregate
+    # + dedup all evidence. cov_map: per-chunk request coverage, so resume re-reports the gap it did not re-run.
     _p = _prev()
-    done_map: dict[str, str] = _load_map(_p)
-    evidence_map: dict[str, list[str]] = _load_evidence(_p)
+    digest_map: dict[str, str] = _load_digests(_p)            # {rel: sha256} — binds every recorded artifact
+    done_map: dict[str, str] = _load_map(_p, digest_map)
+    evidence_map: dict[str, list[str]] = _load_evidence(_p, digest_map)
+    cov_map: dict[str, dict] = _load_coverage(_p, done_map)
+    # drop digests whose artifact no longer survives validation, so the state file cannot grow a tail of
+    # references to entries that are no longer trusted
+    _kept_rels = set(done_map.values()) | {r for v in evidence_map.values() for r in v}
+    digest_map = {k: v for k, v in digest_map.items() if k in _kept_rels}
+
+    def _bind(rel, path) -> None:
+        """Record an artifact's sha256 at the moment we trust it. A later resume re-verifies against this."""
+        try:
+            digest_map[rel] = events.file_digest(path)
+        except OSError:
+            digest_map.pop(rel, None)                         # cannot digest -> leave it unverifiable -> re-run
 
     def _add_evidence(ci_str, rel):                          # append-only, unique, per chunk
         lst = evidence_map.setdefault(ci_str, [])
         if rel not in lst:
             lst.append(rel)
 
-    for _ci, _rel in done_map.items():                       # a clean chunk's artifact is always also evidence
+    for _ci, _rel in done_map.items():                       # a done chunk's artifact is always also evidence
         _add_evidence(_ci, _rel)
 
     def _save():
         state_f.write_text(json.dumps(
-            {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": done_map, "evidence": evidence_map}))
+            {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": done_map,
+             "evidence": evidence_map, "coverage": cov_map, "digests": digest_map}))
+
+    def _emit_coverage(ci: int, planned, requests, *, why: str) -> None:
+        """Per-chunk REQUEST coverage as structured counters, one stable unit per chunk so the store's
+        latest-per-unit reconciliation sums them into a single (source, "requests") rollup for the run.
+
+        COVERAGE_TIMEOUT, not CAP: nothing here is OUR ceiling or the operator's chosen subset — the requests
+        were lost in flight (target/network errors, or nuclei dropping a host once `-mhe` is exceeded, which is
+        off by default). That is exactly the TIMEOUT bucket's policy contract: always feeds the verdict. The
+        constant's name is narrower than its bucket; see the note on events.COVERAGE_TIMEOUT.
+
+        Counters go through RAW — the validator flags an impossible triple as coverage UNKNOWN instead of us
+        inventing a consistent-looking one."""
+        if planned is None or requests is None:
+            # review#P1.1: COVERAGE_UNKNOWN, not a reason-only event. A reason-only partial neither opens a
+            # generation nor reaches the rollup, so an unmeasurable chunk read as fully covered and a PRIOR
+            # run's counters kept standing in for it. Unknown must reach the verdict as a gap.
+            events.coverage_partial(sid, kind=events.COVERAGE_UNKNOWN, unit=f"chunk_{ci}", measure="requests",
+                                    reason=f"chunk {ci + 1}/{len(batches)}: {why} (request counters unavailable "
+                                           f"— coverage UNMEASURED, not assumed complete)")
+            return
+        events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, measure="requests", unit=f"chunk_{ci}",
+                                eligible=planned, tested=requests, omitted=planned - requests,
+                                reason=(f"chunk {ci + 1}/{len(batches)}: {requests}/{planned} planned request(s) "
+                                        f"sent ({why})"))
+
     events.tool_start(sid, cmd=["nuclei", "-l", "<chunk>", "-jsonl"], input_total=len(live), work_unit=scan_wu)
     t0 = time.monotonic()
-    degraded = 0
+    incomplete = 0                                        # chunks whose EXECUTION did not complete (retryable)
 
-    def _completed_hosts():                               # UX #4: hosts in CLEANLY-done chunks only (NOT attempted)
+    def _completed_hosts():                               # UX #4: hosts in EXECUTION-COMPLETE chunks (NOT attempted)
         return sum(len(batches[j]) for j in (int(k) for k in done_map) if j < len(batches))
 
     # C07 inc4: a source terminal ALWAYS fires (try/finally) even if the loop raises. status starts FAILED
@@ -228,40 +393,79 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             # host count; the per-chunk work_unit is the stable unit id (resume/audit key).
             events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches),
                                  current_index=_completed_hosts(), work_unit=chunk_wu)
-            if str(ci) in done_map:                       # resume: already CLEAN in a prior attempt (its artifact
-                continue                                  # is recorded + preserved; do not re-run or re-emit)
+            if str(ci) in done_map:                       # resume: EXECUTION already completed in a prior attempt
+                _prior = cov_map.get(str(ci)) or {}        # (artifact recorded + preserved; do not re-run)
+                _emit_coverage(ci, _prior.get("planned"), _prior.get("requests"),
+                               why="resumed — coverage as first recorded")
+                continue
             attempt_dir.mkdir(parents=True, exist_ok=True)   # lazy: only create the attempt dir if a chunk runs
             bf = ctx.write_list(f"nuclei_targets_{ci}.txt", batch)
             cf = attempt_dir / f"findings_{ci}.jsonl"        # review#4: THIS attempt's artifact (never overwrites a prior)
+            ef = attempt_dir / f"stderr_{ci}.log"            # per-chunk FULL stderr: the completion/coverage oracle
             rel = f"wu_{scan_wu}/attempt_{attempt_id}/findings_{ci}.jsonl"   # recorded in state, relative to the state dir
             events.tool_start(sid, work_unit=chunk_wu, input_total=len(batch))   # this chunk's own lifecycle
             res = None
             chunk_status = Status.FAILED.value               # review#1: promoted ONLY after ALL bookkeeping below
             try:                                             # review#1: chunk terminal ALWAYS fires (finally)
-                res = exec_tool("nuclei", _nuclei_cmd(bf, cf, prof),
-                                timeout=nuclei_timeout(len(batch), ctx.http_timeout))
+                res = exec_tool("nuclei", _nuclei_cmd(bf, cf, prof, mhe),
+                                timeout=nuclei_timeout(len(batch), ctx.http_timeout), stderr_path=ef)
                 if res.stderr_tail:
                     with log.open("a", encoding="utf-8") as lf:
                         lf.write(res.stderr_tail + "\n")
-                # KEEP a chunk's findings regardless of status — real even if WAF/timeout-degraded. Mark DONE
-                # only on a clean status; a degraded chunk stays retryable (re-run into a NEW attempt, its prior
-                # artifact preserved). Aggregate reads from evidence_map (clean OR degraded-with-output).
-                if res.status in (Status.SUCCESS, Status.EMPTY):
+                # Ask NUCLEI whether it finished, from its OWN terminal line in the FULL stderr (the 8-line tail
+                # can be evicted by a trailing [INF] burst, so prefer the file and fall back only if it is absent).
+                try:
+                    _err = ef.read_text(encoding="utf-8", errors="replace") if ef.is_file() else res.stderr_tail
+                except OSError:
+                    _err = res.stderr_tail
+                prog = _nuclei_progress(_err)
+                # ── the split, in one line each ────────────────────────────────────────────────────────────
+                # EXECUTION COMPLETE  <- res.exit_code == 0. NOTHING else. The process reached its own end; a
+                #                        kill leaves exit_code None (TIMED_OUT) and a crash leaves it nonzero.
+                # COVERAGE            <- the -stats counters. Absent -> coverage:unknown, never "complete".
+                # `Scan completed in …` is CORROBORATING TELEMETRY only (it rides the reason string) — it must
+                #                        NOT gate resumability.
+                #
+                # review#P1.4: requiring that sentence whenever ANY stats line was recognized left a second way
+                # to lock resumability forever — a nuclei release that keeps the stats JSON but reworded only its
+                # terminal would give completed=False, exit 0, and a chunk retryable on every future run: the
+                # 8.5-hour bug again, through a PARTIAL format change. (review#P1.2 closed the same hole for the
+                # status fallback; this is its twin.) Consequence worth naming: "we sent fewer requests than
+                # planned" is now ALWAYS a coverage fact, never a resumability one — which is correct, because a
+                # process that ran to its own end has no work left to resume.
+                complete = res.exit_code == 0
+                terminal_seen = bool(prog["completed"])      # telemetry: did we recognize nuclei's own terminal?
+                planned, requests = prog["planned"], prog["requests"]
+                # KEEP a chunk's findings regardless of outcome — real even if WAF/timeout-degraded.
+                if complete:
                     if not cf.exists():
                         cf.touch()                           # review#1: explicit zero-byte artifact for a clean-EMPTY
-                    done_map[str(ci)] = rel                  # clean -> controls SKIP
+                    done_map[str(ci)] = rel                  # execution complete -> controls SKIP
                     _add_evidence(str(ci), rel)              # ...and joins this chunk's evidence history
+                    _bind(rel, cf)                           # content binding: a later edit invalidates the skip
+                    if planned is not None and requests is not None:
+                        cov_map[str(ci)] = {"planned": planned, "requests": requests}
                     _save()
+                    _emit_coverage(ci, planned, requests,
+                                   why=("exit 0" + ("" if terminal_seen else ", nuclei terminal not recognized")
+                                        + (f", {prog['errors']} error(s)" if prog["errors"] is not None else "")))
+                    # status now reflects EXECUTION, not a stderr signature: findings -> SUCCESS, none -> EMPTY.
+                    chunk_status = (Status.SUCCESS if cf.stat().st_size > 0 else Status.EMPTY).value
                 else:
-                    degraded += 1
-                    events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {res.status.value}")
-                    # review#1: a DEGRADED chunk that produced real output APPENDS to this chunk's evidence list
+                    incomplete += 1
+                    _emit_coverage(ci, planned, requests,
+                                   why=f"execution INCOMPLETE (exit {res.exit_code}, {res.status.value}) "
+                                       f"— chunk stays retryable")
+                    # review#1: a chunk that produced real output APPENDS to this chunk's evidence list
                     # (PARTIAL(A) then PARTIAL(B) keeps BOTH). A degraded/failed retry with NO output appends
                     # nothing, so an earlier attempt's findings are never erased.
                     if cf.exists() and cf.stat().st_size > 0:
                         _add_evidence(str(ci), rel)
+                        _bind(rel, cf)
                         _save()
-                chunk_status = res.status.value              # bookkeeping complete -> now trust the tool's status
+                    # never launder an incomplete execution into a clean status
+                    chunk_status = (res.status if res.status not in (Status.SUCCESS, Status.EMPTY)
+                                    else Status.PARTIAL).value
             finally:
                 _chunk_terminal(sid, chunk_wu, res, cf, status=chunk_status)   # FAILED if exec OR bookkeeping raised
         # review#1/#2/#4: rebuild the aggregate into a TEMP file, then swap ATOMICALLY — the prior findings.jsonl
@@ -284,22 +488,38 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                             seen_lines.add(line)
                             fh.write(line + "\n")
         os.replace(tmp, findings)
-        status = Status.PARTIAL if degraded else Status.SUCCESS
+        # Scan STATUS tracks EXECUTION only. Degraded request coverage does NOT go here — it rides the
+        # structured counters and reaches the operator through the run verdict (complete_with_gaps), so the
+        # status stays a signal that can actually discriminate "a chunk needs re-running" from "the target
+        # dropped some requests". Before this split every real-target run read PARTIAL and told us nothing.
+        status = Status.PARTIAL if incomplete else Status.SUCCESS
     finally:
         events.tool_progress(sid, chunk_index=len(batches), chunk_total=len(batches),
-                             current_index=_completed_hosts(), work_unit=scan_wu)   # final: cleanly completed
+                             current_index=_completed_hosts(), work_unit=scan_wu)   # final: execution-complete
         try:                                                 # review#1: a stat() raise must NOT defeat the scan terminal
             size = findings.stat().st_size
         except OSError:
             size = None
         events.tool_finish(sid, status=status.value, work_unit=scan_wu,
-                           reason=(f"{degraded}/{len(batches)} chunk(s) degraded" if degraded else None),
+                           reason=(f"{incomplete}/{len(batches)} chunk(s) execution-incomplete (retryable)"
+                                   if incomplete else None),
                            duration=round(time.monotonic() - t0, 2),
                            raw_ref=str(findings), artifact_size=size, discovery_context="params")
     lines = len(findings.read_text().splitlines()) if findings.exists() else 0
+    _planned = sum(v["planned"] for v in cov_map.values())
+    _sent = sum(v["requests"] for v in cov_map.values())
+    if _planned:
+        # Say WHICH chunks the percentage covers — nuclei may not report counters for every chunk, and an
+        # unqualified "92.44%" over a subset would read as a whole-scan figure.
+        _scope = ("" if len(cov_map) == len(batches)
+                  else f" over {len(cov_map)}/{len(batches)} measured chunk(s)")
+        ctx.echo(f"  nuclei coverage: {_sent}/{_planned} planned request(s) sent "
+                 f"({100 * _sent / _planned:.2f}%, {_planned - _sent} skipped{_scope}; -mhe "
+                 f"{'off (full depth)' if mhe == 0 else mhe})")
     return RunResult("nuclei", ["nuclei", "-l", "<chunked>"], status, 0,
                      round(time.monotonic() - t0, 2), findings if findings.exists() else None,
-                     lines, note=f"{len(batches)} chunk(s), {degraded} degraded")
+                     lines, note=f"{len(batches)} chunk(s), {len(done_map)} execution-complete, "
+                                 f"{incomplete} retryable")
 
 
 def _exposed_urls(ctx, scope) -> list[str]:

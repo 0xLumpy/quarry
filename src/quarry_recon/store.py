@@ -554,7 +554,10 @@ class Run:
                 sid = rec.get("source_id", "?")
                 if et == events.COVERAGE_RESET:
                     live.pop(sid, None)                            # new generation: prior units gone
-                elif et == events.COVERAGE_PARTIAL and rec.get("eligible") is not None:
+                elif et == events.COVERAGE_PARTIAL and (rec.get("eligible") is not None
+                                                        or rec.get("kind") == events.COVERAGE_UNKNOWN):
+                    # COVERAGE_UNKNOWN is structured-but-uncounted: admit it so "ran, unmeasurable" reaches the
+                    # verdict as a gap. Skipping it made a first run with no stats read as fully covered.
                     live.setdefault(sid, {})[rec.get("unit", sid)] = rec   # latest per unit, this generation
         except Exception:
             pass
@@ -570,11 +573,16 @@ class Run:
                 elig, tst, omt = _int(rec.get("eligible")), _int(rec.get("tested")), _int(rec.get("omitted"))
                 a = agg.setdefault((sid, measure),
                                    {"source_id": sid, "measure": measure, "eligible": 0, "tested": 0,
-                                    "omitted": 0, "reason": None, "valid": True, "by_kind": {}, "units": []})
+                                    "omitted": 0, "reason": None, "valid": True, "by_kind": {}, "units": [],
+                                    "unknown": []})
                 unit_valid = (rec.get("coverage_valid") is not False and None not in (elig, tst, omt)
                               and elig >= 0 and tst >= 0 and omt >= 0 and tst + omt == elig)
                 if not unit_valid:
                     a["valid"] = False                            # do NOT sum garbage -> no += on a str
+                    # ...but KEEP its reason: an unknown/inconsistent unit is exactly the one an operator needs
+                    # explained, and dropping it left the coverage:unknown gap with `why: null`.
+                    a["unknown"].append({"unit": rec.get("unit", sid), "kind": kind,
+                                         "reason": rec.get("reason")})
                     continue
                 a["eligible"] += elig; a["tested"] += tst; a["omitted"] += omt
                 a["units"].append({"unit": rec.get("unit", sid), "eligible": elig, "tested": tst,
@@ -583,7 +591,15 @@ class Run:
                 bk["eligible"] += elig; bk["tested"] += tst; bk["omitted"] += omt
         for a in agg.values():                                    # honest aggregate reason (attribution kept in `units`)
             limited = [u for u in a["units"] if u["omitted"] > 0]
-            if len(limited) == 1:
+            unk = a["unknown"]
+            if unk:
+                # UNMEASURABLE dominates the headline: a rollup that mixes measured and unmeasured units must
+                # not report only the measured part, or a "5348 omitted" line would imply the rest was covered.
+                a["reason"] = (unk[0]["reason"] if len(unk) == 1 and not a["units"]
+                               else f"{len(unk)} of {len(unk) + len(a['units'])} unit(s) unmeasurable"
+                                    + (f"; {a['omitted']} {a['measure']} omitted in the rest"
+                                       if a["omitted"] else ""))
+            elif len(limited) == 1:
                 a["reason"] = limited[0]["reason"]
             elif len(limited) > 1:
                 a["reason"] = f"{len(limited)} unit(s) limited; {a['omitted']} {a['measure']} omitted"

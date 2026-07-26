@@ -245,11 +245,14 @@ class TestChunkedLifecycleBehavior:
         monkeypatch.setenv("NUCLEI_CONFIG", str(cfgdir))      # deterministic wu (no nonce) -> same wu across runs
         nucdir = tmp_path / "raw" / "params" / "nuclei"
 
-        # attempt 1: chunk 0 clean, chunk 1 degraded (retryable), chunk 2 clean
+        # attempt 1: chunk 0 clean, chunk 1 execution-INCOMPLETE (retryable), chunk 2 clean.
+        # [145]: retryability is now EXECUTION completion, not the classifier's status — a chunk that exited 0
+        # is done even if stderr looked degraded. So an incomplete chunk is modelled by a nonzero exit (a real
+        # crash/kill), which is what actually leaves work behind.
         def partial(tool, cmd, timeout=None, **k):
             cf = __import__("pathlib").Path(cmd[cmd.index("-o") + 1])
             if "findings_1." in cf.name:
-                cf.write_text('{"deg":1}\n'); return RunResult("nuclei", cmd, Status.PARTIAL, 0, 0.1, cf, 1)
+                cf.write_text('{"deg":1}\n'); return RunResult("nuclei", cmd, Status.PARTIAL, 2, 0.1, cf, 1)
             cf.write_text('{"clean":1}\n'); return RunResult("nuclei", cmd, Status.SUCCESS, 0, 0.1, cf, 1)
         r1 = self._run_nuclei(tmp_path, monkeypatch, partial)
         assert r1.status == Status.PARTIAL
@@ -313,10 +316,11 @@ class TestChunkedLifecycleBehavior:
         monkeypatch.setenv("NUCLEI_CONFIG", str(cfgdir))
         nucdir = tmp_path / "raw" / "params" / "nuclei"
 
+        # [145]: nonzero exit = execution INCOMPLETE, which is what keeps chunk 1 retryable across attempts
         def partial(tool, cmd, timeout=None, **k):
             cf = __import__("pathlib").Path(cmd[cmd.index("-o") + 1])
             if "findings_1." in cf.name:
-                cf.write_text('{"deg":1}\n'); return RunResult("nuclei", cmd, Status.PARTIAL, 0, 0.1, cf, 1)
+                cf.write_text('{"deg":1}\n'); return RunResult("nuclei", cmd, Status.PARTIAL, 2, 0.1, cf, 1)
             cf.write_text('{"clean":1}\n'); return RunResult("nuclei", cmd, Status.SUCCESS, 0, 0.1, cf, 1)
         r1 = self._run_nuclei(tmp_path, monkeypatch, partial)
         assert r1.status == Status.PARTIAL
@@ -340,16 +344,17 @@ class TestChunkedLifecycleBehavior:
         monkeypatch.setenv("NUCLEI_CONFIG", str(cfgdir))
         nucdir = tmp_path / "raw" / "params" / "nuclei"
 
+        # [145]: an INCOMPLETE execution (nonzero exit) is what leaves a chunk retryable across attempts
         def partial_a(tool, cmd, timeout=None, **k):
             cf = __import__("pathlib").Path(cmd[cmd.index("-o") + 1])
             if "findings_1." in cf.name:
-                cf.write_text('{"f1":1}\n{"f2":1}\n'); return RunResult("nuclei", cmd, Status.PARTIAL, 0, 0.1, cf, 2)
+                cf.write_text('{"f1":1}\n{"f2":1}\n'); return RunResult("nuclei", cmd, Status.PARTIAL, 2, 0.1, cf, 2)
             cf.write_text('{"clean":1}\n'); return RunResult("nuclei", cmd, Status.SUCCESS, 0, 0.1, cf, 1)
         self._run_nuclei(tmp_path, monkeypatch, partial_a)
 
         def partial_b(tool, cmd, timeout=None, **k):          # attempt 2: chunk 1 re-run, overlapping + new finding
             cf = __import__("pathlib").Path(cmd[cmd.index("-o") + 1])
-            cf.write_text('{"f2":1}\n{"f3":1}\n'); return RunResult("nuclei", cmd, Status.PARTIAL, 0, 0.1, cf, 2)
+            cf.write_text('{"f2":1}\n{"f3":1}\n'); return RunResult("nuclei", cmd, Status.PARTIAL, 2, 0.1, cf, 2)
         self._run_nuclei(tmp_path, monkeypatch, partial_b)
         agg = (nucdir / "findings.jsonl").read_text()
         # both attempts' distinct findings kept, the overlapping one deduped ONCE

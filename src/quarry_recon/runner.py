@@ -399,6 +399,7 @@ def run(
     ok_empty: bool = True,
     ok_codes: tuple[int, ...] = (0,),
     env: dict | None = None,
+    stderr_path: Path | None = None,
 ) -> RunResult:
     """Run `cmd`, capture everything, persist raw stdout to `raw_path`, classify.
 
@@ -406,6 +407,12 @@ def run(
     the stdin note below — fd-streaming breaks xnLinkFinder; callers cap the file size).
     `ok_codes` lists exit codes that are NOT failures — e.g. gitleaks exits 1 when it
     *finds* leaks, which is success, not error.
+
+    `stderr_path`, if given, persists the COMPLETE stderr (every path, including a timeout kill). Opt-in
+    because `stderr_tail` keeps only the last 8 lines — enough for a signature match, but NOT enough for a
+    caller that must read a tool's OWN completion/progress report out of its stderr (nuclei prints
+    `Scan completed in …` plus periodic `-stats` lines, and a trailing burst of `[INF]` lines can evict
+    both from an 8-line tail). A caller parsing tool-reported facts must read this file, never the tail.
     """
     bin_name = cmd[0]
     if not have(bin_name):
@@ -477,6 +484,17 @@ def run(
     cpu_s = round((cpu1.ru_utime + cpu1.ru_stime) - cpu_base, 2) if cpu1 else 0.0
     rss_mb = round(peak_rss[0], 1)
     out, err = out or "", err or ""
+
+    # Persist the COMPLETE stderr BEFORE any return branch — a timed-out chunk's stderr is exactly the
+    # evidence that it did NOT reach its own completion marker, so the kill path needs it too. A write
+    # failure must never mask the tool's real result: the run is already done, so swallow and carry on
+    # (the caller falls back to stderr_tail and, lacking proof of completion, treats the unit as retryable).
+    if stderr_path is not None:
+        try:
+            stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_path.write_text(err)
+        except OSError:
+            pass
 
     if timed_out:
         wrote = False

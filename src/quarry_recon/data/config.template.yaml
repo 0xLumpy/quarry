@@ -22,6 +22,7 @@ PERFORMANCE:
   ARJUN_THREADS:             # arjun -t (was hard-coded 5 → now I/O-scaled)
   NUCLEI_BULK_SIZE:          # nuclei -bs, hosts per template batch (default 25) — raise for many-host scopes
   NUCLEI_CHUNK_HOSTS:        # nuclei hosts per resumable batch (default 50; smaller = finer resume/progress, more template reloads)
+  NUCLEI_MAX_HOST_ERROR:     # nuclei -mhe, errors per host before it is SKIPPED. DEFAULT 0 = full depth (-nmhe, never drop an erroring host) — Quarry is coverage-first. A nonzero value is an explicitly bounded coverage policy (nuclei-native default would be 30) and costs coverage to save time. Changing it invalidates nuclei resume state
   SUBFINDER_MAX_TIME:        # subfinder -max-time budget in MINUTES per apex (default 60). Reaching it = PARTIAL (capped, results kept); 0 = practically unbounded (24h) — run to completion
   DALFOX_TARGETS:            # dalfox v3 --max-concurrent-targets, target parallelism (default 4; conservative — raise via OTC)
   DALFOX_CHUNK:              # dalfox xss candidate shapes per resumable batch (default 40)

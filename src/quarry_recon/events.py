@@ -261,7 +261,13 @@ def artifact_written(source_id, *, path=None, count=None, artifact_size=None) ->
 # kinds of coverage shortfall — they reconcile into the run verdict DIFFERENTLY (see store._run_summary):
 COVERAGE_SAMPLE = "sample"    # operator-CHOSEN subset: a soft LIMIT (complete_with_limits), never a gap
 COVERAGE_CAP = "cap"          # a hard ceiling truncated eligible input: a gap whenever omitted>0 (10%/100 = priority only)
-COVERAGE_TIMEOUT = "timeout"  # per-item timeout/deps-fail skipped input: ALWAYS feeds the verdict
+COVERAGE_TIMEOUT = "timeout"  # input the TARGET/network cost us — a per-item timeout, an error-driven skip (e.g.
+                              # nuclei -mhe dropping a host after N request errors), a deps-fail: ALWAYS feeds
+                              # the verdict. The name is narrower than the bucket; the bucket is "not our
+                              # ceiling, not the operator's choice — it was lost in flight".
+COVERAGE_UNKNOWN = "unknown"  # the source RAN but its coverage is UNMEASURABLE (stats missing/corrupt). Carries NO
+                              # counters, so it is never summed — it forces coverage_valid=False, which the verdict
+                              # reads as a GAP. Unmeasured must never be indistinguishable from fully covered.
 
 
 def mark_provider_generation(source_id) -> bool:
@@ -304,14 +310,23 @@ def coverage_partial(source_id, *, reason=None, produced=None,
 
     Counters are validated: non-negative ints with ``tested + omitted == eligible``. An inconsistent triple
     is flagged ``coverage_valid=False`` so the verdict treats it as UNKNOWN (a gap), never fake completion.
+
+    ``kind=COVERAGE_UNKNOWN`` is the FIRST-CLASS "ran but unmeasurable" record: it carries no counters yet is
+    still a STRUCTURED unit — it opens a generation and reaches the rollup. Without that, an unmeasurable unit
+    was a reason-only event, which (a) the rollup skipped entirely, so a first run with no stats read as fully
+    covered, and (b) did not reset, so a PRIOR run's counters kept standing in for it. Both made unmeasured
+    indistinguishable from complete.
     """
-    # Auto-open a generation ONLY for STRUCTURED coverage (eligible given). A legacy reason-only partial must
-    # not reset — it carries no replacement counters, so resetting would wrongly clear the real prior units.
-    if eligible is not None and source_id not in _coverage_seen:
+    structured = eligible is not None or kind == COVERAGE_UNKNOWN
+    # Auto-open a generation for STRUCTURED coverage only. A legacy reason-only partial must not reset — it
+    # carries no replacement counters, so resetting would wrongly clear the real prior units.
+    if structured and source_id not in _coverage_seen:
         _coverage_seen.add(source_id)
         coverage_reset(source_id)
     coverage_valid = None
-    if eligible is not None:
+    if kind == COVERAGE_UNKNOWN:
+        coverage_valid = False           # unmeasurable is NOT valid coverage; the verdict must read it as a gap
+    elif eligible is not None:
         try:
             eligible = int(eligible)
             tested = int(tested) if tested is not None else 0
@@ -322,7 +337,7 @@ def coverage_partial(source_id, *, reason=None, produced=None,
             coverage_valid = False
     return emit(COVERAGE_PARTIAL, source_id, reason=reason, produced=produced,
                 eligible=eligible, tested=tested, omitted=omitted, kind=kind,
-                unit=unit if unit is not None else (source_id if eligible is not None else None),
+                unit=unit if unit is not None else (source_id if structured else None),
                 measure=measure, coverage_valid=coverage_valid)
 
 
