@@ -57,6 +57,27 @@ def web_port_prefilter() -> bool:
     return str(v).strip().lower() not in ("false", "no", "0", "off")
 
 
+def strict_int(key: str, *, default: int, maximum: int) -> int:
+    """A COVERAGE/BUDGET knob from PERFORMANCE, parsed strictly: an exact int (never a bool) or a clean
+    int-string in 0..maximum. Anything else — bool, float, negative, oversized, whitespace, garbage —
+    falls back to `default` rather than inventing a policy from a typo.
+
+    `0` is a MEANINGFUL value for these knobs (the caller decides what it means: unbounded budget, full
+    depth, …), which is why this is separate from `concurrency()` — that one clamps to >= 1 and would turn
+    an intentional 0 into 1. Shared because the same parser is needed by every knob that decides how much
+    of the eligible input gets processed (SUBFINDER_MAX_TIME, NUCLEI_MAX_HOST_ERROR, the fetch budgets),
+    and three hand-rolled copies would drift."""
+    raw = performance().get(key)
+    if isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        return raw if 0 <= raw <= maximum else default
+    if isinstance(raw, str) and raw.strip().isdigit():
+        v = int(raw.strip())
+        return v if 0 <= v <= maximum else default
+    return default
+
+
 def concurrency(key: str, default: int) -> int:
     """An explicit per-tool concurrency override from PERFORMANCE (e.g. `NUCLEI_CONCURRENCY`,
     `HTTPX_THREADS`), else `default`. This is the explicit-override floor; the auto/core-scaling

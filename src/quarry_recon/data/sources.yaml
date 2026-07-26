@@ -136,10 +136,24 @@ sources:
       intelligence — heavy (a plan long-pole) but DEFAULT-ON. bounded by waymore_limit."}
   crawl.js_fetch:            {tool: internal, phase: crawl, tier: core, class: active, default: on,
     input: js_urls, output: "js_files (downloaded, deduped, beautified)", workers: n/a, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: none, log: delta,
-    notes: "internal JS downloader (scoped_get); ACTIVE-ALLOWED only (eligible counted after gating); capped at 2000 → coverage_partial(cap)"}
+    notes: "internal JS downloader (scoped_get); ACTIVE-ALLOWED only (eligible counted after gating).
+      NO input cap (the old 2000-slice was the cap lottery: influx1 went 433/439 -> 0/439 between runs).
+      FULL eligible set, host-round-robin order, throughput budget PERFORMANCE.JS_FETCH_BUDGET_S seconds
+      (default 0 = unbounded); remainder is a resumable per-URL ledger (raw/crawl/js_fetch.state.json,
+      sha256-bound). TWO measures: js_urls = selection (budget -> cap gap), js_fetched = outcome
+      (in-flight loss -> timeout gap). Per-item 15 MB size guard KEPT.
+      js_files/ = IMMUTABLE content-addressed raw responses (full sha256; the ledger's evidence, published
+      atomically). Miners/scanners read js_derived/, which is STAGED from validated evidence only, beautified
+      while staged, then swapped in atomically — exact by construction, and NOT mined at all if it cannot be
+      published exactly (measure: js_mineable)."}
   crawl.sourcemaps:          {tool: internal, phase: crawl, tier: core, class: active, default: on,
     input: js_sourceMappingURL, output: "recovered sources → sourcemaps dir", workers: n/a, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
-    notes: "internal sourcemap fetcher (scoped_get); off-scope map-URL guarded; fetch capped at 100 → coverage_partial(cap)"}
+    notes: "internal sourcemap fetcher (scoped_get); off-scope map-URL guarded. NO fetch cap (the old
+      sorted()[:100] CLUSTERED by host: one alphabetically-early host ate all 100 slots -> 46 maps recovered
+      one run, 5 the next). FULL set, host-round-robin, PERFORMANCE.SOURCEMAP_BUDGET_S seconds (default 0 =
+      unbounded); fetched bodies cached under sourcemaps/fetched + resumable ledger
+      (raw/crawl/sourcemap_fetch.state.json). Measures: sourcemaps (selection) + sourcemaps_fetched
+      (outcome). Per-item 20 MB size guard KEPT."}
   crawl.jsluice_urls:        {tool: jsluice, phase: crawl, tier: core, class: active, default: on,
     input: js_files, output: endpoint, workers: n/a, rate: n/a, timeout: "runner-managed (0=unbounded); per-file", failure: quiet-warn, fallback: skip, parser: normalize.jsluice_urls, log: delta,
     notes: "WIRED 4.1: per-file chunked via runner.run (-j raw-input), source-level events + tool_progress + ledger; --timeout-0 drift fixed"}

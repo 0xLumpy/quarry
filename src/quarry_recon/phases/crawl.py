@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import time
 from pathlib import Path
 
-from .. import events, fetch, normalize, secrets, settings
+from .. import budget, events, fetch, normalize, secrets, settings
 from ..contract import run_contract
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
@@ -231,6 +233,663 @@ def _safe_srcpath(name: str) -> str:
     return "/".join(parts) or "source"
 
 
+def _js_download(ctx):
+    """The crawl JS-download LANE: fetch every active-allowed JS URL, host-fair, under a throughput budget,
+    resumably. Extracted from run() so the cap-lottery fix is testable on its own — driving the whole crawl
+    phase to assert a fetch order would test everything except the thing that broke.
+
+    Returns (ledger, raw_dir). The LEDGER is the interface: it maps each obtained URL to the immutable raw
+    artifact holding that URL's body. Downstream lanes must ask it rather than re-deriving a filename.
+
+    ARTIFACTS ARE IMMUTABLE and CONTENT-ADDRESSED (review#1/#3). Two consequences, both of them fixes:
+      - the raw response is never rewritten, so beautification (which replaces its target) cannot invalidate
+        the ledger's digests. It used to: every resume re-fetched everything because the digest recorded at
+        fetch time no longer matched the beautified file. Beautifying happens on DERIVED copies.
+      - a body served identically at two URLs maps to ONE file and BOTH URLs get an entry pointing at it.
+        The old md5(url) naming plus a content-dedup `continue` left the duplicate with no artifact and no
+        entry, so its relative `sourceMappingURL` was never resolved — two origins sharing a bundle yielded
+        only one origin's sourcemap, and the duplicate was re-fetched on every resume."""
+    # Downloading JS is an ACTIVE fetch: gate on active_allowed (scope + OOS + passive-skip) and go
+    # through the shared choke point (rate pace + bounded read + off-scope-redirect guard).
+    MAX_JS = 15 * 1024 * 1024      # 15 MB PER-ITEM guard (RAM/disk); bounds one file's cost, not which files
+    # No JS_CAP. The old `_js_eligible[:2000]` is exactly the cap-lottery defect: a flat slice of a
+    # store-ordered list let a couple of JS-heavy hosts eat the whole budget, and which hosts won depended on
+    # discovery order — `influx1.eco.tsi-dev` went 433/439 -> 0/439 between two runs of the same target and
+    # took its secrets with it. Now: FULL eligible set, host-fair order, a throughput budget that defaults to
+    # UNBOUNDED, and a resumable per-URL ledger for whatever a bounded run did not reach.
+    #
+    # eligible = ACTIVE-ALLOWED JS only (count AFTER gating, not before): in passive mode active_allowed is
+    # empty, so eligible collapses to 0 and we never report a phantom tested for URLs we won't fetch.
+    eligible = [u for u in ctx.run.values("js_url")
+                if ctx.scope.active_allowed(normalize.host_of_url(u))]
+    raw_dir = ctx.run.dir / "raw" / "crawl" / "js_files"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    # state lives OUTSIDE js_files/: that dir is scanned by gitleaks/trufflehog and mined by xnLinkFinder,
+    # so a ledger inside it would inject its own recorded URLs into the URL corpus and offer its sha256
+    # digests to the secret scanners as high-entropy strings.
+    ledger = budget.Ledger(raw_dir.parent / "js_fetch.state.json", lane="crawl.js_fetch")
+    js_budget = budget.Budget(budget.budget_seconds("JS_FETCH_BUDGET_S"))
+    # review#5: fairness is computed over PENDING work only. Ordering the whole eligible set interleaves a
+    # host's hundreds of ALREADY-DONE URLs through the sequence, so its genuinely-new remainder lands late
+    # and a bounded run can be consumed by other hosts before ever reaching it.
+    resumed = [u for u in eligible if ledger.has(u)]
+    pending = budget.order_fairly([u for u in eligible if not ledger.has(u)],
+                                  lambda u: normalize.host_of_url(u))
+    attempted, obtained = len(resumed), len(resumed)     # a validated completion counts as both
+    fail: dict[str, int] = {}
+    persisted = True
+    try:
+        for u in pending:
+            if js_budget.exhausted():
+                break                                   # checked BETWEEN items — never mid-write
+            attempted += 1
+            try:
+                data, _final, status = fetch.scoped_get(ctx, u, max_body=MAX_JS)
+                if data is None:
+                    fail["not_contacted"] = fail.get("not_contacted", 0) + 1
+                    continue                            # off-scope redirect / scan-box guard
+                if status != 200:
+                    fail[f"http_{status}"] = fail.get(f"http_{status}", 0) + 1
+                    continue
+                if not (100 <= len(data) <= MAX_JS):
+                    fail["size_guard"] = fail.get("size_guard", 0) + 1
+                    continue
+                digest = hashlib.sha256(data).hexdigest()
+                dest = raw_dir / (digest + ".js")        # CONTENT-addressed (FULL sha256, not a 64-bit prefix)
+                if not budget.publish_bytes(dest, data, digest=digest):
+                    fail["write_failed"] = fail.get("write_failed", 0) + 1
+                    continue                             # never record an artifact we could not prove landed
+                obtained += 1
+                ledger.record(u, dest, digest=digest)    # ...and EVERY url gets an entry, duplicates included
+            except Exception:
+                fail["error"] = fail.get("error", 0) + 1
+                continue
+    finally:
+        # review#2: a Ctrl-C / kill mid-lane must not discard completed network work. record() journals every
+        # completion, so worst-case loss is bounded either way.
+        persisted = ledger.save()
+        if not persisted:                           # review#3 (r6): persistence CAN fail — say so
+            _persistence_gap(ctx, "crawl.js_fetch", ledger, len(eligible))
+        else:
+            events.coverage_partial("crawl.js_fetch", kind=events.COVERAGE_TIMEOUT, measure="state_persisted",
+                                    unit="state_persisted", eligible=1, tested=1, omitted=0,
+                                    reason="completion state persisted")
+    # SELECTION (did the budget stop us short?) and OUTCOME (did the target give us what we asked for?) are
+    # separate facts with separate causes. The outcome number was invisible before: OTC attempted 2000 JS URLs
+    # and obtained 628, then 1321 — a 69%/34% in-flight loss rate nobody could see.
+    budget.report_selection("crawl.js_fetch", measure="js_urls", eligible=len(eligible),
+                            attempted=attempted, budget=js_budget, noun="JS URL", durable=persisted)
+    budget.report_outcome("crawl.js_fetch", measure="js_fetched", attempted=attempted,
+                          obtained=obtained, classes=fail, noun="JS URL")
+    left = len(eligible) - attempted
+    ctx.echo(f"  JS files downloaded: {obtained}/{attempted} attempted obtained"
+             + (f" ({len(resumed)} resumed)" if resumed else "")
+             + (f", {left} left by budget — {'resumable' if persisted else 'NOT saved, will restart'}"
+                if left else ""))
+    return ledger, raw_dir
+
+
+def _persistence_gap(ctx, lane: str, ledger, eligible: int) -> None:
+    """Report that a lane's completion state could NOT be persisted.
+
+    review#3 (r6): both lanes called `ledger.save()` and discarded the result. When the state file belongs to
+    another lane the save is refused, so nothing is durable — yet the lane still reported its remainder as
+    "resumable" and every future run redoes the whole lane. An un-persisted lane is a coverage gap: the work
+    happened, but no future run can build on it."""
+    ctx.echo(f"    {lane}: completion state NOT persisted"
+             + (" (state file belongs to another lane)" if getattr(ledger, "foreign", False) else ""))
+    events.coverage_partial(lane, kind=events.COVERAGE_TIMEOUT, measure="state_persisted",
+                            unit="state_persisted", eligible=1, tested=0, omitted=1,
+                            reason=(f"completion state for {eligible} item(s) could not be persisted"
+                                    + (" — the state path is owned by a different lane"
+                                       if getattr(ledger, "foreign", False) else "")
+                                    + "; a resume will redo this lane"))
+
+
+def _stage_dir(active):
+    """A FRESH, provably-empty staging directory beside `active`.
+
+    review#5 (r5): staging was a PID-only path cleaned with `rmtree(..., ignore_errors=True)` and then reused —
+    so a file surviving an earlier failed attempt could ride into the active tree. The name is unique per
+    attempt and `mkdir()` is exclusive, so a leftover directory makes staging FAIL rather than be inherited."""
+    for _ in range(8):
+        cand = active.with_name(f"{active.name}.gen-{os.getpid()}-{os.urandom(4).hex()}")
+        try:
+            cand.mkdir(parents=True)
+            return cand
+        except FileExistsError:
+            continue
+        except OSError:
+            return None                       # permission / disk / anything else: no stage, no publication
+    return None
+
+
+def _js_publish_derived(ctx, ledger, raw_dir):
+    """Build the DERIVED JS tree — the one the miners and secret scanners read — as a fresh generation and
+    swap it in. Returns the published directory, or None when it could not be published exactly.
+
+    Four review rounds tried to keep an in-place tree correct: prune what is unwanted, publish copies
+    atomically, track provenance so beautification is not undone. Each round left another way for an
+    unverified file to remain live — a failed replacement kept the old destination and then got SEALED as
+    good, a leftover `.part-` temp survived, an undeletable stale file stayed mineable while coverage read
+    clean. The tree is now EXACT BY CONSTRUCTION: staged from validated evidence only, beautified while still
+    staged, and published atomically. Nothing partially-built is ever mineable, so there is no provenance
+    state to get wrong.
+
+    Beautification therefore re-runs each time rather than being preserved across runs. That is the right
+    trade: it is derived data, and correctness of what the scanners read matters more than repeating a
+    local reformat."""
+    active = raw_dir.parent / "js_derived"
+    for old in raw_dir.parent.glob("js_derived.gen-*"):           # abandoned staging from a killed run
+        shutil.rmtree(old, ignore_errors=True)
+    (raw_dir.parent / "js_derived.state.json").unlink(missing_ok=True)   # provenance state is obsolete
+    wanted = ledger.artifacts()
+    staging = _stage_dir(active)
+    if staging is None:
+        ctx.echo("    js_derived: could not create a clean staging directory — mining skipped")
+        _js_mineable(ctx, eligible=len(wanted), tested=0)
+        return None
+    staged, failed = [], 0
+    for src in sorted(wanted, key=lambda q: q.name):
+        dst = staging / src.name
+        try:
+            data = src.read_bytes()
+            dst.write_bytes(data)
+            if dst.stat().st_size != len(data):
+                raise OSError("short write")
+            staged.append(dst)
+        except OSError:
+            failed += 1
+            dst.unlink(missing_ok=True)                            # never leave a partial in the generation
+    if failed:
+        # an incomplete generation must not become the mineable tree — the scanners would silently see less
+        ctx.echo(f"    js_derived: {failed} artifact(s) could not be staged — mining skipped")
+        shutil.rmtree(staging, ignore_errors=True)
+        _js_mineable(ctx, eligible=len(wanted), tested=0)
+        return None
+    if staged and have("js-beautify"):
+        # beautify while STAGED: the published tree is then already in its final form, so there is no window
+        # in which the mineable tree is mid-mutation and no digest to re-seal afterwards.
+        try:
+            ok, degraded, bstatus = _beautify_run(ctx, staged)
+            events.ledger("crawl.js_beautify", beautified=ok, degraded=degraded,
+                          input_total=len(staged), status=bstatus.value)
+        except Exception as ex:
+            ctx.echo(f"    js-beautify: {ex}")
+    for stray in list(staging.glob("*.beauty")) + list(staging.glob("*.part-*")):
+        stray.unlink(missing_ok=True)                              # tool temps never ship
+    if not _publish_tree(ctx, active, staging):
+        _js_mineable(ctx, eligible=len(wanted), tested=0)
+        return None
+    _js_mineable(ctx, eligible=len(wanted), tested=len(staged))
+    return active
+
+
+def _js_mineable(ctx, *, eligible: int, tested: int) -> None:
+    """Coverage for "is every validated JS artifact actually available to the miners?". A tree we could not
+    publish exactly means NONE of it is mineable — reported as such rather than as a warning beside a clean
+    number."""
+    omitted = max(0, eligible - tested)
+    events.coverage_partial("crawl.js_fetch", kind=events.COVERAGE_TIMEOUT, measure="js_mineable",
+                            unit="js_mineable", eligible=eligible, tested=tested, omitted=omitted,
+                            reason=(f"{omitted} validated artifact(s) not available for mining"
+                                    if omitted else
+                                    f"all {tested} validated artifact(s) available for mining"))
+
+
+def _publish_tree(ctx, active, staging) -> bool:
+    """Swap a freshly built generation into place as the ACTIVE derived tree. Returns True only when the
+    active tree is the new generation.
+
+    review#1 (r3): the active tree must equal exactly what this run validated, and a swap makes that true by
+    construction where an in-place prune cannot.
+
+    review#1 (r4): the previous version could DESTROY THE LAST GOOD GENERATION. `os.replace` cannot overwrite
+    a non-empty directory, so the outgoing tree is moved aside first; if publishing then failed AND rollback
+    also failed, a `finally` deleted the retired copy anyway — leaving no tree at all. The retired copy is now
+    removed ONLY after publication or rollback is confirmed, and the caller gets a status so a failure can be
+    reported as a gap instead of passing silently."""
+    # review#2 (r6): NEVER create the stage here. `mkdir(exist_ok=True)` recreated a MISSING generation and
+    # published it as an empty success — reproduced: a missing stage returned True and replaced a populated
+    # active tree with an empty directory. Publication requires a stage that the caller built exclusively.
+    if staging is None or not staging.is_dir():
+        ctx.echo(f"    refusing to publish {active.name}: staging generation is missing")
+        return False
+    retired = active.with_name(active.name + f".retired-{os.getpid()}")
+    moved_aside = False
+    try:
+        if active.exists():
+            os.replace(active, retired)
+            moved_aside = True
+        os.replace(staging, active)
+    except OSError as ex:
+        ctx.echo(f"    could not publish {active.name}: {ex}")
+        shutil.rmtree(staging, ignore_errors=True)
+        if moved_aside and not active.exists():
+            try:
+                os.replace(retired, active)          # put the previous generation back...
+                moved_aside = False
+            except OSError as ex2:
+                # ...and if even that fails, KEEP it. A stale generation an operator can find beats no
+                # evidence at all, so `retired` survives on disk and the failure is reported.
+                ctx.echo(f"    WARNING: previous {active.name} left at {retired.name}: {ex2}")
+        return False
+    # publication confirmed — only now is the retired copy safe to drop
+    if moved_aside:
+        shutil.rmtree(retired, ignore_errors=True)
+    return True
+
+
+_SOURCEMAP_VERSION = 3          # the only source-map revision whose sourcesContent layout we extract
+
+
+def _payload_key(label: str, ref_index: int, payload: bytes) -> str:
+    """A stable, collision-resistant identity for one sourcemap payload.
+
+    review#5: the extraction subdir was `md5(label)[:10]` — 40 bits, and worse, TWO INLINE MAPS IN ONE JS FILE
+    share the same label, so extracting the second deleted the first's recovered sources while both counted as
+    recovered. Identity is (origin url, reference index, payload digest), domain-separated."""
+    h = hashlib.sha256()
+    for part in (label.encode(), str(ref_index).encode(), payload):
+        h.update(len(part).to_bytes(8, "big"))
+        h.update(part)
+    return h.hexdigest()
+
+
+def _sourcemap_schema(obj):
+    """Validate an UNTRUSTED sourcemap and return (sources, contents) or None when it is not one.
+
+    review#2: checking only the OUTER list types was fail-open — `{}`, `{"message":"not found"}`, and
+    `sourcesContent: [3, {"x":1}]` all counted as VALID maps while their non-string members were silently
+    skipped, and non-string `sources` turned into synthetic filenames. A map must declare `version: 3` and
+    carry string-or-null members. An INDEX map (`sections`) is a real sourcemap we do not extract — it is
+    attributed as unsupported, never accepted as if we had handled it."""
+    if not isinstance(obj, dict):
+        return None
+    version = obj.get("version")
+    # `type(...) is int`, not ==: bool is an int subclass and 3.0 == 3 is True, so `{"version": 3.0}` and
+    # `{"version": True}` both slipped through an equality check (review#3 r4).
+    if type(version) is not int or version != _SOURCEMAP_VERSION:
+        return None
+    if "sections" in obj:                             # index map: valid spec, unsupported here
+        return "index_map"
+    sources, contents = obj.get("sources"), obj.get("sourcesContent")
+    # `sources` is REQUIRED by the spec. Treating it as optional made `{"version": 3}` and
+    # `{"version": 3, "message": "not found"}` count as valid maps (review#3 r4).
+    if not isinstance(sources, list):
+        return None
+    if contents is not None and not isinstance(contents, list):
+        return None
+    # review#4 (r5): `sourcesContent` must line up with `sources`. One source plus two contents used to be
+    # accepted, with the extra content handed a synthetic filename.
+    if contents is not None and len(contents) != len(sources):
+        return None
+    for member in (sources, contents or []):
+        for x in member:
+            if x is not None and not isinstance(x, str):
+                return None                           # a non-string member makes the whole map untrusted
+    return (sources, contents or [])
+
+
+def _path_fingerprint(rels) -> str:
+    """A stable fingerprint of an exact relative-path SET. Domain-separated and length-prefixed so no
+    concatenation of two paths can ever equal a third."""
+    h = hashlib.sha256()
+    for r in sorted(rels):
+        b = r.encode()
+        h.update(len(b).to_bytes(8, "big"))
+        h.update(b)
+    return h.hexdigest()
+
+
+def _extract_payload(text, key, staging, tally, workroot=None):
+    """Validate ONE sourcemap payload and extract its embedded sources into `staging`. Updates `tally`
+    in place and returns the staging subdir name when extraction succeeded, else None.
+
+    review#1 (r6): extraction is per-payload and STREAMED precisely so the caller never has to hold more
+    than one map body in memory.
+
+    review#3 (r2): a sourcemap is UNTRUSTED input — validate shapes and isolate extraction here, or one
+    hostile map raises and aborts the phase before any coverage observation is emitted, discarding every
+    valid sibling too."""
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        tally["parse_fail"]["not_json"] = tally["parse_fail"].get("not_json", 0) + 1
+        return None                                              # e.g. a WAF HTML page served with 200
+    shape = _sourcemap_schema(obj)
+    if shape is None:
+        tally["parse_fail"]["invalid_schema"] = tally["parse_fail"].get("invalid_schema", 0) + 1
+        return None
+    if shape == "index_map":
+        tally["parse_fail"]["index_map_unsupported"] = tally["parse_fail"].get("index_map_unsupported", 0) + 1
+        return None
+    sources, contents = shape
+    # review#4 (r2): `sourcesContent` is OPTIONAL in a valid source map. Its absence means "valid map, no
+    # embedded source" — NOT failed recovery. Validity is one measure; EXTRACTION is another.
+    tally["valid_maps"] += 1
+    if not any(isinstance(c, str) and c for c in contents):
+        return None
+    tally["with_content"] += 1
+    # review#1 (r7): extract into a WORK directory outside the publishable generation and move it in only on
+    # success. Writing straight into staging meant a failed extraction whose `rmtree` cleanup ALSO failed left
+    # a partial subdir inside the generation — published, and ingested by the scanners as evidence that
+    # appears in no counter at all.
+    sub = staging / key[:32]                                     # keyed by full payload identity (review#5 r3)
+    work = (workroot or staging.parent) / f"{staging.name}.work-{key[:32]}"
+    shutil.rmtree(work, ignore_errors=True)
+    local = 0
+    rels: list = []                              # exact relative paths written for this payload
+    try:
+        for i, content in enumerate(contents):
+            if not isinstance(content, str) or not content:
+                continue                                         # null entries are normal and legal
+            name = sources[i] if i < len(sources) else None
+            # review#4 (r5): sanitizing ALONE collides — `../a.js`, `./a.js`, `/a.js`, `webpack:///./a.js`
+            # and `a.js` all reduce to `a.js`, so later sources silently overwrote earlier ones while both
+            # were counted as recovered. The source INDEX makes every output path unique.
+            safe = _safe_srcpath(name if isinstance(name, str) and name else f"src{i}.js")
+            out = work / f"{i:04d}" / safe
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(content)
+            rels.append(f"{i:04d}/{safe}")
+            local += 1
+        # complete: move the finished payload INTO the generation. Only now can a scanner ever see it.
+        os.replace(work, sub)
+    except (OSError, ValueError, TypeError):
+        # review#3 (r3): valid_maps was already incremented, so without a separate extraction measure the
+        # outcome report saw obtained == attempted and DROPPED the class from its reason.
+        tally["extract_fail"]["extract_error"] = tally["extract_fail"].get("extract_error", 0) + 1
+        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(sub, ignore_errors=True)
+        return None
+    # review#5 (r4): commit the count only once the payload finished — per-file increments stayed on the
+    # books when a later error deleted the whole payload directory.
+    tally["recovered"] += local
+    tally["extracted"] += 1
+    # review#1 (r10): a COUNT was not containment. Counting only regular non-symlink files meant a planted
+    # `payload/extra.js -> outside/file` left the expected count unchanged, published, and was then followed
+    # by the downstream `is_file()` straight to the miners. The manifest is now the exact set of relative
+    # paths (fingerprinted, so memory stays O(1) per payload) and verification additionally refuses ANY
+    # symlink anywhere inside a payload.
+    tally["manifest"][key[:32]] = (local, _path_fingerprint(rels))
+    return key[:32]
+
+
+def _sourcemap_recover(ctx, js_ledger):
+    """The crawl SOURCEMAP lane: find .map references in the fetched JS, fetch every in-scope one host-fair
+    under a throughput budget, and recover `sourcesContent` to disk. Returns the published recovered-source
+    directory, or None when it could not be published exactly — in which case NOTHING may be mined from it.
+
+    review#3: reference resolution is driven by the LEDGER's url->artifact map, once per ORIGINAL URL. It used
+    to recompute md5(url) and skip any URL whose file was absent — which silently excluded every URL whose
+    body had been content-deduplicated away.
+
+    review#1 (r6): payload bodies are STREAMED — decoded, extracted, released. Collecting them first meant the
+    unbounded lane held every inline map plus every resumed and fetched body in memory at once (20 MiB allowed
+    each), so a large target OOM'd and every resume rebuilt the same list and OOM'd again. Peak is now roughly
+    one map."""
+    recov_dir = ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered"
+    MAX_MAP = 20 * 1024 * 1024     # 20 MB PER-ITEM guard
+    live_subdirs: set = set()      # map subdirs backed by a payload THIS run; everything else is pruned
+    tally = {"valid_maps": 0, "with_content": 0, "extracted": 0, "recovered": 0,
+             "parse_fail": {}, "extract_fail": {}, "manifest": {}}
+    for _old in list(recov_dir.parent.glob(f"{recov_dir.name}.gen-*")) + \
+                list(recov_dir.parent.glob(f"{recov_dir.name}.gen-*.work-*")):
+        shutil.rmtree(_old, ignore_errors=True)                  # abandoned staging/work from a killed run
+    staging = _stage_dir(recov_dir)                              # unique + provably empty (review#5 r5)
+    obtained_js = list(js_ledger.items())
+    map_urls: set = set()          # in-scope http(s) .map candidates (for the review queue)
+    inline_n, inline_fail = 0, {}  # data: URIs are candidates too, and must be accounted for
+    payload_n = 0                  # every payload we actually looked at (inline + resumed + fetched)
+    m_att = m_got = 0
+    m_fail: dict = {}
+    map_budget = budget.Budget(budget.budget_seconds("SOURCEMAP_BUDGET_S"))
+    map_persisted = True
+    published = False
+    if staging is None:
+        # review#2 (r6): the exclusive-stage contract is end-to-end. No stage -> no extraction, no publication.
+        ctx.echo("    sourcemaps: could not create a clean staging directory — extraction skipped")
+    elif obtained_js:
+        import base64
+        from urllib.parse import urljoin
+        js_read_ok, js_read_fail = 0, 0
+        for u, art in obtained_js:
+            try:
+                text = art.read_text(errors="replace")
+            except OSError:
+                # review#1 (r9): mirrors the cached-map fix. Skipping silently meant that if the ONLY JS
+                # artifact became unreadable after ledger validation, every sourcemap measure reported a
+                # clean 0/0 and an empty generation was published — indistinguishable from "this target has
+                # no sourcemaps". This lane cannot refetch JS, so it reports the inspection gap instead.
+                js_read_fail += 1
+                continue
+            js_read_ok += 1
+            refs = [line.split("sourceMappingURL=", 1)[1].strip()
+                    for line in text.splitlines() if "sourceMappingURL=" in line]
+            refs.append(u.split("?")[0] + ".map")               # conventional fallback
+            for ref_i, ref in enumerate(refs):
+                if ref.startswith("data:"):                     # inline base64 sourcemap
+                    # review#6 (r2): an inline map that fails to decode or busts the size guard used to be
+                    # dropped before any measure saw it.
+                    inline_n += 1
+                    try:
+                        raw = base64.b64decode(ref.split(",", 1)[1])
+                    except Exception:
+                        inline_fail["decode_error"] = inline_fail.get("decode_error", 0) + 1
+                        continue
+                    if len(raw) > MAX_MAP:
+                        inline_fail["size_guard"] = inline_fail.get("size_guard", 0) + 1
+                        continue
+                    payload_n += 1                               # extract NOW; never accumulate the body
+                    got = _extract_payload(raw.decode("utf-8", "replace"),
+                                           _payload_key(u, ref_i, raw), staging, tally)
+                    if got:
+                        live_subdirs.add(got)
+                    del raw
+                else:
+                    # resolved against THIS url, which is why the per-url loop must cover deduplicated bodies
+                    m = urljoin(u, ref)
+                    # fetching is ACTIVE — a malicious sourceMappingURL can point off-scope.
+                    if ctx.scope.active_allowed(normalize.host_of_url(m)):
+                        map_urls.add(m)
+            del text
+        # No MAP_CAP. `sorted(map_urls)[:100]` was the cap lottery at its worst: sorting CLUSTERS by host, so
+        # one alphabetically-early host consumed the entire 100-fetch budget. Measured on two OTC runs of the
+        # same target — the first window landed on `influx1` (85 of 100 slots) and recovered 46 maps; the second
+        # landed on `dependencytrack` (74 slots) and recovered 5, and `report-sourcemap.json` came back `[]`
+        # because the map holding the secret was never fetched. Host-fair order + a budget + a ledger instead.
+        map_dir = ctx.run.dir / "raw" / "crawl" / "sourcemaps"
+        map_dir.mkdir(parents=True, exist_ok=True)
+        # same reasoning as js_fetch: keep state out of any directory a scanner or miner walks
+        map_ledger = budget.Ledger(map_dir.parent / "sourcemap_fetch.state.json", lane="crawl.sourcemaps")
+        cache_dir = map_dir / "fetched"                          # the raw .map bodies: the ledger's artifacts
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # resumed maps: read ONE body at a time from its cached artifact, extract, release.
+        # review#2 (r7): a resumed entry whose artifact is gone or unreadable used to be `continue`d — then
+        # counted in `m_got` as successfully fetched while `payload_n` excluded it, so it vanished from every
+        # denominator. It is REQUEUED for fetching instead (coverage-first); only if the re-fetch also fails
+        # does it surface, as a named failure.
+        requeue = []
+        resumed_ok = 0
+        for m in [m for m in map_urls if map_ledger.has(m)]:
+            art = map_ledger.artifact(m)
+            body = None
+            if art is not None:
+                try:
+                    body = art.read_bytes()
+                except OSError:
+                    body = None
+            if body is None:
+                requeue.append(m)                                # cached artifact unusable -> fetch it again
+                continue
+            resumed_ok += 1
+            payload_n += 1
+            got = _extract_payload(body.decode("utf-8", "replace"), _payload_key(m, 0, body), staging, tally)
+            if got:
+                live_subdirs.add(got)
+            del body
+        # review#5 (r2): order only PENDING work, so a host's already-fetched history cannot push its new
+        # remainder behind other hosts in a bounded run.
+        pending = budget.order_fairly(sorted([m for m in map_urls if not map_ledger.has(m)] + requeue),
+                                      lambda m: normalize.host_of_url(m))
+        m_att = m_got = resumed_ok
+        try:
+            for m in pending:
+                if map_budget.exhausted():
+                    break                                        # between items only
+                m_att += 1
+                try:
+                    # shared choke point: rate pace + bounded read + off-scope-redirect guard.
+                    data, _final, status = fetch.scoped_get(ctx, m, max_body=MAX_MAP)
+                    if data is None:
+                        m_fail["not_contacted"] = m_fail.get("not_contacted", 0) + 1
+                        continue
+                    if status != 200:
+                        m_fail[f"http_{status}"] = m_fail.get(f"http_{status}", 0) + 1
+                        continue
+                    if len(data) > MAX_MAP:
+                        m_fail["size_guard"] = m_fail.get("size_guard", 0) + 1
+                        continue
+                    m_digest = hashlib.sha256(data).hexdigest()
+                    cached = cache_dir / (m_digest + ".map")
+                    if not budget.publish_bytes(cached, data, digest=m_digest):
+                        m_fail["write_failed"] = m_fail.get("write_failed", 0) + 1
+                        continue                                 # a truncated cache file must never be evidence
+                    map_ledger.record(m, cached, digest=m_digest)
+                    m_got += 1
+                    payload_n += 1
+                    got = _extract_payload(data.decode("utf-8", "replace"),
+                                           _payload_key(m, 0, data), staging, tally)
+                    if got:
+                        live_subdirs.add(got)
+                    del data
+                except Exception:
+                    m_fail["error"] = m_fail.get("error", 0) + 1
+                    continue
+        finally:
+            map_persisted = map_ledger.save()                    # review#3 (r6): persistence CAN fail
+            if not map_persisted:
+                _persistence_gap(ctx, "crawl.sourcemaps", map_ledger, len(map_urls))
+            else:                                                # emit BOTH ways, or a prior gap lingers
+                events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_TIMEOUT,
+                                        measure="state_persisted", unit="state_persisted",
+                                        eligible=1, tested=1, omitted=0,
+                                        reason="completion state persisted")
+        sm_raw = ctx.run.raw_path("crawl", "sourcemaps", "candidates.txt")
+        sm_raw.write_text("\n".join(sorted(map_urls)) + "\n")
+        for smap in sorted(map_urls):
+            ctx.run.add("review", {"id": f"sourcemap:{smap}", "klass": "sourcemap", "value": smap,
+                                   "sources": ["sourcemap-scan"]})
+        budget.report_outcome("crawl.sourcemaps", measure="js_inspected", attempted=len(obtained_js),
+                              obtained=js_read_ok,
+                              classes={"unreadable_artifact": js_read_fail} if js_read_fail else {},
+                              noun="JS artifact")
+        budget.report_selection("crawl.sourcemaps", measure="sourcemaps", eligible=len(map_urls),
+                                attempted=m_att, budget=map_budget, noun="sourcemap", durable=map_persisted)
+        budget.report_outcome("crawl.sourcemaps", measure="sourcemaps_fetched", attempted=m_att,
+                              obtained=m_got, classes=m_fail, noun="sourcemap")
+    if staging is not None and (obtained_js or True):
+        # review#6 (r2)/#3 (r3): VALIDITY and EXTRACTION are separate outcomes, and inline candidates that
+        # never became payloads are still counted.
+        budget.report_outcome("crawl.sourcemaps", measure="sourcemaps_valid",
+                              attempted=payload_n + sum(inline_fail.values()),
+                              obtained=tally["valid_maps"],
+                              classes={**tally["parse_fail"], **inline_fail}, noun="sourcemap payload")
+        budget.report_outcome("crawl.sourcemaps", measure="sourcemaps_extracted",
+                              attempted=tally["with_content"], obtained=tally["extracted"],
+                              classes=tally["extract_fail"], noun="sourcemap with embedded source")
+    else:
+        # review#2 (r8): with JS evidence present but no staging, candidate discovery never ran — so these
+        # measures are UNMEASURED, not zero. Clean 0/0 records would imply there was nothing to inspect.
+        # COVERAGE_UNKNOWN reaches the verdict as a gap and keeps the input count as attribution.
+        for _m in ("sourcemaps", "sourcemaps_fetched", "sourcemaps_valid", "sourcemaps_extracted",
+                   "js_inspected"):
+            events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_UNKNOWN, measure=_m, unit=_m,
+                                    reason=f"no staging directory — {len(obtained_js)} JS artifact(s) were "
+                                           f"never inspected for sourcemaps; coverage UNMEASURED")
+    if not obtained_js and staging is not None:
+        # no JS -> zero eligible sourcemaps. Emit zero observations anyway so the structured auto-reset opens a
+        # fresh generation and a PRIOR gap doesn't linger as stale.
+        events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_CAP, measure="sourcemaps",
+                                eligible=0, tested=0, omitted=0, reason="no JS files this run -> 0 sourcemaps")
+        events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_TIMEOUT, measure="sourcemaps_fetched",
+                                eligible=0, tested=0, omitted=0, reason="no JS files this run -> 0 fetches")
+        events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_TIMEOUT, measure="js_inspected",
+                                eligible=0, tested=0, omitted=0, reason="no JS files this run -> 0 inspected")
+    # review#1 (r5): publication is ONE operation, measured 1/0. Sizing it by subdir count meant an EMPTY
+    # generation that failed to publish reported eligible=0/omitted=0 — no gap at all — while the rolled-back
+    # previous tree stayed on disk. And returning the directory regardless let jsluice / xnLinkFinder /
+    # gitleaks / trufflehog mine that stale tree as if it were this run's output.
+    # review#1 (r7/r8/r9): the generation must contain EXACTLY what we counted — checked in BOTH directions
+    # and down to the FILE level. Removing only the EXTRAS was one-sided (a counted payload that vanished
+    # shipped an incomplete tree while the counters still claimed it); comparing only top-level DIRECTORY
+    # names was still too coarse (a recovered file disappearing inside a counted directory published fine
+    # while `recovered_sources` overstated disk evidence).
+    #
+    # review#3 (r9): the whole check runs inside a guard. iterdir()/unlink() can raise, and an escaping
+    # exception aborted before `sourcemaps_published` recorded the gap — so a failure to verify became a
+    # failure to report.
+    if staging is not None and staging.is_dir():
+        try:
+            for entry in list(staging.iterdir()):                # drop what no counter claims
+                ok = (entry.name in live_subdirs and entry.is_dir() and not entry.is_symlink())
+                if ok:
+                    continue
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)                # a symlink is unlinked, never followed
+                if entry.exists():
+                    raise OSError(f"uncounted entry {entry.name} could not be removed")
+            manifest = {e.name for e in staging.iterdir() if e.is_dir() and not e.is_symlink()}
+            if manifest != live_subdirs:
+                raise OSError(f"{len(live_subdirs - manifest)} counted payload(s) missing from the generation")
+            for key, (exp_n, exp_fp) in tally["manifest"].items():   # ...and the FILES inside each payload
+                sub = staging / key
+                seen = []
+                for q in sub.rglob("*"):
+                    if q.is_symlink():
+                        # review#1 (r10): no symlink may exist anywhere inside a payload. Rejecting is the
+                        # only real containment — the scanners walk this tree themselves and we cannot make
+                        # gitleaks or xnLinkFinder stop following links.
+                        raise OSError(f"payload {key} contains a symlink ({q.name})")
+                    if q.is_file():
+                        seen.append(str(q.relative_to(sub)))
+                if len(seen) != exp_n or _path_fingerprint(seen) != exp_fp:
+                    raise OSError(f"payload {key} has {len(seen)} recovered file(s), counted {exp_n} "
+                                  f"(or the paths differ)")
+        except OSError as ex:
+            ctx.echo(f"    sourcemaps: generation disagrees with its counters ({ex}) — not publishing")
+            shutil.rmtree(staging, ignore_errors=True)
+            staging = None
+    published = _publish_tree(ctx, recov_dir, staging)
+    events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_TIMEOUT, measure="sourcemaps_published",
+                            unit="sourcemaps_published", eligible=1, tested=1 if published else 0,
+                            omitted=0 if published else 1,
+                            reason=(f"recovered-source tree published ({len(live_subdirs)} map(s))"
+                                    if published else
+                                    "recovered-source tree could NOT be published; extraction unavailable "
+                                    "and the directory on disk is a stale generation"))
+    # review#4 (r6): emit a ledger EVERY lifecycle. Event folding carries the latest ledger forward, so
+    # omitting it on failure/empty left the PREVIOUS generation's recovered_sources on display as current —
+    # confirmed: an old count of nine survived a newer publication-failure event.
+    events.ledger("crawl.sourcemaps",
+                  produced={"recovered_sources": tally["recovered"] if published else 0,
+                            "valid_maps": tally["valid_maps"] if published else 0,
+                            "published": 1 if published else 0},
+                  consumed={"map_candidates": len(map_urls), "inline_candidates": inline_n,
+                            "payloads": payload_n})
+    if not published:
+        return None
+    m_left = len(map_urls) - m_att
+    ctx.echo(f"  sourcemaps: {len(map_urls)} .map candidate(s), {m_got}/{m_att} fetched"
+             + (f", {m_left} left by budget — {'resumable' if map_persisted else 'NOT saved, will restart'}"
+                if m_left else "")
+             + f", {tally['valid_maps']}/{payload_n} valid, recovered {tally['recovered']} source file(s)")
+    return recov_dir
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
     roots = ctx.write_list("roots.txt", prof.apex_domains)
@@ -338,126 +997,25 @@ def run(ctx) -> None:
             _xnl(ctx, str(wdir), f"waymore-{d}", extra=["-orig", "-spo"], depth=3)
 
     # ── download JS, dedup, beautify ──
-    # Downloading JS is an ACTIVE fetch: gate on active_allowed (scope + OOS + passive-skip) and go
-    # through the shared choke point (rate pace + bounded read + off-scope-redirect guard).
-    MAX_JS = 15 * 1024 * 1024      # 15 MB cap per JS (RAM/disk guard; bundles are large but bounded)
-    JS_CAP = 2000
-    # eligible = ACTIVE-ALLOWED JS only (count AFTER gating, not before): in passive mode active_allowed is
-    # empty, so eligible collapses to 0 and we never report a phantom tested=2000 for URLs we won't fetch.
-    _js_eligible = [u for u in ctx.run.values("js_url")
-                    if ctx.scope.active_allowed(normalize.host_of_url(u))]
-    js_urls = _js_eligible[:JS_CAP]
-    # emit EVERY run (omitted=0 when uncapped) so a later uncapped rerun CLEARS a prior cap gap (latest-per-unit)
-    _n_js = len(_js_eligible)
-    events.coverage_partial("crawl.js_fetch", kind=events.COVERAGE_CAP, measure="js_urls",
-                            eligible=_n_js, tested=min(_n_js, JS_CAP), omitted=max(0, _n_js - JS_CAP),
-                            reason=f"JS download {min(_n_js, JS_CAP)}/{_n_js} active-allowed (cap {JS_CAP})")
-    js_dir = ctx.run.dir / "raw" / "crawl" / "js_files"
-    js_dir.mkdir(parents=True, exist_ok=True)
-    seen_hash = set()
-    for u in js_urls:
-        if not ctx.scope.active_allowed(normalize.host_of_url(u)):
-            continue
-        dest = js_dir / (hashlib.md5(u.encode()).hexdigest()[:16] + ".js")
-        if dest.exists():
-            continue
-        try:
-            data, _final, status = fetch.scoped_get(ctx, u, max_body=MAX_JS)
-            if data is None or status != 200 or not (100 <= len(data) <= MAX_JS):
-                continue
-            h = hashlib.md5(data).hexdigest()
-            if h in seen_hash:
-                continue
-            seen_hash.add(h)
-            dest.write_bytes(data)
-        except Exception:
-            continue
-    js_files = list(js_dir.glob("*.js"))
-    ctx.echo(f"  JS files downloaded: {len(js_files)}")
+    js_ledger, js_raw_dir = _js_download(ctx)
 
-    # beautify in place (better extraction) — UNDER CONTRACT (per-file via runner, source-level events)
-    if js_files and have("js-beautify"):
-        try:
-            ok, degraded, bstatus = _beautify_run(ctx, js_files)
-            events.ledger("crawl.js_beautify", beautified=ok, degraded=degraded,
-                          input_total=len(js_files), status=bstatus.value)
-        except Exception as ex:
-            ctx.echo(f"    js-beautify: {ex}")
+    # review#1/#2: the mineable tree is a STAGED generation, beautified before publication and swapped in
+    # atomically — so what the miners and secret scanners read is exactly this run's validated evidence, or
+    # nothing at all. `None` means it could not be published exactly, and NOTHING is mined from it.
+    js_derived_dir = _js_publish_derived(ctx, js_ledger, js_raw_dir)
+    js_files = sorted(js_derived_dir.glob("*.js")) if js_derived_dir else []
 
-    # ── 9.1 source-map UNPACK: detect .map refs, fetch, recover original source ──
-    recov_dir = ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered"
-    MAX_MAP = 20 * 1024 * 1024     # 20 MB cap per sourcemap (RAM/disk guard)
-    if js_files:
-        import base64
-        from urllib.parse import urljoin
-        map_payloads = []          # (label, json_text) — both inline-data and fetched .map
-        map_urls = set()           # in-scope http(s) .map candidates (for the review queue)
-        for u in ctx.run.values("js_url"):
-            dest = js_dir / (hashlib.md5(u.encode()).hexdigest()[:16] + ".js")
-            if not dest.exists():
-                continue
-            refs = [line.split("sourceMappingURL=", 1)[1].strip()
-                    for line in dest.read_text(errors="replace").splitlines()
-                    if "sourceMappingURL=" in line]
-            refs.append(u.split("?")[0] + ".map")               # conventional fallback
-            for ref in refs:
-                if ref.startswith("data:"):                     # inline base64 sourcemap
-                    try:
-                        raw = base64.b64decode(ref.split(",", 1)[1])
-                        if len(raw) <= MAX_MAP:                  # size guard
-                            map_payloads.append((u, raw.decode("utf-8", "replace")))
-                    except Exception:
-                        pass
-                else:
-                    m = urljoin(u, ref)
-                    # fetching is ACTIVE — a malicious sourceMappingURL can point off-scope.
-                    if ctx.scope.active_allowed(normalize.host_of_url(m)):
-                        map_urls.add(m)
-        MAP_CAP = 100
-        _maps = sorted(map_urls)
-        _n_map = len(_maps)                                     # emit every run (omitted=0 clears prior cap)
-        events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_CAP, measure="sourcemaps",
-                                eligible=_n_map, tested=min(_n_map, MAP_CAP), omitted=max(0, _n_map - MAP_CAP),
-                                reason=f"sourcemap fetch {min(_n_map, MAP_CAP)}/{_n_map} referenced (cap {MAP_CAP})")
-        for m in _maps[:MAP_CAP]:                               # bound number of fetches
-            try:
-                # shared choke point: rate pace + bounded read + off-scope-redirect guard.
-                data, _final, status = fetch.scoped_get(ctx, m, max_body=MAX_MAP)
-                if data is None or status != 200 or len(data) > MAX_MAP:
-                    continue
-                map_payloads.append((m, data.decode("utf-8", "replace")))
-            except Exception:
-                continue
-        recovered = 0
-        for label, text in map_payloads:
-            try:
-                obj = json.loads(text)
-            except json.JSONDecodeError:
-                continue
-            # per-map subdir so two maps with the same source path don't overwrite each other
-            mh = hashlib.md5(label.encode()).hexdigest()[:10]
-            sources = obj.get("sources") or []
-            for i, content in enumerate(obj.get("sourcesContent") or []):
-                if not content:
-                    continue
-                out = recov_dir / mh / _safe_srcpath(sources[i] if i < len(sources) else f"src{i}.js")
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_text(content)
-                recovered += 1
-        sm_raw = ctx.run.raw_path("crawl", "sourcemaps", "candidates.txt")
-        sm_raw.write_text("\n".join(sorted(map_urls)) + "\n")
-        for s in sorted(map_urls):
-            ctx.run.add("review", {"id": f"sourcemap:{s}", "klass": "sourcemap", "value": s,
-                                   "sources": ["sourcemap-scan"]})
-        ctx.echo(f"  sourcemaps: {len(map_urls)} .map candidate(s), recovered {recovered} source file(s)")
-    else:
-        # no JS this run -> zero eligible sourcemaps. Emit a zero observation anyway so the structured auto-reset
-        # opens a fresh generation and a PRIOR sourcemap cap doesn't linger as a stale gap.
-        events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_CAP, measure="sourcemaps",
-                                eligible=0, tested=0, omitted=0, reason="no JS files this run -> 0 sourcemaps")
+    # the sourcemap lane reads the RAW bodies (immutable, and a reformat could disturb the trailing
+    # sourceMappingURL comment) and takes its URL->artifact truth from the ledger.
+    recov_dir = _sourcemap_recover(ctx, js_ledger)
 
     # ── re-mine recovered source (jsluice + xnLinkFinder), provenance = sourcemap ──
-    recov_files = [p for p in recov_dir.rglob("*") if p.is_file()] if recov_dir.exists() else []
+    # review#1 (r5): None means publication failed, so the directory on disk is a ROLLED-BACK previous
+    # generation. Mining it would present stale extraction as this run's output.
+    # `is_file()` FOLLOWS symlinks, so filter them explicitly — publication already refuses a tree
+    # containing any, and this keeps the invariant local to where the files are consumed.
+    recov_files = ([p for p in recov_dir.rglob("*") if p.is_file() and not p.is_symlink()]
+                   if (recov_dir and recov_dir.exists()) else [])
     if recov_files and have("jsluice"):
         for sub, parser in (("urls", normalize.jsluice_urls), ("secrets", normalize.jsluice_secrets)):
             raw = ctx.run.raw_path("crawl", "jsluice-sourcemap", f"{sub}.jsonl")
@@ -482,7 +1040,8 @@ def run(ctx) -> None:
             except Exception as ex:
                 ctx.echo(f"    jsluice-sourcemap {sub}: {ex}")
     if recov_files and have("xnLinkFinder"):
-        _xnl(ctx, str(recov_dir), "sourcemap", extra=[])
+        if recov_dir:
+            _xnl(ctx, str(recov_dir), "sourcemap", extra=[])
 
     # ── 9.2 deep-mine: GraphQL / WebSocket / API-base over JS + recovered source ──
     nd = _deep_mine(ctx, js_files, "js") + _deep_mine(ctx, recov_files, "sourcemap")
@@ -515,7 +1074,7 @@ def run(ctx) -> None:
 
     # ── xnLinkFinder over JS dir (links + params + secrets + wordlist) ──
     if js_files and have("xnLinkFinder"):
-        _xnl(ctx, str(js_dir), "js", extra=[])
+        _xnl(ctx, str(js_derived_dir), "js", extra=[])
 
     # ── xnLinkFinder over katana's stored responses (flags.md: crawl-then-mine) ──
     if have("xnLinkFinder") and kat_resp.exists() and any(kat_resp.iterdir()):
@@ -527,8 +1086,10 @@ def run(ctx) -> None:
     # BOTH dirs must be scanned: a canary planted only in a recovered source (e.g. a stripe key in
     # app.js.map's sourcesContent) is missed if we scan js_files/ alone (Test-5). js_files gate
     # holds — no JS means no sourcemaps, nothing to scan.
-    scan_dirs = [d for d in (js_dir, recov_dir)
-                 if d.exists() and any(p.is_file() for p in d.rglob("*"))]
+    # the DERIVED tree, not raw_dir: scanning both would double-report every secret, and raw is kept as
+    # immutable evidence (review#1) rather than as scanner input.
+    scan_dirs = [d for d in (js_derived_dir, recov_dir)
+                 if d and d.exists() and any(p.is_file() for p in d.rglob("*"))]
     if scan_dirs and have("gitleaks"):
         # `gitleaks dir <path>` (T1.3 drift fix): the old `detect --no-git -s <path>` is deprecated —
         # current gitleaks uses the `dir` subcommand with a POSITIONAL path (filesystem scan, no-git is
@@ -539,9 +1100,9 @@ def run(ctx) -> None:
         # (Report redaction + version pinning are separate items — C15 secret-hygiene / C08 install-lock.)
         for sd in scan_dirs:
             rep = ctx.run.raw_path("crawl", "gitleaks",
-                                   "report.json" if sd == js_dir else "report-sourcemap.json")
+                                   "report.json" if sd == js_derived_dir else "report-sourcemap.json")
             rep.unlink(missing_ok=True)                    # stale report must not fabricate findings/success
-            # review#4/#6: gitleaks runs TWICE under one source_id (js_dir + sourcemap dir). Each invocation
+            # review#4/#6: gitleaks runs TWICE under one source_id (js_derived + sourcemap dir). Each invocation
             # needs its OWN work_unit so C10b tracks them separately AND re-scans a dir whose CONTENT changed.
             # Keyed on the dir name + a per-file CONTENT digest (not path+size — a same-size edit MUST re-scan;
             # a size-only key would skip a canary swapped into an equal-length secret).

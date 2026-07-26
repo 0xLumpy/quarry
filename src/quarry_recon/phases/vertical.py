@@ -30,16 +30,8 @@ def _subfinder_budget_min(http_timeout) -> int:
     negative / oversized / garbage value falls back to 60 (never a silent 1-min cap from `true`, a 24h run from
     `false`/negatives, or a Go duration overflow). Quarry's 0 = 'practically unbounded' -> 1440m (NEVER 0 to
     subfinder, which would cancel); `quarry run --timeout 0` likewise forces the practical-unbounded budget."""
-    raw = settings.performance().get("SUBFINDER_MAX_TIME")
-    knob = _SUBFINDER_DEFAULT_MIN
-    if isinstance(raw, bool):                                # bool is an int subclass — reject explicitly
-        knob = _SUBFINDER_DEFAULT_MIN
-    elif isinstance(raw, int):
-        knob = raw if 0 <= raw <= _SUBFINDER_UNBOUNDED_MIN else _SUBFINDER_DEFAULT_MIN
-    elif isinstance(raw, str) and raw.strip().isdigit():     # a clean NON-negative integer string (no float/sign)
-        v = int(raw.strip())
-        knob = v if 0 <= v <= _SUBFINDER_UNBOUNDED_MIN else _SUBFINDER_DEFAULT_MIN
-    # else (None/""/float/garbage): keep the 60m default
+    knob = settings.strict_int("SUBFINDER_MAX_TIME",         # shared coverage-knob parser (same semantics)
+                               default=_SUBFINDER_DEFAULT_MIN, maximum=_SUBFINDER_UNBOUNDED_MIN)
     if knob <= 0 or http_timeout == 0:                       # 0 (or unbounded outer) -> practically unbounded
         return _SUBFINDER_UNBOUNDED_MIN
     return knob

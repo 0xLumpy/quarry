@@ -101,18 +101,11 @@ def _nuclei_mhe() -> int:
     folded into the resume fingerprint and a change re-scans rather than silently resuming a shallower
     generation. (It does cost wall-clock: the requests `-mhe` was suppressing now actually go out.)
 
-    STRICT parse (mirrors SUBFINDER_MAX_TIME): an exact int (never a bool) or a clean int-string in
-    0.._NUCLEI_MHE_MAX; anything else — bool, float, negative, oversized, garbage — falls back to the
-    default rather than inventing a policy from a typo."""
-    raw = settings.performance().get("NUCLEI_MAX_HOST_ERROR")
-    if isinstance(raw, bool):
-        return _NUCLEI_MHE_DEFAULT
-    if isinstance(raw, int):
-        return raw if 0 <= raw <= _NUCLEI_MHE_MAX else _NUCLEI_MHE_DEFAULT
-    if isinstance(raw, str) and raw.strip().isdigit():
-        v = int(raw.strip())
-        return v if 0 <= v <= _NUCLEI_MHE_MAX else _NUCLEI_MHE_DEFAULT
-    return _NUCLEI_MHE_DEFAULT
+    STRICT parse via the shared coverage-knob parser (settings.strict_int): an exact int (never a bool) or
+    a clean int-string in 0.._NUCLEI_MHE_MAX; anything else — bool, float, negative, oversized, garbage —
+    falls back to the default rather than inventing a policy from a typo."""
+    return settings.strict_int("NUCLEI_MAX_HOST_ERROR",
+                               default=_NUCLEI_MHE_DEFAULT, maximum=_NUCLEI_MHE_MAX)
 
 
 def _nuclei_progress(text: str) -> dict:
