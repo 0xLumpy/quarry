@@ -168,12 +168,56 @@ def ffuf_results(out_file) -> "list | None":
     results = data.get("results")
     if not isinstance(results, list):
         return None
-    # drop malformed rows centrally: a row must be an object, else a caller's `.get()` crashes on it
-    # (e.g. `{"results":[null]}`). Filtering here keeps every ingest site (probe/content) row-safe.
-    return [row for row in results if isinstance(row, dict)]
+    # review#4 (A1): a structurally malformed ROW means the artifact itself is not trustworthy. Silently
+    # filtering `{"results":[null]}` down to `[]` made a corrupt artifact read as a clean EMPTY, which a
+    # resumable ledger then journaled as done. ffuf does not emit non-object rows, so any is corruption:
+    # fail CLOSED for the whole artifact rather than ingest a subset of a broken file.
+    if any(not isinstance(row, dict) for row in results):
+        return None
+    return list(results)
 
 
-def reclassify_ffuf(r: "RunResult", out_file) -> "RunResult":
+def ffuf_usable_rows(rows, validate) -> "tuple[list, int]":
+    """Split structurally-valid ffuf rows into (USABLE, dropped_count) using a lane's TYPE-CHECKING predicate.
+
+    review#4 (A1): structural validity is not usability — `{"results":[{}]}` is a dict row, so it survived the
+    central filter and the run read SUCCESS while yielding no evidence.
+
+    review#1 (A1 r2): a "non-empty field" check is still fail-open. Verified: `url: ["http://h/a"]`,
+    `status: true` and `status: "200"` all passed it — the list URL then raised TypeError inside
+    host_of_url, and the others would have polluted normalized data. `validate` is a per-lane PREDICATE so
+    each lane asserts the actual TYPES it ingests, not merely the presence of a key."""
+    usable = [r for r in rows if validate(r)]
+    return usable, len(rows) - len(usable)
+
+
+def ffuf_http_row(row) -> bool:
+    """A usable ffuf row for a URL-ingesting lane: a genuinely ABSOLUTE http(s) URL and a real HTTP status.
+
+    `isinstance(x, bool)` is excluded explicitly — bool is an int subclass, so `status: true` would otherwise
+    read as a valid status code.
+
+    review#6 (A1 r3): `startswith()` + `int` was still fail-open. Verified passing: `http://` (no authority),
+    `http:///path` (empty host), `https://h:99999/` (impossible port), `status: 9999` and `status: 0`. The
+    authority is parsed and the status constrained to the real HTTP range instead."""
+    from urllib.parse import urlsplit
+    u, st = row.get("url"), row.get("status")
+    if not isinstance(st, int) or isinstance(st, bool) or not (100 <= st <= 599):
+        return False
+    if not isinstance(u, str) or len(u) > 8192:
+        return False
+    try:
+        parts = urlsplit(u)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return False
+        if parts.port is not None and not (1 <= parts.port <= 65535):
+            return False
+    except ValueError:                                   # urlsplit raises on a malformed port
+        return False
+    return True
+
+
+def reclassify_ffuf(r: "RunResult", out_file, stderr_file=None, maxtime=None) -> "RunResult":
     """ffuf artifact adapter (audit): ffuf writes hits to `-o` JSON while `-s` keeps stdout empty, so the
     generic classifier (stdout + stderr only) can't see the real result and a transport line mislabels the
     run. A VALID artifact (dict root + list `results`) means ffuf reached completion; refine on it:
@@ -195,11 +239,38 @@ def reclassify_ffuf(r: "RunResult", out_file) -> "RunResult":
     # ffuf hit its native -maxtime ceiling: it STOPS mid-wordlist, finalizes the artifact, then exits
     # CLEAN (exit 0) — so the generic classifier reads SUCCESS/EMPTY even though the run was TRUNCATED.
     # Demote to PARTIAL first (a degraded state) so the matrix below never launders it into SUCCESS/EMPTY.
-    if r.status in (Status.SUCCESS, Status.EMPTY) and "maximum running time" in (r.stderr_tail or "").lower():
-        r.status = Status.PARTIAL
+    # review#4 (vhost r1): read the COMPLETE stderr when the caller persisted it. `stderr_tail` is only the
+    # LAST 8 LINES, so ffuf output after the cap notice evicted the marker and a TRUNCATED run became
+    # SUCCESS — then a resumable ledger journaled it as done. Exactly the mistake just fixed for nuclei.
+    _err, _full = r.stderr_tail or "", False
+    if stderr_file is not None:
+        try:
+            if Path(stderr_file).is_file():
+                _err, _full = Path(stderr_file).read_text(errors="replace"), True
+        except OSError:
+            pass
+    if r.status in (Status.SUCCESS, Status.EMPTY):
+        capped = "maximum running time" in _err.lower()
+        if not capped and not _full and maxtime:
+            # review#3 (vhost r2): falling back to the 8-line tail RECREATED the original bug whenever the
+            # stderr file was missing or unreadable — an evicted marker meant a truncated run read SUCCESS
+            # and got journaled as done. Without the full text we cannot see the marker, so DURATION decides:
+            # reaching the ceiling means truncated. An early natural finish stays clean.
+            capped = r.duration >= maxtime
+        if capped:
+            r.status = Status.PARTIAL
+            r.note = ("ffuf: hit its -maxtime ceiling — run TRUNCATED, coverage incomplete"
+                      + ("" if _full else " (inferred from duration; full stderr unavailable)"))
     results = ffuf_results(out_file)
     if results is None:
-        return r                                             # no valid artifact -> trust the classifier
+        # review#4 (A1): FAIL CLOSED on a clean exit. `-o` is ffuf's REQUIRED output, so a missing or
+        # malformed artifact after a clean run means completion is UNPROVEN — leaving SUCCESS/EMPTY let a
+        # resumable ledger journal it as done and never rerun it. A degraded status keeps its own verdict
+        # (a hard stop before write is already honest).
+        if r.status in (Status.SUCCESS, Status.EMPTY):
+            r.status = Status.PARTIAL
+            r.note = "ffuf: -o artifact missing/malformed — completion uncertain"
+        return r
     n = len(results)
     r.stdout_lines = n
     # ffuf hard states: ffuf errored / was killed. It may have left a partial artifact, but the run did

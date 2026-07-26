@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-import idna as _idna                                       # IDNA2008 / UTS-46 (correct domain identity)
 import yaml
 
 # HTTP probe set from the proven manual workflow. Empty PORTS.HTTP means use this full set;
@@ -106,9 +105,9 @@ def _canon_domain(d: str) -> str:
         s = s[2:]                                          # wildcard -> root (already covers subs + bare apex)
     if not s:
         raise ProfileError(f"invalid APEX_DOMAINS entry {d!r} (empty)")
-    try:
-        core = _idna.encode(s, uts46=True, transitional=False).decode("ascii")
-    except (_idna.IDNAError, UnicodeError, ValueError):
+    from . import normalize as _n
+    core = _n.idna_ascii(s)                      # shared policy; raising is THIS site's choice
+    if core is None:
         raise ProfileError(f"invalid domain in APEX_DOMAINS: {d!r}")
     if not _DOMAIN_RE.match(core) or _looks_like_ip(core):
         raise ProfileError(f"invalid domain in APEX_DOMAINS: {d!r} (not a hostname)")

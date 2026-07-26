@@ -211,3 +211,45 @@ def jsluice_secrets(raw: str, source: str, raw_ref: str | None = None) -> Iterat
 def host_of_url(url: str) -> str:
     m = re.match(r"https?://([^/:]+)", url, re.IGNORECASE)
     return m.group(1).lower() if m else ""
+
+def idna_ascii(s: str):
+    """THE single IDNA implementation: IDNA2008 / UTS-46, NON-transitional. Returns the A-label form, or None
+    when the input cannot be encoded.
+
+    review#2 (vhost r4): three call sites shared the POLICY but each re-implemented the encode, so a fourth
+    (the vhost wordlist) drifted onto Python's builtin transitional codec and would have contacted `fass.de`
+    for `faß.de`. The encode now lives here; callers keep their own FAILURE policy, which legitimately
+    differs — config raises ProfileError, store falls back best-effort, this module's strict form returns
+    None because its caller is about to make a request."""
+    import idna as _idna
+    try:
+        return _idna.encode(s, uts46=True, transitional=False).decode("ascii")
+    except Exception:
+        return None
+
+
+def canon_host_strict(h: str):
+    """Canonicalize a hostname under Quarry's ONE IDNA policy — IDNA2008 / UTS-46 NON-transitional — or
+    return None when it cannot be a real hostname.
+
+    review#2 (vhost r3): the vhost wordlist used Python's builtin `str.encode("idna")` codec, which applies
+    TRANSITIONAL mapping: `faß` becomes `fass`, a DIFFERENT domain, so the lane would actively contact a name
+    the operator never scoped. config._canon_domain and store._canon_host both already use the correct policy;
+    this is the shared entry point so a third divergent copy cannot appear.
+
+    Unlike store._canon_host (best-effort, falls back to the lowered form) this is STRICT: anything that is
+    not a syntactically valid hostname returns None, because the caller is about to CONTACT it."""
+    s = str(h).strip().lower().rstrip(".")
+    if not s or "/" in s or ".." in s or any(c.isspace() for c in s):
+        return None
+    core = idna_ascii(s)
+    if core is None:
+        return None
+    if len(core) > 253:
+        return None
+    for label in core.split("."):
+        if not (1 <= len(label) <= 63) or label[0] == "-" or label[-1] == "-":
+            return None
+        if any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in label):
+            return None
+    return core

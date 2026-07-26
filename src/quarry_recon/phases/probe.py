@@ -7,15 +7,18 @@ optional smap passive (Shodan-backed) port scan.
 """
 from __future__ import annotations
 
+import hashlib
+
 import json as _json
 import ipaddress as _ipaddress
 import re as _re
 import urllib.parse
 import urllib.request
 
-from .. import events, netguard, normalize, secrets, settings
+from .. import budget, events, netguard, normalize, secrets, settings
 from ..contract import ProviderResult, classify_provider_error, run_contract, run_provider
-from ..runner import (Status, ffuf_results, fresh_artifact_dir, have, nuclei_timeout, reclassify_ffuf,
+from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir, have,
+                      nuclei_timeout, reclassify_ffuf,
                       reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
                       skipped)
 
@@ -237,16 +240,227 @@ def _vhost_wordlist():
     return None
 
 
+_VHOST_SCHEMA = 2        # v2: typed status + canonical-host + wordlist-membership row validation
+
+
+def _vhost_unknown_lifecycle(ctx, why) -> None:
+    """Emit an UNKNOWN-coverage generation for the vhost lane, then record the skip.
+
+    review#1 (vhost r5): distinct from _vhost_zero_lifecycle. A missing ffuf binary or a missing wordlist is
+    not "zero eligible input" — we could not LOOK at the input at all, so a clean 0/0 would assert there was
+    nothing to find. COVERAGE_UNKNOWN carries no counters, forces coverage_valid=False and reaches the verdict
+    as a gap. Both exits previously returned without opening any generation, so a PRIOR run's vhost counters
+    stayed current after the tool or wordlist went away."""
+    for m in ("base_services", "base_services_scanned", "state_persisted"):
+        events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_UNKNOWN, measure=m, unit=m,
+                                reason=why)
+    ctx.run.record("probe", skipped("ffuf-vhost", why))
+
+
+def _vhost_zero_lifecycle(ctx, why, *, excluded=0, invalid=0) -> None:
+    """Emit a COMPLETE zero-valued lifecycle for the vhost lane, then record the skip.
+
+    review#1 (vhost r4): both early returns used to leave a PRIOR run's `base_services`,
+    `base_services_scanned`, `result_rows` and persistence state standing as current — so after a scope or
+    live-service change that leaves nothing eligible, the operator still saw the old numbers. Every exit path
+    now goes through here, which is the same emit-every-lifecycle rule the sourcemap ledger taught us."""
+    events.ledger("probe.ffuf_vhost",
+                  consumed={"wordlist_submitted": 0, "wordlist_oos_excluded": excluded,
+                            "wordlist_invalid": invalid})
+    for m in ("base_services", "base_services_scanned", "state_persisted"):
+        events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_TIMEOUT, measure=m, unit=m,
+                                eligible=0, tested=0, omitted=0, reason=why)
+    ctx.run.record("probe", skipped("ffuf-vhost", why))
+
+
+def _vhost_effective_wordlist(ctx, wl, apex, scope):
+    """Build the per-apex wordlist containing ONLY candidates we are allowed to CONTACT.
+
+    review#1 (vhost r1): ffuf sends every word as `Host: FUZZ.<apex>`, so an OOS name was ACTIVELY PROBED and
+    only filtered after the response came back. Post-filtering cannot un-send a request to an explicitly
+    excluded host. The boundary Lumpy set is: observe and mine OOS evidence, never actively expand against
+    OOS — so the exclusion has to happen BEFORE the request, in the wordlist itself.
+
+    Returns (path, digest, submitted_set, eligible_n, excluded_n, invalid_n). The digest binds this EFFECTIVE
+    file into the work unit and ledger generation, so a scope change re-scans instead of resuming a narrower
+    sweep."""
+    words, excluded, invalid = [], 0, 0
+    seen = set()
+    for raw in wl.read_text(errors="replace").splitlines():
+        w = raw.strip().lower().strip(".")
+        if not w or w.startswith("#"):
+            continue
+        # review#1 (vhost r2): CANONICALIZE AND VALIDATE HERE. Validating after the response meant `../admin`,
+        # `a/b`, bad labels and Unicode had already been sent in a Host header. The submitted file must
+        # contain only names we are willing to contact.
+        # review#2 (vhost r3): via the SHARED canonicalizer, so this lane uses the same IDNA2008/UTS-46
+        # non-transitional policy as scope canonicalization. The builtin codec maps `faß` -> `fass`, a
+        # DIFFERENT domain, which would mean actively contacting a name the operator never scoped.
+        host = normalize.canon_host_strict(f"{w}.{apex}")
+        if host is None or not host.endswith("." + apex):
+            invalid += 1                                 # never contactable: malformed / not under this apex
+            continue
+        w = host[: -(len(apex) + 1)]                     # the canonical label(s) we will actually submit
+        if w in seen:
+            continue
+        seen.add(w)
+        if not scope.active_allowed(host):
+            excluded += 1                                # OOS / passive-skipped: never contacted
+            continue
+        words.append(w)
+    eff = ctx.tmp(f"vhost-{apex}.txt")
+    eff.write_text("\n".join(words) + ("\n" if words else ""))
+    return eff, events.file_digest(eff), set(words), len(words), excluded, invalid
+
+
+def _vhost_row(row, submitted, apex, scope) -> bool:
+    """A usable vhost row — validated, not merely present (review#3 vhost r1).
+
+    Requires a real integer HTTP status (bool excluded: it is an int subclass), a FUZZ value that BELONGS to
+    the wordlist we actually submitted (so a fabricated or mangled row cannot invent a candidate), and a
+    canonical in-scope final hostname (`../admin` and friends never become a host)."""
+    st = row.get("status")
+    if not isinstance(st, int) or isinstance(st, bool) or not (100 <= st <= 599):
+        return False
+    inp = row.get("input")
+    if not isinstance(inp, dict):
+        return False
+    word = inp.get("FUZZ")
+    if not isinstance(word, str):
+        return False
+    w = word.strip().lower().strip(".")
+    if not w or w not in submitted:                      # not something we asked for
+        return False
+    host = normalize.canon_host_strict(f"{w}.{apex}")
+    if host is None:
+        return False
+    return scope.in_scope(host)
+
+
+
+def _vhost_status(out, submitted, apex, scope) -> tuple:
+    """(trustworthy, clean_rows) for ONE artifact — the completion judgement for the CURRENT attempt only.
+    History contributes evidence and must never decide whether this unit is done."""
+    rows = ffuf_results(out)
+    if rows is None:
+        return False, False
+    _usable, dropped = ffuf_usable_rows(rows, lambda r: _vhost_row(r, submitted, apex, scope))
+    return True, dropped == 0
+
+
+def _vhost_ingest(ctx, scope, known, base, addrs, apex, unit_id, artifacts, current, seen_hosts,
+                  launched, submitted) -> int:
+    """Ingest EVERY retained artifact for one BASE SERVICE x apex, then report coverage for the CURRENT one.
+
+    Mirrors the cleared content lane: history is PROVENANCE only (so a dirty old artifact cannot keep the
+    coverage gap open forever), coverage is emitted AFTER consumption, and candidate identities are counted
+    UNIQUELY per lifecycle so replay cannot inflate them."""
+    added = 0
+    try:
+        for out in artifacts:
+            rows = ffuf_results(out)
+            if rows is None:
+                continue                                     # untrustworthy history: replay nothing from it
+            usable, _dropped = ffuf_usable_rows(rows, lambda r: _vhost_row(r, submitted, apex, scope))
+            for hit in usable:
+                word = hit["input"]["FUZZ"].strip().lower().strip(".")
+                host = f"{word}.{apex}"                  # already validated by _vhost_row
+                # a vhost that's ALREADY a known subdomain isn't the signal — the value is DNS-INVISIBLE names
+                if host in known:
+                    continue
+                # review#2 (vhost r2): the identity is the BASE SERVICE that served it. Keying on a
+                # hostname-as-"origin" wrote a host into the `ip` field, collapsed http://h:80 and
+                # https://h:443 into one identity (so two distinct observations merged and could conflict on
+                # status), and the note claimed an "origin" served it. `addrs` stays as CONTEXT only.
+                if ctx.run.add("review", {"id": f"vhost:{base}:{host}", "klass": "vhost",
+                                          "value": host, "host": host, "base": base,
+                                          "a": list(addrs) or None,
+                                          "status_code": hit.get("status"),
+                                          "note": f"base service {base} serves vhost {host} "
+                                                  f"(may not resolve in DNS) — VERIFY",
+                                          "sources": ["ffuf-vhost"], "raw_ref": str(out)}):
+                    added += 1
+                seen_hosts.add(f"{base}:{host}")
+    except Exception:
+        events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_UNKNOWN,
+                                unit=f"rows:{unit_id}", measure="result_rows",
+                                reason=f"{base}/{apex}: ingestion failed mid-artifact — UNMEASURED")
+        raise
+    if current is None:
+        events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_UNKNOWN,
+                                unit=f"rows:{unit_id}", measure="result_rows",
+                                reason=(f"{base}/{apex}: "
+                                        + ("attempted but produced no ffuf artifact" if launched
+                                           else "no current artifact this lifecycle (not launched)")
+                                        + " — row coverage UNMEASURED"))
+        return added
+    rows = ffuf_results(current)
+    if rows is None:
+        events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_UNKNOWN,
+                                unit=f"rows:{unit_id}", measure="result_rows",
+                                reason=f"{base}/{apex}: current artifact missing/malformed — UNMEASURED")
+        return added
+    usable, dropped = ffuf_usable_rows(rows, lambda r: _vhost_row(r, submitted, apex, scope))
+    if dropped:
+        events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_UNKNOWN,
+                                unit=f"rows:{unit_id}", measure="result_rows",
+                                reason=f"{base}/{apex}: {dropped} row(s) failed the input/FUZZ contract "
+                                       f"— row coverage UNMEASURED")
+        return added
+    events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_TIMEOUT,
+                            unit=f"rows:{unit_id}", measure="result_rows",
+                            eligible=len(usable), tested=len(usable), omitted=0,
+                            reason=f"{base}/{apex}: {len(usable)} vhost row(s) ingested")
+    return added
+
+
+def _vhost_scan(ctx, base, apex, out, wl, wl_digest, mc, ffuf_to, prof):
+    """One ffuf vhost sweep for one BASE SERVICE x apex, under the contract. Extracted FIRST, as a
+    standalone no-behaviour-change step, because the enclosing function is a 120-line doubly-nested
+    loop and patching it in place is what broke it twice."""
+    # -mc = "served/exists" (2xx/3xx/401/403), NOT `all`: a 404/5xx means the server does NOT
+    # serve that Host, so it isn't a vhost. -ac drops the catch-all baseline. NO -r: a redirecting
+    # vhost is matched on its 3xx (in -mc) and -ac folds a uniform catch-all by size regardless —
+    # so we never follow a Location to another (possibly off-scope) host.
+    # -maxtime: ffuf GRACEFULLY stops the run at the ceiling (writing its partial -o), so a
+    # slow/calibration-stuck service yields real partial results instead of a hard SIGKILL that
+    # loses the buffered artifact. exec_tool's timeout is now the hard BACKSTOP (ceiling + margin).
+    # -noninteractive: no interactive keybinding console (batch hygiene). -ach not needed — one
+    # base service per ffuf call, so -ac already calibrates per-service. (T2.2)
+    cmd = ["ffuf", "-w", f"{wl}:FUZZ", "-H", f"Host: FUZZ.{apex}",
+           "-u", f"{base}/", "-ac", "-timeout", "7", "-noninteractive",
+           "-t", str(settings.workers("ffuf", 40)), "-s",
+           "-mc", mc,
+           "-o", str(out), "-of", "json"]
+    if ffuf_to:                                  # 0 = fully unbounded (RoE no-cut) -> no ceiling at all
+        cmd += ["-maxtime", str(ffuf_to)]
+    if prof.http_rl:
+        cmd += ["-rate", str(prof.http_rl)]
+    hard = ffuf_to + 60 if ffuf_to else 0        # backstop when bounded; stays UNBOUNDED (0) when ffuf_to==0
+    # C07 inc3: per-base×apex work_unit binds the semantic inputs + coverage-affecting config (match codes,
+    # effective wordlist) + that wordlist's digest, so a completed unit is re-run on any change.
+    # the unit is BASE SERVICE x apex. The base is what the scan actually CONNECTS through — scheme, host and
+    # port — so it IS the identity; a different representative for the same address set is a different unit.
+    wu = events.work_unit("probe.ffuf_vhost", inputs={"base": base, "apex": apex},
+                          config={"mc": mc, "wordlist": wl.name},
+                          file_digests={"wordlist": wl_digest}, schema_version=_VHOST_SCHEMA)
+    errf = out.with_suffix(".stderr.log")            # FULL stderr: the -maxtime marker must not be evictable
+    r = run_contract("probe.ffuf_vhost", cmd, work_unit=wu, timeout=hard, stderr_path=errf,
+                     reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ffuf_to or None))   # graceful -maxtime; hard backstop
+    return r
+
+
 def _vhost_enum(ctx) -> None:
-    """Virtual-host enumeration (ffuf `-H 'Host: FUZZ.<apex>'`): an origin frequently serves name-based
+    """Virtual-host enumeration (ffuf `-H 'Host: FUZZ.<apex>'`): a web server frequently serves name-based
     vhosts that DON'T resolve in public DNS (staging/internal/legacy/pre-prod). We fuzz the Host header
-    against a REPRESENTATIVE live URL of each non-CDN origin — NOT `http://<ip>/`. A bare-IP request
+    against every non-CDN active-allowed live BASE SERVICE — NOT `http://<ip>/`. A bare-IP request
     fails on HTTPS/redirecting origins: Caddy/CDN answers port 80 with a uniform redirect that `-ac`
     folds to nothing, and a bare-IP TLS handshake fails SNI. Connecting via a real live host (valid
-    scheme + SNI + cert) still reaches the same origin, and the overridden Host header surfaces the
+    scheme + SNI + cert) still reaches the same server, and the overridden Host header surfaces the
     DNS-invisible vhosts. `-ac` drops the catch-all so a distinct response stands out. Hits are `vhost`
     review candidates (a 200 isn't proof the name resolves/is owned — human verifies). Active; needs
-    ffuf + a vhost wordlist. Origins de-duped by IP so each is fuzzed once.
+    ffuf + a vhost wordlist. Membership is base services (that is what ffuf connects through); the address
+    set only RANKS them, so one co-hosted representative is fuzzed first and the rest follow — never dropped.
 
     Only DNS-INVISIBLE hits are surfaced — a vhost that's already a known subdomain is dropped (the
     signal is names that DON'T resolve). Base URL is chosen HTTPS-first + subdomain-first (the apex is
@@ -256,18 +470,28 @@ def _vhost_enum(ctx) -> None:
     (3xx matched) and `-ac` folds a uniform catch-all by response SIZE whether or not we follow — so we
     classify on the 3xx itself and never chase a Location cross-host / off-scope."""
     if not have("ffuf"):
+        _vhost_unknown_lifecycle(ctx, "ffuf not installed — vhost coverage UNMEASURED")
         return
     wl = _vhost_wordlist()
     if wl is None:
-        ctx.run.record("probe", skipped("ffuf-vhost",
-                       "no vhost wordlist (~/.config/quarry/wordlists/vhost.txt) — vhost enum skipped"))
+        _vhost_unknown_lifecycle(ctx, "no vhost wordlist (~/.config/quarry/wordlists/vhost.txt) "
+                                      "— vhost coverage UNMEASURED")
         return
     scope, prof = ctx.scope, ctx.profile
-    # BEST connection URL per non-CDN origin IP (co-hosted names fuzz once). Prefer HTTPS (valid SNI,
-    # no port-80 redirect dance) and a SUBDOMAIN host — the bare apex is often a SEPARATE static site,
-    # not the vhost-routing app, so fuzzing it misses the app's vhosts. score = https(2) + subdomain(1).
+    # EVERY non-CDN active-allowed base service is a unit; the score only RANKS them. Prefer HTTPS (valid
+    # SNI, no port-80 redirect dance) and a SUBDOMAIN host — the bare apex is often a SEPARATE static site,
+    # not the vhost-routing app, so fuzzing it first would miss the app's vhosts. score = https(2) + sub(1).
     apexset = {a.lower() for a in prof.apex_domains}
-    best: dict[str, tuple[int, str]] = {}
+    # review#2 (vhost r1): "origin coverage" was FICTIONAL. Keeping only `a[0]` collapsed 74 distinct A-record
+    # origins to 47 keys on the OTC data, silently dropping 27 before any budget — and ffuf connects to
+    # `base`, a HOSTNAME, so it never routed through the origin key at all; DNS decided which address
+    # answered. ffuf 2.1.0-dev offers `-sni` (static) but NO address-pinning flag, so honestly scanning a
+    # chosen A record is not achievable with this tool. So membership is what we ACTUALLY scan: BASE SERVICES.
+    #
+    # The ADDRESS SET survives as a RANK ONLY: one representative per co-hosted set is fuzzed first, then
+    # the rest. A bounded run therefore gets full origin spread before it spends time on likely-redundant
+    # co-hosted names — and nothing is excluded.
+    bases: list = []
     for l in ctx.run.read("live"):
         if l.get("cdn"):
             continue
@@ -277,90 +501,165 @@ def _vhost_enum(ctx) -> None:
         if not m or not scope.active_allowed(host):
             continue
         score = (2 if url.lower().startswith("https://") else 0) + (1 if host not in apexset else 0)
-        key = str((l.get("a") or [None])[0] or host)   # origin identity (IP preferred, else host)
-        if key not in best or score > best[key][0]:
-            best[key] = (score, m.group(1))
-    VHOST_CAP = 25
-    origins = {k: v[1] for k, v in list(best.items())[:VHOST_CAP]}
-    _n_best = len(best)         # emit every run (omitted=0 clears a prior cap gap on rerun)
-    events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_CAP, measure="origins",
-                            eligible=_n_best, tested=min(_n_best, VHOST_CAP), omitted=max(0, _n_best - VHOST_CAP),
-                            reason=f"vhost origins {min(_n_best, VHOST_CAP)}/{_n_best} non-CDN (cap {VHOST_CAP})")
-    if not origins:
-        ctx.run.record("probe", skipped("ffuf-vhost", "no non-CDN origin live hosts to fuzz"))
+        addrs = tuple(sorted(l.get("a") or []))          # the FULL A set, not just the first
+        bases.append({"base": m.group(1), "host": host, "score": score, "addrs": addrs})
+    # rank tier 0 = the best-scoring representative of each co-hosted address set; tier 1 = every other base
+    best_of: dict = {}
+    for b in bases:
+        k = b["addrs"] or (b["host"],)
+        if k not in best_of or b["score"] > best_of[k]["score"]:
+            best_of[k] = b
+    reps = {id(b) for b in best_of.values()}
+    for b in bases:
+        b["tier"] = 0 if id(b) in reps else 1
+    if not bases:
+        _vhost_zero_lifecycle(ctx, "no non-CDN active-allowed live service to fuzz")
         return
     # a vhost that's ALREADY a known subdomain isn't the signal — vhost enum's value is the
     # DNS-INVISIBLE hosts. Filter results against everything we already discovered.
     known = set(ctx.run.values("subdomain")) | set(ctx.run.values("resolved"))
     apexes = [a for a in prof.apex_domains if scope.in_scope(a)]
     found = 0
-    # per-call ceiling scaled by wordlist size (each ffuf fuzzes one origin×apex over the vhost list);
+    # per-call ceiling scaled by wordlist size (each ffuf fuzzes one base-service x apex over the list);
     # the flat 1800s cut a big-wordlist run. Higher -t (I/O-bound concurrency) makes each call faster.
-    wl_n = sum(1 for _ in wl.open())
+    # review#1 (vhost r1): one EFFECTIVE wordlist per apex, containing only names we may CONTACT. Built here
+    # so the exclusion happens before any request, and digested into the resume identity.
+    eff: dict = {}
+    excluded_total = invalid_total = 0
+    for apex in apexes:
+        path, digest, submitted, n_ok, n_ex, n_bad = _vhost_effective_wordlist(ctx, wl, apex, scope)
+        excluded_total += n_ex
+        invalid_total += n_bad
+        # review#5 (vhost r2): an apex whose every candidate is OOS or malformed has NOTHING contactable.
+        # Building units for it produced repeated ffuf failures against an empty file; skip it cleanly.
+        if n_ok == 0:
+            ctx.run.record("probe", skipped("ffuf-vhost", f"{apex}: no contactable vhost candidate "
+                                                          f"({n_ex} out of scope, {n_bad} malformed)"))
+            continue
+        eff[apex] = {"path": path, "digest": digest, "submitted": submitted, "n": n_ok}
+    if excluded_total or invalid_total:
+        ctx.echo(f"  vhost: {excluded_total} out-of-scope + {invalid_total} malformed candidate(s) "
+                 f"removed BEFORE contact")
+    apexes = [a for a in apexes if a in eff]                 # only apexes with contactable candidates
+    if not apexes:
+        _vhost_zero_lifecycle(ctx, "no contactable vhost candidate for any apex (scope policy)",
+                              excluded=excluded_total, invalid=invalid_total)
+        return
+    # review#4 (vhost r2): NOT a coverage measure. COVERAGE_SAMPLE means an operator-chosen subset of
+    # otherwise-eligible input and yields complete_with_limits — but an OOS or malformed candidate was never
+    # eligible ACTIVE input at all, so calling it "omitted" would invent a shortfall. It is policy context.
+    events.ledger("probe.ffuf_vhost",
+                  consumed={"wordlist_submitted": sum(e["n"] for e in eff.values()),
+                            "wordlist_oos_excluded": excluded_total,
+                            "wordlist_invalid": invalid_total})
+    wl_n = max([e["n"] for e in eff.values()] or [0])
     ffuf_to = scaled_timeout(wl_n, ctx.http_timeout, per_unit=0.4)
-    wl_digest = events.file_digest(wl)                       # C07 inc3: wordlist change → new work_unit (no wrong skip)
+    wl_digest = events.file_digest(wl)                       # provenance: the SOURCE list this run derived from
+    # EXECUTION completion and ARTIFACT usability are separate counters (content review#4).
     ffuf_clean = ffuf_partial = ffuf_blocked = ffuf_errors = ffuf_total = 0
-    for origin, base in origins.items():
-        for apex in apexes:
-            out = ctx.run.raw_path("probe", "ffuf-vhost", f"{origin}_{apex}.json")
-            out.unlink(missing_ok=True)                 # clear any stale artifact: a prior run must not fake completion
-            # -mc = "served/exists" (2xx/3xx/401/403), NOT `all`: a 404/5xx means the origin does NOT
-            # serve that Host, so it isn't a vhost. -ac drops the catch-all baseline. NO -r: a redirecting
-            # vhost is matched on its 3xx (in -mc) and -ac folds a uniform catch-all by size regardless —
-            # so we never follow a Location to another (possibly off-scope) host.
-            # -maxtime: ffuf GRACEFULLY stops the run at the ceiling (writing its partial -o), so a
-            # slow/calibration-stuck origin yields real partial results instead of a hard SIGKILL that
-            # loses the buffered artifact. exec_tool's timeout is now the hard BACKSTOP (ceiling + margin).
-            # -noninteractive: no interactive keybinding console (batch hygiene). -ach not needed — one
-            # origin per ffuf call, so -ac already calibrates per-origin. (T2.2)
-            cmd = ["ffuf", "-w", f"{wl}:FUZZ", "-H", f"Host: FUZZ.{apex}",
-                   "-u", f"{base}/", "-ac", "-timeout", "7", "-noninteractive",
-                   "-t", str(settings.workers("ffuf", 40)), "-s",
-                   "-mc", "200-299,301,302,303,307,308,401,403",
-                   "-o", str(out), "-of", "json"]
-            if ffuf_to:                                  # 0 = fully unbounded (RoE no-cut) -> no ceiling at all
-                cmd += ["-maxtime", str(ffuf_to)]
-            if prof.http_rl:
-                cmd += ["-rate", str(prof.http_rl)]
-            hard = ffuf_to + 60 if ffuf_to else 0        # backstop when bounded; stays UNBOUNDED (0) when ffuf_to==0
-            # C07 inc3: per-origin×apex work_unit binds the semantic inputs + coverage-affecting config
-            # (match codes, wordlist) + the wordlist digest, so a completed origin is re-run if any change.
-            wu = events.work_unit("probe.ffuf_vhost", inputs={"origin": origin, "apex": apex},
-                                  config={"mc": "200-299,301,302,303,307,308,401,403", "wordlist": wl.name},
-                                  file_digests={"wordlist": wl_digest})
-            r = run_contract("probe.ffuf_vhost", cmd, work_unit=wu, timeout=hard,
-                             reclassify=lambda res, o=out: reclassify_ffuf(res, o))   # graceful -maxtime; hard backstop
-            ctx.run.record("probe", r)
-            ffuf_total += 1
-            # per-origin: rollup counters + a coverage_partial event ONLY for a degraded/blocked origin
-            # (console stays one concise line; the origin detail lives in events/manifest, never 25 lines).
-            if r.status == Status.BLOCKED:
-                ffuf_blocked += 1
-                events.coverage_partial("probe.ffuf_vhost", reason=f"{origin}/{apex}: blocked — {r.note}")
-            elif r.status == Status.PARTIAL:
-                ffuf_partial += 1
-                events.coverage_partial("probe.ffuf_vhost", reason=f"{origin}/{apex}: partial — {r.note}")
-            elif r.status in (Status.SUCCESS, Status.EMPTY):
-                ffuf_clean += 1                        # ONLY a completed run counts as clean coverage
-            else:
-                ffuf_errors += 1                       # FAILED / TIMED_OUT / SKIPPED — coverage did NOT happen
-                events.coverage_partial("probe.ffuf_vhost", reason=f"{origin}/{apex}: {r.status.value} — {r.note}")
-            res = ffuf_results(out) or []              # None (no valid artifact) or non-list -> no rows to ingest
-            for hit in res:
-                inp = hit.get("input")
-                word = (inp.get("FUZZ") if isinstance(inp, dict) else "") or ""
-                host = f"{word.lower().strip('.')}.{apex}" if word else ""
-                if not host or "." not in host or not scope.in_scope(host) or host in known:
-                    continue                           # skip junk + already-known subs (DNS-invisible only)
-                if ctx.run.add("review", {"id": f"vhost:{origin}:{host}", "klass": "vhost",
-                        "value": host, "host": host, "ip": origin,
-                        "status_code": hit.get("status"),
-                        "note": f"origin {origin} serves vhost {host} (may not resolve in DNS) — VERIFY",
-                        "sources": ["ffuf-vhost"], "raw_ref": str(out)}):
-                    found += 1
-    if ffuf_total:
+    ffuf_resumed = ffuf_unusable = 0
+    _mc = "200-299,301,302,303,307,308,401,403"
+    # ledger namespaced by the COVERAGE CONFIG: an artifact from a different wordlist/match-set validates by
+    # digest and must not count as this generation's completed work. schema_version tracks the row parser.
+    cfg_fp = events.work_unit("probe.ffuf_vhost", inputs={}, config={"mc": _mc, "wordlist": wl.name},
+                              file_digests={"wordlist": wl_digest,
+                                            **{f"eff:{a}": e["digest"] for a, e in eff.items()}},
+                              schema_version=_VHOST_SCHEMA)
+    sbase = ctx.run.dir / "raw" / "probe"
+    sbase.mkdir(parents=True, exist_ok=True)
+    budget.prune_state(sbase, "probe.ffuf_vhost", cfg_fp)
+    ledger = budget.Ledger(budget.state_path(sbase, "probe.ffuf_vhost", cfg_fp), lane="probe.ffuf_vhost")
+    vh_budget = budget.Budget(budget.budget_seconds("VHOST_BUDGET_S"))
+    cfg_dir = sbase / "ffuf-vhost" / cfg_fp[:16]
+    attempt_dir = fresh_artifact_dir(cfg_dir)
+    # One unit = BASE SERVICE x apex. The base carries scheme + host + port, which is exactly what ffuf
+    # connects through, so it IS the identity. The ADDRESS SET only ranks the order (co-hosted
+    # representative first), never membership.
+    units = [(b, a) for b in bases for a in apexes]
+    # rank: co-hosted representatives first (tier 0), then by descending service score. ORDER only.
+    ordered = budget.order_ranked_fair(units, rank=lambda u: (u[0]["tier"], -u[0]["score"]),
+                                       group=lambda u: u[0]["host"])
+    seen_hosts: set = set()                      # unique vhost identities this lifecycle, not per-replay
+    attempted = 0
+    for b, apex in ordered:
+        base = b["base"]
+        item = f"{base}|{apex}"                          # the BASE service is the identity (it carries scheme+port)
+
+        unit_id = hashlib.sha256(item.encode()).hexdigest()
+        done = ledger.has(item)
+        current, ran_clean, launched = None, False, False
+        if not done:
+            if not vh_budget.exhausted():        # the budget gates LAUNCHING only; replay is unconditional
+                launched = True
+                current = attempt_dir / f"{unit_id}.json"
+                current.unlink(missing_ok=True)  # our OWN fresh attempt file, never a recorded one
+                r = _vhost_scan(ctx, base, apex, current, eff[apex]["path"],
+                                eff[apex]["digest"], _mc, ffuf_to, prof)
+                ctx.run.record("probe", r)
+                ffuf_total += 1
+                if r.status == Status.BLOCKED:
+                    ffuf_blocked += 1
+                    events.coverage_partial("probe.ffuf_vhost", reason=f"{base}/{apex}: blocked — {r.note}")
+                elif r.status == Status.PARTIAL:
+                    ffuf_partial += 1
+                    events.coverage_partial("probe.ffuf_vhost", reason=f"{base}/{apex}: partial — {r.note}")
+                elif r.status in (Status.SUCCESS, Status.EMPTY):
+                    ffuf_clean += 1              # EXECUTION completed (says nothing about the rows)
+                else:
+                    ffuf_errors += 1             # FAILED / TIMED_OUT / SKIPPED
+                    events.coverage_partial("probe.ffuf_vhost",
+                                            reason=f"{base}/{apex}: {r.status.value} — {r.note}")
+                ran_clean = r.status in (Status.SUCCESS, Status.EMPTY)
+                if not current.exists():
+                    current = None
+                elif ffuf_results(current) is not None:
+                    ledger.add_evidence(item, current)   # retain ANY trustworthy artifact; not a completion
+                attempted += 1
+        else:
+            ffuf_resumed += 1
+            attempted += 1
+            current = ledger.artifact(item)
+        artifacts = ledger.evidence(item)        # digest-bound: contained, no symlinks, content-verified
+        if current is not None and current not in artifacts:
+            artifacts = artifacts + [current]
+        if not launched and not artifacts:
+            continue                             # never launched, nothing retained -> selection covers it
+        found += _vhost_ingest(ctx, scope, known, base, b["addrs"], apex, unit_id, artifacts, current,
+                               seen_hosts, launched, eff[apex]["submitted"])
+        if done or current is None:
+            continue
+        cur_ok, cur_clean = _vhost_status(current, eff[apex]["submitted"], apex, scope)
+        if ran_clean and cur_ok and cur_clean:
+            ledger.record(item, current)         # completion needs a CLEAN EXECUTION and a usable artifact
+        elif ran_clean:
+            ffuf_unusable += 1
+            events.coverage_partial("probe.ffuf_vhost",
+                                    reason=f"{base}/{apex}: unusable/untrustworthy rows — not resumable")
+    persisted = ledger.save()
+    if not persisted:
+        ctx.echo("    probe.ffuf_vhost: completion state NOT persisted"
+                 + (" (state file belongs to another lane)" if ledger.foreign else ""))
+    events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_TIMEOUT, measure="state_persisted",
+                            unit="state_persisted", eligible=1, tested=1 if persisted else 0,
+                            omitted=0 if persisted else 1,
+                            reason=("completion state persisted" if persisted else
+                                    "completion state could not be persisted; a resume will redo this lane"))
+    # measure = BASE SERVICES, not "origins": that is what we actually scan (review#2 vhost r1).
+    budget.report_selection("probe.ffuf_vhost", measure="base_services", eligible=len(units),
+                            attempted=attempted, budget=vh_budget, noun="service x apex", durable=persisted)
+    budget.report_outcome("probe.ffuf_vhost", measure="base_services_scanned", attempted=attempted,
+                          obtained=ffuf_clean - ffuf_unusable + ffuf_resumed,
+                          classes={k: v for k, v in (("partial", ffuf_partial), ("blocked", ffuf_blocked),
+                                                     ("error", ffuf_errors),
+                                                     ("unusable_output", ffuf_unusable)) if v},
+                          noun="service x apex")
+    _left = len(units) - attempted
+    if ffuf_total or ffuf_resumed:
         ctx.echo(f"  vhost ffuf: {ffuf_clean}/{ffuf_total} clean · {ffuf_partial} partial · "
-                 f"{ffuf_blocked} blocked · {ffuf_errors} error · {found} candidate(s)")
+                 f"{ffuf_blocked} blocked · {ffuf_errors} error · {ffuf_unusable} unusable · "
+                 f"{ffuf_resumed} resumed · {len(seen_hosts)} candidate(s)"
+                 + (f" · {_left} left by budget — "
+                    f"{'resumable' if persisted else 'NOT saved, will restart'}" if _left else ""))
 
 
 def _httpx_probe_cmd(hosts_file, ports, http_rl) -> list[str]:
@@ -900,7 +1199,7 @@ def run(ctx) -> None:
     _favicon_pivot(ctx)
     _cert_pivot(ctx)
 
-    # ── virtual-host enumeration (ffuf Host-header fuzz over origin IPs; needs a vhost wordlist) ──
+    # ── virtual-host enumeration (ffuf Host-header fuzz over base services; needs a vhost wordlist) ──
     _vhost_enum(ctx)
 
     # ── WAF fingerprint (nuclei waf-detect templates over live hosts) ──

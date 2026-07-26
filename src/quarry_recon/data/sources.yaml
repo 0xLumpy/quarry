@@ -107,8 +107,25 @@ sources:
   probe.naabu_web:           {tool: naabu, phase: probe, tier: core, class: active, default: on,
     input: syn_eligible_ips×ports, output: web_port, workers: rate, rate: portscan_rate, timeout: "scaled(ips×ports)", failure: "clean-only-trusted → else direct-httpx", fallback: direct-httpx, parser: internal, log: matrix-line,
     notes: "SYN web-port prefilter (bbot-style); NOT infra portscan. CDN/WAF edge excluded via offline cdncheck (T0.3, no contact); any-CDN host + zero-open host → direct-httpx (never dropped)"}
-  probe.ffuf_vhost:          {tool: ffuf, phase: probe, tier: core, class: active, default: on,
-    input: origins, output: review(vhost), workers: "settings.workers(ffuf)", rate: http_rl, timeout: "scaled(wordlist)", failure: "per-origin isolate (not phase BLOCKED)", fallback: skip, parser: internal, log: delta}
+  probe.ffuf_vhost:          {tool: ffuf, phase: probe, tier: core, class: active, default: on, bounded: planned,
+    input: "base services x apex (live, non-CDN, active-allowed)", output: review(vhost),
+    workers: "settings.workers(ffuf)", rate: http_rl,
+    timeout: "per-unit scaled(effective wordlist) -maxtime + hard backstop; lane budget PERFORMANCE.VHOST_BUDGET_S seconds (default 0 = unbounded)",
+    failure: "per-unit isolate (not phase BLOCKED)", fallback: skip, parser: internal, log: delta,
+    notes: "NO origin cap. `list(best.items())[:25]` was a MEMBERSHIP cap AND origin coverage was fictional
+      (only a[0] kept: 74 A-origins -> 47 keys on OTC, 27 dropped before any budget) — and ffuf connects to a
+      BASE HOSTNAME, never to the origin key, so DNS chose the address. ffuf 2.1.0-dev has -sni but NO
+      address pinning, so membership is what we actually scan: BASE SERVICES x apex. The ADDRESS SET ranks
+      them (one co-hosted representative first, then the rest) — order, never membership.
+      UNIT IDENTITY = base service (scheme+host+port) + apex; findings are keyed vhost:{base}:{candidate} so
+      http://h:80 and https://h:443 stay DISTINCT, and the A set rides along as DNS context only (never as an
+      `ip` claim). SCOPE: the effective per-apex wordlist is canonicalized through Quarry's shared IDNA2008 /
+      UTS-46 non-transitional policy and filtered to active_allowed, so a malformed or OOS name is never
+      CONTACTED (observe/mine OOS evidence, never actively expand against it); that file's digest is bound
+      into the resume identity. An apex with no contactable candidate is a clean policy skip. Rows validated
+      (int status 100-599, canonical hostname, FUZZ must be in the submitted wordlist). Measures:
+      base_services (selection) + base_services_scanned (outcome) + result_rows + state_persisted; excluded
+      /invalid candidate counts are POLICY telemetry on the ledger, never omitted coverage."}
   probe.tlsx_certs:          {tool: tlsx, phase: probe, tier: core, class: active, default: on,
     input: live_hosts, output: certificate, workers: fixed, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.tlsx_certs, log: delta}
   probe.gowitness:           {tool: gowitness, phase: probe, tier: core, class: active, default: on,
@@ -191,8 +208,16 @@ sources:
 
   # ── content (candidate-driven path discovery; off by default) ──────────────────────────
   content.ffuf:              {tool: ffuf, phase: content, tier: optional, class: active, default: off, reason: "user-intent (content discovery)",
-    input: live_urls+wordlist, output: url+review(content), workers: "settings.workers(ffuf)", rate: http_rl, timeout: "scaled(wordlist×recursion)", failure: quiet-warn, fallback: skip, parser: internal, log: delta,
-    notes: "off|light|balanced|deep; MATCHES 3xx (ISC-16), no -r"}
+    input: "live services x wordlist (active-allowed)", output: url+review(content),
+    workers: "settings.workers(ffuf)", rate: http_rl,
+    timeout: "per-service scaled(wordlist x recursion) -maxtime + hard backstop; lane budget PERFORMANCE.CONTENT_FFUF_BUDGET_S seconds (default 0 = unbounded)",
+    failure: quiet-warn, fallback: skip, parser: internal, log: delta,
+    notes: "off|light|balanced|deep; MATCHES 3xx (ISC-16), no -r. NO host cap (was 25 of 498 on OTC) and NO
+      row cap (was 500 — it discarded discovered URLs). Full eligible set, origin-first RANK then host
+      round-robin, resumable per-service ledger keyed by a full-sha256 service id and namespaced by the
+      coverage-config fingerprint. Completion needs a clean EXECUTION and a usable artifact; any trustworthy
+      artifact is retained as digest-bound evidence and replayed. Coverage comes from the CURRENT artifact
+      only. Measures: hosts (selection) + hosts_scanned (outcome) + result_rows + state_persisted."}
 
   # ── params (vuln triage — the 15.6h; the first painful contract batch) ─────────────────
   params.gf:                 {tool: gf, phase: params, tier: core, class: active, default: on,

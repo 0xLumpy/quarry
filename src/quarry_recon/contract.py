@@ -167,7 +167,7 @@ def run_contract(source_id, cmd, *, input_total=None, env=None, reclassify=None,
     FINAL status, and ALWAYS emit a terminal event (try/finally). Returns the (reclassified) RunResult.
 
     ``run_kwargs`` pass straight through to runner.run (raw_path, timeout, stdin_data, input_file,
-    ok_empty, ok_codes). The event layer is ADDITIVE — the phase still records the RunResult to the
+    ok_empty, ok_codes, stderr_path). The event layer is ADDITIVE — the phase still records the RunResult to the
     manifest itself. Provenance fields ride on the events only; they never alter execution.
     """
     # No tool runs outside a contract. An unknown source_id fails LOUD before execution: emit a

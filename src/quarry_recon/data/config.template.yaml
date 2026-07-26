@@ -30,6 +30,8 @@ PERFORMANCE:
   # reach is a counted, RESUMABLE remainder — never a silent omission. Bound these only to time-box a run.
   JS_FETCH_BUDGET_S:         # crawl JS download lane (was: cap 2000 of eligible JS URLs)
   SOURCEMAP_BUDGET_S:        # crawl .map fetch lane (was: cap 100 of referenced sourcemaps)
+  CONTENT_FFUF_BUDGET_S:     # content discovery lane (was: cap 25 of eligible live services)
+  VHOST_BUDGET_S:            # vhost enumeration lane (was: cap 25 origins; membership is now base services)
   DALFOX_TARGETS:            # dalfox v3 --max-concurrent-targets, target parallelism (default 4; conservative — raise via OTC)
   DALFOX_CHUNK:              # dalfox xss candidate shapes per resumable batch (default 40)
   # v0.3.5 web-port SYN prefilter: before the bulk httpx, naabu SYN-checks each host's PUBLIC IP(s) on

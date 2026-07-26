@@ -19,7 +19,6 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
-import idna as _idna                                        # IDNA2008/UTS-46 host canonicalization (C09a)
 from pathlib import Path
 
 # PRIORITY thresholds (NOT a gate): any cap/timeout with omitted>0 is already a gap — truth is not a
@@ -77,10 +76,8 @@ def _canon_host(h: str) -> str:
     h = h.strip().lower().rstrip(".")
     if not h:
         return h
-    try:
-        return _idna.encode(h, uts46=True, transitional=False).decode("ascii")
-    except Exception:
-        return h
+    from . import normalize as _n
+    return _n.idna_ascii(h) or h                 # shared policy; best-effort fallback is THIS site's choice
 
 
 def _canon_url(u: str) -> str:

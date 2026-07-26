@@ -112,6 +112,46 @@ def publish_bytes(dest: Path, data: bytes, *, digest: str) -> bool:
         return False
 
 
+def order_ranked_fair(items, *, rank, group) -> list:
+    """Order by RANK TIER first, then round-robin fairly WITHIN each tier.
+
+    Lumpy's rule, encoded: **ranking may determine the order work is done in, but never permanent
+    membership.** A lane that prefers origin (non-CDN) hosts, or https over http, keeps that preference as a
+    TIER ORDER — every item still appears in the output, so a budget that stops early has simply done the
+    most valuable work first rather than excluded anything.
+
+    Fairness applies inside a tier for the same reason it does anywhere: without it, one host's eight ports
+    drain the budget before another host's first port is touched."""
+    tiers: dict = {}
+    for it in items:
+        tiers.setdefault(rank(it), []).append(it)
+    out: list = []
+    for r in sorted(tiers):
+        out += order_fairly(tiers[r], group)
+    return out
+
+
+def state_path(base, lane: str, config_fp: str):
+    """The per-lane ledger path, namespaced by a COVERAGE-CONFIG fingerprint.
+
+    A per-item ledger cannot use the work_unit trick the chunked lanes use, and it must not skip an item
+    whose artifact was produced under a DIFFERENT coverage config (a changed wordlist, changed match codes):
+    that artifact still validates by digest and would be wrongly treated as done. Putting the config
+    fingerprint in the FILENAME means a config change starts a clean generation — no stale entries, and no
+    collision with the foreign-path guard (a same-path different-lane state is a different problem, and
+    `Ledger.foreign` must keep meaning exactly that)."""
+    return Path(base) / f"{lane.replace('.', '_')}.{config_fp[:12]}.state.json"
+
+
+def prune_state(base, lane: str, keep_fp: str) -> None:
+    """Drop ledgers for superseded coverage configs of this lane, so the run dir does not accumulate them."""
+    keep = state_path(base, lane, keep_fp).name
+    for old in Path(base).glob(f"{lane.replace('.', '_')}.*.state.json"):
+        if old.name != keep:
+            old.unlink(missing_ok=True)
+            old.with_name(old.name + ".journal").unlink(missing_ok=True)
+
+
 class Ledger:
     """A per-ITEM record of work already completed for a lane, so an interrupted or budget-bounded run
     RESUMES instead of restarting — and so the remainder is a fact rather than a silent omission.
@@ -145,10 +185,12 @@ class Ledger:
         self.path = Path(state_file)
         self.journal = self.path.with_name(self.path.name + ".journal")
         self.lane = lane
-        self.done: dict[str, str] = {}        # item -> artifact path, RELATIVE to the state file's dir
+        self.done: dict[str, str] = {}        # item -> COMPLETION artifact (relative to the state file's dir)
+        self.evid: dict[str, list] = {}       # item -> EVERY retained artifact, append-only (review#2 A1 r3)
         self.digests: dict[str, str] = {}     # relative artifact path -> sha256
         self._journal_unsafe = False          # set when the journal is damaged and unrepairable
         self.foreign = False                  # set when this PATH belongs to a DIFFERENT lane
+        self._raw_evid: dict[str, list] = {}  # unvalidated evidence lists from the snapshot
         self._load()
 
     def _resolved_base(self) -> Path:
@@ -182,6 +224,11 @@ class Ledger:
         done, digests = raw.get("done"), raw.get("digests")
         if not (isinstance(done, dict) and isinstance(digests, dict)):
             return {}, {}
+        ev = raw.get("evidence")
+        if isinstance(ev, dict):
+            for k, v in ev.items():
+                if isinstance(k, str) and isinstance(v, list):
+                    self._raw_evid[k] = [x for x in v if isinstance(x, str)]
         return done, digests
 
     JOURNAL_SCHEMA = 1
@@ -220,8 +267,13 @@ class Ledger:
                 self.foreign = True
                 return
             item, rel, dig = rec.get("i"), rec.get("r"), rec.get("d")
+            ev_item = rec.get("e")
             if isinstance(item, str) and isinstance(rel, str) and isinstance(dig, str) and rel and dig:
                 pending.append((item, rel, dig))
+                kept.append(line)
+            elif isinstance(ev_item, str) and isinstance(rel, str) and isinstance(dig, str) and rel and dig:
+                self._raw_evid.setdefault(ev_item, []).append(rel)   # evidence-only journal record
+                digests[rel] = dig
                 kept.append(line)
             else:
                 damaged = True
@@ -259,9 +311,54 @@ class Ledger:
             if ok:
                 self.done[item] = rel
                 self.digests[rel] = want
+                # review#3 (A1 r4): a validated COMPLETION is always also evidence. Journal replay restores
+                # `done` but never touched `_raw_evid`, so a crash after journalling completion and before
+                # compaction resumed the item while replaying NOTHING — reproduced: has=True, evidence=[].
+                # Old snapshots written without an `evidence` field hit the same hole. Deriving it here fixes
+                # both, and every Ledger caller (vhost included) inherits the fix.
+                self._raw_evid.setdefault(item, [])
+                if rel not in self._raw_evid[item]:
+                    self._raw_evid[item].insert(0, rel)
+        # review#2 (A1 r3): retained EVIDENCE is digest-bound too. Replaying whatever matched a glob under
+        # attempt-*/ trusted mutable, unbound files — a tampered, planted or symlinked artifact could inject
+        # fabricated findings into normalized data. "Immutable" has to be VERIFIED, not assumed.
+        for item, rels in self._raw_evid.items():
+            keep = []
+            for rel in rels:
+                want = digests.get(rel)
+                if not (isinstance(want, str) and want):
+                    continue
+                ok = verified.get(rel)
+                if ok is None:
+                    q = self._safe_path(rel)
+                    try:
+                        ok = q is not None and q.is_file() and events.file_digest(q) == want
+                    except OSError:
+                        ok = False
+                    verified[rel] = ok
+                if ok:
+                    keep.append(rel)
+                    self.digests[rel] = want
+            if keep:
+                self.evid[item] = keep
 
     def has(self, item: str) -> bool:
         return item in self.done
+
+    def evidence(self, item: str) -> list:
+        """Every VALIDATED retained artifact for this item, oldest first. Completion is separate: a historical
+        artifact contributes EVIDENCE only and can never decide whether the item is done (review#1 A1 r3)."""
+        return [q for q in (self._safe_path(r) for r in self.evid.get(item, [])) if q is not None]
+
+    def add_evidence(self, item: str, artifact: Path, *, digest: str | None = None) -> None:
+        """Retain an artifact as evidence WITHOUT claiming completion. Append-only and digest-bound."""
+        rel = str(Path(artifact).relative_to(self.path.parent))
+        dig = digest or events.file_digest(artifact)
+        lst = self.evid.setdefault(item, [])
+        if rel not in lst:
+            lst.append(rel)
+        self.digests[rel] = dig
+        self._append({"e": item, "r": rel, "d": dig})
 
     def artifact(self, item: str) -> Path | None:
         """The artifact this item's content lives in — THE lookup callers must use. May be SHARED with
@@ -295,13 +392,17 @@ class Ledger:
         dig = digest or events.file_digest(artifact)
         self.done[item] = rel
         self.digests[rel] = dig
+        if rel not in self.evid.setdefault(item, []):
+            self.evid[item].append(rel)        # a completion artifact is always also evidence
+        self._append({"i": item, "r": rel, "d": dig})
+
+    def _append(self, rec: dict) -> None:
         if self.foreign or self._journal_unsafe:
             return                             # never append onto a foreign or fragmented journal
         try:
             self.journal.parent.mkdir(parents=True, exist_ok=True)
             with self.journal.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"v": self.JOURNAL_SCHEMA, "l": self.lane,
-                                     "i": item, "r": rel, "d": dig}) + "\n")
+                fh.write(json.dumps({"v": self.JOURNAL_SCHEMA, "l": self.lane, **rec}) + "\n")
         except OSError:
             pass                               # in-memory state still correct; save() will compact it
 
@@ -320,7 +421,8 @@ class Ledger:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps({"lane": self.lane, "done": self.done, "digests": self.digests}))
+            tmp.write_text(json.dumps({"lane": self.lane, "done": self.done,
+                                       "evidence": self.evid, "digests": self.digests}))
             os.replace(tmp, self.path)
         except OSError:
             self._journal_unsafe = True       # the snapshot is not authoritative; keep the journal
