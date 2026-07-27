@@ -12,28 +12,586 @@ import json
 import os
 import re
 import time
+from bisect import insort
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import events, evidence, fetch, netguard, normalize, oob, secrets, settings
-from ..runner import (RunResult, Status, have, nuclei_timeout, reclassify_from_artifact, run as exec_tool,
+from .. import budget, events, evidence, fetch, netguard, normalize, oob, secrets, settings
+from ..runner import (RunResult, Status, cancel_all as runner_cancel_all, fresh_artifact_dir, have,
+                      nuclei_timeout, reset_cancel as runner_reset_cancel, run as exec_tool,
                       scaled_timeout, skipped)
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
 
 
-def _arjun_urls(path):
-    """FAIL-CLOSED read of arjun's -oT output (one param-bearing URL per line, e.g. `.../search?q=7101`).
-    Returns the list of query-bearing URLs (the completion signal for the file-output adapter), or None
-    when the file is missing/unreadable — so a chatty arjun stdout can't mask a missing/empty -oT as
-    SUCCESS (the OTC false-success: 3954 stdout lines, no arjun.txt, 0 params)."""
-    if not path.exists():
+def _arjun_base(url: str) -> "str | None":
+    """The scheme://host[:port]/path identity of an absolute HTTP(S) URL, or None if it is not one.
+
+    review#2 (A2): `"?" in line` is not a URL contract — `garbage?x=1` passed it and was ingested as a
+    discovered parameter. A row must be an absolute http(s) URL with a real host before anything downstream
+    treats it as one."""
+    try:
+        s = urlsplit(url.strip())
+    except ValueError:
+        return None
+    if s.scheme not in ("http", "https") or not s.hostname:
         return None
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        if s.port is not None and not (0 < s.port < 65536):
+            return None
+    except ValueError:                              # a non-numeric port raises here
         return None
-    return [ln.strip() for ln in text.splitlines() if ln.strip() and "?" in ln]
+    host = s.hostname.lower()
+    port = f":{s.port}" if s.port is not None else ""
+    return f"{s.scheme}://{host}{port}{s.path}"
+
+
+def _arjun_rows(path, target: str) -> tuple:
+    """Parse an -oT artifact BOUND TO ITS TARGET -> (rows, malformed). `rows` is None when there is no file.
+
+    Every row must be an absolute http(s) URL, carry a query, and resolve to the SAME base URL we asked
+    arjun to scan. review#2 (A2): without the target binding, an artifact naming a different host was
+    accepted verbatim and its 'parameters' were ingested against a target we never requested — evidence
+    laundering, and a scope escape if that host is out of scope.
+
+    A malformed non-blank row makes the artifact NON-COMPLETABLE (the caller must not journal the target
+    as done) while the rows that DO validate are still retained: partial corruption must not discard
+    trustworthy siblings."""
+    if path is None or not Path(path).exists():
+        return None, 0
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, 0
+    want = _arjun_base(target)
+    rows, malformed = [], 0
+    for raw in text.splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue                                # blank padding is not corruption
+        url = ln.split("\t", 1)[0].strip()          # POST/JSON rows are "<url>\t<params>"
+        base = _arjun_base(url)
+        if base is None or not urlsplit(url).query or want is None or base != want:
+            malformed += 1
+            continue
+        rows.append(url)
+    return rows, malformed
+
+
+# ── arjun completion contract (probed against arjun 2.2.7, 2026-07-27) ────────────────────────────────
+# Measured, not inferred. `main()` returns None on every ordinary path, so the EXIT CODE is not an
+# execution oracle: a run whose every target was skipped still exits 0. Only arjun's own crash exits
+# nonzero — and it crashes on any target answering 400/413/418/429/503 (`initialize()` calls
+# `.status_code` on a dict) or on a transport error (`requester` returns `str(e)`, and the `type(...)
+# == str` guard sits two lines AFTER the attribute access). That traceback is unhandled, so in a BATCHED
+# invocation every remaining target is never scanned: measured 3 targets with a 429 second -> exit 1,
+# `Scanning 1/3` last, target 3 silently lost. Hence one target per process (below).
+_ARJUN_SCHEMA = 1                      # parser+contract version; folded into the resume identity
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_AJ_SCAN_RE = re.compile(r"^\[\*\]\s+Scanning\s+\d+/\d+:\s+(\S+)")
+_AJ_SKIP_RE = re.compile(r"^\[-\]\s+Skipped\s+(\S+)\s+due to errors")
+_AJ_FOUND = "Parameters found:"
+_AJ_NONE = "No parameters were discovered."
+# arjun prints this, then `return []` — which main() reports with the ORDINARY no-parameters line. The
+# terminal line therefore LIES about a target it actually abandoned; treat it as a skip, never a clean zero.
+_AJ_UNSTABLE = "Webpage is returning different content on each request. Skipping."
+
+
+def _arjun_signals(text: str) -> dict:
+    """The structured facts carried by arjun's stdout. Progress lines use `end='\\r'`, so splitlines()
+    (which breaks on \\r too) is required to see the terminal line that follows them."""
+    lines = [_ANSI_RE.sub("", ln).strip() for ln in (text or "").splitlines()]
+    return {"scanned": [m.group(1) for ln in lines if (m := _AJ_SCAN_RE.match(ln))],
+            "found": [ln for ln in lines if _AJ_FOUND in ln],
+            "none": [ln for ln in lines if _AJ_NONE in ln],
+            "skipped": [ln for ln in lines if _AJ_SKIP_RE.match(ln)],
+            # the URL the skip line names, EXTRACTED — the caller binds it to the requested target, and
+            # passing the whole line to a URL parser silently yields "not a URL" for every skip.
+            "skipped_url": [m.group(1) for ln in lines if (m := _AJ_SKIP_RE.match(ln))],
+            "unstable": [ln for ln in lines if _AJ_UNSTABLE in ln]}
+
+
+def _arjun_verdict(exit_ok: bool, sig: dict, urls, *, target: str, malformed: int = 0) -> tuple:
+    """FAIL-CLOSED per-target classification -> (verdict, detail). `urls` is `_arjun_rows()[0]`: the
+    validated rows, or None when no -oT file exists.
+
+    Completion is claimed ONLY when the exit code, the stdout terminal line and the artifact state all
+    agree — AND all three are about the target we actually asked for. `Scanning i/N` proves a target was
+    ATTEMPTED, never that it completed, so it is a precondition here and not evidence of success.
+    Verdicts:
+      success  -> complete, params found        · empty    -> complete, target genuinely has none
+      skipped  -> degraded, retained, retryable · failed   -> nonzero exit; keep partial findings
+      unknown  -> missing / duplicate / contradictory / OFF-TARGET signals; never a clean zero"""
+    n_scan = len(sig["scanned"])
+    terminal = len(sig["found"]) + len(sig["none"]) + len(sig["skipped"])
+    if not exit_ok:
+        # the traceback is the evidence; any -oT rows already exported stay valid (text_export appends
+        # per target as params are confirmed), so findings survive but the target is NEVER complete.
+        return "failed", "arjun exited nonzero (crash) — findings retained, target not complete"
+    if n_scan != 1:
+        return "unknown", f"expected exactly 1 target attempt on stdout, saw {n_scan}"
+    # review#2 (A2): the stdout must be ABOUT the requested target. arjun prints the URL it was given
+    # (main() captures `url` before initialize() rewrites request['url']), so a mismatch means this
+    # output does not belong to this target and nothing in it may be attributed to it.
+    want = _arjun_base(target)
+    if want is None or _arjun_base(sig["scanned"][0]) != want:
+        return "unknown", f"stdout reports scanning {sig['scanned'][0]!r}, not the requested target"
+    if terminal != 1:
+        return "unknown", f"expected exactly 1 terminal line, saw {terminal}"
+    if sig["skipped"]:
+        if not sig["skipped_url"] or _arjun_base(sig["skipped_url"][0]) != want:
+            return "unknown", "the skip line names a different target than the one requested"
+        return "skipped", "arjun skipped the target due to errors"
+    if malformed:
+        # partial corruption: the valid rows are still ingested by the caller, but an artifact we cannot
+        # fully account for must never be journaled as this target's finished work.
+        return "unknown", f"{malformed} malformed/off-target row(s) in the -oT artifact"
+    if sig["none"]:
+        if sig["unstable"]:
+            return "skipped", "target returns different content per request — arjun abandoned it"
+        if urls is not None:
+            return "unknown", "terminal line reports no parameters but an -oT artifact exists"
+        return "empty", "no parameters (clean, no artifact expected)"
+    if not urls:
+        return "unknown", "terminal line reports parameters but the -oT artifact is missing/empty"
+    return "success", f"{len(urls)} param-bearing URL(s)"
+
+
+def _arjun_manifest(dest: Path, url: str, verdict: str, channels: dict) -> tuple:
+    """Publish the completion MANIFEST binding every evidence channel of one attempt, -> (path, digest)
+    or (None, None).
+
+    The manifest — not the -oT file — is the ledger's completion artifact, because an attempt has THREE
+    evidence channels (stdout, stderr/traceback, optional -oT) and completion must cover all of them.
+    Recording one channel while merely retaining the others would let a resume trust a verdict whose
+    proof had since been truncated or replaced."""
+    body = json.dumps({"schema": _ARJUN_SCHEMA, "url": url, "verdict": verdict,
+                       "channels": dict(sorted(channels.items()))}, sort_keys=True).encode()
+    dig = hashlib.sha256(body).hexdigest()
+    return (dest, dig) if budget.publish_bytes(dest, body, digest=dig) else (None, None)
+
+
+def _arjun_channels(ledger, url: str) -> "dict | None":
+    """The validated channel paths for a COMPLETED target, or None when the attempt can no longer be
+    trusted and must be redone.
+
+    `Ledger.evidence()` returns only artifacts whose digest still matches, so requiring every channel the
+    manifest names to appear there is what stops a half-remembered attempt from being resumed: alter or
+    truncate any one channel and the whole completion is withdrawn, not silently narrowed."""
+    man = ledger.artifact(url)
+    if man is None:
+        return None
+    try:
+        data = json.loads(man.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("schema") != _ARJUN_SCHEMA or data.get("url") != url:
+        return None
+    ch = data.get("channels")
+    if not isinstance(ch, dict) or not ch:
+        return None
+    base = ledger.path.parent
+    validated = set()
+    for p in ledger.evidence(url):
+        try:
+            validated.add(str(p.relative_to(base)))
+        except ValueError:
+            continue
+    out = {}
+    for name, rel in ch.items():
+        if not isinstance(rel, str) or rel not in validated:
+            return None                    # a bound channel failed digest validation -> redo the target
+        out[name] = base / rel
+    return out
+
+
+def _arjun_ingest(ctx, rows, params_path) -> int:
+    """Feed a target's VALIDATED -oT rows forward — provenance AND the param-bearing URL handed to dalfox
+    so a hidden reflected param actually gets XSS-tested (without this it was written to a file + dropped).
+
+    review#5 (A2): every entity carries `raw_ref` to the artifact the evidence actually came from, per
+    Quarry's traceability contract — a finding whose proof cannot be located is not reviewable."""
+    ref = str(params_path) if params_path is not None else None
+    n = 0
+    for u in rows or []:
+        base, qs = u.split("?", 1)
+        # review#4 (A2): a truncated identity COLLIDES. Two long URLs sharing a 100-char prefix collapsed
+        # into one review, silently discarding a distinct finding. Bind the id to the whole URL — the FULL
+        # digest, so the identity matches what the comment claims (a 32-hex slice is 128-bit, not sha256).
+        uid = hashlib.sha256(u.encode()).hexdigest()
+        ctx.run.add("url", {"url": u, "sources": ["arjun"], "raw_ref": ref})
+        for pair in qs.split("&"):
+            pname = pair.split("=", 1)[0]
+            if pname:
+                ctx.run.add("parameter", {"value": f"{base}?{pname}=", "sources": ["arjun"],
+                                          "raw_ref": ref})
+        ctx.run.add("review", {"id": f"arjun-param:{uid}", "klass": "xss", "value": u,
+                               "host": normalize.host_of_url(u), "sources": ["arjun"], "raw_ref": ref})
+        n += 1
+    return n
+
+
+def _arjun_engine() -> str:
+    """The VERIFIED identity of the arjun binary that will ACTUALLY run (registry health), folded into the
+    resume work unit.
+
+    review#3 (A2): returning a stable "" when identity could not be established let a shadowed, drifted or
+    unidentifiable arjun resume another binary's completions — the exact hole `_dalfox_engine_id` already
+    closes. An unverified engine now yields a per-run NONCE, so that run is NON-resumable: re-scanning is a
+    safe superset, silently skipping targets we cannot prove ran on this binary is not."""
+    try:
+        from ..registry import health, load_tools
+        t = next((x for x in load_tools() if x.bin == "arjun"), None)
+        if t is not None:
+            h = health(t)
+            if h.get("ok") and h.get("identity"):
+                return str(h["identity"])
+    except Exception:
+        pass
+    return "unverified-" + os.urandom(8).hex()
+
+
+_AJ_STATUS = {"success": Status.SUCCESS, "empty": Status.EMPTY,
+              "skipped": Status.PARTIAL, "unknown": Status.PARTIAL}
+
+
+def _arjun_rate_shares(rl: int, procs: int) -> list:
+    """Partition a GLOBAL lane rate `rl` (req/s) across `procs` concurrent arjun processes.
+
+    review#1 (A2): `--rate-limit` is PER PROCESS. Handing every worker the full `rl` would multiply the
+    real rate at the target by the worker count — an RoE breach dressed as a rate cap. The shares are
+    integers summing to EXACTLY `rl`, and no process may be given 0 (arjun treats that as unlimited), so
+    a rate below the pool size reduces the POOL instead: concurrency yields to the rate, never the
+    reverse. `rl` falsy = no operator cap = no flag at all and the pool runs unthrottled.
+
+    review#1 (A2 r2): shares are returned LARGEST FIRST and slots are consumed in order, so a run that
+    never fills the pool still uses the biggest share available. `procs` must already be the EFFECTIVE
+    pool (see `_arjun_pool`) — partitioning across slots that cannot run strands the operator's rate."""
+    if not rl:
+        return [0] * max(1, procs)
+    procs = max(1, min(procs, rl))
+    base, extra = divmod(rl, procs)
+    return [base + (1 if i < extra else 0) for i in range(procs)]
+
+
+def _arjun_pool(configured: int, hosts: int, rl: int) -> int:
+    """The EFFECTIVE number of concurrent arjun processes.
+
+    review#1 (A2 r2): the pool was sized from config alone and the rate partitioned across it BEFORE
+    knowing how many slots could ever run. One eligible host with rate 7 and pool 5 produced shares
+    [2,2,1,1,1], ran strictly one at a time (one active target per host), and — taking the last slot
+    first — used 1 req/s of the 7 the operator permitted. Bound the pool by the work that actually
+    exists: at most one target per host means more slots than hosts are unusable by construction."""
+    n = max(1, min(configured, max(1, hosts)))
+    return max(1, min(n, rl)) if rl else n
+
+
+def _arjun_exec(url: str, rate: int, threads: int, paths: tuple, timeout: int) -> dict:
+    """Run ONE arjun process for ONE target and return everything the parent needs to classify it.
+
+    Deliberately does NO ledger / event / store writes: those stay single-threaded in the parent, so the
+    append-only journal, the coverage generation and the entity store keep exactly the ordering guarantees
+    they were hardened for. A worker only produces facts."""
+    out_f, std_f, err_f = paths
+    out_f.unlink(missing_ok=True)          # our OWN fresh attempt file; a stale -oT must not fake output
+    cmd = ["arjun", "-u", url, "-oT", str(out_f), "-t", str(threads)]
+    if rate:
+        cmd += ["--rate-limit", str(rate)]              # this process's SHARE of the global lane rate
+    r = exec_tool("arjun", cmd, raw_path=std_f, stderr_path=err_f, timeout=timeout)
+    try:
+        text = std_f.read_text(encoding="utf-8", errors="replace") if std_f.exists() else ""
+    except OSError:
+        text = ""                          # unreadable stdout -> no signals -> unknown (fails CLOSED)
+    rows, malformed = _arjun_rows(out_f, url)
+    verdict, detail = _arjun_verdict(r.exit_code == 0, _arjun_signals(text), rows,
+                                     target=url, malformed=malformed)
+    return {"url": url, "result": r, "verdict": verdict, "detail": detail,
+            "rows": rows, "malformed": malformed, "paths": paths}
+
+
+def _arjun_zero_lifecycle(ctx, why: str) -> None:
+    """Emit a COMPLETE zero-valued lifecycle, then record the skip.
+
+    review#6 (A2): the no-input exit simply returned, so on a resumed lifecycle a PRIOR run's arjun
+    coverage units stayed visible as current — the same defect the content/vhost lanes fixed by routing
+    EVERY exit through an explicit generation."""
+    for m in ("api_endpoints", "endpoints_tested", "state_persisted"):
+        events.coverage_partial("params.arjun", measure=m, unit=m, eligible=0, tested=0, omitted=0,
+                                reason=why)
+    ctx.run.record("params", skipped("arjun", why))
+
+
+def _arjun_lane(ctx, prof, corpus) -> None:
+    """arjun param discovery, ONE TARGET PER PROCESS.
+
+    A batched `-i` invocation cannot attribute completion per target, and arjun's unhandled `.status_code`
+    crash on a 400/413/418/429/503 (or any transport error) aborts every REMAINING target in the file —
+    measured: 3 targets, a 429 second, target 3 never scanned. Per-target isolation contains that to its
+    own target, makes each URL independently classifiable, and makes the remainder resumable. Overhead is
+    0.08 s interpreter start against a network-bound scan.
+
+    Targets run CONCURRENTLY in a bounded pool (`ARJUN_TARGETS`, default 5), one process per target and at
+    most one active target per HOST. review#1 (A2): isolation is about one process per target — forcing
+    those processes to run one at a time was false conservatism that bought nothing when no rate is
+    configured, and it contradicts Quarry's own rate-is-not-concurrency rule. When the operator DOES set
+    RATELIMIT.HTTP it is a GLOBAL lane limit, partitioned across the workers by `_arjun_rate_shares`."""
+    api_all = sorted({u.split("?")[0] for u in corpus
+                      if "?" not in u and any(s in u.lower() for s in
+                      ("/api", "/rest", "/account", "/profile", "/search", "/user", "/order"))})
+    # fresh-resolve: withhold scan-box/metadata, contact private
+    api_all = netguard.guard_urls(ctx, api_all, phase="params.arjun")
+    if not api_all:
+        _arjun_zero_lifecycle(ctx, "no param-less API endpoints found")
+        return
+    if not have("arjun"):
+        # A1 invariant: an unavailable TOOL is COVERAGE_UNKNOWN, never a clean zero — we could not look,
+        # so 0/0 would assert these endpoints have no hidden parameters.
+        ctx.run.record("params", skipped("arjun", "arjun not on PATH"))
+        events.coverage_partial("params.arjun", kind=events.COVERAGE_UNKNOWN, measure="api_endpoints",
+                                unit="api_endpoints", eligible=len(api_all), tested=0, omitted=len(api_all),
+                                reason="arjun not installed — parameter discovery was not attempted")
+        return
+    threads = settings.workers("arjun", 5)
+    engine = _arjun_engine()
+    cfg_fp = events.work_unit("params.arjun", inputs={}, config={"engine": engine},
+                              schema_version=_ARJUN_SCHEMA)
+    state_base = ctx.run.dir / "raw" / "params"
+    state_base.mkdir(parents=True, exist_ok=True)
+    budget.prune_state(state_base, "params.arjun", cfg_fp)
+    ledger = budget.Ledger(budget.state_path(state_base, "params.arjun", cfg_fp), lane="params.arjun")
+    aj_budget = budget.Budget(budget.budget_seconds("ARJUN_BUDGET_S"))
+    attempt_dir = fresh_artifact_dir(state_base / "arjun" / cfg_fp[:16])
+
+    def _rank(u):
+        """NEVER-ATTEMPTED work runs first. A target arjun skipped (or crashed on) is retried only after
+        every untouched endpoint, so a permanent 'not a webpage' skip cannot consume a finite budget on
+        every rerun and hide the remainder that was never looked at once."""
+        return 0 if (ledger.has(u) or not ledger.evidence(u)) else 1
+
+    ordered = budget.order_ranked_fair(api_all, rank=_rank, group=normalize.host_of_url)
+    counts = {"success": 0, "empty": 0, "skipped": 0, "failed": 0, "unknown": 0}
+    attempted = resumed = nfound = 0
+    unpublished: list = []                   # trusted completions whose evidence could not be published
+
+    # ── replay completed targets FIRST (no process, no budget cost) ──
+    pending = []
+    for u in ordered:
+        if ledger.has(u):
+            ch = _arjun_channels(ledger, u)
+            if ch is not None:
+                resumed += 1
+                attempted += 1
+                rows, _bad = _arjun_rows(ch.get("params"), u)
+                nfound += _arjun_ingest(ctx, rows, ch.get("params"))
+                continue
+            # evidence no longer validates -> the completion is withdrawn and the target is redone
+        pending.append(u)
+
+    # ── bounded concurrent pool over the remainder ──
+    # size the pool from the work that can ACTUALLY run concurrently (one target per host) BEFORE
+    # partitioning the rate, or the operator's budget is split across slots that will never open.
+    n_hosts = len({normalize.host_of_url(u) for u in pending})
+    procs = _arjun_pool(max(1, settings.concurrency("ARJUN_TARGETS", 5)), n_hosts, prof.http_rl)
+    shares = _arjun_rate_shares(prof.http_rl, procs)
+    procs = len(shares)                      # a rate below the pool size SHRINKS the pool (never the rate)
+    ctx.echo(f"  arjun: {len(api_all)} param-less API endpoint(s)"
+             + (f", {resumed} resumed" if resumed else "")
+             + f" · {procs} concurrent target(s)"
+             + (f" @ {prof.http_rl} req/s global ({'+'.join(map(str, shares))})" if prof.http_rl else "")
+             + (f" · budget {aj_budget.seconds}s" if not aj_budget.unbounded else ""))
+
+    def _finish(res: dict) -> None:
+        """Parent-side, SINGLE-THREADED: ledger, events and store writes for one completed target."""
+        nonlocal nfound
+        u, r, verdict = res["url"], res["result"], res["verdict"]
+        uid = hashlib.sha256(u.encode()).hexdigest()
+        out_f, std_f, err_f = res["paths"]
+        counts[verdict] += 1
+        # EVERY channel is bound as evidence BEFORE any completion claim, so a retained attempt can
+        # never be remembered by one channel while another goes unverified.
+        # review#2 (A2 r3): the digest is computed and CHECKED here rather than inside add_evidence.
+        # `events.file_digest` returns "" for an unreadable file instead of raising, so the channel was
+        # bound with an empty digest, the manifest still named it, `state_persisted` still read 1/1 — and
+        # the next load rejected the unhashed channel and silently redid the target.
+        channels, channels_ok = {}, True
+        for name, p in (("stdout", std_f), ("stderr", err_f), ("params", out_f)):
+            if not p.exists():
+                continue
+            dig = events.file_digest(p)
+            if not dig:
+                channels_ok = False              # unhashable evidence cannot back a completion claim
+                continue
+            ledger.add_evidence(u, p, digest=dig)
+            channels[name] = str(p.relative_to(state_base))
+        if verdict != "failed":
+            r.status = _AJ_STATUS[verdict]
+        elif r.status in (Status.SUCCESS, Status.EMPTY, Status.PARTIAL):
+            # a NONZERO exit is never a clean or merely-degraded status. The generic classifier reads
+            # arjun's traceback as a transport hiccup and returns PARTIAL, which understates a crash
+            # that ended the process. Only a MORE specific hard status (TIMED_OUT / BLOCKED / SKIPPED)
+            # survives — hardening the verdict, never laundering it.
+            r.status = Status.FAILED
+        r.note = f"arjun[{verdict}] {normalize.host_of_url(u)}: {res['detail']}"
+        ctx.run.record("params", r)
+        if verdict == "unknown":
+            events.coverage_partial("params.arjun", kind=events.COVERAGE_UNKNOWN,
+                                    measure="target", unit=f"target:{uid[:16]}", eligible=1, tested=0,
+                                    omitted=1, reason=f"{u}: {res['detail']}")
+        elif verdict in ("skipped", "failed"):
+            events.coverage_partial("params.arjun", reason=f"{u}: {verdict} — {res['detail']}")
+        if verdict in ("success", "empty"):
+            man, dig = (_arjun_manifest(attempt_dir / f"{uid}.attempt.json", u, verdict, channels)
+                        if channels_ok else (None, None))
+            if man is not None:
+                ledger.record(u, man, digest=dig)
+            else:
+                # review#4 (A2 r2): the manifest (or a channel digest) could not be published, so this
+                # TRUSTED completion is not durable — the target will be redone. ledger.save() knows
+                # nothing about that, so without this counter `state_persisted` still reported 1/1 and
+                # the operator read a resumable lane that will silently repeat work.
+                unpublished.append(u)
+        # rows that VALIDATED are ingested even from a non-completable attempt: partial corruption must
+        # not discard trustworthy siblings, and a crashed target's exported params are real evidence.
+        nfound += _arjun_ingest(ctx, res["rows"], out_f if out_f.exists() else None)
+
+    def _paths(u: str) -> tuple:
+        uid = hashlib.sha256(u.encode()).hexdigest()
+        return (attempt_dir / f"{uid}.txt", attempt_dir / f"{uid}.out", attempt_dir / f"{uid}.err")
+
+    queue = list(pending)
+    active: dict = {}                        # future -> (url, host, slot)
+    busy_hosts: set = set()
+    free = list(range(procs))
+    runner_reset_cancel()                    # a previous lane's latch must not cancel this one
+    # review#2 (A2 r2): KeyboardInterrupt is delivered to the MAIN thread only. A tool running inside a
+    # worker never reaches runner.run()'s interrupt branch, so its process keeps going and the pool's
+    # __exit__ waits for it — unbounded under `timeout 0`. On Ctrl-C we stop submitting, reach into the
+    # workers via the runner's live-process registry to tear every group down, let the futures unwind,
+    # then RE-RAISE. future.cancel() alone cannot stop an already-running subprocess.
+    interrupted = False
+    # review#1 (A2 r3): NOT a `with` block. ThreadPoolExecutor.__exit__ is shutdown(wait=True), so leaving
+    # the block after a cancellation re-blocks on any worker that did not unwind — the exact unbounded wait
+    # the handler exists to avoid. Shutdown is explicit on each path instead.
+    pool = ThreadPoolExecutor(max_workers=procs)
+    try:
+        while True:
+            # SUBMIT: fill free slots with the first queued target whose host is not already active, so a
+            # host with many endpoints never gets several concurrent processes pointed at it.
+            while free and not aj_budget.exhausted():
+                pick = next((i for i, u in enumerate(queue)
+                             if normalize.host_of_url(u) not in busy_hosts), None)
+                if pick is None:
+                    break                    # every remaining target belongs to a currently-active host
+                u = queue.pop(pick)
+                # take the LOWEST free slot: shares are largest-first, so a partly-filled pool still runs
+                # at the biggest rate available instead of stranding it on an unused slot.
+                host, slot = normalize.host_of_url(u), free.pop(0)
+                busy_hosts.add(host)
+                attempted += 1
+                active[pool.submit(_arjun_exec, u, shares[slot], threads, _paths(u),
+                                   ctx.http_timeout)] = (u, host, slot)
+            if not active:
+                break                        # nothing running and nothing submittable -> done
+            # the budget stops LAUNCHING new work; targets already in flight always finish.
+            done, _ = wait(list(active), return_when=FIRST_COMPLETED)
+            for fut in done:
+                u, host, slot = active.pop(fut)
+                busy_hosts.discard(host)
+                insort(free, slot)               # keep slots ordered so the largest share is reused first
+                try:
+                    _finish(fut.result())
+                except Exception as exc:     # a worker crash is OUR failure, not a target verdict
+                    counts["unknown"] += 1
+                    events.coverage_partial("params.arjun", kind=events.COVERAGE_UNKNOWN,
+                                            measure="target",
+                                            unit=f"target:{hashlib.sha256(u.encode()).hexdigest()[:16]}",
+                                            eligible=1, tested=0, omitted=1,
+                                            reason=f"{u}: worker failed — {type(exc).__name__}: {exc}")
+    except KeyboardInterrupt:
+        interrupted = True
+        # 1) HARVEST FIRST. A target that finished just before the interrupt has EARNED its completion;
+        #    killing without harvesting threw it away and the resume repeated that whole scan. Only
+        #    futures already done at THIS instant are harvested — anything completing later raced the
+        #    kill and is reported as cancelled, never as a measured verdict.
+        for fut in [f for f in list(active) if f.done()]:
+            u, _host, _slot = active.pop(fut)
+            try:
+                _finish(fut.result())
+            except Exception as exc:
+                counts["unknown"] += 1
+                events.coverage_partial("params.arjun", kind=events.COVERAGE_UNKNOWN, measure="target",
+                                        unit=f"target:{hashlib.sha256(u.encode()).hexdigest()[:16]}",
+                                        eligible=1, tested=0, omitted=1,
+                                        reason=f"{u}: worker failed — {type(exc).__name__}: {exc}")
+        # 2) then tear down what is still running (ONE shared grace deadline across every group).
+        killed = runner_cancel_all()
+        for fut in list(active):
+            fut.cancel()                     # only drops NOT-YET-STARTED work; the kill handles the rest
+        wait(list(active), timeout=30)       # bounded: the groups are already dead
+        # 3) HARVEST AGAIN. review#2 (A2 r4): a target that finished naturally BETWEEN the snapshot in (1)
+        #    and process termination was previously declared unmeasured, throwing away a verdict — and its
+        #    evidence — that had actually been reached. Harvesting is safe for killed runs too: completion
+        #    demands the exit code, terminal line and artifact to AGREE, which a truncated kill cannot fake.
+        for fut in [f for f in list(active) if f.done() and not f.cancelled()]:
+            u, _host, _slot = active.pop(fut)
+            try:
+                _finish(fut.result())
+            except Exception as exc:
+                counts["unknown"] += 1
+                events.coverage_partial("params.arjun", kind=events.COVERAGE_UNKNOWN, measure="target",
+                                        unit=f"target:{hashlib.sha256(u.encode()).hexdigest()[:16]}",
+                                        eligible=1, tested=0, omitted=1,
+                                        reason=f"{u}: worker failed — {type(exc).__name__}: {exc}")
+        # 4) only what is still UNRESOLVED (or was cancelled before it ran) is unmeasured — looked at but
+        #    never judged. An honest gap, not a clean zero, and absent from the ledger so a resume retries.
+        for _fut, (u, _h, _s) in list(active.items()):
+            counts["unknown"] += 1
+            events.coverage_partial("params.arjun", kind=events.COVERAGE_UNKNOWN, measure="target",
+                                    unit=f"target:{hashlib.sha256(u.encode()).hexdigest()[:16]}",
+                                    eligible=1, tested=0, omitted=1,
+                                    reason=f"{u}: cancelled by operator before a verdict was reached")
+        ctx.echo(f"    params.arjun: cancelled — terminated {killed} running arjun process(es), "
+                 f"{len(active)} target(s) left unmeasured")
+    finally:
+        # NEVER wait on workers here: on the interrupt path their processes are already dead, and on every
+        # other path the loop only exits once `active` is empty.
+        pool.shutdown(wait=False, cancel_futures=True)
+    # DURABILITY is the conjunction: the state file was written AND every trusted completion actually
+    # published its evidence. Either failure means a resume redoes work, so both must reach the verdict.
+    saved = ledger.save()
+    persisted = saved and not unpublished
+    if not persisted:
+        ctx.echo("    params.arjun: completion state NOT persisted"
+                 + (" (state file belongs to another lane)" if ledger.foreign else "")
+                 + (f" ({len(unpublished)} completion(s) could not publish evidence)" if unpublished else ""))
+    events.coverage_partial("params.arjun", kind=events.COVERAGE_TIMEOUT, measure="state_persisted",
+                            unit="state_persisted", eligible=1, tested=1 if persisted else 0,
+                            omitted=0 if persisted else 1,
+                            reason=("completion state persisted" if persisted else
+                                    (f"{len(unpublished)} completed target(s) could not publish their "
+                                     "evidence manifest; those targets WILL be redone" if unpublished else
+                                     "completion state could not be persisted; a resume will redo this lane")))
+    # SELECTION: of every eligible endpoint, how many did we get to at all? (the old ARJUN_CAP lived here)
+    budget.report_selection("params.arjun", measure="api_endpoints", eligible=len(api_all),
+                            attempted=attempted, budget=aj_budget, noun="endpoint", durable=persisted)
+    # OUTCOME: of those attempted, how many reached a TRUSTED terminal state?
+    budget.report_outcome("params.arjun", measure="endpoints_tested", attempted=attempted,
+                          obtained=counts["success"] + counts["empty"] + resumed,
+                          classes={k: v for k, v in (("skipped", counts["skipped"]),
+                                                     ("crashed", counts["failed"]),
+                                                     ("unknown", counts["unknown"])) if v},
+                          noun="endpoint")
+    left = len(api_all) - attempted
+    ctx.echo(f"  arjun: {counts['success']} with params · {counts['empty']} none · "
+             f"{counts['skipped']} skipped · {counts['failed']} crashed · {counts['unknown']} unknown · "
+             f"{resumed} resumed · {nfound} param-bearing URL(s) -> dalfox candidates"
+             + (f" · {left} left by budget — {'resumable' if persisted else 'NOT saved, will restart'}"
+                if left else ""))
+    if interrupted:
+        # coverage and completion state for the work that DID finish are now recorded; only then does the
+        # cancellation propagate, so a Ctrl-C costs the operator nothing already earned.
+        raise KeyboardInterrupt
 
 
 def _apply_nuclei_oob(cmd: list[str]) -> list[str]:
@@ -1391,56 +1949,11 @@ def run(ctx) -> None:
         nf = evidence.probe_framework_endpoints(ctx, fw_cands)
         ctx.echo(f"  framework-endpoints: {len(fw_cands)} candidate(s) probed, {nf} exposed (200)")
 
-    # ── arjun param discovery on param-less API endpoints (throttled) ──
-    ARJUN_CAP = 40
-    _api_all = sorted({u.split("?")[0] for u in corpus
-                       if "?" not in u and any(s in u.lower() for s in
-                       ("/api", "/rest", "/account", "/profile", "/search", "/user", "/order"))})
-    _api_all = netguard.guard_urls(ctx, _api_all, phase="params.arjun")   # fresh-resolve: withhold scan-box/metadata, contact private
-    api_eps = _api_all[:ARJUN_CAP]
-    _n_api = len(_api_all)          # emit every run (omitted=0 clears a prior cap gap on rerun)
-    events.coverage_partial("params.arjun", kind=events.COVERAGE_CAP, measure="api_endpoints",
-                            eligible=_n_api, tested=min(_n_api, ARJUN_CAP), omitted=max(0, _n_api - ARJUN_CAP),
-                            reason=f"arjun targets {min(_n_api, ARJUN_CAP)}/{_n_api} API endpoints (cap {ARJUN_CAP})")
-    if api_eps:
-        aj_in = ctx.write_list("arjun_targets.txt", api_eps)
-        aj_out = ctx.run.raw_path("params", "arjun", "arjun.txt")
-        aj_out.unlink(missing_ok=True)                     # stale -oT must not fake completion
-        # RoE rate. The old `-d 1/rl` was NOT a breach: arjun forces threads=1 whenever a delay is set
-        # (verified arjun __main__.py), so it paced correctly but SERIALLY. `--rate-limit` (verified -h)
-        # is the better control — a global RPS cap that does NOT collapse threads, so concurrency (`-t`)
-        # is preserved under the ceiling. Applied only when the operator sets http_rl. Coverage unchanged.
-        aj_cmd = ["arjun", "-i", str(aj_in), "-oT", str(aj_out),
-                  "-t", str(settings.workers("arjun", 5))]   # was hard-coded -t 5; I/O-scaled + config-tunable
-        if prof.http_rl:
-            aj_cmd += ["--rate-limit", str(prof.http_rl)]   # global RPS cap; keeps -t concurrency (unlike -d)
-        r = exec_tool("arjun", aj_cmd, timeout=ctx.http_timeout)
-        # arjun is a FILE-output tool (-oT); its status must come from the artifact, not its chatty stdout.
-        # The OTC false-success: exit 0 + 3954 stdout lines but NO arjun.txt -> classified SUCCESS with 0
-        # params. Reclassify from the parsed -oT via the shared adapter (0 params -> EMPTY, absent/unreadable
-        # -> PARTIAL/keep-hard). Each -oT line is a param-bearing URL (e.g. ".../v1/search?q=7101").
-        urls = _arjun_urls(aj_out)
-        reclassify_from_artifact(r, None if urls is None else len(urls), label="arjun")
-        ctx.run.record("params", r)
-        # Feed arjun's output forward — record provenance AND hand the param-bearing URL to dalfox so a
-        # hidden reflected param actually gets XSS-tested (without this it was written to a file + dropped).
-        naj = 0
-        for u in (urls or []):
-            base, qs = u.split("?", 1)
-            ctx.run.add("url", {"url": u, "sources": ["arjun"]})
-            for pair in qs.split("&"):
-                pname = pair.split("=", 1)[0]
-                if pname:
-                    ctx.run.add("parameter", {"value": f"{base}?{pname}=",
-                                              "sources": ["arjun"]})
-            ctx.run.add("review", {"id": f"arjun-param:{u[:100]}", "klass": "xss",
-                                   "value": u, "host": normalize.host_of_url(u),
-                                   "sources": ["arjun"]})
-            naj += 1
-        if naj:
-            ctx.echo(f"  arjun: +{naj} param-bearing URL(s) -> dalfox candidates")
-    else:
-        ctx.run.record("params", skipped("arjun", "no param-less API endpoints found"))
+    # ── arjun param discovery on param-less API endpoints — per-target, bounded, resumable (A2) ──
+    # The ARJUN_CAP 40 membership cap is GONE: the full guarded endpoint set is processed in host-fair
+    # order under ARJUN_BUDGET_S (0 = unbounded = default), and whatever a bounded run does not reach is
+    # a counted, resumable remainder. See _arjun_lane for the measured completion contract.
+    _arjun_lane(ctx, prof, corpus)
 
     # ── vuln-primitive probes over the 4.3.A CANONICALIZED shapes, SPLIT by primitive ──
     # XSS reflection -> params.dalfox_xss_fast (dalfox, 4.3.B). Open-redirect -> params.redirect_confirm

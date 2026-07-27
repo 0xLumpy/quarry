@@ -32,6 +32,12 @@ PERFORMANCE:
   SOURCEMAP_BUDGET_S:        # crawl .map fetch lane (was: cap 100 of referenced sourcemaps)
   CONTENT_FFUF_BUDGET_S:     # content discovery lane (was: cap 25 of eligible live services)
   VHOST_BUDGET_S:            # vhost enumeration lane (was: cap 25 origins; membership is now base services)
+  ARJUN_BUDGET_S:            # arjun param discovery (was: cap 40 of eligible API endpoints). ONE TARGET PER
+                             # PROCESS: arjun crashes on a 400/413/418/429/503 target and a batched run loses
+                             # every target after it, so isolation is coverage
+  ARJUN_TARGETS:             # concurrent arjun TARGET processes (default 5; at most one per host). RATE is
+                             # separate: RATELIMIT.HTTP is a GLOBAL lane cap partitioned across these workers
+                             # (never handed to each in full), and a rate below the pool size shrinks the POOL
   DALFOX_TARGETS:            # dalfox v3 --max-concurrent-targets, target parallelism (default 4; conservative — raise via OTC)
   DALFOX_CHUNK:              # dalfox xss candidate shapes per resumable batch (default 40)
   # v0.3.5 web-port SYN prefilter: before the bulk httpx, naabu SYN-checks each host's PUBLIC IP(s) on

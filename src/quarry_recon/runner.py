@@ -378,6 +378,129 @@ def have(bin_name: str) -> bool:
     return shutil.which(bin_name) is not None
 
 
+# ── concurrent-run CPU accounting (review#7, A2) ──────────────────────────────────────────────────────
+# getrusage(RUSAGE_CHILDREN) is per-PROCESS, not per-child, so a delta taken around one tool is only that
+# tool's CPU while tools run sequentially. Any overlap makes every concurrent delta wrong. Rather than
+# silently report a fabricated number we mark each overlapping run unmeasurable: a run is contaminated if
+# ANY other run was in flight at any moment of its lifetime — including one that started after it.
+_CPU_LOCK = threading.Lock()
+_CPU_INFLIGHT: dict[int, bool] = {}
+_CPU_NEXT = [0]
+
+
+def _cpu_start() -> int:
+    with _CPU_LOCK:
+        token = _CPU_NEXT[0]
+        _CPU_NEXT[0] += 1
+        overlap = bool(_CPU_INFLIGHT)
+        _CPU_INFLIGHT[token] = overlap
+        if overlap:
+            for k in _CPU_INFLIGHT:                # the runs already in flight are contaminated too
+                _CPU_INFLIGHT[k] = True
+        return token
+
+
+def _cpu_finish(token: int) -> bool:
+    """True when this run overlapped another and its CPU delta must NOT be reported."""
+    with _CPU_LOCK:
+        return _CPU_INFLIGHT.pop(token, False)
+
+
+def cpu_measured(r: "RunResult") -> bool:
+    """Whether `r.cpu_s` is a real measurement (-1.0 = unmeasured, concurrent execution)."""
+    return r.cpu_s >= 0.0
+
+
+# ── cooperative cancellation for CONCURRENT lanes (review#2, A2) ──────────────────────────────────────
+# Python delivers KeyboardInterrupt to the MAIN thread only, so a tool running inside a worker thread
+# never reaches run()'s own interrupt branch: its subprocess keeps going and ThreadPoolExecutor.__exit__
+# waits for it — unbounded with `timeout 0`. The main thread therefore needs a way to reach INTO the
+# workers and tear their process groups down. `future.cancel()` cannot: it only drops work not yet
+# started. A registry of live process groups can.
+_LIVE_LOCK = threading.Lock()
+_LIVE_PROCS: dict[int, "subprocess.Popen"] = {}
+_LIVE_SEQ = [0]
+_CANCELLED = threading.Event()
+
+
+def cancelled() -> bool:
+    return _CANCELLED.is_set()
+
+
+def reset_cancel() -> None:
+    """Clear the cancellation latch (a fresh lane, or a test)."""
+    _CANCELLED.clear()
+
+
+def cancel_all(grace: "float | None" = None) -> int:
+    """Latch cancellation and terminate EVERY live tool process group. Returns how many were signalled.
+
+    Safe to call from the main thread while workers are blocked in communicate(): the group is killed,
+    communicate() then returns promptly, and each worker unwinds through its own finally.
+
+    review#1 (A2 r3): the groups are signalled CONCURRENTLY under ONE SHARED grace deadline. Looping over
+    `terminate_group` gave each stubborn child its own full grace, so N children that ignore SIGTERM cost
+    N x grace before the first SIGKILL — cancellation that degrades linearly with concurrency is not
+    bounded in any useful sense."""
+    _CANCELLED.set()
+    grace = _TERM_GRACE if grace is None else grace   # resolved at CALL time (defined later in module)
+    with _LIVE_LOCK:
+        procs = list(_LIVE_PROCS.values())
+    if not procs:
+        return 0
+    if not _POSIX:                                 # no process groups: fall back to per-process handling
+        for p in procs:
+            try:
+                terminate_group(p, grace=grace)
+            except Exception:
+                pass
+        return len(procs)
+
+    def _sig(p, sig):
+        try:
+            os.killpg(p.pid, sig)                  # start_new_session=True => pid == pgid
+        except (ProcessLookupError, OSError):
+            pass                                   # group already gone — fine
+
+    for p in procs:
+        _sig(p, signal.SIGTERM)                    # ask them ALL first, then wait ONCE
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if all(p.poll() is not None for p in procs):
+            break
+        time.sleep(0.05)
+    for p in procs:
+        _sig(p, signal.SIGKILL)                    # hard-kill every survivor after the SHARED deadline
+    # review#3 (A2 r4): the REAP deadline must be shared too. A sequential `p.wait(timeout=2)` per process
+    # reintroduced exactly the linear blow-up the shared TERM deadline removed — 2s x N whenever a process
+    # is slow to reap (or unreapable). SIGKILL is usually instant, which is why a real-child test cannot
+    # see this; the bound has to be structural, not incidental.
+    reap_deadline = time.monotonic() + _REAP_GRACE
+    while time.monotonic() < reap_deadline:
+        if all(p.poll() is not None for p in procs):
+            break
+        time.sleep(0.05)
+    for p in procs:
+        try:
+            p.poll()                               # final non-blocking reap; a survivor is left to the OS
+        except (ProcessLookupError, OSError):
+            pass
+    return len(procs)
+
+
+def _register(proc) -> int:
+    with _LIVE_LOCK:
+        token = _LIVE_SEQ[0]
+        _LIVE_SEQ[0] += 1
+        _LIVE_PROCS[token] = proc
+        return token
+
+
+def _unregister(token: int) -> None:
+    with _LIVE_LOCK:
+        _LIVE_PROCS.pop(token, None)
+
+
 def _classify(exit_code: int, out: str, err: str, ok_empty: bool,
               ok_codes: tuple[int, ...] = (0,)) -> tuple[Status, str]:
     low_err = err.lower()
@@ -414,6 +537,7 @@ def _classify(exit_code: int, out: str, err: str, ok_empty: bool,
 
 
 _TERM_GRACE = 3.0        # seconds between SIGTERM and the hard SIGKILL of a tool's process group
+_REAP_GRACE = 2.0        # SHARED post-SIGKILL reap window in cancel_all (never per-process — see r4#3)
 _POSIX = (os.name == "posix")
 
 
@@ -507,6 +631,7 @@ def run(
     # timeout=) is behavior-equivalent to the old run(): same 0/None = no-wall-clock-kill semantics.
     cpu0 = (resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None)
     cpu_base = (cpu0.ru_utime + cpu0.ru_stime) if cpu0 else 0.0
+    _cpu_token = _cpu_start()          # marks THIS run, and every overlapping one, as CPU-unmeasurable
     peak_rss = [0.0]
     stop = threading.Event()
 
@@ -518,41 +643,83 @@ def run(
     # kill the WHOLE tree (tool + any children) on timeout/interrupt — no orphaned chromium/subshell.
     # It also detaches the tool from Quarry's controlling terminal, so a Ctrl-C hits Quarry (not the tool
     # directly) and we do the cleanup deterministically here.
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            env=proc_env, cwd=_TOOL_CWD, start_new_session=True, **stdin_kw)
-
-    def _sample():
-        while not stop.wait(0.3):
-            r = _rss_tree_mb(proc.pid)
-            if r > peak_rss[0]:
-                peak_rss[0] = r
-    sampler = threading.Thread(target=_sample, daemon=True)
-    sampler.start()
-
-    timed_out = False
+    # review#3 (A2): everything after _cpu_start() must unwind through a finally. Popen itself can raise
+    # (ENOENT on a racing uninstall, EMFILE, OOM) and communicate() can raise on a decode error — either
+    # left the token in _CPU_INFLIGHT forever, so EVERY later tool looked concurrent and permanently
+    # reported its CPU as unmeasured. A telemetry leak that outlives the failure that caused it.
+    proc = None
+    live_token = None
+    group_settled = False                         # True once this run's process group needs no teardown
     try:
-        out, err = proc.communicate(input=stdin_data if stdin_data is not None else None,
-                                    timeout=timeout or None)
-    except subprocess.TimeoutExpired:
-        terminate_group(proc)                     # kill the whole group, not just the leader
-        out, err = proc.communicate()             # reap + drain whatever the tool buffered
-        timed_out = True
-    except KeyboardInterrupt:
-        # operator cancellation: tear the tool's group down, drain/reap, then RE-RAISE — never report a
-        # cancel as a tool FAILED/TIMED_OUT.
-        terminate_group(proc)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env=proc_env, cwd=_TOOL_CWD, start_new_session=True, **stdin_kw)
+        live_token = _register(proc)              # reachable by cancel_all() from the main thread
+        if _CANCELLED.is_set():
+            # cancellation latched between the check above and the launch: don't leave a new process
+            # running after the operator asked to stop.
+            terminate_group(proc)
+
+        def _sample():
+            while not stop.wait(0.3):
+                r = _rss_tree_mb(proc.pid)
+                if r > peak_rss[0]:
+                    peak_rss[0] = r
+        sampler = threading.Thread(target=_sample, daemon=True)
+        sampler.start()
+
+        timed_out = False
         try:
-            proc.communicate(timeout=5)
-        except Exception:
-            pass
-        raise
+            out, err = proc.communicate(input=stdin_data if stdin_data is not None else None,
+                                        timeout=timeout or None)
+        except subprocess.TimeoutExpired:
+            terminate_group(proc)                 # kill the whole group, not just the leader
+            out, err = proc.communicate()         # reap + drain whatever the tool buffered
+            timed_out = True
+        except KeyboardInterrupt:
+            # operator cancellation: tear the tool's group down, drain/reap, then RE-RAISE — never report a
+            # cancel as a tool FAILED/TIMED_OUT.
+            terminate_group(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            group_settled = True                  # already torn down here — the outer guard must not repeat it
+            raise
+        finally:
+            stop.set()                            # sampler shutdown ALWAYS, incl. interrupt/cleanup paths
+            sampler.join(timeout=1)
+        group_settled = True                      # reached only when nothing propagated out of the block
     finally:
-        stop.set()                                # sampler shutdown ALWAYS, incl. interrupt/cleanup paths
-        sampler.join(timeout=1)
+        # review#1 (A2 r4): an UNEXPECTED exception out of communicate() (a decode error, MemoryError, a
+        # bug in this function) runs NEITHER the timeout nor the interrupt branch, so nothing had killed
+        # the child — and the very next line drops it from the registry, leaving a process alive that
+        # cancel_all() can no longer even see. Reproduced with a real `sleep`: child_alive=True, registry=0.
+        #
+        # review#1 (A2 r5): `poll() is None` is the WRONG gate. It answers only for the process LEADER, and
+        # a leader can exit while its children keep the group alive — which is precisely the case
+        # terminate_group() exists for (it signals the PGID, valid while any member lives). A leader that
+        # spawned `sleep` and exited before communicate() raised left a live, unreachable process GROUP
+        # while poll() reported 0. On any EXCEPTIONAL exit, tear the group down regardless of the leader.
+        # the ENTIRE probe is guarded, not just the kill: this runs in a finally, so ANY exception raised
+        # here (including from poll() itself) would replace the exception actually in flight — a cancelled
+        # run reported as an unrelated AttributeError.
+        try:
+            if proc is not None and (not group_settled or proc.poll() is None):
+                terminate_group(proc)
+        except Exception:
+            pass                                  # best-effort: never mask the original exception
+        if live_token is not None:
+            _unregister(live_token)
+        _cpu_contended = _cpu_finish(_cpu_token)  # ALWAYS reclaim the token, however we leave
 
     dur = time.monotonic() - start
     cpu1 = (resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None)
-    cpu_s = round((cpu1.ru_utime + cpu1.ru_stime) - cpu_base, 2) if cpu1 else 0.0
+    # review#7 (A2): RUSAGE_CHILDREN is PROCESS-GLOBAL, so the delta only attributes cleanly while tools run
+    # one at a time. The arjun lane now runs several single-target processes concurrently, and overlapping
+    # deltas would each absorb the others' CPU — fabricating per-target numbers that look precise. Report
+    # UNMEASURED (-1.0) instead: an honest gap beats an invented measurement.
+    cpu_s = -1.0 if _cpu_contended else (
+        round((cpu1.ru_utime + cpu1.ru_stime) - cpu_base, 2) if cpu1 else 0.0)
     rss_mb = round(peak_rss[0], 1)
     out, err = out or "", err or ""
 

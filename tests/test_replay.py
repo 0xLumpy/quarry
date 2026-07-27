@@ -64,6 +64,19 @@ class TestRoERateControl:
         assert "-w" not in cmd and "--max-cpu" not in cmd
 
     def test_arjun_uses_global_rate_limit_not_per_thread_delay(self):
+        # A2 moved the invocation from a batched `-i` in run() into the per-target _arjun_lane; the RoE
+        # property is unchanged (global --rate-limit, never the thread-collapsing -d).
         import inspect
-        src = inspect.getsource(params.run)
-        assert 'aj_cmd += ["--rate-limit", str(prof.http_rl)]' in src and 'aj_cmd += ["-d"' not in src
+        assert hasattr(params, "_arjun_exec")          # fail LOUD if the worker is renamed away
+        src = inspect.getsource(params._arjun_exec)
+        assert '"--rate-limit", str(rate)' in src and '"-d"' not in src
+        assert "if rate:" in src                       # applied only when the operator sets a rate
+
+    def test_arjun_global_rate_is_partitioned_across_concurrent_targets(self):
+        # --rate-limit is PER PROCESS, so the lane may run several targets at once ONLY if the operator's
+        # global rate is split between them. Isolation is one process per target; it never implied serial.
+        assert sum(params._arjun_rate_shares(10, 5)) == 10
+        assert sum(params._arjun_rate_shares(7, 5)) == 7          # indivisible rate still sums exactly
+        assert params._arjun_rate_shares(0, 5) == [0] * 5         # no cap -> no flag, full pool
+        assert len(params._arjun_rate_shares(3, 5)) == 3          # rate below pool SHRINKS the pool
+        assert all(s >= 1 for s in params._arjun_rate_shares(3, 5))   # 0 would mean UNLIMITED to arjun

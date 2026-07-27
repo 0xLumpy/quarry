@@ -28,7 +28,10 @@ except ImportError:                                # non-unix — telemetry degr
 def build(run, phases: list[dict], run_wall: float, run_cpu: float, peak_rss_mb: float) -> dict:
     tools = [{"phase": r.phase, "tool": r.tool, "status": r.status,
               "wall_s": round(r.duration, 2), "out_lines": r.stdout_lines,
-              "cpu_s": getattr(r, "cpu_s", 0.0), "peak_rss_mb": getattr(r, "peak_rss_mb", 0.0)}
+              # -1.0 = UNMEASURED (the tool ran concurrently with another, so the process-global
+              # getrusage delta cannot be attributed to it). Render null, never a 0 that reads as "free".
+              "cpu_s": (None if getattr(r, "cpu_s", 0.0) < 0 else getattr(r, "cpu_s", 0.0)),
+              "peak_rss_mb": getattr(r, "peak_rss_mb", 0.0)}
              for r in run.tool_runs()]
     long_tools = sorted(tools, key=lambda t: t["wall_s"], reverse=True)[:5]
     long_phases = sorted(phases, key=lambda p: p.get("wall_s", 0), reverse=True)[:3]
