@@ -127,6 +127,20 @@ def _effective_phases(selected, profile) -> set:
 
 
 # ── lock (C08 compatibility lock) ─────────────────────────────────────────────
+def _osint_verdict(cdir) -> tuple:
+    """(summary, verdict) for a finished OSINT session directory.
+
+    review-B0r3#5: an UNREADABLE truth is not a clean one. Defaulting a missing or corrupt manifest to
+    "complete" printed confident green over a session whose outcome we could not read at all — the same
+    false-clean shape as the Whoxy empty this batch exists to kill. Anything unreadable is `unknown`."""
+    import json as _json
+    try:
+        summary = (_json.loads((cdir / "manifest.json").read_text()) or {}).get("summary") or {}
+        return summary, (summary.get("verdict") or "unknown")
+    except (OSError, _json.JSONDecodeError, ValueError, AttributeError, TypeError):
+        return {}, "unknown"
+
+
 @cli.command()
 @click.option("--drift-only", is_flag=True, help="only print tools whose installed version DRIFTS from the pin")
 @click.option("--maintenance", is_flag=True, help="refresh-policy view: tools grouped by maintenance state")
@@ -688,7 +702,15 @@ def osint(profile_path, timeout):
     cands = [json.loads(l) for l in cfile.read_text().splitlines() if l.strip()] \
         if cfile.exists() else []
     apex = [c for c in cands if c["type"] == "apex" and c["scope_hint"] != "noise"]
-    click.echo(_c(f"\n══ osint done · {cdir}", "green"))
+    # review-B0r2#5: never print an unconditional green "done" over a session a provider cut short —
+    # the verdict is in the manifest, so surface it in the one line the operator actually reads.
+    _sum, _verdict = _osint_verdict(cdir)
+    click.echo(_c(f"\n══ osint {_verdict.replace('_', ' ')} · {cdir}",
+                  "green" if _verdict == "complete" else "yellow"))
+    for _lim in _sum.get("provider_limits", []):
+        click.echo(_c(f"   provider limit: {_lim.get('tool')} — {_lim.get('why')}", "yellow"))
+    for _gap in _sum.get("gaps", []):
+        click.echo(_c(f"   incomplete: {_gap.get('tool')} — {_gap.get('why')}", "yellow"))
     click.echo(f"   report:    {report}")
     click.echo(f"   suggested: {cdir / 'target.suggested.yaml'}")
     click.echo(_c(f"   {len(apex)} apex candidate(s) — review, confirm scope, add to target.yaml:", "yellow"))

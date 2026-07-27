@@ -433,7 +433,7 @@ class Run:
         any source failed OR degraded OR a phase raised OR a required tool was missing.
         `note`/`stderr_tail` were already redacted by record(); phase_exceptions are redacted here so no
         free-text bypasses the manifest secret choke point."""
-        from . import events, secrets
+        from . import contract, events, secrets
         _DEGRADED = ("partial", "blocked", "timed_out")
         _MISSING = ("not on path", "not installed", "not found")   # skip reason == the tool is absent
         # a REQUIRED (non-optional) tool skipped because it is MISSING is a coverage gap; an optional /
@@ -463,17 +463,27 @@ class Run:
         # so a FAILED/PARTIAL provider feeds the verdict AND every provider terminal (incl. clean) increments
         # tool_status (a `tools_failed` count without a matching status count is a lie). Keyed by
         # (source_id, work_unit), latest per current generation.
+        provider_limits: list = []                            # external LIMITS (quota/entitlement)
         for term in self._read_provider_terminals():
             sid = term.get("source_id", "?")
             st = term.get("status")
             status_counts[st] = status_counts.get(st, 0) + 1     # providers count toward tool_status too
-            if st not in ("failed", "partial", "incomplete"):
+            if st not in ("failed", "partial", "incomplete", "limited"):
                 continue
             why = term.get("reason") or term.get("error_class") or st
             entry = {"phase": sid.split(".", 1)[0], "tool": sid, "why": why}
-            if term.get("error_class"):
-                entry["error_class"] = term["error_class"]
-            if st == "failed":
+            ec = term.get("error_class")
+            if ec:
+                entry["error_class"] = ec
+            # review-B0#3: an EXTERNAL PROVIDER LIMIT is not a Quarry defect. Exhausted credits (or a plan
+            # that cannot reach the endpoint) mean the provider stopped us, not that anything went wrong —
+            # so it is a soft LIMIT (complete_with_limits), never a failure or a coverage gap. It still
+            # reaches the operator: coverage is genuinely incomplete and the verdict says so.
+            # Limits are PROVEN classes only (quota/entitlement, from a body or balance) — a bare 403 is
+            # `forbidden` and stays a failure.
+            if contract.is_provider_limit(ec):
+                provider_limits.append({**entry, "status": st, "output_lines": 0})
+            elif st == "failed":
                 failures.append(entry)
             else:                                                 # partial / incomplete (crash) -> a coverage gap
                 gaps.append({**entry, "status": st, "output_lines": 0})
@@ -483,10 +493,11 @@ class Run:
         # event carries eligible/tested/omitted/kind/unit. TRUTH policy (not a threshold): dropping eligible
         # methodology means the run is NOT clean —
         #   · a CAP or TIMEOUT with omitted>0 is a GAP (complete_with_gaps), regardless of fraction;
-        #   · an operator-selected SAMPLE with omitted>0 is a soft LIMIT (complete_with_limits, not a gap);
+        #   · an operator-selected SAMPLE, or an external PROVIDER limit, with omitted>0 is a soft LIMIT
+        #     (complete_with_limits, not a gap) — nothing failed and there is nothing to retry this run;
         #   · an INCONSISTENT triple is coverage:unknown (a gap — never fabricated completion).
         # The 10%/100 rule is retained ONLY as a `priority` label (major/minor) for triage, NOT to gate.
-        # by_kind is kept so a mixed source is reported honestly (sample counts stay sample, timeouts gate).
+        # by_kind is kept so a mixed source is reported honestly (sample/provider stay soft, timeouts gate).
         coverage = self._read_coverage()
         coverage_limits = []
         for cov in coverage:
@@ -503,15 +514,19 @@ class Run:
                 entry = {**base, "status": f"coverage:{kind}", "output_lines": c["tested"],
                          "eligible": c["eligible"], "omitted": c["omitted"], "omitted_fraction": frac,
                          "priority": "major" if _coverage_gates(frac, c["omitted"]) else "minor"}
-                if kind == events.COVERAGE_SAMPLE:
-                    coverage_limits.append(entry)                     # operator-chosen subset -> soft limit
+                if kind in (events.COVERAGE_SAMPLE, events.COVERAGE_PROVIDER):
+                    coverage_limits.append(entry)                     # operator subset / provider limit -> soft
                 else:
                     gaps.append(entry)                                # cap/timeout with omitted>0 -> gap
+        # a LIMIT never downgrades a run that also has real gaps — gaps dominate; limits only lift a
+        # otherwise-clean run to complete_with_limits so the incompleteness is still stated.
+        limits = coverage_limits + provider_limits
         verdict = ("complete_with_gaps" if (failures or gaps or phase_exceptions)
-                   else "complete_with_limits" if coverage_limits else "complete")
+                   else "complete_with_limits" if limits else "complete")
         return {"verdict": verdict, "tool_status": status_counts, "tools_failed": len(failures),
                 "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions,
-                "coverage": coverage, "coverage_limits": coverage_limits}
+                "coverage": coverage, "coverage_limits": coverage_limits,
+                "provider_limits": provider_limits}
 
     def _read_coverage(self) -> list[dict]:
         """Aggregate STRUCTURED coverage_partial events (those carrying eligible/tested/omitted) from
@@ -520,7 +535,7 @@ class Run:
              every run (including with omitted=0 when it no longer caps), so latest-per-unit lets an
              uncapped rerun CLEAR a prior cap. Summing raw appends would double-count and never clear.
           2. aggregate surviving units per source_id, keeping a `by_kind` breakdown so a mixed source
-             reports honestly (sample counts stay sample; timeout counts gate) — no relabeling.
+             reports honestly (sample/provider stay soft limits; cap and timeout counts gate) — no relabeling.
           3. counters are coerced defensively; a unit with a non-numeric / inconsistent triple flags the
              source ``valid=False`` and its garbage numbers are NOT summed (verdict treats it as unknown,
              and manifest generation can never crash on a bad value).

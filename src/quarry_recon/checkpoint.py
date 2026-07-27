@@ -42,7 +42,10 @@ def evaluate(run, phase: str) -> list[Checkpoint]:
     if phase == "vertical":
         passive = run.count("subdomain")
         resolved = run.count("resolved")
-        ran = {r.tool for r in runs if r.status in (Status.SUCCESS.value, Status.PARTIAL.value, Status.EMPTY.value)}
+        # review-B0r4#3: LIMITED is a run that HAPPENED (and was cut short by a provider) — omitting it
+        # made the thinness rules treat a credit-limited source as if it had never executed.
+        ran = {r.tool for r in runs if r.status in (Status.SUCCESS.value, Status.PARTIAL.value,
+                                                   Status.EMPTY.value, Status.LIMITED.value)}
         if "subfinder" in ran and passive == 0:
             cps.append(Checkpoint("warn", phase,
                 "passive subdomain enum returned ZERO for all roots — check API keys (subfinder -stats) and scope."))

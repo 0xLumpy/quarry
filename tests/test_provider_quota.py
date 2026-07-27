@@ -1,0 +1,838 @@
+"""B0 — shared provider-outcome taxonomy + Whoxy status-envelope parsing.
+
+Provider quota exhaustion is not a Quarry error and not a defect, but it IS incomplete coverage: it must
+read as an external LIMIT, never as a failure and never as a clean zero.
+
+The Whoxy payloads below are MEASURED against the live API (2026-07-27), not invented — including the
+detail that makes the whole class of bug possible: Whoxy reports a spent account inside an HTTP **200**.
+"""
+import json
+import urllib.error
+
+import pytest
+
+from quarry_recon import contract, osint, secrets
+from quarry_recon.contract import (PROVIDER_ENTITLEMENT, PROVIDER_FORBIDDEN, PROVIDER_QUOTA,
+                                   PROVIDER_RATE_LIMIT, ProviderBodyError, classify_provider_error,
+                                   classify_provider_reason, is_provider_limit, whoxy_envelope,
+                                   whoxy_reverse_page, whoxy_reverse_rows)
+from quarry_recon.runner import Status
+
+pytestmark = pytest.mark.offline
+
+# ── MEASURED Whoxy payloads (all HTTP 200) ────────────────────────────────────────────────────────
+WHOXY_EXHAUSTED = '{"status": 0, "status_reason": "Zero Account Balance"}'
+WHOXY_BALANCE = ('{"status": 1, "live_whois_balance": 0, "whois_history_balance": 0, '
+                 '"reverse_whois_balance": 0}')
+# schema-shaped from Whoxy's published reverse-whois JSON schema (total_results + search_result), NOT one
+# of the two live-measured payloads above — flagged so nobody mistakes it for ground truth.
+WHOXY_OK = ('{"status": 1, "total_results": 2, "current_page": 1, "total_pages": 1, '
+            '"search_result": [{"domain_name": "a.com"}, {"domain_name": "b.com"}]}')
+
+
+# NOT MEASURED: a synthetic UNRECOGNISED failure reason, used only to exercise the generic-error path.
+# Whoxy's genuine no-match response body is still UNKNOWN — it must be measured before any test freezes
+# what a zero-result query looks like (an open contract, tracked in notes/PROVIDER-QUOTA-DESIGN.md).
+WHOXY_UNKNOWN_FAILURE = '{"status": 0, "status_reason": "Synthetic Unrecognised Failure"}'
+
+
+def _http(code):
+    return urllib.error.HTTPError("http://x", code, "msg", {}, None)
+
+
+class TestTaxonomy:
+    def test_401_and_403_are_different_actions(self):
+        """A bad key and a refused request need different operator responses; one label loses that."""
+        assert classify_provider_error(_http(401)) != classify_provider_error(_http(403))
+
+    def test_403_is_forbidden_not_entitlement(self):
+        """A WAF, an IP allow-list, a permission error and a malformed request all return 403. Calling
+        any of them 'entitlement' would let a real defect pass the run as an expected plan limit."""
+        assert classify_provider_error(_http(403)) == PROVIDER_FORBIDDEN
+        assert not is_provider_limit(classify_provider_error(_http(403)))
+
+    def test_no_status_code_can_produce_a_limit(self):
+        """Both LIMIT classes are claims that need provider evidence — a code can never establish one."""
+        codes = [200, 400, 401, 402, 403, 404, 409, 418, 429, 451, 500, 502, 503]
+        assert all(not is_provider_limit(classify_provider_error(_http(c))) for c in codes)
+
+    def test_429_is_a_rate_limit_not_spent_credits(self):
+        """Being told to slow down says nothing about the balance — the credits may be fully intact."""
+        assert classify_provider_error(_http(429)) == PROVIDER_RATE_LIMIT
+
+    def test_quota_is_never_derived_from_a_status_code(self):
+        codes = [200, 400, 401, 402, 403, 404, 409, 418, 429, 500, 502, 503]
+        assert all(classify_provider_error(_http(c)) != PROVIDER_QUOTA for c in codes)
+
+    def test_limits_are_separable_from_failures(self):
+        assert is_provider_limit(PROVIDER_QUOTA) and is_provider_limit(PROVIDER_ENTITLEMENT)
+        for cls in ("auth", "forbidden", "rate_limit", "transport", "server", "parse", "http", "error"):
+            assert not is_provider_limit(cls)
+
+
+class TestWhoxyEnvelope:
+    def test_success_envelope_passes_through(self):
+        assert whoxy_envelope(json.loads(WHOXY_OK))["total_results"] == 2
+
+    def test_balance_envelope_is_a_success(self):
+        """`account=balance` is free and reports THREE independent service balances."""
+        doc = whoxy_envelope(json.loads(WHOXY_BALANCE))
+        assert doc["reverse_whois_balance"] == 0 and doc["live_whois_balance"] == 0
+
+    def test_exhausted_account_raises_quota_not_empty(self):
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_envelope(json.loads(WHOXY_EXHAUSTED))
+        assert e.value.error_class == PROVIDER_QUOTA
+        assert e.value.reason == "Zero Account Balance"          # verbatim, never paraphrased
+
+    def test_unknown_failure_reason_is_an_error_not_a_limit(self):
+        """Fail-closed in the direction that keeps problems visible: calling an unrecognised failure a
+        'limit' would let a real defect pass as an expected boundary."""
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_envelope({"status": 0, "status_reason": "Invalid API Key"})
+        assert e.value.error_class == "error" and e.value.reason == "Invalid API Key"
+        assert not is_provider_limit(e.value.error_class)
+
+    def test_missing_reason_still_fails_loudly(self):
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_envelope({"status": 0})
+        assert "status=0" in e.value.reason
+
+    def test_non_object_body_is_a_parse_failure(self):
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_envelope([1, 2, 3])
+        assert e.value.error_class == "parse"
+
+    @pytest.mark.parametrize("status", [True, 1.0, "1", None])
+    def test_success_status_must_be_an_exact_int(self, status):
+        """`True == 1` in Python, so a bool sailed through as success. So did a float and a string."""
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_envelope({"status": status, "search_result": []})
+        assert e.value.error_class == "parse"
+
+
+class TestWhoxyResultSchema:
+    def test_bodiless_success_is_schema_drift_not_an_empty_answer(self):
+        """`{"status": 1}` alone used to read as a confident empty result. The documented success body
+        carries `search_result`; a body without it is drift, and drift must never look like 'no matches'."""
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_reverse_rows(whoxy_envelope({"status": 1}))
+        assert e.value.error_class == "parse"
+
+    def test_valid_rows_are_normalised(self):
+        rows = whoxy_reverse_rows(json.loads(WHOXY_OK))
+        assert rows == ["a.com", "b.com"]
+
+    def test_documented_alternate_shape_is_accepted(self):
+        assert whoxy_reverse_rows({"status": 1, "domainsList": ["A.com"]}) == ["a.com"]
+
+    @pytest.mark.parametrize("rows", [
+        [None], ["a.com"], [{"domain_name": None}], [{"domain_name": ""}],
+        [{"domain_name": "not-a-domain"}], [{"no_domain": "x"}],
+        # review-B0r2#6: "contains a dot" admitted all of these as APEX CANDIDATES
+        [{"domain_name": "a..b"}], [{"domain_name": "../evil.com"}],
+        [{"domain_name": "http://evil.com"}], [{"domain_name": "ev il.com"}],
+        [{"domain_name": "a.com/../../etc"}],
+    ])
+    def test_malformed_rows_raise_instead_of_becoming_candidates(self, rows):
+        """A `None` domain used to become a candidate; a non-dict row raised deep inside the caller; a
+        path- or URL-shaped value is a traversal primitive the moment anything derives a filename."""
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_reverse_rows({"status": 1, "search_result": rows})
+        assert e.value.error_class == "parse"
+
+    def test_pagination_shortfall_is_surfaced(self):
+        """`total_results` is the provider's own count: a page holding fewer rows is PAGINATED, and
+        reporting the page as the whole answer silently loses the rest."""
+        doc = {"status": 1, "total_results": 50, "current_page": 1, "total_pages": 1,
+               "search_result": [{"domain_name": "a.com"}]}
+        rows, total, truncated = whoxy_reverse_page(doc)
+        assert rows == ["a.com"] and total == 50 and truncated is True
+
+    def test_complete_page_is_not_flagged_truncated(self):
+        rows, total, truncated = whoxy_reverse_page(json.loads(WHOXY_OK))
+        assert len(rows) == 2 and total == 2 and truncated is False
+
+    @pytest.mark.parametrize("total", [None, "12", -1, True, 1.5])
+    def test_unusable_cardinality_fails_closed(self, total):
+        """review-B0r2#4: 'no cardinality claim' let a drifted body finish CLEAN — the same fail-open
+        shape as the original false empty, one level up. The documented success schema carries
+        total_results, so its absence or corruption is drift, not a complete answer."""
+        doc = {"status": 1, "current_page": 1, "total_pages": 1,
+               "search_result": [{"domain_name": "a.com"}]}
+        if total is not None:
+            doc["total_results"] = total
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_reverse_page(doc)
+        assert e.value.error_class == "parse"
+
+    def test_absent_total_fails_even_with_zero_rows(self):
+        """Pins the absence guard INDEPENDENTLY: with rows present, the total<rows check would mask it,
+        so a mutation deleting this guard still passed. An empty page with no cardinality is still drift."""
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_reverse_page({"status": 1, "current_page": 1, "total_pages": 1, "search_result": []})
+        assert e.value.error_class == "parse"
+
+    def test_total_smaller_than_rows_is_incoherent(self):
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_reverse_page({"status": 1, "total_results": 1, "current_page": 1, "total_pages": 1,
+                                "search_result": [{"domain_name": "a.com"}, {"domain_name": "b.com"}]})
+        assert e.value.error_class == "parse"
+
+    @pytest.mark.parametrize("page,pages", [(0, 2), (2, 1), ("1", 2), (1, 0), (True, 2), (None, 1),
+                                            (1, None)])
+    def test_incoherent_or_missing_page_position_fails_closed(self, page, pages):
+        """review-B0r3#4: validated-only-if-present let a body missing BOTH fields through unchecked."""
+        doc = {"status": 1, "total_results": 1, "search_result": [{"domain_name": "a.com"}]}
+        if page is not None:
+            doc["current_page"] = page
+        if pages is not None:
+            doc["total_pages"] = pages
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_reverse_page(doc)
+        assert e.value.error_class == "parse"
+
+    def test_a_response_for_a_different_page_is_rejected(self):
+        """Accepting page 2 for a page-1 request silently attributes one slice of the answer to another."""
+        doc = {"status": 1, "total_results": 200, "current_page": 2, "total_pages": 2,
+               "search_result": [{"domain_name": "a.com"}]}
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_reverse_page(doc, page=1)
+        assert e.value.error_class == "parse"
+        rows, _total, truncated = whoxy_reverse_page(doc, page=2)     # correct request -> accepted
+        assert rows == ["a.com"] and truncated is True
+
+    def test_multiple_pages_is_truncated_even_when_the_count_fits(self):
+        """`total_pages > 1` is itself a shortfall claim — the count alone can agree while pages remain."""
+        doc = {"status": 1, "total_results": 1, "current_page": 1, "total_pages": 3,
+               "search_result": [{"domain_name": "a.com"}]}
+        _rows, _total, truncated = whoxy_reverse_page(doc)
+        assert truncated is True
+
+    def test_genuinely_empty_page_is_accepted(self):
+        rows, total, truncated = whoxy_reverse_page({"status": 1, "total_results": 0, "current_page": 1,
+                                                     "total_pages": 1, "search_result": []})
+        assert rows == [] and total == 0 and truncated is False
+
+    def test_reason_matching_is_exact_not_substring(self):
+        assert classify_provider_reason("whoxy", "Zero Account Balance") == PROVIDER_QUOTA
+        assert classify_provider_reason("whoxy", "  zero   account balance  ") == PROVIDER_QUOTA
+        # a substring test cannot tell a message from its own NEGATION
+        assert classify_provider_reason("whoxy", "Non-zero Account Balance") == "error"
+        assert classify_provider_reason("whoxy", "Zero Account Balance Restored") == "error"
+        assert classify_provider_reason("whoxy", "Domain Not Found") == "error"
+        assert classify_provider_reason("shodan", "Zero Account Balance") == "error"   # per-provider
+
+
+# ── the false-empty regression ────────────────────────────────────────────────────────────────────
+class _Sess:
+    def __init__(self, tmp_path):
+        self.dir = tmp_path
+        self.cands = []
+        self.recorded = []
+
+    def raw_path(self, source, name):
+        p = self.dir / "raw" / source
+        p.mkdir(parents=True, exist_ok=True)
+        return p / name
+
+    def candidate(self, value, ctype, source, hint, reason, raw_ref=None, manual_followup=None):
+        self.cands.append(value)
+
+    def record(self, result):
+        self.recorded.append(result)
+
+
+def _drive(tmp_path, monkeypatch, bodies):
+    """Run _whoxy with a scripted sequence of HTTP bodies."""
+    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+    seq = list(bodies)
+    calls = []
+
+    def fake_http(url, timeout=None, **kw):
+        calls.append(url)
+        return seq.pop(0) if seq else '{"status": 1}'
+
+    monkeypatch.setattr(osint, "_http", fake_http)
+    s = _Sess(tmp_path)
+    echoed = []
+    osint._whoxy(s, {"a@x.com", "b@x.com"}, ["Acme Inc"], echoed.append, 30)
+    return s, calls, echoed
+
+
+def _outcome(s):
+    return s.recorded[0].meta
+
+
+def test_exhausted_account_is_not_reported_as_zero_domains(tmp_path, monkeypatch):
+    """THE BUG: the results key is absent from a failure body, so reading it directly turned a spent
+    account into `whoxy[...]: 0 domains` — no error, no event, coverage silently lost."""
+    s, _calls, echoed = _drive(tmp_path, monkeypatch, [WHOXY_EXHAUSTED])
+    assert not any("0 domains" in m for m in echoed)
+    assert any("Zero Account Balance" in m for m in echoed)
+    # review-B0r3#1: LIMITED, not PARTIAL — "degraded" would assert something went wrong here.
+    assert s.recorded and s.recorded[0].status == Status.LIMITED
+    assert _outcome(s)["error_class"] == PROVIDER_QUOTA and _outcome(s)["provider_limit"] is True
+
+
+def test_attempted_is_not_the_same_number_as_completed(tmp_path, monkeypatch):
+    """review-B0#6: exhaustion on the FIRST call still SENT that request. Reporting `0/3 sent` and
+    `3 not sent` describes four queries for a three-query lane."""
+    s, calls, _echoed = _drive(tmp_path, monkeypatch, [WHOXY_EXHAUSTED])
+    o = _outcome(s)
+    assert len(calls) == 1
+    assert (o["eligible"], o["attempted"], o["completed"], o["not_sent"]) == (3, 1, 0, 2)
+
+
+def test_exhaustion_stops_further_queries_and_reports_the_remainder(tmp_path, monkeypatch):
+    """Once credits are gone every further call just fails: stop cleanly, and make the unsent queries
+    visible rather than burning them into noise."""
+    s, calls, echoed = _drive(tmp_path, monkeypatch, [WHOXY_EXHAUSTED, WHOXY_OK, WHOXY_OK])
+    assert len(calls) == 1
+    assert any("not sent" in m for m in echoed)
+    assert _outcome(s)["not_sent"] == 2
+
+
+def test_evidence_before_exhaustion_is_kept(tmp_path, monkeypatch):
+    """A limit must never discard what was already earned."""
+    s, calls, _echoed = _drive(tmp_path, monkeypatch, [WHOXY_OK, WHOXY_EXHAUSTED, WHOXY_OK])
+    assert len(calls) == 2
+    assert set(s.cands) == {"a.com", "b.com"}                 # first query's candidates survive
+    o = _outcome(s)
+    assert s.recorded[0].status == Status.LIMITED
+    assert (o["attempted"], o["completed"], o["not_sent"]) == (2, 1, 1)
+
+
+def test_a_clean_run_records_success(tmp_path, monkeypatch):
+    s, calls, _echoed = _drive(tmp_path, monkeypatch, [WHOXY_OK, WHOXY_OK, WHOXY_OK])
+    assert len(calls) == 3
+    assert s.recorded and s.recorded[0].status == Status.SUCCESS
+    assert _outcome(s)["completed"] == 3 and _outcome(s)["failed"] == 0
+
+
+def test_mixed_failures_are_partial_not_success(tmp_path, monkeypatch):
+    """review-B0#2: one failed query among two successes recorded a flat SUCCESS — the failure vanished.
+    (The previous version of this test asserted exactly that, locking the defect in.)"""
+    s, calls, _echoed = _drive(tmp_path, monkeypatch,
+                               [WHOXY_UNKNOWN_FAILURE, WHOXY_OK, WHOXY_OK])
+    assert len(calls) == 3                                    # a per-query failure does NOT stop the lane
+    assert s.recorded[0].status == Status.PARTIAL
+    o = _outcome(s)
+    assert (o["attempted"], o["completed"], o["failed"]) == (3, 2, 1)
+
+
+def test_all_queries_failing_is_a_failure_lifecycle(tmp_path, monkeypatch):
+    """review-B0#2: three failed queries produced NO manifest record at all — the lane looked as if it
+    had never run."""
+    bad = WHOXY_UNKNOWN_FAILURE
+    s, calls, _echoed = _drive(tmp_path, monkeypatch, [bad, bad, bad])
+    assert len(calls) == 3
+    assert s.recorded and s.recorded[0].status == Status.FAILED
+    assert _outcome(s)["completed"] == 0 and _outcome(s)["failed"] == 3
+
+
+def test_transport_failures_also_count(tmp_path, monkeypatch):
+    """An HTTP/transport error is a failed query too — it must not vanish into an echo."""
+    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+
+    def boom(url, timeout=None, **kw):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(osint, "_http", boom)
+    s = _Sess(tmp_path)
+    osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
+    assert s.recorded[0].status == Status.FAILED and _outcome(s)["failed"] == 1
+
+
+def test_no_anchors_is_an_explicit_skip(tmp_path, monkeypatch):
+    """A lane with nothing to pivot on must still say so — silence is indistinguishable from 'not run'."""
+    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+    s = _Sess(tmp_path)
+    osint._whoxy(s, set(), [], lambda m: None, 30)
+    assert s.recorded and s.recorded[0].status == Status.SKIPPED
+
+
+def test_every_anchor_is_queued_no_first_n_cap(tmp_path, monkeypatch):
+    """review-B0#4: `[:5]` on each list was the hidden membership cap this migration removes. Ranking
+    decides ORDER; the provider's balance decides how many are attempted."""
+    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+    monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_OK)
+    s = _Sess(tmp_path)
+    emails = {f"e{i}@x.com" for i in range(9)}
+    orgs = [f"Org {i}" for i in range(7)]
+    osint._whoxy(s, emails, orgs, lambda m: None, 30)
+    assert _outcome(s)["eligible"] == 16 and _outcome(s)["attempted"] == 16
+
+
+def test_emails_are_ordered_before_org_names(tmp_path, monkeypatch):
+    """Ordering is the ranking: registrant emails are the stronger ownership signal."""
+    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+    seen = []
+
+    def spy(url, timeout=None, **kw):
+        seen.append("email" if "email=" in url else "company")
+        return WHOXY_OK
+
+    monkeypatch.setattr(osint, "_http", spy)
+    osint._whoxy(_Sess(tmp_path), {"a@x.com", "b@x.com"}, ["Org"], lambda m: None, 30)
+    assert seen == ["email", "email", "company"]
+
+
+def test_truncated_page_is_not_a_clean_success(tmp_path, monkeypatch):
+    """review-B0r2#2: the shortfall was detected, printed, and then recorded as SUCCESS — so the manifest
+    said the answer was complete while the echo said otherwise. Whoxy pages at 100 results and charges a
+    credit per page, so FETCHING the rest is credit-budget work (B1); until then it must read incomplete."""
+    doc = ('{"status": 1, "total_results": 50, "current_page": 1, "total_pages": 1, '
+           '"search_result": [{"domain_name": "a.com"}]}')
+    s, _calls, echoed = _drive(tmp_path, monkeypatch, [doc, WHOXY_OK, WHOXY_OK])
+    assert any("MORE PAGES not fetched" in m for m in echoed)
+    assert s.recorded[0].status == Status.PARTIAL
+    o = _outcome(s)
+    assert o["completed"] == 3 and o["truncated_pages"] == 1 and o["coverage_incomplete"] is True
+
+
+def test_distinct_anchors_never_share_a_raw_evidence_file(tmp_path, monkeypatch):
+    """review-B0r2#3: a lossy 40-char slug collided, so the later response OVERWROTE the earlier one while
+    the earlier candidates kept pointing at that same raw_ref — provenance naming the wrong evidence."""
+    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+    monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_OK)
+    s = _Sess(tmp_path)
+    osint._whoxy(s, set(), ["Acme Inc", "Acme-Inc", "Acme  Inc"], lambda m: None, 30)
+    written = list((tmp_path / "raw" / "whoxy").glob("*.json"))
+    assert len(written) == 3, f"anchors collided onto {len(written)} file(s)"
+
+
+def test_a_provider_limit_is_not_a_failed_execution(tmp_path, monkeypatch):
+    """review-B0r2#1: the terminal status must not say `failed` for depletion — hiding it later during
+    verdict folding left events.jsonl and tool_status.failed still reporting a failure."""
+    from quarry_recon import events
+    from quarry_recon.store import Run
+    run = Run.create(tmp_path, "t")
+    events.reset()
+    events.configure(run.dir)
+    try:
+        contract.run_provider("vertical.censys",
+                              lambda: (_ for _ in ()).throw(
+                                  ProviderBodyError(PROVIDER_QUOTA, "Zero Account Balance", "censys")),
+                              work_unit="wu-a")
+        run.write_manifest({}, ["vertical"])
+        summary = json.loads(run.manifest_path.read_text())["summary"]
+        terminals = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                     if '"tool_finish"' in l]
+    finally:
+        events.reset()
+    # neither FAILED nor DEGRADED: a limit must not inflate any trouble counter (r3#1)
+    assert terminals and terminals[-1]["status"] == "limited"
+    assert terminals[-1]["error_class"] == PROVIDER_QUOTA
+    assert summary["tools_failed"] == 0
+    assert summary["tool_status"].get("failed", 0) == 0
+    assert summary["tool_status"].get("partial", 0) == 0
+    assert summary["verdict"] == "complete_with_limits"
+
+
+def test_missing_key_is_an_explicit_skip_not_a_gap(tmp_path, monkeypatch):
+    """An unconfigured OPTIONAL provider is SKIPPED — it must not make every ordinary run incomplete."""
+    monkeypatch.setattr(secrets, "whoxy", lambda: "")
+    s = _Sess(tmp_path)
+    osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
+    assert s.recorded and s.recorded[0].status == Status.SKIPPED
+
+
+def _summary_with_terminal(tmp_path, error_class, status):
+    """Drive a REAL provider terminal through run_provider and read the REAL verdict from the manifest —
+    no hand-built event dicts, so the test exercises the wiring rather than describing it."""
+    from quarry_recon import events
+    from quarry_recon.store import Run
+    run = Run.create(tmp_path, "t")
+    events.reset()
+    events.configure(run.dir)
+    try:
+        if status == "partial":
+            contract.run_provider(
+                "vertical.censys",
+                lambda: contract.ProviderResult({"a.acme.com"}, partial=True, partial_kind="degraded",
+                                                error_class=error_class, partial_reason="credits spent"),
+                work_unit="wu-a")
+        else:
+            contract.run_provider(
+                "vertical.censys",
+                lambda: (_ for _ in ()).throw(ProviderBodyError(error_class, "credits spent", "censys")),
+                work_unit="wu-a")
+        run.write_manifest({}, ["vertical"])
+        return json.loads(run.manifest_path.read_text())["summary"]
+    finally:
+        events.reset()
+
+
+class TestVerdictWiring:
+    """review-B0#3: the taxonomy described semantics the verdict could not deliver — PROVIDER_LIMITS and
+    is_provider_limit() had no production consumer, so a quota terminal still became a gap or a failure."""
+
+    def test_provider_limit_yields_complete_with_limits(self, tmp_path):
+        s = _summary_with_terminal(tmp_path, PROVIDER_QUOTA, "partial")
+        assert s["verdict"] == "complete_with_limits"
+        assert s["provider_limits"] and not s["gaps"] and not s["failures"]
+
+    def test_entitlement_is_also_a_limit(self, tmp_path):
+        s = _summary_with_terminal(tmp_path, PROVIDER_ENTITLEMENT, "failed")
+        assert s["verdict"] == "complete_with_limits" and not s["failures"]
+
+    def test_forbidden_is_still_a_failure(self, tmp_path):
+        """The whole reason 403 stopped being 'entitlement': a WAF must not read as an expected limit."""
+        s = _summary_with_terminal(tmp_path, PROVIDER_FORBIDDEN, "failed")
+        assert s["verdict"] == "complete_with_gaps" and s["failures"]
+
+    def test_rate_limit_is_still_a_failure(self, tmp_path):
+        s = _summary_with_terminal(tmp_path, PROVIDER_RATE_LIMIT, "failed")
+        assert s["verdict"] == "complete_with_gaps" and s["failures"]
+
+    def test_a_limit_does_not_mask_a_real_gap(self, tmp_path):
+        """Gaps DOMINATE: a limit may only lift an otherwise-clean run, never soften a broken one."""
+        from quarry_recon import events
+        from quarry_recon.store import Run
+        run = Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+        try:
+            contract.run_provider("vertical.censys",
+                                  lambda: (_ for _ in ()).throw(
+                                      ProviderBodyError(PROVIDER_QUOTA, "spent", "censys")),
+                                  work_unit="wu-a")
+            contract.run_provider("vertical.crtsh",
+                                  lambda: (_ for _ in ()).throw(_http(500)), work_unit="wu-b")
+            run.write_manifest({}, ["vertical"])
+            s = json.loads(run.manifest_path.read_text())["summary"]
+        finally:
+            events.reset()
+        assert s["verdict"] == "complete_with_gaps"
+        assert s["provider_limits"] and s["failures"]
+
+
+class TestOsintSessionVerdict:
+    """review-B0r2#5: the structured limit had no standalone consumer — the OSINT path has no events
+    pipeline, so without a session verdict it lived in a per-tool block nothing ever read."""
+
+    def _session(self, tmp_path):
+        from quarry_recon.osint import OsintSession
+        return OsintSession(tmp_path, "t")
+
+    def test_a_provider_limit_makes_the_session_limited(self, tmp_path, monkeypatch):
+        s = self._session(tmp_path)
+        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+        monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_EXHAUSTED)
+        osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
+        out = s.outcome()
+        assert out["verdict"] == "complete_with_limits"
+        assert out["provider_limits"] and out["provider_limits"][0]["error_class"] == PROVIDER_QUOTA
+        assert not out["gaps"]
+
+    def test_a_clean_session_is_complete(self, tmp_path, monkeypatch):
+        s = self._session(tmp_path)
+        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+        monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_OK)
+        osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
+        assert s.outcome()["verdict"] == "complete"
+
+    def test_a_failure_is_a_gap_not_a_limit(self, tmp_path, monkeypatch):
+        s = self._session(tmp_path)
+        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+        monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_UNKNOWN_FAILURE)
+        osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
+        out = s.outcome()
+        assert out["verdict"] == "complete_with_gaps" and out["gaps"] and not out["provider_limits"]
+
+    def test_the_verdict_reaches_the_manifest(self, tmp_path, monkeypatch):
+        s = self._session(tmp_path)
+        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+        monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_EXHAUSTED)
+        osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
+        prof = type("P", (), {"target": "t", "apex_domains": ["acme.com"], "asn": [], "org_names": [],
+                              "brands": [], "path": None})()
+        s.finalize(prof)
+        mf = json.loads((s.dir / "manifest.json").read_text())
+        assert mf["summary"]["verdict"] == "complete_with_limits"
+
+
+class TestLimitsNeverMaskGaps:
+    """review-B0r3#2/#3: a limit and a gap are independent facts, and the session verdict must see every
+    lane — not just the one that happens to carry custom metadata."""
+
+    def test_a_failed_query_plus_exhaustion_reports_BOTH(self, tmp_path, monkeypatch):
+        """The if/elif recorded only the limit, so a genuine failure vanished behind an expected boundary."""
+        s, calls, _echoed = _drive(tmp_path, monkeypatch, [WHOXY_UNKNOWN_FAILURE, WHOXY_EXHAUSTED])
+        assert len(calls) == 2
+        out = s.outcome() if hasattr(s, "outcome") else None
+        o = _outcome(s)
+        assert o["provider_limit"] is True and o["failed"] == 1
+
+    def test_session_verdict_is_gaps_when_both_are_present(self, tmp_path, monkeypatch):
+        from quarry_recon.osint import OsintSession
+        s = OsintSession(tmp_path, "t")
+        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+        seq = [WHOXY_UNKNOWN_FAILURE, WHOXY_EXHAUSTED]
+        monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: seq.pop(0))
+        osint._whoxy(s, {"a@x.com", "b@x.com"}, [], lambda m: None, 30)
+        out = s.outcome()
+        assert out["verdict"] == "complete_with_gaps"      # a real gap DOMINATES the expected limit
+        assert out["provider_limits"] and out["gaps"]      # and BOTH facts survive
+
+    def test_a_native_lane_failure_reaches_the_verdict(self, tmp_path, monkeypatch):
+        """`_azmap` / whois / dmarc / rdap only ECHOED their exceptions — a session where they all blew up
+        still produced a clean verdict, while the CLI called it the whole-session outcome."""
+        from quarry_recon.osint import OsintSession
+        s = OsintSession(tmp_path, "t")
+        s.note_failure("azmap", "acme.com: boom")
+        out = s.outcome()
+        assert out["verdict"] == "complete_with_gaps" and out["gaps"][0]["tool"] == "azmap"
+
+    def test_native_lane_exceptions_are_recorded_not_only_echoed(self, tmp_path, monkeypatch):
+        from quarry_recon.osint import OsintSession
+        s = OsintSession(tmp_path, "t")
+
+        def boom(url, timeout=None, **kw):
+            raise urllib.error.URLError("dns dead")
+
+        monkeypatch.setattr(osint, "_http", boom)
+        osint._azmap(s, "acme.com", lambda m: None, 30)
+        assert s.outcome()["verdict"] == "complete_with_gaps"
+
+    def test_a_degraded_tool_run_is_a_gap(self, tmp_path):
+        """Any recorded PARTIAL/TIMED_OUT/BLOCKED lane counts, not just ones carrying our metadata."""
+        from quarry_recon.osint import OsintSession
+        from quarry_recon.runner import RunResult
+        s = OsintSession(tmp_path, "t")
+        s.record(RunResult("asnmap", ["asnmap"], Status.TIMED_OUT, None, 0.0, None, 0, note="slow"))
+        assert s.outcome()["verdict"] == "complete_with_gaps"
+
+    def test_a_limited_lane_alone_is_not_a_gap(self, tmp_path):
+        from quarry_recon.osint import OsintSession
+        from quarry_recon.runner import RunResult
+        s = OsintSession(tmp_path, "t")
+        s.record(RunResult("whoxy", ["whoxy"], Status.LIMITED, None, 0.0, None, 0, note="spent",
+                           meta={"provider_limit": True, "error_class": PROVIDER_QUOTA}))
+        out = s.outcome()
+        assert out["verdict"] == "complete_with_limits" and not out["gaps"]
+
+
+class TestUnreadableTruthIsNotGreen:
+    """review-B0r3#5: a missing/corrupt manifest must read `unknown`, never clean green."""
+
+    def _verdict(self, d):
+        from quarry_recon.cli import _osint_verdict
+        return _osint_verdict(d)[1]
+
+    def test_missing_manifest_is_unknown(self, tmp_path):
+        assert self._verdict(tmp_path) == "unknown"
+
+    @pytest.mark.parametrize("body", ["", "{", "null", "[]", '{"summary": null}', '{"summary": []}',
+                                      '{"summary": {}}'])
+    def test_corrupt_or_empty_manifest_is_unknown(self, tmp_path, body):
+        (tmp_path / "manifest.json").write_text(body)
+        assert self._verdict(tmp_path) == "unknown"
+
+    def test_a_real_verdict_is_read_through(self, tmp_path):
+        (tmp_path / "manifest.json").write_text(json.dumps(
+            {"summary": {"verdict": "complete_with_limits", "provider_limits": [], "gaps": []}}))
+        assert self._verdict(tmp_path) == "complete_with_limits"
+
+
+def test_evidence_filename_carries_the_full_digest(tmp_path, monkeypatch):
+    """A truncated identity is a smaller collision space for no benefit — Quarry's other durable
+    identities are full sha256 (the A1 lesson: an 8-hex service id let two URLs collide)."""
+    import hashlib as _h
+    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+    monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_OK)
+    s = _Sess(tmp_path)
+    osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
+    want = _h.sha256(b"email\x00a@x.com\x00page=1").hexdigest()
+    names = [p.name for p in (tmp_path / "raw" / "whoxy").glob("*.json")]
+    assert names and any(want in n for n in names), names
+
+
+class TestLaterPageLimit:
+    """review-B0r4#1: the PAGINATION branch ran before any limit check, so spent credits on page 3 became
+    a degraded PARTIAL *and* a COVERAGE_CAP — Quarry claiming its own ceiling truncated the input."""
+
+    def _run(self, tmp_path, error_class):
+        from quarry_recon import events
+        from quarry_recon.store import Run
+        run = Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+        try:
+            contract.run_provider(
+                "vertical.censys",
+                lambda: contract.ProviderResult({"a.acme.com"}, partial=True, partial_kind="pagination",
+                                                pages=3, cursor="tok", error_class=error_class),
+                work_unit="wu-a")
+            run.write_manifest({}, ["vertical"])
+            summary = json.loads(run.manifest_path.read_text())["summary"]
+            evts = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+        finally:
+            events.reset()
+        return summary, evts
+
+    @pytest.mark.parametrize("cls", [PROVIDER_QUOTA, PROVIDER_ENTITLEMENT])
+    def test_later_page_limit_is_limited_not_a_cap(self, tmp_path, cls):
+        summary, evts = self._run(tmp_path, cls)
+        terminal = [e for e in evts if e.get("event") == "tool_finish"][-1]
+        assert terminal["status"] == "limited"
+        cov = [e for e in evts if e.get("event") == "coverage_partial" and e.get("measure") == "pagination"]
+        assert cov and cov[-1]["kind"] == "provider"          # the PROVIDER's boundary, not ours
+        assert summary["verdict"] == "complete_with_limits"
+        assert summary["tools_failed"] == 0
+        assert summary["tool_status"].get("partial", 0) == 0
+
+    @pytest.mark.parametrize("cls", [PROVIDER_RATE_LIMIT, "transport", "server"])
+    def test_a_later_page_failure_is_lost_in_flight_not_our_cap(self, tmp_path, cls):
+        """review-B0r5#2: every non-limit truncation was labelled `cap`, blaming Quarry's own max_pages
+        ceiling for a page the target rate-limited or broke on. Still a gap — but the attribution is what
+        tuning (and the future AI interface) reads."""
+        summary, evts = self._run(tmp_path, cls)
+        terminal = [e for e in evts if e.get("event") == "tool_finish"][-1]
+        assert terminal["status"] == "partial"
+        cov = [e for e in evts if e.get("event") == "coverage_partial" and e.get("measure") == "pagination"]
+        assert cov and cov[-1]["kind"] == "timeout"
+        assert summary["verdict"] == "complete_with_gaps"
+
+    def test_our_own_page_ceiling_is_still_a_cap(self, tmp_path):
+        """A configured max_pages ceiling IS Quarry's cap — that attribution must survive."""
+        summary, evts = self._run(tmp_path, None)          # truncated with no provider error
+        cov = [e for e in evts if e.get("event") == "coverage_partial" and e.get("measure") == "pagination"]
+        assert cov and cov[-1]["kind"] == "cap"
+        assert summary["verdict"] == "complete_with_gaps"
+
+
+class TestStatusPredicateAudit:
+    """review-B0r4#3: generic predicates were written before LIMITED existed."""
+
+    def test_limited_counts_as_ok(self):
+        from quarry_recon.runner import RunResult
+        r = RunResult("t", ["t"], Status.LIMITED, None, 0.0, None, 0)
+        assert r.ok is True
+
+    def test_limited_counts_as_a_run_that_happened(self):
+        from quarry_recon import checkpoint
+        import inspect
+        src = inspect.getsource(checkpoint)
+        assert "Status.LIMITED.value" in src
+
+    def test_artifact_reclassification_never_rewrites_a_limit(self):
+        """Folding LIMITED into the clean/degraded matrix would either launder it into SUCCESS (losing
+        the limit) or demote it to a degraded PARTIAL (inventing a defect)."""
+        from quarry_recon.runner import RunResult, reclassify_from_artifact
+        for n in (0, 5, None):
+            r = RunResult("t", ["t"], Status.LIMITED, None, 0.0, None, 0)
+            assert reclassify_from_artifact(r, n, label="t").status == Status.LIMITED
+
+
+class TestNativeLaneOutcomes:
+    """review-B0r4#2: exception handlers are not outcome checks — a nonzero exit raises nothing."""
+
+    def _sess(self, tmp_path):
+        from quarry_recon.osint import OsintSession
+        return OsintSession(tmp_path, "t")
+
+    def test_whois_nonzero_exit_is_a_gap(self, tmp_path, monkeypatch):
+        import subprocess as sp
+        monkeypatch.setattr(sp, "run",
+                            lambda *a, **k: sp.CompletedProcess(a[0], 2, stdout="", stderr="no whois"))
+        s = self._sess(tmp_path)
+        osint._whois(s, "acme.com", lambda m: None, 30)
+        assert s.outcome()["verdict"] == "complete_with_gaps"
+
+    def test_dig_nonzero_exit_is_a_gap(self, tmp_path, monkeypatch):
+        import subprocess as sp
+        monkeypatch.setattr(sp, "run",
+                            lambda *a, **k: sp.CompletedProcess(a[0], 9, stdout="", stderr=""))
+        s = self._sess(tmp_path)
+        osint._dmarc(s, "acme.com", lambda m: None, 30)
+        assert s.outcome()["verdict"] == "complete_with_gaps"
+
+    def test_a_clean_subprocess_is_not_a_gap(self, tmp_path, monkeypatch):
+        import subprocess as sp
+        monkeypatch.setattr(sp, "run",
+                            lambda *a, **k: sp.CompletedProcess(a[0], 0, stdout="", stderr=""))
+        s = self._sess(tmp_path)
+        osint._dmarc(s, "acme.com", lambda m: None, 30)
+        assert s.outcome()["verdict"] == "complete"
+
+    def test_unresolvable_apex_is_a_gap_not_a_silent_continue(self, tmp_path, monkeypatch):
+        import socket
+        monkeypatch.setattr(socket, "gethostbyname_ex",
+                            lambda h: (_ for _ in ()).throw(OSError("nxdomain")))
+        s = self._sess(tmp_path)
+        prof = type("P", (), {"apex_domains": ["acme.com"]})()
+        osint._rdap(s, prof, lambda m: None, 30)
+        assert s.outcome()["verdict"] == "complete_with_gaps"
+
+
+class TestGenerationsMoveTogether:
+    """review-B0r5#1: the TERMINAL generation and the COVERAGE generation were independent, so a stale
+    `coverage:cap` from a previous session outlived the run that superseded it."""
+
+    def _session(self, tmp_path, fn):
+        from quarry_recon import events
+        from quarry_recon.store import Run
+        run = Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+        try:
+            contract.run_provider("vertical.censys", fn, work_unit="wu-a")
+            run.write_manifest({}, ["vertical"])
+            return json.loads(run.manifest_path.read_text())["summary"], run
+        finally:
+            events.reset()
+
+    def test_a_stale_cap_does_not_survive_a_later_quota_run(self, tmp_path):
+        """Session 1 truncates at our page ceiling (a cap gap). Session 2 hits spent credits on page 1,
+        so it emits NO pagination counter at all — nothing would have superseded the old cap, and the
+        honest `complete_with_limits` was dragged back to `complete_with_gaps`."""
+        from quarry_recon import events
+        from quarry_recon.store import Run
+        run = Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+        try:
+            # session 1: our own max_pages ceiling -> coverage:cap
+            contract.run_provider("vertical.censys",
+                                  lambda: contract.ProviderResult({"a.acme.com"}, partial=True,
+                                                                  partial_kind="pagination", pages=5),
+                                  work_unit="wu-a")
+            first = Run(run.dir).summary() if hasattr(Run, "summary") else None
+            # session 2: a NEW session for the same source, stopped by spent credits on page 1
+            events.reset()
+            events.configure(run.dir)
+            contract.run_provider("vertical.censys",
+                                  lambda: (_ for _ in ()).throw(
+                                      ProviderBodyError(PROVIDER_QUOTA, "Zero Account Balance", "censys")),
+                                  work_unit="wu-a")
+            run.write_manifest({}, ["vertical"])
+            summary = json.loads(run.manifest_path.read_text())["summary"]
+        finally:
+            events.reset()
+        assert summary["verdict"] == "complete_with_limits", summary.get("gaps")
+        assert not summary["gaps"]
+        assert summary["provider_limits"]
+
+    def test_a_rerun_that_is_clean_clears_the_prior_gap(self, tmp_path):
+        from quarry_recon import events
+        from quarry_recon.store import Run
+        run = Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+        try:
+            contract.run_provider("vertical.censys",
+                                  lambda: contract.ProviderResult({"a.acme.com"}, partial=True,
+                                                                  partial_kind="pagination", pages=5),
+                                  work_unit="wu-a")
+            events.reset()
+            events.configure(run.dir)
+            contract.run_provider("vertical.censys",
+                                  lambda: contract.ProviderResult({"a.acme.com"}, pages=1),
+                                  work_unit="wu-a")
+            run.write_manifest({}, ["vertical"])
+            summary = json.loads(run.manifest_path.read_text())["summary"]
+        finally:
+            events.reset()
+        assert summary["verdict"] == "complete" and not summary["gaps"]

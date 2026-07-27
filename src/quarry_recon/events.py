@@ -260,6 +260,11 @@ def artifact_written(source_id, *, path=None, count=None, artifact_size=None) ->
 
 # kinds of coverage shortfall — they reconcile into the run verdict DIFFERENTLY (see store._run_summary):
 COVERAGE_SAMPLE = "sample"    # operator-CHOSEN subset: a soft LIMIT (complete_with_limits), never a gap
+COVERAGE_PROVIDER = "provider"  # an EXTERNAL provider LIMIT (credits spent / plan) truncated the input: a soft
+                              # LIMIT like sample, NOT a gap — nothing here failed and there is nothing to
+                              # retry in this run. review-B0r4#1: emitting COVERAGE_CAP for a later-page
+                              # quota called the provider's boundary "a hard ceiling of OURS", so a
+                              # depletion produced complete_with_gaps.
 COVERAGE_CAP = "cap"          # a hard ceiling truncated eligible input: a gap whenever omitted>0 (10%/100 = priority only)
 COVERAGE_TIMEOUT = "timeout"  # input the TARGET/network cost us — a per-item timeout, an error-driven skip (e.g.
                               # nuclei -mhe dropping a host after N request errors), a deps-fail: ALWAYS feeds
@@ -291,7 +296,8 @@ def coverage_reset(source_id) -> dict:
 
 def coverage_partial(source_id, *, reason=None, produced=None,
                      eligible=None, tested=None, omitted=None, kind=None, unit=None, measure=None) -> dict:
-    """Ran but did not fully cover its input (timeout, deps-fail, a hard cap, a designed sample).
+    """Ran but did not fully cover its input (timeout, deps-fail, a hard cap, a designed sample, or an
+    external PROVIDER limit).
 
     Carries structured COUNTERS when the site can count them (None-dropped otherwise, so the legacy
     timeout callers that pass only ``reason`` are unchanged):

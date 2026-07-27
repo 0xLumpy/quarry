@@ -13,6 +13,7 @@ Output:  <project>/osint/<ts>/{raw/, candidates.jsonl, intel.jsonl, osint-report
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -25,7 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import osint_report, secrets
-from .runner import have, run as exec_tool, skipped
+from .contract import (ProviderBodyError, is_provider_limit, whoxy_envelope,
+                       whoxy_reverse_page)
+from .runner import RunResult, Status, have, run as exec_tool, skipped
 
 # Full email (no inner capture group) — findall returns the whole address.
 _EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", re.IGNORECASE)
@@ -77,6 +80,7 @@ class OsintSession:
         self._cands: dict[tuple, dict] = {}     # (type, value) -> candidate
         self._intel: list[dict] = []
         self._tool_runs: list[dict] = []
+        self._lane_failures: list[dict] = []    # native lanes that only echo (azmap/whois/dmarc/rdap)
         self.notes: list[str] = []
 
     def raw_path(self, source: str, name: str) -> Path:
@@ -86,9 +90,16 @@ class OsintSession:
 
     def record(self, result) -> None:
         # redact secret values from the recorded command/note (same choke point as store.Run.record)
-        self._tool_runs.append({"tool": result.tool, "status": str(result.status.value),
-                                "note": secrets.redact(result.note),
-                                "cmd": secrets.redact(" ".join(result.cmd))})
+        entry = {"tool": result.tool, "status": str(result.status.value),
+                 "note": secrets.redact(result.note),
+                 "cmd": secrets.redact(" ".join(result.cmd))}
+        # review-B0#3: carry the STRUCTURED outcome into the manifest. A provider limit recorded only as
+        # prose in `note` cannot be acted on — a consumer would have to grep English to tell "the account
+        # is out of credits" from "the tool broke", which is precisely the distinction B0 exists to make.
+        meta = getattr(result, "meta", None)
+        if isinstance(meta, dict) and meta:
+            entry["outcome"] = dict(meta)
+        self._tool_runs.append(entry)
 
     def candidate(self, value: str, ctype: str, source: str, scope_hint: str, reason: str,
                   raw_ref: str | None = None, manual_followup: str | None = None) -> None:
@@ -130,6 +141,32 @@ class OsintSession:
                                 {"high": 0, "med": 1, "low": 2}[c["confidence"]], c["value"]))
         return out
 
+    def note_failure(self, tool: str, why: str) -> None:
+        """Record a native-lane failure. review-B0r3#3: `_azmap` / `whois` / `dmarc` / `rdap` only ECHOED
+        their exceptions, so a session where half of them blew up still produced a clean verdict."""
+        self._lane_failures.append({"tool": tool, "why": secrets.redact(str(why))})
+
+    def outcome(self) -> dict:
+        """The session's own coverage verdict — the OSINT path has no events pipeline, so without this a
+        provider LIMIT lived only in a per-tool `outcome` block nothing ever read (review-B0r2#5), and the
+        CLI printed an unconditional green `osint done` over a run that never queried half its anchors."""
+        limits, gaps = [], list(self._lane_failures)
+        for tr in self._tool_runs:
+            out = tr.get("outcome") or {}
+            entry = {"tool": tr["tool"], "why": tr.get("note", ""), **out}
+            # review-B0r3#2: a limit and a gap are INDEPENDENT facts and one tool result can carry BOTH —
+            # query 1 fails or is page-limited, query 2 exhausts the credits. The old if/elif recorded only
+            # the limit, so a genuine gap vanished behind an expected boundary. Never `elif` these.
+            if out.get("provider_limit"):
+                limits.append(entry)
+            if (out.get("failed") or out.get("truncated_pages")
+                    or tr.get("status") in ("failed", "partial", "timed_out", "blocked")):
+                gaps.append(entry)
+        # gaps DOMINATE: a limit may only lift an otherwise-clean session.
+        verdict = ("complete_with_gaps" if gaps
+                   else "complete_with_limits" if limits else "complete")
+        return {"verdict": verdict, "provider_limits": limits, "gaps": gaps}
+
     def finalize(self, profile) -> Path:
         cands = self.candidates()
         (self.dir / "candidates.jsonl").write_text(
@@ -142,6 +179,7 @@ class OsintSession:
                                 "org_names": profile.org_names, "brands": profile.brands},
             "tool_runs": self._tool_runs, "candidate_count": len(cands),
             "intel_count": len(self._intel), "notes": self.notes,
+            "summary": self.outcome(),
         }, indent=2))
         report = osint_report.render(self, profile, cands, self._intel, MANUAL_TODO)
         (self.dir / "osint-report.md").write_text(report)
@@ -177,6 +215,7 @@ def _azmap(s: OsintSession, apex: str, echo, timeout: int) -> None:
         echo(f"  azmap[{apex}]: {len(obj.get('related_domains') or [])} related domains")
     except Exception as e:
         echo(f"    azmap[{apex}]: {e}")
+        s.note_failure("azmap", f"{apex}: {e}")
 
 
 def _whois(s: OsintSession, apex: str, echo, timeout: int) -> set[str]:
@@ -187,6 +226,11 @@ def _whois(s: OsintSession, apex: str, echo, timeout: int) -> set[str]:
                            timeout=min(timeout, 30), stdin=subprocess.DEVNULL)
         raw = s.raw_path("whois", f"{apex}.txt")
         raw.write_text(p.stdout)
+        # review-B0r4#2: `whois` can exit NONZERO without raising, so the lane parsed an empty/partial
+        # body and reported clean completion. An outcome check is not the same as an exception handler.
+        if p.returncode != 0:
+            s.note_failure("whois", f"{apex}: exit {p.returncode} "
+                                    f"{(p.stderr or '').strip().splitlines()[:1]}")
         for line in p.stdout.splitlines():
             low = line.lower()
             if "registrant organization" in low or "registrant org" in low:
@@ -200,6 +244,7 @@ def _whois(s: OsintSession, apex: str, echo, timeout: int) -> set[str]:
                 emails.add(email)
     except Exception as e:
         echo(f"    whois[{apex}]: {e}")
+        s.note_failure("whois", f"{apex}: {e}")
     return emails
 
 
@@ -210,6 +255,8 @@ def _dmarc(s: OsintSession, apex: str, echo, timeout: int) -> None:
                            stdin=subprocess.DEVNULL)
         raw = s.raw_path("dmarc", f"{apex}.txt")
         raw.write_text(p.stdout)
+        if p.returncode != 0:                          # review-B0r4#2: dig exits nonzero without raising
+            s.note_failure("dmarc", f"{apex}: dig exit {p.returncode}")
         for email in _EMAIL_RE.findall(p.stdout):       # rua/ruf mailto addresses
             dom = _email_domain(email)                  # the reporting DOMAIN is the candidate
             if not dom or dom == apex:
@@ -221,35 +268,117 @@ def _dmarc(s: OsintSession, apex: str, echo, timeout: int) -> None:
                         raw_ref=str(raw))
     except Exception as e:
         echo(f"    dmarc[{apex}]: {e}")
+        s.note_failure("dmarc", f"{apex}: {e}")
 
 
 def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeout: int) -> None:
-    """Reverse-whois by registrant EMAIL (from whois) and by ORG_NAMES (profile anchor)."""
+    """Reverse-whois by registrant EMAIL (from whois) and by ORG_NAMES (profile anchor).
+
+    review-B0#4: there is no first-N cap here any more. `[:5]` on each list was exactly the hidden
+    membership cap this migration exists to remove — it silently dropped anchors with no remainder and no
+    accounting. EVERY anchor is now queued; ordering decides what is asked FIRST, and the provider's own
+    balance decides how many are asked at all. Whatever the credits do not reach is reported, not hidden.
+
+    review-B0#2/#6: every query's outcome is counted and the lane ALWAYS records a lifecycle. Three failed
+    queries used to produce no manifest record at all, and one failure among two successes recorded a flat
+    SUCCESS. `attempted` counts requests actually SENT, `completed` those that returned a usable answer;
+    they are different numbers and the exhausted-on-the-first-call case proves it (attempted 1,
+    completed 0)."""
     key = secrets.whoxy()
     if not key:
         s.record(skipped("whoxy", "no Whoxy key in secrets.yaml"))
         return
-    # (param, value, label) queries: emails first, then org-name anchors
-    queries = [("email", e, f"registrant email {e}") for e in sorted(emails)[:5]]
-    queries += [("company", o, f"org name '{o}'") for o in (org_names or [])[:5]]
+    # ORDER (not membership): registrant emails are the stronger ownership signal, so they go first; org
+    # names are noisier anchors. Deterministic within each group.
+    queries = [("email", e, f"registrant email {e}") for e in sorted(emails)]
+    queries += [("company", o, f"org name '{o}'") for o in sorted(org_names or [])]
     if not queries:
+        s.record(skipped("whoxy", "no registrant email / org-name anchors to pivot on"))
         return
+    eligible = len(queries)
+    attempted = completed = failed = 0
+    truncated_pages = 0
+    limit_reason = limit_class = ""
     for param, val, label in queries:
+        if limit_class:
+            break                                            # credits are spent; asking again just fails
+        attempted += 1
         try:
             q = urllib.parse.quote(val)
             data = _http(f"https://api.whoxy.com/?key={key}&reverse=whois&{param}={q}",
                          timeout=min(timeout, 60))
-            raw = s.raw_path("whoxy", f"{param}-{re.sub(r'[^a-z0-9]+','_',val.lower())[:40]}.json")
+            # review-B0r2#3: the old name was a lossy 40-char slug, so `Acme Inc` and `Acme-Inc` (and any
+            # two anchors sharing a normalised prefix) collided — the later response OVERWROTE the earlier
+            # one while the earlier candidates kept pointing at that same raw_ref, i.e. provenance that
+            # silently names the wrong evidence. Identity = digest over (query type, anchor, page).
+            ident = hashlib.sha256(f"{param}\x00{val}\x00page=1".encode()).hexdigest()
+            slug = re.sub(r"[^a-z0-9]+", "_", val.lower())[:32]
+            raw = s.raw_path("whoxy", f"{param}-{slug}-{ident}.json")
             raw.write_text(data)
-            obj = json.loads(data)
-            doms = obj.get("domainsList") or [d.get("domain_name")
-                                              for d in obj.get("search_result", [])]
-            for d in (doms or []):
+            # `status` is the authority. Whoxy reports failure — including a spent balance — inside an
+            # HTTP 200, so reading the results key directly turned an exhausted account into "0 domains"
+            # (a false EMPTY: no error, no event, silently lost coverage).
+            obj = whoxy_envelope(json.loads(data))
+            doms, total, truncated = whoxy_reverse_page(obj, page=1)
+            for d in doms:
                 s.candidate(d, "apex", "whoxy-revwhois", "in-scope-likely",
                             f"reverse-whois on {label}", raw_ref=str(raw))
-            echo(f"  whoxy[{label}]: {len(doms or [])} domains")
+            completed += 1
+            if truncated:
+                truncated_pages += 1
+                echo(f"  whoxy[{label}]: {len(doms)} of {total} domains — MORE PAGES not fetched")
+            else:
+                echo(f"  whoxy[{label}]: {len(doms)} domains")
+        except ProviderBodyError as e:
+            if is_provider_limit(e.error_class):
+                limit_class, limit_reason = e.error_class, e.reason
+                echo(f"    whoxy[{label}]: {e.reason} — provider {e.error_class}, "
+                     f"{eligible - attempted} query(ies) not sent")
+            else:
+                failed += 1
+                echo(secrets.redact(f"    whoxy[{label}]: {e.reason} ({e.error_class})"))
         except Exception as e:
+            failed += 1                                       # HTTP/transport/JSON — a real failure
             echo(secrets.redact(f"    whoxy[{label}]: {e}"))  # error may echo the key= URL
+    not_sent = eligible - attempted
+    counts = (f"{attempted}/{eligible} attempted · {completed} completed · {failed} failed"
+              + (f" · {not_sent} not sent" if not_sent else "")
+              + (f" · {truncated_pages} truncated page(s)" if truncated_pages else ""))
+    cmd = ["whoxy", "reverse=whois"]
+    if limit_class:
+        # a LIMIT, not a failure: the lane behaved correctly and the provider stopped us. The class is
+        # carried STRUCTURALLY (meta), not only in free text, so a consumer can act on it.
+        s.record(RunResult("whoxy", cmd, Status.LIMITED, None, 0.0, None, completed,
+                           note=f"provider limit ({limit_class}): {limit_reason} — {counts}",
+                           meta={"error_class": limit_class, "provider_limit": True,
+                                 "eligible": eligible, "attempted": attempted,
+                                 "completed": completed, "failed": failed, "not_sent": not_sent,
+                                 "truncated_pages": truncated_pages, "coverage_incomplete": True}))
+    elif failed and completed:
+        s.record(RunResult("whoxy", cmd, Status.PARTIAL, None, 0.0, None, completed,
+                           note=f"partial: {counts}",
+                           meta={"eligible": eligible, "attempted": attempted,
+                                 "completed": completed, "failed": failed,
+                                 "truncated_pages": truncated_pages, "coverage_incomplete": True}))
+    elif failed:
+        s.record(RunResult("whoxy", cmd, Status.FAILED, None, 0.0, None, 0,
+                           note=f"every reverse-whois query failed: {counts}",
+                           meta={"eligible": eligible, "attempted": attempted,
+                                 "completed": 0, "failed": failed, "coverage_incomplete": True}))
+    elif truncated_pages:
+        # review-B0r2#2: a page-limited answer is INCOMPLETE COVERAGE, not a clean success. Whoxy pages at
+        # 100 results and charges a credit per page, so fetching the rest is credit-budget work (B1); until
+        # then the shortfall must be visible instead of being reported as the whole answer.
+        s.record(RunResult("whoxy", cmd, Status.PARTIAL, None, 0.0, None, completed,
+                           note=f"page-limited: {counts}",
+                           meta={"eligible": eligible, "attempted": attempted, "completed": completed,
+                                 "failed": 0, "truncated_pages": truncated_pages,
+                                 "coverage_incomplete": True}))
+    else:
+        s.record(RunResult("whoxy", cmd, Status.SUCCESS, 0, 0.0, None, completed,
+                           note=counts,
+                           meta={"eligible": eligible, "attempted": attempted,
+                                 "completed": completed, "failed": 0}))
 
 
 def _asn_expand(s: OsintSession, profile, echo, timeout: int) -> None:
@@ -306,7 +435,10 @@ def _rdap(s: OsintSession, profile, echo, timeout: int) -> None:
     for apex in profile.apex_domains:
         try:
             ips.update(socket.gethostbyname_ex(apex)[2])
-        except Exception:
+        except Exception as e:
+            # review-B0r4#2: a silent `continue` meant an apex we could not resolve contributed NOTHING
+            # to the verdict — the RDAP lane then reported clean completion over an unexamined apex.
+            s.note_failure("rdap", f"{apex}: resolve failed — {e}")
             continue
     for ip in sorted(ips)[:20]:                       # bound RDAP lookups
         try:
@@ -316,6 +448,7 @@ def _rdap(s: OsintSession, profile, echo, timeout: int) -> None:
             obj = json.loads(data)
         except Exception as e:
             echo(f"    rdap[{ip}]: {e}")
+            s.note_failure("rdap", f"{ip}: {e}")
             continue
         netname = (obj.get("name") or "").strip()
         org = _rdap_org(obj)

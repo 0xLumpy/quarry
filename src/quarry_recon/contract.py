@@ -19,7 +19,7 @@ import json as _json
 import socket as _socket
 import urllib.error as _urlerr
 
-from . import events, sources
+from . import events, normalize, sources
 from .runner import Status, run as _run, skipped
 
 # Non-clean terminal statuses that warrant a dedicated event before the normal tool_finish.
@@ -45,24 +45,211 @@ class ProviderResult(set):
         self.partial_reason = partial_reason
 
 
+# ── shared PROVIDER OUTCOME taxonomy (B0) ────────────────────────────────────────────────────────────
+# ONE taxonomy for every external provider, whether it runs in the events pipeline (vertical/probe) or in
+# the standalone OSINT session (whoxy). Each class implies a DIFFERENT operator action, so collapsing any
+# two of them destroys the only information the label carries:
+#
+#   auth         bad/missing credential          -> the operator fixes a key
+#   forbidden    the server said no, reason UNKNOWN -> a plain failure until something proves otherwise
+#   entitlement  the PLAN cannot, per provider EVIDENCE -> an external LIMIT
+#   rate_limit   too fast RIGHT NOW               -> back off and retry; the quota is untouched
+#   quota        the account's CREDITS are spent  -> an external LIMIT, not a failure; nothing to retry
+#   transport / server / parse / error            -> ordinary failures
+#
+# review-B0#1: a bare 403 is NOT entitlement. A WAF, an IP allow-list, a permission error and a malformed
+# request all return 403, and calling any of them an expected LIMIT would let a real defect pass the run
+# as "the plan is just too small". 403 maps to `forbidden`; only provider EVIDENCE promotes it.
+#
+# QUOTA IS NEVER INFERRED FROM AN HTTP STATUS. It is proven from the provider's own response body or its
+# balance endpoint. Measured 2026-07-27: Whoxy reports exhaustion as `{"status":0,"status_reason":"Zero
+# Account Balance"}` inside an HTTP **200** — no status code could ever have revealed it.
+PROVIDER_AUTH = "auth"
+PROVIDER_FORBIDDEN = "forbidden"
+PROVIDER_ENTITLEMENT = "entitlement"
+PROVIDER_RATE_LIMIT = "rate_limit"
+PROVIDER_QUOTA = "quota"
+PROVIDER_TRANSPORT = "transport"
+PROVIDER_SERVER = "server"
+PROVIDER_PARSE = "parse"
+PROVIDER_HTTP = "http"
+PROVIDER_ERROR = "error"
+
+#: classes that are an EXTERNAL LIMIT rather than a defect — coverage is incomplete, but nothing failed
+#: and nothing is retryable within the run. These feed `complete_with_limits`, never `complete_with_gaps`.
+PROVIDER_LIMITS = frozenset({PROVIDER_QUOTA, PROVIDER_ENTITLEMENT})
+
+
+def is_provider_limit(error_class) -> bool:
+    """True when the class is an external provider LIMIT (quota/entitlement) rather than a failure."""
+    return error_class in PROVIDER_LIMITS
+
+
 def classify_provider_error(exc) -> str:
     """C06: map an in-process provider exception to an EXPLICIT class so a consumer can tell a real failure
-    from 'nothing found' and pick the right response (auth → stop, quota → backoff, transport → retry). A
-    coarse, HTTP-aware taxonomy over stdlib urllib — never a guess, only a mapping of the raised type."""
+    from 'nothing found' and pick the right response (auth → fix the key, entitlement → the plan is the
+    limit, rate_limit → back off, transport → retry). A coarse, HTTP-aware taxonomy over stdlib urllib —
+    never a guess, only a mapping of the raised type.
+
+    B0 (review r1): 401 and 403 were both `auth`, and 429 was `quota`. Both were wrong — but so was the
+    first fix. A 403 is only ever `forbidden` here: entitlement is a claim about the PLAN, and a status
+    code cannot distinguish it from a WAF, an IP restriction or a malformed request (review-B0#1).
+    Neither `quota` nor `entitlement` may EVER be returned from this function: both are LIMITS, and a
+    limit must be proven from the provider's body or balance endpoint, never inferred from a code."""
     if isinstance(exc, _urlerr.HTTPError):
         code = getattr(exc, "code", None)
-        if code in (401, 403):
-            return "auth"                                    # bad/missing key, forbidden — do not retry
+        if code == 401:
+            return PROVIDER_AUTH                             # bad/missing key — do not retry
+        if code == 403:
+            return PROVIDER_FORBIDDEN                        # reason unknown — NOT assumed to be the plan
         if code == 429:
-            return "quota"                                   # rate/quota exhausted — back off
+            return PROVIDER_RATE_LIMIT                       # too fast now — back off; credits untouched
         if code is not None and 500 <= code < 600:
-            return "server"                                  # upstream 5xx — transient, retryable
-        return "http"                                        # other 4xx
+            return PROVIDER_SERVER                           # upstream 5xx — transient, retryable
+        return PROVIDER_HTTP                                 # other 4xx
     if isinstance(exc, (_urlerr.URLError, _socket.timeout, TimeoutError, ConnectionError, OSError)):
-        return "transport"                                   # DNS/connect/timeout — retryable
+        return PROVIDER_TRANSPORT                            # DNS/connect/timeout — retryable
     if isinstance(exc, (_json.JSONDecodeError, ValueError)):
-        return "parse"                                       # malformed/schema-drift body
-    return "error"                                           # unclassified
+        return PROVIDER_PARSE                                # malformed/schema-drift body
+    return PROVIDER_ERROR                                    # unclassified
+
+
+class ProviderBodyError(Exception):
+    """A provider reported failure INSIDE a successful HTTP response.
+
+    The whole point of the class: an HTTP-status-only taxonomy cannot see these. Whoxy answers 200 with
+    `{"status":0,"status_reason":"Zero Account Balance"}`; parsing straight past that envelope turned a
+    spent account into a clean `0 domains` result — a false EMPTY, which is worse than an error because
+    nothing looks wrong. Carries the class AND the provider's verbatim reason (never paraphrased: an
+    unrecognised reason must reach the operator intact)."""
+
+    def __init__(self, error_class: str, reason: str, provider: str = ""):
+        super().__init__(f"{provider or 'provider'}: {reason}" if reason else (provider or "provider error"))
+        self.error_class = error_class
+        self.reason = reason
+        self.provider = provider
+
+
+#: Body-reason substrings that PROVE an exhausted-credit condition, per provider. Matching is deliberately
+#: NARROW and allow-list only: an unrecognised failure reason stays a generic error, because calling an
+#: unknown failure a "limit" would let a real defect read as an expected boundary and quietly pass the run.
+#: (Fail-closed in the direction that keeps problems visible.)
+#: review-B0#7: EXACT (normalised) match, not substring. "Non-zero Account Balance" contains the measured
+#: string and would have been classified as exhausted — a substring test cannot distinguish a message from
+#: its own negation. Normalisation is case + whitespace only; add variants when they are MEASURED.
+_QUOTA_REASONS = {
+    "whoxy": frozenset({"zero account balance"}),            # MEASURED 2026-07-27, inside an HTTP 200
+}
+
+
+def _norm_reason(reason: str) -> str:
+    return " ".join((reason or "").split()).strip().lower()
+
+
+def classify_provider_reason(provider: str, reason: str) -> str:
+    """Map a provider's own failure reason to a taxonomy class. Only the MEASURED exhaustion strings become
+    PROVIDER_QUOTA; everything else is PROVIDER_ERROR with the reason preserved verbatim by the caller."""
+    if _norm_reason(reason) in _QUOTA_REASONS.get(provider, frozenset()):
+        return PROVIDER_QUOTA
+    return PROVIDER_ERROR
+
+
+def whoxy_envelope(doc, *, provider: str = "whoxy"):
+    """Validate Whoxy's status envelope, raising ProviderBodyError on a reported failure.
+
+    MEASURED (HTTP 200 in every case):
+        success   {"status": 1, ...}
+        exhausted {"status": 0, "status_reason": "Zero Account Balance"}
+        balance   {"status": 1, "live_whois_balance": 0, "whois_history_balance": 0,
+                   "reverse_whois_balance": 0}
+
+    `status` is the authority, not the presence of a results key: a failure body simply has no results
+    key, which is exactly how an exhausted account previously read as "0 domains found".
+
+    review-B0#5: the SUCCESS side must be validated too, or the fix is only half a fix. `status == 1`
+    accepted `True` and `1.0` (in Python `True == 1`), and a bodiless `{"status": 1}` sailed through as a
+    clean success — so a drifted or truncated response still produced a confident empty result. A success
+    envelope must be an exact int 1 AND carry the documented result shape."""
+    if not isinstance(doc, dict):
+        raise ProviderBodyError(PROVIDER_PARSE, "response was not a JSON object", provider)
+    status = doc.get("status")
+    if isinstance(status, bool) or not isinstance(status, int):
+        raise ProviderBodyError(PROVIDER_PARSE, f"non-integer status {status!r}", provider)
+    if status != 1:
+        reason = doc.get("status_reason")
+        reason = reason.strip() if isinstance(reason, str) and reason.strip() else f"status={status!r}"
+        raise ProviderBodyError(classify_provider_reason(provider, reason), reason, provider)
+    return doc
+
+
+def whoxy_reverse_rows(doc, *, provider: str = "whoxy") -> list:
+    """A VALIDATED reverse-whois result list from an already-enveloped Whoxy body -> [domain, ...].
+
+    review-B0#5: the old read was `doc.get("domainsList") or [d.get("domain_name") for d in
+    doc.get("search_result", [])]`, which fails OPEN in three ways: a missing results key becomes a clean
+    empty, a non-dict row raises deep in the caller, and a `None` domain becomes a candidate. The
+    documented schema carries `total_results` + `search_result`, so a success body that has neither is
+    schema drift, not an empty answer.
+
+    Cardinality is CHECKED, not trusted: `total_results` is the provider's own count of matches, and a
+    page holding fewer rows than that is PAGINATED — reporting the page as the whole answer is a silent
+    coverage loss. The caller receives the rows and the shortfall is surfaced by `whoxy_reverse_page`."""
+    rows = doc.get("search_result")
+    if rows is None and isinstance(doc.get("domainsList"), list):
+        rows = [{"domain_name": d} for d in doc["domainsList"]]   # documented alternate shape
+    if not isinstance(rows, list):
+        raise ProviderBodyError(PROVIDER_PARSE, "success body has no search_result list", provider)
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ProviderBodyError(PROVIDER_PARSE, f"non-object result row ({type(row).__name__})", provider)
+        name = row.get("domain_name")
+        # review-B0r2#6: "contains a dot" is not a hostname test — it admitted `a..b`, `../evil.com`,
+        # `http://evil.com` and names with whitespace, each of which would have become an apex CANDIDATE
+        # (and a path-shaped one is a traversal primitive the moment anything derives a filename from it).
+        # Reuse Quarry's ONE strict IDNA canonicaliser instead of inventing a third policy.
+        canon = normalize.canon_host_strict(name) if isinstance(name, str) else None
+        if not canon or "." not in canon:
+            raise ProviderBodyError(PROVIDER_PARSE, f"result row has no usable domain_name ({name!r})",
+                                    provider)
+        out.append(canon)
+    return out
+
+
+def whoxy_reverse_page(doc, *, provider: str = "whoxy", page: int = 1) -> tuple:
+    """-> (rows, total_results, truncated). `truncated` is True when the provider says it holds more
+    matches than this page returned — a PAGINATION shortfall the caller must report rather than absorb.
+
+    review-B0r3#4: the page position is REQUIRED, not validated-if-present. Optional validation let a body
+    missing both fields through unchecked, and would have accepted a page-2 response for our page-1
+    request — silently attributing one slice of the answer to another. `page` is what we ASKED for, and
+    the response must say it is that page."""
+    rows = whoxy_reverse_rows(doc, provider=provider)
+    total = doc.get("total_results")
+    # review-B0r2#4: an ABSENT or garbled cardinality is schema drift, not "no claim to check". Treating
+    # it as unknown-but-fine let a drifted body finish CLEAN — the same fail-open shape as the original
+    # false empty, one level up. The documented success schema carries total_results, so its absence,
+    # its wrong type, a negative value, or a count SMALLER than the rows actually delivered are all
+    # unusable cardinality and must fail closed.
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise ProviderBodyError(PROVIDER_PARSE, f"success body has no usable total_results ({total!r})",
+                                provider)
+    if total < len(rows):
+        raise ProviderBodyError(PROVIDER_PARSE,
+                                f"total_results {total} is smaller than the {len(rows)} rows returned",
+                                provider)
+    # the documented schema carries the page position — both fields, always.
+    cur, pages = doc.get("current_page"), doc.get("total_pages")
+    for label, v in (("current_page", cur), ("total_pages", pages)):
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise ProviderBodyError(PROVIDER_PARSE, f"missing/invalid {label} ({v!r})", provider)
+    if cur > pages:
+        raise ProviderBodyError(PROVIDER_PARSE, f"current_page {cur} exceeds total_pages {pages}", provider)
+    if cur != page:
+        raise ProviderBodyError(PROVIDER_PARSE,
+                                f"response is page {cur}, but page {page} was requested", provider)
+    truncated = total > len(rows) or pages > 1
+    return rows, total, truncated
 
 
 def _emit_terminal(source_id, src, res, *, work_unit, parent_id, scope_distance, discovery_context):
@@ -114,6 +301,14 @@ def run_provider(source_id, fn, *, work_unit=None, input_total=None):
     reset_gen = events.mark_provider_generation(source_id)   # first terminal per source per session
     events.tool_start(source_id, input_total=input_total, work_unit=work_unit,
                       provider=True, reset_generation=reset_gen)
+    if reset_gen:
+        # review-B0r5#1: the TERMINAL generation and the COVERAGE generation were independent. A provider
+        # that emitted `coverage:cap` last session and then stops on page 1 this session (quota, or any
+        # failure) emits NO pagination counter at all — so nothing superseded the old cap, and a stale
+        # gap from a previous run dragged this run's honest `complete_with_limits` back to
+        # `complete_with_gaps`. Opening the coverage generation alongside the provider generation makes
+        # the two move together: prior units are a stale snapshot the moment this source runs again.
+        events.coverage_reset(source_id)
     result = None
     status = Status.FAILED.value                             # default: covers a raise BEFORE a result is computed
     reason = n = error_class = None
@@ -124,13 +319,20 @@ def run_provider(source_id, fn, *, work_unit=None, input_total=None):
         if isinstance(result, ProviderResult):
             if result.partial and result.partial_kind == "pagination":
                 is_pagination = True
-                status = Status.PARTIAL.value
                 error_class = result.error_class
+                # review-B0r4#1: the PAGINATION branch ran BEFORE any limit check, so a later page that
+                # died on spent credits became a degraded PARTIAL *and* a COVERAGE_CAP — i.e. Quarry
+                # claiming its own hard ceiling truncated the input. A proven provider limit is LIMITED
+                # with provider-limit coverage, whatever stopped us and on whichever page.
+                status = (Status.LIMITED.value if is_provider_limit(error_class)
+                          else Status.PARTIAL.value)
                 reason = (f"pagination TRUNCATED at {result.pages} page(s), cursor={result.cursor!r}"
                           + (f" — {error_class} on a later page (earlier pages KEPT)" if error_class else ""))
             elif result.partial:                            # review-r4#2: a GENERIC degraded partial (NOT pagination)
-                status = Status.PARTIAL.value
                 error_class = result.error_class
+                # a partial caused by a PROVIDER LIMIT is not degradation either (r3#1)
+                status = (Status.LIMITED.value if is_provider_limit(error_class)
+                          else Status.PARTIAL.value)
                 reason = result.partial_reason or f"partial result ({error_class or 'degraded'}) — earlier evidence KEPT"
             else:                                            # a complete ProviderResult — a paginating provider
                 is_pagination = result.pages is not None     # (only paginating providers carry a completion counter)
@@ -139,7 +341,18 @@ def run_provider(source_id, fn, *, work_unit=None, input_total=None):
             status = Status.SUCCESS.value if n else Status.EMPTY.value
     except Exception as e:                                   # ordinary provider error — record FAILED, don't crash phase
         reason, result = f"{type(e).__name__}: {e}", None
-        error_class = classify_provider_error(e)            # C06: auth/quota/transport/parse/server/error
+        # B0: a ProviderBodyError already carries a class PROVEN from the provider's own body, which the
+        # generic HTTP/type mapping cannot see (it would flatten a measured "Zero Account Balance" into
+        # `error`) — so a body-proven LIMIT could never reach the terminal or the verdict. The proven
+        # class wins; everything else falls back to the exception-type mapping.
+        error_class = getattr(e, "error_class", None) or classify_provider_error(e)
+        # review-B0r2#1 / r3#1: a PROVEN limit is neither a FAILED nor a DEGRADED execution. FAILED left
+        # tool_status.failed lying; PARTIAL then left tool_status.partial lying, because "degraded" asserts
+        # something went wrong HERE and nothing did. Status.LIMITED is the distinct, non-degraded outcome:
+        # the execution was clean and a third party cut it short. The provider OUTCOME (error_class) and
+        # the EXECUTION status stay independent facts.
+        if is_provider_limit(error_class):
+            status = Status.LIMITED.value
     finally:
         # review#7: emit from a finally so a terminal ALSO fires on KeyboardInterrupt/SystemExit (which are NOT
         # `Exception`) — the BaseException then re-raises past this finally, cancelling the run, but the
@@ -148,8 +361,21 @@ def run_provider(source_id, fn, *, work_unit=None, input_total=None):
             # review-r2#1: a STRUCTURED per-unit completion counter the VERDICT can see. Emitted EVERY run
             # (omitted=0 when complete) so a later complete rerun CLEARS a prior truncation; keyed on work_unit
             # so each apex reconciles alone. Only for PAGINATION outcomes — never for a generic degraded partial.
-            truncated = status == Status.PARTIAL.value
-            events.coverage_partial(source_id, kind=events.COVERAGE_CAP, measure="pagination",
+            truncated = status in (Status.PARTIAL.value, Status.LIMITED.value)
+            # the KIND records WHOSE boundary stopped us, and attribution matters for tuning (and for the
+            # future AI interface) even when the verdict is a gap either way:
+            #   provider -> a PROVEN limit (credits/plan): a soft limit, not a defect
+            #   timeout  -> a later page was LOST IN FLIGHT (429 / transport / 5xx) — the target's cost
+            #   cap      -> OUR configured max_pages ceiling truncated it — the only one that is ours
+            # review-B0r5#2: everything non-limit was labelled `cap`, which blamed Quarry's ceiling for a
+            # rate-limited or broken page it never reached.
+            if status == Status.LIMITED.value:
+                _kind = events.COVERAGE_PROVIDER
+            elif error_class:
+                _kind = events.COVERAGE_TIMEOUT
+            else:
+                _kind = events.COVERAGE_CAP
+            events.coverage_partial(source_id, kind=_kind, measure="pagination",
                                     unit=(work_unit or source_id), eligible=1,
                                     tested=0 if truncated else 1, omitted=1 if truncated else 0,
                                     reason=(reason if truncated else "pagination complete"))

@@ -34,8 +34,10 @@ def _http(code):
 
 class TestClassifier:
     @pytest.mark.parametrize("exc,cls", [
-        (_http(401), "auth"), (_http(403), "auth"),
-        (_http(429), "quota"),
+        # B0: 401 (bad key) and 403 (plan/entitlement) are DIFFERENT operator actions; 429 is a RATE
+        # LIMIT, not spent credits. Quota is proven from a body/balance and can never come from a code.
+        (_http(401), "auth"), (_http(403), "forbidden"),
+        (_http(429), "rate_limit"),
         (_http(500), "server"), (_http(503), "server"),
         (_http(418), "http"),
         (urllib.error.URLError("dns boom"), "transport"),
@@ -51,22 +53,36 @@ class TestClassifier:
 
     def test_httperror_precedence_over_oserror(self):
         # HTTPError is an OSError subclass — must classify by HTTP code, not fall through to transport
-        assert classify_provider_error(_http(403)) == "auth"
+        assert classify_provider_error(_http(403)) == "forbidden"
+
+    def test_no_http_status_can_produce_quota(self):
+        """Quota is an account-balance fact, provable only from a provider body or balance endpoint.
+        Whoxy reports a spent account inside an HTTP 200, so no status code implies it."""
+        codes = [200, 400, 401, 402, 403, 404, 418, 429, 500, 503]
+        assert all(classify_provider_error(_http(c)) != "quota" for c in codes)
 
 
 class TestRunProviderTagsErrorClass:
     def test_auth_failure_tagged(self, tmp_path):
         def boom():
-            raise _http(403)
+            raise _http(401)
         assert contract.run_provider("vertical.crtsh", boom) is None
         t = _terminal(tmp_path)
         assert t["status"] == "failed" and t["error_class"] == "auth"
 
-    def test_quota_failure_tagged(self, tmp_path):
+    def test_forbidden_failure_tagged(self, tmp_path):
+        """A 403 is NEUTRAL: a WAF, an IP allow-list and a plan limit all produce it, so it stays a plain
+        failure. Only provider EVIDENCE may promote it to the `entitlement` LIMIT."""
+        def boom():
+            raise _http(403)
+        assert contract.run_provider("vertical.crtsh", boom) is None
+        assert _terminal(tmp_path)["error_class"] == "forbidden"
+
+    def test_rate_limit_failure_tagged(self, tmp_path):
         def boom():
             raise _http(429)
         contract.run_provider("vertical.crtsh", boom)
-        assert _terminal(tmp_path)["error_class"] == "quota"
+        assert _terminal(tmp_path)["error_class"] == "rate_limit"
 
     def test_transport_failure_tagged(self, tmp_path):
         def boom():

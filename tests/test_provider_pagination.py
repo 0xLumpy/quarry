@@ -177,7 +177,7 @@ class TestCensysPagination:
             raise urllib.error.HTTPError("u", 429, "rate", {}, None)   # page 2 fails
         monkeypatch.setattr(vertical.urllib.request, "urlopen", fake)
         r = vertical._censys({"token": "t", "org": "o"}, "acme.com", max_pages=5)
-        assert isinstance(r, ProviderResult) and r.partial and "a.acme.com" in r and r.error_class == "quota"
+        assert isinstance(r, ProviderResult) and r.partial and "a.acme.com" in r and r.error_class == "rate_limit"
 
     def test_first_page_failure_propagates(self, monkeypatch):
         # review-r2#4: a FIRST-page failure has no earlier evidence -> propagate (run_provider -> FAILED)
@@ -289,7 +289,7 @@ class TestVerdictFoldsProviderTerminals:
         s = self._summary(tmp_path, run)
         assert s["verdict"] == "complete_with_gaps"
         f = [x for x in s["failures"] if x["tool"] == "vertical.crtsh"]
-        assert f and f[0]["error_class"] == "auth"
+        assert f and f[0]["error_class"] == "forbidden"
         events.reset()
 
     def test_partial_provider_is_a_gap(self, tmp_path):
@@ -482,7 +482,7 @@ class TestShodanPivot:
             ctx, "k", ["h1"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}"))
         assert out is None
         term = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines() if '"tool_finish"' in l]
-        assert term[-1]["status"] == "failed" and term[-1]["error_class"] == "quota"
+        assert term[-1]["status"] == "failed" and term[-1]["error_class"] == "rate_limit"
 
     def test_some_fail_is_partial_with_dominant_class(self, monkeypatch, tmp_path):
         # SOME pivots fail (with a successful one) -> PARTIAL ProviderResult carrying the dominant error class
@@ -496,7 +496,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.urllib.request, "urlopen", mixed)
         ctx, _ = self._ctx(tmp_path)
         r = probe._shodan_pivot(ctx, "k", ["h_good", "h_bad"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
-        assert isinstance(r, ProviderResult) and r.partial and r.error_class == "quota" and "real.acme.com" in r
+        assert isinstance(r, ProviderResult) and r.partial and r.error_class == "rate_limit" and "real.acme.com" in r
 
     def test_truncation_flagged_when_total_exceeds_paged(self, monkeypatch, tmp_path):
         from quarry_recon.phases import probe

@@ -123,7 +123,10 @@ def reclassify_from_artifact(r: "RunResult", n: "int | None", *, label: str = "t
       - degraded (anything else — FAILED/TIMED_OUT/BLOCKED/PARTIAL): n>0 -> PARTIAL (evidence, incomplete);
         n==0 or None -> KEEP the original status (an empty/absent artifact preserves nothing, so a hard
         run is NEVER laundered into SUCCESS/EMPTY)."""
-    if r.status == Status.SKIPPED:
+    if r.status in (Status.SKIPPED, Status.LIMITED):
+        # review-B0r4#3: LIMITED must never be re-derived from an artifact. It is a PROVEN provider
+        # boundary; folding it into the clean/degraded matrix would either launder it into SUCCESS
+        # (losing the limit) or demote it to a degraded PARTIAL (inventing a defect).
         return r
     # enforce the count contract: only a real int >= 0 is a trustworthy count. bool (a truthy int
     # subclass), float, str, or a negative -> None (no trustworthy artifact), so a bad count fails CLOSED
@@ -234,7 +237,10 @@ def reclassify_ffuf(r: "RunResult", out_file, stderr_file=None, maxtime=None) ->
     A missing / invalid `-o` (hard error / real block before write) keeps the classifier verdict.
     Callers MUST clear `out_file` before invoking ffuf so a stale prior-run artifact can't fake completion.
     Sets stdout_lines to the result count. Returns the mutated RunResult."""
-    if r.status == Status.SKIPPED:
+    if r.status in (Status.SKIPPED, Status.LIMITED):
+        # review-B0r4#3: LIMITED must never be re-derived from an artifact. It is a PROVEN provider
+        # boundary; folding it into the clean/degraded matrix would either launder it into SUCCESS
+        # (losing the limit) or demote it to a degraded PARTIAL (inventing a defect).
         return r                                             # never ran -> no artifact refinement
     # ffuf hit its native -maxtime ceiling: it STOPS mid-wordlist, finalizes the artifact, then exits
     # CLEAN (exit 0) — so the generic classifier reads SUCCESS/EMPTY even though the run was TRUNCATED.
@@ -338,6 +344,11 @@ class Status(str, Enum):
     TIMED_OUT = "timed_out"
     BLOCKED = "blocked"     # stderr matches WAF/rate-limit/forbidden signatures
     SKIPPED = "skipped"     # not run (scope/mode/missing tool/no input)
+    # review-B0r3#1: an EXTERNAL PROVIDER LIMIT (credits spent, plan cannot reach the endpoint) is a
+    # CLEAN execution that a third party cut short. It is not FAILED and it is not degraded either — a
+    # degraded count says something went wrong here, and nothing did. Distinct outcome, deliberately
+    # OUTSIDE store._DEGRADED, so it feeds `complete_with_limits` without inflating any trouble counter.
+    LIMITED = "limited"     # ran clean; the PROVIDER stopped us (quota/entitlement) — coverage incomplete
 
 
 # stderr signatures of a real DENIAL — the target STOPPED us (WAF/rate-limit/forbidden), not "nothing exists".
@@ -371,7 +382,9 @@ class RunResult:
 
     @property
     def ok(self) -> bool:
-        return self.status in (Status.SUCCESS, Status.PARTIAL)
+        """Ran acceptably. review-B0r4#3: LIMITED belongs here — the execution was CLEAN and a provider
+        cut it short, so excluding it would make an external limit read as 'did not run acceptably'."""
+        return self.status in (Status.SUCCESS, Status.PARTIAL, Status.LIMITED)
 
 
 def have(bin_name: str) -> bool:
