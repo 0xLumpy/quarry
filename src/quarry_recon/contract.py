@@ -216,16 +216,93 @@ def whoxy_reverse_rows(doc, *, provider: str = "whoxy") -> list:
     return out
 
 
-def whoxy_reverse_page(doc, *, provider: str = "whoxy", page: int = 1) -> tuple:
+def whoxy_reverse_page(doc, *, provider: str = "whoxy", page: int = 1,
+                       param: "str | None" = None, value: "str | None" = None) -> tuple:
     """-> (rows, total_results, truncated). `truncated` is True when the provider says it holds more
     matches than this page returned — a PAGINATION shortfall the caller must report rather than absorb.
+
+    `param`/`value` are the REQUEST IDENTITY (e.g. ``("company", "Acme Inc")``) — the compact zero-result
+    shape carries no rows to check, so the only thing tying it to our question is its own echo of it.
 
     review-B0r3#4: the page position is REQUIRED, not validated-if-present. Optional validation let a body
     missing both fields through unchecked, and would have accepted a page-2 response for our page-1
     request — silently attributing one slice of the answer to another. `page` is what we ASKED for, and
     the response must say it is that page."""
-    rows = whoxy_reverse_rows(doc, provider=provider)
     total = doc.get("total_results")
+    # MEASURED 2026-07-27 — a genuine reverse-whois NO-MATCH (HTTP 200):
+    #   {"status": 1, "api_query": "reverse_whois", "search_identifier": {"company": "<what we asked>"},
+    #    "total_results": 0, "api_execution_time": 0.01}
+    # i.e. NO `search_result`, NO `current_page`, NO `total_pages`. The first fix accepted "any body whose
+    # total_results is 0", which was far wider than the evidence: a bare {"status":1,"total_results":0},
+    # an `account_balance` answer, or a half-paged hybrid all became a clean EMPTY — re-creating the very
+    # false-empty this batch exists to kill. EXACTLY TWO shapes are accepted, and nothing in between.
+    if isinstance(total, int) and not isinstance(total, bool) and total == 0:
+        sr, dl = doc.get("search_result"), doc.get("domainsList")
+        cur, pages = doc.get("current_page"), doc.get("total_pages")
+        # a zero count with actual rows is contradictory in EITHER supported carrier
+        for name, v in (("search_result", sr), ("domainsList", dl)):
+            if v is not None and (not isinstance(v, list) or v):
+                raise ProviderBodyError(PROVIDER_PARSE,
+                                        f"total_results is 0 but {name} carries rows", provider)
+        # review-B0r7#1: ABSENCE, not None. `doc.get()` cannot tell a missing key from an explicit null,
+        # so `{"search_result": null}` / `{"current_page": null}` looked like the measured compact shape
+        # and became a clean EMPTY. A present-but-null key is a MALFORMED presence, not an absence.
+        has_carrier = "search_result" in doc or "domainsList" in doc
+        has_paging = "current_page" in doc or "total_pages" in doc
+        if not has_carrier and not has_paging:
+            # SHAPE A — the MEASURED compact empty. Bound to the REQUEST: without this a response to a
+            # different question (another anchor, or `account=balance`) counted as "this query found
+            # nothing", which is a false empty wearing the measured shape.
+            if doc.get("api_query") != "reverse_whois":
+                raise ProviderBodyError(PROVIDER_PARSE,
+                                        f"compact zero-result body is not a reverse_whois answer "
+                                        f"(api_query={doc.get('api_query')!r})", provider)
+            # review-B0r7#2: the binding is MANDATORY and EXACT. It was optional (so a caller that simply
+            # forgot the identity got a free clean empty) and it matched only ONE key, so an identifier
+            # ALSO naming a different anchor passed. A body with no rows has nothing else tying it to our
+            # question — the echo IS the evidence, so it must be complete and it must be present.
+            if param not in ("company", "email") or not isinstance(value, str) or not value.strip():
+                raise ProviderBodyError(PROVIDER_PARSE,
+                                        f"compact zero-result body cannot be bound to a request "
+                                        f"(param={param!r} value={value!r})", provider)
+            ident = doc.get("search_identifier")
+            if ident != {param: value}:
+                raise ProviderBodyError(PROVIDER_PARSE,
+                                        f"compact zero-result body identifies {ident!r}, "
+                                        f"not exactly the {param}={value!r} we asked", provider)
+            # review-B0r8: the compact body carries NO page identity, so it can only ever prove the
+            # INITIAL request. Accepting it for page 2 would let B1's pagination complete a page it never
+            # actually received — the shape says "this query matched nothing", which is only a coherent
+            # answer to the first page.
+            if isinstance(page, bool) or not isinstance(page, int) or page != 1:
+                raise ProviderBodyError(PROVIDER_PARSE,
+                                        f"compact zero-result body carries no page identity and cannot "
+                                        f"answer page {page!r}", provider)
+            return [], 0, False
+        if has_carrier and "current_page" in doc and "total_pages" in doc:
+            # SHAPE B — a strict PAGED empty: an empty collection plus BOTH pagination fields, valid.
+            # the carrier must be a real (empty) LIST — a null one is malformed, not empty.
+            if not (isinstance(sr, list) or isinstance(dl, list)):
+                raise ProviderBodyError(PROVIDER_PARSE,
+                                        f"zero-result carrier is not a list "
+                                        f"(search_result={sr!r} domainsList={dl!r})", provider)
+            for label, v in (("current_page", cur), ("total_pages", pages)):
+                if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                    raise ProviderBodyError(PROVIDER_PARSE, f"invalid {label} ({v!r})", provider)
+            if pages > 1:
+                raise ProviderBodyError(PROVIDER_PARSE,
+                                        f"total_results is 0 but total_pages is {pages}", provider)
+            if cur != page:
+                raise ProviderBodyError(PROVIDER_PARSE,
+                                        f"response is page {cur}, but page {page} was requested", provider)
+            return [], 0, False
+        # anything between the two: half-present pagination, a carrier without paging, paging without a
+        # carrier. Unrecognised shape -> fail closed rather than guess which half to trust.
+        raise ProviderBodyError(PROVIDER_PARSE,
+                                "zero-result body is neither the compact empty shape nor a fully paged "
+                                f"empty (search_result={sr!r} domainsList={dl!r} "
+                                f"current_page={cur!r} total_pages={pages!r})", provider)
+    rows = whoxy_reverse_rows(doc, provider=provider)
     # review-B0r2#4: an ABSENT or garbled cardinality is schema drift, not "no claim to check". Treating
     # it as unknown-but-fine let a drifted body finish CLEAN — the same fail-open shape as the original
     # false empty, one level up. The documented success schema carries total_results, so its absence,

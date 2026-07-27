@@ -319,7 +319,7 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
             # HTTP 200, so reading the results key directly turned an exhausted account into "0 domains"
             # (a false EMPTY: no error, no event, silently lost coverage).
             obj = whoxy_envelope(json.loads(data))
-            doms, total, truncated = whoxy_reverse_page(obj, page=1)
+            doms, total, truncated = whoxy_reverse_page(obj, page=1, param=param, value=val)
             for d in doms:
                 s.candidate(d, "apex", "whoxy-revwhois", "in-scope-likely",
                             f"reverse-whois on {label}", raw_ref=str(raw))
