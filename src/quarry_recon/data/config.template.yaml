@@ -35,6 +35,16 @@ PERFORMANCE:
   ARJUN_BUDGET_S:            # arjun param discovery (was: cap 40 of eligible API endpoints). ONE TARGET PER
                              # PROCESS: arjun crashes on a 400/413/418/429/503 target and a batched run loses
                              # every target after it, so isolation is coverage
+  SHODAN_CREDIT_RESERVE:     # query credits this run will NOT spend, kept back for manual work (default 0
+                             # = spend everything available). Shodan meters query credits MONTHLY. Among
+                             # QUARRY'S CURRENT Shodan calls only /shodan/host/search consumes them —
+                             # /api-info, /shodan/host/count and /shodan/host/{ip} are free and keep
+                             # working at a zero balance (measured). Other Shodan endpoints DO charge
+                             # (e.g. /dns/domain/{domain}); re-check when a new call is added.
+                             # Exhaustion is an expected boundary, not an error: the run reports
+                             # complete_with_limits and persists the unqueried pivots as a resumable
+                             # remainder. NB if this is set but UNPARSEABLE, Quarry issues NO paid search
+                             # rather than silently spending — a broken cost guard must not read as none
   ARJUN_TARGETS:             # concurrent arjun TARGET processes (default 5; at most one per host). RATE is
                              # separate: RATELIMIT.HTTP is a GLOBAL lane cap partitioned across these workers
                              # (never handed to each in full), and a rate below the pool size shrinks the POOL

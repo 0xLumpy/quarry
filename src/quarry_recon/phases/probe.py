@@ -8,6 +8,7 @@ optional smap passive (Shodan-backed) port scan.
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass as _dataclass
 
 import json as _json
 import ipaddress as _ipaddress
@@ -91,6 +92,270 @@ def _shodan_search(key, facet, v, max_pages):
         if len(page_matches) < _SHODAN_PAGE or len(matches) >= total:   # short/last page — done
             break
     return matches, total, pages, None
+
+
+# ── B1.2: the Shodan CREDIT BALANCE contract ─────────────────────────────────────────────────────────
+# `/api-info` is FREE and works at a ZERO balance (measured 2026-07-28), so the remaining credits are a
+# fact we can always read rather than a number we have to guess or track locally across runs. A MONTHLY
+# quota cannot be protected by per-run bookkeeping anyway — another client may spend concurrently — so the
+# provider's own answer is the planning input and its 401-quota body stays the authority.
+_SHODAN_RESERVE_MAX = 1_000_000
+
+
+@_dataclass(frozen=True)
+class ShodanBalance:
+    """The settled credit contract. Facts stay DISTINCT — collapsing any two of them loses the only
+    information the number carries:
+
+      remaining   finite credits the provider reports   (None = UNKNOWN — never "unlimited": the
+                                                         top-level field has no documented -1 sentinel,
+                                                         and assuming one fails OPEN on a cost guard)
+      allowance   the plan's monthly limit              (context; None when unreadable or unlimited)
+      reserve     credits the OPERATOR withholds        (our own config, always known)
+      spendable   what this run may use                 (None = UNKNOWN, i.e. no computable bound —
+                                                         permitted only when no reserve is set)
+      allowance_unlimited  the PLAN has no monthly ceiling (usage_limits.query_credits == -1)
+      stop_kind   WHY we may not spend, as a token      (never inferred from prose; NOT all stops are
+                                                         soft limits — see `stop_is_limit`)
+      read_error  how the /api-info read FAILED         (None on success — kept even when the balance
+                                                         itself is unusable, so a bad key stays visible)"""
+
+    remaining: "int | None"
+    allowance: "int | None"
+    reserve: int
+    spendable: "int | None"
+    may_spend: bool
+    reason: str
+    allowance_unlimited: bool = False
+    stop_kind: str = ""
+    read_error: "str | None" = None
+
+    @property
+    def known(self) -> bool:
+        return self.remaining is not None
+
+    @property
+    def stop_is_limit(self) -> bool:
+        """Whether a stop is an EXPECTED soft limit (-> complete_with_limits) or a real gap.
+
+        review-B1.2r3#2: one `read_refused` token held auth, generic forbidden AND entitlement, so a BAD
+        KEY would have softened into complete_with_limits alongside a genuinely exhausted account. A
+        credential that does not work is a defect in our setup; an account that ran out is not."""
+        return self.stop_kind in _STOP_LIMITS
+
+
+# stop_kind tokens — a machine-readable WHY, so no consumer has to parse `reason`.
+SHODAN_PROVIDER_EXHAUSTED = "provider_exhausted"   # the account really is empty          -> LIMIT
+SHODAN_ENTITLEMENT = "entitlement"                 # the PLAN cannot reach the endpoint   -> LIMIT
+SHODAN_OPERATOR_RESERVE = "operator_reserve"       # credits exist; WE withhold them      -> LIMIT
+SHODAN_UNKNOWN_WITH_RESERVE = "unknown_with_reserve"  # our own caution stopped us        -> LIMIT
+SHODAN_AUTH_REFUSED = "auth_refused"               # the credential does not work         -> GAP
+SHODAN_FORBIDDEN = "forbidden"                     # refused, reason unproven             -> GAP
+SHODAN_RESERVE_INVALID = "reserve_invalid"         # the knob is present but unusable     -> GAP
+
+#: stops that are EXPECTED boundaries rather than defects. Everything else is a gap: a bad key, an
+#: unexplained refusal and a broken cost guard are all things the operator must FIX, not accept.
+_STOP_LIMITS = frozenset({SHODAN_PROVIDER_EXHAUSTED, SHODAN_ENTITLEMENT, SHODAN_OPERATOR_RESERVE,
+                          SHODAN_UNKNOWN_WITH_RESERVE})
+
+#: read outcomes that PROVE paid work is pointless. transport/parse/server say nothing about the account,
+#: so they keep the ordinary unknown fallback; these four are the provider telling us plainly.
+_BLOCKING_READ = frozenset({"auth", "quota", "entitlement", "forbidden"})
+
+
+def _exact_int(v, *, minimum: int = 0):
+    """An exact int >= minimum, or None. `True` is an int in Python, and a float or numeric string is a
+    different kind of claim — none of them may pass for a credit count."""
+    if isinstance(v, bool) or not isinstance(v, int) or v < minimum:
+        return None
+    return v
+
+
+def _allowance_field(v):
+    """-> (value, unlimited). `usage_limits.query_credits == -1` is Shodan's DOCUMENTED unlimited-plan
+    sentinel, so rejecting it would report an unlimited plan as unreadable."""
+    if isinstance(v, bool) or not isinstance(v, int):
+        return None, False
+    if v == -1:
+        return None, True
+    return (v, False) if v >= 0 else (None, False)
+
+
+def _remaining_field(v):
+    """-> value or None. An EXACT non-negative int, with NO -1 sentinel.
+
+    review-B1.2r3#1: I had the top-level `query_credits` share the allowance parser, so `-1` there meant
+    "unlimited" and disabled the reserve entirely. Nothing establishes that sentinel for this field —
+    Shodan's own documented example pairs a FINITE `query_credits` with `usage_limits.query_credits: -1`,
+    and the test asserting it was a shape I invented rather than measured. Guessing here fails OPEN on a
+    spending control, so an unproven `-1` is schema drift until a real payload says otherwise."""
+    return _exact_int(v)
+
+
+def _shodan_reserve_setting():
+    """-> (reserve, valid). ABSENT means 0 and is fine. PRESENT-BUT-INVALID is NOT: a typo, a bool, a
+    float or an oversized value would otherwise fall back to 0 and silently DISABLE the operator's cost
+    guard — failing open on a control whose whole purpose is to withhold spending."""
+    raw = settings.performance().get("SHODAN_CREDIT_RESERVE")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return 0, True
+    v = _exact_int(raw)
+    if v is None and isinstance(raw, str):
+        s = raw.strip()
+        if s.isdigit():
+            v = int(s)
+    if v is None or v > _SHODAN_RESERVE_MAX:
+        return 0, False
+    return v, True
+
+
+def shodan_balance(doc, *, reserve: "int | None" = None) -> ShodanBalance:
+    """Turn an `/api-info` body (or None, when the read failed) into the settled contract.
+
+    The cases that matter, each with a distinct `stop_kind` (and see `stop_is_limit` — not every stop is
+    an expected boundary):
+
+      remaining 0, reserve 0   -> PROVIDER EXHAUSTED. The account really is empty.            LIMIT
+      remaining <= reserve     -> OPERATOR RESERVE. Credits exist; Shodan would still serve   LIMIT
+                                  us, and calling this exhaustion would blame the provider
+                                  for our own policy.
+      unknown + reserve 0      -> may spend: exhaustion is a clean, self-announcing outcome.
+      unknown + reserve >0     -> NO paid searches: we cannot tell where the reserve begins.  LIMIT
+      reserve knob invalid     -> NO paid searches: a broken cost guard must not read as      GAP
+                                  'no guard'.
+
+    An unlimited PLAN ALLOWANCE (`usage_limits.query_credits == -1`) is context only — it never makes
+    this month's finite balance unbounded, and it never suspends the reserve."""
+    reserve_valid = True
+    if reserve is None:
+        reserve, reserve_valid = _shodan_reserve_setting()
+    else:
+        strict = _exact_int(reserve)
+        if strict is None:                       # a caller passing True/12.9/"abc" is a bug, not a policy
+            reserve, reserve_valid = 0, False
+        else:
+            reserve = strict
+    remaining = allowance = None
+    unlimited = False
+    allowance_unlimited = False
+    if isinstance(doc, dict):
+        remaining = _remaining_field(doc.get("query_credits"))
+        limits = doc.get("usage_limits")
+        if isinstance(limits, dict):
+            allowance, allowance_unlimited = _allowance_field(limits.get("query_credits"))
+    # review-B1.2r2#1: the ALLOWANCE and the REMAINING balance are separate facts. Shodan's own /api-info
+    # example returns a finite `query_credits: 100000` alongside `usage_limits.query_credits: -1` — an
+    # unlimited PLAN with a finite balance right now. Letting the allowance flip the account to unlimited
+    # discarded the real number and would have spent against a ceiling that does not describe this month.
+    if not reserve_valid:
+        return ShodanBalance(remaining, allowance, 0, 0, False,
+                             "SHODAN_CREDIT_RESERVE is set but unusable — refusing to spend rather than "
+                             "silently disabling the operator's cost guard",
+                             allowance_unlimited=allowance_unlimited,
+                             stop_kind=SHODAN_RESERVE_INVALID)
+    if remaining is None:
+        if reserve:
+            return ShodanBalance(None, allowance, reserve, 0, False,
+                                 "balance UNKNOWN and a reserve is set — cannot tell where the reserve "
+                                 "begins, so no paid search is issued (free operations continue)",
+                                 allowance_unlimited=allowance_unlimited,
+                                 stop_kind=SHODAN_UNKNOWN_WITH_RESERVE)
+        return ShodanBalance(None, allowance, reserve, None, True,
+                             "balance UNKNOWN, no reserve — spending until the provider refuses "
+                             "(exhaustion is a clean, self-announcing outcome)",
+                             allowance_unlimited=allowance_unlimited)
+    spendable = max(0, remaining - reserve)
+    if spendable == 0:
+        if remaining <= 0:
+            return ShodanBalance(remaining, allowance, reserve, 0, False,
+                                 f"provider balance EXHAUSTED ({remaining} credit(s) remain)"
+                                 + (f"; reserve {reserve} is not the cause" if reserve else ""),
+                                 allowance_unlimited=allowance_unlimited,
+                                 stop_kind=SHODAN_PROVIDER_EXHAUSTED)
+        return ShodanBalance(remaining, allowance, reserve, 0, False,
+                             f"{remaining} credit(s) remain but SHODAN_CREDIT_RESERVE={reserve} withholds "
+                             f"them — an OPERATOR limit, not provider exhaustion",
+                             allowance_unlimited=allowance_unlimited,
+                             stop_kind=SHODAN_OPERATOR_RESERVE)
+    return ShodanBalance(remaining, allowance, reserve, spendable, True,
+                         f"{spendable} spendable of {remaining} remaining"
+                         + (" (plan allowance UNLIMITED)" if allowance_unlimited else
+                            f" (plan allowance {allowance})" if allowance is not None else "")
+                         + (f", reserve {reserve}" if reserve else ""),
+                         allowance_unlimited=allowance_unlimited)
+
+
+def _blocked_read(bal: ShodanBalance, cls: str) -> ShodanBalance:
+    """A read outcome that PROVES paid work is pointless must also STOP it.
+
+    review-B1.2r2#2: the failure paths were `replace(shodan_balance(None), read_error=...)`, and with
+    reserve 0 that unknown contract says `may_spend=True`. So `/api-info` could prove a bad key or an
+    exhausted account and the coordinator would still have gone and spent credits against it. The read
+    error was recorded and then ignored by the only field anyone acts on."""
+    import dataclasses
+    if cls not in _BLOCKING_READ:
+        return dataclasses.replace(bal, read_error=cls)      # transport/parse/server: says nothing
+    kind = {"quota": SHODAN_PROVIDER_EXHAUSTED, "entitlement": SHODAN_ENTITLEMENT,
+            "auth": SHODAN_AUTH_REFUSED}.get(cls, SHODAN_FORBIDDEN)
+    why = {"quota": "the provider reports the query-credit balance EXHAUSTED",
+           "entitlement": "the PLAN cannot reach this endpoint",
+           "auth": "the credential was REJECTED — a setup defect, not an expected boundary",
+           }.get(cls, f"the provider REFUSED the balance read ({cls})")
+    return dataclasses.replace(bal, read_error=cls, may_spend=False, spendable=0, stop_kind=kind,
+                               reason=f"{why} — no paid search is issued (free operations continue)")
+
+
+def _read_shodan_balance(key, timeout: int = 15) -> ShodanBalance:
+    """Read `/api-info` (FREE, and it works at a ZERO balance) and settle the contract.
+
+    review-B1.2#3: the READ OUTCOME is preserved separately from the balance facts. Collapsing every
+    failure into an undifferentiated "unknown" hid a real problem: with a reserve configured no paid
+    request follows, so a BAD KEY produced no other signal and stayed invisible behind "balance unknown;
+    reserve protected". `read_error` keeps auth/quota/transport/parse distinguishable — and, for the
+    classes that PROVE refusal, also blocks spending.
+
+    A failure yields UNKNOWN, never zero: "we could not look" and "there is nothing left" are different
+    facts with different consequences."""
+    try:
+        url = f"https://api.shodan.io/api-info?key={urllib.parse.quote(str(key))}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(64 * 1024).decode("utf-8", "replace")
+    except Exception as e:
+        # B1.1 helper: reads the body AT THE RAISE SITE, closes the stream, and refines 401 by body —
+        # so an exhausted account reads `quota` here and a bad key reads `auth`, not one blurred class.
+        capture_error_body(e, provider="shodan")
+        return _blocked_read(shodan_balance(None), provider_error_class(e))
+    try:
+        doc = _json.loads(body)
+    except Exception:
+        return _blocked_read(shodan_balance(None), "parse")
+    bal = shodan_balance(doc)
+    # review-B1.2r2#3: decoding is not validating. A well-formed JSON body carrying `"85"`, `-2` or no
+    # `query_credits` at all is SCHEMA drift at the read boundary, and reporting it as a successful read
+    # of an unknown balance let a broken response look like a healthy one. (A malformed `usage_limits`
+    # stays non-fatal — it is context, not the balance.)
+    if not bal.known:
+        return _blocked_read(bal, "parse")
+    return bal
+
+
+def _emit_shodan_balance(sid: str, bal: ShodanBalance) -> None:
+    """Publish the balance as its OWN ledger event, every lifecycle.
+
+    Emitted unconditionally, INCLUDING the unknown case — a run that could not read the balance must
+    still say so, or the previous run's numbers stay on display as if current. `remaining`/`allowance`
+    are null when unknown and never defaulted to 0, which would read as a spent account.
+
+    SCOPE (review-B1.2#4): nothing CONSUMES this yet — `views._fold_events` keeps only produced/consumed
+    from a ledger event. B1.3 adds the reconciling consumer; until then this is an honest record, not a
+    reconciled fact, and no code should claim the latest one supersedes the rest."""
+    events.ledger(sid, produced=None, consumed=None, balance={
+        "provider": "shodan", "remaining": bal.remaining, "allowance": bal.allowance,
+        "reserve": bal.reserve, "spendable": bal.spendable, "known": bal.known,
+        "may_spend": bal.may_spend, "allowance_unlimited": bal.allowance_unlimited,
+        "stop_kind": bal.stop_kind or None, "stop_is_limit": bal.stop_is_limit,
+        "read_error": bal.read_error, "reason": bal.reason})
 
 
 _SHODAN_PIVOT_CAP = 20                                      # max distinct pivot values per lane (credit budget)
