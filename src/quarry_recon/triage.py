@@ -36,6 +36,14 @@ CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "s
 _FW_CVE: dict | None = None
 
 
+#: what each review class actually IS, so the report never implies we probed something we observed.
+_REVIEW_LABELS = {
+    "sourcemap": "fetch .map -> unminified source",
+    "related-host": "PASSIVE off-scope evidence — observed, never actively expanded",
+    "dns-owner-name": "PASSIVE DNS owner evidence (not a hostname) — never actively expanded",
+}
+
+
 def _framework_cve() -> dict:
     """Load + cache the framework → CVE/primitive REFERENCE map (data/framework-cve.yaml). Best-effort:
     missing/malformed yields {} (no tech-intel annotations). Recon fires nothing from this — it is
@@ -294,13 +302,22 @@ def build(run, scope) -> str:
     for r in reviews:
         by_klass.setdefault(r.get("klass", "other"), []).append(r.get("value", ""))
     if reviews:
-        A(f"## Candidate queues ({len(reviews)}) — gf buckets / source maps")
+        # review-B1.5br4#3: the class headings became truthful while this one still said every queue was
+        # a gf bucket or a source map. Some of them are evidence Quarry OBSERVED and will not act on.
+        A(f"## Review queues ({len(reviews)}) — candidates and passive evidence")
         for klass in sorted(by_klass):
             items = sorted(set(by_klass[klass]))
-            label = "fetch .map -> unminified source" if klass == "sourcemap" else "gf match"
+            # every non-sourcemap class was labelled "gf match", which is wrong for anything that did
+            # not come from a gf bucket — and actively misleading for PASSIVE evidence, which an operator
+            # must not read as something Quarry probed.
+            label = _REVIEW_LABELS.get(klass, "gf match")
             A(f"### {klass.upper()}  ({len(items)}) — {label}")
             for v in items[:15]:
                 A(f"- {v}")
+            if len(items) > 15:
+                # B1.5b: a DISPLAY may be bounded; the stored evidence never is. Say so, or a reader
+                # takes the preview for the whole queue — which is how a cap hides in plain sight.
+                A(f"- … {len(items) - 15} more — full list in normalized/review.jsonl")
             A("")
 
     A("## Review order")

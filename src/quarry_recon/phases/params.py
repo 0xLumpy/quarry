@@ -25,6 +25,26 @@ from ..runner import (RunResult, Status, cancel_all as runner_cancel_all, fresh_
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
 
 
+def active_review_values(ctx, klass: str) -> list:
+    """Review rows an ACTIVE lane may act on: the expected `klass` AND `scope.active_allowed`.
+
+    review-B1.5br1#2: every active consumer of `review` filtered on its own klass, and most also asked
+    `active_allowed` — but each did it inline, so the RoE guarantee was a convention repeated four times
+    rather than a rule. Off-scope evidence (`related-host`) is RETAINED IN FULL and must never reach a
+    lane that CONTACTS anything; that is what makes full retention passive. One helper, so a new active
+    lane cannot select rows generically and quietly widen the boundary.
+
+    Values are returned in store order; the caller still canonicalizes and guards its own targets."""
+    out = []
+    for r in ctx.run.read("review"):
+        if r.get("klass") != klass:
+            continue
+        v = (r.get("value") or "").strip()
+        if v and ctx.scope.active_allowed(normalize.host_of_url(v)):
+            out.append(v)
+    return out
+
+
 def _arjun_base(url: str) -> "str | None":
     """The scheme://host[:port]/path identity of an absolute HTTP(S) URL, or None if it is not one.
 
@@ -1213,11 +1233,8 @@ def _ssti_targets(ctx, scope) -> list[str]:
     confirm the SSTI primitive on."""
     seen: set[str] = set()
     out: list[str] = []
-    for r in ctx.run.read("review"):
-        if r.get("klass") != "ssti":
-            continue
-        u = (r.get("value") or "").strip()
-        if u and u not in seen and "?" in u and scope.active_allowed(normalize.host_of_url(u)):
+    for u in active_review_values(ctx, "ssti"):
+        if u not in seen and "?" in u:
             seen.add(u)
             out.append(u)
     return out
@@ -1738,8 +1755,7 @@ def _oob_probe(ctx, scope, prof):
     if not have("interactsh-client"):
         ctx.run.record("params", skipped("oob_probe", "interactsh-client not installed"))
         return None
-    raw = [r["value"] for r in ctx.run.read("review")
-           if r.get("klass") == "ssrf" and scope.active_allowed(normalize.host_of_url(r.get("value", "")))]
+    raw = active_review_values(ctx, "ssrf")
     cands, _canon = _canonicalize_candidates(raw)
     probes = []                                    # (url, split, pairs, ssrf-param) — one token per param
     for u in cands:
@@ -1958,8 +1974,10 @@ def run(ctx) -> None:
     # ── vuln-primitive probes over the 4.3.A CANONICALIZED shapes, SPLIT by primitive ──
     # XSS reflection -> params.dalfox_xss_fast (dalfox, 4.3.B). Open-redirect -> params.redirect_confirm
     # (native Location probe, NO dalfox, 4.3.C). dalfox is no longer responsible for redirect at all.
-    xss_raw = [r["value"] for r in ctx.run.read("review") if r.get("klass") == "xss"]
-    redir_raw = [r["value"] for r in ctx.run.read("review") if r.get("klass") == "redirect"]
+    # review-B1.5br1#2: these two selected on klass ALONE, so the RoE gate was left entirely to
+    # netguard downstream. Scope policy and network policy are different questions; ask both.
+    xss_raw = active_review_values(ctx, "xss")
+    redir_raw = active_review_values(ctx, "redirect")
     xss_cands, xss_canon = _canonicalize_candidates(xss_raw)
     redir_cands, redir_canon = _canonicalize_candidates(redir_raw)
     # audit #1: dalfox is an external tool that CONTACTS these URLs — drop any whose host resolves internal /

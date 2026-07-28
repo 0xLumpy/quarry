@@ -288,14 +288,32 @@ def valid_page(doc, pivot: Pivot, page: int):
 
 
 def valid_fresh(matches, total) -> bool:
-    """Whether a provider answer may be published as a completed page.
+    """Whether a page may be treated as complete — the ONE contract for fresh output and replayed
+    evidence alike, since `valid_page` delegates here.
 
     review-r2#2: replayed evidence was validated and FRESH output was not, so the coordinator trusted the
     network more than its own disk. `([], None, None)` recorded a "complete" page whose total was unknown
-    — owning a page while being unable to enumerate the rest of them."""
+    — owning a page while being unable to enumerate the rest of them.
+
+    review-B1.5br3#1: the ROWS were not checked at all, only that `matches` is a list. The adapter had
+    just been taught to reject a non-string hostname member, but a page PAID FOR AND RECORDED before that
+    contract existed replayed straight past it and crashed the ingest that trusted it. Validating here
+    rather than bumping SHODAN_WORK_SCHEMA is deliberate: a bump invalidates every page already bought,
+    including the valid ones, and would have us re-pay for them. A malformed old page simply stops being
+    owned, so it is repurchased on its own."""
     if isinstance(total, bool) or not isinstance(total, int) or total < 0:
         return False
-    return isinstance(matches, list)
+    if not isinstance(matches, list):
+        return False
+    for m in matches:
+        if not isinstance(m, dict):                       # a null/scalar row is corruption, not empty
+            return False
+        hns = m.get("hostnames")
+        if hns is None:
+            continue
+        if not isinstance(hns, list) or any(not isinstance(h, str) for h in hns):
+            return False
+    return True
 
 
 def _read_page(path, pivot: Pivot, page: int):

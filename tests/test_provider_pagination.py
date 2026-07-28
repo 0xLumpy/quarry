@@ -647,7 +647,8 @@ class TestShodanPivot:
         assert "h999.acme.com" in found and rows[-1]["hostnames"] == ["h999.acme.com"]
 
     def test_high_total_still_ingests_in_scope(self, monkeypatch, tmp_path):
-        # review-r2#3: a generic high-`total` pivot must NOT drop valid in-scope hosts — only off-scope noise is bounded
+        # review-r2#3: a generic high-`total` pivot must NOT drop valid in-scope hosts. B1.5b: off-scope
+        # candidates are no longer bounded either — nothing about cardinality removes membership.
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
 
@@ -658,7 +659,10 @@ class TestShodanPivot:
         ctx, added = self._ctx(tmp_path)
         found = probe._shodan_pivot(ctx, "k", ["hashX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         assert "real.acme.com" in found                       # in-scope kept despite the huge total
-        assert sum(1 for e, r in added if e == "review") <= 15   # off-scope review bounded
+        # B1.5b: off-scope candidates are RETAINED IN FULL. The old first-N slice dropped them by page
+        # order, so which related hosts an operator ever saw depended on where they appeared. The RoE
+        # boundary is OBSERVE, never expand — retention costs no traffic (see the active-queue test).
+        assert sum(1 for e, r in added if e == "review") == 99
 
     def test_EVERY_pivot_value_is_queried_and_none_is_sliced_away(self, monkeypatch, tmp_path):
         """review-B1.4r2#2: `all_vals[:20]` truncated MEMBERSHIP — it picked WHICH pivots to query by
@@ -826,6 +830,219 @@ class TestShodanPivot:
             events.reset()
         assert term["status"] == "limited", term
         assert term.get("error_class") is None, "our reserve was blamed on the provider"
+
+    def _oos_run(self, monkeypatch, tmp_path, hosts, *, pivots=("hX",)):
+        from quarry_recon.phases import probe
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+            lambda req, timeout=20: _Resp(json.dumps(
+                {"total": len(hosts), "matches": [{"hostnames": [h]} for h in hosts]}).encode()),
+            credits=50))
+        ctx, added = self._ctx(tmp_path)
+        probe._shodan_pivot(ctx, "k", list(pivots), "http.favicon.hash", "favicon-shodan",
+                            "probe.favicon", "{}")
+        return [r for e, r in added if e == "review"]
+
+    def test_a_NON_STRING_hostname_member_makes_the_page_invalid(self, monkeypatch, tmp_path):
+        """review-B1.5br1#1: the LIST was validated and its MEMBERS were not, so ingest stringified
+        whatever arrived — a dict became the literal "{'x': 'a.evil.com'}" and was retained because it
+        contains a dot, while null and 123 vanished before any counter moved."""
+        from quarry_recon.phases import probe
+        for bad in ([{"x": "a.evil.com"}], [None], [123], ["ok.evil.com", None]):
+            monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+                lambda req, timeout=20, b=bad: _Resp(json.dumps(
+                    {"total": 1, "matches": [{"hostnames": b}]}).encode())))
+            ms, total, err = probe._shodan_page("k", "http.favicon.hash", "hX", 1)
+            assert err is not None, f"{bad} was accepted as a valid page"
+            assert "non-string hostname" in str(err), (bad, err)
+
+    def test_unicode_and_punycode_are_the_SAME_retained_host(self, monkeypatch, tmp_path):
+        """One canonical form decides identity AND scope, so a name and its punycode spelling cannot
+        become two candidates (nor be scoped differently)."""
+        # the A-label is DERIVED, not guessed: canon_host_strict("fäßchen.evil.com") is the authority
+        # (IDNA2008/UTS-46 non-transitional, so ß does NOT become ss).
+        revs = self._oos_run(monkeypatch, tmp_path, ["fäßchen.evil.com", "xn--fchen-lqa8a.evil.com"])
+        assert len({r["id"] for r in revs}) == 1, [r["value"] for r in revs]
+        assert {r["value"] for r in revs} == {"xn--fchen-lqa8a.evil.com"}
+
+    def _run_hosts(self, monkeypatch, tmp_path, hosts, *, in_scope="acme.com"):
+        """Drive the lane with a scope where `in_scope` really is in scope, and hand back every added
+        entity — so "what became a subdomain" is directly observable."""
+        from quarry_recon.phases import probe
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+            lambda req, timeout=20: _Resp(json.dumps(
+                {"total": len(hosts), "matches": [{"hostnames": [h]} for h in hosts]}).encode()),
+            credits=50))
+        ctx, added = self._ctx(tmp_path)
+        probe._shodan_pivot(ctx, "k", ["hX"], "http.favicon.hash", "favicon-shodan", "probe.favicon",
+                            "{}")
+        return added
+
+    def test_a_NON_HOST_dns_name_is_KEPT_but_NEVER_a_subdomain(self, monkeypatch, tmp_path):
+        """review-B1.5br2#1: `_dmarc.acme.com` is a valid DNS OWNER NAME and not a valid hostname. It was
+        stored as a `subdomain` — an entity ACTIVE lanes consume (resolution, alterx, takeover, httpx) —
+        so "this lane never contacts it" was true of this lane and false of Quarry. It is real evidence
+        and is retained, as PASSIVE review evidence."""
+        added = self._run_hosts(monkeypatch, tmp_path, ["_dmarc.acme.com"])
+        assert not [r for e, r in added if e == "subdomain"], added
+        revs = [r for e, r in added if e == "review"]
+        assert [r["value"] for r in revs] == ["_dmarc.acme.com"]
+        assert revs[0]["klass"] == "dns-owner-name" and revs[0]["raw_ref"]
+        assert "in-scope" in revs[0]["note"]
+        cov = self._cov(tmp_path, "shodan_hostnames")[0]
+        assert cov["omitted"] == 0 and "PASSIVE evidence" in cov["reason"], cov
+
+    def test_the_report_labels_passive_evidence_as_PASSIVE(self, tmp_path):
+        """review-B1.5br3#2: every non-sourcemap class was labelled "gf match", so passive DNS evidence
+        would read as `DNS-OWNER-NAME — gf match` — an operator taking observed evidence for something
+        Quarry probed. Visible, and truthfully labelled."""
+        from types import SimpleNamespace
+        from quarry_recon import triage
+        rows = [{"klass": "dns-owner-name", "value": "_dmarc.acme.com"},
+                {"klass": "related-host", "value": "oos.evil.com"},
+                {"klass": "xss", "value": "https://in.acme.com/?a=1"}]
+        run = SimpleNamespace(
+            target="acme.com", run_id="t-1",
+            read=lambda e: rows if e == "review" else [],
+            values=lambda e: [], count=lambda e: 0)
+        out = triage.build(run, SimpleNamespace(in_scope=lambda h: True, is_oos=lambda h: False))
+        # rendered, not just tabulated: the report is what the operator actually reads
+        head = [l for l in out.splitlines() if l.startswith("## Review queues")]
+        assert head and "gf buckets" not in head[0], out
+        for klass in ("DNS-OWNER-NAME", "RELATED-HOST"):
+            line = [l for l in out.splitlines() if l.startswith(f"### {klass}")]
+            assert line, out
+            assert "PASSIVE" in line[0] and "never actively expanded" in line[0], line[0]
+            assert "gf match" not in line[0], line[0]
+        xss = [l for l in out.splitlines() if l.startswith("### XSS")]
+        assert xss and "gf match" in xss[0], xss        # a real gf bucket still says so
+
+    def test_the_registry_declares_the_review_output(self, tmp_path):
+        """review-B1.5br3#3: both lanes still declared `output: subdomain` while also writing review."""
+        from quarry_recon import sources
+        for sid in ("probe.favicon", "probe.cert"):
+            assert sources.get(sid)["output"] == "subdomain+review", sid
+
+    def test_MIXED_hostname_outcomes_report_BOTH_facts(self, monkeypatch, tmp_path):
+        """review-B1.5br4#2: one if/else meant any unusable name suppressed the noncanonical count, so a
+        page carrying `_dmarc` alongside one malformed value stopped reporting that passive DNS owner
+        evidence had been retained at all. Two facts about two different names, stated independently."""
+        added = self._run_hosts(monkeypatch, tmp_path,
+                                ["_dmarc.acme.com", "bad name.acme.com", "real.acme.com"])
+        assert [r["host"] for e, r in added if e == "subdomain"] == ["real.acme.com"]
+        assert [r["value"] for e, r in added if e == "review"] == ["_dmarc.acme.com"]
+        cov = self._cov(tmp_path, "shodan_hostnames")[0]
+        assert cov["eligible"] == 3 and cov["omitted"] == 1, cov
+        assert "1 not usable" in cov["reason"], cov["reason"]
+        assert "1 valid DNS owner name(s) retained as PASSIVE" in cov["reason"], cov["reason"]
+
+    def test_a_non_host_name_never_reaches_an_ACTIVE_review_queue(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        from quarry_recon.phases import params
+        rows = [{"klass": "dns-owner-name", "value": "_dmarc.acme.com", "id": "1"}]
+        ctx = SimpleNamespace(run=SimpleNamespace(read=lambda e: rows if e == "review" else []),
+                              scope=SimpleNamespace(active_allowed=lambda h: True))
+        for klass in ("ssti", "ssrf", "xss", "redirect"):
+            assert params.active_review_values(ctx, klass) == [], klass
+
+    @pytest.mark.parametrize("bad", ["../admin.acme.com", "a/b.acme.com", "bad name.acme.com",
+                                     "-lead.acme.com", "trail-.acme.com", "a..b.acme.com",
+                                     # charset-only cases: no traversal, no slash, no whitespace, so
+                                     # ONLY the per-label character check can reject them
+                                     "a,b.acme.com", "pct%20.acme.com", "q?x.acme.com",
+                                     "at@host.acme.com"])
+    def test_a_MALFORMED_suffix_looking_name_is_unusable_not_evidence(self, monkeypatch, tmp_path, bad):
+        """These all end in an in-scope suffix and all pass `active_allowed`. Containing a dot was the
+        only thing keeping them, and it kept traversal and whitespace alongside `_dmarc`."""
+        added = self._run_hosts(monkeypatch, tmp_path, [bad])
+        assert added == [], added
+        cov = self._cov(tmp_path, "shodan_hostnames")[0]
+        assert cov["eligible"] == 1 and cov["omitted"] == 1, cov
+
+    def test_an_UNUSABLE_name_is_counted_not_silently_skipped(self, monkeypatch, tmp_path):
+        revs = self._oos_run(monkeypatch, tmp_path, ["nodot", "", "ok.evil.com"])
+        assert {r["value"] for r in revs} == {"ok.evil.com"}
+        cov = self._cov(tmp_path, "shodan_hostnames")[0]
+        assert cov["eligible"] == 3 and cov["omitted"] == 2, cov
+
+    def test_EVERY_off_scope_candidate_is_retained(self, monkeypatch, tmp_path):
+        """B1.5b: the last hidden membership cap. 40 off-scope hosts on one page used to become 15, and
+        WHICH 15 depended on page order — the same non-deterministic breadth loss as the pivot cap."""
+        hosts = [f"oos{i}.evil.com" for i in range(40)]
+        revs = self._oos_run(monkeypatch, tmp_path, hosts)
+        assert {r["value"] for r in revs} == set(hosts), len(revs)
+        assert all(r["klass"] == "related-host" and r["raw_ref"] for r in revs)
+        assert len({r["id"] for r in revs}) == 40, "identities are not stable/distinct"
+
+    def test_repeats_are_DEDUPLICATED_not_truncated(self, monkeypatch, tmp_path):
+        """The same host on the same pivot is ONE candidate however often it appears — dedup by identity
+        bounds growth without ever choosing which host survives."""
+        hosts = ["a.evil.com", "a.evil.com", "b.evil.com", "a.evil.com"]
+        revs = self._oos_run(monkeypatch, tmp_path, hosts)
+        assert {r["value"] for r in revs} == {"a.evil.com", "b.evil.com"}
+        assert len({r["id"] for r in revs}) == 2
+        cov = self._cov(tmp_path, "shodan_oos_retained")[0]
+        assert cov["omitted"] == 0, cov          # a duplicate is NOT an omission
+        assert "2 distinct" in cov["reason"], cov["reason"]
+
+    def test_the_SAME_host_under_TWO_pivots_stays_two_candidates(self, monkeypatch, tmp_path):
+        """Identity is (lane, pivot value, host): the same infrastructure reached from two different
+        favicons is two pieces of evidence, and collapsing them would lose the pivot that found it."""
+        revs = self._oos_run(monkeypatch, tmp_path, ["shared.evil.com"], pivots=("hA", "hB"))
+        assert len({r["id"] for r in revs}) == 2, revs
+        assert {r["value"] for r in revs} == {"shared.evil.com"}
+
+    def test_retained_OOS_never_reaches_an_ACTIVE_queue(self, monkeypatch, tmp_path):
+        """The RoE boundary that makes full retention safe: OBSERVE and mine, never actively expand.
+
+        review-B1.5br1#2: this used to assert that the literal string "related-host" was absent from
+        params.py — it would have passed had an active lane started selecting review rows generically,
+        and failed on a harmless comment. Behavioural now: a store holding ONLY off-scope candidates,
+        driven through the real selector every active lane uses."""
+        from types import SimpleNamespace
+        from quarry_recon.phases import params
+        rows = [{"klass": "related-host", "value": "oos1.evil.com", "id": "favicon:hX:oos1.evil.com"},
+                {"klass": "related-host", "value": "https://oos2.evil.com/?a=1", "id": "b"}]
+        allowed = []
+        ctx = SimpleNamespace(
+            run=SimpleNamespace(read=lambda e: rows if e == "review" else []),
+            scope=SimpleNamespace(active_allowed=lambda h: (allowed.append(h), True)[1]))
+        for klass in ("ssti", "ssrf", "xss", "redirect"):
+            assert params.active_review_values(ctx, klass) == [], klass
+        assert allowed == [], f"an off-scope host was even scope-tested: {allowed}"
+
+    def test_the_active_selector_requires_BOTH_klass_and_scope(self, monkeypatch, tmp_path):
+        """The other half: a row of the RIGHT klass is still refused when scope says no. Without this
+        the helper would be a klass filter wearing an RoE label."""
+        from types import SimpleNamespace
+        from quarry_recon.phases import params
+        rows = [{"klass": "xss", "value": "https://in.acme.com/?a=1", "id": "1"},
+                {"klass": "xss", "value": "https://out.evil.com/?a=1", "id": "2"}]
+        ctx = SimpleNamespace(
+            run=SimpleNamespace(read=lambda e: rows if e == "review" else []),
+            scope=SimpleNamespace(active_allowed=lambda h: h.endswith("acme.com")))
+        assert params.active_review_values(ctx, "xss") == ["https://in.acme.com/?a=1"]
+
+    def test_every_active_lane_selects_THROUGH_the_helper(self, monkeypatch, tmp_path):
+        """A new active lane must not be able to read `review` directly and widen the boundary."""
+        import inspect
+        from quarry_recon.phases import params
+        src = inspect.getsource(params)
+        direct = [ln.strip() for ln in src.splitlines() if 'read("review")' in ln]
+        assert len(direct) == 1, f"an active lane reads review outside the helper: {direct}"
+        assert "def active_review_values" in src
+
+    def test_an_UNSTORABLE_candidate_is_reported_not_swallowed(self, monkeypatch, tmp_path):
+        """Dedup is not omission, but a candidate we cannot IDENTIFY is a real evidence loss."""
+        from quarry_recon import store
+        monkeypatch.setattr(store, "canonical_key",
+                            lambda e, r: "" if e == "review" else r.get("id", "k"))
+        revs = self._oos_run(monkeypatch, tmp_path, ["oos1.evil.com", "oos2.evil.com"])
+        assert revs == []
+        cov = self._cov(tmp_path, "shodan_oos_retained")[0]
+        assert cov["omitted"] == 2 and cov["kind"] == "timeout", cov
+        assert "could not be identified" in cov["reason"]
 
     def test_the_DEFAULT_page_policy_is_unbounded(self, monkeypatch, tmp_path):
         """The settled design: 0 = no Quarry-imposed limit. Nothing here patches `settings.concurrency`,

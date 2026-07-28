@@ -50,11 +50,11 @@ sources:
     input: apex_org, output: review, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "review-r4#7 ACTIVE (contacts guessed bucket endpoints; discover() skips passive mode). External status-only existence check (provider endpoints) — NO body read; flags candidates for ownership/verification"}
   probe.favicon:             {tool: internal, phase: probe, tier: optional, class: passive, default: key,
-    input: favicon_hash, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
-    notes: "Shodan http.favicon.hash pivot (key-gated) — related infra by shared favicon; in-scope->subdomain, off-scope->bounded review. Credit-aware bounded pagination (SHODAN_MAX_PAGES)."}
+    input: favicon_hash, output: subdomain+review, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
+    notes: "Shodan http.favicon.hash pivot (key-gated) — related infra by shared favicon; in-scope->subdomain, off-scope->review, RETAINED IN FULL (observe/mine, never actively expanded). Membership is never capped; spend is bounded by the credit balance + SHODAN_MAX_PAGES (0=unbounded), shared with probe.cert by one coordinator."}
   probe.cert:                {tool: internal, phase: probe, tier: optional, class: passive, default: key,
-    input: cert_sha1, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
-    notes: "Shodan ssl.cert.fingerprint pivot (key-gated) — related infra by shared leaf cert; in-scope->subdomain, off-scope->bounded review. Credit-aware bounded pagination (SHODAN_MAX_PAGES)."}
+    input: cert_sha1, output: subdomain+review, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
+    notes: "Shodan ssl.cert.fingerprint pivot (key-gated) — related infra by shared leaf cert; in-scope->subdomain, off-scope->review, RETAINED IN FULL (observe/mine, never actively expanded). Membership is never capped; spend is bounded by the credit balance + SHODAN_MAX_PAGES (0=unbounded), shared with probe.favicon by one coordinator."}
   horizontal.tlsx_san:       {tool: tlsx, phase: horizontal, tier: core, class: active, default: on,
     input: cidr, output: subdomain+certificate, workers: fixed, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: normalize.tlsx_certs, log: delta,
     notes: "runs only when CIDR present"}

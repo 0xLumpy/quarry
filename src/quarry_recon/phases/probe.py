@@ -16,7 +16,7 @@ import re as _re
 import urllib.parse
 import urllib.request
 
-from .. import budget, contract, events, netguard, normalize, secrets, settings, shodan_sched
+from .. import budget, contract, events, netguard, normalize, secrets, settings, shodan_sched, store
 from ..contract import (ProviderResult, capture_error_body, is_provider_limit,
                         provider_error_class, run_contract, run_provider)
 from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir, have,
@@ -63,6 +63,34 @@ def _classified(e: BaseException) -> BaseException:
         return ShodanPageError(cls, e)
 
 
+#: characters a DNS owner name may use beyond a hostname's. `_` appears in real records (`_dmarc`,
+#: `_acme-challenge`); `*` is a wildcard owner. Neither is a valid HOSTNAME, and neither is junk.
+_DNS_OWNER_EXTRA = "_*"
+
+
+def _dns_owner_name(h: str):
+    """A syntactically valid DNS OWNER NAME that is not a valid hostname, or None.
+
+    review-B1.5br2#1: `_dmarc.acme.com` was kept on the strength of containing a dot — and so were
+    `../admin.acme.com`, `a/b.acme.com` and `bad name.acme.com`. The first is real evidence; the rest are
+    malformed. Separating them is what lets the real one be retained without letting the others through.
+
+    This is deliberately NOT a hostname check (`normalize.canon_host_strict` is that, and it is the one
+    a caller about to CONTACT a name must use)."""
+    s = str(h).strip().lower().rstrip(".")
+    if not s or "." not in s or ".." in s or "/" in s or any(c.isspace() for c in s):
+        return None
+    if len(s) > 253:
+        return None
+    ok = "abcdefghijklmnopqrstuvwxyz0123456789-" + _DNS_OWNER_EXTRA
+    for label in s.split("."):
+        if not (1 <= len(label) <= 63) or label[0] == "-" or label[-1] == "-":
+            return None
+        if any(c not in ok for c in label):
+            return None
+    return s
+
+
 def _shodan_page(key, facet, v, page):
     """ONE page of a Shodan search, as the coordinator's `(matches, total, error)` triple. NEVER raises.
 
@@ -95,6 +123,14 @@ def _shodan_page(key, facet, v, page):
             hns = m.get("hostnames")
             if hns is not None and not isinstance(hns, list):
                 raise ValueError(f"shodan: non-list hostnames {type(hns).__name__}")
+            # review-B1.5br1#1: the LIST was validated and its MEMBERS were not, so the ingest side
+            # stringified whatever arrived. `{"x": "a.evil.com"}` became the literal `"{'x': ...}"`,
+            # kept because it contains a dot; `null` and `123` vanished before any counter moved. A
+            # non-string member is corruption, exactly like a non-dict row — fail closed here rather
+            # than guess downstream.
+            for _h in (hns or []):
+                if not isinstance(_h, str):
+                    raise ValueError(f"shodan: non-string hostname {type(_h).__name__}")
             page_rows.append(m)
     except Exception as e:
         # B1.1: read the error BODY here, while it is still readable, and stamp the refined class onto
@@ -379,7 +415,24 @@ def _emit_shodan_balance(sid: str, bal: ShodanBalance) -> None:
         "read_error": bal.read_error, "reason": bal.reason})
 
 
-_SHODAN_OOS_CAP = 15                                        # max off-scope related-host review candidates per pivot
+#: B1.5b: there is no OOS cap. RoE boundary — OBSERVE and mine OOS evidence, never actively expand
+#: against it. A first-N slice bounded MEMBERSHIP by page order, so which related hosts an operator ever
+#: saw depended on which page they happened to appear on; the last hidden membership cap in the lane.
+#: Bound a DISPLAY if a report is long. Never the stored evidence.
+
+
+@_dataclass
+class _SharedWork:
+    """What ONE coordinator run produced for ALL lanes. Each field is per-source_id; nothing here is a
+    lane-agnostic aggregate, because every one of these facts belongs to exactly one lane."""
+
+    balance: "ShodanBalance"
+    result: "shodan_sched.WorkResult"
+    found: dict                     # sid -> in-scope hosts
+    errs: dict                      # sid -> {"last", "last_fail"}
+    oos: dict                       # sid -> {"seen", "invalid", "kept": set of identities}
+    names: dict                     # sid -> {"seen", "unusable", "noncanonical"} hostname members
+    max_pages: int
 
 
 @_dataclass(frozen=True)
@@ -421,7 +474,8 @@ def _shodan_work(ctx, key, lanes):
         # caller this telemetry existed and was never emitted.
         _emit_shodan_balance(spec.sid, bal)
     found: dict = {spec.sid: set() for spec, _vals in lanes}
-    oos_used: dict = {}                                     # (sid, value) -> off-scope candidates kept
+    oos: dict = {spec.sid: {"seen": 0, "invalid": 0, "kept": set()} for spec, _vals in lanes}
+    hostnames: dict = {spec.sid: {"seen": 0, "unusable": 0, "noncanonical": 0} for spec, _vals in lanes}
 
     # ONE ledger for the coordinator's own lane. Pages never collide inside it: `item_key` is namespaced
     # by the pivot's lane, so a favicon page and a cert page are distinct identities by construction.
@@ -453,10 +507,39 @@ def _shodan_work(ctx, key, lanes):
         spec = by_sid[pivot.lane]
         label = spec.sid.split(".", 1)[-1]
         v = pivot.value
+        names = hostnames[spec.sid]
         for m in matches:
-            for hn in (m.get("hostnames") or []):
-                hn = str(hn).lower().rstrip(".")
-                if not hn or "." not in hn:
+            for raw_hn in (m.get("hostnames") or []):
+                names["seen"] += 1
+                hn = raw_hn.strip().lower().rstrip(".")
+                # ONE canonical form decides identity AND scope, so a Unicode name and its punycode
+                # spelling are the same host to both. `canon_host_strict` is Quarry's single IDNA policy.
+                canon = normalize.canon_host_strict(hn)
+                if canon is None:
+                    # review-B1.5br2#1: a name that is not a valid HOSTNAME must never become a
+                    # `subdomain`. That entity is consumed by ACTIVE lanes elsewhere — resolution,
+                    # alterx, takeover checks, httpx — so "this lane never contacts it" was true of this
+                    # lane and false of Quarry. A valid DNS OWNER NAME (`_dmarc`, `_acme-challenge`, a
+                    # wildcard) is real evidence and is retained as PASSIVE review evidence; anything
+                    # else is malformed and counted as unusable.
+                    owner = _dns_owner_name(hn)
+                    if owner is None:
+                        names["unusable"] += 1      # counted, never silently skipped
+                        continue
+                    names["noncanonical"] += 1
+                    where = "in-scope" if (scope.in_scope(owner) and not scope.is_oos(owner)) else "off-scope"
+                    rec = {"id": f"{label}:{v}:{owner}", "klass": "dns-owner-name", "value": owner,
+                           "note": f"{where} DNS owner name (not a hostname) seen alongside "
+                                   + spec.note.format(v),
+                           "sources": [spec.source], "raw_ref": str(raw_path)}
+                    if store.canonical_key("review", rec):
+                        ctx.run.add("review", rec)
+                    continue
+                hn = canon
+                if "." not in hn:
+                    # a bare label canonicalizes cleanly but names no domain, so it can neither be
+                    # scoped nor attributed. Counted, like every other name we cannot use.
+                    names["unusable"] += 1
                     continue
                 if scope.in_scope(hn) and not scope.is_oos(hn):
                     # review-r6#1: the response HAD this in-scope host — it belongs in `found` REGARDLESS
@@ -464,21 +547,52 @@ def _shodan_work(ctx, key, lanes):
                     found[spec.sid].add(hn)
                     ctx.run.add("subdomain", {"host": hn, "sources": [spec.source],
                                               "raw_ref": str(raw_path)})
-                elif oos_used.get((spec.sid, v), 0) < _SHODAN_OOS_CAP:
-                    if ctx.run.add("review", {"id": f"{label}:{v}:{hn}", "klass": "related-host",
-                            "value": hn, "note": spec.note.format(v), "sources": [spec.source],
-                            "raw_ref": str(raw_path)}):
-                        oos_used[(spec.sid, v)] = oos_used.get((spec.sid, v), 0) + 1
+                else:
+                    # OFF-SCOPE. The RoE boundary is OBSERVE, never expand: a host returned by a page we
+                    # already BOUGHT is evidence we hold, and mining it is passive. It reaches a REVIEW
+                    # queue — `related-host` is consumed by nothing active (every active lane filters on
+                    # its own klass AND `scope.active_allowed`), so retention adds no traffic.
+                    #
+                    # B1.5b: retained in FULL. The old first-N slice per pivot dropped candidates by page
+                    # order, so which related hosts an operator ever saw depended on where they appeared.
+                    # Deduplicate by identity; never truncate.
+                    rec = {"id": f"{label}:{v}:{hn}", "klass": "related-host", "value": hn,
+                           "note": spec.note.format(v), "sources": [spec.source],
+                           "raw_ref": str(raw_path)}
+                    stats = oos[spec.sid]
+                    stats["seen"] += 1
+                    if not store.canonical_key("review", rec):
+                        stats["invalid"] += 1       # unidentifiable -> unstorable: a REAL loss, reported
+                        continue
+                    ctx.run.add("review", rec)      # False here means ALREADY KNOWN, which is not a loss
+                    stats["kept"].add(rec["id"])
         return len(matches)
 
     states = [shodan_sched.PivotState(shodan_sched.Pivot(spec.sid, spec.facet, v))
               for spec, vals in lanes for v in vals]
     res = shodan_sched.run_work(ctx, states=states, balance=bal, search=search, ingest=ingest,
                                 ledger=ledger, attempt_dir=attempt_dir, max_pages=max_pages)
-    return bal, res, found, errs, max_pages
+    return _SharedWork(balance=bal, result=res, found=found, errs=errs, oos=oos, names=hostnames,
+                       max_pages=max_pages)
 
 
-def _shodan_result(spec, values, bal, res, found, errs, max_pages):
+def _hostname_facts(nm: dict) -> list:
+    """Every hostname fact, stated INDEPENDENTLY.
+
+    review-B1.5br4#2: this was one if/else, so any unusable name suppressed the noncanonical count — a
+    page carrying `_dmarc.acme.com` alongside one malformed value stopped reporting that passive DNS
+    owner evidence had been retained at all. Two different facts about two different names cannot share
+    a branch."""
+    facts = [f"{nm['seen']} hostname(s) read"]
+    if nm["unusable"]:
+        facts.append(f"{nm['unusable']} not usable as a host name")
+    if nm["noncanonical"]:
+        facts.append(f"{nm['noncanonical']} valid DNS owner name(s) retained as PASSIVE evidence "
+                     f"(not hostnames, never actively expanded)")
+    return facts
+
+
+def _shodan_result(spec, values, work):
     """One lane's COVERAGE and TERMINAL, derived from the shared coordinator run.
 
     Runs inside that lane's own `run_provider` bracket, because `coverage_reset` opens the generation
@@ -487,11 +601,30 @@ def _shodan_result(spec, values, bal, res, found, errs, max_pages):
     review-r3#4 terminal truth: a plain set (SUCCESS/EMPTY) when nothing failed; a PARTIAL
     ProviderResult (with the dominant class) when evidence exists alongside errors; and a RAISE when the
     lane yielded nothing and something either broke or refused us."""
+    bal, res, max_pages = work.balance, work.result, work.max_pages
     o = res.lanes.get(spec.sid) or shodan_sched.LaneOutcome(lane=spec.sid)
     shodan_sched.report(spec.sid, o, balance=bal, persisted=res.persisted, max_pages=max_pages,
                         stop_cause=res.stop_cause)
-    hits = found.get(spec.sid) or set()
-    lane_errs = errs.get(spec.sid) or {"last": None, "last_fail": None}
+    hits = work.found.get(spec.sid) or set()
+    lane_errs = work.errs.get(spec.sid) or {"last": None, "last_fail": None}
+    # B1.5b: OOS RETENTION is its own fact. Deduplication is not omission, so only candidates we could
+    # not IDENTIFY (and therefore could not store) count as omitted — a real evidence loss, reported as
+    # a gap rather than absorbed silently. Emitted every run so a later clean run clears it.
+    st = work.oos.get(spec.sid) or {"seen": 0, "invalid": 0, "kept": set()}
+    events.coverage_partial(spec.sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_oos_retained",
+                            unit=f"{spec.sid}.oos", eligible=st["seen"],
+                            tested=st["seen"] - st["invalid"], omitted=st["invalid"],
+                            reason=(f"{st['invalid']} off-scope candidate(s) could not be identified "
+                                    f"and were NOT stored" if st["invalid"] else
+                                    f"{len(st['kept'])} distinct off-scope related host(s) retained "
+                                    f"from {st['seen']} observation(s) — no cap"))
+    # hostname MEMBERS are their own contract: a name we cannot use at all is a lost observation, and a
+    # name that is not canonical is usable but deduplicates on the weaker form. Both are stated.
+    nm = work.names.get(spec.sid) or {"seen": 0, "unusable": 0, "noncanonical": 0}
+    events.coverage_partial(spec.sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_hostnames",
+                            unit=f"{spec.sid}.hostnames", eligible=nm["seen"],
+                            tested=nm["seen"] - nm["unusable"], omitted=nm["unusable"],
+                            reason="; ".join(_hostname_facts(nm)))
     fail_classes, limit_classes = dict(o.fail_classes), dict(o.limit_classes)
     errored = sum(fail_classes.values()) + sum(limit_classes.values())
     evidence = o.pages_bought + o.pages_replayed
@@ -561,8 +694,7 @@ def _shodan_pivot(ctx, key, values, facet, source, sid, note):
     one lane directly, not a second implementation."""
     spec = _LaneSpec(sid, facet, source, "", "", note)
     vals = sorted({str(v) for v in values if v})
-    bal, res, found, errs, max_pages = _shodan_work(ctx, key, [(spec, vals)])
-    return _shodan_result(spec, vals, bal, res, found, errs, max_pages)
+    return _shodan_result(spec, vals, _shodan_work(ctx, key, [(spec, vals)]))
 
 
 def _shodan_pivots(ctx) -> None:
@@ -580,13 +712,12 @@ def _shodan_pivots(ctx) -> None:
     lanes = [(spec, sorted({str(r.get(spec.field)) for r in ctx.run.read(spec.entity)
                             if r.get(spec.field)}))
              for spec in _SHODAN_LANES]
-    shared: dict = {}
+    shared: list = []
 
     def collect():
         if not key or not any(vals for _spec, vals in lanes):
             return                                  # nothing to spend on; each lane finalizes as SKIPPED
-        shared.update(zip(("bal", "res", "found", "errs", "max_pages"),
-                          _shodan_work(ctx, key, [(s, v) for s, v in lanes if v])))
+        shared.append(_shodan_work(ctx, key, [(s, v) for s, v in lanes if v]))
 
     def finalize(spec, values):
         if not key:
@@ -595,8 +726,7 @@ def _shodan_pivots(ctx) -> None:
             raise contract.ProviderSkip(f"no {spec.field} value to pivot on")
         if not shared:
             raise ShodanPageError("error", RuntimeError("shodan: shared work produced no result"))
-        return _shodan_result(spec, values, shared["bal"], shared["res"], shared["found"],
-                              shared["errs"], shared["max_pages"])
+        return _shodan_result(spec, values, shared[0])
 
     entries = []
     for spec, values in lanes:
@@ -605,7 +735,9 @@ def _shodan_pivots(ctx) -> None:
         wu = events.work_unit(spec.sid, inputs={"values": values},
                               config={"facet": spec.facet,
                                       "max_pages": settings.concurrency("SHODAN_MAX_PAGES", 0),
-                                      "oos_cap": _SHODAN_OOS_CAP,
+                                      "oos_cap": 0,        # B1.5b: no cap; kept in the key so a
+                                                           # resumed unit from a CAPPED generation is
+                                                           # not mistaken for a complete one
                                       "cred_fp": secrets.fingerprint(key) if key else None})
         entries.append((spec.sid, wu, lambda s=spec, v=values: finalize(s, v)))
     results = contract.run_providers(entries, collect)

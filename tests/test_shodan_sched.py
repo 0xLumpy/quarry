@@ -1144,6 +1144,66 @@ def _pages(index: dict) -> dict:
     return {k: [pg for pg, _art, _doc in v] for k, v in index.items()}
 
 
+class TestRowContractOnReplay:
+    """review-B1.5br3#1: the adapter learned to reject a non-string hostname member, but a page PAID FOR
+    and RECORDED before that contract existed replayed straight past it. `valid_fresh` is the one gate
+    both paths use, so the contract lives there — NOT in a schema bump, which would invalidate every
+    page already bought, including the valid ones."""
+
+    def test_a_malformed_recorded_page_is_NOT_owned(self, tmp_path):
+        from quarry_recon.shodan_sched import owned_index, valid_fresh
+        led = _ledger(tmp_path)
+        _res(tmp_path, _states((FAV, "a")), _Provider(totals={"a": 100}), balance=_Bal(spendable=1),
+             ledger=led)
+        art = led.artifact(item_key(Pivot(FAV, "facet", "a"), 1))
+        doc = json.loads(art.read_text())
+        doc["matches"] = [{"hostnames": [None]}]              # what an OLD page could hold
+        body = json.dumps(doc).encode()
+        art.write_bytes(body)
+        led2 = _ledger(tmp_path)
+        led2.record(item_key(Pivot(FAV, "facet", "a"), 1), art)   # re-bind: digest-VALID, row-invalid
+        led2.save()
+        assert valid_fresh(doc["matches"], doc["total"]) is False
+        assert owned_index(_ledger(tmp_path)) == {}, "a malformed page was still owned"
+
+    def test_a_malformed_recorded_page_is_REPURCHASED(self, tmp_path):
+        led = _ledger(tmp_path)
+        _res(tmp_path, _states((FAV, "a")), _Provider(totals={"a": 100}), balance=_Bal(spendable=1),
+             ledger=led)
+        art = led.artifact(item_key(Pivot(FAV, "facet", "a"), 1))
+        doc = json.loads(art.read_text())
+        doc["matches"] = [{"hostnames": [None]}]
+        art.write_bytes(json.dumps(doc).encode())
+        led2 = _ledger(tmp_path)
+        led2.record(item_key(Pivot(FAV, "facet", "a"), 1), art)
+        led2.save()
+        p = _Provider(totals={"a": 100})
+        res, _ = _res(tmp_path, _states((FAV, "a")), p, balance=_Bal(spendable=None),
+                      ledger=_ledger(tmp_path))
+        assert (FAV, "a", 1) in p.calls, "the unusable page was never re-bought"
+        assert res.lanes[FAV].pages_bought == 1
+
+    def test_a_VALID_recorded_page_still_replays_FREE(self, tmp_path):
+        """The control that keeps the fix from being a schema bump in disguise."""
+        led = _ledger(tmp_path)
+        _res(tmp_path, _states((FAV, "a")), _Provider(totals={"a": 100}), balance=_Bal(spendable=1),
+             ledger=led)
+        p = _Provider(totals={"a": 100})
+        res, _ = _res(tmp_path, _states((FAV, "a")), p, balance=_Bal(spendable=None),
+                      ledger=_ledger(tmp_path))
+        assert p.calls == [], f"a valid paid page was re-bought: {p.calls}"
+        assert res.lanes[FAV].pages_replayed == 1
+
+    def test_a_non_dict_row_is_rejected_on_BOTH_paths(self):
+        from quarry_recon.shodan_sched import valid_fresh
+        assert valid_fresh([None], 1) is False
+        assert valid_fresh([{"hostnames": "oops"}], 1) is False
+        assert valid_fresh([{"hostnames": [1]}], 1) is False
+        assert valid_fresh([{"hostnames": ["ok.acme.com"]}], 1) is True
+        assert valid_fresh([{"hostnames": None}], 1) is True      # absent is fine
+        assert valid_fresh([{}], 1) is True
+
+
 class TestDriftTelemetry:
     def test_drift_is_REPORTED_not_just_counted(self, tmp_path):
         """The user's integration requirement: `total_drift` must reach telemetry. It is a soft PROVIDER
