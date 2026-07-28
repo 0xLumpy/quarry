@@ -464,6 +464,11 @@ class Run:
         # tool_status (a `tools_failed` count without a matching status count is a lie). Keyed by
         # (source_id, work_unit), latest per current generation.
         provider_limits: list = []                            # external LIMITS (quota/entitlement)
+        # review-B1.4r8#2: an OPERATOR boundary is a limit, but it is OURS. Filing it under
+        # `provider_limits` said the provider refused us — the exact blame-shift the taxonomy exists to
+        # prevent, reintroduced by the field it was recorded in. Separate bucket, and every entry
+        # carries a structured `origin` so a consumer can read either shape.
+        operator_limits: list = []                            # OUR OWN bounds (reserve, withheld budget)
         for term in self._read_provider_terminals():
             sid = term.get("source_id", "?")
             st = term.get("status")
@@ -480,9 +485,13 @@ class Run:
             # so it is a soft LIMIT (complete_with_limits), never a failure or a coverage gap. It still
             # reaches the operator: coverage is genuinely incomplete and the verdict says so.
             # Limits are PROVEN classes only (quota/entitlement, from a body or balance) — a bare 403 is
-            # `forbidden` and stays a failure.
-            if contract.is_provider_limit(ec):
-                provider_limits.append({**entry, "status": st, "output_lines": 0})
+            # `forbidden` and stays a failure. review-B1.4r7#1: an OPERATOR boundary is a limit too, and
+            # it carries NO provider class by design, so the question is asked of the TERMINAL (status
+            # AND class) rather than of the class alone.
+            if contract.terminal_is_limit(st, ec):
+                bucket = provider_limits if ec else operator_limits
+                bucket.append({**entry, "status": st, "output_lines": 0,
+                               "origin": "provider" if ec else "operator"})
             elif st == "failed":
                 failures.append(entry)
             else:                                                 # partial / incomplete (crash) -> a coverage gap
@@ -520,13 +529,13 @@ class Run:
                     gaps.append(entry)                                # cap/timeout with omitted>0 -> gap
         # a LIMIT never downgrades a run that also has real gaps — gaps dominate; limits only lift a
         # otherwise-clean run to complete_with_limits so the incompleteness is still stated.
-        limits = coverage_limits + provider_limits
+        limits = coverage_limits + provider_limits + operator_limits
         verdict = ("complete_with_gaps" if (failures or gaps or phase_exceptions)
                    else "complete_with_limits" if limits else "complete")
         return {"verdict": verdict, "tool_status": status_counts, "tools_failed": len(failures),
                 "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions,
                 "coverage": coverage, "coverage_limits": coverage_limits,
-                "provider_limits": provider_limits}
+                "provider_limits": provider_limits, "operator_limits": operator_limits}
 
     def _read_coverage(self) -> list[dict]:
         """Aggregate STRUCTURED coverage_partial events (those carrying eligible/tested/omitted) from

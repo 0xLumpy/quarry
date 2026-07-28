@@ -265,7 +265,14 @@ def test_provider_lanes_carry_work_unit_and_literal_source_ids():
     from quarry_recon.phases import probe
     from quarry_recon import cloud
     psrc = inspect.getsource(probe)
-    assert 'run_provider("probe.favicon"' in psrc and 'run_provider("probe.cert"' in psrc
+    # B1.4: the Shodan lanes are declared in _SHODAN_LANES and share one coordinator, so the id reaches
+    # run_provider as `spec.sid` — still a LITERAL, just declared once. What this guards against is a
+    # CONSTRUCTED id (asserted below); `run_provider` itself is registry-authoritative at runtime and
+    # refuses to execute an unknown source_id.
+    assert '_LaneSpec("probe.favicon"' in psrc and '_LaneSpec("probe.cert"' in psrc
+    # B1.4r3: the Shodan lanes are bracketed TOGETHER (run_providers), because their credit budget is
+    # shared — every lane starts before any of them spends.
+    assert "run_providers(entries, collect)" in psrc and "entries.append((spec.sid, wu," in psrc
     assert "work_unit=wu" in psrc
     assert 'f"probe.{label}"' not in psrc                 # the constructed source_id anti-pattern is gone
     csrc = inspect.getsource(cloud)
@@ -279,6 +286,65 @@ class TestVerdictFoldsProviderTerminals:
     def _summary(self, tmp_path, run):
         run.write_manifest({}, ["vertical"])
         return json.loads(run.manifest_path.read_text())["summary"]
+
+    def _fold(self, tmp_path, result):
+        from quarry_recon.store import Run
+        run = Run.create(tmp_path, "t"); events.reset(); events.configure(run.dir)
+        try:
+            contract.run_provider("vertical.crtsh", lambda: result, work_unit="wu-a")
+            return self._summary(tmp_path, run)
+        finally:
+            events.reset()
+
+    def test_a_pure_OPERATOR_limit_folds_as_a_LIMIT_not_a_gap(self, tmp_path):
+        """review-B1.4r7#1: reconciliation recognised a limit only by a PROVEN provider class, so an
+        operator boundary — LIMITED with deliberately no class — fell into the generic gap branch and
+        reversed the terminal and coverage semantics at the last step."""
+        s = self._fold(tmp_path, ProviderResult({"h.acme.com"}, limited=True,
+                                                partial_reason="operator reserve withheld 5 credit(s)"))
+        assert s["verdict"] == "complete_with_limits", (s["gaps"], s["failures"])
+        assert not s["gaps"] and not s["failures"]
+        # review-B1.4r8#2: OURS, and filed as ours. `provider_limits` said the provider refused us.
+        assert not s["provider_limits"], s["provider_limits"]
+        assert [x["tool"] for x in s["operator_limits"]] == ["vertical.crtsh"], s["operator_limits"]
+        assert s["operator_limits"][0]["origin"] == "operator"
+
+    def test_a_PROVIDER_quota_still_folds_as_a_limit(self, tmp_path):
+        """The control: the provider's own boundary is unchanged by widening the rule."""
+        s = self._fold(tmp_path, ProviderResult({"h.acme.com"}, partial=True, partial_kind="degraded",
+                                                error_class="quota", partial_reason="credits spent"))
+        assert s["verdict"] == "complete_with_limits", (s["gaps"], s["failures"])
+        assert s["provider_limits"] and not s["gaps"] and not s["operator_limits"]
+        assert s["provider_limits"][0]["origin"] == "provider"
+
+    def test_a_MALFORMED_limited_terminal_never_softens_a_real_failure(self, tmp_path):
+        """A LIMITED terminal carrying a NON-limit class is a contradiction. `_partial_status` refuses to
+        produce one, but reconciliation must not TRUST that — the guard is what stops a hand-built or
+        future-miswired terminal from laundering a transport failure into a soft limit."""
+        import quarry_recon.contract as c
+        assert c.terminal_is_limit("limited", "transport") is False
+        assert c.terminal_is_limit("limited", None) is True
+        assert c.terminal_is_limit("limited", "quota") is True
+        assert c.terminal_is_limit("partial", None) is False
+        # review-B1.4r8#1: the REVERSE malformed combination. The class alone used to be enough, so a
+        # FAILED/quota terminal folded as complete_with_limits with an EMPTY failure list.
+        assert c.terminal_is_limit("failed", "quota") is False
+        assert c.terminal_is_limit("partial", "entitlement") is False
+
+    def test_a_FAILED_terminal_carrying_a_quota_class_stays_a_FAILURE(self, tmp_path):
+        """The folded half of the same defect, end to end."""
+        from quarry_recon.store import Run
+        run = Run.create(tmp_path, "t"); events.reset(); events.configure(run.dir)
+        try:
+            (run.dir / "events.jsonl").write_text(json.dumps({
+                "event": "tool_finish", "source_id": "vertical.crtsh", "status": "failed",
+                "provider": True, "error_class": "quota", "reason": "hand-built contradiction",
+                "work_unit": "wu-a"}) + "\n")
+            s = self._summary(tmp_path, run)
+        finally:
+            events.reset()
+        assert s["verdict"] == "complete_with_gaps", (s["gaps"], s["failures"])
+        assert s["failures"] and not s["provider_limits"] and not s["operator_limits"]
 
     def test_failed_provider_makes_run_incomplete(self, tmp_path):
         from quarry_recon.store import Run
@@ -438,6 +504,41 @@ class TestCloudDiscoverCoverage:
         assert cloud.discover(ctx) == 0 and not recorded
 
 
+SHODAN_QUOTA_BODY = ('{"error": "Insufficient query credits, please upgrade your API plan or wait for '
+                     'the monthly limit to reset"}')
+
+
+def _http_err(code, body):
+    """An HTTPError carrying a real readable body, like urllib produces."""
+    import io
+    return urllib.error.HTTPError("http://x", code, "msg", {}, io.BytesIO(body.encode()))
+
+
+def _with_balance(responder, *, credits=100):
+    """Answer `/api-info` from a HEALTHY balance and send everything else to `responder`.
+
+    B1.4: the lane reads its credit balance before scheduling any paid page, so a responder that answers
+    EVERY url makes the balance read consume the scenario's first scripted response. `/api-info` is free
+    and keeps working at a zero balance (measured), so a fixture where it fails alongside the search is
+    testing a state Shodan does not produce."""
+    class _Bal:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n=None):
+            return json.dumps({"query_credits": credits, "scan_credits": 0,
+                               "usage_limits": {"query_credits": credits}}).encode()
+
+    def route(req, timeout=20):
+        if "api-info" in str(getattr(req, "full_url", req)):
+            return _Bal()
+        return responder(req, timeout=timeout)
+    return route
+
+
 class TestShodanPivot:
     def _ctx(self, tmp_path):
         from types import SimpleNamespace
@@ -446,6 +547,7 @@ class TestShodanPivot:
         run = SimpleNamespace(
             raw_path=lambda ph, lb, nm: (tmp_path / ph / lb).joinpath(nm) if
             (tmp_path / ph / lb).mkdir(parents=True, exist_ok=True) or True else None,
+            dir=tmp_path,                 # B1.4: the coordinator's ledger/attempt tree lives under it
             add=lambda e, r: (added.append((e, r)), True)[1],
             read=lambda e: [])
         scope = SimpleNamespace(in_scope=lambda h: h.endswith("acme.com"), is_oos=lambda h: False)
@@ -461,7 +563,7 @@ class TestShodanPivot:
 
         def auth_fail(req, timeout=20):
             raise urllib.error.HTTPError("u", 401, "unauthorized", {}, None)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", auth_fail)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(auth_fail))
         ctx, _ = self._ctx(tmp_path)
         # review-r3#4: ALL pivots fail with no results -> RAISE (run_provider records FAILED + classified),
         # never a silent clean EMPTY. Coverage is still emitted before the raise.
@@ -475,8 +577,7 @@ class TestShodanPivot:
         from quarry_recon.phases import probe
         from quarry_recon import contract
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
-                            lambda req, timeout=20: (_ for _ in ()).throw(urllib.error.HTTPError("u", 429, "rate", {}, None)))
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: (_ for _ in ()).throw(urllib.error.HTTPError("u", 429, "rate", {}, None))))
         ctx, _ = self._ctx(tmp_path)
         out = contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
             ctx, "k", ["h1"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}"))
@@ -493,7 +594,7 @@ class TestShodanPivot:
             if "h_bad" in req.full_url:
                 raise urllib.error.HTTPError("u", 429, "rate", {}, None)
             return _Resp(json.dumps({"total": 1, "matches": [{"hostnames": ["real.acme.com"]}]}).encode())
-        monkeypatch.setattr(probe.urllib.request, "urlopen", mixed)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(mixed))
         ctx, _ = self._ctx(tmp_path)
         r = probe._shodan_pivot(ctx, "k", ["h_good", "h_bad"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         assert isinstance(r, ProviderResult) and r.partial and r.error_class == "rate_limit" and "real.acme.com" in r
@@ -506,19 +607,20 @@ class TestShodanPivot:
             # total 150 but page 1 only returns 100 -> truncated at 1 page (credit-bounded)
             return _Resp(json.dumps({"total": 150,
                                      "matches": [{"hostnames": [f"h{i}.acme.com"]} for i in range(100)]}).encode())
-        monkeypatch.setattr(probe.urllib.request, "urlopen", big)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(big))
         ctx, added = self._ctx(tmp_path)
         probe._shodan_pivot(ctx, "k", ["hashX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
-        res = self._cov(tmp_path, "shodan_results")
-        assert res and res[0]["omitted"] == 1 and res[0]["kind"] == "cap"     # 1 pivot truncated
+        # B1.4: our page budget is counted in PAGES (total 150 = 2 pages, we bought 1). Still a CAP —
+        # review-B1 (Lumpy): "SHODAN_MAX_PAGES=1 is still a cap".
+        res = self._cov(tmp_path, "shodan_pages_withheld")
+        assert res and res[0]["omitted"] == 1 and res[0]["kind"] == "cap"
 
     def test_preseeded_host_clean_rerun_is_success_not_empty(self, monkeypatch, tmp_path):
         # review-r6#1: a host already in the store (Run.add -> False) must STILL appear in `found` — the
         # response HAD it. Gating found on the new-key return made a clean rerun a false EMPTY.
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
-                            lambda req, timeout=20: _Resp(json.dumps({"total": 1, "matches": [{"hostnames": ["seen.acme.com"]}]}).encode()))
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: _Resp(json.dumps({"total": 1, "matches": [{"hostnames": ["seen.acme.com"]}]}).encode())))
         ctx, added = self._ctx(tmp_path)
         monkeypatch.setattr(ctx.run, "add", lambda e, r: False)   # store already has it (dedup -> False)
         found = probe._shodan_pivot(ctx, "k", ["hX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
@@ -530,14 +632,19 @@ class TestShodanPivot:
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
         big = [{"hostnames": [f"h{i}.acme.com"], "pad": "x" * 4096} for i in range(1000)]   # > 2 MiB serialized
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
-                            lambda req, timeout=20: _Resp(json.dumps({"total": 1000, "matches": big}).encode()))
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: _Resp(json.dumps({"total": 1000, "matches": big}).encode())))
         ctx, _ = self._ctx(tmp_path)
         found = probe._shodan_pivot(ctx, "k", ["hX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
-        art = list((tmp_path / "probe" / "favicon").glob("*.jsonl"))[0]
-        rows = [json.loads(ln) for ln in art.read_text().splitlines()]   # every line valid JSON
+        # B1.4: evidence is now ONE ARTIFACT PER PAGE, published by the coordinator and content-bound in
+        # the ledger, instead of one appended JSONL per pivot. The provenance property is unchanged and
+        # is what this test protects: the artifact a host's `raw_ref` points at really does contain that
+        # host's row — never sliced, never truncated.
+        art = list((tmp_path / "raw" / "probe" / "shodan").rglob("*.json"))
+        art = [q for q in art if q.name != ".quarry-write-probe"]
+        assert len(art) == 1, [str(q) for q in art]
+        rows = json.loads(art[0].read_text())["matches"]
         assert len(rows) == 1000                              # COMPLETE — no truncation
-        assert "h999.acme.com" in found and rows[-1]["hostnames"] == ["h999.acme.com"]   # last host's evidence present
+        assert "h999.acme.com" in found and rows[-1]["hostnames"] == ["h999.acme.com"]
 
     def test_high_total_still_ingests_in_scope(self, monkeypatch, tmp_path):
         # review-r2#3: a generic high-`total` pivot must NOT drop valid in-scope hosts — only off-scope noise is bounded
@@ -547,23 +654,250 @@ class TestShodanPivot:
         def big(req, timeout=20):
             ms = [{"hostnames": ["real.acme.com"]}] + [{"hostnames": [f"junk{i}.example.org"]} for i in range(99)]
             return _Resp(json.dumps({"total": 5000, "matches": ms}).encode())   # total>200, once dropped everything
-        monkeypatch.setattr(probe.urllib.request, "urlopen", big)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(big))
         ctx, added = self._ctx(tmp_path)
         found = probe._shodan_pivot(ctx, "k", ["hashX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         assert "real.acme.com" in found                       # in-scope kept despite the huge total
         assert sum(1 for e, r in added if e == "review") <= 15   # off-scope review bounded
 
-    def test_pivot_cap_reported_and_zero_units_emitted(self, monkeypatch, tmp_path):
+    def test_EVERY_pivot_value_is_queried_and_none_is_sliced_away(self, monkeypatch, tmp_path):
+        """review-B1.4r2#2: `all_vals[:20]` truncated MEMBERSHIP — it picked WHICH pivots to query by
+        store order, so a 30-hash lane silently lost 10 of them and which 10 depended on discovery
+        order. Reporting it as a gap made it honest without making it right. Throughput is bounded by
+        the credit balance and the page policy; membership is not bounded at all."""
         from quarry_recon.phases import probe
+        calls = []
+
+        def counted(req, timeout=20):
+            calls.append(str(req.full_url))
+            return _Resp(json.dumps({"total": 0, "matches": []}).encode())
+
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
-                            lambda req, timeout=20: _Resp(json.dumps({"total": 0, "matches": []}).encode()))
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(counted, credits=1000))
         ctx, _ = self._ctx(tmp_path)
-        probe._shodan_pivot(ctx, "k", [f"h{i}" for i in range(30)], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
-        cap = self._cov(tmp_path, "shodan_pivot_values")
-        assert cap and cap[0]["eligible"] == 30 and cap[0]["tested"] == 20 and cap[0]["omitted"] == 10
+        probe._shodan_pivot(ctx, "k", [f"h{i}" for i in range(30)], "http.favicon.hash",
+                            "favicon-shodan", "probe.favicon", "{}")
+        assert len(calls) == 30, f"{len(calls)}/30 pivot values queried"
         # zero-count units still emitted so a prior gap clears
         assert self._cov(tmp_path, "shodan_pivots")[0]["omitted"] == 0
+        assert self._cov(tmp_path, "shodan_pivot_values") == [], "the membership cap measure survived"
+
+    def _events(self, tmp_path):
+        return [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+
+    def _both_lanes(self, monkeypatch, tmp_path, responder, *, credits=100, key="KEY"):
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: key)
+        monkeypatch.setattr(secrets, "shodan", lambda: key)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(responder, credits=credits))
+        ctx, _added = self._ctx(tmp_path)
+        ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
+                                  else [{"sha1": "C1"}] if e == "certificate" else [])
+        probe._shodan_pivots(ctx)
+        return self._events(tmp_path)
+
+    def test_EVERY_lane_starts_before_ANY_credit_is_spent(self, monkeypatch, tmp_path):
+        """review-B1.4r3#1: the shared coordinator ran BEFORE either bracket, so /api-info and paid
+        searches happened before `tool_start` and before the generation reset. An interruption mid-spend
+        then left credits gone with no lane lifecycle and a stale previous generation still standing."""
+        order = []
+
+        def watched(req, timeout=20):
+            order.append(("http", str(req.full_url)))
+            return _Resp(json.dumps({"total": 1, "matches": []}).encode())
+
+        import quarry_recon.events as ev
+        real = ev.tool_start
+        monkeypatch.setattr(ev, "tool_start",
+                            lambda sid, **k: (order.append(("start", sid)), real(sid, **k))[1])
+        self._both_lanes(monkeypatch, tmp_path, watched)
+        starts = [i for i, (kind, _v) in enumerate(order) if kind == "start"]
+        https = [i for i, (kind, _v) in enumerate(order) if kind == "http"]
+        assert len(starts) == 2, [o for o in order if o[0] == "start"]
+        assert max(starts) < min(https), f"spent before every lane was started: {order[:6]}"
+
+    def test_a_failure_in_ONE_lane_does_not_contaminate_the_OTHER(self, monkeypatch, tmp_path):
+        """review-B1.4r3#2: one global last-error decided both terminals — cert taking a 500 and favicon
+        a quota reported BOTH as FAILED/server."""
+        def split(req, timeout=20):
+            if "ssl.cert.fingerprint" in req.full_url:
+                raise _http_err(500, "upstream exploded")
+            raise _http_err(401, SHODAN_QUOTA_BODY)
+
+        evs = self._both_lanes(monkeypatch, tmp_path, split)
+        term = {e["source_id"]: e for e in evs if e.get("event") == "tool_finish"}
+        assert term["probe.cert"]["status"] == "failed", term["probe.cert"]
+        assert term["probe.cert"]["error_class"] == "server", term["probe.cert"]
+        assert term["probe.favicon"]["status"] == "limited", term["probe.favicon"]
+        assert term["probe.favicon"]["error_class"] == "quota", term["probe.favicon"]
+
+    def test_a_STARVED_lane_never_reports_a_clean_EMPTY(self, monkeypatch, tmp_path):
+        """review-B1.4r3#3: with one credit and two eligible lanes, the loser emitted
+        `shodan_pivots_unqueried omitted=1` AND an EMPTY terminal — "asked, found nothing" about a pivot
+        that was never asked."""
+        def ok(req, timeout=20):
+            return _Resp(json.dumps({"total": 10, "matches": []}).encode())
+
+        evs = self._both_lanes(monkeypatch, tmp_path, ok, credits=1)
+        term = {e["source_id"]: e for e in evs if e.get("event") == "tool_finish"}
+        starved = [s for s, e in term.items() if e["status"] != "empty"]
+        assert len(term) == 2 and len(starved) == 1, term
+        lost = term[starved[0]]
+        assert lost["status"] in ("limited", "partial") and "never queried" in (lost["reason"] or "")
+
+    def test_an_unconfigured_lane_still_gets_a_LIFECYCLE(self, monkeypatch, tmp_path):
+        """review-B1.4r3#4: a silent early return left the PREVIOUS run's terminal and coverage
+        generation standing as though current. A lane that cannot run is SKIPPED, not absent."""
+        def never(req, timeout=20):
+            raise AssertionError("a request was issued without a key")
+
+        evs = self._both_lanes(monkeypatch, tmp_path, never, key=None)
+        term = {e["source_id"]: e for e in evs if e.get("event") == "tool_finish"}
+        assert set(term) == {"probe.favicon", "probe.cert"}, term
+        assert all(e["status"] == "skipped" for e in term.values()), term
+        assert all(e.get("error_class") is None for e in term.values()), term
+
+    def test_a_lane_with_no_INPUT_is_skipped_not_empty(self, monkeypatch, tmp_path):
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+            lambda req, timeout=20: _Resp(json.dumps({"total": 1, "matches": []}).encode())))
+        ctx, _ = self._ctx(tmp_path)
+        ctx.run.read = lambda e: [{"favicon": "F1"}] if e == "live" else []   # no certificates
+        probe._shodan_pivots(ctx)
+        term = {e["source_id"]: e for e in self._events(tmp_path) if e.get("event") == "tool_finish"}
+        assert term["probe.cert"]["status"] == "skipped", term["probe.cert"]
+        assert term["probe.favicon"]["status"] in ("empty", "success"), term["probe.favicon"]
+
+    def test_the_balance_is_reported_for_EVERY_lane(self, monkeypatch, tmp_path):
+        """review-B1.4r3#4: `_emit_shodan_balance` had no production caller at all."""
+        evs = self._both_lanes(monkeypatch, tmp_path,
+                               lambda req, timeout=20: _Resp(json.dumps({"total": 1,
+                                                                         "matches": []}).encode()))
+        bals = {e["source_id"] for e in evs
+                if (e.get("balance") or {}).get("provider") == "shodan"}
+        assert bals == {"probe.favicon", "probe.cert"}, bals
+
+    def test_a_PARTIALLY_queried_pivot_never_reports_clean(self, monkeypatch, tmp_path):
+        """review-B1.4r4#2: the terminal read only `unqueried`, so a pivot with one bought page and four
+        provider-bounded pages left reported EMPTY while its own coverage said omitted=4 — and with a
+        non-empty first page it would have reported SUCCESS."""
+        def one_credit(req, timeout=20):
+            return _Resp(json.dumps({"total": 500, "matches": []}).encode())
+
+        from quarry_recon.phases import probe
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(one_credit, credits=1))
+        ctx, _ = self._ctx(tmp_path)
+        r = probe._shodan_pivot(ctx, "k", ["hX"], "http.favicon.hash", "favicon-shodan",
+                                "probe.favicon", "{}")
+        assert isinstance(r, ProviderResult) and r.partial, r
+        assert "4 page(s) unbought" in (r.partial_reason or ""), r.partial_reason
+        assert self._cov(tmp_path, "shodan_pages_left")[0]["omitted"] == 4
+
+    def test_an_OPERATOR_reserve_is_LIMITED_not_degraded(self, monkeypatch, tmp_path):
+        """review-B1.4r4#3: our own reserve came back as PARTIAL with no class — a DEGRADED execution,
+        which asserts something went wrong when nothing did. Nor may it borrow `quota` and blame the
+        provider for our policy."""
+        from quarry_recon.phases import probe
+        from quarry_recon.store import Run
+        ctx, _ = self._ctx(tmp_path)                 # (configures events at tmp_path; re-point below)
+        run = Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe, "_shodan_reserve_setting", lambda: (5, True))   # withhold 5 of 6
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+            lambda req, timeout=20: _Resp(json.dumps({"total": 500, "matches": []}).encode()),
+            credits=6))
+        ctx.run = run
+        try:
+            contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
+                ctx, "k", ["hA", "hB", "hC"], "http.favicon.hash", "favicon-shodan", "probe.favicon",
+                "{}"), work_unit="wu")
+            term = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                    if '"tool_finish"' in l][-1]
+        finally:
+            events.reset()
+        assert term["status"] == "limited", term
+        assert term.get("error_class") is None, "our reserve was blamed on the provider"
+
+    def test_the_DEFAULT_page_policy_is_unbounded(self, monkeypatch, tmp_path):
+        """The settled design: 0 = no Quarry-imposed limit. Nothing here patches `settings.concurrency`,
+        so this is the default an operator actually gets — a default of 1 would silently cap every pivot
+        at page one, and the credit balance (not an arbitrary page number) is what bounds the spend."""
+        from quarry_recon.phases import probe
+        calls = []
+
+        def counted(req, timeout=20):
+            calls.append(str(req.full_url))
+            page = int(req.full_url.split("page=")[1])
+            n = 100 if page < 3 else 50
+            return _Resp(json.dumps({"total": 250,
+                                     "matches": [{"hostnames": [f"p{page}h{i}.acme.com"]}
+                                                 for i in range(n)]}).encode())
+
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(counted, credits=10))
+        ctx, _ = self._ctx(tmp_path)
+        probe._shodan_pivot(ctx, "k", ["hX"], "http.favicon.hash", "favicon-shodan", "probe.favicon",
+                            "{}")
+        assert len(calls) == 3, f"a 3-page pivot bought {len(calls)} page(s) by default"
+        assert self._cov(tmp_path, "shodan_pages_withheld")[0]["omitted"] == 0
+
+    def test_BOTH_lanes_are_collected_before_ANY_credit_is_spent(self, monkeypatch, tmp_path):
+        """review-B1.4r2#1, the central B1.3 property in the REAL flow. Each lane used to build its own
+        balance, ledger and coordinator run, called in sequence — so favicon could consume every
+        spendable credit before certificate work was even collected. With one coordinator and a budget
+        of 2, each lane gets one page: fairness that only existed in the isolated coordinator."""
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+        calls = []
+
+        def counted(req, timeout=20):
+            calls.append(str(req.full_url))
+            return _Resp(json.dumps({"total": 500,
+                                     "matches": [{"hostnames": ["x.acme.com"]}]}).encode())
+
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(counted, credits=2))
+        ctx, _added = self._ctx(tmp_path)
+        ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
+                                  else [{"sha1": "C1"}] if e == "certificate" else [])
+        probe._shodan_pivots(ctx)
+        facets = [c.split("query=")[1].split("%3A")[0] for c in calls]
+        assert len(calls) == 2, f"budget of 2 bought {len(calls)} pages: {calls}"
+        assert set(facets) == {"http.favicon.hash", "ssl.cert.fingerprint"}, (
+            f"one lane took the whole budget: {facets}")
+
+    def test_a_starved_budget_still_reaches_the_SECOND_lane(self, monkeypatch, tmp_path):
+        """The sharper case: 1 credit, and BOTH lanes have work. Whoever wins, the other must be a
+        counted remainder rather than an unqueried surprise."""
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+        calls = []
+
+        def counted(req, timeout=20):
+            calls.append(str(req.full_url))
+            return _Resp(json.dumps({"total": 10, "matches": []}).encode())
+
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(counted, credits=1))
+        ctx, _added = self._ctx(tmp_path)
+        ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
+                                  else [{"sha1": "C1"}] if e == "certificate" else [])
+        probe._shodan_pivots(ctx)
+        assert len(calls) == 1
+        unq = self._cov(tmp_path, "shodan_pivots_unqueried")
+        assert sum(r["omitted"] for r in unq) == 1, f"the unbought lane vanished: {unq}"
 
     @pytest.mark.parametrize("body", [
         {"total": 1, "matches": [None]},                     # review-r3#3: a null row is NOT a clean empty
@@ -576,7 +910,7 @@ class TestShodanPivot:
         # crash and never a laundered clean empty.
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", lambda req, timeout=20: _Resp(json.dumps(body).encode()))
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: _Resp(json.dumps(body).encode())))
         ctx, added = self._ctx(tmp_path)
         with pytest.raises(ValueError):
             probe._shodan_pivot(ctx, "k", ["hashX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
@@ -595,9 +929,14 @@ class TestShodanPivot:
             if page == 1:
                 return _Resp(json.dumps({"total": 500, "matches": [{"hostnames": [f"h{i}.acme.com"]} for i in range(100)]}).encode())
             raise urllib.error.HTTPError("u", 429, "rate", {}, None)   # page 2 fails
-        monkeypatch.setattr(probe.urllib.request, "urlopen", paged)
-        ms, total, pages, err = probe._shodan_search("k", "http.favicon.hash", "hX", 3)
-        assert len(ms) == 100 and total == 500 and pages == 1 and isinstance(err, urllib.error.HTTPError)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(paged))
+        # B1.4: the adapter fetches ONE page and never raises — it hands the coordinator a classified
+        # error instead, and the coordinator decides what that costs.
+        ms, total, err = probe._shodan_page("k", "http.favicon.hash", "hX", 1)
+        assert len(ms) == 100 and total == 500 and err is None
+        ms2, total2, err2 = probe._shodan_page("k", "http.favicon.hash", "hX", 2)
+        assert ms2 == [] and total2 is None and isinstance(err2, urllib.error.HTTPError)
+        assert err2.error_class, "the error reached the coordinator unclassified"
         ctx, _ = self._ctx(tmp_path)
         r = probe._shodan_pivot(ctx, "k", ["hX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         assert "h0.acme.com" in r                             # page-1 hosts preserved despite the page-2 failure
@@ -605,10 +944,9 @@ class TestShodanPivot:
         # review-r5#2: a DEGRADED pivot got page-1 data -> NOT counted as wholly-omitted (shodan_pivots), but
         # its result set IS incomplete (shodan_results).
         assert self._cov(tmp_path, "shodan_pivots")[0]["omitted"] == 0
-        # B1.1r2: `shodan_results` now means OUR page budget only. A later page lost to a 429 is a
-        # FAILURE at a later position, so it is counted in `shodan_results_failed` (a gap) — the old
-        # single measure blamed Quarry's cap for a page the target rate-limited.
-        assert self._cov(tmp_path, "shodan_results")[0]["omitted"] == 0
+        # B1.1r2: our page budget is its OWN measure. A later page lost to a 429 is a FAILURE at a later
+        # position, counted in `shodan_results_failed` (a gap) — never blamed on Quarry's cap.
+        assert self._cov(tmp_path, "shodan_pages_withheld")[0]["omitted"] == 2   # pages 4-5, max_pages=3
         assert self._cov(tmp_path, "shodan_results_failed")[0]["omitted"] == 1
         assert self._cov(tmp_path, "shodan_results_limited")[0]["omitted"] == 0
 
@@ -623,7 +961,7 @@ class TestShodanPivot:
             if "h_bad" in req.full_url:
                 raise urllib.error.HTTPError("u", 429, "rate", {}, None)
             return _Resp(json.dumps({"total": 1, "matches": [{"hostnames": ["real.acme.com"]}]}).encode())
-        monkeypatch.setattr(probe.urllib.request, "urlopen", mixed)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(mixed))
         ctx, _ = self._ctx(tmp_path)
         contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
             ctx, "k", ["h_good", "h_bad"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}"),
@@ -643,8 +981,8 @@ class TestShodanPivot:
             page = int(req.full_url.split("page=")[1])
             ms = [{"hostnames": [f"p{page}h{i}.acme.com"]} for i in range(100 if page == 1 else 50)]
             return _Resp(json.dumps({"total": 150, "matches": ms}).encode())
-        monkeypatch.setattr(probe.urllib.request, "urlopen", paged)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(paged))
         ctx, added = self._ctx(tmp_path)
         n = probe._shodan_pivot(ctx, "k", ["hashX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         assert calls["n"] == 2 and len(n) == 150                   # both pages read, all 150 hosts ingested
-        assert not self._cov(tmp_path, "shodan_results")[0]["omitted"]   # fully paged -> not truncated
+        assert not self._cov(tmp_path, "shodan_pages_withheld")[0]["omitted"]   # fully paged

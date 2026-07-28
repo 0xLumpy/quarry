@@ -709,6 +709,8 @@ def osint(profile_path, timeout):
                   "green" if _verdict == "complete" else "yellow"))
     for _lim in _sum.get("provider_limits", []):
         click.echo(_c(f"   provider limit: {_lim.get('tool')} — {_lim.get('why')}", "yellow"))
+    for _lim in _sum.get("operator_limits", []):     # OURS — say so, never "provider limit"
+        click.echo(_c(f"   operator limit: {_lim.get('tool')} — {_lim.get('why')}", "yellow"))
     for _gap in _sum.get("gaps", []):
         click.echo(_c(f"   incomplete: {_gap.get('tool')} — {_gap.get('why')}", "yellow"))
     click.echo(f"   report:    {report}")

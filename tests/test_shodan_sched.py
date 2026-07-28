@@ -448,11 +448,14 @@ class TestFoldedVerdict:
         s, _out = self._fold(tmp_path, _states((FAV, "a")), _Provider(), bal)
         assert s["verdict"] == "complete_with_gaps"
 
-    def test_an_operator_page_policy_is_a_soft_limit(self, tmp_path):
+    def test_an_operator_page_policy_is_OUR_CAP(self, tmp_path):
+        """review-B1 (Lumpy): "SHODAN_MAX_PAGES=1 is still a cap". It was emitted as a soft SAMPLE, which
+        let a run that never looked past its page policy fold as `complete_with_limits` — a hard ceiling
+        WE imposed, reported as somebody else's boundary."""
         s, out = self._fold(tmp_path, _states((FAV, "a")), _Provider(totals={"a": 500}),
                             self._bal(), max_pages=2)
         assert out[FAV].pages_withheld == 3
-        assert s["verdict"] == "complete_with_limits", (s["gaps"], s["failures"])
+        assert s["verdict"] == "complete_with_gaps", (s["gaps"], s["failures"])
 
     def test_unpersisted_state_is_a_gap(self, tmp_path):
         from quarry_recon import contract
@@ -621,7 +624,7 @@ class TestWithheldPagesAreVisible:
                       balance=_Bal(spendable=None))
         assert out[FAV].pages_withheld == 0 and out[FAV].pages_bought == 5
 
-    def test_withheld_pages_are_emitted_as_a_SOFT_limit(self, tmp_path):
+    def test_withheld_pages_are_emitted_as_OUR_CAP(self, tmp_path):
         out, _ = _run(tmp_path, _states((FAV, "a")), _Provider(totals={"a": 500}),
                       balance=_Bal(spendable=None), max_pages=2)
         events.reset()
@@ -633,7 +636,7 @@ class TestWithheldPagesAreVisible:
         finally:
             events.reset()
         w = [r for r in recs if r["measure"] == "shodan_pages_withheld"][0]
-        assert w["omitted"] == 3 and w["kind"] == "sample"
+        assert w["omitted"] == 3 and w["kind"] == "cap"
 
 
 # ── review r6/r7: cursor + duplicate identities ───────────────────────────────────────────────────
@@ -1139,6 +1142,51 @@ def _publish_pages_fail(mod):
 def _pages(index: dict) -> dict:
     """Just the page numbers — `owned_index` also carries each page's artifact and validated document."""
     return {k: [pg for pg, _art, _doc in v] for k, v in index.items()}
+
+
+class TestDriftTelemetry:
+    def test_drift_is_REPORTED_not_just_counted(self, tmp_path):
+        """The user's integration requirement: `total_drift` must reach telemetry. It is a soft PROVIDER
+        limit — the index moved under us — and never a gap, because keeping the maximum omits nothing."""
+        from quarry_recon.shodan_sched import report
+        led = _ledger(tmp_path)
+        p = _Provider(totals={("a", 1): 200, ("a", 2): 500, "a": 500})
+        res, _ = _res(tmp_path, _states((FAV, "a")), p, balance=_Bal(spendable=2), ledger=led)
+        ev = tmp_path / "ev"
+        ev.mkdir(parents=True, exist_ok=True)
+        events.reset()
+        events.configure(ev)
+        try:
+            report(FAV, res.lanes[FAV], balance=_Bal(spendable=2), persisted=True)
+            recs = [json.loads(l) for l in (ev / "events.jsonl").read_text().splitlines()
+                    if '"coverage_partial"' in l]
+        finally:
+            events.reset()
+        rec = [r for r in recs if r["measure"] == "shodan_total_drift"]
+        assert rec, f"drift never reached telemetry: {[r['measure'] for r in recs]}"
+        # review-B1.4r2#4: VISIBLE but never a coverage boundary — keeping the maximum omits nothing, so
+        # a single drifting total must not fold an otherwise complete scan into complete_with_limits.
+        assert rec[0]["omitted"] == 0
+        assert "1 of 2 page(s)" in rec[0]["reason"], rec[0]["reason"]
+
+    def test_no_drift_still_reports_a_clean_measure(self, tmp_path):
+        """Emitted every run, so a later clean run CLEARS a prior drift record."""
+        from quarry_recon.shodan_sched import report
+        led = _ledger(tmp_path)
+        res, _ = _res(tmp_path, _states((FAV, "a")), _Provider(totals={"a": 500}),
+                      balance=_Bal(spendable=2), ledger=led)
+        ev = tmp_path / "ev"
+        ev.mkdir(parents=True, exist_ok=True)
+        events.reset()
+        events.configure(ev)
+        try:
+            report(FAV, res.lanes[FAV], balance=_Bal(spendable=2), persisted=True)
+            recs = [json.loads(l) for l in (ev / "events.jsonl").read_text().splitlines()
+                    if '"coverage_partial"' in l]
+        finally:
+            events.reset()
+        rec = [r for r in recs if r["measure"] == "shodan_total_drift"]
+        assert rec and rec[0]["omitted"] == 0
 
 
 class TestTotalReconciliation:

@@ -32,17 +32,26 @@ class ProviderResult(set):
     TRUNCATED — run_provider then records PARTIAL (not SUCCESS) and a structured coverage_partial, so a
     consumer can tell complete collection from a bounded/truncated one and resume from `cursor`."""
     def __init__(self, iterable=(), *, partial=False, cursor=None, pages=None, error_class=None,
-                 partial_kind="pagination", partial_reason=None):
+                 partial_kind=None, partial_reason=None, limited=False):
         super().__init__(iterable)
-        self.partial = partial
+        # review-B1.4r5#1: `limited` without `partial` was a silent SUCCESS/EMPTY — a bounded outcome
+        # reported as a complete one. A limit IS incompleteness, so it implies partial rather than
+        # depending on the caller to say both. And it is never PAGINATION truncation, so an unstated
+        # kind resolves to "degraded" instead of inheriting a default that fabricates a cursor reason.
+        self.partial = partial or limited
         self.cursor = cursor
         self.pages = pages
         self.error_class = error_class      # set when a LATER page failed (earlier pages preserved as PARTIAL)
         # review-r4#2: a partial result is EITHER "pagination" (cap/cursor truncation — emits a pagination
         # coverage gap) OR "degraded" (a generic partial, e.g. some Shodan pivots failed — NOT pagination, so
         # run_provider must not fabricate a "TRUNCATED at None pages" reason or a pagination coverage unit).
-        self.partial_kind = partial_kind
+        self.partial_kind = partial_kind or ("degraded" if limited else "pagination")
         self.partial_reason = partial_reason
+        # review-B1.4r4#3: an OPERATOR boundary (a credit reserve, a withheld budget) is a LIMIT that no
+        # provider error class describes. Without this it could only be expressed by borrowing `quota` —
+        # blaming the provider for our own policy — or by falling through to PARTIAL, which asserts a
+        # DEGRADED execution when nothing went wrong. `limited` says the outcome was bounded on purpose.
+        self.limited = limited
 
 
 # ── shared PROVIDER OUTCOME taxonomy (B0) ────────────────────────────────────────────────────────────
@@ -449,11 +458,88 @@ def run_provider(source_id, fn, *, work_unit=None, input_total=None):
     failure the phase still continues (returns None). Returns fn()'s result on success. C06: a FAILED terminal
     carries an ``error_class`` (auth/quota/transport/parse/server) so a consumer can tell a real failure from
     'nothing found' and choose retry/backoff."""
+    if not _provider_start(source_id, work_unit=work_unit, input_total=input_total):
+        return None
+    return _provider_terminal(source_id, fn, work_unit=work_unit)
+
+
+class ProviderSkip(Exception):
+    """A lane that did not run and did not fail: no credential, no input. It still needs a LIFECYCLE —
+    without one the previous run's terminal and coverage generation stay standing as if current."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _partial_status(error_class, limited: bool) -> str:
+    """The ONE precedence for every incomplete provider result, in both partial branches.
+
+    review-B1.4r5#1: `limited` was consulted only in the generic-partial branch, so the same flag meant
+    different things depending on `partial_kind` — and where it WAS read it outranked `error_class`, so a
+    transport failure alongside an operator bound reported LIMITED/transport. Gaps dominate limits:
+
+      1. a NON-limit error_class is a real failure          -> PARTIAL (a degraded execution)
+      2. a PROVEN provider limit, or a deliberate operator bound -> LIMITED (clean, cut short)
+      3. otherwise (incomplete, nothing broke, nobody refused)   -> PARTIAL
+    """
+    if error_class and not is_provider_limit(error_class):
+        return Status.PARTIAL.value
+    if is_provider_limit(error_class) or limited:
+        return Status.LIMITED.value
+    return Status.PARTIAL.value
+
+
+def terminal_is_limit(status, error_class) -> bool:
+    """Whether a provider TERMINAL is a soft limit (-> complete_with_limits) rather than a gap.
+
+    review-B1.4r7#1: reconciliation recognised a limit only by a PROVEN provider class, so an OPERATOR
+    boundary — `LIMITED` with deliberately no provider class — fell into the generic gap branch and
+    reversed the terminal and coverage semantics at the last step. `Status.LIMITED` means "ran clean,
+    something bounded it"; WHY is carried separately by `error_class`.
+
+    Malformed combinations are guarded rather than trusted, in BOTH directions — the status and the
+    class must agree, and either one alone is not enough:
+
+      · `LIMITED` + a NON-limit class (a transport failure) is a contradiction; it must not soften that
+        failure, so it reads as a gap.
+      · review-B1.4r8#1: any OTHER status + a proven limit class was accepted on the strength of the
+        class alone, so a FAILED/quota terminal folded as `complete_with_limits` with an EMPTY failure
+        list — a hard failure laundered into a soft limit. Every producer already emits `LIMITED` for a
+        genuine quota (`_partial_status`, and the exception path in `_provider_terminal`), so nothing
+        legitimate needs the permissive fallback.
+
+    Fail closed: the status decides, the class may only disqualify."""
+    if status != Status.LIMITED.value:
+        return False
+    return not error_class or is_provider_limit(error_class)
+
+
+def _partial_coverage_kind(error_class, limited: bool) -> str:
+    """WHOSE boundary truncated a paginating provider — the same precedence as `_partial_status`.
+
+    review-B1.4r6#1: this was derived from the STATUS, so every LIMITED outcome emitted
+    `COVERAGE_PROVIDER`. That collapsed the two ways a run can be limited and told the reader the
+    provider had refused us when the truth was our own operator boundary — the attribution the whole
+    B0/B1 taxonomy exists to keep apart, reappearing one layer downstream of the terminal that had just
+    been fixed."""
+    if error_class and not is_provider_limit(error_class):
+        return events.COVERAGE_TIMEOUT               # a later page was LOST — the target's cost
+    if is_provider_limit(error_class):
+        return events.COVERAGE_PROVIDER              # a PROVEN provider limit (credits/plan)
+    if limited:
+        return events.COVERAGE_SAMPLE                # an OPERATOR policy — deliberately bounded
+    return events.COVERAGE_CAP                       # OUR configured ceiling truncated it
+
+
+def _provider_start(source_id, *, work_unit=None, input_total=None) -> bool:
+    """Open a provider lane: registry check, generation reset, tool_start. False = not in the registry."""
     if sources.get(source_id) is None:
         events.tool_blocked(source_id, reason=f"unknown source_id {source_id!r} — not in registry; not executed")
-        return None
-    # review-r5#1: stamp the generation reset on the START (persisted BEFORE execution) so a crash between start
-    # and terminal still supersedes the prior generation, and the un-terminated start reads as INCOMPLETE.
+        return False
+    # review-r5#1: stamp the generation reset on the START (persisted BEFORE execution) so a crash between
+    # start and terminal still supersedes the prior generation, and the un-terminated start reads as
+    # INCOMPLETE.
     reset_gen = events.mark_provider_generation(source_id)   # first terminal per source per session
     events.tool_start(source_id, input_total=input_total, work_unit=work_unit,
                       provider=True, reset_generation=reset_gen)
@@ -465,10 +551,61 @@ def run_provider(source_id, fn, *, work_unit=None, input_total=None):
         # `complete_with_gaps`. Opening the coverage generation alongside the provider generation makes
         # the two move together: prior units are a stale snapshot the moment this source runs again.
         events.coverage_reset(source_id)
+    return True
+
+
+def run_providers(entries, shared):
+    """Bracket SEVERAL provider lanes around ONE shared body.
+
+    `entries` is [(source_id, work_unit, finalize)]; `shared` runs ONCE, after every lane has started and
+    before any lane is finalized. Returns {source_id: result or None}.
+
+    review-B1.4r3#1: work shared by several lanes — a coordinator spending one credit budget across them
+    — used to run BEFORE either bracket. Requests were then issued before `tool_start` and before the
+    generation reset, so an interruption mid-spend left credits gone with no lane lifecycle to show for
+    it, and a stale previous generation still standing. Starting every participating lane first makes the
+    un-terminated start the honest record of exactly that.
+
+    A raise from `shared` is every started lane's failure: none of them can produce a result."""
+    live = [(sid, wu, fin) for sid, wu, fin in entries
+            if _provider_start(sid, work_unit=wu)]
+    cancel = failed = None
+    try:
+        shared()
+    except (KeyboardInterrupt, SystemExit) as e:
+        cancel = e
+    except Exception as e:
+        # review-B1.4r4#4: this caught BaseException and always re-raised, so an ordinary failure in
+        # shared setup aborted the surrounding PHASE — while the single-lane `run_provider` records
+        # FAILED and returns None. Best-effort is the provider contract; only cancellation propagates.
+        failed = e
+    results: dict = {}
+    # fixed BEFORE the loop: only a failure of the SHARED body kills every lane. A cancellation raised
+    # by one lane's finalizer must not be replayed into the others — their results are already computed
+    # and finalizing them is pure bookkeeping, which is exactly what must not be skipped.
+    dead = cancel if cancel is not None else failed
+    for sid, wu, fin in live:
+        body = fin if dead is None else (lambda e=dead: (_ for _ in ()).throw(e))
+        try:
+            results[sid] = _provider_terminal(sid, body, work_unit=wu)
+        except BaseException as e:
+            # review-B1.4r4#1: `_provider_terminal` re-raises cancellation PAST its own finally — the
+            # terminal for THIS lane is already written, but an un-caught re-raise ended the loop and
+            # left every later lane permanently started. Remember it, finish the lanes, raise after.
+            results[sid] = None
+            cancel = cancel if cancel is not None else e
+    if cancel is not None:
+        raise cancel
+    return results
+
+
+def _provider_terminal(source_id, fn, *, work_unit=None):
+    """Run `fn` and emit this lane's terminal, whatever happens. The lane must already be STARTED."""
     result = None
     status = Status.FAILED.value                             # default: covers a raise BEFORE a result is computed
     reason = n = error_class = None
     is_pagination = False                                     # this result reports pagination COMPLETION (emit a counter)
+    partial_limited = False                                   # the truncation was a DELIBERATE bound
     try:
         result = fn()
         n = len(result) if hasattr(result, "__len__") else None
@@ -476,25 +613,26 @@ def run_provider(source_id, fn, *, work_unit=None, input_total=None):
             if result.partial and result.partial_kind == "pagination":
                 is_pagination = True
                 error_class = result.error_class
+                partial_limited = bool(result.limited)
                 # review-B0r4#1: the PAGINATION branch ran BEFORE any limit check, so a later page that
                 # died on spent credits became a degraded PARTIAL *and* a COVERAGE_CAP — i.e. Quarry
                 # claiming its own hard ceiling truncated the input. A proven provider limit is LIMITED
                 # with provider-limit coverage, whatever stopped us and on whichever page.
-                status = (Status.LIMITED.value if is_provider_limit(error_class)
-                          else Status.PARTIAL.value)
+                status = _partial_status(error_class, result.limited)
                 reason = (f"pagination TRUNCATED at {result.pages} page(s), cursor={result.cursor!r}"
                           + (f" — {error_class} on a later page (earlier pages KEPT)" if error_class else ""))
             elif result.partial:                            # review-r4#2: a GENERIC degraded partial (NOT pagination)
                 error_class = result.error_class
                 # a partial caused by a PROVIDER LIMIT is not degradation either (r3#1)
-                status = (Status.LIMITED.value if is_provider_limit(error_class)
-                          else Status.PARTIAL.value)
+                status = _partial_status(error_class, result.limited)
                 reason = result.partial_reason or f"partial result ({error_class or 'degraded'}) — earlier evidence KEPT"
             else:                                            # a complete ProviderResult — a paginating provider
                 is_pagination = result.pages is not None     # (only paginating providers carry a completion counter)
                 status = Status.SUCCESS.value if n else Status.EMPTY.value
         else:
             status = Status.SUCCESS.value if n else Status.EMPTY.value
+    except ProviderSkip as e:                                # did not run and did not fail
+        status, reason, result = Status.SKIPPED.value, e.reason, None
     except Exception as e:                                   # ordinary provider error — record FAILED, don't crash phase
         reason, result = f"{type(e).__name__}: {e}", None
         # B0: a ProviderBodyError already carries a class PROVEN from the provider's own body, which the
@@ -525,12 +663,7 @@ def run_provider(source_id, fn, *, work_unit=None, input_total=None):
             #   cap      -> OUR configured max_pages ceiling truncated it — the only one that is ours
             # review-B0r5#2: everything non-limit was labelled `cap`, which blamed Quarry's ceiling for a
             # rate-limited or broken page it never reached.
-            if status == Status.LIMITED.value:
-                _kind = events.COVERAGE_PROVIDER
-            elif error_class:
-                _kind = events.COVERAGE_TIMEOUT
-            else:
-                _kind = events.COVERAGE_CAP
+            _kind = _partial_coverage_kind(error_class, partial_limited)
             events.coverage_partial(source_id, kind=_kind, measure="pagination",
                                     unit=(work_unit or source_id), eligible=1,
                                     tested=0 if truncated else 1, omitted=1 if truncated else 0,

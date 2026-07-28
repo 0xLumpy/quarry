@@ -1098,6 +1098,39 @@ def _http_err(code, body):
     return urllib.error.HTTPError("http://x", code, "msg", {}, io.BytesIO(body.encode()))
 
 
+class _Body:
+    """A minimal urlopen context manager."""
+
+    def __init__(self, payload):
+        self._payload = payload.encode() if isinstance(payload, str) else payload
+
+    def read(self, n=None):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _with_balance(responder, *, credits=100, allowance=100):
+    """Answer `/api-info` from a HEALTHY balance and send everything else to `responder`.
+
+    B1.4: the lane reads the credit balance before it schedules any paid page, so a responder that
+    answers EVERY url would have the balance read consume the first scripted error. `/api-info` is free
+    and keeps working at a zero balance (measured), so a fixture where it fails alongside the search is
+    testing a state Shodan does not produce. Tests that want a depleted ACCOUNT say so with `credits=0`;
+    tests that want a failing SEARCH leave the balance healthy."""
+    def route(req, timeout=20):
+        url = getattr(req, "full_url", req)
+        if "api-info" in str(url):
+            return _Body(json.dumps({"query_credits": credits, "scan_credits": 0,
+                                     "usage_limits": {"query_credits": allowance}}))
+        return responder(req, timeout=timeout)
+    return route
+
+
 class TestShodanBodyRefinedClassification:
     """Shodan returns 401 for a bad key AND for spent credits. A status-only taxonomy would send the
     operator to re-key a credential that was never wrong, and report a failure where the truth is a
@@ -1205,19 +1238,22 @@ class TestShodanPivotUsesTheProvenClass:
     def test_the_pivot_lane_captures_the_body_at_the_raise_site(self):
         import inspect
         from quarry_recon.phases import probe
-        src = inspect.getsource(probe._shodan_search)
+        src = inspect.getsource(probe._shodan_page)
         assert 'capture_error_body(e, provider="shodan")' in src
-        # The capture must happen BEFORE the propagate/return decision, or the body is gone by then.
-        # NB anchor on the CODE, not the word "raise" — the docstring says "propagates (raise ...)" and
-        # a naive index() matched that instead, passing for the wrong reason.
-        assert src.index("capture_error_body") < src.index("if page == 1:")
+        # The capture must happen BEFORE the error leaves the adapter, or the body is gone by then
+        # (an HTTPError wraps a live socket). B1.4: the adapter RETURNS the classified error instead of
+        # raising, so anchor on the return that hands it to the coordinator.
+        assert src.index("capture_error_body") < src.index("return [], None, _classified(e)")
 
     def test_the_pivot_counts_the_proven_class(self):
         import inspect
         from quarry_recon.phases import probe
-        src = inspect.getsource(probe._shodan_pivot)
-        assert "provider_error_class(e)" in src and "provider_error_class(page_err)" in src
-        assert "classify_provider_error(" not in src
+        # B1.4: classification is the ADAPTER's job now — every exception leaves it carrying a class the
+        # coordinator can act on, so the pivot never re-derives one.
+        src = inspect.getsource(probe._classified)
+        assert "provider_error_class(e)" in src and "classify_provider_error(" not in src
+        piv = inspect.getsource(probe._shodan_work)
+        assert "provider_error_class(err)" in piv and "classify_provider_error(" not in piv
 
 
 class TestRealShodanLaneUnderQuota:
@@ -1241,7 +1277,8 @@ class TestRealShodanLaneUnderQuota:
         return type("C", (), {"run": run, "scope": _Scope(), "http_timeout": 20,
                               "echo": staticmethod(lambda m: None)})()
 
-    def _drive(self, tmp_path, monkeypatch, responder, values=("abc", "def")):
+    def _drive(self, tmp_path, monkeypatch, responder, values=("abc", "def"), with_dir=False,
+               route_balance=True, credits=100):
         """Run the REAL pivot through a faked urlopen and read the REAL verdict from the manifest."""
         import urllib.request
         from quarry_recon import events
@@ -1250,14 +1287,18 @@ class TestRealShodanLaneUnderQuota:
         run = Run.create(tmp_path, "t")
         events.reset()
         events.configure(run.dir)
-        monkeypatch.setattr(urllib.request, "urlopen", responder)
+        # route_balance=False lets a test refuse the BALANCE read itself, which the wrapper would
+        # otherwise answer — the failure mode that made this test pass for the wrong reason.
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            _with_balance(responder, credits=credits) if route_balance else responder)
         ctx = self._ctx(tmp_path, run)
         try:
             contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
                 ctx, "KEY", values, "http.favicon.hash", "favicon-shodan", "probe.favicon", "seen {}"),
                 work_unit="wu-a")
             run.write_manifest({}, ["probe"])
-            return json.loads(run.manifest_path.read_text())["summary"]
+            s = json.loads(run.manifest_path.read_text())["summary"]
+            return (s, run.dir) if with_dir else s
         finally:
             events.reset()
 
@@ -1291,7 +1332,9 @@ class TestRealShodanLaneUnderQuota:
     def test_quota_plus_a_real_failure_keeps_BOTH_and_ends_in_gaps(self, tmp_path, monkeypatch):
         """review#2: the outcome used to depend on which pivot happened to be last. The limit must stay
         visible, and a genuine failure must still dominate the verdict."""
-        seq = [_http_err(401, SHODAN_QUOTA_BODY), _http_err(500, "boom")]
+        # B1.4: the failure comes FIRST, because a proven limit stops purchasing and anything scripted
+        # behind it is never requested (see test_a_limit_STOPS_the_run_... for that half).
+        seq = [_http_err(500, "boom"), _http_err(401, SHODAN_QUOTA_BODY)]
 
         def mixed(*a, **kw):
             raise seq.pop(0) if seq else _http_err(500, "boom")
@@ -1301,11 +1344,96 @@ class TestRealShodanLaneUnderQuota:
                    if any(k == "provider" for k in (c.get("by_kind") or {}))]
         assert limited, "the provider limit vanished behind the failure"
 
+    def test_a_ZERO_BALANCE_stops_before_any_request_and_still_reads_as_LIMITED(self, tmp_path,
+                                                                                monkeypatch):
+        """B1.4: when /api-info proves there are no credits, the coordinator issues NOTHING — so there is
+        no exception to raise, and a bare empty set would read as a clean EMPTY: the lane silently doing
+        nothing on a depleted account. The proven stop is carried in the result instead."""
+        calls = []
+
+        def counted(req, timeout=20):
+            calls.append(str(getattr(req, "full_url", req)))
+            raise AssertionError("a paid search was issued at a zero balance")
+
+        term = self._drive_terminal(tmp_path, monkeypatch, counted, credits=0)
+        assert calls == [], f"spent on a proven-empty account: {calls}"
+        assert term["status"] == "limited" and term["error_class"] == PROVIDER_QUOTA
+
+    def test_a_balance_read_REFUSED_by_the_provider_is_not_a_gap(self, tmp_path, monkeypatch):
+        """B1.4: /api-info is read before any page, and its failure was counted as a failure whatever the
+        cause — so a depleted account emitted a gap from the balance probe while its pivots correctly
+        reported a limit. A refusal the provider PROVED is a limit in every channel, including this one."""
+        def refused(*a, **kw):
+            raise _http_err(401, SHODAN_QUOTA_BODY)                 # /api-info itself is refused
+
+        s, run_dir = self._drive(tmp_path, monkeypatch, refused, with_dir=True, route_balance=False)
+        fails = [json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()
+                 if '"shodan_failures"' in l]
+        assert fails and fails[-1]["omitted"] == 0, f"the refused balance read became a gap: {fails}"
+        assert s["verdict"] == "complete_with_limits", (s["gaps"], s["failures"])
+
+    def test_an_operator_reserve_ALONE_folds_as_complete_with_limits(self, tmp_path, monkeypatch):
+        """review-B1.4r7#1, end to end through the real lane: our own reserve withholds every credit, so
+        nothing is queried and nothing goes wrong. The run is INCOMPLETE and CLEAN."""
+        from quarry_recon.phases import probe
+        monkeypatch.setattr(probe, "_shodan_reserve_setting", lambda: (10, True))
+
+        def never(*a, **kw):
+            raise AssertionError("a credit was spent past the reserve")
+
+        s = self._drive(tmp_path, monkeypatch, never, credits=10)
+        assert s["verdict"] == "complete_with_limits", (s["gaps"], s["failures"])
+        assert not s["gaps"] and not s["failures"]
+        # OUR bound, filed as ours — never as the provider refusing us (review-B1.4r8#2)
+        assert s["operator_limits"] and not s["provider_limits"], s
+        assert {x["origin"] for x in s["operator_limits"]} == {"operator"}
+
+    def test_a_reserve_PLUS_a_broken_balance_read_still_ends_in_gaps(self, tmp_path, monkeypatch):
+        """The real gap dominates. `unknown_with_reserve` is our own caution — a soft limit — but the
+        transport failure that made the balance unknown is a genuine gap, and BOTH must survive."""
+        from quarry_recon.phases import probe
+        monkeypatch.setattr(probe, "_shodan_reserve_setting", lambda: (10, True))
+
+        def dead(*a, **kw):
+            raise urllib.error.URLError("connection refused")
+
+        s = self._drive(tmp_path, monkeypatch, dead, route_balance=False)
+        assert s["verdict"] == "complete_with_gaps", (s["gaps"], s["failures"])
+        assert s["gaps"] or s["failures"], s
+
+    def test_a_BAD_KEY_produces_a_CLASSIFIED_FAILED_terminal_not_a_ghost_empty(self, tmp_path,
+                                                                               monkeypatch):
+        """review-B1.4r2#3: only quota/entitlement were carried into the result, so an auth stop fell
+        through to `return found` — an EMPTY terminal with no class and produced.host=0, while coverage
+        said "gap". The verdict was right and `failed_tools` was a lie. `stop_is_limit` already draws
+        exactly the line: an expected boundary is a limit, a credential that does not work is a DEFECT."""
+        def bad_key(*a, **kw):
+            raise _http_err(401, SHODAN_AUTH_BODY)                  # /api-info: HTML 401 = auth
+
+        term = self._drive_terminal(tmp_path, monkeypatch, bad_key, route_balance=False)
+        assert term["status"] == "failed", term
+        assert term["error_class"] == "auth", term
+
+    def test_a_BAD_KEY_is_never_dressed_up_as_a_provider_limit(self, tmp_path, monkeypatch):
+        """The control for the balance-stop terminal: `stop_kind` covers our OWN stops too (a bad
+        credential, an operator reserve), and only the provider's own boundary may be reported as its
+        boundary. A credential that does not work is a defect in our setup, and must stay a gap."""
+        def bad_key(*a, **kw):
+            raise _http_err(401, SHODAN_AUTH_BODY)                  # /api-info: HTML 401 = auth
+
+        s, run_dir = self._drive(tmp_path, monkeypatch, bad_key, with_dir=True, route_balance=False)
+        assert s["verdict"] == "complete_with_gaps", (s["gaps"], s["failures"])
+        assert not s["provider_limits"], "a bad key was reported as the provider limiting us"
+        fails = [json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()
+                 if '"shodan_failures"' in l]
+        assert fails and fails[-1]["omitted"] >= 1, "the auth failure did not read as a gap"
+
     def _terminal(self, run_dir):
         return [json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()
                 if '"tool_finish"' in l][-1]
 
-    def _drive_terminal(self, tmp_path, monkeypatch, responder, values=("abc", "def")):
+    def _drive_terminal(self, tmp_path, monkeypatch, responder, values=("abc", "def"), with_dir=False,
+                        credits=100, route_balance=True):
         """Same as _drive but hands back the TERMINAL event — the verdict alone cannot see which
         exception was raised, because the coverage gap is emitted before the raise either way."""
         import urllib.request
@@ -1315,29 +1443,48 @@ class TestRealShodanLaneUnderQuota:
         run = Run.create(tmp_path, "t")
         events.reset()
         events.configure(run.dir)
-        monkeypatch.setattr(urllib.request, "urlopen", responder)
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            _with_balance(responder, credits=credits) if route_balance else responder)
         ctx = self._ctx(tmp_path, run)
         try:
             contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
                 ctx, "KEY", values, "http.favicon.hash", "favicon-shodan", "probe.favicon", "seen {}"),
                 work_unit="wu-a")
-            return self._terminal(run.dir)
+            return (self._terminal(run.dir), run.dir) if with_dir else self._terminal(run.dir)
         finally:
             events.reset()
 
-    @pytest.mark.parametrize("order", [["quota", "fail"], ["fail", "quota"]])
-    def test_a_real_failure_outranks_a_limit_whichever_came_last(self, tmp_path, monkeypatch, order):
+    def test_a_real_failure_outranks_a_limit_that_did_not_stop_the_run(self, tmp_path, monkeypatch):
         """review#2: with everything failing and no evidence, the lane raises ONE exception — and it used
-        to be simply the LAST one. So a quota arriving after a 500 turned a broken run into a mere limit.
-        The verdict cannot catch this (the gap is emitted before the raise), so assert the TERMINAL."""
-        seq = [_http_err(401, SHODAN_QUOTA_BODY) if k == "quota" else _http_err(500, "boom")
-               for k in order]
+        to be simply the LAST one, so a quota arriving after a 500 turned a broken run into a mere limit.
+        The verdict cannot catch this (the gap is emitted before the raise), so assert the TERMINAL.
+
+        B1.4 narrows WHEN both can be observed: a proven provider limit now STOPS purchasing, so a
+        failure that would have happened after it never happens (see the companion test below). With the
+        failure FIRST, both are real and the failure must still win."""
+        seq = [_http_err(500, "boom"), _http_err(401, SHODAN_QUOTA_BODY)]
 
         def mixed(*a, **kw):
             raise seq.pop(0) if seq else _http_err(500, "boom")
         term = self._drive_terminal(tmp_path, monkeypatch, mixed)
         assert term["status"] == "failed", term
         assert term["error_class"] != PROVIDER_QUOTA
+
+    def test_a_limit_STOPS_the_run_so_later_pivots_are_a_counted_remainder(self, tmp_path, monkeypatch):
+        """B1.4, the deliberate behaviour change: once the provider proves there are no credits, further
+        requests cannot succeed, so the coordinator stops. A pivot that would have failed afterwards is
+        never attempted — reporting it as a failure would be inventing an observation. Nothing is hidden:
+        the unattempted pivots are an explicit, resumable remainder."""
+        seq = [_http_err(401, SHODAN_QUOTA_BODY), _http_err(500, "boom")]
+
+        def mixed(*a, **kw):
+            raise seq.pop(0) if seq else _http_err(500, "boom")
+        term, run_dir = self._drive_terminal(tmp_path, monkeypatch, mixed,
+                                             values=("abc", "def", "ghi"), with_dir=True)
+        assert term["status"] == "limited" and term["error_class"] == PROVIDER_QUOTA
+        unq = [json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()
+               if '"shodan_pivots_unqueried"' in l]
+        assert unq and unq[-1]["omitted"] == 2, f"the unbought pivots were not reported: {unq}"
 
     def test_only_limits_and_no_evidence_still_reads_as_LIMITED(self, tmp_path, monkeypatch):
         """The control for the rule above: with NO real failure, the limit is the honest terminal."""
@@ -1361,9 +1508,11 @@ class TestRealShodanLaneUnderQuota:
             def read(self, n=None):
                 return ok_body
 
-        # the limit must OUTNUMBER the failure, or a combined pool would pick the failure anyway on
-        # tie-break and the mutation stays invisible (it did, first time round).
-        seq = ["ok", "quota", "quota", "fail"]
+        # B1.4: the limit can no longer OUTNUMBER the failure — the first provider limit stops
+        # purchasing, so at most one is ever recorded per run. The property under test is unchanged
+        # (failures pick the dominant class, limits only fill in when there are none); what changed is
+        # that the failure must be observed BEFORE the limit, because nothing is bought after it.
+        seq = ["ok", "fail", "quota", "quota"]
 
         def mixed(*a, **kw):
             k = seq.pop(0) if seq else "fail"
@@ -1372,7 +1521,7 @@ class TestRealShodanLaneUnderQuota:
             raise _http_err(401, SHODAN_QUOTA_BODY) if k == "quota" else _http_err(500, "boom")
 
         term = self._drive_terminal(tmp_path, monkeypatch, mixed, values=("a", "b", "c", "d"))
-        assert term["status"] == "partial"
+        assert term["status"] == "partial"       # a real failure -> degraded, NOT merely limited
         assert term["error_class"] != PROVIDER_QUOTA, "a real failure was relabelled as a limit"
         assert not is_provider_limit(term["error_class"])
 
@@ -1412,8 +1561,9 @@ class TestLaterPagePositionAccounting:
         events.reset()
         events.configure(run.dir)
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: max_pages)
-        monkeypatch.setattr(urllib.request, "urlopen", responder)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", responder)
+        routed = _with_balance(responder)
+        monkeypatch.setattr(urllib.request, "urlopen", routed)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", routed)
         ctx = type("C", (), {"run": run, "scope": _Scope(), "http_timeout": 20,
                              "echo": staticmethod(lambda m: None)})()
         try:
@@ -1454,9 +1604,15 @@ class TestLaterPagePositionAccounting:
 
         s, d = self._drive(tmp_path, monkeypatch, paged, ("hX",))
         assert self._cov(d, "shodan_results_limited")[0]["omitted"] == 1     # the later LIMIT
-        assert self._cov(d, "shodan_results")[0]["omitted"] == 0             # NOT our page budget
+        # B1.4: our page budget is now counted in PAGES, not pivots — a finer denominator for the same
+        # fact. max_pages=3 of a 5-page pivot withholds 2, and the quota is not one of them.
+        assert self._cov(d, "shodan_pages_withheld")[0]["omitted"] == 2      # NOT the quota
         assert self._cov(d, "shodan_results_failed")[0]["omitted"] == 0      # NOT a failure
-        assert s["verdict"] == "complete_with_limits", (s["gaps"], s["failures"])
+        # B1.4: our own page cap withheld pages 4-5 of this 5-page pivot, and a cap is a GAP (Lumpy:
+        # "SHODAN_MAX_PAGES=1 is still a cap"). Both facts are true at once — the provider limited us on
+        # page 2 AND we never asked for pages past 3 — so the verdict carries the gap and the LIMIT stays
+        # visible in its own measure.
+        assert s["verdict"] == "complete_with_gaps", (s["gaps"], s["failures"])
         assert any(h.endswith("acme.com") for h in
                    [x["host"] for x in (json.loads(l) for l in
                     (d / "normalized" / "subdomain.jsonl").read_text().splitlines())])
@@ -1487,7 +1643,11 @@ class TestLaterPagePositionAccounting:
             return self._Resp(body)
 
         s, d = self._drive(tmp_path, monkeypatch, one_page, ("hX",), max_pages=1)
-        assert self._cov(d, "shodan_results")[0]["omitted"] == 1          # ours
+        withheld = self._cov(d, "shodan_pages_withheld")[0]
+        assert withheld["omitted"] == 4                                   # ours: 4 of 5 pages
+        # review-B1 (Lumpy): "SHODAN_MAX_PAGES=1 is still a cap" — a soft SAMPLE would let a run that
+        # never looked past page 1 call itself complete.
+        assert withheld["kind"] == "cap"
         assert self._cov(d, "shodan_results_failed")[0]["omitted"] == 0
         assert self._cov(d, "shodan_results_limited")[0]["omitted"] == 0
 
@@ -1508,12 +1668,12 @@ class TestLaterPagePositionAccounting:
 
         _s, d = self._drive(tmp_path, monkeypatch, mixed, ("hSPENT", "hDEAD", "hOK"))
         kinds = {m: self._cov(d, m)[0]["kind"] for m in
-                 ("shodan_pivots", "shodan_pivots_limited", "shodan_results",
+                 ("shodan_pivots", "shodan_pivots_limited", "shodan_pages_withheld",
                   "shodan_results_failed", "shodan_results_limited")}
         assert kinds == {
             "shodan_pivots": "timeout",            # first-page FAILURE — the target's cost
             "shodan_pivots_limited": "provider",   # first-page LIMIT — the provider's boundary
-            "shodan_results": "cap",               # OUR page budget — the only one that is ours
+            "shodan_pages_withheld": "cap",        # OUR page budget — the only one that is ours
             "shodan_results_failed": "timeout",    # later-page FAILURE
             "shodan_results_limited": "provider",  # later-page LIMIT
         }, kinds
@@ -1555,8 +1715,13 @@ class TestLaterPagePositionAccounting:
         assert "transport" in first_fail and "server" not in first_fail, first_fail
         assert "server" in later_fail and "transport" not in later_fail, later_fail
 
-    def test_first_page_quota_and_later_page_failure_are_both_counted(self, tmp_path, monkeypatch):
-        """The mirror case: a first-page LIMIT must not erase a later-page FAILURE either."""
+    def test_a_first_page_limit_stops_the_run_and_the_rest_is_a_REMAINDER(self, tmp_path, monkeypatch):
+        """The mirror case, re-derived for B1.4. It used to assert that a first-page LIMIT could not
+        erase a LATER-page failure. That combination is now unreachable, and for a structural reason
+        worth stating: the coordinator schedules PAGE TIER first, so every pivot's page 1 is attempted
+        before any pivot's page 2 — a first-page limit therefore always precedes any later page, and
+        stops purchasing. So the property to protect is no longer "both are counted" but "what we never
+        bought is COUNTED, not silently dropped"."""
         body = self._full_page()
 
         def mixed(req, timeout=20):
@@ -1564,10 +1729,13 @@ class TestLaterPagePositionAccounting:
                 raise _http_err(401, SHODAN_QUOTA_BODY)                  # first-page LIMIT
             if "page=1" in req.full_url:
                 return self._Resp(body)
-            raise _http_err(500, "boom")                                 # later-page FAILURE
+            raise _http_err(500, "boom")                                 # never reached
 
         s, d = self._drive(tmp_path, monkeypatch, mixed, ("hSPENT", "hOK"))
         assert self._cov(d, "shodan_pivots_limited")[0]["omitted"] == 1   # first-page limit
         assert self._cov(d, "shodan_pivots")[0]["omitted"] == 0           # no first-page failure
-        assert self._cov(d, "shodan_results_failed")[0]["omitted"] == 1   # later-page failure survives
+        assert self._cov(d, "shodan_results_failed")[0]["omitted"] == 0   # it never happened
+        # the pages we did not buy are visible as a remainder rather than vanishing with the run
+        left = self._cov(d, "shodan_pages_left")[0]
+        assert left["omitted"] >= 1, left
         assert s["verdict"] == "complete_with_gaps"

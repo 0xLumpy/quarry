@@ -344,11 +344,16 @@ class Status(str, Enum):
     TIMED_OUT = "timed_out"
     BLOCKED = "blocked"     # stderr matches WAF/rate-limit/forbidden signatures
     SKIPPED = "skipped"     # not run (scope/mode/missing tool/no input)
-    # review-B0r3#1: an EXTERNAL PROVIDER LIMIT (credits spent, plan cannot reach the endpoint) is a
-    # CLEAN execution that a third party cut short. It is not FAILED and it is not degraded either — a
-    # degraded count says something went wrong here, and nothing did. Distinct outcome, deliberately
-    # OUTSIDE store._DEGRADED, so it feeds `complete_with_limits` without inflating any trouble counter.
-    LIMITED = "limited"     # ran clean; the PROVIDER stopped us (quota/entitlement) — coverage incomplete
+    # review-B0r3#1: a LIMIT (credits spent, plan cannot reach the endpoint) is a CLEAN execution that
+    # something cut short. It is not FAILED and it is not degraded either — a degraded count says
+    # something went wrong here, and nothing did. Distinct outcome, deliberately OUTSIDE store._DEGRADED,
+    # so it feeds `complete_with_limits` without inflating any trouble counter.
+    #
+    # review-B1.4r7#1: WHO bounded us is carried by `error_class`, NOT by the status. A provider limit
+    # has a proven class (quota/entitlement); an OPERATOR boundary — a credit reserve, a withheld budget
+    # — is equally clean and equally incomplete, and deliberately has none. A real failure is never
+    # LIMITED. See `contract.terminal_is_limit`, the one place that answers this.
+    LIMITED = "limited"     # ran clean; a PROVIDER or OPERATOR boundary cut coverage short
 
 
 # stderr signatures of a real DENIAL — the target STOPPED us (WAF/rate-limit/forbidden), not "nothing exists".

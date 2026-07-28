@@ -35,6 +35,10 @@ PERFORMANCE:
   ARJUN_BUDGET_S:            # arjun param discovery (was: cap 40 of eligible API endpoints). ONE TARGET PER
                              # PROCESS: arjun crashes on a 400/413/418/429/503 target and a batched run loses
                              # every target after it, so isolation is coverage
+  SHODAN_MAX_PAGES:          # pages bought per Shodan pivot. DEFAULT 0 = UNBOUNDED (page until the pivot
+                             # is exhausted) — the CREDIT BALANCE is what bounds the spend, not an
+                             # arbitrary page number. A nonzero value is a hard CAP on eligible input and
+                             # is reported as a gap, never as a soft sample
   SHODAN_CREDIT_RESERVE:     # query credits this run will NOT spend, kept back for manual work (default 0
                              # = spend everything available). Shodan meters query credits MONTHLY. Among
                              # QUARRY'S CURRENT Shodan calls only /shodan/host/search consumes them —

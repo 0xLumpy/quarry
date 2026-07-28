@@ -215,6 +215,14 @@ class LaneOutcome:
     matches: int = 0
     fail_classes: dict = field(default_factory=dict)
     limit_classes: dict = field(default_factory=dict)
+    # POSITION and CAUSE are independent facts (review-B1.1r2/r3). A pivot that yielded NOTHING is not
+    # the same as one that kept page-1 evidence and lost a later page, and the reason prose must never
+    # name a class from the other position. The aggregates above stay, but they are a SUMMARY — these
+    # four are what the coverage measures are derived from.
+    first_fail_classes: dict = field(default_factory=dict)
+    first_limit_classes: dict = field(default_factory=dict)
+    later_fail_classes: dict = field(default_factory=dict)
+    later_limit_classes: dict = field(default_factory=dict)
     unqueried: list = field(default_factory=list)      # EXACT identities, never a count alone
     pages_left_known: int = 0               # only for pivots whose total is KNOWN
     pages_left_unknown_pivots: int = 0      # pivots whose page count we cannot know
@@ -462,8 +470,16 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
             if err is not None:
                 cls = getattr(err, "error_class", None) or "error"
                 st.stopped = cls
-                bucket = o.limit_classes if is_limit(cls) else o.fail_classes
+                limit = is_limit(cls)
+                bucket = o.limit_classes if limit else o.fail_classes
                 bucket[cls] = bucket.get(cls, 0) + 1
+                # FIRST position = this pivot has no page at all yet, so the error cost us the whole
+                # pivot. Otherwise page-1 evidence is already kept and only a later page was lost.
+                if not st.pages_done:
+                    pos = o.first_limit_classes if limit else o.first_fail_classes
+                else:
+                    pos = o.later_limit_classes if limit else o.later_fail_classes
+                pos[cls] = pos.get(cls, 0) + 1
                 if is_limit(cls):
                     # DEGRADE, don't disable: stop buying, keep everything already earned, leave the rest
                     # as a counted remainder. The provider's boundary ends purchasing, not the run.
@@ -617,19 +633,54 @@ def report(lane: str, outcome: LaneOutcome, *, balance, persisted: bool = True,
                                        if outcome.pages_left_unknown_pivots else "")
                                     if outcome.pages_left_known or outcome.pages_left_unknown_pivots
                                     else "no known page left unbought"))
-    # a MID-FLIGHT provider limit (quota on page N) has its own measure. Without it the classes were
-    # counted in LaneOutcome and emitted by nothing: a run stopped dead by quota folded as `complete`,
-    # because an attempted pivot is not "unqueried" and a pivot with no total has no page remainder.
-    limited = sum(outcome.limit_classes.values())
-    events.coverage_partial(lane, kind=events.COVERAGE_PROVIDER, measure="shodan_pivots_limited",
-                            unit=f"{lane}.provider_limit", eligible=max(1, outcome.pivots),
-                            tested=max(1, outcome.pivots) - min(limited, max(1, outcome.pivots)),
-                            omitted=min(limited, max(1, outcome.pivots)),
-                            reason=(f"{limited} pivot(s) stopped by a PROVIDER LIMIT "
-                                    f"{dict(outcome.limit_classes)} — not a defect; nothing to retry "
-                                    f"this run" if limited else "no pivot hit a provider limit"))
-    # an OPERATOR page policy is a soft limit, never a silent truncation
-    events.coverage_partial(lane, kind=events.COVERAGE_SAMPLE, measure="shodan_pages_withheld",
+    # POSITION x CAUSE, four measures, each naming ONLY its own position's classes. A mid-flight
+    # provider limit (quota on page N) is not the same event as a pivot the provider refused outright,
+    # and a later-page transport failure is not our page budget. Without these the classes were counted
+    # in LaneOutcome and emitted by nothing: a run stopped dead by quota folded as `complete`, because an
+    # attempted pivot is not "unqueried" and a pivot with no total has no page remainder.
+    #
+    #   position   cause      kind                 verdict
+    #   first      broke      COVERAGE_TIMEOUT     gap        (the target/network cost us the pivot)
+    #   first      refused    COVERAGE_PROVIDER    soft limit (nothing to retry this run)
+    #   later      broke      COVERAGE_TIMEOUT     gap
+    #   later      refused    COVERAGE_PROVIDER    soft limit
+    piv = max(1, outcome.pivots)
+    for measure, unit, kind, classes, phrase in (
+            ("shodan_pivots", "failed", events.COVERAGE_TIMEOUT, outcome.first_fail_classes,
+             "fully failed by class"),
+            ("shodan_pivots_limited", "provider_limit", events.COVERAGE_PROVIDER,
+             outcome.first_limit_classes,
+             "stopped by a PROVIDER LIMIT (not a defect; nothing to retry this run)"),
+            ("shodan_results_failed", "later_failed", events.COVERAGE_TIMEOUT,
+             outcome.later_fail_classes, "lost a LATER page to a failure (page-1 evidence KEPT)"),
+            ("shodan_results_limited", "later_limit", events.COVERAGE_PROVIDER,
+             outcome.later_limit_classes,
+             "lost a LATER page to a PROVIDER LIMIT (page-1 evidence KEPT)")):
+        n = min(sum(classes.values()), piv)
+        events.coverage_partial(lane, kind=kind, measure=measure, unit=f"{lane}.{unit}", eligible=piv,
+                                tested=piv - n, omitted=n,
+                                reason=(f"{n}/{piv} pivot(s) {phrase} {dict(classes)}" if n
+                                        else f"no pivot {phrase.split(' (')[0]}"))
+    # PROVIDER DRIFT: Shodan's index is live, so two pages of one pivot can report different totals. We
+    # keep the maximum, so nothing is omitted and the remainder is never understated.
+    #
+    # review-B1.4r2#4: this was emitted with `omitted=total_drift`, which made an otherwise complete,
+    # unbounded scan fold as `complete_with_limits` because one total moved. Drift is TELEMETRY about the
+    # provider's denominator, not a coverage boundary: it must be visible and must not touch the verdict.
+    # `omitted=0` says exactly that, and the count lives in the reason where a reader can see it.
+    drift_of = max(1, done)
+    events.coverage_partial(lane, kind=events.COVERAGE_PROVIDER, measure="shodan_total_drift",
+                            unit=f"{lane}.total_drift", eligible=drift_of, tested=drift_of, omitted=0,
+                            reason=(f"{outcome.total_drift} of {done} page(s) reported a total that "
+                                    f"disagreed with another page of the same pivot — the provider's "
+                                    f"index moved; the LARGEST total is kept, so NOTHING is omitted"
+                                    if outcome.total_drift
+                                    else "every page agreed on its pivot's total"))
+    # OUR page policy is a CAP, not a sample. review-B1 (Lumpy): "SHODAN_MAX_PAGES=1 is still a cap" —
+    # a soft SAMPLE would let a run that never looked past page 1 call itself complete, which is exactly
+    # the silent truncation the bounded-lane work exists to prevent. It is a hard ceiling WE imposed on
+    # eligible input, so it reads as a gap whenever it withheld anything.
+    events.coverage_partial(lane, kind=events.COVERAGE_CAP, measure="shodan_pages_withheld",
                             unit=f"{lane}.pages_withheld", eligible=done + outcome.pages_withheld,
                             tested=done, omitted=outcome.pages_withheld,
                             reason=(f"{outcome.pages_withheld} page(s) withheld by SHODAN_MAX_PAGES="
@@ -637,9 +688,16 @@ def report(lane: str, outcome: LaneOutcome, *, balance, persisted: bool = True,
                                     else "no page withheld by an operator page policy"))
     # FAILURES are gaps — including the balance read itself, which may have failed while an operator
     # limit was the thing that stopped us. BOTH facts must survive to reconciliation.
+    from .contract import is_provider_limit as _is_limit
     fails = sum(outcome.fail_classes.values()) + outcome.evidence_invalid + outcome.publish_failed
     read_err = getattr(balance, "read_error", None)
-    if read_err:
+    # B1.4: a balance read REFUSED by the provider is a limit like any other. Counting every `read_error`
+    # as a failure made a depleted account emit a gap from the balance probe while its pivots correctly
+    # reported a limit — the exact conflation B0 exists to prevent, arriving through the one channel that
+    # had not been classified. Surfaced by integrating the real lane, where /api-info fails the same way
+    # the search does.
+    read_limited = bool(read_err) and _is_limit(read_err)
+    if read_err and not read_limited:
         fails += 1
     denom = max(1, outcome.pivots)
     events.coverage_partial(lane, kind=events.COVERAGE_TIMEOUT, measure="shodan_failures",
@@ -650,8 +708,11 @@ def report(lane: str, outcome: LaneOutcome, *, balance, persisted: bool = True,
                                        if outcome.evidence_invalid else "")
                                     + (f", {outcome.publish_failed} page(s) not durably recorded"
                                        if outcome.publish_failed else "")
-                                    + (f", balance read failed ({read_err})" if read_err else "")
-                                    if fails else "no failure"))
+                                    + (f", balance read failed ({read_err})"
+                                       if read_err and not read_limited else "")
+                                    if fails else
+                                    (f"no failure (balance read stopped by a provider limit: {read_err})"
+                                     if read_limited else "no failure")))
     events.coverage_partial(lane, kind=events.COVERAGE_TIMEOUT, measure="state_persisted",
                             unit=f"{lane}.state_persisted", eligible=1, tested=1 if persisted else 0,
                             omitted=0 if persisted else 1,
