@@ -95,6 +95,7 @@ def publish_bytes(dest: Path, data: bytes, *, digest: str) -> bool:
     so a lane recorded the digest of what it MEANT to write while the file on disk held something else, and
     the miners read the truncated bytes. Write a same-directory temp, verify what actually landed, then
     os.replace. A pre-existing destination is verified before reuse, never trusted for existing."""
+    tmp = None
     try:
         if dest.exists():
             if events.file_digest(dest) == digest:
@@ -109,6 +110,16 @@ def publish_bytes(dest: Path, data: bytes, *, digest: str) -> bool:
         os.replace(tmp, dest)
         return True
     except OSError:
+        # review-B1.3r8#2: the digest-mismatch path cleaned up and this one did not, so a failing
+        # os.replace (or a write that ran out of space) left `<name>.part-<pid>` in a tree whose
+        # contract is that every file in it is validated evidence. Measured with a failing replace:
+        # leftovers=['.quarry-write-probe.part-756343']. Cleanup belongs in the shared primitive, so
+        # every publisher gets it rather than each caller re-deriving the temp name.
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass                              # nothing further we can do; the caller still gets False
         return False
 
 
@@ -188,7 +199,8 @@ class Ledger:
         self.done: dict[str, str] = {}        # item -> COMPLETION artifact (relative to the state file's dir)
         self.evid: dict[str, list] = {}       # item -> EVERY retained artifact, append-only (review#2 A1 r3)
         self.digests: dict[str, str] = {}     # relative artifact path -> sha256
-        self._journal_unsafe = False          # set when the journal is damaged and unrepairable
+        self._journal_unsafe = False          # set when the journal may not be APPENDED to
+        self._journal_lost = False            # set when the journal can no longer be REPLAYED
         self.foreign = False                  # set when this PATH belongs to a DIFFERENT lane
         self._raw_evid: dict[str, list] = {}  # unvalidated evidence lists from the snapshot
         self._load()
@@ -275,6 +287,8 @@ class Ledger:
                 self._raw_evid.setdefault(ev_item, []).append(rel)   # evidence-only journal record
                 digests[rel] = dig
                 kept.append(line)
+            elif rec.get("k") == "ckpt":
+                kept.append(line)                  # durability probe: carries no state, repairs nothing
             else:
                 damaged = True
         for item, rel, dig in pending:
@@ -350,7 +364,7 @@ class Ledger:
         artifact contributes EVIDENCE only and can never decide whether the item is done (review#1 A1 r3)."""
         return [q for q in (self._safe_path(r) for r in self.evid.get(item, [])) if q is not None]
 
-    def add_evidence(self, item: str, artifact: Path, *, digest: str | None = None) -> None:
+    def add_evidence(self, item: str, artifact: Path, *, digest: str | None = None) -> bool:
         """Retain an artifact as evidence WITHOUT claiming completion. Append-only and digest-bound."""
         rel = str(Path(artifact).relative_to(self.path.parent))
         dig = digest or events.file_digest(artifact)
@@ -358,7 +372,7 @@ class Ledger:
         if rel not in lst:
             lst.append(rel)
         self.digests[rel] = dig
-        self._append({"e": item, "r": rel, "d": dig})
+        return self._append({"e": item, "r": rel, "d": dig})
 
     def artifact(self, item: str) -> Path | None:
         """The artifact this item's content lives in — THE lookup callers must use. May be SHARED with
@@ -385,7 +399,20 @@ class Ledger:
                 out.append(p)
         return out
 
-    def record(self, item: str, artifact: Path, *, digest: str | None = None) -> None:
+    @property
+    def durable(self) -> bool:
+        """Whether completions recorded so far will SURVIVE this process — i.e. the journal is intact.
+        Independent of `save()`: a successful journal makes a run resumable even if compaction later
+        fails, because `_load` replays the journal.
+
+        review-B1.3r5#2: this read `_journal_unsafe`, which answers a DIFFERENT question — "may I append?"
+        `save()` sets that flag when the SNAPSHOT write fails, deliberately keeping the journal, so the
+        completions still replay on the next open. Measured: `save()=False`, journal present, completion
+        survives reopen — and durability nonetheless read False, producing a false persistence gap on
+        genuinely resumable work."""
+        return not self.foreign and not self._journal_lost
+
+    def record(self, item: str, artifact: Path, *, digest: str | None = None) -> bool:
         """Mark an item complete and bind its artifact's content. APPENDS to the journal (O(1)) — the whole
         map is only re-serialized by save()."""
         rel = str(Path(artifact).relative_to(self.path.parent))
@@ -394,17 +421,36 @@ class Ledger:
         self.digests[rel] = dig
         if rel not in self.evid.setdefault(item, []):
             self.evid[item].append(rel)        # a completion artifact is always also evidence
-        self._append({"i": item, "r": rel, "d": dig})
+        return self._append({"i": item, "r": rel, "d": dig})
 
-    def _append(self, rec: dict) -> None:
+    def checkpoint(self) -> bool:
+        """PROVE the journal is writable, without claiming anything. review-B1.3r5#3: `ledger_writable`
+        only reads flags, and the flags for an unwritable journal are only set BY a failed write — so a
+        paid caller had to spend one credit to discover it could not record the result. This appends a
+        no-op record that carries no state and is ignored on replay."""
+        return self._append({"k": "ckpt"})
+
+    def _append(self, rec: dict) -> bool:
+        """True when the record is DURABLY journaled. review-B1.3r4: this swallowed OSError silently and
+        left both safety flags clear, so a caller could not tell an appended completion from one that
+        exists only in memory — and for PAID work that difference is money."""
         if self.foreign or self._journal_unsafe:
-            return                             # never append onto a foreign or fragmented journal
+            return False                       # never append onto a foreign or fragmented journal
         try:
             self.journal.parent.mkdir(parents=True, exist_ok=True)
             with self.journal.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"v": self.JOURNAL_SCHEMA, "l": self.lane, **rec}) + "\n")
+            return True
         except OSError:
-            pass                               # in-memory state still correct; save() will compact it
+            self._journal_unsafe = True        # in-memory state is correct but NOT appendable
+            # APPENDABILITY and REPLAYABILITY differ here too: a torn tail is repaired to its intact
+            # prefix on load, so records that already returned True still replay. Only a journal we can
+            # no longer read is actually lost.
+            try:
+                self._journal_lost = not self.journal.is_file()
+            except OSError:
+                self._journal_lost = True
+            return False
 
     def save(self) -> bool:
         """COMPACT: write the snapshot atomically (temp + os.replace), then drop the journal it supersedes.
