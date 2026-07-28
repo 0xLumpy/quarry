@@ -85,6 +85,80 @@ def is_provider_limit(error_class) -> bool:
     return error_class in PROVIDER_LIMITS
 
 
+_ERROR_BODY_LIMIT = 8192                                     # an error body is a sentence, not a payload
+
+
+def capture_error_body(exc, *, provider: str = "", limit: int = _ERROR_BODY_LIMIT):
+    """Read an HTTPError's body ONCE, AT THE RAISE SITE, and stamp the refined class onto the exception.
+
+    It has to happen here: an HTTPError is a live file wrapper over the socket, so by the time the
+    exception has propagated out of the requesting function the body may be unreadable or gone. Capturing
+    late would silently degrade every quota into whatever the status code alone implies.
+
+    Bounded and best-effort — a body we cannot read simply yields no extra signal, never an error."""
+    if not isinstance(exc, _urlerr.HTTPError):
+        return exc
+    if getattr(exc, "body_text", None) is None:
+        try:
+            raw = exc.read(limit)
+        except Exception:
+            raw = b""
+        finally:
+            # review-B1.1#3: an HTTPError holds a LIVE response stream. Reading it without closing leaks
+            # the connection, and a lane that fails repeatedly (auth or quota on every pivot) leaks once
+            # per failure. body_text, status, headers and the stamped class all survive the close.
+            try:
+                exc.close()
+            except Exception:
+                pass
+        exc.body_text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else ""
+    if provider and getattr(exc, "error_class", None) is None:
+        exc.error_class = classify_provider_http(exc, provider=provider)
+    return exc
+
+
+def error_body_reason(exc) -> "str | None":
+    """The provider's own reason string from a JSON error body, or None when the body is not that shape.
+
+    A non-JSON body (Shodan answers auth failures with an HTML page) is NOT a parse failure — it simply
+    carries no signal, and the caller falls back to the status code. Turning it into `parse` would report
+    a plain bad key as schema drift."""
+    text = getattr(exc, "body_text", None)
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        doc = _json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    err = doc.get("error")
+    return err.strip() if isinstance(err, str) and err.strip() else None
+
+
+def classify_provider_http(exc, *, provider: str) -> str:
+    """Classify an HTTP error, letting the provider's own BODY refine the status code.
+
+    MEASURED (Shodan, 2026-07-28): 401 + HTML = a bad key; 401 + `{"error": "Insufficient query credits,
+    ..."}` = spent credits. The code is identical, so a status-only taxonomy would send the operator to
+    re-key a credential that was never wrong while reporting a failure where the truth is a LIMIT.
+
+    An UNRECOGNISED reason falls back to the status class (401 -> auth), never to a limit: an unknown
+    failure must stay visible, and inventing `quota` would let a real defect pass as an expected boundary."""
+    cls = classify_provider_error(exc)
+    reason = error_body_reason(exc)
+    if reason is None:
+        return cls
+    refined = classify_provider_reason(provider, reason)
+    return refined if refined != PROVIDER_ERROR else cls
+
+
+def provider_error_class(exc) -> str:
+    """THE accessor for a provider error's class: one PROVEN at the raise site wins over the generic
+    exception-type mapping, which cannot see a body."""
+    return getattr(exc, "error_class", None) or classify_provider_error(exc)
+
+
 def classify_provider_error(exc) -> str:
     """C06: map an in-process provider exception to an EXPLICIT class so a consumer can tell a real failure
     from 'nothing found' and pick the right response (auth → fix the key, entitlement → the plan is the
@@ -139,6 +213,11 @@ class ProviderBodyError(Exception):
 #: its own negation. Normalisation is case + whitespace only; add variants when they are MEASURED.
 _QUOTA_REASONS = {
     "whoxy": frozenset({"zero account balance"}),            # MEASURED 2026-07-27, inside an HTTP 200
+    # MEASURED 2026-07-28 by depleting a real account: Shodan answers a spent balance with HTTP **401** and
+    # a JSON body. The status code is the SAME one it returns for a bad key (with an HTML body), so 401
+    # alone cannot tell auth from quota — see classify_provider_http.
+    "shodan": frozenset({"insufficient query credits, please upgrade your api plan or wait for the "
+                         "monthly limit to reset"}),
 }
 
 
@@ -422,7 +501,7 @@ def run_provider(source_id, fn, *, work_unit=None, input_total=None):
         # generic HTTP/type mapping cannot see (it would flatten a measured "Zero Account Balance" into
         # `error`) — so a body-proven LIMIT could never reach the terminal or the verdict. The proven
         # class wins; everything else falls back to the exception-type mapping.
-        error_class = getattr(e, "error_class", None) or classify_provider_error(e)
+        error_class = provider_error_class(e)
         # review-B0r2#1 / r3#1: a PROVEN limit is neither a FAILED nor a DEGRADED execution. FAILED left
         # tool_status.failed lying; PARTIAL then left tool_status.partial lying, because "degraded" asserts
         # something went wrong HERE and nothing did. Status.LIMITED is the distinct, non-degraded outcome:

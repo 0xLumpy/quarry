@@ -1081,3 +1081,493 @@ class TestMeasuredNoMatch:
                                 "search_result": [{"domain_name": "a.com"}, {"domain_name": "b.com"}]})
         rows, total, truncated = whoxy_reverse_page(json.loads(WHOXY_OK))
         assert rows == ["a.com", "b.com"] and total == 2 and truncated is False
+
+
+# ── B1.1 — a Shodan error body refines an ambiguous status code ───────────────────────────────────
+# MEASURED 2026-07-28 by depleting a real account. Both are HTTP 401; only the body differs.
+SHODAN_QUOTA_BODY = ('{"error": "Insufficient query credits, please upgrade your API plan or wait for '
+                     'the monthly limit to reset"}')
+SHODAN_AUTH_BODY = ("<html>\n <head>\n  <title>401 Unauthorized</title>\n </head>\n <body>\n"
+                    "  <h1>401 Unauthorized</h1>\n  This server could not verify that you are "
+                    "authorized to access the document you requested.<br/><br/>\n </body>\n</html>")
+
+
+def _http_err(code, body):
+    """An HTTPError carrying a real readable body, like urllib produces."""
+    import io
+    return urllib.error.HTTPError("http://x", code, "msg", {}, io.BytesIO(body.encode()))
+
+
+class TestShodanBodyRefinedClassification:
+    """Shodan returns 401 for a bad key AND for spent credits. A status-only taxonomy would send the
+    operator to re-key a credential that was never wrong, and report a failure where the truth is a
+    LIMIT."""
+
+    def test_the_two_401s_are_told_apart_by_body(self):
+        quota = contract.capture_error_body(_http_err(401, SHODAN_QUOTA_BODY), provider="shodan")
+        auth = contract.capture_error_body(_http_err(401, SHODAN_AUTH_BODY), provider="shodan")
+        assert quota.error_class == PROVIDER_QUOTA
+        assert auth.error_class == "auth"
+        assert is_provider_limit(quota.error_class) and not is_provider_limit(auth.error_class)
+
+    def test_an_html_body_yields_NO_reason_at_all(self):
+        """Pins the parser directly. Asserting only `error_class != "parse"` was too weak: a mutation
+        returning a junk reason string still landed on `auth` via the unknown-reason fallback, so the
+        guard's removal was invisible. A non-JSON body must produce NO signal, not a bogus one."""
+        e = contract.capture_error_body(_http_err(401, SHODAN_AUTH_BODY), provider="shodan")
+        assert contract.error_body_reason(e) is None
+        assert e.error_class != "parse"
+
+    def test_the_measured_phrase_is_registered_for_shodan(self):
+        """The exhaustion phrase must be bound to THIS provider — the reason table is per-provider so one
+        provider's wording can never classify another's."""
+        measured = ("Insufficient query credits, please upgrade your API plan or wait for the monthly "
+                    "limit to reset")
+        assert classify_provider_reason("shodan", measured) == PROVIDER_QUOTA
+        assert classify_provider_reason("whoxy", measured) == "error"
+
+    def test_an_unrecognised_json_reason_falls_back_to_the_status_class(self):
+        """Never invent a limit from an unknown reason: an unknown failure must stay visible."""
+        e = contract.capture_error_body(_http_err(401, '{"error": "Some New Message"}'), provider="shodan")
+        assert e.error_class == "auth" and not is_provider_limit(e.error_class)
+
+    @pytest.mark.parametrize("body", ["", "   ", "not json", "[]", "null", '{"error": null}',
+                                      '{"error": ""}', '{"nope": "x"}', '{"error": 7}'])
+    def test_a_bodyless_or_shapeless_error_uses_the_status_class(self, body):
+        e = contract.capture_error_body(_http_err(401, body), provider="shodan")
+        assert e.error_class == "auth"
+
+    def test_the_reason_match_is_exact_for_shodan_too(self):
+        near = '{"error": "Insufficient scan credits, please upgrade your API plan"}'
+        e = contract.capture_error_body(_http_err(401, near), provider="shodan")
+        assert e.error_class == "auth"          # NOT the measured query-credit phrase
+
+    def test_other_status_codes_still_classify_normally(self):
+        for code, want in ((429, PROVIDER_RATE_LIMIT), (403, PROVIDER_FORBIDDEN), (500, "server")):
+            e = contract.capture_error_body(_http_err(code, "irrelevant"), provider="shodan")
+            assert e.error_class == want
+
+    def test_a_quota_body_on_another_code_is_still_quota(self):
+        """The reason is the proof; the code is not. If Shodan ever moves it to 403, it stays a LIMIT."""
+        e = contract.capture_error_body(_http_err(403, SHODAN_QUOTA_BODY), provider="shodan")
+        assert e.error_class == PROVIDER_QUOTA
+
+    def test_the_body_is_read_once_and_survives_propagation(self):
+        """An HTTPError wraps a live socket: read late and the body may be gone. Capturing at the raise
+        site must make the class available to a caller far downstream — AFTER the stream is closed."""
+        e = _http_err(401, SHODAN_QUOTA_BODY)
+        contract.capture_error_body(e, provider="shodan")
+        assert contract.provider_error_class(e) == PROVIDER_QUOTA
+        assert contract.error_body_reason(e).startswith("Insufficient query credits")
+
+    def test_the_response_stream_is_closed(self):
+        """review-B1.1#3: an HTTPError holds a LIVE response. A lane failing on every pivot would leak one
+        connection per failure."""
+        e = _http_err(401, SHODAN_QUOTA_BODY)
+        contract.capture_error_body(e, provider="shodan")
+        assert e.fp is None or e.fp.closed, "response stream left open"
+
+    def test_capture_is_idempotent(self):
+        """A second capture must not try to re-read a closed stream and must not change the verdict."""
+        e = contract.capture_error_body(_http_err(401, SHODAN_QUOTA_BODY), provider="shodan")
+        first = e.body_text
+        contract.capture_error_body(e, provider="shodan")
+        assert e.body_text == first and e.error_class == PROVIDER_QUOTA
+
+    def test_an_uncaptured_error_falls_back_to_the_generic_mapping(self):
+        assert contract.provider_error_class(_http_err(401, SHODAN_QUOTA_BODY)) == "auth"
+
+    def test_capture_is_harmless_for_non_http_errors(self):
+        e = contract.capture_error_body(urllib.error.URLError("dns dead"), provider="shodan")
+        assert contract.provider_error_class(e) == "transport"
+
+    def test_a_quota_terminal_is_LIMITED_not_failed(self, tmp_path):
+        """End to end: the whole point is that a depleted Shodan account reads as complete_with_limits."""
+        from quarry_recon import events
+        from quarry_recon.store import Run
+        run = Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+        try:
+            def boom():
+                raise contract.capture_error_body(_http_err(401, SHODAN_QUOTA_BODY), provider="shodan")
+            contract.run_provider("probe.favicon", boom, work_unit="wu-a")
+            run.write_manifest({}, ["probe"])
+            summary = json.loads(run.manifest_path.read_text())["summary"]
+        finally:
+            events.reset()
+        assert summary["verdict"] == "complete_with_limits"
+        assert summary["tools_failed"] == 0 and summary["tool_status"].get("failed", 0) == 0
+        assert summary["provider_limits"]
+
+
+class TestShodanPivotUsesTheProvenClass:
+    def test_the_pivot_lane_captures_the_body_at_the_raise_site(self):
+        import inspect
+        from quarry_recon.phases import probe
+        src = inspect.getsource(probe._shodan_search)
+        assert 'capture_error_body(e, provider="shodan")' in src
+        # The capture must happen BEFORE the propagate/return decision, or the body is gone by then.
+        # NB anchor on the CODE, not the word "raise" — the docstring says "propagates (raise ...)" and
+        # a naive index() matched that instead, passing for the wrong reason.
+        assert src.index("capture_error_body") < src.index("if page == 1:")
+
+    def test_the_pivot_counts_the_proven_class(self):
+        import inspect
+        from quarry_recon.phases import probe
+        src = inspect.getsource(probe._shodan_pivot)
+        assert "provider_error_class(e)" in src and "provider_error_class(page_err)" in src
+        assert "classify_provider_error(" not in src
+
+
+class TestRealShodanLaneUnderQuota:
+    """The regression that was MISSING, and whose absence let the P1 through: the earlier 'end-to-end'
+    test raised a pre-classified exception directly, bypassing `_shodan_search` and `_shodan_pivot` — the
+    two functions that actually decide whether a quota becomes a limit or a gap."""
+
+    def _ctx(self, tmp_path, run):
+        class _Scope:
+            passive_only = False
+
+            def in_scope(self, h):
+                return bool(h) and h.endswith("acme.com")
+
+            def is_oos(self, h):
+                return not self.in_scope(h)
+
+            def active_allowed(self, h):
+                return True
+
+        return type("C", (), {"run": run, "scope": _Scope(), "http_timeout": 20,
+                              "echo": staticmethod(lambda m: None)})()
+
+    def _drive(self, tmp_path, monkeypatch, responder, values=("abc", "def")):
+        """Run the REAL pivot through a faked urlopen and read the REAL verdict from the manifest."""
+        import urllib.request
+        from quarry_recon import events
+        from quarry_recon.phases import probe
+        from quarry_recon.store import Run
+        run = Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+        monkeypatch.setattr(urllib.request, "urlopen", responder)
+        ctx = self._ctx(tmp_path, run)
+        try:
+            contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
+                ctx, "KEY", values, "http.favicon.hash", "favicon-shodan", "probe.favicon", "seen {}"),
+                work_unit="wu-a")
+            run.write_manifest({}, ["probe"])
+            return json.loads(run.manifest_path.read_text())["summary"]
+        finally:
+            events.reset()
+
+    def _quota_urlopen(self, *a, **kw):
+        raise _http_err(401, SHODAN_QUOTA_BODY)
+
+    def test_a_depleted_account_is_a_LIMIT_not_a_gap(self, tmp_path, monkeypatch):
+        """The P1: every first-page failure was emitted as COVERAGE_TIMEOUT (a gap) including a proven
+        quota, so a depleted account produced BOTH a limit and a gap — and gaps dominate."""
+        s = self._drive(tmp_path, monkeypatch, self._quota_urlopen)
+        assert s["verdict"] == "complete_with_limits", (s["gaps"], s["failures"])
+        assert not s["gaps"] and not s["failures"]
+        assert s["provider_limits"]
+        assert s["tools_failed"] == 0 and s["tool_status"].get("failed", 0) == 0
+
+    def test_a_real_failure_is_still_a_gap(self, tmp_path, monkeypatch):
+        """The control: the limit path must not swallow genuine breakage."""
+        def boom(*a, **kw):
+            raise _http_err(500, "upstream exploded")
+        s = self._drive(tmp_path, monkeypatch, boom)
+        assert s["verdict"] == "complete_with_gaps"
+        assert s["failures"] or s["gaps"]
+
+    def test_an_html_401_is_an_auth_FAILURE_not_a_limit(self, tmp_path, monkeypatch):
+        def bad_key(*a, **kw):
+            raise _http_err(401, SHODAN_AUTH_BODY)
+        s = self._drive(tmp_path, monkeypatch, bad_key)
+        assert s["verdict"] == "complete_with_gaps"
+        assert not s["provider_limits"]
+
+    def test_quota_plus_a_real_failure_keeps_BOTH_and_ends_in_gaps(self, tmp_path, monkeypatch):
+        """review#2: the outcome used to depend on which pivot happened to be last. The limit must stay
+        visible, and a genuine failure must still dominate the verdict."""
+        seq = [_http_err(401, SHODAN_QUOTA_BODY), _http_err(500, "boom")]
+
+        def mixed(*a, **kw):
+            raise seq.pop(0) if seq else _http_err(500, "boom")
+        s = self._drive(tmp_path, monkeypatch, mixed)
+        assert s["verdict"] == "complete_with_gaps"
+        limited = [c for c in s["coverage"]
+                   if any(k == "provider" for k in (c.get("by_kind") or {}))]
+        assert limited, "the provider limit vanished behind the failure"
+
+    def _terminal(self, run_dir):
+        return [json.loads(l) for l in (run_dir / "events.jsonl").read_text().splitlines()
+                if '"tool_finish"' in l][-1]
+
+    def _drive_terminal(self, tmp_path, monkeypatch, responder, values=("abc", "def")):
+        """Same as _drive but hands back the TERMINAL event — the verdict alone cannot see which
+        exception was raised, because the coverage gap is emitted before the raise either way."""
+        import urllib.request
+        from quarry_recon import events
+        from quarry_recon.phases import probe
+        from quarry_recon.store import Run
+        run = Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+        monkeypatch.setattr(urllib.request, "urlopen", responder)
+        ctx = self._ctx(tmp_path, run)
+        try:
+            contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
+                ctx, "KEY", values, "http.favicon.hash", "favicon-shodan", "probe.favicon", "seen {}"),
+                work_unit="wu-a")
+            return self._terminal(run.dir)
+        finally:
+            events.reset()
+
+    @pytest.mark.parametrize("order", [["quota", "fail"], ["fail", "quota"]])
+    def test_a_real_failure_outranks_a_limit_whichever_came_last(self, tmp_path, monkeypatch, order):
+        """review#2: with everything failing and no evidence, the lane raises ONE exception — and it used
+        to be simply the LAST one. So a quota arriving after a 500 turned a broken run into a mere limit.
+        The verdict cannot catch this (the gap is emitted before the raise), so assert the TERMINAL."""
+        seq = [_http_err(401, SHODAN_QUOTA_BODY) if k == "quota" else _http_err(500, "boom")
+               for k in order]
+
+        def mixed(*a, **kw):
+            raise seq.pop(0) if seq else _http_err(500, "boom")
+        term = self._drive_terminal(tmp_path, monkeypatch, mixed)
+        assert term["status"] == "failed", term
+        assert term["error_class"] != PROVIDER_QUOTA
+
+    def test_only_limits_and_no_evidence_still_reads_as_LIMITED(self, tmp_path, monkeypatch):
+        """The control for the rule above: with NO real failure, the limit is the honest terminal."""
+        term = self._drive_terminal(tmp_path, monkeypatch, self._quota_urlopen)
+        assert term["status"] == "limited" and term["error_class"] == PROVIDER_QUOTA
+
+    def test_mixed_errors_WITH_evidence_report_the_failure_class(self, tmp_path, monkeypatch):
+        """When some pivot succeeded the lane returns a degraded PARTIAL instead of raising, and the
+        dominant class is chosen there. Picking it from the combined pool let a single transport error be
+        relabelled a provider limit (or the reverse) purely on counts."""
+        import io
+        ok_body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n=None):
+                return ok_body
+
+        # the limit must OUTNUMBER the failure, or a combined pool would pick the failure anyway on
+        # tie-break and the mutation stays invisible (it did, first time round).
+        seq = ["ok", "quota", "quota", "fail"]
+
+        def mixed(*a, **kw):
+            k = seq.pop(0) if seq else "fail"
+            if k == "ok":
+                return _Resp()
+            raise _http_err(401, SHODAN_QUOTA_BODY) if k == "quota" else _http_err(500, "boom")
+
+        term = self._drive_terminal(tmp_path, monkeypatch, mixed, values=("a", "b", "c", "d"))
+        assert term["status"] == "partial"
+        assert term["error_class"] != PROVIDER_QUOTA, "a real failure was relabelled as a limit"
+        assert not is_provider_limit(term["error_class"])
+
+
+class TestLaterPagePositionAccounting:
+    """review-B1.1r2: position and cause are INDEPENDENT facts, and collapsing them let a later-page quota
+    cancel an unrelated first-page transport failure. The existing TestLaterPageLimit cannot see any of
+    this — it hands `run_provider` a prebuilt ProviderResult and never enters the Shodan lane."""
+
+    def _cov(self, run_dir, measure):
+        out = []
+        for line in (run_dir / "events.jsonl").read_text().splitlines():
+            e = json.loads(line)
+            if e.get("event") == "coverage_partial" and e.get("measure") == measure:
+                out.append(e)
+        return out
+
+    def _drive(self, tmp_path, monkeypatch, responder, values, max_pages=3):
+        import urllib.request
+        from quarry_recon import events
+        from quarry_recon.phases import probe
+        from quarry_recon.store import Run
+
+        class _Scope:
+            passive_only = False
+
+            def in_scope(self, h):
+                return bool(h) and h.endswith("acme.com")
+
+            def is_oos(self, h):
+                return not self.in_scope(h)
+
+            def active_allowed(self, h):
+                return True
+
+        run = Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: max_pages)
+        monkeypatch.setattr(urllib.request, "urlopen", responder)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", responder)
+        ctx = type("C", (), {"run": run, "scope": _Scope(), "http_timeout": 20,
+                             "echo": staticmethod(lambda m: None)})()
+        try:
+            contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
+                ctx, "KEY", values, "http.favicon.hash", "favicon-shodan", "probe.favicon", "seen {}"),
+                work_unit="wu-a")
+            run.write_manifest({}, ["probe"])
+            return json.loads(run.manifest_path.read_text())["summary"], run.dir
+        finally:
+            events.reset()
+
+    def _full_page(self):
+        from quarry_recon.phases import probe
+        return json.dumps({"total": 500, "matches": [{"hostnames": [f"h{i}.acme.com"]}
+                                                     for i in range(probe._SHODAN_PAGE)]}).encode()
+
+    class _Resp:
+        def __init__(self, body):
+            self._b = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n=None):
+            return self._b
+
+    def test_page_one_evidence_then_page_two_quota_is_a_LIMIT(self, tmp_path, monkeypatch):
+        """Page-1 data is kept and the later quota is a soft limit — NOT Quarry's page cap, and not a gap."""
+        body = self._full_page()
+
+        def paged(req, timeout=20):
+            if "page=1" in req.full_url:
+                return self._Resp(body)
+            raise _http_err(401, SHODAN_QUOTA_BODY)
+
+        s, d = self._drive(tmp_path, monkeypatch, paged, ("hX",))
+        assert self._cov(d, "shodan_results_limited")[0]["omitted"] == 1     # the later LIMIT
+        assert self._cov(d, "shodan_results")[0]["omitted"] == 0             # NOT our page budget
+        assert self._cov(d, "shodan_results_failed")[0]["omitted"] == 0      # NOT a failure
+        assert s["verdict"] == "complete_with_limits", (s["gaps"], s["failures"])
+        assert any(h.endswith("acme.com") for h in
+                   [x["host"] for x in (json.loads(l) for l in
+                    (d / "normalized" / "subdomain.jsonl").read_text().splitlines())])
+
+    def test_a_later_limit_cannot_erase_a_first_page_failure(self, tmp_path, monkeypatch):
+        """THE defect: `first_page_failures - limited_pivots` mixed positions, so a page-2 quota on one
+        pivot cancelled a page-1 transport failure on ANOTHER."""
+        body = self._full_page()
+
+        def mixed(req, timeout=20):
+            if "hDEAD" in req.full_url:
+                raise urllib.error.URLError("connection refused")        # first-page FAILURE
+            if "page=1" in req.full_url:
+                return self._Resp(body)
+            raise _http_err(401, SHODAN_QUOTA_BODY)                      # later-page LIMIT
+
+        s, d = self._drive(tmp_path, monkeypatch, mixed, ("hDEAD", "hOK"))
+        assert self._cov(d, "shodan_pivots")[0]["omitted"] == 1, "the first-page failure was erased"
+        assert self._cov(d, "shodan_pivots_limited")[0]["omitted"] == 0   # the limit was at a LATER page
+        assert self._cov(d, "shodan_results_limited")[0]["omitted"] == 1
+        assert s["verdict"] == "complete_with_gaps"                       # a real failure still dominates
+
+    def test_our_own_page_budget_is_still_our_cap(self, tmp_path, monkeypatch):
+        """The control: when nothing errors and we simply stop paging, that IS Quarry's cap."""
+        body = self._full_page()
+
+        def one_page(req, timeout=20):
+            return self._Resp(body)
+
+        s, d = self._drive(tmp_path, monkeypatch, one_page, ("hX",), max_pages=1)
+        assert self._cov(d, "shodan_results")[0]["omitted"] == 1          # ours
+        assert self._cov(d, "shodan_results_failed")[0]["omitted"] == 0
+        assert self._cov(d, "shodan_results_limited")[0]["omitted"] == 0
+
+    def test_each_measure_carries_the_RIGHT_KIND(self, tmp_path, monkeypatch):
+        """Counts alone are not enough: `cap`, `timeout` and `provider` are all gaps-or-limits with
+        different MEANINGS, and two of them read as gaps — so mislabelling one is invisible in the verdict
+        (a mutation relabelling a later-page failure as OUR cap passed every count assertion)."""
+        body = self._full_page()
+
+        def mixed(req, timeout=20):
+            if "hSPENT" in req.full_url:
+                raise _http_err(401, SHODAN_QUOTA_BODY)
+            if "hDEAD" in req.full_url:
+                raise urllib.error.URLError("refused")
+            if "page=1" in req.full_url:
+                return self._Resp(body)
+            raise _http_err(500, "boom")
+
+        _s, d = self._drive(tmp_path, monkeypatch, mixed, ("hSPENT", "hDEAD", "hOK"))
+        kinds = {m: self._cov(d, m)[0]["kind"] for m in
+                 ("shodan_pivots", "shodan_pivots_limited", "shodan_results",
+                  "shodan_results_failed", "shodan_results_limited")}
+        assert kinds == {
+            "shodan_pivots": "timeout",            # first-page FAILURE — the target's cost
+            "shodan_pivots_limited": "provider",   # first-page LIMIT — the provider's boundary
+            "shodan_results": "cap",               # OUR page budget — the only one that is ours
+            "shodan_results_failed": "timeout",    # later-page FAILURE
+            "shodan_results_limited": "provider",  # later-page LIMIT
+        }, kinds
+
+    def test_each_reason_names_only_ITS_OWN_position(self, tmp_path, monkeypatch):
+        """review-B1.1r3: counts and kinds were right while the PROSE lied — one combined class counter
+        made the first-page reason report classes that only ever happened on page 2 of another pivot."""
+        body = self._full_page()
+
+        def mixed(req, timeout=20):
+            if "hDEAD" in req.full_url:
+                raise urllib.error.URLError("refused")               # FIRST-page failure: transport
+            if "page=1" in req.full_url:
+                return self._Resp(body)
+            raise _http_err(401, SHODAN_QUOTA_BODY)                  # LATER-page limit: quota
+
+        _s, d = self._drive(tmp_path, monkeypatch, mixed, ("hDEAD", "hOK"))
+        first_fail = self._cov(d, "shodan_pivots")[0]["reason"]
+        later_limit = self._cov(d, "shodan_results_limited")[0]["reason"]
+        assert "transport" in first_fail and "quota" not in first_fail, first_fail
+        assert "quota" in later_limit and "transport" not in later_limit, later_limit
+
+    def test_a_later_FAILURE_class_never_leaks_into_the_first_page_reason(self, tmp_path, monkeypatch):
+        """The sharper case: when the later problem is a FAILURE (not a limit) it lands in the same
+        fail-class pool as the first-page one, so a combined counter is invisible unless the two classes
+        DIFFER. transport (first page) vs server (later page)."""
+        body = self._full_page()
+
+        def mixed(req, timeout=20):
+            if "hDEAD" in req.full_url:
+                raise urllib.error.URLError("refused")               # FIRST page: transport
+            if "page=1" in req.full_url:
+                return self._Resp(body)
+            raise _http_err(500, "boom")                             # LATER page: server
+
+        _s, d = self._drive(tmp_path, monkeypatch, mixed, ("hDEAD", "hOK"))
+        first_fail = self._cov(d, "shodan_pivots")[0]["reason"]
+        later_fail = self._cov(d, "shodan_results_failed")[0]["reason"]
+        assert "transport" in first_fail and "server" not in first_fail, first_fail
+        assert "server" in later_fail and "transport" not in later_fail, later_fail
+
+    def test_first_page_quota_and_later_page_failure_are_both_counted(self, tmp_path, monkeypatch):
+        """The mirror case: a first-page LIMIT must not erase a later-page FAILURE either."""
+        body = self._full_page()
+
+        def mixed(req, timeout=20):
+            if "hSPENT" in req.full_url:
+                raise _http_err(401, SHODAN_QUOTA_BODY)                  # first-page LIMIT
+            if "page=1" in req.full_url:
+                return self._Resp(body)
+            raise _http_err(500, "boom")                                 # later-page FAILURE
+
+        s, d = self._drive(tmp_path, monkeypatch, mixed, ("hSPENT", "hOK"))
+        assert self._cov(d, "shodan_pivots_limited")[0]["omitted"] == 1   # first-page limit
+        assert self._cov(d, "shodan_pivots")[0]["omitted"] == 0           # no first-page failure
+        assert self._cov(d, "shodan_results_failed")[0]["omitted"] == 1   # later-page failure survives
+        assert s["verdict"] == "complete_with_gaps"

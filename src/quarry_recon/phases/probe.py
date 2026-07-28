@@ -16,7 +16,8 @@ import urllib.parse
 import urllib.request
 
 from .. import budget, events, netguard, normalize, secrets, settings
-from ..contract import ProviderResult, classify_provider_error, run_contract, run_provider
+from ..contract import (ProviderResult, capture_error_body, is_provider_limit,
+                        provider_error_class, run_contract, run_provider)
 from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir, have,
                       nuclei_timeout, reclassify_ffuf,
                       reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
@@ -74,6 +75,11 @@ def _shodan_search(key, facet, v, max_pages):
                     raise ValueError(f"shodan: non-list hostnames {type(hns).__name__}")
                 page_rows.append(m)
         except Exception as e:
+            # B1.1: read the error BODY here, while it is still readable, and stamp the refined class onto
+            # the exception. Shodan answers a spent balance with HTTP 401 + JSON and a bad key with HTTP
+            # 401 + HTML, so the status code alone would report every exhausted account as a broken
+            # credential. Capturing later is unreliable: an HTTPError wraps a live socket.
+            capture_error_body(e, provider="shodan")
             # review-r4#1: first-page failure -> no evidence -> propagate (FAILED). Later page -> KEEP earlier
             # pages' matches and report the error, so the caller ingests + preserves them.
             if page == 1:
@@ -113,23 +119,47 @@ def _shodan_pivot(ctx, key, values, facet, source, sid, note):
     all_vals = sorted({str(x) for x in values if x})
     vals = all_vals[:_SHODAN_PIVOT_CAP]
     found: set = set()
-    err_classes: collections.Counter = collections.Counter()   # ALL error classes (first-page + later-page)
-    first_page_failures = 0                                 # pivots that yielded NOTHING (first-page failure)
-    degraded = 0                                            # pivots that got SOME pages then a later page failed
-    truncated = 0
+    # review-B1.1r3: class counters are PER POSITION. One combined counter made the first-page reason
+    # list later-page classes — a pivot "fully failed by class {quota}" when the quota actually happened
+    # on page 2 of a different pivot that kept its evidence. Counts and kinds were right; the prose lied.
+    first_fail_cls: collections.Counter = collections.Counter()
+    first_limit_cls: collections.Counter = collections.Counter()
+    later_fail_cls: collections.Counter = collections.Counter()
+    later_limit_cls: collections.Counter = collections.Counter()
+    # review-B1.1r2: FOUR outcomes, tracked apart. Collapsing them let a LATER-page quota cancel an
+    # UNRELATED first-page transport failure (`first_page_failures - limited_pivots` mixed the two
+    # positions), and labelled every later-page problem as OUR page cap.
+    first_limit = 0        # pivot yielded NOTHING — the PROVIDER refused (quota/entitlement)
+    first_failure = 0      # pivot yielded NOTHING — something actually BROKE
+    later_limit = 0        # page-1 evidence kept, a LATER page hit a provider limit
+    later_failure = 0      # page-1 evidence kept, a later page BROKE
+    truncated = 0          # complete-but-more-than-paged: OUR page budget (policy, not a defect)
     last_exc = None
+    last_fail_exc = None                                    # the last NON-limit error (a real failure)
     for v in vals:
         try:
             matches, total, _pages, page_err = _shodan_search(key, facet, v, max_pages)
         except Exception as e:                             # first-page failure -> no evidence (do NOT swallow)
-            err_classes[classify_provider_error(e)] += 1
-            first_page_failures += 1
+            _cls = provider_error_class(e)
             last_exc = e
+            if is_provider_limit(_cls):
+                first_limit += 1
+                first_limit_cls[_cls] += 1
+            else:
+                first_failure += 1
+                first_fail_cls[_cls] += 1
+                last_fail_exc = e
             continue
         if page_err is not None:                           # review-r4#1: later page failed — KEEP earlier matches
-            err_classes[classify_provider_error(page_err)] += 1
-            degraded += 1
+            _pcls = provider_error_class(page_err)
             last_exc = page_err
+            if is_provider_limit(_pcls):
+                later_limit += 1
+                later_limit_cls[_pcls] += 1
+            else:
+                later_failure += 1
+                later_fail_cls[_pcls] += 1
+                last_fail_exc = page_err
         elif total > len(matches):                         # complete-but-more-than-paged (credit budget) — truncated
             truncated += 1
         raw = ctx.run.raw_path("probe", label, f"{_re.sub(r'[^A-Za-z0-9]', '_', v)[:32]}.jsonl")
@@ -157,31 +187,74 @@ def _shodan_pivot(ctx, key, values, facet, source, sid, note):
                             "value": hn, "note": note.format(v), "sources": [source],
                             "raw_ref": str(raw)}):
                         oos += 1
-    errored = first_page_failures + degraded               # pivots with ANY error (no-evidence OR partial)
-    incomplete_results = truncated + degraded              # result sets KNOWN incomplete (paged-cap OR later-page fail)
+    # B1.1 review#1/#2: a PROVIDER LIMIT is not a failure and must be accounted SEPARATELY. Folding quota
+    # into the failure counters made a depleted account emit COVERAGE_TIMEOUT (a gap) alongside the limit
+    # — and gaps dominate, so the verdict read complete_with_gaps: exactly the conflation B0 exists to
+    # prevent, reintroduced one layer down in the real lane.
+    # the TERMINAL aggregate is DERIVED from the position counters, never the other way round
+    limit_classes = dict(first_limit_cls + later_limit_cls)
+    fail_classes = dict(first_fail_cls + later_fail_cls)
+    first_page_failures = first_limit + first_failure       # pivots that yielded NOTHING, for ANY reason
+    degraded = later_limit + later_failure                  # pivots with page-1 evidence and a later problem
+    limited_pivots = first_limit + later_limit
+    errored = first_page_failures + degraded                # pivots with ANY error (no-evidence OR partial)
     # review#5/r2#3/r4#2: STRUCTURED coverage EVERY run (omitted=0 clears a prior gap), even with zero pivots.
-    # review-r5#2: `shodan_pivots.omitted` = WHOLLY-omitted pivots only (first-page failures — no evidence). A
-    # DEGRADED pivot got page-1 data, so it is TESTED here; its incompleteness is counted in shodan_results.
+    # review-r5#2: a WHOLLY-omitted pivot (first-page) is distinct from a DEGRADED one (page-1 data kept);
+    # B1.1r2 splits BOTH by WHO stopped us, because the answer differs per position AND per cause.
+    #
+    #   position   cause      kind                 verdict
+    #   first      broke      COVERAGE_TIMEOUT     gap        (the target/network cost us the pivot)
+    #   first      refused    COVERAGE_PROVIDER    soft limit (nothing to retry this run)
+    #   later      broke      COVERAGE_TIMEOUT     gap
+    #   later      refused    COVERAGE_PROVIDER    soft limit
+    #   later      our budget COVERAGE_CAP         gap        (the ONLY one that is ours)
     events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_pivots", unit=f"{label}.failed",
-                            eligible=len(vals), tested=len(vals) - first_page_failures, omitted=first_page_failures,
-                            reason=(f"{first_page_failures} shodan pivot(s) fully failed by class {dict(err_classes)}"
-                                    if first_page_failures else "all shodan pivots yielded data"))
-    events.coverage_partial(sid, kind=events.COVERAGE_CAP, measure="shodan_results", unit=f"{label}.incomplete",
-                            eligible=len(vals), tested=len(vals) - incomplete_results, omitted=incomplete_results,
-                            reason=(f"{incomplete_results}/{len(vals)} pivot(s) with an INCOMPLETE result set "
-                                    f"({truncated} credit-truncated, {degraded} later-page failure)"
-                                    if incomplete_results else "no pivot result set truncated"))
+                            eligible=len(vals), tested=len(vals) - first_failure, omitted=first_failure,
+                            reason=(f"{first_failure} shodan pivot(s) fully failed by class "
+                                    f"{dict(first_fail_cls)}" if first_failure else "no shodan pivot failed"))
+    events.coverage_partial(sid, kind=events.COVERAGE_PROVIDER, measure="shodan_pivots_limited",
+                            unit=f"{label}.provider_limit",
+                            eligible=len(vals), tested=len(vals) - first_limit, omitted=first_limit,
+                            reason=(f"{first_limit} shodan pivot(s) stopped by a PROVIDER LIMIT "
+                                    f"{dict(first_limit_cls)} — not a defect; nothing to retry this run"
+                                    if first_limit else "no shodan pivot hit a provider limit"))
+    events.coverage_partial(sid, kind=events.COVERAGE_CAP, measure="shodan_results", unit=f"{label}.page_budget",
+                            eligible=len(vals), tested=len(vals) - truncated, omitted=truncated,
+                            reason=(f"{truncated}/{len(vals)} pivot(s) truncated by OUR page budget "
+                                    f"(SHODAN_MAX_PAGES)" if truncated else "no pivot truncated by our page budget"))
+    events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_results_failed",
+                            unit=f"{label}.later_failed",
+                            eligible=len(vals), tested=len(vals) - later_failure, omitted=later_failure,
+                            reason=(f"{later_failure}/{len(vals)} pivot(s) lost a LATER page to a failure "
+                                    f"{dict(later_fail_cls)} (page-1 evidence KEPT)"
+                                    if later_failure else "no later page failed"))
+    events.coverage_partial(sid, kind=events.COVERAGE_PROVIDER, measure="shodan_results_limited",
+                            unit=f"{label}.later_limit",
+                            eligible=len(vals), tested=len(vals) - later_limit, omitted=later_limit,
+                            reason=(f"{later_limit}/{len(vals)} pivot(s) lost a LATER page to a PROVIDER "
+                                    f"LIMIT {dict(later_limit_cls)} (page-1 evidence KEPT)"
+                                    if later_limit else "no later page limited"))
     events.coverage_partial(sid, kind=events.COVERAGE_CAP, measure="shodan_pivot_values", unit=f"{label}.pivot_cap",
                             eligible=len(all_vals), tested=len(vals), omitted=len(all_vals) - len(vals),
                             reason=f"pivot values {len(vals)}/{len(all_vals)} queried (cap {_SHODAN_PIVOT_CAP})")
     # review-r3#4: honest terminal — every pivot failed with NOTHING found -> FAILED; ANY error (no-result OR
     # partial) with some evidence -> a GENERIC degraded PARTIAL (partial_kind=degraded, NOT pagination truncation).
     if len(vals) and first_page_failures == len(vals) and not found:
-        raise last_exc
+        # everything failed with no evidence. A REAL failure outranks a limit here: if anything actually
+        # broke, the run must not read as "merely limited" (review#2 — the outcome used to depend on
+        # which pivot happened to be last).
+        raise (last_fail_exc if last_fail_exc is not None else last_exc)
     if errored:
-        dominant = err_classes.most_common(1)[0][0]
+        # review#2: pick the dominant class from REAL failures when there are any, so a single transport
+        # error is never relabelled as a provider limit (nor the reverse). A run carrying BOTH keeps the
+        # limit visible in its own coverage measure above AND ends complete_with_gaps via this partial.
+        pool = fail_classes or limit_classes
+        dominant = max(pool.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        detail = (f"{errored}/{len(vals)} shodan pivot(s) errored ({dominant})"
+                  + (f", incl. {limited_pivots} provider-limited" if limited_pivots and fail_classes else "")
+                  + " — evidence KEPT")
         return ProviderResult(found, partial=True, partial_kind="degraded", error_class=dominant,
-                              partial_reason=f"{errored}/{len(vals)} shodan pivot(s) errored ({dominant}) — evidence KEPT")
+                              partial_reason=detail)
     return found
 
 

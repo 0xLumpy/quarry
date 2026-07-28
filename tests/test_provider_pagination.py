@@ -605,7 +605,12 @@ class TestShodanPivot:
         # review-r5#2: a DEGRADED pivot got page-1 data -> NOT counted as wholly-omitted (shodan_pivots), but
         # its result set IS incomplete (shodan_results).
         assert self._cov(tmp_path, "shodan_pivots")[0]["omitted"] == 0
-        assert self._cov(tmp_path, "shodan_results")[0]["omitted"] == 1
+        # B1.1r2: `shodan_results` now means OUR page budget only. A later page lost to a 429 is a
+        # FAILURE at a later position, so it is counted in `shodan_results_failed` (a gap) — the old
+        # single measure blamed Quarry's cap for a page the target rate-limited.
+        assert self._cov(tmp_path, "shodan_results")[0]["omitted"] == 0
+        assert self._cov(tmp_path, "shodan_results_failed")[0]["omitted"] == 1
+        assert self._cov(tmp_path, "shodan_results_limited")[0]["omitted"] == 0
 
     def test_degraded_partial_is_not_labeled_pagination(self, monkeypatch, tmp_path):
         # review-r4#2: a generic degraded shodan PARTIAL must NOT become a "pagination TRUNCATED at None pages"
