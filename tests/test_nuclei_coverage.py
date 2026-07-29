@@ -149,6 +149,17 @@ class TestExecutionVsCoverage:
         monkeypatch.setattr(settings, "workers", lambda t, d: d)
         monkeypatch.setattr(settings, "performance", lambda: {})
         monkeypatch.setattr(params, "exec_tool", exec_fn)
+        # The work unit folds a fingerprint of the INSTALLED nuclei template set, and an UNREADABLE state
+        # correctly makes the unit non-resumable (a fresh nonce): an unknown template set must never be
+        # treated as unchanged. That production behaviour is proven by
+        # `test_workunit.py::TestNucleiTemplateFingerprint::test_unknown_template_state_is_non_resumable`
+        # and is deliberately untouched here.
+        #
+        # These tests are about RESUME, so they must not silently depend on whether the machine running
+        # them happens to have ~/.config/nuclei. On a clean CI runner the fingerprint is None, every run
+        # gets a new work unit, and four resume tests failed for a reason that had nothing to do with
+        # what they assert. Pinning it makes the fixture state the precondition instead of inheriting it.
+        monkeypatch.setattr(params, "_nuclei_templates_fp", lambda: "test-templates-v1")
         ctx = _Ctx(tmp_path)
         f = ctx.raw_path("params", "nuclei", "findings.jsonl")
         lg = ctx.raw_path("params", "nuclei", "nuclei.run.log")
@@ -330,6 +341,22 @@ class TestExecutionVsCoverage:
 
 
 class TestResumeReportsPersistedCoverage:
+    def test_resume_does_not_depend_on_the_DEVELOPERS_nuclei_config(self, tmp_path, monkeypatch):
+        """The CI failure, as a test. With no readable nuclei template state — a clean runner, or any
+        machine without ~/.config/nuclei — these resume tests used to fail because the work unit carried
+        a fresh nonce each run. The harness now pins the fingerprint, so the environment cannot decide
+        whether a resume test passes."""
+        monkeypatch.setenv("NUCLEI_CONFIG", str(tmp_path / "no-such-nuclei-config"))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-such-xdg"))
+        t = TestExecutionVsCoverage()
+        t._run(tmp_path, monkeypatch, t._fake(status=Status.SUCCESS, stderr_text=_stderr()))
+        assert sorted(t._state(tmp_path)["chunks"]) == ["0", "1", "2"]
+
+        def never(tool, cmd, **k):
+            raise AssertionError("a done chunk was re-run: the work unit changed between runs")
+        _, res = t._run(tmp_path, monkeypatch, never)
+        assert res.status == Status.SUCCESS
+
     def test_resumed_chunks_re_emit_their_recorded_coverage(self, tmp_path, monkeypatch):
         """A resume must not understate the run's gap: a chunk it SKIPS still has to report the coverage it
         recorded the first time, or the rollup silently shrinks to only the chunks that re-ran."""
