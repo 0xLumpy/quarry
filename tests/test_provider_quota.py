@@ -26,8 +26,21 @@ WHOXY_BALANCE = ('{"status": 1, "live_whois_balance": 0, "whois_history_balance"
                  '"reverse_whois_balance": 0}')
 # schema-shaped from Whoxy's published reverse-whois JSON schema (total_results + search_result), NOT one
 # of the two live-measured payloads above — flagged so nobody mistakes it for ground truth.
-WHOXY_OK = ('{"status": 1, "total_results": 2, "current_page": 1, "total_pages": 1, '
+# review-B1.6r5#1: every reverse-whois response owes the ENDPOINT and REQUEST binding, not just the
+# compact empty one — so the shared fixture carries them, and callers pass what they asked for.
+WHOXY_ANCHOR = ("company", "Acme")
+WHOXY_OK = ('{"status": 1, "api_query": "reverse_whois", "search_identifier": {"company": "Acme"}, '
+            '"total_results": 2, "current_page": 1, "total_pages": 1, '
             '"search_result": [{"domain_name": "a.com"}, {"domain_name": "b.com"}]}')
+
+
+def _bound(doc, param="company", value="Acme"):
+    """Add the binding a real response always carries, so a fixture tests the shape under scrutiny
+    rather than the absence of a field."""
+    out = dict(doc)
+    out.setdefault("api_query", "reverse_whois")
+    out.setdefault("search_identifier", {param: value})
+    return out
 
 
 # MEASURED 2026-07-27 — a genuine reverse-whois NO-MATCH, verbatim from the live API (HTTP 200). Note what
@@ -116,6 +129,50 @@ class TestWhoxyEnvelope:
         with pytest.raises(ProviderBodyError) as e:
             whoxy_envelope({"status": status, "search_result": []})
         assert e.value.error_class == "parse"
+
+
+class TestWhoxyRequestBinding:
+    """review-B1.6r5#1: the endpoint and request binding lived on the COMPACT empty shape only, so a
+    PAGED body could arrive answering a different question — or no identifiable question — and its rows
+    became confident domain results. The live lane calls this parser directly, so the enforcement has to
+    be here, where every caller gets it."""
+
+    def _page(self, **over):
+        doc = {"status": 1, "api_query": "reverse_whois", "search_identifier": {"company": "Acme"},
+               "total_results": 1, "current_page": 1, "total_pages": 1,
+               "search_result": [{"domain_name": "a.com"}]}
+        doc.update(over)
+        for k, v in list(over.items()):
+            if v is None:
+                doc.pop(k, None)
+        return doc
+
+    @pytest.mark.parametrize("over", [
+        {"api_query": None},                            # no endpoint at all
+        {"api_query": "account_balance"},               # a DIFFERENT endpoint's answer
+        {"api_query": "whois_history"},
+        {"search_identifier": None},                    # nothing tying it to a question
+        {"search_identifier": {"company": "Other Co"}},  # someone ELSE's answer
+        {"search_identifier": {"company": "Acme", "email": "x@y.z"}},   # extra keys
+        {"search_identifier": {"email": "Acme"}},       # right value, wrong param
+    ])
+    def test_a_PAGED_body_that_is_not_our_answer_is_rejected(self, over):
+        with pytest.raises(ProviderBodyError) as e:
+            whoxy_reverse_page(whoxy_envelope(self._page(**over)), page=1,
+                               param="company", value="Acme")
+        assert e.value.error_class == "parse", e.value.reason
+
+    def test_our_own_answer_is_accepted(self):
+        rows, total, truncated = whoxy_reverse_page(whoxy_envelope(self._page()), page=1,
+                                                    param="company", value="Acme")
+        assert rows == ["a.com"] and total == 1 and truncated is False
+
+    @pytest.mark.parametrize("param,value", [(None, "Acme"), ("company", None), ("nickname", "Acme"),
+                                             ("company", ""), ("company", 5)])
+    def test_a_caller_that_cannot_state_its_request_gets_nothing(self, param, value):
+        """A response can only be bound to a question the caller actually names."""
+        with pytest.raises(ProviderBodyError):
+            whoxy_reverse_page(whoxy_envelope(self._page()), page=1, param=param, value=value)
 
 
 class TestWhoxyTotalResults:
@@ -228,11 +285,11 @@ class TestWhoxyResultSchema:
         reporting the page as the whole answer silently loses the rest."""
         doc = {"status": 1, "total_results": 50, "current_page": 1, "total_pages": 1,
                "search_result": [{"domain_name": "a.com"}]}
-        rows, total, truncated = whoxy_reverse_page(doc)
+        rows, total, truncated = whoxy_reverse_page(_bound(doc), param="company", value="Acme")
         assert rows == ["a.com"] and total == 50 and truncated is True
 
     def test_complete_page_is_not_flagged_truncated(self):
-        rows, total, truncated = whoxy_reverse_page(json.loads(WHOXY_OK))
+        rows, total, truncated = whoxy_reverse_page(json.loads(WHOXY_OK), param="company", value="Acme")
         assert len(rows) == 2 and total == 2 and truncated is False
 
     # MEASURED 2026-07-29: `"12"` was in this list, asserting that a decimal STRING is unusable — and
@@ -249,20 +306,24 @@ class TestWhoxyResultSchema:
         if total is not None:
             doc["total_results"] = total
         with pytest.raises(ProviderBodyError) as e:
-            whoxy_reverse_page(doc)
+            whoxy_reverse_page(_bound(doc), param="company", value="Acme")
         assert e.value.error_class == "parse"
 
     def test_absent_total_fails_even_with_zero_rows(self):
         """Pins the absence guard INDEPENDENTLY: with rows present, the total<rows check would mask it,
         so a mutation deleting this guard still passed. An empty page with no cardinality is still drift."""
         with pytest.raises(ProviderBodyError) as e:
-            whoxy_reverse_page({"status": 1, "current_page": 1, "total_pages": 1, "search_result": []})
+            whoxy_reverse_page(_bound({"status": 1, "current_page": 1, "total_pages": 1,
+                                       "search_result": []}), param="company", value="Acme")
         assert e.value.error_class == "parse"
 
     def test_total_smaller_than_rows_is_incoherent(self):
         with pytest.raises(ProviderBodyError) as e:
-            whoxy_reverse_page({"status": 1, "total_results": 1, "current_page": 1, "total_pages": 1,
-                                "search_result": [{"domain_name": "a.com"}, {"domain_name": "b.com"}]})
+            whoxy_reverse_page(_bound({"status": 1, "total_results": 1, "current_page": 1,
+                                       "total_pages": 1,
+                                       "search_result": [{"domain_name": "a.com"},
+                                                         {"domain_name": "b.com"}]}),
+                               param="company", value="Acme")
         assert e.value.error_class == "parse"
 
     @pytest.mark.parametrize("page,pages", [(0, 2), (2, 1), ("1", 2), (1, 0), (True, 2), (None, 1),
@@ -275,7 +336,7 @@ class TestWhoxyResultSchema:
         if pages is not None:
             doc["total_pages"] = pages
         with pytest.raises(ProviderBodyError) as e:
-            whoxy_reverse_page(doc)
+            whoxy_reverse_page(_bound(doc), param="company", value="Acme")
         assert e.value.error_class == "parse"
 
     def test_a_response_for_a_different_page_is_rejected(self):
@@ -283,21 +344,22 @@ class TestWhoxyResultSchema:
         doc = {"status": 1, "total_results": 200, "current_page": 2, "total_pages": 2,
                "search_result": [{"domain_name": "a.com"}]}
         with pytest.raises(ProviderBodyError) as e:
-            whoxy_reverse_page(doc, page=1)
+            whoxy_reverse_page(_bound(doc), page=1, param="company", value="Acme")
         assert e.value.error_class == "parse"
-        rows, _total, truncated = whoxy_reverse_page(doc, page=2)     # correct request -> accepted
+        rows, _total, truncated = whoxy_reverse_page(_bound(doc), page=2, param="company", value="Acme")     # correct request -> accepted
         assert rows == ["a.com"] and truncated is True
 
     def test_multiple_pages_is_truncated_even_when_the_count_fits(self):
         """`total_pages > 1` is itself a shortfall claim — the count alone can agree while pages remain."""
         doc = {"status": 1, "total_results": 1, "current_page": 1, "total_pages": 3,
                "search_result": [{"domain_name": "a.com"}]}
-        _rows, _total, truncated = whoxy_reverse_page(doc)
+        _rows, _total, truncated = whoxy_reverse_page(_bound(doc), param="company", value="Acme")
         assert truncated is True
 
     def test_genuinely_empty_page_is_accepted(self):
-        rows, total, truncated = whoxy_reverse_page({"status": 1, "total_results": 0, "current_page": 1,
-                                                     "total_pages": 1, "search_result": []})
+        rows, total, truncated = whoxy_reverse_page(
+            _bound({"status": 1, "total_results": 0, "current_page": 1, "total_pages": 1,
+                    "search_result": []}), param="company", value="Acme")
         assert rows == [] and total == 0 and truncated is False
 
     def test_reason_matching_is_exact_not_substring(self):
@@ -329,6 +391,26 @@ class _Sess:
         self.recorded.append(result)
 
 
+def _echo_request(body, url):
+    """Stamp `api_query` + `search_identifier` onto a scripted body from the URL that asked for it,
+    unless the fixture set them deliberately."""
+    import urllib.parse as _up
+    try:
+        doc = json.loads(body)
+    except Exception:
+        return body
+    if not isinstance(doc, dict) or doc.get("status") != 1:
+        return body                      # a failure envelope carries no identity, and the real one
+                                         # does not add one — leave it exactly as scripted
+    q = _up.parse_qs(_up.urlsplit(url).query)
+    for param in ("company", "email"):
+        if param in q:
+            doc["api_query"] = "reverse_whois"
+            doc["search_identifier"] = {param: q[param][0]}   # ALWAYS the question actually asked
+            break
+    return json.dumps(doc)
+
+
 def _drive(tmp_path, monkeypatch, bodies):
     """Run _whoxy with a scripted sequence of HTTP bodies."""
     monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
@@ -337,7 +419,11 @@ def _drive(tmp_path, monkeypatch, bodies):
 
     def fake_http(url, timeout=None, **kw):
         calls.append(url)
-        return seq.pop(0) if seq else '{"status": 1}'
+        body = seq.pop(0) if seq else '{"status": 1}'
+        # review-B1.6r5#1: a real reverse-whois response ECHOES the question it answers, and every
+        # response now owes that binding. A fixture that always claimed one fixed anchor would be
+        # testing a body the provider never sends — so the fake echoes the URL it was actually given.
+        return _echo_request(body, url)
 
     monkeypatch.setattr(osint, "_http", fake_http)
     s = _Sess(tmp_path)
@@ -615,7 +701,10 @@ class TestOsintSessionVerdict:
     def test_a_clean_session_is_complete(self, tmp_path, monkeypatch):
         s = self._session(tmp_path)
         monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
-        monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_OK)
+        # the response must echo the question actually asked — a fixed identity would be a body the
+        # provider never sends (review-B1.6r5#1).
+        monkeypatch.setattr(osint, "_http",
+                            lambda url, timeout=None, **kw: _echo_request(WHOXY_OK, url))
         osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
         assert s.outcome()["verdict"] == "complete"
 
@@ -1003,7 +1092,7 @@ class TestMeasuredNoMatch:
         doc = {"status": 1, "total_results": 0, "domainsList": ["a.com"],
                "current_page": 1, "total_pages": 1}
         with pytest.raises(ProviderBodyError) as e:
-            whoxy_reverse_page(doc, page=1)
+            whoxy_reverse_page(_bound(doc), page=1, param="company", value="Acme")
         assert e.value.error_class == "parse" and "domainsList" in e.value.reason
 
     def test_the_lane_rejects_an_answer_to_a_different_anchor(self, tmp_path, monkeypatch):
@@ -1033,15 +1122,23 @@ class TestMeasuredNoMatch:
         doc = {"status": 1, "total_results": 0, "search_result": None,
                "current_page": 1, "total_pages": 1}
         with pytest.raises(ProviderBodyError) as e:
-            whoxy_reverse_page(doc, page=1)
+            whoxy_reverse_page(_bound(doc), page=1, param="company", value="Acme")
         assert e.value.error_class == "parse" and "not a list" in e.value.reason
 
-    def test_the_compact_shape_cannot_be_accepted_without_a_request_identity(self):
-        """review-B0r7#2: the binding was OPTIONAL, so a caller that simply omitted it got a free clean
-        empty — the compact shape has no rows, so the echo IS the evidence."""
+    def test_OMITTING_the_request_identity_is_a_CALLER_defect(self):
+        """review-B1.6r6: `param`/`value` defaulted to None while being mandatory in effect, so a caller
+        that simply forgot them got a ProviderBodyError — Quarry blaming the PROVIDER for a defect in its
+        own call. They are required keyword arguments, so forgetting them fails immediately and locally."""
         doc = json.loads(_no_match_body("company", "Acme"))
-        for bad in ({}, {"param": "company"}, {"value": "Acme"},
-                    {"param": "org", "value": "Acme"},          # not a supported anchor kind
+        for bad in ({}, {"param": "company"}, {"value": "Acme"}):
+            with pytest.raises(TypeError):
+                whoxy_reverse_page(doc, **bad)
+
+    def test_an_UNUSABLE_request_identity_is_still_a_parse_failure(self):
+        """review-B0r7#2: a caller that names its request badly cannot be given a free clean empty —
+        the compact shape has no rows, so the echo IS the evidence."""
+        doc = json.loads(_no_match_body("company", "Acme"))
+        for bad in ({"param": "org", "value": "Acme"},           # not a supported anchor kind
                     {"param": "company", "value": ""},           # empty value proves nothing
                     {"param": "company", "value": "   "},
                     {"param": "company", "value": 7}):
@@ -1085,7 +1182,7 @@ class TestMeasuredNoMatch:
 
     def test_a_fully_paged_empty_is_still_accepted(self):
         doc = {"status": 1, "total_results": 0, "current_page": 1, "total_pages": 1, "search_result": []}
-        assert whoxy_reverse_page(doc, page=1) == ([], 0, False)
+        assert whoxy_reverse_page(_bound(doc), page=1, param="company", value="Acme") == ([], 0, False)
 
     def test_end_to_end_no_match_produces_no_failure_limit_or_gap(self, tmp_path, monkeypatch):
         from quarry_recon.osint import OsintSession
@@ -1121,44 +1218,50 @@ class TestMeasuredNoMatch:
         if total is not None:
             doc["total_results"] = total
         with pytest.raises(ProviderBodyError) as e:
-            whoxy_reverse_page(doc)
+            whoxy_reverse_page(_bound(doc), param="company", value="Acme")
         assert e.value.error_class == "parse"
 
     def test_zero_with_rows_is_still_contradictory(self):
         with pytest.raises(ProviderBodyError) as e:
             whoxy_reverse_page({"status": 1, "total_results": 0,
-                                "search_result": [{"domain_name": "a.com"}]})
+                                "search_result": [{"domain_name": "a.com"}]},
+                param="company", value="Acme")
         assert e.value.error_class == "parse"
 
     def test_zero_with_a_non_list_result_is_still_drift(self):
         with pytest.raises(ProviderBodyError) as e:
-            whoxy_reverse_page({"status": 1, "total_results": 0, "search_result": "nope"})
+            whoxy_reverse_page({"status": 1, "total_results": 0, "search_result": "nope"},
+                param="company", value="Acme")
         assert e.value.error_class == "parse"
 
     def test_zero_claiming_multiple_pages_is_contradictory(self):
         with pytest.raises(ProviderBodyError) as e:
-            whoxy_reverse_page({"status": 1, "total_results": 0, "current_page": 1, "total_pages": 4})
+            whoxy_reverse_page({"status": 1, "total_results": 0, "current_page": 1, "total_pages": 4},
+                param="company", value="Acme")
         assert e.value.error_class == "parse"
 
     @pytest.mark.parametrize("cur,pages", [(0, 1), ("1", 1), (True, 1), (1, 0)])
     def test_zero_with_an_invalid_page_position_still_fails(self, cur, pages):
         with pytest.raises(ProviderBodyError) as e:
             whoxy_reverse_page({"status": 1, "total_results": 0, "current_page": cur,
-                                "total_pages": pages})
+                                "total_pages": pages},
+                param="company", value="Acme")
         assert e.value.error_class == "parse"
 
     def test_zero_for_the_wrong_page_is_rejected(self):
         with pytest.raises(ProviderBodyError) as e:
             whoxy_reverse_page({"status": 1, "total_results": 0, "current_page": 2, "total_pages": 1},
-                               page=1)
+                               page=1,
+                param="company", value="Acme")
         assert e.value.error_class == "parse"
 
     def test_a_non_empty_answer_still_owes_the_full_contract(self):
         """The relaxation applies ONLY to the zero case: any real result keeps the strict schema."""
         with pytest.raises(ProviderBodyError):
             whoxy_reverse_page({"status": 1, "total_results": 2,
-                                "search_result": [{"domain_name": "a.com"}, {"domain_name": "b.com"}]})
-        rows, total, truncated = whoxy_reverse_page(json.loads(WHOXY_OK))
+                                "search_result": [{"domain_name": "a.com"}, {"domain_name": "b.com"}]},
+                param="company", value="Acme")
+        rows, total, truncated = whoxy_reverse_page(json.loads(WHOXY_OK), param="company", value="Acme")
         assert rows == ["a.com", "b.com"] and total == 2 and truncated is False
 
 

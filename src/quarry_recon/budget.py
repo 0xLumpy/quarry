@@ -23,6 +23,7 @@ item's cost, not which items get processed.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -120,6 +121,32 @@ def publish_bytes(dest: Path, data: bytes, *, digest: str) -> bool:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass                              # nothing further we can do; the caller still gets False
+        return False
+
+
+def store_writable(attempt_dir) -> bool:
+    """Whether a bought page could actually be PUBLISHED — proven by writing, not assumed.
+
+    review-B1.3r7#2: the ledger was probed before spending and the artifact store was not, so a
+    read-only attempt directory was discovered by paying for a page and then failing to store it
+    (`calls=[1]`, `stop_cause=publish_failed`) — and the next run bought it again. Both sinks are
+    required, so both are proven up front.
+
+    The probe exercises the same primitive the real page uses (temp + verify + replace) and then REMOVES
+    itself: an artifact directory must contain only real evidence, and a probe we cannot clean up is
+    itself a failure — it would be an orphan in a tree whose contract says every file is a validated
+    artifact.
+
+    B1.6: moved here from the Shodan coordinator, because the Whoxy paginator needs the identical probe
+    and the contract really is the same one. Two copies of a safety precondition would drift."""
+    probe = Path(attempt_dir) / ".quarry-write-probe"
+    body = b'{"probe":1}'
+    try:
+        Path(attempt_dir).mkdir(parents=True, exist_ok=True)
+        ok = publish_bytes(probe, body, digest=hashlib.sha256(body).hexdigest())
+        probe.unlink(missing_ok=True)
+        return bool(ok) and not probe.exists()
+    except OSError:
         return False
 
 

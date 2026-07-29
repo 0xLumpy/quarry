@@ -179,27 +179,10 @@ def ledger_writable(ledger) -> bool:
     return not getattr(ledger, "foreign", False) and not getattr(ledger, "_journal_unsafe", False)
 
 
-def store_writable(attempt_dir) -> bool:
-    """Whether a bought page could actually be PUBLISHED — proven by writing, not assumed.
+#: B1.6: the identical probe is now `budget.store_writable` — the Whoxy paginator needs the same one,
+#: and the contract is the same. Re-exported so this module's readers still find it where it was.
+store_writable = budget.store_writable
 
-    review-B1.3r7#2: the ledger was probed before spending and the artifact store was not, so a
-    read-only attempt directory was discovered by paying for a page and then failing to store it
-    (`calls=[1]`, `stop_cause=publish_failed`) — and the next run bought it again. Both sinks are
-    required, so both are proven up front.
-
-    The probe exercises the same primitive the real page uses (temp + verify + replace) and then REMOVES
-    itself: an artifact directory must contain only real evidence, and a probe we cannot clean up is
-    itself a failure — it would be an orphan in a tree whose contract says every file is a validated
-    artifact."""
-    probe = Path(attempt_dir) / ".quarry-write-probe"
-    body = b'{"probe":1}'
-    try:
-        Path(attempt_dir).mkdir(parents=True, exist_ok=True)
-        ok = budget.publish_bytes(probe, body, digest=hashlib.sha256(body).hexdigest())
-        probe.unlink(missing_ok=True)
-        return bool(ok) and not probe.exists()
-    except OSError:
-        return False
 
 
 def dedupe(states: "list[PivotState]") -> "list[PivotState]":

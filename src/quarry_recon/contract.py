@@ -349,18 +349,40 @@ def whoxy_reverse_rows(doc, *, provider: str = "whoxy") -> list:
     return out
 
 
-def whoxy_reverse_page(doc, *, provider: str = "whoxy", page: int = 1,
-                       param: "str | None" = None, value: "str | None" = None) -> tuple:
+def whoxy_reverse_page(doc, *, param: str, value: str, provider: str = "whoxy",
+                       page: int = 1) -> tuple:
     """-> (rows, total_results, truncated). `truncated` is True when the provider says it holds more
     matches than this page returned — a PAGINATION shortfall the caller must report rather than absorb.
 
-    `param`/`value` are the REQUEST IDENTITY (e.g. ``("company", "Acme Inc")``) — the compact zero-result
-    shape carries no rows to check, so the only thing tying it to our question is its own echo of it.
+    `param`/`value` are the REQUEST IDENTITY (e.g. ``("company", "Acme Inc")``) and are REQUIRED — every
+    response is bound to the question it answers, and the compact zero-result shape has nothing else
+    tying it to ours. review-B1.6r6: they defaulted to None while being mandatory in effect, so a caller
+    that simply forgot them got a `ProviderBodyError` blaming the PROVIDER for a defect in the call.
 
     review-B0r3#4: the page position is REQUIRED, not validated-if-present. Optional validation let a body
     missing both fields through unchecked, and would have accepted a page-2 response for our page-1
     request — silently attributing one slice of the answer to another. `page` is what we ASKED for, and
-    the response must say it is that page."""
+    the response must say it is that page.
+
+    review-B1.6r5#1: the ENDPOINT and REQUEST binding applied to the compact empty shape ONLY, so a
+    PAGED body could arrive with `api_query` missing or saying `account_balance`, with no
+    `search_identifier` at all, or with one naming a different company, and its rows still became
+    confident domain results. B1.6's reader enforced this — but the LIVE lane calls this function
+    directly, so the enforcement has to be HERE, where every caller gets it. A response that cannot be
+    tied to the question we asked is not an answer to it."""
+    if doc.get("api_query") != "reverse_whois":
+        raise ProviderBodyError(PROVIDER_PARSE,
+                                f"not a reverse_whois answer (api_query={doc.get('api_query')!r})",
+                                provider)
+    if param not in ("company", "email") or not isinstance(value, str) or not value.strip():
+        raise ProviderBodyError(PROVIDER_PARSE,
+                                f"a reverse-whois response cannot be bound to a request "
+                                f"(param={param!r} value={value!r})", provider)
+    ident = doc.get("search_identifier")
+    if ident != {param: value}:
+        raise ProviderBodyError(PROVIDER_PARSE,
+                                f"response identifies {ident!r}, not exactly the {param}={value!r} "
+                                f"we asked", provider)
     raw_total = doc.get("total_results")
     total = whoxy_total(raw_total)
     # MEASURED 2026-07-27 — a genuine reverse-whois NO-MATCH (HTTP 200):
@@ -387,23 +409,8 @@ def whoxy_reverse_page(doc, *, provider: str = "whoxy", page: int = 1,
             # SHAPE A — the MEASURED compact empty. Bound to the REQUEST: without this a response to a
             # different question (another anchor, or `account=balance`) counted as "this query found
             # nothing", which is a false empty wearing the measured shape.
-            if doc.get("api_query") != "reverse_whois":
-                raise ProviderBodyError(PROVIDER_PARSE,
-                                        f"compact zero-result body is not a reverse_whois answer "
-                                        f"(api_query={doc.get('api_query')!r})", provider)
-            # review-B0r7#2: the binding is MANDATORY and EXACT. It was optional (so a caller that simply
-            # forgot the identity got a free clean empty) and it matched only ONE key, so an identifier
-            # ALSO naming a different anchor passed. A body with no rows has nothing else tying it to our
-            # question — the echo IS the evidence, so it must be complete and it must be present.
-            if param not in ("company", "email") or not isinstance(value, str) or not value.strip():
-                raise ProviderBodyError(PROVIDER_PARSE,
-                                        f"compact zero-result body cannot be bound to a request "
-                                        f"(param={param!r} value={value!r})", provider)
-            ident = doc.get("search_identifier")
-            if ident != {param: value}:
-                raise ProviderBodyError(PROVIDER_PARSE,
-                                        f"compact zero-result body identifies {ident!r}, "
-                                        f"not exactly the {param}={value!r} we asked", provider)
+            # review-B0r7#2: the binding is MANDATORY and EXACT — now enforced above for EVERY shape,
+            # because a paged body needs it just as much as this one (review-B1.6r5#1).
             # review-B0r8: the compact body carries NO page identity, so it can only ever prove the
             # INITIAL request. Accepting it for page 2 would let B1's pagination complete a page it never
             # actually received — the shape says "this query matched nothing", which is only a coherent
