@@ -142,6 +142,26 @@ def redact(text: str | None) -> str | None:
     return text
 
 
+def redact_deep(value):
+    """`redact` over a whole STRUCTURE — every string leaf, at any depth.
+
+    review-B1.6b24#1: structured outcome metadata was copied into the manifest verbatim while its prose
+    siblings went through `redact`. Anything that carries an exception string — and machinery reasons
+    now do — can carry a configured credential with it, and one unredacted sink is the whole leak.
+
+    Containers are rebuilt rather than mutated: the caller's own object is evidence and is not ours to
+    edit. Only CONFIGURED credentials are replaced; discovered secrets and verbatim provider evidence
+    are untouched by this — they live in raw/ and are the point of the run."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        # keys too: a dict built from provider data can key on anything.
+        return {redact_deep(k): redact_deep(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return type(value)(redact_deep(v) for v in value)
+    return value
+
+
 def _coerce(value) -> str:
     if isinstance(value, str):
         return value

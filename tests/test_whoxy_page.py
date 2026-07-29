@@ -21,6 +21,13 @@ pytestmark = pytest.mark.offline
 #: originals stay out of the repo — they carry registrant PII.
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "whoxy"
 
+
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_spend_lock(tmp_path, monkeypatch):
+    """The spend lock is installation-wide, which means the operator's own `~/.config/quarry` — no test
+    may create or contend for it, including via a default argument."""
+    monkeypatch.setattr(wp, "SPEND_LOCK", tmp_path / "install-spend.lock")
+
 COMPANY = "company"
 EMAIL = "email"
 
@@ -91,7 +98,8 @@ def _run(tmp_path, states, provider, *, spend=None, ledger=None, seen=None, atte
         seen.extend(rows)
         return len(rows)
 
-    return wp.run_pages(states, spend=spend, fetch=provider.fetch, ingest=ingest, read=_read,
+    return wp.run_pages(states, paid=lambda: wp.fixed_allowance(spend), fetch=provider.fetch,
+                        ingest=ingest, read=_read,
                         ledger=ledger if ledger is not None else _ledger(tmp_path), attempt_dir=d), seen
 
 
@@ -108,6 +116,7 @@ class TestSpendable:
         (0, 0, 0, 0),            # a genuinely empty account
     ])
     def test_the_bound_is_the_tighter_of_the_two(self, bal, res, run, want):
+        """`spendable` is the pure arithmetic; `spend_policy` wraps it with the mandatory preflight."""
         assert wp.spendable(bal, res, run) == want
 
     def test_an_UNKNOWN_balance_is_not_zero(self):
@@ -120,6 +129,10 @@ class TestSpendable:
         balance. Our own caution stops us — an operator limit, not the provider refusing."""
         assert wp.spendable(None, 50, 0) == 0
         assert wp.spendable(None, 50, 10) == 0
+
+    def test_the_reserve_is_NOT_part_of_a_page_identity_either(self):
+        a = Anchor(COMPANY, "Acme")
+        assert item_key(a, 1) == item_key(a, 1)
 
     def test_the_reserve_is_NOT_part_of_a_page_identity(self):
         """Changing a spending policy must never re-buy a page that is already paid for."""
@@ -247,6 +260,17 @@ class TestOrdering:
 
 
 class TestPurchaseAndReplay:
+    def test_a_REQUESTED_anchor_is_recorded(self, tmp_path):
+        """review-B1.6b14#6: `anchors - unopened` counted a replay-only lifecycle as having attempted
+        every anchor while issuing zero requests, so the paginator records which anchors it ASKED."""
+        led = _ledger(tmp_path)
+        out, _ = _run(tmp_path, _states((COMPANY, "a")), _Provider(totals={"a": 250}), ledger=led)
+        assert out.requested == {(COMPANY, "a")} and out.requests_issued == 3
+        p2 = _Provider(totals={"a": 250})
+        out2, _ = _run(tmp_path, _states((COMPANY, "a")), p2, ledger=_ledger(tmp_path), attempt="a1")
+        assert out2.requested == set() and out2.requests_issued == 0, "a replay counted as a request"
+        assert out2.pages_replayed == 3
+
     def test_a_full_walk_buys_every_page_once(self, tmp_path):
         p = _Provider(totals={"a": 250})                       # 3 pages
         out, seen = _run(tmp_path, _states((COMPANY, "a")), p)
@@ -463,13 +487,14 @@ class TestReviewB1_6r1:
     def test_an_INVALID_spending_control_stops_paid_work(self, tmp_path):
         """#5: `run_budget=-1` clamped to 0, and 0 MEANS "no operator ceiling" — a typo in a cost guard
         became permission to spend the whole balance."""
-        assert wp.spend_policy(200, 0, -1).pages == 0
-        assert "WHOXY_PAGE_BUDGET" in wp.spend_policy(200, 0, -1).invalid
-        assert wp.spend_policy(200, -5, 0).pages == 0
-        assert "WHOXY_CREDIT_RESERVE" in wp.spend_policy(200, -5, 0).invalid
-        assert wp.spend_policy(200, True, 0).pages == 0        # bool is not a count
-        assert wp.spend_policy(200, "10", 0).pages == 0
-        good = wp.spend_policy(200, 50, 0)
+        bal = wp.read_balance('{"status": 1, "reverse_whois_balance": 200}')
+        assert wp.spend_policy(bal, 0, -1).pages == 0
+        assert "WHOXY_PAGE_BUDGET" in wp.spend_policy(bal, 0, -1).invalid
+        assert wp.spend_policy(bal, -5, 0).pages == 0
+        assert "WHOXY_CREDIT_RESERVE" in wp.spend_policy(bal, -5, 0).invalid
+        assert wp.spend_policy(bal, True, 0).pages == 0        # bool is not a count
+        assert wp.spend_policy(bal, "10", 0).pages == 0
+        good = wp.spend_policy(bal, 50, 0)
         assert good.pages == 150 and good.invalid == ""
 
     def test_a_FAILED_response_body_is_kept_as_evidence(self, tmp_path):
@@ -553,26 +578,36 @@ class TestReviewB1_6r2:
         assert [c[2] for c in p2.calls] == [1], p2.calls
         assert out.pages_bought == 1 and len(seen) == 100
 
-    @pytest.mark.parametrize("bad", ["200", True, 12.5, -1, [], {}])
+    @pytest.mark.parametrize("bad", ['{"status": 1, "reverse_whois_balance": "200"}',
+                                     '{"status": 1, "reverse_whois_balance": true}',
+                                     '{"status": 1, "reverse_whois_balance": 12.5}',
+                                     '{"status": 1, "reverse_whois_balance": -1}',
+                                     "[]", "{}"])
     def test_a_MALFORMED_provider_balance_permits_no_paid_work(self, bad):
         """#2: the operator's controls were validated and the provider's balance — the least trustworthy
         of the three, since it arrives over the network — was coerced with `int()`.
 
         review-B1.6r3#4: it is reported SEPARATELY from the operator's controls. Provider schema drift
         filed as configuration would send an operator to fix a knob that is perfectly correct."""
-        pol = wp.spend_policy(bad, 0, 0)
+        pol = wp.spend_policy(wp.read_balance(bad), 0, 0)
         assert pol.pages == 0, (bad, pol)
-        assert "provider balance" in pol.balance_invalid, (bad, pol)
-        assert pol.invalid == "", (bad, pol)
+        assert pol.balance_invalid and pol.invalid == "", (bad, pol)
 
     def test_an_operator_control_and_a_provider_balance_are_DIFFERENT_faults(self):
-        cfg = wp.spend_policy(200, -5, 0)
+        ok = wp.read_balance('{"status": 1, "reverse_whois_balance": 200}')
+        drifted = wp.read_balance('{"status": 1, "reverse_whois_balance": "200"}')
+        cfg = wp.spend_policy(ok, -5, 0)
         assert "WHOXY_CREDIT_RESERVE" in cfg.invalid and cfg.balance_invalid == ""
-        both = wp.spend_policy("200", -5, 0)
-        assert both.invalid and both.balance_invalid, both
+        drift = wp.spend_policy(drifted, 0, 0)
+        assert drift.balance_invalid and drift.invalid == "", drift
+        # a broken CONTROL is checked first: an operator cannot act on a provider report while their own
+        # configuration is unusable, and both stop paid work anyway.
+        both = wp.spend_policy(drifted, -5, 0)
+        assert both.pages == 0 and both.invalid, both
 
-    def test_an_UNKNOWN_balance_is_still_allowed(self):
-        assert wp.spend_policy(None, 0, 0).invalid == ""
+    def test_a_READABLE_balance_carries_no_fault(self):
+        assert wp.spend_policy(wp.read_balance('{"status": 1, "reverse_whois_balance": 5}'),
+                               0, 0).invalid == ""
 
     def test_the_measured_COMPACT_no_match_is_a_terminal_page(self, tmp_path):
         """#3: the measured no-match carries NO pagination fields at all. That is not drift — it is the
@@ -609,6 +644,66 @@ class TestReviewB1_6r3:
         assert wp.classify_page({"total_results_int": 0})[0] == wp.PAGE_TERMINAL
         assert wp.classify_page({"total_results_int": 0,
                                  "search_result": [{"domain_name": "a.com"}]})[0] == wp.PAGE_CONTRADICTORY
+
+    @pytest.mark.parametrize("total,pages,page,rows,ok", [
+        (50, 1, 1, 50, True),        # the whole answer on one page
+        (50, 1, 1, 1, False),        # THE DEFECT: 50 claimed, one delivered, accepted as complete
+        (50, 1, 1, 49, False),
+        (250, 3, 1, 100, True),      # a non-final page is always full
+        (250, 3, 1, 99, False),
+        (250, 3, 3, 50, True),       # the final page carries the remainder
+        (250, 3, 3, 49, False),
+        (250, 3, 3, 51, False),
+        (250, 3, 4, 50, False),      # a page beyond the count it declares
+        (250, 3, 0, 100, False),
+    ])
+    def test_the_ROW_COUNT_must_match_the_page_position(self, total, pages, page, rows, ok):
+        """review-B1.6b18#2: the page COUNT was corroborated and the ROW COUNT was not, so a body
+        claiming 50 results across one page and returning ONE row was accepted as a complete answer —
+        49 results lost, and OWNED, so it could never be re-bought. The measured contract fixes both
+        numbers: 100 rows a page, and total_pages == ceil(total / 100)."""
+        doc = {"total_results_int": total, "total_pages": pages, "current_page": page,
+               "rows": [{"domain_name": f"d{i}.example.com"} for i in range(rows)]}
+        kind, _n = wp.classify_page(doc)
+        assert (kind == wp.PAGE_PAGED) is ok, (kind, total, pages, page, rows)
+
+    def test_a_SHORT_page_is_retryable_evidence_not_a_completion(self, tmp_path):
+        """It must stay re-buyable: owning a contradictory page makes a transient fault permanent."""
+        led = _ledger(tmp_path)
+        p = _Provider()
+
+        def short(anchor, page):
+            p.calls.append((anchor.param, anchor.value, page))
+            return json.dumps({
+                "status": 1, "api_query": "reverse_whois",
+                "search_identifier": {anchor.param: anchor.value},
+                "total_results": "50", "total_pages": 1, "current_page": 1,
+                "search_result": [{"domain_name": "only.example.com"}]}).encode(), None
+
+        p.fetch = short
+        out, seen = _run(tmp_path, _states((COMPANY, "a")), p, ledger=led, spend=2)
+        assert out.pages_bought == 0 and out.evidence_invalid == 1 and seen == []
+        assert not _ledger(tmp_path).has(item_key(Anchor(COMPANY, "a"), 1))
+        p2 = _Provider(totals={"a": 50})                    # the provider recovers
+        out2, seen2 = _run(tmp_path, _states((COMPANY, "a")), p2, ledger=_ledger(tmp_path),
+                           attempt="a1")
+        assert out2.pages_bought == 1 and len(seen2) == 50
+
+    def test_a_SHORT_page_already_OWNED_does_not_replay(self, tmp_path):
+        """Fresh and replayed pages owe the same contract — a short page recorded by an older build
+        must not replay as a complete answer."""
+        led = _ledger(tmp_path)
+        d = tmp_path / "state" / "pages" / "a0"
+        d.mkdir(parents=True, exist_ok=True)
+        body = json.dumps({"status": 1, "api_query": "reverse_whois",
+                           "search_identifier": {COMPANY: "a"}, "total_results": "50",
+                           "total_pages": 1, "current_page": 1,
+                           "search_result": [{"domain_name": "only.example.com"}]}).encode()
+        art = d / f"{item_key(Anchor(COMPANY, 'a'), 1)}.json"
+        art.write_bytes(body)
+        led.record(item_key(Anchor(COMPANY, "a"), 1), art)
+        led.save()
+        assert wp.owned_index(_ledger(tmp_path), _read) == {}
 
     def test_a_CONTRADICTORY_owned_page_does_not_replay(self, tmp_path):
         """#2: enumeration accepted anything the reader could identify, so a digest-valid contradictory
@@ -730,6 +825,281 @@ class TestReviewB1_6r3:
         assert wp.read_page(art) is None
 
 
+def _paid(spend_path, allowance, *, seen=None):
+    """A realistic paid phase: take the installation-wide spend lock, THEN yield the allowance. This is
+    where a real lifecycle also reads the balance, so `seen` records that it got that far."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def phase():
+        with wp.spend_lock(spend_path):
+            if seen is not None:
+                seen.append("balance read")
+            yield allowance
+
+    return phase
+
+
+class TestDurableProjectState:
+    """B1.6b: page ownership lives beside the timestamped sessions, not inside one. An `OsintSession`
+    directory is per-run, so state kept there dies with it and every run re-buys page 1."""
+
+    def _run_in(self, project, provider, **kw):
+        # `open_state` is a context manager: the provider lock is held across the whole lifecycle, and
+        # there is no way to reach the ledger without it (review-B1.6b2#2).
+        # the spend lock is installation-wide by default; tests must never touch the real
+        # ~/.config/quarry, so they point it at their own tmp path.
+        with wp.open_state(project) as (led, pages):
+            d = pages / f"attempt-{len(list(pages.iterdir()))}"
+            d.mkdir(parents=True, exist_ok=True)
+            seen = []
+
+            def ingest(anchor, page, doc, art):
+                rows = _rows(doc)
+                seen.extend(rows)
+                return len(rows)
+
+            allowance = kw.pop("spend", None)
+            out = wp.run_pages(_states((COMPANY, "a")),
+                               paid=_paid(project.parent / "spend.lock", allowance),
+                               fetch=provider.fetch, ingest=ingest, read=_read, ledger=led,
+                               attempt_dir=d, **kw)
+        return out, seen
+
+    def test_TWO_SESSIONS_in_one_project_replay_without_repurchasing(self, tmp_path):
+        """The whole point: two `quarry osint` runs an hour apart share ownership."""
+        proj = tmp_path / "proj"
+        p1 = _Provider(totals={"a": 250})
+        out1, _ = self._run_in(proj, p1)
+        assert out1.pages_bought == 3
+        p2 = _Provider(totals={"a": 250})
+        out2, seen = self._run_in(proj, p2)
+        assert p2.calls == [], f"a second session re-bought paid pages: {p2.calls}"
+        assert out2.pages_replayed == 3 and len(seen) == 250
+
+    def test_DIFFERENT_PROJECTS_never_share_ownership(self, tmp_path):
+        """Two engagements are two evidence trees. One must never replay the other's paid pages."""
+        p1 = _Provider(totals={"a": 250})
+        self._run_in(tmp_path / "acme", p1)
+        p2 = _Provider(totals={"a": 250})
+        out, _ = self._run_in(tmp_path / "other", p2)
+        assert [c[2] for c in p2.calls] == [1, 2, 3], p2.calls
+        assert out.pages_replayed == 0
+
+    @pytest.mark.parametrize("reserve,run_budget", [(0, 0), (50, 0), (0, 5), (75, 9)])
+    def test_changing_a_SPENDING_POLICY_does_not_repurchase(self, tmp_path, reserve, run_budget):
+        """A page bought under one policy is byte-identical under another, so neither the reserve nor the
+        page budget may touch the state generation."""
+        proj = tmp_path / "proj"
+        self._run_in(proj, _Provider(totals={"a": 250}))
+        before = wp.state_dir(proj)
+        p2 = _Provider(totals={"a": 250})
+        pol = wp.spend_policy(wp.read_balance('{"status": 1, "reverse_whois_balance": 200}'),
+                              reserve, run_budget)
+        out, _ = self._run_in(proj, p2, spend=pol.pages)
+        assert p2.calls == [], f"a policy change re-bought paid pages: {p2.calls}"
+        assert out.pages_replayed == 3 and wp.state_dir(proj) == before
+
+    def test_the_API_KEY_and_anchors_are_not_part_of_the_generation(self, tmp_path):
+        """A page's bytes do not depend on which credential paid for it, nor on what else was asked."""
+        proj = tmp_path / "proj"
+        rel = wp.state_dir(proj).relative_to(proj).parts     # RELATIVE: tmp_path names are not ours
+        assert rel == ("osint", "state", "whoxy", f"v{wp.WHOXY_WORK_SCHEMA}"), rel
+
+    def test_a_SCHEMA_change_starts_ISOLATED_ownership(self, tmp_path, monkeypatch):
+        """A schema bump is the one thing that genuinely invalidates stored pages — and it ISOLATES the
+        old ones rather than deleting them. Paid evidence is never pruned automatically."""
+        proj = tmp_path / "proj"
+        self._run_in(proj, _Provider(totals={"a": 250}))
+        old = wp.state_dir(proj)
+        assert (old / "ledger.json").exists()
+        monkeypatch.setattr(wp, "WHOXY_WORK_SCHEMA", wp.WHOXY_WORK_SCHEMA + 1)
+        new = wp.state_dir(proj)
+        assert new != old and not (new / "ledger.json").exists()
+        assert wp.provider_dir(proj) == old.parent == new.parent   # the LOCK level is shared
+        p2 = _Provider(totals={"a": 250})
+        out, _ = self._run_in(proj, p2)
+        assert [c[2] for c in p2.calls] == [1, 2, 3] and out.pages_replayed == 0
+        assert (old / "ledger.json").exists(), "the previous generation's paid evidence was destroyed"
+
+    def test_osint_LATEST_still_resolves_to_a_real_session(self, tmp_path, monkeypatch):
+        """review-B1.6b#2: the old test only checked path ancestry — it never called `finalize()` nor
+        looked at the pointer, so it could not have caught `latest` resolving to `state/`."""
+        from quarry_recon.osint import OsintSession
+        proj = tmp_path / "proj"
+        wp.state_dir(proj).mkdir(parents=True, exist_ok=True)      # state/ exists FIRST
+        s = OsintSession(proj, "acme.com")
+        s.dir.mkdir(parents=True, exist_ok=True)
+        profile = type("P", (), {"target": "acme.com", "apex_domains": ["acme.com"], "asn": [],
+                                 "org_names": [], "brands": [], "path": None})()
+        s.finalize(profile)
+        link = proj / "osint" / "latest"
+        txt = proj / "osint" / "latest.txt"
+        target = (link.resolve() if link.exists() or link.is_symlink()
+                  else pathlib.Path(txt.read_text().strip()))
+        assert target == s.dir.resolve(), target
+        assert target != wp.state_dir(proj) and "state" not in target.relative_to(proj).parts
+
+
+class TestBalanceOutcome:
+    """MEASURED 2026-07-29: `account=balance` is FREE (two consecutive reads, no change) and answers
+    `{"status": 1, ..., "reverse_whois_balance": N}`. Only the reverse-whois figure funds this lane.
+
+    review-B1.6b7: the reader returned a bare int|None, so a PROVEN refusal was indistinguishable from
+    "we could not read it" — and with no reserve that means UNBOUNDED. The provider stating plainly that
+    there are no credits became permission to spend."""
+
+    def test_the_MEASURED_balance_shape_reads(self):
+        raw = json.dumps({"status": 1, "live_whois_balance": 500, "whois_history_balance": 100,
+                          "reverse_whois_balance": 197})
+        r = wp.read_balance(raw)
+        assert r.remaining == 197 and not r.refused and r.error_class == ""
+
+    def test_a_genuine_ZERO_balance_is_KNOWN_not_unknown(self):
+        r = wp.read_balance('{"status": 1, "reverse_whois_balance": 0}')
+        assert r.remaining == 0 and not r.refused
+        assert wp.spend_policy(r, 0, 0).pages == 0
+
+    def test_a_PROVEN_QUOTA_refusal_permits_no_spending_and_is_a_SOFT_limit(self):
+        """The measured exhaustion body. Nothing went wrong — the account is simply spent."""
+        r = wp.read_balance('{"status": 0, "status_reason": "Zero Account Balance"}')
+        assert r.refused and r.error_class == "quota" and "Zero Account Balance" in r.reason
+        pol = wp.spend_policy(r, 0, 0)
+        assert pol.pages == 0 and pol.limit and not pol.gap
+
+    def test_an_UNCLASSIFIED_refusal_permits_no_spending_and_is_a_GAP(self):
+        """The provider refused for a reason we cannot classify. Not a boundary — something to fix.
+
+        review-B1.6b8#3: this asserted `r.refused and pytest.approx`, which only tests that pytest has
+        an `approx` attribute. The exact class and the verbatim reason are the point."""
+        r = wp.read_balance('{"status": 0, "status_reason": "Something Odd"}')
+        assert r.refused is True and r.error_class == "error"
+        assert r.reason == "Something Odd", r.reason
+        pol = wp.spend_policy(r, 0, 0)
+        assert pol.pages == 0 and "Something Odd" in pol.gap and not pol.limit
+
+    def test_a_PARSE_failure_is_not_a_provider_REFUSAL(self):
+        """review-B1.6b8#2: every envelope rejection was marked refused, so `status: true` claimed Whoxy
+        had explicitly refused us. The two send an operator to completely different places."""
+        for raw in ('{"status": true, "reverse_whois_balance": 5}', '{"reverse_whois_balance": 5}',
+                    '{"status": "1", "reverse_whois_balance": 5}', "[]", "null", "garbage"):
+            r = wp.read_balance(raw)
+            assert r.error_class == "parse" and r.refused is False, (raw, r)
+            pol = wp.spend_policy(r, 0, 0)
+            assert pol.pages == 0 and pol.gap and not pol.limit, (raw, pol)
+
+    def test_a_BOOLEAN_status_is_not_success(self):
+        """`True == 1` in Python. The envelope is `contract.whoxy_envelope`, which already excludes it —
+        a second status authority would be one more place for that to be got wrong."""
+        r = wp.read_balance('{"status": true, "reverse_whois_balance": 5}')
+        assert r.remaining is None and r.error_class == "parse" and r.refused is False
+        assert wp.spend_policy(r, 0, 0).pages == 0
+
+    @pytest.mark.parametrize("raw", [
+        "not json", "[]", "null", '{"status": 1}',
+        '{"status": 1, "reverse_whois_balance": "197"}',
+        '{"status": 1, "reverse_whois_balance": true}',
+        '{"status": 1, "reverse_whois_balance": 12.5}',
+        '{"status": 1, "reverse_whois_balance": -1}',
+        '{"status": 1, "live_whois_balance": 500}',            # the WRONG balance
+    ])
+    def test_an_UNREADABLE_balance_permits_NO_paid_work(self, raw):
+        """Fails CLOSED. A cost guard that does not understand the body in front of it must not spend
+        against it, and the gap survives so a run that could not read the balance cannot report itself
+        clean."""
+        r = wp.read_balance(raw)
+        assert r.remaining is None and not r.refused and r.error_class == "parse"
+        pol = wp.spend_policy(r, 0, 0)
+        assert pol.pages == 0 and pol.gap and pol.balance_invalid
+
+    def test_a_malformed_balance_WITH_a_reserve_spends_nothing(self):
+        """A reserve says "keep N back", which cannot be honoured against a balance we could not read."""
+        pol = wp.spend_policy(wp.read_balance("garbage"), 50, 0)
+        assert pol.pages == 0 and pol.gap
+
+    @pytest.mark.parametrize("kw,why", [
+        ({}, "empty: neither a figure nor a reason"),
+        ({"remaining": True}, "bool is an int subclass, not a count"),
+        ({"remaining": "200"}, "a string is not a count"),
+        ({"remaining": 12.5}, "a float is not a count"),
+        ({"remaining": -1}, "negative"),
+        ({"remaining": 5, "error_class": "quota", "reason": "x"}, "read AND failed"),
+        ({"remaining": 5, "refused": True}, "read AND refused"),
+        ({"error_class": "quota"}, "a failure with no reason"),
+        ({"reason": "something"}, "a reason with no class"),
+        ({"error_class": "parse", "reason": "x", "refused": True}, "parse is not a refusal"),
+        # review-B1.6b10#1: the success branch never looked at `reason`, the failure branch tested
+        # truthiness rather than TYPE, and `refused` accepted any truthy value.
+        ({"remaining": 5, "reason": "contradiction"}, "read AND carrying a reason"),
+        ({"error_class": 123, "reason": "failure"}, "class is not a string"),
+        ({"error_class": "quota", "reason": ["x"]}, "reason is not a string"),
+        ({"error_class": "quota", "reason": "x", "refused": 1}, "refused is not a bool"),
+        ({"error_class": "quota", "reason": "x", "refused": "yes"}, "refused is not a bool"),
+        ({"error_class": "Quota", "reason": "x"}, "not the canonical class spelling"),
+        ({"error_class": "quota ", "reason": "x"}, "whitespace in the class"),
+        ({"error_class": "nonsense", "reason": "x"}, "not a provider-outcome class at all"),
+        ({"error_class": "quota", "reason": "   "}, "a blank reason says nothing"),
+        # a PROVEN limit is a refusal by definition; accepting it as unrefused made the one outcome
+        # that is emphatically not a defect report as a gap.
+        ({"error_class": "quota", "reason": "Zero Account Balance"}, "a proven limit must be refused"),
+        ({"error_class": "entitlement", "reason": "plan"}, "a proven limit must be refused"),
+    ])
+    def test_an_INVALID_balance_outcome_cannot_be_CONSTRUCTED(self, kw, why):
+        """review-B1.6b9#1: making this the boundary type moved the validation off `spend_policy`'s
+        argument and onto nothing at all — `BalanceRead()` meant UNBOUNDED spending, `remaining=True`
+        bought a page. An unconstructable bad state is worth more than a checked one."""
+        with pytest.raises(ValueError):
+            wp.BalanceRead(**kw)
+
+    def test_every_class_the_taxonomy_defines_is_accepted(self):
+        """The canonical set, so a consumer never has to guess which spellings are real."""
+        from quarry_recon.contract import PROVIDER_CLASSES, PROVIDER_LIMITS, PROVIDER_PARSE
+        for cls in PROVIDER_CLASSES:
+            r = wp.BalanceRead(error_class=cls, reason="because", refused=cls != PROVIDER_PARSE)
+            assert r.error_class == cls
+        # ...and a proven limit is always a refusal, so it always reads as a LIMIT, never a gap
+        for cls in PROVIDER_LIMITS:
+            pol = wp.spend_policy(wp.BalanceRead(error_class=cls, reason="proven", refused=True), 0, 0)
+            assert pol.pages == 0 and pol.limit and not pol.gap, (cls, pol)
+
+    def test_the_VALID_shapes_construct(self):
+        assert wp.BalanceRead(remaining=0).remaining == 0
+        assert wp.BalanceRead(remaining=200).remaining == 200
+        assert wp.BalanceRead(error_class="quota", reason="Zero Account Balance",
+                              refused=True).refused is True
+        assert wp.BalanceRead(error_class="parse", reason="not JSON").refused is False
+
+    def test_an_invalid_KNOB_does_not_erase_an_observed_provider_fact(self):
+        """review-B1.6b9#2: an invalid control RETURNED immediately, dropping a balance response we had
+        already observed — an operator would fix their config, rerun, and only then discover the account
+        was refused."""
+        quota = wp.read_balance('{"status": 0, "status_reason": "Zero Account Balance"}')
+        pol = wp.spend_policy(quota, -5, 0)
+        assert pol.pages == 0
+        assert "WHOXY_CREDIT_RESERVE" in pol.invalid, pol
+        assert "Zero Account Balance" in pol.limit, pol
+        drifted = wp.spend_policy(wp.read_balance("garbage"), 0, -1)
+        assert drifted.pages == 0 and drifted.invalid and drifted.gap and drifted.balance_invalid
+
+    def test_the_balance_PREFLIGHT_is_MANDATORY(self):
+        """review-B1.6b8#1: accepting a bare int|None left `spend_policy(None, 0, 0)` granting UNBOUNDED
+        spending — a caller that skipped the preflight got the most permissive answer available. There
+        is no path around it, and forgetting it is a defect in the CALL, not a spending decision."""
+        for bad in (None, 200, "200", 0, True):
+            with pytest.raises(TypeError):
+                wp.spend_policy(bad, 0, 0)
+
+    def test_the_reader_feeds_the_spending_contract(self):
+        assert wp.spend_policy(wp.read_balance('{"status":1,"reverse_whois_balance":197}'),
+                               50, 0).pages == 147
+
+    def test_the_ARITHMETIC_is_still_reachable_on_its_own(self):
+        """`spendable` is the pure calculation and stays directly testable; `spend_policy` is where the
+        preflight and the classification live."""
+        assert wp.spendable(200, 50, 0) == 150
+        assert wp.spendable(None, 0, 0) is None and wp.spendable(None, 50, 0) == 0
+
+
 class TestProviderOutcomes:
     def test_a_provider_LIMIT_stops_the_run_and_keeps_the_evidence(self, tmp_path):
         p = _Provider(totals={"a": 1000}, errors={("a", 2): _err("quota")})
@@ -754,3 +1124,176 @@ class TestProviderOutcomes:
         out, _ = _run(tmp_path, _states((COMPANY, "a"), (COMPANY, "b")), p, spend=1)
         assert out.pages_left_unknown_anchors == 0        # b was never opened -> no page count at all
         assert AnchorState(Anchor(COMPANY, "b")).pages_left() == 0
+
+
+class TestMachineryFailuresPreserveTheOutcome:
+    """review-B1.6b22: `run_pages` keeps whatever the lifecycle established when its OWN machinery
+    fails. The cause it reports has to be the one that stopped it, not the last thing to go wrong."""
+
+    def test_the_FIRST_cause_names_the_stop(self, tmp_path, monkeypatch):
+        """A page we could not publish is the reason this run ended; a downstream accounting failure is
+        a consequence of that, and overwriting reports the symptom instead of the cause."""
+        monkeypatch.setattr(budget, "publish_bytes", lambda *a, **k: False)
+        boom = lambda *a, **k: (_ for _ in ()).throw(ValueError("accounting exploded"))
+        monkeypatch.setattr(wp, "_remainder", boom)
+
+        out, _ = _run(tmp_path, _states((COMPANY, "a")), _Provider(totals={"a": 250}), spend=5)
+        assert out.stop_cause == "publish_failed", out.stop_cause
+        # the later failure is real too and is not thrown away — it just does not get to rename the stop
+        assert "accounting exploded" in out.fail_reason, out.fail_reason
+
+    def test_a_PROVIDER_failure_keeps_its_own_wording(self, tmp_path, monkeypatch):
+        """A provider failure is what an operator acts on. Our accounting blowing up afterwards must not
+        rewrite the terminal's reason into one about ourselves."""
+        boom = lambda *a, **k: (_ for _ in ()).throw(ValueError("accounting exploded"))
+        monkeypatch.setattr(wp, "_remainder", boom)
+        prov = _Provider(totals={"a": 250}, errors={("a", 2): _err("transport")})
+
+        out, _ = _run(tmp_path, _states((COMPANY, "a")), prov, spend=5)
+        assert "transport" in out.fail_reason, out.fail_reason
+        assert "accounting exploded" not in out.fail_reason, out.fail_reason
+        assert out.pages_bought == 1 and out.domains == 100, (out.pages_bought, out.domains)
+
+    def test_a_LATER_machinery_failure_is_kept_as_its_own_fact(self, tmp_path, monkeypatch):
+        """review-B1.6b23#3: keeping the first cause used to mean DISCARDING the second. Both happened,
+        so both are recorded — the stop keeps its name, and the later failure keeps its own slot."""
+        boom = lambda *a, **k: (_ for _ in ()).throw(ValueError("accounting exploded"))
+        monkeypatch.setattr(wp, "_remainder", boom)
+        prov = _Provider(totals={"a": 250}, errors={("a", 2): _err("transport")})
+
+        out, _ = _run(tmp_path, _states((COMPANY, "a")), prov, spend=5)
+        assert out.machinery == ["ValueError: accounting exploded"], out.machinery
+
+    def test_a_SAVE_that_raises_keeps_the_whole_lifecycle(self, tmp_path, monkeypatch):
+        """review-B1.6b23#2: `ledger.save()` sat outside the boundary, so a store that raised discarded
+        every page the run had bought — and the caller reported `attempted=0` over them."""
+        led = _ledger(tmp_path)
+        prov = _Provider(totals={"a": 250})
+        out, seen = _run(tmp_path, _states((COMPANY, "a")), prov, spend=5, ledger=led)
+        assert out.pages_bought == 3 and out.persisted
+
+        led2 = _ledger(tmp_path)
+        led2.save = lambda *a, **k: (_ for _ in ()).throw(OSError("store exploded"))
+        out2, seen2 = _run(tmp_path, _states((COMPANY, "a")), prov, spend=5, ledger=led2, attempt="a1")
+        assert out2.pages_replayed == 3, "replayed pages died with the save"
+        assert out2.domains == 250, out2.domains
+        assert len(seen2) == 250, "the replayed candidates never reached the caller"
+        assert out2.stop_cause == "machinery:OSError", out2.stop_cause
+        assert "store exploded" in out2.fail_reason, out2.fail_reason
+        # the JOURNAL is what makes work survive a process, and it is intact here — reporting a
+        # persistence gap on genuinely resumable work is the lie the `durable` branch exists to prevent.
+        assert out2.persisted is True, "an intact journal was reported as lost"
+
+    def test_a_SAVE_that_raises_with_NO_journal_reports_the_persistence_gap(self, tmp_path):
+        """The other half: nothing wrote anywhere, so the pages this run bought will be bought again."""
+        led = _ledger(tmp_path)
+        led.save = lambda *a, **k: (_ for _ in ()).throw(OSError("store exploded"))
+        led._journal_lost = True
+        out, _ = _run(tmp_path, _states((COMPANY, "a")), _Provider(totals={"a": 250}), spend=5,
+                      ledger=led)
+        assert out.pages_bought == 3 and out.domains == 250, (out.pages_bought, out.domains)
+        assert out.persisted is False, "a save that RAISED with no journal cannot count as persisted"
+        assert out.stop_cause == "machinery:OSError", out.stop_cause
+
+    def test_an_INGEST_that_raises_does_not_count_as_a_delivered_page(self, tmp_path, monkeypatch):
+        """review-B1.6b23#1: the page left the remainder as though its rows had landed, so a ten-page
+        anchor that died on page 2 reported eight missing pages for nine it never delivered."""
+        d = tmp_path / "state" / "pages" / "a0"
+        d.mkdir(parents=True, exist_ok=True)
+
+        def ingest(anchor, page, doc, art):
+            if page == 2:
+                raise RuntimeError("ingest exploded")
+            return len(_rows(doc))
+
+        out = wp.run_pages(_states((COMPANY, "a")), paid=lambda: wp.fixed_allowance(5),
+                           fetch=_Provider(totals={"a": 1000}).fetch, ingest=ingest, read=_read,
+                           ledger=_ledger(tmp_path), attempt_dir=d)
+        assert out.pages_unconsumed == 1, out.pages_unconsumed
+        assert out.domains == 100, out.domains
+        # the page is still OWNED: dropping it would have the scheduler sell it to us a second time
+        assert out.pages_bought == 2 and out.pages_left_known == 8, (out.pages_bought,
+                                                                    out.pages_left_known)
+
+    @pytest.mark.parametrize("dead", [1, 2])
+    def test_an_anchor_is_COMPLETE_only_once_a_page_of_it_LANDS(self, tmp_path, dead):
+        """review-B1.6b24#2: `anchors_touched` moved before ingestion, so an anchor whose PAGE 1 failed
+        to ingest was published as `completed=1` beside `domains=0` — the same anchor reported as
+        completed and as failed. Page 2 is the case where completion was legitimately established
+        earlier, and it must still be counted."""
+        d = tmp_path / "state" / "pages" / "a0"
+        d.mkdir(parents=True, exist_ok=True)
+
+        def ingest(anchor, page, doc, art):
+            if page == dead:
+                raise RuntimeError("ingest exploded")
+            return len(_rows(doc))
+
+        out = wp.run_pages(_states((COMPANY, "a")), paid=lambda: wp.fixed_allowance(5),
+                           fetch=_Provider(totals={"a": 1000}).fetch, ingest=ingest, read=_read,
+                           ledger=_ledger(tmp_path), attempt_dir=d)
+        assert out.pages_unconsumed == 1, out.pages_unconsumed
+        if dead == 1:
+            assert out.anchors_touched == 0, "an anchor that delivered NOTHING was reported complete"
+            assert out.domains == 0, out.domains
+        else:
+            assert out.anchors_touched == 1, "page 1 landed; the anchor IS delivered"
+            assert out.domains == 100, out.domains
+
+    def test_a_SUCCESSFUL_save_never_consults_the_fallback(self, tmp_path):
+        """review-B1.6b25: `durable` is the fallback for a snapshot that did NOT land. Reading it
+        unconditionally let a ledger that saved cleanly report a machinery gap over evidence the run had
+        no need of — a fabricated failure on a completely clean lifecycle."""
+        touched = []
+
+        class _Loud(type(_ledger(tmp_path))):
+            @property
+            def durable(self):
+                touched.append(1)
+                raise OSError("fallback exploded")
+
+        led = _ledger(tmp_path)
+        led.__class__ = _Loud
+        led.save = lambda *a, **k: True
+
+        out, _ = _run(tmp_path, _states((COMPANY, "a")), _Provider(totals={"a": 250}), spend=5,
+                      ledger=led)
+        assert touched == [], "the fallback was consulted although the snapshot landed"
+        assert out.persisted is True
+        assert out.machinery == [] and out.stop_cause == "", (out.machinery, out.stop_cause)
+        assert out.fail_reason == "", out.fail_reason
+        assert out.pages_bought == 3 and out.domains == 250, (out.pages_bought, out.domains)
+
+    def test_a_DURABLE_read_that_raises_is_reported_like_any_other_machinery(self, tmp_path):
+        """review-B1.6b24#3: it became `False` silently, contradicting the contract the rest of this
+        function keeps — every machinery failure is retained."""
+        class _Blind(type(_ledger(tmp_path))):
+            @property
+            def durable(self):
+                raise OSError("cannot stat the journal")
+
+        led = _ledger(tmp_path)
+        led.__class__ = _Blind
+        led.save = lambda *a, **k: False
+        out, _ = _run(tmp_path, _states((COMPANY, "a")), _Provider(totals={"a": 250}), spend=5,
+                      ledger=led)
+        assert out.pages_bought == 3 and out.domains == 250, (out.pages_bought, out.domains)
+        assert out.persisted is False
+        assert out.machinery == ["OSError: cannot stat the journal"], out.machinery
+        assert out.stop_cause == "machinery:OSError", out.stop_cause
+
+    def test_a_MACHINERY_failure_names_ITSELF_in_the_reason(self, tmp_path, monkeypatch):
+        """A bare exception string on the terminal is indistinguishable from a provider failure."""
+        monkeypatch.setattr(wp, "_replay",
+                            lambda *a, **k: (_ for _ in ()).throw(ValueError("replay exploded")))
+        out, _ = _run(tmp_path, _states((COMPANY, "a")), _Provider(totals={"a": 250}), spend=5)
+        assert out.stop_cause == "machinery:ValueError", out.stop_cause
+        assert "machinery" in out.fail_reason and "replay exploded" in out.fail_reason, out.fail_reason
+
+    def test_the_REMAINDER_is_still_reported_when_replay_fails(self, tmp_path, monkeypatch):
+        """The remainder is what a later run has to pick up; losing it hides the work that is left."""
+        monkeypatch.setattr(wp, "_replay",
+                            lambda *a, **k: (_ for _ in ()).throw(ValueError("replay exploded")))
+        out, _ = _run(tmp_path, _states((COMPANY, "a")), _Provider(totals={"a": 250}), spend=5)
+        assert out.unopened == [f"{COMPANY}=a"], out.unopened
+        assert out.persisted is not None

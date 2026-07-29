@@ -27,9 +27,11 @@ Three facts drive the whole design:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import budget
 
@@ -47,6 +49,32 @@ class Anchor:
 
     param: str
     value: str
+
+
+def provider_dir(project_dir) -> "Path":
+    """`<project>/osint/state/whoxy` — the PROVIDER level, ABOVE the schema generation.
+
+    review-B1.6b2#1: the lock lived inside the schema directory, so a v1 process and a v2 process took
+    DIFFERENT locks and could spend against the same account at the same time. Concurrency is a property
+    of the provider and the project, not of whichever schema a build happens to be on."""
+    return Path(project_dir) / "osint" / "state" / "whoxy"
+
+
+def state_dir(project_dir) -> "Path":
+    """The DURABLE home for Whoxy page ownership: `<project>/osint/state/whoxy/v<schema>/`.
+
+    An `OsintSession` directory is timestamped, so state kept inside one dies with it and every run
+    re-buys page 1. This sibling survives sessions, and the ledger and the page artifacts live under the
+    SAME schema directory because `Ledger.record` stores paths relative to its own parent — an artifact
+    outside that tree cannot be owned at all.
+
+    The generation is the WORK SCHEMA and nothing else. Not the API key: a page's bytes do not depend on
+    which credential paid for it. Not the anchors: they are the work, not the configuration. Not the
+    reserve or the page budget: those govern how much we are willing to spend, and folding them in would
+    make lowering a spending policy re-buy pages already paid for. A SCHEMA change is the one thing that
+    genuinely invalidates stored pages, and it isolates them rather than deleting them — paid evidence
+    is never pruned automatically."""
+    return provider_dir(project_dir) / f"v{WHOXY_WORK_SCHEMA}"
 
 
 def error_key(anchor: Anchor, page: int) -> str:
@@ -77,6 +105,10 @@ class AnchorState:
     pages_done: set = field(default_factory=set)
     attempted: bool = False
     stopped: str = ""                    # the error class that ended this anchor, if any
+    # review-B1.6b24#2: whether any page of this anchor was actually INGESTED. `not pages_done` answers
+    # "is this the first page we took", which is a different question — an anchor whose page 1 failed to
+    # ingest and whose page 2 succeeded would never be counted as delivered at all.
+    delivered: bool = False
     _cursor: int = 1
 
     def next_page(self) -> "int | None":
@@ -149,8 +181,24 @@ def classify_page(doc) -> tuple:
         if total == 0 and not isinstance(total, bool) and not rows:
             return PAGE_TERMINAL, 1
         return PAGE_CONTRADICTORY, None
-    pages = usable_page_count(doc.get("total_pages"), doc.get("total_results_int"))
-    return (PAGE_PAGED, pages) if pages is not None else (PAGE_CONTRADICTORY, None)
+    total = doc.get("total_results_int")
+    pages = usable_page_count(doc.get("total_pages"), total)
+    if pages is None:
+        return PAGE_CONTRADICTORY, None
+    # review-B1.6b18#2: the page count was corroborated and the ROW COUNT was not, so a page claiming 50
+    # results across one page and returning ONE row was accepted as a complete answer — 49 results lost
+    # to a body that contradicted itself, and OWNED, so it could never be re-bought. The measured
+    # contract fixes both numbers: 100 rows a page, and `total_pages == ceil(total / 100)`.
+    page = doc.get("current_page")
+    if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= pages:
+        return PAGE_CONTRADICTORY, None
+    want = WHOXY_PAGE_SIZE if page < pages else total - WHOXY_PAGE_SIZE * (pages - 1)
+    rows = doc.get("rows")
+    if rows is None:
+        rows = doc.get("search_result")
+    if not isinstance(rows, list) or len(rows) != want:
+        return PAGE_CONTRADICTORY, None
+    return PAGE_PAGED, pages
 
 
 def read_page(artifact):
@@ -259,6 +307,16 @@ class SpendPolicy:
     pages: "int | None" = None       # None = no computable bound
     invalid: str = ""                # which OPERATOR control is unusable, if any
     balance_invalid: str = ""        # the PROVIDER's balance was unreadable as a number
+    limit: str = ""                  # the provider PROVED paid work is pointless — a soft limit
+    gap: str = ""                    # something FAILED; coverage is incomplete and must say so
+    # review-B1.6b13#4: `pages` alone could not say WHOSE boundary produced it, so once the allowance ran
+    # out the lane could not tell provider exhaustion from an operator ceiling. Applies only if work
+    # actually remains — a run that finished inside its allowance hit no boundary at all.
+    stop_kind: str = ""              # "provider_balance" | "operator_reserve" | "run_budget" | ""
+    # review-B1.6b16#3: the balance outcome's own class had no way to reach the terminal, so a 401 or a
+    # 500 on the balance endpoint produced a gap with no class at all — the operator could see that
+    # something failed but not what.
+    error_class: str = ""
 
 
 def _exact_count(v) -> "int | None":
@@ -268,22 +326,66 @@ def _exact_count(v) -> "int | None":
     return v
 
 
-def spend_policy(balance: "int | None", reserve, run_budget) -> SpendPolicy:
-    """The settled spending contract. See `spendable` for the arithmetic.
+def spend_policy(balance, reserve, run_budget) -> SpendPolicy:
+    """The settled spending contract. `balance` MUST be a `BalanceRead` from `read_balance` — there is
+    no path here without having asked. See `spendable` for the arithmetic.
+
+    review-B1.6b7#1: a PROVEN refusal must stop purchasing, and WHY decides how it reads:
+
+      · a provider LIMIT (quota, entitlement) -> no paid work, and it is a SOFT limit: nothing went
+        wrong, the account is simply spent.
+      · any other explicit refusal (auth, forbidden, a status we cannot classify) -> no paid work, and
+        it is a GAP: something needs fixing.
+      · a balance we ASKED for and could not read -> no paid work either, and a GAP. A cost guard that
+        does not understand the body in front of it must not spend against it (review-B1.6r3#2).
+
+    Every path fails CLOSED. `BalanceRead` cannot be built without either a figure or a reason, so there
+    is no third outcome where spending proceeds against something we do not know.
 
     review-B1.6r2#2: the operator's controls were validated and the PROVIDER's balance was not, though it
     is the least trustworthy of the three — it arrives over the network. `int()` turned `"200"` into 200
-    pages, `True` into 1, `12.5` into 12, and `-1` into a silent zero with no fact recorded. Unknown is
-    allowed (a balance we could not read is not a balance of zero); anything else must be exact."""
+    pages, `True` into 1, `12.5` into 12, and `-1` into a silent zero with no fact recorded. The figure
+    must now be exact, and `BalanceRead` refuses to hold anything else."""
+    from .contract import is_provider_limit
+    if not isinstance(balance, BalanceRead):
+        # review-B1.6b8#1: accepting a bare int|None left `spend_policy(None, 0, 0)` granting UNBOUNDED
+        # spending — a caller that skipped the mandatory balance preflight got the most permissive
+        # answer available. Reading the balance is not optional, and forgetting it is a defect in the
+        # CALL, so it fails here rather than becoming a spending decision.
+        raise TypeError(f"spend_policy needs a BalanceRead from read_balance(), got {type(balance).__name__}")
     res, run = _exact_count(reserve), _exact_count(run_budget)
-    bad = [n for n, v in (("WHOXY_CREDIT_RESERVE", res), ("WHOXY_PAGE_BUDGET", run)) if v is None]
-    # review-B1.6r3#4: a malformed BALANCE is provider schema drift, not a broken operator setting.
-    # Reporting it as configuration would send an operator to fix a knob that is perfectly correct.
-    bal_bad = "" if (balance is None or _exact_count(balance) is not None) else \
-        f"provider balance {balance!r} is not an exact count"
-    if bad or bal_bad:
-        return SpendPolicy(pages=0, invalid=", ".join(bad), balance_invalid=bal_bad)
-    return SpendPolicy(pages=spendable(balance, res, run))
+    invalid = ", ".join(n for n, v in (("WHOXY_CREDIT_RESERVE", res), ("WHOXY_PAGE_BUDGET", run))
+                        if v is None)
+    # review-B1.6b9#2: an invalid knob used to RETURN immediately, erasing a provider response we had
+    # already observed — an operator would fix their config, rerun, and only then discover the account
+    # was refused. Both facts are kept; pages are zero either way, and gaps still dominate.
+    if balance.refused:
+        # the provider spoke. Not an unknown, and never a licence to spend.
+        if is_provider_limit(balance.error_class):
+            return SpendPolicy(pages=0, invalid=invalid, error_class=balance.error_class,
+                               limit=f"{balance.error_class}: {balance.reason}")
+        return SpendPolicy(pages=0, invalid=invalid, error_class=balance.error_class,
+                           gap=f"{balance.error_class}: {balance.reason}")
+    if balance.error_class:
+        # We ASKED and could not read the answer. review-B1.6r3#2: that permits no paid work — a cost
+        # guard reading a body it does not understand must not spend against it. There is no longer a
+        # "never asked" case to fall back for: `BalanceRead` cannot be constructed without either a
+        # figure or a reason. review-B1.6r3#4: it is provider schema drift, not a broken operator
+        # setting — reporting it as configuration would send an operator to fix a correct knob.
+        return SpendPolicy(pages=0, invalid=invalid, error_class=balance.error_class,
+                           balance_invalid=f"{balance.error_class}: {balance.reason}",
+                           gap=f"balance unreadable ({balance.error_class}): {balance.reason}")
+    if invalid:
+        return SpendPolicy(pages=0, invalid=invalid)
+    pages = spendable(balance.remaining, res, run)
+    available = max(0, balance.remaining - res)
+    if run and pages == run and run <= available:
+        kind = "run_budget"                       # OUR per-invocation ceiling bit first
+    elif res and pages == available:
+        kind = "operator_reserve"                 # the reserve is what withheld the rest
+    else:
+        kind = "provider_balance"                 # the account itself is the boundary
+    return SpendPolicy(pages=pages, stop_kind=kind)
 
 
 def spendable(balance: "int | None", reserve: int, run_budget: int) -> "int | None":
@@ -319,10 +421,24 @@ class Outcome:
     domains: int = 0
     fail_classes: dict = field(default_factory=dict)
     limit_classes: dict = field(default_factory=dict)
+    # the provider's OWN WORDS, kept verbatim. A class counter says `{"quota": 1}`; an operator needs
+    # "Zero Account Balance" — that is the sentence B0 exists to surface, and a count is not it.
+    limit_reason: str = ""              # ...paired with the class it came from, so several failures
+    fail_reason: str = ""               #    cannot cross-associate class and wording
     unopened: list = field(default_factory=list)     # EXACT anchors, never a count alone
+    # review-B1.6b14#6: anchors we actually SENT a request for this lifecycle. `anchors - unopened`
+    # counted a replay-only run as having attempted every anchor while issuing zero requests.
+    requested: set = field(default_factory=set)
     pages_left_known: int = 0
     pages_left_unknown_anchors: int = 0
     evidence_invalid: int = 0           # a recorded page whose artifact no longer validates
+    # review-B1.6b23#1: OWNERSHIP is not CONSUMPTION. A page whose `ingest` raised is bought and stored
+    # — it stays owned, or the scheduler would offer it again and pay twice — but its rows never reached
+    # the report, and the page remainder alone cannot express that.
+    pages_unconsumed: int = 0
+    # review-B1.6b23#3: every machinery failure, in order. `stop_cause`/`fail_reason` keep the FIRST
+    # cause, which is right, but a later one is a real fact too and used to vanish entirely.
+    machinery: list = field(default_factory=list)
     publish_failed: int = 0
     total_drift: int = 0                # pages whose total disagreed with another page of the anchor
     requests_issued: int = 0            # requests SENT on the paid endpoint. NOT a credit count: the
@@ -331,6 +447,10 @@ class Outcome:
                                         # decremented per attempt (conservative), but only the provider
                                         # balance says what was actually charged (review-B1.6r2#4)
     error_bodies: int = 0               # non-empty failure bodies retained as evidence
+    # review-B1.6b20: the allowance was ACTUALLY used up, as counted by the scheduler. A policy's
+    # `stop_kind` only says what it WOULD bound; if our own machinery stopped the run first, no boundary
+    # was reached and reporting one invents a limit that never applied.
+    allowance_exhausted: bool = False
     records_journaled: bool = True      # every LEDGER WRITE this run reported success — completions and
                                         # evidence binds alike, since both must survive for the run to
                                         # be resumable and for its evidence to be findable
@@ -368,7 +488,233 @@ def owned_index(ledger, read) -> dict:
     return out
 
 
-def run_pages(states, *, spend, fetch, ingest, read, ledger, attempt_dir, is_limit=None) -> Outcome:
+class LockBusy(Exception):
+    """A Whoxy lock is held by another lifecycle.
+
+    Either of two, and the caller usually cares which: the PROJECT lock (another run is using this
+    project's page state — nothing can proceed) or the ACCOUNT lock (another project is spending the
+    shared credit balance — replayed evidence is still valid, and only the unpaid remainder is
+    blocked)."""
+
+
+@dataclass(frozen=True)
+class BalanceRead:
+    """What `account=balance` actually told us — the FACTS kept apart, as everywhere else in Quarry.
+
+    review-B1.6b7#1: this returned a bare `int | None`, so a PROVEN refusal ("Zero Account Balance",
+    HTTP 200, `status: 0`) came back as None — identical to "we could not read it" — and with no reserve
+    that means UNBOUNDED. The provider stating plainly that there are no credits became permission to
+    spend. It also lost the reason, so nothing survived for the verdict to report."""
+
+    remaining: "int | None" = None
+    error_class: str = ""        # the provider-outcome class, when it refused or could not be read
+    reason: str = ""             # verbatim, as the provider said it
+    refused: bool = False        # the provider EXPLICITLY refused, as opposed to us failing to read
+
+    def __post_init__(self):
+        """Only VALID outcomes exist. review-B1.6b9#1: making this the boundary type moved the
+        validation off `spend_policy`'s argument and onto nothing at all — `BalanceRead()` meant
+        unbounded spending, `BalanceRead(remaining=True)` bought a page, and `remaining="200"` was
+        coerced downstream. An unconstructable bad state is worth more than a checked one."""
+        from .contract import PROVIDER_CLASSES, PROVIDER_LIMITS, PROVIDER_PARSE
+        # review-B1.6b10#1: "unconstructable" was overstated — the success branch never looked at
+        # `reason`, the failure branch tested truthiness rather than TYPE, and `refused` accepted any
+        # truthy value. `BalanceRead(remaining=5, reason="contradiction")` and
+        # `BalanceRead(error_class=123, ...)` both constructed happily.
+        if not isinstance(self.refused, bool):
+            raise ValueError(f"refused must be a bool, got {type(self.refused).__name__}")
+        if not isinstance(self.error_class, str) or not isinstance(self.reason, str):
+            raise ValueError("error_class and reason must be strings")
+        if self.remaining is not None:
+            if _exact_count(self.remaining) is None:
+                raise ValueError(f"balance {self.remaining!r} is not an exact non-negative count")
+            if self.error_class or self.reason or self.refused:
+                raise ValueError("a balance that was read cannot also carry a failure")
+            return
+        if self.error_class not in PROVIDER_CLASSES:
+            raise ValueError(f"error_class {self.error_class!r} is not a provider-outcome class")
+        if not self.reason.strip():
+            raise ValueError("a balance with no figure must say WHY — a reason is required")
+        if self.refused and self.error_class == PROVIDER_PARSE:
+            raise ValueError("a body we could not parse is not the provider refusing us")
+        # review-B1.6b11#1: a PROVEN limit is a refusal by definition — the provider told us plainly.
+        # `BalanceRead(error_class="quota", refused=False)` was accepted and then read as an unreadable
+        # balance, i.e. a GAP, so the one outcome that is emphatically not a defect reported as one.
+        if self.error_class in PROVIDER_LIMITS and not self.refused:
+            raise ValueError(f"{self.error_class} is a PROVEN provider limit and must be refused=True")
+
+
+def read_balance(raw) -> BalanceRead:
+    """Whoxy's `account=balance` reply, as a structured outcome.
+
+    MEASURED 2026-07-29: `account=balance` is FREE — two consecutive reads left the balance unchanged —
+    and answers `{"status": 1, "live_whois_balance": N, "whois_history_balance": N,
+    "reverse_whois_balance": N}`. Only the reverse-whois figure funds this lane.
+
+    The envelope is `contract.whoxy_envelope`, not a second status authority (review-B1.6b7#2): it
+    already excludes `True` — which `== 1` in Python — and it classifies a refusal from the provider's
+    OWN words, so "Zero Account Balance" arrives as a proven quota rather than an opaque failure.
+
+    A missing or malformed figure is UNKNOWN, never zero — but it is an unknown that carries its reason,
+    so the gap survives to the verdict."""
+    from .contract import ProviderBodyError, whoxy_envelope
+    try:
+        doc = json.loads(raw)
+    except Exception:
+        return BalanceRead(error_class="parse", reason="balance response was not JSON")
+    if not isinstance(doc, dict):
+        # a non-object is not the provider REFUSING us — it is a body we cannot read at all.
+        return BalanceRead(error_class="parse", reason="balance response was not a JSON object")
+    from .contract import PROVIDER_PARSE
+    try:
+        env = whoxy_envelope(doc)
+    except ProviderBodyError as e:
+        # review-B1.6b8#2: EVERY envelope rejection was marked as a refusal, so `status: true` or a
+        # missing status claimed Whoxy had explicitly refused the request. A body we cannot parse is our
+        # inability to read it, not the provider saying no — and the two lead an operator to look in
+        # completely different places.
+        return BalanceRead(error_class=e.error_class, reason=e.reason,
+                           refused=e.error_class != PROVIDER_PARSE)
+    n = _exact_count(env.get("reverse_whois_balance"))
+    if n is None:
+        return BalanceRead(error_class="parse",
+                           reason=f"provider balance unusable: reverse_whois_balance="
+                                  f"{env.get('reverse_whois_balance')!r}")
+    return BalanceRead(remaining=n)
+
+
+#: where the installation-wide spending lock lives. The Whoxy KEY comes from the single global
+#: `~/.config/quarry/secrets.yaml`, so every project on this machine spends the SAME account.
+SPEND_LOCK = Path.home() / ".config" / "quarry" / "whoxy-spend.lock"
+
+
+@contextlib.contextmanager
+def _flock(path):
+    """An exclusive, ADVISORY, OS-RELEASED lock on `path`. Raises `LockBusy` on contention only."""
+    import errno
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = path.open("a+")
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            # review-B1.6b2#2: only CONTENTION is contention. A read-only filesystem, a bad descriptor or
+            # a filesystem with no lock support would otherwise be reported as "another run is active" —
+            # sending an operator to look for a process that does not exist.
+            if e.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            raise LockBusy(f"another whoxy lifecycle holds {path}") from e
+        yield path
+    finally:
+        # CLOSING the descriptor releases the flock, on every exit including BaseException — a
+        # cancelled run must not wedge anything until someone notices a leftover file. `flock` and not
+        # lockfile EXISTENCE: a stale file from a killed run would block forever, while the kernel
+        # drops an flock with the process. The file itself is never removed — unlinking it lets a
+        # second process lock a path the first no longer shares.
+        #
+        # DELIBERATELY UNFALSIFIABLE ON CPYTHON: refcounting drops `fh` when this frame unwinds, so
+        # removing this line changes nothing a test can observe. It is kept because the guarantee must
+        # not depend on the garbage collector.
+        fh.close()
+
+
+@contextlib.contextmanager
+def spend_lock(path=None):
+    """The installation-wide Whoxy SPENDING lock — the INNER of the two, taken last and briefly.
+
+    review-B1.6b3: the project lock protects one project's ledger, and that is all it protects. The KEY
+    is global, so two runs in DIFFERENT projects take different project locks, read the SAME account
+    balance, and can each spend down to the reserve — together crossing or exhausting it. Credits are an
+    account-wide resource and need an account-wide lock.
+
+    WHAT EACH LOCK COVERS, and the order is fixed:
+
+        project lock (`open_state`)
+          -> replay owned pages                    -- FREE, never waits on the account
+          -> if paid work remains: THIS lock
+               -> balance read
+               -> purchases, each journaled durably as it lands
+             (this lock released here)
+          -> final ledger compaction / save        -- under the PROJECT lock only
+
+    The account lock covers the balance read and the purchases, including each page's own journal
+    record. It does NOT cover `ledger.save()`: compaction happens in `run_pages`'s `finally`, after the
+    paid phase has exited, and it is the project lock that makes that safe. Nothing is lost by the
+    narrower scope — a journaled page survives without the snapshot.
+
+    Taken ONLY when paid work actually remains, and released as soon as it is done. review-B1.6b4: it
+    was once the outermost lock, held for the whole lifecycle — which meant a project that owned every
+    page it needed was blocked by another project's purchasing, and reported a gap for account access it
+    never wanted. Free operations continue; only spending is serialised.
+
+    `run_pages` composes the paid phase, so a caller supplies this lock and the balance read together
+    and cannot take them in the wrong order. Anything that ever holds BOTH must take the project lock
+    first. These are non-blocking acquisitions, so disagreeing call sites do not deadlock — they fail
+    each other's acquisition, which is a live-lock at best and an unexplained `LockBusy` at worst."""
+    with _flock(Path(path) if path is not None else SPEND_LOCK) as p:
+        yield p
+
+
+@contextlib.contextmanager
+def lifecycle_lock(project_dir):
+    """Exclusive, ADVISORY, OS-RELEASED lock over a project's Whoxy page state.
+
+    review-B1.6b#1: `open_state` could be opened by two `quarry osint` runs at once. Both would load the
+    same snapshot, buy the same pages — paying twice for identical bytes — and then race while compacting
+    the ledger and unlinking the journal it supersedes, which is how ownership gets lost outright.
+
+    `flock` and not lockfile EXISTENCE: a stale file from a killed run would block the project forever,
+    while an flock is released by the KERNEL when the holder dies, however it dies. The file itself is
+    never removed — unlinking it lets a second process lock a path the first no longer shares.
+
+    Held across the whole lifecycle: the balance read, ledger load, replay, purchases and the final save.
+    Contention raises `LockBusy` BEFORE any of that, so a blocked run issues zero paid requests.
+
+    This one protects one project's LEDGER. Credits are account-wide and need `spend_lock` as well —
+    the project lock cannot see another project at all (review-B1.6b3).
+
+    It is at the PROVIDER level, above the schema generation: two builds on different schemas still
+    share one account and must not spend at once (review-B1.6b2#1)."""
+    base = provider_dir(project_dir)
+    with _flock(base / ".lock"):
+        yield base
+
+
+@contextlib.contextmanager
+def open_state(project_dir):
+    """`with open_state(project) as (ledger, pages):` — the ONLY way to reach Whoxy page state.
+
+    Takes the PROJECT lock only. review-B1.6b4: taking the account-wide spend lock here blocked free
+    work — while project A was purchasing, project B could not replay pages it already owns, discover it
+    has no remainder, or run under a zero-spend policy, and got a gap for needing no account access at
+    all. That contradicts the rule this whole batch is built on: free operations continue.
+
+    The account lock is acquired LAZILY, by `run_pages`, only once replay has finished and paid work
+    actually remains. Order stays fixed where both are held: project, then account.
+
+    review-B1.6b2#2: locking and state-opening were separable, so a caller could construct the `Ledger`,
+    load its snapshot and read the balance with no lock held, and the durable-state tests did exactly
+    that. Making the safe path the STRUCTURAL one means future wiring cannot get the order wrong: the
+    provider lock is taken first, and everything — balance read, replay, purchases, final save — happens
+    inside it.
+
+    Both the ledger and the pages live under `state_dir`, so `Ledger.record`'s relative-path validation
+    holds. Nothing here is pruned: a page was paid for, and a later run inherits it."""
+    with lifecycle_lock(project_dir):
+        base = state_dir(project_dir)
+        pages = base / "pages"
+        pages.mkdir(parents=True, exist_ok=True)
+        yield budget.Ledger(base / "ledger.json", lane="osint.whoxy"), pages
+
+
+@contextlib.contextmanager
+def fixed_allowance(pages):
+    """A paid phase with a KNOWN allowance and no lock — for callers that already settled both."""
+    yield pages
+
+
+def run_pages(states, *, paid, fetch, ingest, read, ledger, attempt_dir, is_limit=None) -> Outcome:
     """Buy pages under the budget, replaying anything already owned.
 
     `fetch(anchor, page) -> (raw_bytes, error)` returns the provider's EXACT response bytes, and never
@@ -377,34 +723,92 @@ def run_pages(states, *, spend, fetch, ingest, read, ledger, attempt_dir, is_lim
     enumeration and the check on a page we just bought. `ingest(anchor, page, doc, artifact) -> int`
     turns it into candidates and returns how many domains it yielded.
 
-    `spend` is the page allowance from `spend_policy()`; None means no computable bound."""
+    `paid` is a zero-argument callable returning a CONTEXT MANAGER that yields the page allowance. It is
+    entered ONLY when replay has finished and pending work remains, so a lifecycle that owns everything
+    it needs never touches the account — that is where the caller takes the installation-wide spend lock
+    and reads the balance (review-B1.6b4). If it raises `LockBusy`, replayed evidence is KEPT and only
+    the unpaid remainder is reported as blocked."""
     from .contract import is_provider_limit as _default_is_limit
     is_limit = is_limit or _default_is_limit
     states = dedupe(states)
     o = Outcome(anchors=len(states))
     try:
-        _replay(states, o, ledger=ledger, ingest=ingest, read=read)
-        _buy(states, o, spend=spend, fetch=fetch, ingest=ingest, read=read, ledger=ledger,
-             attempt_dir=attempt_dir, is_limit=is_limit)
-        _remainder(states, o)
+        try:
+            _replay(states, o, ledger=ledger, ingest=ingest, read=read)
+            if schedule(states):
+                # PENDING WORK ONLY. A run that owns everything never enters the paid phase, so it never
+                # waits on the account and never reports a gap for access it did not need.
+                try:
+                    with paid() as spend:
+                        _buy(states, o, spend=spend, fetch=fetch, ingest=ingest, read=read,
+                             ledger=ledger, attempt_dir=attempt_dir, is_limit=is_limit)
+                except LockBusy:
+                    # another project is spending this account. What we replayed is real and stays; only
+                    # the part we could not buy is blocked.
+                    o.stop_cause = "account_busy"
+                except Exception as e:
+                    # review-B1.6b21: anything unexpected in the PAID phase used to propagate, discarding
+                    # every page this lifecycle had already replayed or bought along with it. Caught HERE
+                    # rather than only at the lifecycle boundary so `_remainder` still runs and the run
+                    # reports what is left as well as what it got.
+                    _machinery(o, e)
+        except (KeyboardInterrupt, SystemExit):
+            raise                                  # cancellation ends the run; it is not an outcome
+        except Exception as e:
+            # review-B1.6b22: only the PAID phase was covered, so a failure in REPLAY — an ingest that
+            # raised on page 2 after page 1 had already yielded 100 candidates — escaped this function
+            # entirely and the caller fabricated `attempted=0, completed=0` over evidence it held.
+            # Replay is machinery too, and every page it accepted before the failure is a fact.
+            _machinery(o, e)
     finally:
+        # accounting for whatever the states DID reach, however this lifecycle ended. It runs in
+        # `finally` so a machinery failure anywhere above still reports its remainder, and it is a
+        # SNAPSHOT of the states (see `_remainder`), so running it after a partial failure cannot
+        # double-count. Its own failure is machinery like any other and must not mask the outcome.
+        try:
+            _remainder(states, o)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            _machinery(o, e)
         # persistence is this function's job and its RESULT is a fact: a ledger we could not write leaves
         # every page bought this run to be bought again, and the caller must be able to say so.
         # review-B1.6r1#2: `saved or durable` called a page persisted when the checkpoint had journaled,
         # the page's own append had failed, and compaction failed too — every signal survivable while the
         # page reached NEITHER destination. The journal branch needs both facts.
-        saved = bool(ledger.save())
-        o.persisted = saved or (bool(getattr(ledger, "durable", False)) and o.records_journaled)
+        # review-B1.6b23#2: this call sat OUTSIDE the machinery boundary, so a store that raised on save
+        # — after pages had replayed and been bought — escaped the whole function and the caller
+        # fabricated `attempted=0, completed=0` over them. A save that raises did not save.
+        try:
+            saved = bool(ledger.save())
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            saved = False
+            _machinery(o, e)
+        if saved:
+            o.persisted = True                 # the snapshot IS the durable answer; nothing else to ask
+        else:
+            # review-B1.6b25: the fallback was read unconditionally, so a ledger that saved cleanly and
+            # then raised answering `durable` reported a machinery gap over evidence we no longer needed.
+            # This branch exists only when the snapshot did NOT land.
+            try:
+                durable = bool(getattr(ledger, "durable", False))
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                # a store that cannot even answer is not a durable one — review-B1.6b24#3: swallowing
+                # the exception contradicted the contract the rest of this function keeps.
+                durable = False
+                _machinery(o, e)
+            o.persisted = durable and o.records_journaled
     return o
 
 
 def _take(st, o, *, page, art, doc, ingest, replayed: bool) -> None:
     """Fold one validated page into the state and the outcome, however it was obtained."""
-    first = not st.pages_done
     st.pages_done.add(page)
     st.attempted = True
-    if first:
-        o.anchors_touched += 1
     # review-B1.6r1#4: totals were adopted only while unknown, so page 1 saying 200 and page 2 saying
     # 300 left the walk bounded by the FIRST answer — two pages fetched, no remainder reported, the rest
     # silently uncollected. Every page is reconciled, MAX-WINS so the remainder is never understated, and
@@ -421,7 +825,23 @@ def _take(st, o, *, page, art, doc, ingest, replayed: bool) -> None:
         o.pages_replayed += 1
     else:
         o.pages_bought += 1
-    o.domains += ingest(st.anchor, page, doc, art)
+    try:
+        o.domains += ingest(st.anchor, page, doc, art)
+        # review-B1.6b24#2: `anchors_touched` was incremented BEFORE ingestion, so an anchor whose page 1
+        # died on ingest was published as `completed=1` beside `pages_unconsumed=1, domains=0` — the same
+        # anchor reported as completed and as failed. An anchor is delivered when a page of it lands.
+        if not st.delivered:
+            st.delivered = True
+            o.anchors_touched += 1
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        # review-B1.6b23#1: the page counted as read or bought and then dropped out of the remainder,
+        # so a ten-page anchor that died ingesting page 2 reported "8 pages remaining" for NINE pages
+        # this lifecycle never delivered. It stays owned — dropping it from `pages_done` would have the
+        # scheduler sell it to us again — and the shortfall is counted in its own unit.
+        o.pages_unconsumed += 1
+        raise
 
 
 def _replay(states, o, *, ledger, ingest, read) -> None:
@@ -501,6 +921,7 @@ def _buy(states, o, *, spend, fetch, ingest, read, ledger, attempt_dir, is_limit
             tried.add(attempt)
             raw, err = fetch(st.anchor, page)
             o.requests_issued += 1
+            o.requested.add((st.anchor.param, st.anchor.value))
             spent += 1              # the ALLOWANCE is decremented per attempt, conservatively: we
                                     # cannot know what was billed until the balance is read again
             st.attempted = True
@@ -518,8 +939,18 @@ def _buy(states, o, *, spend, fetch, ingest, read, ledger, attempt_dir, is_limit
                         o.stop_cause = why
                     else:
                         o.error_bodies += 1
-                bucket = o.limit_classes if is_limit(cls) else o.fail_classes
+                limited = is_limit(cls)
+                bucket = o.limit_classes if limited else o.fail_classes
                 bucket[cls] = bucket.get(cls, 0) + 1
+                # review-B1.6b13#6: these were declared and never assigned, so the provider's real words
+                # — "Zero Account Balance" — never reached an operator, who saw `{"quota": 1}` instead.
+                # FIRST of each kind wins and is stored WITH its own class, so two different failures can
+                # never have one's class read against the other's wording.
+                why = f"{cls}: {(getattr(err, 'reason', '') or str(err) or cls).strip()}"
+                if limited and not o.limit_reason:
+                    o.limit_reason = why
+                elif not limited and not o.fail_reason:
+                    o.fail_reason = why
                 if is_limit(cls) and not o.stop_cause:
                     # DEGRADE, don't disable: stop buying, keep what is earned, count the rest. A storage
                     # failure already recorded is OURS and outranks it — the provider's boundary explains
@@ -561,6 +992,8 @@ def _buy(states, o, *, spend, fetch, ingest, read, ledger, attempt_dir, is_limit
             _take(st, o, page=page, art=art, doc=doc, ingest=ingest, replayed=False)
             if not journaled or not ledger_writable(ledger):
                 o.stop_cause = "ledger_unwritable"
+        if spend is not None and spent >= spend:
+            o.allowance_exhausted = True
         if not progressed:
             if spend is not None and spent >= spend and not o.stop_cause:
                 o.stop_cause = "budget_exhausted"
@@ -573,7 +1006,25 @@ def ledger_writable(ledger) -> bool:
     return not getattr(ledger, "foreign", False) and not getattr(ledger, "_journal_unsafe", False)
 
 
+def _machinery(o, e: BaseException) -> None:
+    """Record OUR OWN failure without discarding what the lifecycle already established.
+
+    The first failure names the stop: a later one is a consequence, and overwriting would report the
+    symptom instead of the cause."""
+    o.machinery.append(f"{type(e).__name__}: {e}")
+    o.stop_cause = o.stop_cause or f"machinery:{type(e).__name__}"
+    # the reason must SAY it was our own machinery: it is what the operator reads on the terminal, and
+    # a bare exception string is indistinguishable from a provider failure.
+    o.fail_reason = o.fail_reason or f"page state machinery failed ({type(e).__name__}: {e})"
+
+
 def _remainder(states, o) -> None:
+    # a SNAPSHOT of the states, not an accumulator: it is reachable twice (once normally, once after a
+    # machinery failure), and `+=` over a list that already held the first pass would report a remainder
+    # twice the size of the real one.
+    o.unopened = []
+    o.pages_left_known = 0
+    o.pages_left_unknown_anchors = 0
     for st in states:
         # "never opened" is not "asked and refused": an anchor whose page 1 died on a limit WAS queried.
         if not st.pages_done and not st.attempted:

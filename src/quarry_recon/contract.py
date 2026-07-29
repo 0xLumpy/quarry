@@ -87,6 +87,11 @@ PROVIDER_ERROR = "error"
 #: classes that are an EXTERNAL LIMIT rather than a defect — coverage is incomplete, but nothing failed
 #: and nothing is retryable within the run. These feed `complete_with_limits`, never `complete_with_gaps`.
 PROVIDER_LIMITS = frozenset({PROVIDER_QUOTA, PROVIDER_ENTITLEMENT})
+#: every class this taxonomy defines. A consumer validating an error class checks membership here rather
+#: than accepting any non-empty string — "quota " or "Quota" would compare unequal everywhere it matters.
+PROVIDER_CLASSES = frozenset({PROVIDER_AUTH, PROVIDER_FORBIDDEN, PROVIDER_ENTITLEMENT,
+                              PROVIDER_RATE_LIMIT, PROVIDER_QUOTA, PROVIDER_TRANSPORT, PROVIDER_SERVER,
+                              PROVIDER_PARSE, PROVIDER_HTTP, PROVIDER_ERROR})
 
 
 def is_provider_limit(error_class) -> bool:
@@ -112,6 +117,13 @@ def capture_error_body(exc, *, provider: str = "", limit: int = _ERROR_BODY_LIMI
             raw = exc.read(limit)
         except Exception:
             raw = b""
+        # review-B1.6b14#5: `body_text` is a lossy decode — invalid UTF-8 becomes replacement characters,
+        # so re-encoding it does not give back what the provider sent. A caller persisting failure
+        # EVIDENCE needs the bytes, not our reading of them.
+        try:
+            exc.body_bytes = raw
+        except Exception:
+            pass
         finally:
             # review-B1.1#3: an HTTPError holds a LIVE response stream. Reading it without closing leaks
             # the connection, and a lane that fails repeatedly (auth or quota on every pivot) leaks once

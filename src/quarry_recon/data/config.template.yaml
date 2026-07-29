@@ -49,6 +49,19 @@ PERFORMANCE:
                              # complete_with_limits and persists the unqueried pivots as a resumable
                              # remainder. NB if this is set but UNPARSEABLE, Quarry issues NO paid search
                              # rather than silently spending — a broken cost guard must not read as none
+  WHOXY_CREDIT_RESERVE:      # reverse-whois credits this run will NOT spend, kept back for manual work
+                             # (default 0 = spend everything available). Whoxy charges ONE CREDIT PER
+                             # PAGE and a single anchor can run to hundreds of pages, so one anchor can
+                             # drain an account. `account=balance` is FREE and works at any balance
+                             # (measured), so the balance is read before any page is bought. Pages
+                             # already paid for are OWNED and replayed for free — changing this never
+                             # re-buys them. NB an UNPARSEABLE value issues NO paid request rather than
+                             # silently spending: a broken cost guard must not read as none
+  WHOXY_PAGE_BUDGET:         # pages this RUN may buy across all anchors (default 0 = unbounded; the
+                             # credit balance and the reserve are then the only bound). Distinct from
+                             # the reserve: the reserve protects credits for later, this limits THIS
+                             # invocation. Whatever a budget does not reach is a counted, RESUMABLE
+                             # remainder — the next run continues instead of starting over
   ARJUN_TARGETS:             # concurrent arjun TARGET processes (default 5; at most one per host). RATE is
                              # separate: RATELIMIT.HTTP is a GLOBAL lane cap partitioned across these workers
                              # (never handed to each in full), and a rate below the pool size shrinks the POOL

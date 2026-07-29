@@ -11,7 +11,9 @@ import urllib.error
 
 import pytest
 
-from quarry_recon import contract, osint, secrets
+import pathlib
+
+from quarry_recon import contract, osint, secrets, settings, whoxy_page
 from quarry_recon.contract import (PROVIDER_ENTITLEMENT, PROVIDER_FORBIDDEN, PROVIDER_QUOTA,
                                    PROVIDER_RATE_LIMIT, ProviderBodyError, classify_provider_error,
                                    classify_provider_reason, is_provider_limit, whoxy_envelope,
@@ -19,6 +21,12 @@ from quarry_recon.contract import (PROVIDER_ENTITLEMENT, PROVIDER_FORBIDDEN, PRO
 from quarry_recon.runner import Status
 
 pytestmark = pytest.mark.offline
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_the_real_spend_lock(tmp_path, monkeypatch):
+    """The Whoxy spend lock is installation-wide — the operator's own `~/.config/quarry`."""
+    monkeypatch.setattr(whoxy_page, "SPEND_LOCK", tmp_path / "install-spend.lock")
 
 # ── MEASURED Whoxy payloads (all HTTP 200) ────────────────────────────────────────────────────────
 WHOXY_EXHAUSTED = '{"status": 0, "status_reason": "Zero Account Balance"}'
@@ -376,6 +384,9 @@ class TestWhoxyResultSchema:
 class _Sess:
     def __init__(self, tmp_path):
         self.dir = tmp_path
+        # B1.6b: page ownership is DURABLE and lives beside the timestamped sessions, so the lane needs
+        # the project root as well as this session's directory.
+        self.project_dir = tmp_path / "project"
         self.cands = []
         self.recorded = []
 
@@ -411,6 +422,43 @@ def _echo_request(body, url):
     return json.dumps(doc)
 
 
+def _whoxy_provider(monkeypatch, respond, *, balance=200, calls=None):
+    """THE lane double. B1.6b: production fetches EXACT BYTES via `_whoxy_get(url) -> (bytes, error)`,
+    and reads a FREE `account=balance` before any paid page. Patching `_http` no longer reaches the lane
+    at all, so every lane test goes through one endpoint-aware provider instead of its own stub.
+
+    `respond(url) -> bytes | (bytes, error) | Exception` answers a reverse-whois request."""
+    calls = calls if calls is not None else []
+
+    def get(url, timeout=None):
+        calls.append(url)
+        if "account=balance" in url:
+            return json.dumps({"status": 1, "reverse_whois_balance": balance}).encode(), None
+        out = respond(url)
+        if isinstance(out, BaseException):
+            from quarry_recon.contract import capture_error_body, provider_error_class
+            capture_error_body(out, provider="whoxy")
+            try:
+                out.error_class = provider_error_class(out)
+            except Exception:
+                pass
+            return getattr(out, "body_bytes", b"") or b"", out
+        if isinstance(out, tuple):
+            return out
+        return (out.encode() if isinstance(out, str) else out), None
+
+    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
+    monkeypatch.setattr(osint.secrets, "whoxy", lambda: "KEY")
+    monkeypatch.setattr(osint, "_whoxy_get", get)
+    monkeypatch.setattr(settings, "performance", dict)
+    return calls
+
+
+def _paid(calls):
+    """Paid requests only — the balance read is free and is not a query."""
+    return [c for c in calls if "account=balance" not in c]
+
+
 def _drive(tmp_path, monkeypatch, bodies):
     """Run _whoxy with a scripted sequence of HTTP bodies."""
     monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
@@ -419,17 +467,24 @@ def _drive(tmp_path, monkeypatch, bodies):
 
     def fake_http(url, timeout=None, **kw):
         calls.append(url)
+        if "account=balance" in url:                 # FREE, and answered before any paid page
+            return json.dumps({"status": 1, "reverse_whois_balance": 200}).encode()
         body = seq.pop(0) if seq else '{"status": 1}'
         # review-B1.6r5#1: a real reverse-whois response ECHOES the question it answers, and every
         # response now owes that binding. A fixture that always claimed one fixed anchor would be
         # testing a body the provider never sends — so the fake echoes the URL it was actually given.
-        return _echo_request(body, url)
+        return _echo_request(body, url).encode()
 
-    monkeypatch.setattr(osint, "_http", fake_http)
+    # B1.6b: the lane fetches EXACT BYTES through `_whoxy_get`, so the double returns bytes and an
+    # error slot rather than decoded text.
+    monkeypatch.setattr(osint, "_whoxy_get",
+                        lambda url, timeout=None: (fake_http(url, timeout), None))
+    monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: fake_http(url, timeout).decode())
     s = _Sess(tmp_path)
     echoed = []
     osint._whoxy(s, {"a@x.com", "b@x.com"}, ["Acme Inc"], echoed.append, 30)
-    return s, calls, echoed
+    # the FREE balance read is not a query — tests count paid requests.
+    return s, [c for c in calls if "account=balance" not in c], echoed
 
 
 def _outcome(s):
@@ -461,8 +516,11 @@ def test_exhaustion_stops_further_queries_and_reports_the_remainder(tmp_path, mo
     visible rather than burning them into noise."""
     s, calls, echoed = _drive(tmp_path, monkeypatch, [WHOXY_EXHAUSTED, WHOXY_OK, WHOXY_OK])
     assert len(calls) == 1
-    assert any("not sent" in m for m in echoed)
+    # B1.6b: the unsent anchors are reported as `not_sent` and named in `unopened`, and the echo carries
+    # the provider's own words rather than a count of what we skipped.
     assert _outcome(s)["not_sent"] == 2
+    assert len(_outcome(s)["unopened"]) == 2
+    assert any("Zero Account Balance" in m for m in echoed), echoed
 
 
 def test_evidence_before_exhaustion_is_kept(tmp_path, monkeypatch):
@@ -507,10 +565,7 @@ def test_transport_failures_also_count(tmp_path, monkeypatch):
     """An HTTP/transport error is a failed query too — it must not vanish into an echo."""
     monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
 
-    def boom(url, timeout=None, **kw):
-        raise urllib.error.URLError("connection refused")
-
-    monkeypatch.setattr(osint, "_http", boom)
+    _whoxy_provider(monkeypatch, lambda url: urllib.error.URLError("connection refused"))
     s = _Sess(tmp_path)
     osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
     assert s.recorded[0].status == Status.FAILED and _outcome(s)["failed"] == 1
@@ -527,8 +582,7 @@ def test_no_anchors_is_an_explicit_skip(tmp_path, monkeypatch):
 def test_every_anchor_is_queued_no_first_n_cap(tmp_path, monkeypatch):
     """review-B0#4: `[:5]` on each list was the hidden membership cap this migration removes. Ranking
     decides ORDER; the provider's balance decides how many are attempted."""
-    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
-    monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_OK)
+    _whoxy_provider(monkeypatch, lambda url: _echo_request(WHOXY_OK, url))
     s = _Sess(tmp_path)
     emails = {f"e{i}@x.com" for i in range(9)}
     orgs = [f"Org {i}" for i in range(7)]
@@ -536,18 +590,16 @@ def test_every_anchor_is_queued_no_first_n_cap(tmp_path, monkeypatch):
     assert _outcome(s)["eligible"] == 16 and _outcome(s)["attempted"] == 16
 
 
-def test_emails_are_ordered_before_org_names(tmp_path, monkeypatch):
-    """Ordering is the ranking: registrant emails are the stronger ownership signal."""
-    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
-    seen = []
-
-    def spy(url, timeout=None, **kw):
-        seen.append("email" if "email=" in url else "company")
-        return WHOXY_OK
-
-    monkeypatch.setattr(osint, "_http", spy)
-    osint._whoxy(_Sess(tmp_path), {"a@x.com", "b@x.com"}, ["Org"], lambda m: None, 30)
-    assert seen == ["email", "email", "company"]
+def test_neither_anchor_KIND_can_starve_the_other(tmp_path, monkeypatch):
+    """B1.6b: ordering was strict emails-first. One credit buys one PAGE now, so the paginator orders
+    page-tier-first and round-robins between the two anchor KINDS inside a tier — fifty company anchors
+    cannot spend the account before a single registrant email is opened. Every anchor still gets its
+    page 1 before any anchor gets a page 2, which is the property the old ordering was reaching for."""
+    calls = _whoxy_provider(monkeypatch, lambda url: _echo_request(WHOXY_OK, url))
+    osint._whoxy(_Sess(tmp_path), {f"e{i}@x.com" for i in range(4)}, ["Org"], lambda m: None, 30)
+    seen = ["email" if "email=" in c else "company" for c in _paid(calls)]
+    assert seen[:2] == ["company", "email"], seen        # alternating, not four emails first
+    assert seen.count("company") == 1 and seen.count("email") == 4
 
 
 def test_truncated_page_is_not_a_clean_success(tmp_path, monkeypatch):
@@ -556,21 +608,26 @@ def test_truncated_page_is_not_a_clean_success(tmp_path, monkeypatch):
     credit per page, so FETCHING the rest is credit-budget work (B1); until then it must read incomplete."""
     doc = ('{"status": 1, "total_results": 50, "current_page": 1, "total_pages": 1, '
            '"search_result": [{"domain_name": "a.com"}]}')
-    s, _calls, echoed = _drive(tmp_path, monkeypatch, [doc, WHOXY_OK, WHOXY_OK])
-    assert any("MORE PAGES not fetched" in m for m in echoed)
+    s, _calls, _echoed = _drive(tmp_path, monkeypatch, [doc, WHOXY_OK, WHOXY_OK])
+    # B1.6b: a body claiming 50 results on one page and returning ONE row is not a truncated success —
+    # it CONTRADICTS ITSELF. It is retryable evidence, never an owned page, so the run reports a real
+    # failure rather than a page budget we did not impose.
     assert s.recorded[0].status == Status.PARTIAL
     o = _outcome(s)
-    assert o["completed"] == 3 and o["truncated_pages"] == 1 and o["coverage_incomplete"] is True
+    assert o["failed"] >= 1 and o["coverage_incomplete"] is True
+    assert s.recorded[0].meta["error_class"] == "parse"
 
 
 def test_distinct_anchors_never_share_a_raw_evidence_file(tmp_path, monkeypatch):
     """review-B0r2#3: a lossy 40-char slug collided, so the later response OVERWROTE the earlier one while
     the earlier candidates kept pointing at that same raw_ref — provenance naming the wrong evidence."""
-    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
-    monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_OK)
+    _whoxy_provider(monkeypatch, lambda url: _echo_request(WHOXY_OK, url))
     s = _Sess(tmp_path)
     osint._whoxy(s, set(), ["Acme Inc", "Acme-Inc", "Acme  Inc"], lambda m: None, 30)
-    written = list((tmp_path / "raw" / "whoxy").glob("*.json"))
+    # B1.6b: pages live in the DURABLE project state, named by the per-page identity, so they survive
+    # the timestamped session that bought them.
+    written = [q for q in (whoxy_page.state_dir(s.project_dir) / "pages").rglob("*.json")
+               if q.name != ".quarry-write-probe"]
     assert len(written) == 3, f"anchors collided onto {len(written)} file(s)"
 
 
@@ -690,8 +747,7 @@ class TestOsintSessionVerdict:
 
     def test_a_provider_limit_makes_the_session_limited(self, tmp_path, monkeypatch):
         s = self._session(tmp_path)
-        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
-        monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_EXHAUSTED)
+        _whoxy_provider(monkeypatch, lambda url: WHOXY_EXHAUSTED)
         osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
         out = s.outcome()
         assert out["verdict"] == "complete_with_limits"
@@ -700,26 +756,22 @@ class TestOsintSessionVerdict:
 
     def test_a_clean_session_is_complete(self, tmp_path, monkeypatch):
         s = self._session(tmp_path)
-        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
         # the response must echo the question actually asked — a fixed identity would be a body the
         # provider never sends (review-B1.6r5#1).
-        monkeypatch.setattr(osint, "_http",
-                            lambda url, timeout=None, **kw: _echo_request(WHOXY_OK, url))
+        _whoxy_provider(monkeypatch, lambda url: _echo_request(WHOXY_OK, url))
         osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
         assert s.outcome()["verdict"] == "complete"
 
     def test_a_failure_is_a_gap_not_a_limit(self, tmp_path, monkeypatch):
         s = self._session(tmp_path)
-        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
-        monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_UNKNOWN_FAILURE)
+        _whoxy_provider(monkeypatch, lambda url: WHOXY_UNKNOWN_FAILURE)
         osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
         out = s.outcome()
         assert out["verdict"] == "complete_with_gaps" and out["gaps"] and not out["provider_limits"]
 
     def test_the_verdict_reaches_the_manifest(self, tmp_path, monkeypatch):
         s = self._session(tmp_path)
-        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
-        monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_EXHAUSTED)
+        _whoxy_provider(monkeypatch, lambda url: WHOXY_EXHAUSTED)
         osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
         prof = type("P", (), {"target": "t", "apex_domains": ["acme.com"], "asn": [], "org_names": [],
                               "brands": [], "path": None})()
@@ -743,9 +795,8 @@ class TestLimitsNeverMaskGaps:
     def test_session_verdict_is_gaps_when_both_are_present(self, tmp_path, monkeypatch):
         from quarry_recon.osint import OsintSession
         s = OsintSession(tmp_path, "t")
-        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
         seq = [WHOXY_UNKNOWN_FAILURE, WHOXY_EXHAUSTED]
-        monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: seq.pop(0))
+        _whoxy_provider(monkeypatch, lambda url: seq.pop(0))
         osint._whoxy(s, {"a@x.com", "b@x.com"}, [], lambda m: None, 30)
         out = s.outcome()
         assert out["verdict"] == "complete_with_gaps"      # a real gap DOMINATES the expected limit
@@ -814,14 +865,15 @@ class TestUnreadableTruthIsNotGreen:
 def test_evidence_filename_carries_the_full_digest(tmp_path, monkeypatch):
     """A truncated identity is a smaller collision space for no benefit — Quarry's other durable
     identities are full sha256 (the A1 lesson: an 8-hex service id let two URLs collide)."""
-    import hashlib as _h
-    monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
-    monkeypatch.setattr(osint, "_http", lambda url, timeout=None, **kw: WHOXY_OK)
+    _whoxy_provider(monkeypatch, lambda url: _echo_request(WHOXY_OK, url))
     s = _Sess(tmp_path)
     osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
-    want = _h.sha256(b"email\x00a@x.com\x00page=1").hexdigest()
-    names = [p.name for p in (tmp_path / "raw" / "whoxy").glob("*.json")]
+    # B1.6b: the identity is the per-PAGE key `(schema, param, value, page)` — still a full sha256, and
+    # now the same identity the ledger owns the page under, so evidence and ownership cannot diverge.
+    want = whoxy_page.item_key(whoxy_page.Anchor("email", "a@x.com"), 1)
+    names = [q.name for q in (whoxy_page.state_dir(s.project_dir) / "pages").rglob("*.json")]
     assert names and any(want in n for n in names), names
+    assert len(want) == 64, "a truncated identity is a smaller collision space for no benefit"
 
 
 class TestLaterPageLimit:
@@ -1098,9 +1150,7 @@ class TestMeasuredNoMatch:
     def test_the_lane_rejects_an_answer_to_a_different_anchor(self, tmp_path, monkeypatch):
         """End-to-end proof that the lane actually PASSES the request identity down: a provider echoing
         someone else's query must not count as 'this anchor found nothing'."""
-        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
-        monkeypatch.setattr(osint, "_http",
-                            lambda url, timeout=None, **kw: _no_match_body("company", "Someone Else"))
+        _whoxy_provider(monkeypatch, lambda url: _no_match_body("company", "Someone Else"))
         s = _Sess(tmp_path)
         osint._whoxy(s, {"a@x.com"}, [], lambda m: None, 30)
         assert s.recorded[0].status == Status.FAILED
@@ -1188,9 +1238,7 @@ class TestMeasuredNoMatch:
         from quarry_recon.osint import OsintSession
         import urllib.parse as _up
         s = OsintSession(tmp_path, "t")
-        monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
-
-        def echoing_no_match(url, timeout=None, **kw):
+        def echoing_no_match(url):
             """Answer each query with ITS OWN identity. The previous version returned one company body
             for two email queries and a different company query, and counted all three complete — the
             test itself asserting that a mismatched answer is fine."""
@@ -1198,7 +1246,7 @@ class TestMeasuredNoMatch:
             param = "email" if "email" in q else "company"
             return _no_match_body(param, q[param][0])
 
-        monkeypatch.setattr(osint, "_http", echoing_no_match)
+        _whoxy_provider(monkeypatch, echoing_no_match)
         echoed = []
         osint._whoxy(s, {"a@x.com", "b@x.com"}, ["Acme Inc"], echoed.append, 30)
         out = s.outcome()
@@ -1207,8 +1255,11 @@ class TestMeasuredNoMatch:
         run = s._tool_runs[0]
         assert run["status"] == "success"
         assert run["outcome"]["completed"] == 3 and run["outcome"]["failed"] == 0
-        assert "truncated_pages" not in run["outcome"]
-        assert any("0 domains" in m for m in echoed)          # an honest zero, not a suppressed one
+        # B1.6b: `truncated_pages` is always present and carries the remainder — a clean no-match has
+        # none. The property is unchanged: nothing was left behind.
+        assert run["outcome"]["truncated_pages"] == 0 and run["outcome"]["pages_left"] == 0
+        assert run["outcome"]["unopened_anchors"] == 0
+        assert any("0 domain(s)" in m for m in echoed)         # an honest zero, not a suppressed one
 
     @pytest.mark.parametrize("total", [False, True, "0", None, -0.0])
     def test_only_an_exact_integer_zero_takes_the_empty_path(self, total):

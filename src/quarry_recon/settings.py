@@ -78,6 +78,17 @@ def strict_int(key: str, *, default: int, maximum: int) -> int:
     return default
 
 
+def raw(key: str, default=None):
+    """The configured value EXACTLY as written, or `default` when unset.
+
+    review-B1.6b13#1: `concurrency()` exists for worker counts, where `max(1, ...)` and a silent fallback
+    are right — a zero worker pool is meaningless. They are wrong for a SPENDING control, where `0` means
+    "no ceiling", a negative is a typo, and a malformed value must not become a permissive default. A
+    cost guard needs the value as the operator wrote it so its own parser can refuse it."""
+    v = performance().get(key)
+    return default if v in (None, "") else v
+
+
 def concurrency(key: str, default: int) -> int:
     """An explicit per-tool concurrency override from PERFORMANCE (e.g. `NUCLEI_CONCURRENCY`,
     `HTTPX_THREADS`), else `default`. This is the explicit-override floor; the auto/core-scaling
