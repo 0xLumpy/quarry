@@ -270,6 +270,51 @@ def whoxy_envelope(doc, *, provider: str = "whoxy"):
     return doc
 
 
+#: an upper bound on the digits in `total_results`. A count of domain names cannot approach this, and it
+#: keeps the conversion well inside CPython's int-from-string limit so the result never depends on the
+#: interpreter's configuration.
+_WHOXY_TOTAL_MAX_DIGITS = 15
+
+
+def whoxy_total(value):
+    """Whoxy's `total_results` as an exact non-negative int, or None when it is not usable.
+
+    MEASURED 2026-07-29 — the type VARIES BY VALUE. A no-match answers `"total_results": 0` (an int); a
+    non-empty reverse-whois answers `"total_results": "39766"` (a STRING). The int-only check therefore
+    fail-closed on every successful query that actually found something, which is every query the lane
+    exists for. B0 had only ever measured the empty case, so the non-empty branch was written from the
+    documented schema and had never met a live answer.
+
+    Deliberately NOT `int(value)`: that accepts `" 39766\n"`, `"+39766"`, `"-1"`, `True`, and Unicode
+    digits (`str.isdigit()` accepts superscripts and Devanagari alike). Only a CANONICAL ASCII decimal is
+    a value we can claim to have read — anything else is drift, and drift is reported, not guessed at.
+    Leading zeros are non-canonical for the same reason: one value, one spelling.
+
+    review-B1.6r1#1: the string form is accepted only for a POSITIVE total. What was measured is exact:
+    an EMPTY answer carries the integer `0`, and a non-empty one carries a string. Accepting `"0"` would
+    let an unmeasured shape take the zero-result path — a clean EMPTY produced by a body we have never
+    seen, which is the false empty this whole contract exists to prevent.
+
+    review-B1.6r1#2: the digit count is BOUNDED. CPython refuses to convert an over-long decimal string
+    (`sys.get_int_max_str_digits()`, 4300 by default), so a long run of digits passed the character check
+    and then made `int()` raise — breaking this function's one promise, that unusable input returns None.
+    15 digits is past any conceivable count of registered domain names, and far below the interpreter
+    limit, so the answer never depends on how the interpreter is configured."""
+    if isinstance(value, bool):
+        return None                                  # bool is an int subclass; `True` is not a count
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if not isinstance(value, str) or not value:
+        return None
+    if any(c not in "0123456789" for c in value):     # no sign, space, separator or Unicode digit
+        return None
+    if value[0] == "0":                               # "0" is the MEASURED INT form only; "007" is drift
+        return None
+    if len(value) > _WHOXY_TOTAL_MAX_DIGITS:
+        return None
+    return int(value)
+
+
 def whoxy_reverse_rows(doc, *, provider: str = "whoxy") -> list:
     """A VALIDATED reverse-whois result list from an already-enveloped Whoxy body -> [domain, ...].
 
@@ -316,7 +361,8 @@ def whoxy_reverse_page(doc, *, provider: str = "whoxy", page: int = 1,
     missing both fields through unchecked, and would have accepted a page-2 response for our page-1
     request — silently attributing one slice of the answer to another. `page` is what we ASKED for, and
     the response must say it is that page."""
-    total = doc.get("total_results")
+    raw_total = doc.get("total_results")
+    total = whoxy_total(raw_total)
     # MEASURED 2026-07-27 — a genuine reverse-whois NO-MATCH (HTTP 200):
     #   {"status": 1, "api_query": "reverse_whois", "search_identifier": {"company": "<what we asked>"},
     #    "total_results": 0, "api_execution_time": 0.01}
@@ -324,7 +370,7 @@ def whoxy_reverse_page(doc, *, provider: str = "whoxy", page: int = 1,
     # total_results is 0", which was far wider than the evidence: a bare {"status":1,"total_results":0},
     # an `account_balance` answer, or a half-paged hybrid all became a clean EMPTY — re-creating the very
     # false-empty this batch exists to kill. EXACTLY TWO shapes are accepted, and nothing in between.
-    if isinstance(total, int) and not isinstance(total, bool) and total == 0:
+    if total == 0:
         sr, dl = doc.get("search_result"), doc.get("domainsList")
         cur, pages = doc.get("current_page"), doc.get("total_pages")
         # a zero count with actual rows is contradictory in EITHER supported carrier
@@ -396,9 +442,9 @@ def whoxy_reverse_page(doc, *, provider: str = "whoxy", page: int = 1,
     # false empty, one level up. The documented success schema carries total_results, so its absence,
     # its wrong type, a negative value, or a count SMALLER than the rows actually delivered are all
     # unusable cardinality and must fail closed.
-    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-        raise ProviderBodyError(PROVIDER_PARSE, f"success body has no usable total_results ({total!r})",
-                                provider)
+    if total is None:
+        raise ProviderBodyError(PROVIDER_PARSE,
+                                f"success body has no usable total_results ({raw_total!r})", provider)
     if total < len(rows):
         raise ProviderBodyError(PROVIDER_PARSE,
                                 f"total_results {total} is smaller than the {len(rows)} rows returned",

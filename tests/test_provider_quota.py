@@ -118,6 +118,81 @@ class TestWhoxyEnvelope:
         assert e.value.error_class == "parse"
 
 
+class TestWhoxyTotalResults:
+    """MEASURED 2026-07-29: Whoxy varies the TYPE of `total_results` by value — int `0` on a no-match,
+    the string `"39766"` on a non-empty answer. The int-only check fail-closed on every query that
+    actually found something, which B0 never saw because it had only ever measured the empty case."""
+
+    def test_the_MEASURED_string_form_is_accepted(self):
+        assert contract.whoxy_total("39766") == 39766
+        assert contract.whoxy_total(0) == 0 and contract.whoxy_total(39766) == 39766
+
+    @pytest.mark.parametrize("bad", [
+        True, False,                      # bool is an int subclass; `True` is not a count
+        -1, "-1", "+1",                   # signed
+        " 39766", "39766\n", "39 766",    # whitespace / separators
+        "0039766", "007",                 # non-canonical: one value, one spelling
+        "", "abc", "3.9e4", "39766.0",    # not a decimal integer at all
+        "٣٩", "³⁹",                       # Unicode digits — `str.isdigit()` accepts these
+        None, [], {}, 3.0,
+    ])
+    def test_anything_NOT_a_canonical_decimal_is_unusable(self, bad):
+        assert contract.whoxy_total(bad) is None, bad
+
+    def test_the_STRING_zero_is_an_UNMEASURED_shape(self):
+        """review-B1.6r1#1: what was measured is exact — an EMPTY answer carries the INTEGER 0, a
+        non-empty one carries a string. Accepting `"0"` would send an unmeasured body down the
+        zero-result path and produce a clean EMPTY from a shape we have never seen."""
+        assert contract.whoxy_total(0) == 0            # the measured empty
+        assert contract.whoxy_total("0") is None       # never measured; not a licence to invent one
+        assert contract.whoxy_total("00") is None
+
+    @pytest.mark.parametrize("doc", [
+        # the compact shape, which would otherwise have been read as "this query found nothing"
+        {"status": 1, "api_query": "reverse_whois",
+         "search_identifier": {"company": "Acme"}, "total_results": "0"},
+        # and the paged shape, which reaches the cardinality check itself
+        {"status": 1, "api_query": "reverse_whois", "search_identifier": {"company": "Acme"},
+         "total_results": "0", "current_page": 1, "total_pages": 1, "search_result": []},
+    ])
+    def test_a_string_zero_body_fails_CLOSED_rather_than_reading_as_empty(self, doc):
+        """The property, not the wording: a `"0"` body must never come back as a clean empty result."""
+        with pytest.raises(contract.ProviderBodyError) as e:
+            contract.whoxy_reverse_page(contract.whoxy_envelope(doc), page=1,
+                                        param="company", value="Acme")
+        assert e.value.error_class == contract.PROVIDER_PARSE, e.value.error_class
+
+    @pytest.mark.parametrize("n", [16, 4301, 5000])
+    def test_an_OVERLONG_digit_string_returns_None_and_never_RAISES(self, n):
+        """review-B1.6r1#2: CPython refuses to convert an over-long decimal string, so a long run of
+        digits passed the character check and then made `int()` raise — breaking the one promise this
+        function makes, that unusable input comes back as None."""
+        assert contract.whoxy_total("1" * n) is None
+
+    def test_the_bound_is_generous_enough_for_any_real_count(self):
+        assert contract.whoxy_total("1" * 15) == int("1" * 15)
+
+    def test_a_REAL_measured_page_parses(self):
+        """The live body that production used to reject, as a fixture."""
+        doc = {"status": 1, "api_query": "reverse_whois",
+               "search_identifier": {"company": "Deutsche Telekom AG"},
+               "total_results": "39766", "total_pages": 398, "current_page": 1,
+               "search_result": [{"domain_name": f"d{i}.example.com"} for i in range(100)]}
+        rows, total, truncated = contract.whoxy_reverse_page(
+            contract.whoxy_envelope(doc), page=1, param="company", value="Deutsche Telekom AG")
+        assert len(rows) == 100 and total == 39766 and truncated is True
+
+    def test_a_garbled_total_still_fails_CLOSED(self):
+        doc = {"status": 1, "api_query": "reverse_whois",
+               "search_identifier": {"company": "Acme"}, "total_results": "3 9766",
+               "total_pages": 1, "current_page": 1,
+               "search_result": [{"domain_name": "a.example.com"}]}
+        with pytest.raises(contract.ProviderBodyError) as e:
+            contract.whoxy_reverse_page(contract.whoxy_envelope(doc), page=1,
+                                        param="company", value="Acme")
+        assert "no usable total_results" in e.value.reason and "'3 9766'" in e.value.reason
+
+
 class TestWhoxyResultSchema:
     def test_bodiless_success_is_schema_drift_not_an_empty_answer(self):
         """`{"status": 1}` alone used to read as a confident empty result. The documented success body
@@ -160,7 +235,11 @@ class TestWhoxyResultSchema:
         rows, total, truncated = whoxy_reverse_page(json.loads(WHOXY_OK))
         assert len(rows) == 2 and total == 2 and truncated is False
 
-    @pytest.mark.parametrize("total", [None, "12", -1, True, 1.5])
+    # MEASURED 2026-07-29: `"12"` was in this list, asserting that a decimal STRING is unusable — and
+    # a canonical decimal string is exactly what Whoxy sends for every non-empty answer. The case was
+    # written from the documented schema, so it pinned the bug rather than catching it. Non-canonical
+    # strings are still unusable and are covered by TestWhoxyTotalResults.
+    @pytest.mark.parametrize("total", [None, " 12", "-1", -1, True, 1.5])
     def test_unusable_cardinality_fails_closed(self, total):
         """review-B0r2#4: 'no cardinality claim' let a drifted body finish CLEAN — the same fail-open
         shape as the original false empty, one level up. The documented success schema carries
