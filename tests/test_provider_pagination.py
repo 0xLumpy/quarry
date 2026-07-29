@@ -504,6 +504,9 @@ class TestCloudDiscoverCoverage:
         assert cloud.discover(ctx) == 0 and not recorded
 
 
+SHODAN_AUTH_BODY = ("<html>\n <head>\n  <title>401 Unauthorized</title>\n </head>\n <body>\n"
+                    "  <h1>401 Unauthorized</h1>\n  This server could not verify that you are "
+                    "authorized to access the document you requested.<br/><br/>\n </body>\n</html>")
 SHODAN_QUOTA_BODY = ('{"error": "Insufficient query credits, please upgrade your API plan or wait for '
                      'the monthly limit to reset"}')
 
@@ -514,6 +517,11 @@ def _http_err(code, body):
     return urllib.error.HTTPError("http://x", code, "msg", {}, io.BytesIO(body.encode()))
 
 
+def probe_mod():
+    from quarry_recon.phases import probe
+    return probe
+
+
 def _with_balance(responder, *, credits=100):
     """Answer `/api-info` from a HEALTHY balance and send everything else to `responder`.
 
@@ -521,6 +529,16 @@ def _with_balance(responder, *, credits=100):
     EVERY url makes the balance read consume the scenario's first scripted response. `/api-info` is free
     and keeps working at a zero balance (measured), so a fixture where it fails alongside the search is
     testing a state Shodan does not produce."""
+    class _Cnt:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n=None):
+            return json.dumps({"total": 10}).encode()
+
     class _Bal:
         def __enter__(self):
             return self
@@ -533,6 +551,8 @@ def _with_balance(responder, *, credits=100):
                                "usage_limits": {"query_credits": credits}}).encode()
 
     def route(req, timeout=20):
+        if "host/count" in str(getattr(req, "full_url", req)):
+            return _Cnt()
         if "api-info" in str(getattr(req, "full_url", req)):
             return _Bal()
         return responder(req, timeout=timeout)
@@ -540,6 +560,12 @@ def _with_balance(responder, *, credits=100):
 
 
 class TestShodanPivot:
+    @pytest.fixture(autouse=True)
+    def _no_real_sleep(self, monkeypatch):
+        """B1.5 pacing is real, so a scripted 429 now costs wall-clock. Tests that are ABOUT pacing
+        install their own recorder (applied later, so it wins); every other test just must not wait."""
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: None)
+
     def _ctx(self, tmp_path):
         from types import SimpleNamespace
         events.reset(); events.configure(tmp_path)
@@ -569,8 +595,13 @@ class TestShodanPivot:
         # never a silent clean EMPTY. Coverage is still emitted before the raise.
         with pytest.raises(urllib.error.HTTPError):
             probe._shodan_pivot(ctx, "badkey", ["h1", "h2"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
+        # review-B1.5r4#2: this used to assert BOTH pivots auth-failed — i.e. it locked in asking a
+        # rejected credential once per pivot. A proven refusal stops requesting: the first pivot fails
+        # and is classified, and the rest are a counted, resumable remainder rather than more refusals.
         piv = self._cov(tmp_path, "shodan_pivots")
-        assert piv and piv[0]["omitted"] == 2 and "auth" in (piv[0].get("reason") or "")   # both auth-failed, recorded
+        assert piv and piv[0]["omitted"] == 1 and "auth" in (piv[0].get("reason") or "")
+        unq = self._cov(tmp_path, "shodan_pivots_unqueried")
+        assert unq and unq[0]["omitted"] == 1 and unq[0]["kind"] == "timeout", unq
 
     def test_all_fail_via_run_provider_is_failed_terminal(self, monkeypatch, tmp_path):
         # end-to-end: total failure -> run_provider FAILED terminal with the classified error (not EMPTY)
@@ -639,8 +670,10 @@ class TestShodanPivot:
         # the ledger, instead of one appended JSONL per pivot. The provenance property is unchanged and
         # is what this test protects: the artifact a host's `raw_ref` points at really does contain that
         # host's row — never sliced, never truncated.
-        art = list((tmp_path / "raw" / "probe" / "shodan").rglob("*.json"))
-        art = [q for q in art if q.name != ".quarry-write-probe"]
+        # B1.5: the attempt dir also holds free /host/count sizing evidence — the provider's EXACT
+        # bytes, which carry no `matches`. Select the PAGE doc.
+        art = [q for q in (tmp_path / "raw" / "probe" / "shodan").rglob("*.json")
+               if q.name != ".quarry-write-probe" and "matches" in json.loads(q.read_text())]
         assert len(art) == 1, [str(q) for q in art]
         rows = json.loads(art[0].read_text())["matches"]
         assert len(rows) == 1000                              # COMPLETE — no truncation
@@ -1043,6 +1076,448 @@ class TestShodanPivot:
         cov = self._cov(tmp_path, "shodan_oos_retained")[0]
         assert cov["omitted"] == 2 and cov["kind"] == "timeout", cov
         assert "could not be identified" in cov["reason"]
+
+    def _sized(self, monkeypatch, tmp_path, *, counts, search=None, credits=100, pivots=("hX",),
+               trace=None, api_info=None, seen=None):
+        """Drive the real lane with a scripted /host/count per pivot value."""
+        from quarry_recon.phases import probe
+        calls = seen if seen is not None else []
+
+        def route(req, timeout=20):
+            url = str(req.full_url)
+            calls.append(url)
+            if "api-info" in url:        # answered HERE, not by _with_balance, so the scripted counts
+                if api_info is not None:   # below are the ones the lane actually receives
+                    raise api_info
+                return _Resp(json.dumps(
+                    {"query_credits": credits, "scan_credits": 0,
+                     "usage_limits": {"query_credits": max(credits, 1)}}).encode())
+            if "host/count" in url:
+                if trace is not None:
+                    trace.append("count")
+                v = url.split("%3A")[-1]
+                got = counts.get(v, counts.get("*"))
+                if isinstance(got, Exception):
+                    raise got
+                return _Resp(json.dumps({"total": got} if got is not None else {"nope": 1}).encode())
+            if trace is not None:
+                trace.append("search")
+            if search is not None:
+                return search(req, timeout=timeout)
+            return _Resp(json.dumps({"total": 50, "matches": []}).encode())
+
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.urllib.request, "urlopen", route)
+        ctx, added = self._ctx(tmp_path)
+        probe._shodan_pivot(ctx, "k", list(pivots), "http.favicon.hash", "favicon-shodan",
+                            "probe.favicon", "{}")
+        return calls, added
+
+    def _ledger_events(self, tmp_path, field):
+        return [json.loads(l)[field] for l in (tmp_path / "events.jsonl").read_text().splitlines()
+                if f'"{field}"' in l]
+
+    def _sizing(self, tmp_path):
+        ev = self._ledger_events(tmp_path, "shodan_sizing")
+        assert ev, "no sizing telemetry was emitted"
+        return ev[-1]
+
+    def test_sizing_order_is_CROSS_LANE_FAIR(self, monkeypatch, tmp_path):
+        """review-B1.5r1#2: sizing walked lane by lane, so an early stop sized every favicon pivot and
+        no certificate one — a provider slowdown deciding which lane got ordered at all."""
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+        calls = []
+
+        def route(req, timeout=20):
+            url = str(req.full_url)
+            calls.append(url)
+            if "api-info" in url:
+                return _Resp(json.dumps({"query_credits": 50, "scan_credits": 0,
+                                         "usage_limits": {"query_credits": 50}}).encode())
+            if "host/count" in url:
+                return _Resp(json.dumps({"total": 10}).encode())
+            return _Resp(json.dumps({"total": 10, "matches": []}).encode())
+
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(probe.urllib.request, "urlopen", route)
+        ctx, _ = self._ctx(tmp_path)
+        ctx.run.read = lambda e: ([{"favicon": "F1"}, {"favicon": "F2"}] if e == "live"
+                                  else [{"sha1": "C1"}, {"sha1": "C2"}] if e == "certificate" else [])
+        probe._shodan_pivots(ctx)
+        lanes = ["cert" if "ssl.cert" in c else "fav" for c in calls if "host/count" in c]
+        assert lanes == ["cert", "fav", "cert", "fav"], lanes
+
+    def test_EVERY_eligible_pivot_is_counted(self, monkeypatch, tmp_path):
+        calls, _ = self._sized(monkeypatch, tmp_path, counts={"*": 50},
+                               pivots=("hA", "hB", "hC"))
+        counted = {c.split("%3A")[-1] for c in calls if "host/count" in c}
+        assert counted == {"hA", "hB", "hC"}, counted
+
+    def test_sizing_spends_ZERO_query_credits(self, monkeypatch, tmp_path):
+        """`/host/count` is free; only `/host/search` consumes a credit. Sizing is a SEPARATE pass that
+        issues nothing but counts — so every count precedes the first paid request, and the number of
+        paid requests is unchanged by sizing."""
+        calls, _ = self._sized(monkeypatch, tmp_path, counts={"*": 500}, pivots=("hA", "hB"))
+        kinds = ["count" if "host/count" in c else "search" if "host/search" in c else "info"
+                 for c in calls]
+        assert kinds.count("count") == 2
+        assert kinds.index("search") > max(i for i, k in enumerate(kinds) if k == "count"), kinds
+
+    def test_a_genuine_ZERO_count_is_KNOWN_and_orders_FIRST(self, monkeypatch, tmp_path):
+        """The other side of "never read unknown as zero": a real zero must not be demoted to unknown
+        either. It is the rarest possible pivot, so it is queried first — and an unsized pivot, which we
+        know nothing about, is queried last."""
+        calls, _ = self._sized(monkeypatch, tmp_path,
+                               counts={"hZERO": 0, "hBIG": 500,
+                                       "hUNK": urllib.error.URLError("refused")},
+                               pivots=("hZERO", "hBIG", "hUNK"))
+        seen, order = set(), []
+        for c in calls:
+            if "host/search" not in c:
+                continue
+            v = c.split("%3A")[-1].split("&")[0]
+            if v not in seen:                 # FIRST page of each pivot: the tier ordering under test
+                seen.add(v)
+                order.append(v)
+        assert order == ["hZERO", "hBIG", "hUNK"], order
+
+    def test_a_ZERO_count_never_marks_a_pivot_COMPLETE(self, monkeypatch, tmp_path):
+        """Cardinality orders work; it may not decide that there is none. A pivot Shodan currently counts
+        at zero is still queried — the count is a sizing hint, not an oracle."""
+        calls, _ = self._sized(monkeypatch, tmp_path, counts={"*": 0}, pivots=("hA", "hB"))
+        bought = {c.split("%3A")[-1].split("&")[0] for c in calls if "host/search" in c}
+        assert bought == {"hA", "hB"}, bought
+
+    def test_sizing_still_runs_at_a_ZERO_paid_balance(self, monkeypatch, tmp_path):
+        """Free operations continue when paid credits are exhausted or reserved."""
+        def never_search(req, timeout=20):
+            raise AssertionError("a paid search was issued at a zero balance")
+
+        calls, _ = self._sized(monkeypatch, tmp_path, counts={"*": 500}, search=never_search,
+                               credits=0, pivots=("hA", "hB"))
+        assert len([c for c in calls if "host/count" in c]) == 2, calls
+
+    def test_a_FAILED_count_leaves_its_pivot_ELIGIBLE(self, monkeypatch, tmp_path):
+        """One failed count neither drops nor permanently demotes its pivot: it is still bought."""
+        calls, _ = self._sized(monkeypatch, tmp_path,
+                               counts={"hBAD": urllib.error.URLError("refused"), "*": 10},
+                               pivots=("hBAD", "hOK"))
+        bought = {c.split("%3A")[-1].split("&")[0] for c in calls if "host/search" in c}
+        assert bought == {"hBAD", "hOK"}, bought
+
+    def test_a_MALFORMED_count_is_unknown_not_zero(self, monkeypatch, tmp_path):
+        calls, _ = self._sized(monkeypatch, tmp_path, counts={"*": None}, pivots=("hA",))
+        assert [c for c in calls if "host/search" in c], "a malformed count suppressed the search"
+        sz = self._sizing(tmp_path)
+        assert sz["attempted"] == 1 and sz["succeeded"] == 0, sz
+        assert sz["failed_by_class"] == {"parse": 1}, sz
+
+    def test_a_429_is_HONORED_by_the_paid_run_too(self, monkeypatch, tmp_path):
+        """review-B1.5r1#2: sizing stopped on a 429 and paid search began immediately, so the provider's
+        slowdown was heard and ignored. One cooldown, shared — the paid request waits it out."""
+        waits = []
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: waits.append(s))
+        calls, _ = self._sized(monkeypatch, tmp_path,
+                               counts={"hA": _http_err(429, "slow down"), "*": 10},
+                               pivots=("hA", "hB"))
+        assert waits, "no cooldown was observed after a 429"
+        first_search = min(i for i, c in enumerate(calls) if "host/search" in c)
+        assert first_search > 0 and waits, calls
+
+    def test_the_cooldown_is_honored_BEFORE_the_next_count(self, monkeypatch, tmp_path):
+        """Not just "a sleep happened somewhere": the wait must fall BETWEEN the 429 and the next
+        request, which is the only thing that makes it pacing."""
+        seq = []
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: seq.append("sleep"))
+        calls, _ = self._sized(monkeypatch, tmp_path,
+                               counts={"hA": _http_err(429, "slow"), "*": 10},
+                               pivots=("hA", "hB"), trace=seq)
+        counts = [i for i, s in enumerate(seq) if s == "count"]
+        sleeps = [i for i, s in enumerate(seq) if s == "sleep"]
+        assert len(counts) == 2 and sleeps, seq
+        assert counts[0] < sleeps[0] < counts[1], seq
+
+    def test_the_cooldown_is_honored_BEFORE_the_first_PAID_request(self, monkeypatch, tmp_path):
+        """A 429 on the LAST sized pivot leaves no further count to pace — the paid run must still wait,
+        which is the half that was heard and ignored."""
+        seq = []
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: seq.append("sleep"))
+        self._sized(monkeypatch, tmp_path, counts={"hA": _http_err(429, "slow")},
+                    pivots=("hA",), trace=seq)
+        assert seq.count("count") == 1, seq
+        assert "sleep" in seq and seq.index("sleep") < seq.index("search"), seq
+
+    def test_an_API_INFO_429_paces_the_FIRST_count(self, monkeypatch, tmp_path):
+        """review-B1.5r2#1: the balance read sat outside the shared cooldown, so a 429 there was followed
+        immediately by a count for every pivot."""
+        seq = []
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: seq.append("sleep"))
+        self._sized(monkeypatch, tmp_path, counts={"*": 10}, pivots=("hA",), trace=seq,
+                    api_info=_http_err(429, "slow down"))
+        assert "sleep" in seq and seq.index("sleep") < seq.index("count"), seq
+
+    def test_a_PROVEN_BAD_KEY_issues_no_counts_at_all(self, monkeypatch, tmp_path):
+        """Free is not a licence to hammer: the contract continues free operations only while Shodan
+        still ACCEPTS the key. A rejected credential used to cost one count per pivot."""
+        # a rejected credential is a DEFECT, so the lane also raises a classified failure (B1.4r2#3);
+        # the sizing telemetry is emitted before that, which is the point under test here.
+        with pytest.raises(Exception):
+            self._sized(monkeypatch, tmp_path, counts={"*": 10}, pivots=("hA", "hB", "hC"),
+                        api_info=_http_err(401, SHODAN_AUTH_BODY))
+        calls = self._ledger_events(tmp_path, "shodan_count")
+        assert calls == [], calls
+        sz = self._sizing(tmp_path)
+        assert sz["attempted"] == 0 and sz["not_attempted"] == 3, sz
+        assert sz["stop_reason"] == "auth_refused", sz
+
+    def test_a_QUOTA_balance_still_allows_free_counts(self, monkeypatch, tmp_path):
+        """The control: quota means the SPEND is refused, not the key — sizing continues."""
+        calls, _ = self._sized(monkeypatch, tmp_path, counts={"*": 10}, pivots=("hA", "hB"),
+                               credits=0)
+        assert len([c for c in calls if "host/count" in c]) == 2, calls
+
+    def test_a_PAID_429_is_paced_and_recorded(self, monkeypatch, tmp_path):
+        """review-B1.5r3#1: only one wait ran, before the whole paid loop, so a 429 mid-purchase was
+        neither noted nor honored and the scheduler moved straight to the next pivot."""
+        seq = []
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: seq.append("sleep"))
+        hits = {"n": 0}
+
+        def flaky(req, timeout=20):
+            hits["n"] += 1
+            if hits["n"] == 1:
+                raise _http_err(429, "slow down")
+            return _Resp(json.dumps({"total": 10, "matches": []}).encode())
+
+        self._sized(monkeypatch, tmp_path, counts={"*": 10}, search=flaky,
+                    pivots=("hA", "hB"), trace=seq)
+        searches = [i for i, s in enumerate(seq) if s == "search"]
+        sleeps = [i for i, s in enumerate(seq) if s == "sleep"]
+        assert len(searches) >= 2 and sleeps, seq
+        assert any(searches[0] < s < searches[1] for s in sleeps), seq
+
+    def test_a_paid_AUTH_refusal_stops_the_run_and_stays_a_GAP(self, monkeypatch, tmp_path):
+        """review-B1.5r4#2: a key revoked after sizing cost one rejected paid request per pivot. It stops
+        requesting — and stays a FAILURE, because "stop asking" and "soft limit" are different facts."""
+        def revoked(req, timeout=20):
+            raise _http_err(401, SHODAN_AUTH_BODY)
+
+        calls = []
+        with pytest.raises(Exception):
+            self._sized(monkeypatch, tmp_path, counts={"*": 10}, search=revoked,
+                        pivots=("hA", "hB", "hC"), seen=calls)
+        assert len([c for c in calls if "host/search" in c]) == 1, calls
+        unq = self._cov(tmp_path, "shodan_pivots_unqueried")
+        assert unq and unq[0]["omitted"] == 2 and unq[0]["kind"] == "timeout", unq
+
+    def test_a_REPEATED_paid_429_stops_the_run_but_is_NOT_a_soft_limit(self, monkeypatch, tmp_path):
+        """review-B1.5r4#1: escalating a repeat into a provider LIMIT contradicted the shared taxonomy —
+        `contract.PROVIDER_LIMITS` excludes rate_limit — so the remainder folded as a soft limit while
+        the same exception was still remembered as a real failure. It stops the run and stays a gap."""
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: None)
+
+        def always(req, timeout=20):
+            raise _http_err(429, "slow down")
+
+        with pytest.raises(Exception):
+            self._sized(monkeypatch, tmp_path, counts={"*": 10}, search=always,
+                        pivots=("hA", "hB", "hC", "hD"))
+        unq = self._cov(tmp_path, "shodan_pivots_unqueried")
+        assert unq and unq[0]["kind"] == "timeout", unq
+        lim = self._cov(tmp_path, "shodan_pivots_limited")
+        assert lim and lim[0]["omitted"] == 0, lim
+
+    def test_a_stop_in_ONE_lane_is_explained_in_the_OTHER(self, monkeypatch, tmp_path):
+        """review-B1.5r5#1: a lane left unqueried by another lane's refused credential returned PARTIAL
+        with no class, and explained its own omission with a perfectly healthy credit balance."""
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+
+        def route(req, timeout=20):
+            url = str(req.full_url)
+            if "api-info" in url:
+                return _Resp(json.dumps({"query_credits": 50, "scan_credits": 0,
+                                         "usage_limits": {"query_credits": 50}}).encode())
+            if "host/count" in url:
+                return _Resp(json.dumps({"total": 10}).encode())
+            raise _http_err(401, SHODAN_AUTH_BODY)          # the KEY is revoked mid-run
+
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(probe.urllib.request, "urlopen", route)
+        ctx, _ = self._ctx(tmp_path)
+        ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
+                                  else [{"sha1": "C1"}] if e == "certificate" else [])
+        probe._shodan_pivots(ctx)
+        evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+        term = {e["source_id"]: e for e in evs if e.get("event") == "tool_finish"}
+        assert set(term) == {"probe.favicon", "probe.cert"}, term
+        untouched = [e for e in term.values() if e["status"] == "partial"]
+        assert untouched and untouched[0]["error_class"] == "auth", untouched
+        unq = [e for e in evs if e.get("measure") == "shodan_pivots_unqueried" and e["omitted"]]
+        assert unq and "provider_stop:auth" in unq[0]["reason"], unq
+
+    def test_a_count_refusal_reaches_the_FAILURE_coverage(self, monkeypatch, tmp_path):
+        """review-B1.5r5#2: `shodan_failures` said "no failure" about a run stopped by a rejected key,
+        because it read only page failures and the balance-read error."""
+        with pytest.raises(Exception):
+            self._sized(monkeypatch, tmp_path,
+                        counts={"hA": _http_err(401, SHODAN_AUTH_BODY), "*": 10},
+                        pivots=("hA", "hB"))
+        fail = self._cov(tmp_path, "shodan_failures")[0]
+        assert fail["omitted"] >= 1, fail
+        assert "/host/count refused the credential (auth)" in fail["reason"], fail["reason"]
+
+    def test_a_count_refusal_terminal_carries_the_CANONICAL_class(self, monkeypatch, tmp_path):
+        with pytest.raises(Exception) as exc:
+            self._sized(monkeypatch, tmp_path,
+                        counts={"hA": _http_err(401, SHODAN_AUTH_BODY), "*": 10},
+                        pivots=("hA", "hB"))
+        assert getattr(exc.value, "error_class", None) == "auth", exc.value
+
+    def test_EVERY_lane_gets_a_balance_record_when_the_run_EXPLODES(self, monkeypatch, tmp_path):
+        """review-B1.5r5r1: the single-lane seam proves ONE record survives, not one PER LANE — a
+        `finally` iterating `lanes[:1]` would pass it. Two lanes, shared coordinator, sizing explodes."""
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+            lambda req, timeout=20: _Resp(json.dumps({"total": 1, "matches": []}).encode())))
+        monkeypatch.setattr(probe, "_size_pivots",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("setup exploded")))
+        ctx, _ = self._ctx(tmp_path)
+        ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
+                                  else [{"sha1": "C1"}] if e == "certificate" else [])
+        probe._shodan_pivots(ctx)                    # ordinary failure -> best-effort, no re-raise
+        evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+        bal = [e for e in evs if (e.get("balance") or {}).get("provider") == "shodan"]
+        assert {e["source_id"] for e in bal} == {"probe.favicon", "probe.cert"}, bal
+        assert len(bal) == 2, f"{len(bal)} balance records for 2 lanes"
+
+    def test_the_balance_is_emitted_even_when_the_run_EXPLODES(self, monkeypatch, tmp_path):
+        """review-B1.5r5#3: moving the emission after sizing meant a failure in state setup, the cooldown
+        or sizing left NO balance record — the missing-lifecycle hole this telemetry exists to close."""
+        from quarry_recon.phases import probe
+        monkeypatch.setattr(probe, "_size_pivots",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("setup exploded")))
+        with pytest.raises(RuntimeError):
+            self._sized(monkeypatch, tmp_path, counts={"*": 10}, pivots=("hA",))
+        bal = self._ledger_events(tmp_path, "balance")
+        assert len(bal) == 1 and bal[0]["provider"] == "shodan", bal
+
+    def test_a_count_refusal_is_NOT_reported_as_a_balance_read_failure(self, monkeypatch, tmp_path):
+        """review-B1.5r4#3: /api-info succeeded; overwriting `read_error` made reconciliation announce
+        "balance read failed" about a read that worked, and emitted the balance twice with conflicting
+        provenance."""
+        with pytest.raises(Exception):
+            self._sized(monkeypatch, tmp_path,
+                        counts={"hA": _http_err(401, SHODAN_AUTH_BODY), "*": 10},
+                        pivots=("hA", "hB"))
+        bal = self._ledger_events(tmp_path, "balance")
+        assert len(bal) == 1, f"the balance was emitted {len(bal)} times"
+        assert bal[0]["read_error"] is None and bal[0]["count_refused"] == "auth", bal[0]
+        fail = self._cov(tmp_path, "shodan_failures")
+        assert fail and "balance read failed" not in (fail[0].get("reason") or ""), fail[0]
+
+    @pytest.mark.parametrize("bad", ["inf", "1e309", "-5", "nan", "9999999", "Wed, 21 Oct 2015"])
+    def test_a_MALFORMED_Retry_After_falls_back(self, monkeypatch, tmp_path, bad):
+        """review-B1.5r3#3: `float()` accepts inf and 1e309; `sleep(inf)` raises OverflowError and a huge
+        finite value stalls the run."""
+        waits = []
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: waits.append(s))
+        err = _http_err(429, "slow")
+        err.headers = {"Retry-After": bad}
+        self._sized(monkeypatch, tmp_path, counts={"hA": err, "*": 10}, pivots=("hA", "hB"))
+        assert waits and all(0 <= w <= 5.0 for w in waits), (bad, waits)
+
+    def test_an_AUTH_refusal_on_COUNT_stops_sizing_AND_paid_work(self, monkeypatch, tmp_path):
+        """review-B1.5r3#2: /api-info can succeed and the key be revoked a moment later. A count that
+        proves the credential is refused stopped nothing — every remaining pivot was counted and then
+        paid searches went out against the unchanged balance."""
+        with pytest.raises(Exception):
+            self._sized(monkeypatch, tmp_path,
+                        counts={"hA": _http_err(401, SHODAN_AUTH_BODY), "*": 10},
+                        pivots=("hA", "hB", "hC"))
+        sz = self._sizing(tmp_path)
+        assert sz["attempted"] == 1 and sz["stop_reason"] == "auth", sz
+        assert self._ledger_events(tmp_path, "shodan_count") == []
+
+    def test_a_FORBIDDEN_count_stops_sizing_ONLY(self, monkeypatch, tmp_path):
+        """Proven for the endpoint that said it, and nothing else: the paid lane still runs."""
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: None)
+        calls, _ = self._sized(monkeypatch, tmp_path,
+                               counts={"hA": _http_err(403, "nope"), "*": 10},
+                               pivots=("hA", "hB", "hC"))
+        assert len([c for c in calls if "host/count" in c]) == 1, calls
+        bought = {c.split("%3A")[-1].split("&")[0] for c in calls if "host/search" in c}
+        assert bought == {"hA", "hB", "hC"}, bought
+        assert self._sizing(tmp_path)["stop_reason"] == "forbidden"
+
+    def test_a_Retry_After_header_sets_the_cooldown(self, monkeypatch, tmp_path):
+        waits = []
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: waits.append(s))
+        err = _http_err(429, "slow down")
+        err.headers = {"Retry-After": "17"}
+        self._sized(monkeypatch, tmp_path, counts={"hA": err, "*": 10}, pivots=("hA", "hB"))
+        assert waits and max(waits) > 16, waits
+
+    def test_a_SINGLE_429_backs_off_and_KEEPS_sizing(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: None)
+        calls, _ = self._sized(monkeypatch, tmp_path,
+                               counts={"hA": _http_err(429, "slow"), "*": 10},
+                               pivots=("hA", "hB", "hC"))
+        assert len([c for c in calls if "host/count" in c]) == 3, calls
+
+    def test_a_REPEATED_429_stops_sizing_but_not_the_paid_run(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(probe_mod()._time, "sleep", lambda s: None)
+        calls, _ = self._sized(monkeypatch, tmp_path,
+                               counts={"*": _http_err(429, "slow")},
+                               pivots=("hA", "hB", "hC", "hD"))
+        assert len([c for c in calls if "host/count" in c]) == 2, calls
+        bought = {c.split("%3A")[-1].split("&")[0] for c in calls if "host/search" in c}
+        assert bought == {"hA", "hB", "hC", "hD"}, bought
+        sz = self._sizing(tmp_path)
+        assert sz["stop_reason"] == "rate_limit" and sz["not_attempted"] == 2, sz
+
+    def test_count_evidence_is_the_EXACT_response_bytes(self, monkeypatch, tmp_path):
+        """review-B1.5r1#3: the bytes were parsed, discarded, and a fresh document synthesized in their
+        place — the "raw evidence" was Quarry's account of the answer, not the answer."""
+        self._sized(monkeypatch, tmp_path, counts={"*": 250}, pivots=("hA",))
+        raws = [q.read_bytes() for q in (tmp_path / "raw" / "probe" / "shodan").rglob("*.json")
+                if q.name != ".quarry-write-probe" and "matches" not in json.loads(q.read_text())]
+        assert raws == [json.dumps({"total": 250}).encode()], raws
+        ev = self._ledger_events(tmp_path, "shodan_count")
+        assert len(ev) == 1 and ev[0]["value"] == "hA" and ev[0]["total"] == 250
+        assert ev[0]["facet"] == "http.favicon.hash" and ev[0]["digest"] and ev[0]["artifact"]
+
+    def test_UNBOUND_count_evidence_never_orders_paid_work(self, monkeypatch, tmp_path):
+        """Scarce credits must not be ranked by evidence we failed to keep."""
+        from quarry_recon import budget as _b
+        from quarry_recon.shodan_sched import Pivot, count_key
+        # fail ONLY the count artifact — pages and the pre-flight write probe must still publish, or the
+        # run stops for an unrelated reason and proves nothing about sizing.
+        ck = count_key(Pivot("probe.favicon", "http.favicon.hash", "hA"))
+        real = _b.publish_bytes
+        monkeypatch.setattr(_b, "publish_bytes",
+                            lambda dest, data, digest: (False if ck in str(dest)
+                                                        else real(dest, data, digest=digest)))
+        calls, _ = self._sized(monkeypatch, tmp_path, counts={"*": 250}, pivots=("hA",))
+        sz = self._sizing(tmp_path)
+        assert sz["succeeded"] == 0 and sz["evidence_failed"] == 1, sz
+        assert [c for c in calls if "host/search" in c], "the paid run was blocked by sizing"
+
+    def test_a_fully_owned_pivot_is_STILL_counted(self, monkeypatch, tmp_path):
+        """Counting is how growth beyond a completed pagination is found — an old completion is not
+        permanent. Second lifecycle: page 1 is owned, and the count must still be issued."""
+        self._sized(monkeypatch, tmp_path, counts={"*": 50}, pivots=("hA",))
+        calls, _ = self._sized(monkeypatch, tmp_path, counts={"*": 50}, pivots=("hA",))
+        assert [c for c in calls if "host/count" in c], calls
 
     def test_the_DEFAULT_page_policy_is_unbounded(self, monkeypatch, tmp_path):
         """The settled design: 0 = no Quarry-imposed limit. Nothing here patches `settings.concurrency`,

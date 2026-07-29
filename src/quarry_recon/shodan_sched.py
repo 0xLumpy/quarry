@@ -52,17 +52,36 @@ class PivotState:
     total: "int | None" = None              # the provider's own match count; None until page 1 answers
     pages_done: set = field(default_factory=set)
     attempted: bool = False                 # a request was ISSUED for this pivot (a credit was spent)
+    cardinality: "int | None" = None      # /host/count sizing, held SEPARATELY from `total` so neither
+                                          # can contaminate the other (review-B1.5r1#1)
+    count_compared: bool = False          # the count has met page evidence at least once
+    count_drifted: bool = False            # ...and the CURRENT verdict of that comparison
     stopped: str = ""                       # a class that ended this pivot early (limit or failure)
     _cursor: int = 1                        # lowest page not known-complete; never rescans the prefix
+
+    def effective_total(self) -> "int | None":
+        """What we currently believe the pivot holds, for SCHEDULING only.
+
+        review-B1.5r1#1: sizing used to be written INTO `total`, which corrupted the page-derived value
+        every later comparison depends on — two pages that agreed on 100 reported drift because a count
+        of 500 had overwritten one of them, and a count that disagreed with a fresh page reported none
+        because it had already become that page's baseline. `total` stays PURELY page-derived; the count
+        is a second, separately-held observation, and only their MAXIMUM decides how much to schedule.
+
+        None while no page has proved a total: a count alone may order a pivot, never size it."""
+        if self.total is None:
+            return None
+        return max(self.total, self.cardinality) if self.cardinality is not None else self.total
 
     def page_count(self) -> "int | None":
         """How many pages this pivot HAS, or None while unknown.
 
         An unqueried pivot has NO knowable page count, and inventing one would fabricate a denominator.
         `None` is the honest answer and the caller must not sum it into anything."""
-        if self.total is None:
+        total = self.effective_total()
+        if total is None:
             return None
-        return max(1, -(-self.total // SHODAN_PAGE_SIZE))    # ceil division
+        return max(1, -(-total // SHODAN_PAGE_SIZE))         # ceil division
 
     def next_page(self, max_pages: int = 0) -> "int | None":
         """The lowest page still owed, or None. `max_pages` 0 = unbounded (operator policy only).
@@ -91,6 +110,13 @@ class PivotState:
         if pages is None or not max_pages:
             return 0
         return sum(1 for p in range(max_pages + 1, pages + 1) if p not in self.pages_done)
+
+
+def count_key(pivot: Pivot) -> str:
+    """Identity of a pivot's /host/count evidence. A DISTINCT namespace from `item_key`, so count
+    evidence can never be mistaken for a purchased page (nor collide with page 0 of anything)."""
+    raw = f"{SHODAN_WORK_SCHEMA}|{pivot.lane}|{pivot.facet}|{pivot.value}|count"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def item_key(pivot: Pivot, page: int) -> str:
@@ -191,6 +217,16 @@ def dedupe(states: "list[PivotState]") -> "list[PivotState]":
     return out
 
 
+def _card_key(st: "PivotState"):
+    """Ordering position for a pivot's cardinality.
+
+    UNKNOWN sorts after KNOWN inside its page tier. Rare-first exists to reach the most distinct pivots
+    per credit, and an unsized pivot could be a five-million-result generic — spending ahead of a proven
+    rare one contradicts the policy. It is a position, never an exclusion: the pivot stays eligible, is
+    re-sized every lifecycle, and whatever a budget does not reach is a counted, resumable remainder."""
+    return (0, st.cardinality) if st.cardinality is not None else (1, 0)
+
+
 def schedule(states: "list[PivotState]", *, max_pages: int = 0) -> list:
     """The next round of work: at most one page per pivot, ordered PAGE TIER first and fair across lanes
     inside a tier.
@@ -199,6 +235,12 @@ def schedule(states: "list[PivotState]", *, max_pages: int = 0) -> list:
     history and push a lane's real remainder behind another lane's finished pages (the A1 lesson)."""
     pending = [(st, st.next_page(max_pages)) for st in states]
     pending = [(st, pg) for st, pg in pending if pg is not None]
+    # B1.5: cardinality orders WITHIN a lane, and must not become part of the rank TIER. `order_ranked_fair`
+    # buckets by rank and round-robins across lanes inside a bucket, so a rank of (page, cardinality) would
+    # give almost every pivot its own tier and collapse cross-lane fairness into a global cardinality sort.
+    # Pre-sorting instead keeps the tier on PAGE alone, and `order_fairly` preserves this order inside each
+    # lane — so: page one everywhere, lanes alternating, rarest first within a lane.
+    pending.sort(key=lambda it: (it[1], _card_key(it[0]), it[0].pivot.value))
     return budget.order_ranked_fair(pending, rank=lambda it: it[1],
                                     group=lambda it: it[0].pivot.lane)
 
@@ -228,6 +270,8 @@ class LaneOutcome:
     pages_left_unknown_pivots: int = 0      # pivots whose page count we cannot know
     pages_withheld: int = 0                 # pages an operator policy (max_pages) kept us from buying
     total_drift: int = 0                    # pages whose total disagreed with another page's
+    count_compared: int = 0                 # pivots whose count met a page-derived total
+    count_drift: int = 0                    # ...and disagreed with it
     evidence_invalid: int = 0               # recorded pages whose artifact did not validate
     publish_failed: int = 0                 # bought pages we could not durably record
 
@@ -258,6 +302,9 @@ def observe_total(st, o, total) -> None:
     if st.total is not None and st.total != total:
         o.total_drift += 1
     st.total = total if st.total is None else max(st.total, total)
+    # a total has just become known, so this is the moment a count can be measured against it — RETAINED
+    # or FRESH, one call site, no path left to forget (review-B1.5r1#1).
+    compare_count(st, o)
 
 
 def _page_doc(pivot: Pivot, page: int, total, matches) -> dict:
@@ -287,6 +334,13 @@ def valid_page(doc, pivot: Pivot, page: int):
     return doc
 
 
+def valid_total(total) -> bool:
+    """An EXACT non-negative integer. `bool` is excluded deliberately — it is an int subclass, so `True`
+    would otherwise pass as the total 1. Shared by page evidence and /host/count sizing so the two can
+    never disagree about what a total is."""
+    return not isinstance(total, bool) and isinstance(total, int) and total >= 0
+
+
 def valid_fresh(matches, total) -> bool:
     """Whether a page may be treated as complete — the ONE contract for fresh output and replayed
     evidence alike, since `valid_page` delegates here.
@@ -301,7 +355,7 @@ def valid_fresh(matches, total) -> bool:
     rather than bumping SHODAN_WORK_SCHEMA is deliberate: a bump invalidates every page already bought,
     including the valid ones, and would have us re-pay for them. A malformed old page simply stops being
     owned, so it is repurchased on its own."""
-    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+    if not valid_total(total):
         return False
     if not isinstance(matches, list):
         return False
@@ -325,7 +379,7 @@ def _read_page(path, pivot: Pivot, page: int):
 
 
 def run_work(ctx, *, states, balance, search, ingest, ledger, attempt_dir,
-             max_pages: int = 0, is_limit=None) -> WorkResult:
+             max_pages: int = 0, is_limit=None, should_stop=None) -> WorkResult:
     """Buy pages under the balance, replaying anything already owned.
 
     `search(pivot, page) -> (matches, total, error)` and `ingest(pivot, page, matches, raw_path) -> int`
@@ -333,6 +387,11 @@ def run_work(ctx, *, states, balance, search, ingest, ledger, attempt_dir,
     spent, `spendable` (None = no computable bound) decides how many."""
     from .contract import is_provider_limit as _default_is_limit
     is_limit = is_limit or _default_is_limit
+    # review-B1.5r4#1: "stop requesting" and "soft limit" are DIFFERENT questions, and answering the
+    # first by lying about the second put the run's own taxonomy at odds with itself. `should_stop` ends
+    # purchasing without touching classification: the class stays whatever it is, and a failure stays a
+    # gap. Only `is_limit` decides softness.
+    should_stop = should_stop or (lambda cls: False)
     states = dedupe(states)
     res = WorkResult()
     for st in states:
@@ -340,8 +399,10 @@ def run_work(ctx, *, states, balance, search, ingest, ledger, attempt_dir,
         o.pivots += 1
     try:
         _replay_indexed(states, res, ledger=ledger, ingest=ingest)
+        _apply_cardinality(states, res)
         _work(states, res, balance=balance, search=search, ingest=ingest, ledger=ledger,
-              attempt_dir=attempt_dir, max_pages=max_pages, is_limit=is_limit)
+              attempt_dir=attempt_dir, max_pages=max_pages, is_limit=is_limit,
+              should_stop=should_stop)
         _sweep_owned(states, res, ledger=ledger, ingest=ingest, max_pages=max_pages)
         _remainder(states, res, max_pages=max_pages)
     finally:
@@ -412,7 +473,52 @@ def _replay_indexed(states, res, *, ledger, ingest) -> None:
             _replay_one(st, o, page=page, ledger=ledger, ingest=ingest, owned=(art, doc))
 
 
-def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_pages, is_limit) -> None:
+def compare_count(st, o) -> None:
+    """Measure a pivot's count against its page-derived total, and keep that verdict CURRENT.
+
+    Only meaningful once a page has proved a total, and the count is compared whether that page was
+    RETAINED or FRESH — review-B1.5r1#1: comparing at one of those two moments only reported drift for
+    whichever happened to come first.
+
+    review-B1.5r2#2: "once per pivot" is the OUTCOME rule, not "only look at its first page". Freezing
+    after the first comparison froze the verdict against page 1 while `total` was still being reconciled
+    max-wins — retained totals of 100 then 500 called a count of 500 drift, and a count of 100 agreement.
+    Each pivot is still counted once in `count_compared`; its drift fact is REVISED as evidence
+    accumulates, so the run reports the comparison against the total it actually ended up with."""
+    if st.cardinality is None or st.total is None:
+        return
+    drift = st.cardinality != st.total
+    if not st.count_compared:
+        st.count_compared = True
+        st.count_drifted = drift
+        o.count_compared += 1
+        o.count_drift += 1 if drift else 0
+        return
+    if drift != st.count_drifted:                 # a later page revised the baseline
+        st.count_drifted = drift
+        o.count_drift += 1 if drift else -1
+
+
+def _apply_cardinality(states, res) -> None:
+    """Fold /host/count sizing into what we know, AFTER replay and BEFORE scheduling.
+
+    Two rules, and the boundary between them is the whole design:
+
+      · NO page-derived total  -> the count orders the pivot and NOTHING else. Letting it size the pivot
+        would give an unqueried one a page count, so it would report as `unqueried` AND as "N pages
+        left" — a phantom remainder over a denominator no page ever proved.
+      · A page-derived total   -> `effective_total` takes the MAXIMUM of the two, which is how a pivot
+        that was complete under yesterday's total discovers that new results exist instead of treating
+        an old completion as permanent. Neither value is overwritten by the other.
+
+    Runs before `_work`, so growth found here is bought in the SAME lifecycle rather than next time."""
+    for st in states:
+        compare_count(st, res.lanes[st.pivot.lane])
+
+
+def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_pages, is_limit,
+          should_stop=None) -> None:
+    should_stop = should_stop or (lambda cls: False)
     spendable = balance.spendable
     if not balance.may_spend:
         spendable = 0
@@ -502,6 +608,11 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
                     # DEGRADE, don't disable: stop buying, keep everything already earned, leave the rest
                     # as a counted remainder. The provider's boundary ends purchasing, not the run.
                     res.stop_cause = f"provider_limit:{cls}"
+                elif should_stop(cls):
+                    # a FAILURE that further requests cannot get past — a refused credential, a provider
+                    # we keep being throttled by. Purchasing ends; the class is untouched, so this reads
+                    # as the gap it is and the remainder is counted like any other.
+                    res.stop_cause = f"provider_stop:{cls}"
                 continue
             if not valid_fresh(matches, total):
                 # the provider answered, but not with something we can call a page.
@@ -612,6 +723,7 @@ def _unqueried_kind(balance, stop_cause: str = "") -> str:
             return events.COVERAGE_SAMPLE                # the OPERATOR withheld the rest
         if stop_cause == "budget_provider" or stop_cause.startswith("provider_limit:"):
             return events.COVERAGE_PROVIDER              # the provider's balance was the boundary
+        # provider_stop:* is a FAILURE we stopped requesting through — a gap, never a soft limit.
         # publish_failed / ledger_unwritable / scheduler_invariant — all OURS, all defects
         return events.COVERAGE_TIMEOUT
     kind = getattr(balance, "stop_kind", "") or ""
@@ -630,11 +742,14 @@ def report(lane: str, outcome: LaneOutcome, *, balance, persisted: bool = True,
     remainder, and split so that WHO stopped us stays visible."""
     kind = _unqueried_kind(balance, stop_cause)
     unq = len(outcome.unqueried)
+    # review-B1.5r5#1: the reason always quoted the BALANCE, so a lane left unqueried because another
+    # lane's credential was refused explained itself with a perfectly healthy credit balance. The
+    # scheduler's own answer comes first; the balance is the fallback for stops it settled beforehand.
+    why = stop_cause or getattr(balance, "reason", "")
     events.coverage_partial(lane, kind=kind, measure="shodan_pivots_unqueried",
                             unit=f"{lane}.unqueried", eligible=outcome.pivots,
                             tested=outcome.pivots - unq, omitted=unq,
-                            reason=(f"{unq}/{outcome.pivots} pivot(s) never queried — "
-                                    f"{getattr(balance, 'reason', '')}" if unq else
+                            reason=(f"{unq}/{outcome.pivots} pivot(s) never queried — {why}" if unq else
                                     f"all {outcome.pivots} pivot(s) queried"))
     # pages are counted ONLY where the total is known. A pivot we never bought a page for has no knowable
     # page count, and an invented denominator is the same class of lie as an unmeasured zero.
@@ -717,6 +832,12 @@ def report(lane: str, outcome: LaneOutcome, *, balance, persisted: bool = True,
     read_limited = bool(read_err) and _is_limit(read_err)
     if read_err and not read_limited:
         fails += 1
+    # review-B1.5r5#2: a credential refused by the FREE count endpoint is a failure of this run's ability
+    # to work at all. It is not a balance-read error (that read succeeded), so it needed its own term —
+    # without it `shodan_failures` said "no failure" about a run stopped by a rejected key.
+    count_refused = getattr(balance, "count_refused", None)
+    if count_refused:
+        fails += 1
     denom = max(1, outcome.pivots)
     events.coverage_partial(lane, kind=events.COVERAGE_TIMEOUT, measure="shodan_failures",
                             unit=f"{lane}.failed", eligible=denom,
@@ -728,6 +849,8 @@ def report(lane: str, outcome: LaneOutcome, *, balance, persisted: bool = True,
                                        if outcome.publish_failed else "")
                                     + (f", balance read failed ({read_err})"
                                        if read_err and not read_limited else "")
+                                    + (f", /host/count refused the credential ({count_refused})"
+                                       if count_refused else "")
                                     if fails else
                                     (f"no failure (balance read stopped by a provider limit: {read_err})"
                                      if read_limited else "no failure")))

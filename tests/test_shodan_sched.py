@@ -1204,6 +1204,182 @@ class TestRowContractOnReplay:
         assert valid_fresh([{}], 1) is True
 
 
+class TestCardinalityOrdering:
+    """B1.5: /host/count sizes pivots. Cardinality orders work and NEVER removes, caps, or completes it."""
+
+    def _sched(self, states, **kw):
+        from quarry_recon.shodan_sched import schedule
+        return [(st.pivot.lane, st.pivot.value, pg) for st, pg in schedule(states, **kw)]
+
+    def _st(self, lane, value, card=None, total=None, done=()):
+        s = PivotState(Pivot(lane, "facet", value), total=total)
+        s.cardinality = card
+        for pg in done:
+            s.pages_done.add(pg)
+        return s
+
+    def test_rare_pivots_run_before_generic_ones(self, tmp_path):
+        got = self._sched([self._st(FAV, "generic", 500000), self._st(FAV, "rare", 12),
+                           self._st(FAV, "mid", 900)])
+        assert [v for _l, v, _p in got] == ["rare", "mid", "generic"]
+
+    def test_ordering_never_changes_MEMBERSHIP(self, tmp_path):
+        states = [self._st(FAV, "generic", 5000000), self._st(FAV, "rare", 1)]
+        assert len(self._sched(states)) == 2, "a pivot was dropped by ranking"
+
+    def test_PAGE_TIER_still_outranks_cardinality(self, tmp_path):
+        """Breadth before depth: every pivot's page 1 precedes any pivot's page 2, however rare."""
+        rare_deep = self._st(FAV, "rare", 1, total=500, done=(1,))
+        generic_shallow = self._st(FAV, "generic", 500000)
+        got = self._sched([rare_deep, generic_shallow])
+        assert got == [(FAV, "generic", 1), (FAV, "rare", 2)], got
+
+    def test_lanes_still_alternate_within_a_page_tier(self, tmp_path):
+        """review-B1.5: cardinality must not enter the rank TIER — that would bucket almost every pivot
+        alone and collapse cross-lane fairness into a global cardinality sort."""
+        got = self._sched([self._st(FAV, "f1", 10), self._st(FAV, "f2", 20),
+                           self._st(CERT, "c1", 15), self._st(CERT, "c2", 25)])
+        assert [l for l, _v, _p in got] == [CERT, FAV, CERT, FAV], got
+        assert [v for _l, v, _p in got] == ["c1", "f1", "c2", "f2"], got
+
+    def test_an_UNSIZED_pivot_is_ordered_last_but_never_dropped(self, tmp_path):
+        got = self._sched([self._st(FAV, "unknown", None), self._st(FAV, "generic", 999999)])
+        assert [v for _l, v, _p in got] == ["generic", "unknown"], got
+
+    def test_unsized_pivots_are_ordered_DETERMINISTICALLY(self, tmp_path):
+        a = self._sched([self._st(FAV, "b", None), self._st(FAV, "a", None)])
+        b = self._sched([self._st(FAV, "a", None), self._st(FAV, "b", None)])
+        assert a == b == [(FAV, "a", 1), (FAV, "b", 1)]
+
+
+class TestCardinalityFold:
+    def _fold(self, st):
+        from quarry_recon.shodan_sched import LaneOutcome, WorkResult, _apply_cardinality
+        res = WorkResult()
+        res.lanes[st.pivot.lane] = LaneOutcome(lane=st.pivot.lane, pivots=1)
+        _apply_cardinality([st], res)
+        return st, res.lanes[st.pivot.lane]
+
+    def test_an_UNQUERIED_pivot_gets_no_phantom_remainder(self):
+        """The boundary: a count may order a pivot we have never bought, and may NOT give it a page
+        count — it would report as `unqueried` AND as "N pages left" over a denominator no page proved."""
+        st = PivotState(Pivot(FAV, "facet", "a"))
+        st.cardinality = 500
+        st, o = self._fold(st)
+        assert st.total is None and st.effective_total() is None and st.page_count() is None
+        assert o.count_compared == 0 and o.count_drift == 0
+
+    def test_a_HIGHER_count_EXPANDS_a_known_remainder(self):
+        """Growth beyond a completed pagination: yesterday's total is not permanent. The PAGE total is
+        left intact — only the EFFECTIVE total grows (review-B1.5r1#1)."""
+        st = PivotState(Pivot(FAV, "facet", "a"), total=100)
+        st.pages_done.add(1)
+        st.cardinality = 500
+        st, o = self._fold(st)
+        assert st.total == 100, "the count contaminated the page-derived total"
+        assert st.effective_total() == 500 and st.page_count() == 5
+        assert st.next_page() == 2, "the newly known pages are not schedulable"
+        assert o.count_drift == 1 and o.count_compared == 1
+
+    def test_a_LOWER_count_keeps_the_MAXIMUM(self):
+        st = PivotState(Pivot(FAV, "facet", "a"), total=500)
+        st.pages_done.add(1)
+        st.cardinality = 100
+        st, o = self._fold(st)
+        assert st.total == 500 and st.effective_total() == 500 and o.count_drift == 1
+
+    def test_an_AGREEING_count_is_not_drift(self):
+        st = PivotState(Pivot(FAV, "facet", "a"), total=300)
+        st.cardinality = 300
+        st, o = self._fold(st)
+        assert st.total == 300 and o.count_drift == 0 and o.count_compared == 1
+
+    def test_a_count_does_NOT_make_two_agreeing_pages_look_like_DRIFT(self, tmp_path):
+        """review-B1.5r1#1, reproduction one: page 1 says 100, the count says 500, page 2 says 100. The
+        pages agree with each other; only the COUNT disagrees, and each fact must be reported as itself."""
+        led = _ledger(tmp_path)
+        states = _states((FAV, "a"))
+        states[0].cardinality = 500
+        p = _Provider(totals={"a": 100})
+        res, _ = _res(tmp_path, states, p, balance=_Bal(spendable=None), ledger=led)
+        o = res.lanes[FAV]
+        assert o.total_drift == 0, "two agreeing pages were reported as drifting"
+        assert o.count_drift == 1 and o.count_compared == 1
+
+    def test_a_count_IS_compared_against_a_RETAINED_page_total(self, tmp_path):
+        """The replay half: a pivot bought in an earlier lifecycle has its total on disk, so a count is
+        measured against THAT with nothing fresh bought at all."""
+        led = _ledger(tmp_path)
+        _res(tmp_path, _states((FAV, "a")), _Provider(totals={"a": 100}), balance=_Bal(spendable=1),
+             ledger=led)
+        states = _states((FAV, "a"))
+        states[0].cardinality = 500
+        p = _Provider(totals={"a": 100})
+        res, _ = _res(tmp_path, states, p, balance=_Bal(spendable=0), ledger=_ledger(tmp_path))
+        o = res.lanes[FAV]
+        assert p.calls == [], "the fixture bought a fresh page; this tests the RETAINED path"
+        assert o.pages_replayed == 1 and o.count_compared == 1 and o.count_drift == 1
+
+    def test_a_count_IS_compared_against_a_FRESH_page_total(self, tmp_path):
+        """Reproduction two: nothing retained, count 100, the first search returns 500. Comparing only
+        at fold time reported no drift because no page total existed yet."""
+        led = _ledger(tmp_path)
+        states = _states((FAV, "a"))
+        states[0].cardinality = 100
+        res, _ = _res(tmp_path, states, _Provider(totals={"a": 500}), balance=_Bal(spendable=1),
+                      ledger=led)
+        o = res.lanes[FAV]
+        assert o.count_compared == 1 and o.count_drift == 1
+
+    def test_drift_is_measured_against_the_FINAL_reconciled_total(self, tmp_path):
+        """review-B1.5r2#2: retained totals 150 then 500, count 500. Freezing the verdict on page 1
+        called that drift; the total it actually ended up with is 500, so it AGREES."""
+        led = _ledger(tmp_path)
+        p = _Provider(totals={("a", 1): 150, ("a", 2): 500, "a": 500})
+        _res(tmp_path, _states((FAV, "a")), p, balance=_Bal(spendable=2), ledger=led)
+        states = _states((FAV, "a"))
+        states[0].cardinality = 500
+        res, _ = _res(tmp_path, states, _Provider(totals={"a": 500}), balance=_Bal(spendable=0),
+                      ledger=_ledger(tmp_path))
+        o = res.lanes[FAV]
+        assert o.pages_replayed == 2 and o.count_compared == 1
+        assert o.count_drift == 0, "a count matching the reconciled total was reported as drift"
+
+    def test_a_count_matching_only_the_FIRST_page_is_drift(self, tmp_path):
+        """The mirror: count 150 agrees with page 1 and disagrees with the reconciled 500."""
+        led = _ledger(tmp_path)
+        p = _Provider(totals={("a", 1): 150, ("a", 2): 500, "a": 500})
+        _res(tmp_path, _states((FAV, "a")), p, balance=_Bal(spendable=2), ledger=led)
+        states = _states((FAV, "a"))
+        states[0].cardinality = 150
+        res, _ = _res(tmp_path, states, _Provider(totals={"a": 500}), balance=_Bal(spendable=0),
+                      ledger=_ledger(tmp_path))
+        o = res.lanes[FAV]
+        assert o.pages_replayed == 2 and o.count_compared == 1 and o.count_drift == 1
+
+    def test_a_count_is_compared_ONCE_per_pivot(self, tmp_path):
+        led = _ledger(tmp_path)
+        states = _states((FAV, "a"))
+        states[0].cardinality = 100
+        res, _ = _res(tmp_path, states, _Provider(totals={"a": 500}), balance=_Bal(spendable=None),
+                      ledger=led)
+        o = res.lanes[FAV]
+        assert o.count_compared == 1, "the same pivot was compared on every page"
+
+    def test_an_UNKNOWN_count_is_never_read_as_zero(self):
+        st = PivotState(Pivot(FAV, "facet", "a"), total=300)
+        st.cardinality = None
+        st, o = self._fold(st)
+        assert st.total == 300 and st.effective_total() == 300
+        assert o.count_compared == 0 and o.count_drift == 0
+
+    def test_a_MALFORMED_total_fails_closed_as_unknown(self):
+        from quarry_recon.shodan_sched import valid_total
+        for bad in (True, False, -1, 1.0, "5", None, [], {}):
+            assert valid_total(bad) is False, bad
+        assert valid_total(0) is True and valid_total(500) is True
+
+
 class TestDriftTelemetry:
     def test_drift_is_REPORTED_not_just_counted(self, tmp_path):
         """The user's integration requirement: `total_drift` must reach telemetry. It is a soft PROVIDER

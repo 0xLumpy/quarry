@@ -1114,16 +1114,22 @@ class _Body:
         return False
 
 
-def _with_balance(responder, *, credits=100, allowance=100):
+def _with_balance(responder, *, credits=100, allowance=100, count_total=10):
     """Answer `/api-info` from a HEALTHY balance and send everything else to `responder`.
 
     B1.4: the lane reads the credit balance before it schedules any paid page, so a responder that
     answers EVERY url would have the balance read consume the first scripted error. `/api-info` is free
     and keeps working at a zero balance (measured), so a fixture where it fails alongside the search is
     testing a state Shodan does not produce. Tests that want a depleted ACCOUNT say so with `credits=0`;
-    tests that want a failing SEARCH leave the balance healthy."""
+    tests that want a failing SEARCH leave the balance healthy.
+
+    B1.5: `/shodan/host/count` is answered here too. It is FREE and keeps working at a zero balance, so a
+    fixture that routed it to the scenario's responder would have sizing consume the scripted errors that
+    the PAID search is supposed to receive."""
     def route(req, timeout=20):
         url = getattr(req, "full_url", req)
+        if "host/count" in str(url):
+            return _Body(json.dumps({"total": count_total}))
         if "api-info" in str(url):
             return _Body(json.dumps({"query_credits": credits, "scan_credits": 0,
                                      "usage_limits": {"query_credits": allowance}}))
@@ -1739,3 +1745,24 @@ class TestLaterPagePositionAccounting:
         left = self._cov(d, "shodan_pages_left")[0]
         assert left["omitted"] >= 1, left
         assert s["verdict"] == "complete_with_gaps"
+
+
+class TestBalanceReasonMatchesTheGate:
+    """review-B1.5r3#4: the reason told every operator that "free operations continue" — which stopped
+    being true once a REFUSED CREDENTIAL began blocking free /host/count sizing too. Operator-visible
+    telemetry that contradicts the behaviour is worse than none."""
+
+    def _reason(self, cls):
+        from quarry_recon.phases import probe
+        return probe._blocked_read(probe.shodan_balance(None), cls).reason
+
+    def test_a_refused_key_does_NOT_claim_free_operations_continue(self):
+        for cls in ("auth", "forbidden"):
+            why = self._reason(cls)
+            assert "free operations continue" not in why, (cls, why)
+            assert "the key itself was refused" in why, (cls, why)
+
+    def test_a_refused_SPEND_still_says_free_operations_continue(self):
+        for cls in ("quota", "entitlement"):
+            why = self._reason(cls)
+            assert "free operations continue" in why, (cls, why)
