@@ -2028,7 +2028,7 @@ class TestXnLinkFinderNeverCrawls:
 
     This lane extracts from bytes we already hold. It never requests anything."""
 
-    def _capture(self, tmp_path, monkeypatch, extra=None):
+    def _capture(self, tmp_path, monkeypatch, **kw):
         seen = {}
 
         def fake_exec(tool, cmd, **kw):
@@ -2041,7 +2041,7 @@ class TestXnLinkFinderNeverCrawls:
         src = tmp_path / "indir"
         src.mkdir(parents=True, exist_ok=True)
         (src / "a.js").write_text("var u = '/api/v1/users';\n")
-        crawl._xnl(ctx, str(src), "t", extra=extra or [])
+        crawl._xnl(ctx, str(src), "t", **kw)
         return seen["cmd"]
 
     def test_the_command_is_always_offline(self, tmp_path, monkeypatch):
@@ -2060,13 +2060,36 @@ class TestXnLinkFinderNeverCrawls:
         import inspect
         assert "depth" not in inspect.signature(crawl._xnl).parameters
         with pytest.raises(TypeError):
-            crawl._xnl(None, "x", "t", extra=[], depth=3)
+            crawl._xnl(None, "x", "t", depth=3)
 
-    def test_extra_flags_cannot_reintroduce_a_crawl(self, tmp_path, monkeypatch):
-        """`extra` is caller-supplied; `-d 0` must still be what the tool sees."""
-        cmd = self._capture(tmp_path, monkeypatch, extra=["-spo"])
-        assert cmd.count("-d") == 1 and cmd[cmd.index("-d") + 1] == "0", cmd
-        assert "-spo" in cmd, cmd
+    @pytest.mark.parametrize("injection", [
+        {"extra": ["-d", "3"]}, {"extra": ["-insecure"]}, {"extra": ["-i", "https://evil.net"]},
+        {"extra": []}, {"flags": ["-d", "3"]}, {"spo": True, "extra": ["-d", "3"]},
+    ])
+    def test_NO_free_form_flags_can_be_injected(self, tmp_path, monkeypatch, injection):
+        """review-B-audit: `extra: list` was an unrestricted injection point into the command line of a lane
+        whose contract is "never requests anything". A caller could pass `-d 3` or `-i <url>` straight
+        through. An OPTION cannot smuggle a flag the way a list can."""
+        with pytest.raises(TypeError):
+            crawl._xnl(None, "x", "t", **injection)
+
+    def test_the_COMMAND_is_exactly_the_allowed_flag_set(self, tmp_path, monkeypatch):
+        """The strongest form of the same claim: enumerate what the tool is actually asked to do, so any
+        future addition has to be stated here."""
+        cmd = self._capture(tmp_path, monkeypatch)
+        flags = [a for a in cmd if a.startswith("-")]
+        # -owl/-os are requested only for SMALL input (they are permutation timekillers on a big blob), so
+        # this fixture — a couple of hundred bytes — sees the full set.
+        assert flags == ["-sp", "-sf", "-ow", "-o", "-op", "-all", "-mfs", "-owl", "-os", "-d"], flags
+        assert cmd[0] == "xnLinkFinder" and cmd[cmd.index("-d") + 1] == "0", cmd
+
+    def test_spo_is_the_ONLY_optional_flag(self, tmp_path, monkeypatch):
+        """`-spo` is meaningful because `-sp` is always supplied; it is not dead, so it stays — as an
+        option, not as free-form text."""
+        without = self._capture(tmp_path, monkeypatch)
+        with_spo = self._capture(tmp_path, monkeypatch, spo=True)
+        assert "-spo" not in without and "-spo" in with_spo
+        assert set(with_spo) - set(without) == {"-spo"}, (without, with_spo)
 
     def test_the_stdin_blob_starts_with_a_BLANK_LINE(self, tmp_path, monkeypatch):
         """A first line starting with `http`/`//` makes stdin a URL LIST and the tool crawls those URLs.
@@ -2083,7 +2106,7 @@ class TestXnLinkFinderNeverCrawls:
         src = tmp_path / "indir2"
         src.mkdir(parents=True, exist_ok=True)
         (src / "urls.txt").write_text("https://example.com/a\nhttps://example.com/b\n")
-        crawl._xnl(ctx, str(src), "t2", extra=[])
+        crawl._xnl(ctx, str(src), "t2")
         assert seen["input"].startswith(b"\n"), seen["input"][:40]
 
     def test_no_CALL_SITE_asks_for_a_crawl(self):

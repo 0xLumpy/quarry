@@ -995,7 +995,7 @@ def run(ctx) -> None:
         # mine the response dir (only if responses were actually downloaded)
         if mode == "B" and have("xnLinkFinder") and len([p for p in wdir.iterdir() if p.name != "waymore.txt"]) > 1:
             # OFFLINE mining of the archived bodies only — see `_xnl` for why depth-3 crawling is gone.
-            _xnl(ctx, str(wdir), f"waymore-{d}", extra=["-orig", "-spo"])
+            _xnl(ctx, str(wdir), f"waymore-{d}", spo=True)
 
     # ── download JS, dedup, beautify ──
     js_ledger, js_raw_dir = _js_download(ctx)
@@ -1042,7 +1042,7 @@ def run(ctx) -> None:
                 ctx.echo(f"    jsluice-sourcemap {sub}: {ex}")
     if recov_files and have("xnLinkFinder"):
         if recov_dir:
-            _xnl(ctx, str(recov_dir), "sourcemap", extra=[])
+            _xnl(ctx, str(recov_dir), "sourcemap")
 
     # ── 9.2 deep-mine: GraphQL / WebSocket / API-base over JS + recovered source ──
     nd = _deep_mine(ctx, js_files, "js") + _deep_mine(ctx, recov_files, "sourcemap")
@@ -1075,11 +1075,11 @@ def run(ctx) -> None:
 
     # ── xnLinkFinder over JS dir (links + params + secrets + wordlist) ──
     if js_files and have("xnLinkFinder"):
-        _xnl(ctx, str(js_derived_dir), "js", extra=[])
+        _xnl(ctx, str(js_derived_dir), "js")
 
     # ── xnLinkFinder over katana's stored responses (flags.md: crawl-then-mine) ──
     if have("xnLinkFinder") and kat_resp.exists() and any(kat_resp.iterdir()):
-        _xnl(ctx, str(kat_resp), "katana-resp", extra=["-orig"])
+        _xnl(ctx, str(kat_resp), "katana-resp")
 
     # (waymore response mining happens per-apex above via -mode B + xnLinkFinder)
 
@@ -1182,7 +1182,7 @@ XNL_PARAM_CAP = 2000                   # xnLinkFinder emits POTENTIAL params (no
 XNL_WORDLIST_DERIVE_CAP = 5000         # bounded vocabulary derived from links/params when -owl is skipped
 
 
-def _xnl(ctx, indir: str, tag: str, extra: list) -> None:
+def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
     roots = ctx.write_list("roots.txt", ctx.profile.apex_domains)
     safe_tag = tag.replace("/", "_").replace(".", "_")
     out_links = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_links.txt")
@@ -1245,8 +1245,17 @@ def _xnl(ctx, indir: str, tag: str, extra: list) -> None:
     # -orig ("LINK [ORIGIN]") is useless in stdin mode — origin is always "<stdin>" and would CORRUPT the
     # endpoint value — so strip it from the flags. (We do NOT post-strip a trailing "[..]": with -orig gone
     # xnLinkFinder never appends one, and a strip would mangle legitimate route templates like /users/[id].)
+    # review-B-audit: `extra: list` was an UNRESTRICTED flag injection point — a caller could pass `-d 3`,
+    # `-i <url>` or any other crawl flag straight into the command line of a lane whose whole contract is
+    # "never requests anything". The only flag any call site actually needed is `-spo`, so that is the only
+    # one that exists now: an option cannot smuggle a flag the way a list can.
+    # `-orig` used to be passed and then filtered out here — in stdin mode the origin is always `<stdin>`,
+    # so it is simply gone rather than accepted-and-dropped.
     cmd = ["xnLinkFinder", "-sp", str(roots), "-sf", str(roots), "-ow",
-           "-o", str(out_links), "-op", str(out_params), "-all", "-mfs", "0"] + [e for e in extra if e != "-orig"]
+           "-o", str(out_links), "-op", str(out_params), "-all", "-mfs", "0"]
+    if spo:
+        # -spo (scope-prefix-original) is meaningful because `-sp` is always supplied above.
+        cmd.append("-spo")
     # -owl (wordlist permutations) + -os (secrets regex) are TIMEKILLERS on large input (a 74 MB blob hangs
     # xnLinkFinder for minutes after links are written). Request them only for SMALL input; a large dir gets
     # links+params fast, a DERIVED wordlist (below) so A1d still has vocabulary, and -os skipped (secrets are
