@@ -2144,6 +2144,7 @@ class TestXnLinkFinderOutputIsUntrusted:
     @pytest.mark.parametrize("link", [
         "https://acme.com.evil.net/x",       # the tool's regex says IN
         "https://notacme.com/x",             # ...and for this one too
+        "//acme.com.attacker.io/y",          # ...and scheme-relative is not an exemption
         "https://xacme.common.io/z",
         "https://evil.net/?u=acme.com",
     ])
@@ -2151,9 +2152,11 @@ class TestXnLinkFinderOutputIsUntrusted:
         kind, _v = crawl._xnl_classify_link(link, self._S())
         assert kind == crawl.XNL_OOS, (link, kind)
 
-    def test_a_scheme_relative_OFF_SCOPE_link_is_not_an_endpoint_either(self):
-        """It has no scheme we were told, so it is never surface — whatever its host says."""
-        assert crawl._xnl_classify_link("//acme.com.attacker.io/y", self._S())[0] == crawl.XNL_SCHEMELESS
+    def test_an_OFF_SCOPE_scheme_relative_link_keeps_its_own_form(self):
+        """Off scope either way — and we still do not know what scheme it was written under, so the
+        evidence keeps the form it was found in."""
+        kind, v = crawl._xnl_classify_link("//acme.com.attacker.io/y", self._S())
+        assert (kind, v) == (crawl.XNL_OOS, "//acme.com.attacker.io/y")
 
     @pytest.mark.parametrize("link", ["https://www.acme.com/a", "http://acme.com/"])
     def test_a_genuinely_in_scope_link_IS_an_endpoint(self, link):
@@ -2519,3 +2522,58 @@ class TestXnLinkFinderBoundarySemantics:
         _added, evs = self._ingest(tmp_path, monkeypatch, links=["<stdin>", "plainword", "https://[bad/"])
         led = [e for e in evs if e.get("event") == "ledger"][0]
         assert led["xnl_rejected"]["links_ignored"] == 1 and led["xnl_rejected"]["links_unusable"] == 2, led
+
+
+class TestSchemeRelativeIsNotAnExemption:
+    """review-B-audit-4#1: the schemeless branch returned BEFORE the authority was parsed, so
+    `//acme.com.attacker.io/y` became an `endpoint` (D12's inventory poisoning, reopened) and
+    `//user:pass@evil.net/g` missed the credential classification. The temporary scheme used to PARSE such a
+    reference decides nothing about what is stored."""
+
+    class _S:
+        """Scope with a real OOS rule, so "under our apex but excluded" is an actual case here."""
+
+        def in_scope(self, h):
+            return h == "acme.com" or h.endswith(".acme.com")
+
+        def is_oos(self, h):
+            return h.startswith("oos.")
+
+    def _ingest(self, tmp_path, monkeypatch, links):
+        return TestXnLinkFinderIngestionBoundary()._ingest(tmp_path, monkeypatch, links=links)
+
+    def test_an_OFF_SCOPE_scheme_relative_link_never_reaches_the_endpoint_store(self, tmp_path, monkeypatch):
+        added, _evs = self._ingest(tmp_path, monkeypatch, links=["//acme.com.attacker.io/y"])
+        assert not [r for k, r in added if k == "endpoint"], added
+        rev = [r for k, r in added if k == "review"][0]
+        assert rev["klass"] == "oos-link" and rev["value"] == "//acme.com.attacker.io/y", rev
+
+    def test_a_scheme_relative_CREDENTIAL_url_is_evidence_not_surface(self, tmp_path, monkeypatch):
+        added, _evs = self._ingest(tmp_path, monkeypatch, links=["//user:pass@evil.net/graphql"])
+        assert not [r for k, r in added if k == "endpoint"], added
+        rev = [r for k, r in added if k == "review"][0]
+        assert rev["klass"] == "credential-in-url"
+        assert rev["value"] == "//user:pass@evil.net/graphql", "verbatim, and never given a scheme"
+
+    def test_an_IN_SCOPE_scheme_relative_link_is_still_unbound(self, tmp_path, monkeypatch):
+        added, _evs = self._ingest(tmp_path, monkeypatch, links=["//api.acme.com/v1"])
+        row = [r for k, r in added if k == "endpoint"][0]
+        assert row["value"] == "//api.acme.com/v1" and row["scheme"] == "unbound", row
+
+    @pytest.mark.parametrize("link,kind", [
+        ("//oos.acme.com/x", "oos"),            # an OOS pattern under our own apex
+        ("//notacme.com/z", "oos"),
+        ("//[bad:/x", "malformed"),
+        ("//acme.com:notaport/x", "malformed"),
+        ("//api.acme.com/v1", "schemeless"),
+    ])
+    def test_every_authority_rule_applies_identically(self, link, kind):
+        assert crawl._xnl_classify_link(link, self._S())[0] == kind, link
+
+    def test_the_PARSING_scheme_is_never_stored(self, tmp_path, monkeypatch):
+        added, _evs = self._ingest(tmp_path, monkeypatch,
+                                   links=["//api.acme.com/v1", "//acme.com.attacker.io/y",
+                                          "//user:pass@evil.net/g"])
+        assert "https://api.acme.com" not in json.dumps(added), added
+        assert "https://acme.com.attacker.io" not in json.dumps(added), added
+        assert "https://user:pass@evil.net" not in json.dumps(added), added

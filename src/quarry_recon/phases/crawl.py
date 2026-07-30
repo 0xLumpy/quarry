@@ -1260,26 +1260,32 @@ def _xnl_classify_link(raw: str, scope) -> tuple:
         return XNL_IGNORED, ""
     if any(ch in v for ch in "\t \x00") or len(v) > 4096:
         return XNL_MALFORMED, v               # a link with whitespace/NUL, or an absurd length, is not a link
-    if v.startswith("//"):
-        # review-B-audit-3#1: a protocol-relative reference inherits the SOURCE DOCUMENT's scheme, and the
-        # concatenated blob destroyed which document that was. Manufacturing `https:` invents a target we
-        # were never told about. Kept VERBATIM: `normalize.host_of_url` answers "" for a schemeless value,
-        # so every scope check — and therefore every request path — refuses it by construction.
-        return XNL_SCHEMELESS, v
-    if _XNL_ABSOLUTE_RX.match(v):
-        if "@" in _urlsplit(v).netloc if _safe_netloc(v) else False:
-            # review-B-audit-3#2: unsafe to CONTACT is not the same as worthless. `https://user:pass@host/`
-            # carries credentials someone published — a finding in its own right — so it is retained
-            # VERBATIM as review evidence and never as surface. (Quarry's own configured credentials are
-            # the only thing redacted from telemetry; discovered ones are the point.)
+    schemeless = v.startswith("//")
+    if schemeless or _XNL_ABSOLUTE_RX.match(v):
+        # review-B-audit-4#1: the schemeless branch used to return BEFORE the authority was parsed, so
+        # `//acme.com.attacker.io/y` was stored as an endpoint (D12's inventory poisoning, reopened) and
+        # `//user:pass@evil.net/g` missed the credential classification entirely.
+        #
+        # A protocol-relative reference still inherits its SOURCE DOCUMENT's scheme, and the blob destroyed
+        # which document that was — so `https:` here is a PARSING DEVICE ONLY. It decides nothing about
+        # what is stored: an in-scope schemeless link keeps its verbatim `//host/...` form with the scheme
+        # unbound. Every other authority rule applies identically.
+        probe = ("https:" + v) if schemeless else v
+        if _safe_netloc(probe) and "@" in _urlsplit(probe).netloc:
+            # review-B-audit-3#2: unsafe to CONTACT is not the same as worthless. `user:pass@host` carries
+            # credentials someone published — a finding in its own right — so it is retained VERBATIM as
+            # review evidence and never as surface. (Quarry's own configured credentials are the only thing
+            # redacted from telemetry; discovered ones are the point.)
             return XNL_CREDENTIAL, v
-        safe = _xnl_safe_url(v)
+        safe = _xnl_safe_url(probe)
         if safe is None:
             return XNL_MALFORMED, v           # not a URL an HTTP client could act on, so not surface
         canon_url, canon_host = safe
-        if scope.in_scope(canon_host) and not scope.is_oos(canon_host):
-            return XNL_ENDPOINT, canon_url
-        return XNL_OOS, canon_url
+        if not (scope.in_scope(canon_host) and not scope.is_oos(canon_host)):
+            # off scope either way — and a schemeless one keeps its own form, because we still do not know
+            # what scheme it was written under.
+            return XNL_OOS, (v if schemeless else canon_url)
+        return (XNL_SCHEMELESS, v) if schemeless else (XNL_ENDPOINT, canon_url)
     if v.startswith("/") or v.startswith("./") or v.startswith("../"):
         return XNL_PATH, v
     # anything else — a bare word, a code fragment, a mangled token — is not a reference at all
