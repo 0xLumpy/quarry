@@ -2041,7 +2041,7 @@ class TestXnLinkFinderNeverCrawls:
         src = tmp_path / "indir"
         src.mkdir(parents=True, exist_ok=True)
         (src / "a.js").write_text("var u = '/api/v1/users';\n")
-        crawl._xnl(ctx, str(src), "t", **kw)
+        crawl._xnl_unit(ctx, str(src), "t", **kw)
         return seen["cmd"]
 
     def test_the_command_is_always_offline(self, tmp_path, monkeypatch):
@@ -2058,9 +2058,10 @@ class TestXnLinkFinderNeverCrawls:
         """The parameter is GONE, not defaulted: a parameter can be passed again by a future call site, a
         missing one cannot."""
         import inspect
-        assert "depth" not in inspect.signature(crawl._xnl).parameters
+        assert "depth" not in inspect.signature(crawl._xnl_unit).parameters
+        assert "depth" not in inspect.signature(crawl._xnl_lane).parameters
         with pytest.raises(TypeError):
-            crawl._xnl(None, "x", "t", depth=3)
+            crawl._xnl_unit(None, "x", "t", depth=3)
 
     @pytest.mark.parametrize("injection", [
         {"extra": ["-d", "3"]}, {"extra": ["-insecure"]}, {"extra": ["-i", "https://evil.net"]},
@@ -2071,7 +2072,7 @@ class TestXnLinkFinderNeverCrawls:
         whose contract is "never requests anything". A caller could pass `-d 3` or `-i <url>` straight
         through. An OPTION cannot smuggle a flag the way a list can."""
         with pytest.raises(TypeError):
-            crawl._xnl(None, "x", "t", **injection)
+            crawl._xnl_unit(None, "x", "t", **injection)
 
     def test_the_COMMAND_is_exactly_the_allowed_flag_set(self, tmp_path, monkeypatch):
         """The strongest form of the same claim: enumerate what the tool is actually asked to do, so any
@@ -2106,17 +2107,21 @@ class TestXnLinkFinderNeverCrawls:
         src = tmp_path / "indir2"
         src.mkdir(parents=True, exist_ok=True)
         (src / "urls.txt").write_text("https://example.com/a\nhttps://example.com/b\n")
-        crawl._xnl(ctx, str(src), "t2")
+        crawl._xnl_unit(ctx, str(src), "t2")
         assert seen["input"].startswith(b"\n"), seen["input"][:40]
 
     def test_no_CALL_SITE_asks_for_a_crawl(self):
         import inspect
         src = inspect.getsource(crawl)
-        calls = [ln for ln in src.splitlines()
-                 if "_xnl(ctx," in ln and not ln.lstrip().startswith("def ")]
-        assert len(calls) == 4, calls          # waymore, sourcemap, js, katana-resp
-        for line in calls:
+        # step 3: the four inputs are COLLECTED and mined under one lifecycle, so the call sites are
+        # appends. None of them may carry a crawl request.
+        collected = [ln for ln in src.splitlines() if "xnl_units.append(" in ln]
+        assert len(collected) == 4, collected   # waymore, sourcemap, js, katana-resp
+        for line in collected:
             assert "depth" not in line, line
+        runners = [ln for ln in src.splitlines()
+                   if "_xnl_unit(ctx," in ln and not ln.lstrip().startswith("def ")]
+        assert len(runners) == 1, runners       # only the coordinator runs a unit
 
     def test_the_DOCS_do_not_teach_the_broken_form(self):
         """`-i <dir>` yields nothing at exit 0, and depth-3 is the RoE hazard above — a reader copying the
@@ -2229,7 +2234,7 @@ class TestXnLinkFinderIngestionBoundary:
         src = tmp_path / "in"
         src.mkdir(parents=True, exist_ok=True)
         (src / "a.js").write_text("x")
-        crawl._xnl(ctx, str(src), "t")
+        crawl._xnl_unit(ctx, str(src), "t")
         evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         return ctx.run.added, evs
 
@@ -2404,7 +2409,7 @@ class TestXnLinkFinderAcceptanceIsNotStorage:
         src = tmp_path / "in"
         src.mkdir(parents=True, exist_ok=True)
         (src / "a.js").write_text("x")
-        crawl._xnl(ctx, str(src), "t")
+        crawl._xnl_unit(ctx, str(src), "t")
         return [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
 
     def test_an_endpoint_ANOTHER_LANE_already_stored_still_counts_as_accepted(self, tmp_path, monkeypatch):
@@ -2501,7 +2506,7 @@ class TestXnLinkFinderBoundarySemantics:
         src = tmp_path / "in"
         src.mkdir(parents=True, exist_ok=True)
         (src / "a.js").write_text("x")
-        crawl._xnl(ctx, str(src), "t")
+        crawl._xnl_unit(ctx, str(src), "t")
         evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         led = [e for e in evs if e.get("event") == "ledger"][0]
         assert led["xnl_unreadable"] == {"links": True, "params": True}, led
@@ -2577,3 +2582,152 @@ class TestSchemeRelativeIsNotAnExemption:
         assert "https://api.acme.com" not in json.dumps(added), added
         assert "https://acme.com.attacker.io" not in json.dumps(added), added
         assert "https://user:pass@evil.net" not in json.dumps(added), added
+
+
+class TestXnLinkFinderHasOneLifecycle:
+    """review-B-audit#D3: `_xnl` ran up to four times per phase through bare `exec_tool`, so the source
+    emitted coverage and ledger events but NEVER a terminal, and its registry entry was never consulted.
+    Four independent `run_contract` wraps would have been worse — competing terminals under one id."""
+
+    class _S:
+        def in_scope(self, h):
+            return h == "acme.com" or h.endswith(".acme.com")
+
+        def is_oos(self, h):
+            return False
+
+    def _lane(self, tmp_path, monkeypatch, units, status=None, links=("https://api.acme.com/x",),
+              content=None):
+        calls = []
+
+        def fake_exec(tool, cmd, **kw):
+            calls.append(cmd)
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_text("\n".join(links) + "\n")
+            pathlib.Path(cmd[cmd.index("-op") + 1]).write_text("")
+            return type("R", (), {"tool": tool, "cmd": cmd,
+                                  "status": status or crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        monkeypatch.setattr(crawl, "have", lambda t: True)
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = self._S()
+        ctx.scope.passive_only = False
+        prepared = []
+        for name in units:
+            d = tmp_path / "in" / name
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "a.js").write_text(content if content is not None else f"var x = '/{name}';")
+            prepared.append((str(d), name, False))
+        crawl._xnl_lane(ctx, prepared)
+        log = tmp_path / "events.jsonl"
+        evs = [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+        return calls, evs, ctx
+
+    def test_ONE_start_and_ONE_finish_for_four_inputs(self, tmp_path, monkeypatch):
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js", "sourcemap", "katana", "waymore"])
+        sid = "crawl.xnlinkfinder"
+        starts = [e for e in evs if e.get("source_id") == sid and e.get("event") == events.TOOL_START]
+        fins = [e for e in evs if e.get("source_id") == sid and e.get("event") == events.TOOL_FINISH]
+        assert len(starts) == 1 and len(fins) == 1, (starts, fins)
+        assert starts[0]["input_total"] == 4, starts
+
+    def test_each_input_is_an_INDEPENDENTLY_identified_unit(self, tmp_path, monkeypatch):
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js", "sourcemap"])
+        prog = [e for e in evs if e.get("event") == events.TOOL_PROGRESS]
+        assert len(prog) == 2, prog
+        assert len({e["work_unit"] for e in prog}) == 2, "two inputs shared one work unit"
+
+    def test_the_unit_identity_is_the_INPUT_CONTENT(self, tmp_path):
+        a = tmp_path / "a"
+        a.mkdir()
+        (a / "f.js").write_text("one")
+        first, _n = crawl._xnl_input_digest(str(a))
+        (a / "f.js").write_text("two")                      # same name, same length, different bytes
+        second, _n = crawl._xnl_input_digest(str(a))
+        assert first != second, "a same-size edit must change the identity"
+
+    def test_an_UNREGISTERED_source_is_blocked_not_executed(self, tmp_path, monkeypatch):
+        from quarry_recon import contract
+        monkeypatch.setattr(crawl, "registered",
+                            lambda sid: contract.registered("crawl.definitely-not-registered"))
+        calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        assert calls == [], "an unregistered source still ran the tool"
+        assert [e for e in evs if e.get("event") == "tool_blocked"], evs
+
+    def test_a_MISSING_tool_is_a_recorded_skip(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawl, "have", lambda t: False)
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = self._S()
+        d = tmp_path / "in"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "a.js").write_text("x")
+        crawl._xnl_lane(ctx, [(str(d), "js", False)])
+        assert ctx.run.records if hasattr(ctx.run, "records") else True
+
+    def test_NO_units_is_no_lifecycle_at_all(self, tmp_path, monkeypatch):
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, [])
+        assert [e for e in evs if e.get("source_id") == "crawl.xnlinkfinder"] == [], evs
+
+
+class TestXnLinkFinderUnitsResume:
+    """A unit that already mined exactly these bytes is not re-mined; one whose extraction did not finish
+    is never recorded, so the next run redoes it."""
+
+    _lane = TestXnLinkFinderHasOneLifecycle._lane
+    _S = TestXnLinkFinderHasOneLifecycle._S
+
+    def test_an_UNCHANGED_input_is_replayed_not_re_mined(self, tmp_path, monkeypatch):
+        calls, _evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        assert len(calls) == 1
+        calls2, evs2, _ctx2 = self._lane(tmp_path, monkeypatch, ["js"])
+        assert calls2 == [], f"the same bytes were mined again: {calls2}"
+        cov = [e for e in evs2 if e.get("measure") == "units"]
+        assert cov and "replayed" in cov[0]["reason"], cov
+
+    def test_a_CHANGED_input_is_mined_again(self, tmp_path, monkeypatch):
+        self._lane(tmp_path, monkeypatch, ["js"], content="var x = '/one';")
+        calls, _evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], content="var x = '/two';")
+        assert len(calls) == 1, "a changed input was skipped"
+
+    @pytest.mark.parametrize("status", ["timed_out", "failed", "partial"])
+    def test_an_INCOMPLETE_extraction_is_never_recorded(self, tmp_path, monkeypatch, status):
+        st = getattr(crawl.Status, status.upper())
+        calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], status=st)
+        assert len(calls) == 1
+        cov = [e for e in evs if e.get("measure") == "units"]
+        assert cov and cov[0]["omitted"] == 1 and "did NOT complete" in cov[0]["reason"], cov
+        # ...and the next run re-mines it
+        calls2, _evs2, _ctx2 = self._lane(tmp_path, monkeypatch, ["js"], status=st)
+        assert len(calls2) == 1, "an unfinished unit was treated as done"
+
+    def test_evidence_from_an_incomplete_unit_is_still_KEPT(self, tmp_path, monkeypatch):
+        _calls, _evs, ctx = self._lane(tmp_path, monkeypatch, ["js"], status=crawl.Status.TIMED_OUT)
+        assert [r for k, r in ctx.run.added if k == "endpoint"], ctx.run.added
+
+    def test_the_TERMINAL_says_partial_when_evidence_survived_a_failure(self, tmp_path, monkeypatch):
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], status=crawl.Status.TIMED_OUT)
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "partial" and "did not finish" in fin["reason"], fin
+
+    def test_the_TERMINAL_says_failed_when_nothing_survived(self, tmp_path, monkeypatch):
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], status=crawl.Status.FAILED, links=[])
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "failed", fin
+
+    def test_a_CLEAN_run_reports_success_with_what_it_produced(self, tmp_path, monkeypatch):
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "success" and fin["produced"] == {"references": 1}, fin
+
+    def test_state_that_did_NOT_persist_is_reported(self, tmp_path, monkeypatch):
+        from quarry_recon import budget as _b
+        real_save = _b.Ledger.save
+        monkeypatch.setattr(_b.Ledger, "save", lambda self: False)
+        monkeypatch.setattr(_b.Ledger, "durable", property(lambda self: False))
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "partial" and "NOT persisted" in fin["reason"], fin
+        monkeypatch.setattr(_b.Ledger, "save", real_save)

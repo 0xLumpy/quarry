@@ -800,6 +800,22 @@ def _provider_terminal(source_id, fn, *, work_unit=None):
     return result                                            # None on failure — caller guards (best-effort)
 
 
+def registered(source_id: str) -> bool:
+    """Whether this source may execute, emitting `tool_blocked` when it may not.
+
+    The registry is authoritative for EXECUTION, and that authority lives here — `run_contract` and
+    `run_provider` are the only places that consult it, so a phase never imports `sources` (the registry
+    stays declarative from a phase's point of view).
+
+    For a lane that runs SEVERAL units under ONE lifecycle — nuclei's chunks, arjun's targets, the
+    xnLinkFinder inputs — `run_contract` per unit would emit competing terminals under one source id. Such
+    a lane brackets itself with `tool_start`/`tool_finish` and asks THIS for the same gate."""
+    if sources.get(source_id) is not None:
+        return True
+    events.tool_blocked(source_id, reason=f"unknown source_id {source_id!r} — not in registry; not executed")
+    return False
+
+
 def run_contract(source_id, cmd, *, input_total=None, env=None, reclassify=None, work_unit=None,
                  parent_id=None, scope_distance=None, discovery_context=None,
                  **run_kwargs):

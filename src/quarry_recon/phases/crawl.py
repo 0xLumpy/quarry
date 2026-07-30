@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
 
 from .. import budget, events, fetch, normalize, secrets, settings
-from ..contract import run_contract
+from ..contract import registered, run_contract
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
 # 9.2 deep-mine patterns over JS / recovered source — extraction only, no fetch.
@@ -892,6 +892,8 @@ def _sourcemap_recover(ctx, js_ledger):
 
 
 def run(ctx) -> None:
+    # every xnLinkFinder input, mined together at the end of the phase under ONE source lifecycle.
+    xnl_units: list = []
     prof, scope = ctx.profile, ctx.scope
     roots = ctx.write_list("roots.txt", prof.apex_domains)
 
@@ -995,8 +997,10 @@ def run(ctx) -> None:
             _collect_url(ctx, wm.read_text(), "waymore", str(wm))
         # mine the response dir (only if responses were actually downloaded)
         if mode == "B" and have("xnLinkFinder") and len([p for p in wdir.iterdir() if p.name != "waymore.txt"]) > 1:
-            # OFFLINE mining of the archived bodies only — see `_xnl` for why depth-3 crawling is gone.
-            _xnl(ctx, str(wdir), f"waymore-{d}", spo=True)
+            # OFFLINE mining of the archived bodies only — see `_xnl_unit` for why depth-3 crawling is
+            # gone. Collected, not run: all four inputs are mined under ONE source lifecycle at the end of
+            # the phase (step 3), so `crawl.xnlinkfinder` has one terminal instead of four competing ones.
+            xnl_units.append((str(wdir), f"waymore-{d}", True))
 
     # ── download JS, dedup, beautify ──
     js_ledger, js_raw_dir = _js_download(ctx)
@@ -1043,7 +1047,7 @@ def run(ctx) -> None:
                 ctx.echo(f"    jsluice-sourcemap {sub}: {ex}")
     if recov_files and have("xnLinkFinder"):
         if recov_dir:
-            _xnl(ctx, str(recov_dir), "sourcemap")
+            xnl_units.append((str(recov_dir), "sourcemap", False))
 
     # ── 9.2 deep-mine: GraphQL / WebSocket / API-base over JS + recovered source ──
     nd = _deep_mine(ctx, js_files, "js") + _deep_mine(ctx, recov_files, "sourcemap")
@@ -1076,11 +1080,11 @@ def run(ctx) -> None:
 
     # ── xnLinkFinder over JS dir (links + params + secrets + wordlist) ──
     if js_files and have("xnLinkFinder"):
-        _xnl(ctx, str(js_derived_dir), "js")
+        xnl_units.append((str(js_derived_dir), "js", False))
 
     # ── xnLinkFinder over katana's stored responses (flags.md: crawl-then-mine) ──
     if have("xnLinkFinder") and kat_resp.exists() and any(kat_resp.iterdir()):
-        _xnl(ctx, str(kat_resp), "katana-resp")
+        xnl_units.append((str(kat_resp), "katana-resp", False))
 
     # (waymore response mining happens per-apex above via -mode B + xnLinkFinder)
 
@@ -1171,6 +1175,9 @@ def run(ctx) -> None:
                                        "kind": det, "preview": red or secrets.mask(raw_s),
                                        "verified": verified, "verification": verification,
                                        "sources": ["trufflehog"]})
+
+    # ── xnLinkFinder: ONE lifecycle over every collected input, LAST so each input is complete ──
+    _xnl_lane(ctx, xnl_units)
 
     ctx.echo(f"  urls: {ctx.run.count('url')}  js: {ctx.run.count('js_url')}  "
              f"endpoints: {ctx.run.count('endpoint')}  params: {ctx.run.count('parameter')}  "
@@ -1327,7 +1334,112 @@ def _xnl_lines(path) -> tuple:
     return out, bad, False
 
 
-def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
+def _xnl_input_digest(indir) -> tuple:
+    """`(file_digests, files)` for one input dir — the IMMUTABLE identity of what a unit mined.
+
+    Content digests, not paths or sizes: a same-size edit must re-mine, and a renamed file with identical
+    bytes must not. This is what makes a resumed run able to say "this unit already ran on exactly these
+    bytes"."""
+    digests, files = {}, 0
+    for f in sorted(Path(indir).rglob("*")):
+        try:
+            if f.is_file():
+                digests[str(f.relative_to(indir))] = events.file_digest(f)
+                files += 1
+        except OSError:
+            continue                                   # unreadable input is the unit's problem, not identity's
+    return digests, files
+
+
+def _xnl_lane(ctx, units: list) -> None:
+    """Mine every collected input under ONE `crawl.xnlinkfinder` lifecycle.
+
+    review-B-audit#D3: `_xnl` ran up to four times per phase via bare `exec_tool`, so the source emitted
+    coverage and ledger events but NEVER a terminal, and its registry entry was never consulted (only
+    `run_contract`/`run_provider` are registry-authoritative). Wrapping each call independently would have
+    been worse — four competing terminals under one source id, last-writer-wins telemetry.
+
+    So: one `tool_start`, one `tool_finish`, and INDEPENDENTLY IDENTIFIED units in between. Each unit is
+    keyed by its input's content digests, so a resumed run re-mines only what changed, and a unit whose
+    extraction did not complete is never recorded as done."""
+    if not units:
+        return
+    sid = "crawl.xnlinkfinder"
+    if not registered(sid):
+        # the registry is authoritative for execution, and that authority lives in `contract` — a phase
+        # asking `sources` directly would be a second copy of the same gate.
+        return
+    if not have("xnLinkFinder"):
+        ctx.run.record("crawl", skipped("xnLinkFinder", "not installed"))
+        return
+
+    # units are keyed by CONTENT, so the resume key changes exactly when the bytes do.
+    prepared = []
+    for indir, tag, spo in units:
+        digests, files = _xnl_input_digest(indir)
+        wu = events.work_unit(sid, inputs={"tag": tag}, file_digests=digests,
+                              config={"param_cap": XNL_PARAM_CAP, "input_cap": XNL_MAX_INPUT})
+        prepared.append({"indir": indir, "tag": tag, "spo": spo, "wu": wu, "files": files})
+
+    base = ctx.run.dir / "raw" / "crawl"
+    base.mkdir(parents=True, exist_ok=True)
+    fp = events.work_unit(sid, inputs={}, config={"param_cap": XNL_PARAM_CAP,
+                                                  "input_cap": XNL_MAX_INPUT})
+    budget.prune_state(base, sid, fp)
+    ledger = budget.Ledger(budget.state_path(base, sid, fp), lane=sid)
+
+    events.tool_start(sid, cmd=["xnLinkFinder", "(stdin)"], input_total=len(prepared), work_unit=fp)
+    done = incomplete = replayed = 0
+    results = []
+    try:
+        for i, u in enumerate(prepared, 1):
+            events.tool_progress(sid, input_total=len(prepared), current_index=i, work_unit=u["wu"])
+            if ledger.has(u["wu"]):
+                # the same bytes were mined by an earlier run of this project, and its entities are already
+                # in that run's store. Re-mining would spend the time again for the same answer.
+                replayed += 1
+                events.coverage_partial(sid, kind=events.COVERAGE_CAP, unit=f"{u['tag']}:unit",
+                                        measure="units", eligible=1, tested=1, omitted=0,
+                                        reason=f"{u['tag']}: already mined on these exact bytes (replayed)")
+                continue
+            res = _xnl_unit(ctx, u["indir"], u["tag"], spo=u["spo"])
+            results.append(res)
+            if res["complete"] and not res["unreadable"]:
+                done += 1
+                # bind the unit to the INPUT BLOB it actually mined: an artifact whose bytes changed can
+                # never satisfy a later resume.
+                blob = res["blob"]
+                if blob.exists():
+                    ledger.record(u["wu"], blob, digest=events.file_digest(blob))
+            else:
+                incomplete += 1
+                events.coverage_partial(
+                    sid, kind=events.COVERAGE_TIMEOUT, unit=f"{u['tag']}:unit", measure="units",
+                    eligible=1, tested=0, omitted=1,
+                    reason=(f"{u['tag']}: extraction did NOT complete (tool status "
+                            f"{res['status'].value}{'; output unreadable' if res['unreadable'] else ''}) — "
+                            f"evidence KEPT, unit not recorded, next run re-mines it"))
+    finally:
+        persisted = bool(ledger.save()) or bool(getattr(ledger, "durable", False))
+        got = sum(r["endpoints"] + r["paths"] + r["schemeless"] + r["oos"] + r["credentials"]
+                  for r in results)
+        if incomplete and got:
+            status, reason = Status.PARTIAL.value, (f"{incomplete}/{len(prepared)} input(s) did not finish "
+                                                    f"extracting — evidence KEPT")
+        elif incomplete:
+            status, reason = Status.FAILED.value, f"{incomplete}/{len(prepared)} input(s) failed to extract"
+        else:
+            status = Status.SUCCESS.value if got else Status.EMPTY.value
+            reason = None
+        if not persisted:
+            status, reason = Status.PARTIAL.value, "unit state was NOT persisted — every input re-mines"
+        events.tool_finish(sid, status=status, reason=reason, work_unit=fp,
+                           produced={"references": got})
+        ctx.echo(f"  xnLinkFinder: {len(prepared)} input(s) · {done} mined · {replayed} replayed · "
+                 f"{incomplete} incomplete")
+
+
+def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
     roots = ctx.write_list("roots.txt", ctx.profile.apex_domains)
     safe_tag = tag.replace("/", "_").replace(".", "_")
     out_links = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_links.txt")
@@ -1432,6 +1544,10 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
     r = exec_tool("xnLinkFinder", cmd, timeout=ctx.http_timeout, input_file=blob,
                   env={"PYTHONHASHSEED": "0"})
     ctx.run.record("crawl", r)
+    # review-B-audit#D5: the tool's OWN status was recorded and then ignored when interpreting output.
+    # `-ow` truncates the four artifacts at start, so a killed run leaves whatever was flushed — real
+    # evidence, and NOT a completed extraction. Both facts travel out of here.
+    extraction_complete = r.status in (Status.SUCCESS, Status.EMPTY)
     # STRUCTURED input coverage per tag (emit every run so an uncapped rerun clears). tested = files read to
     # EOF ONLY; a file cut off by the 200MB cap (partial) or that raised (unreadable) is NOT counted tested —
     # it is honestly part of `omitted`. measure=files so this is never summed with the param-candidate measure.
@@ -1454,7 +1570,10 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
     # ACCEPTANCE is a parser fact; NOVELTY is a store fact. Both are counted, separately.
     n_endpoints = n_paths = n_oos = n_bad_links = 0        # accepted by the parser
     n_schemeless = n_credential = n_ignored = 0
-    new_endpoints = new_paths = 0                          # ...and new to the store
+    # ...and new to the store. review-B-audit-4 (note): `xnl_stored` reported novelty for surface only,
+    # because the other `add()` results were discarded — so a re-run looked like it had stored nothing new
+    # even when it had recorded a fresh off-scope link or credential.
+    new_endpoints = new_paths = new_schemeless = new_oos = new_credential = 0
     for line in lines:
         kind, v = _xnl_classify_link(line, ctx.scope)
         if kind == XNL_ENDPOINT:
@@ -1473,26 +1592,29 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
             # a host we may well own, but with NO scheme we were told — kept verbatim and marked unbound on
             # both axes, so nothing downstream can turn it into a request.
             n_schemeless += 1
-            ctx.run.add("endpoint", {"value": v, "kind": "scheme-relative", "scheme": "unbound",
-                                     "origin": "unbound", "sources": [src_tag]})
+            if ctx.run.add("endpoint", {"value": v, "kind": "scheme-relative", "scheme": "unbound",
+                                        "origin": "unbound", "sources": [src_tag]}):
+                new_schemeless += 1
         elif kind == XNL_CREDENTIAL:
             # DISCOVERED credentials are a finding, not noise. Verbatim — masking a discovered secret would
             # destroy the evidence; only Quarry's OWN configured credentials are redacted from telemetry.
             n_credential += 1
-            ctx.run.add("review", {"id": f"{src_tag}:cred:{v}", "klass": "credential-in-url", "value": v,
+            if ctx.run.add("review", {"id": f"{src_tag}:cred:{v}", "klass": "credential-in-url", "value": v,
                                    "note": f"{src_tag} extracted a URL carrying USERINFO — never contacted "
-                                           f"(the authority is ambiguous), retained verbatim as evidence",
-                                   "sources": [src_tag]})
+                                              f"(the authority is ambiguous), retained verbatim as evidence",
+                                      "sources": [src_tag]}):
+                new_credential += 1
         elif kind == XNL_IGNORED:
             n_ignored += 1                     # blank lines and the tool's own token: neither finding nor error
         elif kind == XNL_OOS:
             # the archive really did link there: real evidence, and NOT surface. `endpoint` feeds lanes that
             # go on to contact things, so an off-scope URL is retained where nothing active consumes it.
             n_oos += 1
-            ctx.run.add("review", {"id": f"{src_tag}:oos:{v}", "klass": "oos-link", "value": v,
+            if ctx.run.add("review", {"id": f"{src_tag}:oos:{v}", "klass": "oos-link", "value": v,
                                    "note": f"{src_tag} extracted an OFF-SCOPE link — retained as evidence, "
-                                           f"never probed (Quarry scope, not the tool's filter)",
-                                   "sources": [src_tag]})
+                                              f"never probed (Quarry scope, not the tool's filter)",
+                                      "sources": [src_tag]}):
+                new_oos += 1
         else:
             n_bad_links += 1
     events.coverage_partial("crawl.xnlinkfinder", kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:links",
@@ -1566,7 +1688,7 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
             n_secrets = len(sd) if isinstance(sd, (list, dict)) else 0
         except Exception:
             n_secrets = 0
-    events.ledger("crawl.xnlinkfinder",
+    events.ledger("crawl.xnlinkfinder", unit=tag,
                   produced={"endpoints": n_endpoints, "paths": n_paths, "oos_links": n_oos,
                             "scheme_relative": n_schemeless, "credential_urls": n_credential,
                             "potential_params": n_params_seen, "params_kept": n_params_added,
@@ -1578,7 +1700,8 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
                                 "links_ignored": n_ignored},
                   # ACCEPTED vs NEW: a line the parser took that the store already had is not a rejection.
                   xnl_stored={"endpoints_new": new_endpoints, "paths_new": new_paths,
-                              "params_new": n_params_added},
+                              "scheme_relative_new": new_schemeless, "oos_links_new": new_oos,
+                              "credential_urls_new": new_credential, "params_new": n_params_added},
                   # an artifact that EXISTS and cannot be read is our machinery failing, not a zero result.
                   # Step 3 turns these into a gap; recorded now so the fact is not invented later.
                   xnl_unreadable={"links": links_unreadable, "params": params_unreadable})
@@ -1589,3 +1712,11 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: {written}B input -> 0 links/params/words/secrets "
                                        f"(capability drift? input kept: {blob.name})")
+    return {"tag": tag, "status": r.status, "complete": extraction_complete,
+            "blob": blob, "input_bytes": written, "files": _n_files, "files_read": files_completed,
+            "endpoints": n_endpoints, "paths": n_paths, "schemeless": n_schemeless, "oos": n_oos,
+            "credentials": n_credential, "params": n_params_seen, "params_kept": n_params_added,
+            "wordlist": n_words, "secrets": n_secrets,
+            "unusable": n_bad_links + n_bad_params, "undecodable": undecodable + param_undecodable,
+            "unreadable": links_unreadable or params_unreadable,
+            "artifacts": [out_links, out_params, out_secrets, out_wl]}
