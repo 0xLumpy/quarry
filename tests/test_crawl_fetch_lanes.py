@@ -2012,3 +2012,93 @@ class TestTemplateDefectsRound10:
         assert fp(["ab/c"]) != fp(["a", "bc"])                   # no concatenation ambiguity
         assert fp(["a", "b"]) == fp(["b", "a"])                  # order-independent (it is a SET)
         assert fp(["a"]) != fp(["a", "a2"])
+
+
+class TestXnLinkFinderNeverCrawls:
+    """review-B-audit D1/D2: the waymore-response mining ran at DEPTH 3, which makes xnLinkFinder REQUEST
+    every link it extracts — and the only scope gate on those requests is the tool's own `-sf` regex
+    (xnLinkFinder 8.2 line ~1053), which is not anchored at the end of the host:
+
+        ^([A-Za-z]*)?(://|//|^)[^/|?|#]*<apex>
+
+    Measured against apex `acme.com` it accepts `acme.com.evil.net`, `notacme.com`,
+    `//acme.com.attacker.io` and `xacme.common.io` — hosts Quarry's own scope (`host == apex or
+    host.endswith("." + apex)`) refuses. The input is ARCHIVED THIRD-PARTY RESPONSE BODIES, so anyone can
+    plant such a link. That crawl also followed redirects and ran with `-insecure`.
+
+    This lane extracts from bytes we already hold. It never requests anything."""
+
+    def _capture(self, tmp_path, monkeypatch, extra=None):
+        seen = {}
+
+        def fake_exec(tool, cmd, **kw):
+            seen["tool"], seen["cmd"], seen["kw"] = tool, list(cmd), kw
+            return type("R", (), {"tool": tool, "cmd": cmd, "status": crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        ctx = _Ctx(tmp_path, [])
+        src = tmp_path / "indir"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "a.js").write_text("var u = '/api/v1/users';\n")
+        crawl._xnl(ctx, str(src), "t", extra=extra or [])
+        return seen["cmd"]
+
+    def test_the_command_is_always_offline(self, tmp_path, monkeypatch):
+        cmd = self._capture(tmp_path, monkeypatch)
+        assert "-d" in cmd and cmd[cmd.index("-d") + 1] == "0", cmd
+
+    @pytest.mark.parametrize("flag", ["-insecure", "-u", "-rl", "-s429", "-s403", "-sTO", "-sCE"])
+    def test_NO_crawl_flag_survives(self, tmp_path, monkeypatch, flag):
+        """Every one of these exists only to make requests kinder — they have no meaning offline, and
+        their presence would mean the lane is crawling again."""
+        assert flag not in self._capture(tmp_path, monkeypatch), flag
+
+    def test_a_CALLER_cannot_ask_for_depth(self, tmp_path, monkeypatch):
+        """The parameter is GONE, not defaulted: a parameter can be passed again by a future call site, a
+        missing one cannot."""
+        import inspect
+        assert "depth" not in inspect.signature(crawl._xnl).parameters
+        with pytest.raises(TypeError):
+            crawl._xnl(None, "x", "t", extra=[], depth=3)
+
+    def test_extra_flags_cannot_reintroduce_a_crawl(self, tmp_path, monkeypatch):
+        """`extra` is caller-supplied; `-d 0` must still be what the tool sees."""
+        cmd = self._capture(tmp_path, monkeypatch, extra=["-spo"])
+        assert cmd.count("-d") == 1 and cmd[cmd.index("-d") + 1] == "0", cmd
+        assert "-spo" in cmd, cmd
+
+    def test_the_stdin_blob_starts_with_a_BLANK_LINE(self, tmp_path, monkeypatch):
+        """A first line starting with `http`/`//` makes stdin a URL LIST and the tool crawls those URLs.
+        The blank line forces offline content mode — the other half of "never requests anything"."""
+        seen = {}
+
+        def fake_exec(tool, cmd, **kw):
+            seen["input"] = pathlib.Path(kw["input_file"]).read_bytes()
+            return type("R", (), {"tool": tool, "cmd": cmd, "status": crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        ctx = _Ctx(tmp_path, [])
+        src = tmp_path / "indir2"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "urls.txt").write_text("https://example.com/a\nhttps://example.com/b\n")
+        crawl._xnl(ctx, str(src), "t2", extra=[])
+        assert seen["input"].startswith(b"\n"), seen["input"][:40]
+
+    def test_no_CALL_SITE_asks_for_a_crawl(self):
+        import inspect
+        src = inspect.getsource(crawl)
+        calls = [ln for ln in src.splitlines()
+                 if "_xnl(ctx," in ln and not ln.lstrip().startswith("def ")]
+        assert len(calls) == 4, calls          # waymore, sourcemap, js, katana-resp
+        for line in calls:
+            assert "depth" not in line, line
+
+    def test_the_DOCS_do_not_teach_the_broken_form(self):
+        """`-i <dir>` yields nothing at exit 0, and depth-3 is the RoE hazard above — a reader copying the
+        docs must not reproduce either."""
+        doc = pathlib.Path(__file__).parent.parent / "docs" / "example.md"
+        text = doc.read_text()
+        assert "xnLinkFinder -i " not in text, "the docs still teach `-i <dir>`"
+        assert "-d 3" not in text and "-insecure" not in text, "the docs still teach the depth-3 crawl"

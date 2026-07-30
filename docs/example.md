@@ -320,13 +320,23 @@ gau --subs --threads 5 0xlumpy.cc            # → raw/crawl/gau/gau.txt
 waymore -i 0xlumpy.cc -mode B -oU raw/crawl/waymore/0xlumpy.cc/waymore.txt \
   -f -ci d -p 3 -oR raw/crawl/waymore/0xlumpy.cc -oijs -l 5000
 ```
-Then xnLinkFinder mines that response directory (depth 3 — the "killer combo"):
+Then xnLinkFinder mines that response directory — OFFLINE, over the bytes waymore already
+downloaded. Two things about the invocation are not cosmetic:
+
+* **stdin, never `-i <dir>`.** `-i <dir>` yields nothing at exit 0, and `-i <file>` is read as a
+  list of DOMAINS TO CRAWL. Only stdin parses file *content*. The leading blank line forces
+  content mode — a first line starting with `http`/`//` makes stdin a URL list and the tool goes
+  to the network instead of reading bytes.
+* **`-d 0`, always.** Depth > 0 makes xnLinkFinder request the links it extracts, and its own
+  `-sf` scope regex is not anchored at the end of the host — for apex `acme.com` it accepts
+  `acme.com.evil.net`, `notacme.com` and `xacme.common.io`. From archived third-party bodies that
+  is an off-scope request Quarry never sanctioned, so this lane does not crawl at all.
+
 ```bash
-xnLinkFinder -i raw/crawl/waymore/0xlumpy.cc \
+{ printf '\n'; cat raw/crawl/waymore/0xlumpy.cc/*; } | xnLinkFinder \
   -sp <work>/roots.txt -sf <work>/roots.txt \
   -o  …waymore-0xlumpy_cc_links.txt -op …params.txt -os …secrets.json -owl …wordlist.txt \
-  -inc -all -mfs 0 -orig -spo \
-  -d 3 -u desktop mobile -insecure -s429 -s403 -sTO -sCE
+  -all -mfs 0 -ow -spo -d 0
 ```
 
 **6.4 JS files** — download every discovered `.js` (≤2000), dedup by content hash, drop
@@ -346,20 +356,23 @@ jsluice urls    -   < (all js_files)          # → endpoint entities
 jsluice secrets -   < (all js_files)          # → secret entities
 ```
 
-**6.7 xnLinkFinder over the JS dir** (depth 0, static):
+**6.7 xnLinkFinder over the JS dir** (offline, `-d 0` — see 6.3 for why):
 
 ```bash
-xnLinkFinder -i raw/crawl/js_files -sp <work>/roots.txt -sf <work>/roots.txt \
-  -o js_links.txt -op js_params.txt -os js_secrets.json -owl js_wordlist.txt -inc -all -mfs 0
+{ printf '\n'; cat raw/crawl/js_files/*; } | xnLinkFinder \
+  -sp <work>/roots.txt -sf <work>/roots.txt \
+  -o js_links.txt -op js_params.txt -os js_secrets.json -owl js_wordlist.txt -all -mfs 0 -ow -d 0
 ```
 → `endpoint` + `parameter`.
 
-**6.8 xnLinkFinder over katana's stored responses** (`-srd` dir from 6.1):
+**6.8 xnLinkFinder over katana's stored responses** (`-srd` dir from 6.1, offline):
 
 ```bash
-xnLinkFinder -i raw/crawl/katana_resp -sp <work>/roots.txt -sf <work>/roots.txt \
-  -o katana-resp_links.txt -op …params.txt -os …json -owl …txt -inc -all -mfs 0 -orig
+{ printf '\n'; cat raw/crawl/katana_resp/*; } | xnLinkFinder \
+  -sp <work>/roots.txt -sf <work>/roots.txt \
+  -o katana-resp_links.txt -op …params.txt -os …json -owl …txt -all -mfs 0 -ow -d 0
 ```
+(`-orig` is pointless in stdin mode — the origin is always `<stdin>`.)
 
 **6.9 secret scanners** on the JS dir:
 

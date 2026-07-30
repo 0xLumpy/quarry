@@ -994,7 +994,8 @@ def run(ctx) -> None:
             _collect_url(ctx, wm.read_text(), "waymore", str(wm))
         # mine the response dir (only if responses were actually downloaded)
         if mode == "B" and have("xnLinkFinder") and len([p for p in wdir.iterdir() if p.name != "waymore.txt"]) > 1:
-            _xnl(ctx, str(wdir), f"waymore-{d}", extra=["-orig", "-spo"], depth=3)
+            # OFFLINE mining of the archived bodies only — see `_xnl` for why depth-3 crawling is gone.
+            _xnl(ctx, str(wdir), f"waymore-{d}", extra=["-orig", "-spo"])
 
     # ── download JS, dedup, beautify ──
     js_ledger, js_raw_dir = _js_download(ctx)
@@ -1181,7 +1182,7 @@ XNL_PARAM_CAP = 2000                   # xnLinkFinder emits POTENTIAL params (no
 XNL_WORDLIST_DERIVE_CAP = 5000         # bounded vocabulary derived from links/params when -owl is skipped
 
 
-def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
+def _xnl(ctx, indir: str, tag: str, extra: list) -> None:
     roots = ctx.write_list("roots.txt", ctx.profile.apex_domains)
     safe_tag = tag.replace("/", "_").replace(".", "_")
     out_links = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_links.txt")
@@ -1253,15 +1254,23 @@ def _xnl(ctx, indir: str, tag: str, extra: list, depth: int = 0) -> None:
     small = written < XNL_WORDLIST_LIMIT
     if small:
         cmd += ["-owl", str(out_wl), "-os", str(out_secrets)]
-    # depth>0 makes xnLinkFinder actually request the found links — add UA spread, rate limit, and
-    # stop-on-block flags (author's documented recommendation for deep crawls).
-    if depth > 0:
-        cmd += ["-d", str(depth), "-u", "desktop", "mobile", "-insecure",
-                "-s429", "-s403", "-sTO", "-sCE"]
-        if ctx.profile.http_rl:
-            cmd += ["-rl", str(ctx.profile.http_rl)]
-    else:
-        cmd += ["-d", "0"]   # explicit offline: never crawl (belt-and-suspenders if a blob slipped into URL mode)
+    # ALWAYS -d 0. This lane EXTRACTS from bytes we already hold; it never requests anything.
+    #
+    # It used to run the waymore-response mining at depth 3, which makes xnLinkFinder REQUEST every link it
+    # extracts — and the only scope gate on those requests is the tool's own `-sf` regex
+    # (xnLinkFinder 8.2, line ~1053):
+    #     ^([A-Za-z]*)?(://|//|^)[^\/|?|#]*<apex>
+    # which is not anchored at the END of the host. Measured against apex `acme.com`, all of these are IN
+    # scope for it: `acme.com.evil.net`, `notacme.com`, `//acme.com.attacker.io`, `xacme.common.io`.
+    # Quarry's own scope requires `host == apex or host.endswith("." + apex)`, so the lane was contacting
+    # hosts Quarry itself refuses — from ARCHIVED THIRD-PARTY RESPONSE BODIES, i.e. content anyone can plant
+    # a link in. The same crawl followed redirects (`allow_redirects=True`, xnLinkFinder 8.2:709/2519) and
+    # ran with `-insecure`, so an off-scope hop was both unverified and unbounded.
+    #
+    # The depth parameter is GONE rather than defaulted: a parameter can be passed again by a future call
+    # site, a missing one cannot. Crawling archived links is a real technique, but it needs Quarry's scope
+    # and Quarry's transport — not a tool flag we cannot constrain.
+    cmd += ["-d", "0"]
     # PYTHONHASHSEED=0: xnLinkFinder dedups via list(set(...)) whose iteration order is hash-seed-randomized;
     # on large/link-dense input that randomness makes the extracted SET vary run-to-run (verified: waymore
     # swung 2693..9858 endpoints at a FIXED -p, offline, no timeout — pinning the seed gives a stable 7259,
