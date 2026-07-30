@@ -35,6 +35,16 @@ PERFORMANCE:
   ARJUN_BUDGET_S:            # arjun param discovery (was: cap 40 of eligible API endpoints). ONE TARGET PER
                              # PROCESS: arjun crashes on a 400/413/418/429/503 target and a batched run loses
                              # every target after it, so isolation is coverage
+  SHODAN_HOST_BUDGET_S:      # wall-clock budget for the FREE `/shodan/host/{ip}` lane (probe.shodan_host).
+                             # DEFAULT 0 = UNBOUNDED: the endpoint costs no query credit (measured at a zero
+                             # balance), so nothing but time bounds it, and what a bound does not reach is a
+                             # counted remainder — never a silent omission. RESUMABLE while the project-level
+                             # sweep progress persists (least-recently-asked first, so each bounded run
+                             # advances); when that progress cannot be written the remainder is reported as
+                             # RESTARTS instead, because the next run would re-ask the same prefix.
+                             # Membership is never capped: every OBSERVED in-scope address is eligible,
+                             # ordered fairly across /24 (v4) and /48 (v6) netblocks so one dense block
+                             # cannot monopolise a bound
   SHODAN_MAX_PAGES:          # pages bought per Shodan pivot. DEFAULT 0 = UNBOUNDED (page until the pivot
                              # is exhausted) — the CREDIT BALANCE is what bounds the spend, not an
                              # arbitrary page number. A nonzero value is a hard CAP on eligible input and

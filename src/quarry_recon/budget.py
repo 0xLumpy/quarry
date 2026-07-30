@@ -169,6 +169,19 @@ def order_ranked_fair(items, *, rank, group) -> list:
     return out
 
 
+def ledger_writable(ledger) -> bool:
+    """Whether completions can actually be JOURNALED — a precondition, not a postcondition.
+
+    review-shodan-r3#1: writability was checked only AFTER every purchase, so a foreign ledger let a run
+    buy 15 pages and then report `persisted=False`, and the next lifecycle bought all 15 again. For paid
+    work that difference is money; for free work it is a run that cannot resume.
+
+    B1.7: lives HERE because it is a question about a `Ledger` and nothing else. It existed identically in
+    `shodan_sched` and `whoxy_page`, and a third copy in the host lane is how three answers to one question
+    start to drift apart."""
+    return not getattr(ledger, "foreign", False) and not getattr(ledger, "_journal_unsafe", False)
+
+
 def state_path(base, lane: str, config_fp: str):
     """The per-lane ledger path, namespaced by a COVERAGE-CONFIG fingerprint.
 

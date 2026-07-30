@@ -1,0 +1,86 @@
+{
+ "area_code": null,
+ "asn": "AS13335",
+ "city": "Brisbane",
+ "country_code": "AU",
+ "country_name": "Australia",
+ "data": [
+  {
+   "_shodan": {
+    "crawler": "ada8582d54117e5eb7c72186882e76f0854a54ae",
+    "id": "43983184-c0a8-4474-b0af-64f7b46e2da6",
+    "module": "dns-tcp",
+    "ptr": true
+   },
+   "domains": [
+    "one.one"
+   ],
+   "hostnames": [
+    "one.one.one.one"
+   ],
+   "port": 53,
+   "timestamp": "2026-07-29T17:04:46.190270",
+   "transport": "tcp"
+  },
+  {
+   "_shodan": {
+    "crawler": "a6644fa6bd81b0fc2e35eb413fdb37501bd2770c",
+    "id": "e043562d-946b-4732-97d6-7c3126684347",
+    "module": "https",
+    "ptr": true
+   },
+   "domains": [
+    "one.one",
+    "schoolloop.com"
+   ],
+   "hostnames": [
+    "one.one.one.one",
+    "seacliff-huntington-ca.schoolloop.com"
+   ],
+   "port": 443,
+   "ssl": {
+    "cipher": {
+     "bits": 256,
+     "name": "TLS_AES_256_GCM_SHA384",
+     "version": "TLSv1.3"
+    },
+    "jarm": "27d27d27d00027d00042d43d00041df04c41293ba84f6efe3a613b22f983e6"
+   },
+   "timestamp": "2026-07-30T04:06:49.637414",
+   "transport": "tcp"
+  }
+ ],
+ "domains": [
+  "dbi-nyc.com",
+  "one.one",
+  "schoolloop.com"
+ ],
+ "hostnames": [
+  "seacliff-huntington-ca.schoolloop.com",
+  "www.photo.dbi-nyc.com",
+  "one.one.one.one"
+ ],
+ "ip": 16843009,
+ "ip_str": "1.1.1.1",
+ "isp": "Cloudflare, Inc.",
+ "last_update": "2026-07-30T04:14:37.743242",
+ "latitude": -27.48159,
+ "longitude": 153.0175,
+ "org": "APNIC and Cloudflare DNS Resolver project",
+ "os": null,
+ "ports": [
+  161,
+  2082,
+  2083,
+  2086,
+  2087,
+  80,
+  8880,
+  8080,
+  53,
+  8443,
+  443
+ ],
+ "region_code": "QLD",
+ "tags": []
+}

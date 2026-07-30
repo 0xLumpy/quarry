@@ -172,11 +172,9 @@ def owned_index(ledger) -> dict:
     return out
 
 
-def ledger_writable(ledger) -> bool:
-    """Whether completions can actually be journaled. review-r3#1: writability was checked only AFTER
-    every purchase, so a foreign ledger let a run buy 15 pages and then report `persisted=False` — and
-    the next lifecycle bought all 15 again. For PAID work this is a precondition, not a postcondition."""
-    return not getattr(ledger, "foreign", False) and not getattr(ledger, "_journal_unsafe", False)
+#: B1.7: one definition, in `budget`, where the Ledger is. This module and `whoxy_page` had identical
+#: copies and the host lane needed a third.
+ledger_writable = budget.ledger_writable
 
 
 #: B1.6: the identical probe is now `budget.store_writable` — the Whoxy paginator needs the same one,

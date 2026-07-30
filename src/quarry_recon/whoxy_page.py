@@ -1000,10 +1000,8 @@ def _buy(states, o, *, spend, fetch, ingest, read, ledger, attempt_dir, is_limit
             break
 
 
-def ledger_writable(ledger) -> bool:
-    """Whether completions can actually be journaled. For PAID work this is a precondition, not a
-    postcondition: discovering it afterwards means the credits are already gone."""
-    return not getattr(ledger, "foreign", False) and not getattr(ledger, "_journal_unsafe", False)
+#: B1.7: shared with every other ledger consumer — see `budget.ledger_writable`.
+ledger_writable = budget.ledger_writable
 
 
 def _machinery(o, e: BaseException) -> None:

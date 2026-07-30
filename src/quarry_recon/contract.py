@@ -26,14 +26,39 @@ from .runner import Status, run as _run, skipped
 _PARTIAL = (Status.PARTIAL, Status.TIMED_OUT)
 
 
+def _exact_counts(produced) -> dict:
+    """`produced` as a validated `{entity: count}` map. Raises on anything that could lie about a count —
+    constructing an impossible outcome is a defect, not something to normalise away."""
+    if not isinstance(produced, dict):
+        raise ValueError(f"produced must be a dict of counts, got {type(produced).__name__}")
+    out: dict = {}
+    for key, value in produced.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"produced key must be a non-empty entity name, got {key!r}")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"produced[{key!r}] must be an exact non-negative int, got {value!r}")
+        out[key] = value
+    return out
+
+
 class ProviderResult(set):
     """A provider's hostname set that can also carry PAGINATION COMPLETION metadata (C06). A plain set means
     'complete'; `partial=True` means the page cap was hit with a live continuation cursor, so collection was
     TRUNCATED — run_provider then records PARTIAL (not SUCCESS) and a structured coverage_partial, so a
     consumer can tell complete collection from a bounded/truncated one and resume from `cursor`."""
     def __init__(self, iterable=(), *, partial=False, cursor=None, pages=None, error_class=None,
-                 partial_kind=None, partial_reason=None, limited=False):
+                 partial_kind=None, partial_reason=None, limited=False, produced=None):
         super().__init__(iterable)
+        # review-B1.7r9#3: this type assumed every provider produces HOSTNAMES, so a lane whose evidence is
+        # ports and review rows had only two ways to report a productive run — fabricate a hostname count,
+        # or return an empty set and be recorded as a clean EMPTY after storing real evidence. `produced` is
+        # the entity counts the lane ACTUALLY wrote, e.g. {"port": 3, "review": 2}; absent (None) keeps the
+        # hostname-set behaviour every other provider relies on.
+        # review-B1.7r10#4: `dict(produced) if produced else None` accepted `{"port": True, "review": -2}`
+        # — a status sum of -1, which is TRUTHY and therefore reported SUCCESS — and turned an explicit `{}`
+        # back into None, resurrecting the fabricated `{"host": 0}` fallback for a lane that genuinely
+        # produced nothing. A count is an exact non-negative int; a key is a name.
+        self.produced = None if produced is None else _exact_counts(produced)
         # review-B1.4r5#1: `limited` without `partial` was a silent SUCCESS/EMPTY — a bounded outcome
         # reported as a complete one. A limit IS incompleteness, so it implies partial rather than
         # depending on the caller to say both. And it is never PAGINATION truncation, so an unstated
@@ -132,9 +157,18 @@ def capture_error_body(exc, *, provider: str = "", limit: int = _ERROR_BODY_LIMI
                 exc.close()
             except Exception:
                 pass
-        exc.body_text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else ""
+        # review-B1.7r8#4: both stamps are BEST-EFFORT, like the read above. An exception with `__slots__`
+        # or an overridden `__setattr__` rejects them, and this function's contract is that a body we
+        # cannot use yields no extra signal — never an error out of a raise-site helper.
+        try:
+            exc.body_text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else ""
+        except Exception:
+            pass
     if provider and getattr(exc, "error_class", None) is None:
-        exc.error_class = classify_provider_http(exc, provider=provider)
+        try:
+            exc.error_class = classify_provider_http(exc, provider=provider)
+        except Exception:
+            pass
     return exc
 
 
@@ -242,8 +276,29 @@ _QUOTA_REASONS = {
 }
 
 
+#: a provider's own words for "I HAVE NO DATA", which is not a failure. Same discipline as
+#: `_QUOTA_REASONS`: EXACT normalised match, never substring, because a message cannot be distinguished
+#: from its own negation by containment. Add variants only when they are MEASURED.
+_EMPTY_REASONS = {
+    # MEASURED 2026-07-30 at a ZERO query-credit balance: `/shodan/host/{ip}` answers an IP it has never
+    # seen with HTTP **404** and this body, and answers a known IP with 200 and a full record. Without
+    # this rule a 404 classifies as `http` (see `classify_provider_http`) and "not in Shodan" — the
+    # ordinary case for most eligible addresses — would report as a lane failure on nearly every IP.
+    "shodan": frozenset({"no information available for that ip."}),
+}
+
+
 def _norm_reason(reason: str) -> str:
     return " ".join((reason or "").split()).strip().lower()
+
+
+def is_measured_empty(provider: str, reason: str) -> bool:
+    """True when the provider SAID it has no data, in words we have measured.
+
+    A provider that answers "nothing here" is reporting COVERAGE, not failing: the lane asked, got a
+    definitive answer, and there is nothing to retry. Anything else about the same status code stays a
+    failure — an unmeasured 404 body is a 404 we do not understand."""
+    return _norm_reason(reason) in _EMPTY_REASONS.get(provider, frozenset())
 
 
 def classify_provider_reason(provider: str, reason: str) -> str:
@@ -674,6 +729,10 @@ def _provider_terminal(source_id, fn, *, work_unit=None):
     try:
         result = fn()
         n = len(result) if hasattr(result, "__len__") else None
+        produced = getattr(result, "produced", None)
+        if produced is not None:
+            # the lane told us what it wrote. Status follows THAT, not a hostname set it never fills.
+            n = sum(v for v in produced.values() if isinstance(v, int))
         if isinstance(result, ProviderResult):
             if result.partial and result.partial_kind == "pagination":
                 is_pagination = True
@@ -733,9 +792,11 @@ def _provider_terminal(source_id, fn, *, work_unit=None):
                                     unit=(work_unit or source_id), eligible=1,
                                     tested=0 if truncated else 1, omitted=1 if truncated else 0,
                                     reason=(reason if truncated else "pagination complete"))
+        _produced = getattr(result, "produced", None)
         events.tool_finish(source_id, status=status, work_unit=work_unit,
                            reason=reason, error_class=error_class, provider=True,   # verdict folds provider terminals
-                           produced={"host": n} if n is not None else None)         # (reset is on the START now)
+                           produced=(dict(_produced) if _produced is not None else
+                                     ({"host": n} if n is not None else None)))     # (reset is on the START now)
     return result                                            # None on failure — caller guards (best-effort)
 
 
