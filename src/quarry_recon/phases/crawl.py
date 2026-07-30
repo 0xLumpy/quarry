@@ -1182,6 +1182,74 @@ XNL_PARAM_CAP = 2000                   # xnLinkFinder emits POTENTIAL params (no
 XNL_WORDLIST_DERIVE_CAP = 5000         # bounded vocabulary derived from links/params when -owl is skipped
 
 
+#: what one line of xnLinkFinder output can be. The tool's OWN scope filter is not a boundary Quarry may
+#: rely on: its `-sf` regex is unanchored at the end of the host, so for apex `acme.com` it admits
+#: `acme.com.evil.net`, `notacme.com` and `xacme.common.io` (measured, xnLinkFinder 8.2 ~line 1053). Output
+#: is therefore UNTRUSTED input, re-validated here against Quarry's own scope before anything is stored.
+XNL_ENDPOINT = "endpoint"        # an absolute URL, IN Quarry's scope
+XNL_PATH = "path"                # a relative path — no host, so not contactable and not scope-checkable
+XNL_OOS = "oos"                  # an absolute URL OUTSIDE scope: retained as review evidence, never endpoint
+XNL_MALFORMED = "malformed"      # not usable as either — counted, never stored as surface
+
+#: a potential parameter NAME. xnLinkFinder mines path words, JSON keys, JS variables, input names and meta
+#: fields, so the file also picks up sentences, code fragments and binary noise from minified sources.
+_XNL_PARAM_RX = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:\-\[\]]{0,63}$")
+#: an absolute reference: a scheme, or a scheme-relative `//host/...`
+_XNL_ABSOLUTE_RX = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.\-]*:)?//", re.IGNORECASE)
+
+
+def _xnl_classify_link(raw: str, scope) -> tuple:
+    """`(kind, value)` for one line of xnLinkFinder link output. NEVER raises.
+
+    Absolute URLs are scoped by QUARRY (`in_scope` and not `is_oos`) on a CANONICAL host, not by the tool's
+    substring regex. An off-scope URL is real evidence — the archive really did link there — so it is kept
+    as review, but it is not surface: `endpoint` is consumed by lanes that go on to contact things."""
+    v = (raw or "").strip()
+    if not v or v == "<stdin>":
+        return XNL_MALFORMED, ""              # the tool's own noise token; not a finding, not an error
+    if any(ch in v for ch in "\t \x00") or len(v) > 4096:
+        return XNL_MALFORMED, v               # a link with whitespace/NUL, or an absurd length, is not a link
+    if _XNL_ABSOLUTE_RX.match(v):
+        host = normalize.host_of_url(v if "//" not in v[:2] else "http:" + v)
+        canon = normalize.canon_host_strict(host) if host else None
+        if not canon:
+            return XNL_MALFORMED, v           # an absolute reference whose host we cannot even canonicalize
+        if scope.in_scope(canon) and not scope.is_oos(canon):
+            return XNL_ENDPOINT, v
+        return XNL_OOS, v
+    if v.startswith("/") or v.startswith("./") or v.startswith("../"):
+        return XNL_PATH, v
+    # anything else — a bare word, a code fragment, a mangled token — is not a reference at all
+    return XNL_MALFORMED, v
+
+
+def _xnl_classify_param(raw: str) -> tuple:
+    """`(ok, value)` for one line of xnLinkFinder param output. NEVER raises."""
+    v = (raw or "").strip()
+    if not v or v == "<stdin>":
+        return False, ""
+    return bool(_XNL_PARAM_RX.match(v)), v
+
+
+def _xnl_lines(path) -> tuple:
+    """`(lines, undecodable)` — read tool output as BYTES and decode per line, strictly.
+
+    A whole-file `errors="replace"` decode turns invalid UTF-8 into replacement characters that then look
+    like perfectly good values; mined minified/binary sources produce exactly that. A line we cannot decode
+    is counted, not guessed at."""
+    try:
+        blob = path.read_bytes() if path.exists() else b""
+    except OSError:
+        return [], 0
+    out, bad = [], 0
+    for chunk in blob.splitlines():
+        try:
+            out.append(chunk.decode("utf-8"))
+        except UnicodeDecodeError:
+            bad += 1
+    return out, bad
+
+
 def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
     roots = ctx.write_list("roots.txt", ctx.profile.apex_domains)
     safe_tag = tag.replace("/", "_").replace(".", "_")
@@ -1242,9 +1310,9 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
     # -ow so a re-run is DETERMINISTIC (a stale artifact from an earlier invocation can't inflate the count).
     for _o in (out_links, out_params, out_secrets, out_wl):
         _o.unlink(missing_ok=True)
-    # -orig ("LINK [ORIGIN]") is useless in stdin mode — origin is always "<stdin>" and would CORRUPT the
-    # endpoint value — so strip it from the flags. (We do NOT post-strip a trailing "[..]": with -orig gone
-    # xnLinkFinder never appends one, and a strip would mangle legitimate route templates like /users/[id].)
+    # -orig ("LINK [ORIGIN]") is OMITTED entirely: in stdin mode the origin is always "<stdin>", so the flag
+    # buys nothing and would CORRUPT the endpoint value. (We do NOT post-strip a trailing "[..]": with -orig
+    # never passed xnLinkFinder appends none, and a strip would mangle route templates like /users/[id].)
     # review-B-audit: `extra: list` was an UNRESTRICTED flag injection point — a caller could pass `-d 3`,
     # `-i <url>` or any other crawl flag straight into the command line of a lane whose whole contract is
     # "never requests anything". The only flag any call site actually needed is `-spo`, so that is the only
@@ -1298,20 +1366,55 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
                                    f"({partial_files} partial, {unreadable} unreadable; input cap "
                                    f"{XNL_MAX_INPUT // (1024*1024)}MB)")
 
-    # ── endpoints: ingest as-is (scope already applied by xnLinkFinder; no -orig -> no origin suffix) ──
-    n_endpoints = 0
-    if out_links.exists():
-        for line in out_links.read_text(errors="replace").splitlines():
-            v = line.strip()
-            if v and ctx.run.add("endpoint", {"value": v, "sources": [f"xnLinkFinder-{tag}"]}):
+    # ── links: UNTRUSTED output, re-validated against QUARRY's scope before anything is stored ──
+    # It used to be ingested as-is, "scope already applied by xnLinkFinder" — but that filter admits
+    # `acme.com.evil.net` and `notacme.com` for apex `acme.com`, so the inventory was inheriting the same
+    # defect the depth-3 crawl was contained for.
+    src_tag = f"xnLinkFinder-{tag}"
+    lines, undecodable = _xnl_lines(out_links)
+    n_endpoints = n_paths = n_oos = n_bad_links = 0
+    for line in lines:
+        kind, v = _xnl_classify_link(line, ctx.scope)
+        if kind == XNL_ENDPOINT:
+            if ctx.run.add("endpoint", {"value": v, "sources": [src_tag]}):
                 n_endpoints += 1
+        elif kind == XNL_PATH:
+            # a relative path has no host, so it is not contactable on its own — and the concatenated stdin
+            # blob has already destroyed which file it came from. `origin: unbound` says that plainly rather
+            # than letting a consumer assume the path belongs to some particular site.
+            if ctx.run.add("endpoint", {"value": v, "kind": "path", "origin": "unbound",
+                                        "sources": [src_tag]}):
+                n_paths += 1
+        elif kind == XNL_OOS:
+            # the archive really did link there: real evidence, and NOT surface. `endpoint` feeds lanes that
+            # go on to contact things, so an off-scope URL is retained where nothing active consumes it.
+            n_oos += 1
+            ctx.run.add("review", {"id": f"{src_tag}:oos:{v}", "klass": "oos-link", "value": v,
+                                   "note": f"{src_tag} extracted an OFF-SCOPE link — retained as evidence, "
+                                           f"never probed (Quarry scope, not the tool's filter)",
+                                   "sources": [src_tag]})
+        else:
+            n_bad_links += 1
+    events.coverage_partial("crawl.xnlinkfinder", kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:links",
+                            measure="links", eligible=len(lines) + undecodable,
+                            tested=n_endpoints + n_paths + n_oos,
+                            omitted=n_bad_links + undecodable,
+                            reason=(f"{tag}: {n_endpoints} in-scope, {n_paths} relative, {n_oos} off-scope "
+                                    f"(review only); {n_bad_links} unusable, {undecodable} undecodable"))
 
     # ── params: xnLinkFinder emits POTENTIAL params (path words / JSON keys / JS vars / input names / meta)
     #    — NOT confirmed request params. Store as CANDIDATES (kind=potential) with a per-call CAP so a 52k
     #    dump can't flood the inventory / downstream arjun. Drop the <stdin> noise token. ──
     n_params_added = 0
-    cand = sorted({ln.strip() for ln in out_params.read_text(errors="replace").splitlines()
-                   if ln.strip() and ln.strip() != "<stdin>"}) if out_params.exists() else []
+    param_lines, param_undecodable = _xnl_lines(out_params)
+    cand_set, n_bad_params = set(), param_undecodable
+    for line in param_lines:
+        ok, v = _xnl_classify_param(line)
+        if ok:
+            cand_set.add(v)
+        elif v:
+            n_bad_params += 1                 # a sentence, a code fragment, binary noise — not a param name
+    cand = sorted(cand_set)
     n_params_seen = len(cand)
     # cap a DETERMINISTIC subset: sort first, then keep the first N — so a re-run keeps the SAME candidates
     # (xnLinkFinder's -op file order is set-derived / unstable; capping the raw order was non-idempotent).
@@ -1327,7 +1430,7 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
                             eligible=n_params_seen, tested=min(n_params_seen, XNL_PARAM_CAP),
                             omitted=max(0, n_params_seen - XNL_PARAM_CAP),
                             reason=f"{tag}: {min(n_params_seen, XNL_PARAM_CAP)}/{n_params_seen} potential params "
-                                   f"(cap {XNL_PARAM_CAP})")
+                                   f"(cap {XNL_PARAM_CAP}); {n_bad_params} rejected as unusable")
 
     # ── A1d vocabulary: if -owl was skipped (large), DERIVE a bounded target wordlist from the mined
     #    links+params (path segments + param names are exactly the useful brute words) so A1d isn't starved;
@@ -1361,9 +1464,16 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
         except Exception:
             n_secrets = 0
     events.ledger("crawl.xnlinkfinder",
-                  produced={"endpoints": n_endpoints, "potential_params": n_params_seen,
-                            "params_kept": n_params_added, "wordlist": n_words, "secrets": n_secrets})
-    if written > 512 and not (n_endpoints or n_params_seen or n_words or n_secrets):
+                  produced={"endpoints": n_endpoints, "paths": n_paths, "oos_links": n_oos,
+                            "potential_params": n_params_seen, "params_kept": n_params_added,
+                            "wordlist": n_words, "secrets": n_secrets},
+                  # what the tool emitted that Quarry REFUSED to treat as surface. A parser boundary that
+                  # reports nothing is indistinguishable from a tool that emitted nothing.
+                  xnl_rejected={"links_unusable": n_bad_links, "links_undecodable": undecodable,
+                                "params_unusable": n_bad_params, "off_scope_links": n_oos})
+    # a run that produced NOTHING usable is suspicious; one that produced only off-scope links is a
+    # different fact, so both are named.
+    if written > 512 and not (n_endpoints or n_paths or n_params_seen or n_words or n_secrets or n_oos):
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: {written}B input -> 0 links/params/words/secrets "
                                        f"(capability drift? input kept: {blob.name})")

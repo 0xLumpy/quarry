@@ -2125,3 +2125,145 @@ class TestXnLinkFinderNeverCrawls:
         text = doc.read_text()
         assert "xnLinkFinder -i " not in text, "the docs still teach `-i <dir>`"
         assert "-d 3" not in text and "-insecure" not in text, "the docs still teach the depth-3 crawl"
+
+
+class TestXnLinkFinderOutputIsUntrusted:
+    """review-B-audit step 2: xnLinkFinder's own `-sf` scope filter is not a boundary Quarry may rely on —
+    its regex is unanchored at the end of the host, so for apex `acme.com` it admits `acme.com.evil.net`,
+    `notacme.com` and `xacme.common.io` (measured, 8.2 ~line 1053). The lane used to ingest links "as-is,
+    scope already applied by xnLinkFinder", so the inventory inherited the same defect the depth-3 crawl
+    was contained for."""
+
+    class _S:
+        def in_scope(self, h):
+            return h == "acme.com" or h.endswith(".acme.com")
+
+        def is_oos(self, h):
+            return h.startswith("oos.")
+
+    @pytest.mark.parametrize("link", [
+        "https://acme.com.evil.net/x",       # the tool's regex says IN
+        "https://notacme.com/x",             # ...and for this one too
+        "//acme.com.attacker.io/y",
+        "https://xacme.common.io/z",
+        "https://evil.net/?u=acme.com",
+    ])
+    def test_a_link_the_TOOLS_filter_admits_is_not_an_endpoint(self, link):
+        kind, _v = crawl._xnl_classify_link(link, self._S())
+        assert kind == crawl.XNL_OOS, (link, kind)
+
+    @pytest.mark.parametrize("link", ["https://www.acme.com/a", "http://acme.com/", "//api.acme.com/v1"])
+    def test_a_genuinely_in_scope_link_IS_an_endpoint(self, link):
+        assert crawl._xnl_classify_link(link, self._S())[0] == crawl.XNL_ENDPOINT, link
+
+    def test_an_OOS_pattern_host_is_off_scope_even_under_the_apex(self):
+        assert crawl._xnl_classify_link("https://oos.acme.com/x", self._S())[0] == crawl.XNL_OOS
+
+    @pytest.mark.parametrize("link,kind", [
+        ("/api/v1/users", "path"), ("./rel", "path"), ("../up", "path"),
+        ("plainword", "malformed"), ("<stdin>", "malformed"), ("", "malformed"),
+        ("https://[bad/", "malformed"), ("http://a b.com/", "malformed"), ("x" * 5000, "malformed"),
+        ("https://acme.com/\x00evil", "malformed"),
+    ])
+    def test_every_other_shape_is_classified_not_stored_blindly(self, link, kind):
+        assert crawl._xnl_classify_link(link, self._S())[0] == kind, link
+
+    def test_the_classifier_NEVER_raises(self):
+        for junk in ["", "   ", "://", "//", "http://", "https://:80/", "%%%", "\x00", "a" * 4097]:
+            crawl._xnl_classify_link(junk, self._S())
+
+    @pytest.mark.parametrize("raw,ok", [
+        ("user_id", True), ("q", True), ("a.b", True), ("x[0]", True), ("Auth-Token", True),
+        ("", False), ("<stdin>", False), ("has space", False), ("a" * 65, False),
+        ("=eq", False), ("{}", False), ("function(){}", False),
+    ])
+    def test_param_names_are_validated_too(self, raw, ok):
+        assert crawl._xnl_classify_param(raw)[0] is ok, raw
+
+    def test_UNDECODABLE_bytes_are_counted_not_replaced(self, tmp_path):
+        """A whole-file `errors="replace"` decode turns invalid UTF-8 into replacement characters that then
+        look like perfectly good values — mined minified sources produce exactly that."""
+        f = tmp_path / "links.txt"
+        f.write_bytes(b"https://www.acme.com/ok\n\xff\xfe/bad\nhttps://api.acme.com/two\n")
+        lines, undecodable = crawl._xnl_lines(f)
+        assert lines == ["https://www.acme.com/ok", "https://api.acme.com/two"], lines
+        assert undecodable == 1
+
+    def test_a_missing_file_is_empty_not_an_error(self, tmp_path):
+        assert crawl._xnl_lines(tmp_path / "nope.txt") == ([], 0)
+
+
+class TestXnLinkFinderIngestionBoundary:
+    """The same claims, through `_xnl` itself: what reaches the store, and what is reported about what did
+    not."""
+
+    def _ingest(self, tmp_path, monkeypatch, links=(), params=()):
+        def fake_exec(tool, cmd, **kw):
+            out = {cmd[i + 1]: None for i, a in enumerate(cmd) if a in ("-o", "-op")}
+            paths = list(out)
+            pathlib.Path(paths[0]).write_text("\n".join(links) + ("\n" if links else ""))
+            pathlib.Path(paths[1]).write_text("\n".join(params) + ("\n" if params else ""))
+            return type("R", (), {"tool": tool, "cmd": cmd, "status": crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = TestXnLinkFinderOutputIsUntrusted._S()
+        ctx.scope.passive_only = False
+        src = tmp_path / "in"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "a.js").write_text("x")
+        crawl._xnl(ctx, str(src), "t")
+        evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+        return ctx.run.added, evs
+
+    def test_only_IN_SCOPE_urls_become_endpoints(self, tmp_path, monkeypatch):
+        added, _evs = self._ingest(tmp_path, monkeypatch, links=[
+            "https://www.acme.com/keep", "https://acme.com.evil.net/drop", "https://notacme.com/drop"])
+        endpoints = [r["value"] for k, r in added if k == "endpoint"]
+        assert endpoints == ["https://www.acme.com/keep"], endpoints
+
+    def test_an_OFF_SCOPE_url_is_review_evidence_never_surface(self, tmp_path, monkeypatch):
+        added, _evs = self._ingest(tmp_path, monkeypatch, links=["https://acme.com.evil.net/x"])
+        assert not [r for k, r in added if k == "endpoint"], added
+        rev = [r for k, r in added if k == "review"]
+        assert rev and rev[0]["klass"] == "oos-link" and rev[0]["value"] == "https://acme.com.evil.net/x"
+        assert "never probed" in rev[0]["note"]
+
+    def test_a_RELATIVE_path_says_it_has_no_origin(self, tmp_path, monkeypatch):
+        """The concatenated stdin blob has already destroyed which file a path came from — a consumer must
+        not be able to assume it belongs to some particular site."""
+        added, _evs = self._ingest(tmp_path, monkeypatch, links=["/api/v1/users"])
+        row = [r for k, r in added if k == "endpoint"][0]
+        assert row["kind"] == "path" and row["origin"] == "unbound", row
+
+    def test_MALFORMED_output_is_counted_not_stored(self, tmp_path, monkeypatch):
+        added, evs = self._ingest(tmp_path, monkeypatch,
+                                  links=["plainword", "https://[bad/", "https://www.acme.com/ok"])
+        assert [r["value"] for k, r in added if k == "endpoint"] == ["https://www.acme.com/ok"]
+        cov = [e for e in evs if e.get("measure") == "links"]
+        assert cov and cov[0]["omitted"] == 2 and cov[0]["tested"] == 1, cov
+
+    def test_the_coverage_names_each_disposition(self, tmp_path, monkeypatch):
+        _added, evs = self._ingest(tmp_path, monkeypatch, links=[
+            "https://www.acme.com/a", "/rel", "https://notacme.com/x", "junk"])
+        cov = [e for e in evs if e.get("measure") == "links"][0]
+        assert cov["eligible"] == 4 and cov["tested"] == 3 and cov["omitted"] == 1, cov
+        assert "1 in-scope" in cov["reason"] and "1 off-scope" in cov["reason"], cov["reason"]
+
+    def test_the_ledger_reports_what_the_boundary_REFUSED(self, tmp_path, monkeypatch):
+        """A parser boundary that reports nothing is indistinguishable from a tool that emitted nothing."""
+        _added, evs = self._ingest(tmp_path, monkeypatch,
+                                   links=["https://notacme.com/x", "junk"], params=["ok_name", "not a param"])
+        led = [e for e in evs if e.get("event") == "ledger"][0]
+        assert led["xnl_rejected"]["links_unusable"] == 1
+        assert led["xnl_rejected"]["off_scope_links"] == 1
+        assert led["xnl_rejected"]["params_unusable"] == 1
+        assert led["produced"]["oos_links"] == 1 and led["produced"]["endpoints"] == 0
+
+    def test_UNUSABLE_params_never_reach_the_store(self, tmp_path, monkeypatch):
+        added, _evs = self._ingest(tmp_path, monkeypatch,
+                                   params=["user_id", "function(){}", "has space", "q"])
+        got = sorted(r["value"] for k, r in added if k == "parameter")
+        assert got == ["q", "user_id"], got
