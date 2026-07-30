@@ -20,8 +20,9 @@ import urllib.parse
 import urllib.request
 
 from .. import budget, contract, events, netguard, normalize, secrets, settings, shodan_sched, store
-from ..contract import (PROVIDER_RATE_LIMIT, ProviderResult, capture_error_body, is_provider_limit,
-                        provider_error_class, run_contract, run_provider)
+from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_RATE_LIMIT, ProviderResult,
+                        capture_error_body, is_provider_limit, provider_error_class, run_contract,
+                        run_provider)
 from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir, have,
                       nuclei_timeout, reclassify_ffuf,
                       reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
@@ -287,6 +288,35 @@ SHODAN_RESERVE_INVALID = "reserve_invalid"         # the knob is present but unu
 #: unexplained refusal and a broken cost guard are all things the operator must FIX, not accept.
 _STOP_LIMITS = frozenset({SHODAN_PROVIDER_EXHAUSTED, SHODAN_ENTITLEMENT, SHODAN_OPERATOR_RESERVE,
                           SHODAN_UNKNOWN_WITH_RESERVE})
+
+#: review-B1.7a#4: every stop token that is NOT already a taxonomy class, mapped to the one it means.
+#: `auth_refused` IS `auth` (the credential does not work); a broken cost guard, an unwritable ledger, a
+#: failed publish and a scheduler invariant are all OUR defect, which the taxonomy calls `error`.
+_TOKEN_CLASS = {SHODAN_AUTH_REFUSED: "auth", SHODAN_RESERVE_INVALID: PROVIDER_ERROR,
+                "ledger_unwritable": PROVIDER_ERROR, "publish_failed": PROVIDER_ERROR,
+                "scheduler_invariant": PROVIDER_ERROR}
+
+
+#: stop causes that are OUR OWN machinery, not the provider's. review-B1.7a#4: these were only ever
+#: consulted when a page REMAINDER was left, so a run that bought every page it wanted and then could not
+#: journal one returned a clean terminal — the defect visible in `stop_cause` and nowhere else.
+_INTERNAL_STOPS = frozenset({"ledger_unwritable", "publish_failed", "scheduler_invariant"})
+
+
+def _internal_stop(stop: str) -> bool:
+    return stop in _INTERNAL_STOPS or stop.startswith("machinery:")
+
+
+def _canonical_class(token) -> str:
+    """A CANONICAL taxonomy class for an internal stop token.
+
+    review-B1.7a#4: the lane emitted its own scheduler vocabulary as `error_class` — `publish_failed`,
+    `machinery:OSError`, `auth_refused` — and a consumer validating against `PROVIDER_CLASSES` sees a
+    value the taxonomy does not define. The token itself stays in the REASON, where prose belongs."""
+    if token in PROVIDER_CLASSES:
+        return token
+    return _TOKEN_CLASS.get(token, PROVIDER_ERROR)
+
 
 #: a stop that the PROVIDER proved, as the error class the terminal speaks. Only these two are the
 #: provider's own boundary; an operator reserve or an unreadable balance is OUR policy or OUR problem and
@@ -653,9 +683,13 @@ def _shodan_work(ctx, key, lanes):
                     if scope.in_scope(hn) and not scope.is_oos(hn):
                         # review-r6#1: the response HAD this in-scope host — it belongs in `found` REGARDLESS
                         # of whether the store already had it (dedup is a storage concern, NOT presence).
-                        found[spec.sid].add(hn)
+                        # review-B1.7a#1: but the STORE COMES FIRST. `found` drives the lane terminal and the
+                        # announcement, so adding before the write meant a storage failure — now correctly
+                        # counted as an unconsumed page — still reported the hostname as produced. A `False`
+                        # return is dedup and still counts; an exception means the host is not there.
                         ctx.run.add("subdomain", {"host": hn, "sources": [spec.source],
                                                   "raw_ref": str(raw_path)})
+                        found[spec.sid].add(hn)
                     else:
                         # OFF-SCOPE. The RoE boundary is OBSERVE, never expand: a host returned by a page we
                         # already BOUGHT is evidence we hold, and mining it is passive. It reaches a REVIEW
@@ -857,7 +891,7 @@ def _shodan_result(spec, values, work):
     errored = sum(fail_classes.values()) + sum(limit_classes.values())
     evidence = o.pages_bought + o.pages_replayed
     if values and not evidence and not errored:
-        stop_cls = _STOP_CLASS.get(bal.stop_kind)
+        stop_cls = _STOP_CLASS.get(bal.stop_kind)          # already canonical: quota / entitlement
         if stop_cls:
             # the balance PROVED further work is pointless, so no request was issued. There is no
             # exception to raise (nothing failed), and a bare empty set would read as a clean EMPTY —
@@ -871,8 +905,9 @@ def _shodan_result(spec, values, work):
             # coverage said "gap": the verdict was right and `failed_tools` was a lie.
             # the CANONICAL class, not the internal stop token: `count_refused` is set when a free
             # count proved the key is refused, and it is what a consumer can act on (review-B1.5r5#2).
-            raise ShodanPageError(bal.count_refused or bal.read_error or bal.stop_kind,
-                                  RuntimeError(f"shodan: {bal.reason}"))
+            token = bal.count_refused or bal.read_error or bal.stop_kind
+            raise ShodanPageError(_canonical_class(token),
+                                  RuntimeError(f"shodan: {bal.reason} ({token})"))
     if values and errored and not hits and not evidence:
         # everything we attempted yielded NOTHING. A REAL failure outranks a limit: if something actually
         # broke, the run must not read as "merely limited" (review#2 — the outcome used to depend on
@@ -882,12 +917,53 @@ def _shodan_result(spec, values, work):
     # a pivot with one bought page and four provider-bounded pages left is just as incomplete, and it
     # reported EMPTY (or SUCCESS, with a non-empty first page) while its own coverage said omitted=4.
     # The scheduler already models the whole remainder; the terminal must read ALL of it.
+    # review-B1.7a: OUR OWN machinery failing is a defect and must read as one — and it is independent of
+    # whether a remainder is left. A run that bought every page and then could not write its state has
+    # nothing "unqueried" at all, and used to return a clean terminal with the failure discarded. A page
+    # we own but could not ingest is the same class of loss: the evidence is bought and unusable.
+    # review-B1.7a#2: THIS lane's machinery, plus failures that genuinely belong to every lane (the
+    # ledger save, remainder accounting). Another lane's ingest defect is not this lane's outcome.
+    machinery = list(o.machinery) + list(res.machinery)
     left = len(o.unqueried) + o.pages_left_known
+    # a GLOBAL internal stop reaches this lane only if it actually COST it something: work left, or state
+    # that did not persist. A lane that bought everything it wanted and journaled it owes nothing to
+    # another lane's ingest defect — the stop ended purchasing this lane had no need of (review-B1.7a#5).
+    # review-B1.7a#7: this also consulted `records_journaled`, and that was WRONG — `Ledger.record`
+    # updates the ownership map before appending and a successful `save()` snapshots that map, so a
+    # rescued append failure still leaves the pages owned. `persisted` IS the durability handshake
+    # ("snapshot written OR journal intact"); reproduced: snapshot holding both completions, both lanes
+    # nonetheless reporting a defect. A stop we recovered from cost this lane nothing.
+    if machinery or o.pages_unconsumed or (_internal_stop(res.stop_cause)
+                                          and (left or not res.persisted)):
+        # review-B1.7a#7: an internal stop with no lane-local fact produced "failed —  (token)" — a
+        # dangling dash and an empty clause. Every part is added only when it says something.
+        parts = [x for x in ("; ".join(machinery),
+                             (f"{o.pages_unconsumed} owned page(s) could not be ingested"
+                              if o.pages_unconsumed else ""),
+                             ("page state was NOT persisted — bought pages will be bought again"
+                              if not res.persisted else "")) if x]
+        # review-B1.7a#3: `res.stop_cause` is a SCHEDULER TOKEN, not a provider class, and emitting
+        # `machinery:OSError` as `error_class` put a value outside `contract.PROVIDER_CLASSES` into
+        # provider telemetry. Our own defect IS the canonical `error`; the token stays in the reason.
+        if res.stop_cause:
+            parts.append(f"stopped: {res.stop_cause}")
+        why = "; ".join(parts)
+        # A GAP DOMINATES a limit — and the limit is not destroyed by that: it keeps its own coverage
+        # measures (`shodan_pivots_limited` / `shodan_results_limited`, already emitted by `report()`
+        # above) and is named here too. Passing `limited=True` beside a non-limit class would be a claim
+        # nothing can observe: both `_partial_status` and `_partial_coverage_kind` let the gap win, so
+        # the flag would change no status, no kind and no verdict.
+        if limit_classes:
+            why += f"; {sum(limit_classes.values())} page(s) provider-limited {dict(limit_classes)}"
+        if not hits and not evidence:
+            raise ShodanPageError(PROVIDER_ERROR,
+                                  RuntimeError(f"shodan: page state machinery failed — {why}"))
+        return ProviderResult(hits, partial=True, partial_kind="degraded", error_class=PROVIDER_ERROR,
+                              partial_reason=f"evidence KEPT; page state machinery failed — {why}")
+    # The scheduler already models the whole remainder; the terminal must read ALL of it (`left` above).
     if left and not errored:
         stop = res.stop_cause or ""
-        if stop in ("ledger_unwritable", "publish_failed", "scheduler_invariant"):
-            # OUR machinery failed. That is a defect and must read as one.
-            raise ShodanPageError(stop, RuntimeError(f"shodan: scheduling stopped — {stop}"))
+        # OUR OWN machinery is handled ABOVE, whether or not a remainder is left (`_internal_stop`).
         cls = stop.split(":", 1)[1] if stop.startswith("provider_limit:") else None
         if stop.startswith("provider_stop:"):
             # review-B1.5r5#1: another lane's FAILURE ended purchasing. This lane is incomplete for a
@@ -963,7 +1039,8 @@ def _shodan_pivots(ctx) -> None:
         if not values:
             raise contract.ProviderSkip(f"no {spec.field} value to pivot on")
         if not shared:
-            raise ShodanPageError("error", RuntimeError("shodan: shared work produced no result"))
+            raise ShodanPageError(PROVIDER_ERROR,
+                                  RuntimeError("shodan: shared work produced no result"))
         return _shodan_result(spec, values, shared[0])
 
     entries = []

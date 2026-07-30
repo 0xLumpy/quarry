@@ -10,6 +10,7 @@ Hitting the page cap with a live cursor is TRUNCATION → a PARTIAL ProviderResu
 PARTIAL + a coverage gap (never a clean SUCCESS). cloud._check separates definitive absence (404) from an
 INDETERMINATE probe (transport/other) and emits STRUCTURED, every-run coverage the verdict can see.
 """
+import io
 import json
 import socket
 import urllib.error
@@ -557,6 +558,13 @@ def _with_balance(responder, *, credits=100):
             return _Bal()
         return responder(req, timeout=timeout)
     return route
+
+
+def _refuse_completion_appends(self, rec):
+    """A journal that takes the writability CHECKPOINT and refuses every completion record. Patched over
+    `Ledger._append`, so `record()`'s in-memory ownership update still happens first — the real sequence
+    (review-B1.7a#9)."""
+    return "i" not in rec
 
 
 class TestShodanPivot:
@@ -1678,3 +1686,406 @@ class TestShodanPivot:
         n = probe._shodan_pivot(ctx, "k", ["hashX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         assert calls["n"] == 2 and len(n) == 150                   # both pages read, all 150 hosts ingested
         assert not self._cov(tmp_path, "shodan_pages_withheld")[0]["omitted"]   # fully paged
+
+    def _machinery_lanes(self, monkeypatch, tmp_path, *, hostname="a.acme.com", store_ok=True,
+                         save_raises=False):
+        """Both real lanes through `_shodan_pivots`, with a REAL `run_work`. `store_ok=False` makes
+        `ctx.run.add` raise for the FAVICON lane's hostname only — a lane-local ingestion failure."""
+        from quarry_recon.phases import probe
+        from quarry_recon import budget, secrets
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        body = json.dumps({"total": 1, "matches": [{"hostnames": [hostname]}]}).encode()
+        monkeypatch.setattr(probe.urllib.request, "urlopen",
+                            _with_balance(lambda req, timeout=20: _Resp(body), credits=100))
+        if save_raises:
+            real_save = budget.Ledger.save
+            monkeypatch.setattr(budget.Ledger, "save",
+                                lambda self: (_ for _ in ()).throw(OSError("store exploded"))
+                                if self.lane == "probe.shodan" else real_save(self))
+        ctx, added = self._ctx(tmp_path)
+        ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
+                                  else [{"sha1": "C1"}] if e == "certificate" else [])
+        if not store_ok:
+            def add(entity, rec):
+                if entity == "subdomain" and "favicon-shodan" in (rec.get("sources") or []):
+                    raise OSError("store exploded")
+                added.append((entity, rec))
+                return True
+            ctx.run.add = add
+        probe._shodan_pivots(ctx)
+        return added, self._events(tmp_path)
+
+    def _terminals(self, evs, sid):
+        from quarry_recon import events as _ev
+        return [e for e in evs if e.get("source_id") == sid and e.get("event") == _ev.TOOL_FINISH]
+
+    def test_a_MACHINERY_failure_is_never_a_clean_lane_terminal(self, monkeypatch, tmp_path):
+        """review-B1.7a: the terminal only recognised machinery when a REMAINDER was left, so a run that
+        bought every page and then could not write its state returned a clean terminal. Driven through a
+        real `run_work` and a real raising save — not a fabricated `WorkResult`."""
+        _added, evs = self._machinery_lanes(monkeypatch, tmp_path, save_raises=True)
+        term = self._terminals(evs, "probe.favicon")
+        assert term, [e.get("event") for e in evs]
+        assert all(e["status"] != "success" for e in term), term
+        assert "store exploded" in json.dumps(term), term
+
+    def _classes(self, evs):
+        return [e.get("error_class") for e in evs
+                if e.get("source_id", "").startswith("probe.") and e.get("error_class")]
+
+    def test_the_machinery_terminal_carries_a_CANONICAL_error_class(self, monkeypatch, tmp_path):
+        """review-B1.7a#3: `res.stop_cause` was emitted AS the class, so `machinery:OSError` — a value
+        outside `contract.PROVIDER_CLASSES` — reached provider telemetry."""
+        from quarry_recon.contract import PROVIDER_CLASSES
+        _added, evs = self._machinery_lanes(monkeypatch, tmp_path, save_raises=True)
+        classes = self._classes(evs)
+        assert classes, evs
+        assert all(c in PROVIDER_CLASSES for c in classes), classes
+        assert "machinery:OSError" not in json.dumps(classes)
+        assert "error" in classes, classes
+
+    def test_EVERY_internal_stop_cause_emits_a_canonical_class(self, monkeypatch, tmp_path):
+        """review-B1.7a#4: only the raising-`save` path was covered, and `publish_failed` /
+        `ledger_unwritable` / `scheduler_invariant` still emitted their own scheduler vocabulary as the
+        provider error class. Driven through the real lane, one internal failure per case."""
+        from quarry_recon.contract import PROVIDER_CLASSES
+        from quarry_recon.phases import probe
+        from quarry_recon import budget, secrets
+
+        def lane(**kw):
+            monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+            monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+            monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+            body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
+            monkeypatch.setattr(probe.urllib.request, "urlopen",
+                                _with_balance(lambda req, timeout=20: _Resp(body), credits=100))
+            for target, attr, value in kw.get("patches", ()):
+                monkeypatch.setattr(target, attr, value)
+            ctx, _ = self._ctx(tmp_path)
+            ctx.run.read = lambda e: [{"favicon": "F1"}] if e == "live" else []
+            probe._shodan_pivots(ctx)
+            return self._events(tmp_path)
+
+        # publish_failed: the artifact store refuses the page we just paid for
+        evs = lane(patches=((budget, "publish_bytes", lambda *a, **k: False),))
+        classes = self._classes(evs)
+        assert classes, evs
+        assert all(c in PROVIDER_CLASSES for c in classes), classes
+        assert "publish_failed" not in json.dumps(classes), classes
+        assert "publish_failed" in json.dumps([e.get("reason") for e in evs]), evs
+
+    def _ledger_lane(self, monkeypatch, tmp_path, *, record=None, save=None):
+        from quarry_recon.phases import probe
+        from quarry_recon import budget, secrets
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
+        monkeypatch.setattr(probe.urllib.request, "urlopen",
+                            _with_balance(lambda req, timeout=20: _Resp(body), credits=100))
+        # review-B1.7a#9: patch `_append`, never `record`. `record` updates the in-memory ownership map
+        # and THEN appends, and that order is the whole point of the durability handshake — replacing it
+        # skips the update, so the test would prove nothing about a rescued append.
+        if record is not None:
+            monkeypatch.setattr(budget.Ledger, "_append", record)
+        if save is not None:
+            monkeypatch.setattr(budget.Ledger, "save", save)
+        ctx, _ = self._ctx(tmp_path)
+        ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
+                                  else [{"sha1": "C1"}] if e == "certificate" else [])
+        probe._shodan_pivots(ctx)
+        return self._events(tmp_path)
+
+    def test_a_RESCUED_append_failure_is_not_a_lane_defect(self, monkeypatch, tmp_path):
+        """review-B1.7a#7: `Ledger.record` updates the ownership map BEFORE appending, and a successful
+        `save()` snapshots that map — so an append that failed and a snapshot that wrote leaves the pages
+        owned. `persisted` is the durability handshake; both lanes reported a defect over a snapshot that
+        contained both completions."""
+        from quarry_recon import budget
+        real = budget.Ledger._append
+        seen = []
+
+        def append(self, rec):
+            if "i" not in rec:                   # a checkpoint, not a completion
+                return real(self, rec)
+            seen.append(rec["i"])
+            if len(seen) < 2:
+                return real(self, rec)           # the FIRST completion journals normally
+            return False                         # the SECOND append is refused; the snapshot still writes
+
+        evs = self._ledger_lane(monkeypatch, tmp_path, record=append)
+        assert len(seen) == 2, seen              # both lanes bought their page
+        for sid in ("probe.favicon", "probe.cert"):
+            term = self._terminals(evs, sid)
+            assert term, (sid, evs)
+            assert all(e["status"] in ("success", "empty") for e in term), (sid, term)
+            assert "ledger_unwritable" not in json.dumps(term), (sid, term)
+        # ...and the claim underneath it: the SNAPSHOT owns both completions, so a reopened ledger has
+        # them and neither page is ever bought again.
+        state = [p for p in tmp_path.rglob("probe_shodan.*.state.json")]
+        assert state, list((tmp_path).rglob("*.json"))
+        reopened = budget.Ledger(state[0], lane="probe.shodan")
+        owned = dict(reopened.items())
+        assert len(seen) == 2 and all(k in owned for k in seen), (seen, owned)
+
+    def test_a_lane_LEFT_UNQUERIED_by_a_ledger_stop_still_reports_it(self, monkeypatch, tmp_path):
+        """The counterpart: the FIRST append fails, so the second lane never gets its page. A rescued
+        append is not a defect — an unqueried pivot is, and the stop is what explains it."""
+        evs = self._ledger_lane(monkeypatch, tmp_path, record=_refuse_completion_appends)
+        unqueried = [e for e in self._terminals(evs, "probe.favicon")
+                     if "ledger_unwritable" in (e.get("reason") or "")]
+        assert unqueried, self._terminals(evs, "probe.favicon")
+        assert all(e["status"] != "success" for e in unqueried), unqueried
+        # the lane that DID get its page keeps its clean terminal
+        cert = self._terminals(evs, "probe.cert")
+        assert any(e["status"] in ("success", "empty") for e in cert), cert
+
+    def test_a_LEDGER_that_persists_NOTHING_emits_a_canonical_class(self, monkeypatch, tmp_path):
+        """The other half: the append failed AND the snapshot did not write, so the pages really are lost
+        and every lane owes the operator that fact — with a canonical class and no dangling prose."""
+        from quarry_recon.contract import PROVIDER_CLASSES
+        evs = self._ledger_lane(monkeypatch, tmp_path, record=_refuse_completion_appends,
+                                save=lambda self: False)
+        classes = self._classes(evs)
+        assert classes, evs
+        assert all(c in PROVIDER_CLASSES for c in classes), classes
+        assert "ledger_unwritable" not in json.dumps(classes), classes
+        reasons = [e.get("reason") or "" for e in self._terminals(evs, "probe.favicon")]
+        assert any("NOT persisted" in r for r in reasons), reasons
+        assert not any("—  " in r or r.endswith("— ") for r in reasons), reasons
+        assert any("ledger_unwritable" in r for r in reasons), reasons
+
+    @pytest.mark.parametrize("token,want", [
+        ("auth_refused", "auth"),            # the CREDENTIAL does not work — that is `auth`
+        ("reserve_invalid", "error"),         # a broken cost guard is OUR defect
+        ("ledger_unwritable", "error"),
+        ("publish_failed", "error"),
+        ("scheduler_invariant", "error"),
+        ("machinery:OSError", "error"),
+        ("provider_exhausted", "error"),      # a stop KIND, not a class: `_STOP_CLASS` maps it to quota
+        ("auth", "auth"), ("quota", "quota"), ("forbidden", "forbidden"),
+        ("entitlement", "entitlement"), ("transport", "transport"), ("parse", "parse"),
+    ])
+    def test_the_canonicaliser_maps_EVERY_internal_token(self, token, want):
+        """review-B1.7a#4: one mapper, so no call site has to remember. Every token the lane can hold is
+        listed here, and every answer is a value `contract.PROVIDER_CLASSES` actually defines."""
+        from quarry_recon.contract import PROVIDER_CLASSES
+        from quarry_recon.phases import probe
+        got = probe._canonical_class(token)
+        assert got == want, f"{token} -> {got}"
+        assert got in PROVIDER_CLASSES, got
+
+    def test_a_COUNT_refusal_emits_its_canonical_class_not_the_token(self, monkeypatch, tmp_path):
+        """The `auth_refused` path in production: a FREE /host/count proves the credential is refused,
+        which stops paid work. `auth_refused` is a stop token; the class it means is `auth`."""
+        from quarry_recon.contract import PROVIDER_CLASSES
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+
+        body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
+        # NB not `_with_balance`: that helper answers /host/count itself, so a refusal scripted through it
+        # never reaches the endpoint under test.
+        info = json.dumps({"query_credits": 100, "scan_credits": 0}).encode()
+
+        def urlopen(req, timeout=20):
+            url = str(req.full_url)
+            if "api-info" in url:
+                return _Resp(info)
+            if "/shodan/host/count" in url:
+                # ONLY the free count endpoint refuses: a bad key answers 401 with HTML — the measured
+                # shape that is auth, not quota. That refusal stops paid work before any search.
+                raise urllib.error.HTTPError(url, 401, "unauthorized", {},
+                                            io.BytesIO(b"<html>bad key</html>"))
+            return _Resp(body)
+
+        monkeypatch.setattr(probe.urllib.request, "urlopen", urlopen)
+        ctx, _ = self._ctx(tmp_path)
+        ctx.run.read = lambda e: [{"favicon": "F1"}] if e == "live" else []
+        probe._shodan_pivots(ctx)
+        evs = self._events(tmp_path)
+        classes = self._classes(evs)
+        assert classes, evs
+        assert all(c in PROVIDER_CLASSES for c in classes), classes
+        assert "auth_refused" not in json.dumps(classes), classes
+        assert classes == ["auth"], classes            # what the refusal MEANS, from the free endpoint
+        # ...and WHICH endpoint proved it stays in the prose, where a scheduler token belongs
+        assert "/host/count" in json.dumps([e.get("reason") for e in evs]), evs
+
+    def test_a_BROKEN_COST_GUARD_emits_a_canonical_class(self, monkeypatch, tmp_path):
+        """`reserve_invalid` is the one non-canonical token production reaches through the BALANCE site: a
+        present-but-unusable `SHODAN_CREDIT_RESERVE` stops spending with no read error to speak for it.
+        It is OUR defect, which the taxonomy calls `error` — and the token stays in the reason."""
+        from quarry_recon.contract import PROVIDER_CLASSES
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.settings, "performance",
+                            lambda: {"SHODAN_CREDIT_RESERVE": "not-a-number"})
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
+        monkeypatch.setattr(probe.urllib.request, "urlopen",
+                            _with_balance(lambda req, timeout=20: _Resp(body), credits=100))
+        ctx, _ = self._ctx(tmp_path)
+        ctx.run.read = lambda e: [{"favicon": "F1"}] if e == "live" else []
+        probe._shodan_pivots(ctx)
+        evs = self._events(tmp_path)
+        classes = self._classes(evs)
+        assert classes, evs
+        assert all(c in PROVIDER_CLASSES for c in classes), classes
+        assert "reserve_invalid" not in json.dumps(classes), classes
+        assert classes == ["error"], classes
+        assert "reserve_invalid" in json.dumps([e.get("reason") for e in evs]), evs
+
+    def test_a_BALANCE_stop_token_is_not_emitted_as_a_class(self, monkeypatch, tmp_path):
+        """`auth_refused` and `reserve_invalid` are stop tokens, not taxonomy classes."""
+        from quarry_recon.contract import PROVIDER_CLASSES
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+
+        def refused(req, timeout=20):
+            raise urllib.error.HTTPError(str(req.full_url), 401, "unauthorized", {},
+                                        io.BytesIO(b"<html>bad key</html>"))
+
+        monkeypatch.setattr(probe.urllib.request, "urlopen", refused)
+        ctx, _ = self._ctx(tmp_path)
+        ctx.run.read = lambda e: [{"favicon": "F1"}] if e == "live" else []
+        probe._shodan_pivots(ctx)
+        evs = self._events(tmp_path)
+        classes = self._classes(evs)
+        assert classes, evs
+        assert all(c in PROVIDER_CLASSES for c in classes), classes
+        assert "auth_refused" not in json.dumps(classes), classes
+        assert "auth" in classes, classes
+
+    def test_lane_isolation_holds_for_a_store_error_that_REJECTS_ATTRIBUTES(self, monkeypatch,
+                                                                            tmp_path):
+        """review-B1.7a#5, end to end: the store raises an exception that cannot be tagged."""
+        from quarry_recon.phases import probe
+        from quarry_recon import secrets
+
+        class _Immutable(OSError):
+            __slots__ = ()
+
+            def __setattr__(self, k, v):
+                raise AttributeError("this exception refuses attributes")
+
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
+        monkeypatch.setattr(probe.urllib.request, "urlopen",
+                            _with_balance(lambda req, timeout=20: _Resp(body), credits=100))
+        ctx, added = self._ctx(tmp_path)
+        ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
+                                  else [{"sha1": "C1"}] if e == "certificate" else [])
+
+        def add(entity, rec):
+            if entity == "subdomain" and "favicon-shodan" in (rec.get("sources") or []):
+                raise _Immutable("store exploded")
+            added.append((entity, rec))
+            return True
+
+        ctx.run.add = add
+        probe._shodan_pivots(ctx)
+        evs = self._events(tmp_path)
+        fav, cert = self._terminals(evs, "probe.favicon"), self._terminals(evs, "probe.cert")
+        assert fav and cert, evs
+        assert all(e["status"] != "success" for e in fav), fav
+        assert any(e["status"] in ("success", "empty") for e in cert), cert
+        assert "store exploded" not in json.dumps(cert), cert
+        # ...and the failing lane says it ONCE: a double-filed fault used to appear lane-local AND global
+        assert json.dumps(fav).count("store exploded") == 1, fav
+
+    def test_a_LANE_LOCAL_store_failure_leaves_the_SIBLING_lane_successful(self, monkeypatch, tmp_path):
+        """review-B1.7a#2: reproduced end-to-end — cert completed, favicon's store raised, and BOTH
+        terminals read partial."""
+        _added, evs = self._machinery_lanes(monkeypatch, tmp_path, store_ok=False)
+        fav = self._terminals(evs, "probe.favicon")
+        cert = self._terminals(evs, "probe.cert")
+        assert fav and cert, evs
+        assert all(e["status"] != "success" for e in fav), fav
+        # the failing lane must NAME its own failure, not merely count an unconsumed page
+        assert "store exploded" in json.dumps(fav), fav
+        assert any(e["status"] in ("success", "empty") for e in cert), cert
+        assert "store exploded" not in json.dumps(cert), cert
+
+    def test_a_HOSTNAME_we_could_not_store_is_not_reported_as_produced(self, monkeypatch, tmp_path):
+        """review-B1.7a#1: `found.add()` ran BEFORE `ctx.run.add()`, so a storage failure still announced
+        the hostname the store never took. `produced` on the terminal is that announcement."""
+        added, evs = self._machinery_lanes(monkeypatch, tmp_path, store_ok=False)
+        assert not [r for e, r in added if e == "subdomain"
+                    and "favicon-shodan" in (r.get("sources") or [])]
+        fav = self._terminals(evs, "probe.favicon")
+        assert fav, evs
+        produced = [e.get("produced") for e in fav]
+        assert all((pr or {}).get("host", 0) == 0 for pr in produced), produced
+        # the SIBLING lane stored its own host and must still report it
+        cert = self._terminals(evs, "probe.cert")
+        assert any((e.get("produced") or {}).get("host") == 1 for e in cert), cert
+
+    def test_a_PROVIDER_LIMIT_survives_a_later_machinery_failure(self, monkeypatch, tmp_path):
+        """review-B1.7a#3: the gap dominates — and the limit is an independent fact that must not be
+        destroyed by it. It keeps its own coverage measure and is named on the terminal."""
+        from quarry_recon.phases import probe
+        from quarry_recon import budget, secrets
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
+        monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
+        monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
+        page1 = json.dumps({"total": 2 * 100, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
+
+        # MEASURED (contract.py:163): a spent Shodan account answers 401 with an "Insufficient query
+        # credits" BODY. The code alone is `auth`; only the body proves `quota`.
+        quota_body = json.dumps({"error": "Insufficient query credits, please upgrade your API plan "
+                                          "or wait for the monthly limit to reset"}).encode()
+
+        def responder(req, timeout=20):
+            if "page=2" in str(req.full_url):
+                raise urllib.error.HTTPError(str(req.full_url), 401, "unauthorized", {},
+                                            io.BytesIO(quota_body))
+            return _Resp(page1)
+
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(responder, credits=100))
+        real_save = budget.Ledger.save
+        monkeypatch.setattr(budget.Ledger, "save",
+                            lambda self: (_ for _ in ()).throw(OSError("store exploded"))
+                            if self.lane == "probe.shodan" else real_save(self))
+        ctx, _added = self._ctx(tmp_path)
+        ctx.run.read = lambda e: [{"favicon": "F1"}] if e == "live" else []
+        probe._shodan_pivots(ctx)
+
+        evs = self._events(tmp_path)
+        fav = self._terminals(evs, "probe.favicon")
+        assert fav, evs
+        blob = json.dumps(fav)
+        assert "store exploded" in blob, blob                       # the gap
+        # the LIMIT, still stated on the terminal in its own words — `provider_stop:*` is the scheduler
+        # explaining why it stopped, not the count of pages the provider refused.
+        assert "provider-limited" in blob, blob
+        assert "'quota': 1" in blob or '"quota": 1' in blob, blob
+        assert all(e.get("error_class") == "error" for e in fav if e.get("error_class")), fav
+        lim = self._cov(tmp_path, "shodan_results_limited")
+        assert lim and lim[0]["omitted"] == 1, lim
+
+    def test_an_UNCONSUMED_page_reaches_coverage(self, monkeypatch, tmp_path):
+        """An owned page whose ingestion failed is out of the page remainder; nothing else can say its
+        rows are missing."""
+        from types import SimpleNamespace
+
+        from quarry_recon import shodan_sched
+        self._ctx(tmp_path)                              # events sink
+        o = shodan_sched.LaneOutcome(lane="probe.favicon", pivots=1, pages_bought=2,
+                                     pages_unconsumed=1)
+        shodan_sched.report("probe.favicon", o, persisted=True,
+                            balance=SimpleNamespace(stop_kind="", reason="test"))
+        cov = self._cov(tmp_path, "shodan_pages_unconsumed")
+        assert cov and cov[0]["omitted"] == 1, cov
+        assert "NOT in the store" in cov[0]["reason"], cov[0]["reason"]

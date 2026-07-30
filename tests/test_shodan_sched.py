@@ -549,6 +549,9 @@ class TestDurability:
         assert res.persisted is False
 
     def test_persistence_runs_even_when_the_body_raises(self, tmp_path):
+        """review-B1.7a: this used to assert the exception PROPAGATES. It does not any more — the caller
+        then fabricated `attempted=0` over pages the run had already bought. Persistence still runs, and
+        now the outcome survives with the failure named."""
         from quarry_recon.shodan_sched import run_work
         d = tmp_path / "att"
         d.mkdir(parents=True, exist_ok=True)
@@ -560,10 +563,12 @@ class TestDurability:
         def boom(pivot, page):
             raise RuntimeError("search exploded")
 
-        with pytest.raises(RuntimeError):
-            run_work(None, states=_states((FAV, "a")), balance=_Bal(spendable=None), search=boom,
-                     ingest=lambda *a: 0, ledger=led, attempt_dir=d)
+        res = run_work(None, states=_states((FAV, "a")), balance=_Bal(spendable=None), search=boom,
+                       ingest=lambda *a: 0, ledger=led, attempt_dir=d)
         assert saved, "completion state was not persisted on the failure path"
+        assert res.stop_cause == "machinery:RuntimeError", res.stop_cause
+        assert res.machinery == ["RuntimeError: search exploded"], res.machinery
+        assert res.lanes[FAV].unqueried == ["a"], "the remainder was lost with the exception"
 
     def test_a_failed_publish_is_not_recorded_as_bought(self, tmp_path, monkeypatch):
         from quarry_recon import budget as _b
@@ -1818,3 +1823,340 @@ class TestPivotsTouched:
         res, _ = _res(tmp_path, _states((FAV, "a")), _Provider(totals={"a": 500}),
                       balance=_Bal(spendable=None))
         assert res.lanes[FAV].pivots_touched == 1 and res.lanes[FAV].pages_bought == 5
+
+
+# ── B1.7a: the machinery boundary, ported from `whoxy_page` ────────────────────────────────────────
+class TestMachineryFailuresPreserveTheWorkResult:
+    """review-B1.7a: `run_work` had no boundary at all, so an exception in replay, scheduling, sweeping,
+    remainder accounting or the ledger save escaped the coordinator and the caller fabricated zero
+    accounting over pages the run had already replayed and bought. Best effort is the contract; only
+    cancellation ends the run."""
+
+    def _work(self, tmp_path, provider, *, states=None, ledger=None, balance=None, ingest=None):
+        d = tmp_path / "attempts"
+        d.mkdir(parents=True, exist_ok=True)
+        return run_work(None, states=states or _states((FAV, "a")), balance=balance or _Bal(),
+                        search=provider.search, ingest=ingest or (lambda p, pg, m, r: len(m)),
+                        ledger=ledger if ledger is not None else _ledger(tmp_path), attempt_dir=d)
+
+    def test_a_REPLAY_failure_keeps_the_pages_already_ingested(self, tmp_path):
+        prov = _Provider(totals={"a": 3 * SHODAN_PAGE_SIZE})
+        led = _ledger(tmp_path)
+        first = self._work(tmp_path, prov, ledger=led)
+        assert first.lanes[FAV].pages_bought == 3, first.lanes[FAV].pages_bought
+
+        seen = []
+
+        def ingest(pivot, page, matches, raw):
+            if len(seen) >= 1:
+                raise RuntimeError("ingest exploded during replay")
+            seen.append(page)
+            return len(matches)
+
+        res = self._work(tmp_path, prov, ledger=_ledger(tmp_path), ingest=ingest)
+        o = res.lanes[FAV]
+        assert o.pages_replayed >= 1, "replayed pages died with the exception"
+        assert o.pages_unconsumed == 1, o.pages_unconsumed
+        assert res.stop_cause == "machinery:RuntimeError", res.stop_cause
+        # review-B1.7a#2: an INGEST failure is the lane's own, not the run's — filing it globally turned
+        # completed sibling lanes partial. The stop is still global; the fault is lane-scoped.
+        assert o.machinery == ["RuntimeError: ingest exploded during replay"], o.machinery
+        assert res.machinery == [], res.machinery
+
+    def test_a_PAID_page_we_could_not_ingest_is_counted_as_unconsumed(self, tmp_path):
+        """The credit is spent and the page is journaled — it stays owned, or the scheduler sells it to
+        us again — but its matches are not in the store, and the page remainder cannot say so."""
+        def boom(pivot, page, matches, raw):
+            raise RuntimeError("ingest exploded on a bought page")
+
+        res = self._work(tmp_path, _Provider(totals={"a": SHODAN_PAGE_SIZE}), ingest=boom)
+        o = res.lanes[FAV]
+        assert o.pages_bought == 1, o.pages_bought
+        assert o.pages_unconsumed == 1, o.pages_unconsumed
+        assert o.matches == 0 and res.stop_cause == "machinery:RuntimeError", (o.matches,
+                                                                              res.stop_cause)
+        assert o.machinery == ["RuntimeError: ingest exploded on a bought page"], o.machinery
+        assert res.machinery == [], res.machinery
+
+    def test_a_REMAINDER_failure_keeps_the_run(self, tmp_path, monkeypatch):
+        import quarry_recon.shodan_sched as ss
+        prov = _Provider(totals={"a": SHODAN_PAGE_SIZE})
+        monkeypatch.setattr(ss, "_remainder",
+                            lambda *a, **k: (_ for _ in ()).throw(ValueError("accounting exploded")))
+        res = self._work(tmp_path, prov)
+        assert res.lanes[FAV].pages_bought == 1
+        assert res.machinery == ["ValueError: accounting exploded"], res.machinery
+
+    def test_the_REMAINDER_is_a_snapshot_not_an_accumulator(self, tmp_path):
+        import quarry_recon.shodan_sched as ss
+        states = _states((FAV, "a"))
+        res = ss.WorkResult()
+        res.lanes[FAV] = LaneOutcome(lane=FAV, pivots=1)
+        ss._remainder(states, res, max_pages=0)
+        first = (list(res.lanes[FAV].unqueried), res.lanes[FAV].pages_left_known)
+        ss._remainder(states, res, max_pages=0)
+        assert (list(res.lanes[FAV].unqueried), res.lanes[FAV].pages_left_known) == first
+
+    def test_a_SAVE_that_raises_keeps_the_pages_it_bought(self, tmp_path):
+        prov = _Provider(totals={"a": 2 * SHODAN_PAGE_SIZE})
+        led = _ledger(tmp_path)
+        led.save = lambda *a, **k: (_ for _ in ()).throw(OSError("store exploded"))
+        led._journal_lost = True                       # neither snapshot nor journal survives
+        res = self._work(tmp_path, prov, ledger=led)
+        assert res.lanes[FAV].pages_bought == 2, res.lanes[FAV].pages_bought
+        assert res.persisted is False
+        assert res.machinery == ["OSError: store exploded"], res.machinery
+
+    def test_a_SUCCESSFUL_save_never_consults_the_fallback(self, tmp_path):
+        touched = []
+        led = _ledger(tmp_path)
+
+        class _Loud(type(led)):
+            @property
+            def durable(self):
+                touched.append(1)
+                raise OSError("fallback exploded")
+
+        led.__class__ = _Loud
+        led.save = lambda *a, **k: True
+        res = self._work(tmp_path, _Provider(totals={"a": SHODAN_PAGE_SIZE}), ledger=led)
+        assert touched == [], "the fallback was consulted although the snapshot landed"
+        assert res.persisted is True and res.machinery == [] and res.stop_cause == ""
+
+    def test_CANCELLATION_still_ends_the_run(self, tmp_path):
+        def boom(pivot, page):
+            raise KeyboardInterrupt("ctrl-c")
+
+        prov = _Provider()
+        prov.search = boom
+        with pytest.raises(KeyboardInterrupt):
+            self._work(tmp_path, prov)
+
+    def test_the_FIRST_cause_names_the_stop(self, tmp_path, monkeypatch):
+        """A page we could not publish is why this run ended; a later accounting failure is a
+        consequence of it, and renaming the stop would report the symptom."""
+        import quarry_recon.shodan_sched as ss
+        from quarry_recon import budget as _b
+        monkeypatch.setattr(_b, "publish_bytes", lambda *a, **k: False)
+        monkeypatch.setattr(ss, "_remainder",
+                            lambda *a, **k: (_ for _ in ()).throw(ValueError("accounting exploded")))
+        res = self._work(tmp_path, _Provider(totals={"a": SHODAN_PAGE_SIZE}))
+        assert res.stop_cause == "publish_failed", res.stop_cause
+        assert res.machinery == ["ValueError: accounting exploded"], res.machinery
+
+
+    def test_a_LANE_LOCAL_ingest_failure_does_not_contaminate_a_COMPLETED_sibling(self, tmp_path):
+        """review-B1.7a#2: reproduced — cert completed with every page bought and stored, favicon's
+        ingest then raised, and BOTH terminals read degraded. A completed lane owes nothing to another
+        lane's ingestion defect."""
+        d = tmp_path / "attempts"
+        d.mkdir(parents=True, exist_ok=True)
+
+        def ingest(pivot, page, matches, raw):
+            if pivot.lane == FAV:
+                raise RuntimeError("favicon ingest exploded")
+            return len(matches)
+
+        res = run_work(None, states=_states((CERT, "x"), (FAV, "a")), balance=_Bal(),
+                       search=_Provider(totals={"x": SHODAN_PAGE_SIZE,
+                                                "a": SHODAN_PAGE_SIZE}).search,
+                       ingest=ingest, ledger=_ledger(tmp_path), attempt_dir=d)
+        assert res.lanes[FAV].machinery, "the failing lane lost its own fact"
+        assert res.lanes[CERT].machinery == [], "a completed lane inherited another lane's failure"
+        assert res.lanes[CERT].pages_unconsumed == 0 and res.lanes[CERT].matches > 0
+        assert res.machinery == [], "a lane-local failure was filed as everyone's"
+
+
+    def test_lane_scope_survives_an_exception_that_REJECTS_ATTRIBUTES(self, tmp_path):
+        """review-B1.7a#5: attribution used to be a flag set ON the raised exception, so a class with
+        `__slots__` or an overridden `__setattr__` silently fell back to being filed against every lane —
+        a completed sibling went partial again and the failing lane's reason said it twice. Scope is now
+        carried by the exception TYPE the boundary receives, which the callback cannot influence."""
+        class _Immutable(Exception):
+            __slots__ = ()
+
+            def __setattr__(self, k, v):
+                raise AttributeError("this exception refuses attributes")
+
+        def ingest(pivot, page, matches, raw):
+            if pivot.lane == FAV:
+                raise _Immutable("favicon ingest exploded")
+            return len(matches)
+
+        d = tmp_path / "attempts"
+        d.mkdir(parents=True, exist_ok=True)
+        res = run_work(None, states=_states((CERT, "x"), (FAV, "a")), balance=_Bal(),
+                       search=_Provider(totals={"x": SHODAN_PAGE_SIZE,
+                                                "a": SHODAN_PAGE_SIZE}).search,
+                       ingest=ingest, ledger=_ledger(tmp_path), attempt_dir=d)
+        assert res.machinery == [], "a lane-local fault was filed as everyone's"
+        assert res.lanes[CERT].machinery == [], "a completed lane inherited another lane's failure"
+        assert res.lanes[FAV].machinery == ["_Immutable: favicon ingest exploded"], res.lanes[FAV].machinery
+        # the STOP still names what actually broke, not the carrier we wrapped it in
+        assert res.stop_cause == "machinery:_Immutable", res.stop_cause
+
+
+    def test_a_REPLAY_failure_in_ONE_lane_does_not_stop_the_SIBLING_replaying(self, tmp_path):
+        """review-B1.7a#6: the carrier propagated out of the WHOLE replay pass, so a favicon store
+        failure on resume meant an already-owned cert page was never replayed and cert reported FAILED
+        with its ingest never called. Replay is free and per-lane."""
+        d = tmp_path / "attempts"
+        d.mkdir(parents=True, exist_ok=True)
+        led = _ledger(tmp_path)
+        prov = _Provider(totals={"a": SHODAN_PAGE_SIZE, "x": SHODAN_PAGE_SIZE})
+        first = run_work(None, states=_states((FAV, "a"), (CERT, "x")), balance=_Bal(),
+                         search=prov.search, ingest=lambda *a: 1, ledger=led, attempt_dir=d)
+        assert first.lanes[FAV].pages_bought == 1 and first.lanes[CERT].pages_bought == 1
+
+        seen = []
+
+        def ingest(pivot, page, matches, raw):
+            if pivot.lane == FAV:
+                raise RuntimeError("favicon store exploded")
+            seen.append((pivot.lane, page))
+            return len(matches)
+
+        calls = len(prov.calls)
+        res = run_work(None, states=_states((FAV, "a"), (CERT, "x")), balance=_Bal(),
+                       search=prov.search, ingest=ingest, ledger=_ledger(tmp_path), attempt_dir=d)
+        assert len(prov.calls) == calls, "a resumed run bought pages it already owned"
+        assert seen == [(CERT, 1)], f"the sibling lane never re-ingested its owned page: {seen}"
+        assert res.lanes[CERT].pages_replayed == 1 and res.lanes[CERT].machinery == []
+        assert res.lanes[CERT].pages_unconsumed == 0
+        assert res.lanes[FAV].pages_unconsumed == 1
+        assert res.lanes[FAV].machinery == ["RuntimeError: favicon store exploded"]
+
+    def test_a_PURCHASE_ingest_failure_does_not_skip_the_owned_page_SWEEP(self, tmp_path):
+        """The same rule on the paid path: a page one lane could not ingest ends PURCHASING, not the free
+        sweep of pages another lane already paid for."""
+        d = tmp_path / "attempts"
+        d.mkdir(parents=True, exist_ok=True)
+        led = _ledger(tmp_path)
+        prov = _Provider(totals={"x": 3 * SHODAN_PAGE_SIZE, "a": SHODAN_PAGE_SIZE})
+        # lifecycle 1: cert owns all three of its pages
+        run_work(None, states=_states((CERT, "x")), balance=_Bal(), search=prov.search,
+                 ingest=lambda *a: 1, ledger=led, attempt_dir=d)
+
+        swept = []
+
+        def ingest(pivot, page, matches, raw):
+            if pivot.lane == FAV:
+                raise RuntimeError("favicon store exploded")
+            swept.append(page)
+            return len(matches)
+
+        # max_pages=1 excludes cert pages 2-3 from PURCHASING; the sweep must still replay them
+        res = run_work(None, states=_states((FAV, "a"), (CERT, "x")), balance=_Bal(),
+                       search=prov.search, ingest=ingest, ledger=_ledger(tmp_path), attempt_dir=d,
+                       max_pages=1)
+        assert sorted(swept) == [1, 2, 3], f"the owned-page sweep was skipped: {swept}"
+        assert res.lanes[CERT].pages_replayed == 3, res.lanes[CERT].pages_replayed
+        assert res.lanes[FAV].machinery and res.lanes[CERT].machinery == []
+
+
+    def test_a_BROKEN_SINK_stops_that_lane_rather_than_repeating_the_failure(self, tmp_path):
+        """Its sink is broken: the next pivot of the same lane would fail identically, so the lane stops
+        after the first failure. Other lanes are unaffected (see the sibling test)."""
+        d = tmp_path / "attempts"
+        d.mkdir(parents=True, exist_ok=True)
+        led = _ledger(tmp_path)
+        prov = _Provider(totals={"a": SHODAN_PAGE_SIZE, "b": SHODAN_PAGE_SIZE, "x": SHODAN_PAGE_SIZE})
+        run_work(None, states=_states((FAV, "a"), (FAV, "b"), (CERT, "x")), balance=_Bal(),
+                 search=prov.search, ingest=lambda *a: 1, ledger=led, attempt_dir=d)
+
+        tried = []
+
+        def ingest(pivot, page, matches, raw):
+            tried.append(pivot.value)
+            if pivot.lane == FAV:
+                raise RuntimeError("favicon store exploded")
+            return len(matches)
+
+        res = run_work(None, states=_states((FAV, "a"), (FAV, "b"), (CERT, "x")), balance=_Bal(),
+                       search=prov.search, ingest=ingest, ledger=_ledger(tmp_path), attempt_dir=d)
+        assert tried.count("a") + tried.count("b") == 1, f"the broken lane kept being retried: {tried}"
+        assert res.lanes[FAV].pages_unconsumed == 1, res.lanes[FAV].pages_unconsumed
+        assert len(res.lanes[FAV].machinery) == 1, res.lanes[FAV].machinery
+        assert "x" in tried and res.lanes[CERT].pages_replayed == 1
+
+    def test_a_PURCHASE_failure_does_not_skip_the_MAX_PAGES_sweep(self, tmp_path, monkeypatch):
+        """`_sweep_owned` is the seam under test: with the owned-page INDEX empty, it is the only path
+        that replays pages an operator page policy excluded from purchasing. A purchase-path ingest
+        failure in another lane must not skip it (review-B1.7a#6)."""
+        import quarry_recon.shodan_sched as ss
+        d = tmp_path / "attempts"
+        d.mkdir(parents=True, exist_ok=True)
+        led = _ledger(tmp_path)
+        prov = _Provider(totals={"x": 3 * SHODAN_PAGE_SIZE, "a": SHODAN_PAGE_SIZE})
+        run_work(None, states=_states((CERT, "x")), balance=_Bal(), search=prov.search,
+                 ingest=lambda *a: 1, ledger=led, attempt_dir=d)
+
+        swept = []
+
+        def ingest(pivot, page, matches, raw):
+            if pivot.lane == FAV:
+                raise RuntimeError("favicon store exploded")
+            swept.append(page)
+            return len(matches)
+
+        monkeypatch.setattr(ss, "owned_index", lambda ledger: {})   # only the SWEEP can replay now
+        states = _states((FAV, "a"), (CERT, "x"))
+        for st in states:
+            if st.pivot.lane == CERT:
+                st.total = 3 * SHODAN_PAGE_SIZE     # the page count the sweep walks
+        res = run_work(None, states=states, balance=_Bal(), search=prov.search, ingest=ingest,
+                       ledger=_ledger(tmp_path), attempt_dir=d, max_pages=1)
+        # page 1 is bought (the index is empty, so it reads as pending under max_pages=1); pages 2-3 can
+        # only come from the sweep.
+        assert sorted(swept) == [1, 2, 3], f"the owned-page sweep was skipped: {swept}"
+        assert res.lanes[CERT].machinery == [] and res.lanes[FAV].machinery
+
+
+    def test_a_BROKEN_SINK_stays_broken_ACROSS_passes(self, tmp_path):
+        """review-B1.7a#8: `broken` was per-PASS, so indexed replay and the max-pages sweep forgot each
+        other's failures — ingestion was called for pages 1 AND 2, `pages_unconsumed=2`, and the machinery
+        reason appeared twice for one broken sink."""
+        d = tmp_path / "attempts"
+        d.mkdir(parents=True, exist_ok=True)
+        led = _ledger(tmp_path)
+        prov = _Provider(totals={"a": 3 * SHODAN_PAGE_SIZE})
+        run_work(None, states=_states((FAV, "a")), balance=_Bal(), search=prov.search,
+                 ingest=lambda *a: 1, ledger=led, attempt_dir=d)
+        assert prov.calls, "the first lifecycle bought nothing to replay"
+
+        tried = []
+
+        def ingest(pivot, page, matches, raw):
+            tried.append(page)
+            raise RuntimeError("store exploded")
+
+        res = run_work(None, states=_states((FAV, "a")), balance=_Bal(), search=prov.search,
+                       ingest=ingest, ledger=_ledger(tmp_path), attempt_dir=d, max_pages=1)
+        assert tried == [1], f"the broken sink was tried again in a later pass: {tried}"
+        assert res.lanes[FAV].pages_unconsumed == 1, res.lanes[FAV].pages_unconsumed
+        assert res.lanes[FAV].machinery == ["RuntimeError: store exploded"], res.lanes[FAV].machinery
+
+    def test_a_PAID_PATH_fault_also_stops_the_later_sweep(self, tmp_path, monkeypatch):
+        """The same rule seeded from the OTHER direction: the fault is recorded while buying, and the
+        sweep that follows must not try the same broken sink."""
+        import quarry_recon.shodan_sched as ss
+        d = tmp_path / "attempts"
+        d.mkdir(parents=True, exist_ok=True)
+        led = _ledger(tmp_path)
+        prov = _Provider(totals={"a": 3 * SHODAN_PAGE_SIZE})
+        run_work(None, states=_states((FAV, "a")), balance=_Bal(), search=prov.search,
+                 ingest=lambda *a: 1, ledger=led, attempt_dir=d)
+
+        tried = []
+
+        def ingest(pivot, page, matches, raw):
+            tried.append(page)
+            raise RuntimeError("store exploded")
+
+        monkeypatch.setattr(ss, "owned_index", lambda ledger: {})   # nothing to replay; page 1 is BOUGHT
+        st = _states((FAV, "a"))[0]
+        st.total = 3 * SHODAN_PAGE_SIZE
+        res = run_work(None, states=[st], balance=_Bal(), search=prov.search, ingest=ingest,
+                       ledger=_ledger(tmp_path), attempt_dir=d, max_pages=1)
+        assert tried == [1], f"the sweep retried a sink that failed while buying: {tried}"
+        assert len(res.lanes[FAV].machinery) == 1, res.lanes[FAV].machinery

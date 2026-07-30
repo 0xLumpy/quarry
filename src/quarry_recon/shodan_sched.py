@@ -257,6 +257,15 @@ class LaneOutcome:
     count_drift: int = 0                    # ...and disagreed with it
     evidence_invalid: int = 0               # recorded pages whose artifact did not validate
     publish_failed: int = 0                 # bought pages we could not durably record
+    # review-B1.7a: OWNERSHIP is not CONSUMPTION. A page whose `ingest` raised is bought and journaled —
+    # it stays owned, or the scheduler would offer it again and pay for it twice — but its matches never
+    # reached the store, and the page remainder cannot express that.
+    pages_unconsumed: int = 0
+    # review-B1.7a#2: LANE-LOCAL machinery failures. Ingesting a page is one lane's work on one lane's
+    # pivot, and filing it globally turned a completed sibling lane PARTIAL — cert with every page bought
+    # and stored reported degraded because favicon's ingest raised. Genuinely shared failures (the ledger
+    # save, remainder accounting) stay on `WorkResult`, because they really are everyone's.
+    machinery: list = field(default_factory=list)
 
 
 @dataclass
@@ -267,6 +276,9 @@ class WorkResult:
     stop_cause: str = ""                    # WHY scheduling ended — the scheduler's own answer, which
                                             # the balance alone cannot give (it does not know whether we
                                             # ran out mid-flight, hit the reserve, or lost the store)
+    # review-B1.7a: every failure of OUR OWN machinery, in order. `stop_cause` keeps the FIRST cause,
+    # because a later failure is its consequence; the rest would otherwise vanish entirely.
+    machinery: list = field(default_factory=list)
 
 
 def observe_total(st, o, total) -> None:
@@ -381,14 +393,36 @@ def run_work(ctx, *, states, balance, search, ingest, ledger, attempt_dir,
         o = res.lanes.setdefault(st.pivot.lane, LaneOutcome(lane=st.pivot.lane))
         o.pivots += 1
     try:
-        _replay_indexed(states, res, ledger=ledger, ingest=ingest)
-        _apply_cardinality(states, res)
-        _work(states, res, balance=balance, search=search, ingest=ingest, ledger=ledger,
-              attempt_dir=attempt_dir, max_pages=max_pages, is_limit=is_limit,
-              should_stop=should_stop)
-        _sweep_owned(states, res, ledger=ledger, ingest=ingest, max_pages=max_pages)
-        _remainder(states, res, max_pages=max_pages)
+        try:
+            _replay_indexed(states, res, ledger=ledger, ingest=ingest)
+            _apply_cardinality(states, res)
+            try:
+                _work(states, res, balance=balance, search=search, ingest=ingest, ledger=ledger,
+                      attempt_dir=attempt_dir, max_pages=max_pages, is_limit=is_limit,
+                      should_stop=should_stop)
+            except LaneMachineryError as e:
+                # review-B1.7a#6: a bought page one lane could not ingest ends PURCHASING — which the
+                # stop cause already says — but it must not skip the FREE sweep of pages other lanes
+                # already own and paid for.
+                _machinery(res, e)
+            _sweep_owned(states, res, ledger=ledger, ingest=ingest, max_pages=max_pages)
+        except (KeyboardInterrupt, SystemExit):
+            raise                      # cancellation ends the run; it is not an outcome
+        except Exception as e:
+            # review-B1.7a: an exception ANYWHERE here escaped the coordinator, and the caller reported
+            # zero pivots attempted over pages it had already replayed and bought. Everything the run
+            # established is a fact whatever happened next.
+            _machinery(res, e)
     finally:
+        # accounting for whatever the pivots DID reach, however this run ended. It runs in `finally` so a
+        # machinery failure above still reports its remainder, and it is a SNAPSHOT (see `_remainder`),
+        # so running it after a partial failure cannot double-count.
+        try:
+            _remainder(states, res, max_pages=max_pages)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            _machinery(res, e)
         # persistence is the coordinator's job and its RESULT is a fact. Leaving save() to the caller
         # (and ignoring it) let a foreign or unwritable ledger keep bought pages looking resumable in
         # memory while the next run would pay for them all over again.
@@ -403,8 +437,28 @@ def run_work(ctx, *, states, balance, search, ingest, ledger, attempt_dir,
         # record() then fails, the journal stays perfectly readable — and compaction fails too. Every
         # individual signal looked survivable while the page reached NEITHER destination. Reproduced:
         # persisted=True, page survives reopen=False. The journal branch needs BOTH facts.
-        saved = bool(ledger.save())
-        res.persisted = saved or (bool(getattr(ledger, "durable", False)) and res.records_journaled)
+        # review-B1.7a: `save()` sat outside the boundary too — a store that RAISED discarded every page
+        # the run had bought. A save that raises did not save.
+        try:
+            saved = bool(ledger.save())
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            saved = False
+            _machinery(res, e)
+        if saved:
+            res.persisted = True               # the snapshot IS the durable answer; nothing else to ask
+        else:
+            # `durable` is the FALLBACK for a snapshot that did not land. Reading it unconditionally
+            # would let a ledger that saved cleanly and then raised here report a false machinery gap.
+            try:
+                durable = bool(getattr(ledger, "durable", False))
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                durable = False                # a store that cannot even answer is not a durable one
+                _machinery(res, e)
+            res.persisted = durable and res.records_journaled
     return res
 
 
@@ -435,8 +489,80 @@ def _replay_one(st, o, *, page, ledger, ingest, owned=None) -> "bool | None":
     if first_touch:
         o.pivots_touched += 1                 # ANY page, not just page 1 (review-r4#5)
     observe_total(st, o, doc.get("total"))
-    o.matches += ingest(st.pivot, page, doc.get("matches") or [], art)
+    try:
+        o.matches += ingest(st.pivot, page, doc.get("matches") or [], art)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        # the page stays OWNED (dropping it from `pages_done` would have the scheduler sell it to us
+        # again) and the shortfall is counted in its own unit — see `LaneOutcome.pages_unconsumed`.
+        _lane_machinery(o, e)                  # raises the lane-scoped carrier
     return True
+
+
+class LaneMachineryError(Exception):
+    """An ingestion failure ALREADY attributed to the lane whose page it was.
+
+    review-B1.7a#5: attribution used to be a flag set ON the original exception, so an exception that
+    rejects attributes — a `__slots__` class, an overridden `__setattr__` — silently fell back to being
+    filed against every lane, and a completed sibling went partial again. Scope is now carried
+    STRUCTURALLY by the exception type the boundary receives, which nothing about the ingest callback can
+    influence. The original is the `__cause__` and keeps its own type and message."""
+
+    def __init__(self, lane: str, cause: BaseException):
+        super().__init__(f"{lane}: {type(cause).__name__}: {cause}")
+        self.lane = lane
+        self.__cause__ = cause
+
+
+def _lane_machinery(o, e: BaseException):
+    """Attribute an ingestion failure to the lane whose page it was, then RAISE the scoped carrier."""
+    o.pages_unconsumed += 1
+    o.machinery.append(f"{type(e).__name__}: {e}")
+    raise LaneMachineryError(o.lane, e) from e
+
+
+def _machinery(res, e: BaseException) -> None:
+    """Record OUR OWN failure without discarding what the run already established.
+
+    review-B1.7a: ported from `whoxy_page`, where this cost five review rounds. A boundary that only
+    stops the crash is not a boundary — the caller fabricates zero accounting over evidence the run is
+    holding. The FIRST failure names the stop; a later one is its consequence."""
+    lane_scoped = isinstance(e, LaneMachineryError)
+    # the CAUSE names the stop either way: `machinery:RuntimeError` says what actually broke, where the
+    # carrier's own type would say only that we wrapped it.
+    cause = e.__cause__ if lane_scoped and e.__cause__ is not None else e
+    if not lane_scoped:
+        # a lane-scoped fault is already filed against the lane that owns the work — see
+        # `LaneOutcome.machinery`. The STOP is still global (purchasing ends for everyone), the FAULT is not.
+        res.machinery.append(f"{type(cause).__name__}: {cause}")
+    res.stop_cause = res.stop_cause or f"machinery:{type(cause).__name__}"
+
+
+def _replay_lane_safe(states, res, replay_one) -> None:
+    """Run `replay_one(st, o)` over every state, keeping ONE LANE's ingestion failure from ending the
+    others' free replay.
+
+    review-B1.7a#6: the carrier fixed ATTRIBUTION and not control flow — it propagated out of the whole
+    replay pass, so a favicon store failure meant an already-owned cert page was never replayed at all
+    and cert reported FAILED with its store callback never called. Replay is FREE and per-lane: the
+    failing lane stops (its sink is broken; the next page would fail identically), purchasing stops
+    globally via `stop_cause`, and every other lane replays exactly what it owns."""
+    # review-B1.7a#8: a fresh set per PASS meant indexed replay and the sweep forgot each other, so a
+    # lane whose sink had already failed was tried again the moment the next pass began — two unconsumed
+    # pages and the same reason twice. A lane's own recorded machinery IS the lifecycle-wide answer to
+    # "is this sink broken", and it covers a fault recorded on the paid path too.
+    broken = {lane for lane, o in res.lanes.items() if o.machinery}
+    for st in states:
+        lane = st.pivot.lane
+        if lane in broken:
+            continue
+        o = res.lanes[lane]
+        try:
+            replay_one(st, o)
+        except LaneMachineryError as e:
+            broken.add(e.lane)
+            _machinery(res, e)                 # the lane keeps the fault; the STOP is global
 
 
 def _replay_indexed(states, res, *, ledger, ingest) -> None:
@@ -448,12 +574,14 @@ def _replay_indexed(states, res, *, ledger, ingest) -> None:
 
     review-B1.3r5#1: the ledger is enumerated ONCE for the whole run rather than probed per pivot."""
     index = owned_index(ledger)
-    for st in states:
-        o = res.lanes[st.pivot.lane]
+
+    def one(st, o):
         for page, art, doc in index.get((st.pivot.lane, st.pivot.facet, st.pivot.value), ()):
             if page in st.pages_done:
                 continue
             _replay_one(st, o, page=page, ledger=ledger, ingest=ingest, owned=(art, doc))
+
+    _replay_lane_safe(states, res, one)
 
 
 def compare_count(st, o) -> None:
@@ -630,7 +758,13 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
             # review-B1.3r6#1: a readable journal proves OLD content survives, not that THIS page reached
             # it. Both facts are needed, and only the record itself carries the second one.
             res.records_journaled = res.records_journaled and journaled
-            o.matches += ingest(st.pivot, page, matches, raw)
+            try:
+                o.matches += ingest(st.pivot, page, matches, raw)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                # the credit is spent and the page is owned; its rows are not. Raises the carrier.
+                _lane_machinery(o, e)
             if not journaled or not ledger_writable(ledger):
                 res.stop_cause = "ledger_unwritable"
         if not progressed:
@@ -651,18 +785,27 @@ def _sweep_owned(states, res, *, ledger, ingest, max_pages) -> None:
     limit."""
     if not max_pages:
         return                                            # nothing was excluded from scheduling
-    for st in states:
+    def one(st, o):
         pages = st.page_count()
         if pages is None:
-            continue
-        o = res.lanes[st.pivot.lane]
+            return
         for page in range(max_pages + 1, pages + 1):
             if page in st.pages_done:
                 continue
             _replay_one(st, o, page=page, ledger=ledger, ingest=ingest)
 
+    _replay_lane_safe(states, res, one)          # the same per-lane rule: owned evidence is FREE
+
 
 def _remainder(states, res, *, max_pages) -> None:
+    # a SNAPSHOT of the states, not an accumulator: it is reachable twice (once normally, once after a
+    # machinery failure), and `+=` over a list that already held the first pass would report a remainder
+    # twice the size of the real one.
+    for o in res.lanes.values():
+        o.unqueried = []
+        o.pages_left_known = 0
+        o.pages_left_unknown_pivots = 0
+        o.pages_withheld = 0
     for st in states:
         o = res.lanes[st.pivot.lane]
         # "never reached" is not the same as "asked and refused". A pivot whose only page died on a quota
@@ -749,6 +892,15 @@ def report(lane: str, outcome: LaneOutcome, *, balance, persisted: bool = True,
                                        if outcome.pages_left_unknown_pivots else "")
                                     if outcome.pages_left_known or outcome.pages_left_unknown_pivots
                                     else "no known page left unbought"))
+    # review-B1.7a: an OWNED page whose ingestion failed is out of the page remainder — nothing else in
+    # this report can say its rows are missing. Emitted every lifecycle so a later clean run clears it.
+    unc = outcome.pages_unconsumed
+    events.coverage_partial(lane, kind=events.COVERAGE_TIMEOUT, measure="shodan_pages_unconsumed",
+                            unit=f"{lane}.pages_unconsumed", eligible=done, tested=done - unc,
+                            omitted=unc,
+                            reason=(f"{unc}/{done} owned page(s) could not be ingested — their rows are "
+                                    f"NOT in the store" if unc else
+                                    f"every one of {done} owned page(s) was ingested"))
     # POSITION x CAUSE, four measures, each naming ONLY its own position's classes. A mid-flight
     # provider limit (quota on page N) is not the same event as a pivot the provider refused outright,
     # and a later-page transport failure is not our page budget. Without these the classes were counted
