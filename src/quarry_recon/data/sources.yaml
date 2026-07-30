@@ -86,7 +86,7 @@ sources:
   vertical.certspotter:      {tool: certspotter, phase: vertical, tier: core, class: passive, default: on,
     input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
   vertical.censys:           {tool: censys, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (Censys)",
-    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: silent-skip, fallback: skip, parser: internal, log: one-line, notes: "needs Censys key"}
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: silent-skip, fallback: skip, parser: internal, log: one-line, notes: "needs a Censys Platform PAT **and** an ORGANIZATION ID. MEASURED 2026-07-30: the search API is org-gated — a Free PAT (wallet readable, 100 credits) gets HTTP 403 problem+json \"This endpoint requires an organization ID for API access. Free users can only access this endpoint through the Platform UI\", and the refusal costs 0 credits. A token without an org records a SKIP carrying that sentence rather than staying silent."}
   vertical.openintel:        {tool: openintel-subs, phase: vertical, tier: optional, class: passive, default: key, reason: "setup (local DB, manual)",
     input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: one-line,
     notes: "local DB; SILENT if unconfigured; when configured runs via the runner + records its result (empty vs timeout vs broken-binary is observable in the manifest, not swallowed)"}

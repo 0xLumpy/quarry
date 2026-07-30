@@ -16,7 +16,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from .. import events, netguard, normalize, secrets, settings
-from ..contract import ProviderResult, classify_provider_error, run_contract, run_provider
+from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, run_contract,
+                        run_provider)
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
 _SUBFINDER_DEFAULT_MIN = 60                  # default -max-time budget (minutes) for a normal bounded run
@@ -170,6 +171,33 @@ def _openintel(ctx, cfg: dict, apex: str, timeout: int = 180) -> set:
     out = Path(r.raw_path).read_text(encoding="utf-8", errors="replace")
     return {h for h in (line.strip().lower().rstrip(".") for line in out.splitlines())
             if h and "." in h}
+
+
+#: the provider's OWN sentence, MEASURED 2026-07-30 with a real Free PAT (HTTP 403,
+#: `application/problem+json`, and the refusal cost 0 credits — the wallet still read 100 afterwards).
+CENSYS_ORG_REQUIRED = ("This endpoint requires an organization ID for API access. Free users can only "
+                       "access this endpoint through the Platform UI.")
+
+
+def censys_entitlement_skip(cen: dict, apexes) -> bool:
+    """Record the lane's lifecycle when a Censys token is configured but cannot possibly work.
+
+    The Platform search API is ORG-GATED — measured, not inferred: a Free PAT reads its wallet fine (100
+    credits, monthly reset) and `/v3/global/search/query` answers 403 with `CENSYS_ORG_REQUIRED`. This used
+    to be total silence: no lifecycle, nothing in the manifest, so an operator who had set up a Free PAT
+    could not tell "not configured" from "configured and cannot work".
+
+    Only that ONE state is reported. No config at all, or an org with no token, stays silent — an operator
+    is not told about a lane they never asked for."""
+    if not (cen.get("token") and not cen.get("org")):
+        return False
+    run_provider("vertical.censys",
+                 lambda: (_ for _ in ()).throw(ProviderSkip(
+                     f"Censys token configured WITHOUT an organization id — the Platform search API is "
+                     f"org-gated (MEASURED 2026-07-30: HTTP 403 \"{CENSYS_ORG_REQUIRED}\"). A Free account "
+                     f"cannot run this lane; nothing was queried and no credit was spent.")),
+                 input_total=len(list(apexes)))
+    return True
 
 
 def _censys_hit_names(hit: dict) -> list:
@@ -596,6 +624,7 @@ def run(ctx) -> None:
 
     # ── passive: Censys Platform cert search (OPTIONAL — SILENT unless secrets.yaml `censys:` set) ──
     cen = secrets.censys()
+    censys_entitlement_skip(cen, prof.apex_domains)
     if cen.get("token") and cen.get("org"):
         # review-r5#5: org id (non-secret) + a token FINGERPRINT (never the token) — a different account/org
         # sees different data, so the resume identity must change with it.

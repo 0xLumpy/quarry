@@ -86,6 +86,73 @@ class TestCertspotterPagination:
             v._certspotter("acme.com", max_pages=5)
 
 
+class TestCensysFreeIsNotSilence:
+    """MEASURED 2026-07-30 with a real Free PAT: the Censys Platform search API is ORG-GATED. The wallet
+    reads fine (100 credits, resets monthly) and `/v3/global/search/query` answers HTTP 403
+    `application/problem+json`:
+
+        "This endpoint requires an organization ID for API access. Free users can only access this
+         endpoint through the Platform UI."
+
+    The refusal costs 0 credits, so this is entitlement and not money. Configuring a token WITHOUT an org
+    was answered with total silence — no lifecycle, nothing in the manifest — so a Free user could not tell
+    "not configured" from "cannot work"."""
+
+    def _drive(self, tmp_path, cen):
+        from quarry_recon import events
+        from quarry_recon.phases import vertical
+        events.reset(); events.configure(tmp_path)
+        recorded = vertical.censys_entitlement_skip(cen, ["acme.com", "example.com"])
+        from quarry_recon import events as _ev
+        rows = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()] \
+            if (tmp_path / "events.jsonl").exists() else []
+        return recorded, [e for e in rows if e.get("source_id") == "vertical.censys"
+                          and e.get("event") == _ev.TOOL_FINISH]
+
+    def test_a_token_WITHOUT_an_org_records_a_skip_not_silence(self, tmp_path):
+        recorded, term = self._drive(tmp_path, {"token": "PAT"})
+        assert recorded is True
+        assert term and term[0]["status"] == "skipped", term
+
+    #: the sentence Censys actually returned, quoted here VERBATIM rather than imported — asserting the
+    #: constant against itself would pass whatever the constant said, which is how a measurement quietly
+    #: turns into a paraphrase.
+    MEASURED = ("This endpoint requires an organization ID for API access. Free users can only access "
+                "this endpoint through the Platform UI.")
+
+    def test_the_skip_carries_the_PROVIDERS_OWN_sentence(self, tmp_path):
+        _recorded, term = self._drive(tmp_path, {"token": "PAT"})
+        why = term[0].get("reason") or ""
+        assert self.MEASURED in why, why
+        assert "no credit was spent" in why and "2026-07-30" in why, why
+
+    def test_the_CONSTANT_is_the_measured_sentence(self):
+        from quarry_recon.phases import vertical
+        assert vertical.CENSYS_ORG_REQUIRED == self.MEASURED, vertical.CENSYS_ORG_REQUIRED
+
+    @pytest.mark.parametrize("cen", [{}, {"org": "o"}, {"token": "", "org": ""}, {"token": "PAT", "org": "o"}])
+    def test_every_OTHER_configuration_stays_silent(self, tmp_path, cen):
+        """Unconfigured is not the same as configured-and-unusable, an org with no token has no credential
+        to be refused, and a COMPLETE config is the lane's normal path — none of them get this skip."""
+        recorded, term = self._drive(tmp_path, cen)
+        assert recorded is False, cen
+        assert term == [], (cen, term)
+
+    def test_the_LANE_actually_calls_it(self):
+        """A guard nothing invokes is the silence it was written to fix."""
+        import inspect
+
+        from quarry_recon.phases import vertical
+        src = inspect.getsource(vertical.run)
+        assert "censys_entitlement_skip(cen, prof.apex_domains)" in src, src[-400:]
+
+    def test_the_REGISTRY_states_the_measured_entitlement(self):
+        from quarry_recon import sources
+        notes = (sources.get("vertical.censys") or {}).get("notes", "")
+        assert "organization ID" in notes and "2026-07-30" in notes, notes
+        assert "0 credits" in notes, notes
+
+
 class TestCensysPagination:
     def _mock(self, monkeypatch, pages, seen=None):
         from quarry_recon.phases import vertical
