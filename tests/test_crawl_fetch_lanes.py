@@ -2144,7 +2144,6 @@ class TestXnLinkFinderOutputIsUntrusted:
     @pytest.mark.parametrize("link", [
         "https://acme.com.evil.net/x",       # the tool's regex says IN
         "https://notacme.com/x",             # ...and for this one too
-        "//acme.com.attacker.io/y",
         "https://xacme.common.io/z",
         "https://evil.net/?u=acme.com",
     ])
@@ -2152,7 +2151,11 @@ class TestXnLinkFinderOutputIsUntrusted:
         kind, _v = crawl._xnl_classify_link(link, self._S())
         assert kind == crawl.XNL_OOS, (link, kind)
 
-    @pytest.mark.parametrize("link", ["https://www.acme.com/a", "http://acme.com/", "//api.acme.com/v1"])
+    def test_a_scheme_relative_OFF_SCOPE_link_is_not_an_endpoint_either(self):
+        """It has no scheme we were told, so it is never surface — whatever its host says."""
+        assert crawl._xnl_classify_link("//acme.com.attacker.io/y", self._S())[0] == crawl.XNL_SCHEMELESS
+
+    @pytest.mark.parametrize("link", ["https://www.acme.com/a", "http://acme.com/"])
     def test_a_genuinely_in_scope_link_IS_an_endpoint(self, link):
         assert crawl._xnl_classify_link(link, self._S())[0] == crawl.XNL_ENDPOINT, link
 
@@ -2161,7 +2164,7 @@ class TestXnLinkFinderOutputIsUntrusted:
 
     @pytest.mark.parametrize("link,kind", [
         ("/api/v1/users", "path"), ("./rel", "path"), ("../up", "path"),
-        ("plainword", "malformed"), ("<stdin>", "malformed"), ("", "malformed"),
+        ("plainword", "malformed"), ("<stdin>", "ignored"), ("", "ignored"), ("   ", "ignored"),
         ("https://[bad/", "malformed"), ("http://a b.com/", "malformed"), ("x" * 5000, "malformed"),
         ("https://acme.com/\x00evil", "malformed"),
     ])
@@ -2290,16 +2293,20 @@ class TestXnLinkFinderAuthorityIsParsedNotGuessed:
         def is_oos(self, h):
             return False
 
-    def test_the_USERINFO_confusion_is_refused(self):
+    def test_the_USERINFO_confusion_is_never_an_endpoint(self):
         kind, _v = crawl._xnl_classify_link("https://acme.com:443@evil.net/graphql", self._S())
-        assert kind == crawl.XNL_MALFORMED
+        assert kind == crawl.XNL_CREDENTIAL
 
     @pytest.mark.parametrize("url", [
         "https://acme.com@evil.net/x", "https://acme.com:443@evil.net/x",
         "http://user:pass@acme.com/x", "https://acme.com%40evil.net@evil.net/x",
     ])
-    def test_ANY_userinfo_is_refused(self, url):
-        assert crawl._xnl_classify_link(url, self._S())[0] == crawl.XNL_MALFORMED, url
+    def test_ANY_userinfo_is_never_surface(self, url):
+        """review-B-audit-3#2: unsafe to CONTACT is not the same as worthless — a published credential is a
+        finding. It gets its own disposition, and it is never an endpoint."""
+        kind, v = crawl._xnl_classify_link(url, self._S())
+        assert kind == crawl.XNL_CREDENTIAL, url
+        assert v == url, "the evidence must be verbatim"
 
     @pytest.mark.parametrize("url", ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd",
                                      "ftp://acme.com/x", "mailto:a@acme.com"])
@@ -2319,9 +2326,13 @@ class TestXnLinkFinderAuthorityIsParsedNotGuessed:
         from quarry_recon import normalize
         assert normalize.host_of_url(v) == "www.acme.com"
 
-    def test_a_scheme_relative_link_is_stored_with_a_scheme(self):
+    def test_a_scheme_relative_link_keeps_its_UNKNOWN_scheme(self):
+        """review-B-audit-3#1: a protocol-relative reference inherits the SOURCE DOCUMENT's scheme, and the
+        blob destroyed which document that was. Manufacturing `https:` invents a target."""
         kind, v = crawl._xnl_classify_link("//api.acme.com/v1", self._S())
-        assert kind == crawl.XNL_ENDPOINT and v == "https://api.acme.com/v1", v
+        assert kind == crawl.XNL_SCHEMELESS and v == "//api.acme.com/v1", v
+        from quarry_recon import normalize
+        assert normalize.host_of_url(v) == "", "a schemeless value must be uncontactable by construction"
 
     def test_the_MALICIOUS_url_reaches_no_consumer(self, tmp_path, monkeypatch):
         """End to end: it is not stored, so the GraphQL/actuator consumers never see it and nothing is
@@ -2332,9 +2343,11 @@ class TestXnLinkFinderAuthorityIsParsedNotGuessed:
                                            "https://api.acme.com/graphql"])
         stored = [r["value"] for k, r in added if k == "endpoint"]
         assert stored == ["https://api.acme.com/graphql"], stored
-        assert "evil.net" not in json.dumps(added), added
-        cov = [e for e in evs if e.get("measure") == "links"][0]
-        assert cov["omitted"] == 1, cov
+        # the credential URL is retained as evidence, but never as something a lane can contact
+        assert not [r for k, r in added if k == "endpoint" and "evil.net" in r["value"]], added
+        rev = [r for k, r in added if k == "review"]
+        assert rev and rev[0]["klass"] == "credential-in-url", rev
+        assert rev[0]["value"] == "https://acme.com:443@evil.net/graphql", "evidence must be verbatim"
 
     @pytest.mark.parametrize("url,want", [
         ("https://acme.com:443@evil.net/g", ""),      # the confusion itself
@@ -2404,3 +2417,105 @@ class TestXnLinkFinderAcceptanceIsNotStorage:
         led = [e for e in evs if e.get("event") == "ledger"][0]
         assert led["produced"]["endpoints"] == 2, led          # accepted
         assert led["xnl_stored"]["endpoints_new"] == 1, led    # ...one of them new to the store
+
+
+class TestXnLinkFinderBoundarySemantics:
+    """review-B-audit-3: four boundary meanings that were wrong — an invented scheme, a discarded finding,
+    a masked read failure, and noise counted as damage."""
+
+    _S = TestXnLinkFinderAuthorityIsParsedNotGuessed._S
+
+    def _ingest(self, tmp_path, monkeypatch, links=(), params=()):
+        return TestXnLinkFinderIngestionBoundary()._ingest(tmp_path, monkeypatch, links=links, params=params)
+
+    # ── #1 scheme-relative ────────────────────────────────────────────────────────────────────────────
+    def test_a_scheme_relative_link_is_stored_UNBOUND_on_both_axes(self, tmp_path, monkeypatch):
+        added, _evs = self._ingest(tmp_path, monkeypatch, links=["//api.acme.com/graphql"])
+        row = [r for k, r in added if k == "endpoint"][0]
+        assert row["value"] == "//api.acme.com/graphql", "the scheme must not be invented"
+        assert row["kind"] == "scheme-relative" and row["scheme"] == "unbound", row
+        assert row["origin"] == "unbound", row
+
+    def test_NO_https_is_manufactured_anywhere(self, tmp_path, monkeypatch):
+        added, _evs = self._ingest(tmp_path, monkeypatch, links=["//api.acme.com/graphql"])
+        assert "https://api.acme.com/graphql" not in json.dumps(added), added
+
+    def test_a_scheme_relative_value_cannot_become_a_request(self):
+        """The structural guarantee, not a promise: the authority helper every request path uses answers ""
+        for a schemeless value, so a scope check refuses it."""
+        from quarry_recon import normalize
+        assert normalize.host_of_url("//api.acme.com/graphql") == ""
+
+    # ── #2 credentials are evidence ───────────────────────────────────────────────────────────────────
+    def test_a_credential_URL_is_kept_VERBATIM_as_review(self, tmp_path, monkeypatch):
+        added, _evs = self._ingest(tmp_path, monkeypatch, links=["https://user:pass@acme.com/private"])
+        assert not [r for k, r in added if k == "endpoint"], added
+        rev = [r for k, r in added if k == "review"][0]
+        assert rev["klass"] == "credential-in-url"
+        assert rev["value"] == "https://user:pass@acme.com/private", "a discovered secret is not masked"
+        assert "never contacted" in rev["note"]
+
+    def test_a_credential_URL_is_counted_as_evidence_not_damage(self, tmp_path, monkeypatch):
+        _added, evs = self._ingest(tmp_path, monkeypatch, links=["https://user:pass@acme.com/x"])
+        cov = [e for e in evs if e.get("measure") == "links"][0]
+        assert (cov["eligible"], cov["tested"], cov["omitted"]) == (1, 1, 0), cov
+        led = [e for e in evs if e.get("event") == "ledger"][0]
+        assert led["produced"]["credential_urls"] == 1, led
+
+    # ── #3 unreadable vs absent ───────────────────────────────────────────────────────────────────────
+    def test_a_read_that_fails_is_NOT_reported_as_absent(self, tmp_path, monkeypatch):
+        """`exists()` collapses a stat/permission failure to False and adds a check/read race — the ERROR
+        is what distinguishes the two."""
+        f = tmp_path / "links.txt"
+        f.write_text("x\n")
+        monkeypatch.setattr(pathlib.Path, "read_bytes",
+                            lambda self: (_ for _ in ()).throw(PermissionError("denied")))
+        assert crawl._xnl_lines(f) == ([], 0, True)
+
+    def test_a_genuinely_absent_file_is_a_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pathlib.Path, "read_bytes",
+                            lambda self: (_ for _ in ()).throw(FileNotFoundError("nope")))
+        assert crawl._xnl_lines(tmp_path / "gone.txt") == ([], 0, False)
+
+    def test_NO_exists_precheck_remains(self):
+        import inspect
+        src = inspect.getsource(crawl._xnl_lines)
+        assert ".exists()" not in src, src
+
+    def test_an_unreadable_file_says_so_in_the_ledger(self, tmp_path, monkeypatch):
+        def fake_exec(tool, cmd, **kw):
+            return type("R", (), {"tool": tool, "cmd": cmd, "status": crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        monkeypatch.setattr(pathlib.Path, "read_bytes",
+                            lambda self: (_ for _ in ()).throw(PermissionError("denied"))
+                            if self.name.endswith(("_links.txt", "_params.txt")) else b"")
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = self._S()
+        ctx.scope.passive_only = False
+        src = tmp_path / "in"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "a.js").write_text("x")
+        crawl._xnl(ctx, str(src), "t")
+        evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+        led = [e for e in evs if e.get("event") == "ledger"][0]
+        assert led["xnl_unreadable"] == {"links": True, "params": True}, led
+        cov = [e for e in evs if e.get("measure") == "links"][0]
+        assert "UNREADABLE" in cov["reason"], cov
+
+    # ── #4 ignored noise is not damage ────────────────────────────────────────────────────────────────
+    def test_BLANK_lines_and_the_stdin_token_are_neither_finding_nor_error(self, tmp_path, monkeypatch):
+        _added, evs = self._ingest(tmp_path, monkeypatch,
+                                   links=["", "<stdin>", "   ", "https://www.acme.com/real"])
+        cov = [e for e in evs if e.get("measure") == "links"][0]
+        assert (cov["eligible"], cov["tested"], cov["omitted"]) == (1, 1, 0), cov
+        led = [e for e in evs if e.get("event") == "ledger"][0]
+        assert led["xnl_rejected"]["links_ignored"] == 3, led
+        assert led["xnl_rejected"]["links_unusable"] == 0, led
+
+    def test_REAL_damage_is_still_counted_as_damage(self, tmp_path, monkeypatch):
+        _added, evs = self._ingest(tmp_path, monkeypatch, links=["<stdin>", "plainword", "https://[bad/"])
+        led = [e for e in evs if e.get("event") == "ledger"][0]
+        assert led["xnl_rejected"]["links_ignored"] == 1 and led["xnl_rejected"]["links_unusable"] == 2, led

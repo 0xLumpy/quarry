@@ -1189,14 +1189,27 @@ XNL_WORDLIST_DERIVE_CAP = 5000         # bounded vocabulary derived from links/p
 #: is therefore UNTRUSTED input, re-validated here against Quarry's own scope before anything is stored.
 XNL_ENDPOINT = "endpoint"        # an absolute URL, IN Quarry's scope
 XNL_PATH = "path"                # a relative path — no host, so not contactable and not scope-checkable
+XNL_SCHEMELESS = "schemeless"    # `//host/path` — a host, but its SCHEME is the source document's, and the
+                                 # blob destroyed which document that was. Evidence, never a contact target.
 XNL_OOS = "oos"                  # an absolute URL OUTSIDE scope: retained as review evidence, never endpoint
-XNL_MALFORMED = "malformed"      # not usable as either — counted, never stored as surface
+XNL_CREDENTIAL = "credential"    # a URL carrying USERINFO: unsafe to contact, but possibly a real finding
+XNL_MALFORMED = "malformed"      # not usable as a reference at all — counted, never stored as surface
+XNL_IGNORED = "ignored"          # blank lines and the tool's own `<stdin>` token: not a finding, not an error
 
 #: a potential parameter NAME. xnLinkFinder mines path words, JSON keys, JS variables, input names and meta
 #: fields, so the file also picks up sentences, code fragments and binary noise from minified sources.
 _XNL_PARAM_RX = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:\-\[\]]{0,63}$")
 #: an absolute reference: a scheme, or a scheme-relative `//host/...`
 _XNL_ABSOLUTE_RX = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.\-]*:)?//", re.IGNORECASE)
+
+
+def _safe_netloc(raw: str) -> bool:
+    """Whether `urlsplit` can even read this reference's authority. Never raises."""
+    try:
+        _urlsplit(raw)
+        return True
+    except ValueError:
+        return False
 
 
 def _xnl_safe_url(raw: str):
@@ -1211,8 +1224,8 @@ def _xnl_safe_url(raw: str):
     Refused: any scheme but http/https, userinfo (`user@host` — the confusion itself, and nothing in recon
     input needs it), an unparseable authority, a host that is not a canonical hostname."""
     v = raw.strip()
-    if v.startswith("//"):
-        v = "https:" + v                      # scheme-relative: the client would inherit https here
+    # NB no scheme is invented here: a `//host/path` reference never reaches this function (see
+    # `_xnl_classify_link`), because its scheme belongs to a source document the blob destroyed.
     # ONE authority decision, in ONE place. `normalize.host_of_url` is what every scope check in the repo
     # runs through — including `fetch.scoped_get`, which makes the request — and it is fail-closed: a
     # non-http scheme, any userinfo, an unparseable port or IPv6 literal all answer "". Re-checking those
@@ -1242,10 +1255,24 @@ def _xnl_classify_link(raw: str, scope) -> tuple:
     as review, but it is not surface: `endpoint` is consumed by lanes that go on to contact things."""
     v = (raw or "").strip()
     if not v or v == "<stdin>":
-        return XNL_MALFORMED, ""              # the tool's own noise token; not a finding, not an error
+        # review-B-audit-3#4: this said "not an error" and was then counted as malformed. Ignored noise has
+        # its own disposition, so the rejected count means what it says.
+        return XNL_IGNORED, ""
     if any(ch in v for ch in "\t \x00") or len(v) > 4096:
         return XNL_MALFORMED, v               # a link with whitespace/NUL, or an absurd length, is not a link
+    if v.startswith("//"):
+        # review-B-audit-3#1: a protocol-relative reference inherits the SOURCE DOCUMENT's scheme, and the
+        # concatenated blob destroyed which document that was. Manufacturing `https:` invents a target we
+        # were never told about. Kept VERBATIM: `normalize.host_of_url` answers "" for a schemeless value,
+        # so every scope check — and therefore every request path — refuses it by construction.
+        return XNL_SCHEMELESS, v
     if _XNL_ABSOLUTE_RX.match(v):
+        if "@" in _urlsplit(v).netloc if _safe_netloc(v) else False:
+            # review-B-audit-3#2: unsafe to CONTACT is not the same as worthless. `https://user:pass@host/`
+            # carries credentials someone published — a finding in its own right — so it is retained
+            # VERBATIM as review evidence and never as surface. (Quarry's own configured credentials are
+            # the only thing redacted from telemetry; discovered ones are the point.)
+            return XNL_CREDENTIAL, v
         safe = _xnl_safe_url(v)
         if safe is None:
             return XNL_MALFORMED, v           # not a URL an HTTP client could act on, so not surface
@@ -1277,12 +1304,14 @@ def _xnl_lines(path) -> tuple:
     review-B-audit-2#3: every `OSError` used to become `([], 0)`, so a file that EXISTS and cannot be read
     was indistinguishable from a tool that found nothing. Absence is a legitimate zero; an unreadable
     artifact is our own machinery failing, and `unreadable` says which happened."""
-    if not path.exists():
-        return [], 0, False                   # no output file: a legitimate zero
+    # review-B-audit-3#3: an `exists()` pre-check collapses a stat/permission failure to "absent" and adds a
+    # check/read race. Read, then let the ERROR say which happened.
     try:
         blob = path.read_bytes()
+    except FileNotFoundError:
+        return [], 0, False                   # no output file: a legitimate zero
     except OSError:
-        return [], 0, True
+        return [], 0, True                    # it is there and we cannot read it: our machinery failing
     out, bad = [], 0
     for chunk in blob.splitlines():
         try:
@@ -1418,6 +1447,7 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
     # already stored made the parser look like it had rejected it (`tested=0` for a line it accepted).
     # ACCEPTANCE is a parser fact; NOVELTY is a store fact. Both are counted, separately.
     n_endpoints = n_paths = n_oos = n_bad_links = 0        # accepted by the parser
+    n_schemeless = n_credential = n_ignored = 0
     new_endpoints = new_paths = 0                          # ...and new to the store
     for line in lines:
         kind, v = _xnl_classify_link(line, ctx.scope)
@@ -1433,6 +1463,22 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
             if ctx.run.add("endpoint", {"value": v, "kind": "path", "origin": "unbound",
                                         "sources": [src_tag]}):
                 new_paths += 1
+        elif kind == XNL_SCHEMELESS:
+            # a host we may well own, but with NO scheme we were told — kept verbatim and marked unbound on
+            # both axes, so nothing downstream can turn it into a request.
+            n_schemeless += 1
+            ctx.run.add("endpoint", {"value": v, "kind": "scheme-relative", "scheme": "unbound",
+                                     "origin": "unbound", "sources": [src_tag]})
+        elif kind == XNL_CREDENTIAL:
+            # DISCOVERED credentials are a finding, not noise. Verbatim — masking a discovered secret would
+            # destroy the evidence; only Quarry's OWN configured credentials are redacted from telemetry.
+            n_credential += 1
+            ctx.run.add("review", {"id": f"{src_tag}:cred:{v}", "klass": "credential-in-url", "value": v,
+                                   "note": f"{src_tag} extracted a URL carrying USERINFO — never contacted "
+                                           f"(the authority is ambiguous), retained verbatim as evidence",
+                                   "sources": [src_tag]})
+        elif kind == XNL_IGNORED:
+            n_ignored += 1                     # blank lines and the tool's own token: neither finding nor error
         elif kind == XNL_OOS:
             # the archive really did link there: real evidence, and NOT surface. `endpoint` feeds lanes that
             # go on to contact things, so an off-scope URL is retained where nothing active consumes it.
@@ -1444,11 +1490,13 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
         else:
             n_bad_links += 1
     events.coverage_partial("crawl.xnlinkfinder", kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:links",
-                            measure="links", eligible=len(lines) + undecodable,
-                            tested=n_endpoints + n_paths + n_oos,
+                            # IGNORED noise is neither eligible nor omitted: it was never a candidate.
+                            measure="links", eligible=len(lines) - n_ignored + undecodable,
+                            tested=n_endpoints + n_paths + n_schemeless + n_oos + n_credential,
                             omitted=n_bad_links + undecodable,
-                            reason=(f"{tag}: {n_endpoints} in-scope, {n_paths} relative, {n_oos} off-scope "
-                                    f"(review only); {n_bad_links} unusable, {undecodable} undecodable"
+                            reason=(f"{tag}: {n_endpoints} in-scope, {n_paths} relative, {n_schemeless} "
+                                    f"scheme-relative, {n_oos} off-scope, {n_credential} credential-bearing "
+                                    f"(evidence only); {n_bad_links} unusable, {undecodable} undecodable"
                                     + ("; LINK OUTPUT UNREADABLE" if links_unreadable else "")))
 
     # ── params: xnLinkFinder emits POTENTIAL params (path words / JSON keys / JS vars / input names / meta)
@@ -1514,12 +1562,14 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
             n_secrets = 0
     events.ledger("crawl.xnlinkfinder",
                   produced={"endpoints": n_endpoints, "paths": n_paths, "oos_links": n_oos,
+                            "scheme_relative": n_schemeless, "credential_urls": n_credential,
                             "potential_params": n_params_seen, "params_kept": n_params_added,
                             "wordlist": n_words, "secrets": n_secrets},
                   # what the tool emitted that Quarry REFUSED to treat as surface. A parser boundary that
                   # reports nothing is indistinguishable from a tool that emitted nothing.
                   xnl_rejected={"links_unusable": n_bad_links, "links_undecodable": undecodable,
-                                "params_unusable": n_bad_params, "off_scope_links": n_oos},
+                                "params_unusable": n_bad_params, "off_scope_links": n_oos,
+                                "links_ignored": n_ignored},
                   # ACCEPTED vs NEW: a line the parser took that the store already had is not a rejection.
                   xnl_stored={"endpoints_new": new_endpoints, "paths_new": new_paths,
                               "params_new": n_params_added},
@@ -1528,7 +1578,8 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
                   xnl_unreadable={"links": links_unreadable, "params": params_unreadable})
     # a run that produced NOTHING usable is suspicious; one that produced only off-scope links is a
     # different fact, so both are named.
-    if written > 512 and not (n_endpoints or n_paths or n_params_seen or n_words or n_secrets or n_oos):
+    if written > 512 and not (n_endpoints or n_paths or n_params_seen or n_words or n_secrets or n_oos
+                              or n_schemeless or n_credential):
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: {written}B input -> 0 links/params/words/secrets "
                                        f"(capability drift? input kept: {blob.name})")
