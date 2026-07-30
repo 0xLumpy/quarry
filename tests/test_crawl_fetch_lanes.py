@@ -2185,12 +2185,21 @@ class TestXnLinkFinderOutputIsUntrusted:
         look like perfectly good values — mined minified sources produce exactly that."""
         f = tmp_path / "links.txt"
         f.write_bytes(b"https://www.acme.com/ok\n\xff\xfe/bad\nhttps://api.acme.com/two\n")
-        lines, undecodable = crawl._xnl_lines(f)
+        lines, undecodable, unreadable = crawl._xnl_lines(f)
         assert lines == ["https://www.acme.com/ok", "https://api.acme.com/two"], lines
-        assert undecodable == 1
+        assert undecodable == 1 and unreadable is False
 
-    def test_a_missing_file_is_empty_not_an_error(self, tmp_path):
-        assert crawl._xnl_lines(tmp_path / "nope.txt") == ([], 0)
+    def test_a_MISSING_file_is_a_legitimate_zero(self, tmp_path):
+        assert crawl._xnl_lines(tmp_path / "nope.txt") == ([], 0, False)
+
+    def test_an_UNREADABLE_file_is_machinery_not_a_zero(self, tmp_path, monkeypatch):
+        """review-B-audit-2#3: every OSError became `([], 0)`, so a file that EXISTS and cannot be read was
+        indistinguishable from a tool that found nothing."""
+        f = tmp_path / "links.txt"
+        f.write_text("https://www.acme.com/ok\n")
+        monkeypatch.setattr(pathlib.Path, "read_bytes",
+                            lambda self: (_ for _ in ()).throw(OSError("permission denied")))
+        assert crawl._xnl_lines(f) == ([], 0, True)
 
 
 class TestXnLinkFinderIngestionBoundary:
@@ -2267,3 +2276,131 @@ class TestXnLinkFinderIngestionBoundary:
                                    params=["user_id", "function(){}", "has space", "q"])
         got = sorted(r["value"] for k, r in added if k == "parameter")
         assert got == ["q", "user_id"], got
+
+
+class TestXnLinkFinderAuthorityIsParsedNotGuessed:
+    """review-B-audit-2#1: scope was decided on a regex-extracted host while consumers re-parse the RAW
+    string. `https://acme.com:443@evil.net/graphql` read as `acme.com` and would have been fetched from
+    `evil.net` — the same RoE class the containment commit removed, re-entering through the inventory."""
+
+    class _S:
+        def in_scope(self, h):
+            return h == "acme.com" or h.endswith(".acme.com")
+
+        def is_oos(self, h):
+            return False
+
+    def test_the_USERINFO_confusion_is_refused(self):
+        kind, _v = crawl._xnl_classify_link("https://acme.com:443@evil.net/graphql", self._S())
+        assert kind == crawl.XNL_MALFORMED
+
+    @pytest.mark.parametrize("url", [
+        "https://acme.com@evil.net/x", "https://acme.com:443@evil.net/x",
+        "http://user:pass@acme.com/x", "https://acme.com%40evil.net@evil.net/x",
+    ])
+    def test_ANY_userinfo_is_refused(self, url):
+        assert crawl._xnl_classify_link(url, self._S())[0] == crawl.XNL_MALFORMED, url
+
+    @pytest.mark.parametrize("url", ["javascript:alert(1)", "data:text/html,<b>x", "file:///etc/passwd",
+                                     "ftp://acme.com/x", "mailto:a@acme.com"])
+    def test_only_HTTP_schemes_can_be_surface(self, url):
+        assert crawl._xnl_classify_link(url, self._S())[0] == crawl.XNL_MALFORMED, url
+
+    @pytest.mark.parametrize("url", ["https://acme.com:notaport/x", "https://acme.com:99999999/x",
+                                     "https://[bad:/x"])
+    def test_an_unparseable_AUTHORITY_is_refused(self, url):
+        assert crawl._xnl_classify_link(url, self._S())[0] == crawl.XNL_MALFORMED, url
+
+    def test_what_is_STORED_is_rebuilt_from_the_parsed_parts(self):
+        """A downstream re-parse must not be able to disagree with the scope decision that admitted it."""
+        kind, v = crawl._xnl_classify_link("https://WWW.ACME.COM:8443/a?b=1#f", self._S())
+        assert kind == crawl.XNL_ENDPOINT
+        assert v == "https://www.acme.com:8443/a?b=1#f", v
+        from quarry_recon import normalize
+        assert normalize.host_of_url(v) == "www.acme.com"
+
+    def test_a_scheme_relative_link_is_stored_with_a_scheme(self):
+        kind, v = crawl._xnl_classify_link("//api.acme.com/v1", self._S())
+        assert kind == crawl.XNL_ENDPOINT and v == "https://api.acme.com/v1", v
+
+    def test_the_MALICIOUS_url_reaches_no_consumer(self, tmp_path, monkeypatch):
+        """End to end: it is not stored, so the GraphQL/actuator consumers never see it and nothing is
+        requested."""
+        ingest = TestXnLinkFinderIngestionBoundary()
+        added, evs = ingest._ingest(tmp_path, monkeypatch,
+                                    links=["https://acme.com:443@evil.net/graphql",
+                                           "https://api.acme.com/graphql"])
+        stored = [r["value"] for k, r in added if k == "endpoint"]
+        assert stored == ["https://api.acme.com/graphql"], stored
+        assert "evil.net" not in json.dumps(added), added
+        cov = [e for e in evs if e.get("measure") == "links"][0]
+        assert cov["omitted"] == 1, cov
+
+    @pytest.mark.parametrize("url,want", [
+        ("https://acme.com:443@evil.net/g", ""),      # the confusion itself
+        ("https://acme.com@evil.net/g", ""),
+        ("http://user:pass@acme.com/x", ""),
+        ("javascript:alert(1)", ""),                  # no host to contact
+        ("data:text/html,<b>", ""),
+        ("ftp://acme.com/x", ""),                     # a host, but not a scheme this project speaks
+        ("file:///etc/passwd", ""),
+        ("https://acme.com:notaport/x", ""),
+        ("https://[bad:/x", ""),
+        ("", ""),
+        ("https://www.acme.com/a", "www.acme.com"),
+        ("http://ACME.com:8080/x", "acme.com"),
+        ("https://[::1]:8443/x", "::1"),
+    ])
+    def test_the_SHARED_helper_is_the_ONE_authority(self, url, want):
+        """`normalize.host_of_url` is what every scope check in the repo runs through — including
+        `fetch.scoped_get`, which makes the request. The boundary defers to it rather than keeping a second
+        copy of the same decision."""
+        from quarry_recon import normalize
+        assert normalize.host_of_url(url) == want, url
+
+
+class TestXnLinkFinderAcceptanceIsNotStorage:
+    """review-B-audit-2#2: the counters incremented only when `add()` reported a NEW row, so an endpoint
+    jsluice had already stored made the parser look like it had rejected it."""
+
+    def _ingest_with_store(self, tmp_path, monkeypatch, links, already):
+        def fake_exec(tool, cmd, **kw):
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_text("\n".join(links) + "\n")
+            pathlib.Path(cmd[cmd.index("-op") + 1]).write_text("")
+            return type("R", (), {"tool": tool, "cmd": cmd, "status": crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = TestXnLinkFinderAuthorityIsParsedNotGuessed._S()
+        ctx.scope.passive_only = False
+        seen = set(already)
+
+        def add(kind, rec):
+            key = (kind, rec.get("value"))
+            new = key not in seen
+            seen.add(key)
+            ctx.run.added.append((kind, rec))
+            return new
+
+        ctx.run.add = add
+        src = tmp_path / "in"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "a.js").write_text("x")
+        crawl._xnl(ctx, str(src), "t")
+        return [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+
+    def test_an_endpoint_ANOTHER_LANE_already_stored_still_counts_as_accepted(self, tmp_path, monkeypatch):
+        evs = self._ingest_with_store(tmp_path, monkeypatch, ["https://api.acme.com/x"],
+                                      already={("endpoint", "https://api.acme.com/x")})
+        cov = [e for e in evs if e.get("measure") == "links"][0]
+        assert (cov["eligible"], cov["tested"], cov["omitted"]) == (1, 1, 0), cov
+
+    def test_NOVELTY_is_reported_separately(self, tmp_path, monkeypatch):
+        evs = self._ingest_with_store(tmp_path, monkeypatch,
+                                      ["https://api.acme.com/x", "https://api.acme.com/y"],
+                                      already={("endpoint", "https://api.acme.com/x")})
+        led = [e for e in evs if e.get("event") == "ledger"][0]
+        assert led["produced"]["endpoints"] == 2, led          # accepted
+        assert led["xnl_stored"]["endpoints_new"] == 1, led    # ...one of them new to the store

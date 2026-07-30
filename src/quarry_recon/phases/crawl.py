@@ -14,6 +14,7 @@ import re
 import shutil
 import time
 from pathlib import Path
+from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
 
 from .. import budget, events, fetch, normalize, secrets, settings
 from ..contract import run_contract
@@ -1198,6 +1199,41 @@ _XNL_PARAM_RX = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:\-\[\]]{0,63}$")
 _XNL_ABSOLUTE_RX = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.\-]*:)?//", re.IGNORECASE)
 
 
+def _xnl_safe_url(raw: str):
+    """`(canonical_url, canonical_host)` for an absolute reference, or None.
+
+    review-B-audit-2#1: scope was decided on a host extracted by regex while a consumer would later re-parse
+    the RAW string — so `https://acme.com:443@evil.net/graphql` passed as `acme.com` and would have been
+    fetched from `evil.net`. The authority is parsed STRUCTURALLY here, the dangerous shapes are refused
+    outright, and what gets STORED is rebuilt from the parsed parts: a downstream re-parse cannot then
+    disagree with the scope decision that admitted it.
+
+    Refused: any scheme but http/https, userinfo (`user@host` — the confusion itself, and nothing in recon
+    input needs it), an unparseable authority, a host that is not a canonical hostname."""
+    v = raw.strip()
+    if v.startswith("//"):
+        v = "https:" + v                      # scheme-relative: the client would inherit https here
+    # ONE authority decision, in ONE place. `normalize.host_of_url` is what every scope check in the repo
+    # runs through — including `fetch.scoped_get`, which makes the request — and it is fail-closed: a
+    # non-http scheme, any userinfo, an unparseable port or IPv6 literal all answer "". Re-checking those
+    # here would be a second copy that cannot be falsified while the first one holds, and two copies of a
+    # security decision are how they drift apart.
+    host = normalize.host_of_url(v)
+    if not host:
+        return None
+    canon = normalize.canon_host_strict(host)
+    if not canon:
+        return None
+    try:
+        parts = _urlsplit(v)
+        port = parts.port
+    except ValueError:
+        return None
+    authority = canon if port is None else f"{canon}:{port}"
+    rebuilt = _urlunsplit((parts.scheme.lower(), authority, parts.path, parts.query, parts.fragment))
+    return rebuilt, canon
+
+
 def _xnl_classify_link(raw: str, scope) -> tuple:
     """`(kind, value)` for one line of xnLinkFinder link output. NEVER raises.
 
@@ -1210,13 +1246,13 @@ def _xnl_classify_link(raw: str, scope) -> tuple:
     if any(ch in v for ch in "\t \x00") or len(v) > 4096:
         return XNL_MALFORMED, v               # a link with whitespace/NUL, or an absurd length, is not a link
     if _XNL_ABSOLUTE_RX.match(v):
-        host = normalize.host_of_url(v if "//" not in v[:2] else "http:" + v)
-        canon = normalize.canon_host_strict(host) if host else None
-        if not canon:
-            return XNL_MALFORMED, v           # an absolute reference whose host we cannot even canonicalize
-        if scope.in_scope(canon) and not scope.is_oos(canon):
-            return XNL_ENDPOINT, v
-        return XNL_OOS, v
+        safe = _xnl_safe_url(v)
+        if safe is None:
+            return XNL_MALFORMED, v           # not a URL an HTTP client could act on, so not surface
+        canon_url, canon_host = safe
+        if scope.in_scope(canon_host) and not scope.is_oos(canon_host):
+            return XNL_ENDPOINT, canon_url
+        return XNL_OOS, canon_url
     if v.startswith("/") or v.startswith("./") or v.startswith("../"):
         return XNL_PATH, v
     # anything else — a bare word, a code fragment, a mangled token — is not a reference at all
@@ -1232,22 +1268,28 @@ def _xnl_classify_param(raw: str) -> tuple:
 
 
 def _xnl_lines(path) -> tuple:
-    """`(lines, undecodable)` — read tool output as BYTES and decode per line, strictly.
+    """`(lines, undecodable, unreadable)` — read tool output as BYTES and decode per line, strictly.
 
     A whole-file `errors="replace"` decode turns invalid UTF-8 into replacement characters that then look
     like perfectly good values; mined minified/binary sources produce exactly that. A line we cannot decode
-    is counted, not guessed at."""
+    is counted, not guessed at.
+
+    review-B-audit-2#3: every `OSError` used to become `([], 0)`, so a file that EXISTS and cannot be read
+    was indistinguishable from a tool that found nothing. Absence is a legitimate zero; an unreadable
+    artifact is our own machinery failing, and `unreadable` says which happened."""
+    if not path.exists():
+        return [], 0, False                   # no output file: a legitimate zero
     try:
-        blob = path.read_bytes() if path.exists() else b""
+        blob = path.read_bytes()
     except OSError:
-        return [], 0
+        return [], 0, True
     out, bad = [], 0
     for chunk in blob.splitlines():
         try:
             out.append(chunk.decode("utf-8"))
         except UnicodeDecodeError:
             bad += 1
-    return out, bad
+    return out, bad, False
 
 
 def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
@@ -1371,20 +1413,26 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
     # `acme.com.evil.net` and `notacme.com` for apex `acme.com`, so the inventory was inheriting the same
     # defect the depth-3 crawl was contained for.
     src_tag = f"xnLinkFinder-{tag}"
-    lines, undecodable = _xnl_lines(out_links)
-    n_endpoints = n_paths = n_oos = n_bad_links = 0
+    lines, undecodable, links_unreadable = _xnl_lines(out_links)
+    # review-B-audit-2#2: these used to count only what `add()` reported as NEW, so an endpoint jsluice had
+    # already stored made the parser look like it had rejected it (`tested=0` for a line it accepted).
+    # ACCEPTANCE is a parser fact; NOVELTY is a store fact. Both are counted, separately.
+    n_endpoints = n_paths = n_oos = n_bad_links = 0        # accepted by the parser
+    new_endpoints = new_paths = 0                          # ...and new to the store
     for line in lines:
         kind, v = _xnl_classify_link(line, ctx.scope)
         if kind == XNL_ENDPOINT:
+            n_endpoints += 1
             if ctx.run.add("endpoint", {"value": v, "sources": [src_tag]}):
-                n_endpoints += 1
+                new_endpoints += 1
         elif kind == XNL_PATH:
             # a relative path has no host, so it is not contactable on its own — and the concatenated stdin
             # blob has already destroyed which file it came from. `origin: unbound` says that plainly rather
             # than letting a consumer assume the path belongs to some particular site.
+            n_paths += 1
             if ctx.run.add("endpoint", {"value": v, "kind": "path", "origin": "unbound",
                                         "sources": [src_tag]}):
-                n_paths += 1
+                new_paths += 1
         elif kind == XNL_OOS:
             # the archive really did link there: real evidence, and NOT surface. `endpoint` feeds lanes that
             # go on to contact things, so an off-scope URL is retained where nothing active consumes it.
@@ -1400,13 +1448,14 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
                             tested=n_endpoints + n_paths + n_oos,
                             omitted=n_bad_links + undecodable,
                             reason=(f"{tag}: {n_endpoints} in-scope, {n_paths} relative, {n_oos} off-scope "
-                                    f"(review only); {n_bad_links} unusable, {undecodable} undecodable"))
+                                    f"(review only); {n_bad_links} unusable, {undecodable} undecodable"
+                                    + ("; LINK OUTPUT UNREADABLE" if links_unreadable else "")))
 
     # ── params: xnLinkFinder emits POTENTIAL params (path words / JSON keys / JS vars / input names / meta)
     #    — NOT confirmed request params. Store as CANDIDATES (kind=potential) with a per-call CAP so a 52k
     #    dump can't flood the inventory / downstream arjun. Drop the <stdin> noise token. ──
     n_params_added = 0
-    param_lines, param_undecodable = _xnl_lines(out_params)
+    param_lines, param_undecodable, params_unreadable = _xnl_lines(out_params)
     cand_set, n_bad_params = set(), param_undecodable
     for line in param_lines:
         ok, v = _xnl_classify_param(line)
@@ -1470,7 +1519,13 @@ def _xnl(ctx, indir: str, tag: str, *, spo: bool = False) -> None:
                   # what the tool emitted that Quarry REFUSED to treat as surface. A parser boundary that
                   # reports nothing is indistinguishable from a tool that emitted nothing.
                   xnl_rejected={"links_unusable": n_bad_links, "links_undecodable": undecodable,
-                                "params_unusable": n_bad_params, "off_scope_links": n_oos})
+                                "params_unusable": n_bad_params, "off_scope_links": n_oos},
+                  # ACCEPTED vs NEW: a line the parser took that the store already had is not a rejection.
+                  xnl_stored={"endpoints_new": new_endpoints, "paths_new": new_paths,
+                              "params_new": n_params_added},
+                  # an artifact that EXISTS and cannot be read is our machinery failing, not a zero result.
+                  # Step 3 turns these into a gap; recorded now so the fact is not invented later.
+                  xnl_unreadable={"links": links_unreadable, "params": params_unreadable})
     # a run that produced NOTHING usable is suspicious; one that produced only off-scope links is a
     # different fact, so both are named.
     if written > 512 and not (n_endpoints or n_paths or n_params_seen or n_words or n_secrets or n_oos):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.parse import urlsplit as _urlsplit
 from typing import Iterator
 
 _HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$", re.IGNORECASE)
@@ -209,8 +210,33 @@ def jsluice_secrets(raw: str, source: str, raw_ref: str | None = None) -> Iterat
 
 
 def host_of_url(url: str) -> str:
-    m = re.match(r"https?://([^/:]+)", url, re.IGNORECASE)
-    return m.group(1).lower() if m else ""
+    """The host an HTTP client would ACTUALLY contact, or "" when that cannot be determined.
+
+    review-B-audit-2#1: this was `^https?://([^/:]+)`, which stops at the first `:` — so
+    `https://acme.com:443@evil.net/graphql` returned `acme.com` while `urlsplit().hostname` and every HTTP
+    client use `evil.net`. Every scope decision in the repo runs through this function (49 call sites,
+    including `fetch.scoped_get`), so a URL could pass an in-scope check and then contact somewhere else.
+
+    Structural now, and FAIL-CLOSED — an empty answer makes a scope check refuse:
+      · only `http`/`https` (a `javascript:`/`data:` URL has no host to contact);
+      · USERINFO is refused outright. `user:pass@host` is exactly the confusion above, and no recon input
+        needs it — a caller that returns "" simply declines to treat the value as an in-scope URL;
+      · an invalid port (or a malformed IPv6 literal) makes `urlsplit` raise, which is also "".
+    """
+    try:
+        parts = _urlsplit(url.strip())
+    except ValueError:
+        return ""
+    if parts.scheme.lower() not in ("http", "https"):
+        return ""
+    if "@" in parts.netloc:
+        return ""
+    try:
+        host = parts.hostname or ""          # raises on a malformed port/IPv6 literal
+        parts.port
+    except ValueError:
+        return ""
+    return host.lower()
 
 def idna_ascii(s: str):
     """THE single IDNA implementation: IDNA2008 / UTS-46, NON-transitional. Returns the A-label form, or None
