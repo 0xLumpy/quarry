@@ -139,10 +139,11 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     slots = sorted(members)
     out.eligible_pairs = sum(len(w) for w in members.values())
     content = {slot: content_digest(words) for slot, words in members.items()}
+    owners: dict = {}
     if attribution is not None:
         for words in members.values():
             for word in words:
-                src = attribution(word)
+                owners[word] = src = attribution(word)      # cached: the attempted split must be counted
                 out.per_source_eligible[src] = out.per_source_eligible.get(src, 0) + 1
 
     if dependency_ok is not None and not dependency_ok():
@@ -198,6 +199,10 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 break
             out.slots_attempted += 1
             out.attempted_pairs += len(words)
+            for word in words:                              # review v15#4: the two attempted totals must
+                src = owners.get(word)                      # agree even when publication never happens
+                if src is not None:
+                    out.per_source_attempted[src] = out.per_source_attempted.get(src, 0) + 1
             if result.status in _OBTAINED:
                 out.slots_obtained += 1
             else:
@@ -227,15 +232,18 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 # of the counters swearing nothing was published while the disk says otherwise.
                 out.pending_completions += 1
 
-            if attribution is not None:
-                for word in words:
-                    src = attribution(word)
-                    out.per_source_attempted[src] = out.per_source_attempted.get(src, 0) + 1
 
-        if clock.exhausted() and len(picked) < len(slots):
+        if out.stop_kind is None and clock.exhausted() and len(picked) < len(slots):
+            # FIRST CAUSE WINS (review v15#1). A machinery stop that happened to cross the bound was being
+            # relabelled "budget", which reads as an operator cap — laundering a failure into a choice.
             out.stop = f"budget exhausted after {clock.elapsed()}s of {clock.seconds}s"
             out.stop_kind = "budget"           # a CAP we chose, not a failure (v14#4)
     out.completion_unpersisted = out.pending_completions
+    if out.completion_unpersisted:
+        # review v15#2: a counter no emitted fact consumes is still silent loss. These slots RAN and their
+        # evidence stands, but the rotation does not know it — they may be selected again.
+        out.machinery.append(f"{out.completion_unpersisted} completion(s) not published — those slot(s) "
+                             f"may be selected again")
     _report(coverage_lane, out, clock)
     return out
 
@@ -274,9 +282,11 @@ def _report(lane: str, out: SweepResult, clock) -> None:
     budget.report_outcome(lane, measure="slot_outcomes", attempted=out.slots_attempted,
                           obtained=out.slots_obtained, classes=out.classes or None, noun="slot")
     if out.per_source_eligible:
-        elig, done = sum(out.per_source_eligible.values()), sum(out.per_source_attempted.values())
-        events.coverage_partial(lane, kind=events.COVERAGE_CAP, measure="vocabulary_attribution",
-                                unit="attribution", eligible=elig, tested=done, omitted=max(0, elig - done),
-                                reason=f"accounting attribution — scheduled "
-                                       f"{dict(sorted(out.per_source_attempted.items()))} of eligible "
-                                       f"{dict(sorted(out.per_source_eligible.items()))}")
+        # review v15#3: NOT a third coverage denominator — it would re-count the candidate remainder the
+        # selection record already owns, and it would have to invent a `kind` for a stop it does not model.
+        # It is structured METADATA about the same selection: who the scheduled prefix belonged to.
+        events.ledger(lane, unit="attribution",
+                      produced={"eligible": sum(out.per_source_eligible.values()),
+                                "scheduled": sum(out.per_source_attempted.values())},
+                      per_source_eligible=dict(sorted(out.per_source_eligible.items())),
+                      per_source_scheduled=dict(sorted(out.per_source_attempted.items())))

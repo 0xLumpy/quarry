@@ -273,8 +273,9 @@ class TestStableIdentityAndAttribution:
         out, _t = _run(tmp_path, attribution=lambda w: "js" if w.endswith(("0", "2", "4")) else "katana")
         assert sum(out.per_source_eligible.values()) == 20
         assert sum(out.per_source_attempted.values()) == 20             # an unbounded sweep ran them all
-        attr = [e for e in _events(tmp_path) if e.get("measure") == "vocabulary_attribution"][-1]
-        assert "js" in attr["reason"] and attr["omitted"] == 0, attr
+        attr = [e for e in _events(tmp_path) if e.get("unit") == "attribution"][-1]
+        assert attr["per_source_scheduled"] == attr["per_source_eligible"], attr   # an unbounded sweep
+        assert set(attr["per_source_eligible"]) == {"js", "katana"}, attr
 
 
 class TestStateHonesty:
@@ -364,8 +365,10 @@ class TestReviewV14:
         assert len(tool.calls) == 1, tool.calls
         assert sum(out.per_source_eligible.values()) == 20
         assert sum(out.per_source_attempted.values()) == out.attempted_pairs < 20
-        attr = [e for e in _events(tmp_path) if e.get("measure") == "vocabulary_attribution"][-1]
-        assert attr["tested"] == out.attempted_pairs and attr["omitted"] > 0, attr
+        attr = [e for e in _events(tmp_path) if e.get("unit") == "attribution"][-1]
+        assert attr["produced"]["scheduled"] == out.attempted_pairs, attr
+        assert attr["produced"]["eligible"] == 20 > attr["produced"]["scheduled"], attr
+        assert sum(attr["per_source_scheduled"].values()) == out.attempted_pairs, attr
 
     def test_BUDGET_EXHAUSTION_is_a_named_stop(self, tmp_path, monkeypatch):
         """v14#4: `stop` stayed None, which the dataclass defines as "the whole eligible set ran"."""
@@ -394,3 +397,59 @@ class TestReviewV14:
         submitted = [w for c in tool.calls for w in c[2]]
         assert sorted(submitted) == ["alpha", "beta"], submitted
         assert len({c[0] for c in tool.calls}) == 1, tool.calls
+
+
+class TestReviewV15:
+    """First-cause and reporting contracts the v15 review reproduced against cd1882f."""
+
+    def test_a_MACHINERY_stop_is_not_relabelled_as_a_budget_cap(self, tmp_path, monkeypatch):
+        """An invocation that crosses the bound AND raises was reported as an operator cap — a failure
+        laundered into a choice."""
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+
+        class _SlowBoom(_Tool):
+            def __call__(self, target, bucket, words):
+                ticks["t"] += 20.0                       # past the 10s bound
+                raise RuntimeError("popen exploded")
+
+        out, _t = _run(tmp_path, tool=_SlowBoom(), budget_s=10)
+        assert out.stop_kind == "machinery", out
+        assert "popen exploded" in " ".join(out.machinery)
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert sel["kind"] == "timeout" and "invocation raised" in sel["reason"], sel
+
+    def test_an_UNPUBLISHED_completion_reaches_the_reported_facts(self, tmp_path, monkeypatch):
+        """v15#2: a counter no emitted fact consumes is still silent loss."""
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+
+        def last_completion_fails(self):
+            calls["n"] += 1
+            return False if calls["n"] == 2 else real(self)      # the ONLY completion save fails
+
+        monkeypatch.setattr(budget.RotationProgress, "save", last_completion_fails)
+        out, tool = _run(tmp_path, words=["only-one"])
+        assert len(tool.calls) == 1 and out.completion_unpersisted == 1
+        assert any("may be selected again" in m for m in out.machinery), out.machinery
+
+    def test_ATTRIBUTION_carries_the_stop_it_actually_had(self, tmp_path):
+        """v15#3: it is metadata on the same selection, not a second denominator with an invented kind."""
+        out, _t = _run(tmp_path, dependency_ok=lambda: False, attribution=lambda w: "js")
+        evs = _events(tmp_path)
+        assert not [e for e in evs if e.get("measure") == "vocabulary_attribution"], "a third denominator"
+        sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+        assert sel["kind"] == "timeout" and "not installed" in sel["reason"], sel
+        attr = [e for e in evs if e.get("unit") == "attribution"][-1]
+        assert attr["produced"] == {"eligible": 20, "scheduled": 0}, attr
+
+    def test_the_two_ATTEMPTED_totals_agree_even_on_the_invariant_path(self, tmp_path, monkeypatch):
+        """v15#4: `attempted_pairs` counted on return, the per-source split only after publication — so a
+        `SchedulerInvariant` between them left the two disagreeing."""
+        def boom(self, *a, **k):
+            raise budget.SchedulerInvariant("moved under the holder")
+
+        monkeypatch.setattr(budget.RotationProgress, "complete", boom)
+        out, tool = _run(tmp_path, attribution=lambda w: "js")
+        assert out.stop_kind == "machinery" and out.slots_attempted == 1
+        assert sum(out.per_source_attempted.values()) == out.attempted_pairs, out
