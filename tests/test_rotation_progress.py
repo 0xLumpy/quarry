@@ -528,3 +528,28 @@ class TestReviewV13:
         _gen, _targets, status, _why = budget.RotationProgress._parse(doc, lane="a1d", schema=schema)
         assert status == "unusable", (schema, status)
 
+    def test_a_PERSISTED_generation_zero_can_never_read_as_clean(self, tmp_path):
+        """review v13b#1: `reserve()` never allocates 0 and `complete()` never accepts it, so a stored 0 is
+        corruption — and reading it as real made a never-run slot report CLEAN, the one direction a
+        rotation must not fail in."""
+        (tmp_path / "a1d.json").write_text(json.dumps(
+            {"lane": "a1d", "schema": SCHEMA, "gen": 0,
+             "targets": {"t": {"seq": 0, "slots": {"01": {"res": {"gen": 0, "at": 1.0},
+                                                          "done": {"gen": 0, "at": 2.0,
+                                                                   "c": "x", "n": 1}}}}}}))
+        p = _progress(tmp_path)
+        assert p.tier("t", "01", "x") == 0, "a fabricated completion read as clean"
+        assert p.state_status == "degraded" and "dropped" in p.state_reason, p.state_reason
+
+    @pytest.mark.parametrize("doc", [
+        {"lane": "a1d", "schema": SCHEMA, "gen": 2,
+         "targets": {"": {"seq": 2, "slots": {"01": {"res": {"gen": 2, "at": 1.0}}}}}},
+        {"lane": "a1d", "schema": SCHEMA, "gen": 2,
+         "targets": {"t": {"seq": 2, "slots": {"": {"res": {"gen": 2, "at": 1.0}}}}}},
+    ])
+    def test_an_EMPTY_identity_is_refused_on_the_way_IN_too(self, tmp_path, doc):
+        (tmp_path / "a1d.json").write_text(json.dumps(doc))
+        p = _progress(tmp_path)
+        assert p.targets.get("", {}).get("slots", {}) == {} and "" not in p.targets.get("t", {}).get("slots", {})
+        assert p.state_status == "degraded", p.state_status
+

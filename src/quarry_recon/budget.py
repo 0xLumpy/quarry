@@ -348,7 +348,10 @@ class RotationProgress:
         if not isinstance(raw, dict):
             return None
         gen, at = cls._count(raw.get("gen")), cls._num(raw.get("at"))
-        if gen is None or at is None:
+        # review v13b#1: generations START AT 1. `reserve()` refuses to allocate 0 and `complete()` refuses
+        # to accept it, so a PERSISTED 0 cannot have come from this map — and reading it as real made a
+        # never-run slot report CLEAN, which is the one direction a rotation must never fail in.
+        if gen is None or gen < 1 or at is None:
             return None
         out = {"gen": gen, "at": at}
         if with_content:
@@ -386,7 +389,9 @@ class RotationProgress:
         dropped = 0                                        # records we could not trust (review v12#5)
         repaired = 0                                       # records we clamped back into consistency
         for name, raw_t in raw_targets.items():
-            if not isinstance(name, str) or not isinstance(raw_t, dict):
+            # review v13b#2: the same identity rule the mutations enforce — an empty key is not a target,
+            # on the way in or the way out.
+            if not isinstance(name, str) or not name or not isinstance(raw_t, dict):
                 dropped += 1                               # a container we cannot read is not a target
                 continue
             seq = cls._count(raw_t.get("seq"))
@@ -400,7 +405,7 @@ class RotationProgress:
                 seq, repaired = gen, repaired + 1
             slots: dict = {}
             for bucket, raw_s in raw_slots.items():
-                if not isinstance(bucket, str) or not isinstance(raw_s, dict):
+                if not isinstance(bucket, str) or not bucket or not isinstance(raw_s, dict):
                     dropped += 1
                     continue
                 res = cls._tuple(raw_s.get("res"), with_content=False)
