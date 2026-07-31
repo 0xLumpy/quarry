@@ -219,19 +219,12 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     cancellation."""
     out = SweepResult()
     clock = budget.Budget(budget_s)
-    try:
-        max_pairs_per_target = _exact_cap(max_pairs_per_target)
-    except ValueError as e:
-        # the driver promises to raise nothing but cancellation, so a nonsense bound is a MACHINERY stop
-        # with nothing submitted — never a silent "unbounded" and never a bound nothing can satisfy.
-        out.stop, out.stop_kind = f"machinery: {e}", "machinery"
-        _report(lane, out, clock)
-        return out
 
     # ── BEFORE the lock: the workload is a pure function of the corpus and the targets, so a CONTENDER can
     #    still report an exact denominator instead of a gap with no arithmetic (design v8#2). ──
     members: dict = {}
     seen_pairs: set = set()
+    corpus: dict = {}
     for target in dict.fromkeys(targets):              # a repeated target is one target
         per_target: list = []
         for word in vocabulary(target) or []:
@@ -239,10 +232,26 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 continue                               # a duplicate would inflate the denominator, the
             seen_pairs.add((target, word))             # digest, the attribution AND the active payload
             per_target.append(word)
+        corpus[target] = per_target
+    # the DENOMINATOR is known before the bound is: every eligible pair exists whether or not we can
+    # partition it (v27#2). Reporting 0/0 for a lane that had work would hide the omission entirely.
+    out.eligible_pairs = sum(len(words) for words in corpus.values())
+
+    try:
+        max_pairs_per_target = _exact_cap(max_pairs_per_target)
+    except ValueError as e:
+        # the driver promises to raise nothing but cancellation, so a nonsense bound is a MACHINERY stop
+        # with nothing submitted — never a silent "unbounded" and never a bound nothing can satisfy.
+        out.stop, out.stop_kind = f"machinery: {e}", "machinery"
+        _report(coverage_lane, out, clock)             # v27#1: coverage is filed under the REGISTERED
+        return out                                     # source, never the scheduler's private lane name
+
+    for target, per_target in corpus.items():
         for slot, group in allocate(per_target, cap=max_pairs_per_target).items():
             members[(target, slot)] = group
     slots = sorted(members)
-    out.eligible_pairs = sum(len(w) for w in members.values())
+    # the denominator stays the CORPUS count taken above, not a re-count of the partition: if allocation
+    # ever lost a word, that has to surface as an unattempted pair, not shrink the denominator to match.
     content = {slot: content_digest(words) for slot, words in members.items()}
     owners: dict = {}
     if attribution is not None:

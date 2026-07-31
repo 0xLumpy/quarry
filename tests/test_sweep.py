@@ -518,6 +518,18 @@ class TestTheAdaptiveSlotSpace:
         out, tool = _run(tmp_path, max_pairs_per_target=True)
         assert tool.calls == [] and out.stop_kind == "machinery"
 
+    def test_an_INVALID_bound_still_reports_the_REAL_denominator_under_the_REGISTERED_source(
+            self, tmp_path):
+        """v27: the machinery stop was filed under the scheduler's private lane name, with `0/0` — a lane
+        that had four unsubmitted candidate-target pairs reporting no omission at all."""
+        out, tool = _run(tmp_path, targets=("acme.com", "acme.net"), words=["api", "internal"],
+                         max_pairs_per_target=-1)
+        assert tool.calls == [] and out.eligible_pairs == 4 and out.attempted_pairs == 0
+        cov = [e for e in _events(tmp_path) if str(e.get("event", "")).startswith("coverage")]
+        assert cov and {e["source_id"] for e in cov} == {COV}, cov
+        sel = [e for e in cov if e.get("measure") == "candidate_pairs"]
+        assert sel and sel[0]["eligible"] == 4 and sel[0]["omitted"] == 4, sel
+
     def test_allocation_is_DETERMINISTIC_and_never_moves_a_word_sideways(self):
         vocab = [f"w{i:05d}" for i in range(4000)]
         first = sweep.allocate(vocab, cap=25)
