@@ -778,3 +778,23 @@ class TestBatchedMutationsAreAllOrNone:
         first = p.reserve("acme.com", "01", at=1.0)
         gens = p.reserve_batch("acme.com", ["02", "03"], at=2.0)
         assert sorted([first, *gens.values()]) == [1, 2, 3]
+
+
+class TestTheRemainderTail:
+    """v34#2: an impossible `unretriable` count was coerced and clamped into a plausible sentence."""
+
+    def test_an_INEXACT_count_is_refused(self):
+        for bad in (True, 1.0, "1", None, -1):
+            with pytest.raises(ValueError):
+                budget._remainder_tail(5, True, bad)
+
+    def test_MORE_unretriable_than_remainder_is_refused(self):
+        with pytest.raises(ValueError, match="exceeds the remainder"):
+            budget._remainder_tail(5, True, 99)
+
+    def test_the_THREE_dispositions_read_differently(self):
+        assert budget._remainder_tail(5, True, 0) == "left as a RESUMABLE remainder"
+        assert "RESTARTS" in budget._remainder_tail(5, False, 0)
+        assert budget._remainder_tail(5, True, 5).startswith("left UNSCHEDULABLE")
+        mixed = budget._remainder_tail(5, True, 2)
+        assert "3 as a RESUMABLE remainder" in mixed and "2 UNSCHEDULABLE" in mixed, mixed

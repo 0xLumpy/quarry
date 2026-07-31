@@ -1100,7 +1100,12 @@ def _remainder_tail(omitted: int, durable: bool, unretriable: int) -> str:
     """How to describe what was left. review v33: there were only two states — a RESUMABLE remainder or a
     lane that RESTARTS — and neither is true of work no later run can reach at all (a slot no bound can
     admit). Naming it resumable is a false promise in the opposite direction from the restart case."""
-    unretriable = max(0, min(int(unretriable), omitted))
+    if isinstance(unretriable, bool) or not isinstance(unretriable, int) or unretriable < 0:
+        raise ValueError(f"unretriable must be an exact non-negative int, got {unretriable!r}")
+    if unretriable > omitted:
+        # v34#2: clamping rewrote inconsistent accounting into a plausible sentence. More unretriable work
+        # than there is remainder is a bug in the caller's arithmetic, and it must say so.
+        raise ValueError(f"unretriable ({unretriable}) exceeds the remainder ({omitted})")
     resumable = omitted - unretriable
     kept = ("left as a RESUMABLE remainder" if durable else
             "left over — completion state was NOT persisted, so this lane RESTARTS from the beginning")
@@ -1127,7 +1132,9 @@ def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, 
     # `stop` names what ACTUALLY stopped us when it was not the budget — contention, a machinery failure, a
     # missing dependency. Wording every omission as "budget exhausted" would misname those, and the KIND
     # matters too: a budget is a CAP we chose, anything else is a TIMEOUT-class gap (step-4 design v4#3).
-    kind = events.COVERAGE_CAP if stop is None else events.COVERAGE_TIMEOUT
+    # v34#1: work nothing can schedule is a GAP whatever stopped us — an operator cap that also left
+    # unschedulable pairs behind is not a clean sample of the eligible set.
+    kind = events.COVERAGE_TIMEOUT if (stop is not None or unretriable) else events.COVERAGE_CAP
     tail = _remainder_tail(omitted, durable, unretriable)
     if omitted and cap_reason is not None and stop is None:
         # an OPERATOR CAP that is not the wall clock — a per-target candidate bound, say. Still a CAP we
@@ -1135,6 +1142,10 @@ def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, 
         why = f"{cap_reason} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
     elif omitted and stop is not None:
         why = f"{stop} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
+    elif omitted and unretriable == omitted:
+        # nothing stopped us and the clock never ran out: the remainder is simply not schedulable, and
+        # blaming a budget that did not fire would misname it (v34#1).
+        why = f"{attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
     elif omitted:
         # review#4 (r7): only call the remainder RESUMABLE when the completion state was actually persisted.
         # Otherwise the next run starts over, and "resumable" is a false promise.

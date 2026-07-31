@@ -768,10 +768,24 @@ class TestExecutorBatching:
         assert all(len(c[2]) <= 2 for c in tool.calls), tool.calls
         assert out.unselectable_slots == 1 and out.unselectable_pairs == 3
         assert any("can never be scheduled" in m for m in out.machinery), out.machinery
-        assert out.stop_kind == "unselectable" and "will not be retried" in out.stop
+        assert out.stop_kind is None, "nothing STOPPED the run — the work simply cannot be scheduled"
         assert out.attempted_pairs == 3 and out.eligible_pairs == 6
         sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
-        assert "cannot be scheduled" in sel["reason"] and "RESUMABLE" not in sel["reason"], sel
+        assert "UNSCHEDULABLE" in sel["reason"] and "RESUMABLE" not in sel["reason"], sel
+        assert "budget exhausted" not in sel["reason"], sel      # no clock fired
+        assert sel["kind"] == "timeout", sel                     # a GAP, never a clean cap
+
+    def test_the_REAL_stop_keeps_the_sentence_while_the_residual_keeps_its_count(self, tmp_path,
+                                                                                 monkeypatch):
+        """v34#1: `unselectable` used to be assigned as the stop, hiding a clock that really did fire."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        self._residual(monkeypatch)
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)], budget_s=0,
+                         max_pairs_per_target=1)
+        assert out.stop_kind == "bound" and out.unselectable_pairs == 3
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "bound" in sel["reason"] and "UNSCHEDULABLE" in sel["reason"], sel
+        assert sel["kind"] == "timeout", sel      # an operator cap that ALSO left unschedulable work
 
     def test_a_residual_under_a_SPEND_CAP_is_not_laundered_into_an_ordinary_bound(self, tmp_path,
                                                                                   monkeypatch):
@@ -892,3 +906,21 @@ class TestExecutorBatching:
         sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
         assert "RESUMABLE" in sel["reason"] and "UNSCHEDULABLE" in sel["reason"], sel
         assert sel["omitted"] == 5 and out.unselectable_pairs == 3, (sel, out)
+
+    def test_a_BUDGET_that_really_fired_is_not_hidden_by_the_residual(self, tmp_path, monkeypatch):
+        """The clock stop and the unschedulable count are different facts and both must survive."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        self._residual(monkeypatch)
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+
+        class _Slow(_Tool):
+            def __call__(self, target, unit, words):
+                ticks["t"] += 20.0
+                return super().__call__(target, unit, words)
+
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)], budget_s=10, tool=_Slow())
+        assert out.stop_kind == "budget" and out.unselectable_pairs == 3
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "budget exhausted" in sel["reason"], sel
+        assert "RESUMABLE" in sel["reason"] and "UNSCHEDULABLE" in sel["reason"], sel

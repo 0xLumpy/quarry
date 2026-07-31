@@ -171,7 +171,10 @@ class SweepResult:
     invocations: int = 0                    # runner calls that actually ran — NOT a slot count
     invocations_obtained: int = 0
     invocation_classes: dict = field(default_factory=dict)
-    unselectable_slots: int = 0             # slots no bound can ever admit — NOT a resumable remainder
+    #: slots no bound can ever admit, and their pairs. NOT a stop: the run was not stopped by them, and
+    #: whatever did stop it keeps the sentence. They are an orthogonal REMAINDER DISPOSITION (v34#1) —
+    #: reported through `unretriable`, which also forces the coverage record to a gap class.
+    unselectable_slots: int = 0
     unselectable_pairs: int = 0
     slots_attempted: int = 0
     slots_obtained: int = 0             # SUCCESS or EMPTY — a clean answer, including "nothing resolved"
@@ -409,12 +412,6 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.pending_completions += len(chosen)
 
 
-        if out.stop_kind is None and out.unselectable_pairs:
-            # neither "resumable" nor "restarts" is true of these pairs: nothing about a later lifecycle
-            # changes them. They are named as what they are, and only when no real stop preceded them.
-            out.stop = (f"{out.unselectable_pairs} candidate(s) in {out.unselectable_slots} slot(s) "
-                        f"cannot be scheduled under the current bounds and will not be retried")
-            out.stop_kind = "unselectable"
         if out.stop_kind is None and clock.exhausted() and len(picked) < len(slots):
             # FIRST CAUSE WINS (review v15#1). A machinery stop that happened to cross the bound was being
             # relabelled "budget", which reads as an operator cap — laundering a failure into a choice.
