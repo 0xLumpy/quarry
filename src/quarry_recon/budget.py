@@ -313,9 +313,10 @@ class RotationProgress:
         self.held = _session is _SESSION       # ONLY `rotation_session` can hand over the token
         self.gen = 0
         self.targets: dict = {}
-        #: `missing` (no file yet) · `valid` (parsed) · `unusable` (present but not trustworthy). A driver
-        #: must be able to say "state unusable, the rotation restarted" instead of reporting advancement
-        #: over a prefix it silently repeated.
+        #: `missing` (no file yet) · `valid` (parsed clean) · `degraded` (parsed, but records were dropped
+        #: or repaired, so work may repeat) · `unusable` (present and not trustworthy at all). A driver must
+        #: be able to say which of those happened instead of reporting advancement over a prefix it
+        #: silently repeated.
         self.state_status = "missing"
         self.state_reason = ""
         self._read()
@@ -953,7 +954,8 @@ class Ledger:
 
 
 def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, budget: Budget,
-                     noun: str = "item", durable: bool = True) -> None:
+                     noun: str = "item", durable: bool = True, stop: str | None = None,
+                     unit: str | None = None) -> None:
     """SELECTION coverage: of everything eligible, how much did we get to at all?
 
     Emitted EVERY run (omitted=0 when the whole set was processed) so a later unbounded rerun CLEARS a prior
@@ -961,7 +963,15 @@ def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, 
     must read as a gap whenever omitted > 0 — never as an operator-chosen SAMPLE, which would be a soft
     limit and let the run still call itself complete."""
     omitted = max(0, eligible - attempted)
-    if omitted:
+    # `stop` names what ACTUALLY stopped us when it was not the budget — contention, a machinery failure, a
+    # missing dependency. Wording every omission as "budget exhausted" would misname those, and the KIND
+    # matters too: a budget is a CAP we chose, anything else is a TIMEOUT-class gap (step-4 design v4#3).
+    kind = events.COVERAGE_CAP if stop is None else events.COVERAGE_TIMEOUT
+    if omitted and stop is not None:
+        tail = ("left as a RESUMABLE remainder" if durable else
+                "left over — completion state was NOT persisted, so this lane RESTARTS from the beginning")
+        why = f"{stop} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
+    elif omitted:
         # review#4 (r7): only call the remainder RESUMABLE when the completion state was actually persisted.
         # Otherwise the next run starts over, and "resumable" is a false promise.
         tail = ("left as a RESUMABLE remainder" if durable else
@@ -973,7 +983,7 @@ def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, 
     # unit MUST be distinct per measure: reconciliation keeps the latest per (source_id, unit), so leaving
     # it to default to the source_id would make the outcome report OVERWRITE the selection report and one of
     # the two facts would silently vanish from the rollup.
-    events.coverage_partial(lane, kind=events.COVERAGE_CAP, measure=measure, unit=measure,
+    events.coverage_partial(lane, kind=kind, measure=measure, unit=unit or measure,
                             eligible=eligible, tested=attempted, omitted=omitted, reason=why)
 
 
