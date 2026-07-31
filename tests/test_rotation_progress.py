@@ -798,3 +798,12 @@ class TestTheRemainderTail:
         assert budget._remainder_tail(5, True, 5).startswith("left UNSCHEDULABLE")
         mixed = budget._remainder_tail(5, True, 2)
         assert "3 as a RESUMABLE remainder" in mixed and "2 UNSCHEDULABLE" in mixed, mixed
+
+    def test_a_MIXED_remainder_reads_correctly_when_NOTHING_was_persisted(self):
+        """v36: the mixed phrase was built by stripping "left " off the pure one, which produced
+        "left over: 3 over — completion state was NOT persisted…"."""
+        mixed = budget._remainder_tail(5, False, 2)
+        assert mixed == ("left over: 3 with NO persisted completion state (this lane RESTARTS from the "
+                         "beginning), 2 UNSCHEDULABLE under the current bounds — no later run reaches "
+                         "them without a corpus or policy change"), mixed
+        assert " over — " not in mixed, mixed

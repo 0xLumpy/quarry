@@ -1115,7 +1115,11 @@ def _remainder_tail(omitted: int, durable: bool, unretriable: int) -> str:
              "policy change")
     if not resumable:
         return f"left {never}"
-    return f"left over: {resumable} {kept.replace('left ', '')}, {unretriable} {never}"
+    # v36: the mixed phrase was built by stripping "left " off the pure one, which turned the non-durable
+    # sentence into "3 over — completion state was NOT persisted". Both halves are written out instead.
+    carried = ("as a RESUMABLE remainder" if durable else
+               "with NO persisted completion state (this lane RESTARTS from the beginning)")
+    return f"left over: {resumable} {carried}, {unretriable} {never}"
 
 
 def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, budget: Budget,
