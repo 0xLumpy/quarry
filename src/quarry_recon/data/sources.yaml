@@ -191,6 +191,9 @@ sources:
     input: js+sourcemap_dirs, output: secret, workers: n/a, rate: n/a, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
 
   # ── enrich (late-host catch-up) ───────────────────────────────────────────────────────
+  enrich.a1d_brute:          {tool: puredns, phase: enrich, tier: core, class: active, default: on,
+    input: crawl-mined wordlist+apex, output: subdomain(target-wordlist), workers: resolvers, rate: dns_rate, timeout: scaled, failure: quiet-warn, fallback: skip, parser: normalize.hosts, log: delta,
+    notes: "A1d recursive re-brute, SCHEDULED: stable buckets, one sweeper per lane, resumable rotation (sweep.run_sweep)"}
   enrich.wildcard_a1d:       {tool: httpx, phase: enrich, tier: core, class: active, default: on,
     input: wildcard_zone, output: subdomain(wildcard-http-a1d), workers: httpx, rate: http_rl, timeout: scaled, failure: quiet-warn, fallback: skip, parser: internal-differ, log: delta,
     notes: "A1d wildcard HTTP differentiation with the crawl-mined vocabulary (same mechanism as vertical.wildcard_http, its OWN lifecycle)"}

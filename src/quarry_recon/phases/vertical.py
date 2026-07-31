@@ -449,6 +449,9 @@ def _target_wordlist(ctx, loss: dict | None = None) -> list[str]:
     loss.setdefault("dropped_lines", 0)
     loss.setdefault("unreadable_files", 0)
     loss.setdefault("files", 0)
+    #: word -> the artifacts that produced it. PROVENANCE stays with the evidence; this is what the
+    #: scheduler attributes a submitted word against (one owner per word, chosen by rendezvous hashing).
+    origins = loss.setdefault("origins", {})
     wl_dir = ctx.run.dir / "raw" / "crawl" / "xnLinkFinder"
     if not wl_dir.exists():
         return []
@@ -474,9 +477,11 @@ def _target_wordlist(ctx, loss: dict | None = None) -> list[str]:
                 dropped += 1
                 continue
             for piece in _LABEL_RX.findall(line.strip().lower()):
-                if len(piece) >= 3 and any(c.isalpha() for c in piece) and piece not in seen:
-                    seen.add(piece)
-                    out.append(piece)
+                if len(piece) >= 3 and any(c.isalpha() for c in piece):
+                    origins.setdefault(piece, set()).add(f.name)
+                    if piece not in seen:
+                        seen.add(piece)
+                        out.append(piece)
     loss["dropped_lines"] = dropped
     return out
 

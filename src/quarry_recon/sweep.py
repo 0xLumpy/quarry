@@ -84,7 +84,8 @@ class SweepResult:
     machinery: list = field(default_factory=list)
     stop: str | None = None             # None = the whole eligible set ran
     #: what ENDED the sweep: None (nothing did), "budget", "machinery", "contention", "dependency". The
-    #: coverage KIND follows from it (a budget is a CAP we chose; everything else is a TIMEOUT-class gap),
+    #: coverage KIND follows from it (a budget or a candidate bound is a CAP we chose; everything else is
+    #: a TIMEOUT-class gap),
     #: and the terminal needs the cause even when the wording is identical (review v14#4).
     stop_kind: str | None = None
     state_status: str = "missing"
@@ -116,10 +117,14 @@ _OBTAINED = (Status.SUCCESS, Status.EMPTY)
 
 
 def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: int,
-              coverage_lane: str, dependency_ok=None, attribution=None, now=time.time) -> SweepResult:
+              coverage_lane: str, dependency_ok=None, attribution=None, max_pairs_per_target: int = 0,
+              now=time.time) -> SweepResult:
     """Drive one lane's sweep.
 
     `vocabulary(target) -> list[str]` is the eligible corpus for that target; the driver buckets it.
+    `max_pairs_per_target` (0 = unbounded) is a SPEND bound in candidates per target: a slot that would
+    take a target past it is not submitted, so the bound is never exceeded — a wall-clock budget cannot
+    express "no more than N names per apex", which is what an existing lane's posture may already be.
     `execute(target, bucket, words) -> RunResult` submits one slot. `attribution(word) -> source` is
     optional ACCOUNTING only. Returns what happened, emits the two coverage records, and raises nothing but
     cancellation."""
@@ -167,13 +172,23 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         if progress.state_status == "degraded":
             out.machinery.append(f"rotation state degraded: {progress.state_reason}")
         picked: set = set()
+        spent: dict = {}                                   # candidates submitted per target
         while not clock.exhausted() and len(picked) < len(slots):
             choice = _rank(progress, slots, content, picked)
             if choice is None:
                 break
             target, bucket = choice
-            picked.add(choice)
             words = members[choice]
+            if max_pairs_per_target and spent.get(target, 0) + len(words) > max_pairs_per_target:
+                # this target has spent what it may. Excluding the SLOT (not just skipping the pick) keeps
+                # the loop terminating and leaves the remainder to the next run's rotation.
+                picked.add(choice)
+                out.stop_kind = out.stop_kind or "bound"
+                out.stop = out.stop or (f"the per-target candidate bound ({max_pairs_per_target}) was "
+                                        f"reached")
+                continue
+            picked.add(choice)
+            spent[target] = spent.get(target, 0) + len(words)
             gen = progress.reserve(target, bucket, at=now())
             if not progress.save():
                 # FAIL CLOSED: nothing is submitted for a slot whose reservation nobody owns (v6#2).
@@ -278,7 +293,7 @@ def _report(lane: str, out: SweepResult, clock) -> None:
     budget.report_selection(lane, measure="candidate_pairs", eligible=out.eligible_pairs,
                             attempted=out.attempted_pairs, budget=clock, noun="candidate",
                             durable=out.durable,
-                            stop=None if out.stop_kind in (None, "budget") else out.stop)
+                            stop=None if out.stop_kind in (None, "budget", "bound") else out.stop)
     budget.report_outcome(lane, measure="slot_outcomes", attempted=out.slots_attempted,
                           obtained=out.slots_obtained, classes=out.classes or None, noun="slot")
     if out.per_source_eligible:

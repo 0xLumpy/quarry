@@ -1026,8 +1026,10 @@ class TestA1dVocabularyLossReachesTheVerdict:
             ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
             enrich._a1d_recursive_brute(ctx)
             assert cmds and cmds[0][0] == "puredns", cmds
-            words_file = pathlib.Path(cmds[0][2])
-            assert len(words_file.read_text().split()) == 50, len(words_file.read_text().split())
+            # step 4.2: the bound is per APEX across the sweep's bucket invocations, not one file
+            submitted = [w for c in cmds for w in pathlib.Path(c[2]).read_text().split()]
+            assert 0 < len(submitted) <= 50, len(submitted)
+            assert len(submitted) == len(set(submitted)), "a word was submitted twice"
             recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
             assert len(recs) == 1 and recs[0].status == "partial", recs
             assert "450/500 mined word(s) withheld by the 50-word A1d spend bound" in recs[0].note, recs
@@ -1155,3 +1157,146 @@ class TestA1dVocabularyLossReachesTheVerdict:
         assert "8/10 mined word(s) withheld from the wildcard differ" in recs[0].note, recs
         assert "A1d spend bound" not in recs[0].note, recs          # the DNS lane took everything
         assert summary["verdict"] != "complete", summary
+
+    # ── step 4.2: the apex brute is SCHEDULED ────────────────────────────────────────────────────
+    def _scheduled(self, tmp_path, monkeypatch, *, words, cap=6, run_name="t"):
+        """Drive A1d's real brute through the sweep and return (submitted words, project dir)."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        monkeypatch.setattr(enrich, "A1D_WORD_CAP", cap)
+        run = store.Run.create(tmp_path, run_name)
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("\n".join(words))
+            from quarry_recon.runner import RunResult as _RR
+            cmds = []
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)          # no wildcard pass here
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: (
+                                    cmds.append(cmd), _RR(tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))[1])
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            submitted = [w for c in cmds if c[0] == "puredns"
+                         for w in pathlib.Path(c[2]).read_text().split()]
+            return submitted, run
+        finally:
+            events.reset()
+
+    def test_the_SPEND_is_unchanged_but_the_SELECTION_rotates(self, tmp_path, monkeypatch):
+        """4.2's whole claim: the same number of candidates per apex, but a bounded run advances instead
+        of re-submitting the lexicographic prefix forever."""
+        words = [f"word{i:03d}" for i in range(30)]
+        first, _run1 = self._scheduled(tmp_path, monkeypatch, words=words)
+        assert 0 < len(first) <= 6, first
+        second, _run2 = self._scheduled(tmp_path, monkeypatch, words=words, run_name="t2")
+        assert 0 < len(second) <= 6, second
+        assert not (set(first) & set(second)), "the second run re-submitted the first run's prefix"
+
+    def test_the_rotation_state_is_PROJECT_scoped(self, tmp_path, monkeypatch):
+        _submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(10)])
+        state = tmp_path / "recon" / "state" / "sched" / "a1d_brute.json"
+        assert state.exists(), list((tmp_path / "recon" / "state").rglob("*"))
+        assert not (run.dir / "recon").exists()          # evidence is run-scoped, scheduling is not
+
+    def test_the_lane_reports_SELECTION_and_OUTCOME_coverage(self, tmp_path, monkeypatch):
+        _submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(30)])
+        evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+        cov = {e.get("measure"): e for e in evs if e.get("event") == "coverage_partial"}
+        assert cov["candidate_pairs"]["eligible"] == 30, cov["candidate_pairs"]
+        assert 0 < cov["candidate_pairs"]["tested"] <= 6, cov["candidate_pairs"]
+        assert cov["candidate_pairs"]["omitted"] > 0 and cov["candidate_pairs"]["kind"] == "cap"
+        assert cov["slot_outcomes"]["eligible"] == cov["slot_outcomes"]["tested"], cov["slot_outcomes"]
+        assert all(e.get("source_id") == "enrich.a1d_brute"
+                   for e in evs if e.get("measure") in ("candidate_pairs", "slot_outcomes"))
+
+    def test_a_SECOND_LIFECYCLE_on_one_project_submits_nothing(self, tmp_path, monkeypatch):
+        """One sweeper per lane: the contender reports a zero-evidence gap instead of duplicate traffic."""
+        from quarry_recon import budget as _b
+        sched = tmp_path / "recon" / "state" / "sched"
+        sched.mkdir(parents=True, exist_ok=True)
+        with _b.state_lock(sched / "a1d_brute.lock"):
+            submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(10)])
+        assert submitted == [], submitted
+        evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+        sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+        assert sel["tested"] == 0 and sel["omitted"] == 10, sel
+        assert "another lifecycle" in sel["reason"], sel
+
+    def test_a_MISSING_puredns_reserves_nothing_and_is_recorded_ONCE(self, tmp_path, monkeypatch):
+        """The dependency gate is the SWEEP's — one authority. The lane still records the skip with the
+        unsubmitted count, and no rotation state is created."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("internal\napi\n")
+            monkeypatch.setattr(enrich, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            pd = [r for r in run.tool_runs("enrich") if r.tool == "puredns"]
+            assert len(pd) == 1 and pd[0].status == "skipped", pd
+            assert "1 A1d apex brute(s) unsubmitted" in (pd[0].note or ""), pd
+            assert not (tmp_path / "recon" / "state" / "sched" / "a1d_brute.json").exists()
+            evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+            sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+            assert (sel["tested"], sel["omitted"]) == (0, 2) and "not installed" in sel["reason"], sel
+        finally:
+            events.reset()
+
+    def test_the_scheduled_prefix_is_ATTRIBUTED_to_the_artifact_that_produced_it(self, tmp_path,
+                                                                                 monkeypatch):
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        monkeypatch.setattr(enrich, "A1D_WORD_CAP", 4)
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("\n".join(f"jsword{i:02d}" for i in range(10)))
+            (wl / "katana_wordlist.txt").write_text("\n".join(f"katword{i:02d}" for i in range(10)))
+            from quarry_recon.runner import RunResult as _RR
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
+                                    tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+            attr = [e for e in evs if e.get("unit") == "attribution"][-1]["selection_attribution"]
+            assert attr["eligible"] == 20 and 0 < attr["scheduled"] <= 4, attr
+            assert set(attr["per_source_eligible"]) <= {"js_wordlist.txt", "katana_wordlist.txt"}, attr
+            assert sum(attr["per_source_scheduled"].values()) == attr["scheduled"], attr
+        finally:
+            events.reset()

@@ -17,6 +17,7 @@ from .. import normalize
 from .. import settings
 from ..runner import (RunResult, Status, fresh_artifact_dir, have, nuclei_timeout, reclassify_from_files,
                       run as exec_tool, scaled_timeout, skipped)
+from .. import budget, sweep
 
 
 #: how many mined labels A1d may actually brute-force per apex (puredns, DNS). A SPEND bound, unchanged
@@ -90,6 +91,10 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
     if loss.get("wildcard_withheld"):
         parts.append(f"{loss['wildcard_withheld']}/{loss.get('after_base', 0)} mined word(s) withheld from "
                      f"the wildcard differ by its {A1D_WILDCARD_WORD_CAP}-word bound")
+    if loss.get("sweep_stop"):
+        parts.append(f"the scheduled brute stopped early ({loss['sweep_stop']})")
+    if loss.get("sweep_machinery"):
+        parts.append(loss["sweep_machinery"])
     if loss.get("withheld_by_word_cap"):
         # the SPEND bound is a fact, like every other cap: it withheld mined vocabulary this run did not
         # brute-force. (Making that bound measured, chunked and resumable is step 4.2.)
@@ -121,7 +126,9 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     wl_loss["after_base"] = len(kept)
     # `kept` is RETENTION: the whole mined corpus minus what the base dictionary already covers. Each
     # ACTIVE lane then selects from it under its OWN bound, so a change to one cannot widen the other.
-    twords = sorted(kept[:A1D_WORD_CAP])                       # -> puredns (DNS), per apex
+    # SELECTION 1 -> puredns (DNS): the SWEEP picks which `A1D_WORD_CAP` candidates per apex, from the
+    # whole retained corpus, in rotation. `twords` stays only as the "is there vocabulary at all" answer.
+    twords = kept
     wc_words = sorted(kept[:A1D_WILDCARD_WORD_CAP])            # -> the wildcard differ (HTTP), per zone
     wl_loss["withheld_by_word_cap"] = max(0, len(kept) - A1D_WORD_CAP)
     # review-step4-remeasure2#1: the wildcard withholding is NOT a fact yet. Words are only withheld from
@@ -145,35 +152,59 @@ def _a1d_recursive_brute(ctx) -> set[str]:
         else:
             ctx.run.record("enrich", skipped("a1d", "no target-specific words mined from crawl"))
         return set()
-    twl = ctx.write_list("a1d_target_words.txt", twords)
-    ctx.echo(f"  A1d: {len(twords)} target-specific word(s) mined from crawl → recursive re-brute")
+    ctx.echo(f"  A1d: {len(kept)} target-specific word(s) mined from crawl → scheduled re-brute "
+             f"({A1D_WORD_CAP}/apex)")
     discovered: set[str] = set()
 
-    # apex brute with the target wordlist (same puredns invocation as vertical's brute)
+    # ── the apex brute is SCHEDULED (step 4.2): stable buckets, one sweeper per lane, a resumable
+    #    rotation. The SPEND is unchanged — `A1D_WORD_CAP` candidates per apex, exactly as before — but
+    #    WHICH candidates is no longer the lexicographic first N forever: a bounded run advances the
+    #    rotation and the next one continues where it stopped. ──
     submitted_apexes = 0
+    swept = None
+    origins = wl_loss.get("origins") or {}
+    apexes_run: set = set()
+    resolvers = trusted = None
     if have("puredns"):
         resolvers, trusted = _resolvers(ctx)
-        for d in prof.apex_domains:
-            cmd = ["puredns", "bruteforce", str(twl), d, "--resolvers-trusted", str(trusted), "-q"]
-            if resolvers:
-                cmd += ["-r", str(resolvers)]
-            if prof.dns_rate:
-                cmd += ["--rate-limit", str(prof.dns_rate)]
-            br = ctx.run.raw_path("enrich", "puredns", f"a1d-brute-{d}.txt")
-            r = exec_tool("puredns", cmd, raw_path=br, timeout=ctx.http_timeout)
-            ctx.run.record("enrich", r)
-            if r.raw_path:
-                for e in normalize.hosts(r.raw_path.read_text(), "target-wordlist", str(br)):
-                    if scope.in_scope(e["host"]) and not scope.is_oos(e["host"]):
-                        ctx.run.add("subdomain", e)
-                        discovered.add(e["host"])
-            submitted_apexes += 1
-    else:
-        # review-B-audit-13#1: this branch was silently skipped, so eligible A1d work simply vanished —
-        # the run showed a mined wordlist and no brute, and nothing said why. A missing REQUIRED tool is
-        # already a coverage gap in the manifest; the note carries how much work went unsubmitted.
-        ctx.run.record("enrich", skipped("puredns", f"not installed — {len(prof.apex_domains)} A1d apex "
-                                                    f"brute(s) unsubmitted"))
+
+    def _brute(apex: str, bucket: str, words):
+        nonlocal submitted_apexes
+        wl_file = ctx.write_list(f"a1d_words_{apex.replace('.', '_')}_{bucket}.txt", sorted(words))
+        cmd = ["puredns", "bruteforce", str(wl_file), apex, "--resolvers-trusted", str(trusted), "-q"]
+        if resolvers:
+            cmd += ["-r", str(resolvers)]
+        if prof.dns_rate:
+            cmd += ["--rate-limit", str(prof.dns_rate)]
+        br = ctx.run.raw_path("enrich", "puredns", f"a1d-brute-{apex}-{bucket}.txt")
+        r = exec_tool("puredns", cmd, raw_path=br, timeout=ctx.http_timeout)
+        ctx.run.record("enrich", r)
+        if apex not in apexes_run:
+            apexes_run.add(apex)
+            submitted_apexes = len(apexes_run)
+        if r.raw_path and r.raw_path.exists():
+            for row in normalize.hosts(r.raw_path.read_text(), "target-wordlist", str(br)):
+                if scope.in_scope(row["host"]) and not scope.is_oos(row["host"]):
+                    ctx.run.add("subdomain", row)
+                    discovered.add(row["host"])
+        return r
+
+    swept = sweep.run_sweep(
+        lane="a1d_brute", state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched",
+        targets=list(prof.apex_domains), vocabulary=lambda _apex: list(kept), execute=_brute,
+        budget_s=budget.budget_seconds("A1D_BUDGET_S"), coverage_lane="enrich.a1d_brute",
+        dependency_ok=lambda: have("puredns"), max_pairs_per_target=A1D_WORD_CAP,
+        attribution=lambda w: sweep.owner_of(w, sorted(origins.get(w) or ["crawl"])))
+    if swept.machinery:
+        wl_loss["sweep_machinery"] = "; ".join(swept.machinery)
+    if swept.stop_kind not in (None, "bound"):
+        wl_loss["sweep_stop"] = swept.stop
+    if swept.stop_kind == "dependency":
+        # review-B-audit-13#1: an eligible brute that never ran must SAY so — a missing REQUIRED tool
+        # is already a manifest gap, and the note carries how much work went unsubmitted. The gate
+        # itself is the sweep's (one authority), so this is the reporting half only.
+        ctx.run.record("enrich", skipped("puredns", f"not installed — {len(prof.apex_domains)} A1d "
+                                                    f"apex brute(s) unsubmitted"))
 
     # wildcard-zone differ with the target words folded in (zones persisted by vertical)
     zones = set(ctx.run.values("wildcard_zone"))
