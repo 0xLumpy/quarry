@@ -1187,11 +1187,26 @@ def run(ctx) -> None:
 
 #: bump when CLASSIFICATION or INGEST meaning changes — it is part of a unit's identity, because the same
 #: bytes parsed under different rules are a different result.
-XNL_PARSER_SCHEMA = 1
+#: v2 (step 4.1): RETENTION is complete. The per-call param cap and the derived-wordlist cap are gone, so a
+#: v1 bundle holds a TRUNCATED corpus and must not be replayed as if it answered today's question.
+XNL_PARSER_SCHEMA = 2
 XNL_MAX_INPUT = 200 * 1024 * 1024      # cap the stdin blob so a huge dir can't blow RAM
 XNL_WORDLIST_LIMIT = 10 * 1024 * 1024  # -owl/-os are permutation timekillers on big input -> small only
-XNL_PARAM_CAP = 2000                   # xnLinkFinder emits POTENTIAL params (noisy) -> cap per call
-XNL_WORDLIST_DERIVE_CAP = 5000         # bounded vocabulary derived from links/params when -owl is skipped
+#
+# step 4.1 — RETENTION vs ACTIVE SELECTION. `XNL_PARAM_CAP = 2000` and `XNL_WORDLIST_DERIVE_CAP = 5000`
+# used to live here. They were RETENTION caps, and they bought no request safety at all: the `parameter`
+# entity has exactly one consumer, `exports.parameters.txt`; nothing turns a stored candidate into a
+# request. What DOES spend — the A1d brute vocabulary and the wildcard candidate set — is selected
+# downstream and stays bounded there, unchanged by this commit.
+#
+# MEASURED on OTC 20260725: 111,313 distinct candidates produced, 6,086 stored — 94.5% destroyed. The cap
+# sorted and then kept the first N, which is deterministic for identical input but LEXICOGRAPHIC, so it
+# favoured punctuation and digits: on the `js` unit the 2,000 survivors ran from `-` to `34498` with ZERO
+# entries beginning with a letter, and the same for `katana-resp`; only `sourcemap` reached letters at all
+# (1,551 of its 2,000). Most named candidates were the part thrown away.
+#
+# The corpus is now kept whole (~20 MB/run at 190 B/row). Bounding what we SPEND is step 4.2/4.3, after a
+# measured run: an active lane does not get an unbounded default on my say-so.
 
 
 #: what one line of xnLinkFinder output can be. The tool's OWN scope filter is not a boundary Quarry may
@@ -1493,9 +1508,8 @@ def _xnl_unit_identity(ctx, tag: str, spo: bool, blob_digest: str, engine: str) 
     return events.work_unit("crawl.xnlinkfinder",
                             inputs={"tag": tag, "apexes": sorted(ctx.profile.apex_domains)},
                             file_digests={"input_blob": blob_digest},
-                            config={"engine": engine, "spo": bool(spo), "param_cap": XNL_PARAM_CAP,
-                                    "input_cap": XNL_MAX_INPUT, "wordlist_limit": XNL_WORDLIST_LIMIT,
-                                    "derive_cap": XNL_WORDLIST_DERIVE_CAP},
+                            config={"engine": engine, "spo": bool(spo),
+                                    "input_cap": XNL_MAX_INPUT, "wordlist_limit": XNL_WORDLIST_LIMIT},
                             schema_version=XNL_PARSER_SCHEMA)
 
 
@@ -1609,8 +1623,7 @@ def _xnl_lane(ctx, units: list) -> None:
         # the registry is authoritative for execution, and that authority lives in `contract` — a phase
         # asking `sources` directly would be a second copy of the same gate.
         return
-    fp = events.work_unit(sid, inputs={}, config={"param_cap": XNL_PARAM_CAP,
-                                                  "input_cap": XNL_MAX_INPUT},
+    fp = events.work_unit(sid, inputs={}, config={"input_cap": XNL_MAX_INPUT},
                           schema_version=XNL_PARSER_SCHEMA)
     events.tool_start(sid, cmd=["xnLinkFinder", "(stdin)"], input_total=len(units), work_unit=fp)
 
@@ -2108,8 +2121,8 @@ def _xnl_ingest(ctx, tag: str, snap: dict, *, blob=None, written: int = 0, repla
                                     + ("; LINK OUTPUT UNREADABLE" if links_unreadable else "")))
 
     # ── params: xnLinkFinder emits POTENTIAL params (path words / JSON keys / JS vars / input names / meta)
-    #    — NOT confirmed request params. Store as CANDIDATES (kind=potential) with a per-call CAP so a 52k
-    #    dump can't flood the inventory / downstream arjun. Drop the <stdin> noise token. ──
+    #    — NOT confirmed request params. Store as CANDIDATES (kind=potential), ALL of them: the inventory
+    #    is retention, and nothing turns a stored candidate into a request (step 4.1). Drop <stdin>. ──
     n_params_added = 0
     param_lines, param_undecodable, params_unreadable = _xnl_decode(snap["params"])
     res["undecodable"] += param_undecodable
@@ -2128,9 +2141,9 @@ def _xnl_ingest(ctx, tag: str, snap: dict, *, blob=None, written: int = 0, repla
     # DELIVERED; parser-seen and novelty are their own counters.
     res["params_seen"] = n_params_seen
     res["unusable"] += n_bad_params
-    # cap a DETERMINISTIC subset: sort first, then keep the first N — so a re-run keeps the SAME candidates
-    # (xnLinkFinder's -op file order is set-derived / unstable; capping the raw order was non-idempotent).
-    for v in cand[:XNL_PARAM_CAP]:
+    # step 4.1: EVERY accepted candidate is stored. Sorted so a re-run writes them in the same order (the
+    # tool's -op order is set-derived and unstable); nothing is dropped.
+    for v in cand:
         stored = ctx.run.add("parameter", {"value": v, "kind": "potential",
                                            "sources": [f"xnLinkFinder-{tag}"]})
         res["params"] += 1                     # delivered: the write returned (novel or already present)
@@ -2138,19 +2151,18 @@ def _xnl_ingest(ctx, tag: str, snap: dict, *, blob=None, written: int = 0, repla
             n_params_added += 1
             res["params_kept"] = n_params_added
     # STRUCTURED param coverage per tag (emit every run): eligible = distinct POTENTIAL params xnLinkFinder
-    # produced, tested = kept under the cap, omitted = dropped. These are candidates (path words/JSON keys/JS
-    # vars — not all request params) but a dropped candidate is still un-mined surface, so this is honestly a
-    # gap; priority follows the generic 10%/100 rule (a large omission is `major`, like any other cap).
+    # produced, tested = stored. Since step 4.1 nothing is dropped by policy, so `omitted` is 0 and this
+    # record CLEARS the cap gap a v1 run left behind; only unusable lines are still counted as rejected.
     events.coverage_partial("crawl.xnlinkfinder", kind=events.COVERAGE_CAP, unit=f"{tag}:params",
                             measure="potential_params",
-                            eligible=n_params_seen, tested=min(n_params_seen, XNL_PARAM_CAP),
-                            omitted=max(0, n_params_seen - XNL_PARAM_CAP),
-                            reason=f"{tag}: {min(n_params_seen, XNL_PARAM_CAP)}/{n_params_seen} potential params "
-                                   f"(cap {XNL_PARAM_CAP}); {n_bad_params} rejected as unusable")
+                            eligible=n_params_seen, tested=n_params_seen, omitted=0,
+                            reason=f"{tag}: {n_params_seen}/{n_params_seen} potential params retained "
+                                   f"(no cap); {n_bad_params} rejected as unusable")
 
-    # ── A1d vocabulary: if -owl was skipped (large), DERIVE a bounded target wordlist from the mined
-    #    links+params (path segments + param names are exactly the useful brute words) so A1d isn't starved;
-    #    record the -owl/-os skip. ──
+    # ── A1d vocabulary: if -owl was skipped (large), DERIVE a target wordlist from the mined links+params
+    #    (path segments + param names are exactly the useful brute words) so A1d isn't starved; record the
+    #    -owl/-os skip. The artifact is the RETAINED corpus — how much of it is ever brute-forced is
+    #    `vertical._target_wordlist`'s decision, and that bound lives there (step 4.1). ──
     # `-owl`/`-os` are requested only for SMALL input (see `_xnl_run`); the same threshold decides here
     # whether a wordlist must be DERIVED instead. Computed from the blob size the caller passed, so the
     # replay path reaches the same conclusion the fresh path did.
@@ -2167,13 +2179,13 @@ def _xnl_ingest(ctx, tag: str, snap: dict, *, blob=None, written: int = 0, repla
         # (on REPLAY the owned bundle already carries the derived wordlist — deriving it again would be a
         # second answer to a question the mining run already answered and bound by digest.)
         words = set()
-        for value in accepted + cand[:XNL_PARAM_CAP]:
+        for value in accepted + cand:
             for w in re.split(r"[^A-Za-z0-9]+", value.lower()):
                 if 3 <= len(w) <= 30 and not w.isdigit():
                     words.add(w)
-            if len(words) >= XNL_WORDLIST_DERIVE_CAP:
-                break
-        derived = ("\n".join(sorted(words)[:XNL_WORDLIST_DERIVE_CAP]) + "\n").encode()
+        # step 4.1: the derived vocabulary is RETAINED whole. How much of it is ever brute-forced is the
+        # A1d selection's decision (`vertical._target_wordlist`), and that bound is unchanged here.
+        derived = ("\n".join(sorted(words)) + "\n").encode()
         out_wl = _xnl_outputs(ctx, tag)["wordlist"]
         out_wl.write_bytes(derived)
         snap["wordlist"] = ("ok", derived)     # OUR artifact now, and the bytes that will be published

@@ -2694,9 +2694,12 @@ class TestXnLinkFinderHasOneLifecycle:
         assert crawl._xnl_unit_identity(ctx, "t", True, "deadbeef", "8.2") != base, "spo changes the output"
         ctx.profile.apex_domains = ["other.com"]
         assert crawl._xnl_unit_identity(ctx, "t", False, "deadbeef", "8.2") != base, "scope changes the output"
-        monkeypatch.setattr(crawl, "XNL_PARAM_CAP", crawl.XNL_PARAM_CAP + 1)
+        monkeypatch.setattr(crawl, "XNL_MAX_INPUT", crawl.XNL_MAX_INPUT + 1)
         ctx.profile.apex_domains = ["ex.com"]
-        assert crawl._xnl_unit_identity(ctx, "t", False, "deadbeef", "8.2") != base, "the cap changes the output"
+        assert crawl._xnl_unit_identity(ctx, "t", False, "deadbeef", "8.2") != base, \
+            "the input cap changes WHICH BYTES are mined"
+        monkeypatch.undo()
+        assert crawl._xnl_unit_identity(ctx, "t", False, "deadbeef", "8.3") != base, "the engine changes it"
 
     def test_an_UNREGISTERED_source_is_blocked_not_executed(self, tmp_path, monkeypatch):
         from quarry_recon import contract
@@ -3793,3 +3796,72 @@ class TestXnLinkFinderLifecycleBoundary:
         assert any("identity is unproven" in (e.get("reason") or "") for e in evs), evs
         calls2, _evs2, _c2 = self._lane(tmp_path, monkeypatch, ["js"], engine="")
         assert len(calls2) == 1, "an unowned unit was replayed"
+
+
+class TestRetentionIsComplete:
+    """step 4.1 — RETENTION and ACTIVE SELECTION are different decisions.
+
+    Measured on OTC 20260725: xnLinkFinder produced 111,313 distinct param candidates and the store kept
+    6,086 — 94.5% destroyed by a cap that bought no request safety, because the `parameter` entity has one
+    consumer (`exports.parameters.txt`) and nothing turns a stored candidate into a request. What spends —
+    the A1d brute vocabulary, the wildcard candidate set — is selected downstream and is NOT touched here.
+    """
+
+    _S = TestXnLinkFinderHasOneLifecycle._S
+    _lane = TestXnLinkFinderHasOneLifecycle._lane
+
+    def test_EVERY_accepted_parameter_is_stored(self, tmp_path, monkeypatch):
+        params = tuple(f"p{i:05d}" for i in range(5000))          # far beyond the old 2000 cap
+        _calls, evs, ctx = self._lane(tmp_path, monkeypatch, ["js"], links=[], params=params)
+        stored = [r["value"] for k, r in ctx.run.added if k == "parameter"]
+        assert len(stored) == 5000, len(stored)
+        assert set(stored) == set(params), (len(set(stored)), len(set(params)))
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["produced"]["params"] == 5000, fin
+
+    def test_the_param_coverage_record_reports_NO_omission(self, tmp_path, monkeypatch):
+        params = tuple(f"p{i:05d}" for i in range(3000))
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], links=[], params=params)
+        cov = [e for e in evs if e.get("measure") == "potential_params"][0]
+        assert (cov["eligible"], cov["tested"], cov["omitted"]) == (3000, 3000, 0), cov
+        assert "no cap" in cov["reason"], cov
+
+    def test_the_DERIVED_wordlist_keeps_the_whole_vocabulary(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawl, "XNL_WORDLIST_LIMIT", 1)       # large input -> the wordlist is DERIVED
+        params = tuple(f"word{i:05d}" for i in range(6000))       # beyond the old 5000 derive cap
+        self._lane(tmp_path, monkeypatch, ["js"], links=[], params=params)
+        wl = next((tmp_path / "raw" / "crawl" / "xnLinkFinder").glob("*_wordlist.txt")).read_text()
+        words = [w for w in wl.split() if w.startswith("word")]
+        assert len(words) == 6000, len(words)
+
+    def test_a_project_holding_ONLY_v1_state_re_mines_under_v2(self, tmp_path, monkeypatch):
+        """review-step4#P2: a v1 bundle holds a TRUNCATED corpus. Starting from a project that has ONLY v1
+        state — the real migration — the unit must re-mine and store the WHOLE set. (My first version
+        created v2 first, so the final run replayed its own v2 bundle and proved nothing.)"""
+        params = tuple(f"p{i:05d}" for i in range(2500))
+        state = tmp_path / "recon" / "state" / "xnlinkfinder"
+
+        monkeypatch.setattr(crawl, "XNL_PARSER_SCHEMA", 1)          # the world before step 4.1
+        calls_v1, _e, ctx_v1 = self._lane(tmp_path, monkeypatch, ["js"], links=[], params=params[:2000])
+        assert len(calls_v1) == 1 and (state / "v1").exists() and not (state / "v2").exists()
+        assert len([r for k, r in ctx_v1.run.added if k == "parameter"]) == 2000
+        monkeypatch.undo()
+
+        assert crawl.XNL_PARSER_SCHEMA == 2
+        calls_v2, _e2, ctx_v2 = self._lane(tmp_path, monkeypatch, ["js"], links=[], params=params)
+        assert len(calls_v2) == 1, "the v1 bundle was replayed instead of re-mined"
+        assert (state / "v2").exists(), list(state.iterdir())
+        assert len([r for k, r in ctx_v2.run.added if k == "parameter"]) == 2500
+
+        # ...and the v2 unit is then owned normally: a third run replays IT
+        calls_v3, _e3, ctx_v3 = self._lane(tmp_path, monkeypatch, ["js"], links=[], params=params)
+        assert calls_v3 == [], calls_v3
+        assert len([r for k, r in ctx_v3.run.added if k == "parameter"]) == 2500
+
+    def test_ACTIVE_SELECTION_is_unchanged_by_this_commit(self, tmp_path, monkeypatch):
+        """The spend-side bounds are step 4.2/4.3 and must still be exactly where they were."""
+        import inspect
+        from quarry_recon.phases import vertical
+        assert vertical.WILDCARD_WORD_CAP == 5000
+        assert inspect.signature(vertical._target_wordlist).parameters["cap"].default == 2000
+        assert "ZONE_CAP = 5" in inspect.getsource(vertical._wildcard_differentiate)
