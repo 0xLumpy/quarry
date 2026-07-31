@@ -171,6 +171,8 @@ class SweepResult:
     invocations: int = 0                    # runner calls that actually ran — NOT a slot count
     invocations_obtained: int = 0
     invocation_classes: dict = field(default_factory=dict)
+    unselectable_slots: int = 0             # slots no bound can ever admit — NOT a resumable remainder
+    unselectable_pairs: int = 0
     slots_attempted: int = 0
     slots_obtained: int = 0             # SUCCESS or EMPTY — a clean answer, including "nothing resolved"
     classes: dict = field(default_factory=dict)
@@ -276,6 +278,18 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.stop_kind = "machinery"
             _report(coverage_lane, out, clock)
             return out
+        # v33: a slot the allocator could not split below the bound can never be scheduled — not by this
+        # run and not by any later one, until the corpus or the bounds change. It is removed HERE, in one
+        # place, so neither the spend-bound check nor the batch loop can quietly reclassify it as an
+        # ordinary cap or a resumable remainder.
+        if alloc_cap:
+            over = {slot: group for slot, group in partition.items() if len(group) > alloc_cap}
+            for slot, group in sorted(over.items())[:5]:
+                out.machinery.append(f"{target}/{slot}: {len(group)} candidates cannot be split below "
+                                     f"the bound ({alloc_cap}) and can never be scheduled")
+            out.unselectable_slots += len(over)
+            out.unselectable_pairs += sum(len(group) for group in over.values())
+            partition = {slot: group for slot, group in partition.items() if slot not in over}
         for slot, group in partition.items():
             members[(target, slot)] = group
     slots = sorted(members)
@@ -395,6 +409,12 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.pending_completions += len(chosen)
 
 
+        if out.stop_kind is None and out.unselectable_pairs:
+            # neither "resumable" nor "restarts" is true of these pairs: nothing about a later lifecycle
+            # changes them. They are named as what they are, and only when no real stop preceded them.
+            out.stop = (f"{out.unselectable_pairs} candidate(s) in {out.unselectable_slots} slot(s) "
+                        f"cannot be scheduled under the current bounds and will not be retried")
+            out.stop_kind = "unselectable"
         if out.stop_kind is None and clock.exhausted() and len(picked) < len(slots):
             # FIRST CAUSE WINS (review v15#1). A machinery stop that happened to cross the bound was being
             # relabelled "budget", which reads as an operator cap — laundering a failure into a choice.
@@ -453,15 +473,9 @@ def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: i
             out.stop_kind = out.stop_kind or "bound"
             out.stop = out.stop or f"the per-target candidate bound ({cap}) was reached"
             continue
-        if max_words and len(words) > max_words:
-            # a DEPTH-LIMIT residual: the allocator could not split this slot small enough (only reachable
-            # through a 64-bit collision class). It is refused and named, never run oversized (v32#1).
-            picked.add(choice)
-            out.machinery.append(f"{this_target}/{bucket}: slot of {len(words)} candidates exceeds the "
-                                 f"invocation maximum ({max_words}) and was not submitted")
-            continue
-        if chosen and total + len(words) > max_words:
-            break
+        if chosen and max_words and total + len(words) > max_words:
+            break                                       # an oversized SLOT never reaches here: the
+                                                        # allocator's own bound removed it (v33)
         target, tier = this_target, this_tier
         chosen.append((bucket, words))
         total += len(words)
@@ -495,7 +509,9 @@ def _report(lane: str, out: SweepResult, clock) -> None:
                             stop=None if out.stop_kind in (None, "budget", "bound") else out.stop,
                             # a candidate BOUND is a cap with its own wording: reusing the budget sentence
                             # would report "exhausted after 0s of 0s" on an unbounded clock (v17#5).
-                            cap_reason=out.stop if out.stop_kind == "bound" else None)
+                            cap_reason=out.stop if out.stop_kind == "bound" else None,
+                            # pairs in a slot no bound can admit are not a remainder anyone will retry
+                            unretriable=out.unselectable_pairs)
     budget.report_outcome(lane, measure="slot_outcomes", attempted=out.slots_attempted,
                           obtained=out.slots_obtained, classes=out.classes or None, noun="slot")
     if out.invocations:

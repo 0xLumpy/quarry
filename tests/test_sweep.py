@@ -749,19 +749,48 @@ class TestExecutorBatching:
         out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(8)], max_pairs_per_target=2)
         assert all(len(c[2]) <= 2 for c in tool.calls) and out.attempted_pairs == 2
 
-    def test_a_DEPTH_LIMIT_residual_is_refused_and_NAMED_never_run_oversized(self, tmp_path,
-                                                                            monkeypatch):
-        """The allocator cannot split a 64-bit collision class. Such a slot must not be submitted, and its
-        candidates must not vanish silently either."""
-        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+    def _residual(self, monkeypatch, keep=3):
+        """Force what a 64-bit collision class would do: a slot the allocator cannot split below the
+        bound."""
         real = sweep.allocate
         monkeypatch.setattr(sweep, "allocate",
-                            lambda words, *, cap: {"000": list(words)[:3], **{
-                                s: g for s, g in real(list(words)[3:], cap=cap).items() if s != "000"}})
+                            lambda words, *, cap: {"000": list(words)[:keep], **{
+                                s: g for s, g in real(list(words)[keep:], cap=cap).items()
+                                if s != "000"}})
+
+    def test_an_UNSPLITTABLE_residual_is_never_submitted_and_never_called_RESUMABLE(self, tmp_path,
+                                                                                    monkeypatch):
+        """v33: it was appended to machinery and then reported as "budget exhausted … RESUMABLE" — but no
+        later lifecycle can reach it, so neither "resumable" nor "restarts" is true."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        self._residual(monkeypatch)
         out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)])
         assert all(len(c[2]) <= 2 for c in tool.calls), tool.calls
-        assert any("exceeds the invocation maximum" in m for m in out.machinery), out.machinery
+        assert out.unselectable_slots == 1 and out.unselectable_pairs == 3
+        assert any("can never be scheduled" in m for m in out.machinery), out.machinery
+        assert out.stop_kind == "unselectable" and "will not be retried" in out.stop
         assert out.attempted_pairs == 3 and out.eligible_pairs == 6
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "cannot be scheduled" in sel["reason"] and "RESUMABLE" not in sel["reason"], sel
+
+    def test_a_residual_under_a_SPEND_CAP_is_not_laundered_into_an_ordinary_bound(self, tmp_path,
+                                                                                  monkeypatch):
+        """The cap check used to run first, so the same residual read as a routine cap with no machinery
+        note at all."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 100)
+        self._residual(monkeypatch)
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)], max_pairs_per_target=2)
+        assert out.unselectable_slots == 1 and out.unselectable_pairs == 3
+        assert any("can never be scheduled" in m for m in out.machinery), out.machinery
+        assert all(len(c[2]) <= 2 for c in tool.calls), tool.calls
+
+    def test_a_REAL_stop_still_wins_over_the_residual_sentence(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        self._residual(monkeypatch)
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)],
+                         tool=_Tool(raises=(1, RuntimeError("popen exploded"))))
+        assert out.stop_kind == "machinery" and out.unselectable_pairs == 3
+        assert any("can never be scheduled" in m for m in out.machinery), out.machinery
 
     def test_the_batch_policy_still_STOPS_a_batch_from_growing(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
@@ -854,3 +883,12 @@ class TestExecutorBatching:
         assert out.invocation_classes == {}
         inv = [e for e in _events(tmp_path) if e.get("measure") == "tool_invocations"][-1]
         assert "{" not in inv["reason"], inv        # no class map at all when every call was obtained
+
+    def test_a_MIXED_remainder_names_both_parts(self, tmp_path, monkeypatch):
+        """Some pairs wait for the next lifecycle, some never come back at all — one sentence, both."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 100)
+        self._residual(monkeypatch)
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)], max_pairs_per_target=1)
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "RESUMABLE" in sel["reason"] and "UNSCHEDULABLE" in sel["reason"], sel
+        assert sel["omitted"] == 5 and out.unselectable_pairs == 3, (sel, out)

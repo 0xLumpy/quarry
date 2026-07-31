@@ -1096,9 +1096,27 @@ class Ledger:
         return True
 
 
+def _remainder_tail(omitted: int, durable: bool, unretriable: int) -> str:
+    """How to describe what was left. review v33: there were only two states — a RESUMABLE remainder or a
+    lane that RESTARTS — and neither is true of work no later run can reach at all (a slot no bound can
+    admit). Naming it resumable is a false promise in the opposite direction from the restart case."""
+    unretriable = max(0, min(int(unretriable), omitted))
+    resumable = omitted - unretriable
+    kept = ("left as a RESUMABLE remainder" if durable else
+            "left over — completion state was NOT persisted, so this lane RESTARTS from the beginning")
+    if not unretriable:
+        return kept
+    never = ("UNSCHEDULABLE under the current bounds — no later run reaches them without a corpus or "
+             "policy change")
+    if not resumable:
+        return f"left {never}"
+    return f"left over: {resumable} {kept.replace('left ', '')}, {unretriable} {never}"
+
+
 def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, budget: Budget,
                      noun: str = "item", durable: bool = True, stop: str | None = None,
-                     unit: str | None = None, cap_reason: str | None = None) -> None:
+                     unit: str | None = None, cap_reason: str | None = None,
+                     unretriable: int = 0) -> None:
     """SELECTION coverage: of everything eligible, how much did we get to at all?
 
     Emitted EVERY run (omitted=0 when the whole set was processed) so a later unbounded rerun CLEARS a prior
@@ -1110,21 +1128,16 @@ def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, 
     # missing dependency. Wording every omission as "budget exhausted" would misname those, and the KIND
     # matters too: a budget is a CAP we chose, anything else is a TIMEOUT-class gap (step-4 design v4#3).
     kind = events.COVERAGE_CAP if stop is None else events.COVERAGE_TIMEOUT
+    tail = _remainder_tail(omitted, durable, unretriable)
     if omitted and cap_reason is not None and stop is None:
         # an OPERATOR CAP that is not the wall clock — a per-target candidate bound, say. Still a CAP we
         # chose (never a TIMEOUT-class failure), but "budget exhausted after 0s of 0s" would be a lie.
-        tail = ("left as a RESUMABLE remainder" if durable else
-                "left over — completion state was NOT persisted, so this lane RESTARTS from the beginning")
         why = f"{cap_reason} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
     elif omitted and stop is not None:
-        tail = ("left as a RESUMABLE remainder" if durable else
-                "left over — completion state was NOT persisted, so this lane RESTARTS from the beginning")
         why = f"{stop} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
     elif omitted:
         # review#4 (r7): only call the remainder RESUMABLE when the completion state was actually persisted.
         # Otherwise the next run starts over, and "resumable" is a false promise.
-        tail = ("left as a RESUMABLE remainder" if durable else
-                "left over — completion state was NOT persisted, so this lane RESTARTS from the beginning")
         why = (f"{noun} budget exhausted after {budget.elapsed()}s of {budget.seconds}s — "
                f"{attempted}/{eligible} processed, {omitted} {tail}")
     else:
