@@ -226,6 +226,11 @@ def state_lock(path):
         fh.close()
 
 
+#: only `rotation_session` holds this, so only it can build an already-locked progress map. A public
+#: `held=True` was an escape hatch: any caller could have written the lane file with no lock at all.
+_SESSION = object()
+
+
 class SchedulerInvariant(RuntimeError):
     """A scheduling fact moved under the holder of the lane lock — a BUG, never an expected disposition.
 
@@ -251,7 +256,7 @@ def rotation_session(state_dir, lane: str, *, schema: int):
     """
     base = Path(state_dir)
     with state_lock(base / f"{lane}.lock"):
-        yield RotationProgress(base / f"{lane}.json", lane=lane, schema=schema, held=True)
+        yield RotationProgress(base / f"{lane}.json", lane=lane, schema=schema, _session=_SESSION)
 
 
 #: how long a save OUTSIDE a session waits for the lane lock, and how often it retries. Giving up does NOT
@@ -297,19 +302,25 @@ class RotationProgress:
     the launch look clean (v4#3).
     """
 
-    def __init__(self, path, *, lane: str, schema: int, held: bool = False):
+    def __init__(self, path, *, lane: str, schema: int, _session=None):
         self.path = Path(path) if path else None
         self.lane = lane
         self.schema = int(schema)
-        self.held = held
+        self.held = _session is _SESSION       # ONLY `rotation_session` can hand over the token
         self.gen = 0
         self.targets: dict = {}
+        #: `missing` (no file yet) · `valid` (parsed) · `unusable` (present but not trustworthy). A driver
+        #: must be able to say "state unusable, the rotation restarted" instead of reporting advancement
+        #: over a prefix it silently repeated.
+        self.state_status = "missing"
+        self.state_reason = ""
         self._read()
 
     # ── validation: every record is fail-closed. An unusable record reads as "never run", which puts the
     #    slot at the FRONT of the rotation — the safe direction for a scheduler that only orders. ──
     @staticmethod
     def _num(value, *, minimum=0.0):
+        """A TIMESTAMP we can order by: finite, non-negative, never a bool."""
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
         v = float(value)
@@ -317,24 +328,32 @@ class RotationProgress:
             return None
         return v
 
+    @staticmethod
+    def _count(value):
+        """An EXACT non-negative integer. `True` is not 1 and `1.9` is not 1: a generation that silently
+        truncates breaks the ordering it exists to provide, and a fractional member count is not a count."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if value >= 0 else None
+
     @classmethod
     def _tuple(cls, raw, *, with_content: bool):
         if not isinstance(raw, dict):
             return None
-        gen, at = cls._num(raw.get("gen")), cls._num(raw.get("at"))
+        gen, at = cls._count(raw.get("gen")), cls._num(raw.get("at"))
         if gen is None or at is None:
             return None
-        out = {"gen": int(gen), "at": at}
+        out = {"gen": gen, "at": at}
         if with_content:
-            c, n = raw.get("c"), cls._num(raw.get("n"))
+            c, n = raw.get("c"), cls._count(raw.get("n"))
             if not isinstance(c, str) or not c or n is None:
                 return None
             out["c"] = c
-            out["n"] = int(n)
+            out["n"] = n
         return out
 
     @classmethod
-    def _parse(cls, text: str, *, lane: str, schema: int) -> tuple:
+    def _parse(cls, text: str, *, lane: str, schema: int) -> tuple:      # -> (gen, targets, status, why)
         """`(gen, targets)` from a state document, or a FRESH rotation when it cannot be trusted.
 
         A different lane or a different schema starts fresh rather than being reinterpreted: the schema
@@ -343,35 +362,63 @@ class RotationProgress:
         try:
             doc = json.loads(text)
         except (ValueError, TypeError):
-            return 0, {}
-        if not isinstance(doc, dict) or doc.get("lane") != lane or doc.get("schema") != schema:
-            return 0, {}
-        gen = cls._num(doc.get("gen")) or 0.0
+            return 0, {}, "unusable", "not a JSON document"
+        if not isinstance(doc, dict):
+            return 0, {}, "unusable", f"top level is a {type(doc).__name__}, not an object"
+        if doc.get("lane") != lane:
+            return 0, {}, "unusable", f"lane is {doc.get('lane')!r}, not {lane!r}"
+        if doc.get("schema") is True or doc.get("schema") != schema:
+            return 0, {}, "unusable", f"schema {doc.get('schema')!r} != {schema} — a different question"
+        gen = cls._count(doc.get("gen"))
+        raw_targets = doc.get("targets")
+        if gen is None or not isinstance(raw_targets, dict):
+            return 0, {}, "unusable", "generation or targets malformed"
         targets: dict = {}
-        for name, raw_t in (doc.get("targets") or {}).items():
+        for name, raw_t in raw_targets.items():
             if not isinstance(name, str) or not isinstance(raw_t, dict):
+                continue                                   # a container we cannot read is not a target
+            seq = cls._count(raw_t.get("seq"))
+            raw_slots = raw_t.get("slots")
+            if seq is None or not isinstance(raw_slots, dict):
                 continue
-            seq = cls._num(raw_t.get("seq")) or 0.0
             slots: dict = {}
-            for bucket, raw_s in (raw_t.get("slots") or {}).items():
+            for bucket, raw_s in raw_slots.items():
                 if not isinstance(bucket, str) or not isinstance(raw_s, dict):
                     continue
                 res = cls._tuple(raw_s.get("res"), with_content=False)
                 done = cls._tuple(raw_s.get("done"), with_content=True)
+                # a completion without its reservation, or one claiming to precede it, is not a record we
+                # can order — it reads as never-run, which is the SAFE direction for a rotation.
+                if done is not None and (res is None or done["gen"] > res["gen"]):
+                    done = None
+                if res is not None and res["gen"] > gen:
+                    continue                               # a slot ahead of its own lane generation
                 if res is None and done is None:
                     continue
                 slots[bucket] = {k: v for k, v in (("res", res), ("done", done)) if v is not None}
-            targets[name] = {"seq": int(seq), "slots": slots}
-        return int(gen), targets
+            highest = max([s["res"]["gen"] for s in slots.values() if "res" in s] or [0])
+            targets[name] = {"seq": max(seq, highest), "slots": slots}
+        return gen, targets, "valid", ""
 
     def _read(self) -> None:
         if self.path is None:
+            self.state_status, self.state_reason = "missing", "no state path"
             return
         try:
             text = self.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            return                                  # unreadable progress = a fresh rotation, never a stop
-        self.gen, self.targets = self._parse(text, lane=self.lane, schema=self.schema)
+        except FileNotFoundError:
+            self.state_status = "missing"           # a first run, not a loss
+            return
+        except (OSError, UnicodeError) as e:
+            # unreadable progress = a fresh rotation, never a stop — but the driver must be able to SAY so
+            self.state_status, self.state_reason = "unusable", f"unreadable ({type(e).__name__})"
+            return
+        try:
+            self.gen, self.targets, self.state_status, self.state_reason = self._parse(
+                text, lane=self.lane, schema=self.schema)
+        except Exception as e:                      # `_parse` must never raise (review v11#1)
+            self.gen, self.targets = 0, {}
+            self.state_status, self.state_reason = "unusable", f"unparseable ({type(e).__name__})"
 
     # ── reading the rotation ──────────────────────────────────────────────────────────────────────
     def _slot(self, target: str, bucket: str) -> dict:
@@ -397,10 +444,17 @@ class RotationProgress:
         self.gen += 1
         return self.gen
 
-    def reserve(self, target: str, bucket: str, gen: int, *, at: float) -> None:
+    def reserve(self, target: str, bucket: str, *, at: float) -> int:
+        """Take the next generation and reserve this slot with it. Returns the generation.
+
+        review v11#2: the caller used to PASS a generation, so a slot could hold gen 39 while the lane's own
+        counter was 0 — the monotonic authority behind ordering and merge, broken by one careless call.
+        Allocation belongs to the map."""
+        gen = self.next_gen()
         t = self.targets.setdefault(target, {"seq": 0, "slots": {}})
-        t["slots"].setdefault(bucket, {})["res"] = {"gen": int(gen), "at": float(at)}
-        t["seq"] = max(int(t.get("seq", 0)), int(gen))      # the cursor advances on every pick
+        t["slots"].setdefault(bucket, {})["res"] = {"gen": gen, "at": float(at)}
+        t["seq"] = max(int(t.get("seq", 0)), gen)           # the cursor advances on every pick
+        return gen
 
     def complete(self, target: str, bucket: str, gen: int, *, at: float, content: str, members: int) -> None:
         """Record that this slot RAN. Raises `SchedulerInvariant` if its reservation moved under us."""
@@ -440,9 +494,9 @@ class RotationProgress:
                 return False
         try:
             try:
-                disk_gen, disk_targets = self._parse(self.path.read_text(encoding="utf-8"),
-                                                     lane=self.lane, schema=self.schema)
-            except (OSError, UnicodeError):
+                disk_gen, disk_targets, _status, _why = self._parse(
+                    self.path.read_text(encoding="utf-8"), lane=self.lane, schema=self.schema)
+            except (OSError, UnicodeError, Exception):      # a document that changed under us, unusable
                 disk_gen, disk_targets = 0, {}
             merged = {name: {"seq": int(t.get("seq", 0)), "slots": dict(t.get("slots", {}))}
                       for name, t in disk_targets.items()}
