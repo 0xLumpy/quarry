@@ -1408,6 +1408,11 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert len(recs) == 1 and "the tool did not run" in recs[0].note, recs
             # the apex WAS brute-forced (the first bucket ran), so nothing is "unsubmitted" for it
             assert "apex brute(s) unsubmitted" not in recs[0].note, recs
+            # ...and the source terminal is NOT a skip: work happened before the tool vanished
+            fins = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                    if json.loads(l).get("event") == "tool_finish"
+                    and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(fins) == 1 and fins[0]["status"] != "skipped", fins
         finally:
             events.reset()
 
@@ -1464,3 +1469,121 @@ class TestA1dVocabularyLossReachesTheVerdict:
         monkeypatch.setattr(sweep, "BUCKETS", 3)
         assert sweep.bucket_of("alpha") != before or sweep.BUCKETS == 3
         assert int(sweep.bucket_of("alpha")) < 3, sweep.bucket_of("alpha")
+
+    # ── v18: the lane's own lifecycle boundary ───────────────────────────────────────────────────
+    def test_a_disabled_BRUTE_does_not_suppress_the_WILDCARD_lane(self, tmp_path, monkeypatch):
+        """v18#1: they are separate registered sources. One being unavailable must not silence the other."""
+        from quarry_recon.phases import enrich, vertical
+        monkeypatch.setattr(enrich, "registered", lambda s: s != "enrich.a1d_brute")
+        monkeypatch.setattr(vertical.netguard, "contact_state",
+                            lambda host, block_private=False: ("public", False, None))
+        monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
+        monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
+        seen: list = []
+        real_cov = events.coverage_partial
+        monkeypatch.setattr(events, "coverage_partial",
+                            lambda sid, **k: (seen.append({"source_id": sid, **k}), real_cov(sid, **k))[1])
+        recs = self._a1d_zones(tmp_path, monkeypatch, zones=("z.acme.com",), httpx=True, puredns=True)
+        # the WILDCARD pass ran under its own source even though the brute's source was rejected
+        wl_evs = seen
+        zones_cov = [e for e in wl_evs if e.get("measure") == "zones"]
+        assert zones_cov and zones_cov[-1]["source_id"] == "enrich.wildcard_a1d", wl_evs[-3:]
+        assert zones_cov[-1]["tested"] == 1, zones_cov[-1]
+        assert not any(e.get("source_id") == "enrich.a1d_brute" for e in wl_evs), "the brute ran anyway"
+        assert not any("wildcard zone(s) not differentiated" in (r.note or "") for r in recs), recs
+
+    def test_CANCELLATION_closes_the_source_lifecycle_before_propagating(self, tmp_path, monkeypatch):
+        """v18#2: a `tool_start` with no `tool_finish` is a source that never answered."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("one\ntwo\n")
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt("ctrl-c")))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            with pytest.raises(KeyboardInterrupt):
+                enrich._a1d_recursive_brute(ctx)
+            evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+            starts = [e for e in evs if e.get("event") == "tool_start"
+                      and e.get("source_id") == "enrich.a1d_brute"]
+            fins = [e for e in evs if e.get("event") == "tool_finish"
+                    and e.get("source_id") == "enrich.a1d_brute"]
+            assert len(starts) == len(fins) == 1, (starts, fins)
+            assert "CANCELLED" in (fins[0].get("reason") or ""), fins
+        finally:
+            events.reset()
+
+    def test_a_NON_CONTENTION_sweep_failure_still_terminates_the_source(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import enrich
+        monkeypatch.setattr(enrich.sweep, "run_sweep",
+                            lambda **k: (_ for _ in ()).throw(OSError("read-only filesystem")))
+        submitted, run = self._scheduled(tmp_path, monkeypatch, words=["one", "two"])
+        evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+        fins = [e for e in evs if e.get("event") == "tool_finish"
+                and e.get("source_id") == "enrich.a1d_brute"]
+        assert len(fins) == 1 and fins[0]["status"] == "failed", fins
+        assert "read-only filesystem" in fins[0]["reason"], fins
+
+    @pytest.mark.parametrize("statuses,produced_hosts,want", [
+        (["empty", "empty"], 0, "empty"),          # the runner answered, nothing was found
+        (["success"], 1, "success"),               # a host came back
+        (["failed", "empty"], 0, "failed"),        # a slot did not answer and nothing was produced
+        (["failed", "success"], 1, "partial"),     # a slot did not answer but evidence exists
+    ])
+    def test_the_TERMINAL_follows_production_and_slot_classes(self, tmp_path, monkeypatch,
+                                                              statuses, produced_hosts, want):
+        """v18#3: `slots_obtained` counts SUCCESS *and* EMPTY, so an all-empty sweep read SUCCESS and a
+        failed one read EMPTY, while failed/timed-out slots never reached the terminal at all."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        monkeypatch.setattr(sweep, "BUCKETS", len(statuses))
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("\n".join(f"w{i:03d}" for i in range(8)))
+            from quarry_recon.runner import RunResult as _RR
+            seq = list(statuses)
+
+            def fake(tool, cmd, raw_path=None, timeout=None, **k):
+                st = getattr(crawl.Status, seq.pop(0).upper()) if seq else crawl.Status.EMPTY
+                if produced_hosts and st is crawl.Status.SUCCESS and raw_path is not None:
+                    raw_path.parent.mkdir(parents=True, exist_ok=True)
+                    raw_path.write_text("found.acme.com\n")
+                return _RR(tool, cmd, st, 0, 0.1, raw_path if st is crawl.Status.SUCCESS else None, 0)
+
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool", fake)
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            fins = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                    if json.loads(l).get("event") == "tool_finish"
+                    and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(fins) == 1 and fins[0]["status"] == want, (fins, statuses)
+            assert fins[0]["produced"]["subdomains"] == produced_hosts, fins
+        finally:
+            events.reset()

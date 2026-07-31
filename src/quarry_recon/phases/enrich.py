@@ -105,6 +105,58 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
     return "; ".join(parts)
 
 
+def _a1d_sweep(ctx, prof, kept, origins, execute):
+    """The scheduled apex brute. Isolated so its caller can bracket it in ONE source lifecycle."""
+    return sweep.run_sweep(
+        lane="a1d_brute",
+        # the SCHEMA is part of the path: changing `BUCKETS` bumps it, and a bumped schema must start a
+        # fresh rotation rather than meeting a document `RotationProgress` will (correctly) refuse to
+        # overwrite — which would leave the lane unable to reserve anything until an operator intervened
+        # (review v17#2).
+        state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}",
+        targets=list(prof.apex_domains), vocabulary=lambda _apex: list(kept), execute=execute,
+        budget_s=budget.budget_seconds("A1D_BUDGET_S"), coverage_lane="enrich.a1d_brute",
+        dependency_ok=lambda: have("puredns"), max_pairs_per_target=A1D_WORD_CAP,
+        attribution=lambda w: sweep.owner_of(w, sorted(origins.get(w) or ["crawl"])))
+
+
+def _a1d_report_sweep(ctx, prof, swept, wl_loss, sid, fp, produced: int) -> None:
+    """Fold the sweep into the lane's facts and close the source lifecycle with ONE terminal."""
+    if swept.machinery:
+        wl_loss["sweep_machinery"] = "; ".join(swept.machinery)
+    if swept.stop_kind not in (None, "bound"):
+        wl_loss["sweep_stop"] = swept.stop
+    if swept.stop_kind == "dependency" and not swept.slots_attempted:
+        # review-B-audit-13#1: an eligible brute that never ran must SAY so — a missing REQUIRED tool is
+        # already a manifest gap, and the note carries how much work went unsubmitted. The gate itself is
+        # the sweep's (one authority), so this is the reporting half. A tool that vanished MID-sweep is a
+        # different fact and is carried by the terminal, not by a second dependency record (v17#3).
+        ctx.run.record("enrich", skipped("puredns", f"not installed — {len(prof.apex_domains)} A1d "
+                                                    f"apex brute(s) unsubmitted"))
+    # ONE terminal for the source, over the WHOLE multi-bucket sweep (v17#1)
+    # review v18#3: the terminal is derived from what was PRODUCED and from the slot CLASSES, not from
+    # "the runner returned". `slots_obtained` counts SUCCESS *and* EMPTY, so an all-empty sweep read
+    # SUCCESS and a failed one read EMPTY, while failed/timed-out/blocked slots never showed at all.
+    if swept.contended:
+        _st, _why = Status.FAILED, swept.stop
+    elif swept.stop_kind == "dependency" and not swept.slots_attempted:
+        _st, _why = Status.SKIPPED, swept.stop          # nothing ran at all
+    elif swept.machinery:
+        _st = Status.PARTIAL if produced else Status.FAILED
+        _why = "; ".join(swept.machinery)
+    elif swept.classes or swept.stop_kind == "dependency":
+        # some slots did not answer (or the tool vanished mid-sweep): degraded. PARTIAL asserts something
+        # was PRODUCED — a slot answering "nothing here" is not production (the audit-7#2 rule).
+        _st = Status.PARTIAL if produced else Status.FAILED
+        _why = "; ".join(p for p in (swept.stop, f"slot outcomes {dict(sorted(swept.classes.items()))}"
+                                     if swept.classes else "") if p)
+    else:
+        _st = Status.SUCCESS if produced else Status.EMPTY
+        _why = swept.stop
+    events.tool_finish(sid, status=_st.value, reason=_why, work_unit=fp,
+                       produced={"subdomains": produced})
+
+
 def _a1d_recursive_brute(ctx) -> set[str]:
     """A1d — recursion: feed the target-specific wordlist mined during the crawl back into the brute.
 
@@ -197,47 +249,32 @@ def _a1d_recursive_brute(ctx) -> set[str]:
                     discovered.add(row["host"])
         return r
 
-    if not registered(sid):
-        # the registry is authoritative for EXECUTION: an absent or misspelled entry must stop active DNS
-        # traffic, not merely omit a line from a report (review v17#1).
-        return discovered
-    events.tool_start(sid, cmd=["puredns", "bruteforce", "(scheduled)"],
-                      input_total=len(prof.apex_domains), work_unit=fp)
-    swept = sweep.run_sweep(
-        lane="a1d_brute",
-        # the SCHEMA is part of the path: changing `BUCKETS` bumps it, and a bumped schema must start a
-        # fresh rotation rather than meeting a document `RotationProgress` will (correctly) refuse to
-        # overwrite — which would leave the lane unable to reserve anything until an operator intervened
-        # (review v17#2).
-        state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}",
-        targets=list(prof.apex_domains), vocabulary=lambda _apex: list(kept), execute=_brute,
-        budget_s=budget.budget_seconds("A1D_BUDGET_S"), coverage_lane="enrich.a1d_brute",
-        dependency_ok=lambda: have("puredns"), max_pairs_per_target=A1D_WORD_CAP,
-        attribution=lambda w: sweep.owner_of(w, sorted(origins.get(w) or ["crawl"])))
-    if swept.machinery:
-        wl_loss["sweep_machinery"] = "; ".join(swept.machinery)
-    if swept.stop_kind not in (None, "bound"):
-        wl_loss["sweep_stop"] = swept.stop
-    if swept.stop_kind == "dependency" and not swept.slots_attempted:
-        # review-B-audit-13#1: an eligible brute that never ran must SAY so — a missing REQUIRED tool is
-        # already a manifest gap, and the note carries how much work went unsubmitted. The gate itself is
-        # the sweep's (one authority), so this is the reporting half. A tool that vanished MID-sweep is a
-        # different fact and is carried by the terminal, not by a second dependency record (v17#3).
-        ctx.run.record("enrich", skipped("puredns", f"not installed — {len(prof.apex_domains)} A1d "
-                                                    f"apex brute(s) unsubmitted"))
-    # ONE terminal for the source, over the WHOLE multi-bucket sweep (v17#1)
-    if swept.contended:
-        _st, _why = Status.FAILED, swept.stop
-    elif swept.stop_kind == "dependency":
-        _st, _why = Status.SKIPPED, swept.stop
-    elif swept.machinery:
-        _st = Status.PARTIAL if swept.slots_obtained else Status.FAILED
-        _why = "; ".join(swept.machinery)
-    else:
-        _st = Status.SUCCESS if swept.slots_obtained else Status.EMPTY
-        _why = swept.stop
-    events.tool_finish(sid, status=_st.value, reason=_why, work_unit=fp,
-                       produced={"subdomains": len(discovered)})
+    # review v18#1: the registry gate is for THIS source only. `enrich.wildcard_a1d` is a separate lane
+    # with its own entry, and a disabled or unavailable puredns lane must not suppress eligible wildcard
+    # differentiation — so the gate skips the sweep and the function continues.
+    if registered(sid):
+        events.tool_start(sid, cmd=["puredns", "bruteforce", "(scheduled)"],
+                          input_total=len(prof.apex_domains), work_unit=fp)
+        try:
+            swept = _a1d_sweep(ctx, prof, kept, origins, _brute)
+        except (KeyboardInterrupt, SystemExit):
+            # review v18#2: a started lifecycle is ALWAYS closed. Cancellation gets its terminal first,
+            # then propagates — a `tool_start` with no `tool_finish` is a source that never answered.
+            events.tool_finish(sid, status=Status.PARTIAL.value if discovered else Status.FAILED.value,
+                               reason="CANCELLED mid-sweep — evidence KEPT" if discovered
+                                      else "CANCELLED mid-sweep — nothing extracted",
+                               work_unit=fp, produced={"subdomains": len(discovered)})
+            raise
+        except Exception as ex:                     # a non-contention acquisition failure, say
+            wl_loss["sweep_machinery"] = f"{type(ex).__name__}: {ex}"
+            events.tool_finish(sid, status=Status.PARTIAL.value if discovered else Status.FAILED.value,
+                               reason=f"the scheduled brute failed ({type(ex).__name__}: {ex})",
+                               work_unit=fp, produced={"subdomains": len(discovered)})
+            swept = None
+        else:
+            _a1d_report_sweep(ctx, prof, swept, wl_loss, sid, fp, len(discovered))
+
+    # ── the wildcard differ is its OWN registered lane and runs regardless of the brute above ──
 
     # wildcard-zone differ with the target words folded in (zones persisted by vertical)
     zones = set(ctx.run.values("wildcard_zone"))
