@@ -167,9 +167,17 @@ class TestA1dVocabularyLossReachesTheVerdict:
                     raise PermissionError("denied")
                 return real(self, *a, **k)
 
+            real_open = pathlib.Path.open
+
+            def picky_open(self, *a, **k):
+                if base_deny and base_path is not None and self.name == base_path.name:
+                    raise PermissionError("denied")     # the base list is STREAMED, not read whole
+                return real_open(self, *a, **k)
+
             monkeypatch.setattr(pathlib.Path, "read_bytes", picky)
+            monkeypatch.setattr(pathlib.Path, "open", picky_open)
             monkeypatch.setattr(enrich, "have", lambda t: puredns)
-            monkeypatch.setattr(vertical, "_wordlist", lambda c: base_path)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: base_path)   # the BASE dictionary
             if puredns:
                 from quarry_recon.runner import RunResult as _RR
                 monkeypatch.setattr(vertical, "_resolvers",
@@ -341,10 +349,14 @@ class TestA1dVocabularyLossReachesTheVerdict:
             from quarry_recon.runner import RunResult as _RR
             monkeypatch.setattr(enrich, "have", lambda t: puredns)
             monkeypatch.setattr(vertical, "have", lambda t: httpx and t == "httpx")
+            # the A1d BASE dictionary and the wildcard GENERIC list are separate inputs: the giant DNS
+            # list is no longer a vhost fallback (step 4 measurement #2)
+            (tmp_path / "base.txt").write_bytes(b"")
             monkeypatch.setattr(vertical, "_wordlist", lambda c: (tmp_path / "base.txt")
                                 if wordlist else None)
-            (tmp_path / "base.txt").write_bytes(generic)
-            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            (tmp_path / "vhost.txt").write_bytes(generic)
+            monkeypatch.setattr(probe, "_vhost_wordlist",
+                                lambda: (tmp_path / "vhost.txt") if wordlist else None)
             monkeypatch.setattr(enrich, "exec_tool",
                                 lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
                                     tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))
@@ -555,7 +567,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
             ctx.run = run
             wl = tmp_path / "generic.txt"
             wl.write_bytes(b"good\nhttps://outside.example/x\nbad\xffword\n")
-            monkeypatch.setattr(vertical, "_wordlist", lambda c: wl)
+            from quarry_recon.phases import probe
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: wl)
             vertical._wildcard_differentiate(ctx, {"a.acme.com"}, extra_words=["api"], label="wildcard")
             run.write_manifest({}, ["vertical"])
             summary = json.loads(run.manifest_path.read_text())["summary"]
@@ -581,7 +594,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
             ctx.run = run
             wl = tmp_path / "generic.txt"
             wl.write_bytes(b"good\n")
-            monkeypatch.setattr(vertical, "_wordlist", lambda c: wl)
+            from quarry_recon.phases import probe
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: wl)
             real = pathlib.Path.read_bytes
             monkeypatch.setattr(pathlib.Path, "read_bytes",
                                 lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("denied"))
@@ -624,7 +638,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         real = pathlib.Path.read_bytes
         monkeypatch.setattr(pathlib.Path, "read_bytes",
                             lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("denied"))
-                            if self.name == "base.txt" else real(self, *a, **k))
+                            if self.name == "vhost.txt" else real(self, *a, **k))
         recs = self._a1d_zones(tmp_path, monkeypatch, httpx=True, puredns=True)
         assert len(recs) == 1 and recs[0].status == "partial", recs
         assert "present and UNREADABLE" in recs[0].note, recs
@@ -690,11 +704,12 @@ class TestA1dVocabularyLossReachesTheVerdict:
             ctx.run = run
             bad = tmp_path / "bad.txt"
             bad.write_bytes(b"good\nhttps://outside.example/x\n")
-            monkeypatch.setattr(vertical, "_wordlist", lambda c: bad)
+            from quarry_recon.phases import probe
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: bad)
             vertical._wildcard_differentiate(ctx, {"a.acme.com"}, extra_words=["api"], label="wildcard")
             good = tmp_path / "good.txt"
             good.write_bytes(b"good\nfine\n")
-            monkeypatch.setattr(vertical, "_wordlist", lambda c: good)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: good)
             vertical._wildcard_differentiate(ctx, {"a.acme.com"}, extra_words=["api"], label="wildcard")
             run.write_manifest({}, ["vertical"])
             summary = json.loads(run.manifest_path.read_text())["summary"]
@@ -847,7 +862,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
         ctx = self._differ_ctx(tmp_path, monkeypatch)
         wl = tmp_path / "generic.txt"
         wl.write_bytes(b"good\nbad\xffword\nhttps://outside.example/x\n")
-        monkeypatch.setattr(vertical, "_wordlist", lambda c: wl)
+        from quarry_recon.phases import probe
+        monkeypatch.setattr(probe, "_vhost_wordlist", lambda: wl)
         st = {}
         vertical._wildcard_differentiate(ctx, {"a.acme.com"}, extra_words=["api"], label="wildcard",
                                          stats=st)
@@ -866,7 +882,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         wl_dir.mkdir(parents=True, exist_ok=True)
         (wl_dir / "js_wordlist.txt").write_bytes(b"internal\nadmin\xffsecret\n")
         loss = {}
-        words = vertical._target_wordlist(ctx, set(), loss=loss)
+        words = vertical._target_wordlist(ctx, loss=loss)
         assert "internal" in words, words
         assert not any("admin" in w or "secret" in w for w in words), words
         assert loss["dropped_lines"] == 1 and loss["unreadable_files"] == 0 and loss["files"] == 1, loss
@@ -889,9 +905,253 @@ class TestA1dVocabularyLossReachesTheVerdict:
 
         monkeypatch.setattr(pathlib.Path, "read_bytes", denied)
         loss = {}
-        words = vertical._target_wordlist(ctx, set(), loss=loss)
+        words = vertical._target_wordlist(ctx, loss=loss)
         assert words == [] and loss["unreadable_files"] == 1 and loss["files"] == 1, (words, loss)
 
 
 
     # ── audit-10#2 rejected bytes never become ACTIVE vocabulary ─────────────────────────────────
+
+    # ── step 4 measurement follow-ups ───────────────────────────────────────────────────────────
+    def test_the_DNS_brute_list_is_NEVER_a_vhost_fallback(self, tmp_path, monkeypatch):
+        """measurement#2: `_vhost_wordlist` promises never to fall back to the big DNS list, and
+        `_wildcard_differentiate` did exactly that — MEASURED at 6,037,953 candidate hosts per zone, of
+        which the 5000-word cap probed 0.1%."""
+        import inspect
+        from quarry_recon.phases import probe, vertical
+        src = inspect.getsource(vertical._wildcard_differentiate)
+        assert "_vhost_wordlist() or _wordlist(ctx)" not in src, src[:0]
+        events.reset(); events.configure(tmp_path)
+        ctx = self._differ_ctx(tmp_path, monkeypatch)
+        huge = tmp_path / "dns.txt"
+        huge.write_text("\n".join(f"d{i}" for i in range(1000)))
+        monkeypatch.setattr(vertical, "_wordlist", lambda c: huge)      # the DNS list IS configured
+        monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)     # ...but no dedicated vhost list
+        st = {}
+        vertical._wildcard_differentiate(ctx, {"a.acme.com"}, extra_words=["api"], label="wildcard",
+                                         stats=st)
+        assert st["vocabulary"]["entries"] == 1, st          # ONLY the caller's word
+        assert st["vocabulary"]["absent"] is True, st
+
+    def test_VERTICAL_reports_a_vocabulary_gap_when_no_vhost_list_exists(self, tmp_path, monkeypatch):
+        """Without a dedicated list the vertical pass has no vocabulary of its own — it must say so and
+        probe nothing, not borrow the DNS list."""
+        from quarry_recon import store
+        from quarry_recon.phases import probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            ctx = self._differ_ctx(tmp_path, monkeypatch)
+            events.configure(run.dir)
+            ctx.run = run
+            huge = tmp_path / "dns.txt"
+            huge.write_text("\n".join(f"d{i}" for i in range(1000)))
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: huge)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            vertical._wildcard_differentiate(ctx, {"a.acme.com"}, label="wildcard")   # no extra_words
+            run.write_manifest({}, ["vertical"])
+            summary = json.loads(run.manifest_path.read_text())["summary"]
+            assert summary["verdict"] != "complete", summary
+            cov = {(c["source_id"], c["measure"]): c for c in summary["coverage"]}
+            zc = cov[("vertical.wildcard_http", "zones")]
+            assert (zc["eligible"], zc["tested"], zc["omitted"]) == (1, 0, 1), zc
+            assert "no usable vocabulary" in str(zc), zc
+        finally:
+            events.reset()
+
+    def test_A1d_still_runs_on_its_OWN_words_without_a_vhost_list(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical.netguard, "contact_state",
+                            lambda host, block_private=False: ("public", False, None))
+        monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
+        monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
+        recs = self._a1d_zones(tmp_path, monkeypatch, httpx=True, puredns=True, wordlist=False)
+        assert recs == [], recs        # the pass RAN on the mined vocabulary; nothing unsubmitted
+
+    def test_the_BASE_dictionary_is_STREAMED_not_materialised(self, tmp_path, monkeypatch):
+        """measurement#3: the base set was 9,544,235 words / 1.5 GB RSS, built only to subtract a few
+        thousand mined labels. Only OUR side belongs in memory."""
+        import inspect
+        from quarry_recon.phases import enrich
+        src = inspect.getsource(enrich._a1d_subtract_base)
+        assert 'open("rb")' in src and "read_bytes()" not in src, src
+        # ...and only OUR side is held: the membership test is against the mined set, so the base file
+        # contributes nothing to memory beyond the words it actually hits
+        assert "w in mined" in src, src
+        base = tmp_path / "base.txt"
+        base.write_bytes(b"api\nwww\n# comment\nbad\xffline\n")
+        loss = {}
+        kept = enrich._a1d_subtract_base(None, ["portal", "api", "internal", "www"],
+                                         lambda c: base, loss)
+        assert kept == ["portal", "internal"], kept          # ENCOUNTER order, not sorted
+        assert loss["base_dropped_lines"] == 1, loss
+
+    def test_the_subtraction_keeps_reporting_its_failures(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import enrich
+        loss = {}
+        kept = enrich._a1d_subtract_base(None, ["api", "internal"],
+                                         lambda c: (_ for _ in ()).throw(OSError("gone")), loss)
+        assert kept == ["api", "internal"] and "could not be located" in loss["base_error"], (kept, loss)
+        missing = tmp_path / "nope.txt"
+        loss2 = {}
+        kept2 = enrich._a1d_subtract_base(None, ["api"], lambda c: missing, loss2)
+        assert kept2 == ["api"] and "could not be read" in loss2["base_error"], (kept2, loss2)
+
+    def test_the_A1d_SPEND_BOUND_is_actually_applied(self, tmp_path, monkeypatch):
+        """The cap is unchanged by step 4, and it is applied to the list handed to puredns — not merely
+        declared as a constant."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        monkeypatch.setattr(enrich, "A1D_WORD_CAP", 50)
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "a_wordlist.txt").write_text("\n".join(f"word{i:04d}" for i in range(500)))
+            cmds = []
+            from quarry_recon.runner import RunResult as _RR
+            monkeypatch.setattr(enrich, "have", lambda t: t == "puredns")
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: (
+                                    cmds.append(cmd), _RR(tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))[1])
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            assert cmds and cmds[0][0] == "puredns", cmds
+            words_file = pathlib.Path(cmds[0][2])
+            assert len(words_file.read_text().split()) == 50, len(words_file.read_text().split())
+            recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+            assert len(recs) == 1 and recs[0].status == "partial", recs
+            assert "450/500 mined word(s) withheld by the 50-word A1d spend bound" in recs[0].note, recs
+        finally:
+            events.reset()
+
+    def test_the_DNS_and_WILDCARD_selections_are_INDEPENDENT(self, tmp_path, monkeypatch):
+        """review-step4-remeasure#3: both lanes were handed the SAME list, so widening the puredns
+        selection in 4.2 would have silently widened HTTP work in a lane 4.3 has not scheduled yet."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        monkeypatch.setattr(enrich, "A1D_WORD_CAP", 1)
+        monkeypatch.setattr(enrich, "A1D_WILDCARD_WORD_CAP", 3)
+        monkeypatch.setattr(vertical.netguard, "contact_state",
+                            lambda host, block_private=False: ("public", False, None))
+        monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
+        monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "a_wordlist.txt").write_text("\n".join(f"word{i:03d}" for i in range(20)))
+            from quarry_recon.runner import RunResult as _RR
+            cmds = []
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            for mod in (enrich, vertical):
+                monkeypatch.setattr(mod, "exec_tool",
+                                    lambda tool, cmd, raw_path=None, timeout=None, **k: (
+                                        cmds.append(cmd),
+                                        _RR(tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))[1])
+            monkeypatch.setattr(type(run), "values",
+                                lambda self, kind: ["z.acme.com"] if kind == "wildcard_zone" else [],
+                                raising=False)
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+
+            pd = [c for c in cmds if c[0] == "puredns"]
+            hx = [c for c in cmds if c[0] == "httpx"]
+            assert pd and hx, cmds
+            dns_words = pathlib.Path(pd[0][2]).read_text().split()
+            wc_cands = [x for x in pathlib.Path(hx[0][hx[0].index("-l") + 1]).read_text().split() if x]
+            assert len(dns_words) == 1, dns_words                 # the DNS bound
+            assert len(wc_cands) == 3 + 2, wc_cands               # the wildcard bound + 2 baseline names
+            recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+            assert len(recs) == 1 and recs[0].status == "partial", recs
+            assert "19/20 mined word(s) withheld by the 1-word A1d spend bound" in recs[0].note, recs
+            assert "17/20 mined word(s) withheld from the wildcard differ" in recs[0].note, recs
+        finally:
+            events.reset()
+
+    def test_both_SPEND_BOUNDS_exist_and_are_unchanged(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import enrich, vertical
+        assert enrich.A1D_WORD_CAP == 2000                  # puredns, per apex
+        assert enrich.A1D_WILDCARD_WORD_CAP == 2000         # the wildcard differ, per zone
+        assert vertical.WILDCARD_WORD_CAP == 5000           # the differ's own ceiling over its full input
+
+    def _a1d_brute_only(self, tmp_path, monkeypatch, *, words: int, zones=()):
+        """A puredns run with a generous DNS bound and (by default) NO wildcard zone."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "a_wordlist.txt").write_text("\n".join(f"word{i:04d}" for i in range(words)))
+            from quarry_recon.runner import RunResult as _RR
+            monkeypatch.setattr(enrich, "A1D_WORD_CAP", words)         # the DNS lane takes everything
+            monkeypatch.setattr(enrich, "A1D_WILDCARD_WORD_CAP", 2)    # ...the wildcard lane would not
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(vertical.netguard, "contact_state",
+                                lambda host, block_private=False: ("public", False, None))
+            monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
+            monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
+            for mod in (enrich, vertical):
+                monkeypatch.setattr(mod, "exec_tool",
+                                    lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
+                                        tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))
+            monkeypatch.setattr(type(run), "values",
+                                lambda self, kind: list(zones) if kind == "wildcard_zone" else [],
+                                raising=False)
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            run.write_manifest({}, ["enrich"])
+            return ([r for r in run.tool_runs("enrich") if r.tool == "a1d"],
+                    json.loads(run.manifest_path.read_text())["summary"])
+        finally:
+            events.reset()
+
+    def test_NO_wildcard_zone_means_NO_wildcard_withholding(self, tmp_path, monkeypatch):
+        """review-step4-remeasure2#1: the withholding was computed before the zone set was even read, so a
+        puredns-only run degraded itself over vocabulary no work wanted."""
+        recs, summary = self._a1d_brute_only(tmp_path, monkeypatch, words=10)
+        assert recs == [], recs
+        assert summary["verdict"] == "complete", summary
+
+    def test_only_OUT_OF_SCOPE_zones_also_means_no_withholding(self, tmp_path, monkeypatch):
+        recs, _summary = self._a1d_brute_only(tmp_path, monkeypatch, words=10,
+                                              zones=("z.somewhere-else.example",))
+        assert recs == [], recs
+
+    def test_an_ELIGIBLE_zone_DOES_report_the_withholding(self, tmp_path, monkeypatch):
+        """The other half: with real wildcard work, the words its bound withheld are a fact again."""
+        recs, summary = self._a1d_brute_only(tmp_path, monkeypatch, words=10, zones=("z.acme.com",))
+        assert len(recs) == 1 and recs[0].status == "partial", recs
+        assert "8/10 mined word(s) withheld from the wildcard differ" in recs[0].note, recs
+        assert "A1d spend bound" not in recs[0].note, recs          # the DNS lane took everything
+        assert summary["verdict"] != "complete", summary

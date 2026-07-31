@@ -3861,7 +3861,7 @@ class TestRetentionIsComplete:
     def test_ACTIVE_SELECTION_is_unchanged_by_this_commit(self, tmp_path, monkeypatch):
         """The spend-side bounds are step 4.2/4.3 and must still be exactly where they were."""
         import inspect
-        from quarry_recon.phases import vertical
+        from quarry_recon.phases import enrich, vertical
         assert vertical.WILDCARD_WORD_CAP == 5000
-        assert inspect.signature(vertical._target_wordlist).parameters["cap"].default == 2000
+        assert enrich.A1D_WORD_CAP == 2000        # the A1d spend bound, now owned by its caller
         assert "ZONE_CAP = 5" in inspect.getsource(vertical._wildcard_differentiate)

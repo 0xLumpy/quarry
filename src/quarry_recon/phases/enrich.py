@@ -19,38 +19,54 @@ from ..runner import (RunResult, Status, fresh_artifact_dir, have, nuclei_timeou
                       run as exec_tool, scaled_timeout, skipped)
 
 
-def _a1d_base_words(ctx, wordlist_fn, loss: dict) -> set:
-    """The configured BASE dictionary, read inside A1d's loss boundary.
+#: how many mined labels A1d may actually brute-force per apex (puredns, DNS). A SPEND bound, unchanged
+#: since before step 4 — what a measured, chunked, resumable selection should look like is 4.2's question.
+A1D_WORD_CAP = 2000
 
-    review-B-audit-12#2: this read sat outside every boundary — a permission or decoding failure escaped
-    `_a1d_recursive_brute`, recorded no A1d result at all and took the rest of the enrich phase with it.
-    The base list is only used to DEDUP mined words against, so failing to read it does not stop A1d; it
-    makes the run re-brute dictionary words, which is a loss worth reporting, not a reason to abort."""
+#: how many mined labels A1d may hand to the WILDCARD HTTP differentiator, per zone. review-step4-remeasure
+#: #3: this used to be the very same list `puredns` got, so widening the DNS selection in 4.2 would have
+#: silently widened HTTP work in a lane 4.3 had not scheduled yet. Two lanes, two bounds — the value is
+#: today's effective behaviour, so nothing widens now.
+A1D_WILDCARD_WORD_CAP = 2000
+
+
+def _a1d_subtract_base(ctx, words: list, wordlist_fn, loss: dict) -> list:
+    """Drop mined words the BASE dictionary already covers, by STREAMING the base file.
+
+    review-step4-measure#3: this used to build a `set()` of the whole base list — MEASURED at 9,544,235
+    words, 1.5 GB RSS and 3.9 s on this box — purely to subtract a few thousand mined labels from. The
+    membership test only needs OUR side in memory: stream the base file and drop the mined words it hits.
+
+    review-B-audit-12#2: the read stays inside A1d's loss boundary. The base list exists only to avoid
+    re-brute-forcing dictionary words, so failing to read it does not stop A1d; it means the mined words
+    were NOT deduped against it, which is a loss worth reporting."""
     try:
         base_wl = wordlist_fn(ctx)
     except Exception as ex:
         loss["base_error"] = f"the base wordlist could not be located ({type(ex).__name__})"
-        return set()
+        return list(words)
     if not base_wl:
-        return set()
+        return list(words)
+    mined = set(words)
+    covered: set = set()
+    dropped = 0
     try:
-        raw = Path(base_wl).read_bytes()
+        with Path(base_wl).open("rb") as fh:
+            for chunk in fh:
+                try:
+                    w = chunk.decode("utf-8")
+                except UnicodeDecodeError:
+                    dropped += 1               # a line we cannot decode cannot exclude anything
+                    continue
+                w = w.strip().lower()
+                if w and not w.startswith("#") and w in mined:
+                    covered.add(w)
     except OSError as ex:
         loss["base_error"] = f"the base wordlist could not be read ({type(ex).__name__})"
-        return set()
-    out, dropped = set(), 0
-    for chunk in raw.splitlines():
-        try:
-            w = chunk.decode("utf-8")
-        except UnicodeDecodeError:
-            dropped += 1                       # a line we cannot decode cannot exclude anything
-            continue
-        w = w.strip().lower()
-        if w and not w.startswith("#"):
-            out.add(w)
+        return list(words)
     if dropped:
         loss["base_dropped_lines"] = dropped
-    return out
+    return [w for w in words if w not in covered]
 
 
 def _a1d_loss_why(loss: dict, produced: int) -> str:
@@ -71,6 +87,14 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
         parts.append(f"{loss['base_error']} — mined words were NOT deduped against it")
     if loss.get("base_dropped_lines"):
         parts.append(f"{loss['base_dropped_lines']} base wordlist line(s) not valid UTF-8")
+    if loss.get("wildcard_withheld"):
+        parts.append(f"{loss['wildcard_withheld']}/{loss.get('after_base', 0)} mined word(s) withheld from "
+                     f"the wildcard differ by its {A1D_WILDCARD_WORD_CAP}-word bound")
+    if loss.get("withheld_by_word_cap"):
+        # the SPEND bound is a fact, like every other cap: it withheld mined vocabulary this run did not
+        # brute-force. (Making that bound measured, chunked and resumable is step 4.2.)
+        parts.append(f"{loss['withheld_by_word_cap']}/{loss.get('after_base', 0)} mined word(s) withheld "
+                     f"by the {A1D_WORD_CAP}-word A1d spend bound")
     return "; ".join(parts)
 
 
@@ -88,8 +112,21 @@ def _a1d_recursive_brute(ctx) -> set[str]:
         return set()
     from .vertical import _target_wordlist, _wildcard_differentiate, _resolvers, _wordlist
     wl_loss: dict = {}
-    base_words = _a1d_base_words(ctx, _wordlist, wl_loss)
-    twords = _target_wordlist(ctx, base_words, loss=wl_loss)
+    # RETENTION: everything the crawl mined, in encounter order. SUBTRACTION: streamed against the base
+    # dictionary. SELECTION: the spend bound, applied last and unchanged by step 4.1 — the set A1d
+    # brute-forces is the same size it has always been.
+    mined = _target_wordlist(ctx, loss=wl_loss)
+    kept = _a1d_subtract_base(ctx, mined, _wordlist, wl_loss)
+    wl_loss["mined_words"] = len(mined)
+    wl_loss["after_base"] = len(kept)
+    # `kept` is RETENTION: the whole mined corpus minus what the base dictionary already covers. Each
+    # ACTIVE lane then selects from it under its OWN bound, so a change to one cannot widen the other.
+    twords = sorted(kept[:A1D_WORD_CAP])                       # -> puredns (DNS), per apex
+    wc_words = sorted(kept[:A1D_WILDCARD_WORD_CAP])            # -> the wildcard differ (HTTP), per zone
+    wl_loss["withheld_by_word_cap"] = max(0, len(kept) - A1D_WORD_CAP)
+    # review-step4-remeasure2#1: the wildcard withholding is NOT a fact yet. Words are only withheld from
+    # work that EXISTS, and whether any wildcard zone is eligible is something only the pass can say — a
+    # puredns-only run with no in-scope zone was degrading itself over vocabulary nothing wanted.
     # review-B-audit-12#1: ONE attempt, ONE outcome. Two independent branches used to record a PARTIAL and
     # then a FAILED/SKIPPED for the same attempt, and the FAILED claimed "every artifact was unreadable"
     # even when a readable one had simply yielded nothing. The verdict is chosen once, from what was
@@ -142,11 +179,14 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     zones = set(ctx.run.values("wildcard_zone"))
     wc: dict = {}
     if zones:
-        discovered.update(_wildcard_differentiate(ctx, zones, extra_words=twords, phase="enrich",
+        discovered.update(_wildcard_differentiate(ctx, zones, extra_words=wc_words, phase="enrich",
                                                   label="wildcard-a1d", source="wildcard-http-a1d",
                                                   source_id="enrich.wildcard_a1d", stats=wc))
     # ── ONE A1d outcome, chosen AFTER the work (review-B-audit-13#1): the earlier note claimed "the
     #    brute ran with less vocabulary" before anything had run — including when it never ran at all.
+    if wc.get("eligible_zones", 0) > 0:
+        wl_loss["wildcard_withheld"] = max(0, len(kept) - A1D_WILDCARD_WORD_CAP)
+        lost = _a1d_loss_why(wl_loss, len(twords))     # now that the wildcard side has an answer
     unsubmitted = max(0, len(prof.apex_domains) - submitted_apexes)
     # review-B-audit-14: "there were wildcard zones" is not "the wildcard pass ran" — passive mode, a
     # missing httpx, no wordlist, the self-contact guard and the zone cap all leave zones UNSUBMITTED.

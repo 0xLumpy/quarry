@@ -428,7 +428,7 @@ def _wordlist(ctx) -> Path | None:
 _LABEL_RX = _re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
 
 
-def _target_wordlist(ctx, base_words: set, cap: int = 2000, loss: dict | None = None) -> list[str]:
+def _target_wordlist(ctx, loss: dict | None = None) -> list[str]:
     """A1d — build a TARGET-SPECIFIC label wordlist from what the crawl already mined.
 
     xnLinkFinder (run in the crawl phase over waymore responses + JS + recovered source) writes a
@@ -436,9 +436,13 @@ def _target_wordlist(ctx, base_words: set, cap: int = 2000, loss: dict | None = 
     internal service names, path segments — the exact words a generic dictionary misses. Here we
     harvest every `*_wordlist.txt` xnLinkFinder produced, tokenize each entry into DNS-label pieces,
     keep only plausible labels (has a letter, len>=3, valid label chars — drops `v1`/`api`-vs-nothing
-    noise and pure-numeric junk that would explode a brute), drop anything already in the base
-    wordlist (no point re-brute-forcing dictionary words), dedup, and cap. Bounded by construction so
-    the recursive brute load can't blow up. Empty when the crawl mined nothing."""
+    noise and pure-numeric junk that would explode a brute) and dedup, in ENCOUNTER order.
+
+    review-step4-measure#3: base-dictionary subtraction and the selection bound used to happen HERE, which
+    forced the caller to materialise the whole 9.5M-word base list (1.5 GB RSS, measured) just to exclude
+    a few thousand mined words. Both moved to the caller: `enrich._a1d_subtract_base` streams the base file
+    against this (small) set, and the selection bound is the caller's spend decision. RETENTION is what
+    this function does; SELECTION is not its job."""
     # `loss` is the caller's OUT-parameter: undecodable lines and unreadable artifacts are facts A1d has
     # to report (review-B-audit-11#2/#3). Filled in even on the early returns.
     loss = loss if loss is not None else {}
@@ -470,15 +474,11 @@ def _target_wordlist(ctx, base_words: set, cap: int = 2000, loss: dict | None = 
                 dropped += 1
                 continue
             for piece in _LABEL_RX.findall(line.strip().lower()):
-                if (len(piece) >= 3 and any(c.isalpha() for c in piece)
-                        and piece not in base_words and piece not in seen):
+                if len(piece) >= 3 and any(c.isalpha() for c in piece) and piece not in seen:
                     seen.add(piece)
                     out.append(piece)
-                    if len(out) >= cap:
-                        loss["dropped_lines"] = dropped
-                        return sorted(out)
     loss["dropped_lines"] = dropped
-    return sorted(out)
+    return out
 
 
 #: an EXACT DNS label: letters/digits/hyphen, no leading or trailing hyphen, 1..63 chars. Deliberately not
@@ -584,8 +584,14 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         ctx.run.record(phase, skipped("httpx", f"not installed — {len(_zones_all)} wildcard zone(s) "
                                                f"undifferentiated ({label})"))
         return _gate("httpx is not installed")
-    from .probe import _vhost_wordlist          # small label list (lives in probe); DNS list is fallback
-    wl = _vhost_wordlist() or _wordlist(ctx)
+    from .probe import _vhost_wordlist          # DEDICATED small label list (lives in probe)
+    # review-step4-measure#2: this used to fall back to `_wordlist(ctx)` — the DNS brute list — which
+    # `_vhost_wordlist` explicitly promises never to use, "because vhost fuzzing is IPs x apexes x words,
+    # so an unbounded list is a footgun". MEASURED on this box: that fallback made the eligible set
+    # 6,037,953 candidate hosts PER ZONE (6,030,367 of the 9.5M DNS entries are valid single labels), of
+    # which the 5000-word cap probed 0.1%. No fallback: without a dedicated list the pass runs on the
+    # CALLER's vocabulary (A1d's mined words) or reports a vocabulary gap and probes nothing.
+    wl = _vhost_wordlist()
     # review-B-audit-15#1: a missing GENERIC list is not a missing wordlist when the caller brought its
     # own. A1d only gets here having mined a non-empty target vocabulary, and those words plus the bogus
     # baseline are enough to differentiate — refusing to run threw away work we had already paid for.
