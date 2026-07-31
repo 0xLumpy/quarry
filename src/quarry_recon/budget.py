@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -223,6 +224,251 @@ def state_lock(path):
         # closing the descriptor releases the lock on EVERY exit, BaseException included: a cancelled run
         # must not wedge the project until someone notices a leftover file.
         fh.close()
+
+
+class SchedulerInvariant(RuntimeError):
+    """A scheduling fact moved under the holder of the lane lock — a BUG, never an expected disposition.
+
+    One sweeper owns a lane for the whole sweep, so nothing else can re-reserve a slot while it runs. A
+    generation that changes anyway means the state was written by something that ignored the lock, or the
+    driver reserved twice. Callers report it as MACHINERY and stop the lane; they never treat it as an
+    ordinary outcome (step-4 design v9#1)."""
+
+
+@contextlib.contextmanager
+def rotation_session(state_dir, lane: str, *, schema: int):
+    """`with rotation_session(dir, "a1d", schema=1) as progress:` — the ONLY way to reach lane progress.
+
+    Takes the lane's lock ONCE and yields a `RotationProgress` that knows the lock is HELD, so no `save()`
+    inside the session acquires it a second time. That is structural, not a caller convention: `state_lock`
+    is flock-based, so a nested acquisition in the SAME process raises `StateBusy` (proven) — a `save()`
+    that re-locked would report every write as contended (step-4 design v8#1 / v9#2).
+
+    Contention is an ACQUISITION fact: `StateBusy` escapes from entering this manager and means another
+    lifecycle owns the rotation. A `StateBusy` raised inside the body is the body's own machinery failure
+    and must not be reported as contention (v10#2) — so callers enter this manager under their own
+    `except`, and run the sweep outside it.
+    """
+    base = Path(state_dir)
+    with state_lock(base / f"{lane}.lock"):
+        yield RotationProgress(base / f"{lane}.json", lane=lane, schema=schema, held=True)
+
+
+#: how long a save OUTSIDE a session waits for the lane lock, and how often it retries. Giving up does NOT
+#: proceed unlocked: `save()` answers False, because a write we could not serialise is not an atomic save.
+_ROTATION_LOCK_WAIT_S = 5.0
+_ROTATION_LOCK_POLL_S = 0.05
+
+
+def _acquire_bounded(path: Path):
+    """An exclusive lock on `path` within a bounded wait, or None. NEVER blocks indefinitely."""
+    import errno
+    import fcntl
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = path.open("a+")
+    except OSError:
+        return None
+    deadline = time.monotonic() + _ROTATION_LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError as e:
+            if e.errno not in (errno.EACCES, errno.EAGAIN) or time.monotonic() >= deadline:
+                fh.close()
+                return None
+            time.sleep(_ROTATION_LOCK_POLL_S)
+
+
+class RotationProgress:
+    """PROJECT-LEVEL rotation state for one lane: which slot was RESERVED when, and what it last RAN.
+
+    It ORDERS and nothing else. It never records an outcome, never claims completion, and losing it costs
+    ordering quality rather than coverage — evidence stays run-scoped (step-4 design).
+
+    Two independently ordered tuples per slot, never merged field-by-field:
+
+        res  = {"gen": int, "at": float}                     # the reservation: taken BEFORE the tool runs
+        done = {"gen": int, "at": float, "c": str, "n": int}  # written AFTER the invocation RETURNED
+
+    `c` is the digest of the members actually submitted, so a slot whose membership changed since it last
+    ran is DIRTY and outranks clean slots. Writing `c` at reservation time would have made a crash before
+    the launch look clean (v4#3).
+    """
+
+    def __init__(self, path, *, lane: str, schema: int, held: bool = False):
+        self.path = Path(path) if path else None
+        self.lane = lane
+        self.schema = int(schema)
+        self.held = held
+        self.gen = 0
+        self.targets: dict = {}
+        self._read()
+
+    # ── validation: every record is fail-closed. An unusable record reads as "never run", which puts the
+    #    slot at the FRONT of the rotation — the safe direction for a scheduler that only orders. ──
+    @staticmethod
+    def _num(value, *, minimum=0.0):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        v = float(value)
+        if not math.isfinite(v) or v < minimum:
+            return None
+        return v
+
+    @classmethod
+    def _tuple(cls, raw, *, with_content: bool):
+        if not isinstance(raw, dict):
+            return None
+        gen, at = cls._num(raw.get("gen")), cls._num(raw.get("at"))
+        if gen is None or at is None:
+            return None
+        out = {"gen": int(gen), "at": at}
+        if with_content:
+            c, n = raw.get("c"), cls._num(raw.get("n"))
+            if not isinstance(c, str) or not c or n is None:
+                return None
+            out["c"] = c
+            out["n"] = int(n)
+        return out
+
+    @classmethod
+    def _parse(cls, text: str, *, lane: str, schema: int) -> tuple:
+        """`(gen, targets)` from a state document, or a FRESH rotation when it cannot be trusted.
+
+        A different lane or a different schema starts fresh rather than being reinterpreted: the schema
+        binds the bucket count, the hash and the record's meaning, so an old document is not the same
+        question asked earlier — it is a different question."""
+        try:
+            doc = json.loads(text)
+        except (ValueError, TypeError):
+            return 0, {}
+        if not isinstance(doc, dict) or doc.get("lane") != lane or doc.get("schema") != schema:
+            return 0, {}
+        gen = cls._num(doc.get("gen")) or 0.0
+        targets: dict = {}
+        for name, raw_t in (doc.get("targets") or {}).items():
+            if not isinstance(name, str) or not isinstance(raw_t, dict):
+                continue
+            seq = cls._num(raw_t.get("seq")) or 0.0
+            slots: dict = {}
+            for bucket, raw_s in (raw_t.get("slots") or {}).items():
+                if not isinstance(bucket, str) or not isinstance(raw_s, dict):
+                    continue
+                res = cls._tuple(raw_s.get("res"), with_content=False)
+                done = cls._tuple(raw_s.get("done"), with_content=True)
+                if res is None and done is None:
+                    continue
+                slots[bucket] = {k: v for k, v in (("res", res), ("done", done)) if v is not None}
+            targets[name] = {"seq": int(seq), "slots": slots}
+        return int(gen), targets
+
+    def _read(self) -> None:
+        if self.path is None:
+            return
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return                                  # unreadable progress = a fresh rotation, never a stop
+        self.gen, self.targets = self._parse(text, lane=self.lane, schema=self.schema)
+
+    # ── reading the rotation ──────────────────────────────────────────────────────────────────────
+    def _slot(self, target: str, bucket: str) -> dict:
+        return (self.targets.get(target, {}).get("slots", {}) or {}).get(bucket, {})
+
+    def target_seq(self, target: str) -> int:
+        """The reservation SEQUENCE this target was last selected at — the fairness cursor. A sequence, not
+        a clock: a backward jump in wall time must not reorder the rotation (v4#4)."""
+        return int(self.targets.get(target, {}).get("seq", 0))
+
+    def slot_seq(self, target: str, bucket: str) -> int:
+        return int(self._slot(target, bucket).get("res", {}).get("gen", 0))
+
+    def tier(self, target: str, bucket: str, content: str) -> int:
+        """0 never ran (including reserved-then-crashed) · 1 DIRTY (membership changed since it ran) · 2 clean."""
+        done = self._slot(target, bucket).get("done")
+        if not done:
+            return 0
+        return 1 if done.get("c") != content else 2
+
+    # ── writing it ────────────────────────────────────────────────────────────────────────────────
+    def next_gen(self) -> int:
+        self.gen += 1
+        return self.gen
+
+    def reserve(self, target: str, bucket: str, gen: int, *, at: float) -> None:
+        t = self.targets.setdefault(target, {"seq": 0, "slots": {}})
+        t["slots"].setdefault(bucket, {})["res"] = {"gen": int(gen), "at": float(at)}
+        t["seq"] = max(int(t.get("seq", 0)), int(gen))      # the cursor advances on every pick
+
+    def complete(self, target: str, bucket: str, gen: int, *, at: float, content: str, members: int) -> None:
+        """Record that this slot RAN. Raises `SchedulerInvariant` if its reservation moved under us."""
+        slot = self._slot(target, bucket)
+        held_gen = int((slot.get("res") or {}).get("gen", 0))
+        if held_gen != int(gen):
+            raise SchedulerInvariant(f"{self.lane}:{target}/{bucket}: reservation gen {held_gen} != {gen}")
+        slot["done"] = {"gen": int(gen), "at": float(at), "c": str(content), "n": int(members)}
+
+    @staticmethod
+    def _merge_slot(mine: dict, theirs: dict) -> dict:
+        """Newer GENERATION wins, per TUPLE, whole. Field-wise merging could assemble `at`, digest and
+        member count from three different runs (v5#3)."""
+        out = dict(theirs)
+        for key in ("res", "done"):
+            m, o = mine.get(key), theirs.get(key)
+            if m and (not o or int(m["gen"]) > int(o["gen"])):
+                out[key] = m
+        return out
+
+    def save(self) -> bool:
+        """MERGE into whatever is on disk and replace atomically. True only when the write really landed."""
+        if self.path is None:
+            return False
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        fh = None
+        if not self.held:
+            # Outside a session we serialise ourselves; inside one the lock is already held and a second
+            # acquisition would block against our own descriptor. The wait is BOUNDED and non-blocking at
+            # the syscall (the Shodan lesson: a `LOCK_EX` that blocks forever turns a best-effort write
+            # into a hang) — giving up answers False rather than writing unserialised.
+            fh = _acquire_bounded(self.path.parent / f"{self.lane}.lock")
+            if fh is None:
+                return False
+        try:
+            try:
+                disk_gen, disk_targets = self._parse(self.path.read_text(encoding="utf-8"),
+                                                     lane=self.lane, schema=self.schema)
+            except (OSError, UnicodeError):
+                disk_gen, disk_targets = 0, {}
+            merged = {name: {"seq": int(t.get("seq", 0)), "slots": dict(t.get("slots", {}))}
+                      for name, t in disk_targets.items()}
+            for name, mine in self.targets.items():
+                theirs = merged.setdefault(name, {"seq": 0, "slots": {}})
+                theirs["seq"] = max(int(theirs["seq"]), int(mine.get("seq", 0)))
+                for bucket, slot in mine.get("slots", {}).items():
+                    theirs["slots"][bucket] = self._merge_slot(slot, theirs["slots"].get(bucket, {}))
+            gen = max(int(self.gen), int(disk_gen))
+            tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
+            try:
+                tmp.write_text(json.dumps({"lane": self.lane, "schema": self.schema, "gen": gen,
+                                           "targets": merged}), encoding="utf-8")
+                os.replace(tmp, self.path)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self.gen, self.targets = gen, merged
+            return True
+        except OSError:
+            return False
+        finally:
+            if fh is not None:
+                fh.close()
 
 
 def state_path(base, lane: str, config_fp: str):
