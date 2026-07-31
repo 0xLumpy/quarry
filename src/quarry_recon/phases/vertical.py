@@ -428,7 +428,7 @@ def _wordlist(ctx) -> Path | None:
 _LABEL_RX = _re.compile(r"[a-z0-9][a-z0-9-]{1,62}")
 
 
-def _target_wordlist(ctx, base_words: set, cap: int = 2000) -> list[str]:
+def _target_wordlist(ctx, base_words: set, cap: int = 2000, loss: dict | None = None) -> list[str]:
     """A1d — build a TARGET-SPECIFIC label wordlist from what the crawl already mined.
 
     xnLinkFinder (run in the crawl phase over waymore responses + JS + recovered source) writes a
@@ -439,30 +439,103 @@ def _target_wordlist(ctx, base_words: set, cap: int = 2000) -> list[str]:
     noise and pure-numeric junk that would explode a brute), drop anything already in the base
     wordlist (no point re-brute-forcing dictionary words), dedup, and cap. Bounded by construction so
     the recursive brute load can't blow up. Empty when the crawl mined nothing."""
+    # `loss` is the caller's OUT-parameter: undecodable lines and unreadable artifacts are facts A1d has
+    # to report (review-B-audit-11#2/#3). Filled in even on the early returns.
+    loss = loss if loss is not None else {}
+    loss.setdefault("dropped_lines", 0)
+    loss.setdefault("unreadable_files", 0)
+    loss.setdefault("files", 0)
     wl_dir = ctx.run.dir / "raw" / "crawl" / "xnLinkFinder"
     if not wl_dir.exists():
         return []
     out: list[str] = []
     seen: set[str] = set()
+    dropped = 0
     for f in sorted(wl_dir.glob("*_wordlist.txt")):
+        loss["files"] += 1
         try:
-            text = f.read_text(errors="replace")
+            raw = f.read_bytes()
         except OSError:
+            # review-B-audit-11#2: swallowing this made "every wordlist is unreadable" indistinguishable
+            # from "the crawl mined nothing" — machinery failure reported as legitimate absence.
+            loss["unreadable_files"] += 1
             continue
-        for line in text.splitlines():
+        for chunk in raw.splitlines():
+            # review-B-audit-10#2: this decoded the whole file with `errors="replace"`, so a line the
+            # crawl boundary REJECTED as undecodable still yielded labels — and these words drive an
+            # ACTIVE puredns brute (A1d). A line we cannot decode is not vocabulary; it is a dropped line.
+            try:
+                line = chunk.decode("utf-8")
+            except UnicodeDecodeError:
+                dropped += 1
+                continue
             for piece in _LABEL_RX.findall(line.strip().lower()):
                 if (len(piece) >= 3 and any(c.isalpha() for c in piece)
                         and piece not in base_words and piece not in seen):
                     seen.add(piece)
                     out.append(piece)
                     if len(out) >= cap:
+                        loss["dropped_lines"] = dropped
                         return sorted(out)
+    loss["dropped_lines"] = dropped
     return sorted(out)
+
+
+#: an EXACT DNS label: letters/digits/hyphen, no leading or trailing hyphen, 1..63 chars. Deliberately not
+#: a "looks fine" filter — this is the gate between a mined word and a hostname Quarry will CONTACT.
+#: review-B-audit-17#2: matched with `fullmatch`, because `$` also matches before a FINAL NEWLINE — so
+#: `"safe\n"` passed the check and kept its newline in a name we would have contacted.
+_DNS_LABEL_RX = _re.compile(r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)")
+
+#: how many labels one wildcard pass may probe per zone. A POLICY bound (brute load), not a parse fact —
+#: it is reported separately from what the parser could not use (review-B-audit-17#1).
+WILDCARD_WORD_CAP = 5000
+
+
+def _wc_vocab_coverage(sid: str, label: str, vocab: dict) -> None:
+    """Structured VOCABULARY coverage for a wildcard pass — words we could not use are un-probed surface.
+
+    review-B-audit-16#2: these losses lived only in `stats["blocked"]`, which nothing reconciles, so an
+    unreadable or half-rejected wordlist could still leave the run reading `complete`.
+
+    review-B-audit-18#1: the two stages are SEQUENTIAL over the same words, so they may not share a
+    measure — a rollup sums units per (source, measure) as disjoint work, and 10 words became eligible=20.
+    PARSING is counted in `vocabulary_entries` (what the input offered), SELECTION in `vocabulary_words`
+    (what survived parsing, and how much of it the cap let through)."""
+    lost = vocab["undecodable"] + vocab["rejected"]
+    # review-B-audit-17#3: coverage is LATEST-per-(source, unit), so a clean pass has to say so — emitting
+    # nothing left an earlier UNKNOWN or omission standing as the current truth for this unit.
+    if vocab["unreadable"]:
+        # a present list we cannot read: RAN, unmeasurable -> a gap the reconciler admits
+        events.coverage_partial(sid, kind=events.COVERAGE_UNKNOWN,
+                                unit=f"{label}:vocabulary", measure="vocabulary_entries",
+                                reason=f"{label}: the wildcard wordlist is present and UNREADABLE — the "
+                                       f"generic vocabulary was NOT probed")
+    else:
+        eligible = vocab["valid_entries"] + lost
+        events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT,
+                                unit=f"{label}:vocabulary", measure="vocabulary_entries",
+                                eligible=eligible, tested=vocab["valid_entries"], omitted=lost,
+                                reason=f"{label}: {vocab['valid_entries']}/{eligible} vocabulary entr(ies) "
+                                       f"usable — {vocab['undecodable']} not valid UTF-8, "
+                                       f"{vocab['rejected']} not a single DNS label (a URL-shaped word "
+                                       f"would introduce another authority); {vocab['usable']} unique "
+                                       f"name(s) after canonicalisation")
+    # the CAP is its own fact, under its own stable unit: policy truncation is not parse loss, and one
+    # must never mask the other.
+    events.coverage_partial(sid, kind=events.COVERAGE_CAP,
+                            unit=f"{label}:vocabulary_cap", measure="vocabulary_words",
+                            eligible=vocab["usable"], tested=vocab["selected"], omitted=vocab["withheld"],
+                            # review-B-audit-19#2: this stage is SELECTION, not execution — whether the
+                            # selected names were ever submitted is the `zones` measure's answer.
+                            reason=f"{label}: {vocab['selected']}/{vocab['usable']} usable name(s) SELECTED "
+                                   f"for probing (cap {WILDCARD_WORD_CAP}) — {vocab['withheld']} withheld")
 
 
 def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
                             phase: str = "vertical", label: str = "wildcard",
-                            source: str = "wildcard-http") -> set[str]:
+                            source: str = "wildcard-http", stats: dict | None = None,
+                            source_id: str = "vertical.wildcard_http") -> set[str]:
     """A1 — recover the distinct vhosts hidden behind a wildcard zone. A `*.zone` cert makes every
     `<word>.zone` resolve to one IP, so a DNS-gated pipeline strips them all as noise and loses the
     real hosts (CDN / k8s ingress / SaaS). Instead: brute `<word>.zone` + a couple of guaranteed-bogus
@@ -474,22 +547,103 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
     import uuid as _uuid
     scope = ctx.scope
     ZONE_CAP = 5
+    # review-B-audit-14: `stats` is the caller's OUT-parameter. Whether this pass actually RAN cannot be
+    # inferred from "there were zones" — passive mode, a missing httpx, no wordlist and the self-contact
+    # guard all return an empty set without probing anything, and a caller that reads that as "it ran"
+    # reports work it never submitted.
+    # review-B-audit-15#2: SNAPSHOT semantics, not `setdefault` — a reused dict could otherwise report
+    # this call's `eligible_zones` beside a previous call's `probed_zones`.
+    st = stats if stats is not None else {}
+    st.clear()
+    st.update({"eligible_zones": 0, "probed_zones": 0, "blocked_reason": "",
+               "blocked": {"zone_cap": 0, "self_or_private": 0}})
     _zones_all = sorted(z for z in zones if scope.in_scope(z) and not scope.is_oos(z))
+    st["eligible_zones"] = len(_zones_all)
     zones = _zones_all[:ZONE_CAP]
-    if not zones or scope.passive_only or not have("httpx"):
-        return set()                               # passive/no-httpx: no active pass -> no coverage counter
+
+    def _gate(reason: str) -> set:
+        """A hard exit that still REPORTS. review-B-audit-20#1: these returns happened before the `zones`
+        event, so the A1d caller could reconstruct the omission from `stats` but the production vertical
+        caller — which passes none — recorded nothing at all: eligible zones, zero differentiated, verdict
+        `complete`."""
+        st["blocked_reason"] = reason
+        events.coverage_partial(source_id, kind=events.COVERAGE_TIMEOUT, measure="zones", unit=label,
+                                eligible=len(_zones_all), tested=0, omitted=len(_zones_all),
+                                reason=f"{label}: 0/{len(_zones_all)} wildcard zone(s) differentiated "
+                                       f"({reason})")
+        return set()
+
+    if not zones:
+        # nothing eligible: still emit (0/0/0 is VALID and clears any earlier gap for this unit)
+        return _gate("no in-scope wildcard zone")
+    if scope.passive_only:
+        # an intentional MODE, not a gap: passive runs make no active pass by design.
+        st["blocked_reason"] = "passive-only mode"
+        return set()
+    if not have("httpx"):
+        ctx.run.record(phase, skipped("httpx", f"not installed — {len(_zones_all)} wildcard zone(s) "
+                                               f"undifferentiated ({label})"))
+        return _gate("httpx is not installed")
     from .probe import _vhost_wordlist          # small label list (lives in probe); DNS list is fallback
     wl = _vhost_wordlist() or _wordlist(ctx)
-    if wl is None:
-        return set()                               # no wordlist -> zero zones actually attempted; no counter
-    block_private = netguard._block_private(ctx)
-    words = [w.strip() for w in wl.read_text().splitlines()
-             if w.strip() and not w.startswith("#")]
+    # review-B-audit-15#1: a missing GENERIC list is not a missing wordlist when the caller brought its
+    # own. A1d only gets here having mined a non-empty target vocabulary, and those words plus the bogus
+    # baseline are enough to differentiate — refusing to run threw away work we had already paid for.
+    vocab = {"lines": 0, "entries": 0, "valid_entries": 0, "usable": 0, "selected": 0, "withheld": 0,
+             "accepted": 0, "undecodable": 0, "rejected": 0, "unreadable": False, "absent": wl is None}
+    st["vocabulary"] = vocab
+    generic: list = []
+    if wl is not None:
+        try:
+            raw = Path(wl).read_bytes()
+        except OSError:
+            # review-B-audit-16#2: ABSENT and PRESENT-BUT-UNREADABLE are different facts and were both
+            # becoming b"". The caller's own words still run; the loss is measured, not swallowed.
+            raw = b""
+            vocab["unreadable"] = True
+        for chunk in raw.splitlines():
+            vocab["lines"] += 1
+            try:
+                w = chunk.decode("utf-8").strip()  # strict: these labels are CONTACTED, like every other
+            except UnicodeDecodeError:             # active vocabulary (review-B-audit-10#2)
+                vocab["undecodable"] += 1
+                continue
+            if w and not w.startswith("#"):
+                generic.append(w)
     # A1d: fold the target-specific words (mined from the crawl) IN FRONT so the target's own
     # naming vocabulary is tried first, then dedup + cap so brute load stays bounded.
-    if extra_words:
-        words = list(dict.fromkeys([w for w in extra_words if w] + words))
-    words = words[:5000]
+    candidates = [w for w in (extra_words or []) if w] + generic
+    # review-B-audit-16#1: a decodable line is not a LABEL. `https://outside.example/x` would build
+    # `https://outside.example/x.<zone>`, whose AUTHORITY httpx resolves as `outside.example` — an active
+    # request at a host nobody checked against scope or the contact guard. Every candidate is validated
+    # STRUCTURALLY here, at the boundary that turns a word into a name we will contact.
+    valid: list = []
+    for w in candidates:
+        if _DNS_LABEL_RX.fullmatch(w):
+            valid.append(w.lower())            # canonicalised BEFORE dedup: API and api are ONE name
+        else:
+            vocab["rejected"] += 1
+    # review-B-audit-19#1: PARSING is counted in ENTRIES (what the input offered), SELECTION in unique
+    # NAMES. Mixing them made `API`, `api`, `bad/url` report eligible=2 for three entries. Deduplication
+    # is not a loss — the two spellings are ONE name we would contact — so it is neither omitted nor
+    # eligible twice; it is simply where one measure ends and the next begins.
+    # review-B-audit-20#2: ENTRIES is everything the input offered, including the lines we could not even
+    # decode — assigning `len(candidates)` counted them out while the coverage denominator counted them in.
+    vocab["valid_entries"] = len(valid)
+    vocab["entries"] = len(valid) + vocab["rejected"] + vocab["undecodable"]
+    usable = list(dict.fromkeys(valid))
+    # review-B-audit-17#1: the cap SILENTLY dropped valid labels and then reported the truncated count as
+    # "accepted", so thousands of withheld words produced no omission at all. Usable, selected and withheld
+    # are three separate facts, and the cap is reported as the POLICY bound it is.
+    words = usable[:WILDCARD_WORD_CAP]
+    vocab["usable"] = len(usable)
+    vocab["accepted"] = vocab["selected"] = len(words)
+    vocab["withheld"] = len(usable) - len(words)
+    if not words:
+        _wc_vocab_coverage(source_id, label, vocab)
+        return _gate("no usable vocabulary")       # nothing to probe WITH -> zero zones attempted
+    st["blocked"]["zone_cap"] = max(0, len(_zones_all) - ZONE_CAP)
+    block_private = netguard._block_private(ctx)
 
     def _sig(o):
         return (o.get("status_code"), o.get("content_length"),
@@ -505,8 +659,12 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         if _wintel:
             netguard.record_internal(ctx, f"*.{zone}", _wintel)
         if _wstate in ("self", "private_blocked"):
+            # review-B-audit-15#3: this omission used to raise the unsubmitted count with no reason, so a
+            # capped run blamed the cap for zones the CONTACT GUARD had refused.
+            st["blocked"]["self_or_private"] += 1
             continue
         zones_probed += 1
+        st["probed_zones"] = zones_probed
         bogus = [f"quarry-wc-{_uuid.uuid4().hex[:10]}.{zone}" for _ in range(2)]
         cf = ctx.write_list(f"{label}_cand_{zone.replace('.', '_')}.txt",
                             [f"{w}.{zone}" for w in words] + bogus)
@@ -546,13 +704,26 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
                     ctx.run.add("resolved", {"host": host, "a": o.get("a") or [],
                                              "sources": [source], "raw_ref": str(hx)})
                     kept.add(host)
+    _wc_vocab_coverage(source_id, label, vocab)
+    _why = "; ".join(p for p in (
+        f"{st['blocked']['zone_cap']} zone(s) over the {ZONE_CAP}-zone cap"
+        if st["blocked"]["zone_cap"] else "",
+        f"{st['blocked']['self_or_private']} zone(s) refused by the self/private contact guard"
+        if st["blocked"]["self_or_private"] else "") if p)
+    # review-B-audit-18#2: ZONE reasons only. The vocabulary facts live in `stats["vocabulary"]`, and a
+    # caller that reported both used to print the word cap twice.
+    st["blocked_reason"] = _why
     # coverage AFTER filtering (audit #5): `tested` = zones ACTUALLY probed (safe candidates existed), so a
     # zone skipped for being internal / dnsx-missing is honestly counted as omitted, not tested.
-    events.coverage_partial("vertical.wildcard_http", kind=events.COVERAGE_CAP, measure="zones",
+    # review-B-audit-15#4 / 16#3: the SOURCE and the UNIT are the caller's. Reconciliation keeps the
+    # latest per (source, unit) and then aggregates per source — a hard-coded id let the A1d invocation
+    # replace the vertical pass's coverage AND file its own work under the vertical lifecycle.
+    events.coverage_partial(source_id, kind=events.COVERAGE_CAP, measure="zones",
+                            unit=label,
                             eligible=len(_zones_all), tested=zones_probed,
                             omitted=max(0, len(_zones_all) - zones_probed),
-                            reason=f"wildcard vhost zones {zones_probed}/{len(_zones_all)} probed "
-                                   f"(cap {ZONE_CAP}; internal/unresolved zones skipped)")
+                            reason=f"{label}: wildcard vhost zones {zones_probed}/{len(_zones_all)} probed"
+                                   + (f" ({_why})" if _why else ""))
     if kept:
         ctx.echo(f"  wildcard: +{len(kept)} distinct vhost(s) recovered via HTTP-differentiation ({label})")
     return kept

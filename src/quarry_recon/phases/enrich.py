@@ -9,12 +9,69 @@ ones that resolve, so late-discovered hosts get the same treatment as vertical-d
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import json as _json
 
 from .. import normalize
 from .. import settings
-from ..runner import (fresh_artifact_dir, have, nuclei_timeout, reclassify_from_files, run as exec_tool,
-                      scaled_timeout, skipped)
+from ..runner import (RunResult, Status, fresh_artifact_dir, have, nuclei_timeout, reclassify_from_files,
+                      run as exec_tool, scaled_timeout, skipped)
+
+
+def _a1d_base_words(ctx, wordlist_fn, loss: dict) -> set:
+    """The configured BASE dictionary, read inside A1d's loss boundary.
+
+    review-B-audit-12#2: this read sat outside every boundary — a permission or decoding failure escaped
+    `_a1d_recursive_brute`, recorded no A1d result at all and took the rest of the enrich phase with it.
+    The base list is only used to DEDUP mined words against, so failing to read it does not stop A1d; it
+    makes the run re-brute dictionary words, which is a loss worth reporting, not a reason to abort."""
+    try:
+        base_wl = wordlist_fn(ctx)
+    except Exception as ex:
+        loss["base_error"] = f"the base wordlist could not be located ({type(ex).__name__})"
+        return set()
+    if not base_wl:
+        return set()
+    try:
+        raw = Path(base_wl).read_bytes()
+    except OSError as ex:
+        loss["base_error"] = f"the base wordlist could not be read ({type(ex).__name__})"
+        return set()
+    out, dropped = set(), 0
+    for chunk in raw.splitlines():
+        try:
+            w = chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            dropped += 1                       # a line we cannot decode cannot exclude anything
+            continue
+        w = w.strip().lower()
+        if w and not w.startswith("#"):
+            out.add(w)
+    if dropped:
+        loss["base_dropped_lines"] = dropped
+    return out
+
+
+def _a1d_loss_why(loss: dict, produced: int) -> str:
+    """One accurate sentence for everything A1d lost, or "" when nothing was lost.
+
+    review-B-audit-12#1: "every mined wordlist artifact was unreadable" was asserted whenever ANY file was
+    unreadable, so one unreadable file beside a readable-but-empty one produced a false claim. What the
+    readable files yielded is stated, not assumed."""
+    files, unreadable = loss.get("files", 0), loss.get("unreadable_files", 0)
+    parts = []
+    if unreadable:
+        parts.append(f"ALL {files} mined wordlist artifact(s) unreadable" if unreadable == files and files
+                     else (f"{unreadable}/{files} mined wordlist artifact(s) unreadable — the readable "
+                           f"{files - unreadable} yielded {produced} usable word(s)"))
+    if loss.get("dropped_lines"):
+        parts.append(f"{loss['dropped_lines']} mined line(s) not valid UTF-8 and dropped")
+    if loss.get("base_error"):
+        parts.append(f"{loss['base_error']} — mined words were NOT deduped against it")
+    if loss.get("base_dropped_lines"):
+        parts.append(f"{loss['base_dropped_lines']} base wordlist line(s) not valid UTF-8")
+    return "; ".join(parts)
 
 
 def _a1d_recursive_brute(ctx) -> set[str]:
@@ -30,18 +87,33 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     if scope.passive_only:
         return set()
     from .vertical import _target_wordlist, _wildcard_differentiate, _resolvers, _wordlist
-    base_wl = _wordlist(ctx)
-    base_words = {w.strip().lower() for w in base_wl.read_text().splitlines()
-                  if w.strip() and not w.startswith("#")} if base_wl else set()
-    twords = _target_wordlist(ctx, base_words)
+    wl_loss: dict = {}
+    base_words = _a1d_base_words(ctx, _wordlist, wl_loss)
+    twords = _target_wordlist(ctx, base_words, loss=wl_loss)
+    # review-B-audit-12#1: ONE attempt, ONE outcome. Two independent branches used to record a PARTIAL and
+    # then a FAILED/SKIPPED for the same attempt, and the FAILED claimed "every artifact was unreadable"
+    # even when a readable one had simply yielded nothing. The verdict is chosen once, from what was
+    # PRODUCED and what was LOST.
+    lost = _a1d_loss_why(wl_loss, len(twords))
     if not twords:
-        ctx.run.record("enrich", skipped("a1d", "no target-specific words mined from crawl"))
+        # review-B-audit-13#2: the base list exists only to DEDUP mined words against. With nothing mined,
+        # dedup had no work to do, so a base-only failure is not A1d damage — a genuine no-input SKIP must
+        # survive it. Damage to the MINED input is a different fact and still fails.
+        mined_damage = _a1d_loss_why({k: v for k, v in wl_loss.items() if not k.startswith("base_")}, 0)
+        if mined_damage:
+            why = (f"A1d has NO vocabulary and the mined input was DAMAGED ({mined_damage}) — not proof "
+                   f"the target had none")
+            ctx.run.record("enrich", RunResult("a1d", ["a1d"], Status.FAILED, None, 0.0, None, 0, note=why))
+            ctx.echo(f"  A1d: {why}")
+        else:
+            ctx.run.record("enrich", skipped("a1d", "no target-specific words mined from crawl"))
         return set()
     twl = ctx.write_list("a1d_target_words.txt", twords)
     ctx.echo(f"  A1d: {len(twords)} target-specific word(s) mined from crawl → recursive re-brute")
     discovered: set[str] = set()
 
     # apex brute with the target wordlist (same puredns invocation as vertical's brute)
+    submitted_apexes = 0
     if have("puredns"):
         resolvers, trusted = _resolvers(ctx)
         for d in prof.apex_domains:
@@ -58,12 +130,52 @@ def _a1d_recursive_brute(ctx) -> set[str]:
                     if scope.in_scope(e["host"]) and not scope.is_oos(e["host"]):
                         ctx.run.add("subdomain", e)
                         discovered.add(e["host"])
+            submitted_apexes += 1
+    else:
+        # review-B-audit-13#1: this branch was silently skipped, so eligible A1d work simply vanished —
+        # the run showed a mined wordlist and no brute, and nothing said why. A missing REQUIRED tool is
+        # already a coverage gap in the manifest; the note carries how much work went unsubmitted.
+        ctx.run.record("enrich", skipped("puredns", f"not installed — {len(prof.apex_domains)} A1d apex "
+                                                    f"brute(s) unsubmitted"))
 
     # wildcard-zone differ with the target words folded in (zones persisted by vertical)
     zones = set(ctx.run.values("wildcard_zone"))
+    wc: dict = {}
     if zones:
         discovered.update(_wildcard_differentiate(ctx, zones, extra_words=twords, phase="enrich",
-                                                  label="wildcard-a1d", source="wildcard-http-a1d"))
+                                                  label="wildcard-a1d", source="wildcard-http-a1d",
+                                                  source_id="enrich.wildcard_a1d", stats=wc))
+    # ── ONE A1d outcome, chosen AFTER the work (review-B-audit-13#1): the earlier note claimed "the
+    #    brute ran with less vocabulary" before anything had run — including when it never ran at all.
+    unsubmitted = max(0, len(prof.apex_domains) - submitted_apexes)
+    # review-B-audit-14: "there were wildcard zones" is not "the wildcard pass ran" — passive mode, a
+    # missing httpx, no wordlist, the self-contact guard and the zone cap all leave zones UNSUBMITTED.
+    # The differentiator now says what it actually probed, and both facts are reported.
+    wc_eligible, wc_probed = wc.get("eligible_zones", 0), wc.get("probed_zones", 0)
+    wc_unsubmitted = max(0, wc_eligible - wc_probed)
+    parts = ([lost] if lost else []) + ([f"puredns is not installed — {unsubmitted} apex brute(s) "
+                                         f"unsubmitted"] if unsubmitted else [])
+    if wc_unsubmitted:
+        parts.append(f"{wc_unsubmitted}/{wc_eligible} wildcard zone(s) not differentiated"
+                     + (f" ({wc['blocked_reason']})" if wc.get("blocked_reason") else ""))
+    # review-B-audit-16#2: vocabulary the wildcard pass could not use is A1d's loss too, and it was only
+    # ever looked at when zones went unsubmitted — so a probed run with a damaged wordlist read clean.
+    _v = wc.get("vocabulary") or {}
+    _vlost = _v.get("undecodable", 0) + _v.get("rejected", 0)
+    if _v.get("unreadable"):
+        parts.append("the wildcard wordlist is present and UNREADABLE — only the mined vocabulary was used")
+    if _vlost:
+        parts.append(f"{_vlost} wildcard vocabulary word(s) unusable ({_v.get('undecodable', 0)} not valid "
+                     f"UTF-8, {_v.get('rejected', 0)} not a single DNS label)")
+    if _v.get("withheld"):
+        parts.append(f"{_v['withheld']} usable wildcard word(s) withheld by the word cap")
+    if parts:
+        ran = bool(submitted_apexes or wc_probed)
+        why = (f"A1d ran with less than its eligible work ({'; '.join(parts)})" if ran else
+               f"A1d did NOT run ({'; '.join(parts)})")
+        ctx.run.record("enrich", RunResult("a1d", ["a1d"], Status.PARTIAL if ran else Status.FAILED,
+                                           None, 0.0, None, 0, note=why))
+        ctx.echo(f"  A1d: {why}")
     if discovered:
         ctx.echo(f"  A1d: +{len(discovered)} host(s) via target-specific recursive re-brute")
     return discovered
