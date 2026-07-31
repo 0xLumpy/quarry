@@ -285,8 +285,12 @@ def _report(lane: str, out: SweepResult, clock) -> None:
         # review v15#3: NOT a third coverage denominator — it would re-count the candidate remainder the
         # selection record already owns, and it would have to invent a `kind` for a stop it does not model.
         # It is structured METADATA about the same selection: who the scheduled prefix belonged to.
-        events.ledger(lane, unit="attribution",
-                      produced={"eligible": sum(out.per_source_eligible.values()),
-                                "scheduled": sum(out.per_source_attempted.values())},
-                      per_source_eligible=dict(sorted(out.per_source_eligible.items())),
-                      per_source_scheduled=dict(sorted(out.per_source_attempted.items())))
+        # `produced` is RESERVED for real parser/store entity counts and a status view folds it as such —
+        # selection counters there would read as output this lane produced (review v16#1). The whole
+        # structure rides as its own field instead.
+        events.ledger(lane, unit="attribution", produced=None,
+                      selection_attribution={
+                          "eligible": sum(out.per_source_eligible.values()),
+                          "scheduled": sum(out.per_source_attempted.values()),
+                          "per_source_eligible": dict(sorted(out.per_source_eligible.items())),
+                          "per_source_scheduled": dict(sorted(out.per_source_attempted.items()))})

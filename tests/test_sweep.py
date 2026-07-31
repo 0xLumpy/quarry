@@ -273,7 +273,7 @@ class TestStableIdentityAndAttribution:
         out, _t = _run(tmp_path, attribution=lambda w: "js" if w.endswith(("0", "2", "4")) else "katana")
         assert sum(out.per_source_eligible.values()) == 20
         assert sum(out.per_source_attempted.values()) == 20             # an unbounded sweep ran them all
-        attr = [e for e in _events(tmp_path) if e.get("unit") == "attribution"][-1]
+        attr = [e for e in _events(tmp_path) if e.get("unit") == "attribution"][-1]["selection_attribution"]
         assert attr["per_source_scheduled"] == attr["per_source_eligible"], attr   # an unbounded sweep
         assert set(attr["per_source_eligible"]) == {"js", "katana"}, attr
 
@@ -365,9 +365,11 @@ class TestReviewV14:
         assert len(tool.calls) == 1, tool.calls
         assert sum(out.per_source_eligible.values()) == 20
         assert sum(out.per_source_attempted.values()) == out.attempted_pairs < 20
-        attr = [e for e in _events(tmp_path) if e.get("unit") == "attribution"][-1]
-        assert attr["produced"]["scheduled"] == out.attempted_pairs, attr
-        assert attr["produced"]["eligible"] == 20 > attr["produced"]["scheduled"], attr
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "attribution"][-1]
+        attr = ev["selection_attribution"]
+        assert ev.get("produced") is None, ev          # `produced` is for real entity counts only
+        assert attr["scheduled"] == out.attempted_pairs, attr
+        assert attr["eligible"] == 20 > attr["scheduled"], attr
         assert sum(attr["per_source_scheduled"].values()) == out.attempted_pairs, attr
 
     def test_BUDGET_EXHAUSTION_is_a_named_stop(self, tmp_path, monkeypatch):
@@ -440,8 +442,10 @@ class TestReviewV15:
         assert not [e for e in evs if e.get("measure") == "vocabulary_attribution"], "a third denominator"
         sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
         assert sel["kind"] == "timeout" and "not installed" in sel["reason"], sel
-        attr = [e for e in evs if e.get("unit") == "attribution"][-1]
-        assert attr["produced"] == {"eligible": 20, "scheduled": 0}, attr
+        ev = [e for e in evs if e.get("unit") == "attribution"][-1]
+        assert ev.get("produced") is None, ev
+        assert ev["selection_attribution"]["eligible"] == 20, ev
+        assert ev["selection_attribution"]["scheduled"] == 0, ev
 
     def test_the_two_ATTEMPTED_totals_agree_even_on_the_invariant_path(self, tmp_path, monkeypatch):
         """v15#4: `attempted_pairs` counted on return, the per-source split only after publication — so a
@@ -453,3 +457,14 @@ class TestReviewV15:
         out, tool = _run(tmp_path, attribution=lambda w: "js")
         assert out.stop_kind == "machinery" and out.slots_attempted == 1
         assert sum(out.per_source_attempted.values()) == out.attempted_pairs, out
+
+    def test_attribution_NEVER_touches_the_reserved_produced_namespace(self, tmp_path):
+        """v16#1: `produced` is real parser/store entity counts, and a status view folds it as such — a
+        two-word sweep reporting `produced={'eligible': 2, 'scheduled': 2}` presents selection counters as
+        output this lane created."""
+        out, _t = _run(tmp_path, words=["alpha", "beta"], attribution=lambda w: "js")
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "attribution"][-1]
+        assert ev.get("produced") is None, ev
+        assert ev["selection_attribution"] == {"eligible": 2, "scheduled": 2,
+                                               "per_source_eligible": {"js": 2},
+                                               "per_source_scheduled": {"js": 2}}, ev
