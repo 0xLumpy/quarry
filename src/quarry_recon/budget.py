@@ -955,7 +955,7 @@ class Ledger:
 
 def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, budget: Budget,
                      noun: str = "item", durable: bool = True, stop: str | None = None,
-                     unit: str | None = None) -> None:
+                     unit: str | None = None, cap_reason: str | None = None) -> None:
     """SELECTION coverage: of everything eligible, how much did we get to at all?
 
     Emitted EVERY run (omitted=0 when the whole set was processed) so a later unbounded rerun CLEARS a prior
@@ -967,7 +967,13 @@ def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, 
     # missing dependency. Wording every omission as "budget exhausted" would misname those, and the KIND
     # matters too: a budget is a CAP we chose, anything else is a TIMEOUT-class gap (step-4 design v4#3).
     kind = events.COVERAGE_CAP if stop is None else events.COVERAGE_TIMEOUT
-    if omitted and stop is not None:
+    if omitted and cap_reason is not None and stop is None:
+        # an OPERATOR CAP that is not the wall clock — a per-target candidate bound, say. Still a CAP we
+        # chose (never a TIMEOUT-class failure), but "budget exhausted after 0s of 0s" would be a lie.
+        tail = ("left as a RESUMABLE remainder" if durable else
+                "left over — completion state was NOT persisted, so this lane RESTARTS from the beginning")
+        why = f"{cap_reason} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
+    elif omitted and stop is not None:
         tail = ("left as a RESUMABLE remainder" if durable else
                 "left over — completion state was NOT persisted, so this lane RESTARTS from the beginning")
         why = f"{stop} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"

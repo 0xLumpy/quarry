@@ -17,7 +17,8 @@ from .. import normalize
 from .. import settings
 from ..runner import (RunResult, Status, fresh_artifact_dir, have, nuclei_timeout, reclassify_from_files,
                       run as exec_tool, scaled_timeout, skipped)
-from .. import budget, sweep
+from .. import budget, events, sweep
+from ..contract import registered
 
 
 #: how many mined labels A1d may actually brute-force per apex (puredns, DNS). A SPEND bound, unchanged
@@ -96,10 +97,11 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
     if loss.get("sweep_machinery"):
         parts.append(loss["sweep_machinery"])
     if loss.get("withheld_by_word_cap"):
-        # the SPEND bound is a fact, like every other cap: it withheld mined vocabulary this run did not
-        # brute-force. (Making that bound measured, chunked and resumable is step 4.2.)
-        parts.append(f"{loss['withheld_by_word_cap']}/{loss.get('after_base', 0)} mined word(s) withheld "
-                     f"by the {A1D_WORD_CAP}-word A1d spend bound")
+        # the SPEND bound is a fact, like every other cap. Counted in candidate-TARGET PAIRS, exactly as
+        # the scheduler measures them, and taken from what it ACTUALLY submitted — whole buckets can
+        # underfill the bound, so the arithmetic `corpus - cap` was wrong (review v17#4).
+        parts.append(f"{loss['withheld_by_word_cap']}/{loss.get('after_base', 0)} candidate(s) withheld "
+                     f"by the {A1D_WORD_CAP}-per-apex A1d spend bound")
     return "; ".join(parts)
 
 
@@ -168,6 +170,11 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     if have("puredns"):
         resolvers, trusted = _resolvers(ctx)
 
+    sid = "enrich.a1d_brute"
+    fp = events.work_unit(sid, inputs={"apexes": sorted(prof.apex_domains)},
+                          config={"per_apex": A1D_WORD_CAP, "buckets": sweep.BUCKETS},
+                          schema_version=sweep.SCHEMA)
+
     def _brute(apex: str, bucket: str, words):
         nonlocal submitted_apexes
         wl_file = ctx.write_list(f"a1d_words_{apex.replace('.', '_')}_{bucket}.txt", sorted(words))
@@ -179,7 +186,8 @@ def _a1d_recursive_brute(ctx) -> set[str]:
         br = ctx.run.raw_path("enrich", "puredns", f"a1d-brute-{apex}-{bucket}.txt")
         r = exec_tool("puredns", cmd, raw_path=br, timeout=ctx.http_timeout)
         ctx.run.record("enrich", r)
-        if apex not in apexes_run:
+        if r.status is not Status.SKIPPED and apex not in apexes_run:
+            # an invocation that never spawned is not an apex we brute-forced (review v17#3)
             apexes_run.add(apex)
             submitted_apexes = len(apexes_run)
         if r.raw_path and r.raw_path.exists():
@@ -189,8 +197,19 @@ def _a1d_recursive_brute(ctx) -> set[str]:
                     discovered.add(row["host"])
         return r
 
+    if not registered(sid):
+        # the registry is authoritative for EXECUTION: an absent or misspelled entry must stop active DNS
+        # traffic, not merely omit a line from a report (review v17#1).
+        return discovered
+    events.tool_start(sid, cmd=["puredns", "bruteforce", "(scheduled)"],
+                      input_total=len(prof.apex_domains), work_unit=fp)
     swept = sweep.run_sweep(
-        lane="a1d_brute", state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched",
+        lane="a1d_brute",
+        # the SCHEMA is part of the path: changing `BUCKETS` bumps it, and a bumped schema must start a
+        # fresh rotation rather than meeting a document `RotationProgress` will (correctly) refuse to
+        # overwrite — which would leave the lane unable to reserve anything until an operator intervened
+        # (review v17#2).
+        state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}",
         targets=list(prof.apex_domains), vocabulary=lambda _apex: list(kept), execute=_brute,
         budget_s=budget.budget_seconds("A1D_BUDGET_S"), coverage_lane="enrich.a1d_brute",
         dependency_ok=lambda: have("puredns"), max_pairs_per_target=A1D_WORD_CAP,
@@ -199,12 +218,26 @@ def _a1d_recursive_brute(ctx) -> set[str]:
         wl_loss["sweep_machinery"] = "; ".join(swept.machinery)
     if swept.stop_kind not in (None, "bound"):
         wl_loss["sweep_stop"] = swept.stop
-    if swept.stop_kind == "dependency":
-        # review-B-audit-13#1: an eligible brute that never ran must SAY so — a missing REQUIRED tool
-        # is already a manifest gap, and the note carries how much work went unsubmitted. The gate
-        # itself is the sweep's (one authority), so this is the reporting half only.
+    if swept.stop_kind == "dependency" and not swept.slots_attempted:
+        # review-B-audit-13#1: an eligible brute that never ran must SAY so — a missing REQUIRED tool is
+        # already a manifest gap, and the note carries how much work went unsubmitted. The gate itself is
+        # the sweep's (one authority), so this is the reporting half. A tool that vanished MID-sweep is a
+        # different fact and is carried by the terminal, not by a second dependency record (v17#3).
         ctx.run.record("enrich", skipped("puredns", f"not installed — {len(prof.apex_domains)} A1d "
                                                     f"apex brute(s) unsubmitted"))
+    # ONE terminal for the source, over the WHOLE multi-bucket sweep (v17#1)
+    if swept.contended:
+        _st, _why = Status.FAILED, swept.stop
+    elif swept.stop_kind == "dependency":
+        _st, _why = Status.SKIPPED, swept.stop
+    elif swept.machinery:
+        _st = Status.PARTIAL if swept.slots_obtained else Status.FAILED
+        _why = "; ".join(swept.machinery)
+    else:
+        _st = Status.SUCCESS if swept.slots_obtained else Status.EMPTY
+        _why = swept.stop
+    events.tool_finish(sid, status=_st.value, reason=_why, work_unit=fp,
+                       produced={"subdomains": len(discovered)})
 
     # wildcard-zone differ with the target words folded in (zones persisted by vertical)
     zones = set(ctx.run.values("wildcard_zone"))
@@ -217,15 +250,22 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     #    brute ran with less vocabulary" before anything had run — including when it never ran at all.
     if wc.get("eligible_zones", 0) > 0:
         wl_loss["wildcard_withheld"] = max(0, len(kept) - A1D_WILDCARD_WORD_CAP)
-        lost = _a1d_loss_why(wl_loss, len(twords))     # now that the wildcard side has an answer
+    # review v17#3/#4: everything below used to assume one call per apex — `unsubmitted` was always
+    # blamed on a missing tool, and the withheld count assumed the scheduler spends the cap exactly. Both
+    # come from the sweep now: it knows what it submitted and why it stopped.
+    if swept is not None:
+        wl_loss["withheld_by_word_cap"] = max(0, swept.eligible_pairs - swept.attempted_pairs)
+        wl_loss["after_base"] = swept.eligible_pairs
     unsubmitted = max(0, len(prof.apex_domains) - submitted_apexes)
+    unsubmitted_why = (swept.stop if swept is not None and swept.stop else "puredns is not installed")
     # review-B-audit-14: "there were wildcard zones" is not "the wildcard pass ran" — passive mode, a
     # missing httpx, no wordlist, the self-contact guard and the zone cap all leave zones UNSUBMITTED.
     # The differentiator now says what it actually probed, and both facts are reported.
     wc_eligible, wc_probed = wc.get("eligible_zones", 0), wc.get("probed_zones", 0)
     wc_unsubmitted = max(0, wc_eligible - wc_probed)
-    parts = ([lost] if lost else []) + ([f"puredns is not installed — {unsubmitted} apex brute(s) "
-                                         f"unsubmitted"] if unsubmitted else [])
+    lost = _a1d_loss_why(wl_loss, swept.attempted_pairs if swept is not None else len(twords))
+    parts = ([lost] if lost else []) + ([f"{unsubmitted} apex brute(s) unsubmitted "
+                                         f"({unsubmitted_why})"] if unsubmitted else [])
     if wc_unsubmitted:
         parts.append(f"{wc_unsubmitted}/{wc_eligible} wildcard zone(s) not differentiated"
                      + (f" ({wc['blocked_reason']})" if wc.get("blocked_reason") else ""))

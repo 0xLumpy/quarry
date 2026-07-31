@@ -12,7 +12,7 @@ import pathlib
 
 import pytest
 
-from quarry_recon import events
+from quarry_recon import events, sweep
 from quarry_recon.phases import crawl
 
 from test_crawl_fetch_lanes import _Ctx, TestXnLinkFinderHasOneLifecycle
@@ -1032,7 +1032,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert len(submitted) == len(set(submitted)), "a word was submitted twice"
             recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
             assert len(recs) == 1 and recs[0].status == "partial", recs
-            assert "450/500 mined word(s) withheld by the 50-word A1d spend bound" in recs[0].note, recs
+            assert "450/500 candidate(s) withheld by the 50-per-apex A1d spend bound" in recs[0].note, recs
         finally:
             events.reset()
 
@@ -1085,7 +1085,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert len(wc_cands) == 3 + 2, wc_cands               # the wildcard bound + 2 baseline names
             recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
             assert len(recs) == 1 and recs[0].status == "partial", recs
-            assert "19/20 mined word(s) withheld by the 1-word A1d spend bound" in recs[0].note, recs
+            assert "19/20 candidate(s) withheld by the 1-per-apex A1d spend bound" in recs[0].note, recs
             assert "17/20 mined word(s) withheld from the wildcard differ" in recs[0].note, recs
         finally:
             events.reset()
@@ -1205,7 +1205,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
 
     def test_the_rotation_state_is_PROJECT_scoped(self, tmp_path, monkeypatch):
         _submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(10)])
-        state = tmp_path / "recon" / "state" / "sched" / "a1d_brute.json"
+        state = tmp_path / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}" / "a1d_brute.json"
         assert state.exists(), list((tmp_path / "recon" / "state").rglob("*"))
         assert not (run.dir / "recon").exists()          # evidence is run-scoped, scheduling is not
 
@@ -1223,7 +1223,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
     def test_a_SECOND_LIFECYCLE_on_one_project_submits_nothing(self, tmp_path, monkeypatch):
         """One sweeper per lane: the contender reports a zero-evidence gap instead of duplicate traffic."""
         from quarry_recon import budget as _b
-        sched = tmp_path / "recon" / "state" / "sched"
+        sched = tmp_path / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}"
         sched.mkdir(parents=True, exist_ok=True)
         with _b.state_lock(sched / "a1d_brute.lock"):
             submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(10)])
@@ -1258,7 +1258,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
             pd = [r for r in run.tool_runs("enrich") if r.tool == "puredns"]
             assert len(pd) == 1 and pd[0].status == "skipped", pd
             assert "1 A1d apex brute(s) unsubmitted" in (pd[0].note or ""), pd
-            assert not (tmp_path / "recon" / "state" / "sched" / "a1d_brute.json").exists()
+            assert not (tmp_path / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}"
+                    / "a1d_brute.json").exists()
             evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
             sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
             assert (sel["tested"], sel["omitted"]) == (0, 2) and "not installed" in sel["reason"], sel
@@ -1300,3 +1301,166 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert sum(attr["per_source_scheduled"].values()) == attr["scheduled"], attr
         finally:
             events.reset()
+
+    def test_the_source_is_REGISTRY_GATED_and_BRACKETED(self, tmp_path, monkeypatch):
+        """v17#1: an absent registry entry must stop active DNS traffic, and a multi-bucket sweep still
+        owes the source exactly ONE terminal."""
+        from quarry_recon.phases import enrich
+        submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(8)])
+        evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+        starts = [e for e in evs if e.get("event") == "tool_start" and e.get("source_id") == "enrich.a1d_brute"]
+        fins = [e for e in evs if e.get("event") == "tool_finish" and e.get("source_id") == "enrich.a1d_brute"]
+        assert len(starts) == 1 and len(fins) == 1, (starts, fins)
+        assert starts[0]["input_total"] == 1 and fins[0]["status"] in ("success", "empty"), fins
+
+        monkeypatch.setattr(enrich, "registered", lambda sid: False)
+        blocked, _run2 = self._scheduled(tmp_path, monkeypatch, words=["one", "two"], run_name="t2")
+        assert blocked == [], blocked
+
+    def test_a_SCHEMA_bump_starts_a_FRESH_rotation(self, tmp_path, monkeypatch):
+        """v17#2: without the schema in the PATH, bumping it met a document RotationProgress refuses to
+        overwrite — and the lane could never reserve again until an operator deleted the file."""
+        words = [f"w{i:03d}" for i in range(8)]
+        first, _r1 = self._scheduled(tmp_path, monkeypatch, words=words)
+        assert first, "the first schema never ran"
+        monkeypatch.setattr(sweep, "SCHEMA", sweep.SCHEMA + 1)
+        second, _r2 = self._scheduled(tmp_path, monkeypatch, words=words, run_name="t2")
+        assert second, "a schema bump bricked the lane"
+        base = tmp_path / "recon" / "state" / "sched"
+        assert (base / f"v{sweep.SCHEMA - 1}" / "a1d_brute.json").exists()
+        assert (base / f"v{sweep.SCHEMA}" / "a1d_brute.json").exists()
+
+    def test_a_CONTENDED_sweep_is_not_blamed_on_a_missing_tool(self, tmp_path, monkeypatch):
+        """v17#3: every unattempted apex used to be reported as "puredns is not installed"."""
+        from quarry_recon import budget as _b
+        sched = tmp_path / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}"
+        sched.mkdir(parents=True, exist_ok=True)
+        with _b.state_lock(sched / "a1d_brute.lock"):
+            submitted, run = self._scheduled(tmp_path, monkeypatch, words=["one", "two"])
+        assert submitted == []
+        recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+        assert len(recs) == 1 and "another lifecycle" in recs[0].note, recs
+        assert "not installed" not in recs[0].note, recs
+        assert not [r for r in run.tool_runs("enrich") if r.tool == "puredns"], "a false dependency record"
+        fin = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+               if json.loads(l).get("event") == "tool_finish"
+               and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+        assert fin and fin[-1]["status"] == "failed", fin        # zero evidence under contention
+
+    def test_the_WITHHELD_count_is_the_scheduler_s_own_arithmetic(self, tmp_path, monkeypatch):
+        """v17#4: whole buckets can underfill the bound, so `corpus - cap` disagreed with coverage."""
+        submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(9)],
+                                         cap=4)
+        evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+        sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+        recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+        assert len(submitted) == sel["tested"], (submitted, sel)
+        assert f"{sel['omitted']}/{sel['eligible']} candidate(s) withheld" in recs[0].note, (recs, sel)
+
+    def test_a_BOUND_stop_is_not_reported_as_wall_clock_exhaustion(self, tmp_path, monkeypatch):
+        _submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(9)],
+                                          cap=4)
+        evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+        sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+        assert sel["kind"] == "cap", sel
+        assert "per-target candidate bound" in sel["reason"], sel
+        assert "0s of 0s" not in sel["reason"], sel
+
+    def test_a_tool_that_vanishes_MID_SWEEP_is_not_a_missing_dependency(self, tmp_path, monkeypatch):
+        """v17#3: a SKIPPED result mid-sweep is not "puredns is not installed" — the earlier buckets ran.
+        It also does not count as an apex we brute-forced."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        monkeypatch.setattr(sweep, "BUCKETS", 4)
+        monkeypatch.setattr(enrich, "A1D_WORD_CAP", 50)
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("\n".join(f"w{i:03d}" for i in range(12)))
+            from quarry_recon.runner import RunResult as _RR
+            seen = []
+
+            def flaky(tool, cmd, raw_path=None, timeout=None, **k):
+                seen.append(cmd)
+                status = crawl.Status.EMPTY if len(seen) == 1 else crawl.Status.SKIPPED
+                return _RR(tool, cmd, status, 0, 0.1, None, 0)
+
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool", flaky)
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            assert len(seen) == 2, seen
+            pd = [r for r in run.tool_runs("enrich") if r.tool == "puredns" and r.status == "skipped"]
+            assert len(pd) == 1, pd          # the SKIPPED invocation itself, NOT a "not installed" record
+            assert "not installed" not in " ".join(r.note or "" for r in pd), pd
+            recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+            assert len(recs) == 1 and "the tool did not run" in recs[0].note, recs
+            # the apex WAS brute-forced (the first bucket ran), so nothing is "unsubmitted" for it
+            assert "apex brute(s) unsubmitted" not in recs[0].note, recs
+        finally:
+            events.reset()
+
+    def test_the_withheld_count_survives_an_UNDERFILLED_bound(self, tmp_path, monkeypatch):
+        """v17#4: whole buckets can leave the bound unspent, so `corpus - cap` overstates what ran."""
+        # MEASURED split at BUCKETS=2 over these 8 words: 5 + 3. With a bound of 7 the second bucket
+        # would cross it, so the sweep submits 5 and leaves 3 — the bound is UNDERFILLED by 2.
+        monkeypatch.setattr(sweep, "BUCKETS", 2)
+        submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(8)],
+                                         cap=7)
+        evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+        sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+        recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+        assert len(submitted) == sel["tested"] == 5, (submitted, sel)     # a whole bucket was skipped
+        assert sel["omitted"] == 3 != 8 - 7, sel                          # `corpus - cap` would say 1
+        assert f"{sel['omitted']}/{sel['eligible']} candidate(s) withheld" in recs[0].note, (recs, sel)
+
+    def test_an_apex_whose_FIRST_invocation_never_ran_is_unsubmitted(self, tmp_path, monkeypatch):
+        """v17#3 (the other half): a SKIPPED invocation is not an apex we brute-forced."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("one\ntwo\n")
+            from quarry_recon.runner import RunResult as _RR
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
+                                    tool, cmd, crawl.Status.SKIPPED, None, 0.0, None, 0))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+            assert len(recs) == 1, recs
+            assert "1 apex brute(s) unsubmitted (the tool did not run)" in recs[0].note, recs
+        finally:
+            events.reset()
+
+    def test_the_BUCKET_COUNT_is_read_at_call_time(self, tmp_path, monkeypatch):
+        """A default argument would freeze the module constant at import, so a bucket-count change (with
+        its schema bump) would silently keep the old slot space."""
+        before = sweep.bucket_of("alpha")
+        monkeypatch.setattr(sweep, "BUCKETS", 3)
+        assert sweep.bucket_of("alpha") != before or sweep.BUCKETS == 3
+        assert int(sweep.bucket_of("alpha")) < 3, sweep.bucket_of("alpha")

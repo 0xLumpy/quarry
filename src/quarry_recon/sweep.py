@@ -40,9 +40,13 @@ SCHEMA = 1
 BUCKETS = 256
 
 
-def bucket_of(word: str, buckets: int = BUCKETS) -> str:
-    """The slot a word belongs to. Stable per word: inserting words never moves the ones already placed."""
-    return f"{int(hashlib.sha256(word.encode('utf-8')).hexdigest()[:8], 16) % buckets:03d}"
+def bucket_of(word: str, buckets: int | None = None) -> str:
+    """The slot a word belongs to. Stable per word: inserting words never moves the ones already placed.
+
+    `BUCKETS` is read at CALL time, not bound as a default: a default argument would freeze the module
+    constant at import, so changing the bucket count (which the timing pass may do, with a schema bump)
+    would silently keep the old slot space."""
+    return f"{int(hashlib.sha256(word.encode('utf-8')).hexdigest()[:8], 16) % (buckets or BUCKETS):03d}"
 
 
 def owner_of(word: str, sources) -> str:
@@ -293,7 +297,10 @@ def _report(lane: str, out: SweepResult, clock) -> None:
     budget.report_selection(lane, measure="candidate_pairs", eligible=out.eligible_pairs,
                             attempted=out.attempted_pairs, budget=clock, noun="candidate",
                             durable=out.durable,
-                            stop=None if out.stop_kind in (None, "budget", "bound") else out.stop)
+                            stop=None if out.stop_kind in (None, "budget", "bound") else out.stop,
+                            # a candidate BOUND is a cap with its own wording: reusing the budget sentence
+                            # would report "exhausted after 0s of 0s" on an unbounded clock (v17#5).
+                            cap_reason=out.stop if out.stop_kind == "bound" else None)
     budget.report_outcome(lane, measure="slot_outcomes", attempted=out.slots_attempted,
                           obtained=out.slots_obtained, classes=out.classes or None, noun="slot")
     if out.per_source_eligible:
