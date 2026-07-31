@@ -105,7 +105,7 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
     return "; ".join(parts)
 
 
-def _a1d_sweep(ctx, prof, kept, origins, execute):
+def _a1d_sweep(ctx, prof, kept, origins, execute, *, dependency_ok):
     """The scheduled apex brute. Isolated so its caller can bracket it in ONE source lifecycle."""
     return sweep.run_sweep(
         lane="a1d_brute",
@@ -116,7 +116,7 @@ def _a1d_sweep(ctx, prof, kept, origins, execute):
         state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}",
         targets=list(prof.apex_domains), vocabulary=lambda _apex: list(kept), execute=execute,
         budget_s=budget.budget_seconds("A1D_BUDGET_S"), coverage_lane="enrich.a1d_brute",
-        dependency_ok=lambda: have("puredns"), max_pairs_per_target=A1D_WORD_CAP,
+        dependency_ok=dependency_ok, max_pairs_per_target=A1D_WORD_CAP,
         attribution=lambda w: sweep.owner_of(w, sorted(origins.get(w) or ["crawl"])))
 
 
@@ -228,9 +228,11 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     origins = wl_loss.get("origins") or {}
     apexes_run: set = set()
     resolvers = trusted = None
-    if have("puredns"):
-        resolvers, trusted = _resolvers(ctx)
-
+    # review v20#1: dependency detection and resolver preparation happen INSIDE the guarded interval
+    # below — they used to run before the registry gate and before `tool_start`, so a raising
+    # `_resolvers()` aborted the whole enrich phase with no A1d lifecycle at all (and silenced the
+    # wildcard lane), and `have()` was observed TWICE: False here and True in the scheduler's gate ran
+    # puredns with `--resolvers-trusted None`.
     sid = "enrich.a1d_brute"
     fp = events.work_unit(sid, inputs={"apexes": sorted(prof.apex_domains)},
                           config={"per_apex": A1D_WORD_CAP, "buckets": sweep.BUCKETS},
@@ -269,7 +271,10 @@ def _a1d_recursive_brute(ctx) -> set[str]:
         # can raise), and a `tool_start` with no `tool_finish` is a source that never answered.
         outcome = (Status.FAILED, "the scheduled brute did not report an outcome")
         try:
-            swept = _a1d_sweep(ctx, prof, kept, origins, _brute)
+            tool_ok = have("puredns")               # ONE observation, used for setup AND the gate
+            if tool_ok:
+                resolvers, trusted = _resolvers(ctx)
+            swept = _a1d_sweep(ctx, prof, kept, origins, _brute, dependency_ok=lambda: tool_ok)
             _a1d_fold_sweep(ctx, prof, swept, wl_loss)          # may raise: still inside the boundary
             outcome = _a1d_terminal(swept, len(discovered))
         except (KeyboardInterrupt, SystemExit):
@@ -286,7 +291,9 @@ def _a1d_recursive_brute(ctx) -> set[str]:
             events.tool_finish(sid, status=outcome[0].value, reason=outcome[1], work_unit=fp,
                                produced={"subdomains": len(discovered)})
 
-    # ── the wildcard differ is its OWN registered lane and runs regardless of the brute above ──
+    # ── the wildcard differ is its own lane and runs regardless of the brute above. NOTE: today
+    #    `enrich.wildcard_a1d` is a COVERAGE identity only — `_wildcard_differentiate` does not yet gate on
+    #    the registry or emit its own start/terminal. Making it an enforced lifecycle is 4.3. ──
 
     # wildcard-zone differ with the target words folded in (zones persisted by vertical)
     zones = set(ctx.run.values("wildcard_zone"))

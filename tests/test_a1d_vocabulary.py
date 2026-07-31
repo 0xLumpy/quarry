@@ -1728,3 +1728,81 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert "yielded 3 usable word(s)" in recs[0].note, recs   # words, never the 6 pairs
         finally:
             events.reset()
+
+    def test_a_failing_RESOLVER_SETUP_terminates_A1d_and_lets_the_wildcard_lane_run(self, tmp_path,
+                                                                                    monkeypatch):
+        """v20#1: `_resolvers()` used to run BEFORE the registry gate and before `tool_start`, so an
+        OSError aborted the whole enrich phase — no A1d terminal at all, and the wildcard lane silenced
+        with it."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("one\ntwo\n")
+            reached = []
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers",
+                                lambda c: (_ for _ in ()).throw(OSError("no resolver file")))
+            monkeypatch.setattr(vertical, "_wildcard_differentiate",
+                                lambda *a, **k: reached.append(a) or {})
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            monkeypatch.setattr(type(run), "values",
+                                lambda self, kind: ["z.acme.com"] if kind == "wildcard_zone" else [],
+                                raising=False)
+            enrich._a1d_recursive_brute(ctx)                 # the phase survives the setup failure
+            evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+            starts = [e for e in evs if e.get("event") == "tool_start"
+                      and e.get("source_id") == "enrich.a1d_brute"]
+            fins = [e for e in evs if e.get("event") == "tool_finish"
+                    and e.get("source_id") == "enrich.a1d_brute"]
+            assert len(starts) == len(fins) == 1, (starts, fins)
+            assert "no resolver file" in (fins[0].get("reason") or ""), fins
+            assert reached, "the wildcard lane must still run after a failed brute setup"
+        finally:
+            events.reset()
+
+    def test_the_DEPENDENCY_is_observed_ONCE_for_setup_and_for_the_gate(self, tmp_path, monkeypatch):
+        """v20#1 (the other half): two independent `have()` observations authorised execution with
+        UNINITIALISED resolver paths — puredns ran with `--resolvers-trusted None`."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("one\ntwo\n")
+            seen = []
+            answers = iter([False])                  # the FIRST observation says no; any later one says yes
+            monkeypatch.setattr(enrich, "have", lambda t: next(answers, True))
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers",
+                                lambda c: (_ for _ in ()).throw(AssertionError("setup must not run")))
+            monkeypatch.setattr(enrich, "exec_tool", lambda tool, cmd, **k: seen.append(cmd))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            assert seen == [], seen        # never executed on the strength of a SECOND observation
+            fins = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                    if json.loads(l).get("event") == "tool_finish"
+                    and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(fins) == 1 and "not installed" in fins[0]["reason"], fins
+        finally:
+            events.reset()
