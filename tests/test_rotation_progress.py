@@ -355,6 +355,12 @@ class TestReviewV11:
         (tmp_path / "a1d.json").write_text("not json")
         broken = _progress(tmp_path)
         assert broken.state_status == "unusable" and broken.state_reason, broken.state_reason
+        # ...and an unusable document is NOT overwritten (v12#1): the rotation degrades, it does not
+        # silently destroy state that might belong to another lifecycle.
+        broken.reserve("acme.com", "07", at=1.0)
+        assert broken.save() is False
+        assert (tmp_path / "a1d.json").read_text() == "not json"
+        (tmp_path / "a1d.json").unlink()                   # recovery is the operator's explicit act
         good = _progress(tmp_path)
         good.reserve("acme.com", "07", at=1.0)
         assert good.save() is True
@@ -368,4 +374,107 @@ class TestReviewV11:
                             if self.name == "a1d.json" else real(self, *a, **k))
         p = _progress(tmp_path)
         assert p.state_status == "unusable" and "unreadable" in p.state_reason
+
+
+class TestReviewV12:
+    """Four contract violations the v12 review reproduced against c6bccd0, each confirmed here first."""
+
+    def test_a_save_NEVER_overwrites_state_it_could_not_read(self, tmp_path, monkeypatch):
+        p = _progress(tmp_path)
+        p.reserve("acme.com", "01", at=1.0)
+        assert p.save() is True
+        before = (tmp_path / "a1d.json").read_bytes()
+
+        later = _progress(tmp_path)
+        later.reserve("acme.com", "02", at=2.0)
+        monkeypatch.setattr(budget.RotationProgress, "_parse",
+                            classmethod(lambda cls, *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))))
+        assert later.save() is False
+        assert (tmp_path / "a1d.json").read_bytes() == before
+
+    def test_an_UNREADABLE_document_is_not_overwritten_either(self, tmp_path, monkeypatch):
+        p = _progress(tmp_path)
+        p.reserve("acme.com", "01", at=1.0)
+        assert p.save() is True
+        before = (tmp_path / "a1d.json").read_bytes()
+        later = _progress(tmp_path)
+        later.reserve("acme.com", "02", at=2.0)
+        real = pathlib.Path.read_text
+        monkeypatch.setattr(pathlib.Path, "read_text",
+                            lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("denied"))
+                            if self.name == "a1d.json" else real(self, *a, **k))
+        assert later.save() is False
+        assert (tmp_path / "a1d.json").read_bytes() == before
+
+    def test_ABSENCE_is_still_a_legitimate_empty_start(self, tmp_path):
+        p = _progress(tmp_path)
+        p.reserve("acme.com", "01", at=1.0)
+        assert p.save() is True and (tmp_path / "a1d.json").exists()
+
+    @pytest.mark.parametrize("kwargs", [
+        {"at": float("nan")},
+        {"at": float("inf")},
+        {"at": -1.0},
+        {"at": True},
+        {"at": "1"},
+    ])
+    def test_reserve_REJECTS_a_timestamp_it_cannot_order_by(self, tmp_path, kwargs):
+        p = _progress(tmp_path)
+        with pytest.raises(ValueError):
+            p.reserve("acme.com", "01", **kwargs)
+
+    @pytest.mark.parametrize("bad", [{"members": 2.9}, {"members": True}, {"members": -1},
+                                     {"content": None}, {"content": ""}, {"content": 7}])
+    def test_complete_REJECTS_what_it_cannot_persist(self, tmp_path, bad):
+        p = _progress(tmp_path)
+        gen = p.reserve("acme.com", "01", at=1.0)
+        kwargs = {"at": 2.0, "content": "digest", "members": 3}
+        kwargs.update(bad)
+        with pytest.raises(ValueError):
+            p.complete("acme.com", "01", gen, **kwargs)
+
+    def test_no_NON_STANDARD_json_token_can_reach_the_document(self, tmp_path):
+        """`json.dumps(float('nan'))` emits a bare `NaN`, which is not JSON and nothing else reads back."""
+        p = _progress(tmp_path)
+        gen = p.reserve("acme.com", "01", at=1.0)
+        p.complete("acme.com", "01", gen, at=2.0, content="d", members=1)
+        assert p.save() is True
+        raw = (tmp_path / "a1d.json").read_text()
+        assert "NaN" not in raw and "Infinity" not in raw, raw
+        json.loads(raw)                                     # strict: no non-standard tokens
+
+    def test_a_CURSOR_ahead_of_the_lane_generation_is_clamped_and_reported(self, tmp_path):
+        (tmp_path / "a1d.json").write_text(json.dumps(
+            {"lane": "a1d", "schema": SCHEMA, "gen": 5, "targets": {"t": {"seq": 99, "slots": {}}}}))
+        p = _progress(tmp_path)
+        assert p.target_seq("t") == 5, p.target_seq("t")     # not 99 for the next 94 lifecycles
+        assert p.state_status == "degraded" and "clamped" in p.state_reason, p.state_reason
+
+    @pytest.mark.parametrize("schema", [1.0, False, True, "1"])
+    def test_a_STORED_schema_must_be_an_exact_int(self, tmp_path, schema):
+        (tmp_path / "a1d.json").write_text(json.dumps(
+            {"lane": "a1d", "schema": schema, "gen": 1, "targets": {}}))
+        assert _progress(tmp_path).state_status == "unusable"
+
+    @pytest.mark.parametrize("schema", [True, 1.0, "1", -1])
+    def test_a_CONFIGURED_schema_must_be_an_exact_int(self, tmp_path, schema):
+        with pytest.raises(ValueError):
+            budget.RotationProgress(tmp_path / "a1d.json", lane="a1d", schema=schema)
+
+    def test_SALVAGED_records_are_reported_as_DEGRADED_not_valid(self, tmp_path):
+        """Keeping the healthy records is right; presenting the result as an intact rotation is not."""
+        (tmp_path / "a1d.json").write_text(json.dumps(
+            {"lane": "a1d", "schema": SCHEMA, "gen": 4,
+             "targets": {"good.com": {"seq": 4, "slots": {"01": {"res": {"gen": 4, "at": 1.0}}}},
+                         "bad.com": ["not a target"]}}))
+        p = _progress(tmp_path)
+        assert p.slot_seq("good.com", "01") == 4            # the healthy record survives
+        assert p.state_status == "degraded" and "dropped" in p.state_reason, p.state_reason
+
+    def test_a_CLEAN_document_is_still_plain_valid(self, tmp_path):
+        p = _progress(tmp_path)
+        gen = p.reserve("acme.com", "01", at=1.0)
+        p.complete("acme.com", "01", gen, at=2.0, content="d", members=1)
+        assert p.save() is True
+        assert _progress(tmp_path).state_status == "valid"
 
