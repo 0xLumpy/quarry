@@ -301,10 +301,21 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     content = {slot: content_digest(words) for slot, words in members.items()}
     owners: dict = {}
     if attribution is not None:
-        for words in members.values():
-            for word in words:
-                owners[word] = src = attribution(word)      # cached: the attempted split must be counted
+        # ELIGIBLE attribution is over the whole deduplicated corpus, not over what survived partitioning
+        # (v35#1): a slot removed as unschedulable is still a pair this lane was eligible to submit, and
+        # dropping it made the attribution denominator disagree with the selection record's. SCHEDULED
+        # attribution is still counted per submitted word, inside the loop.
+        for target, per_target in corpus.items():
+            for word in per_target:
+                owners[word] = src = attribution(word)
                 out.per_source_eligible[src] = out.per_source_eligible.get(src, 0) + 1
+
+    if not members:
+        # NOTHING is schedulable — an empty corpus, or one whose every slot the bounds cannot admit. No
+        # tool could have been invoked and no rotation state is needed, so neither a missing dependency
+        # nor a busy lock is the reason for this run's remainder (v35#2).
+        _report(coverage_lane, out, clock)
+        return out
 
     if dependency_ok is not None and not dependency_ok():
         out.stop = "the tool is not installed"          # no reservations at all (design v7#2)

@@ -924,3 +924,35 @@ class TestExecutorBatching:
         sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
         assert "budget exhausted" in sel["reason"], sel
         assert "RESUMABLE" in sel["reason"] and "UNSCHEDULABLE" in sel["reason"], sel
+
+    def test_ATTRIBUTION_counts_the_WHOLE_eligible_corpus(self, tmp_path, monkeypatch):
+        """v35#1: eligible attribution was taken after unschedulable slots had been removed, so it
+        disagreed with the selection record it describes."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        self._residual(monkeypatch)
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)], attribution=lambda w: "js")
+        assert out.eligible_pairs == 6 and out.unselectable_pairs == 3
+        assert sum(out.per_source_eligible.values()) == 6, out.per_source_eligible
+        assert sum(out.per_source_attempted.values()) == out.attempted_pairs == 3
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "attribution"][-1]
+        assert ev["selection_attribution"]["eligible"] == 6, ev
+        assert ev["selection_attribution"]["scheduled"] == 3, ev
+
+    def test_an_ENTIRELY_unschedulable_workload_blames_no_dependency(self, tmp_path, monkeypatch):
+        """v35#2: with nothing schedulable, the dependency gate still reported "the tool is not
+        installed" — for a tool no slot could ever have invoked."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        monkeypatch.setattr(sweep, "allocate", lambda words, *, cap: {"000": list(words)})
+        out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"], dependency_ok=lambda: False)
+        assert tool.calls == [] and out.stop_kind is None and out.unselectable_pairs == 3
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "not installed" not in sel["reason"] and "UNSCHEDULABLE" in sel["reason"], sel
+
+    def test_an_ENTIRELY_unschedulable_workload_takes_no_rotation_lock(self, tmp_path, monkeypatch):
+        """Contention is likewise not the reason: the lane never needed the state at all."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        monkeypatch.setattr(sweep, "allocate", lambda words, *, cap: {"000": list(words)})
+        with budget.rotation_session(tmp_path, LANE, schema=sweep.SCHEMA):
+            out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"])
+        assert out.contended is False and out.stop_kind is None
+        assert out.unselectable_pairs == 3 and tool.calls == []
