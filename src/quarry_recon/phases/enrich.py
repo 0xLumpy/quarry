@@ -100,8 +100,8 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
         # the SPEND bound is a fact, like every other cap. Counted in candidate-TARGET PAIRS, exactly as
         # the scheduler measures them, and taken from what it ACTUALLY submitted — whole buckets can
         # underfill the bound, so the arithmetic `corpus - cap` was wrong (review v17#4).
-        parts.append(f"{loss['withheld_by_word_cap']}/{loss.get('after_base', 0)} candidate(s) withheld "
-                     f"by the {A1D_WORD_CAP}-per-apex A1d spend bound")
+        parts.append(f"{loss['withheld_by_word_cap']}/{loss.get('sweep_eligible_pairs', 0)} candidate(s) "
+                     f"withheld by the {A1D_WORD_CAP}-per-apex A1d spend bound")
     return "; ".join(parts)
 
 
@@ -120,8 +120,8 @@ def _a1d_sweep(ctx, prof, kept, origins, execute):
         attribution=lambda w: sweep.owner_of(w, sorted(origins.get(w) or ["crawl"])))
 
 
-def _a1d_report_sweep(ctx, prof, swept, wl_loss, sid, fp, produced: int) -> None:
-    """Fold the sweep into the lane's facts and close the source lifecycle with ONE terminal."""
+def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
+    """Fold the sweep into the lane's reported facts. Fallible on purpose — the caller contains it."""
     if swept.machinery:
         wl_loss["sweep_machinery"] = "; ".join(swept.machinery)
     if swept.stop_kind not in (None, "bound"):
@@ -133,10 +133,20 @@ def _a1d_report_sweep(ctx, prof, swept, wl_loss, sid, fp, produced: int) -> None
         # different fact and is carried by the terminal, not by a second dependency record (v17#3).
         ctx.run.record("enrich", skipped("puredns", f"not installed — {len(prof.apex_domains)} A1d "
                                                     f"apex brute(s) unsubmitted"))
-    # ONE terminal for the source, over the WHOLE multi-bucket sweep (v17#1)
-    # review v18#3: the terminal is derived from what was PRODUCED and from the slot CLASSES, not from
-    # "the runner returned". `slots_obtained` counts SUCCESS *and* EMPTY, so an all-empty sweep read
-    # SUCCESS and a failed one read EMPTY, while failed/timed-out/blocked slots never showed at all.
+    # review v19#2: the SELECTION remainder is not automatically cap withholding — contention, a
+    # dependency stop, machinery and the clock all leave `eligible - attempted` behind, and each already
+    # has its own fact. Only a `bound` stop is the spend bound withholding work.
+    if swept.stop_kind == "bound":
+        wl_loss["withheld_by_word_cap"] = max(0, swept.eligible_pairs - swept.attempted_pairs)
+        wl_loss["sweep_eligible_pairs"] = swept.eligible_pairs
+
+
+def _a1d_terminal(swept, produced: int):
+    """ONE terminal for the source, over the WHOLE multi-bucket sweep (v17#1).
+
+    review v18#3: derived from what was PRODUCED and from the slot CLASSES, not from "the runner
+    returned" — `slots_obtained` counts SUCCESS *and* EMPTY, so an all-empty sweep read SUCCESS and a
+    failed one read EMPTY, while failed/timed-out/blocked slots never showed at all."""
     if swept.contended:
         _st, _why = Status.FAILED, swept.stop
     elif swept.stop_kind == "dependency" and not swept.slots_attempted:
@@ -153,8 +163,7 @@ def _a1d_report_sweep(ctx, prof, swept, wl_loss, sid, fp, produced: int) -> None
     else:
         _st = Status.SUCCESS if produced else Status.EMPTY
         _why = swept.stop
-    events.tool_finish(sid, status=_st.value, reason=_why, work_unit=fp,
-                       produced={"subdomains": produced})
+    return _st, _why
 
 
 def _a1d_recursive_brute(ctx) -> set[str]:
@@ -184,7 +193,7 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     # whole retained corpus, in rotation. `twords` stays only as the "is there vocabulary at all" answer.
     twords = kept
     wc_words = sorted(kept[:A1D_WILDCARD_WORD_CAP])            # -> the wildcard differ (HTTP), per zone
-    wl_loss["withheld_by_word_cap"] = max(0, len(kept) - A1D_WORD_CAP)
+    # the DNS withholding is the SWEEP's fact — it knows what it submitted and why it stopped (v19#2).
     # review-step4-remeasure2#1: the wildcard withholding is NOT a fact yet. Words are only withheld from
     # work that EXISTS, and whether any wildcard zone is eligible is something only the pass can say — a
     # puredns-only run with no in-scope zone was degrading itself over vocabulary nothing wanted.
@@ -255,24 +264,27 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     if registered(sid):
         events.tool_start(sid, cmd=["puredns", "bruteforce", "(scheduled)"],
                           input_total=len(prof.apex_domains), work_unit=fp)
+        # review v18#2 / v19#1: the WHOLE start-to-terminal interval is protected, and the terminal is
+        # emitted in `finally` — exactly once, whatever happened. Reporting is fallible too (`record()`
+        # can raise), and a `tool_start` with no `tool_finish` is a source that never answered.
+        outcome = (Status.FAILED, "the scheduled brute did not report an outcome")
         try:
             swept = _a1d_sweep(ctx, prof, kept, origins, _brute)
+            _a1d_fold_sweep(ctx, prof, swept, wl_loss)          # may raise: still inside the boundary
+            outcome = _a1d_terminal(swept, len(discovered))
         except (KeyboardInterrupt, SystemExit):
-            # review v18#2: a started lifecycle is ALWAYS closed. Cancellation gets its terminal first,
-            # then propagates — a `tool_start` with no `tool_finish` is a source that never answered.
-            events.tool_finish(sid, status=Status.PARTIAL.value if discovered else Status.FAILED.value,
-                               reason="CANCELLED mid-sweep — evidence KEPT" if discovered
-                                      else "CANCELLED mid-sweep — nothing extracted",
-                               work_unit=fp, produced={"subdomains": len(discovered)})
-            raise
-        except Exception as ex:                     # a non-contention acquisition failure, say
+            outcome = (Status.PARTIAL if discovered else Status.FAILED,
+                       "CANCELLED mid-sweep — evidence KEPT" if discovered
+                       else "CANCELLED mid-sweep — nothing extracted")
+            raise                                               # after the terminal, never before
+        except Exception as ex:                                 # a broken acquisition, a broken record …
             wl_loss["sweep_machinery"] = f"{type(ex).__name__}: {ex}"
-            events.tool_finish(sid, status=Status.PARTIAL.value if discovered else Status.FAILED.value,
-                               reason=f"the scheduled brute failed ({type(ex).__name__}: {ex})",
-                               work_unit=fp, produced={"subdomains": len(discovered)})
-            swept = None
-        else:
-            _a1d_report_sweep(ctx, prof, swept, wl_loss, sid, fp, len(discovered))
+            wl_loss["sweep_error"] = f"{type(ex).__name__}: {ex}"
+            outcome = (Status.PARTIAL if discovered else Status.FAILED,
+                       f"the scheduled brute failed ({type(ex).__name__}: {ex})")
+        finally:
+            events.tool_finish(sid, status=outcome[0].value, reason=outcome[1], work_unit=fp,
+                               produced={"subdomains": len(discovered)})
 
     # ── the wildcard differ is its OWN registered lane and runs regardless of the brute above ──
 
@@ -287,20 +299,19 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     #    brute ran with less vocabulary" before anything had run — including when it never ran at all.
     if wc.get("eligible_zones", 0) > 0:
         wl_loss["wildcard_withheld"] = max(0, len(kept) - A1D_WILDCARD_WORD_CAP)
-    # review v17#3/#4: everything below used to assume one call per apex — `unsubmitted` was always
-    # blamed on a missing tool, and the withheld count assumed the scheduler spends the cap exactly. Both
-    # come from the sweep now: it knows what it submitted and why it stopped.
-    if swept is not None:
-        wl_loss["withheld_by_word_cap"] = max(0, swept.eligible_pairs - swept.attempted_pairs)
-        wl_loss["after_base"] = swept.eligible_pairs
+    # review v19#3: `after_base` is the RETAINED WORD count and other wording (wildcard withholding, the
+    # unreadable-input sentence) reads it as such — the scheduler's candidate-target PAIRS are a different
+    # unit and live in their own fields.
     unsubmitted = max(0, len(prof.apex_domains) - submitted_apexes)
-    unsubmitted_why = (swept.stop if swept is not None and swept.stop else "puredns is not installed")
+    unsubmitted_why = (swept.stop if swept is not None and swept.stop
+                       else wl_loss.get("sweep_error") or ("the source is not registered"
+                                                           if swept is None else "no reason recorded"))
     # review-B-audit-14: "there were wildcard zones" is not "the wildcard pass ran" — passive mode, a
     # missing httpx, no wordlist, the self-contact guard and the zone cap all leave zones UNSUBMITTED.
     # The differentiator now says what it actually probed, and both facts are reported.
     wc_eligible, wc_probed = wc.get("eligible_zones", 0), wc.get("probed_zones", 0)
     wc_unsubmitted = max(0, wc_eligible - wc_probed)
-    lost = _a1d_loss_why(wl_loss, swept.attempted_pairs if swept is not None else len(twords))
+    lost = _a1d_loss_why(wl_loss, len(kept))        # `produced` here is USABLE WORDS, not pairs (v19#3)
     parts = ([lost] if lost else []) + ([f"{unsubmitted} apex brute(s) unsubmitted "
                                          f"({unsubmitted_why})"] if unsubmitted else [])
     if wc_unsubmitted:

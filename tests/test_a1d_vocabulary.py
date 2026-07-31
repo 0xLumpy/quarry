@@ -1491,6 +1491,9 @@ class TestA1dVocabularyLossReachesTheVerdict:
         assert zones_cov[-1]["tested"] == 1, zones_cov[-1]
         assert not any(e.get("source_id") == "enrich.a1d_brute" for e in wl_evs), "the brute ran anyway"
         assert not any("wildcard zone(s) not differentiated" in (r.note or "") for r in recs), recs
+        # ...and the unsubmitted brute names the REAL cause, not a missing binary (v19#2)
+        assert any("the source is not registered" in (r.note or "") for r in recs), recs
+        assert not any("puredns is not installed" in (r.note or "") for r in recs), recs
 
     def test_CANCELLATION_closes_the_source_lifecycle_before_propagating(self, tmp_path, monkeypatch):
         """v18#2: a `tool_start` with no `tool_finish` is a source that never answered."""
@@ -1585,5 +1588,143 @@ class TestA1dVocabularyLossReachesTheVerdict:
                     and json.loads(l).get("source_id") == "enrich.a1d_brute"]
             assert len(fins) == 1 and fins[0]["status"] == want, (fins, statuses)
             assert fins[0]["produced"]["subdomains"] == produced_hosts, fins
+        finally:
+            events.reset()
+
+    # ── v19: the boundary covers reporting, and each remainder keeps its own cause ───────────────
+    def test_a_failing_REPORT_still_terminates_the_source(self, tmp_path, monkeypatch):
+        """v19#1: reporting is fallible too — `record()` can raise before the terminal was emitted."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("one\ntwo\n")
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "_a1d_fold_sweep",
+                                lambda *a, **k: (_ for _ in ()).throw(OSError("record failed")))
+            from quarry_recon.runner import RunResult as _RR
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
+                                    tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)                 # must NOT raise
+            evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+            starts = [e for e in evs if e.get("event") == "tool_start"
+                      and e.get("source_id") == "enrich.a1d_brute"]
+            fins = [e for e in evs if e.get("event") == "tool_finish"
+                    and e.get("source_id") == "enrich.a1d_brute"]
+            assert len(starts) == len(fins) == 1, (starts, fins)
+            assert "record failed" in (fins[0].get("reason") or ""), fins
+        finally:
+            events.reset()
+
+    def test_the_terminal_is_emitted_EXACTLY_ONCE_on_cancellation(self, tmp_path, monkeypatch):
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("one\ntwo\n")
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt("ctrl-c")))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            with pytest.raises(KeyboardInterrupt):
+                enrich._a1d_recursive_brute(ctx)
+            fins = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                    if json.loads(l).get("event") == "tool_finish"
+                    and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(fins) == 1 and "CANCELLED" in fins[0]["reason"], fins
+        finally:
+            events.reset()
+
+    def test_a_CONTENDED_remainder_is_not_blamed_on_the_spend_bound(self, tmp_path, monkeypatch):
+        """v19#2: contention, dependency, machinery and the clock all leave a remainder — none of them is
+        the cap withholding work."""
+        from quarry_recon import budget as _b
+        sched = tmp_path / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}"
+        sched.mkdir(parents=True, exist_ok=True)
+        with _b.state_lock(sched / "a1d_brute.lock"):
+            _submitted, run = self._scheduled(tmp_path, monkeypatch,
+                                              words=[f"w{i:03d}" for i in range(10)])
+        recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+        assert len(recs) == 1, recs
+        assert "spend bound" not in recs[0].note, recs
+        assert "another lifecycle" in recs[0].note, recs
+
+    def test_the_WILDCARD_note_keeps_the_WORD_denominator(self, tmp_path, monkeypatch):
+        """v19#3: `after_base` is retained WORDS; the scheduler's candidate-target pairs are a different
+        unit, and two apexes made the wildcard note read `8/20` for a 10-word corpus."""
+        from quarry_recon.phases import enrich, vertical
+        monkeypatch.setattr(enrich, "A1D_WILDCARD_WORD_CAP", 1)
+        monkeypatch.setattr(vertical.netguard, "contact_state",
+                            lambda host, block_private=False: ("public", False, None))
+        monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
+        monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
+        recs = self._a1d_zones(tmp_path, monkeypatch, zones=("z.acme.com",), httpx=True, puredns=True)
+        assert len(recs) == 1, recs
+        # the mined corpus here is "internal" + "api" = 2 WORDS. With two apexes the scheduler would count
+        # 4 candidate PAIRS; this note must still speak in words.
+        assert "1/2 mined word(s) withheld from the wildcard differ" in recs[0].note, recs
+
+    def test_the_unreadable_sentence_counts_WORDS_not_candidate_pairs(self, tmp_path, monkeypatch):
+        """v19#3 (the other half): `_a1d_loss_why(produced=…)` renders "the readable N yielded X usable
+        word(s)". With two apexes the scheduler's candidate PAIRS are double the words."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "a_wordlist.txt").write_text("internal\napi\nportal\n")   # 3 usable words
+            (wl / "b_wordlist.txt").write_text("unreadable\n")
+            real = pathlib.Path.read_bytes
+            monkeypatch.setattr(pathlib.Path, "read_bytes",
+                                lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("denied"))
+                                if self.name == "b_wordlist.txt" else real(self, *a, **k))
+            from quarry_recon.runner import RunResult as _RR
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
+                                    tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com", "acme.net"], "http_rl": 0,
+                                         "dns_rate": 0})()          # 3 words x 2 apexes = 6 PAIRS
+            enrich._a1d_recursive_brute(ctx)
+            recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+            assert len(recs) == 1, recs
+            assert "yielded 3 usable word(s)" in recs[0].note, recs   # words, never the 6 pairs
         finally:
             events.reset()
