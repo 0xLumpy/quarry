@@ -63,6 +63,7 @@ class TestTheTwoTuples:
     def test_a_moved_reservation_is_an_INVARIANT_not_a_disposition(self, tmp_path):
         """v9#1: one sweeper owns the lane, so this cannot happen — if it does, it is a bug."""
         p = _progress(tmp_path)
+        p.reserve("acme.com", "06", at=0.5)                  # push the lane generation past 1
         gen = p.reserve("acme.com", "07", at=1.0)
         with pytest.raises(budget.SchedulerInvariant):
             p.complete("acme.com", "07", gen - 1, at=2.0, content="abc", members=1)
@@ -477,4 +478,53 @@ class TestReviewV12:
         p.complete("acme.com", "01", gen, at=2.0, content="d", members=1)
         assert p.save() is True
         assert _progress(tmp_path).state_status == "valid"
+
+
+class TestReviewV13:
+    """Identity and publication invariants the v13 review reproduced against b3abc39."""
+
+    def test_completing_a_slot_that_was_NEVER_RESERVED_is_an_invariant(self, tmp_path):
+        """`gen=0` matched the default of an absent reservation, so the call succeeded, wrote into a
+        throwaway dict and `save()` answered True with nothing persisted."""
+        p = _progress(tmp_path)
+        with pytest.raises(ValueError):                      # 0 is not a generation at all
+            p.complete("never", "07", 0, at=1.0, content="x", members=1)
+        with pytest.raises(budget.SchedulerInvariant):       # ...and 1 has no reservation behind it
+            p.complete("never", "07", 1, at=1.0, content="x", members=1)
+        assert p.save() is True
+        assert json.loads((tmp_path / "a1d.json").read_text())["targets"] == {}
+
+    @pytest.mark.parametrize("target,bucket", [(7, "01"), ("acme.com", True), ("", "01"),
+                                               ("acme.com", ""), (None, "01"), ("acme.com", 3)])
+    def test_slot_identity_must_survive_PERSISTENCE(self, tmp_path, target, bucket):
+        """JSON keys are strings: `reserve(7, True, …)` came back as target "7" and bucket "true", so the
+        rotation history was orphaned under a key nothing looks up again."""
+        p = _progress(tmp_path)
+        with pytest.raises(ValueError):
+            p.reserve(target, bucket, at=1.0)
+        assert p.gen == 0, "the generation moved for a slot that was never valid"
+
+    def test_a_rejected_identity_does_not_consume_a_generation(self, tmp_path):
+        p = _progress(tmp_path)
+        with pytest.raises(ValueError):
+            p.reserve(7, "01", at=1.0)
+        assert p.reserve("acme.com", "01", at=1.0) == 1
+
+    def test_PARSE_survives_an_integer_too_large_for_a_float(self, tmp_path):
+        """A 401-digit JSON integer makes `float()` raise OverflowError — the standalone never-raises
+        contract has to hold, not just the constructor's guard."""
+        doc = json.dumps({"lane": "a1d", "schema": SCHEMA, "gen": 1,
+                          "targets": {"t": {"seq": 1, "slots": {"01": {"res": {"gen": 1,
+                                                                               "at": int("9" * 401)}}}}}})
+        gen, targets, status, _why = budget.RotationProgress._parse(doc, lane="a1d", schema=SCHEMA)
+        assert targets["t"]["slots"] == {}, targets          # the unusable tuple is dropped, nothing raises
+        (tmp_path / "a1d.json").write_text(doc)
+        assert _progress(tmp_path).tier("t", "01", "x") == 0
+
+    @pytest.mark.parametrize("schema", [True, False, 1.0, "1", -1])
+    def test_PARSE_validates_its_own_schema_argument(self, tmp_path, schema):
+        """`schema=True` compared equal to a stored 1 and read as valid."""
+        doc = json.dumps({"lane": "a1d", "schema": 1, "gen": 0, "targets": {}})
+        _gen, _targets, status, _why = budget.RotationProgress._parse(doc, lane="a1d", schema=schema)
+        assert status == "unusable", (schema, status)
 

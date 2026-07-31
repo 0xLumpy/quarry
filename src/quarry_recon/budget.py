@@ -327,7 +327,10 @@ class RotationProgress:
         """A TIMESTAMP we can order by: finite, non-negative, never a bool."""
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
-        v = float(value)
+        try:
+            v = float(value)                       # a 401-digit JSON integer raises OverflowError here
+        except (OverflowError, ValueError):
+            return None
         if not math.isfinite(v) or v < minimum:
             return None
         return v
@@ -371,6 +374,8 @@ class RotationProgress:
             return 0, {}, "unusable", f"top level is a {type(doc).__name__}, not an object"
         if doc.get("lane") != lane:
             return 0, {}, "unusable", f"lane is {doc.get('lane')!r}, not {lane!r}"
+        if cls._count(schema) is None:                   # the CALLER's schema, checked at this boundary
+            return 0, {}, "unusable", f"configured schema {schema!r} is not an exact non-negative int"
         if cls._count(doc.get("schema")) != schema:      # 1.0 is not 1 here, and False is not 0
             return 0, {}, "unusable", f"schema {doc.get('schema')!r} != {schema} — a different question"
         gen = cls._count(doc.get("gen"))
@@ -465,6 +470,16 @@ class RotationProgress:
         self.gen += 1
         return self.gen
 
+    @staticmethod
+    def _key(target, bucket) -> tuple:
+        """Slot identity is EXACT (review v13#2). `reserve(7, True, …)` used to succeed and then come back
+        from JSON as target `"7"` and bucket `"true"` — the rotation history for a slot orphaned under a
+        key nothing will look up again."""
+        for name, value in (("target", target), ("bucket", bucket)):
+            if isinstance(value, bool) or not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty str, got {value!r}")
+        return target, bucket
+
     @classmethod
     def _checked(cls, *, at=None, members=None, content=None) -> tuple:
         """Validate what a MUTATION is about to persist. review v12#2: these coerced instead of checking,
@@ -493,6 +508,7 @@ class RotationProgress:
         review v11#2: the caller used to PASS a generation, so a slot could hold gen 39 while the lane's own
         counter was 0 — the monotonic authority behind ordering and merge, broken by one careless call.
         Allocation belongs to the map."""
+        target, bucket = self._key(target, bucket)
         (when,) = self._checked(at=at)
         gen = self.next_gen()
         t = self.targets.setdefault(target, {"seq": 0, "slots": {}})
@@ -502,11 +518,16 @@ class RotationProgress:
 
     def complete(self, target: str, bucket: str, gen: int, *, at: float, content: str, members: int) -> None:
         """Record that this slot RAN. Raises `SchedulerInvariant` if its reservation moved under us."""
+        target, bucket = self._key(target, bucket)
         when, n, digest = self._checked(at=at, members=members, content=content)
-        if self._count(gen) is None:
-            raise ValueError(f"generation must be an exact non-negative int, got {gen!r}")
+        if self._count(gen) is None or gen < 1:
+            # generations start at 1, so 0 can only come from a caller that never reserved anything —
+            # and `held_gen` defaults to 0 too, which made the two match (review v13#1).
+            raise ValueError(f"generation must be an exact positive int, got {gen!r}")
         slot = self._slot(target, bucket)
-        held_gen = int((slot.get("res") or {}).get("gen", 0))
+        if not slot.get("res"):
+            raise SchedulerInvariant(f"{self.lane}:{target}/{bucket}: completing a slot never reserved")
+        held_gen = int(slot["res"]["gen"])
         if held_gen != gen:
             raise SchedulerInvariant(f"{self.lane}:{target}/{bucket}: reservation gen {held_gen} != {gen}")
         slot["done"] = {"gen": gen, "at": when, "c": digest, "n": n}
