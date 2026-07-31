@@ -734,14 +734,34 @@ class TestExecutorBatching:
         assert out.slots_attempted >= 2 and out.attempted_pairs <= 50
         assert len(tool.calls[0][2]) == out.attempted_pairs
 
-    def test_a_SINGLE_slot_bigger_than_the_batch_policy_still_runs(self, tmp_path, monkeypatch):
-        """The batch size is a blast radius, never a reason to withhold a slot: a slot that alone exceeds
-        it must still run, or the lane would starve exactly the way the fixed slot space did."""
-        monkeypatch.setattr(sweep, "BUCKETS", 1)              # every word lands in ONE slot
-        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)      # which is bigger than a whole batch may be
+    def test_the_INVOCATION_MAXIMUM_bounds_the_SLOT_not_just_the_batch(self, tmp_path, monkeypatch):
+        """v32#1: applied only after a slot was chosen it was no maximum at all — a lone oversized slot
+        walked straight past it. The allocator now splits against the smaller of the two bounds."""
+        monkeypatch.setattr(sweep, "BUCKETS", 1)              # every word would land in ONE root slot
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"])
-        assert len(tool.calls) == 1 and len(tool.calls[0][2]) == 3, tool.calls
-        assert out.attempted_pairs == 3 and out.slots_attempted == 1
+        assert out.attempted_pairs == 3 and out.slots_attempted == 3
+        assert all(len(c[2]) <= 1 for c in tool.calls), tool.calls
+
+    def test_the_SMALLER_of_the_two_bounds_shapes_the_slots(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "BUCKETS", 1)
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 100)
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(8)], max_pairs_per_target=2)
+        assert all(len(c[2]) <= 2 for c in tool.calls) and out.attempted_pairs == 2
+
+    def test_a_DEPTH_LIMIT_residual_is_refused_and_NAMED_never_run_oversized(self, tmp_path,
+                                                                            monkeypatch):
+        """The allocator cannot split a 64-bit collision class. Such a slot must not be submitted, and its
+        candidates must not vanish silently either."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        real = sweep.allocate
+        monkeypatch.setattr(sweep, "allocate",
+                            lambda words, *, cap: {"000": list(words)[:3], **{
+                                s: g for s, g in real(list(words)[3:], cap=cap).items() if s != "000"}})
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)])
+        assert all(len(c[2]) <= 2 for c in tool.calls), tool.calls
+        assert any("exceeds the invocation maximum" in m for m in out.machinery), out.machinery
+        assert out.attempted_pairs == 3 and out.eligible_pairs == 6
 
     def test_the_batch_policy_still_STOPS_a_batch_from_growing(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
@@ -816,3 +836,21 @@ class TestExecutorBatching:
                          words=[f"w{i:03d}" for i in range(4)])
         assert [c[0] for c in tool.calls] == ["a.com", "b.com", "c.com"], tool.calls
         assert all(len(c[2]) == 4 for c in tool.calls)
+
+    def test_INVOCATION_classes_are_counted_ONCE_per_call(self, tmp_path, monkeypatch):
+        """v32#2: with batches of different sizes the slot-weighted map cannot say how many CALLS failed.
+        Here a 4-slot batch times out and a 1-slot batch fails: slots say 4 and 1, calls say 1 and 1."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 4)
+        tool = _Tool(statuses=[Status.TIMED_OUT, Status.FAILED])
+        out, _t = _run(tmp_path, words=[f"w{i:03d}" for i in range(5)], tool=tool)
+        assert out.classes == {"timed_out": 4, "failed": 1}, out.classes
+        assert out.invocation_classes == {"timed_out": 1, "failed": 1}, out.invocation_classes
+        inv = [e for e in _events(tmp_path) if e.get("measure") == "tool_invocations"][-1]
+        assert "{'failed': 1, 'timed_out': 1}" in inv["reason"], inv        # calls, not slots
+        assert (inv["eligible"], inv["tested"]) == (2, 0), inv
+
+    def test_a_CLEAN_run_reports_no_invocation_classes(self, tmp_path):
+        out, _t = _run(tmp_path, words=["alpha", "beta"])
+        assert out.invocation_classes == {}
+        inv = [e for e in _events(tmp_path) if e.get("measure") == "tool_invocations"][-1]
+        assert "{" not in inv["reason"], inv        # no class map at all when every call was obtained

@@ -17,8 +17,12 @@ The contract, argued out over ten review rounds (`notes/STEP4-SCHEDULING-DESIGN.
   FACTS      the reservation is written BEFORE the tool runs and the completion AFTER it returned. Nothing
              about SUCCESS is durable: outcomes are evidence, and evidence is run-scoped.
 
-Coverage is two records with different denominators: candidate-target PAIRS (selection) and SLOTS
-(outcome). A launched-but-failed bucket must not read as tested with no gap.
+  BATCH      one INVOCATION carries the prefix of the rank order that stays inside one target and one
+             tier. Slots keep their own reservation, completion and outcome; only the tool call is shared.
+
+Coverage is three records with different denominators: candidate-target PAIRS (selection), SLOTS
+(outcome) and tool INVOCATIONS. A launched-but-failed slot must not read as tested with no gap, and the
+three are never read off one another.
 """
 from __future__ import annotations
 
@@ -35,9 +39,9 @@ from .runner import Status
 #: a fresh rotation rather than reading old records under new arithmetic. 2: adaptive prefix subslots.
 SCHEMA = 2
 
-#: how many buckets a lane's vocabulary is spread over. One bucket = one tool invocation, so this is the
-#: granularity at which a wall-clock budget can stop us (`Budget.exhausted()` only fires BETWEEN items).
-#: MEASURED input for the choice is the timing pass; 256 over the OTC corpus is ~195 candidates per call.
+#: how many ROOT slots a lane's vocabulary is spread over, before any adaptive split. A slot is the unit
+#: of reservation, completion and rotation; an invocation may carry several of them, and the wall-clock
+#: budget can stop us BETWEEN invocations (`Budget.exhausted()` only fires between items).
 BUCKETS = 256
 
 
@@ -166,6 +170,7 @@ class SweepResult:
     attempted_pairs: int = 0            # candidates inside slots whose invocation RETURNED
     invocations: int = 0                    # runner calls that actually ran — NOT a slot count
     invocations_obtained: int = 0
+    invocation_classes: dict = field(default_factory=dict)
     slots_attempted: int = 0
     slots_obtained: int = 0             # SUCCESS or EMPTY — a clean answer, including "nothing resolved"
     classes: dict = field(default_factory=dict)
@@ -222,9 +227,10 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     `max_pairs_per_target` (0 = unbounded) is a SPEND bound in candidates per target: a slot that would
     take a target past it is not submitted, so the bound is never exceeded — a wall-clock budget cannot
     express "no more than N names per apex", which is what an existing lane's posture may already be.
-    `execute(target, bucket, words) -> RunResult` submits one slot. `attribution(word) -> source` is
-    optional ACCOUNTING only. Returns what happened, emits the two coverage records, and raises nothing but
-    cancellation."""
+    `execute(target, unit, words) -> RunResult` submits ONE INVOCATION, which may carry several slots:
+    `unit` names it (a lone slot keeps its own id) and `words` is their union. Its returned status attests
+    every slot the invocation carried. `attribution(word) -> source` is optional ACCOUNTING only. Returns
+    what happened, emits the three coverage records, and raises nothing but cancellation."""
     out = SweepResult()
     clock = budget.Budget(budget_s)
 
@@ -254,8 +260,12 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         _report(coverage_lane, out, clock)             # v27#1: coverage is filed under the REGISTERED
         return out                                     # source, never the scheduler's private lane name
 
+    # v32#1: the batch maximum has to bound the SLOT, not just the batch — applied after a slot was
+    # chosen it was no maximum at all, because a lone oversized slot bypassed it. The allocator splits
+    # against the smaller of the two positive bounds, so no slot can exceed either.
+    alloc_cap = min([b for b in (max_pairs_per_target, MAX_BATCH_WORDS) if b] or [0])
     for target, per_target in corpus.items():
-        partition = allocate(per_target, cap=max_pairs_per_target)
+        partition = allocate(per_target, cap=alloc_cap)
         placed = [word for group in partition.values() for word in group]
         if len(placed) != len(per_target) or set(placed) != set(per_target):
             # v28: a pair the partition dropped is not a RESUMABLE remainder — it is in no slot, so no
@@ -357,6 +367,9 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             else:
                 key = str(getattr(result.status, "value", result.status))
                 out.classes[key] = out.classes.get(key, 0) + len(chosen)
+                # v32#2: the slot-weighted map cannot say how many CALLS failed once batches differ in
+                # size — a 10-slot timeout and a 1-slot failure are 10 and 1 there, 1 and 1 here.
+                out.invocation_classes[key] = out.invocation_classes.get(key, 0) + 1
 
             try:
                 progress.complete_batch(target, [(b, gens[b], content[(target, b)], len(words))
@@ -440,7 +453,14 @@ def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: i
             out.stop_kind = out.stop_kind or "bound"
             out.stop = out.stop or f"the per-target candidate bound ({cap}) was reached"
             continue
-        if chosen and max_words and total + len(words) > max_words:
+        if max_words and len(words) > max_words:
+            # a DEPTH-LIMIT residual: the allocator could not split this slot small enough (only reachable
+            # through a 64-bit collision class). It is refused and named, never run oversized (v32#1).
+            picked.add(choice)
+            out.machinery.append(f"{this_target}/{bucket}: slot of {len(words)} candidates exceeds the "
+                                 f"invocation maximum ({max_words}) and was not submitted")
+            continue
+        if chosen and total + len(words) > max_words:
             break
         target, tier = this_target, this_tier
         chosen.append((bucket, words))
@@ -483,7 +503,8 @@ def _report(lane: str, out: SweepResult, clock) -> None:
         # several slots, so "how many calls ran" and "how many slots were attempted" are different facts
         # and neither may be read off the other.
         budget.report_outcome(lane, measure="tool_invocations", attempted=out.invocations,
-                              obtained=out.invocations_obtained, noun="invocation")
+                              obtained=out.invocations_obtained,
+                              classes=out.invocation_classes or None, noun="invocation")
     if out.per_source_eligible:
         # review v15#3: NOT a third coverage denominator — it would re-count the candidate remainder the
         # selection record already owns, and it would have to invent a `kind` for a stop it does not model.
