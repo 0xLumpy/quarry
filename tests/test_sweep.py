@@ -177,7 +177,8 @@ class TestTheFourDispositions:
         monkeypatch.setattr(budget.RotationProgress, "save", lambda self: False)
         out, tool = _run(tmp_path)
         assert tool.calls == [], tool.calls                            # FAIL CLOSED
-        assert out.stop == "machinery: the reservation could not be persisted" and out.durable is False
+        assert out.stop == "machinery: the reservation could not be persisted"
+        assert out.stop_kind == "machinery" and out.durable is False    # nothing persisted at all
 
     def test_an_unpublishable_COMPLETION_keeps_the_evidence(self, tmp_path, monkeypatch):
         saves = {"n": 0}
@@ -191,7 +192,13 @@ class TestTheFourDispositions:
         monkeypatch.setattr(budget.RotationProgress, "save", flaky)
         out, tool = _run(tmp_path, words=["one", "two", "three"])
         assert tool.calls, "the sweep stopped instead of running"
-        assert out.completion_unpersisted > 0 and out.completions_published == 0
+        # v14#1: a completion whose own save failed is PENDING, and a later successful reservation save
+        # carries it to disk — so it is reclassified as published rather than reported lost.
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA)
+        durable_done = sum(1 for t in reopened.targets.values()
+                           for sl in t["slots"].values() if "done" in sl)
+        assert out.completions_published == durable_done, (out.completions_published, durable_done)
+        assert out.completion_unpersisted == 0 or durable_done < len(tool.calls)
         assert out.slots_attempted == len(tool.calls)                  # the evidence still counts
 
 
@@ -264,7 +271,8 @@ class TestStableIdentityAndAttribution:
 
     def test_per_source_ACCOUNTING_is_reported(self, tmp_path):
         out, _t = _run(tmp_path, attribution=lambda w: "js" if w.endswith(("0", "2", "4")) else "katana")
-        assert sum(out.per_source.values()) == 20 and set(out.per_source) == {"js", "katana"}
+        assert sum(out.per_source_eligible.values()) == 20
+        assert sum(out.per_source_attempted.values()) == 20             # an unbounded sweep ran them all
         attr = [e for e in _events(tmp_path) if e.get("measure") == "vocabulary_attribution"][-1]
         assert "js" in attr["reason"] and attr["omitted"] == 0, attr
 
@@ -286,7 +294,103 @@ class TestStateHonesty:
         out, tool = _run(tmp_path)
         assert out.state_status == "unusable"
         assert tool.calls == [], tool.calls
-        assert out.stop == "machinery: the reservation could not be persisted" and out.durable is False
+        assert out.stop == "machinery: the reservation could not be persisted"
+        assert out.durable is False                                      # no reservation ever landed
         assert (tmp_path / f"{LANE}.json").read_text() == "not json"     # nothing was destroyed
         sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
         assert (sel["tested"], sel["omitted"]) == (0, 20), sel
+
+
+class TestReviewV14:
+    """Five accounting contracts the v14 review reproduced against 940ee2d."""
+
+    def test_a_completion_RESCUED_by_a_later_save_is_counted_as_published(self, tmp_path):
+        """The `done` tuple stays in the in-memory map, so the next successful save carries it to disk.
+        Reporting it as unpersisted while the disk holds it is the counters lying about the state."""
+        saves = {"n": 0}
+        real = budget.RotationProgress.save
+
+        def flaky(self):
+            saves["n"] += 1
+            return False if saves["n"] == 2 else real(self)     # only the FIRST completion save fails
+
+        import unittest.mock as _m
+        with _m.patch.object(budget.RotationProgress, "save", flaky):
+            out, tool = _run(tmp_path, words=["one", "two", "three"])
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA)
+        durable_done = sum(1 for t in reopened.targets.values()
+                           for sl in t["slots"].values() if "done" in sl)
+        assert out.completions_published == durable_done, (out.completions_published, durable_done)
+        assert out.completion_unpersisted == len(tool.calls) - durable_done
+
+    def test_PARTIAL_progress_is_not_reported_as_a_full_restart(self, tmp_path):
+        """v14#2: a reservation failure after real progress used to claim the lane RESTARTS."""
+        saves = {"n": 0}
+        real = budget.RotationProgress.save
+
+        def fail_third(self):
+            saves["n"] += 1
+            return False if saves["n"] >= 3 else real(self)
+
+        import unittest.mock as _m
+        with _m.patch.object(budget.RotationProgress, "save", fail_third):
+            out, tool = _run(tmp_path, words=["one", "two", "three"])
+        assert out.reservations_persisted >= 1 and out.stop_kind == "machinery"
+        assert out.durable is True, out
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "RESTARTS" not in sel["reason"], sel["reason"]
+        assert "RESUMABLE" in sel["reason"], sel["reason"]
+
+    def test_CONTENTION_never_claims_completion_state_was_lost(self, tmp_path):
+        with budget.rotation_session(tmp_path, LANE, schema=sweep.SCHEMA):
+            out, _tool = _run(tmp_path)
+        assert out.durable is True and out.stop_kind == "contention"
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "RESTARTS" not in sel["reason"], sel["reason"]
+
+    def test_ATTRIBUTION_measures_the_SCHEDULED_PREFIX(self, tmp_path, monkeypatch):
+        """v14#3: it summed the whole eligible corpus and reported no omission, so the timing pass could
+        not see the first-k distribution it exists to measure."""
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+
+        class _Slow(_Tool):
+            def __call__(self, target, bucket, words):
+                ticks["t"] += 20.0
+                return super().__call__(target, bucket, words)
+
+        out, tool = _run(tmp_path, tool=_Slow(), budget_s=10,
+                         attribution=lambda w: "js" if w < "w010" else "katana")
+        assert len(tool.calls) == 1, tool.calls
+        assert sum(out.per_source_eligible.values()) == 20
+        assert sum(out.per_source_attempted.values()) == out.attempted_pairs < 20
+        attr = [e for e in _events(tmp_path) if e.get("measure") == "vocabulary_attribution"][-1]
+        assert attr["tested"] == out.attempted_pairs and attr["omitted"] > 0, attr
+
+    def test_BUDGET_EXHAUSTION_is_a_named_stop(self, tmp_path, monkeypatch):
+        """v14#4: `stop` stayed None, which the dataclass defines as "the whole eligible set ran"."""
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+
+        class _Slow(_Tool):
+            def __call__(self, target, bucket, words):
+                ticks["t"] += 20.0
+                return super().__call__(target, bucket, words)
+
+        out, _tool = _run(tmp_path, tool=_Slow(), budget_s=10)
+        assert out.stop_kind == "budget" and "budget exhausted" in (out.stop or ""), out.stop
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert sel["kind"] == "cap", sel          # a budget is still a CAP we chose
+        assert "budget exhausted" in sel["reason"], sel
+
+    def test_a_COMPLETE_sweep_has_no_stop_at_all(self, tmp_path):
+        out, _tool = _run(tmp_path)
+        assert out.stop is None and out.stop_kind is None
+
+    def test_DUPLICATE_input_is_ONE_submission(self, tmp_path):
+        """v14#5: `['alpha', 'alpha']` produced eligible=2 and submitted the word twice."""
+        out, tool = _run(tmp_path, targets=("acme.com", "acme.com"), words=["alpha", "alpha", "beta"])
+        assert out.eligible_pairs == 2, out.eligible_pairs
+        submitted = [w for c in tool.calls for w in c[2]]
+        assert sorted(submitted) == ["alpha", "beta"], submitted
+        assert len({c[0] for c in tool.calls}) == 1, tool.calls

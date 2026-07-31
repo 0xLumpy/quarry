@@ -73,18 +73,41 @@ class SweepResult:
     slots_obtained: int = 0             # SUCCESS or EMPTY — a clean answer, including "nothing resolved"
     classes: dict = field(default_factory=dict)
     reservations_persisted: int = 0
+    pending_completions: int = 0        # completions rescued by a later save are counted as published
     completions_published: int = 0
     completion_unpersisted: int = 0
-    per_source: dict = field(default_factory=dict)
+    #: ACCOUNTING attribution. `eligible` is the whole corpus; `attempted` is the SCHEDULED PREFIX — the
+    #: distribution the timing pass actually needs, since uniform hashing spreads sources over the CORPUS
+    #: and says nothing about the first k buckets (review v14#3).
+    per_source_eligible: dict = field(default_factory=dict)
+    per_source_attempted: dict = field(default_factory=dict)
     machinery: list = field(default_factory=list)
     stop: str | None = None             # None = the whole eligible set ran
-    durable: bool = True
+    #: what ENDED the sweep: None (nothing did), "budget", "machinery", "contention", "dependency". The
+    #: coverage KIND follows from it (a budget is a CAP we chose; everything else is a TIMEOUT-class gap),
+    #: and the terminal needs the cause even when the wording is identical (review v14#4).
+    stop_kind: str | None = None
     state_status: str = "missing"
     contended: bool = False
 
     @property
     def ran(self) -> bool:
         return self.slots_attempted > 0
+
+    @property
+    def durable(self) -> bool:
+        """Whether the remainder is a RESUMABLE remainder rather than "this lane restarts from the
+        beginning". review v14#2: one lane-wide False claimed the restart even after reservations and
+        completions had persisted — the Boolean the design rejected. Rendered from the state and the
+        counters instead:
+
+        * unusable state -> False: nothing can be trusted, so nothing can be resumed;
+        * a machinery stop that persisted NOTHING -> False: we tried to advance and could not;
+        * anything else -> True, including contention (the holder is advancing it), a missing dependency
+          (nothing was touched) and a machinery stop AFTER real progress."""
+        if self.state_status == "unusable":
+            return False
+        return not (self.stop_kind == "machinery" and self.reservations_persisted == 0)
 
 
 #: statuses that mean the tool answered. EMPTY is an answer ("this bucket resolved nothing"); SKIPPED never
@@ -106,8 +129,12 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     # ── BEFORE the lock: the workload is a pure function of the corpus and the targets, so a CONTENDER can
     #    still report an exact denominator instead of a gap with no arithmetic (design v8#2). ──
     members: dict = {}
-    for target in targets:
+    seen_pairs: set = set()
+    for target in dict.fromkeys(targets):              # a repeated target is one target
         for word in vocabulary(target) or []:
+            if (target, word) in seen_pairs:           # review v14#5: one submission per word per target —
+                continue                               # a duplicate would inflate the denominator, the
+            seen_pairs.add((target, word))             # digest, the attribution AND the active payload
             members.setdefault((target, bucket_of(word)), []).append(word)
     slots = sorted(members)
     out.eligible_pairs = sum(len(w) for w in members.values())
@@ -116,10 +143,11 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         for words in members.values():
             for word in words:
                 src = attribution(word)
-                out.per_source[src] = out.per_source.get(src, 0) + 1
+                out.per_source_eligible[src] = out.per_source_eligible.get(src, 0) + 1
 
     if dependency_ok is not None and not dependency_ok():
         out.stop = "the tool is not installed"          # no reservations at all (design v7#2)
+        out.stop_kind = "dependency"
         _report(coverage_lane, out, clock)
         return out
 
@@ -130,7 +158,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             # ACQUISITION-only: a StateBusy raised by the sweep BODY is machinery, not contention (v10#2).
             out.contended = True
             out.stop = f"another lifecycle owns this rotation ({e})"
-            out.durable = False
+            out.stop_kind = "contention"       # nothing was submitted and NO completion state was lost
             _report(coverage_lane, out, clock)
             return out
 
@@ -149,9 +177,10 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             if not progress.save():
                 # FAIL CLOSED: nothing is submitted for a slot whose reservation nobody owns (v6#2).
                 out.stop = "machinery: the reservation could not be persisted"
-                out.durable = False
+                out.stop_kind = "machinery"
                 break
             out.reservations_persisted += 1
+            _rescue(out)                       # this save also carried any pending completion (v14#1)
 
             try:
                 result = execute(target, bucket, words)
@@ -160,10 +189,12 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             except Exception as e:                      # `runner.run` can raise around Popen (v10#1)
                 out.machinery.append(f"{target}/{bucket}: {type(e).__name__}: {e}")
                 out.stop = "machinery: the invocation raised"
+                out.stop_kind = "machinery"
                 break
 
             if result.status is Status.SKIPPED:          # no process ran — a dependency answer
                 out.stop = "the tool did not run"
+                out.stop_kind = "dependency"
                 break
             out.slots_attempted += 1
             out.attempted_pairs += len(words)
@@ -182,17 +213,38 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             except budget.SchedulerInvariant as e:
                 out.machinery.append(f"scheduler_invariant: {e}")
                 out.stop = "machinery: scheduler invariant"
+                out.stop_kind = "machinery"
                 break
             except Exception as e:                      # the evidence exists; only the bookkeeping failed
                 out.machinery.append(f"{target}/{bucket}: completion not published ({type(e).__name__})")
                 published = False
             if published:
                 out.completions_published += 1
+                _rescue(out)
             else:
-                out.completion_unpersisted += 1
+                # review v14#1: the `done` tuple stays in the in-memory map, so a LATER successful save
+                # persists it. It is PENDING, not lost — and it is reclassified when that happens, instead
+                # of the counters swearing nothing was published while the disk says otherwise.
+                out.pending_completions += 1
 
+            if attribution is not None:
+                for word in words:
+                    src = attribution(word)
+                    out.per_source_attempted[src] = out.per_source_attempted.get(src, 0) + 1
+
+        if clock.exhausted() and len(picked) < len(slots):
+            out.stop = f"budget exhausted after {clock.elapsed()}s of {clock.seconds}s"
+            out.stop_kind = "budget"           # a CAP we chose, not a failure (v14#4)
+    out.completion_unpersisted = out.pending_completions
     _report(coverage_lane, out, clock)
     return out
+
+
+def _rescue(out: "SweepResult") -> None:
+    """A successful save writes the WHOLE in-memory map, so it carries every pending completion with it."""
+    if out.pending_completions:
+        out.completions_published += out.pending_completions
+        out.pending_completions = 0
 
 
 def _rank(progress, slots, content, picked):
@@ -213,14 +265,18 @@ def _rank(progress, slots, content, picked):
 
 def _report(lane: str, out: SweepResult, clock) -> None:
     """SELECTION over candidate-target pairs, OUTCOME over slots — different denominators, never summed."""
+    # a BUDGET stop keeps `report_selection`'s own CAP wording and kind; every other stop is named and
+    # classed as a gap (v14#4).
     budget.report_selection(lane, measure="candidate_pairs", eligible=out.eligible_pairs,
                             attempted=out.attempted_pairs, budget=clock, noun="candidate",
-                            durable=out.durable, stop=out.stop)
+                            durable=out.durable,
+                            stop=None if out.stop_kind in (None, "budget") else out.stop)
     budget.report_outcome(lane, measure="slot_outcomes", attempted=out.slots_attempted,
                           obtained=out.slots_obtained, classes=out.classes or None, noun="slot")
-    if out.per_source:
+    if out.per_source_eligible:
+        elig, done = sum(out.per_source_eligible.values()), sum(out.per_source_attempted.values())
         events.coverage_partial(lane, kind=events.COVERAGE_CAP, measure="vocabulary_attribution",
-                                unit="attribution", eligible=sum(out.per_source.values()),
-                                tested=sum(out.per_source.values()), omitted=0,
-                                reason=f"accounting attribution per source: "
-                                       f"{dict(sorted(out.per_source.items()))}")
+                                unit="attribution", eligible=elig, tested=done, omitted=max(0, elig - done),
+                                reason=f"accounting attribution — scheduled "
+                                       f"{dict(sorted(out.per_source_attempted.items()))} of eligible "
+                                       f"{dict(sorted(out.per_source_eligible.items()))}")
