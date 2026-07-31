@@ -553,3 +553,92 @@ class TestReviewV13:
         assert p.targets.get("", {}).get("slots", {}) == {} and "" not in p.targets.get("t", {}).get("slots", {})
         assert p.state_status == "degraded", p.state_status
 
+
+
+class TestPrefixInheritanceIsRankOnly:
+    """v22#2 / v23: a split replaces one slot with children whose ids nothing has seen. Order may be
+    inherited from the containing slot; AUTHORITY never is."""
+
+    def test_ANCESTORS_are_the_containing_prefixes_nearest_first(self):
+        assert budget.RotationProgress._ancestors("177.0110") == ["177.011", "177.01", "177.0", "177"]
+        assert budget.RotationProgress._ancestors("177") == []          # a flat id has no ancestors
+
+    def test_a_SPLIT_child_inherits_its_parent_s_place_in_the_rotation(self, tmp_path):
+        p = _progress(tmp_path)
+        gen = p.reserve("acme.com", "177", at=1.0)
+        p.complete("acme.com", "177", gen, at=2.0, content="parent-members", members=400)
+        # the child has no record of its own — without inheritance it would rank as never-run (0) and
+        # jump ahead of slots that genuinely never ran.
+        assert p.slot_seq("acme.com", "177.0") == gen
+        assert p.tier("acme.com", "177.0", "child-members") == 1
+
+    def test_an_INHERITED_run_can_never_certify_a_child_as_CLEAN(self, tmp_path):
+        """Digest equality across a split is a collision, not evidence that these members ran."""
+        p = _progress(tmp_path)
+        gen = p.reserve("acme.com", "177", at=1.0)
+        p.complete("acme.com", "177", gen, at=2.0, content="same-digest", members=400)
+        assert p.tier("acme.com", "177.0", "same-digest") == 1          # NOT 2
+        assert p.tier("acme.com", "177", "same-digest") == 2            # its own record still may
+
+    def test_the_NEAREST_ancestor_wins(self, tmp_path):
+        p = _progress(tmp_path)
+        old = p.reserve("acme.com", "177", at=1.0)
+        near = p.reserve("acme.com", "177.01", at=2.0)
+        assert old != near
+        assert p.slot_seq("acme.com", "177.0110") == near
+
+    def test_a_COLLAPSE_reads_the_OLDEST_descendant(self, tmp_path):
+        """When only children exist, the parent takes the stalest of them — it runs sooner, never later."""
+        p = _progress(tmp_path)
+        first = p.reserve("acme.com", "177.0", at=1.0)
+        later = p.reserve("acme.com", "177.1", at=2.0)
+        assert first < later
+        assert p.slot_seq("acme.com", "177") == first
+
+    def test_a_slot_s_OWN_record_always_wins(self, tmp_path):
+        p = _progress(tmp_path)
+        p.reserve("acme.com", "177", at=1.0)
+        mine = p.reserve("acme.com", "177.0", at=2.0)
+        assert p.slot_seq("acme.com", "177.0") == mine
+
+    def test_a_CHILD_may_not_complete_on_its_PARENT_s_reservation(self, tmp_path):
+        p = _progress(tmp_path)
+        gen = p.reserve("acme.com", "177", at=1.0)
+        with pytest.raises(budget.SchedulerInvariant):
+            p.complete("acme.com", "177.0", gen, at=2.0, content="c", members=1)
+
+    def test_a_PARENT_may_not_complete_on_a_CHILD_s_reservation(self, tmp_path):
+        p = _progress(tmp_path)
+        gen = p.reserve("acme.com", "177.0", at=1.0)
+        with pytest.raises(budget.SchedulerInvariant):
+            p.complete("acme.com", "177", gen, at=2.0, content="c", members=1)
+
+    def test_RESERVING_a_child_creates_its_OWN_exact_record(self, tmp_path):
+        p = _progress(tmp_path)
+        parent = p.reserve("acme.com", "177", at=1.0)
+        child = p.reserve("acme.com", "177.0", at=2.0)
+        assert child != parent
+        p.complete("acme.com", "177.0", child, at=3.0, content="c", members=1)
+        assert p.save()
+        doc = json.loads((tmp_path / "a1d.json").read_text())
+        slots = doc["targets"]["acme.com"]["slots"]
+        assert slots["177.0"]["done"]["gen"] == child
+        assert "done" not in slots["177"], "the parent must not be completed by its child"
+
+    def test_reading_an_INHERITED_rank_never_writes_a_record(self, tmp_path):
+        p = _progress(tmp_path)
+        gen = p.reserve("acme.com", "177", at=1.0)
+        p.complete("acme.com", "177", gen, at=2.0, content="c", members=1)
+        p.slot_seq("acme.com", "177.0")
+        p.tier("acme.com", "177.0", "other")
+        assert p.save()
+        doc = json.loads((tmp_path / "a1d.json").read_text())
+        assert list(doc["targets"]["acme.com"]["slots"]) == ["177"]
+
+    def test_a_SIBLING_whose_id_merely_starts_the_same_is_not_a_descendant(self, tmp_path):
+        """Containment is the DOT, not string prefix. A lane whose ids are not zero-padded has slots `7`
+        and `70`, and `70` is a different slot — not a child of `7`."""
+        p = _progress(tmp_path)
+        p.reserve("acme.com", "70", at=1.0)
+        assert p.slot_seq("acme.com", "7") == 0
+        assert p.tier("acme.com", "7", "members") == 0

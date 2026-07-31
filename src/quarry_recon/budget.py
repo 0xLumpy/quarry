@@ -461,14 +461,58 @@ class RotationProgress:
         a clock: a backward jump in wall time must not reorder the rotation (v4#4)."""
         return int(self.targets.get(target, {}).get("seq", 0))
 
+    @staticmethod
+    def _ancestors(bucket: str) -> list:
+        """The containing slots of a hash-prefix id, NEAREST FIRST: `177.0110` is contained in `177.011`,
+        `177.01`, `177.0` and `177`. A flat id has no ancestors, so a lane that never splits is unaffected."""
+        head, dot, bits = bucket.partition(".")
+        if not dot:
+            return []
+        out = []
+        while bits:
+            bits = bits[:-1]
+            out.append(f"{head}.{bits}" if bits else head)
+        return out
+
+    def _rank_record(self, target: str, bucket: str) -> tuple:
+        """The record ORDER may be read from, and whether it is this slot's own.
+
+        A split replaces one slot with two children whose ids nothing has ever seen. Without this, every
+        split would send its subtree to the front of the rotation as never-run, ahead of slots that
+        genuinely never ran. So an absent id falls back to the nearest ANCESTOR (the slot that actually
+        covered these words), or — after a collapse, when only children exist — to the OLDEST descendant,
+        which is the conservative direction: it runs sooner, never later.
+
+        This is RANK ONLY (design v22#2). The returned record may supply `tier` and `slot_seq` and nothing
+        else: `reserve()` still allocates a generation for the exact id, and `complete()` still demands
+        that exact id's own reservation. An inherited record is never authority."""
+        own = self._slot(target, bucket)
+        if own:
+            return own, True
+        slots = (self.targets.get(target, {}).get("slots", {}) or {})
+        for anc in self._ancestors(bucket):
+            rec = slots.get(anc)
+            if rec:
+                return rec, False
+        kids = [rec for key, rec in slots.items() if key.startswith(f"{bucket}.") and rec]
+        if kids:
+            return min(kids, key=lambda r: int((r.get("res") or {}).get("gen", 0))), False
+        return {}, True
+
     def slot_seq(self, target: str, bucket: str) -> int:
-        return int(self._slot(target, bucket).get("res", {}).get("gen", 0))
+        rec, _own = self._rank_record(target, bucket)
+        return int((rec.get("res") or {}).get("gen", 0))
 
     def tier(self, target: str, bucket: str, content: str) -> int:
         """0 never ran (including reserved-then-crashed) · 1 DIRTY (membership changed since it ran) · 2 clean."""
-        done = self._slot(target, bucket).get("done")
+        rec, own = self._rank_record(target, bucket)
+        done = rec.get("done")
         if not done:
             return 0
+        if not own:
+            # an INHERITED run covered a different member set, so it can never certify this slot as clean.
+            # Digest equality across a split is not evidence — it would be a collision, not a run.
+            return 1
         return 1 if done.get("c") != content else 2
 
     # ── writing it ────────────────────────────────────────────────────────────────────────────────
