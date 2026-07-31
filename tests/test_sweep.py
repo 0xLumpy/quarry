@@ -599,6 +599,30 @@ class TestTheSlotGrammarGuard:
         p = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA)
         assert p.reserve("acme.com", "anything-at-all", at=1.0) == 1
 
+    def test_a_PARTITION_that_loses_a_candidate_is_a_machinery_stop(self, tmp_path, monkeypatch):
+        """v28: the denominator made the loss visible, but it was classed as a resumable remainder — a
+        pair in no slot is in no rotation, so nothing can resume it."""
+        real = sweep.allocate
+        monkeypatch.setattr(sweep, "allocate",
+                            lambda words, *, cap: real(list(words)[:-1], cap=cap))
+        out, tool = _run(tmp_path, words=["api", "internal"], max_pairs_per_target=10)
+        assert tool.calls == [] and out.stop_kind == "machinery" and "does not cover" in out.stop
+        assert out.eligible_pairs == 2 and out.attempted_pairs == 0
+        sel = [e for e in _events(tmp_path)
+               if str(e.get("event", "")).startswith("coverage") and e.get("measure") == "candidate_pairs"]
+        assert sel and sel[0]["source_id"] == COV and sel[0]["omitted"] == 2, sel
+
+    def test_a_PARTITION_that_SUBMITS_a_candidate_TWICE_is_caught_too(self, tmp_path, monkeypatch):
+        """Membership alone is not enough either: a partition covering every word but placing one of them
+        in two slots would submit that pair twice and inflate the attempted count."""
+        def twice(words, *, cap):
+            kept = list(words)
+            return {"000": kept, "001": kept[:1]}
+        monkeypatch.setattr(sweep, "allocate", twice)
+        out, tool = _run(tmp_path, words=["api", "internal"], max_pairs_per_target=10)
+        assert tool.calls == [] and out.stop_kind == "machinery" and "does not cover" in out.stop
+        assert "3 placed, 2 distinct, of 2" in out.stop
+
     def test_the_grammar_rejects_a_ROOT_outside_the_space_and_a_trailing_newline(self):
         """v26#2: `$` matches before a final newline, and three digits are not automatically a bucket."""
         assert sweep.slot_id_ok("255") and not sweep.slot_id_ok("256")

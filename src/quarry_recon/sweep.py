@@ -247,7 +247,18 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         return out                                     # source, never the scheduler's private lane name
 
     for target, per_target in corpus.items():
-        for slot, group in allocate(per_target, cap=max_pairs_per_target).items():
+        partition = allocate(per_target, cap=max_pairs_per_target)
+        placed = [word for group in partition.values() for word in group]
+        if len(placed) != len(per_target) or set(placed) != set(per_target):
+            # v28: a pair the partition dropped is not a RESUMABLE remainder — it is in no slot, so no
+            # rotation will ever reach it, and reporting it as "left over" would promise a later run that
+            # cannot happen. Membership, not counts: one dropped word and one duplicated word balance.
+            out.stop = (f"machinery: the slot partition does not cover {target} "
+                        f"({len(placed)} placed, {len(set(placed))} distinct, of {len(per_target)})")
+            out.stop_kind = "machinery"
+            _report(coverage_lane, out, clock)
+            return out
+        for slot, group in partition.items():
             members[(target, slot)] = group
     slots = sorted(members)
     # the denominator stays the CORPUS count taken above, not a re-count of the partition: if allocation
