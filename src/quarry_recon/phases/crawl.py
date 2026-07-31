@@ -7,6 +7,7 @@ gitleaks + trufflehog secret scans.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
 
-from .. import budget, events, fetch, normalize, secrets, settings
+from .. import budget, events, fetch, normalize, registry, secrets, settings
 from ..contract import registered, run_contract
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
@@ -996,7 +997,7 @@ def run(ctx) -> None:
         if wm.exists():
             _collect_url(ctx, wm.read_text(), "waymore", str(wm))
         # mine the response dir (only if responses were actually downloaded)
-        if mode == "B" and have("xnLinkFinder") and len([p for p in wdir.iterdir() if p.name != "waymore.txt"]) > 1:
+        if mode == "B" and len([p for p in wdir.iterdir() if p.name != "waymore.txt"]) > 1:
             # OFFLINE mining of the archived bodies only — see `_xnl_unit` for why depth-3 crawling is
             # gone. Collected, not run: all four inputs are mined under ONE source lifecycle at the end of
             # the phase (step 3), so `crawl.xnlinkfinder` has one terminal instead of four competing ones.
@@ -1045,7 +1046,7 @@ def run(ctx) -> None:
                               produced={sub: produced}, consumed={"js_file": len(recov_files)})
             except Exception as ex:
                 ctx.echo(f"    jsluice-sourcemap {sub}: {ex}")
-    if recov_files and have("xnLinkFinder"):
+    if recov_files:
         if recov_dir:
             xnl_units.append((str(recov_dir), "sourcemap", False))
 
@@ -1079,11 +1080,11 @@ def run(ctx) -> None:
                 ctx.echo(f"    jsluice {sub}: {ex}")
 
     # ── xnLinkFinder over JS dir (links + params + secrets + wordlist) ──
-    if js_files and have("xnLinkFinder"):
+    if js_files:
         xnl_units.append((str(js_derived_dir), "js", False))
 
     # ── xnLinkFinder over katana's stored responses (flags.md: crawl-then-mine) ──
-    if have("xnLinkFinder") and kat_resp.exists() and any(kat_resp.iterdir()):
+    if kat_resp.exists() and any(kat_resp.iterdir()):
         xnl_units.append((str(kat_resp), "katana-resp", False))
 
     # (waymore response mining happens per-apex above via -mode B + xnLinkFinder)
@@ -1184,6 +1185,9 @@ def run(ctx) -> None:
              f"secrets: {ctx.run.count('secret')}")
 
 
+#: bump when CLASSIFICATION or INGEST meaning changes — it is part of a unit's identity, because the same
+#: bytes parsed under different rules are a different result.
+XNL_PARSER_SCHEMA = 1
 XNL_MAX_INPUT = 200 * 1024 * 1024      # cap the stdin blob so a huge dir can't blow RAM
 XNL_WORDLIST_LIMIT = 10 * 1024 * 1024  # -owl/-os are permutation timekillers on big input -> small only
 XNL_PARAM_CAP = 2000                   # xnLinkFinder emits POTENTIAL params (noisy) -> cap per call
@@ -1307,6 +1311,118 @@ def _xnl_classify_param(raw: str) -> tuple:
     return bool(_XNL_PARAM_RX.match(v)), v
 
 
+def _xnl_wants_secrets(written: int) -> bool:
+    """Whether `-os` was asked for at this input size. ONE authority: `_xnl_run` decides with it and the
+    parser boundary asks it again, so "the tool wrote no secrets file" can be told apart from "we never
+    asked" — on the fresh path and on replay alike."""
+    return written < XNL_WORDLIST_LIMIT
+
+
+def _xnl_secret_row(item) -> bool:
+    """Whether a row matches the MEASURED `-os` row exactly. review-B-audit-7#4: only `value` was checked,
+    so a row with a malformed `type`/`sources`/`count` was ingested and the unit owned — the contract names
+    four fields, and a document that disagrees with it is not one we have measured."""
+    src = item.get("sources") if isinstance(item, dict) else None
+    return bool(isinstance(item, dict)
+                and isinstance(item.get("type"), str) and item["type"].strip()
+                and isinstance(item.get("value"), str) and item["value"].strip()
+                # MEASURED provenance: this lane always streams the concatenated blob on stdin, so every
+                # row the tool writes carries `["<stdin>"]`. A different source list is a document from a
+                # mode we have not measured — including an EMPTY one, which claims no origin at all.
+                and isinstance(src, list) and src and all(s == "<stdin>" for s in src)
+                # a real occurrence count: a positive int, and `bool` is not an int here.
+                and isinstance(item.get("count"), int) and not isinstance(item.get("count"), bool)
+                and item["count"] >= 1)
+
+
+def _xnl_secrets(ctx, tag: str, shot: tuple, *, requested: bool, carrier: dict | None = None) -> tuple:
+    """Ingest xnLinkFinder's `-os` output. Returns (stored, unusable, parse_gap).
+
+    MEASURED schema (xnLinkFinder 8.2, this machine, offline stdin fixtures): a JSON ARRAY of
+        {"type": str, "value": str, "sources": [str], "count": int}
+    and a run that finds NOTHING writes the array `[]` — measured separately, because "the tool found no
+    secrets" and "the artifact we asked for is missing" are different facts and only one of them is clean.
+    `sources` is always `["<stdin>"]` in the offline mode this lane runs in: the concatenated blob has no
+    per-file provenance to give, so it is not stored as if it did.
+
+    A discovered secret is BOUNTY EVIDENCE. It is stored VERBATIM: not masked, not truncated, not
+    rewritten. (Only QUARRY's own configured credentials are ever redacted, and none of them appear here.)
+    The counted result used to be `len(json)` with a bare `except: 0` — so a malformed or unexpected
+    document produced a confident `secrets=0` AND an ownable unit, freezing that silence forever. Anything
+    the measured schema does not explain is a PARSE GAP that keeps the unit retryable."""
+    res = carrier if carrier is not None else _xnl_result(tag)
+    state, raw = shot
+    if state == "absent":
+        if requested:
+            # review-B-audit-7#5: `-os` was passed and the tool wrote no file. The measured no-find shape
+            # is `[]`, so this is UNMEASURED — fail closed rather than call our own blind spot a zero.
+            return 0, 0, (f"{tag}: -os was requested and no artifact was written (the measured no-find "
+                          f"shape is `[]`) — unit retryable")
+        return 0, 0, ""                        # the tool was never asked for secrets
+    if state == "unreadable":
+        res["unreadable"] = True
+        return 0, 0, f"{tag}: -os artifact exists and could not be read"
+    if not raw.strip():
+        return 0, 0, (f"{tag}: -os artifact is empty (the measured no-find shape is `[]`) — artifact "
+                      f"RETAINED, unit retryable")
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return 0, 0, f"{tag}: -os output is not the measured JSON document — artifact RETAINED, unit retryable"
+    if not isinstance(doc, list):
+        return 0, 0, (f"{tag}: -os output is a {type(doc).__name__}, not the measured array — artifact "
+                      f"RETAINED, unit retryable")
+    stored = bad = 0
+    for item in doc:
+        if not _xnl_secret_row(item):
+            bad += 1
+            res["unusable"] += 1
+            continue
+        value, kind = item["value"], item["type"]
+        # id from the VERBATIM value, so the same secret from two inputs is one row; `secrets.fingerprint`
+        # is a digest, not a redaction — the value itself is stored beside it.
+        ctx.run.add("secret", {"id": f"xnLinkFinder:{kind}:{secrets.fingerprint(value)}",
+                               "kind": kind, "value": value, "preview": value,
+                               "verified": None, "verification": "not_checked",
+                               "sources": ["xnLinkFinder"], "context": f"xnLinkFinder-{tag}"})
+        # review-B-audit-9#2: counted into the CARRIER the moment the write returns — the local total only
+        # reached the caller if the whole document parsed, so a sink dying on the second secret reported
+        # zero while the first one sat in the store.
+        stored += 1
+        res["secrets"] += 1
+    gap = (f"{tag}: {bad}/{len(doc)} -os entries do not match the measured schema — artifact RETAINED, "
+           f"unit retryable") if bad else ""
+    return stored, bad, gap
+
+
+def _xnl_decode(shot: tuple) -> tuple:
+    """`(lines, undecodable, unreadable)` from a snapshot entry `(state, bytes)` — decode per line, never
+    whole-file: a `errors="replace"` decode turns invalid UTF-8 into replacement characters that then look
+    like perfectly good values, and mined minified/binary sources produce exactly that."""
+    state, data = shot
+    if state == "unreadable":
+        return [], 0, True                    # it is there and we cannot read it: our machinery failing
+    if state == "absent":
+        return [], 0, False                   # no output file: a legitimate zero
+    out, bad = [], 0
+    for chunk in data.splitlines():
+        try:
+            out.append(chunk.decode("utf-8"))
+        except UnicodeDecodeError:
+            bad += 1
+    return out, bad, False
+
+
+def _xnl_snapshot(outs: dict) -> dict:
+    """Read a unit's four artifacts ONCE: `{key: (state, bytes)}`.
+
+    review-B-audit-10#1: parsing, the presence check, publication and (on replay) digest verification each
+    re-read the files, so the bytes that produced the ENTITIES were not provably the bytes bound into the
+    ledger. A sink callback rewriting an artifact between two of those reads could make a run store URL A
+    and own URL B, which every later replay would then ingest. One snapshot, carried through all four."""
+    return {k: _xnl_read(outs[k]) for k in ("links", "params", "secrets", "wordlist")}
+
+
 def _xnl_lines(path) -> tuple:
     """`(lines, undecodable, unreadable)` — read tool output as BYTES and decode per line, strictly.
 
@@ -1319,49 +1435,173 @@ def _xnl_lines(path) -> tuple:
     artifact is our own machinery failing, and `unreadable` says which happened."""
     # review-B-audit-3#3: an `exists()` pre-check collapses a stat/permission failure to "absent" and adds a
     # check/read race. Read, then let the ERROR say which happened.
+    return _xnl_decode(_xnl_read(path))
+
+
+def _xnl_read(path):
+    """Read an artifact ONCE and say what it is: `("absent"|"ok"|"unreadable", bytes)`.
+
+    review-B-audit-9#3: `exists()` followed by a read is the check/read split `_xnl_lines` was fixed for
+    and it kept coming back — a permission or stat failure was reported as "the tool wrote no artifact",
+    and between the two calls the answer could change. One read, one verdict, used by everything that
+    needs to know whether an artifact is there."""
     try:
-        blob = path.read_bytes()
+        return "ok", Path(path).read_bytes()
     except FileNotFoundError:
-        return [], 0, False                   # no output file: a legitimate zero
+        return "absent", b""
     except OSError:
-        return [], 0, True                    # it is there and we cannot read it: our machinery failing
-    out, bad = [], 0
-    for chunk in blob.splitlines():
-        try:
-            out.append(chunk.decode("utf-8"))
-        except UnicodeDecodeError:
-            bad += 1
-    return out, bad, False
+        return "unreadable", b""
 
 
-def _xnl_input_digest(indir) -> tuple:
-    """`(file_digests, files)` for one input dir — the IMMUTABLE identity of what a unit mined.
+def _xnl_state_dir(ctx):
+    """PROJECT-owned state for the lane: `<project>/recon/state/xnlinkfinder/v<schema>/`.
 
-    Content digests, not paths or sizes: a same-size edit must re-mine, and a renamed file with identical
-    bytes must not. This is what makes a resumed run able to say "this unit already ran on exactly these
-    bytes"."""
-    digests, files = {}, 0
-    for f in sorted(Path(indir).rglob("*")):
-        try:
-            if f.is_file():
-                digests[str(f.relative_to(indir))] = events.file_digest(f)
-                files += 1
-        except OSError:
-            continue                                   # unreadable input is the unit's problem, not identity's
-    return digests, files
+    review-B-audit-5#1: this lived under `ctx.run.dir`, which `Run.create()` mints fresh for every run —
+    so the "resume" ledger was empty on every production invocation and only a test reusing one tmp_path
+    could see it work. The same single-run fixture blindness that hid the Whoxy cross-run defect."""
+    d = (Path(ctx.run.project_dir) / "recon" / "state" / "xnlinkfinder"
+         / f"v{XNL_PARSER_SCHEMA}")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _xnl_engine() -> str:
+    """The INSTALLED xnLinkFinder's proven identity (pipx metadata for the executable that resolves on
+    PATH), or "" when it cannot be proven.
+
+    review-B-audit-6#7: `have()` only asks whether the name resolves, and `pipx upgrade xnLinkFinder` is an
+    allowed operation — so a unit mined by 8.2 was replayed forever under a newer extractor that would have
+    found more. The engine is part of what produced the output, so it is part of the unit's identity."""
+    try:
+        tool = next((x for x in registry.load_tools() if x.bin == "xnLinkFinder"), None)
+        return registry.installed_identity(tool) if tool is not None else ""
+    except Exception:
+        return ""                       # an unprovable engine is handled by the caller, never guessed
+
+
+def _xnl_unit_identity(ctx, tag: str, spo: bool, blob_digest: str, engine: str) -> str:
+    """The unit's work identity: the exact BOUNDED INPUT ARTIFACT plus everything that changes the output.
+
+    review-B-audit-5#7: a per-file digest map keyed on RELATIVE FILENAMES made a rename a new unit (so the
+    old "a renamed identical file does not re-mine" claim was simply false), while omitting the scope roots,
+    `spo`, the caps and the parser schema — all of which change what is extracted or stored. The blob digest
+    covers the bytes AND the path order and byte cap that selected them."""
+    if not blob_digest:
+        # review-B-audit-6#7: an unreadable input digested to "", and every such unit collapsed onto ONE
+        # identity — mine one, own them all. A unit we cannot identify is a unit we must not own.
+        raise ValueError(f"{tag}: input artifact could not be digested — unit has no identity")
+    return events.work_unit("crawl.xnlinkfinder",
+                            inputs={"tag": tag, "apexes": sorted(ctx.profile.apex_domains)},
+                            file_digests={"input_blob": blob_digest},
+                            config={"engine": engine, "spo": bool(spo), "param_cap": XNL_PARAM_CAP,
+                                    "input_cap": XNL_MAX_INPUT, "wordlist_limit": XNL_WORDLIST_LIMIT,
+                                    "derive_cap": XNL_WORDLIST_DERIVE_CAP},
+                            schema_version=XNL_PARSER_SCHEMA)
+
+
+def _xnl_bundle(state_dir, wu: str) -> dict:
+    """Where a unit's OUTPUTS are kept so a LATER RUN can re-ingest them."""
+    return {"links": state_dir / f"{wu}_links.txt", "params": state_dir / f"{wu}_params.txt",
+            "secrets": state_dir / f"{wu}_secrets.json", "wordlist": state_dir / f"{wu}_wordlist.txt"}
+
+
+def _xnl_publish_bundle(ledger, state_dir, wu: str, snap: dict) -> dict:
+    """Copy a unit's outputs into project state, DIGEST-BOUND, and record the unit.
+
+    review-B-audit-5#1: the ledger bound only the INPUT blob, so `has()` meant "we mined this once" and the
+    lane then skipped — storing nothing in the new run. Evidence has to travel with the completion, or a
+    resumed run silently loses every entity the earlier run found.
+
+    review-B-audit-5#3: `record()`'s boolean is the durability handshake and it was discarded. It is
+    returned here so the caller can tell "journaled" from "in memory only"."""
+    bundle = _xnl_bundle(state_dir, wu)
+    manifest = {}
+    for key, dst in bundle.items():
+        # review-B-audit-10#1: the bytes come from the SNAPSHOT the parser used, never a fresh read — a
+        # second read is a second answer, and the ledger must bind exactly what produced the entities.
+        # Absence is one measured answer; an unreadable artifact fails publication (review-B-audit-6#6).
+        state, data = snap[key]
+        if state == "unreadable":
+            return {"stored": False, "journaled": False}
+        present = state == "ok"
+        dig = hashlib.sha256(data).hexdigest()
+        if present and not budget.publish_bytes(dst, data, digest=dig):
+            return {"stored": False, "journaled": False}
+        if not present:
+            dst.unlink(missing_ok=True)          # a file the tool never wrote must not exist in state
+        manifest[key] = {"file": dst.name, "present": present, "digest": dig, "bytes": len(data)}
+    man_path = state_dir / f"{wu}_bundle.json"
+    raw = json.dumps({"schema": XNL_PARSER_SCHEMA, "unit": wu, "outputs": manifest},
+                     sort_keys=True).encode()
+    if not budget.publish_bytes(man_path, raw, digest=hashlib.sha256(raw).hexdigest()):
+        return {"stored": False, "journaled": False}
+    # review-B-audit-6#5: every one of these is a durability answer and all four were discarded. Evaluated
+    # eagerly (never short-circuited) so each artifact is actually bound before the verdict is taken.
+    bound = [ledger.add_evidence(wu, dst, digest=manifest[key]["digest"])
+             for key, dst in bundle.items() if manifest[key]["present"]]
+    recorded = bool(ledger.record(wu, man_path, digest=hashlib.sha256(raw).hexdigest()))
+    return {"stored": True, "journaled": recorded and all(bound)}
+
+
+def _xnl_replay_bundle(ledger, state_dir, wu: str) -> dict | None:
+    """The stored outputs for an owned unit as a verified SNAPSHOT, or None when they no longer validate."""
+    man_path = ledger.artifact(wu)
+    if man_path is None:
+        return None
+    try:
+        man = json.loads(man_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if man.get("schema") != XNL_PARSER_SCHEMA or man.get("unit") != wu:
+        return None
+    bundle = _xnl_bundle(state_dir, wu)
+    declared = man.get("outputs") or {}
+    snap = {}
+    for key, path in bundle.items():
+        decl = declared.get(key) or {}
+        want = decl.get("digest")
+        state, data = _xnl_read(path)          # ONE read: the bytes that are verified ARE the bytes used
+        if decl.get("present") is False:
+            # the tool wrote no such artifact. A file appearing there later is not our evidence.
+            if state != "absent":
+                return None
+            snap[key] = ("absent", b"")
+            continue
+        if state != "ok":
+            return None
+        if not want or want != hashlib.sha256(data).hexdigest():
+            return None                # the bundle no longer says what it said: re-mine rather than trust
+        snap[key] = ("ok", data)
+    return snap
+
+
+def _xnl_materialize(ctx, tag: str, snap: dict) -> None:
+    """Write an owned unit's VERIFIED bytes into this run's raw tree, for the operator to inspect.
+
+    review-B-audit-6#2: replay handed the project-state files straight to `_xnl_ingest`, which REWRITES the
+    derived wordlist for large inputs — mutating digest-bound evidence after verifying it, and failing
+    outright on read-only state. Verified evidence is immutable; a run works on its own copy.
+
+    review-B-audit-10#1: it no longer RE-READS state to make that copy. The snapshot returned by
+    verification is what is written here and what is ingested — one set of bytes, one meaning."""
+    outs = _xnl_outputs(ctx, tag)
+    for key, dst in outs.items():
+        state, data = snap[key]
+        if state != "ok":
+            dst.unlink(missing_ok=True)      # the mining run produced no such artifact; neither do we
+            continue
+        dst.write_bytes(data)
 
 
 def _xnl_lane(ctx, units: list) -> None:
     """Mine every collected input under ONE `crawl.xnlinkfinder` lifecycle.
 
     review-B-audit#D3: `_xnl` ran up to four times per phase via bare `exec_tool`, so the source emitted
-    coverage and ledger events but NEVER a terminal, and its registry entry was never consulted (only
-    `run_contract`/`run_provider` are registry-authoritative). Wrapping each call independently would have
-    been worse — four competing terminals under one source id, last-writer-wins telemetry.
+    coverage and ledger events but NEVER a terminal, and its registry entry was never consulted. Wrapping
+    each call independently would have been worse — four competing terminals under one source id.
 
-    So: one `tool_start`, one `tool_finish`, and INDEPENDENTLY IDENTIFIED units in between. Each unit is
-    keyed by its input's content digests, so a resumed run re-mines only what changed, and a unit whose
-    extraction did not complete is never recorded as done."""
+    So: one `tool_start`, one `tool_finish`, and INDEPENDENTLY IDENTIFIED units in between, whose state is
+    PROJECT-owned, LOCKED for the whole lifecycle, and re-ingested on every run."""
     if not units:
         return
     sid = "crawl.xnlinkfinder"
@@ -1369,83 +1609,274 @@ def _xnl_lane(ctx, units: list) -> None:
         # the registry is authoritative for execution, and that authority lives in `contract` — a phase
         # asking `sources` directly would be a second copy of the same gate.
         return
+    fp = events.work_unit(sid, inputs={}, config={"param_cap": XNL_PARAM_CAP,
+                                                  "input_cap": XNL_MAX_INPUT},
+                          schema_version=XNL_PARSER_SCHEMA)
+    events.tool_start(sid, cmd=["xnLinkFinder", "(stdin)"], input_total=len(units), work_unit=fp)
+
+    # review-B-audit-5#6: the tool check lived at every COLLECTION site, so an uninstalled tool meant no
+    # units, no lane, and total silence from a `tier: core` source. The units are eligible either way; only
+    # the mining depends on the binary.
     if not have("xnLinkFinder"):
+        events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, unit="install", measure="units",
+                                eligible=len(units), tested=0, omitted=len(units),
+                                reason=f"xnLinkFinder is not installed — {len(units)} input(s) unmined")
         ctx.run.record("crawl", skipped("xnLinkFinder", "not installed"))
+        events.tool_finish(sid, status=Status.SKIPPED.value, work_unit=fp,
+                           reason=f"xnLinkFinder not installed — {len(units)} input(s) eligible")
         return
 
-    # units are keyed by CONTENT, so the resume key changes exactly when the bytes do.
-    prepared = []
-    for indir, tag, spo in units:
-        digests, files = _xnl_input_digest(indir)
-        wu = events.work_unit(sid, inputs={"tag": tag}, file_digests=digests,
-                              config={"param_cap": XNL_PARAM_CAP, "input_cap": XNL_MAX_INPUT})
-        prepared.append({"indir": indir, "tag": tag, "spo": spo, "wu": wu, "files": files})
-
-    base = ctx.run.dir / "raw" / "crawl"
-    base.mkdir(parents=True, exist_ok=True)
-    fp = events.work_unit(sid, inputs={}, config={"param_cap": XNL_PARAM_CAP,
-                                                  "input_cap": XNL_MAX_INPUT})
-    budget.prune_state(base, sid, fp)
-    ledger = budget.Ledger(budget.state_path(base, sid, fp), lane=sid)
-
-    events.tool_start(sid, cmd=["xnLinkFinder", "(stdin)"], input_total=len(prepared), work_unit=fp)
-    done = incomplete = replayed = 0
-    results = []
+    st = {"done": 0, "incomplete": 0, "replayed": 0, "machinery": [], "results": [],
+          "pending": [], "persisted": False, "busy": False, "cancelled": False,
+          "persist_note": "unit state was NOT persisted — every input re-mines"}
     try:
-        for i, u in enumerate(prepared, 1):
-            events.tool_progress(sid, input_total=len(prepared), current_index=i, work_unit=u["wu"])
-            if ledger.has(u["wu"]):
-                # the same bytes were mined by an earlier run of this project, and its entities are already
-                # in that run's store. Re-mining would spend the time again for the same answer.
-                replayed += 1
-                events.coverage_partial(sid, kind=events.COVERAGE_CAP, unit=f"{u['tag']}:unit",
-                                        measure="units", eligible=1, tested=1, omitted=0,
-                                        reason=f"{u['tag']}: already mined on these exact bytes (replayed)")
-                continue
-            res = _xnl_unit(ctx, u["indir"], u["tag"], spo=u["spo"])
-            results.append(res)
-            if res["complete"] and not res["unreadable"]:
-                done += 1
-                # bind the unit to the INPUT BLOB it actually mined: an artifact whose bytes changed can
-                # never satisfy a later resume.
-                blob = res["blob"]
-                if blob.exists():
-                    ledger.record(u["wu"], blob, digest=events.file_digest(blob))
-            else:
-                incomplete += 1
+        # review-B-audit-6#1: state creation, pruning and ledger load were OUTSIDE every boundary — an
+        # ordinary IO error there aborted the whole crawl phase with no terminal at all. And nothing
+        # serialised two runs of one project: both pruned the same directory, mined the same units, raced
+        # on the shared `.tmp` and unlinked each other's journal. ONE lock, taken before prune/load and
+        # held through replay, publication and save.
+        with contextlib.ExitStack() as stack:
+            state_dir = _xnl_state_dir(ctx)
+            stack.enter_context(budget.state_lock(state_dir / ".lock"))
+            budget.prune_state(state_dir, sid, fp)
+            ledger = budget.Ledger(budget.state_path(state_dir, sid, fp), lane=sid)
+            try:
+                _xnl_mine(ctx, sid, units, state_dir, ledger, st)
+            finally:
+                _xnl_settle(sid, ledger, st)
+    except budget.StateBusy as e:
+        st["busy"] = True
+        st["machinery"].append(f"another lifecycle holds this project's xnLinkFinder state ({e})")
+        events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, unit="lock", measure="units",
+                                eligible=len(units), tested=0, omitted=len(units),
+                                reason=f"another lifecycle holds the lane state — {len(units)} input(s) "
+                                       f"unmined in THIS run")
+    except (KeyboardInterrupt, SystemExit):
+        # review-B-audit-6#3: cancellation re-raised, but the terminal was computed in a `finally` that had
+        # no idea the run had been cancelled — so an interrupted lane signed off SUCCESS or EMPTY. The
+        # terminal is emitted HERE, saying what actually happened, before the signal continues upward.
+        st["cancelled"] = True
+        _xnl_terminal(ctx, sid, fp, units, st)
+        raise
+    except Exception as e:
+        st["machinery"].append(f"lane state unavailable ({type(e).__name__}: {e})")
+    _xnl_terminal(ctx, sid, fp, units, st)
+
+
+def _xnl_mine(ctx, sid: str, units: list, state_dir, ledger, st: dict) -> None:
+    """Replay or mine every unit, under the lane's lock. Accumulates into `st`; raises only cancellation."""
+    engine = _xnl_engine()
+    for i, (indir, tag, spo) in enumerate(units, 1):
+        events.tool_progress(sid, input_total=len(units), current_index=i)
+        try:
+            prep = _xnl_blob(ctx, indir, tag)
+            if not prep["digest"]:
+                # review-B-audit-6#7: without a digest there is no identity, and every such unit collapsed
+                # onto the same one. Named as the input problem it is, not as a machinery failure.
+                st["incomplete"] += 1
                 events.coverage_partial(
-                    sid, kind=events.COVERAGE_TIMEOUT, unit=f"{u['tag']}:unit", measure="units",
+                    sid, kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:unit", measure="units",
                     eligible=1, tested=0, omitted=1,
-                    reason=(f"{u['tag']}: extraction did NOT complete (tool status "
-                            f"{res['status'].value}{'; output unreadable' if res['unreadable'] else ''}) — "
-                            f"evidence KEPT, unit not recorded, next run re-mines it"))
-    finally:
-        persisted = bool(ledger.save()) or bool(getattr(ledger, "durable", False))
-        got = sum(r["endpoints"] + r["paths"] + r["schemeless"] + r["oos"] + r["credentials"]
-                  for r in results)
-        if incomplete and got:
-            status, reason = Status.PARTIAL.value, (f"{incomplete}/{len(prepared)} input(s) did not finish "
-                                                    f"extracting — evidence KEPT")
-        elif incomplete:
-            status, reason = Status.FAILED.value, f"{incomplete}/{len(prepared)} input(s) failed to extract"
+                    reason=f"{tag}: the bounded input artifact could not be digested — unit has no "
+                           f"identity, nothing mined, next run retries it")
+                continue
+            wu = _xnl_unit_identity(ctx, tag, spo, prep["digest"], engine)
+            bundle = _xnl_replay_bundle(ledger, state_dir, wu) if ledger.has(wu) else None
+            if bundle is not None:
+                # REPLAY, not skip: the stored outputs are re-ingested so this run's store holds the same
+                # entities the run that mined them did. Read-only: we ingest our own copies.
+                st["replayed"] += 1
+                _xnl_materialize(ctx, tag, bundle)     # the verified bytes, copied for the operator
+                res = _xnl_result(tag)
+                st["results"].append(res)          # registered BEFORE the writes, not after them
+                _xnl_ingest(ctx, tag, bundle, blob=prep["blob"], written=prep["written"],
+                            replay=True, carrier=res)
+                events.coverage_partial(sid, kind=events.COVERAGE_CAP, unit=f"{tag}:unit",
+                                        measure="units", eligible=1, tested=1, omitted=0,
+                                        reason=f"{tag}: replayed from owned evidence (same bytes)")
+                continue
+            run = _xnl_run(ctx, tag, prep["blob"], prep["written"], spo=spo)
+            # ONE read of each artifact; these exact bytes parse, publish and are digest-bound.
+            snap = _xnl_snapshot(run["outs"])
+            # review-B-audit-8#1: the carrier joins the accounting BEFORE any entity is written, so a sink
+            # that raises — or a cancellation — half-way through cannot leave the terminal claiming
+            # "nothing extracted" while the store holds what was already saved.
+            res = _xnl_result(tag)
+            st["results"].append(res)
+            _xnl_ingest(ctx, tag, snap, blob=prep["blob"], written=prep["written"], carrier=res)
+            # review-B-audit-5#2: a unit whose INPUT was truncated by the byte cap, or whose files could
+            # not all be read, has not mined everything it was given — recording it would freeze that
+            # omitted suffix forever. Completion needs the tool AND the whole input AND readable output.
+            whole_input = (prep["files_completed"] == prep["files"] and not prep["capped"]
+                           and not prep["partial_files"] and not prep["unreadable_files"])
+            if not engine:
+                # review-B-audit-6#7: an unprovable engine cannot be bound into the identity, so a later
+                # upgrade could not invalidate this unit. Mine it, keep the evidence, own nothing.
+                st["incomplete"] += 1
+                events.coverage_partial(
+                    sid, kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:unit", measure="units",
+                    eligible=1, tested=0, omitted=1,
+                    reason=f"{tag}: the installed xnLinkFinder's identity is unproven — evidence KEPT, "
+                           f"unit not recorded (an upgrade must not replay old output)")
+            elif run["complete"] and not res["unreadable"] and not res["parse_gap"] and whole_input:
+                pub = _xnl_publish_bundle(ledger, state_dir, wu, snap)
+                if not pub["stored"]:
+                    st["incomplete"] += 1
+                    events.coverage_partial(
+                        sid, kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:unit", measure="units",
+                        eligible=1, tested=0, omitted=1,
+                        reason=f"{tag}: evidence could not be stored durably — unit not recorded")
+                elif pub["journaled"]:
+                    st["done"] += 1
+                else:
+                    # review-B-audit-6#5: a failed APPEND still leaves the completion in memory, and a
+                    # later successful snapshot persists it — so the unit IS owned next run. Counting it
+                    # incomplete now and never revisiting produced a gap for work that was in fact kept.
+                    # It is PENDING until `save()` answers.
+                    st["pending"].append(tag)
+            else:
+                st["incomplete"] += 1
+                why = ("tool status " + run["status"].value if not run["complete"] else
+                       "output unreadable" if res["unreadable"] else
+                       res["parse_gap"] if res["parse_gap"] else
+                       f"input incomplete ({prep['files_completed']}/{prep['files']} files"
+                       f"{', byte cap hit' if prep['capped'] else ''})")
+                events.coverage_partial(
+                    sid, kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:unit", measure="units",
+                    eligible=1, tested=0, omitted=1,
+                    reason=(f"{tag}: extraction did NOT complete ({why}) — evidence KEPT, unit not "
+                            f"recorded, next run re-mines it"))
+        except (KeyboardInterrupt, SystemExit):
+            raise                                  # cancellation ends the run; it is not a unit outcome
+        except Exception as e:
+            # review-B-audit-5#5: an ordinary failure in one unit used to abort the whole crawl phase and
+            # leave the lane's terminal claiming success. Contain it, keep what the other units found.
+            st["incomplete"] += 1
+            st["machinery"].append(f"{tag}: {type(e).__name__}: {e}")
+            events.coverage_partial(
+                sid, kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:unit", measure="units",
+                eligible=1, tested=0, omitted=1,
+                reason=f"{tag}: our own machinery failed ({type(e).__name__}: {e})")
+
+
+def _xnl_settle(sid: str, ledger, st: dict) -> None:
+    """Compact the ledger and RESOLVE every pending completion — still under the lane's lock."""
+    try:
+        saved = bool(ledger.save())
+    except Exception as e:                          # `save()` promises a bool; a broken promise is ours
+        saved = False
+        st["machinery"].append(f"ledger save failed ({type(e).__name__}: {e})")
+    # review-B-audit-7#3: the durability fallback is a FALLBACK. A successful snapshot has already answered
+    # the question, and reading `durable` anyway let a raising property fabricate machinery on a clean run
+    # (the same short-circuit Whoxy needed).
+    durable = True
+    if not saved:
+        try:
+            durable = bool(getattr(ledger, "durable", False))
+        except Exception as e:
+            durable = False
+            st["machinery"].append(f"ledger durability unreadable ({type(e).__name__}: {e})")
+    # review-B-audit-5#3: `durable` alone says the JOURNAL is readable, not that every completion reached
+    # it. A record that failed to append leaves an older journal perfectly intact.
+    st["persisted"] = saved or (durable and not st["pending"])
+    # review-B-audit-7#6 / 8#4: "every input re-mines" was printed even when the journal held some of
+    # them, and the fraction was taken over every RESULT — replayed and gapped units included — rather
+    # than over the units that actually attempted a completion. What is lost is exactly the completions
+    # that reached NEITHER the journal nor a snapshot; what survives (an earlier snapshot's units, and
+    # anything journaled) is not this run's to disown.
+    pending, attempted = len(st["pending"]), st["done"] + len(st["pending"])
+    if not st["persisted"]:
+        st["persist_note"] = (f"{pending}/{attempted} completion(s) reached neither the journal nor a "
+                              f"snapshot — those re-mine" if durable else
+                              f"the journal is unusable and the snapshot failed — {attempted} "
+                              f"completion(s) from this run re-mine; units owned by an earlier snapshot "
+                              f"still replay")
+    for tag in st["pending"]:
+        if saved:
+            # the snapshot carries it: the unit IS owned, and the earlier "not recorded" reading was wrong.
+            # Coverage is LATEST per (source, unit), so this REPLACES the gap rather than adding a fact.
+            st["done"] += 1
+            events.coverage_partial(sid, kind=events.COVERAGE_CAP, unit=f"{tag}:unit", measure="units",
+                                    eligible=1, tested=1, omitted=0,
+                                    reason=f"{tag}: journal append failed but the snapshot compacted — "
+                                           f"unit owned")
         else:
-            status = Status.SUCCESS.value if got else Status.EMPTY.value
-            reason = None
-        if not persisted:
-            status, reason = Status.PARTIAL.value, "unit state was NOT persisted — every input re-mines"
-        events.tool_finish(sid, status=status, reason=reason, work_unit=fp,
-                           produced={"references": got})
-        ctx.echo(f"  xnLinkFinder: {len(prepared)} input(s) · {done} mined · {replayed} replayed · "
-                 f"{incomplete} incomplete")
+            st["incomplete"] += 1
+            events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:unit",
+                                    measure="units", eligible=1, tested=0, omitted=1,
+                                    reason=f"{tag}: completion reached neither the journal nor a snapshot "
+                                           f"— evidence KEPT, next run re-mines it")
+    st["pending"] = []
 
 
-def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
-    roots = ctx.write_list("roots.txt", ctx.profile.apex_domains)
+def _xnl_terminal(ctx, sid: str, fp: str, units: list, st: dict) -> None:
+    """The lane's ONE terminal, computed from what actually happened."""
+    results, machinery = st["results"], st["machinery"]
+    # review-B-audit-5#4: production is EVERY evidence category, replayed evidence included — a
+    # parameter-only extraction is not an empty one.
+    # ...and it counts what the PARSER ACCEPTED, not what the store found NEW (review-B-audit-2#2):
+    # a parameter jsluice already stored is still this lane's output, and an EMPTY terminal would be a
+    # lie about extraction.
+    got = sum(r["endpoints"] + r["paths"] + r["schemeless"] + r["oos"] + r["credentials"]
+              + r["params"] + r["wordlist"] + r["secrets"] for r in results)
+    produced = {"references": sum(r["endpoints"] + r["paths"] + r["schemeless"] + r["oos"]
+                                  + r["credentials"] for r in results),
+                "params": sum(r["params"] for r in results),
+                "wordlist": sum(r["wordlist"] for r in results),
+                "secrets": sum(r["secrets"] for r in results)}
+    incomplete = st["incomplete"]
+    if st["cancelled"]:
+        # an interrupted lane has NOT covered its input, whatever it managed to extract first.
+        # review-B-audit-7#2: PARTIAL asserts something was produced. A cancellation before any ingestion
+        # produced nothing, and that is a FAILED lifecycle with a cancellation reason — not a partial one.
+        status = Status.PARTIAL.value if got else Status.FAILED.value
+        reason = (f"CANCELLED after {st['done'] + st['replayed']}/{len(units)} input(s)"
+                  + (" — evidence KEPT" if got else " — nothing extracted")
+                  + ("; " + "; ".join(machinery) if machinery else ""))
+    elif st["busy"]:
+        # review-B-audit-7#1: SKIPPED claims we CHOSE not to run. Losing the lock is not a choice, and this
+        # run holds none of the holder's evidence — its own store is empty. Same rule as everywhere else:
+        # zero evidence is FAILED, and the `lock` coverage gap says who bounded us.
+        status = Status.PARTIAL.value if got else Status.FAILED.value
+        reason = "; ".join(machinery)
+    elif machinery:
+        status = Status.PARTIAL.value if got else Status.FAILED.value
+        reason = "; ".join(machinery)
+    elif incomplete and got:
+        status, reason = Status.PARTIAL.value, (f"{incomplete}/{len(units)} input(s) did not finish "
+                                                f"extracting — evidence KEPT")
+    elif incomplete:
+        status, reason = Status.FAILED.value, f"{incomplete}/{len(units)} input(s) failed to extract"
+    else:
+        status = Status.SUCCESS.value if got else Status.EMPTY.value
+        reason = None
+    if not (st["persisted"] or st["busy"]):
+        # the note always rides along; it may only make the verdict WORSE. Turning a FAILED lane into a
+        # PARTIAL one because its state also failed to persist would hide the first, larger fact.
+        if status in (Status.SUCCESS.value, Status.EMPTY.value):
+            status = Status.PARTIAL.value
+        reason = ((reason + "; ") if reason else "") + st.get(
+            "persist_note", "unit state was NOT persisted — every input re-mines")
+    events.tool_finish(sid, status=status, reason=reason, work_unit=fp, produced=produced)
+    ctx.echo(f"  xnLinkFinder: {len(units)} input(s) · {st['done']} mined · {st['replayed']} replayed · "
+             f"{incomplete} incomplete")
+
+
+def _xnl_outputs(ctx, tag: str) -> dict:
+    """The four artifacts one unit writes, under this run's raw tree."""
+    safe = tag.replace("/", "_").replace(".", "_")
+    return {"links": ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe}_links.txt"),
+            "params": ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe}_params.txt"),
+            "secrets": ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe}_secrets.json"),
+            "wordlist": ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe}_wordlist.txt")}
+
+
+def _xnl_blob(ctx, indir: str, tag: str) -> dict:
+    """Build the BOUNDED INPUT ARTIFACT for one unit — the exact bytes that will be mined.
+
+    This artifact IS the unit's identity (review-B-audit-5#7): it already reflects the byte cap and the
+    path order that decided WHICH bytes made it in, which a per-file digest map does not."""
     safe_tag = tag.replace("/", "_").replace(".", "_")
-    out_links = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_links.txt")
-    out_params = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_params.txt")
-    out_secrets = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_secrets.json")
-    out_wl = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_wordlist.txt")
     # xnLinkFinder v8.2: `-i <dir>` silently yields NOTHING (exit 0) and `-i <file>` is treated as a file
     # of DOMAINS to crawl — only STDIN parses file CONTENT offline (this silently produced 0 links/params
     # on every run). Concatenate the dir's files into a bounded blob and stream it via stdin (no -i).
@@ -1495,10 +1926,6 @@ def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
             if written < XNL_MAX_INPUT:
                 bf.write(b"\n")
                 written += 1
-    # xnLinkFinder APPENDS to existing output files (dedup) unless -ow — clear the per-tag outputs and pass
-    # -ow so a re-run is DETERMINISTIC (a stale artifact from an earlier invocation can't inflate the count).
-    for _o in (out_links, out_params, out_secrets, out_wl):
-        _o.unlink(missing_ok=True)
     # -orig ("LINK [ORIGIN]") is OMITTED entirely: in stdin mode the origin is always "<stdin>", so the flag
     # buys nothing and would CORRUPT the endpoint value. (We do NOT post-strip a trailing "[..]": with -orig
     # never passed xnLinkFinder appends none, and a strip would mangle route templates like /users/[id].)
@@ -1508,6 +1935,32 @@ def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
     # one that exists now: an option cannot smuggle a flag the way a list can.
     # `-orig` used to be passed and then filtered out here — in stdin mode the origin is always `<stdin>`,
     # so it is simply gone rather than accepted-and-dropped.
+    # STRUCTURED input coverage per tag (emit every run so an uncapped rerun clears). tested = files read to
+    # EOF ONLY; a file cut off by the 200MB cap (partial) or that raised (unreadable) is NOT counted tested —
+    # it is honestly part of `omitted`. measure=files so this is never summed with the param-candidate measure.
+    _n_files = len(files)
+    events.coverage_partial("crawl.xnlinkfinder", kind=events.COVERAGE_CAP, unit=f"{tag}:input",
+                            measure="files", eligible=_n_files, tested=files_completed,
+                            omitted=max(0, _n_files - files_completed),
+                            reason=f"{tag}: {files_completed}/{_n_files} files fully read "
+                                   f"({partial_files} partial, {unreadable} unreadable; input cap "
+                                   f"{XNL_MAX_INPUT // (1024*1024)}MB)")
+    return {"blob": blob, "written": written, "capped": capped, "files": _n_files,
+            "files_completed": files_completed, "partial_files": partial_files,
+            "unreadable_files": unreadable,
+            "digest": events.file_digest(blob) if blob.exists() else ""}
+
+
+def _xnl_run(ctx, tag: str, blob, written: int, *, spo: bool = False) -> dict:
+    """Run the tool over one prepared blob. Returns the tool's own status and its four artifacts."""
+    roots = ctx.write_list("roots.txt", ctx.profile.apex_domains)
+    outs = _xnl_outputs(ctx, tag)
+    out_links, out_params, out_secrets, out_wl = (outs["links"], outs["params"], outs["secrets"],
+                                                  outs["wordlist"])
+    # xnLinkFinder APPENDS to existing output files (dedup) unless -ow — clear the per-tag outputs and pass
+    # -ow so a re-run is DETERMINISTIC (a stale artifact from an earlier invocation can't inflate the count).
+    for _o in (out_links, out_params, out_secrets, out_wl):
+        _o.unlink(missing_ok=True)
     cmd = ["xnLinkFinder", "-sp", str(roots), "-sf", str(roots), "-ow",
            "-o", str(out_links), "-op", str(out_params), "-all", "-mfs", "0"]
     if spo:
@@ -1517,7 +1970,7 @@ def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
     # xnLinkFinder for minutes after links are written). Request them only for SMALL input; a large dir gets
     # links+params fast, a DERIVED wordlist (below) so A1d still has vocabulary, and -os skipped (secrets are
     # covered by trufflehog/gitleaks/jsluice).
-    small = written < XNL_WORDLIST_LIMIT
+    small = _xnl_wants_secrets(written)
     if small:
         cmd += ["-owl", str(out_wl), "-os", str(out_secrets)]
     # ALWAYS -d 0. This lane EXTRACTS from bytes we already hold; it never requests anything.
@@ -1548,28 +2001,44 @@ def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
     # `-ow` truncates the four artifacts at start, so a killed run leaves whatever was flushed — real
     # evidence, and NOT a completed extraction. Both facts travel out of here.
     extraction_complete = r.status in (Status.SUCCESS, Status.EMPTY)
-    # STRUCTURED input coverage per tag (emit every run so an uncapped rerun clears). tested = files read to
-    # EOF ONLY; a file cut off by the 200MB cap (partial) or that raised (unreadable) is NOT counted tested —
-    # it is honestly part of `omitted`. measure=files so this is never summed with the param-candidate measure.
-    _n_files = len(files)
-    events.coverage_partial("crawl.xnlinkfinder", kind=events.COVERAGE_CAP, unit=f"{tag}:input",
-                            measure="files", eligible=_n_files, tested=files_completed,
-                            omitted=max(0, _n_files - files_completed),
-                            reason=f"{tag}: {files_completed}/{_n_files} files fully read "
-                                   f"({partial_files} partial, {unreadable} unreadable; input cap "
-                                   f"{XNL_MAX_INPUT // (1024*1024)}MB)")
+    return {"status": r.status, "complete": extraction_complete, "outs": outs, "small": small}
 
+
+def _xnl_result(tag: str) -> dict:
+    """A unit's OUTCOME CARRIER, zeroed. Created by the lane BEFORE ingestion and updated as each entity
+    lands (review-B-audit-8#1): the counts used to exist only in `_xnl_ingest`'s return value, so a sink
+    that raised — or a cancellation — after real writes left the store holding evidence while the terminal
+    reported `FAILED / nothing extracted`."""
+    return {"tag": tag, "endpoints": 0, "paths": 0, "schemeless": 0, "oos": 0, "credentials": 0,
+            "params": 0, "params_seen": 0, "params_kept": 0, "wordlist": 0, "secrets": 0,
+            "unusable": 0, "undecodable": 0, "unreadable": False, "parse_gap": ""}
+
+
+def _xnl_ingest(ctx, tag: str, snap: dict, *, blob=None, written: int = 0, replay: bool = False,
+                carrier: dict | None = None) -> dict:
+    """The PARSER BOUNDARY and the entity writes, over one unit's four artifacts.
+
+    Used by the fresh path AND by replay: fresh and replayed evidence owe the same contract, and a second
+    implementation is how the two drift apart. Counts land in `carrier` AS THEY HAPPEN, so an interruption
+    part-way through leaves the terminal agreeing with the store."""
+    res = carrier if carrier is not None else _xnl_result(tag)
     # ── links: UNTRUSTED output, re-validated against QUARRY's scope before anything is stored ──
     # It used to be ingested as-is, "scope already applied by xnLinkFinder" — but that filter admits
     # `acme.com.evil.net` and `notacme.com` for apex `acme.com`, so the inventory was inheriting the same
     # defect the depth-3 crawl was contained for.
     src_tag = f"xnLinkFinder-{tag}"
-    lines, undecodable, links_unreadable = _xnl_lines(out_links)
+    lines, undecodable, links_unreadable = _xnl_decode(snap["links"])
     # review-B-audit-2#2: these used to count only what `add()` reported as NEW, so an endpoint jsluice had
     # already stored made the parser look like it had rejected it (`tested=0` for a line it accepted).
     # ACCEPTANCE is a parser fact; NOVELTY is a store fact. Both are counted, separately.
-    n_endpoints = n_paths = n_oos = n_bad_links = 0        # accepted by the parser
-    n_schemeless = n_credential = n_ignored = 0
+    n_ignored = n_bad_links = 0                            # local aliases for the telemetry lines below
+    # review-B-audit-10#2: the DERIVED wordlist used to be built by re-decoding the raw artifacts with
+    # `errors="replace"`, so a line the strict reader REJECTED as undecodable still contributed words —
+    # and those words drive an ACTIVE puredns brute in A1d. Derivation now consumes only values this
+    # boundary accepted.
+    accepted: list = []
+    res["undecodable"] += undecodable
+    res["unreadable"] = res["unreadable"] or links_unreadable
     # ...and new to the store. review-B-audit-4 (note): `xnl_stored` reported novelty for surface only,
     # because the other `add()` results were discarded — so a re-run looked like it had stored nothing new
     # even when it had recorded a fresh off-scope link or credential.
@@ -1577,46 +2046,57 @@ def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
     for line in lines:
         kind, v = _xnl_classify_link(line, ctx.scope)
         if kind == XNL_ENDPOINT:
-            n_endpoints += 1
-            if ctx.run.add("endpoint", {"value": v, "sources": [src_tag]}):
-                new_endpoints += 1
+            # counted AFTER the write returns: a line the parser accepted and the store REFUSED (already
+            # present) is still production, but a write that RAISED never happened (review-B-audit-8#1).
+            stored = ctx.run.add("endpoint", {"value": v, "sources": [src_tag]})
+            res["endpoints"] += 1
+            accepted.append(v)
+            new_endpoints += 1 if stored else 0
         elif kind == XNL_PATH:
             # a relative path has no host, so it is not contactable on its own — and the concatenated stdin
             # blob has already destroyed which file it came from. `origin: unbound` says that plainly rather
             # than letting a consumer assume the path belongs to some particular site.
-            n_paths += 1
-            if ctx.run.add("endpoint", {"value": v, "kind": "path", "origin": "unbound",
-                                        "sources": [src_tag]}):
-                new_paths += 1
+            stored = ctx.run.add("endpoint", {"value": v, "kind": "path", "origin": "unbound",
+                                              "sources": [src_tag]})
+            res["paths"] += 1
+            accepted.append(v)
+            new_paths += 1 if stored else 0
         elif kind == XNL_SCHEMELESS:
             # a host we may well own, but with NO scheme we were told — kept verbatim and marked unbound on
             # both axes, so nothing downstream can turn it into a request.
-            n_schemeless += 1
-            if ctx.run.add("endpoint", {"value": v, "kind": "scheme-relative", "scheme": "unbound",
-                                        "origin": "unbound", "sources": [src_tag]}):
-                new_schemeless += 1
+            stored = ctx.run.add("endpoint", {"value": v, "kind": "scheme-relative", "scheme": "unbound",
+                                              "origin": "unbound", "sources": [src_tag]})
+            res["schemeless"] += 1
+            accepted.append(v)
+            new_schemeless += 1 if stored else 0
         elif kind == XNL_CREDENTIAL:
             # DISCOVERED credentials are a finding, not noise. Verbatim — masking a discovered secret would
             # destroy the evidence; only Quarry's OWN configured credentials are redacted from telemetry.
-            n_credential += 1
-            if ctx.run.add("review", {"id": f"{src_tag}:cred:{v}", "klass": "credential-in-url", "value": v,
-                                   "note": f"{src_tag} extracted a URL carrying USERINFO — never contacted "
-                                              f"(the authority is ambiguous), retained verbatim as evidence",
-                                      "sources": [src_tag]}):
-                new_credential += 1
+            stored = ctx.run.add("review", {"id": f"{src_tag}:cred:{v}", "klass": "credential-in-url",
+                                            "value": v,
+                                            "note": f"{src_tag} extracted a URL carrying USERINFO — never "
+                                                    f"contacted (the authority is ambiguous), retained "
+                                                    f"verbatim as evidence",
+                                            "sources": [src_tag]})
+            res["credentials"] += 1
+            new_credential += 1 if stored else 0
         elif kind == XNL_IGNORED:
             n_ignored += 1                     # blank lines and the tool's own token: neither finding nor error
         elif kind == XNL_OOS:
             # the archive really did link there: real evidence, and NOT surface. `endpoint` feeds lanes that
             # go on to contact things, so an off-scope URL is retained where nothing active consumes it.
-            n_oos += 1
-            if ctx.run.add("review", {"id": f"{src_tag}:oos:{v}", "klass": "oos-link", "value": v,
-                                   "note": f"{src_tag} extracted an OFF-SCOPE link — retained as evidence, "
-                                              f"never probed (Quarry scope, not the tool's filter)",
-                                      "sources": [src_tag]}):
-                new_oos += 1
+            stored = ctx.run.add("review", {"id": f"{src_tag}:oos:{v}", "klass": "oos-link", "value": v,
+                                            "note": f"{src_tag} extracted an OFF-SCOPE link — retained as "
+                                                    f"evidence, never probed (Quarry scope, not the "
+                                                    f"tool's filter)",
+                                            "sources": [src_tag]})
+            res["oos"] += 1
+            new_oos += 1 if stored else 0
         else:
-            n_bad_links += 1
+            res["unusable"] += 1
+            n_bad_links += 1                   # local alias for the telemetry line below
+    n_endpoints, n_paths, n_schemeless = res["endpoints"], res["paths"], res["schemeless"]
+    n_credential, n_oos = res["credentials"], res["oos"]
     events.coverage_partial("crawl.xnlinkfinder", kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:links",
                             # IGNORED noise is neither eligible nor omitted: it was never a candidate.
                             measure="links", eligible=len(lines) - n_ignored + undecodable,
@@ -1631,7 +2111,9 @@ def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
     #    — NOT confirmed request params. Store as CANDIDATES (kind=potential) with a per-call CAP so a 52k
     #    dump can't flood the inventory / downstream arjun. Drop the <stdin> noise token. ──
     n_params_added = 0
-    param_lines, param_undecodable, params_unreadable = _xnl_lines(out_params)
+    param_lines, param_undecodable, params_unreadable = _xnl_decode(snap["params"])
+    res["undecodable"] += param_undecodable
+    res["unreadable"] = res["unreadable"] or params_unreadable
     cand_set, n_bad_params = set(), param_undecodable
     for line in param_lines:
         ok, v = _xnl_classify_param(line)
@@ -1641,11 +2123,20 @@ def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
             n_bad_params += 1                 # a sentence, a code fragment, binary noise — not a param name
     cand = sorted(cand_set)
     n_params_seen = len(cand)
+    # review-B-audit-9#1: `params` was the PARSER-SEEN count, assigned before the first write — so a store
+    # that raised on the first parameter still reported every candidate as produced. Production is what was
+    # DELIVERED; parser-seen and novelty are their own counters.
+    res["params_seen"] = n_params_seen
+    res["unusable"] += n_bad_params
     # cap a DETERMINISTIC subset: sort first, then keep the first N — so a re-run keeps the SAME candidates
     # (xnLinkFinder's -op file order is set-derived / unstable; capping the raw order was non-idempotent).
     for v in cand[:XNL_PARAM_CAP]:
-        if ctx.run.add("parameter", {"value": v, "kind": "potential", "sources": [f"xnLinkFinder-{tag}"]}):
+        stored = ctx.run.add("parameter", {"value": v, "kind": "potential",
+                                           "sources": [f"xnLinkFinder-{tag}"]})
+        res["params"] += 1                     # delivered: the write returned (novel or already present)
+        if stored:
             n_params_added += 1
+            res["params_kept"] = n_params_added
     # STRUCTURED param coverage per tag (emit every run): eligible = distinct POTENTIAL params xnLinkFinder
     # produced, tested = kept under the cap, omitted = dropped. These are candidates (path words/JSON keys/JS
     # vars — not all request params) but a dropped candidate is still un-mined surface, so this is honestly a
@@ -1660,35 +2151,66 @@ def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
     # ── A1d vocabulary: if -owl was skipped (large), DERIVE a bounded target wordlist from the mined
     #    links+params (path segments + param names are exactly the useful brute words) so A1d isn't starved;
     #    record the -owl/-os skip. ──
-    if not small:
+    # `-owl`/`-os` are requested only for SMALL input (see `_xnl_run`); the same threshold decides here
+    # whether a wordlist must be DERIVED instead. Computed from the blob size the caller passed, so the
+    # replay path reaches the same conclusion the fresh path did.
+    # review-B-audit-8#2: computed HERE, before the derived wordlist is written, so it asks what the TOOL
+    # produced. `-o`/`-op` are always requested; `-owl` only on small input.
+    # ABSENCE only. An artifact that is there and UNREADABLE is our machinery failing, and each reader
+    # (`_xnl_lines`, `_lines`, `_xnl_secrets`) already says so from its own read — a second verdict here
+    # would be a duplicate no test could distinguish.
+    asked_for = {"-o": True, "-op": True, "-owl": _xnl_wants_secrets(written)}
+    tool_missing = [name for name in ("-o", "-op", "-owl")
+                    if asked_for[name] and snap[{"-o": "links", "-op": "params",
+                                                 "-owl": "wordlist"}[name]][0] == "absent"]
+    if written >= XNL_WORDLIST_LIMIT and not replay:
+        # (on REPLAY the owned bundle already carries the derived wordlist — deriving it again would be a
+        # second answer to a question the mining run already answered and bound by digest.)
         words = set()
-        for p in (out_links, out_params):
-            if not (p.exists() and len(words) < XNL_WORDLIST_DERIVE_CAP):
-                continue
-            for ln in p.read_text(errors="replace").splitlines():
-                for w in re.split(r"[^A-Za-z0-9]+", ln.lower()):
-                    if 3 <= len(w) <= 30 and not w.isdigit():
-                        words.add(w)
-                if len(words) >= XNL_WORDLIST_DERIVE_CAP:
-                    break
-        out_wl.write_text("\n".join(sorted(words)[:XNL_WORDLIST_DERIVE_CAP]) + "\n")
+        for value in accepted + cand[:XNL_PARAM_CAP]:
+            for w in re.split(r"[^A-Za-z0-9]+", value.lower()):
+                if 3 <= len(w) <= 30 and not w.isdigit():
+                    words.add(w)
+            if len(words) >= XNL_WORDLIST_DERIVE_CAP:
+                break
+        derived = ("\n".join(sorted(words)[:XNL_WORDLIST_DERIVE_CAP]) + "\n").encode()
+        out_wl = _xnl_outputs(ctx, tag)["wordlist"]
+        out_wl.write_bytes(derived)
+        snap["wordlist"] = ("ok", derived)     # OUR artifact now, and the bytes that will be published
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: -owl skipped ({written // (1024*1024)}MB input, timekiller) — "
                                        f"wordlist DERIVED from links/params ({len(words)}); -os skipped "
                                        f"(secrets covered by trufflehog/gitleaks/jsluice)")
 
     # ── ledger over all four artifacts + suspicious-empty (real input, none produced) ──
-    def _lines(p):
-        return len([ln for ln in p.read_text(errors="replace").splitlines() if ln.strip()]) if p.exists() else 0
-    n_words = _lines(out_wl)
-    n_secrets = 0
-    if out_secrets.exists():
-        try:
-            sd = json.loads(out_secrets.read_text() or "[]")
-            n_secrets = len(sd) if isinstance(sd, (list, dict)) else 0
-        except Exception:
-            n_secrets = 0
-    events.ledger("crawl.xnlinkfinder", unit=tag,
+    # the wordlist is counted the same STRICT way as every other artifact: an undecodable line is not a
+    # word, it is a rejected line (review-B-audit-10#2).
+    wl_lines, wl_undecodable, wl_unreadable = _xnl_decode(snap["wordlist"])
+    res["unreadable"] = res["unreadable"] or wl_unreadable
+    res["undecodable"] += wl_undecodable
+    n_words = len([ln for ln in wl_lines if ln.strip()])
+    res["wordlist"] = n_words
+    # review-B-audit-11#1: a REASON-ONLY coverage event never reaches the verdict — the reconciler admits
+    # structured counters (or COVERAGE_UNKNOWN) only. These words arm an ACTIVE brute in A1d, so a line we
+    # dropped is un-mined vocabulary and must gate the run. Emitted EVERY run so a clean rerun clears it.
+    events.coverage_partial("crawl.xnlinkfinder", kind=events.COVERAGE_TIMEOUT, unit=f"{tag}:wordlist",
+                            measure="wordlist_lines", eligible=n_words + wl_undecodable,
+                            tested=n_words, omitted=wl_undecodable,
+                            reason=(f"{tag}: {n_words} wordlist line(s) usable, {wl_undecodable} not valid "
+                                    f"UTF-8 and DROPPED (this vocabulary drives the A1d brute)"
+                                    + ("; WORDLIST OUTPUT UNREADABLE" if wl_unreadable else "")))
+    n_secrets, n_secret_bad, secret_gap = _xnl_secrets(ctx, tag, snap["secrets"],
+                                                       requested=_xnl_wants_secrets(written), carrier=res)
+    # `-o`, `-op` and (on small input) `-owl` are requested EXPLICITLY, and the MEASURED no-find shape of
+    # each is an EMPTY FILE, not an absent one (xnLinkFinder 8.2, empty stdin blob: links/params/wordlist
+    # all created at 0 bytes, secrets `[]`). A requested artifact that is missing is our blind spot, and
+    # the unit stays retryable.
+    missing = tool_missing
+    gaps = [g for g in (secret_gap,
+                        (f"{tag}: {', '.join(missing)} requested and no artifact written (the measured "
+                         f"no-find shape is an EMPTY FILE) — unit retryable") if missing else "") if g]
+    res["parse_gap"] = "; ".join(gaps)
+    events.ledger("crawl.xnlinkfinder", unit=tag, replay=replay,
                   produced={"endpoints": n_endpoints, "paths": n_paths, "oos_links": n_oos,
                             "scheme_relative": n_schemeless, "credential_urls": n_credential,
                             "potential_params": n_params_seen, "params_kept": n_params_added,
@@ -1697,26 +2219,25 @@ def _xnl_unit(ctx, indir: str, tag: str, *, spo: bool = False) -> dict:
                   # reports nothing is indistinguishable from a tool that emitted nothing.
                   xnl_rejected={"links_unusable": n_bad_links, "links_undecodable": undecodable,
                                 "params_unusable": n_bad_params, "off_scope_links": n_oos,
-                                "links_ignored": n_ignored},
+                                "links_ignored": n_ignored, "secrets_unusable": n_secret_bad,
+                                "wordlist_undecodable": wl_undecodable},
                   # ACCEPTED vs NEW: a line the parser took that the store already had is not a rejection.
                   xnl_stored={"endpoints_new": new_endpoints, "paths_new": new_paths,
                               "scheme_relative_new": new_schemeless, "oos_links_new": new_oos,
                               "credential_urls_new": new_credential, "params_new": n_params_added},
                   # an artifact that EXISTS and cannot be read is our machinery failing, not a zero result.
                   # Step 3 turns these into a gap; recorded now so the fact is not invented later.
-                  xnl_unreadable={"links": links_unreadable, "params": params_unreadable})
+                  xnl_unreadable={"links": links_unreadable, "params": params_unreadable,
+                                  "wordlist": wl_unreadable})
     # a run that produced NOTHING usable is suspicious; one that produced only off-scope links is a
     # different fact, so both are named.
     if written > 512 and not (n_endpoints or n_paths or n_params_seen or n_words or n_secrets or n_oos
                               or n_schemeless or n_credential):
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: {written}B input -> 0 links/params/words/secrets "
-                                       f"(capability drift? input kept: {blob.name})")
-    return {"tag": tag, "status": r.status, "complete": extraction_complete,
-            "blob": blob, "input_bytes": written, "files": _n_files, "files_read": files_completed,
-            "endpoints": n_endpoints, "paths": n_paths, "schemeless": n_schemeless, "oos": n_oos,
-            "credentials": n_credential, "params": n_params_seen, "params_kept": n_params_added,
-            "wordlist": n_words, "secrets": n_secrets,
-            "unusable": n_bad_links + n_bad_params, "undecodable": undecodable + param_undecodable,
-            "unreadable": links_unreadable or params_unreadable,
-            "artifacts": [out_links, out_params, out_secrets, out_wl]}
+                                       f"(capability drift? input kept: "
+                                       f"{blob.name if blob is not None else '?'})")
+    # the carrier IS the result: everything above wrote into it as it happened. (A PARSE GAP is neither an
+    # unreadable file nor a zero result: the artifact is retained evidence we could not fully account for,
+    # so the unit stays retryable — review-B-audit-6#4.)
+    return res

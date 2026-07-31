@@ -38,6 +38,10 @@ class _Scope:
 class _Run:
     def __init__(self, d):
         self.dir = d
+        # step 3: xnLinkFinder unit state is PROJECT-owned, so a run knows its project. In production
+        # `Run.create()` mints `dir` fresh per run under a stable `project_dir` — a fixture that conflates
+        # them is exactly what hid the cross-run defect.
+        self.project_dir = d.parent if d.name == "run" else d
         self._vals = {}
         self.added = []
 
@@ -2041,7 +2045,8 @@ class TestXnLinkFinderNeverCrawls:
         src = tmp_path / "indir"
         src.mkdir(parents=True, exist_ok=True)
         (src / "a.js").write_text("var u = '/api/v1/users';\n")
-        crawl._xnl_unit(ctx, str(src), "t", **kw)
+        prep = crawl._xnl_blob(ctx, str(src), "t")
+        crawl._xnl_run(ctx, "t", prep["blob"], prep["written"], **kw)
         return seen["cmd"]
 
     def test_the_command_is_always_offline(self, tmp_path, monkeypatch):
@@ -2058,10 +2063,10 @@ class TestXnLinkFinderNeverCrawls:
         """The parameter is GONE, not defaulted: a parameter can be passed again by a future call site, a
         missing one cannot."""
         import inspect
-        assert "depth" not in inspect.signature(crawl._xnl_unit).parameters
+        assert "depth" not in inspect.signature(crawl._xnl_run).parameters
         assert "depth" not in inspect.signature(crawl._xnl_lane).parameters
         with pytest.raises(TypeError):
-            crawl._xnl_unit(None, "x", "t", depth=3)
+            crawl._xnl_run(None, "t", "blob", 0, depth=3)
 
     @pytest.mark.parametrize("injection", [
         {"extra": ["-d", "3"]}, {"extra": ["-insecure"]}, {"extra": ["-i", "https://evil.net"]},
@@ -2072,7 +2077,7 @@ class TestXnLinkFinderNeverCrawls:
         whose contract is "never requests anything". A caller could pass `-d 3` or `-i <url>` straight
         through. An OPTION cannot smuggle a flag the way a list can."""
         with pytest.raises(TypeError):
-            crawl._xnl_unit(None, "x", "t", **injection)
+            crawl._xnl_run(None, "t", "blob", 0, **injection)
 
     def test_the_COMMAND_is_exactly_the_allowed_flag_set(self, tmp_path, monkeypatch):
         """The strongest form of the same claim: enumerate what the tool is actually asked to do, so any
@@ -2107,7 +2112,8 @@ class TestXnLinkFinderNeverCrawls:
         src = tmp_path / "indir2"
         src.mkdir(parents=True, exist_ok=True)
         (src / "urls.txt").write_text("https://example.com/a\nhttps://example.com/b\n")
-        crawl._xnl_unit(ctx, str(src), "t2")
+        prep = crawl._xnl_blob(ctx, str(src), "t2")
+        crawl._xnl_run(ctx, "t2", prep["blob"], prep["written"])
         assert seen["input"].startswith(b"\n"), seen["input"][:40]
 
     def test_no_CALL_SITE_asks_for_a_crawl(self):
@@ -2120,7 +2126,7 @@ class TestXnLinkFinderNeverCrawls:
         for line in collected:
             assert "depth" not in line, line
         runners = [ln for ln in src.splitlines()
-                   if "_xnl_unit(ctx," in ln and not ln.lstrip().startswith("def ")]
+                   if "_xnl_run(ctx," in ln and not ln.lstrip().startswith("def ")]
         assert len(runners) == 1, runners       # only the coordinator runs a unit
 
     def test_the_DOCS_do_not_teach_the_broken_form(self):
@@ -2234,7 +2240,10 @@ class TestXnLinkFinderIngestionBoundary:
         src = tmp_path / "in"
         src.mkdir(parents=True, exist_ok=True)
         (src / "a.js").write_text("x")
-        crawl._xnl_unit(ctx, str(src), "t")
+        prep = crawl._xnl_blob(ctx, str(src), "t")
+        run = crawl._xnl_run(ctx, "t", prep["blob"], prep["written"])
+        crawl._xnl_ingest(ctx, "t", crawl._xnl_snapshot(run["outs"]), blob=prep["blob"],
+                          written=prep["written"])
         evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         return ctx.run.added, evs
 
@@ -2409,7 +2418,10 @@ class TestXnLinkFinderAcceptanceIsNotStorage:
         src = tmp_path / "in"
         src.mkdir(parents=True, exist_ok=True)
         (src / "a.js").write_text("x")
-        crawl._xnl_unit(ctx, str(src), "t")
+        prep = crawl._xnl_blob(ctx, str(src), "t")
+        run = crawl._xnl_run(ctx, "t", prep["blob"], prep["written"])
+        crawl._xnl_ingest(ctx, "t", crawl._xnl_snapshot(run["outs"]), blob=prep["blob"],
+                          written=prep["written"])
         return [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
 
     def test_an_endpoint_ANOTHER_LANE_already_stored_still_counts_as_accepted(self, tmp_path, monkeypatch):
@@ -2506,10 +2518,13 @@ class TestXnLinkFinderBoundarySemantics:
         src = tmp_path / "in"
         src.mkdir(parents=True, exist_ok=True)
         (src / "a.js").write_text("x")
-        crawl._xnl_unit(ctx, str(src), "t")
+        prep = crawl._xnl_blob(ctx, str(src), "t")
+        run = crawl._xnl_run(ctx, "t", prep["blob"], prep["written"])
+        crawl._xnl_ingest(ctx, "t", crawl._xnl_snapshot(run["outs"]), blob=prep["blob"],
+                          written=prep["written"])
         evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         led = [e for e in evs if e.get("event") == "ledger"][0]
-        assert led["xnl_unreadable"] == {"links": True, "params": True}, led
+        assert led["xnl_unreadable"] == {"links": True, "params": True, "wordlist": False}, led
         cov = [e for e in evs if e.get("measure") == "links"][0]
         assert "UNREADABLE" in cov["reason"], cov
 
@@ -2597,23 +2612,35 @@ class TestXnLinkFinderHasOneLifecycle:
             return False
 
     def _lane(self, tmp_path, monkeypatch, units, status=None, links=("https://api.acme.com/x",),
-              content=None):
+              content=None, installed=True, params=(), store_novel=True, engine="8.2", add=None):
         calls = []
 
         def fake_exec(tool, cmd, **kw):
             calls.append(cmd)
             pathlib.Path(cmd[cmd.index("-o") + 1]).write_text("\n".join(links) + "\n")
-            pathlib.Path(cmd[cmd.index("-op") + 1]).write_text("")
+            pathlib.Path(cmd[cmd.index("-op") + 1]).write_text("\n".join(params) + ("\n" if params else ""))
+            # MEASURED (8.2, empty stdin blob): every REQUESTED artifact is created — links/params/
+            # wordlist as EMPTY FILES, secrets as `[]`. A fixture that writes fewer is not the tool.
+            if "-os" in cmd:
+                pathlib.Path(cmd[cmd.index("-os") + 1]).write_text("[]")
+            if "-owl" in cmd:
+                pathlib.Path(cmd[cmd.index("-owl") + 1]).write_text("")
             return type("R", (), {"tool": tool, "cmd": cmd,
                                   "status": status or crawl.Status.SUCCESS,
                                   "note": "", "duration": 0.0, "exit_code": 0})()
 
         monkeypatch.setattr(crawl, "exec_tool", fake_exec)
-        monkeypatch.setattr(crawl, "have", lambda t: True)
+        monkeypatch.setattr(crawl, "have", lambda t: installed)
+        monkeypatch.setattr(crawl, "_xnl_engine", lambda: engine)
         events.reset(); events.configure(tmp_path)
         ctx = _Ctx(tmp_path, [])
         ctx.scope = self._S()
         ctx.scope.passive_only = False
+        if not store_novel:                       # every row already present: acceptance without novelty
+            _add = ctx.run.add
+            ctx.run.add = lambda *a, **k: (_add(*a, **k), False)[1]
+        if add is not None:
+            ctx.run.add = add
         prepared = []
         for name in units:
             d = tmp_path / "in" / name
@@ -2637,16 +2664,39 @@ class TestXnLinkFinderHasOneLifecycle:
         _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js", "sourcemap"])
         prog = [e for e in evs if e.get("event") == events.TOOL_PROGRESS]
         assert len(prog) == 2, prog
-        assert len({e["work_unit"] for e in prog}) == 2, "two inputs shared one work unit"
+        # identity is per-unit and lives on the ledger; the progress events carry the index
+        assert [e.get("current_index") for e in prog] == [1, 2], prog
+        cov = [e for e in evs if e.get("measure") == "files"]
+        assert len({e["unit"] for e in cov}) == 2, "two inputs shared one coverage unit"
 
-    def test_the_unit_identity_is_the_INPUT_CONTENT(self, tmp_path):
+    def test_the_unit_identity_is_the_BOUNDED_INPUT_ARTIFACT(self, tmp_path, monkeypatch):
+        """review-B-audit-5#7: identity is the blob — the bytes that will actually be mined, already
+        reflecting the byte cap and the path order that selected them — plus every output-affecting
+        setting."""
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = self._S()
         a = tmp_path / "a"
         a.mkdir()
         (a / "f.js").write_text("one")
-        first, _n = crawl._xnl_input_digest(str(a))
+        prep1 = crawl._xnl_blob(ctx, str(a), "t")
+        id1 = crawl._xnl_unit_identity(ctx, "t", False, prep1["digest"], "8.2")
         (a / "f.js").write_text("two")                      # same name, same length, different bytes
-        second, _n = crawl._xnl_input_digest(str(a))
-        assert first != second, "a same-size edit must change the identity"
+        prep2 = crawl._xnl_blob(ctx, str(a), "t")
+        id2 = crawl._xnl_unit_identity(ctx, "t", False, prep2["digest"], "8.2")
+        assert id1 != id2, "a same-size edit must change the identity"
+
+    def test_identity_covers_the_OUTPUT_AFFECTING_settings(self, tmp_path, monkeypatch):
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = self._S()
+        base = crawl._xnl_unit_identity(ctx, "t", False, "deadbeef", "8.2")
+        assert crawl._xnl_unit_identity(ctx, "t", True, "deadbeef", "8.2") != base, "spo changes the output"
+        ctx.profile.apex_domains = ["other.com"]
+        assert crawl._xnl_unit_identity(ctx, "t", False, "deadbeef", "8.2") != base, "scope changes the output"
+        monkeypatch.setattr(crawl, "XNL_PARAM_CAP", crawl.XNL_PARAM_CAP + 1)
+        ctx.profile.apex_domains = ["ex.com"]
+        assert crawl._xnl_unit_identity(ctx, "t", False, "deadbeef", "8.2") != base, "the cap changes the output"
 
     def test_an_UNREGISTERED_source_is_blocked_not_executed(self, tmp_path, monkeypatch):
         from quarry_recon import contract
@@ -2657,15 +2707,10 @@ class TestXnLinkFinderHasOneLifecycle:
         assert [e for e in evs if e.get("event") == "tool_blocked"], evs
 
     def test_a_MISSING_tool_is_a_recorded_skip(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawl, "have", lambda t: False)
-        events.reset(); events.configure(tmp_path)
-        ctx = _Ctx(tmp_path, [])
-        ctx.scope = self._S()
-        d = tmp_path / "in"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "a.js").write_text("x")
-        crawl._xnl_lane(ctx, [(str(d), "js", False)])
-        assert ctx.run.records if hasattr(ctx.run, "records") else True
+        calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], installed=False)
+        assert calls == [], calls
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH]
+        assert fin and fin[0]["status"] == "skipped", fin
 
     def test_NO_units_is_no_lifecycle_at_all(self, tmp_path, monkeypatch):
         _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, [])
@@ -2720,7 +2765,9 @@ class TestXnLinkFinderUnitsResume:
     def test_a_CLEAN_run_reports_success_with_what_it_produced(self, tmp_path, monkeypatch):
         _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
         fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
-        assert fin["status"] == "success" and fin["produced"] == {"references": 1}, fin
+        # review-B-audit-5#4: production covers EVERY evidence category, not links alone
+        assert fin["status"] == "success", fin
+        assert fin["produced"] == {"references": 1, "params": 0, "wordlist": 0, "secrets": 0}, fin
 
     def test_state_that_did_NOT_persist_is_reported(self, tmp_path, monkeypatch):
         from quarry_recon import budget as _b
@@ -2729,5 +2776,1020 @@ class TestXnLinkFinderUnitsResume:
         monkeypatch.setattr(_b.Ledger, "durable", property(lambda self: False))
         _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
         fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
-        assert fin["status"] == "partial" and "NOT persisted" in fin["reason"], fin
+        assert fin["status"] == "partial", fin
+        # the note names what is actually lost, and does not disown units an earlier snapshot still owns
+        assert "the journal is unusable and the snapshot failed" in fin["reason"], fin
+        assert "still replay" in fin["reason"], fin
         monkeypatch.setattr(_b.Ledger, "save", real_save)
+
+
+class TestXnLinkFinderResumesAcrossREALRUNS:
+    """review-B-audit-5#1: the unit ledger lived under `ctx.run.dir`, which `Run.create()` mints fresh for
+    every run — so "resume" was empty on every production invocation, and only a fixture reusing one
+    tmp_path could see it work. The same single-run blindness that hid the Whoxy cross-run defect.
+
+    And `has()` alone was a SKIP: no output was read, no entity re-ingested, so a resumed run silently
+    lost every endpoint the earlier run had found."""
+
+    class _S:
+        def in_scope(self, h):
+            return h == "acme.com" or h.endswith(".acme.com")
+
+        def is_oos(self, h):
+            return False
+
+    def _run_once(self, project, monkeypatch, indir, links=("https://api.acme.com/x",), params=("q",),
+                  status=None):
+        from quarry_recon import store
+        run = store.Run.create(project, "acme.com")
+        events.reset(); events.configure(run.dir)
+        calls = []
+
+        def fake_exec(tool, cmd, **kw):
+            calls.append(cmd)
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_text("\n".join(links) + "\n")
+            pathlib.Path(cmd[cmd.index("-op") + 1]).write_text("\n".join(params) + "\n")
+            if "-os" in cmd:
+                pathlib.Path(cmd[cmd.index("-os") + 1]).write_text("[]")   # the MEASURED no-find shapes
+            if "-owl" in cmd:
+                pathlib.Path(cmd[cmd.index("-owl") + 1]).write_text("")
+            return type("R", (), {"tool": tool, "cmd": cmd, "status": status or crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        monkeypatch.setattr(crawl, "have", lambda t: True)
+        monkeypatch.setattr(crawl, "_xnl_engine", lambda: "8.2")
+        added = []
+        ctx = _Ctx(run.dir, [])
+        ctx.run.dir = run.dir
+        ctx.run.project_dir = run.project_dir
+        ctx.run.add = lambda kind, rec: (added.append((kind, rec)), True)[1]
+        ctx.run.raw_path = lambda ph, tl, nm: (run.dir / "raw" / ph / tl / nm)
+        (run.dir / "raw" / "crawl" / "xnLinkFinder").mkdir(parents=True, exist_ok=True)
+        ctx.scope = self._S()
+        ctx.scope.passive_only = False
+        crawl._xnl_lane(ctx, [(str(indir), "js", False)])
+        evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+        return calls, added, evs
+
+    def _project(self, tmp_path):
+        project = tmp_path / "project"
+        project.mkdir(parents=True, exist_ok=True)
+        indir = tmp_path / "js"
+        indir.mkdir(parents=True, exist_ok=True)
+        (indir / "a.js").write_text("var u = '/api';")
+        return project, indir
+
+    def test_a_SECOND_REAL_RUN_does_not_re_mine(self, tmp_path, monkeypatch):
+        project, indir = self._project(tmp_path)
+        calls1, _a1, _e1 = self._run_once(project, monkeypatch, indir)
+        calls2, _a2, evs2 = self._run_once(project, monkeypatch, indir)
+        assert len(calls1) == 1 and calls2 == [], f"the same bytes were mined again: {calls2}"
+        cov = [e for e in evs2 if e.get("measure") == "units"]
+        assert cov and "replayed" in cov[0]["reason"], cov
+
+    def test_a_SECOND_REAL_RUN_still_gets_the_EVIDENCE(self, tmp_path, monkeypatch):
+        """The difference between replay and skip: the new run's store must hold what the first run found."""
+        project, indir = self._project(tmp_path)
+        _c1, added1, _e1 = self._run_once(project, monkeypatch, indir)
+        _c2, added2, _e2 = self._run_once(project, monkeypatch, indir)
+        first = sorted(r["value"] for k, r in added1 if k == "endpoint")
+        second = sorted(r["value"] for k, r in added2 if k == "endpoint")
+        assert first == ["https://api.acme.com/x"], first
+        assert second == first, f"a resumed run lost the evidence: {second}"
+        assert [r["value"] for k, r in added2 if k == "parameter"] == ["q"], added2
+
+    def test_a_CHANGED_input_is_mined_again_across_runs(self, tmp_path, monkeypatch):
+        project, indir = self._project(tmp_path)
+        self._run_once(project, monkeypatch, indir)
+        (indir / "a.js").write_text("var u = '/changed';")
+        calls, _added, _evs = self._run_once(project, monkeypatch, indir)
+        assert len(calls) == 1, "a changed input was skipped"
+
+    def test_a_CORRUPTED_bundle_is_re_mined_not_trusted(self, tmp_path, monkeypatch):
+        project, indir = self._project(tmp_path)
+        self._run_once(project, monkeypatch, indir)
+        state = project / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        bundles = [p for p in state.glob("*_links.txt")]
+        assert bundles, list(state.iterdir())
+        bundles[0].write_text("https://evil.net/injected\n")     # digest no longer matches the manifest
+        calls, added, _evs = self._run_once(project, monkeypatch, indir)
+        assert len(calls) == 1, "a tampered bundle was replayed"
+        assert not [r for k, r in added if k == "endpoint" and "evil.net" in r["value"]], added
+
+    def test_an_INCOMPLETE_unit_is_not_owned_across_runs(self, tmp_path, monkeypatch):
+        project, indir = self._project(tmp_path)
+        self._run_once(project, monkeypatch, indir, status=crawl.Status.TIMED_OUT)
+        calls, _added, _evs = self._run_once(project, monkeypatch, indir, status=crawl.Status.SUCCESS)
+        assert len(calls) == 1, "an unfinished unit was treated as done by the next run"
+
+    def test_the_state_lives_in_the_PROJECT_not_the_run(self, tmp_path, monkeypatch):
+        project, indir = self._project(tmp_path)
+        self._run_once(project, monkeypatch, indir)
+        state = project / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert state.exists() and any(state.iterdir()), list(project.rglob("*"))
+
+
+class TestXnLinkFinderUnitCompleteness:
+    """review-B-audit-5#2/#3/#5: a truncated input owned; a lost journal called durable; one unit's
+    exception aborting the phase."""
+
+    _S = TestXnLinkFinderResumesAcrossREALRUNS._S
+    _lane = TestXnLinkFinderHasOneLifecycle._lane
+
+    def test_a_BYTE_CAPPED_input_is_never_recorded_complete(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawl, "XNL_MAX_INPUT", 8)          # the fixture is bigger than this
+        calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        assert len(calls) == 1
+        cov = [e for e in evs if e.get("measure") == "units"]
+        assert cov and cov[0]["omitted"] == 1 and "input incomplete" in cov[0]["reason"], cov
+        calls2, _evs2, _ctx2 = self._lane(tmp_path, monkeypatch, ["js"])
+        assert len(calls2) == 1, "a truncated input was owned, freezing the omitted suffix forever"
+
+    def test_an_UNREADABLE_input_file_is_never_recorded_complete(self, tmp_path, monkeypatch):
+        real = pathlib.Path.open
+
+        def picky(self, *a, **k):
+            if self.name == "a.js" and "b" in (a[0] if a else k.get("mode", "")):
+                raise PermissionError("denied")
+            return real(self, *a, **k)
+
+        monkeypatch.setattr(pathlib.Path, "open", picky)
+        calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        cov = [e for e in evs if e.get("measure") == "units"]
+        assert cov and cov[0]["omitted"] == 1, cov
+
+    def test_a_UNIT_EXCEPTION_does_not_abort_the_others(self, tmp_path, monkeypatch):
+        real_ingest = crawl._xnl_ingest
+        seen = []
+
+        def boom(ctx, tag, outs, **kw):
+            seen.append(tag)
+            if tag == "js":
+                raise RuntimeError("ingest exploded")
+            return real_ingest(ctx, tag, outs, **kw)
+
+        monkeypatch.setattr(crawl, "_xnl_ingest", boom)
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js", "sourcemap"])
+        assert seen == ["js", "sourcemap"], "the second unit never ran"
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert "ingest exploded" in (fin["reason"] or ""), fin
+        assert fin["status"] in ("partial", "failed"), fin
+
+    def test_CANCELLATION_still_ends_the_run(self, tmp_path, monkeypatch):
+        def boom(ctx, tag, outs, **kw):
+            raise KeyboardInterrupt("ctrl-c")
+
+        monkeypatch.setattr(crawl, "_xnl_ingest", boom)
+        with pytest.raises(KeyboardInterrupt):
+            self._lane(tmp_path, monkeypatch, ["js"])
+
+    def test_a_JOURNAL_that_lost_a_completion_is_not_persisted(self, tmp_path, monkeypatch):
+        from quarry_recon import budget as _b
+        monkeypatch.setattr(_b.Ledger, "record", lambda self, *a, **k: False)
+        monkeypatch.setattr(_b.Ledger, "save", lambda self: False)
+        monkeypatch.setattr(_b.Ledger, "durable", property(lambda self: True))   # journal READABLE
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        # the note names exactly what was lost — the completions that reached neither store
+        assert "reached neither the journal nor a snapshot" in (fin.get("reason") or ""), fin
+        assert fin["status"] == "partial", fin
+
+    def test_a_PARAMETER_ONLY_extraction_is_not_EMPTY(self, tmp_path, monkeypatch):
+        """review-B-audit-5#4: production counted link categories only, so a clean parameter-only run
+        reported EMPTY and an unfinished one with retained parameters reported FAILED."""
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], links=[], params=("user_id", "q"))
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["produced"] == {"references": 0, "params": 2, "wordlist": 0, "secrets": 0}, fin
+        assert fin["status"] == "success", fin
+
+    def test_production_is_PARSER_ACCEPTANCE_not_store_novelty(self, tmp_path, monkeypatch):
+        """review-B-audit-2#2 applied to the terminal: a parameter jsluice already stored is still this
+        lane's output. Every `add()` here reports "already present", so novelty is 0 throughout."""
+        real_ctx_add = []
+
+        class _Store:
+            def __getattr__(self, n):
+                raise AttributeError(n)
+
+        _c, evs, ctx = self._lane(tmp_path, monkeypatch, ["js"], links=["https://api.acme.com/x"],
+                                  params=("user_id",), store_novel=False)
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        led = [e for e in evs if e.get("event") == events.LEDGER][0]
+        assert led["xnl_stored"]["params_new"] == 0 and led["xnl_stored"]["endpoints_new"] == 0, led
+        assert fin["produced"] == {"references": 1, "params": 1, "wordlist": 0, "secrets": 0}, fin
+        assert fin["status"] == "success", fin
+        assert not real_ctx_add
+        # ...and when a KNOWN parameter is the only evidence, the terminal is still SUCCESS: extraction
+        # happened. EMPTY here would mean "the tool found nothing", which is a different fact.
+        second = tmp_path / "second"; second.mkdir()      # a FRESH project: this is a mine, not a replay
+        _c2, evs2, _x2 = self._lane(second, monkeypatch, ["js"], links=[], params=("user_id",),
+                                    store_novel=False)
+        fin2 = [e for e in evs2 if e.get("event") == events.TOOL_FINISH][0]
+        assert fin2["status"] == "success" and fin2["produced"]["params"] == 1, fin2
+
+    def test_a_run_with_NOTHING_at_all_is_EMPTY(self, tmp_path, monkeypatch):
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], links=[], params=())
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "empty", fin
+
+    def test_an_UNFINISHED_run_with_retained_params_is_PARTIAL_not_FAILED(self, tmp_path, monkeypatch):
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], links=[], params=("q",),
+                                       status=crawl.Status.TIMED_OUT)
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "partial" and fin["produced"]["params"] == 1, fin
+
+    def test_a_MISSING_TOOL_still_gets_a_lifecycle(self, tmp_path, monkeypatch):
+        """review-B-audit-5#6: the tool check lived at every collection site, so an uninstalled tool meant
+        no units, no lane, and total silence from a `tier: core` source."""
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js", "sourcemap"], installed=False)
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH]
+        assert fin and fin[0]["status"] == "skipped", fin
+        cov = [e for e in evs if e.get("measure") == "units" and e.get("unit") == "install"]
+        assert cov and cov[0]["omitted"] == 2, cov
+
+    def test_the_COLLECTION_sites_do_not_gate_on_the_binary(self):
+        import inspect
+        src = inspect.getsource(crawl.run)
+        for line in src.splitlines():
+            if "xnl_units.append(" in line:
+                assert "have(" not in line, line
+        # ...and the gate exists exactly once, in the coordinator
+        assert inspect.getsource(crawl._xnl_lane).count('have("xnLinkFinder")') == 1
+
+
+class TestXnLinkFinderLifecycleBoundary:
+    """review-B-audit-6: the ownership boundary's own defects — an unlocked project, replay mutating
+    digest-bound evidence, a cancelled run signing off clean, `-os` silence, half-counted durability,
+    an unreadable output published as empty, and an identity that could collapse or go stale."""
+
+    _S = TestXnLinkFinderHasOneLifecycle._S
+    _lane = TestXnLinkFinderHasOneLifecycle._lane
+
+    # ── #1 the lane state is LOCKED ──────────────────────────────────────────────────────────────
+    def test_a_BUSY_project_FAILS_with_a_gap_and_never_mines_twice(self, tmp_path, monkeypatch):
+        import contextlib as _c
+        from quarry_recon import budget as _b
+
+        @_c.contextmanager
+        def busy(path):
+            raise _b.StateBusy(f"another lifecycle holds {path}")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(_b, "state_lock", busy)
+        calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert calls == [], "a second lifecycle mined while another held the state"
+        # review-B-audit-7#1: SKIPPED would claim we chose not to run. This run holds NONE of the holder's
+        # evidence — its own store is empty — so zero evidence is FAILED, as everywhere else.
+        assert fin["status"] == "failed" and "another lifecycle" in (fin["reason"] or ""), fin
+        gap = [e for e in evs if e.get("unit") == "lock"]
+        assert gap and gap[0]["omitted"] == 1, evs
+
+    def test_the_lock_is_taken_BEFORE_prune_and_load(self, tmp_path, monkeypatch):
+        """Pruning deletes superseded ledgers and `Ledger()` loads the snapshot — both are state mutations,
+        so neither may happen outside the lock."""
+        from quarry_recon import budget as _b
+        order = []
+        real_lock, real_prune = _b.state_lock, _b.prune_state
+        real_init, real_save = _b.Ledger.__init__, _b.Ledger.save
+
+        import contextlib as _c
+
+        @_c.contextmanager
+        def lock(path):
+            order.append("lock")
+            with real_lock(path) as p:
+                yield p
+            order.append("unlock")
+
+        monkeypatch.setattr(_b, "state_lock", lock)
+        monkeypatch.setattr(_b, "prune_state", lambda *a, **k: (order.append("prune"), real_prune(*a, **k))[1])
+        monkeypatch.setattr(_b.Ledger, "__init__",
+                            lambda self, *a, **k: (order.append("load"), real_init(self, *a, **k))[1])
+        monkeypatch.setattr(_b.Ledger, "save",
+                            lambda self: (order.append("save"), real_save(self))[1])
+        self._lane(tmp_path, monkeypatch, ["js"])
+        assert order[0] == "lock" and order[-1] == "unlock", order
+        for step in ("prune", "load", "save"):
+            assert 0 < order.index(step) < order.index("unlock"), (step, order)
+
+    # ── #2 replay is READ-ONLY ───────────────────────────────────────────────────────────────────
+    def test_REPLAY_never_writes_into_digest_bound_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawl, "XNL_WORDLIST_LIMIT", 1)      # every input is "large" -> derive a wordlist
+        self._lane(tmp_path, monkeypatch, ["js"])
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        # the EVIDENCE — the digest-bound bundle. (The ledger's own snapshot is state, not evidence, and
+        # it is rewritten by every `save()` on purpose.)
+        def evidence():
+            return {p.name: p.read_bytes() for p in sorted(state.rglob("*"))
+                    if p.is_file() and not p.name.endswith(".state.json") and p.name != ".lock"}
+
+        before = evidence()
+        assert before, state
+        _calls, evs, ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        assert evidence() == before, "replay mutated evidence it had just verified by digest"
+        assert [e for e in evs if e.get("event") == events.LEDGER and e.get("replay")], evs
+
+    def test_REPLAY_works_on_READ_ONLY_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawl, "XNL_WORDLIST_LIMIT", 1)
+        self._lane(tmp_path, monkeypatch, ["js"])
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        bundles = [p for p in state.iterdir() if p.name.endswith("_wordlist.txt")]
+        assert bundles
+        for p in bundles:
+            p.chmod(0o444)
+        try:
+            _calls, evs, ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        finally:
+            for p in bundles:
+                p.chmod(0o644)
+        led = [e for e in evs if e.get("event") == events.LEDGER]
+        assert led and led[-1].get("replay"), evs     # [-1]: the log spans both runs of this fixture
+        assert [r["value"] for k, r in ctx.run.added if k == "endpoint"] == ["https://api.acme.com/x"]
+
+    # ── #3 cancellation and contained initialization ─────────────────────────────────────────────
+    def test_CANCELLATION_emits_an_honest_terminal_before_propagating(self, tmp_path, monkeypatch):
+        def boom(ctx, tag, outs, **kw):
+            raise KeyboardInterrupt("ctrl-c")
+
+        monkeypatch.setattr(crawl, "_xnl_ingest", boom)
+        with pytest.raises(KeyboardInterrupt):
+            self._lane(tmp_path, monkeypatch, ["js"])
+        evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+        fins = [e for e in evs if e.get("event") == events.TOOL_FINISH]
+        assert len(fins) == 1, fins
+        # nothing was ingested before the interrupt, so there is no partial success to report
+        assert fins[0]["status"] == "failed" and "CANCELLED" in (fins[0]["reason"] or ""), fins
+        assert "nothing extracted" in fins[0]["reason"], fins
+
+    def test_CANCELLATION_after_real_production_is_PARTIAL(self, tmp_path, monkeypatch):
+        """The other half of #2: retained evidence is what makes an interrupted lane PARTIAL."""
+        real = crawl._xnl_ingest
+
+        def one_then_stop(ctx, tag, outs, **kw):
+            if tag == "js":
+                return real(ctx, tag, outs, **kw)
+            raise KeyboardInterrupt("ctrl-c")
+
+        monkeypatch.setattr(crawl, "_xnl_ingest", one_then_stop)
+        with pytest.raises(KeyboardInterrupt):
+            self._lane(tmp_path, monkeypatch, ["js", "sourcemap"])
+        evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "partial" and "evidence KEPT" in (fin["reason"] or ""), fin
+        assert fin["produced"]["references"] == 1, fin
+
+    def test_a_STATE_failure_is_contained_and_reported(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawl, "_xnl_state_dir",
+                            lambda ctx: (_ for _ in ()).throw(OSError("read-only filesystem")))
+        calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])       # must NOT raise
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert calls == [] and fin["status"] == "failed", (calls, fin)
+        assert "read-only filesystem" in (fin["reason"] or ""), fin
+
+    def test_a_SAVE_that_raises_is_contained(self, tmp_path, monkeypatch):
+        from quarry_recon import budget as _b
+        monkeypatch.setattr(_b.Ledger, "save",
+                            lambda self: (_ for _ in ()).throw(OSError("disk full")))
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert "disk full" in (fin["reason"] or "") and fin["status"] in ("partial", "failed"), fin
+
+    # ── #4 secrets are evidence ──────────────────────────────────────────────────────────────────
+    def _secret_lane(self, tmp_path, monkeypatch, body, calls=None, add=None):
+        calls = [] if calls is None else calls
+
+        def fake_exec(tool, cmd, **k):
+            calls.append(cmd)
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_text("https://api.acme.com/x\n")
+            pathlib.Path(cmd[cmd.index("-op") + 1]).write_text("")
+            if "-os" in cmd and body is not None:
+                pathlib.Path(cmd[cmd.index("-os") + 1]).write_text(body)
+            if "-owl" in cmd:
+                pathlib.Path(cmd[cmd.index("-owl") + 1]).write_text("")
+            return type("R", (), {"tool": tool, "cmd": cmd, "status": crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        monkeypatch.setattr(crawl, "have", lambda t: True)
+        monkeypatch.setattr(crawl, "_xnl_engine", lambda: "8.2")
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = self._S()
+        ctx.scope.passive_only = False
+        if add is not None:
+            ctx.run.add = add
+        d = tmp_path / "in" / "js"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "a.js").write_text("var x = 1;")
+        crawl._xnl_lane(ctx, [(str(d), "js", False)])
+        log = tmp_path / "events.jsonl"
+        evs = [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+        return ctx, evs
+
+    #: the MEASURED xnLinkFinder 8.2 `-os` document (offline stdin fixture, this machine)
+    MEASURED_OS = ('[\n  {\n    "type": "AWS Access Key",\n    "value": "\\"AKIAIOSFODNN7EXAMPLE\\"",\n'
+                   '    "sources": [\n      "<stdin>"\n    ],\n    "count": 1\n  }\n]')
+
+    def test_a_discovered_secret_is_stored_VERBATIM(self, tmp_path, monkeypatch):
+        ctx, evs = self._secret_lane(tmp_path, monkeypatch, self.MEASURED_OS)
+        secs = [r for k, r in ctx.run.added if k == "secret"]
+        assert len(secs) == 1, secs
+        assert secs[0]["value"] == '"AKIAIOSFODNN7EXAMPLE"', secs        # not masked, not truncated
+        assert secs[0]["preview"] == secs[0]["value"] and "*" not in secs[0]["preview"], secs
+        assert secs[0]["kind"] == "AWS Access Key" and secs[0]["sources"] == ["xnLinkFinder"], secs
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["produced"]["secrets"] == 1 and fin["status"] == "success", fin
+
+    @pytest.mark.parametrize("body,why", [
+        ("{not json at all", "not the measured JSON document"),
+        ('{"secrets": []}', "not the measured array"),
+        ('[{"type": "AWS", "count": 1}]', "do not match the measured schema"),
+        # review-B-audit-7#4: the contract names FOUR fields. A row with a string `value` and a broken
+        # `type`/`sources`/`count` is a document we have not measured, whatever else is right about it.
+        ('[{"type": "", "value": "v", "sources": ["<stdin>"], "count": 1}]', "do not match"),
+        ('[{"type": "AWS", "value": "v", "sources": "stdin", "count": 1}]', "do not match"),
+        ('[{"type": "AWS", "value": "v", "sources": [3], "count": 1}]', "do not match"),
+        ('[{"type": "AWS", "value": "v", "sources": ["<stdin>"]}]', "do not match"),
+        ('[{"type": "AWS", "value": "v", "sources": ["<stdin>"], "count": "1"}]', "do not match"),
+        ('[{"type": "AWS", "value": "v", "sources": ["<stdin>"], "count": true}]', "do not match"),
+        ('["just a string"]', "do not match"),
+        # review-B-audit-8#3: the MEASURED provenance is `["<stdin>"]` and the count is a real occurrence
+        ('[{"type": "AWS", "value": "v", "sources": [], "count": 1}]', "do not match"),
+        ('[{"type": "AWS", "value": "v", "sources": ["elsewhere"], "count": 1}]', "do not match"),
+        ('[{"type": "AWS", "value": "v", "sources": ["<stdin>"], "count": 0}]', "do not match"),
+        ('[{"type": "AWS", "value": "v", "sources": ["<stdin>"], "count": -1}]', "do not match"),
+        ('[{"type": "  ", "value": "v", "sources": ["<stdin>"], "count": 1}]', "do not match"),
+        ('[{"type": "AWS", "value": "   ", "sources": ["<stdin>"], "count": 1}]', "do not match"),
+        # #5: the MEASURED no-find shape is `[]`. An empty artifact is not that.
+        ("", "is empty"),
+        ("   \n", "is empty"),
+    ])
+    def test_MALFORMED_os_output_is_a_PARSE_GAP_never_a_clean_zero(self, tmp_path, monkeypatch, body, why):
+        ctx, evs = self._secret_lane(tmp_path, monkeypatch, body)
+        gaps = [e.get("reason") or "" for e in evs if e.get("event") == "coverage_partial"]
+        assert any(why in g and "RETAINED" in g for g in gaps), gaps
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] != "success", fin           # a unit we cannot account for is not clean
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert not list(state.glob("*_bundle.json")), "an unaccounted unit was OWNED"
+
+    def test_a_VALID_row_beside_a_broken_one_is_still_ingested(self, tmp_path, monkeypatch):
+        """A parse gap does not discard what we CAN read: the good row is stored verbatim, the unit stays
+        retryable because the document is not fully explained."""
+        body = json.dumps([{"type": "AWS Access Key", "value": "AKIA_GOOD", "sources": ["<stdin>"],
+                            "count": 1},
+                           {"type": "Generic", "value": "no-count", "sources": ["<stdin>"]}])
+        ctx, evs = self._secret_lane(tmp_path, monkeypatch, body)
+        secs = [r for k, r in ctx.run.added if k == "secret"]
+        assert [x["value"] for x in secs] == ["AKIA_GOOD"], secs
+        led = [e for e in evs if e.get("event") == events.LEDGER][-1]
+        assert led["produced"]["secrets"] == 1 and led["xnl_rejected"]["secrets_unusable"] == 1, led
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert not list(state.glob("*_bundle.json")), "a partly-unexplained document was OWNED"
+
+    def test_the_MEASURED_no_find_shape_is_CLEAN(self, tmp_path, monkeypatch):
+        """MEASURED (8.2, offline stdin fixture with no secrets): the tool writes the array `[]`."""
+        ctx, evs = self._secret_lane(tmp_path, monkeypatch, "[]")
+        gaps = [e.get("reason") or "" for e in evs if e.get("event") == "coverage_partial"]
+        assert not any("RETAINED" in g or "retryable" in g for g in gaps), gaps
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert list(state.glob("*_bundle.json")), "a clean no-find run was not owned"
+
+    def test_a_REQUESTED_but_MISSING_os_artifact_fails_closed(self, tmp_path, monkeypatch):
+        """review-B-audit-7#5: `-os` was passed and nothing was written. The measured no-find shape is
+        `[]`, so this is OUR blind spot, not the tool's zero."""
+        ctx, evs = self._secret_lane(tmp_path, monkeypatch, None)          # -os requested, never written
+        gaps = [e.get("reason") or "" for e in evs if e.get("event") == "coverage_partial"]
+        assert any("no artifact was written" in g and "retryable" in g for g in gaps), gaps
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert not list(state.glob("*_bundle.json")), "an unmeasured silence was OWNED"
+
+    def test_an_UNREQUESTED_os_artifact_is_not_a_gap(self, tmp_path, monkeypatch):
+        """The other side of #5: on LARGE input `-os` is never asked for, so its absence says nothing."""
+        monkeypatch.setattr(crawl, "XNL_WORDLIST_LIMIT", 1)
+        ctx, evs = self._secret_lane(tmp_path, monkeypatch, None)
+        cmds = [e for e in evs if e.get("event") == events.TOOL_START]
+        gaps = [e.get("reason") or "" for e in evs if e.get("event") == "coverage_partial"]
+        assert not any("no artifact was written" in g for g in gaps), gaps
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert list(state.glob("*_bundle.json")), "a unit that was never asked for secrets stayed unowned"
+
+    def test_the_RAW_os_artifact_survives_a_parse_gap(self, tmp_path, monkeypatch):
+        ctx, _evs = self._secret_lane(tmp_path, monkeypatch, "{not json at all")
+        raw = ctx.run.raw_path("crawl", "xnLinkFinder", "js_secrets.json")
+        assert raw.read_text() == "{not json at all", "the evidence was discarded with the parse"
+
+    def test_a_MALFORMED_unit_is_RE_MINED_next_run(self, tmp_path, monkeypatch):
+        """A parse gap must be RETRYABLE: the same bytes are mined again, not replayed as accounted-for."""
+        calls = []
+        self._secret_lane(tmp_path, monkeypatch, "{not json at all", calls=calls)
+        assert len(calls) == 1
+        self._secret_lane(tmp_path, monkeypatch, "{not json at all", calls=calls)
+        assert len(calls) == 2, "an un-accountable unit was replayed instead of re-mined"
+        # ...and once the output parses, the unit IS owned
+        self._secret_lane(tmp_path, monkeypatch, self.MEASURED_OS, calls=calls)
+        assert len(calls) == 3
+        self._secret_lane(tmp_path, monkeypatch, self.MEASURED_OS, calls=calls)
+        assert len(calls) == 3, "a clean unit was re-mined"
+
+    # ── audit-8#1 evidence already written is never absent from the accounting ───────────────────
+    def test_a_SINK_that_fails_MID_ingestion_keeps_what_was_stored(self, tmp_path, monkeypatch):
+        """review-B-audit-8#1: counts lived only in the ingest RETURN value, so a store that raised after
+        real writes left the terminal saying `FAILED / nothing extracted` while the run store held rows."""
+        seen = []
+
+        def flaky(kind, rec):
+            seen.append(kind)
+            if len(seen) == 2:
+                raise RuntimeError("store died")
+            return True
+
+        _calls, evs, ctx = self._lane(tmp_path, monkeypatch, ["js"],
+                                      links=["https://api.acme.com/a", "https://api.acme.com/b"],
+                                      add=flaky)
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert len(seen) == 2, seen
+        assert fin["produced"]["references"] == 1, fin       # the row that DID land is accounted for
+        assert fin["status"] == "partial" and "store died" in (fin["reason"] or ""), fin
+
+    def test_CANCELLATION_mid_ingestion_keeps_what_was_stored(self, tmp_path, monkeypatch):
+        seen = []
+
+        def stopper(kind, rec):
+            seen.append(kind)
+            if len(seen) == 2:
+                raise KeyboardInterrupt("ctrl-c")
+            return True
+
+        with pytest.raises(KeyboardInterrupt):
+            self._lane(tmp_path, monkeypatch, ["js"],
+                       links=["https://api.acme.com/a", "https://api.acme.com/b"], add=stopper)
+        evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["produced"]["references"] == 1, fin
+        assert fin["status"] == "partial" and "evidence KEPT" in (fin["reason"] or ""), fin
+
+    def test_a_SINK_that_fails_MID_REPLAY_keeps_what_was_re_ingested(self, tmp_path, monkeypatch):
+        """Replay owes the same accounting: its carrier joins before the re-ingestion writes."""
+        self._lane(tmp_path, monkeypatch, ["js"],
+                   links=["https://api.acme.com/a", "https://api.acme.com/b"])
+        seen = []
+
+        def flaky(kind, rec):
+            seen.append(kind)
+            if len(seen) == 2:
+                raise RuntimeError("store died on replay")
+            return True
+
+        calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"],
+                                      links=["https://api.acme.com/a", "https://api.acme.com/b"],
+                                      add=flaky)
+        assert calls == [], "the second run mined instead of replaying"
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][-1]   # the log spans both runs
+        assert fin["produced"]["references"] == 1, fin
+        assert "store died on replay" in (fin["reason"] or ""), fin
+
+    def test_PARAMETERS_are_counted_as_DELIVERED_not_as_seen(self, tmp_path, monkeypatch):
+        """review-B-audit-9#1: `params` was assigned the whole candidate set before the first write, so a
+        store dying on parameter one still reported every candidate as produced."""
+        def die(kind, rec):
+            raise RuntimeError("store died")
+
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], links=[],
+                                       params=("a_param", "b_param", "c_param"), add=die)
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["produced"]["params"] == 0, fin
+        assert fin["status"] == "failed" and "store died" in (fin["reason"] or ""), fin
+
+    def test_PARAMETERS_delivered_before_a_failure_are_kept(self, tmp_path, monkeypatch):
+        seen = []
+
+        def flaky(kind, rec):
+            seen.append(kind)
+            if len(seen) == 3:
+                raise RuntimeError("store died")
+            return True
+
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"], links=[],
+                                       params=("a_param", "b_param", "c_param"), add=flaky)
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["produced"]["params"] == 2, fin      # exactly what the store took
+        assert fin["status"] == "partial", fin
+
+    def test_SECRETS_delivered_before_a_failure_are_kept(self, tmp_path, monkeypatch):
+        """review-B-audit-9#2: the secret total lived in `_xnl_secrets`'s return value, so a sink dying on
+        the second secret reported zero while the first one sat in the store."""
+        body = json.dumps([{"type": "AWS", "value": "AKIA_ONE", "sources": ["<stdin>"], "count": 1},
+                           {"type": "AWS", "value": "AKIA_TWO", "sources": ["<stdin>"], "count": 1}])
+        seen = []
+
+        def flaky(kind, rec):
+            seen.append(kind)
+            if kind == "secret" and len([k for k in seen if k == "secret"]) == 2:
+                raise RuntimeError("store died on secret two")
+            return True
+
+        ctx, evs = self._secret_lane(tmp_path, monkeypatch, body, add=flaky)
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["produced"]["secrets"] == 1, fin
+        assert "store died on secret two" in (fin["reason"] or ""), fin
+        assert fin["status"] == "partial", fin
+
+    def test_SECRETS_survive_a_CANCELLATION_mid_document(self, tmp_path, monkeypatch):
+        body = json.dumps([{"type": "AWS", "value": "AKIA_ONE", "sources": ["<stdin>"], "count": 1},
+                           {"type": "AWS", "value": "AKIA_TWO", "sources": ["<stdin>"], "count": 1}])
+        seen = []
+
+        def stopper(kind, rec):
+            seen.append(kind)
+            if len([k for k in seen if k == "secret"]) == 2:
+                raise KeyboardInterrupt("ctrl-c")
+            return True
+
+        with pytest.raises(KeyboardInterrupt):
+            self._secret_lane(tmp_path, monkeypatch, body, add=stopper)
+        evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["produced"]["secrets"] == 1 and fin["status"] == "partial", fin
+
+    def test_SECRETS_survive_a_failure_on_REPLAY_too(self, tmp_path, monkeypatch):
+        body = json.dumps([{"type": "AWS", "value": "AKIA_ONE", "sources": ["<stdin>"], "count": 1},
+                           {"type": "AWS", "value": "AKIA_TWO", "sources": ["<stdin>"], "count": 1}])
+        calls = []
+        self._secret_lane(tmp_path, monkeypatch, body, calls=calls)
+        assert len(calls) == 1
+        seen = []
+
+        def flaky(kind, rec):
+            seen.append(kind)
+            if len([k for k in seen if k == "secret"]) == 2:
+                raise RuntimeError("store died on replay")
+            return True
+
+        ctx, evs = self._secret_lane(tmp_path, monkeypatch, body, calls=calls, add=flaky)
+        assert len(calls) == 1, "the second run mined instead of replaying"
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][-1]
+        assert fin["produced"]["secrets"] == 1, fin
+        assert "store died on replay" in (fin["reason"] or ""), fin
+
+    # ── audit-10#1 the bytes ingested are the bytes owned ────────────────────────────────────────
+    def test_an_artifact_REWRITTEN_mid_ingestion_cannot_change_what_is_OWNED(self, tmp_path, monkeypatch):
+        """review-B-audit-10#1: parsing, presence and publication each re-read the files, so a sink that
+        rewrote an artifact between two of those reads made the run store URL A and OWN URL B — and every
+        later replay ingested B."""
+        links_file = {}
+
+        def rewrite(kind, rec):
+            # the first stored endpoint swaps the artifact under us
+            for p in (tmp_path / "raw" / "crawl" / "xnLinkFinder").glob("*_links.txt"):
+                links_file["p"] = p
+                p.write_text("https://api.acme.com/SWAPPED\n")
+            assert links_file, "the fixture never found the artifact to swap"
+            return True
+
+        _calls, _evs, ctx = self._lane(tmp_path, monkeypatch, ["js"],
+                                       links=["https://api.acme.com/original"], add=rewrite)
+        stored = [r["value"] for k, r in getattr(ctx.run, "added", []) if k == "endpoint"]
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        owned = next(state.glob("*_links.txt")).read_text()
+        assert "SWAPPED" not in owned, "the ledger bound bytes the parser never saw"
+        assert owned.strip() == "https://api.acme.com/original", owned
+
+    def test_REPLAY_verifies_and_ingests_the_SAME_bytes(self, tmp_path, monkeypatch):
+        """Verification and materialization used to read the bundle separately."""
+        self._lane(tmp_path, monkeypatch, ["js"], links=["https://api.acme.com/original"])
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        real_read = pathlib.Path.read_bytes
+        swapped = {"n": 0}
+
+        def swapping(self, *a, **k):
+            data = real_read(self, *a, **k)
+            if self.name.endswith("_links.txt") and str(self).startswith(str(state)):
+                swapped["n"] += 1
+                if swapped["n"] == 1:                 # only the FIRST read sees the honest bytes
+                    return data
+                return b"https://api.acme.com/SWAPPED\n"
+            return data
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", swapping)
+        calls, evs, ctx = self._lane(tmp_path, monkeypatch, ["js"],
+                                     links=["https://api.acme.com/original"])
+        assert calls == [], "the second run mined instead of replaying"
+        stored = [r["value"] for k, r in ctx.run.added if k == "endpoint"]
+        assert stored == ["https://api.acme.com/original"], stored
+
+    def test_the_MATERIALIZED_copy_is_the_owned_evidence(self, tmp_path, monkeypatch):
+        """The run-local copy exists for the operator; it must be the bytes the ledger owns, byte for
+        byte — written from the verified snapshot, not re-read from anywhere."""
+        self._lane(tmp_path, monkeypatch, ["js"], links=["https://api.acme.com/original"])
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        owned = next(state.glob("*_links.txt")).read_bytes()
+        for p in (tmp_path / "raw" / "crawl" / "xnLinkFinder").glob("*_links.txt"):
+            p.write_bytes(b"stale junk\n")               # a leftover from the previous run
+        calls, _evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"],
+                                       links=["https://api.acme.com/original"])
+        assert calls == [], "the second run mined instead of replaying"
+        copy = next((tmp_path / "raw" / "crawl" / "xnLinkFinder").glob("*_links.txt")).read_bytes()
+        assert copy == owned, (copy, owned)
+
+    def test_an_UNDECODABLE_line_never_reaches_the_derived_wordlist(self, tmp_path, monkeypatch):
+        """The derived wordlist drives an ACTIVE puredns brute in A1d, so it may only contain values this
+        boundary accepted — not words re-decoded out of a line the strict reader rejected."""
+        monkeypatch.setattr(crawl, "XNL_WORDLIST_LIMIT", 1)       # large input: the wordlist is DERIVED
+
+        def fake_exec(tool, cmd, **k):
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_bytes(
+                b"https://api.acme.com/keep\n"
+                b"admin\xffinternal\n"                       # undecodable: rejected by the reader
+                b"this is not a url ###junkword\n"           # decodable, but NOT an accepted value
+                b"https://oosword.evil.example/x\n")         # off-scope: evidence, never brute vocabulary
+            pathlib.Path(cmd[cmd.index("-op") + 1]).write_bytes(b"good_param\nbad\xffparam\n")
+            return type("R", (), {"tool": tool, "cmd": cmd, "status": crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        monkeypatch.setattr(crawl, "have", lambda t: True)
+        monkeypatch.setattr(crawl, "_xnl_engine", lambda: "8.2")
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = self._S()
+        ctx.scope.passive_only = False
+        d = tmp_path / "in" / "js"
+        d.mkdir(parents=True)
+        (d / "a.js").write_text("var x = 1;")
+        crawl._xnl_lane(ctx, [(str(d), "js", False)])
+        wl = next((tmp_path / "raw" / "crawl" / "xnLinkFinder").glob("*_wordlist.txt")).read_text()
+        words = set(wl.split())
+        assert {"keep", "good"} <= words, wl             # accepted values contribute
+        assert "admin" not in words and "internal" not in words, wl   # from the undecodable link line
+        assert "bad" not in words, wl                                  # from the undecodable param line
+        assert "junkword" not in words, wl               # decodable, but the parser did not accept it
+        assert "oosword" not in words, wl                # off-scope evidence is not brute vocabulary
+
+    def test_UNDECODABLE_wordlist_lines_are_counted_and_excluded(self, tmp_path, monkeypatch):
+        def fake_exec(tool, cmd, **k):
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_text("https://api.acme.com/x\n")
+            pathlib.Path(cmd[cmd.index("-op") + 1]).write_text("")
+            if "-os" in cmd:
+                pathlib.Path(cmd[cmd.index("-os") + 1]).write_text("[]")
+            if "-owl" in cmd:
+                pathlib.Path(cmd[cmd.index("-owl") + 1]).write_bytes(b"good\nbad\xffword\n")
+            return type("R", (), {"tool": tool, "cmd": cmd, "status": crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        monkeypatch.setattr(crawl, "have", lambda t: True)
+        monkeypatch.setattr(crawl, "_xnl_engine", lambda: "8.2")
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = self._S()
+        ctx.scope.passive_only = False
+        d = tmp_path / "in" / "js"
+        d.mkdir(parents=True)
+        (d / "a.js").write_text("var x = 1;")
+        crawl._xnl_lane(ctx, [(str(d), "js", False)])
+        evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+        led = [e for e in evs if e.get("event") == events.LEDGER][-1]
+        assert led["produced"]["wordlist"] == 1, led                 # only the decodable line is a word
+        assert led["xnl_rejected"]["wordlist_undecodable"] == 1, led
+
+    # ── audit-8#2 every REQUESTED artifact has a measured no-find shape ──────────────────────────
+    @pytest.mark.parametrize("flag", ["-o", "-op", "-owl"])
+    def test_a_REQUESTED_artifact_that_was_never_written_is_retryable(self, tmp_path, monkeypatch, flag):
+        """MEASURED (8.2, empty stdin blob): links/params/wordlist are CREATED as empty files and secrets
+        as `[]`. A missing one is our blind spot, not the tool's zero."""
+        def fake_exec(tool, cmd, **k):
+            for f, body in (("-o", "https://api.acme.com/x\n"), ("-op", "id\n"), ("-owl", ""),
+                            ("-os", "[]")):
+                if f in cmd and f != flag:
+                    pathlib.Path(cmd[cmd.index(f) + 1]).write_text(body)
+            return type("R", (), {"tool": tool, "cmd": cmd, "status": crawl.Status.SUCCESS,
+                                  "note": "", "duration": 0.0, "exit_code": 0})()
+
+        monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        monkeypatch.setattr(crawl, "have", lambda t: True)
+        monkeypatch.setattr(crawl, "_xnl_engine", lambda: "8.2")
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = self._S()
+        ctx.scope.passive_only = False
+        d = tmp_path / "in" / "js"
+        d.mkdir(parents=True)
+        (d / "a.js").write_text("var x = 1;")
+        crawl._xnl_lane(ctx, [(str(d), "js", False)])
+        evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+        gaps = [e.get("reason") or "" for e in evs if e.get("measure") == "units"]
+        assert any(flag in g and "no artifact written" in g for g in gaps), gaps
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert not list(state.glob("*_bundle.json")), "an unmeasured silence was OWNED"
+
+    def test_an_UNREQUESTED_wordlist_is_not_a_gap(self, tmp_path, monkeypatch):
+        """On LARGE input `-owl` is never asked for (it is a timekiller) — its absence says nothing, and
+        the derived wordlist takes its place."""
+        monkeypatch.setattr(crawl, "XNL_WORDLIST_LIMIT", 1)
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        gaps = [e.get("reason") or "" for e in evs if e.get("measure") == "units"]
+        assert not any("no artifact written" in g for g in gaps), gaps
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert list(state.glob("*_bundle.json")), "a unit whose -owl was never requested stayed unowned"
+
+    # ── #5 the durability handshake is complete in BOTH directions ───────────────────────────────
+    def test_a_failed_EVIDENCE_bind_prevents_ownership(self, tmp_path, monkeypatch):
+        from quarry_recon import budget as _b
+        monkeypatch.setattr(_b.Ledger, "add_evidence", lambda self, *a, **k: False)
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "success", fin            # save() still compacted: the unit IS owned
+        assert any("snapshot compacted" in (e.get("reason") or "") for e in evs), evs
+
+    def test_a_failed_APPEND_plus_a_good_SNAPSHOT_is_OWNED_without_a_false_gap(self, tmp_path, monkeypatch):
+        """review-B-audit-7#6: the claim is OWNERSHIP, so it is proven by REOPENING a real ledger. The
+        journal append fails at the real `_append`; everything the completion binds (digests, evidence)
+        is written by the real `record()`."""
+        from quarry_recon import budget as _b
+        real_append = _b.Ledger._append
+
+        def no_completion(self, rec):
+            if "i" in rec:                       # a COMPLETION append fails; evidence appends still work
+                self._journal_unsafe = True
+                return False
+            return real_append(self, rec)
+
+        monkeypatch.setattr(_b.Ledger, "_append", no_completion)
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        units = [e for e in evs if e.get("measure") == "units"]
+        assert units and units[-1]["omitted"] == 0 and "snapshot compacted" in units[-1]["reason"], units
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "success" and "NOT persisted" not in (fin.get("reason") or ""), fin
+        # the real proof: a fresh ledger opened over that snapshot still owns the unit
+        monkeypatch.undo()
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        snap = next(state.glob("*.state.json"))
+        reopened = _b.Ledger(snap, lane="crawl.xnlinkfinder")
+        assert reopened.done, "the rescued snapshot owns nothing"
+        assert all(reopened.artifact(u) is not None for u in reopened.done), reopened.done
+
+    def test_a_PARTLY_journaled_run_does_not_claim_every_input_re_mines(self, tmp_path, monkeypatch):
+        """One unit journaled, one only in memory, and the snapshot fails: exactly ONE re-mines."""
+        from quarry_recon import budget as _b
+        real_append = _b.Ledger._append
+        seen = {"completions": 0}
+
+        def second_completion_fails(self, rec):
+            if "i" in rec:
+                seen["completions"] += 1
+                if seen["completions"] == 2:
+                    self._journal_unsafe = True
+                    return False
+            return real_append(self, rec)
+
+        monkeypatch.setattr(_b.Ledger, "_append", second_completion_fails)
+        monkeypatch.setattr(_b.Ledger, "save", lambda self: False)
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js", "sourcemap"])
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        # the fraction is over the COMPLETION ATTEMPTS (one journaled, one only in memory) — not over
+        # every result, which would include replayed and gapped units
+        assert "1/2 completion(s) reached neither the journal nor a snapshot" in (fin.get("reason") or ""), fin
+        assert "every input re-mines" not in (fin.get("reason") or ""), fin
+
+    def test_the_persistence_fraction_counts_COMPLETION_ATTEMPTS_not_results(self, tmp_path, monkeypatch):
+        """review-B-audit-8#4: a REPLAYED unit attempted no completion, so it does not belong in the
+        denominator. One replayed + one pending completion is `1/1`, never `1/2`."""
+        from quarry_recon import budget as _b
+        self._lane(tmp_path, monkeypatch, ["js"])                 # js is owned from here on
+        real_append = _b.Ledger._append
+
+        def no_completion(self, rec):
+            if "i" in rec:
+                self._journal_unsafe = True
+                return False
+            return real_append(self, rec)
+
+        monkeypatch.setattr(_b.Ledger, "_append", no_completion)
+        monkeypatch.setattr(_b.Ledger, "save", lambda self: False)
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js", "sourcemap"])
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][-1]   # the log spans both runs
+        assert "1/1 completion(s) reached neither the journal nor a snapshot" in (fin.get("reason") or ""), fin
+
+    def test_a_failed_APPEND_and_a_failed_SNAPSHOT_is_NOT_owned(self, tmp_path, monkeypatch):
+        from quarry_recon import budget as _b
+        monkeypatch.setattr(_b.Ledger, "record", lambda self, *a, **k: False)
+        monkeypatch.setattr(_b.Ledger, "save", lambda self: False)
+        monkeypatch.setattr(_b.Ledger, "durable", property(lambda self: True))
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        units = [e for e in evs if e.get("measure") == "units"]
+        assert units and units[-1]["omitted"] == 1, units
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "partial", fin
+        assert "reached neither the journal nor a snapshot" in (fin.get("reason") or ""), fin
+
+    def test_a_SUCCESSFUL_snapshot_never_consults_the_durability_fallback(self, tmp_path, monkeypatch):
+        """review-B-audit-7#3: `save()` returning True has already answered the question. Reading `durable`
+        anyway let a raising property fabricate machinery on a run where nothing went wrong."""
+        from quarry_recon import budget as _b
+
+        def explode(self):
+            raise AssertionError("durability was consulted after a SUCCESSFUL save")
+
+        monkeypatch.setattr(_b.Ledger, "durable", property(explode))
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
+        assert fin["status"] == "success" and not fin.get("reason"), fin
+
+    # ── #6 an unreadable output is not an empty one ──────────────────────────────────────────────
+    def test_an_UNREADABLE_output_is_never_published_as_EMPTY(self, tmp_path, monkeypatch):
+        real_read = pathlib.Path.read_bytes
+
+        def picky(self, *a, **k):
+            if self.name.endswith("_wordlist.txt") and "raw" in str(self):
+                raise PermissionError("denied")
+            return real_read(self, *a, **k)
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", picky)
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert not list(state.glob("*_bundle.json")), "an unreadable artifact was published as evidence"
+        # the single read authority catches it at the BOUNDARY (review-B-audit-9#3); either way the unit
+        # is not owned and the gap says which of the two happened.
+        gaps = [e.get("reason") or "" for e in evs if e.get("measure") == "units"]
+        assert any("output unreadable" in g for g in gaps), gaps
+
+    def test_an_UNREADABLE_secrets_artifact_is_never_a_clean_zero(self, tmp_path, monkeypatch):
+        real_read = pathlib.Path.read_bytes
+
+        def picky(self, *a, **k):
+            if self.name.endswith("_secrets.json"):
+                raise PermissionError("denied")
+            return real_read(self, *a, **k)
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", picky)
+        ctx, evs = self._secret_lane(tmp_path, monkeypatch, "[]")
+        gaps = [e.get("reason") or "" for e in evs if e.get("measure") == "units"]
+        assert any("unreadable" in g for g in gaps), gaps
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert not list(state.glob("*_bundle.json")), "an unreadable artifact was OWNED"
+
+    def test_a_PUBLICATION_failure_is_not_ownership(self, tmp_path, monkeypatch):
+        """The other half: artifacts read fine, but writing them into project state fails."""
+        from quarry_recon import budget as _b
+        monkeypatch.setattr(_b, "publish_bytes", lambda *a, **k: False)
+        _calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert not list(state.glob("*_bundle.json"))
+        assert any("could not be stored durably" in (e.get("reason") or "") for e in evs), evs
+
+    def test_an_ABSENT_output_stays_absent_and_a_PLANTED_one_is_refused(self, tmp_path, monkeypatch):
+        # LARGE input: `-os` is not requested at all, so a missing secrets artifact is genuine absence
+        # (a REQUESTED-but-missing one is a parse gap — see the `-os` cases below).
+        monkeypatch.setattr(crawl, "XNL_WORDLIST_LIMIT", 1)
+        self._lane(tmp_path, monkeypatch, ["js"])
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        man = json.loads(next(state.glob("*_bundle.json")).read_text())
+        assert man["outputs"]["secrets"]["present"] is False, man
+        assert not list(state.glob("*_secrets.json")), "an artifact the tool never wrote exists in state"
+        planted = next(state.glob("*_links.txt")).with_name(
+            next(state.glob("*_links.txt")).name.replace("_links.txt", "_secrets.json"))
+        planted.write_text('[{"type": "x", "value": "planted"}]')
+        calls, _evs, ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        assert len(calls) == 1, "a planted artifact was replayed as our evidence"
+        assert not any(r.get("value") == "planted" for k, r in ctx.run.added if k == "secret")
+
+    # ── #7 identity cannot collapse or go stale ──────────────────────────────────────────────────
+    def test_an_UNDIGESTIBLE_input_is_never_owned(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawl, "_xnl_blob", lambda ctx, indir, tag: {
+            "blob": ctx.run.raw_path("crawl", "xnLinkFinder", f"{tag}_input.txt"), "written": 10,
+            "capped": False, "files": 1, "files_completed": 1, "partial_files": 0,
+            "unreadable_files": 0, "digest": ""})
+        calls, evs, _ctx = self._lane(tmp_path, monkeypatch, ["js"])
+        assert calls == [], "a unit with no identity was mined anyway"
+        gaps = [e.get("reason") or "" for e in evs if e.get("measure") == "units"]
+        assert any("could not be digested" in g and "next run retries it" in g for g in gaps), gaps
+        # ...and it is named as the INPUT problem it is. Letting the identity helper raise would also stop
+        # the unit, but it would report an undigestible input as our machinery failing.
+        assert not any("machinery failed" in g for g in gaps), gaps
+        state = tmp_path / "recon" / "state" / "xnlinkfinder" / f"v{crawl.XNL_PARSER_SCHEMA}"
+        assert not list(state.glob("*_bundle.json"))
+
+    def test_the_identity_REFUSES_an_empty_digest_structurally(self, tmp_path, monkeypatch):
+        events.reset(); events.configure(tmp_path)
+        ctx = _Ctx(tmp_path, [])
+        ctx.scope = self._S()
+        with pytest.raises(ValueError):
+            crawl._xnl_unit_identity(ctx, "t", False, "", "8.2")
+
+    def test_an_ENGINE_UPGRADE_re_mines_instead_of_replaying(self, tmp_path, monkeypatch):
+        calls1, _evs, _c = self._lane(tmp_path, monkeypatch, ["js"], engine="8.2")
+        calls2, _evs2, _c2 = self._lane(tmp_path, monkeypatch, ["js"], engine="8.2")
+        calls3, evs3, _c3 = self._lane(tmp_path, monkeypatch, ["js"], engine="8.3")
+        assert len(calls1) == 1 and len(calls2) == 0, (calls1, calls2)
+        assert len(calls3) == 1, "an upgraded extractor replayed 8.2's output forever"
+
+    def test_an_UNPROVEN_engine_mines_but_never_owns(self, tmp_path, monkeypatch):
+        calls, evs, ctx = self._lane(tmp_path, monkeypatch, ["js"], engine="")
+        assert len(calls) == 1, "an unprovable engine must not stop the mining"
+        assert [r["value"] for k, r in ctx.run.added if k == "endpoint"] == ["https://api.acme.com/x"]
+        assert any("identity is unproven" in (e.get("reason") or "") for e in evs), evs
+        calls2, _evs2, _c2 = self._lane(tmp_path, monkeypatch, ["js"], engine="")
+        assert len(calls2) == 1, "an unowned unit was replayed"
