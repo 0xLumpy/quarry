@@ -45,6 +45,12 @@ BUCKETS = 256
 #: digits 8..24 are the 64 bits after the four the root is taken from, consumed most-significant first.
 EXT_BITS = 64
 
+#: the largest number of candidates one INVOCATION may carry when no per-target bound applies. A blast
+#: radius, not a measured optimum: the timing curve never stopped improving with size (49,634 candidates
+#: were still the fastest per candidate), so this bounds what ONE failed or cancelled call can cost, not
+#: what is fastest. A capped lane is bounded by its cap long before this.
+MAX_BATCH_WORDS = 25000
+
 #: the id grammar schema 2 accepts: a three-digit root, optionally extended by `.` and up to `EXT_BITS`
 #: binary digits. Anything else is not a slot this lane can rank, split or complete.
 SLOT_RX = re.compile(rf"^[0-9]{{3}}(\.[01]{{1,{EXT_BITS}}})?$")
@@ -158,6 +164,8 @@ class SweepResult:
     """What the sweep did, in the vocabulary the terminal and the coverage records need."""
     eligible_pairs: int = 0
     attempted_pairs: int = 0            # candidates inside slots whose invocation RETURNED
+    invocations: int = 0                    # runner calls that actually ran — NOT a slot count
+    invocations_obtained: int = 0
     slots_attempted: int = 0
     slots_obtained: int = 0             # SUCCESS or EMPTY — a clean answer, including "nothing resolved"
     classes: dict = field(default_factory=dict)
@@ -295,59 +303,64 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         picked: set = set()
         spent: dict = {}                                   # candidates submitted per target
         while not clock.exhausted() and len(picked) < len(slots):
-            choice = _rank(progress, slots, content, picked)
-            if choice is None:
+            batch = _next_batch(progress, slots, content, members, picked, spent, out,
+                                cap=max_pairs_per_target, max_words=MAX_BATCH_WORDS)
+            if batch is None:
                 break
-            target, bucket = choice
-            words = members[choice]
-            if max_pairs_per_target and spent.get(target, 0) + len(words) > max_pairs_per_target:
-                # this target has spent what it may. Excluding the SLOT (not just skipping the pick) keeps
-                # the loop terminating and leaves the remainder to the next run's rotation.
-                picked.add(choice)
-                out.stop_kind = out.stop_kind or "bound"
-                out.stop = out.stop or (f"the per-target candidate bound ({max_pairs_per_target}) was "
-                                        f"reached")
-                continue
-            picked.add(choice)
-            spent[target] = spent.get(target, 0) + len(words)
-            gen = progress.reserve(target, bucket, at=now())
+            target, chosen = batch                         # chosen: [(bucket, words)] — ONE invocation
+            total = sum(len(words) for _b, words in chosen)
+            unit = _unit_of(chosen)
+
+            # RESERVE THE WHOLE BATCH BEFORE CONTACT, in one save (design v22#3, clause 2).
+            try:
+                gens = progress.reserve_batch(target, [b for b, _w in chosen], at=now())
+            except (budget.SchedulerInvariant, ValueError) as e:
+                out.machinery.append(f"{target}/{unit}: reservation refused ({type(e).__name__}: {e})")
+                out.stop = "machinery: the reservation was refused"
+                out.stop_kind = "machinery"
+                break
             if not progress.save():
-                # FAIL CLOSED: nothing is submitted for a slot whose reservation nobody owns (v6#2).
+                # FAIL CLOSED: nothing is submitted for slots whose reservation nobody owns (v6#2).
                 out.stop = "machinery: the reservation could not be persisted"
                 out.stop_kind = "machinery"
                 break
-            out.reservations_persisted += 1
+            out.reservations_persisted += len(chosen)
+            spent[target] = spent.get(target, 0) + total
             _rescue(out)                       # this save also carried any pending completion (v14#1)
 
             try:
-                result = execute(target, bucket, words)
+                result = execute(target, unit, [word for _b, words in chosen for word in words])
             except (KeyboardInterrupt, SystemExit):
                 raise                                   # cancellation ends the run, never a slot outcome
             except Exception as e:                      # `runner.run` can raise around Popen (v10#1)
-                out.machinery.append(f"{target}/{bucket}: {type(e).__name__}: {e}")
+                out.machinery.append(f"{target}/{unit}: {type(e).__name__}: {e}")
                 out.stop = "machinery: the invocation raised"
                 out.stop_kind = "machinery"
                 break
 
             if result.status is Status.SKIPPED:          # no process ran — a dependency answer
-                out.stop = "the tool did not run"
+                out.stop = "the tool did not run"        # clause 3: it completes NO slot
                 out.stop_kind = "dependency"
                 break
-            out.slots_attempted += 1
-            out.attempted_pairs += len(words)
-            for word in words:                              # review v15#4: the two attempted totals must
-                src = owners.get(word)                      # agree even when publication never happens
-                if src is not None:
-                    out.per_source_attempted[src] = out.per_source_attempted.get(src, 0) + 1
+            out.invocations += 1                         # clause 6: invocations are their own measure
+            out.slots_attempted += len(chosen)
+            out.attempted_pairs += total
+            for _b, words in chosen:
+                for word in words:                          # review v15#4: the two attempted totals must
+                    src = owners.get(word)                  # agree even when publication never happens
+                    if src is not None:
+                        out.per_source_attempted[src] = out.per_source_attempted.get(src, 0) + 1
             if result.status in _OBTAINED:
-                out.slots_obtained += 1
+                # clause 4: ONE result attests every slot it carried — completion means ATTEMPTED
+                out.slots_obtained += len(chosen)
+                out.invocations_obtained += 1
             else:
                 key = str(getattr(result.status, "value", result.status))
-                out.classes[key] = out.classes.get(key, 0) + 1
+                out.classes[key] = out.classes.get(key, 0) + len(chosen)
 
             try:
-                progress.complete(target, bucket, gen, at=now(), content=content[choice],
-                                  members=len(words))
+                progress.complete_batch(target, [(b, gens[b], content[(target, b)], len(words))
+                                                for b, words in chosen], at=now())    # clause 5
                 published = progress.save()
             except (KeyboardInterrupt, SystemExit):
                 raise
@@ -357,16 +370,16 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.stop_kind = "machinery"
                 break
             except Exception as e:                      # the evidence exists; only the bookkeeping failed
-                out.machinery.append(f"{target}/{bucket}: completion not published ({type(e).__name__})")
+                out.machinery.append(f"{target}/{unit}: completion not published ({type(e).__name__})")
                 published = False
             if published:
-                out.completions_published += 1
+                out.completions_published += len(chosen)
                 _rescue(out)
             else:
-                # review v14#1: the `done` tuple stays in the in-memory map, so a LATER successful save
-                # persists it. It is PENDING, not lost — and it is reclassified when that happens, instead
+                # review v14#1: the `done` tuples stay in the in-memory map, so a LATER successful save
+                # persists them. They are PENDING, not lost — and reclassified when that happens, instead
                 # of the counters swearing nothing was published while the disk says otherwise.
-                out.pending_completions += 1
+                out.pending_completions += len(chosen)
 
 
         if out.stop_kind is None and clock.exhausted() and len(picked) < len(slots):
@@ -389,6 +402,51 @@ def _rescue(out: "SweepResult") -> None:
     if out.pending_completions:
         out.completions_published += out.pending_completions
         out.pending_completions = 0
+
+
+def _unit_of(chosen) -> str:
+    """The id ONE invocation is reported and named by. A single slot keeps its own id, so a lane that never
+    batches reads exactly as before."""
+    first = chosen[0][0]
+    return first if len(chosen) == 1 else f"{first}+{len(chosen) - 1}"
+
+
+def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: int, max_words: int):
+    """The next INVOCATION: the prefix of the GLOBAL rank order that stays inside one target and one tier.
+
+    The pinned batch protocol (design v22#3), clause by clause. Ranking is still global and re-evaluated
+    for every member, so target fairness and tier dominance survive batching (clause 7) — the batch simply
+    stops at the first slot that belongs to another target or another tier. A slot that alone cannot fit
+    the per-target bound is still EXCLUDED (never withheld silently), and the batch-size policy never
+    withholds a slot on its own: a single oversized slot still runs, or nothing would."""
+    chosen: list = []
+    target = tier = None
+    total = 0
+    while len(picked) < len(slots):
+        choice = _rank(progress, slots, content, picked)
+        if choice is None:
+            break
+        this_target, bucket = choice
+        this_tier = progress.tier(this_target, bucket, content[choice])
+        if chosen and (this_target != target or this_tier != tier):
+            break                                       # clause 1: one target, one tier
+        words = members[choice]
+        if cap and spent.get(this_target, 0) + total + len(words) > cap:
+            # This slot does not fit what the target may still spend. Excluding it (rather than merely
+            # skipping the pick) keeps the loop terminating and leaves it to the next run's rotation —
+            # and the scan CONTINUES, so a smaller slot behind it can still fill the remaining allowance
+            # in the SAME invocation, exactly as the one-slot-per-call driver used to pack it (v31).
+            picked.add(choice)
+            out.stop_kind = out.stop_kind or "bound"
+            out.stop = out.stop or f"the per-target candidate bound ({cap}) was reached"
+            continue
+        if chosen and max_words and total + len(words) > max_words:
+            break
+        target, tier = this_target, this_tier
+        chosen.append((bucket, words))
+        total += len(words)
+        picked.add(choice)
+    return (target, chosen) if chosen else None
 
 
 def _rank(progress, slots, content, picked):
@@ -420,6 +478,12 @@ def _report(lane: str, out: SweepResult, clock) -> None:
                             cap_reason=out.stop if out.stop_kind == "bound" else None)
     budget.report_outcome(lane, measure="slot_outcomes", attempted=out.slots_attempted,
                           obtained=out.slots_obtained, classes=out.classes or None, noun="slot")
+    if out.invocations:
+        # a THIRD outcome denominator, deliberately (design v22#3, clause 6): one invocation may carry
+        # several slots, so "how many calls ran" and "how many slots were attempted" are different facts
+        # and neither may be read off the other.
+        budget.report_outcome(lane, measure="tool_invocations", attempted=out.invocations,
+                              obtained=out.invocations_obtained, noun="invocation")
     if out.per_source_eligible:
         # review v15#3: NOT a third coverage denominator — it would re-count the candidate remainder the
         # selection record already owns, and it would have to invent a `kind` for a stop it does not model.

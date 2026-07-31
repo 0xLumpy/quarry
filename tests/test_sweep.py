@@ -82,6 +82,9 @@ class TestTerminationAndOnceness:
     def test_a_BUDGET_stops_the_sweep_and_the_REMAINDER_goes_first_next_time(self, tmp_path, monkeypatch):
         """A bounded run advances; the next run continues instead of repeating the prefix. The clock is a
         FAKE that only moves when a slot runs, so the test is deterministic."""
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         ticks = {"t": 0.0}
         monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
 
@@ -123,8 +126,11 @@ class TestOrdering:
         assert seen[0] != seen[1], seen                               # A,B,A,B rather than A,A,…,B,B
         assert seen.count("a.com") == seen.count("b.com")
 
-    def test_the_STALEST_slot_goes_first_within_a_target(self, tmp_path):
+    def test_the_STALEST_slot_goes_first_within_a_target(self, tmp_path, monkeypatch):
         """Clean slots are ordered by when they were last SELECTED, not by bucket name."""
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         words = [f"w{i:03d}" for i in range(6)]
         _run(tmp_path, words=words)                                   # everything clean, seq ascends
         # make one LATE bucket the stalest by hand: the state is the scheduler's input
@@ -158,14 +164,20 @@ class TestTheFourDispositions:
         assert out.stop == "the tool is not installed"
         assert not (tmp_path / f"{LANE}.json").exists()
 
-    def test_a_SKIPPED_result_stops_the_lane(self, tmp_path):
+    def test_a_SKIPPED_result_stops_the_lane(self, tmp_path, monkeypatch):
         """v7#2: reserving every remaining slot against a tool that vanished burns the whole rotation."""
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         tool = _Tool(statuses=[Status.SUCCESS, Status.SKIPPED, Status.SUCCESS])
         out, _t = _run(tmp_path, tool=tool)
         assert len(tool.calls) == 2 and out.stop == "the tool did not run"
         assert out.slots_attempted == 1                                # SKIPPED never enters the denominator
 
-    def test_a_RAISING_invocation_keeps_what_was_already_earned(self, tmp_path):
+    def test_a_RAISING_invocation_keeps_what_was_already_earned(self, tmp_path, monkeypatch):
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         tool = _Tool(raises=(2, RuntimeError("popen exploded")))
         out, _t = _run(tmp_path, tool=tool)
         assert out.slots_attempted == 1 and out.attempted_pairs > 0
@@ -181,6 +193,9 @@ class TestTheFourDispositions:
         assert out.stop_kind == "machinery" and out.durable is False    # nothing persisted at all
 
     def test_an_unpublishable_COMPLETION_keeps_the_evidence(self, tmp_path, monkeypatch):
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         saves = {"n": 0}
 
         real = budget.RotationProgress.save
@@ -217,7 +232,7 @@ class TestContentionAndCoverage:
         def boom(self, *a, **k):
             raise budget.StateBusy("something inside the sweep")
 
-        monkeypatch.setattr(budget.RotationProgress, "reserve", boom)
+        monkeypatch.setattr(budget.RotationProgress, "reserve_batch", boom)
         with pytest.raises(budget.StateBusy):
             _run(tmp_path)                     # it is NOT swallowed into a contention gap
 
@@ -236,7 +251,10 @@ class TestContentionAndCoverage:
         with pytest.raises(OSError):
             _run(tmp_path)
 
-    def test_SELECTION_and_OUTCOME_are_separate_denominators(self, tmp_path):
+    def test_SELECTION_and_OUTCOME_are_separate_denominators(self, tmp_path, monkeypatch):
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         tool = _Tool(statuses=[Status.SUCCESS, Status.FAILED] + [Status.EMPTY] * 30)
         out, _t = _run(tmp_path, tool=tool, words=[f"w{i:03d}" for i in range(6)])
         evs = _events(tmp_path)
@@ -305,9 +323,12 @@ class TestStateHonesty:
 class TestReviewV14:
     """Five accounting contracts the v14 review reproduced against 940ee2d."""
 
-    def test_a_completion_RESCUED_by_a_later_save_is_counted_as_published(self, tmp_path):
+    def test_a_completion_RESCUED_by_a_later_save_is_counted_as_published(self, tmp_path, monkeypatch):
         """The `done` tuple stays in the in-memory map, so the next successful save carries it to disk.
         Reporting it as unpersisted while the disk holds it is the counters lying about the state."""
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         saves = {"n": 0}
         real = budget.RotationProgress.save
 
@@ -324,8 +345,11 @@ class TestReviewV14:
         assert out.completions_published == durable_done, (out.completions_published, durable_done)
         assert out.completion_unpersisted == len(tool.calls) - durable_done
 
-    def test_PARTIAL_progress_is_not_reported_as_a_full_restart(self, tmp_path):
+    def test_PARTIAL_progress_is_not_reported_as_a_full_restart(self, tmp_path, monkeypatch):
         """v14#2: a reservation failure after real progress used to claim the lane RESTARTS."""
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         saves = {"n": 0}
         real = budget.RotationProgress.save
 
@@ -352,6 +376,9 @@ class TestReviewV14:
     def test_ATTRIBUTION_measures_the_SCHEDULED_PREFIX(self, tmp_path, monkeypatch):
         """v14#3: it summed the whole eligible corpus and reported no omission, so the timing pass could
         not see the first-k distribution it exists to measure."""
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         ticks = {"t": 0.0}
         monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
 
@@ -374,6 +401,9 @@ class TestReviewV14:
 
     def test_BUDGET_EXHAUSTION_is_a_named_stop(self, tmp_path, monkeypatch):
         """v14#4: `stop` stayed None, which the dataclass defines as "the whole eligible set ran"."""
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         ticks = {"t": 0.0}
         monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
 
@@ -450,10 +480,13 @@ class TestReviewV15:
     def test_the_two_ATTEMPTED_totals_agree_even_on_the_invariant_path(self, tmp_path, monkeypatch):
         """v15#4: `attempted_pairs` counted on return, the per-source split only after publication — so a
         `SchedulerInvariant` between them left the two disagreeing."""
+        # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
+        # invocation. Batching is exercised by `TestExecutorBatching`.
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
         def boom(self, *a, **k):
             raise budget.SchedulerInvariant("moved under the holder")
 
-        monkeypatch.setattr(budget.RotationProgress, "complete", boom)
+        monkeypatch.setattr(budget.RotationProgress, "complete_batch", boom)
         out, tool = _run(tmp_path, attribution=lambda w: "js")
         assert out.stop_kind == "machinery" and out.slots_attempted == 1
         assert sum(out.per_source_attempted.values()) == out.attempted_pairs, out
@@ -550,16 +583,18 @@ class TestTheAdaptiveSlotSpace:
         """Reproduction of the measured defect: 30,000 words, bound 50, smallest root 92 members. Before
         schema 2 this submitted ZERO, run after run, while reporting the ordinary cap sentence."""
         vocab = [f"w{i:07d}" for i in range(30000)]
-        seen, spent, invocations = set(), 0, 0
+        seen, spent, invocations, slots = set(), 0, 0, 0
         for _ in range(4):
             out, tool = _run(tmp_path, words=vocab, max_pairs_per_target=50,
                              tool=_Tool(max_calls=40))
             assert out.attempted_pairs > 0, out.stop
             assert out.attempted_pairs <= 50, "the per-target bound still holds"
-            seen |= {b for _t, b, _w in tool.calls}
+            seen |= {u for _t, u, _w in tool.calls}
             invocations += len(tool.calls)
+            slots += out.slots_attempted
             spent += out.attempted_pairs
-        assert len(seen) == invocations >= 6, (seen, invocations)   # never the same slot twice
+        assert len(seen) == invocations == 4, (seen, invocations)   # one batched call a lifecycle
+        assert slots >= 7, slots                                    # never the same slot twice
         assert spent >= 180
 
     def test_the_bound_is_still_never_EXCEEDED(self, tmp_path):
@@ -666,3 +701,118 @@ class TestTheSlotGrammarGuard:
     def test_the_grammar_bounds_the_DEPTH(self):
         assert sweep.slot_id_ok("158." + "0" * sweep.EXT_BITS)
         assert not sweep.slot_id_ok("158." + "0" * (sweep.EXT_BITS + 1))
+
+
+class TestExecutorBatching:
+    """The pinned batch protocol (design v22#3). One invocation may carry several slots — measured: a
+    puredns call costs ~1.04 s before it resolves anything, which the old one-slot-per-call driver paid
+    once per slot (3.8x on the OTC corpus, 94x on a small one)."""
+
+    def test_ONE_invocation_carries_the_whole_eligible_prefix(self, tmp_path):
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(20)])
+        assert len(tool.calls) == 1 and out.invocations == 1
+        assert out.slots_attempted == 20 and out.attempted_pairs == 20
+        assert len(tool.calls[0][2]) == 20
+
+    def test_a_batch_NEVER_crosses_a_TARGET(self, tmp_path):
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=[f"w{i:03d}" for i in range(6)])
+        assert len(tool.calls) == 2 and {c[0] for c in tool.calls} == {"a.com", "b.com"}
+        assert out.invocations == 2 and out.slots_attempted == 12
+
+    def test_a_batch_NEVER_crosses_a_TIER(self, tmp_path):
+        words = [f"w{i:03d}" for i in range(4)]
+        _run(tmp_path, words=words)                                    # everything clean now
+        out, tool = _run(tmp_path, words=words + ["brand-new-word"])   # one DIRTY slot joins
+        assert len(tool.calls) == 2, tool.calls
+        assert tool.calls[0][2] == ("brand-new-word",), tool.calls[0]  # the dirty tier goes alone, first
+        assert len(tool.calls[1][2]) == 4
+
+    def test_the_batch_is_bounded_by_the_REMAINING_allowance(self, tmp_path):
+        vocab = [f"w{i:07d}" for i in range(30000)]
+        out, tool = _run(tmp_path, words=vocab, max_pairs_per_target=50, tool=_Tool(max_calls=10))
+        assert len(tool.calls) == 1, tool.calls          # ONE call, several slots
+        assert out.slots_attempted >= 2 and out.attempted_pairs <= 50
+        assert len(tool.calls[0][2]) == out.attempted_pairs
+
+    def test_a_SINGLE_slot_bigger_than_the_batch_policy_still_runs(self, tmp_path, monkeypatch):
+        """The batch size is a blast radius, never a reason to withhold a slot: a slot that alone exceeds
+        it must still run, or the lane would starve exactly the way the fixed slot space did."""
+        monkeypatch.setattr(sweep, "BUCKETS", 1)              # every word lands in ONE slot
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)      # which is bigger than a whole batch may be
+        out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"])
+        assert len(tool.calls) == 1 and len(tool.calls[0][2]) == 3, tool.calls
+        assert out.attempted_pairs == 3 and out.slots_attempted == 1
+
+    def test_the_batch_policy_still_STOPS_a_batch_from_growing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)])
+        assert len(tool.calls) == 3 and all(len(c[2]) == 2 for c in tool.calls), tool.calls
+
+    def test_the_UNIT_id_keeps_a_lone_slot_s_own_name(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        out, tool = _run(tmp_path, words=["alpha"])
+        assert tool.calls[0][1] == sweep.bucket_of("alpha")
+
+    def test_a_BATCHED_unit_names_its_first_slot_and_its_size(self, tmp_path):
+        out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"])
+        unit = tool.calls[0][1]
+        assert unit.endswith("+2") and sweep.slot_id_ok(unit.split("+")[0]), unit
+
+    def test_EVERY_reservation_is_persisted_BEFORE_contact(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(budget.RotationProgress, "save", lambda self: False)
+        out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"])
+        assert tool.calls == [] and out.reservations_persisted == 0
+        assert out.stop == "machinery: the reservation could not be persisted"
+
+    def test_a_RAISING_invocation_completes_NO_slot_of_its_batch(self, tmp_path):
+        out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"],
+                         tool=_Tool(raises=(1, RuntimeError("popen exploded"))))
+        assert out.reservations_persisted == 3 and out.slots_attempted == 0
+        assert out.completions_published == 0 and out.stop_kind == "machinery"
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA)
+        assert all("done" not in sl for t in reopened.targets.values() for sl in t["slots"].values())
+
+    def test_a_SKIPPED_invocation_completes_NO_slot_of_its_batch(self, tmp_path):
+        out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"],
+                         tool=_Tool(statuses=[Status.SKIPPED]))
+        assert out.slots_attempted == 0 and out.invocations == 0
+        assert out.stop == "the tool did not run" and out.stop_kind == "dependency"
+
+    def test_ONE_status_applies_to_EVERY_slot_of_the_batch(self, tmp_path):
+        out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"],
+                         tool=_Tool(statuses=[Status.FAILED]))
+        assert out.slots_attempted == 3 and out.slots_obtained == 0
+        assert out.classes == {"failed": 3}, out.classes
+        assert out.invocations == 1 and out.invocations_obtained == 0
+
+    def test_the_WHOLE_batch_is_completed_in_ONE_save(self, tmp_path, monkeypatch):
+        saves = {"n": 0}
+        real = budget.RotationProgress.save
+
+        def flaky(self):
+            saves["n"] += 1
+            return real(self) if saves["n"] == 1 else False     # the reservation lands, the completion not
+
+        monkeypatch.setattr(budget.RotationProgress, "save", flaky)
+        out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"])
+        assert len(tool.calls) == 1
+        assert out.completion_unpersisted == 3, out          # the batch is pending WHOLE, never partly
+
+    def test_INVOCATIONS_are_reported_as_their_own_measure(self, tmp_path):
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=[f"w{i:03d}" for i in range(6)])
+        cov = [e for e in _events(tmp_path) if e.get("measure") == "tool_invocations"]
+        slots = [e for e in _events(tmp_path) if e.get("measure") == "slot_outcomes"]
+        assert cov and cov[-1]["tested"] == 2 and cov[-1]["eligible"] == 2, cov
+        assert slots and slots[-1]["tested"] == 12, slots     # never read off one another
+
+    def test_a_lane_that_ran_NOTHING_reports_no_invocation_measure(self, tmp_path):
+        _run(tmp_path, dependency_ok=lambda: False)
+        assert [e for e in _events(tmp_path) if e.get("measure") == "tool_invocations"] == []
+
+    def test_TARGET_FAIRNESS_survives_batching(self, tmp_path):
+        """Clause 7: ranking is global and re-evaluated for every member, so the batch stops at the first
+        slot of another target and the next batch is chosen globally again."""
+        out, tool = _run(tmp_path, targets=("a.com", "b.com", "c.com"),
+                         words=[f"w{i:03d}" for i in range(4)])
+        assert [c[0] for c in tool.calls] == ["a.com", "b.com", "c.com"], tool.calls
+        assert all(len(c[2]) == 4 for c in tool.calls)

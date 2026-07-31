@@ -1372,6 +1372,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         from quarry_recon import store
         from quarry_recon.phases import enrich, probe, vertical
         monkeypatch.setattr(sweep, "BUCKETS", 4)
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)     # per-SLOT statuses: one slot per invocation
         monkeypatch.setattr(enrich, "A1D_WORD_CAP", 50)
         run = store.Run.create(tmp_path, "t")
         events.reset(); events.configure(run.dir)
@@ -1554,6 +1555,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         from quarry_recon import store
         from quarry_recon.phases import enrich, probe, vertical
         monkeypatch.setattr(sweep, "BUCKETS", len(statuses))
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)     # one status per SLOT, so one slot per call
         run = store.Run.create(tmp_path, "t")
         events.reset(); events.configure(run.dir)
         try:
