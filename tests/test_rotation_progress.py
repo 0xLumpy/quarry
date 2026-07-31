@@ -713,6 +713,17 @@ class TestBatchedMutationsAreAllOrNone:
         p.complete_batch("acme.com", [], at=1.0)
         assert p.targets == {} and p.gen == 0
 
+    def test_the_BATCH_TIMESTAMP_is_checked_even_with_no_members(self, tmp_path):
+        """v29: the clock reading belongs to the BATCH. A check that only fires when a member happens to
+        exist is not a contract — and the two primitives disagreed about it."""
+        p = _progress(tmp_path)
+        for bad in (float("nan"), float("inf"), -1.0, "now", None, True):
+            with pytest.raises(ValueError):
+                p.reserve_batch("acme.com", [], at=bad)
+            with pytest.raises(ValueError):
+                p.complete_batch("acme.com", [], at=bad)
+        assert p.targets == {} and p.gen == 0
+
     def test_COMPLETING_a_batch_writes_every_member(self, tmp_path):
         p = _progress(tmp_path)
         gens = p.reserve_batch("acme.com", ["01", "02"], at=1.0)

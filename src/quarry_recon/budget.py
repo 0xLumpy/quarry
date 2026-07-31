@@ -628,7 +628,11 @@ class RotationProgress:
         """Reserve several slots of ONE target under one clock reading. Returns {bucket: generation}.
 
         Raises before mutating anything if any id is unusable, repeated, or the timestamp is not a
-        timestamp. Generations are still per slot: batching is an execution fact, not a scheduling one."""
+        timestamp. Generations are still per slot: batching is an execution fact, not a scheduling one.
+
+        The timestamp is a property of the BATCH, so it is validated once and even for an empty batch
+        (v29): a caller whose clock returned NaN has a broken clock whether or not there was work, and a
+        check that only fires when a member happens to exist is not a contract."""
         keys = []
         seen = set()
         for bucket in buckets:
@@ -651,7 +655,10 @@ class RotationProgress:
         """Record that several slots RAN, from `(bucket, gen, content, members)` items.
 
         Every slot keeps its OWN reservation check and its own content digest — completion means the slot
-        was ATTEMPTED, and one result may attest several slots, but never one slot's record for another."""
+        was ATTEMPTED, and one result may attest several slots, but never one slot's record for another.
+
+        As in `reserve_batch`, the batch timestamp is validated once and even for an empty batch (v29)."""
+        (when,) = self._checked(at=at)
         checked = []
         seen = set()
         for bucket, gen, content, members in items:
@@ -659,7 +666,7 @@ class RotationProgress:
             if key in seen:
                 raise ValueError(f"slot {key!r} appears twice in one batch")
             seen.add(key)
-            when, n, digest = self._checked(at=at, members=members, content=content)
+            n, digest = self._checked(members=members, content=content)
             if self._count(gen) is None or gen < 1:
                 raise ValueError(f"generation must be an exact positive int, got {gen!r}")
             slot = self._slot(target, key)
