@@ -23,6 +23,7 @@ item's cost, not which items get processed.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -180,6 +181,48 @@ def ledger_writable(ledger) -> bool:
     `shodan_sched` and `whoxy_page`, and a third copy in the host lane is how three answers to one question
     start to drift apart."""
     return not getattr(ledger, "foreign", False) and not getattr(ledger, "_journal_unsafe", False)
+
+
+class StateBusy(RuntimeError):
+    """Another lifecycle already holds this lane's state.
+
+    CONTENTION ONLY. A read-only filesystem, a bad descriptor or a filesystem without lock support raises
+    the underlying OSError instead — reporting those as "another run is active" sends an operator looking
+    for a process that does not exist (review-B1.6b2#2, learned on the Whoxy lock)."""
+
+
+@contextlib.contextmanager
+def state_lock(path):
+    """An exclusive, ADVISORY, OS-RELEASED lock over one lane's PROJECT state — the lock a `Ledger` needs.
+
+    Every ledger-owning lane has the same problem: two runs of the same project load the same snapshot, do
+    the same work twice, then race while compacting and unlinking the journal that supersedes it — which is
+    how ownership gets lost outright. THIS is that lock, defined once next to `Ledger`, because three lanes
+    answering the same question separately is how the three answers drift apart.
+
+    `flock` and not lockfile EXISTENCE: a stale file from a killed run would block the project forever,
+    while the kernel drops an flock when the holder dies, however it dies. The file is never unlinked —
+    removing it lets a second process lock a path the first no longer shares.
+
+    Non-blocking: contention raises `StateBusy` immediately rather than parking a run behind another one
+    for an unbounded time. A caller decides what contention MEANS for it (a gap, a retry, a skip)."""
+    import errno
+    import fcntl
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = path.open("a+")
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            raise StateBusy(f"another lifecycle holds {path}") from e
+        yield path
+    finally:
+        # closing the descriptor releases the lock on EVERY exit, BaseException included: a cancelled run
+        # must not wedge the project until someone notices a leftover file.
+        fh.close()
 
 
 def state_path(base, lane: str, config_fp: str):

@@ -590,33 +590,20 @@ SPEND_LOCK = Path.home() / ".config" / "quarry" / "whoxy-spend.lock"
 
 @contextlib.contextmanager
 def _flock(path):
-    """An exclusive, ADVISORY, OS-RELEASED lock on `path`. Raises `LockBusy` on contention only."""
-    import errno
-    import fcntl
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fh = path.open("a+")
-    try:
+    """An exclusive, ADVISORY, OS-RELEASED lock on `path`. Raises `LockBusy` on contention only.
+
+    The mechanism lives in `budget.state_lock` — the same lock every ledger-owning lane needs, defined once
+    beside `Ledger`. This wrapper exists only to keep Whoxy's own contention type: callers here catch
+    `LockBusy`, and a provider lane's vocabulary should not change because a primitive moved."""
+    with contextlib.ExitStack() as stack:
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
-            # review-B1.6b2#2: only CONTENTION is contention. A read-only filesystem, a bad descriptor or
-            # a filesystem with no lock support would otherwise be reported as "another run is active" —
-            # sending an operator to look for a process that does not exist.
-            if e.errno not in (errno.EACCES, errno.EAGAIN):
-                raise
-            raise LockBusy(f"another whoxy lifecycle holds {path}") from e
-        yield path
-    finally:
-        # CLOSING the descriptor releases the flock, on every exit including BaseException — a
-        # cancelled run must not wedge anything until someone notices a leftover file. `flock` and not
-        # lockfile EXISTENCE: a stale file from a killed run would block forever, while the kernel
-        # drops an flock with the process. The file itself is never removed — unlinking it lets a
-        # second process lock a path the first no longer shares.
-        #
-        # DELIBERATELY UNFALSIFIABLE ON CPYTHON: refcounting drops `fh` when this frame unwinds, so
-        # removing this line changes nothing a test can observe. It is kept because the guarantee must
-        # not depend on the garbage collector.
-        fh.close()
+            p = stack.enter_context(budget.state_lock(path))
+        except budget.StateBusy as e:
+            # review-B-audit-7#7: ONLY the acquisition is translated. Wrapping the yielded body too meant a
+            # `StateBusy` raised by the CALLER (an inner lock, a nested lifecycle) came back out as this
+            # lock's contention — an alias for a completely different lock.
+            raise LockBusy(str(e)) from e
+        yield p
 
 
 @contextlib.contextmanager

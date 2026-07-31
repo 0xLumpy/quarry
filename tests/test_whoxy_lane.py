@@ -262,6 +262,23 @@ class TestMachineryFailuresStayBestEffort:
         assert r.meta["gap_reason"] and r.meta["coverage_incomplete"]
         assert r.meta["provider_limit"] is False and r.meta["operator_limit"] is False
 
+    def test_a_BODY_raised_StateBusy_is_NOT_this_lock_s_contention(self, tmp_path, monkeypatch):
+        """review-B-audit-7#7: the wrapper translated `StateBusy` around the whole `with` body, so a
+        DIFFERENT lock's contention (an inner lifecycle, a nested state lock) came back out as this lock
+        reporting itself busy. Only the acquisition may be translated."""
+        from quarry_recon import budget as _b
+
+        with pytest.raises(_b.StateBusy) as ei:
+            with wp._flock(tmp_path / "x.lock"):
+                raise _b.StateBusy("a DIFFERENT lock is held")
+        assert "a DIFFERENT lock" in str(ei.value)
+
+        # ...and real contention on THIS lock is still `LockBusy`
+        with wp._flock(tmp_path / "y.lock"):
+            with pytest.raises(wp.LockBusy):
+                with wp._flock(tmp_path / "y.lock"):
+                    pass                                   # pragma: no cover
+
     def test_the_SESSION_verdict_reports_the_gap(self, tmp_path, monkeypatch):
         monkeypatch.setattr(secrets, "whoxy", lambda: "KEY")
         monkeypatch.setattr(osint.secrets, "whoxy", lambda: "KEY")
