@@ -633,6 +633,7 @@ class RotationProgress:
         The timestamp is a property of the BATCH, so it is validated once and even for an empty batch
         (v29): a caller whose clock returned NaN has a broken clock whether or not there was work, and a
         check that only fires when a member happens to exist is not a contract."""
+        (when,) = self._checked(at=at)     # the BATCH CLOCK first, in both primitives (v30)
         keys = []
         seen = set()
         for bucket in buckets:
@@ -641,7 +642,6 @@ class RotationProgress:
                 raise ValueError(f"slot {key!r} appears twice in one batch")
             seen.add(key)
             keys.append(key)
-        (when,) = self._checked(at=at)
         out = {}
         for key in keys:                                   # validation is done: now nothing can fail
             gen = self.next_gen()

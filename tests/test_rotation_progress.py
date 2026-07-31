@@ -724,6 +724,16 @@ class TestBatchedMutationsAreAllOrNone:
                 p.complete_batch("acme.com", [], at=bad)
         assert p.targets == {} and p.gen == 0
 
+    def test_the_BATCH_CLOCK_is_the_FIRST_thing_either_primitive_checks(self, tmp_path):
+        """v30: with a broken clock AND a bad id, `reserve_batch` blamed the id while `complete_batch`
+        blamed the clock. One contract means one precedence."""
+        p = _progress(tmp_path)
+        with pytest.raises(ValueError, match="timestamp"):
+            p.reserve_batch("acme.com", ["01", ""], at=float("nan"))
+        with pytest.raises(ValueError, match="timestamp"):
+            p.complete_batch("acme.com", [("", 1, "c", 1)], at=float("nan"))
+        assert p.targets == {} and p.gen == 0
+
     def test_COMPLETING_a_batch_writes_every_member(self, tmp_path):
         p = _progress(tmp_path)
         gens = p.reserve_batch("acme.com", ["01", "02"], at=1.0)
