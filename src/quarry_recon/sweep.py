@@ -24,15 +24,16 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import re
 import time
 from dataclasses import dataclass, field
 
 from . import budget, events
 from .runner import Status
 
-#: bump when the SLOT SPACE changes meaning — the bucket count or the hash. A bump starts a fresh rotation
-#: rather than reading old records under new arithmetic.
-SCHEMA = 1
+#: bump when the SLOT SPACE changes meaning — the bucket count, the hash, or the id grammar. A bump starts
+#: a fresh rotation rather than reading old records under new arithmetic. 2: adaptive prefix subslots.
+SCHEMA = 2
 
 #: how many buckets a lane's vocabulary is spread over. One bucket = one tool invocation, so this is the
 #: granularity at which a wall-clock budget can stop us (`Budget.exhausted()` only fires BETWEEN items).
@@ -40,13 +41,81 @@ SCHEMA = 1
 BUCKETS = 256
 
 
+#: how many extension bits a slot id may carry beyond its root, and where they come from. `sha256` hex
+#: digits 8..24 are the 64 bits after the four the root is taken from, consumed most-significant first.
+EXT_BITS = 64
+
+#: the id grammar schema 2 accepts: a three-digit root, optionally extended by `.` and up to `EXT_BITS`
+#: binary digits. Anything else is not a slot this lane can rank, split or complete.
+SLOT_RX = re.compile(rf"^[0-9]{{3}}(\.[01]{{1,{EXT_BITS}}})?$")
+
+
+def slot_id_ok(slot: str) -> bool:
+    """Whether a persisted id belongs to this slot space. Rank inheritance walks ids structurally, so an
+    arbitrary dotted string must never take part in it (v25)."""
+    return isinstance(slot, str) and bool(SLOT_RX.match(slot))
+
+
+def _parts_of(word: str) -> tuple:
+    """(root, extension). The root is the historical bucket — digest bits 24..31 — and the extension is the
+    next 64 bits. Splitting only ever lengthens the extension, so a word never moves sideways."""
+    h = hashlib.sha256(word.encode("utf-8")).hexdigest()
+    return int(h[:8], 16), int(h[8:24], 16)
+
+
 def bucket_of(word: str, buckets: int | None = None) -> str:
-    """The slot a word belongs to. Stable per word: inserting words never moves the ones already placed.
+    """The ROOT slot a word belongs to — extension depth 0. Stable per word: inserting words never moves
+    the ones already placed.
 
     `BUCKETS` is read at CALL time, not bound as a default: a default argument would freeze the module
     constant at import, so changing the bucket count (which the timing pass may do, with a schema bump)
     would silently keep the old slot space."""
-    return f"{int(hashlib.sha256(word.encode('utf-8')).hexdigest()[:8], 16) % (buckets or BUCKETS):03d}"
+    return f"{_parts_of(word)[0] % (buckets or BUCKETS):03d}"
+
+
+def slot_of(word: str, depth: int = 0, buckets: int | None = None) -> str:
+    """The id of the slot holding this word at `depth` extension bits. Depth 0 is `bucket_of` exactly, and
+    a deeper id only lengthens the prefix — every deeper slot is CONTAINED in the shallower one."""
+    root, ext = _parts_of(word)
+    depth = max(0, min(int(depth), EXT_BITS))
+    bits = "".join(str((ext >> (EXT_BITS - 1 - k)) & 1) for k in range(depth))
+    return f"{root % (buckets or BUCKETS):03d}" + (f".{bits}" if bits else "")
+
+
+def allocate(words, *, cap: int) -> dict:
+    """Group words into slots no larger than `cap`, splitting a slot that does not fit into its two hash
+    children until it does. `cap=0` (unbounded) leaves the roots alone.
+
+    This is what makes the per-target bound REACHABLE. `run_sweep` excludes a slot whose own size crosses
+    the bound, so before this a corpus with a bucket bigger than the cap left those words permanently
+    unselectable — measured: 87% of pairs unreachable at 525,000 words, and every lifecycle after that
+    re-ran the same reachable minority for ever (timing pass, finding 2)."""
+    groups: dict = {}
+    for word in words:
+        groups.setdefault(bucket_of(word), []).append(word)
+    if not cap or cap < 0:
+        return groups
+    out: dict = {}
+    for root, members in groups.items():
+        _split(root, "", members, out, cap)
+    return out
+
+
+def _split(root: str, bits: str, members: list, out: dict, cap: int) -> None:
+    """One deterministic split step. An EMPTY child is not a slot, and the depth limit is a floor on how
+    far this recurses — a residual over the cap there can only come from a 64-bit collision class, and it
+    stays visible as an excluded slot rather than being silently dropped."""
+    if len(members) <= cap or len(bits) >= EXT_BITS:
+        out[root + (f".{bits}" if bits else "")] = members
+        return
+    shift = EXT_BITS - 1 - len(bits)
+    zero: list = []
+    one: list = []
+    for word in members:
+        (one if (_parts_of(word)[1] >> shift) & 1 else zero).append(word)
+    for bit, part in (("0", zero), ("1", one)):
+        if part:
+            _split(root, bits + bit, part, out, cap)
 
 
 def owner_of(word: str, sources) -> str:
@@ -140,11 +209,14 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     members: dict = {}
     seen_pairs: set = set()
     for target in dict.fromkeys(targets):              # a repeated target is one target
+        per_target: list = []
         for word in vocabulary(target) or []:
             if (target, word) in seen_pairs:           # review v14#5: one submission per word per target —
                 continue                               # a duplicate would inflate the denominator, the
             seen_pairs.add((target, word))             # digest, the attribution AND the active payload
-            members.setdefault((target, bucket_of(word)), []).append(word)
+            per_target.append(word)
+        for slot, group in allocate(per_target, cap=max_pairs_per_target).items():
+            members[(target, slot)] = group
     slots = sorted(members)
     out.eligible_pairs = sum(len(w) for w in members.values())
     content = {slot: content_digest(words) for slot, words in members.items()}
@@ -163,7 +235,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
 
     with contextlib.ExitStack() as stack:
         try:
-            progress = stack.enter_context(budget.rotation_session(state_dir, lane, schema=SCHEMA))
+            progress = stack.enter_context(budget.rotation_session(state_dir, lane, schema=SCHEMA,
+                                                                   slot_grammar=slot_id_ok))
         except budget.StateBusy as e:
             # ACQUISITION-only: a StateBusy raised by the sweep BODY is machinery, not contention (v10#2).
             out.contended = True

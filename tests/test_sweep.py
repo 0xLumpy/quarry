@@ -468,3 +468,115 @@ class TestReviewV15:
         assert ev["selection_attribution"] == {"eligible": 2, "scheduled": 2,
                                                "per_source_eligible": {"js": 2},
                                                "per_source_scheduled": {"js": 2}}, ev
+
+
+class TestTheAdaptiveSlotSpace:
+    """Schema 2 (timing pass, finding 2): a slot bigger than the per-target bound was never selectable, so
+    those pairs stayed unreachable FOREVER — 87% of them at 525,000 words, with every later lifecycle
+    re-running the same reachable minority."""
+
+    def test_the_SCHEMA_records_that_the_slot_space_changed_meaning(self):
+        assert sweep.SCHEMA == 2
+
+    def test_DEPTH_ZERO_is_the_historical_bucket_byte_for_byte(self):
+        for word in ("api", "internal", "portal", "w000000xq"):
+            assert sweep.slot_of(word, 0) == sweep.bucket_of(word)
+
+    def test_the_slot_ids_are_PINNED(self):
+        """The same fixtures the cost model asserts. A flipped bit order or a different digest slice would
+        silently re-partition every lane's vocabulary."""
+        assert [sweep.slot_of("api", d) for d in (0, 1, 2)] == ["158", "158.1", "158.10"]
+        assert [sweep.slot_of("internal", d) for d in (0, 1, 2)] == ["179", "179.1", "179.10"]
+        assert [sweep.slot_of("portal", d) for d in (0, 1, 2)] == ["001", "001.1", "001.11"]
+        assert [sweep.slot_of("w000000xq", d) for d in (0, 1, 2)] == ["177", "177.0", "177.00"]
+
+    def test_a_DEEPER_slot_is_CONTAINED_in_the_shallower_one(self):
+        for word in ("api", "internal", "w000000xq"):
+            deep = sweep.slot_of(word, 3)
+            assert budget.RotationProgress._contains(sweep.slot_of(word, 2), deep)
+            assert budget.RotationProgress._contains(sweep.slot_of(word, 0), deep)
+
+    def test_every_ALLOCATED_slot_fits_the_cap_and_nothing_is_lost(self):
+        vocab = [f"w{i:07d}" for i in range(30000)]
+        alloc = sweep.allocate(vocab, cap=50)
+        assert max(len(v) for v in alloc.values()) <= 50
+        assert sorted(w for group in alloc.values() for w in group) == sorted(vocab)
+        assert all(sweep.slot_id_ok(s) for s in alloc)
+
+    def test_an_UNBOUNDED_lane_keeps_the_flat_roots(self):
+        vocab = [f"w{i:05d}" for i in range(2000)]
+        assert sweep.allocate(vocab, cap=0) == sweep.allocate(vocab, cap=-1)
+        assert all("." not in s for s in sweep.allocate(vocab, cap=0))
+
+    def test_allocation_is_DETERMINISTIC_and_never_moves_a_word_sideways(self):
+        vocab = [f"w{i:05d}" for i in range(4000)]
+        first = sweep.allocate(vocab, cap=25)
+        backwards = sweep.allocate(list(reversed(vocab)), cap=25)
+        assert {s: sorted(g) for s, g in first.items()} == {s: sorted(g) for s, g in backwards.items()}
+        # a word's slot at the depth it landed on is the same id `slot_of` computes
+        for slot, group in first.items():
+            depth = len(slot.split(".")[1]) if "." in slot else 0
+            assert all(sweep.slot_of(w, depth) == slot for w in group)
+
+    def test_an_EMPTY_child_is_never_a_slot(self):
+        alloc = sweep.allocate(["x25", "x38"], cap=1)      # both share the root AND the next bit
+        assert len(alloc) == 2 and sorted(w for g in alloc.values() for w in g) == ["x25", "x38"]
+        assert all(len(g) == 1 for g in alloc.values()), alloc
+        assert len({len(s.split(".")[1]) for s in alloc}) == 1, "both children sit at the same depth"
+
+    def test_a_corpus_that_used_to_STARVE_now_advances_every_lifecycle(self, tmp_path):
+        """Reproduction of the measured defect: 30,000 words, bound 50, smallest root 92 members. Before
+        schema 2 this submitted ZERO, run after run, while reporting the ordinary cap sentence."""
+        vocab = [f"w{i:07d}" for i in range(30000)]
+        seen, spent, invocations = set(), 0, 0
+        for _ in range(4):
+            out, tool = _run(tmp_path, words=vocab, max_pairs_per_target=50,
+                             tool=_Tool(max_calls=40))
+            assert out.attempted_pairs > 0, out.stop
+            assert out.attempted_pairs <= 50, "the per-target bound still holds"
+            seen |= {b for _t, b, _w in tool.calls}
+            invocations += len(tool.calls)
+            spent += out.attempted_pairs
+        assert len(seen) == invocations >= 6, (seen, invocations)   # never the same slot twice
+        assert spent >= 180
+
+    def test_the_bound_is_still_never_EXCEEDED(self, tmp_path):
+        vocab = [f"w{i:07d}" for i in range(5000)]
+        out, tool = _run(tmp_path, words=vocab, max_pairs_per_target=100, tool=_Tool(max_calls=40))
+        assert sum(len(w) for _t, _b, w in tool.calls) <= 100
+        assert out.attempted_pairs <= 100
+
+
+class TestTheSlotGrammarGuard:
+    """v25: rank inheritance walks ids structurally, so a document holding arbitrary dotted strings could
+    make unrelated slots each other's ancestors."""
+
+    def test_a_FOREIGN_id_is_dropped_from_the_rotation_and_SAID_so(self, tmp_path):
+        (tmp_path / f"{LANE}.json").write_text(json.dumps({
+            "lane": LANE, "schema": sweep.SCHEMA, "gen": 4,
+            "targets": {"acme.com": {"seq": 4, "slots": {
+                "158": {"res": {"gen": 1, "at": 1.0}},
+                "158.2": {"res": {"gen": 2, "at": 2.0}},          # 2 is not a bit
+                "abc.01": {"res": {"gen": 3, "at": 3.0}},         # not a root
+                "158.": {"res": {"gen": 4, "at": 4.0}},           # no bits at all
+            }}}}))
+        p = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                    slot_grammar=sweep.slot_id_ok)
+        assert list(p.targets["acme.com"]["slots"]) == ["158"]
+        assert p.state_status == "degraded" and "dropped" in p.state_reason
+
+    def test_a_MUTATION_under_a_foreign_id_is_refused(self, tmp_path):
+        p = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                    slot_grammar=sweep.slot_id_ok)
+        for bad in ("158.2", "abc", "158.", "158.0.1", "1580", "158.” "):
+            with pytest.raises(ValueError):
+                p.reserve("acme.com", bad, at=1.0)
+        assert p.reserve("acme.com", "158.01", at=1.0) == 1
+
+    def test_a_lane_with_NO_grammar_is_unconstrained(self, tmp_path):
+        p = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA)
+        assert p.reserve("acme.com", "anything-at-all", at=1.0) == 1
+
+    def test_the_grammar_bounds_the_DEPTH(self):
+        assert sweep.slot_id_ok("158." + "0" * sweep.EXT_BITS)
+        assert not sweep.slot_id_ok("158." + "0" * (sweep.EXT_BITS + 1))

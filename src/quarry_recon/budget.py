@@ -241,7 +241,7 @@ class SchedulerInvariant(RuntimeError):
 
 
 @contextlib.contextmanager
-def rotation_session(state_dir, lane: str, *, schema: int):
+def rotation_session(state_dir, lane: str, *, schema: int, slot_grammar=None):
     """`with rotation_session(dir, "a1d", schema=1) as progress:` — the ONLY way to reach lane progress.
 
     Takes the lane's lock ONCE and yields a `RotationProgress` that knows the lock is HELD, so no `save()`
@@ -256,7 +256,8 @@ def rotation_session(state_dir, lane: str, *, schema: int):
     """
     base = Path(state_dir)
     with state_lock(base / f"{lane}.lock"):
-        yield RotationProgress(base / f"{lane}.json", lane=lane, schema=schema, _session=_SESSION)
+        yield RotationProgress(base / f"{lane}.json", lane=lane, schema=schema,
+                               slot_grammar=slot_grammar, _session=_SESSION)
 
 
 #: how long a save OUTSIDE a session waits for the lane lock, and how often it retries. Giving up does NOT
@@ -302,7 +303,7 @@ class RotationProgress:
     the launch look clean (v4#3).
     """
 
-    def __init__(self, path, *, lane: str, schema: int, _session=None):
+    def __init__(self, path, *, lane: str, schema: int, slot_grammar=None, _session=None):
         # the CONFIGURED schema is validated too (review v12#4): `int(True)` is 1 and `int("2")` is 2, and a
         # schema that coerces is a rotation that can be read under the wrong meaning.
         if isinstance(schema, bool) or not isinstance(schema, int) or schema < 0:
@@ -310,6 +311,10 @@ class RotationProgress:
         self.path = Path(path) if path else None
         self.lane = lane
         self.schema = schema
+        #: the lane's slot-id grammar, or None for a lane that does not constrain ids. Rank inheritance
+        #: walks ids STRUCTURALLY (root + extension bits), so a document holding arbitrary dotted strings
+        #: could otherwise make unrelated slots each other's ancestors (v25).
+        self.slot_grammar = slot_grammar
         self.held = _session is _SESSION       # ONLY `rotation_session` can hand over the token
         self.gen = 0
         self.targets: dict = {}
@@ -364,7 +369,7 @@ class RotationProgress:
         return out
 
     @classmethod
-    def _parse(cls, text: str, *, lane: str, schema: int) -> tuple:      # -> (gen, targets, status, why)
+    def _parse(cls, text: str, *, lane: str, schema: int, slot_grammar=None) -> tuple:
         """`(gen, targets)` from a state document, or a FRESH rotation when it cannot be trusted.
 
         A different lane or a different schema starts fresh rather than being reinterpreted: the schema
@@ -409,6 +414,9 @@ class RotationProgress:
                 if not isinstance(bucket, str) or not bucket or not isinstance(raw_s, dict):
                     dropped += 1
                     continue
+                if slot_grammar is not None and not slot_grammar(bucket):
+                    dropped += 1                       # not an id of this slot space: it may not rank
+                    continue
                 res = cls._tuple(raw_s.get("res"), with_content=False)
                 done = cls._tuple(raw_s.get("done"), with_content=True)
                 # a completion without its reservation, or one claiming to precede it, is not a record we
@@ -447,7 +455,7 @@ class RotationProgress:
             return
         try:
             self.gen, self.targets, self.state_status, self.state_reason = self._parse(
-                text, lane=self.lane, schema=self.schema)
+                text, lane=self.lane, schema=self.schema, slot_grammar=self.slot_grammar)
         except Exception as e:                      # `_parse` must never raise (review v11#1)
             self.gen, self.targets = 0, {}
             self.state_status, self.state_reason = "unusable", f"unparseable ({type(e).__name__})"
@@ -538,14 +546,16 @@ class RotationProgress:
         self.gen += 1
         return self.gen
 
-    @staticmethod
-    def _key(target, bucket) -> tuple:
+    def _key(self, target, bucket) -> tuple:
         """Slot identity is EXACT (review v13#2). `reserve(7, True, …)` used to succeed and then come back
         from JSON as target `"7"` and bucket `"true"` — the rotation history for a slot orphaned under a
         key nothing will look up again."""
         for name, value in (("target", target), ("bucket", bucket)):
             if isinstance(value, bool) or not isinstance(value, str) or not value:
                 raise ValueError(f"{name} must be a non-empty str, got {value!r}")
+        if self.slot_grammar is not None and not self.slot_grammar(bucket):
+            # a MUTATION under a foreign id would persist a record the reader then drops (v25)
+            raise ValueError(f"slot id {bucket!r} does not belong to this lane's slot space")
         return target, bucket
 
     @classmethod
