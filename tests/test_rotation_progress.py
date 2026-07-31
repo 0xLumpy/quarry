@@ -642,3 +642,35 @@ class TestPrefixInheritanceIsRankOnly:
         p.reserve("acme.com", "70", at=1.0)
         assert p.slot_seq("acme.com", "7") == 0
         assert p.tier("acme.com", "7", "members") == 0
+
+    def test_a_DEEP_collapse_reads_the_oldest_child_too(self, tmp_path):
+        """v24#1: child ids EXTEND the bit suffix — `177.0`'s children are `177.00` and `177.01`, not
+        `177.0.x` — so string-prefix containment found nothing below extension depth 0."""
+        p = _progress(tmp_path)
+        first = p.reserve("acme.com", "177.00", at=1.0)
+        later = p.reserve("acme.com", "177.01", at=2.0)
+        assert first < later
+        assert p.slot_seq("acme.com", "177.0") == first
+        assert p.tier("acme.com", "177.0", "members") == 0        # reserved only: still never-run
+
+    def test_a_collapse_TWO_levels_down_is_still_contained(self, tmp_path):
+        p = _progress(tmp_path)
+        gen = p.reserve("acme.com", "177.011", at=1.0)
+        p.complete("acme.com", "177.011", gen, at=2.0, content="c", members=3)
+        assert p.slot_seq("acme.com", "177.0") == gen
+        assert p.tier("acme.com", "177.0", "c") == 1              # inherited: never clean
+
+    def test_a_SIBLING_SUBTREE_is_not_a_descendant(self, tmp_path):
+        """`177.01` is not contained in `177.1` — same root, but the bits diverge."""
+        p = _progress(tmp_path)
+        p.reserve("acme.com", "177.01", at=1.0)
+        assert p.slot_seq("acme.com", "177.1") == 0
+
+    def test_CONTAINMENT_is_a_predicate_with_its_own_edges(self):
+        c = budget.RotationProgress._contains
+        assert c("177", "177.0") and c("177.0", "177.01") and c("177.0", "177.0110")
+        assert not c("177.0", "177.0"), "a slot does not contain itself"
+        assert not c("177.1", "177.01"), "a diverging bit path is a sibling subtree"
+        assert not c("177", "178.0"), "different roots are never related"
+        assert not c("7", "70.1"), "a root is not a prefix of another root"
+        assert not c("177.01", "177.0"), "containment is not symmetric"

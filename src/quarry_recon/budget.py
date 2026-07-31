@@ -462,6 +462,22 @@ class RotationProgress:
         return int(self.targets.get(target, {}).get("seq", 0))
 
     @staticmethod
+    def _parts(bucket: str) -> tuple:
+        """A slot id as (root, bits). `177` is the 8-bit root at extension depth 0; `177.0110` is the same
+        root with four extension bits."""
+        head, _dot, bits = bucket.partition(".")
+        return head, bits                      # no separator -> no extension bits, and `partition` says so
+
+    @classmethod
+    def _contains(cls, parent: str, child: str) -> bool:
+        """Containment is on the PARSED id, not on the string (v24#1). `177.0` contains `177.00`, whose id
+        does NOT begin with `177.0.` — the extension bits extend, they do not nest a second separator.
+        Different roots are never related, so slot `70` is not a child of slot `7`."""
+        proot, pbits = cls._parts(parent)
+        croot, cbits = cls._parts(child)
+        return proot == croot and len(cbits) > len(pbits) and cbits.startswith(pbits)
+
+    @staticmethod
     def _ancestors(bucket: str) -> list:
         """The containing slots of a hash-prefix id, NEAREST FIRST: `177.0110` is contained in `177.011`,
         `177.01`, `177.0` and `177`. A flat id has no ancestors, so a lane that never splits is unaffected."""
@@ -494,7 +510,7 @@ class RotationProgress:
             rec = slots.get(anc)
             if rec:
                 return rec, False
-        kids = [rec for key, rec in slots.items() if key.startswith(f"{bucket}.") and rec]
+        kids = [rec for key, rec in slots.items() if rec and self._contains(bucket, key)]
         if kids:
             return min(kids, key=lambda r: int((r.get("res") or {}).get("gen", 0))), False
         return {}, True
@@ -510,8 +526,10 @@ class RotationProgress:
         if not done:
             return 0
         if not own:
-            # an INHERITED run covered a different member set, so it can never certify this slot as clean.
-            # Digest equality across a split is not evidence — it would be a collision, not a run.
+            # a CONSERVATIVE policy, not a proof: this record belongs to a containing or contained slot,
+            # and a one-sided split can legitimately hand a child exactly the parent's members and digest.
+            # Re-running a slot costs one invocation; certifying it clean on another slot's record would
+            # claim coverage nothing here ever produced.
             return 1
         return 1 if done.get("c") != content else 2
 
