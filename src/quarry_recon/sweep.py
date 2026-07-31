@@ -50,10 +50,15 @@ EXT_BITS = 64
 SLOT_RX = re.compile(rf"^[0-9]{{3}}(\.[01]{{1,{EXT_BITS}}})?$")
 
 
-def slot_id_ok(slot: str) -> bool:
+def slot_id_ok(slot: str, buckets: int | None = None) -> bool:
     """Whether a persisted id belongs to this slot space. Rank inheritance walks ids structurally, so an
-    arbitrary dotted string must never take part in it (v25)."""
-    return isinstance(slot, str) and bool(SLOT_RX.match(slot))
+    arbitrary dotted string must never take part in it (v25).
+
+    `fullmatch`, not `match`: `$` also matches before a trailing newline, so `"158.0\n"` passed (v26#2).
+    And the root is a bucket, not any three digits — `999` is not a slot of a 256-bucket space."""
+    if not isinstance(slot, str) or not SLOT_RX.fullmatch(slot):
+        return False
+    return 0 <= int(slot.partition(".")[0]) < (buckets or BUCKETS)
 
 
 def _parts_of(word: str) -> tuple:
@@ -82,6 +87,16 @@ def slot_of(word: str, depth: int = 0, buckets: int | None = None) -> str:
     return f"{root % (buckets or BUCKETS):03d}" + (f".{bits}" if bits else "")
 
 
+def _exact_cap(cap) -> int:
+    """The bound is an EXACT non-negative int. `True` is not 1 and `-1` is not "unbounded" (v26#4): the
+    documented contract is 0 = unbounded, and a negative bound meant "unbounded" to the allocator while
+    the driver read it as a bound that nothing can satisfy — two answers to one question."""
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+        raise ValueError(f"the per-target bound must be an exact non-negative int (0 = unbounded), "
+                         f"got {cap!r}")
+    return cap
+
+
 def allocate(words, *, cap: int) -> dict:
     """Group words into slots no larger than `cap`, splitting a slot that does not fit into its two hash
     children until it does. `cap=0` (unbounded) leaves the roots alone.
@@ -90,10 +105,11 @@ def allocate(words, *, cap: int) -> dict:
     the bound, so before this a corpus with a bucket bigger than the cap left those words permanently
     unselectable — measured: 87% of pairs unreachable at 525,000 words, and every lifecycle after that
     re-ran the same reachable minority for ever (timing pass, finding 2)."""
+    cap = _exact_cap(cap)
     groups: dict = {}
     for word in words:
         groups.setdefault(bucket_of(word), []).append(word)
-    if not cap or cap < 0:
+    if not cap:
         return groups
     out: dict = {}
     for root, members in groups.items():
@@ -203,6 +219,14 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     cancellation."""
     out = SweepResult()
     clock = budget.Budget(budget_s)
+    try:
+        max_pairs_per_target = _exact_cap(max_pairs_per_target)
+    except ValueError as e:
+        # the driver promises to raise nothing but cancellation, so a nonsense bound is a MACHINERY stop
+        # with nothing submitted — never a silent "unbounded" and never a bound nothing can satisfy.
+        out.stop, out.stop_kind = f"machinery: {e}", "machinery"
+        _report(lane, out, clock)
+        return out
 
     # ── BEFORE the lock: the workload is a pure function of the corpus and the targets, so a CONTENDER can
     #    still report an exact denominator instead of a gap with no arithmetic (design v8#2). ──

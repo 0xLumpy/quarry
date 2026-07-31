@@ -505,8 +505,18 @@ class TestTheAdaptiveSlotSpace:
 
     def test_an_UNBOUNDED_lane_keeps_the_flat_roots(self):
         vocab = [f"w{i:05d}" for i in range(2000)]
-        assert sweep.allocate(vocab, cap=0) == sweep.allocate(vocab, cap=-1)
         assert all("." not in s for s in sweep.allocate(vocab, cap=0))
+
+    def test_the_BOUND_must_be_an_exact_non_negative_int(self, tmp_path):
+        """v26#4: `-1` meant "unbounded" to the allocator and "a bound nothing satisfies" to the driver,
+        and `True` silently became a bound of one."""
+        for bad in (-1, True, 1.0, "50", None):
+            with pytest.raises(ValueError):
+                sweep.allocate(["a", "b"], cap=bad)
+        out, tool = _run(tmp_path, max_pairs_per_target=-1)
+        assert tool.calls == [] and out.stop_kind == "machinery" and "non-negative" in out.stop
+        out, tool = _run(tmp_path, max_pairs_per_target=True)
+        assert tool.calls == [] and out.stop_kind == "machinery"
 
     def test_allocation_is_DETERMINISTIC_and_never_moves_a_word_sideways(self):
         vocab = [f"w{i:05d}" for i in range(4000)]
@@ -576,6 +586,46 @@ class TestTheSlotGrammarGuard:
     def test_a_lane_with_NO_grammar_is_unconstrained(self, tmp_path):
         p = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA)
         assert p.reserve("acme.com", "anything-at-all", at=1.0) == 1
+
+    def test_the_grammar_rejects_a_ROOT_outside_the_space_and_a_trailing_newline(self):
+        """v26#2: `$` matches before a final newline, and three digits are not automatically a bucket."""
+        assert sweep.slot_id_ok("255") and not sweep.slot_id_ok("256")
+        assert not sweep.slot_id_ok("999")
+        assert not sweep.slot_id_ok("158.0\n")
+        assert not sweep.slot_id_ok("158\n")
+        assert sweep.slot_id_ok("099", buckets=100) and not sweep.slot_id_ok("100", buckets=100)
+
+    def test_a_FOREIGN_id_cannot_return_through_the_MERGE(self, tmp_path):
+        """v26#1: the id was dropped on load and then republished by `save()`, to disk AND to live state,
+        where it could rank again in the same sweep."""
+        doc = {"lane": LANE, "schema": sweep.SCHEMA, "gen": 2,
+               "targets": {"acme.com": {"seq": 2, "slots": {
+                   "158.2": {"res": {"gen": 1, "at": 1.0}},
+                   "158": {"res": {"gen": 2, "at": 2.0}}}}}}
+        path = tmp_path / f"{LANE}.json"
+        path.write_text(json.dumps(doc))
+        p = budget.RotationProgress(path, lane=LANE, schema=sweep.SCHEMA, slot_grammar=sweep.slot_id_ok)
+        assert list(p.targets["acme.com"]["slots"]) == ["158"]
+        p.reserve("acme.com", "158.01", at=3.0)
+        assert p.save()
+        assert "158.2" not in json.loads(path.read_text())["targets"]["acme.com"]["slots"]
+        assert "158.2" not in p.targets["acme.com"]["slots"]
+
+    def test_a_RAISING_grammar_leaves_the_rotation_unusable_not_the_read(self, tmp_path):
+        path = tmp_path / f"{LANE}.json"
+        path.write_text(json.dumps({"lane": LANE, "schema": sweep.SCHEMA, "gen": 1,
+                                    "targets": {"acme.com": {"seq": 1, "slots": {
+                                        "158": {"res": {"gen": 1, "at": 1.0}}}}}}))
+        def boom(_slot):
+            raise RuntimeError("predicate exploded")
+        p = budget.RotationProgress(path, lane=LANE, schema=sweep.SCHEMA, slot_grammar=boom)
+        assert p.state_status == "unusable" and "grammar raised" in p.state_reason
+        assert p.targets == {}
+
+    def test_a_grammar_that_is_not_CALLABLE_is_refused(self, tmp_path):
+        with pytest.raises(ValueError):
+            budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                    slot_grammar="^[0-9]{3}$")
 
     def test_the_grammar_bounds_the_DEPTH(self):
         assert sweep.slot_id_ok("158." + "0" * sweep.EXT_BITS)

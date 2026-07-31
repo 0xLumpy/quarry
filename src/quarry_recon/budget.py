@@ -314,6 +314,8 @@ class RotationProgress:
         #: the lane's slot-id grammar, or None for a lane that does not constrain ids. Rank inheritance
         #: walks ids STRUCTURALLY (root + extension bits), so a document holding arbitrary dotted strings
         #: could otherwise make unrelated slots each other's ancestors (v25).
+        if slot_grammar is not None and not callable(slot_grammar):
+            raise ValueError(f"slot_grammar must be callable, got {slot_grammar!r}")
         self.slot_grammar = slot_grammar
         self.held = _session is _SESSION       # ONLY `rotation_session` can hand over the token
         self.gen = 0
@@ -414,9 +416,16 @@ class RotationProgress:
                 if not isinstance(bucket, str) or not bucket or not isinstance(raw_s, dict):
                     dropped += 1
                     continue
-                if slot_grammar is not None and not slot_grammar(bucket):
-                    dropped += 1                       # not an id of this slot space: it may not rank
-                    continue
+                if slot_grammar is not None:
+                    # `_parse` NEVER raises (review v11#1), and that promise now covers a caller-supplied
+                    # predicate: a grammar that blows up leaves the rotation unusable, not the read.
+                    try:
+                        usable = slot_grammar(bucket)
+                    except Exception as e:
+                        return 0, {}, "unusable", f"slot grammar raised ({type(e).__name__})"
+                    if not usable:
+                        dropped += 1                   # not an id of this slot space: it may not rank
+                        continue
                 res = cls._tuple(raw_s.get("res"), with_content=False)
                 done = cls._tuple(raw_s.get("done"), with_content=True)
                 # a completion without its reservation, or one claiming to precede it, is not a record we
@@ -652,7 +661,9 @@ class RotationProgress:
             else:
                 try:
                     disk_gen, disk_targets, status, _why = self._parse(
-                        text, lane=self.lane, schema=self.schema)
+                        text, lane=self.lane, schema=self.schema, slot_grammar=self.slot_grammar)
+                    # v26#1: without the grammar here, a foreign id dropped on LOAD came back through the
+                    # merge and was republished — to disk AND to `self.targets`, where it could rank.
                 except Exception:
                     return False                            # unparseable: leave the bytes alone
                 if status == "unusable":
