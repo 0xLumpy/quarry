@@ -619,6 +619,59 @@ class RotationProgress:
             raise SchedulerInvariant(f"{self.lane}:{target}/{bucket}: reservation gen {held_gen} != {gen}")
         slot["done"] = {"gen": gen, "at": when, "c": digest, "n": n}
 
+    # ── BATCHED mutations: all-or-none, structurally (design v22#3). One invocation may cover several
+    #    slots, and a batch that half-applied would leave slots reserved against a run that never happened,
+    #    or completed against a reservation the rest of the batch never got. Every member is validated
+    #    BEFORE any generation is allocated, and every CAS is checked BEFORE any `done` tuple is written —
+    #    so an invariant discovered in the middle of a batch cannot leave half of it mutated. ──
+    def reserve_batch(self, target: str, buckets, *, at: float) -> dict:
+        """Reserve several slots of ONE target under one clock reading. Returns {bucket: generation}.
+
+        Raises before mutating anything if any id is unusable, repeated, or the timestamp is not a
+        timestamp. Generations are still per slot: batching is an execution fact, not a scheduling one."""
+        keys = []
+        seen = set()
+        for bucket in buckets:
+            _t, key = self._key(target, bucket)
+            if key in seen:
+                raise ValueError(f"slot {key!r} appears twice in one batch")
+            seen.add(key)
+            keys.append(key)
+        (when,) = self._checked(at=at)
+        out = {}
+        for key in keys:                                   # validation is done: now nothing can fail
+            gen = self.next_gen()
+            t = self.targets.setdefault(target, {"seq": 0, "slots": {}})
+            t["slots"].setdefault(key, {})["res"] = {"gen": gen, "at": when}
+            t["seq"] = max(int(t.get("seq", 0)), gen)
+            out[key] = gen
+        return out
+
+    def complete_batch(self, target: str, items, *, at: float) -> None:
+        """Record that several slots RAN, from `(bucket, gen, content, members)` items.
+
+        Every slot keeps its OWN reservation check and its own content digest — completion means the slot
+        was ATTEMPTED, and one result may attest several slots, but never one slot's record for another."""
+        checked = []
+        seen = set()
+        for bucket, gen, content, members in items:
+            _t, key = self._key(target, bucket)
+            if key in seen:
+                raise ValueError(f"slot {key!r} appears twice in one batch")
+            seen.add(key)
+            when, n, digest = self._checked(at=at, members=members, content=content)
+            if self._count(gen) is None or gen < 1:
+                raise ValueError(f"generation must be an exact positive int, got {gen!r}")
+            slot = self._slot(target, key)
+            if not slot.get("res"):
+                raise SchedulerInvariant(f"{self.lane}:{target}/{key}: completing a slot never reserved")
+            held_gen = int(slot["res"]["gen"])
+            if held_gen != gen:
+                raise SchedulerInvariant(f"{self.lane}:{target}/{key}: reservation gen {held_gen} != {gen}")
+            checked.append((slot, {"gen": gen, "at": when, "c": digest, "n": n}))
+        for slot, done in checked:                         # validation is done: now nothing can fail
+            slot["done"] = done
+
     @staticmethod
     def _merge_slot(mine: dict, theirs: dict) -> dict:
         """Newer GENERATION wins, per TUPLE, whole. Field-wise merging could assemble `at`, digest and

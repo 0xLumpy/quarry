@@ -674,3 +674,86 @@ class TestPrefixInheritanceIsRankOnly:
         assert not c("177", "178.0"), "different roots are never related"
         assert not c("7", "70.1"), "a root is not a prefix of another root"
         assert not c("177.01", "177.0"), "containment is not symmetric"
+
+
+class TestBatchedMutationsAreAllOrNone:
+    """v22#3: one invocation may cover several slots. A batch that half-applied would leave slots
+    reserved against a run that never happened, or completed against a reservation the batch never got."""
+
+    def test_a_BATCH_reserves_every_member_with_its_own_generation(self, tmp_path):
+        p = _progress(tmp_path)
+        gens = p.reserve_batch("acme.com", ["01", "02", "03"], at=1.0)
+        assert sorted(gens) == ["01", "02", "03"]
+        assert sorted(gens.values()) == [1, 2, 3]
+        assert p.target_seq("acme.com") == 3
+        assert all(p.slot_seq("acme.com", b) == g for b, g in gens.items())
+
+    def test_a_BAD_id_anywhere_reserves_NOTHING(self, tmp_path):
+        p = _progress(tmp_path)
+        before = p.gen
+        with pytest.raises(ValueError):
+            p.reserve_batch("acme.com", ["01", "", "03"], at=1.0)
+        assert p.targets == {} and p.gen == before
+
+    def test_a_BAD_timestamp_reserves_NOTHING(self, tmp_path):
+        p = _progress(tmp_path)
+        with pytest.raises(ValueError):
+            p.reserve_batch("acme.com", ["01", "02"], at=float("nan"))
+        assert p.targets == {} and p.gen == 0
+
+    def test_a_REPEATED_slot_in_one_batch_is_refused(self, tmp_path):
+        p = _progress(tmp_path)
+        with pytest.raises(ValueError):
+            p.reserve_batch("acme.com", ["01", "01"], at=1.0)
+        assert p.targets == {} and p.gen == 0
+
+    def test_an_EMPTY_batch_mutates_nothing(self, tmp_path):
+        p = _progress(tmp_path)
+        assert p.reserve_batch("acme.com", [], at=1.0) == {}
+        p.complete_batch("acme.com", [], at=1.0)
+        assert p.targets == {} and p.gen == 0
+
+    def test_COMPLETING_a_batch_writes_every_member(self, tmp_path):
+        p = _progress(tmp_path)
+        gens = p.reserve_batch("acme.com", ["01", "02"], at=1.0)
+        p.complete_batch("acme.com", [("01", gens["01"], "c1", 5), ("02", gens["02"], "c2", 7)], at=2.0)
+        assert p.tier("acme.com", "01", "c1") == 2 and p.tier("acme.com", "02", "c2") == 2
+
+    def test_a_STALE_generation_anywhere_completes_NOTHING(self, tmp_path):
+        p = _progress(tmp_path)
+        gens = p.reserve_batch("acme.com", ["01", "02"], at=1.0)
+        with pytest.raises(budget.SchedulerInvariant):
+            p.complete_batch("acme.com", [("01", gens["01"], "c1", 5),
+                                          ("02", gens["02"] + 99, "c2", 7)], at=2.0)
+        assert p.tier("acme.com", "01", "c1") == 0, "the first member must not have been completed"
+        assert p.tier("acme.com", "02", "c2") == 0
+
+    def test_an_UNRESERVED_member_anywhere_completes_NOTHING(self, tmp_path):
+        p = _progress(tmp_path)
+        gens = p.reserve_batch("acme.com", ["01"], at=1.0)
+        with pytest.raises(budget.SchedulerInvariant):
+            p.complete_batch("acme.com", [("01", gens["01"], "c1", 5), ("02", 1, "c2", 7)], at=2.0)
+        assert p.tier("acme.com", "01", "c1") == 0
+
+    def test_a_BAD_value_anywhere_completes_NOTHING(self, tmp_path):
+        p = _progress(tmp_path)
+        gens = p.reserve_batch("acme.com", ["01", "02"], at=1.0)
+        for bad in (("02", gens["02"], "", 7), ("02", gens["02"], "c2", -1),
+                    ("02", 0, "c2", 7), ("02", True, "c2", 7)):
+            with pytest.raises(ValueError):
+                p.complete_batch("acme.com", [("01", gens["01"], "c1", 5), bad], at=2.0)
+            assert p.tier("acme.com", "01", "c1") == 0
+
+    def test_a_BATCH_may_not_complete_ANOTHER_slot_s_reservation(self, tmp_path):
+        """One result may attest several slots — never one slot's record for another."""
+        p = _progress(tmp_path)
+        gens = p.reserve_batch("acme.com", ["177", "177.0"], at=1.0)
+        with pytest.raises(budget.SchedulerInvariant):
+            p.complete_batch("acme.com", [("177.0", gens["177"], "c", 1)], at=2.0)
+        assert p.tier("acme.com", "177.0", "c") == 0
+
+    def test_a_batch_and_a_single_mutation_share_one_generation_counter(self, tmp_path):
+        p = _progress(tmp_path)
+        first = p.reserve("acme.com", "01", at=1.0)
+        gens = p.reserve_batch("acme.com", ["02", "03"], at=2.0)
+        assert sorted([first, *gens.values()]) == [1, 2, 3]
