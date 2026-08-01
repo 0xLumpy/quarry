@@ -16,7 +16,7 @@ import urllib.request
 from dataclasses import replace
 from pathlib import Path
 
-from .. import events, netguard, normalize, secrets, settings
+from .. import budget, events, netguard, normalize, secrets, settings, sweep
 from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, registered, run_contract,
                         run_provider)
 from ..runner import (RunResult, Status, have, reclassify_from_artifact, run as exec_tool,
@@ -503,9 +503,17 @@ WILDCARD_WORD_CAP = 5000
 #: different parser is a different question (v45#3).
 WC_PARSER_SCHEMA = 2
 
-#: how many eligible wildcard zones one differ run may probe. Module scope since the lane's lifecycle
-#: (its work unit) binds it, not only the body that applies it.
-ZONE_CAP = 5
+#: how many eligible wildcard zones ONE run may contact. A THROUGHPUT allowance, not a membership cap:
+#: the rotation decides WHICH zones it spends on, so every eligible zone is eventually differentiated and
+#: a later run continues where this one stopped. `0` removes the per-run limit entirely.
+WILDCARD_ZONES_PER_RUN = 5
+
+
+def wildcard_zones_per_run() -> int:
+    """The per-run zone allowance, overridable from PERFORMANCE. Read at CALL time so a test or an
+    operator setting is honoured without re-importing the module."""
+    from .. import settings as _settings
+    return _settings.strict_int("WILDCARD_ZONES_PER_RUN", default=WILDCARD_ZONES_PER_RUN, maximum=10000)
 
 
 def _wc_with_ledger(st: dict, why: str, raised=None) -> str:
@@ -539,8 +547,8 @@ def _wc_reasons(st: dict) -> tuple:
     blocked = st.get("blocked", {}) or {}
     sel = "; ".join(p for p in (
         st.get("selection_reason") or "",
-        f"{blocked.get('zone_cap', 0)} zone(s) over the {ZONE_CAP}-zone cap" if blocked.get("zone_cap")
-        else "",
+        f"{blocked.get('zone_cap', 0)} zone(s) deferred to a later run by the "
+        f"{wildcard_zones_per_run()}-zone per-run allowance" if blocked.get("zone_cap") else "",
         f"{blocked.get('self_or_private', 0)} zone(s) refused by the self/private contact guard"
         if blocked.get("self_or_private") else "") if p)
     ex = "; ".join(p for p in (st.get("gate_reason") or "", st.get("stopped") or "") if p)
@@ -690,10 +698,19 @@ def _wc_terminal(st: dict, kept: set):
     if not eligible:
         return Status.EMPTY, why or "no in-scope wildcard zone"
     if not probed:
-        # nothing was contacted: a mode, a missing tool, no vocabulary, or the contact guard
+        # nothing was contacted: a mode, a missing tool, no vocabulary, or the contact guard. A clean
+        # SKIP only when nothing went wrong on the way — a failed write is trouble, not a skip.
+        if st.get("ledger_errors") or st.get("unreadable_artifacts") or st.get("missing_artifacts"):
+            return Status.FAILED, "; ".join(facts) if (facts := [p for p in (
+                why, f"{len(st.get('ledger_errors') or [])} tool result(s) not recorded "
+                     f"({'; '.join(st.get('ledger_errors') or [])})"
+                if st.get("ledger_errors") else "") if p]) else "no zone was probed"
         return Status.SKIPPED, why or "no zone was probed"
     no_base = st.get("zones_without_baseline", 0)
+    ledger = st.get("ledger_errors") or []
     facts = [p for p in (why,
+                         f"{len(ledger)} tool result(s) not recorded ({'; '.join(ledger)})"
+                         if ledger else "",
                          f"{st.get('missing_artifacts', 0)} invocation(s) produced no artifact"
                          if st.get("missing_artifacts") else "",
                          f"{st.get('unreadable_artifacts', 0)} artifact(s) present and UNREADABLE "
@@ -752,9 +769,11 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         eligible = _wc_eligible_zones(ctx, zones)
         st["eligible_zones"] = len(eligible)
         st["eligibility_known"] = True          # v54#2: a FAILED scope filter is not an empty set
-        # v53#3: the cap belongs to SELECTION and is known the moment eligibility is. Setting it only
-        # inside the body let a setup failure report every eligible zone as selected.
-        st["blocked"]["zone_cap"] = max(0, len(eligible) - ZONE_CAP)
+        # v53#3 / v62: the per-run allowance is a SELECTION fact and its worst case is known the moment
+        # eligibility is — a setup failure that never reaches the scheduler still reports the zones it
+        # would have deferred. The sweep's real deferral count replaces this once it has run.
+        _allow = wildcard_zones_per_run()
+        st["blocked"]["zone_cap"] = max(0, len(eligible) - _allow) if _allow else 0
         # no eligible zone -> nothing to probe WITH either: the vocabulary is not read, so a run with
         # nothing to differentiate does not report parse facts about a list it would never have used.
         words = _wc_vocabulary(extra_words, st) if eligible else []
@@ -765,7 +784,8 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         fp = events.work_unit(source_id,
                               inputs={"zones": eligible,
                                       "vocabulary": _wc_digest(sorted(set(words)))},
-                              config={"zone_cap": ZONE_CAP, "word_cap": WILDCARD_WORD_CAP},
+                              config={"zones_per_run": wildcard_zones_per_run(),
+                                  "word_cap": WILDCARD_WORD_CAP},
                               schema_version=WC_PARSER_SCHEMA)
         events.tool_start(source_id, cmd=["httpx", "(wildcard-differ)"], input_total=len(eligible),
                           work_unit=fp)
@@ -926,8 +946,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     # reports work it never submitted.
     # review-B-audit-15#2: SNAPSHOT semantics, not `setdefault` — a reused dict could otherwise report
     # this call's `eligible_zones` beside a previous call's `probed_zones`.
-    zones = _zones_all[:ZONE_CAP]
-    st["blocked"]["zone_cap"] = max(0, len(_zones_all) - ZONE_CAP)
+    zones = list(_zones_all)          # v62: membership is no longer cut; the sweep bounds THROUGHPUT
 
     def _gate(reason: str, *, selection: bool = False) -> None:
         """A hard exit. It records WHY and returns; the reporting boundary in the wrapper emits every
@@ -958,7 +977,6 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         return (o.get("status_code"), o.get("content_length"),
                 (o.get("title") or "").strip(), o.get("favicon"))
 
-    ledger_error = None                    # a `record()` that failed; raised AFTER the evidence lands
     zones_probed = 0                       # zones we CONTACTED (an attempt, not an answer)
     st["zones_obtained"] = 0               # zones whose invocation came back usable
     st["invocation_classes"] = {}
@@ -972,6 +990,10 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     st["ledger_errors"] = []
     st["ledger_error_ids"] = []
     st["stopped"] = ""
+
+    # ── SELECTION: the contact guard decides which zones may be contacted AT ALL. It is a selection
+    #    fact, so it is settled before the scheduler sees the target list (v62).
+    contactable = []
     for zone in zones:
         # self-attack guard: if the wildcard resolves to the SCAN BOX / metadata, don't vhost-scan the zone
         # (record it as intel). A private wildcard is CONTACTED by default (recorded either way).
@@ -984,17 +1006,29 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             # capped run blamed the cap for zones the CONTACT GUARD had refused.
             st["blocked"]["self_or_private"] += 1
             continue
+        contactable.append(zone)
+    # the allowance can only defer what the guard left contactable — an estimate over zones nothing may
+    # contact would blame a deferral for a refusal (v62).
+    _allow_now = wildcard_zones_per_run()
+    st["blocked"]["zone_cap"] = max(0, len(contactable) - _allow_now) if _allow_now else 0
+    if not contactable:
+        return _gate("every eligible zone was refused by the self/private contact guard", selection=True)
+
+    def _probe(zone: str, unit: str, ws):
+        """ONE httpx invocation against ONE zone — what the sweep submits for a batch of its slots."""
+        nonlocal zones_probed
+        ledger_error = None
         bogus = [f"quarry-wc-{_uuid.uuid4().hex[:10]}.{zone}" for _ in range(2)]
         # v50#1: ONE token names the whole invocation pair. With a stable candidate name, a retry
         # overwrote the exact contacted set — random baselines included — that the earlier recorded
         # command still points at.
         attempt = _uuid.uuid4().hex[:12]
         cf = ctx.write_list(f"{label}_cand_{zone.replace('.', '_')}_{attempt}.txt",
-                            [f"{w}.{zone}" for w in words] + bogus)
+                            [f"{w}.{zone}" for w in ws] + bogus)
         # v49#1: an IMMUTABLE per-invocation path. A stable per-zone one let a timed-out retry that wrote
         # nothing re-read the PREVIOUS attempt's artifact and report its findings as its own — and a normal
         # retry overwrote evidence earlier records already point at.
-        hx = ctx.run.raw_path(phase, label, f"{zone}-{attempt}.jsonl")
+        hx = ctx.run.raw_path(phase, label, f"{zone}-{unit}-{attempt}.jsonl")
         # -follow-redirects so the signature is the FINAL response, not a bare redirect: without it a
         # candidate httpx probes on http gets the wildcard's uniform 308→https (status 308, len 0) —
         # which "differs" from the 200 baseline and floods false positives. Following it collapses
@@ -1042,20 +1076,19 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             # has been accounted for and ingested, so it degrades the run without erasing what it found.
             st["ledger_errors"].append(f"{zone}: {type(e).__name__}: {e}")
             st["ledger_error_ids"].append(id(e))       # identity, for the dedupe in `_wc_with_ledger`
-            ledger_error = ledger_error or e
-        if r.status is Status.SKIPPED:
-            break
-        if blob is None:
+            ledger_error = e
+        if r.status is Status.SKIPPED or blob is None:
             # the artifact loss is already accounted for above. If the ledger also failed there is
-            # nothing left to ingest for this zone, so stop here rather than contacting another (v56).
+            # nothing left to ingest for this zone, so raise now rather than contacting another (v56).
             if ledger_error is not None:
                 st["stopped"] = st.get("stopped") or "the invocation could not be recorded"
-                break
-            continue
+                st["ledger_raised"] = True     # the scheduler's machinery detail would repeat this
+                raise ledger_error
+            return r
         # v44#5: bytes, not text — one invalid UTF-8 line used to abort the WHOLE artifact as machinery
         # instead of costing one row. Every row is then validated STRUCTURALLY before it can reach `_sig`
         # or the store, and a row for a name this invocation never submitted is not our evidence.
-        expected = {f"{w}.{zone}".lower() for w in words} | {b.lower() for b in bogus}
+        expected = {f"{w}.{zone}".lower() for w in ws} | {b.lower() for b in bogus}
         rows = []
         for chunk in blob.splitlines():
             if not chunk.strip():
@@ -1154,18 +1187,42 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
                                          "sources": [source], "raw_ref": str(hx)})
                 kept.add(host)
         if ledger_error is not None:
-            # v56: this zone's evidence is in — and there will be NO further contact after a write we
-            # could not make. Continuing risked a later cancellation exiting past the deferred raise and
-            # taking the known ledger failure with it, and it would have been unrecorded traffic anyway.
+            # v56: this zone's evidence is IN — and there will be NO further contact after a write we
+            # could not make. Raising here stops the sweep with a machinery cause and leaves the
+            # remaining zones to a later lifecycle, instead of unrecorded traffic now.
             st["stopped"] = st.get("stopped") or "the invocation could not be recorded"
-            break
+            st["ledger_raised"] = True         # the scheduler's machinery detail would repeat this
+            raise ledger_error
+        return r
+
+    # ── SCHEDULING: which zones this lifecycle contacts, and in which order, is the sweep's (v62). The
+    #    rotation is durable and project-scoped, so a bounded run advances instead of re-probing the same
+    #    zones for ever — the ZONE_CAP membership cut is gone.
+    swept = sweep.run_sweep(
+        lane=f"wc_{source_id.replace('.', '_')}",
+        state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}",
+        targets=contactable, vocabulary=lambda _zone: list(words), execute=_probe,
+        budget_s=budget.budget_seconds("WILDCARD_BUDGET_S"), coverage_lane=source_id,
+        dependency_ok=lambda: have("httpx"), max_pairs_per_target=WILDCARD_WORD_CAP,
+        max_targets_per_run=wildcard_zones_per_run())
+    st["sweep_stop"] = swept.stop or ""
+    st["sweep_stop_kind"] = swept.stop_kind or ""
+    st["admitted_zones"] = swept.targets_admitted
+    st["deferred_zones"] = swept.deferred_targets
+    st["blocked"]["zone_cap"] = swept.deferred_targets       # deferred to a LATER run, never dropped
+    # the lane's own cause and the scheduler's DETAIL are both facts — composing them keeps the
+    # underlying error text (which the machinery entry carries) beside the lane's sentence.
+    if st.get("ledger_raised"):
+        # the exception the scheduler contained IS the ledger failure the lane already names, with the
+        # same text. Composing both would state one fact twice (v62).
+        swept.machinery = []
+    _sweep_why = "; ".join(swept.machinery) if swept.machinery else (
+        swept.stop or "" if swept.stop_kind in ("machinery", "dependency", "contention", "budget")
+        else "")
+    st["stopped"] = "; ".join(p for p in (st.get("stopped") or "", _sweep_why) if p)
     # review-B-audit-18#2: ZONE reasons only. The vocabulary facts live in `stats["vocabulary"]`, and a
     # caller that reported both used to print the word cap twice.
     st["blocked_reason"] = _wc_reasons(st)[2]
-    if ledger_error is not None:
-        # this zone's available evidence has landed and the sweep stopped there (v56); NOW the run fails
-        # on the write it could not make.
-        raise ledger_error
     if kept:
         ctx.echo(f"  wildcard: {len(kept)} distinct vhost(s) differentiated, {len(novel)} new ({label})")
 

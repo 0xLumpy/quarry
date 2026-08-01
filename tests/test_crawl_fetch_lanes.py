@@ -3864,5 +3864,5 @@ class TestRetentionIsComplete:
         VALUE is what this pins."""
         from quarry_recon.phases import enrich, vertical
         assert vertical.WILDCARD_WORD_CAP == 5000
-        assert vertical.ZONE_CAP == 5
+        assert vertical.wildcard_zones_per_run() == 5     # a per-run ALLOWANCE now, not a membership cap
         assert enrich.A1D_WORD_CAP == 2000        # the A1d spend bound, now owned by its caller

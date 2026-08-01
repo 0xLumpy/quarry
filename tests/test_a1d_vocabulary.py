@@ -503,11 +503,13 @@ class TestA1dVocabularyLossReachesTheVerdict:
         from quarry_recon.phases import vertical
         ctx = self._differ_ctx(tmp_path, monkeypatch, guard="self")
         st = {}
-        zones = {f"z{i}.acme.com" for i in range(7)}          # 7 zones, cap 5, all guard-refused
+        zones = {f"z{i}.acme.com" for i in range(7)}          # 7 zones, allowance 5, all guard-refused
         vertical._wildcard_differentiate(ctx, zones, extra_words=["api"], stats=st)
-        assert st["blocked"] == {"zone_cap": 2, "self_or_private": 5}, st
-        assert "2 zone(s) over the 5-zone cap" in st["blocked_reason"], st
-        assert "5 zone(s) refused by the self/private contact guard" in st["blocked_reason"], st
+        # v62: the guard is a SELECTION fact settled over every eligible zone, and the allowance can only
+        # defer what the guard leaves contactable — here, nothing.
+        assert st["blocked"] == {"zone_cap": 0, "self_or_private": 7}, st
+        assert "refused by the self/private contact guard" in st["blocked_reason"], st
+        assert "allowance" not in st["blocked_reason"], st
 
     def test_the_A1d_pass_keeps_its_OWN_lifecycle_in_the_MANIFEST(self, tmp_path, monkeypatch):
         """review-B-audit-15#4 / 16#3: distinct units stopped the replacement, but both events still wore
@@ -751,7 +753,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         assert len(recs) == 1 and recs[0].status == "partial", recs
         note = recs[0].note
         assert note.count("withheld by the word cap") == 1, note
-        assert note.count("zone-zone cap") == 0 and note.count("5-zone cap") == 1, note
+        assert note.count("zone-zone cap") == 0 and note.count("5-zone per-run allowance") == 1, note
         assert "wildcard zone(s) not differentiated" in note, note
 
     def test_the_zone_reason_stays_ZONE_only(self, tmp_path, monkeypatch):
@@ -761,7 +763,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         st = {}
         vertical._wildcard_differentiate(ctx, {f"z{i}.acme.com" for i in range(7)},
                                          extra_words=["one", "two", "three"], label="wildcard", stats=st)
-        assert "cap" in st["blocked_reason"] and "guard" in st["blocked_reason"], st
+        assert "guard" in st["blocked_reason"], st
         assert "word" not in st["blocked_reason"] and "vocabulary" not in st["blocked_reason"], st
         assert st["vocabulary"]["withheld"] == 2, st
 
@@ -2399,12 +2401,12 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         """v43#1: every degraded terminal recorded a synthetic failure, so a normal capped run reported
         `tools_failed=1` with nothing failed. The cap is an omission the coverage record already owns."""
         from quarry_recon.phases import vertical
-        monkeypatch.setattr(vertical, "ZONE_CAP", 1)
+        monkeypatch.setattr(vertical, "WILDCARD_ZONES_PER_RUN", 1)
         kept, life = self._differ(tmp_path, monkeypatch, rows=[],
                                   zones=("a.acme.com", "b.acme.com"))
         # v44#1: a CLEAN operator boundary is LIMITED — nothing went wrong, and the run behaved exactly
         # as configured. Not FAILED, and not a failed tool either.
-        assert life[-1]["status"] == "limited" and "over the 1-zone cap" in life[-1]["reason"], life
+        assert life[-1]["status"] == "limited" and "deferred to a later run by the 1-zone per-run allowance" in life[-1]["reason"], life
         summary = self._last_run._run_summary()
         assert summary.get("tools_failed", 0) == 0, summary
         assert not any(r.tool == "wildcard-differ" for r in self._last_run.tool_runs("enrich"))
@@ -2775,7 +2777,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         """v50#2: one record carried both questions, so a parse error in the zone we DID probe turned the
         policy-capped remainder into a timeout."""
         from quarry_recon.phases import vertical
-        monkeypatch.setattr(vertical, "ZONE_CAP", 1)
+        monkeypatch.setattr(vertical, "WILDCARD_ZONES_PER_RUN", 1)
 
         def raw(cands):
             bogus = [c for c in cands if c.startswith("quarry-wc-")]
@@ -2786,7 +2788,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                                   zones=("a.acme.com", "b.acme.com"))
         sel = [e for e in self._events if e.get("measure") == "zones"][-1]
         assert sel["kind"] == "cap" and (sel["eligible"], sel["tested"], sel["omitted"]) == (2, 1, 1), sel
-        assert "over the 1-zone cap" in sel["reason"], sel
+        assert "deferred to a later run by the 1-zone per-run allowance" in sel["reason"], sel
         # v51#2: EXECUTION is complete — the one selected zone returned — so it is NOT timeout-class.
         # The parse loss lives in its own measure.
         ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
@@ -2821,7 +2823,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         """v51#1: a run capped to one zone AND missing httpx reported the whole eligible set as a
         timeout, losing the clean one-zone selection."""
         from quarry_recon.phases import vertical
-        monkeypatch.setattr(vertical, "ZONE_CAP", 1)
+        monkeypatch.setattr(vertical, "WILDCARD_ZONES_PER_RUN", 1)
         kept, life = self._differ(tmp_path, monkeypatch, httpx=False,
                                   zones=("a.acme.com", "b.acme.com"))
         sel = [e for e in self._events if e.get("measure") == "zones"][-1]
@@ -2840,11 +2842,11 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
     def test_SELECTION_and_EXECUTION_carry_their_OWN_causes(self, tmp_path, monkeypatch):
         """v52#1: one reason was appended to both, so the CAP's omitted zone claimed httpx caused it."""
         from quarry_recon.phases import vertical
-        monkeypatch.setattr(vertical, "ZONE_CAP", 1)
+        monkeypatch.setattr(vertical, "WILDCARD_ZONES_PER_RUN", 1)
         kept, life = self._differ(tmp_path, monkeypatch, httpx=False,
                                   zones=("a.acme.com", "b.acme.com"))
         sel = [e for e in self._events if e.get("measure") == "zones"][-1]
-        assert "over the 1-zone cap" in sel["reason"], sel
+        assert "deferred to a later run by the 1-zone per-run allowance" in sel["reason"], sel
         assert "httpx" not in sel["reason"], sel
         ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
         assert "httpx is not installed" in ex["reason"], ex
@@ -2915,14 +2917,14 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         """v53#3: the cap was only set inside the body, so a setup failure reported every eligible zone
         as selected."""
         from quarry_recon.phases import vertical
-        monkeypatch.setattr(vertical, "ZONE_CAP", 1)
+        monkeypatch.setattr(vertical, "WILDCARD_ZONES_PER_RUN", 1)
         monkeypatch.setattr(vertical, "_wc_vocabulary",
                             lambda *a, **k: (_ for _ in ()).throw(OSError("wordlist vanished")))
         kept, life = self._differ(tmp_path, monkeypatch, rows=[],
                                   zones=("a.acme.com", "b.acme.com"))
         sel = [e for e in self._events if e.get("measure") == "zones"][-1]
         assert (sel["eligible"], sel["tested"], sel["omitted"]) == (2, 1, 1), sel
-        assert "over the 1-zone cap" in sel["reason"], sel
+        assert "deferred to a later run by the 1-zone per-run allowance" in sel["reason"], sel
         ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
         assert (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 0, 1), ex
 
@@ -3144,5 +3146,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                  "title": "real", "favicon": "y"}]
         kept, life = self._differ(tmp_path, monkeypatch, rows=rows)
         reason = life[-1]["reason"]
-        assert "the wildcard differ failed (OSError: disk is read-only)" in reason, reason
-        assert "1 tool result(s) not recorded" in reason, reason      # the OTHER failure survives
+        # the ingest failure reaches the terminal through the scheduler's machinery detail, and the
+        # unrecorded RESULT is named separately — two facts, not one collapsed into the other
+        assert "OSError: disk is read-only" in reason, reason
+        assert "1 tool result(s) not recorded" in reason, reason
