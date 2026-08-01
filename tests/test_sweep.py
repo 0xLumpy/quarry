@@ -961,3 +961,37 @@ class TestExecutorBatching:
             out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"])
         assert out.contended is False and out.stop_kind is None
         assert out.unselectable_pairs == 3 and tool.calls == []
+
+    def test_the_DETAIL_bound_is_GLOBAL_not_per_target(self, tmp_path, monkeypatch):
+        """v39#3: the slice sat inside the target loop, so two targets produced twice the allowance."""
+        monkeypatch.setattr(sweep, "_UNSELECTABLE_DETAIL", 1)
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        monkeypatch.setattr(sweep, "allocate", lambda words, *, cap: {"000": list(words)})
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha", "beta", "gamma"])
+        assert len(out.unselectable) == 1, out.unselectable
+        assert out.unselectable_slots == 2 and out.unselectable_pairs == 6
+
+    def test_the_UNSCHEDULABLE_detail_is_EMITTED_not_only_returned(self, tmp_path, monkeypatch):
+        """v39#2: a field on a value that dies with the process is not detail an operator retains."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        monkeypatch.setattr(sweep, "allocate", lambda words, *, cap: {"000": list(words)})
+        out, tool = _run(tmp_path, words=["alpha", "beta", "gamma"])
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "unschedulable"]
+        assert len(ev) == 1, ev
+        got = ev[0]["unschedulable"]
+        assert got["slots"] == 1 and got["pairs"] == 3 and got["truncated"] is False, got
+        assert got["detail"] == [{"target": "acme.com", "slot": "000", "members": 3, "bound": 2}], got
+        assert ev[0].get("produced") is None, ev        # `produced` stays reserved for entity counts
+
+    def test_a_TRUNCATED_detail_says_so(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "_UNSELECTABLE_DETAIL", 1)
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        monkeypatch.setattr(sweep, "allocate", lambda words, *, cap: {"000": list(words)[:3],
+                                                                      "001": list(words)[3:]})
+        out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)])
+        got = [e for e in _events(tmp_path) if e.get("unit") == "unschedulable"][0]["unschedulable"]
+        assert got["slots"] == 2 and len(got["detail"]) == 1 and got["truncated"] is True, got
+
+    def test_a_CLEAN_run_emits_no_unschedulable_record(self, tmp_path):
+        _run(tmp_path, words=["alpha", "beta"])
+        assert [e for e in _events(tmp_path) if e.get("unit") == "unschedulable"] == []

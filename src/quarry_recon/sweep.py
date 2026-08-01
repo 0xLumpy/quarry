@@ -296,7 +296,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # ordinary cap or a resumable remainder.
         if alloc_cap:
             over = {slot: group for slot, group in partition.items() if len(group) > alloc_cap}
-            for slot, group in sorted(over.items())[:_UNSELECTABLE_DETAIL]:
+            room = max(0, _UNSELECTABLE_DETAIL - len(out.unselectable))   # a GLOBAL bound (v39#3)
+            for slot, group in sorted(over.items())[:room]:
                 out.unselectable.append({"target": target, "slot": slot, "members": len(group),
                                          "bound": alloc_cap})
             out.unselectable_slots += len(over)
@@ -538,6 +539,13 @@ def _report(lane: str, out: SweepResult, clock) -> None:
         budget.report_outcome(lane, measure="tool_invocations", attempted=out.invocations,
                               obtained=out.invocations_obtained,
                               classes=out.invocation_classes or None, noun="invocation")
+    if out.unselectable_pairs:
+        # the counters are the fact; this carries the operator detail INTO the run's evidence, because a
+        # field on a value that disappears with the process is not something an operator retains (v39#2).
+        events.ledger(lane, unit="unschedulable", produced=None,
+                      unschedulable={"slots": out.unselectable_slots, "pairs": out.unselectable_pairs,
+                                     "detail": list(out.unselectable),
+                                     "truncated": out.unselectable_slots > len(out.unselectable)})
     if out.per_source_eligible:
         # review v15#3: NOT a third coverage denominator — it would re-count the candidate remainder the
         # selection record already owns, and it would have to invent a `kind` for a stop it does not model.

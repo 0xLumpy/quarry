@@ -1970,3 +1970,46 @@ class TestA1dVocabularyLossReachesTheVerdict:
         assert len(fins) == 1 and fins[0]["status"] == "failed", fins
         assert fins[0]["reason"] == ("5 candidate(s) in 1 slot(s) cannot be scheduled under the current "
                                      "bounds"), fins[0]["reason"]
+
+    def test_UNSCHEDULABLE_work_does_not_SUPPRESS_the_returned_classes(self, tmp_path, monkeypatch):
+        """v39#1: the terminal checked unschedulable work first and returned only that sentence, so the
+        slot and invocation class maps it promises vanished. The facts are orthogonal."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("\n".join(f"word{i:03d}" for i in range(7)))
+            real = sweep.allocate
+            # three candidates in a slot nothing can admit, the rest schedulable
+            monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 4)
+            monkeypatch.setattr(sweep, "allocate",
+                                lambda words, *, cap: {"000": sorted(words)[:5],
+                                                       **real(sorted(words)[5:], cap=cap)})
+            from quarry_recon.runner import RunResult as _RR
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
+                                    tool, cmd, crawl.Status.FAILED, 1, 0.1, None, 0))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            fins = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                    if json.loads(l).get("event") == "tool_finish"
+                    and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(fins) == 1 and fins[0]["status"] == "failed", fins
+            reason = fins[0]["reason"]
+            assert "slot outcomes" in reason and "invocation(s)" in reason, reason
+            assert "5 candidate(s) in 1 slot(s) cannot be scheduled" in reason, reason
+        finally:
+            events.reset()
