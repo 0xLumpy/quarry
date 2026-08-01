@@ -301,7 +301,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             corpus[target] = per_target
     except (KeyboardInterrupt, SystemExit):
         raise
-    except Exception as e:
+    except BaseException as e:                 # v73#1: only CANCELLATION escapes this driver
         # v71#1: `vocabulary` is the CALLER's callable and it ran outside every boundary. A failure there
         # left the driver by the back door, and the eligible set is not zero — it is UNKNOWN.
         out.machinery.append(f"the corpus could not be built ({_safe_exc(e)})")
@@ -376,7 +376,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 _sources_stage[src] = _sources_stage.get(src, 0) + 1
     except (KeyboardInterrupt, SystemExit):
         raise
-    except Exception as e:
+    except BaseException as e:                 # v73#1: only CANCELLATION escapes this driver
         # v71#1: accounting may not authorise or block work, but it may not escape either.
         out.machinery.append(f"attribution failed ({_safe_exc(e)})")
         out.stop, out.stop_kind = "machinery: attribution failed", "machinery"
@@ -397,7 +397,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             ready = dependency_ok()
         except (KeyboardInterrupt, SystemExit):
             raise
-        except Exception as e:
+        except BaseException as e:             # v73#1: only CANCELLATION escapes this driver
             out.machinery.append(f"the dependency check raised ({_safe_exc(e)})")
             out.stop, out.stop_kind = "machinery: the dependency check raised", "machinery"
             _report(coverage_lane, out, clock)
@@ -426,8 +426,19 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         except budget.StateBusy as e:
             # ACQUISITION-only: a StateBusy raised by the sweep BODY is machinery, not contention (v10#2).
             out.contended = True
-            out.stop = f"another lifecycle owns this rotation ({e})"
+            out.stop = f"another lifecycle owns this rotation ({_safe_exc(e)})"
             out.stop_kind = "contention"       # nothing was submitted and NO completion state was lost
+            _report(coverage_lane, out, clock)
+            return out
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            # v73#2: only StateBusy means another lifecycle. Anything else here — a read-only state
+            # directory, say — is MACHINERY, and letting it escape contradicted the driver's contract
+            # and threw away a denominator we already knew.
+            out.machinery.append(f"the rotation could not be acquired ({_safe_exc(e)})")
+            out.stop = "machinery: the rotation could not be acquired"
+            out.stop_kind = "machinery"
             _report(coverage_lane, out, clock)
             return out
 
@@ -459,7 +470,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 persisted = progress.save()
             except (KeyboardInterrupt, SystemExit):
                 raise
-            except Exception as e:
+            except BaseException as e:         # v73#1: only CANCELLATION escapes this driver
                 # v70: the CLOCK is a caller's callable too, and it was only guarded against the
                 # scheduler's own refusals — an `OSError` from `now()` escaped the driver here.
                 out.machinery.append(f"{target}/{unit}: reservation refused ({_safe_exc(e)})")
@@ -482,7 +493,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     allowed = admit(target)
                 except (KeyboardInterrupt, SystemExit):
                     raise
-                except Exception as e:
+                except BaseException as e:     # v73#1: only CANCELLATION escapes this driver
                     out.machinery.append(f"{target}: admission check raised ({_safe_exc(e)})")
                     out.stop = "machinery: the admission check raised"
                     out.stop_kind = "machinery"
@@ -515,7 +526,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 result = execute(target, unit, [word for _b, words in chosen for word in words])
             except (KeyboardInterrupt, SystemExit):
                 raise                                   # cancellation ends the run, never a slot outcome
-            except Exception as e:                      # `runner.run` can raise around Popen (v10#1)
+            except BaseException as e:                  # `runner.run` can raise around Popen (v10#1)
                 out.machinery.append(f"{target}/{unit}: {_safe_exc(e)}")
                 out.stop = "machinery: the invocation raised"
                 out.stop_kind = "machinery"
@@ -564,7 +575,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.stop_kind = "machinery"
                 inflight = 0
                 break
-            except Exception as e:
+            except BaseException as e:                  # v73#1: only CANCELLATION escapes this driver
                 if not staged:
                     # v70: STAGING and PUBLICATION are different failures. Nothing was written to the
                     # in-memory map — `now()` raised, or `complete_batch` did — so there is no `done`

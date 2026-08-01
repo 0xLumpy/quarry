@@ -254,8 +254,13 @@ class TestContentionAndCoverage:
             yield  # pragma: no cover
 
         monkeypatch.setattr(budget, "rotation_session", broken)
-        with pytest.raises(OSError):
-            _run(tmp_path)
+        # v73#2: and it is CONTAINED — escaping contradicted the driver's contract and threw away a
+        # denominator the run already knew.
+        out, tool = _run(tmp_path)
+        assert out.contended is False and out.stop_kind == "machinery", out
+        assert "rotation could not be acquired (OSError: read-only filesystem)" in " ".join(out.machinery)
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert (sel["eligible"], sel["tested"], sel["omitted"]) == (20, 0, 20), sel
 
     def test_SELECTION_and_OUTCOME_are_separate_denominators(self, tmp_path, monkeypatch):
         # v31: this case is about PER-SLOT behaviour, so it drives the driver one slot per
@@ -1567,3 +1572,53 @@ class TestThePreflightCallbacksAreContained:
         assert out.completion_unstaged == 1 and out.completion_unpersisted == 1, out
         ev = [e for e in _events(tmp_path) if e.get("unit") == "completion"][-1]["completion"]
         assert ev["unstaged"] == 1 and ev["pending"] == 0, ev
+
+    @pytest.mark.parametrize("where", ["vocabulary", "attribution", "dependency", "admit", "execute",
+                                       "clock"])
+    def test_a_GENERATOR_EXIT_from_any_callback_is_contained(self, tmp_path, where):
+        """v73#1: only `KeyboardInterrupt` and `SystemExit` are cancellation. Every other
+        `BaseException` from a caller's callable is machinery, not an escape."""
+        def boom(*_a, **_k):
+            raise GeneratorExit("not cancellation")
+
+        kw = {}
+        if where == "vocabulary":
+            out = sweep.run_sweep(lane=LANE, state_dir=tmp_path, targets=["acme.com"],
+                                  vocabulary=boom, execute=_Tool(), budget_s=0, coverage_lane=COV)
+            assert out.stop_kind == "machinery" and out.eligibility_known is False
+            return
+        if where == "attribution":
+            kw["attribution"] = boom
+        elif where == "dependency":
+            kw["dependency_ok"] = boom
+        elif where == "admit":
+            kw["admit"] = boom
+        elif where == "clock":
+            kw["now"] = boom
+        tool = boom if where == "execute" else None
+        out, _t = _run(tmp_path, words=["alpha"], tool=tool, **kw)
+        assert out.stop_kind == "machinery", (where, out)
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"]
+        assert sel, where
+
+    def test_a_GENERATOR_EXIT_from_the_ACQUISITION_is_contained(self, tmp_path, monkeypatch):
+        import contextlib as _c
+
+        @_c.contextmanager
+        def broken(*a, **k):
+            raise GeneratorExit("not cancellation")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(budget, "rotation_session", broken)
+        out, tool = _run(tmp_path, words=["alpha"])
+        assert out.stop_kind == "machinery" and out.contended is False, out
+        assert "rotation could not be acquired" in " ".join(out.machinery), out.machinery
+
+    def test_a_GENERATOR_EXIT_from_STAGING_is_contained(self, tmp_path, monkeypatch):
+        def boom(self, *a, **k):
+            raise GeneratorExit("not cancellation")
+
+        monkeypatch.setattr(budget.RotationProgress, "complete_batch", boom)
+        out, tool = _run(tmp_path, words=["alpha"])
+        assert tool.calls and out.stop_kind == "machinery", out
+        assert out.completion_unstaged == 1, out
