@@ -2163,7 +2163,8 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             return False
 
     def _differ(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, words=("api",),
-                sid="enrich.wildcard_a1d", rows=None, caught=None, preload=(), st=None):
+                sid="enrich.wildcard_a1d", rows=None, caught=None, preload=(), st=None,
+                status=None, raw=None, break_record=None):
         from quarry_recon import store
         from quarry_recon.phases import probe, vertical
         run = store.Run.create(tmp_path, "t")
@@ -2178,6 +2179,11 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             from quarry_recon.runner import RunResult as _RR
 
             def _tool(tool, cmd, raw_path=None, timeout=None, **k):
+                if raw is not None and raw_path is not None:
+                    raw_path.write_text(raw)
+                    return _RR(tool, cmd, status or crawl.Status.SUCCESS, 0, 0.1, raw_path, 0)
+                if status is not None:
+                    return _RR(tool, cmd, status, 1, 0.1, None, 0)
                 if rows is not None and raw_path is not None:
                     cand = pathlib.Path(cmd[cmd.index("-l") + 1]).read_text().split()
                     bogus = [c for c in cand if c.startswith("quarry-wc-")]
@@ -2195,6 +2201,15 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             for kind, row in preload:
                 run.add(kind, row)
             self._last_run = run
+            if break_record is not None:
+                real_record = type(run).record
+
+                def _boom(self, phase, result):
+                    if result.tool == "wildcard-differ":
+                        raise break_record
+                    return real_record(self, phase, result)
+
+                monkeypatch.setattr(type(run), "record", _boom, raising=False)
             kept = set()
             try:
                 kept = vertical._wildcard_differentiate(ctx, set(zones), extra_words=list(words),
@@ -2342,3 +2357,78 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         kept, life = self._differ(tmp_path, monkeypatch, rows=[])
         assert [e["event"] for e in life] == ["tool_start", "tool_finish"], life
         assert life[-1]["status"] == "failed" and "bad zone iterable" in life[-1]["reason"], life
+
+    def test_a_CAPPED_pass_is_NOT_a_failed_tool(self, tmp_path, monkeypatch):
+        """v43#1: every degraded terminal recorded a synthetic failure, so a normal capped run reported
+        `tools_failed=1` with nothing failed. The cap is an omission the coverage record already owns."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "ZONE_CAP", 1)
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[],
+                                  zones=("a.acme.com", "b.acme.com"))
+        # degraded (a zone went undifferentiated) and nothing was produced, so FAILED by the standing
+        # rule that PARTIAL asserts production — but NOT a failed TOOL: nothing failed.
+        assert life[-1]["status"] == "failed" and "over the 1-zone cap" in life[-1]["reason"], life
+        summary = self._last_run._run_summary()
+        assert summary.get("tools_failed", 0) == 0, summary
+        assert not any(r.tool == "wildcard-differ" for r in self._last_run.tool_runs("enrich"))
+
+    def test_a_MACHINERY_failure_is_still_recorded(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "_wc_differentiate",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("differ exploded")))
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[])
+        assert life[-1]["status"] == "failed"
+        assert any(r.tool == "wildcard-differ" for r in self._last_run.tool_runs("enrich"))
+        assert self._last_run._run_summary()["verdict"] != "complete"
+
+    def test_a_FAILED_invocation_is_not_a_clean_EMPTY(self, tmp_path, monkeypatch):
+        """v43#2: the terminal read "did we contact the zone", so a failed httpx left the source reporting
+        a clean EMPTY over full zone coverage."""
+        kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.FAILED)
+        assert life[-1]["status"] == "failed", life
+        assert "zone outcomes {'failed': 1}" in life[-1]["reason"], life
+
+    def test_a_TIMED_OUT_invocation_that_still_found_a_host_is_PARTIAL(self, tmp_path, monkeypatch):
+        raw = "\n".join([json.dumps({"input": "quarry-wc-x.z.acme.com", "status_code": 200,
+                                     "content_length": 5, "title": "wc", "favicon": "x"}),
+                         json.dumps({"input": "api.z.acme.com", "status_code": 200,
+                                     "content_length": 99, "title": "real", "favicon": "y"})])
+        kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.TIMED_OUT, raw=raw)
+        assert kept == set() or life[-1]["status"] in ("partial", "failed"), (kept, life)
+        assert "zone outcomes" in life[-1]["reason"], life
+
+    def test_MALFORMED_output_is_a_PARSE_GAP_not_a_clean_answer(self, tmp_path, monkeypatch):
+        """v43#3: unreadable rows were discarded silently, so a truncated artifact read EMPTY with full
+        coverage."""
+        raw = "\n".join([json.dumps({"input": "quarry-wc-x.z.acme.com", "status_code": 200,
+                                     "content_length": 5, "title": "wc", "favicon": "x"}),
+                         '{"input": "api.z.acme.com", "status_code":',      # truncated
+                         "[1, 2, 3]"])                                      # not an object
+        kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
+        assert life[-1]["status"] == "failed", life
+        assert "2 unparseable output row(s)" in life[-1]["reason"], life
+
+    def test_the_RESOLVED_observation_does_not_depend_on_subdomain_NOVELTY(self, tmp_path, monkeypatch):
+        """v43#4: the resolved write sat inside the new-subdomain branch, so a host another source had
+        already found left `resolved` empty."""
+        rows = [{"input": "api.z.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y", "a": ["1.2.3.4"]}]
+        kept, life = self._differ(tmp_path, monkeypatch, rows=rows,
+                                  preload=[("subdomain", {"host": "api.z.acme.com",
+                                                          "sources": ["subfinder"]})])
+        resolved = list(self._last_run.read("resolved"))
+        assert kept == {"api.z.acme.com"} and resolved, (kept, resolved)
+        assert resolved[-1].get("a") == ["1.2.3.4"], resolved
+
+    def test_an_UNRECORDABLE_outcome_propagates_instead_of_reading_CLEAN(self, tmp_path, monkeypatch):
+        """v43#5: a generic terminal is not folded into the verdict, so a failure to record the outcome
+        left the manifest `complete`."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "_wc_differentiate",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("differ exploded")))
+        caught = []
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], caught=caught,
+                                  break_record=OSError("read-only manifest"))
+        assert life[-1]["status"] == "failed" and "could not be recorded" in life[-1]["reason"], life
+        assert caught and isinstance(caught[0], RuntimeError), caught
+        assert "read-only manifest" in str(caught[0]), caught

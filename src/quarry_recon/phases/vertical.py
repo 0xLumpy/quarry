@@ -550,8 +550,14 @@ def _wc_eligible_zones(ctx, zones) -> list:
 
 
 def _wc_terminal(st: dict, kept: set):
-    """One terminal for the differ, from what it actually did (step 4.3)."""
+    """One terminal for the differ, from what it actually did (step 4.3).
+
+    Three independent facts degrade it and they ACCUMULATE: zones we never contacted (a policy bound or
+    the contact guard), invocations that did not come back usable, and rows we could not parse."""
     eligible, probed = st.get("eligible_zones", 0), st.get("probed_zones", 0)
+    obtained = st.get("zones_obtained", probed)
+    classes = st.get("invocation_classes") or {}
+    parse_errors = st.get("parse_errors", 0)
     blocked = st.get("blocked", {}) or {}
     why = st.get("blocked_reason") or ""
     if not eligible:
@@ -559,9 +565,14 @@ def _wc_terminal(st: dict, kept: set):
     if not probed:
         # nothing was contacted: a mode, a missing tool, no vocabulary, or the contact guard
         return Status.SKIPPED, why or "no zone was probed"
-    if probed < eligible or blocked.get("self_or_private") or blocked.get("zone_cap"):
+    facts = [p for p in (why,
+                         f"zone outcomes {dict(sorted(classes.items()))}" if classes else "",
+                         f"{parse_errors} unparseable output row(s)" if parse_errors else "") if p]
+    if (probed < eligible or blocked.get("self_or_private") or blocked.get("zone_cap")
+            or classes or parse_errors or obtained < probed):
         # PARTIAL asserts production; a differ that probed some zones and found nothing is not production
-        return (Status.PARTIAL if kept else Status.FAILED), why or f"{probed}/{eligible} zone(s) probed"
+        return ((Status.PARTIAL if kept else Status.FAILED),
+                "; ".join(facts) or f"{probed}/{eligible} zone(s) probed")
     return (Status.SUCCESS if kept else Status.EMPTY), why or None
 
 
@@ -581,6 +592,8 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         # the GATE comes before eligibility (v42#4): a refused lane that had filled the carrier made its
         # caller report withheld words and undifferentiated zones for a pass that never existed.
         return set()
+    machinery = None                # the exception that ended the pass, if one did
+    unrecorded = None               # a failure to RECORD the outcome — never silently a clean verdict
     kept: set[str] = set()          # hosts this pass ACCEPTED as distinct vhosts (novel or already known)
     novel: set[str] = set()         # the subset the store had never seen — an echo detail, not production
     eligible: list = []
@@ -613,24 +626,34 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         raise                                                  # after the terminal, never before
     except Exception as ex:
         st["blocked_reason"] = f"{type(ex).__name__}: {ex}"
+        machinery = ex
         outcome = ((Status.PARTIAL if kept else Status.FAILED),
                    f"the wildcard differ failed ({type(ex).__name__}: {ex})")
     finally:
         why = outcome[1]
-        if outcome[0] in (Status.FAILED, Status.PARTIAL):
-            # the manifest verdict folds RECORDED RunResults, not lifecycle events (v42#1): without this
-            # a differ that exploded left the run reading `complete`, with no failure and no gap.
+        if machinery is not None:
+            # MACHINERY only (v43#1): a capped or guard-refused pass is an omission the coverage record
+            # already owns, and recording it as a failed tool made a normal run report `tools_failed=1`
+            # with nothing failed. Invocation failures are already recorded by the body, one per call.
+            # The manifest verdict folds RECORDED RunResults, not lifecycle events (v42#1).
             try:
                 ctx.run.record(phase, RunResult("wildcard-differ", ["httpx", "(wildcard-differ)"],
                                                 outcome[0], None, 0.0, None, 0, note=why))
             except Exception as e:
                 why = f"{why}; the outcome could not be recorded ({type(e).__name__})"
+                unrecorded = e
         if not started:
             # setup failed before the start: the pair is still emitted, so the source never goes silent
             events.tool_start(source_id, cmd=["httpx", "(wildcard-differ)"],
                               input_total=len(eligible), work_unit=fp or "setup-failed")
         events.tool_finish(source_id, status=outcome[0].value, reason=why, work_unit=fp or "setup-failed",
                            produced={"subdomains": len(kept)})
+    if unrecorded is not None:
+        # v43#5: the terminal is out, but a generic terminal is not folded into the manifest verdict — so
+        # a failure to record the outcome would leave the run reading `complete`. It propagates to the
+        # phase boundary, which owns phase exceptions, instead of disappearing here.
+        raise RuntimeError(f"{source_id}: the outcome could not be recorded "
+                           f"({type(unrecorded).__name__}: {unrecorded})") from unrecorded
     return kept
 
 
@@ -768,7 +791,10 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         return (o.get("status_code"), o.get("content_length"),
                 (o.get("title") or "").strip(), o.get("favicon"))
 
-    zones_probed = 0
+    zones_probed = 0                       # zones we CONTACTED (an attempt, not an answer)
+    st["zones_obtained"] = 0               # zones whose invocation came back usable
+    st["invocation_classes"] = {}
+    st["parse_errors"] = 0
     for zone in zones:
         # self-attack guard: if the wildcard resolves to the SCAN BOX / metadata, don't vhost-scan the zone
         # (record it as intel). A private wildcard is CONTACTED by default (recorded either way).
@@ -799,14 +825,31 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             hx_cmd += ["-rl", str(ctx.profile.http_rl)]
         r = exec_tool("httpx", hx_cmd, raw_path=hx, timeout=ctx.http_timeout)
         ctx.run.record(phase, r)
+        # v43#2: the terminal used to read only "did we contact this zone", so a FAILED, TIMED_OUT or
+        # mid-run SKIPPED invocation left the source reporting a clean EMPTY over full zone coverage.
+        # An ATTEMPT and an ANSWER are different facts and are counted separately.
+        if r.status in (Status.SUCCESS, Status.EMPTY):
+            st["zones_obtained"] += 1
+        else:
+            _k = str(getattr(r.status, "value", r.status))
+            st["invocation_classes"][_k] = st["invocation_classes"].get(_k, 0) + 1
         if not (r.raw_path and r.raw_path.exists()):
             continue
         rows = []
         for line in r.raw_path.read_text().splitlines():
-            try:
-                rows.append(_json.loads(line))
-            except _json.JSONDecodeError:
+            if not line.strip():
                 continue
+            try:
+                row = _json.loads(line)
+            except _json.JSONDecodeError:
+                # v43#3: a truncated or malformed artifact was silently a clean empty answer. The rows we
+                # could not read are a PARSE GAP; the artifact stays on disk to be read again.
+                st["parse_errors"] += 1
+                continue
+            if not isinstance(row, dict):
+                st["parse_errors"] += 1
+                continue
+            rows.append(row)
         base = {_sig(o) for o in rows if (o.get("input") or o.get("host") or "") in bogus}
         if not base:                            # bogus didn't respond → not a live wildcard → skip
             continue
@@ -822,9 +865,11 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
                 # nothing produced. Acceptance is the production fact; novelty is an echo detail.
                 if ctx.run.add("subdomain", {"host": host, "sources": [source],
                                              "raw_ref": str(hx)}):
-                    ctx.run.add("resolved", {"host": host, "a": o.get("a") or [],
-                                             "sources": [source], "raw_ref": str(hx)})
                     novel.add(host)
+                # v43#4: the RESOLVED observation is this pass's own evidence about the host — it does not
+                # depend on whether the subdomain entity happened to be new here.
+                ctx.run.add("resolved", {"host": host, "a": o.get("a") or [],
+                                         "sources": [source], "raw_ref": str(hx)})
                 kept.add(host)
     _wc_vocab_coverage(source_id, label, vocab)
     _why = "; ".join(p for p in (
