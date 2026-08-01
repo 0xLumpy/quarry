@@ -306,7 +306,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # left the driver by the back door, and the eligible set is not zero — it is UNKNOWN.
         out.machinery.append(f"the corpus could not be built ({_safe_exc(e)})")
         out.stop, out.stop_kind = "machinery: the corpus could not be built", "machinery"
-        _report(coverage_lane, out, clock)
+        _report_safely(coverage_lane, out, clock)
         return out
     out.eligibility_known = True
     # the DENOMINATOR is known before the bound is: every eligible pair exists whether or not we can
@@ -321,7 +321,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # the driver promises to raise nothing but cancellation, so a nonsense bound is a MACHINERY stop
         # with nothing submitted — never a silent "unbounded" and never a bound nothing can satisfy.
         out.stop, out.stop_kind = f"machinery: {e}", "machinery"
-        _report(coverage_lane, out, clock)             # v27#1: coverage is filed under the REGISTERED
+        _report_safely(coverage_lane, out, clock)             # v27#1: coverage is filed under the REGISTERED
         return out                                     # source, never the scheduler's private lane name
 
     # v32#1: the batch maximum has to bound the SLOT, not just the batch — applied after a slot was
@@ -338,7 +338,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.stop = (f"machinery: the slot partition does not cover {target} "
                         f"({len(placed)} placed, {len(set(placed))} distinct, of {len(per_target)})")
             out.stop_kind = "machinery"
-            _report(coverage_lane, out, clock)
+            _report_safely(coverage_lane, out, clock)
             return out
         # v33: a slot the allocator could not split below the bound can never be scheduled — not by this
         # run and not by any later one, until the corpus or the bounds change. It is removed HERE, in one
@@ -380,7 +380,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # v71#1: accounting may not authorise or block work, but it may not escape either.
         out.machinery.append(f"attribution failed ({_safe_exc(e)})")
         out.stop, out.stop_kind = "machinery: attribution failed", "machinery"
-        _report(coverage_lane, out, clock)     # `per_source_eligible` stays EMPTY: nothing was published
+        _report_safely(coverage_lane, out, clock)     # `per_source_eligible` stays EMPTY: nothing was published
         return out
     owners = _owners_stage                     # the whole corpus was attributed, or none of it is used
     out.per_source_eligible.update(_sources_stage)
@@ -389,7 +389,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # NOTHING is schedulable — an empty corpus, or one whose every slot the bounds cannot admit. No
         # tool could have been invoked and no rotation state is needed, so neither a missing dependency
         # nor a busy lock is the reason for this run's remainder (v35#2).
-        _report(coverage_lane, out, clock)
+        _report_safely(coverage_lane, out, clock)
         return out
 
     if dependency_ok is not None:
@@ -400,7 +400,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         except BaseException as e:             # v73#1: only CANCELLATION escapes this driver
             out.machinery.append(f"the dependency check raised ({_safe_exc(e)})")
             out.stop, out.stop_kind = "machinery: the dependency check raised", "machinery"
-            _report(coverage_lane, out, clock)
+            _report_safely(coverage_lane, out, clock)
             return out
         if ready is not True and ready is not False:
             # v71#1: this gate decides whether ACTIVE work happens. Truthiness let a value like
@@ -408,12 +408,12 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.machinery.append(f"the dependency check answered {_safe_name(ready)} "
                                  f"{_safe_repr(ready)}, not True or False")
             out.stop, out.stop_kind = "machinery: the dependency check gave no usable answer", "machinery"
-            _report(coverage_lane, out, clock)
+            _report_safely(coverage_lane, out, clock)
             return out
         if ready is False:
             out.stop = "the tool is not installed"      # no reservations at all (design v7#2)
             out.stop_kind = "dependency"
-            _report(coverage_lane, out, clock)
+            _report_safely(coverage_lane, out, clock)
             return out
 
     inflight = 0                          # slots whose publication is unresolved (v69)
@@ -428,7 +428,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.contended = True
             out.stop = f"another lifecycle owns this rotation ({_safe_exc(e)})"
             out.stop_kind = "contention"       # nothing was submitted and NO completion state was lost
-            _report(coverage_lane, out, clock)
+            _report_safely(coverage_lane, out, clock)
             return out
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -439,7 +439,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.machinery.append(f"the rotation could not be acquired ({_safe_exc(e)})")
             out.stop = "machinery: the rotation could not be acquired"
             out.stop_kind = "machinery"
-            _report(coverage_lane, out, clock)
+            _report_safely(coverage_lane, out, clock)
             return out
 
         out.state_status = progress.state_status
@@ -647,14 +647,15 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.stop, out.stop_kind = "CANCELLED mid-sweep", "cancelled"
         _settle_completions(out, inflight=inflight, staged=staged)
         try:
-            _report(coverage_lane, out, clock)
+            _report_safely(coverage_lane, out, clock)
         except BaseException:
             # v68#1: `Exception` alone let a reporting `GeneratorExit` REPLACE the cancellation being
-            # handled. The bare `raise` below must always propagate the original one.
+            # handled. The bare `raise` below must always propagate the original one — including when
+            # the sink raises a cancellation of its own (v74#1).
             pass
         raise
     _settle_completions(out)
-    _report(coverage_lane, out, clock)
+    _report_safely(coverage_lane, out, clock)
     return out
 
 
@@ -793,6 +794,23 @@ def _rank(progress, slots, content, picked):
     target = min({t for t, _ in in_tier}, key=lambda t: (progress.target_seq(t), t))
     return min([s for s in in_tier if s[0] == target],
                key=lambda s: (progress.slot_seq(*s), s[1]))
+
+
+def _report_safely(lane: str, out: SweepResult, clock) -> None:
+    """`_report` behind the driver's contract (v74#1).
+
+    The event sink is I/O: it can fail, and losing the accounting must not turn into an escape from a
+    function that promises to raise nothing but cancellation. The failure becomes a machinery fact on the
+    result — a caller that reads it still learns the run reported nothing."""
+    try:
+        _report(lane, out, clock)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:
+        out.machinery.append(f"coverage could not be reported ({_safe_exc(e)})")
+        if out.stop_kind is None:
+            out.stop = "machinery: coverage could not be reported"
+            out.stop_kind = "machinery"
 
 
 def _report(lane: str, out: SweepResult, clock) -> None:

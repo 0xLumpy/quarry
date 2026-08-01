@@ -1622,3 +1622,31 @@ class TestThePreflightCallbacksAreContained:
         out, tool = _run(tmp_path, words=["alpha"])
         assert tool.calls and out.stop_kind == "machinery", out
         assert out.completion_unstaged == 1, out
+
+    @pytest.mark.parametrize("boom", [OSError("event log gone"), GeneratorExit("not cancellation")])
+    def test_a_REPORTING_failure_on_the_NORMAL_path_is_contained(self, tmp_path, monkeypatch, boom):
+        """v74#1: every ordinary and early-return report call sat outside the containment, so an event
+        sink that failed escaped a driver promising to raise nothing but cancellation."""
+        monkeypatch.setattr(sweep, "_report", lambda *a, **k: (_ for _ in ()).throw(boom))
+        out, tool = _run(tmp_path, words=["alpha"])
+        assert tool.calls, "the work still happened"
+        assert out.stop_kind == "machinery", out
+        assert "coverage could not be reported" in " ".join(out.machinery), out.machinery
+
+    def test_a_REPORTING_failure_on_an_EARLY_return_is_contained(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "_report",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("event log gone")))
+        out, tool = _run(tmp_path, words=["alpha"], dependency_ok=lambda: False)
+        assert tool.calls == [] and "coverage could not be reported" in " ".join(out.machinery)
+        assert out.stop_kind == "dependency", out      # the FIRST cause keeps the stop
+
+    def test_a_REPORTING_CANCELLATION_never_replaces_the_original(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "_report",
+                            lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt("from the sink")))
+
+        class _Cancel(_Tool):
+            def __call__(self, target, unit, words):
+                raise SystemExit("the original")
+
+        with pytest.raises(SystemExit, match="the original"):
+            _run(tmp_path, words=["alpha"], tool=_Cancel())
