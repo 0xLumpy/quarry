@@ -2625,13 +2625,53 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                 vertical._wc_reject_constant(token)
 
     def test_NON_STANDARD_json_constants_are_refused(self, tmp_path, monkeypatch):
-        """`NaN` and `Infinity` are not JSON, and they would flow into a signature and a store row."""
+        """`NaN` and `Infinity` are not JSON. v47#3: the constant has to sit in a field the validator
+        IGNORES — otherwise the field check kills the row anyway and the hook proves nothing. Here the
+        row is valid and distinct, so without the hook it becomes host evidence."""
         def raw(cands):
             bogus = [c for c in cands if c.startswith("quarry-wc-")]
             return "\n".join([json.dumps({"input": bogus[0], "status_code": 200, "content_length": 5,
                                           "title": "wc", "favicon": "x"}),
-                              '{"input": "api.z.acme.com", "status_code": 200, "favicon": NaN}'])
+                              '{"input": "api.z.acme.com", "status_code": 200, "content_length": 99, '
+                              '"title": "real", "favicon": "y", "response_time": NaN}'])
 
         kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
-        assert kept == set(), kept
+        assert kept == set(), kept                 # WITHOUT the hook this row is a live host
         assert "1 unparseable output row(s)" in life[-1]["reason"], life
+
+    def test_a_PACKED_INT_is_not_an_address(self, tmp_path, monkeypatch):
+        """v47#1: `ipaddress.ip_address` accepts an int (and a bool) as a packed IPv4 value, so `a: [1]`
+        parsed and was stored verbatim."""
+        def raw(cands):
+            bogus = [c for c in cands if c.startswith("quarry-wc-")]
+            return "\n".join([json.dumps({"input": bogus[0], "status_code": 200, "content_length": 5,
+                                          "title": "wc", "favicon": "x"}),
+                              json.dumps({"input": "api.z.acme.com", "status_code": 200,
+                                          "content_length": 99, "title": "real", "a": [1]})])
+
+        kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
+        assert kept == set() and list(self._last_run.read("resolved")) == [], kept
+        assert "1 unparseable output row(s)" in life[-1]["reason"], life
+
+    def test_an_ADDRESS_is_stored_CANONICALLY(self, tmp_path, monkeypatch):
+        rows = [{"input": "api.z.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y", "a": ["01.2.3.004"]}]
+        kept, life = self._differ(tmp_path, monkeypatch, rows=rows)
+        # a leading-zero octet is not a valid IPv4 string in Python's strict parser: a parse gap, not a
+        # silently "fixed" address
+        assert kept == set(), kept
+        rows = [{"input": "api.z.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y", "a": ["1.2.3.4"]}]
+        kept, life = self._differ(tmp_path / "ok", monkeypatch, rows=rows)
+        assert kept == {"api.z.acme.com"}
+        assert list(self._last_run.read("resolved"))[-1]["a"] == ["1.2.3.4"]
+
+    def test_a_FAILED_invocation_with_no_artifact_is_COUNTABLE_coverage(self, tmp_path, monkeypatch):
+        """v47#2: `omitted > eligible` made reconciliation drop the measure as invalid and report 0/0/0
+        beside a reason that said one artifact was missing."""
+        kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.FAILED)
+        agg = {(a["source_id"], a["measure"]): a
+               for a in self._last_run._run_summary()["coverage"]}
+        art = agg[("enrich.wildcard_a1d", "output_artifacts")]
+        assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
+        assert art["valid"] is True, art

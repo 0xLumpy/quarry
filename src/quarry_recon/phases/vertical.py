@@ -515,7 +515,10 @@ def _wc_artifact_coverage(sid: str, label: str, st: dict) -> None:
     v46#1: incrementing a counter only changed the lifecycle terminal, while the recorded invocation
     stayed SUCCESS and both other records reported `omitted=0` — so the manifest reconciled the run as
     complete beside a FAILED source."""
-    answered = st.get("zones_obtained", 0)
+    # v47#2: the denominator is every invocation that RETURNED — a FAILED call that wrote no file is a
+    # missing artifact too, and counting only clean answers made `omitted > eligible`, which
+    # reconciliation rejects as invalid and reports as 0/0/0 beside a reason saying otherwise.
+    answered = st.get("probed_zones", 0)
     missing = st.get("missing_artifacts", 0)
     events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT if missing else events.COVERAGE_CAP,
                             unit=f"{label}:artifacts", measure="output_artifacts",
@@ -954,14 +957,24 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
                 shape_ok = False                 # httpx writes a hash or a string; never a bool or float
             addrs = row.get("a")
             if addrs is not None:
+                # v47#1: `ipaddress.ip_address` accepts an INT (and a bool) as a packed IPv4 value, so
+                # `a: [1]` parsed and was stored verbatim. `a` is httpx's A-record list: exact strings,
+                # each a real IPv4 address, stored canonically.
                 if not isinstance(addrs, list):
                     shape_ok = False
                 else:
+                    canon = []
                     for x in addrs:
-                        try:
-                            _ipaddress.ip_address(x)
-                        except (ValueError, TypeError):
+                        if not isinstance(x, str):
                             shape_ok = False
+                            break
+                        try:
+                            canon.append(str(_ipaddress.IPv4Address(x)))
+                        except _ipaddress.AddressValueError:
+                            shape_ok = False
+                            break
+                    else:
+                        row["a"] = canon
             if not shape_ok:
                 st["parse_errors"] += 1
                 continue
