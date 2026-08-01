@@ -2163,7 +2163,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             return False
 
     def _differ(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, words=("api",),
-                sid="enrich.wildcard_a1d", rows=None, caught=None):
+                sid="enrich.wildcard_a1d", rows=None, caught=None, preload=(), st=None):
         from quarry_recon import store
         from quarry_recon.phases import probe, vertical
         run = store.Run.create(tmp_path, "t")
@@ -2192,11 +2192,15 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             ctx.run = run
             ctx.scope = self._S()
             ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            for kind, row in preload:
+                run.add(kind, row)
+            self._last_run = run
             kept = set()
             try:
                 kept = vertical._wildcard_differentiate(ctx, set(zones), extra_words=list(words),
                                                         phase="enrich", label="wildcard-a1d",
-                                                        source="wildcard-http-a1d", source_id=sid)
+                                                        source="wildcard-http-a1d", source_id=sid,
+                                                        stats=st)
             except BaseException as e:      # `caught` lets a test inspect the LIFECYCLE of a raising run
                 if caught is None:
                     raise
@@ -2276,3 +2280,65 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
     def test_the_TWO_lanes_keep_SEPARATE_lifecycles(self, tmp_path, monkeypatch):
         _k, life = self._differ(tmp_path, monkeypatch, rows=[], sid="vertical.wildcard_http")
         assert [e["source_id"] for e in life] == ["vertical.wildcard_http"] * 2, life
+
+    def test_a_FAILED_lifecycle_reaches_the_manifest_VERDICT(self, tmp_path, monkeypatch):
+        """v42#1: the manifest folds recorded RunResults, not lifecycle events, so a differ that exploded
+        left the run reading `complete` with no failure and no gap."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "_wc_differentiate",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("differ exploded")))
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[])
+        assert life[-1]["status"] == "failed", life
+        run = self._last_run
+        summary = run._run_summary()
+        assert summary["verdict"] != "complete", summary
+        assert any("differ exploded" in (f.get("why") or "") for f in summary["failures"]), summary
+
+    def test_an_ALREADY_KNOWN_host_still_counts_as_PRODUCTION(self, tmp_path, monkeypatch):
+        """v42#2: `Run.add` answers "new entity", not "accepted observation" — a host another source had
+        already found was differentiated here and reported as EMPTY with nothing produced."""
+        rows = [{"input": "api.z.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y"}]
+        kept, life = self._differ(tmp_path, monkeypatch, rows=rows,
+                                  preload=[("subdomain", {"host": "api.z.acme.com",
+                                                          "sources": ["subfinder"]})])
+        assert kept == {"api.z.acme.com"}, kept
+        assert life[-1]["status"] == "success" and life[-1]["produced"] == {"subdomains": 1}, life
+
+    def test_the_WORK_UNIT_binds_the_ORDERED_vocabulary_actually_submitted(self, tmp_path, monkeypatch):
+        """v42#3: a set digest could not tell `["api", "admin"]` from its reverse, and a cap selects a
+        PREFIX — so the two submit different names."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "WILDCARD_WORD_CAP", 1)
+        _k1, life1 = self._differ(tmp_path / "a", monkeypatch, rows=[], words=("api", "admin"))
+        _k2, life2 = self._differ(tmp_path / "b", monkeypatch, rows=[], words=("admin", "api"))
+        _k3, life3 = self._differ(tmp_path / "c", monkeypatch, rows=[], words=("api", "admin"))
+        assert life1[0]["work_unit"] != life2[0]["work_unit"], (life1[0], life2[0])
+        assert life1[0]["work_unit"] == life3[0]["work_unit"]
+        # and with NO cap in the way: the same members in a different ORDER are still a different
+        # submission, because the cap selects a prefix of whatever order the lane built.
+        monkeypatch.setattr(vertical, "WILDCARD_WORD_CAP", 5000)
+        _k4, life4 = self._differ(tmp_path / "d", monkeypatch, rows=[], words=("api", "admin"))
+        _k5, life5 = self._differ(tmp_path / "e", monkeypatch, rows=[], words=("admin", "api"))
+        assert life4[0]["work_unit"] != life5[0]["work_unit"], (life4[0], life5[0])
+
+    def test_a_REFUSED_lane_leaves_the_carrier_EMPTY(self, tmp_path, monkeypatch):
+        """v42#4: eligibility was written before the gate, so a disabled lane made its caller report
+        withheld words and undifferentiated zones for a pass that never existed."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "registered", lambda sid: False)
+        st = {}
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], st=st)
+        assert kept == set() and life == []
+        assert st == {"eligible_zones": 0, "probed_zones": 0, "blocked_reason": "",
+                      "blocked": {"zone_cap": 0, "self_or_private": 0}}, st
+
+    def test_a_SETUP_failure_still_emits_a_START_and_a_TERMINAL(self, tmp_path, monkeypatch):
+        """v42#5: eligibility and the work unit were built before the protected interval, so a scope
+        failure escaped without either event."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "_wc_eligible_zones",
+                            lambda ctx, zones: (_ for _ in ()).throw(TypeError("bad zone iterable")))
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[])
+        assert [e["event"] for e in life] == ["tool_start", "tool_finish"], life
+        assert life[-1]["status"] == "failed" and "bad zone iterable" in life[-1]["reason"], life

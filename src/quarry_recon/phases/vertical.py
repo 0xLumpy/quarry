@@ -18,7 +18,8 @@ from pathlib import Path
 from .. import events, netguard, normalize, secrets, settings
 from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, registered, run_contract,
                         run_provider)
-from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
+from ..runner import (RunResult, Status, have, reclassify_from_artifact, run as exec_tool,
+                       skipped)
 
 _SUBFINDER_DEFAULT_MIN = 60                  # default -max-time budget (minutes) for a normal bounded run
 _SUBFINDER_UNBOUNDED_MIN = 1440             # Quarry's "0 = practically unbounded" -> 24h (subfinder can't take 0:
@@ -576,21 +577,35 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
     st.clear()
     st.update({"eligible_zones": 0, "probed_zones": 0, "blocked_reason": "",
                "blocked": {"zone_cap": 0, "self_or_private": 0}})
-    eligible = _wc_eligible_zones(ctx, zones)
-    st["eligible_zones"] = len(eligible)
     if not registered(source_id):
-        return set()                       # a DISABLED lane runs nothing and claims nothing
-    fp = events.work_unit(source_id, inputs={"zones": eligible,
-                                             "vocabulary": _wc_digest(extra_words)},
-                          config={"zone_cap": ZONE_CAP, "word_cap": WILDCARD_WORD_CAP},
-                          schema_version=1)
-    events.tool_start(source_id, cmd=["httpx", "(wildcard-differ)"], input_total=len(eligible),
-                      work_unit=fp)
-    kept: set[str] = set()
+        # the GATE comes before eligibility (v42#4): a refused lane that had filled the carrier made its
+        # caller report withheld words and undifferentiated zones for a pass that never existed.
+        return set()
+    kept: set[str] = set()          # hosts this pass ACCEPTED as distinct vhosts (novel or already known)
+    novel: set[str] = set()         # the subset the store had never seen — an echo detail, not production
+    eligible: list = []
+    started = False
+    fp = None
     outcome = (Status.FAILED, "the wildcard differ did not report an outcome")
     try:
-        _wc_differentiate(ctx, eligible, extra_words=extra_words, phase=phase, label=label,
-                          source=source, st=st, source_id=source_id, kept=kept)
+        # fallible SETUP lives inside the protected interval (v42#5): a scope failure, a malformed zone
+        # iterable or an unreadable vocabulary used to escape without a start/terminal pair at all.
+        eligible = _wc_eligible_zones(ctx, zones)
+        st["eligible_zones"] = len(eligible)
+        # no eligible zone -> nothing to probe WITH either: the vocabulary is not read, so a run with
+        # nothing to differentiate does not report parse facts about a list it would never have used.
+        words = _wc_vocabulary(extra_words, st) if eligible else []
+        # the key binds the ORDERED vocabulary the invocation really submits — the caller's words in
+        # front, the dedicated list behind, deduped and capped (v42#3). A set digest could not tell
+        # `["api", "admin"]` from its reverse, which probe different names under a cap of one.
+        fp = events.work_unit(source_id, inputs={"zones": eligible, "vocabulary": _wc_digest(words)},
+                              config={"zone_cap": ZONE_CAP, "word_cap": WILDCARD_WORD_CAP},
+                              schema_version=1)
+        events.tool_start(source_id, cmd=["httpx", "(wildcard-differ)"], input_total=len(eligible),
+                          work_unit=fp)
+        started = True
+        _wc_differentiate(ctx, eligible, words=words, phase=phase, label=label,
+                          source=source, st=st, source_id=source_id, kept=kept, novel=novel)
         outcome = _wc_terminal(st, kept)
     except (KeyboardInterrupt, SystemExit):
         outcome = ((Status.PARTIAL if kept else Status.FAILED),
@@ -601,59 +616,40 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         outcome = ((Status.PARTIAL if kept else Status.FAILED),
                    f"the wildcard differ failed ({type(ex).__name__}: {ex})")
     finally:
-        events.tool_finish(source_id, status=outcome[0].value, reason=outcome[1], work_unit=fp,
+        why = outcome[1]
+        if outcome[0] in (Status.FAILED, Status.PARTIAL):
+            # the manifest verdict folds RECORDED RunResults, not lifecycle events (v42#1): without this
+            # a differ that exploded left the run reading `complete`, with no failure and no gap.
+            try:
+                ctx.run.record(phase, RunResult("wildcard-differ", ["httpx", "(wildcard-differ)"],
+                                                outcome[0], None, 0.0, None, 0, note=why))
+            except Exception as e:
+                why = f"{why}; the outcome could not be recorded ({type(e).__name__})"
+        if not started:
+            # setup failed before the start: the pair is still emitted, so the source never goes silent
+            events.tool_start(source_id, cmd=["httpx", "(wildcard-differ)"],
+                              input_total=len(eligible), work_unit=fp or "setup-failed")
+        events.tool_finish(source_id, status=outcome[0].value, reason=why, work_unit=fp or "setup-failed",
                            produced={"subdomains": len(kept)})
     return kept
 
 
 def _wc_digest(words) -> str:
-    from .. import sweep as _sweep
-    return _sweep.content_digest(sorted({w for w in (words or []) if w}))
+    """The digest of the ORDERED vocabulary an invocation submits. Order matters: a cap selects a PREFIX,
+    so two lists with the same members but different order probe different names (v42#3)."""
+    import hashlib as _h
+    d = _h.sha256()
+    for w in words or []:
+        d.update(w.encode("utf-8"))
+        d.update(b"\n")
+    return d.hexdigest()
 
 
-def _wc_differentiate(ctx, _zones_all: list, *, extra_words, phase: str, label: str, source: str,
-                      st: dict, source_id: str, kept: set) -> None:
-    """A1 — recover the distinct vhosts hidden behind a wildcard zone. A `*.zone` cert makes every
-    `<word>.zone` resolve to one IP, so a DNS-gated pipeline strips them all as noise and loses the
-    real hosts (CDN / k8s ingress / SaaS). Instead: brute `<word>.zone` + a couple of guaranteed-bogus
-    baseline names, HTTP-probe them all, capture the wildcard's HTTP baseline (the bogus responses'
-    status/length/title/favicon), and keep the candidates whose response DIFFERS from it — the real
-    vhosts. Active + bounded (needs httpx + a wordlist). A non-wildcard zone yields no baseline response
-    → nothing kept. Uses the label wordlist; the target-specific wordlist (A1d) folds in later."""
-    import json as _json
-    import uuid as _uuid
-    scope = ctx.scope
-    # review-B-audit-14: `stats` is the caller's OUT-parameter. Whether this pass actually RAN cannot be
-    # inferred from "there were zones" — passive mode, a missing httpx, no wordlist and the self-contact
-    # guard all return an empty set without probing anything, and a caller that reads that as "it ran"
-    # reports work it never submitted.
-    # review-B-audit-15#2: SNAPSHOT semantics, not `setdefault` — a reused dict could otherwise report
-    # this call's `eligible_zones` beside a previous call's `probed_zones`.
-    zones = _zones_all[:ZONE_CAP]
+def _wc_vocabulary(extra_words, st: dict) -> list:
+    """The ORDERED vocabulary this pass will submit, and the parse facts behind it.
 
-    def _gate(reason: str) -> None:
-        """A hard exit that still REPORTS. review-B-audit-20#1: these returns happened before the `zones`
-        event, so the A1d caller could reconstruct the omission from `stats` but the production vertical
-        caller — which passes none — recorded nothing at all: eligible zones, zero differentiated, verdict
-        `complete`."""
-        st["blocked_reason"] = reason
-        events.coverage_partial(source_id, kind=events.COVERAGE_TIMEOUT, measure="zones", unit=label,
-                                eligible=len(_zones_all), tested=0, omitted=len(_zones_all),
-                                reason=f"{label}: 0/{len(_zones_all)} wildcard zone(s) differentiated "
-                                       f"({reason})")
-        return None
-
-    if not zones:
-        # nothing eligible: still emit (0/0/0 is VALID and clears any earlier gap for this unit)
-        return _gate("no in-scope wildcard zone")
-    if scope.passive_only:
-        # an intentional MODE, not a gap: passive runs make no active pass by design.
-        st["blocked_reason"] = "passive-only mode"
-        return None
-    if not have("httpx"):
-        ctx.run.record(phase, skipped("httpx", f"not installed — {len(_zones_all)} wildcard zone(s) "
-                                               f"undifferentiated ({label})"))
-        return _gate("httpx is not installed")
+    Extracted from the body so the lane's work unit can bind exactly what the invocation submits, and so
+    an unreadable list fails inside the lifecycle rather than beside it (v42#3 / v42#5)."""
     from .probe import _vhost_wordlist          # DEDICATED small label list (lives in probe)
     # review-step4-measure#2: this used to fall back to `_wordlist(ctx)` — the DNS brute list — which
     # `_vhost_wordlist` explicitly promises never to use, "because vhost fuzzing is IPs x apexes x words,
@@ -715,6 +711,53 @@ def _wc_differentiate(ctx, _zones_all: list, *, extra_words, phase: str, label: 
     vocab["usable"] = len(usable)
     vocab["accepted"] = vocab["selected"] = len(words)
     vocab["withheld"] = len(usable) - len(words)
+    return words
+
+
+def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: str, source: str,
+                      st: dict, source_id: str, kept: set, novel: set) -> None:
+    """A1 — recover the distinct vhosts hidden behind a wildcard zone. A `*.zone` cert makes every
+    `<word>.zone` resolve to one IP, so a DNS-gated pipeline strips them all as noise and loses the
+    real hosts (CDN / k8s ingress / SaaS). Instead: brute `<word>.zone` + a couple of guaranteed-bogus
+    baseline names, HTTP-probe them all, capture the wildcard's HTTP baseline (the bogus responses'
+    status/length/title/favicon), and keep the candidates whose response DIFFERS from it — the real
+    vhosts. Active + bounded (needs httpx + a wordlist). A non-wildcard zone yields no baseline response
+    → nothing kept. Uses the label wordlist; the target-specific wordlist (A1d) folds in later."""
+    import json as _json
+    import uuid as _uuid
+    scope = ctx.scope
+    # review-B-audit-14: `stats` is the caller's OUT-parameter. Whether this pass actually RAN cannot be
+    # inferred from "there were zones" — passive mode, a missing httpx, no wordlist and the self-contact
+    # guard all return an empty set without probing anything, and a caller that reads that as "it ran"
+    # reports work it never submitted.
+    # review-B-audit-15#2: SNAPSHOT semantics, not `setdefault` — a reused dict could otherwise report
+    # this call's `eligible_zones` beside a previous call's `probed_zones`.
+    zones = _zones_all[:ZONE_CAP]
+
+    def _gate(reason: str) -> None:
+        """A hard exit that still REPORTS. review-B-audit-20#1: these returns happened before the `zones`
+        event, so the A1d caller could reconstruct the omission from `stats` but the production vertical
+        caller — which passes none — recorded nothing at all: eligible zones, zero differentiated, verdict
+        `complete`."""
+        st["blocked_reason"] = reason
+        events.coverage_partial(source_id, kind=events.COVERAGE_TIMEOUT, measure="zones", unit=label,
+                                eligible=len(_zones_all), tested=0, omitted=len(_zones_all),
+                                reason=f"{label}: 0/{len(_zones_all)} wildcard zone(s) differentiated "
+                                       f"({reason})")
+        return None
+
+    if not zones:
+        # nothing eligible: still emit (0/0/0 is VALID and clears any earlier gap for this unit)
+        return _gate("no in-scope wildcard zone")
+    if scope.passive_only:
+        # an intentional MODE, not a gap: passive runs make no active pass by design.
+        st["blocked_reason"] = "passive-only mode"
+        return None
+    if not have("httpx"):
+        ctx.run.record(phase, skipped("httpx", f"not installed — {len(_zones_all)} wildcard zone(s) "
+                                               f"undifferentiated ({label})"))
+        return _gate("httpx is not installed")
+    vocab = st.get("vocabulary") or {}
     if not words:
         _wc_vocab_coverage(source_id, label, vocab)
         return _gate("no usable vocabulary")       # nothing to probe WITH -> zero zones attempted
@@ -774,11 +817,15 @@ def _wc_differentiate(ctx, _zones_all: list, *, extra_words, phase: str, label: 
             if (o.get("status_code") or 0) // 100 == 3:   # un-followed redirect = infra noise, not a vhost
                 continue
             if _sig(o) not in base:             # differs from the wildcard baseline → a REAL vhost
+                # `Run.add` answers "NEW entity", not "accepted observation" (v42#2): a host another
+                # source had already found was differentiated here too, and the pass reported EMPTY with
+                # nothing produced. Acceptance is the production fact; novelty is an echo detail.
                 if ctx.run.add("subdomain", {"host": host, "sources": [source],
                                              "raw_ref": str(hx)}):
                     ctx.run.add("resolved", {"host": host, "a": o.get("a") or [],
                                              "sources": [source], "raw_ref": str(hx)})
-                    kept.add(host)
+                    novel.add(host)
+                kept.add(host)
     _wc_vocab_coverage(source_id, label, vocab)
     _why = "; ".join(p for p in (
         f"{st['blocked']['zone_cap']} zone(s) over the {ZONE_CAP}-zone cap"
@@ -800,7 +847,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, extra_words, phase: str, label: 
                             reason=f"{label}: wildcard vhost zones {zones_probed}/{len(_zones_all)} probed"
                                    + (f" ({_why})" if _why else ""))
     if kept:
-        ctx.echo(f"  wildcard: +{len(kept)} distinct vhost(s) recovered via HTTP-differentiation ({label})")
+        ctx.echo(f"  wildcard: {len(kept)} distinct vhost(s) differentiated, {len(novel)} new ({label})")
 
 
 def run(ctx) -> None:

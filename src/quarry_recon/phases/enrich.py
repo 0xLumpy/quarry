@@ -327,9 +327,9 @@ def _a1d_recursive_brute(ctx) -> set[str]:
             events.tool_finish(sid, status=outcome[0].value, reason=outcome[1], work_unit=fp,
                                produced={"subdomains": len(discovered)})
 
-    # ── the wildcard differ is its own lane and runs regardless of the brute above. NOTE: today
-    #    `enrich.wildcard_a1d` is a COVERAGE identity only — `_wildcard_differentiate` does not yet gate on
-    #    the registry or emit its own start/terminal. Making it an enforced lifecycle is 4.3. ──
+    # ── the wildcard differ is its own lane and runs regardless of the brute above. It owns its full
+    #    lifecycle now (step 4.3): `_wildcard_differentiate` gates on the registry and emits its own
+    #    start and terminal under `enrich.wildcard_a1d`. Putting its SELECTION on the sweep is next. ──
 
     # wildcard-zone differ with the target words folded in (zones persisted by vertical)
     zones = set(ctx.run.values("wildcard_zone"))
