@@ -2176,7 +2176,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
     def _differ(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, words=("api",),
                 sid="enrich.wildcard_a1d", rows=None, caught=None, preload=(), st=None,
                 status=None, raw=None, break_record=None, raw_bytes=None, run=None, statuses=None,
-                no_artifact=False, no_write=False, guard=None):
+                no_artifact=False, no_write=False, guard=None, tool=None):
         from quarry_recon import store
         from quarry_recon.phases import probe, vertical
         fresh = run is None
@@ -2226,7 +2226,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                     raw_path.write_text("\n".join(out) + "\n")
                 return _RR(tool, cmd, st_now or crawl.Status.SUCCESS, 0, 0.1, raw_path, 0)
 
-            monkeypatch.setattr(vertical, "exec_tool", _tool)
+            monkeypatch.setattr(vertical, "exec_tool", tool or _tool)
             ctx = _Ctx(run.dir, [])
             ctx.run = run
             ctx.scope = self._S()
@@ -3047,3 +3047,60 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert caught and isinstance(caught[0], KeyboardInterrupt), caught
         assert "CANCELLED mid-differ" in life[-1]["reason"], life
         assert "not recorded" in life[-1]["reason"] and "read-only" in life[-1]["reason"], life
+
+    def test_an_UNRECORDED_invocation_keeps_its_OUTCOME_in_the_terminal(self, tmp_path, monkeypatch):
+        """v57: raising the ledger error skipped `_wc_terminal`, so a timed-out invocation whose own
+        RunResult never reached the ledger left NO durable trace of the timeout."""
+        from quarry_recon import store
+        real = store.Run.record
+
+        def _boom(self, phase, result):
+            if result.tool == "httpx":
+                raise OSError("manifest is read-only")
+            return real(self, phase, result)
+
+        monkeypatch.setattr(store.Run, "record", _boom, raising=False)
+        kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.TIMED_OUT, rows=[])
+        reason = life[-1]["reason"]
+        assert "zone outcomes {'timed_out': 1}" in reason, reason
+        assert "read-only" in reason, reason
+        assert reason.count("manifest is read-only") == 1, reason      # named once, not twice
+
+    def test_a_SKIPPED_invocation_and_a_LEDGER_failure_both_reach_the_terminal(self, tmp_path,
+                                                                              monkeypatch):
+        from quarry_recon import store
+        real = store.Run.record
+
+        def _boom(self, phase, result):
+            if result.tool == "httpx":
+                raise OSError("manifest is read-only")
+            return real(self, phase, result)
+
+        monkeypatch.setattr(store.Run, "record", _boom, raising=False)
+        kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.SKIPPED, rows=[],
+                                  zones=("a.acme.com", "b.acme.com"))
+        reason = life[-1]["reason"]
+        assert "httpx did not run" in reason, reason        # the first cause survives
+        assert "read-only" in reason, reason
+
+    def test_a_CANCELLATION_keeps_the_ZONE_facts_gathered_before_it(self, tmp_path, monkeypatch):
+        """v57: the cancellation reason was built from scratch, so a zone that had already come back
+        timed out left no trace in the terminal."""
+        from quarry_recon.phases import vertical
+        from quarry_recon.runner import RunResult as _RR
+        calls = []
+
+        def _tool(tool, cmd, raw_path=None, timeout=None, **k):
+            calls.append(cmd)
+            if len(calls) == 1:
+                return _RR(tool, cmd, crawl.Status.TIMED_OUT, None, 0.1, None, 0)
+            raise KeyboardInterrupt("ctrl-c")
+
+        monkeypatch.setattr(vertical, "exec_tool", _tool)
+        caught = []
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], caught=caught,
+                                  zones=("a.acme.com", "b.acme.com"), tool=_tool)
+        assert caught and isinstance(caught[0], KeyboardInterrupt), caught
+        reason = life[-1]["reason"]
+        assert "zone outcomes {'timed_out': 1}" in reason, reason
+        assert "CANCELLED mid-differ" in reason, reason

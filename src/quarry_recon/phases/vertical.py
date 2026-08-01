@@ -511,7 +511,8 @@ ZONE_CAP = 5
 def _wc_with_ledger(st: dict, why: str) -> str:
     """Fold any known LEDGER failure into an exceptional exit's reason (v56). A `record()` we could not
     make is a fact whatever ends the run, and a later cancellation must not carry it away."""
-    errs = st.get("ledger_errors") or []
+    # v57: an error already named in `why` — the raised ledger failure itself — is not repeated.
+    errs = [e for e in (st.get("ledger_errors") or []) if e.split(": ", 1)[-1] not in why]
     return "; ".join(p for p in (why, f"{len(errs)} tool result(s) not recorded ({'; '.join(errs)})"
                                  if errs else "") if p)
 
@@ -757,15 +758,21 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
                           source=source, st=st, source_id=source_id, kept=kept, novel=novel)
         outcome = _wc_terminal(st, kept)
     except (KeyboardInterrupt, SystemExit):
+        # v57: the ZONE facts gathered before the exit are real and are stated first — an invocation
+        # whose own RunResult never reached the ledger has no other durable trace.
+        _base = _wc_terminal(st, kept)[1] or ""
         outcome = ((Status.PARTIAL if kept else Status.FAILED),
-                   _wc_with_ledger(st, "CANCELLED mid-differ — evidence KEPT" if kept
-                                   else "CANCELLED mid-differ"))
+                   _wc_with_ledger(st, "; ".join(p for p in (
+                       _base, "CANCELLED mid-differ — evidence KEPT" if kept
+                       else "CANCELLED mid-differ") if p)))
         raise                                                  # after the terminal, never before
     except Exception as ex:
+        _base = _wc_terminal(st, kept)[1] or ""                # BEFORE the carrier is overwritten
         st["blocked_reason"] = f"{type(ex).__name__}: {ex}"
         machinery = ex
         outcome = ((Status.PARTIAL if kept else Status.FAILED),
-                   _wc_with_ledger(st, f"the wildcard differ failed ({type(ex).__name__}: {ex})"))
+                   _wc_with_ledger(st, "; ".join(p for p in (
+                       _base, f"the wildcard differ failed ({type(ex).__name__}: {ex})") if p)))
     finally:
         try:
             _wc_report(source_id, label, st)      # every record, on every path (v52#2)
@@ -1137,8 +1144,8 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     # caller that reported both used to print the word cap twice.
     st["blocked_reason"] = _wc_reasons(st)[2]
     if ledger_error is not None:
-        # every zone has been processed and every finding ingested; NOW the run fails on the write it
-        # could not make (v55).
+        # this zone's available evidence has landed and the sweep stopped there (v56); NOW the run fails
+        # on the write it could not make.
         raise ledger_error
     if kept:
         ctx.echo(f"  wildcard: {len(kept)} distinct vhost(s) differentiated, {len(novel)} new ({label})")
