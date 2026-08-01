@@ -675,10 +675,13 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         # no eligible zone -> nothing to probe WITH either: the vocabulary is not read, so a run with
         # nothing to differentiate does not report parse facts about a list it would never have used.
         words = _wc_vocabulary(extra_words, st) if eligible else []
-        # the key binds the ORDERED vocabulary the invocation really submits — the caller's words in
-        # front, the dedicated list behind, deduped and capped (v42#3). A set digest could not tell
-        # `["api", "admin"]` from its reverse, which probe different names under a cap of one.
-        fp = events.work_unit(source_id, inputs={"zones": eligible, "vocabulary": _wc_digest(words)},
+        # the key binds the vocabulary the invocation really submits, CANONICALISED the way
+        # `write_list` canonicalises it (v50#3): the file is sorted and deduplicated, so two selections
+        # with the same members ARE the same submission. Order still decides WHICH words a cap selects,
+        # and that difference shows up as different members — which the digest sees.
+        fp = events.work_unit(source_id,
+                              inputs={"zones": eligible,
+                                      "vocabulary": _wc_digest(sorted(set(words)))},
                               config={"zone_cap": ZONE_CAP, "word_cap": WILDCARD_WORD_CAP},
                               schema_version=WC_PARSER_SCHEMA)
         events.tool_start(source_id, cmd=["httpx", "(wildcard-differ)"], input_total=len(eligible),
@@ -725,8 +728,9 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
 
 
 def _wc_digest(words) -> str:
-    """The digest of the ORDERED vocabulary an invocation submits. Order matters: a cap selects a PREFIX,
-    so two lists with the same members but different order probe different names (v42#3)."""
+    """The digest of the vocabulary an invocation submits, over the list as GIVEN. Callers pass the
+    canonical form — sorted and deduplicated, exactly what `write_list` writes — so the key describes the
+    file that is really sent (v50#3)."""
     import hashlib as _h
     d = _h.sha256()
     for w in words or []:
@@ -882,12 +886,16 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             st["blocked"]["self_or_private"] += 1
             continue
         bogus = [f"quarry-wc-{_uuid.uuid4().hex[:10]}.{zone}" for _ in range(2)]
-        cf = ctx.write_list(f"{label}_cand_{zone.replace('.', '_')}.txt",
+        # v50#1: ONE token names the whole invocation pair. With a stable candidate name, a retry
+        # overwrote the exact contacted set — random baselines included — that the earlier recorded
+        # command still points at.
+        attempt = _uuid.uuid4().hex[:12]
+        cf = ctx.write_list(f"{label}_cand_{zone.replace('.', '_')}_{attempt}.txt",
                             [f"{w}.{zone}" for w in words] + bogus)
         # v49#1: an IMMUTABLE per-invocation path. A stable per-zone one let a timed-out retry that wrote
         # nothing re-read the PREVIOUS attempt's artifact and report its findings as its own — and a normal
         # retry overwrote evidence earlier records already point at.
-        hx = ctx.run.raw_path(phase, label, f"{zone}-{_uuid.uuid4().hex[:12]}.jsonl")
+        hx = ctx.run.raw_path(phase, label, f"{zone}-{attempt}.jsonl")
         # -follow-redirects so the signature is the FINAL response, not a bare redirect: without it a
         # candidate httpx probes on http gets the wildcard's uniform 308→https (status 308, len 0) —
         # which "differs" from the 200 baseline and floods false positives. Following it collapses
@@ -1048,18 +1056,26 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     # review-B-audit-15#4 / 16#3: the SOURCE and the UNIT are the caller's. Reconciliation keeps the
     # latest per (source, unit) and then aggregates per source — a hard-coded id let the A1d invocation
     # replace the vertical pass's coverage AND file its own work under the vertical lifecycle.
+    # v50#2: SELECTION and EXECUTION are different questions and were sharing one record, so a parse
+    # error in the zone we DID probe relabelled the policy-capped remainder as a timeout. Selection: how
+    # many eligible zones did we choose to contact, and what withheld the rest (a clean CAP). Execution:
+    # of those chosen, how many invocations actually returned (a GAP when something stopped us).
+    selected = len(zones) - st["blocked"]["self_or_private"]
+    events.coverage_partial(source_id, kind=events.COVERAGE_CAP, measure="zones", unit=label,
+                            eligible=len(_zones_all), tested=max(0, selected),
+                            omitted=max(0, len(_zones_all) - selected),
+                            reason=f"{label}: wildcard vhost zones {max(0, selected)}/{len(_zones_all)} "
+                                   f"selected for contact" + (f" ({_why})" if _why else ""))
+    exec_gap = bool(st.get("stopped") or st.get("invocation_classes") or st.get("parse_errors")
+                    or st.get("missing_artifacts") or st.get("unreadable_artifacts"))
     events.coverage_partial(source_id,
-                            # a policy bound is a CAP; a tool that stopped running, an unusable answer or
-                            # a missing artifact is a GAP (v45#1)
-                            kind=(events.COVERAGE_TIMEOUT
-                                  if (st.get("stopped") or st.get("invocation_classes")
-                                      or st.get("parse_errors") or st.get("missing_artifacts"))
-                                  else events.COVERAGE_CAP),
-                            measure="zones", unit=label,
-                            eligible=len(_zones_all), tested=zones_probed,
-                            omitted=max(0, len(_zones_all) - zones_probed),
-                            reason=f"{label}: wildcard vhost zones {zones_probed}/{len(_zones_all)} probed"
-                                   + (f" ({_why})" if _why else ""))
+                            kind=events.COVERAGE_TIMEOUT if exec_gap else events.COVERAGE_CAP,
+                            measure="zone_execution", unit=f"{label}:execution",
+                            eligible=max(0, selected), tested=zones_probed,
+                            omitted=max(0, selected - zones_probed),
+                            reason=f"{label}: {zones_probed}/{max(0, selected)} selected zone(s) "
+                                   f"returned an invocation"
+                                   + (f" ({st['stopped']})" if st.get("stopped") else ""))
     if kept:
         ctx.echo(f"  wildcard: {len(kept)} distinct vhost(s) differentiated, {len(novel)} new ({label})")
 

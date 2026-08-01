@@ -545,7 +545,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
             extra_words=["https://outside.example/private", "evil.example.com", "ok", "under_score",
                          "-lead", "trail-", "a" * 64, "UPPER"],
             label="wildcard", stats=st)
-        cand = ctx.run.dir / "work" / "wildcard_cand_wild_acme_com.txt"
+        # the candidate file carries a per-INVOCATION token now (v50#1), so it is found by prefix
+        cand = next((ctx.run.dir / "work").glob("wildcard_cand_wild_acme_com_*.txt"))
         lines = [ln for ln in cand.read_text().splitlines() if ln.strip()]
         for ln in lines:
             assert ln.endswith(".wild.acme.com"), ln
@@ -686,7 +687,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         st = {}
         vertical._wildcard_differentiate(ctx, {"a.acme.com"}, extra_words=["safe\n", "API", "api"],
                                          label="wildcard", stats=st)
-        cand = [ln for ln in (ctx.run.dir / "work" / "wildcard_cand_a_acme_com.txt").read_text()
+        cand = [ln for ln in next((ctx.run.dir / "work").glob("wildcard_cand_a_acme_com_*.txt")).read_text()
                 .splitlines() if ln.strip()]
         assert not any("\n" in ln or ln.startswith("safe") for ln in cand), cand
         # ...and canonicalisation happens BEFORE dedup: API and api are ONE contacted name
@@ -787,7 +788,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
             sel = cov[("vertical.wildcard_http", "vocabulary_words")]
             assert (sel["eligible"], sel["tested"], sel["omitted"]) == (1, 1, 0), sel
             # dedup is NOT a loss: one name, contacted once
-            cand = [ln for ln in (ctx.run.dir / "work" / "wildcard_cand_a_acme_com.txt").read_text()
+            cand = [ln for ln in next((ctx.run.dir / "work").glob("wildcard_cand_a_acme_com_*.txt")).read_text()
                     .splitlines() if ln.strip()]
             assert cand.count("api.a.acme.com") == 1, cand
         finally:
@@ -2165,7 +2166,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
     def _differ(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, words=("api",),
                 sid="enrich.wildcard_a1d", rows=None, caught=None, preload=(), st=None,
                 status=None, raw=None, break_record=None, raw_bytes=None, run=None, statuses=None,
-                no_artifact=False, no_write=False):
+                no_artifact=False, no_write=False, guard=None):
         from quarry_recon import store
         from quarry_recon.phases import probe, vertical
         fresh = run is None
@@ -2177,7 +2178,8 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             monkeypatch.setattr(vertical, "have", lambda t: httpx)
             monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
             monkeypatch.setattr(vertical.netguard, "contact_state",
-                                lambda host, block_private=False: ("public", False, None))
+                                lambda host, block_private=False: (guard or "public",
+                                                                   guard is not None, None))
             monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
             monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
             from quarry_recon.runner import RunResult as _RR
@@ -2353,12 +2355,13 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         _k3, life3 = self._differ(tmp_path / "c", monkeypatch, rows=[], words=("api", "admin"))
         assert life1[0]["work_unit"] != life2[0]["work_unit"], (life1[0], life2[0])
         assert life1[0]["work_unit"] == life3[0]["work_unit"]
-        # and with NO cap in the way: the same members in a different ORDER are still a different
-        # submission, because the cap selects a prefix of whatever order the lane built.
+        # v50#3: with NO cap in the way the two orders submit the SAME file — `write_list` sorts and
+        # deduplicates — so they are the same work, and the key says so. Order only decides WHICH words a
+        # cap selects, and that difference is a difference in MEMBERS (above).
         monkeypatch.setattr(vertical, "WILDCARD_WORD_CAP", 5000)
         _k4, life4 = self._differ(tmp_path / "d", monkeypatch, rows=[], words=("api", "admin"))
         _k5, life5 = self._differ(tmp_path / "e", monkeypatch, rows=[], words=("admin", "api"))
-        assert life4[0]["work_unit"] != life5[0]["work_unit"], (life4[0], life5[0])
+        assert life4[0]["work_unit"] == life5[0]["work_unit"], (life4[0], life5[0])
 
     def test_a_REFUSED_lane_leaves_the_carrier_EMPTY(self, tmp_path, monkeypatch):
         """v42#4: eligibility was written before the gate, so a disabled lane made its caller report
@@ -2541,8 +2544,11 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                                   statuses=[crawl.Status.SUCCESS, crawl.Status.SKIPPED])
         assert life[-1]["status"] == "failed", life           # trouble, and nothing was produced
         assert "httpx did not run" in life[-1]["reason"], life
-        zones = [e for e in self._events if e.get("measure") == "zones"]
-        assert zones[-1]["kind"] == "timeout" and zones[-1]["omitted"] == 1, zones
+        # v50#2: SELECTION says both zones were chosen (no cap withheld anything); EXECUTION is the gap
+        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        assert sel["kind"] == "cap" and (sel["eligible"], sel["tested"]) == (2, 2), sel
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert ex["kind"] == "timeout" and (ex["eligible"], ex["tested"], ex["omitted"]) == (2, 1, 1), ex
 
     def test_a_row_with_NO_status_code_is_not_a_live_host(self, tmp_path, monkeypatch):
         """v45#2: the signature fields were all optional, so `{"input": "api.z.acme.com"}` was rescued as
@@ -2753,3 +2759,46 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
         assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
         assert "0 produced none, 1 unreadable" in art["reason"], art
+
+    def test_a_CAPPED_zone_is_not_relabelled_by_an_execution_gap(self, tmp_path, monkeypatch):
+        """v50#2: one record carried both questions, so a parse error in the zone we DID probe turned the
+        policy-capped remainder into a timeout."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "ZONE_CAP", 1)
+
+        def raw(cands):
+            bogus = [c for c in cands if c.startswith("quarry-wc-")]
+            return "\n".join([json.dumps({"input": bogus[0], "status_code": 200, "content_length": 5,
+                                          "title": "wc", "favicon": "x"}), "{oops"])
+
+        kept, life = self._differ(tmp_path, monkeypatch, raw=raw,
+                                  zones=("a.acme.com", "b.acme.com"))
+        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        assert sel["kind"] == "cap" and (sel["eligible"], sel["tested"], sel["omitted"]) == (2, 1, 1), sel
+        assert "over the 1-zone cap" in sel["reason"], sel
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert ex["kind"] == "timeout" and (ex["eligible"], ex["tested"]) == (1, 1), ex
+        rows = [e for e in self._events if e.get("measure") == "output_rows"][-1]
+        assert rows["omitted"] == 1, rows
+
+    def test_a_GUARD_refusal_is_a_SELECTION_fact_not_an_execution_one(self, tmp_path, monkeypatch):
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], guard="self")
+        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        assert (sel["eligible"], sel["tested"], sel["omitted"]) == (1, 0, 1), sel
+        assert sel["kind"] == "cap" and "contact guard" in sel["reason"], sel
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert (ex["eligible"], ex["tested"], ex["omitted"]) == (0, 0, 0), ex
+
+    def test_the_INVOCATION_PAIR_is_kept_whole(self, tmp_path, monkeypatch):
+        """v50#1: only the output carried a token, so a retry overwrote the exact contacted set — random
+        baselines included — that the earlier recorded command still points at."""
+        rows = [{"input": "api.z.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y"}]
+        self._differ(tmp_path, monkeypatch, rows=rows)
+        run = self._last_run
+        self._differ(tmp_path, monkeypatch, rows=rows, run=run)
+        cands = sorted((run.dir / "work").glob("wildcard-a1d_cand_z_acme_com_*.txt"))
+        arts = sorted((run.dir / "raw" / "enrich" / "wildcard-a1d").glob("z.acme.com-*.jsonl"))
+        assert len(cands) == 2 and len(arts) == 2, (cands, arts)
+        # the pair shares ONE token, so an artifact can always be traced to the exact list it probed
+        assert {c.stem.rsplit("_", 1)[-1] for c in cands} == {a.stem.rsplit("-", 1)[-1] for a in arts}
