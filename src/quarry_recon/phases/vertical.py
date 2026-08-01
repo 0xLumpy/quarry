@@ -508,6 +508,14 @@ WC_PARSER_SCHEMA = 2
 ZONE_CAP = 5
 
 
+def _wc_with_ledger(st: dict, why: str) -> str:
+    """Fold any known LEDGER failure into an exceptional exit's reason (v56). A `record()` we could not
+    make is a fact whatever ends the run, and a later cancellation must not carry it away."""
+    errs = st.get("ledger_errors") or []
+    return "; ".join(p for p in (why, f"{len(errs)} tool result(s) not recorded ({'; '.join(errs)})"
+                                 if errs else "") if p)
+
+
 def _wc_reasons(st: dict) -> tuple:
     """(selection, execution, combined) causes, composed from the RAW facts only — so it is idempotent
     and identical whether the body finished or a gate returned early (v52#1)."""
@@ -750,13 +758,14 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         outcome = _wc_terminal(st, kept)
     except (KeyboardInterrupt, SystemExit):
         outcome = ((Status.PARTIAL if kept else Status.FAILED),
-                   "CANCELLED mid-differ — evidence KEPT" if kept else "CANCELLED mid-differ")
+                   _wc_with_ledger(st, "CANCELLED mid-differ — evidence KEPT" if kept
+                                   else "CANCELLED mid-differ"))
         raise                                                  # after the terminal, never before
     except Exception as ex:
         st["blocked_reason"] = f"{type(ex).__name__}: {ex}"
         machinery = ex
         outcome = ((Status.PARTIAL if kept else Status.FAILED),
-                   f"the wildcard differ failed ({type(ex).__name__}: {ex})")
+                   _wc_with_ledger(st, f"the wildcard differ failed ({type(ex).__name__}: {ex})"))
     finally:
         try:
             _wc_report(source_id, label, st)      # every record, on every path (v52#2)
@@ -1011,7 +1020,12 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         if r.status is Status.SKIPPED:
             break
         if blob is None:
-            continue                            # the artifact loss is already accounted for above
+            # the artifact loss is already accounted for above. If the ledger also failed there is
+            # nothing left to ingest for this zone, so stop here rather than contacting another (v56).
+            if ledger_error is not None:
+                st["stopped"] = st.get("stopped") or "the invocation could not be recorded"
+                break
+            continue
         # v44#5: bytes, not text — one invalid UTF-8 line used to abort the WHOLE artifact as machinery
         # instead of costing one row. Every row is then validated STRUCTURALLY before it can reach `_sig`
         # or the store, and a row for a name this invocation never submitted is not our evidence.
@@ -1113,6 +1127,12 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
                 ctx.run.add("resolved", {"host": host, "a": o.get("a") or [],
                                          "sources": [source], "raw_ref": str(hx)})
                 kept.add(host)
+        if ledger_error is not None:
+            # v56: this zone's evidence is in — and there will be NO further contact after a write we
+            # could not make. Continuing risked a later cancellation exiting past the deferred raise and
+            # taking the known ledger failure with it, and it would have been unrecorded traffic anyway.
+            st["stopped"] = st.get("stopped") or "the invocation could not be recorded"
+            break
     # review-B-audit-18#2: ZONE reasons only. The vocabulary facts live in `stats["vocabulary"]`, and a
     # caller that reported both used to print the word cap twice.
     st["blocked_reason"] = _wc_reasons(st)[2]

@@ -2944,14 +2944,15 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         kept, life = self._differ(tmp_path, monkeypatch, rows=[], zones=("a.acme.com", "b.acme.com"),
                                   **kw)
         if check == "artifacts":
-            # v55: a ledger failure no longer aborts the sweep — both zones are contacted, and both
-            # missing artifacts are accounted for
+            # v56: this zone's facts are kept, and there is NO further contact after a write we could
+            # not make — so exactly one zone was contacted
             art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
-            assert (art["eligible"], art["tested"], art["omitted"]) == (2, 0, 2), art
+            assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
         else:
             ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
             assert "httpx did not run" in ex["reason"], ex
             assert (ex["eligible"], ex["tested"], ex["omitted"]) == (2, 0, 2), ex
+            assert "could not be recorded" not in ex["reason"], ex   # the SKIP is the first cause
         assert life[-1]["status"] == "failed" and "read-only" in life[-1]["reason"], life
 
     def test_UNKNOWN_eligibility_is_not_an_EMPTY_set(self, tmp_path, monkeypatch):
@@ -2994,3 +2995,55 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         # ...and the run still FAILS on the write it could not make
         assert life[-1]["status"] == "partial" and "read-only" in life[-1]["reason"], life
         assert self._last_run._run_summary()["verdict"] != "complete"
+
+    def test_a_LEDGER_failure_STOPS_further_contact(self, tmp_path, monkeypatch):
+        """v56: the lane kept probing after a write it could not make — unrecorded traffic, and a later
+        exit could carry the known failure away."""
+        from quarry_recon import store
+        real = store.Run.record
+        seen = []
+
+        def _boom(self, phase, result):
+            if result.tool == "httpx":
+                seen.append(result)
+                raise OSError("manifest is read-only")
+            return real(self, phase, result)
+
+        monkeypatch.setattr(store.Run, "record", _boom, raising=False)
+        rows = [{"input": "api.a.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y"}]
+        kept, life = self._differ(tmp_path, monkeypatch, rows=rows,
+                                  zones=("a.acme.com", "b.acme.com"))
+        assert len(seen) == 1, seen                       # exactly ONE zone was contacted
+        assert kept == {"api.a.acme.com"}, kept           # its evidence still landed
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert (ex["eligible"], ex["tested"], ex["omitted"]) == (2, 1, 1), ex
+        assert "could not be recorded" in ex["reason"], ex
+        assert life[-1]["status"] == "partial" and "read-only" in life[-1]["reason"], life
+
+    def test_a_CANCELLATION_after_a_ledger_failure_keeps_BOTH_facts(self, tmp_path, monkeypatch):
+        """v56: the terminal said only CANCELLED and the ledger failure vanished."""
+        from quarry_recon import store
+        from quarry_recon.phases import vertical
+        real = store.Run.record
+
+        def _boom(self, phase, result):
+            if result.tool == "httpx":
+                raise OSError("manifest is read-only")
+            return real(self, phase, result)
+
+        monkeypatch.setattr(store.Run, "record", _boom, raising=False)
+        real_add = store.Run.add
+
+        def _cancel(self, kind, row):
+            raise KeyboardInterrupt("ctrl-c")
+
+        monkeypatch.setattr(store.Run, "add", _cancel, raising=False)
+        rows = [{"input": "api.a.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y"}]
+        caught = []
+        kept, life = self._differ(tmp_path, monkeypatch, rows=rows, caught=caught,
+                                  zones=("a.acme.com", "b.acme.com"))
+        assert caught and isinstance(caught[0], KeyboardInterrupt), caught
+        assert "CANCELLED mid-differ" in life[-1]["reason"], life
+        assert "not recorded" in life[-1]["reason"] and "read-only" in life[-1]["reason"], life
