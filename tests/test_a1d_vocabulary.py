@@ -485,6 +485,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
         vertical._wildcard_differentiate(ctx, {"out.of.scope.example"}, extra_words=["api"], stats=st)
         assert st == {"eligible_zones": 0, "probed_zones": 0,
                       "blocked_reason": "no in-scope wildcard zone",
+                      # v52#1: selection and execution carry their own causes now
+                      "selection_reason": "no in-scope wildcard zone", "gate_reason": "",
                       "blocked": {"zone_cap": 0, "self_or_private": 0}}, st
 
     def test_a_GUARD_refusal_says_so_instead_of_blaming_the_cap(self, tmp_path, monkeypatch):
@@ -2379,6 +2381,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         kept, life = self._differ(tmp_path, monkeypatch, rows=[], st=st)
         assert kept == set() and life == []
         assert st == {"eligible_zones": 0, "probed_zones": 0, "blocked_reason": "",
+                      "selection_reason": "", "gate_reason": "",
                       "blocked": {"zone_cap": 0, "self_or_private": 0}}, st
 
     def test_a_SETUP_failure_still_emits_a_START_and_a_TERMINAL(self, tmp_path, monkeypatch):
@@ -2832,3 +2835,47 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             rec = [e for e in self._events if e.get("measure") == measure][-1]
             assert (rec["eligible"], rec["tested"], rec["omitted"]) == (0, 0, 0), rec
             assert rec["kind"] == "cap", rec
+
+    def test_SELECTION_and_EXECUTION_carry_their_OWN_causes(self, tmp_path, monkeypatch):
+        """v52#1: one reason was appended to both, so the CAP's omitted zone claimed httpx caused it."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "ZONE_CAP", 1)
+        kept, life = self._differ(tmp_path, monkeypatch, httpx=False,
+                                  zones=("a.acme.com", "b.acme.com"))
+        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        assert "over the 1-zone cap" in sel["reason"], sel
+        assert "httpx" not in sel["reason"], sel
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert "httpx is not installed" in ex["reason"], ex
+        assert "zone cap" not in ex["reason"], ex
+
+    def test_a_GUARD_refusal_is_a_SELECTION_cause(self, tmp_path, monkeypatch):
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], guard="self")
+        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        assert "contact guard" in sel["reason"] and sel["omitted"] == 1, sel
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert "contact guard" not in ex["reason"], ex
+
+    @pytest.mark.parametrize("boom,want", [(OSError("differ exploded"), "failed"),
+                                           (KeyboardInterrupt("ctrl-c"), "failed")])
+    def test_an_EXCEPTIONAL_exit_still_reports_every_record(self, tmp_path, monkeypatch, boom, want):
+        """v52#2: an exception or a cancellation jumped past the body's reporting tail, so selection and
+        execution accounting disappeared even though the machinery failure kept the verdict honest."""
+        from quarry_recon.phases import vertical
+
+        def explode(*a, **k):
+            k["st"]["probed_zones"] = 0
+            raise boom
+
+        monkeypatch.setattr(vertical, "_wc_differentiate", explode)
+        caught = []
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], caught=caught,
+                                  zones=("a.acme.com", "b.acme.com"))
+        assert life[-1]["status"] == want, life
+        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert (sel["eligible"], sel["tested"]) == (2, 2), sel
+        assert (ex["eligible"], ex["tested"], ex["omitted"]) == (2, 0, 2), ex
+        assert ex["kind"] == "timeout", ex
+        for measure in ("output_rows", "output_artifacts"):
+            assert [e for e in self._events if e.get("measure") == measure], measure

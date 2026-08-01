@@ -508,6 +508,49 @@ WC_PARSER_SCHEMA = 2
 ZONE_CAP = 5
 
 
+def _wc_reasons(st: dict) -> tuple:
+    """(selection, execution, combined) causes, composed from the RAW facts only — so it is idempotent
+    and identical whether the body finished or a gate returned early (v52#1)."""
+    blocked = st.get("blocked", {}) or {}
+    sel = "; ".join(p for p in (
+        st.get("selection_reason") or "",
+        f"{blocked.get('zone_cap', 0)} zone(s) over the {ZONE_CAP}-zone cap" if blocked.get("zone_cap")
+        else "",
+        f"{blocked.get('self_or_private', 0)} zone(s) refused by the self/private contact guard"
+        if blocked.get("self_or_private") else "") if p)
+    ex = "; ".join(p for p in (st.get("gate_reason") or "", st.get("stopped") or "") if p)
+    return sel, ex, "; ".join(p for p in (ex, sel) if p)
+
+
+def _wc_report(sid: str, label: str, st: dict) -> None:
+    """EVERY coverage record this lane owns, emitted from ONE boundary the wrapper runs on every path.
+
+    v52#2: they used to be emitted at the end of the body, so an exception or a cancellation took the
+    whole denominator with it — the machinery failure protected the verdict, but selection and execution
+    accounting simply vanished."""
+    eligible = st.get("eligible_zones", 0)
+    selected = max(0, eligible - st.get("blocked", {}).get("zone_cap", 0)
+                   - st.get("blocked", {}).get("self_or_private", 0))
+    probed = st.get("probed_zones", 0)
+    sel_why, exec_why, _ = _wc_reasons(st)
+    events.coverage_partial(sid, kind=events.COVERAGE_CAP, measure="zones", unit=label,
+                            eligible=eligible, tested=selected, omitted=max(0, eligible - selected),
+                            reason=f"{label}: wildcard vhost zones {selected}/{eligible} selected for "
+                                   f"contact" + (f" ({sel_why})" if sel_why else ""))
+    missing = max(0, selected - probed)
+    events.coverage_partial(sid,
+                            # EXECUTION is timeout-class only when a SELECTED zone did not return (v51#2)
+                            kind=events.COVERAGE_TIMEOUT if missing else events.COVERAGE_CAP,
+                            measure="zone_execution", unit=f"{label}:execution",
+                            eligible=selected, tested=probed, omitted=missing,
+                            reason=f"{label}: {probed}/{selected} selected zone(s) returned an invocation"
+                                   + (f" ({exec_why})" if exec_why else ""))
+    if st.get("vocabulary"):
+        _wc_vocab_coverage(sid, label, st["vocabulary"])
+    _wc_rows_coverage(sid, label, st)
+    _wc_artifact_coverage(sid, label, st)
+
+
 def _wc_artifact_coverage(sid: str, label: str, st: dict) -> None:
     """Structured ARTIFACT coverage — an invocation that RETURNED but wrote no output is evidence we
     asked for and did not get. Every returned process counts, whatever its status: a failed call that
@@ -653,8 +696,8 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
     one that ran and found nothing."""
     st = stats if stats is not None else {}
     st.clear()
-    st.update({"eligible_zones": 0, "probed_zones": 0, "blocked_reason": "",
-               "blocked": {"zone_cap": 0, "self_or_private": 0}})
+    st.update({"eligible_zones": 0, "probed_zones": 0, "blocked_reason": "", "selection_reason": "",
+               "gate_reason": "", "blocked": {"zone_cap": 0, "self_or_private": 0}})
     if not registered(source_id):
         # the GATE comes before eligibility (v42#4): a refused lane that had filled the carrier made its
         # caller report withheld words and undifferentiated zones for a pass that never existed.
@@ -700,6 +743,10 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         outcome = ((Status.PARTIAL if kept else Status.FAILED),
                    f"the wildcard differ failed ({type(ex).__name__}: {ex})")
     finally:
+        try:
+            _wc_report(source_id, label, st)      # every record, on every path (v52#2)
+        except Exception as e:
+            st["blocked_reason"] = f"{st.get('blocked_reason') or ''}; coverage not reported ({e})"
         why = outcome[1]
         if machinery is not None:
             # MACHINERY only (v43#1): a capped or guard-refused pass is an omission the coverage record
@@ -829,53 +876,28 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     zones = _zones_all[:ZONE_CAP]
     st["blocked"]["zone_cap"] = max(0, len(_zones_all) - ZONE_CAP)
 
-    def _selected() -> int:
-        """Zones this pass CHOSE to contact: eligible, minus the cap, minus what the guard refused."""
-        return max(0, len(zones) - st["blocked"]["self_or_private"])
+    def _gate(reason: str, *, selection: bool = False) -> None:
+        """A hard exit. It records WHY and returns; the reporting boundary in the wrapper emits every
+        record (v52#2), so an exception on the way out cannot take the accounting with it.
 
-    def _zone_records(reason: str, probed: int) -> None:
-        """SELECTION and EXECUTION, on every exit (v51#1). A hard gate used to emit only the old combined
-        record, so a run that was capped to one zone AND missing httpx lost the clean one-zone selection
-        and reported the whole eligible set as a timeout."""
-        selected = _selected()
-        events.coverage_partial(source_id, kind=events.COVERAGE_CAP, measure="zones", unit=label,
-                                eligible=len(_zones_all), tested=selected,
-                                omitted=max(0, len(_zones_all) - selected),
-                                reason=f"{label}: wildcard vhost zones {selected}/{len(_zones_all)} "
-                                       f"selected for contact" + (f" ({reason})" if reason else ""))
-        missing = max(0, selected - probed)
-        events.coverage_partial(source_id,
-                                # EXECUTION is timeout-class only when a SELECTED zone did not return
-                                # (v51#2): parse loss and artifact loss have their own measures, and
-                                # process outcomes reach the terminal.
-                                kind=events.COVERAGE_TIMEOUT if missing else events.COVERAGE_CAP,
-                                measure="zone_execution", unit=f"{label}:execution",
-                                eligible=selected, tested=probed, omitted=missing,
-                                reason=f"{label}: {probed}/{selected} selected zone(s) returned an "
-                                       f"invocation" + (f" ({reason})" if reason else ""))
-
-    def _gate(reason: str) -> None:
-        """A hard exit that still REPORTS. review-B-audit-20#1: these returns happened before the `zones`
-        event, so the A1d caller could reconstruct the omission from `stats` but the production vertical
-        caller — which passes none — recorded nothing at all: eligible zones, zero differentiated, verdict
-        `complete`."""
+        review-B-audit-20#1: these returns happened before the `zones` event, so the A1d caller could
+        reconstruct the omission from `stats` but the production vertical caller — which passes none —
+        recorded nothing at all: eligible zones, zero differentiated, verdict `complete`."""
         st["blocked_reason"] = reason
-        _zone_records(reason, 0)
+        st["selection_reason" if selection else "gate_reason"] = reason
 
     if not zones:
         # nothing eligible: still emit (0/0/0 is VALID and clears any earlier gap for this unit)
-        return _gate("no in-scope wildcard zone")
+        return _gate("no in-scope wildcard zone", selection=True)
     if scope.passive_only:
         # an intentional MODE, not a gap: passive runs make no active pass by design.
-        st["blocked_reason"] = "passive-only mode"
+        st["blocked_reason"] = st["gate_reason"] = "passive-only mode"
         return None
     if not have("httpx"):
         ctx.run.record(phase, skipped("httpx", f"not installed — {len(_zones_all)} wildcard zone(s) "
                                                f"undifferentiated ({label})"))
         return _gate("httpx is not installed")
-    vocab = st.get("vocabulary") or {}
     if not words:
-        _wc_vocab_coverage(source_id, label, vocab)
         return _gate("no usable vocabulary")       # nothing to probe WITH -> zero zones attempted
     block_private = netguard._block_private(ctx)
 
@@ -1060,26 +1082,9 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
                 ctx.run.add("resolved", {"host": host, "a": o.get("a") or [],
                                          "sources": [source], "raw_ref": str(hx)})
                 kept.add(host)
-    _wc_vocab_coverage(source_id, label, vocab)
-    _wc_rows_coverage(source_id, label, st)
-    _wc_artifact_coverage(source_id, label, st)
-    _why = "; ".join(p for p in (
-        st.get("stopped") or "",
-        f"{st['blocked']['zone_cap']} zone(s) over the {ZONE_CAP}-zone cap"
-        if st["blocked"]["zone_cap"] else "",
-        f"{st['blocked']['self_or_private']} zone(s) refused by the self/private contact guard"
-        if st["blocked"]["self_or_private"] else "") if p)
     # review-B-audit-18#2: ZONE reasons only. The vocabulary facts live in `stats["vocabulary"]`, and a
     # caller that reported both used to print the word cap twice.
-    st["blocked_reason"] = _why
-    # coverage AFTER filtering (audit #5): `tested` = zones ACTUALLY probed (safe candidates existed), so a
-    # zone skipped for being internal / dnsx-missing is honestly counted as omitted, not tested.
-    # review-B-audit-15#4 / 16#3: the SOURCE and the UNIT are the caller's. Reconciliation keeps the
-    # latest per (source, unit) and then aggregates per source — a hard-coded id let the A1d invocation
-    # replace the vertical pass's coverage AND file its own work under the vertical lifecycle.
-    # v50#2: SELECTION and EXECUTION are different questions and were sharing one record, so a parse
-    # error in the zone we DID probe relabelled the policy-capped remainder as a timeout.
-    _zone_records(_why, zones_probed)
+    st["blocked_reason"] = _wc_reasons(st)[2]
     if kept:
         ctx.echo(f"  wildcard: {len(kept)} distinct vhost(s) differentiated, {len(novel)} new ({label})")
 
