@@ -1295,3 +1295,43 @@ class TestTheAdmissionHook:
 
         with pytest.raises(KeyboardInterrupt):
             _run(tmp_path, words=["alpha"], admit=lambda _t: Interrupting())
+
+    def test_a_REPORTING_BaseException_never_replaces_the_cancellation(self, tmp_path, monkeypatch):
+        """v68#1: catching `Exception` alone let a reporting `GeneratorExit` become the exception that
+        left the driver, in place of the Ctrl-C being handled."""
+        monkeypatch.setattr(sweep, "_report",
+                            lambda *a, **k: (_ for _ in ()).throw(GeneratorExit("log gone")))
+
+        def admit(_target):
+            raise KeyboardInterrupt("ctrl-c")
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, words=["alpha"], admit=admit)
+
+    def test_a_HOSTILE_TYPE_NAME_is_contained_too(self, tmp_path):
+        """v68#2: `_safe_repr` protected the value, but `type(value).__name__` went through a metaclass
+        that can raise just as easily."""
+        class Meta(type):
+            @property
+            def __name__(cls):
+                raise RuntimeError("name exploded")
+
+        class Hostile(metaclass=Meta):
+            def __repr__(self):
+                return "<hostile>"
+
+        out, tool = _run(tmp_path, words=["alpha"], admit=lambda _t: Hostile())
+        assert tool.calls == [] and out.stop_kind == "machinery"
+        assert "<unrepresentable> <hostile>" in " ".join(out.machinery), out.machinery
+
+    def test_a_HOSTILE_exception_STR_is_contained(self, tmp_path):
+        class Hostile(Exception):
+            def __str__(self):
+                raise RuntimeError("str exploded")
+
+        def admit(_target):
+            raise Hostile()
+
+        out, tool = _run(tmp_path, words=["alpha"], admit=admit)
+        assert tool.calls == [] and out.stop_kind == "machinery"
+        assert "Hostile: <unrepresentable>" in " ".join(out.machinery), out.machinery

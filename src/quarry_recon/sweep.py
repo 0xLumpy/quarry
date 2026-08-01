@@ -420,7 +420,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 except (KeyboardInterrupt, SystemExit):
                     raise
                 except Exception as e:
-                    out.machinery.append(f"{target}: admission check raised ({type(e).__name__}: {e})")
+                    out.machinery.append(f"{target}: admission check raised ({_safe_exc(e)})")
                     out.stop = "machinery: the admission check raised"
                     out.stop_kind = "machinery"
                     break
@@ -429,7 +429,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     # contact-state string or a tuple would have authorised traffic; the only answers
                     # this hook has are yes and no, and anything else fails closed.
                     out.machinery.append(f"{target}: the admission check answered "
-                                         f"{type(allowed).__name__} {_safe_repr(allowed)}, "
+                                         f"{_safe_name(allowed)} {_safe_repr(allowed)}, "
                                          f"not True or False")
                     out.stop = "machinery: the admission check gave no usable answer"
                     out.stop_kind = "machinery"
@@ -453,7 +453,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             except (KeyboardInterrupt, SystemExit):
                 raise                                   # cancellation ends the run, never a slot outcome
             except Exception as e:                      # `runner.run` can raise around Popen (v10#1)
-                out.machinery.append(f"{target}/{unit}: {type(e).__name__}: {e}")
+                out.machinery.append(f"{target}/{unit}: {_safe_exc(e)}")
                 out.stop = "machinery: the invocation raised"
                 out.stop_kind = "machinery"
                 break
@@ -495,7 +495,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.stop_kind = "machinery"
                 break
             except Exception as e:                      # the evidence exists; only the bookkeeping failed
-                out.machinery.append(f"{target}/{unit}: completion not published ({type(e).__name__})")
+                out.machinery.append(f"{target}/{unit}: completion not published ({_safe_name(e)})")
                 published = False
             if published:
                 out.completions_published += len(chosen)
@@ -552,7 +552,9 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.stop, out.stop_kind = "CANCELLED mid-sweep", "cancelled"
         try:
             _report(coverage_lane, out, clock)
-        except Exception:
+        except BaseException:
+            # v68#1: `Exception` alone let a reporting `GeneratorExit` REPLACE the cancellation being
+            # handled. The bare `raise` below must always propagate the original one.
             pass
         raise
     out.completion_unpersisted = out.pending_completions
@@ -572,18 +574,32 @@ def _rescue(out: "SweepResult") -> None:
         out.pending_completions = 0
 
 
-def _safe_repr(value) -> str:
-    """`repr()` that cannot escape the driver (v66#1). Rendering a returned object's repr outside the
-    protected call let a raising `__repr__` break the "raises nothing but cancellation" contract at the
-    very boundary that exists to fail closed."""
+def _safe_text(render) -> str:
+    """Render a diagnostic without letting it escape the driver (v66#1 / v68#2).
+
+    EVERY part of a diagnostic is attacker-adjacent: a returned object's `__repr__`, its type's
+    `__name__` through a hostile metaclass, an exception's `__str__`. Cancellation is the only thing
+    that leaves this function — anything else becomes a placeholder rather than a broken contract at
+    the boundary that exists to fail closed."""
     try:
-        return repr(value)
+        return str(render())
     except (KeyboardInterrupt, SystemExit):
         raise                                  # cancellation is the ONLY thing that leaves this driver
     except BaseException:
-        # v67#2: `Exception` alone let a hostile `__repr__` raise `GeneratorExit` straight through the
-        # boundary that exists to fail closed.
         return "<unrepresentable>"
+
+
+def _safe_repr(value) -> str:
+    return _safe_text(lambda: repr(value))
+
+
+def _safe_name(value) -> str:
+    return _safe_text(lambda: type(value).__name__)
+
+
+def _safe_exc(exc) -> str:
+    """`Type: message`, both halves contained."""
+    return f"{_safe_name(exc)}: {_safe_text(lambda: exc)}"
 
 
 def _unit_of(chosen) -> str:
