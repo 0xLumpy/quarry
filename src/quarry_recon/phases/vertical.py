@@ -528,6 +528,16 @@ def _wc_report(sid: str, label: str, st: dict) -> None:
     v52#2: they used to be emitted at the end of the body, so an exception or a cancellation took the
     whole denominator with it — the machinery failure protected the verdict, but selection and execution
     accounting simply vanished."""
+    if not st.get("eligibility_known"):
+        # v54#2: scope filtering never finished, so the eligible set is UNKNOWN — not zero. Structured
+        # but uncounted, which the reconciler admits as a gap instead of a clean 0/0/0.
+        for measure, unit in (("zones", label), ("zone_execution", f"{label}:execution")):
+            events.coverage_partial(sid, kind=events.COVERAGE_UNKNOWN, unit=unit, measure=measure,
+                                    reason=f"{label}: the eligible wildcard zone set could not be "
+                                           f"determined — nothing was selected or probed")
+        _wc_rows_coverage(sid, label, st)
+        _wc_artifact_coverage(sid, label, st)
+        return
     eligible = st.get("eligible_zones", 0)
     selected = max(0, eligible - st.get("blocked", {}).get("zone_cap", 0)
                    - st.get("blocked", {}).get("self_or_private", 0))
@@ -697,7 +707,8 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
     st = stats if stats is not None else {}
     st.clear()
     st.update({"eligible_zones": 0, "probed_zones": 0, "blocked_reason": "", "selection_reason": "",
-               "gate_reason": "", "blocked": {"zone_cap": 0, "self_or_private": 0}})
+               "gate_reason": "", "eligibility_known": False,
+               "blocked": {"zone_cap": 0, "self_or_private": 0}})
     if not registered(source_id):
         # the GATE comes before eligibility (v42#4): a refused lane that had filled the carrier made its
         # caller report withheld words and undifferentiated zones for a pass that never existed.
@@ -715,6 +726,7 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         # iterable or an unreadable vocabulary used to escape without a start/terminal pair at all.
         eligible = _wc_eligible_zones(ctx, zones)
         st["eligible_zones"] = len(eligible)
+        st["eligibility_known"] = True          # v54#2: a FAILED scope filter is not an empty set
         # v53#3: the cap belongs to SELECTION and is known the moment eligibility is. Setting it only
         # inside the body let a setup failure report every eligible zone as selected.
         st["blocked"]["zone_cap"] = max(0, len(eligible) - ZONE_CAP)
@@ -958,9 +970,16 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         if ctx.profile.http_rl:                           # honor a configured HTTP rate
             hx_cmd += ["-rl", str(ctx.profile.http_rl)]
         r = exec_tool("httpx", hx_cmd, raw_path=hx, timeout=ctx.http_timeout)
-        # v53#2: the invocation has RETURNED. That fact is committed before the fallible ledger write —
-        # a `record()` that raises used to leave `zone_execution` claiming the call never came back.
-        if r.status is not Status.SKIPPED:
+        # v53#2 / v54#1: everything OBSERVABLE about this invocation is committed BEFORE the fallible
+        # ledger write — whether it returned, what class it came back as, whether the tool stopped
+        # running, and whether it left a readable artifact. A `record()` that raises must not make the
+        # run forget what already happened.
+        blob = None
+        if r.status is Status.SKIPPED:
+            # no process ran: not a zone we contacted, and the tool will not run for the NEXT zone
+            # either (v44#3). The remaining zones stay unprobed and the omission is reported as such.
+            st["stopped"] = "httpx did not run"
+        else:
             zones_probed += 1                   # a CONTACT is an invocation that returned
             st["probed_zones"] = zones_probed
             if r.status in (Status.SUCCESS, Status.EMPTY):
@@ -968,27 +987,22 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             else:
                 _k = str(getattr(r.status, "value", r.status))
                 st["invocation_classes"][_k] = st["invocation_classes"].get(_k, 0) + 1
+            # v48#1: `RunResult.raw_path` means "captured non-empty stdout", NOT "the requested file
+            # exists" — `runner.run` writes the file and returns None for a clean EMPTY. The REQUESTED
+            # path is the one to ask: absent or unreadable is loss, present-and-empty is a clean
+            # nothing-found. v49#2 keeps those two losses apart.
+            try:
+                blob = hx.read_bytes()
+            except FileNotFoundError:
+                st["missing_artifacts"] += 1
+            except OSError as e:
+                st["unreadable_artifacts"] += 1
+                st["artifact_errors"].append(f"{zone}: {type(e).__name__}")
         ctx.run.record(phase, r)
         if r.status is Status.SKIPPED:
-            # no process ran: not a zone we contacted, and the tool will not run for the NEXT zone either
-            # (v44#3). The remaining zones stay unprobed and the omission is reported as such.
-            st["stopped"] = "httpx did not run"
             break
-        # v48#1: `RunResult.raw_path` means "captured non-empty stdout", NOT "the requested file exists".
-        # `runner.run` writes the file and returns raw_path=None for a clean EMPTY result, so testing it
-        # turned every legitimate zero-result invocation into a missing artifact. The REQUESTED path is
-        # the one to ask: absent (or unreadable) is loss, present-and-empty is a clean nothing-found.
-        try:
-            blob = hx.read_bytes()
-        except FileNotFoundError:
-            st["missing_artifacts"] += 1
-            continue
-        except OSError as e:
-            # v49#2: an artifact that EXISTS and cannot be read is a different machinery fact from one
-            # that was never written, and it needs its own diagnosis.
-            st["unreadable_artifacts"] += 1
-            st["artifact_errors"].append(f"{zone}: {type(e).__name__}")
-            continue
+        if blob is None:
+            continue                            # the artifact loss is already accounted for above
         # v44#5: bytes, not text — one invalid UTF-8 line used to abort the WHOLE artifact as machinery
         # instead of costing one row. Every row is then validated STRUCTURALLY before it can reach `_sig`
         # or the store, and a row for a name this invocation never submitted is not our evidence.

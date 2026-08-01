@@ -487,6 +487,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
                       "blocked_reason": "no in-scope wildcard zone",
                       # v52#1: selection and execution carry their own causes now
                       "selection_reason": "no in-scope wildcard zone", "gate_reason": "",
+                      "eligibility_known": True,
                       "blocked": {"zone_cap": 0, "self_or_private": 0}}, st
 
     def test_a_GUARD_refusal_says_so_instead_of_blaming_the_cap(self, tmp_path, monkeypatch):
@@ -2381,7 +2382,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         kept, life = self._differ(tmp_path, monkeypatch, rows=[], st=st)
         assert kept == set() and life == []
         assert st == {"eligible_zones": 0, "probed_zones": 0, "blocked_reason": "",
-                      "selection_reason": "", "gate_reason": "",
+                      "selection_reason": "", "gate_reason": "", "eligibility_known": False,
                       "blocked": {"zone_cap": 0, "self_or_private": 0}}, st
 
     def test_a_SETUP_failure_still_emits_a_START_and_a_TERMINAL(self, tmp_path, monkeypatch):
@@ -2924,3 +2925,45 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert "over the 1-zone cap" in sel["reason"], sel
         ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
         assert (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 0, 1), ex
+
+    @pytest.mark.parametrize("mode,check", [("no_artifact", "artifacts"), ("skip", "stopped")])
+    def test_EVERY_observable_fact_is_committed_before_the_ledger_write(self, tmp_path, monkeypatch,
+                                                                       mode, check):
+        """v54#1: only the returned counter had moved. A returned call that wrote no file still reported
+        an artifact, and a SKIPPED result lost "httpx did not run", when `record()` raised."""
+        from quarry_recon import store
+        real = store.Run.record
+
+        def _boom(self, phase, result):
+            if result.tool == "httpx":
+                raise OSError("manifest is read-only")
+            return real(self, phase, result)
+
+        monkeypatch.setattr(store.Run, "record", _boom, raising=False)
+        kw = {"no_artifact": True} if mode == "no_artifact" else {"status": crawl.Status.SKIPPED}
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], zones=("a.acme.com", "b.acme.com"),
+                                  **kw)
+        if check == "artifacts":
+            art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
+            assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
+        else:
+            ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+            assert "httpx did not run" in ex["reason"], ex
+            assert (ex["eligible"], ex["tested"], ex["omitted"]) == (2, 0, 2), ex
+        assert life[-1]["status"] == "failed" and "read-only" in life[-1]["reason"], life
+
+    def test_UNKNOWN_eligibility_is_not_an_EMPTY_set(self, tmp_path, monkeypatch):
+        """v54#2: a scope filter that raised was indistinguishable from a successfully computed empty
+        set — the reporter emitted clean 0/0/0 for both."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "_wc_eligible_zones",
+                            lambda ctx, zones: (_ for _ in ()).throw(TypeError("scope exploded")))
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[],
+                                  zones=("a.acme.com", "b.acme.com"))
+        for measure in ("zones", "zone_execution"):
+            rec = [e for e in self._events if e.get("measure") == measure][-1]
+            assert rec["kind"] == "unknown", rec
+            assert rec.get("eligible") is None, rec
+            assert "could not be determined" in rec["reason"], rec
+        assert life[-1]["status"] == "failed" and "scope exploded" in life[-1]["reason"], life
+        assert self._last_run._run_summary()["verdict"] != "complete"
