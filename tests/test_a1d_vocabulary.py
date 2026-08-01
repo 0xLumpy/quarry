@@ -2944,8 +2944,10 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         kept, life = self._differ(tmp_path, monkeypatch, rows=[], zones=("a.acme.com", "b.acme.com"),
                                   **kw)
         if check == "artifacts":
+            # v55: a ledger failure no longer aborts the sweep — both zones are contacted, and both
+            # missing artifacts are accounted for
             art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
-            assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
+            assert (art["eligible"], art["tested"], art["omitted"]) == (2, 0, 2), art
         else:
             ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
             assert "httpx did not run" in ex["reason"], ex
@@ -2966,4 +2968,29 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             assert rec.get("eligible") is None, rec
             assert "could not be determined" in rec["reason"], rec
         assert life[-1]["status"] == "failed" and "scope exploded" in life[-1]["reason"], life
+        assert self._last_run._run_summary()["verdict"] != "complete"
+
+    def test_a_LEDGER_failure_never_costs_the_EVIDENCE(self, tmp_path, monkeypatch):
+        """v55: the bytes were already in hand, but a raising `record()` exited before row accounting and
+        ingestion — so a valid host was dropped and the artifact reported as offering no rows."""
+        from quarry_recon import store
+        real = store.Run.record
+
+        def _boom(self, phase, result):
+            if result.tool == "httpx":
+                raise OSError("manifest is read-only")
+            return real(self, phase, result)
+
+        monkeypatch.setattr(store.Run, "record", _boom, raising=False)
+        rows = [{"input": "api.z.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y", "a": ["1.2.3.4"]}]
+        kept, life = self._differ(tmp_path, monkeypatch, rows=rows)
+        assert kept == {"api.z.acme.com"}, kept                      # the finding survives
+        assert list(self._last_run.read("resolved")), "the resolved observation survives too"
+        rowsc = [e for e in self._events if e.get("measure") == "output_rows"][-1]
+        assert (rowsc["eligible"], rowsc["tested"], rowsc["omitted"]) == (3, 3, 0), rowsc
+        art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
+        assert (art["eligible"], art["tested"], art["omitted"]) == (1, 1, 0), art
+        # ...and the run still FAILS on the write it could not make
+        assert life[-1]["status"] == "partial" and "read-only" in life[-1]["reason"], life
         assert self._last_run._run_summary()["verdict"] != "complete"

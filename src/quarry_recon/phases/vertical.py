@@ -925,6 +925,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         return (o.get("status_code"), o.get("content_length"),
                 (o.get("title") or "").strip(), o.get("favicon"))
 
+    ledger_error = None                    # a `record()` that failed; raised AFTER the evidence lands
     zones_probed = 0                       # zones we CONTACTED (an attempt, not an answer)
     st["zones_obtained"] = 0               # zones whose invocation came back usable
     st["invocation_classes"] = {}
@@ -935,6 +936,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     st["missing_artifacts"] = 0
     st["unreadable_artifacts"] = 0
     st["artifact_errors"] = []
+    st["ledger_errors"] = []
     st["stopped"] = ""
     for zone in zones:
         # self-attack guard: if the wildcard resolves to the SCAN BOX / metadata, don't vhost-scan the zone
@@ -998,7 +1000,14 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             except OSError as e:
                 st["unreadable_artifacts"] += 1
                 st["artifact_errors"].append(f"{zone}: {type(e).__name__}")
-        ctx.run.record(phase, r)
+        try:
+            ctx.run.record(phase, r)
+        except Exception as e:
+            # v55: the invocation happened and its bytes are already in hand — a ledger write that fails
+            # must not cost the rows or the evidence. The failure is KEPT and raised after this artifact
+            # has been accounted for and ingested, so it degrades the run without erasing what it found.
+            st["ledger_errors"].append(f"{zone}: {type(e).__name__}: {e}")
+            ledger_error = ledger_error or e
         if r.status is Status.SKIPPED:
             break
         if blob is None:
@@ -1107,6 +1116,10 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     # review-B-audit-18#2: ZONE reasons only. The vocabulary facts live in `stats["vocabulary"]`, and a
     # caller that reported both used to print the word cap twice.
     st["blocked_reason"] = _wc_reasons(st)[2]
+    if ledger_error is not None:
+        # every zone has been processed and every finding ingested; NOW the run fails on the write it
+        # could not make (v55).
+        raise ledger_error
     if kept:
         ctx.echo(f"  wildcard: {len(kept)} distinct vhost(s) differentiated, {len(novel)} new ({label})")
 
