@@ -2105,3 +2105,44 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert "the tool did not run" in fins[0]["reason"], fins
         finally:
             events.reset()
+
+    @pytest.mark.parametrize("found,want", [(False, "empty"), (True, "success")])
+    def test_a_CLEAN_terminal_carries_NO_reason_field(self, tmp_path, monkeypatch, found, want):
+        """v41: the reason is joined from facts, and a clean run has none — an empty string is a field
+        carrying no reason, where `None` is omitted entirely."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("\n".join(f"word{i:03d}" for i in range(4)))
+            from quarry_recon.runner import RunResult as _RR
+
+            def _tool(tool, cmd, raw_path=None, timeout=None, **k):
+                if found and raw_path is not None:
+                    raw_path.write_text("word000.acme.com\n")
+                return _RR(tool, cmd, crawl.Status.SUCCESS if found else crawl.Status.EMPTY,
+                           0, 0.1, raw_path if found else None, 0)
+
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool", _tool)
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            fins = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                    if json.loads(l).get("event") == "tool_finish"
+                    and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(fins) == 1 and fins[0]["status"] == want, fins
+            assert "reason" not in fins[0], fins            # omitted, never an empty string
+        finally:
+            events.reset()

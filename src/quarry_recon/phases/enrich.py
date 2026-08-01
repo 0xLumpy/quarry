@@ -173,7 +173,9 @@ def _a1d_terminal(swept, produced: int):
     if swept.unselectable_pairs:
         facts.append(f"{swept.unselectable_pairs} candidate(s) in {swept.unselectable_slots} slot(s) "
                      f"cannot be scheduled under the current bounds")
-    _why = "; ".join(p for p in ([swept.stop] if swept.stop else []) + facts)
+    # `or None`: a clean sweep has nothing to say, and an EMPTY string is a reason FIELD carrying no
+    # reason. `events.emit` omits None, which is what a clean terminal looked like before (v41).
+    _why = "; ".join(p for p in ([swept.stop] if swept.stop else []) + facts) or None
 
     if swept.contended:
         _st = Status.FAILED
