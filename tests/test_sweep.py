@@ -1934,3 +1934,63 @@ class TestThePreflightCallbacksAreContained:
         out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
         assert out.admission_unknown == 0 and out.admission_unpersisted == 1, out
         assert "not persisted" in " ".join(out.machinery), out.machinery
+
+    def test_a_LATER_save_that_was_interrupted_makes_an_older_ANSWER_unknown(self, tmp_path,
+                                                                            monkeypatch):
+        """v84: every save writes the WHOLE map, so a later one can carry an older pending answer. An
+        interrupted completion save therefore cannot say that answer definitely did not land."""
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+
+        def flaky(self):
+            calls["n"] += 1
+            if calls["n"] == 2:                 # the admission answer's own save fails outright
+                return False
+            if calls["n"] == 3:                 # the COMPLETION save lands, then we are interrupted
+                real(self)
+                raise KeyboardInterrupt("ctrl-c")
+            return real(self)
+
+        monkeypatch.setattr(budget.RotationProgress, "save", flaky)
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: True)
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "admission"][-1]["admission"]
+        assert ev["unknown"] == 1 and ev["unpersisted"] == 1, ev
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        assert reopened.targets["a.com"].get("adm_ok"), reopened.targets   # it really did land
+
+    def test_a_LATER_save_that_was_interrupted_makes_an_older_COMPLETION_unknown(self, tmp_path,
+                                                                                monkeypatch):
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+
+        def flaky(self):
+            calls["n"] += 1
+            if calls["n"] == 2:                 # the first completion save fails outright
+                return False
+            if calls["n"] == 3:                 # the NEXT reservation save lands, then interrupted
+                real(self)
+                raise KeyboardInterrupt("ctrl-c")
+            return real(self)
+
+        monkeypatch.setattr(budget.RotationProgress, "save", flaky)
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, words=["alpha", "beta"])
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "completion"][-1]["completion"]
+        assert ev["unknown"] >= 1 and ev["pending"] == 0, ev
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        done = [s for t in reopened.targets.values() for s in t["slots"].values() if "done" in s]
+        assert done, reopened.targets                                     # it really did land
+
+    def test_a_CONFIRMED_save_still_rescues_everything_it_carried(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+        monkeypatch.setattr(budget.RotationProgress, "save",
+                            lambda self: False if (calls.update(n=calls["n"] + 1) or calls["n"]) == 2
+                            else real(self))
+        out, tool = _run(tmp_path, words=["alpha", "beta"])
+        assert out.completion_unpersisted == 0 and out.completions_published == 2, out

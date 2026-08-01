@@ -182,6 +182,7 @@ class SweepResult:
     #: admission answers whose save was interrupted: on disk or not, we cannot say (v83#1).
     admission_unknown: int = 0
     admission_inflight: int = 0             # transient: answers whose save has not returned yet
+    inflight_completions: int = 0           # transient: pending completions a running save could carry
     #: admission ANSWERS — either kind — written in memory but not yet durable. Like a completion, a
     #: later successful save writes the WHOLE map and carries them, so this is PENDING, not lost (v82).
     admission_pending: int = 0
@@ -489,7 +490,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 gens = progress.reserve_batch(target, [b for b, _w in chosen], at=now())
                 # v72#1: the SAVE is body work too and sat outside this boundary, so a `StateBusy` or an
                 # `OSError` from it escaped the driver with no accounting at all.
-                persisted = progress.save()
+                persisted = _persist(out, progress)
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException as e:         # v73#1: only CANCELLATION escapes this driver
@@ -506,7 +507,6 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 break
             out.reservations_persisted += len(chosen)
             spent[target] = spent.get(target, 0) + total
-            _rescue(out)                       # this save also carried any pending completion (v14#1)
 
             if admit is not None and target not in checked:
                 # ADMISSION (v64): after the reservation is durable, before anything active happens.
@@ -620,7 +620,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 progress.complete_batch(target, [(b, gens[b], content[(target, b)], len(words))
                                                 for b, words in chosen], at=now())    # clause 5
                 staged = True                           # the `done` tuples EXIST in memory from here
-                published = progress.save()
+                published = _persist(out, progress)
             except (KeyboardInterrupt, SystemExit):
                 raise
             except budget.SchedulerInvariant as e:
@@ -648,7 +648,6 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             inflight = 0
             if published:
                 out.completions_published += len(chosen)
-                _rescue(out)
             else:
                 # review v14#1: the `done` tuples stay in the in-memory map, so a LATER successful save
                 # persists them. They are PENDING, not lost — and reclassified when that happens, instead
@@ -730,6 +729,11 @@ def _settle_completions(out: "SweepResult", *, inflight: int = 0, staged: bool =
         out.completion_unstaged += max(0, int(inflight))
     # v82: admission durability settles the same way — an answer a later save carried is NOT unpersisted,
     # and the machinery sentence is written from the FINAL state rather than the first failed write.
+    if out.inflight_completions:
+        # v84: a save that was interrupted could have carried these too — unknown, not lost.
+        out.completion_unknown += out.inflight_completions
+        out.pending_completions -= min(out.pending_completions, out.inflight_completions)
+        out.inflight_completions = 0
     if out.admission_inflight:
         # v83#1: interrupted mid-write. Not "lost" — unknown, and the pending claim it came from is
         # withdrawn so the two are never counted twice.
@@ -760,6 +764,27 @@ def _settle_completions(out: "SweepResult", *, inflight: int = 0, staged: bool =
         out.machinery.append("; ".join(parts) + " — those slot(s) may be selected again")
 
 
+def _persist(out: "SweepResult", progress) -> bool:
+    """`progress.save()` behind the publication contract (v84).
+
+    EVERY save writes the WHOLE map, so it can carry every pending tuple — the current answer, older
+    pending admission answers and older pending completions alike. While it runs they are all IN FLIGHT:
+    an interruption cannot claim they did not land, and a confirmed success rescues them."""
+    out.inflight_completions = out.pending_completions
+    out.admission_inflight = out.admission_pending
+    try:
+        ok = progress.save()
+    except (KeyboardInterrupt, SystemExit):
+        raise                                  # in flight stays set: settled as UNKNOWN, never as lost
+    except BaseException:
+        out.inflight_completions = out.admission_inflight = 0
+        raise                                  # the caller owns its own containment
+    out.inflight_completions = out.admission_inflight = 0
+    if ok:
+        _rescue(out)                           # this save carried every pending tuple with it
+    return ok
+
+
 def _record_admission(out: "SweepResult", progress, target: str, now, write, what: str) -> None:
     """Write an admission answer and try to make it durable, contained (v82).
 
@@ -775,21 +800,12 @@ def _record_admission(out: "SweepResult", progress, target: str, now, write, wha
         out.machinery.append(f"{target}: {what} could not be recorded ({_safe_exc(e)})")
         return
     out.admission_pending += 1
-    # v83#1: while the save runs, publication is IN FLIGHT. `os.replace` is atomic, so a cancellation
-    # arriving after it landed but before the call returned leaves the tuple ON DISK — claiming it was
-    # definitely not persisted would contradict the state file.
-    out.admission_inflight += 1
     try:
-        durable = progress.save()
+        _persist(out, progress)                # v83#1/v84: in flight across the save, rescued on success
     except (KeyboardInterrupt, SystemExit):
-        raise                                  # in flight stays set: settled as UNKNOWN, never as lost
+        raise
     except BaseException as e:
-        out.admission_inflight -= 1
         out.machinery.append(f"{target}: {what} could not be persisted ({_safe_exc(e)})")
-        return
-    out.admission_inflight -= 1
-    if durable:
-        _rescue(out)
 
 
 def _rescue(out: "SweepResult") -> None:
