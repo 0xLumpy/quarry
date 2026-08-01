@@ -310,6 +310,28 @@ class SweepResult:
     def admission_inflight(self, n: int) -> None:
         self.books = replace(self.books, adm_inflight=int(n))
 
+    def pair_remainder(self) -> dict:
+        """Every eligible pair this run did not attempt, split by WHAT withheld it (v64#1).
+
+        `eligible - attempted` is the TOTAL remainder and nothing more: it also holds the pairs an
+        admission refusal turned away, the ones a deferred target still holds, work no bound can admit,
+        and everything a stop left behind. Reporting that total as a policy bound's withholding tells the
+        operator a cap fired when none did — and promises a rotation that a guard refusal will not deliver.
+
+        The dispositions are taken in order and the remainder is what is left after them, so the parts
+        always sum to the total. What is left belongs to the STOP when something stopped the run, and to
+        the per-target spend bound when nothing did."""
+        rest = max(0, self.eligible_pairs - self.attempted_pairs)
+        parts = {}
+        for key, value in (("refused", self.refused_pairs), ("unselectable", self.unselectable_pairs),
+                           ("deferred", self.deferred_pairs)):
+            parts[key] = min(rest, max(0, int(value)))
+            rest -= parts[key]
+        stopped = self.stop_kind not in (None, "bound")
+        parts["stopped"], parts["bound"] = (rest, 0) if stopped else (0, rest)
+        parts["total"] = max(0, self.eligible_pairs - self.attempted_pairs)
+        return parts
+
     @property
     def ran(self) -> bool:
         return self.slots_attempted > 0

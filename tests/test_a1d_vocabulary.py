@@ -749,7 +749,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         recs = self._a1d_zones(tmp_path, monkeypatch, httpx=True, puredns=True,
                                generic=b"one\ntwo\nthree\n")
         assert len(recs) == 1 and recs[0].status == "partial", recs
-        assert "wildcard candidate(s) not submitted this run" in recs[0].note, recs
+        assert "wildcard candidate(s) withheld by the 1-per-zone spend bound" in recs[0].note, recs
         assert "rotate in on a later run" in recs[0].note, recs
 
     def test_a_MIXED_zone_and_vocabulary_failure_names_each_fact_ONCE(self, tmp_path, monkeypatch):
@@ -765,7 +765,10 @@ class TestA1dVocabularyLossReachesTheVerdict:
                                httpx=True, puredns=True, generic=b"one\ntwo\nthree\n")
         assert len(recs) == 1 and recs[0].status == "partial", recs
         note = recs[0].note
-        assert note.count("not submitted this run") == 1, note
+        # v64#1: the ALLOWANCE withheld these pairs, and the zone unit already states it with its own
+        # cause — the pair unit must not repeat it, and no spend bound fired here at all.
+        assert note.count("per-zone spend bound") == 0, note
+        assert note.count("deferred to a later run") == 1, note
         assert note.count("zone-zone cap") == 0 and note.count("5-zone per-run allowance") == 1, note
         assert "wildcard zone(s) not differentiated" in note, note
 
@@ -1113,7 +1116,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
             recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
             assert len(recs) == 1 and recs[0].status == "partial", recs
             assert "19/20 candidate(s) withheld by the 1-per-apex A1d spend bound" in recs[0].note, recs
-            assert ("17/20 wildcard candidate(s) not submitted this run by the 3-per-zone spend bound"
+            assert ("17/20 wildcard candidate(s) withheld by the 3-per-zone spend bound"
                     in recs[0].note), recs
         finally:
             events.reset()
@@ -1182,7 +1185,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         """The other half: with real wildcard work, the words its bound withheld are a fact again."""
         recs, summary = self._a1d_brute_only(tmp_path, monkeypatch, words=10, zones=("z.acme.com",))
         assert len(recs) == 1 and recs[0].status == "partial", recs
-        assert "8/10 wildcard candidate(s) not submitted this run" in recs[0].note, recs
+        assert "8/10 wildcard candidate(s) withheld by the 2-per-zone spend bound" in recs[0].note, recs
         assert "A1d spend bound" not in recs[0].note, recs          # the DNS lane took everything
         assert summary["verdict"] != "complete", summary
 
@@ -1719,7 +1722,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         assert len(recs) == 1, recs
         # ONE zone x the 3 retained words = 3 candidate pairs, of which the 1-per-zone spend submits one.
         # With two apexes the DNS lane counts 6 pairs of its own; this note speaks in the DIFFER's.
-        assert "2/3 wildcard candidate(s) not submitted this run" in recs[0].note, recs
+        assert "2/3 wildcard candidate(s) withheld by the 1-per-zone spend bound" in recs[0].note, recs
 
     def test_the_unreadable_sentence_counts_WORDS_not_candidate_pairs(self, tmp_path, monkeypatch):
         """v19#3 (the other half): `_a1d_loss_why(produced=…)` renders "the readable N yielded X usable
@@ -2445,7 +2448,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         a clean EMPTY over full zone coverage."""
         kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.FAILED)
         assert life[-1]["status"] == "failed", life
-        assert "zone outcomes {'failed': 1}" in life[-1]["reason"], life
+        assert "invocation outcomes {'failed': 1}" in life[-1]["reason"], life
 
     def test_a_TIMED_OUT_invocation_that_still_found_a_host_is_PARTIAL(self, tmp_path, monkeypatch):
         """v44#6: the old fixture hard-coded a bogus hostname that never matched the invocation's random
@@ -2461,7 +2464,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.TIMED_OUT, raw=raw)
         assert kept == {"api.z.acme.com"}, kept          # the evidence a timed-out call still returned
         assert life[-1]["status"] == "partial", life
-        assert "zone outcomes {'timed_out': 1}" in life[-1]["reason"], life
+        assert "invocation outcomes {'timed_out': 1}" in life[-1]["reason"], life
 
     def test_MALFORMED_output_is_a_PARSE_GAP_not_a_clean_answer(self, tmp_path, monkeypatch):
         """v43#3: unreadable rows were discarded silently, so a truncated artifact read EMPTY with full
@@ -3084,7 +3087,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         monkeypatch.setattr(store.Run, "record", _boom, raising=False)
         kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.TIMED_OUT, rows=[])
         reason = life[-1]["reason"]
-        assert "zone outcomes {'timed_out': 1}" in reason, reason
+        assert "invocation outcomes {'timed_out': 1}" in reason, reason
         assert "read-only" in reason, reason
         assert reason.count("manifest is read-only") == 1, reason      # named once, not twice
 
@@ -3124,7 +3127,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                                   zones=("a.acme.com", "b.acme.com"), tool=_tool)
         assert caught and isinstance(caught[0], KeyboardInterrupt), caught
         reason = life[-1]["reason"]
-        assert "zone outcomes {'timed_out': 1}" in reason, reason
+        assert "invocation outcomes {'timed_out': 1}" in reason, reason
         assert "CANCELLED mid-differ" in reason, reason
 
     @pytest.mark.parametrize("boom", [OSError("scope exploded"), KeyboardInterrupt("ctrl-c")])
@@ -3303,3 +3306,70 @@ class TestTheDifferRotatesOverZonesAndWords:
         _k3, life3 = self._differ(tmp_path / "c", monkeypatch, rows=[], words=("api", "admin"), spend=1)
         assert life1[0]["work_unit"] != life2[0]["work_unit"], (life1[0], life2[0])
         assert life1[0]["work_unit"] == life3[0]["work_unit"], (life1[0], life3[0])
+
+    def test_a_GUARD_refusal_is_NOT_reported_as_the_SPEND_bound(self, tmp_path, monkeypatch):
+        """v64#1: `eligible - attempted` is the TOTAL remainder. A guard refusal, a deferral, unschedulable
+        work and a stop are all in it, and reporting the total as the spend bound's withholding told the
+        operator a cap fired when none did — and promised a rotation those pairs will never get."""
+        from quarry_recon.phases import enrich, vertical
+        monkeypatch.setattr(enrich, "A1D_WILDCARD_WORD_CAP", 2000)      # a bound that cannot fire here
+        st: dict = {}
+        _k, life = self._differ(tmp_path, monkeypatch, zones=("z.acme.com",),
+                                words=("one", "two", "three"), rows=[], st=st, spend=2000, guard="self")
+        by = st["candidate_pairs_by_cause"]
+        assert by["refused"] == 3 and by["bound"] == 0 and by["total"] == 3, by
+        assert by["refused"] + by["unselectable"] + by["deferred"] + by["stopped"] + by["bound"] == 3, by
+        why = life[-1]["reason"]
+        assert "guard" in why, why                       # the refusal names ITSELF...
+        assert "spend bound" not in why and "rotate in" not in why, why      # ...and only itself
+
+    def test_an_A1d_guard_refusal_never_names_the_SPEND_bound(self, tmp_path, monkeypatch):
+        """The same fact through A1d's own note, which is what an operator reads."""
+        from quarry_recon.phases import enrich, vertical
+        monkeypatch.setattr(enrich, "A1D_WILDCARD_WORD_CAP", 2000)
+        monkeypatch.setattr(vertical.netguard, "contact_state",
+                            lambda host, block_private=False: ("self", True, None))
+        recs = TestA1dVocabularyLossReachesTheVerdict._a1d_zones(
+            self, tmp_path, monkeypatch, zones=("z.acme.com",), httpx=True, puredns=True,
+            generic=b"one\ntwo\nthree\n")
+        note = recs[0].note if recs else ""
+        assert "guard" in note, note
+        assert "spend bound" not in note and "rotate in on a later run" not in note, note
+
+    def test_a_PAIR_CAPPED_run_is_LIMITED_and_SAYS_the_bound(self, tmp_path, monkeypatch):
+        """v64#2: one zone, ten words, a three-per-zone spend — the coverage record said (10, 3, 7) while
+        the terminal read a clean EMPTY with no reason at all."""
+        from quarry_recon.phases import vertical
+        st: dict = {}
+        _k, life = self._differ(tmp_path, monkeypatch, zones=("z.acme.com",),
+                                words=tuple(f"w{i}" for i in range(10)), rows=[], st=st, spend=3)
+        assert st["candidate_pairs_by_cause"]["bound"] == 7, st["candidate_pairs_by_cause"]
+        assert life[-1]["status"] == "limited", life
+        assert "7/10 candidate pair(s) withheld by the 3-per-zone spend bound" in life[-1]["reason"], life
+        assert "rotate in on a later run" in life[-1]["reason"], life
+
+    def test_INVOCATION_outcomes_are_not_called_ZONE_outcomes(self, tmp_path, monkeypatch):
+        """v64#3: `invocation_classes` counts CALLS and a zone may take several, so the terminal reported
+        two timed-out ZONES for one eligible zone."""
+        from quarry_recon import sweep as _sweep
+        monkeypatch.setattr(_sweep, "MAX_BATCH_WORDS", 1)      # one word per call: TWO calls, ONE zone
+        _k, life = self._differ(tmp_path, monkeypatch, zones=("z.acme.com",), words=("api", "admin"),
+                                spend=2, statuses=[crawl.Status.TIMED_OUT, crawl.Status.TIMED_OUT])
+        why = life[-1]["reason"]
+        assert "invocation outcomes {'timed_out': 2}" in why, why
+        assert "zone outcomes" not in why, why
+
+    def test_a_STOPPED_run_does_not_blame_the_SPEND_bound(self, tmp_path, monkeypatch):
+        """v64#1, the other half: what a STOP left unsubmitted belongs to the stop. Calling it the spend
+        bound's withholding says a cap fired and promises those pairs a rotation the stop never granted."""
+        from quarry_recon import sweep as _sweep
+        monkeypatch.setattr(_sweep, "MAX_BATCH_WORDS", 1)      # one word per call
+        st: dict = {}
+        _k, life = self._differ(tmp_path, monkeypatch, zones=("z.acme.com",),
+                                words=("api", "admin", "www"), rows=[], st=st, spend=3,
+                                statuses=[crawl.Status.SUCCESS, crawl.Status.SKIPPED])
+        by = st["candidate_pairs_by_cause"]
+        assert by["stopped"] >= 1 and by["bound"] == 0, (by, st.get("sweep_stop"))
+        why = life[-1]["reason"]
+        assert "spend bound" not in why and "rotate in" not in why, why
+        assert st["stopped"], st                                # the dependency answer names itself

@@ -717,6 +717,10 @@ def _wc_terminal(st: dict, kept: set):
                 if st.get("ledger_errors") else "") if p]) else "no zone was probed"
         return Status.SKIPPED, why or "no zone was probed"
     no_base = st.get("zones_without_baseline", 0)
+    # v64#2: the per-zone SPEND is a bound of this pass exactly like the zone allowance, and a run that
+    # submitted 3 of 10 candidate pairs is not a clean, complete EMPTY however many zones it contacted.
+    by_cause = st.get("candidate_pairs_by_cause") or {}
+    pairs_bound = int(by_cause.get("bound", 0))
     ledger = st.get("ledger_errors") or []
     facts = [p for p in (why,
                          f"{len(ledger)} tool result(s) not recorded ({'; '.join(ledger)})"
@@ -727,13 +731,19 @@ def _wc_terminal(st: dict, kept: set):
                          f"({'; '.join(st.get('artifact_errors') or [])})"
                          if st.get("unreadable_artifacts") else "",
                          f"{no_base} zone(s) answered with NO wildcard baseline" if no_base else "",
-                         f"zone outcomes {dict(sorted(classes.items()))}" if classes else "",
+                         f"{pairs_bound}/{st.get('candidate_pairs_eligible', 0)} candidate pair(s) "
+                         f"withheld by the {st.get('word_spend', 0)}-per-zone spend bound — they rotate "
+                         f"in on a later run" if pairs_bound else "",
+                         # v64#3: `invocation_classes` counts CALLS, and a zone can take several of them.
+                         # Calling them zone outcomes produced two timed-out zones out of one zone.
+                         f"invocation outcomes {dict(sorted(classes.items()))}" if classes else "",
                          f"{parse_errors} unparseable output row(s)" if parse_errors else "") if p]
     # a mid-run SKIP is DEPENDENCY LOSS, not policy: the tool stopped running and the rest of the zones
     # went unprobed because of it (v45#1). Same for an answer whose artifact never appeared.
     trouble = bool(classes or parse_errors or obtained < probed or st.get("stopped")
                    or st.get("missing_artifacts") or st.get("unreadable_artifacts"))
-    bounded = bool(probed < eligible or blocked.get("self_or_private") or blocked.get("zone_cap"))
+    bounded = bool(probed < eligible or blocked.get("self_or_private") or blocked.get("zone_cap")
+                   or pairs_bound)
     if trouble:
         # something went wrong: an invocation that did not answer, or output we could not read
         return ((Status.PARTIAL if kept else Status.FAILED),
@@ -1237,6 +1247,10 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     st["candidate_pairs_eligible"] = swept.eligible_pairs
     st["candidate_pairs_submitted"] = swept.attempted_pairs
     st["candidate_pairs_withheld"] = max(0, swept.eligible_pairs - swept.attempted_pairs)
+    # v64#1: the remainder is not one fact. A guard refusal, a deferred zone, unschedulable work and a
+    # stop each own their own pairs, and only what is left belongs to the per-zone spend bound — the one
+    # disposition that really does rotate in on a later run.
+    st["candidate_pairs_by_cause"] = swept.pair_remainder()
     st["sweep_stop"] = swept.stop or ""
     st["sweep_stop_kind"] = swept.stop_kind or ""
     st["admitted_zones"] = swept.targets_admitted

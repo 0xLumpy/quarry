@@ -89,12 +89,21 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
         parts.append(f"{loss['base_error']} — mined words were NOT deduped against it")
     if loss.get("base_dropped_lines"):
         parts.append(f"{loss['base_dropped_lines']} base wordlist line(s) not valid UTF-8")
-    if loss.get("wildcard_withheld"):
-        # v63#1: the differ RETAINS the whole corpus; what a run withholds is candidate-target PAIRS, in
-        # the scheduler's own unit, and the rotation submits them on a later run instead of dropping them.
-        parts.append(f"{loss['wildcard_withheld']}/{loss.get('wildcard_pairs', 0)} wildcard candidate(s) "
-                     f"not submitted this run by the {A1D_WILDCARD_WORD_CAP}-per-zone spend bound and the "
-                     f"per-run zone allowance — they rotate in on a later run")
+    # v63#1: the differ RETAINS the whole corpus; what a run withholds is candidate-target PAIRS, in the
+    # scheduler's own unit. v64#1: each disposition names the bound that ACTUALLY withheld it — the total
+    # remainder also holds guard refusals, unschedulable work and whatever a stop left behind, and calling
+    # all of it "the spend bound" promised a rotation those pairs will never get. What a whole ZONE
+    # withheld — a deferral, a guard refusal — is already stated in the ZONE unit beside its own cause, so
+    # only the dispositions the zone count CANNOT express are rendered here.
+    _pairs = loss.get("wildcard_pairs", 0)
+    for _key, _sentence in (
+            ("bound", f"withheld by the {A1D_WILDCARD_WORD_CAP}-per-zone spend bound — they rotate in on "
+                      f"a later run"),
+            ("unselectable", "in slot(s) no bound can admit — they will NOT be retried"),
+            ("stopped", f"left unsubmitted when the wildcard pass stopped "
+                        f"({loss.get('wildcard_stop') or 'no reason recorded'})")):
+        if (loss.get("wildcard_by_cause") or {}).get(_key):
+            parts.append(f"{loss['wildcard_by_cause'][_key]}/{_pairs} wildcard candidate(s) {_sentence}")
     if loss.get("unschedulable_pairs"):
         parts.append(f"{loss['unschedulable_pairs']} candidate(s) in {loss['unschedulable_slots']} "
                      f"slot(s) cannot be scheduled under the current bounds and will NOT be retried")
@@ -350,6 +359,8 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     if wc.get("eligible_zones", 0) > 0:
         wl_loss["wildcard_withheld"] = wc.get("candidate_pairs_withheld", 0)
         wl_loss["wildcard_pairs"] = wc.get("candidate_pairs_eligible", 0)
+        wl_loss["wildcard_by_cause"] = wc.get("candidate_pairs_by_cause") or {}
+        wl_loss["wildcard_stop"] = wc.get("sweep_stop") or wc.get("blocked_reason") or ""
     # review v19#3: `after_base` is the RETAINED WORD count and other wording (wildcard withholding, the
     # unreadable-input sentence) reads it as such — the scheduler's candidate-target PAIRS are a different
     # unit and live in their own fields.
