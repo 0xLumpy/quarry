@@ -1773,3 +1773,23 @@ class TestThePreflightCallbacksAreContained:
                                            slot_grammar=sweep.slot_id_ok)
         content = sweep.content_digest(["alpha"])
         assert reopened.tier("a.com", sweep.bucket_of("alpha"), content) == 2
+
+    def test_a_SUCCESSFUL_retry_supersedes_the_refusal_for_NEW_slots_too(self, tmp_path):
+        """v79#1: the refusal was compared only against each slot's own completion, so a slot that did
+        not exist when the target was refused still inherited tier 3 after a successful retry."""
+        _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: True)
+        assert tool.calls, "the retry ran"
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        fresh = sweep.bucket_of("beta")                    # a slot that did not exist before
+        assert reopened.tier("a.com", fresh, sweep.content_digest(["beta"])) == 0, reopened.targets
+        old = sweep.bucket_of("alpha")
+        assert reopened.tier("a.com", old, sweep.content_digest(["alpha"])) == 2
+
+    def test_a_LATER_refusal_still_outranks_an_older_admission(self, tmp_path):
+        _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: True)
+        _run(tmp_path, targets=("a.com",), words=["alpha", "beta"], admit=lambda t: False)
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        assert reopened.tier("a.com", sweep.bucket_of("beta"), sweep.content_digest(["beta"])) == 3

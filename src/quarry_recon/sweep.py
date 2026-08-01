@@ -511,6 +511,16 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     out.stop = "machinery: the admission check raised"
                     out.stop_kind = "machinery"
                     break
+                if allowed is True:
+                    # v79#1: an admission that SUCCEEDED supersedes any older refusal for the whole
+                    # target. In memory here; the next save carries it, exactly like a completion.
+                    try:
+                        progress.admit_target(target, at=now())
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException as e:
+                        out.machinery.append(f"{target}: the admission could not be recorded "
+                                             f"({_safe_exc(e)})")
                 if allowed is not True and allowed is not False:
                     # v65#1: a SAFETY boundary may not run on truthiness. A callback that returned a
                     # contact-state string or a tuple would have authorised traffic; the only answers

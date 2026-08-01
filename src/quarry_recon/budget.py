@@ -441,15 +441,26 @@ class RotationProgress:
                     continue
                 slots[bucket] = {k: v for k, v in (("res", res), ("done", done)) if v is not None}
             highest = max([s["res"]["gen"] for s in slots.values() if "res" in s] or [0])
-            # v78: a TARGET-level admission refusal. It orders (never claims execution), so it is parsed
-            # fail-closed like everything else: unusable means "never refused", which is the safe
-            # direction — the target simply keeps its ordinary tier.
-            adm = cls._tuple(raw_t.get("adm"), with_content=False)
-            if adm is not None and adm["gen"] > gen:
-                adm, dropped = None, dropped + 1
-            targets[name] = {"seq": max(seq, highest), "slots": slots}
-            if adm is not None:
-                targets[name]["adm"] = adm
+            # v78: TARGET-level admission records — `adm` a refusal, `adm_ok` an admission that
+            # SUCCEEDED and supersedes it. They order (never claim execution) and are parsed fail-closed
+            # like everything else: unusable means "never happened", the safe direction.
+            admission = {}
+            for key in ("adm", "adm_ok"):
+                raw_adm = raw_t.get(key)
+                rec = cls._tuple(raw_adm, with_content=False)
+                if rec is None:
+                    # v79#2: a PRESENT but malformed record is a DROP, not an absence — the document is
+                    # degraded and must say so.
+                    if raw_adm is not None:
+                        dropped += 1
+                    continue
+                if rec["gen"] > gen:
+                    dropped += 1
+                    continue
+                admission[key] = rec
+            # v79#2: the cursor covers every generation this target ORDERS by, admissions included.
+            highest = max([highest] + [r["gen"] for r in admission.values()])
+            targets[name] = {"seq": max(seq, highest), "slots": slots, **admission}
         if dropped or repaired:
             # salvaging the healthy records is right, but the driver must not present the result as an
             # intact rotation: work may repeat, and that is a fact it has to be able to say.
@@ -553,10 +564,16 @@ class RotationProgress:
         refusal is a TARGET fact (nothing about the slot's membership changed), it ranks LAST, and it is
         superseded the moment that slot really runs. A crash BEFORE admission stays never-run: only an
         explicit refusal writes this."""
-        refused = (self.targets.get(target, {}) or {}).get("adm")
+        rec_t = self.targets.get(target, {}) or {}
+        refused = rec_t.get("adm")
         if refused:
+            # v79#1: comparing only against THIS slot's completion left a stale refusal ranking a slot
+            # that did not exist when it happened. A later SUCCESSFUL admission is a target-level fact
+            # and supersedes it for every slot — and it is a generation-ordered tuple, so the merge
+            # cannot resurrect the older refusal.
+            admitted = int((rec_t.get("adm_ok") or {}).get("gen", 0))
             done = (self._rank_record(target, bucket)[0] or {}).get("done") or {}
-            if int(refused["gen"]) > int(done.get("gen", 0)):
+            if int(refused["gen"]) > max(admitted, int(done.get("gen", 0))):
                 return 3
         rec, own = self._rank_record(target, bucket)
         done = rec.get("done")
@@ -635,6 +652,20 @@ class RotationProgress:
         gen = self.next_gen()
         t = self.targets.setdefault(target, {"seq": 0, "slots": {}})
         t["adm"] = {"gen": gen, "at": when}
+        t["seq"] = max(int(t.get("seq", 0)), gen)
+        return gen
+
+    def admit_target(self, target: str, *, at: float) -> int:
+        """Record that the caller's admission check ACCEPTED this target (v79#1).
+
+        The counterpart to `refuse_target`: a target-level fact that supersedes an older refusal for
+        every one of the target's slots, including ones that did not exist when it was refused."""
+        if isinstance(target, bool) or not isinstance(target, str) or not target:
+            raise ValueError(f"target must be a non-empty str, got {target!r}")
+        (when,) = self._checked(at=at)
+        gen = self.next_gen()
+        t = self.targets.setdefault(target, {"seq": 0, "slots": {}})
+        t["adm_ok"] = {"gen": gen, "at": when}
         t["seq"] = max(int(t.get("seq", 0)), gen)
         return gen
 
@@ -764,14 +795,15 @@ class RotationProgress:
                 if status == "unusable":
                     return False
             merged = {name: {k: (dict(v) if k == "slots" else v) for k, v in t.items()
-                             if k in ("seq", "slots", "adm")}
+                             if k in ("seq", "slots", "adm", "adm_ok")}
                       for name, t in disk_targets.items()}
             for name, mine in self.targets.items():
                 theirs = merged.setdefault(name, {"seq": 0, "slots": {}})
                 theirs["seq"] = max(int(theirs["seq"]), int(mine.get("seq", 0)))
-                mine_adm, their_adm = mine.get("adm"), theirs.get("adm")
-                if mine_adm and (not their_adm or int(mine_adm["gen"]) > int(their_adm["gen"])):
-                    theirs["adm"] = mine_adm            # newest refusal wins, whole (v78)
+                for key in ("adm", "adm_ok"):       # newest admission record wins, whole (v78/v79#1)
+                    mine_adm, their_adm = mine.get(key), theirs.get(key)
+                    if mine_adm and (not their_adm or int(mine_adm["gen"]) > int(their_adm["gen"])):
+                        theirs[key] = mine_adm
                 for bucket, slot in mine.get("slots", {}).items():
                     theirs["slots"][bucket] = self._merge_slot(slot, theirs["slots"].get(bucket, {}))
             gen = max(int(self.gen), int(disk_gen))

@@ -807,3 +807,51 @@ class TestTheRemainderTail:
                          "beginning), 2 UNSCHEDULABLE under the current bounds — no later run reaches "
                          "them without a corpus or policy change"), mixed
         assert " over — " not in mixed, mixed
+
+
+class TestTheAdmissionRecords:
+    """v78/v79: target-level admission facts. They ORDER — never claim execution — and a malformed one
+    is a DROP, not an absence."""
+
+    def test_a_MALFORMED_admission_is_a_DROP_not_an_absence(self, tmp_path):
+        (tmp_path / "a1d.json").write_text(json.dumps({
+            "lane": "a1d", "schema": SCHEMA, "gen": 4,
+            "targets": {"acme.com": {"seq": 4, "slots": {}, "adm": {"gen": "nope", "at": 1.0}}}}))
+        p = _progress(tmp_path)
+        assert "adm" not in p.targets["acme.com"], p.targets
+        assert p.state_status == "degraded" and "dropped" in p.state_reason, p.state_reason
+
+    def test_an_admission_AHEAD_of_the_lane_generation_is_dropped(self, tmp_path):
+        (tmp_path / "a1d.json").write_text(json.dumps({
+            "lane": "a1d", "schema": SCHEMA, "gen": 2,
+            "targets": {"acme.com": {"seq": 2, "slots": {}, "adm": {"gen": 9, "at": 1.0}}}}))
+        p = _progress(tmp_path)
+        assert "adm" not in p.targets["acme.com"] and p.state_status == "degraded"
+
+    def test_the_CURSOR_covers_the_admission_generation(self, tmp_path):
+        """v79#2: a target orders by its admission generations too, so the cursor must cover them."""
+        (tmp_path / "a1d.json").write_text(json.dumps({
+            "lane": "a1d", "schema": SCHEMA, "gen": 5,
+            "targets": {"acme.com": {"seq": 0, "slots": {}, "adm": {"gen": 5, "at": 1.0}}}}))
+        p = _progress(tmp_path)
+        assert p.target_seq("acme.com") == 5, p.targets
+
+    def test_an_admission_record_never_claims_a_slot_RAN(self, tmp_path):
+        p = _progress(tmp_path)
+        p.reserve("acme.com", "177", at=1.0)
+        p.refuse_target("acme.com", at=2.0)
+        assert p.tier("acme.com", "177", "members") == 3
+        assert "done" not in p.targets["acme.com"]["slots"]["177"]
+        p.admit_target("acme.com", at=3.0)
+        assert p.tier("acme.com", "177", "members") == 0     # back to never-run, not "clean"
+
+    def test_the_admission_records_are_MERGED_newest_wins(self, tmp_path):
+        p = _progress(tmp_path)
+        p.refuse_target("acme.com", at=1.0)
+        assert p.save()
+        other = _progress(tmp_path)
+        other.admit_target("acme.com", at=2.0)
+        assert other.save()
+        reopened = _progress(tmp_path)
+        assert reopened.targets["acme.com"]["adm"]["gen"] < reopened.targets["acme.com"]["adm_ok"]["gen"]
+        assert reopened.tier("acme.com", "177", "members") == 0
