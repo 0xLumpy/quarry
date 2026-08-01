@@ -1673,10 +1673,51 @@ class TestThePreflightCallbacksAreContained:
         out, _t = _run(tmp_path, words=["alpha"], tool=lambda *a: bad)
         assert out.stop_kind == "machinery", (bad, out)
         assert "no usable status" in " ".join(out.machinery), out.machinery
-        assert out.reservations_persisted == 1 and out.slots_attempted == 0, out
+        # v76#1: the call RETURNED, so the payload went out — the accounting says so, and the
+        # completion nobody staged is counted
+        assert out.reservations_persisted == 1 and out.slots_attempted == 1, out
+        assert out.attempted_pairs == 1 and out.invocations == 1, out
+        assert out.classes == {"invalid_result": 1} and out.completion_unstaged == 1, out
         sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
-        assert (sel["eligible"], sel["tested"]) == (1, 0), sel
+        assert (sel["eligible"], sel["tested"]) == (1, 1), sel
 
     def test_a_VALID_RunResult_is_still_accepted(self, tmp_path):
         out, tool = _run(tmp_path, words=["alpha"])
         assert out.stop_kind is None and out.slots_attempted == 1 and tool.calls
+
+    def test_a_STATEFUL_status_property_is_read_only_ONCE(self, tmp_path):
+        """v76#2: the guard validated one read and the loop re-read it, so a property could pass and then
+        raise on its second access, escaping the driver."""
+        class Once:
+            def __init__(self):
+                self.n = 0
+
+            @property
+            def status(self):
+                self.n += 1
+                if self.n > 1:
+                    raise GeneratorExit("second read explodes")
+                return Status.SUCCESS
+
+        out, _t = _run(tmp_path, words=["alpha"], tool=lambda *a: Once())
+        assert out.stop_kind is None and out.slots_attempted == 1, out
+        assert out.slots_obtained == 1, out
+
+    def test_a_BARE_STRING_vocabulary_is_not_four_candidates(self, tmp_path):
+        """v76#3: `"alpha"` is iterable — it became a, l, p, h and was actively submitted."""
+        out = sweep.run_sweep(lane=LANE, state_dir=tmp_path, targets=["acme.com"],
+                              vocabulary=lambda t: "alpha", execute=_Tool(), budget_s=0,
+                              coverage_lane=COV)
+        assert out.stop_kind == "machinery" and out.eligibility_known is False, out
+        assert "not a collection of words" in " ".join(out.machinery), out.machinery
+
+    def test_a_STR_SUBCLASS_is_not_an_exact_string(self, tmp_path):
+        """A subclass can override `encode` and escape from the allocator."""
+        class Hostile(str):
+            def encode(self, *a, **k):
+                raise GeneratorExit("encode explodes")
+
+        out = sweep.run_sweep(lane=LANE, state_dir=tmp_path, targets=["acme.com"],
+                              vocabulary=lambda t: ["alpha", Hostile("beta")], execute=_Tool(),
+                              budget_s=0, coverage_lane=COV)
+        assert out.stop_kind == "machinery" and "not a non-empty str" in " ".join(out.machinery)

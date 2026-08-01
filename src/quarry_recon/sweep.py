@@ -293,11 +293,18 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     try:
         for target in dict.fromkeys(targets):          # a repeated target is one target
             per_target: list = []
-            for word in vocabulary(target) or []:
-                if isinstance(word, bool) or not isinstance(word, str) or not word:
+            raw = vocabulary(target) or []
+            if isinstance(raw, (str, bytes, bytearray)):
+                # v76#3: a bare string is ITERABLE — `"alpha"` became four candidates and `a`, `h`, `l`,
+                # `p` were actively submitted. The contract is a COLLECTION of words.
+                raise TypeError(f"vocabulary returned {_safe_name(raw)} {_safe_repr(raw)}, "
+                                f"not a collection of words")
+            for word in raw:
+                if type(word) is not str or not word:
                     # v75#1: containing the CALL is not enough — a hashable non-string candidate survived
                     # corpus building and then crashed the allocator outside every boundary. The
-                    # scheduler hashes and joins these: the contract is an exact non-empty str.
+                    # scheduler hashes and joins these: the contract is an EXACT non-empty str, since a
+                    # subclass can override `encode` and escape from the allocator (v76#3).
                     raise TypeError(f"vocabulary returned {_safe_name(word)} {_safe_repr(word)}, "
                                     f"not a non-empty str")
                 if (target, word) in seen_pairs:       # review v14#5: one submission per word per target —
@@ -530,12 +537,6 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
 
             try:
                 result = execute(target, unit, [word for _b, words in chosen for word in words])
-                if not isinstance(getattr(result, "status", None), Status):
-                    # v75#1: the CALL was guarded, its RESULT was not — `None` reached `result.status`
-                    # after active work had already happened, escaping with only a reservation on disk
-                    # and no coverage at all.
-                    raise TypeError(f"the invocation returned {_safe_name(result)} "
-                                    f"{_safe_repr(result)} with no usable status")
             except (KeyboardInterrupt, SystemExit):
                 raise                                   # cancellation ends the run, never a slot outcome
             except BaseException as e:                  # `runner.run` can raise around Popen (v10#1)
@@ -543,8 +544,11 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.stop = "machinery: the invocation raised"
                 out.stop_kind = "machinery"
                 break
+            # v76#2: the status is read ONCE, inside containment. Re-reading `result.status` let a
+            # property pass validation and then raise on its second access, escaping the driver.
+            status = _safe_status(result)
 
-            if result.status is Status.SKIPPED:          # no process ran — a dependency answer
+            if status is Status.SKIPPED:                 # no process ran — a dependency answer
                 out.stop = "the tool did not run"        # clause 3: it completes NO slot
                 out.stop_kind = "dependency"
                 break
@@ -558,12 +562,25 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     src = owners.get(word)                  # agree even when publication never happens
                     if src is not None:
                         out.per_source_attempted[src] = out.per_source_attempted.get(src, 0) + 1
-            if result.status in _OBTAINED:
+            if not isinstance(status, Status):
+                # v75#1 / v76#1: the CALL returned, so the payload went out and every counter above is
+                # true — but the outcome is unusable, and nothing was staged for it. It is a RETURNED
+                # invocation with an invalid result, not a run that never happened.
+                key = "invalid_result"
+                out.classes[key] = out.classes.get(key, 0) + len(chosen)
+                out.invocation_classes[key] = out.invocation_classes.get(key, 0) + 1
+                out.completion_unstaged += len(chosen)
+                out.machinery.append(f"{target}/{unit}: the invocation returned {_safe_name(result)} "
+                                     f"{_safe_repr(result)} with no usable status")
+                out.stop = "machinery: the invocation returned no usable status"
+                out.stop_kind = "machinery"
+                break
+            if status in _OBTAINED:
                 # clause 4: ONE result attests every slot it carried — completion means ATTEMPTED
                 out.slots_obtained += len(chosen)
                 out.invocations_obtained += 1
             else:
-                key = str(getattr(result.status, "value", result.status))
+                key = str(getattr(status, "value", status))
                 out.classes[key] = out.classes.get(key, 0) + len(chosen)
                 # v32#2: the slot-weighted map cannot say how many CALLS failed once batches differ in
                 # size — a 10-slot timeout and a 1-slot failure are 10 and 1 there, 1 and 1 here.
@@ -721,6 +738,22 @@ def _safe_text(render) -> str:
         raise                                  # cancellation is the ONLY thing that leaves this driver
     except BaseException:
         return "<unrepresentable>"
+
+
+def _safe_status(result):
+    """The result's status, read ONCE and contained (v76#2). A property can pass a check and then raise
+    on its next access, so the driver must never look twice."""
+    return _safe_call(lambda: getattr(result, "status", None))
+
+
+def _safe_call(fn):
+    """Call `fn`, containing everything but cancellation; `None` when it could not answer."""
+    try:
+        return fn()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        return None
 
 
 def _safe_repr(value) -> str:
