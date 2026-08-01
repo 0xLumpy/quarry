@@ -2675,3 +2675,41 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         art = agg[("enrich.wildcard_a1d", "output_artifacts")]
         assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
         assert art["valid"] is True, art
+
+    def test_a_CLEAN_EMPTY_invocation_is_not_a_missing_artifact(self, tmp_path, monkeypatch):
+        """v48#1: `RunResult.raw_path` means "captured non-empty stdout", not "the requested file
+        exists". `runner.run` writes the file and returns None for a clean EMPTY, so every legitimate
+        zero-result httpx call was being reported as a missing artifact."""
+        from quarry_recon.runner import RunResult as _RR
+        from quarry_recon.phases import probe, vertical
+        from quarry_recon import store
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            monkeypatch.setattr(vertical, "have", lambda t: True)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical.netguard, "contact_state",
+                                lambda host, block_private=False: ("public", False, None))
+            monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
+            monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
+
+            def _tool(tool, cmd, raw_path=None, timeout=None, **k):
+                raw_path.write_text("")                     # the file EXISTS and is empty, as httpx left it
+                return _RR(tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0)   # ...and stdout was empty
+
+            monkeypatch.setattr(vertical, "exec_tool", _tool)
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            vertical._wildcard_differentiate(ctx, {"z.acme.com"}, extra_words=["api"], phase="enrich",
+                                             label="wildcard-a1d", source="wildcard-http-a1d",
+                                             source_id="enrich.wildcard_a1d")
+            evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
+            fin = [e for e in evs if e.get("event") == "tool_finish"][-1]
+            assert fin["status"] == "empty", fin            # a clean nothing-found, not a failure
+            art = [e for e in evs if e.get("measure") == "output_artifacts"][-1]
+            assert (art["eligible"], art["tested"], art["omitted"]) == (1, 1, 0), art
+            assert "returned invocation(s)" in art["reason"], art
+        finally:
+            events.reset()

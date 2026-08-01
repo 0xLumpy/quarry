@@ -509,8 +509,9 @@ ZONE_CAP = 5
 
 
 def _wc_artifact_coverage(sid: str, label: str, st: dict) -> None:
-    """Structured ARTIFACT coverage — an invocation that ANSWERED but wrote no output is evidence we
-    asked for and did not get.
+    """Structured ARTIFACT coverage — an invocation that RETURNED but wrote no output is evidence we
+    asked for and did not get. Every returned process counts, whatever its status: a failed call that
+    left no file lost the same evidence a clean one would have.
 
     v46#1: incrementing a counter only changed the lifecycle terminal, while the recorded invocation
     stayed SUCCESS and both other records reported `omitted=0` — so the manifest reconciled the run as
@@ -518,12 +519,12 @@ def _wc_artifact_coverage(sid: str, label: str, st: dict) -> None:
     # v47#2: the denominator is every invocation that RETURNED — a FAILED call that wrote no file is a
     # missing artifact too, and counting only clean answers made `omitted > eligible`, which
     # reconciliation rejects as invalid and reports as 0/0/0 beside a reason saying otherwise.
-    answered = st.get("probed_zones", 0)
+    returned = st.get("probed_zones", 0)
     missing = st.get("missing_artifacts", 0)
     events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT if missing else events.COVERAGE_CAP,
                             unit=f"{label}:artifacts", measure="output_artifacts",
-                            eligible=answered, tested=max(0, answered - missing), omitted=missing,
-                            reason=(f"{label}: {max(0, answered - missing)}/{answered} answered "
+                            eligible=returned, tested=max(0, returned - missing), omitted=missing,
+                            reason=(f"{label}: {max(0, returned - missing)}/{returned} returned "
                                     f"invocation(s) left an artifact"
                                     + (f" — {missing} produced none" if missing else "")))
 
@@ -904,9 +905,13 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         else:
             _k = str(getattr(r.status, "value", r.status))
             st["invocation_classes"][_k] = st["invocation_classes"].get(_k, 0) + 1
-        if not (r.raw_path and r.raw_path.exists()):
-            # v45#4: the invocation answered but the output we asked for is not there. Missing and
-            # present-but-empty are different facts, and only the second is a clean nothing-found.
+        # v48#1: `RunResult.raw_path` means "captured non-empty stdout", NOT "the requested file exists".
+        # `runner.run` writes the file and returns raw_path=None for a clean EMPTY result, so testing it
+        # turned every legitimate zero-result invocation into a missing artifact. The REQUESTED path is
+        # the one to ask: absent (or unreadable) is loss, present-and-empty is a clean nothing-found.
+        try:
+            blob = hx.read_bytes()
+        except (FileNotFoundError, OSError):
             st["missing_artifacts"] += 1
             continue
         # v44#5: bytes, not text — one invalid UTF-8 line used to abort the WHOLE artifact as machinery
@@ -914,7 +919,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         # or the store, and a row for a name this invocation never submitted is not our evidence.
         expected = {f"{w}.{zone}".lower() for w in words} | {b.lower() for b in bogus}
         rows = []
-        for chunk in r.raw_path.read_bytes().splitlines():
+        for chunk in blob.splitlines():
             if not chunk.strip():
                 continue
             st["rows_seen"] += 1
