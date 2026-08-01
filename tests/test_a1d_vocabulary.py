@@ -3104,3 +3104,45 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         reason = life[-1]["reason"]
         assert "zone outcomes {'timed_out': 1}" in reason, reason
         assert "CANCELLED mid-differ" in reason, reason
+
+    @pytest.mark.parametrize("boom", [OSError("scope exploded"), KeyboardInterrupt("ctrl-c")])
+    def test_an_exit_BEFORE_eligibility_never_claims_there_were_no_zones(self, tmp_path, monkeypatch,
+                                                                        boom):
+        """v58#1: `_wc_terminal` reads zero-initialised counters, so an exit before eligibility was known
+        added "no in-scope wildcard zone" — contradicting the UNKNOWN coverage the same run emits."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "_wc_eligible_zones",
+                            lambda ctx, zones: (_ for _ in ()).throw(boom))
+        caught = []
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], caught=caught,
+                                  zones=("a.acme.com", "b.acme.com"))
+        reason = life[-1]["reason"]
+        assert "no in-scope wildcard zone" not in reason, reason
+        assert "never determined" in reason, reason
+        rec = [e for e in self._events if e.get("measure") == "zones"][-1]
+        assert rec["kind"] == "unknown", rec
+
+    def test_TWO_identical_failures_are_BOTH_named(self, tmp_path, monkeypatch):
+        """v58#2: the ledger fact was dropped when its rendered text appeared in the reason — two
+        independent failures can carry the same type and message."""
+        from quarry_recon import store
+        real_record, real_add = store.Run.record, store.Run.add
+
+        def _rec(self, phase, result):
+            if result.tool == "httpx":
+                raise OSError("disk is read-only")
+            return real_record(self, phase, result)
+
+        def _add(self, kind, row):
+            if kind == "subdomain":
+                raise OSError("disk is read-only")       # a DIFFERENT failure, same words
+            return real_add(self, kind, row)
+
+        monkeypatch.setattr(store.Run, "record", _rec, raising=False)
+        monkeypatch.setattr(store.Run, "add", _add, raising=False)
+        rows = [{"input": "api.z.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y"}]
+        kept, life = self._differ(tmp_path, monkeypatch, rows=rows)
+        reason = life[-1]["reason"]
+        assert "the wildcard differ failed (OSError: disk is read-only)" in reason, reason
+        assert "1 tool result(s) not recorded" in reason, reason      # the OTHER failure survives

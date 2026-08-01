@@ -508,13 +508,29 @@ WC_PARSER_SCHEMA = 2
 ZONE_CAP = 5
 
 
-def _wc_with_ledger(st: dict, why: str) -> str:
+def _wc_with_ledger(st: dict, why: str, raised=None) -> str:
     """Fold any known LEDGER failure into an exceptional exit's reason (v56). A `record()` we could not
-    make is a fact whatever ends the run, and a later cancellation must not carry it away."""
-    # v57: an error already named in `why` — the raised ledger failure itself — is not repeated.
-    errs = [e for e in (st.get("ledger_errors") or []) if e.split(": ", 1)[-1] not in why]
+    make is a fact whatever ends the run, and a later cancellation must not carry it away.
+
+    v58#2: the raised failure is skipped by IDENTITY, not by matching its rendered text — two independent
+    failures can carry the same type and message, and suppressing one because the other reads the same
+    would delete a fact nothing else records."""
+    ids = st.get("ledger_error_ids") or []
+    errs = [e for i, e in enumerate(st.get("ledger_errors") or [])
+            if raised is None or i >= len(ids) or ids[i] != id(raised)]
     return "; ".join(p for p in (why, f"{len(errs)} tool result(s) not recorded ({'; '.join(errs)})"
                                  if errs else "") if p)
+
+
+def _wc_base_facts(st: dict, kept: set) -> str:
+    """The measured ZONE facts for an exceptional exit — or the honest statement that there are none.
+
+    v58#1: `_wc_terminal` reads zero-initialised counters, so composing it before eligibility was known
+    added "no in-scope wildcard zone" to a run that never learned what was eligible, contradicting the
+    UNKNOWN coverage record it emits."""
+    if not st.get("eligibility_known"):
+        return "the eligible wildcard zone set was never determined"
+    return _wc_terminal(st, kept)[1] or ""
 
 
 def _wc_reasons(st: dict) -> tuple:
@@ -760,19 +776,20 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
     except (KeyboardInterrupt, SystemExit):
         # v57: the ZONE facts gathered before the exit are real and are stated first — an invocation
         # whose own RunResult never reached the ledger has no other durable trace.
-        _base = _wc_terminal(st, kept)[1] or ""
+        _base = _wc_base_facts(st, kept)
         outcome = ((Status.PARTIAL if kept else Status.FAILED),
                    _wc_with_ledger(st, "; ".join(p for p in (
                        _base, "CANCELLED mid-differ — evidence KEPT" if kept
                        else "CANCELLED mid-differ") if p)))
         raise                                                  # after the terminal, never before
     except Exception as ex:
-        _base = _wc_terminal(st, kept)[1] or ""                # BEFORE the carrier is overwritten
+        _base = _wc_base_facts(st, kept)                       # BEFORE the carrier is overwritten
         st["blocked_reason"] = f"{type(ex).__name__}: {ex}"
         machinery = ex
         outcome = ((Status.PARTIAL if kept else Status.FAILED),
                    _wc_with_ledger(st, "; ".join(p for p in (
-                       _base, f"the wildcard differ failed ({type(ex).__name__}: {ex})") if p)))
+                       _base, f"the wildcard differ failed ({type(ex).__name__}: {ex})") if p),
+                                   raised=ex))
     finally:
         try:
             _wc_report(source_id, label, st)      # every record, on every path (v52#2)
@@ -953,6 +970,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     st["unreadable_artifacts"] = 0
     st["artifact_errors"] = []
     st["ledger_errors"] = []
+    st["ledger_error_ids"] = []
     st["stopped"] = ""
     for zone in zones:
         # self-attack guard: if the wildcard resolves to the SCAN BOX / metadata, don't vhost-scan the zone
@@ -1023,6 +1041,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             # must not cost the rows or the evidence. The failure is KEPT and raised after this artifact
             # has been accounted for and ingested, so it degrades the run without erasing what it found.
             st["ledger_errors"].append(f"{zone}: {type(e).__name__}: {e}")
+            st["ledger_error_ids"].append(id(e))       # identity, for the dedupe in `_wc_with_ledger`
             ledger_error = ledger_error or e
         if r.status is Status.SKIPPED:
             break
