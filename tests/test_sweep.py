@@ -1858,6 +1858,44 @@ class TestThePreflightCallbacksAreContained:
         out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: allow,
                          tool=_Tool(raises=(1, RuntimeError("popen exploded"))))
         assert out.admission_unpersisted == 1, out
-        assert "could not be persisted" in " ".join(out.machinery), out.machinery
+        # v82: the sentence is written from the SETTLED state, not from the first failed write
+        assert "1 admission answer(s) not persisted" in " ".join(out.machinery), out.machinery
         ev = [e for e in _events(tmp_path) if e.get("unit") == "admission"][-1]["admission"]
         assert ev["unpersisted"] == 1, ev
+
+    def test_an_admission_RESCUED_by_a_later_save_is_not_reported_unpersisted(self, tmp_path,
+                                                                             monkeypatch):
+        """v82: the counter recorded the first failed save. A later successful save writes the WHOLE map
+        and carries the tuple, so the claim contradicted the disk."""
+        _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+
+        def flaky(self):
+            calls["n"] += 1
+            return False if calls["n"] == 2 else real(self)   # only the admission's own save fails
+
+        monkeypatch.setattr(budget.RotationProgress, "save", flaky)
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: True)
+        assert tool.calls and out.admission_unpersisted == 0, out
+        assert "not persisted" not in " ".join(out.machinery), out.machinery
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        assert reopened.targets["a.com"].get("adm_ok"), reopened.targets   # the disk agrees
+
+    def test_a_RAISED_admission_write_leaves_nothing_to_rescue(self, tmp_path, monkeypatch):
+        """The inverse: no tuple was written at all, so it is machinery — never a pending answer."""
+        def boom(self, target, *, at):
+            raise OSError("state gone")
+
+        monkeypatch.setattr(budget.RotationProgress, "admit_target", boom)
+        # ...even when no later save can rescue anything: there is nothing to rescue
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+        monkeypatch.setattr(budget.RotationProgress, "save",
+                            lambda self: real(self) if (calls.update(n=calls["n"] + 1) or calls["n"]) == 1
+                            else False)
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: True)
+        assert out.admission_pending == 0 and out.admission_unpersisted == 0, out
+        assert "the admission could not be recorded (OSError: state gone)" in " ".join(out.machinery)
+        assert "admission answer(s) not persisted" not in " ".join(out.machinery), out.machinery

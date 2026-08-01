@@ -179,7 +179,10 @@ class SweepResult:
     targets_eligible: int = 0               # every target the corpus offered
     targets_admitted: int = 0               # ...that the per-run allowance let this lifecycle start
     targets_refused: int = 0                # ...that the caller's admission check turned away
-    #: admission ANSWERS — either kind — that did not reach disk. `save()` reports durability through its
+    #: admission ANSWERS — either kind — written in memory but not yet durable. Like a completion, a
+    #: later successful save writes the WHOLE map and carries them, so this is PENDING, not lost (v82).
+    admission_pending: int = 0
+    #: ...and the settled count at the end of the lifecycle. `save()` reports durability through its
     #: RESULT, and ignoring it let the run claim an answer had landed while the older record stood (v81).
     admission_unpersisted: int = 0
     refused_pairs: int = 0
@@ -516,23 +519,11 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     break
                 if allowed is True:
                     # v79#1: an admission that SUCCEEDED supersedes any older refusal for the whole
-                    # target. In memory here; the next save carries it, exactly like a completion.
-                    try:
-                        progress.admit_target(target, at=now())
-                        # v80#2: PERSISTED here, not left to a later completion save — a raised,
-                        # skipped or cancelled invocation would otherwise leave the older refusal
-                        # authoritative on disk while the guard had just said yes.
-                        if not progress.save():
-                            # v81: `save()` reports durability through its RESULT. Ignoring it claimed
-                            # the answer had landed while the older refusal stood on disk.
-                            out.admission_unpersisted += 1
-                            out.machinery.append(f"{target}: the admission answer could not be "
-                                                 f"persisted — an older refusal may still stand")
-                    except (KeyboardInterrupt, SystemExit):
-                        raise
-                    except BaseException as e:
-                        out.machinery.append(f"{target}: the admission could not be recorded "
-                                             f"({_safe_exc(e)})")
+                    # target — and it is persisted where it is learned (v80#2), because a raised,
+                    # skipped or cancelled invocation would otherwise leave the older refusal
+                    # authoritative on disk while the guard had just said yes.
+                    _record_admission(out, progress, target, now, progress.admit_target,
+                                      "the admission")
                 if allowed is not True and allowed is not False:
                     # v65#1: a SAFETY boundary may not run on truthiness. A callback that returned a
                     # contact-state string or a tuple would have authorised traffic; the only answers
@@ -548,17 +539,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     # attempted. Without it the target kept the front of tier 0 and starved every dirty
                     # zone, lifecycle after lifecycle. Best effort: losing the note costs ordering
                     # quality, never coverage.
-                    try:
-                        progress.refuse_target(target, at=now())
-                        if not progress.save():
-                            out.admission_unpersisted += 1
-                            out.machinery.append(f"{target}: the refusal could not be persisted — this "
-                                                 f"target keeps its old rank")
-                    except (KeyboardInterrupt, SystemExit):
-                        raise
-                    except BaseException as e:
-                        out.machinery.append(f"{target}: the refusal could not be recorded "
-                                             f"({_safe_exc(e)})")
+                    _record_admission(out, progress, target, now, progress.refuse_target,
+                                      "the refusal")
                     out.targets_refused += 1
                     if len(out.refused) < _UNSELECTABLE_DETAIL:
                         out.refused.append(target)
@@ -740,6 +722,12 @@ def _settle_completions(out: "SweepResult", *, inflight: int = 0, staged: bool =
         # v71#3: PENDING means a real in-memory tuple a later save can carry. An unstaged batch has no
         # tuple at all and the lifecycle is over — definitely unpublished, and nothing will rescue it.
         out.completion_unstaged += max(0, int(inflight))
+    # v82: admission durability settles the same way — an answer a later save carried is NOT unpersisted,
+    # and the machinery sentence is written from the FINAL state rather than the first failed write.
+    out.admission_unpersisted = out.admission_pending
+    if out.admission_unpersisted:
+        out.machinery.append(f"{out.admission_unpersisted} admission answer(s) not persisted — an older "
+                             f"record may still stand for those target(s)")
     out.completion_unpersisted = (out.pending_completions + out.completion_unknown
                                   + out.completion_unstaged)
     if out.completion_unpersisted:
@@ -755,11 +743,37 @@ def _settle_completions(out: "SweepResult", *, inflight: int = 0, staged: bool =
         out.machinery.append("; ".join(parts) + " — those slot(s) may be selected again")
 
 
+def _record_admission(out: "SweepResult", progress, target: str, now, write, what: str) -> None:
+    """Write an admission answer and try to make it durable, contained (v82).
+
+    Two failures, two meanings. If the WRITE fails there is no tuple at all — machinery, nothing to
+    rescue. If only the SAVE fails the tuple is in memory and PENDING: a later successful save writes the
+    whole map and carries it, exactly like a completion, so it is settled at the end rather than declared
+    lost on the spot."""
+    try:
+        write(target, at=now())
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:
+        out.machinery.append(f"{target}: {what} could not be recorded ({_safe_exc(e)})")
+        return
+    out.admission_pending += 1
+    try:
+        if progress.save():
+            _rescue(out)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:
+        out.machinery.append(f"{target}: {what} could not be persisted ({_safe_exc(e)})")
+
+
 def _rescue(out: "SweepResult") -> None:
-    """A successful save writes the WHOLE in-memory map, so it carries every pending completion with it."""
+    """A successful save writes the WHOLE in-memory map, so it carries every pending completion — and
+    every pending admission answer (v82) — with it."""
     if out.pending_completions:
         out.completions_published += out.pending_completions
         out.pending_completions = 0
+    out.admission_pending = 0
 
 
 def _safe_text(render) -> str:
