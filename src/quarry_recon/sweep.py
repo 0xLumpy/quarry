@@ -360,6 +360,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     # ever lost a word, that has to surface as an unattempted pair, not shrink the denominator to match.
     content = {slot: content_digest(words) for slot, words in members.items()}
     owners: dict = {}
+    _owners_stage: dict = {}
+    _sources_stage: dict = {}
     try:
       if attribution is not None:
         # ELIGIBLE attribution is over the whole deduplicated corpus, not over what survived partitioning
@@ -368,16 +370,20 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # attribution is still counted per submitted word, inside the loop.
         for target, per_target in corpus.items():
             for word in per_target:
-                owners[word] = src = attribution(word)
-                out.per_source_eligible[src] = out.per_source_eligible.get(src, 0) + 1
+                # v72#2: STAGED, not published as we go. A failure on the second word used to leave a
+                # partial map presented as the complete attribution of a corpus twice its size.
+                _owners_stage[word] = src = attribution(word)
+                _sources_stage[src] = _sources_stage.get(src, 0) + 1
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
         # v71#1: accounting may not authorise or block work, but it may not escape either.
         out.machinery.append(f"attribution failed ({_safe_exc(e)})")
         out.stop, out.stop_kind = "machinery: attribution failed", "machinery"
-        _report(coverage_lane, out, clock)
+        _report(coverage_lane, out, clock)     # `per_source_eligible` stays EMPTY: nothing was published
         return out
+    owners = _owners_stage                     # the whole corpus was attributed, or none of it is used
+    out.per_source_eligible.update(_sources_stage)
 
     if not members:
         # NOTHING is schedulable — an empty corpus, or one whose every slot the bounds cannot admit. No
@@ -448,6 +454,9 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             # RESERVE THE WHOLE BATCH BEFORE CONTACT, in one save (design v22#3, clause 2).
             try:
                 gens = progress.reserve_batch(target, [b for b, _w in chosen], at=now())
+                # v72#1: the SAVE is body work too and sat outside this boundary, so a `StateBusy` or an
+                # `OSError` from it escaped the driver with no accounting at all.
+                persisted = progress.save()
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as e:
@@ -457,7 +466,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.stop = "machinery: the reservation was refused"
                 out.stop_kind = "machinery"
                 break
-            if not progress.save():
+            if not persisted:
                 # FAIL CLOSED: nothing is submitted for slots whose reservation nobody owns (v6#2).
                 out.stop = "machinery: the reservation could not be persisted"
                 out.stop_kind = "machinery"
@@ -561,6 +570,9 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     # in-memory map — `now()` raised, or `complete_batch` did — so there is no `done`
                     # tuple for a later save to carry, and calling it PENDING let `_rescue` publish a
                     # completion that does not exist.
+                    # v72#3: it is still a slot that RAN and whose completion nobody holds — counted as
+                    # unstaged rather than cleared and forgotten.
+                    out.completion_unstaged += inflight
                     out.machinery.append(f"{target}/{unit}: completion not staged ({_safe_name(e)})")
                     out.stop = "machinery: the completion could not be staged"
                     out.stop_kind = "machinery"

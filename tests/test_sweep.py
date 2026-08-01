@@ -1525,3 +1525,45 @@ class TestThePreflightCallbacksAreContained:
 
         out, tool = _run(tmp_path, words=["alpha"], dependency_ok=lambda: Hostile())
         assert tool.calls == [] and "<unrepresentable>" in " ".join(out.machinery), out.machinery
+
+    @pytest.mark.parametrize("boom", [budget.StateBusy("held elsewhere"), OSError("disk gone")])
+    def test_a_RESERVATION_SAVE_failure_is_contained(self, tmp_path, monkeypatch, boom):
+        """v72#1: the save sat outside the reservation's boundary, so a body-raised StateBusy or OSError
+        escaped the driver with no accounting at all."""
+        def save(self):
+            raise boom
+
+        monkeypatch.setattr(budget.RotationProgress, "save", save)
+        out, tool = _run(tmp_path, words=["alpha"])
+        assert tool.calls == [] and out.stop_kind == "machinery", out
+        assert out.contended is False and "reservation refused" in " ".join(out.machinery)
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"]
+        assert sel, "the accounting still reaches the log"
+
+    def test_a_PARTIAL_attribution_publishes_NOTHING(self, tmp_path):
+        """v72#2: a failure on the second word left a one-entry map presented as the complete attribution
+        of a two-pair corpus."""
+        seen = {"n": 0}
+
+        def attribution(word):
+            seen["n"] += 1
+            if seen["n"] > 1:
+                raise OSError("owner lookup gone")
+            return "js"
+
+        out, tool = _run(tmp_path, words=["alpha", "beta"], attribution=attribution)
+        assert out.stop_kind == "machinery" and out.per_source_eligible == {}, out
+        assert [e for e in _events(tmp_path) if e.get("unit") == "attribution"] == []
+
+    def test_an_ORDINARY_unstaged_failure_is_COUNTED(self, tmp_path, monkeypatch):
+        """v72#3: `inflight` was cleared and the batch forgotten, so the result claimed nothing was
+        unpersisted even though the tool ran and only the reservation exists."""
+        def boom(self, *a, **k):
+            raise OSError("staging gone")
+
+        monkeypatch.setattr(budget.RotationProgress, "complete_batch", boom)
+        out, tool = _run(tmp_path, words=["alpha"])
+        assert tool.calls and out.stop_kind == "machinery", out
+        assert out.completion_unstaged == 1 and out.completion_unpersisted == 1, out
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "completion"][-1]["completion"]
+        assert ev["unstaged"] == 1 and ev["pending"] == 0, ev
