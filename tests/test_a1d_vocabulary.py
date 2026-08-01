@@ -2579,3 +2579,59 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         monkeypatch.setattr(vertical, "WC_PARSER_SCHEMA", 3)
         _k2, life2 = self._differ(tmp_path / "b", monkeypatch, rows=[])
         assert life1[0]["work_unit"] != life2[0]["work_unit"], (life1[0], life2[0])
+
+    def test_a_MISSING_artifact_gates_the_manifest_VERDICT(self, tmp_path, monkeypatch):
+        """v46#1: the terminal said FAILED while the recorded invocation stayed SUCCESS and every
+        coverage record said `omitted=0`, so the run reconciled as complete."""
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], no_artifact=True)
+        assert life[-1]["status"] == "failed", life
+        summary = self._last_run._run_summary()
+        assert summary["verdict"] != "complete", summary
+        agg = {(a["source_id"], a["measure"]): a for a in summary["coverage"]}
+        art = agg[("enrich.wildcard_a1d", "output_artifacts")]
+        assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
+        # ...and a later clean pass in the SAME run clears it
+        _k2, _l2 = self._differ(tmp_path, monkeypatch, rows=[], run=self._last_run)
+        agg2 = {(a["source_id"], a["measure"]): a for a in self._last_run._run_summary()["coverage"]}
+        assert agg2[("enrich.wildcard_a1d", "output_artifacts")]["omitted"] == 0, agg2
+
+    @pytest.mark.parametrize("row,why", [
+        ({"status_code": -1, "content_length": 9, "title": "t"}, "an impossible status code"),
+        ({"status_code": 999, "content_length": 9, "title": "t"}, "a status outside the HTTP range"),
+        ({"status_code": 200, "content_length": -5, "title": "t"}, "a negative body length"),
+        ({"status_code": 200, "content_length": 9, "favicon": True}, "a bool favicon"),
+        ({"status_code": 200, "content_length": 9, "a": ["not-an-ip"]}, "an address that is not one"),
+    ])
+    def test_a_row_whose_VALUES_are_impossible_is_not_evidence(self, tmp_path, monkeypatch, row, why):
+        """v46#2: types were checked, values were not — `status_code=-1` and `a=["not-an-ip"]` became a
+        successful host and a persisted resolution."""
+        def raw(cands):
+            bogus = [c for c in cands if c.startswith("quarry-wc-")]
+            return "\n".join([json.dumps({"input": bogus[0], "status_code": 200, "content_length": 5,
+                                          "title": "wc", "favicon": "x"}),
+                              json.dumps({"input": "api.z.acme.com", **row})])
+
+        kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
+        assert kept == set(), (why, kept)
+        assert "1 unparseable output row(s)" in life[-1]["reason"], (why, life)
+        assert list(self._last_run.read("resolved")) == [], why
+
+    def test_the_JSON_CONSTANT_hook_refuses_them_by_itself(self):
+        """Defence in depth: no field accepts a float today, so the hook is not observable through the
+        lane — it is tested directly rather than left unproven."""
+        from quarry_recon.phases import vertical
+        for token in ("NaN", "Infinity", "-Infinity"):
+            with pytest.raises(ValueError):
+                vertical._wc_reject_constant(token)
+
+    def test_NON_STANDARD_json_constants_are_refused(self, tmp_path, monkeypatch):
+        """`NaN` and `Infinity` are not JSON, and they would flow into a signature and a store row."""
+        def raw(cands):
+            bogus = [c for c in cands if c.startswith("quarry-wc-")]
+            return "\n".join([json.dumps({"input": bogus[0], "status_code": 200, "content_length": 5,
+                                          "title": "wc", "favicon": "x"}),
+                              '{"input": "api.z.acme.com", "status_code": 200, "favicon": NaN}'])
+
+        kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
+        assert kept == set(), kept
+        assert "1 unparseable output row(s)" in life[-1]["reason"], life

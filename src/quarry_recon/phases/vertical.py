@@ -6,6 +6,7 @@ a human can spot "one source found many another missed" (methodology day1).
 """
 from __future__ import annotations
 
+import ipaddress as _ipaddress
 import json as _json
 import os
 import re as _re
@@ -507,6 +508,23 @@ WC_PARSER_SCHEMA = 2
 ZONE_CAP = 5
 
 
+def _wc_artifact_coverage(sid: str, label: str, st: dict) -> None:
+    """Structured ARTIFACT coverage — an invocation that ANSWERED but wrote no output is evidence we
+    asked for and did not get.
+
+    v46#1: incrementing a counter only changed the lifecycle terminal, while the recorded invocation
+    stayed SUCCESS and both other records reported `omitted=0` — so the manifest reconciled the run as
+    complete beside a FAILED source."""
+    answered = st.get("zones_obtained", 0)
+    missing = st.get("missing_artifacts", 0)
+    events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT if missing else events.COVERAGE_CAP,
+                            unit=f"{label}:artifacts", measure="output_artifacts",
+                            eligible=answered, tested=max(0, answered - missing), omitted=missing,
+                            reason=(f"{label}: {max(0, answered - missing)}/{answered} answered "
+                                    f"invocation(s) left an artifact"
+                                    + (f" — {missing} produced none" if missing else "")))
+
+
 def _wc_rows_coverage(sid: str, label: str, st: dict) -> None:
     """Structured OUTPUT-ROW coverage — rows we could not read are evidence we did not get.
 
@@ -560,6 +578,11 @@ def _wc_vocab_coverage(sid: str, label: str, vocab: dict) -> None:
                             # selected names were ever submitted is the `zones` measure's answer.
                             reason=f"{label}: {vocab['selected']}/{vocab['usable']} usable name(s) SELECTED "
                                    f"for probing (cap {WILDCARD_WORD_CAP}) — {vocab['withheld']} withheld")
+
+
+def _wc_reject_constant(token: str):
+    """`json.loads(parse_constant=...)` hook: NaN/Infinity are not JSON and are not evidence (v46#2)."""
+    raise ValueError(f"non-standard JSON constant {token!r}")
 
 
 def _wc_eligible_zones(ctx, zones) -> list:
@@ -898,8 +921,10 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
                 st["parse_errors"] += 1
                 continue
             try:
-                row = _json.loads(line)
-            except _json.JSONDecodeError:
+                # strict JSON: `NaN`, `Infinity` and `-Infinity` are non-standard constants that would
+                # then flow into a signature and a store row (v46#2).
+                row = _json.loads(line, parse_constant=_wc_reject_constant)
+            except (_json.JSONDecodeError, ValueError):
                 st["parse_errors"] += 1
                 continue
             if not isinstance(row, dict):
@@ -913,19 +938,30 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             # REQUIRED — without one there is no HTTP signature at all, and `{"input": "api.zone"}` was
             # being rescued as a live host on the strength of the name alone. `favicon` enters a set, so a
             # list or dict there raised instead of costing one row.
+            # v46#2: TYPES are not VALUES. `status_code=-1` and `a=["not-an-ip"]` were becoming a
+            # successful host and a persisted resolution; a bool favicon and a non-finite float were
+            # entering the signature set. Every value this pass consumes is range- or format-checked.
             sc = row.get("status_code")
-            shape_ok = isinstance(sc, int) and not isinstance(sc, bool)
-            for field, kinds in (("content_length", int), ("title", str)):
-                v = row.get(field)
-                if v is not None and (isinstance(v, bool) or not isinstance(v, kinds)):
-                    shape_ok = False
+            shape_ok = isinstance(sc, int) and not isinstance(sc, bool) and 100 <= sc <= 599
+            cl = row.get("content_length")
+            if cl is not None and (isinstance(cl, bool) or not isinstance(cl, int) or cl < 0):
+                shape_ok = False
+            title = row.get("title")
+            if title is not None and not isinstance(title, str):
+                shape_ok = False
             fav = row.get("favicon")
-            if fav is not None and not isinstance(fav, (str, int, float)):
-                shape_ok = False
+            if fav is not None and (isinstance(fav, bool) or not isinstance(fav, (str, int))):
+                shape_ok = False                 # httpx writes a hash or a string; never a bool or float
             addrs = row.get("a")
-            if addrs is not None and (not isinstance(addrs, list)
-                                      or not all(isinstance(x, str) for x in addrs)):
-                shape_ok = False
+            if addrs is not None:
+                if not isinstance(addrs, list):
+                    shape_ok = False
+                else:
+                    for x in addrs:
+                        try:
+                            _ipaddress.ip_address(x)
+                        except (ValueError, TypeError):
+                            shape_ok = False
             if not shape_ok:
                 st["parse_errors"] += 1
                 continue
@@ -963,6 +999,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
                 kept.add(host)
     _wc_vocab_coverage(source_id, label, vocab)
     _wc_rows_coverage(source_id, label, st)
+    _wc_artifact_coverage(source_id, label, st)
     _why = "; ".join(p for p in (
         st.get("stopped") or "",
         f"{st['blocked']['zone_cap']} zone(s) over the {ZONE_CAP}-zone cap"
