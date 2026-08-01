@@ -1880,8 +1880,31 @@ class TestA1dVocabularyLossReachesTheVerdict:
                                           words=[f"word{i:03d}" for i in range(5)])
         recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
         assert len(recs) == 1, recs
-        assert "cannot be scheduled under the current bounds" in recs[0].note, recs[0].note
-        assert "will NOT be retried" in recs[0].note, recs[0].note
+        # v37#2: the WHOLE note, not a substring — the same loss was rendered twice and the unsubmitted
+        # apex claimed "no reason recorded" beside the reason.
+        assert recs[0].note == ("A1d did NOT run (5 candidate(s) in 1 slot(s) cannot be scheduled under "
+                                "the current bounds and will NOT be retried; 1 apex brute(s) unsubmitted "
+                                "(no candidate is schedulable under the current bounds))"), recs[0].note
+        assert recs[0].note.count("cannot be scheduled") == 1, recs[0].note
+        assert "can never be scheduled" not in recs[0].note, recs[0].note
+
+    def test_the_RESUME_KEY_identifies_the_VOCABULARY_not_just_the_apexes(self, tmp_path, monkeypatch):
+        """v37#1: two entirely different corpora over the same apexes emitted the SAME work unit, so a
+        resume check could not tell them apart."""
+        def _key(where, words, name):
+            with pytest.MonkeyPatch.context() as mp:
+                _submitted, run = self._scheduled(where, mp, words=words, run_name=name)
+            starts = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                      if json.loads(l).get("event") == "tool_start"
+                      and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(starts) == 1, starts
+            return starts[0]["work_unit"]
+
+        one = _key(tmp_path / "a", [f"alpha{i:03d}" for i in range(9)], "one")
+        two = _key(tmp_path / "b", [f"bravo{i:03d}" for i in range(9)], "two")
+        again = _key(tmp_path / "c", [f"alpha{i:03d}" for i in range(9)], "again")
+        assert one != two, (one, two)
+        assert one == again, (one, again)
 
     def test_the_TERMINAL_counts_failures_in_BOTH_currencies(self, tmp_path, monkeypatch):
         """With batching, ten failed slots may be one failed call or ten — the slot map alone cannot say."""

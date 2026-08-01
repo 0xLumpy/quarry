@@ -123,10 +123,16 @@ def _a1d_sweep(ctx, prof, kept, origins, execute, *, dependency_ok):
         attribution=lambda w: sweep.owner_of(w, sorted(origins.get(w) or ["crawl"])))
 
 
+#: the scheduler names every unschedulable slot in `machinery`; the lane renders that loss ONCE, from its
+#: own counters (v37#2). Folding both produced the same fact twice in one sentence.
+_UNSCHEDULABLE_NOTE = "can never be scheduled"
+
+
 def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
     """Fold the sweep into the lane's reported facts. Fallible on purpose — the caller contains it."""
-    if swept.machinery:
-        wl_loss["sweep_machinery"] = "; ".join(swept.machinery)
+    machinery = [m for m in swept.machinery if _UNSCHEDULABLE_NOTE not in m]
+    if machinery:
+        wl_loss["sweep_machinery"] = "; ".join(machinery)
     if swept.stop_kind not in (None, "bound"):
         wl_loss["sweep_stop"] = swept.stop
     if swept.stop_kind == "dependency" and not swept.slots_attempted:
@@ -251,7 +257,13 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     # the resume key covers everything that shapes the PARTITION, not just the spend: the root count, the
     # invocation maximum (slots are split against the smaller of it and the spend bound) and the slot-space
     # schema. A run under a different partition is a different question, and must not read as the same one.
-    fp = events.work_unit(sid, inputs={"apexes": sorted(prof.apex_domains)},
+    fp = events.work_unit(sid,
+                          # the INPUT is the retained vocabulary, not only which apexes it is aimed at
+                          # (v37#1): two entirely different corpora over the same apexes are not the same
+                          # work, and they were emitting the same key. Per-INVOCATION identity is not
+                          # needed here — the unit names the artifacts and the rotation owns the slots.
+                          inputs={"apexes": sorted(prof.apex_domains),
+                                  "vocabulary": sweep.content_digest(sorted(kept))},
                           config={"per_apex": A1D_WORD_CAP, "buckets": sweep.BUCKETS,
                                   "invocation_max": sweep.MAX_BATCH_WORDS},
                           schema_version=sweep.SCHEMA)
@@ -331,8 +343,13 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     # unit and live in their own fields.
     unsubmitted = max(0, len(prof.apex_domains) - submitted_apexes)
     unsubmitted_why = (swept.stop if swept is not None and swept.stop
-                       else wl_loss.get("sweep_error") or ("the source is not registered"
-                                                           if swept is None else "no reason recorded"))
+                       else wl_loss.get("sweep_error")
+                       or ("the source is not registered" if swept is None else None)
+                       # nothing STOPPED the run: every candidate sat in a slot no bound can admit, which
+                       # is exactly why no apex was brute-forced (v37#2). Without this the note said
+                       # "no reason recorded" beside the reason.
+                       or ("no candidate is schedulable under the current bounds"
+                           if wl_loss.get("unschedulable_pairs") else "no reason recorded"))
     # review-B-audit-14: "there were wildcard zones" is not "the wildcard pass ran" — passive mode, a
     # missing httpx, no wordlist, the self-contact guard and the zone cap all leave zones UNSUBMITTED.
     # The differentiator now says what it actually probed, and both facts are reported.
