@@ -2146,3 +2146,133 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert "reason" not in fins[0], fins            # omitted, never an empty string
         finally:
             events.reset()
+
+
+class TestTheWildcardDifferHasItsOwnLifecycle:
+    """Step 4.3: until now `enrich.wildcard_a1d` and `vertical.wildcard_http` were coverage identities
+    only — they emitted coverage under their id but never a start or a terminal, so a manifest could not
+    tell a pass that never ran from one that ran and found nothing."""
+
+    class _S:
+        passive_only = False
+
+        def in_scope(self, h):
+            return h.endswith("acme.com")
+
+        def is_oos(self, h):
+            return False
+
+    def _differ(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, words=("api",),
+                sid="enrich.wildcard_a1d", rows=None, caught=None):
+        from quarry_recon import store
+        from quarry_recon.phases import probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            monkeypatch.setattr(vertical, "have", lambda t: httpx)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical.netguard, "contact_state",
+                                lambda host, block_private=False: ("public", False, None))
+            monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
+            monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
+            from quarry_recon.runner import RunResult as _RR
+
+            def _tool(tool, cmd, raw_path=None, timeout=None, **k):
+                if rows is not None and raw_path is not None:
+                    cand = pathlib.Path(cmd[cmd.index("-l") + 1]).read_text().split()
+                    bogus = [c for c in cand if c.startswith("quarry-wc-")]
+                    out = [json.dumps({"input": b, "status_code": 200, "content_length": 5,
+                                       "title": "wc", "favicon": "x"}) for b in bogus]
+                    out += [json.dumps(r) for r in rows]
+                    raw_path.write_text("\n".join(out) + "\n")
+                return _RR(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, raw_path, 0)
+
+            monkeypatch.setattr(vertical, "exec_tool", _tool)
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            kept = set()
+            try:
+                kept = vertical._wildcard_differentiate(ctx, set(zones), extra_words=list(words),
+                                                        phase="enrich", label="wildcard-a1d",
+                                                        source="wildcard-http-a1d", source_id=sid)
+            except BaseException as e:      # `caught` lets a test inspect the LIFECYCLE of a raising run
+                if caught is None:
+                    raise
+                caught.append(e)
+            log = run.dir / "events.jsonl"
+            evs = [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+            return kept, [e for e in evs if e.get("event") in ("tool_start", "tool_finish")
+                          and e.get("source_id") == sid]
+        finally:
+            events.reset()
+
+    def test_the_pass_emits_exactly_ONE_start_and_ONE_terminal(self, tmp_path, monkeypatch):
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[])
+        assert [e["event"] for e in life] == ["tool_start", "tool_finish"], life
+        assert life[0]["input_total"] == 1 and life[0]["work_unit"] == life[1]["work_unit"]
+
+    def test_a_pass_that_found_a_VHOST_is_a_SUCCESS(self, tmp_path, monkeypatch):
+        kept, life = self._differ(tmp_path, monkeypatch,
+                                  rows=[{"input": "api.z.acme.com", "status_code": 200,
+                                         "content_length": 99, "title": "real", "favicon": "y"}])
+        assert kept == {"api.z.acme.com"}, kept
+        assert life[-1]["status"] == "success" and life[-1]["produced"] == {"subdomains": 1}
+
+    def test_a_pass_that_probed_and_found_NOTHING_is_EMPTY(self, tmp_path, monkeypatch):
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[])
+        assert kept == set() and life[-1]["status"] == "empty", life
+
+    def test_a_MISSING_httpx_is_a_SKIP_with_its_reason(self, tmp_path, monkeypatch):
+        kept, life = self._differ(tmp_path, monkeypatch, httpx=False)
+        assert life[-1]["status"] == "skipped" and "httpx" in life[-1]["reason"], life
+
+    def test_NO_eligible_zone_is_a_clean_EMPTY(self, tmp_path, monkeypatch):
+        kept, life = self._differ(tmp_path, monkeypatch, zones=("z.example.org",))
+        assert life[-1]["status"] == "empty" and life[0]["input_total"] == 0, life
+
+    def test_NO_usable_vocabulary_is_a_SKIP(self, tmp_path, monkeypatch):
+        kept, life = self._differ(tmp_path, monkeypatch, words=())
+        assert life[-1]["status"] == "skipped" and "vocabulary" in life[-1]["reason"], life
+
+    def test_a_DISABLED_lane_runs_nothing_and_CLAIMS_nothing(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "registered", lambda sid: False)
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[])
+        assert kept == set() and life == [], life
+
+    def test_a_RAISING_pass_still_closes_its_lifecycle(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "_wc_differentiate",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("differ exploded")))
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[])
+        assert [e["event"] for e in life] == ["tool_start", "tool_finish"], life
+        assert life[-1]["status"] == "failed" and "differ exploded" in life[-1]["reason"], life
+
+    def test_CANCELLATION_closes_the_lifecycle_before_propagating(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "_wc_differentiate",
+                            lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt("ctrl-c")))
+        caught = []
+        _kept, life = self._differ(tmp_path, monkeypatch, rows=[], caught=caught)
+        assert caught and isinstance(caught[0], KeyboardInterrupt), caught
+        assert [e["event"] for e in life] == ["tool_start", "tool_finish"], life
+        assert life[-1]["status"] == "failed" and "CANCELLED" in life[-1]["reason"], life
+
+    def test_a_cancelled_pass_that_ALREADY_found_hosts_is_PARTIAL(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import vertical
+        real = vertical._wc_differentiate
+
+        def half(*a, **k):
+            k["kept"].add("api.z.acme.com")
+            raise KeyboardInterrupt("ctrl-c")
+
+        monkeypatch.setattr(vertical, "_wc_differentiate", half)
+        caught = []
+        _kept, life = self._differ(tmp_path, monkeypatch, rows=[], caught=caught)
+        assert life[-1]["status"] == "partial" and "evidence KEPT" in life[-1]["reason"], life
+
+    def test_the_TWO_lanes_keep_SEPARATE_lifecycles(self, tmp_path, monkeypatch):
+        _k, life = self._differ(tmp_path, monkeypatch, rows=[], sid="vertical.wildcard_http")
+        assert [e["source_id"] for e in life] == ["vertical.wildcard_http"] * 2, life

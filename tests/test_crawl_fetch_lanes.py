@@ -3859,9 +3859,10 @@ class TestRetentionIsComplete:
         assert len([r for k, r in ctx_v3.run.added if k == "parameter"]) == 2500
 
     def test_ACTIVE_SELECTION_is_unchanged_by_this_commit(self, tmp_path, monkeypatch):
-        """The spend-side bounds are step 4.2/4.3 and must still be exactly where they were."""
-        import inspect
+        """The spend-side bounds are step 4.2/4.3 and must still be exactly where they were. `ZONE_CAP`
+        moved to module scope when the differ gained its own lifecycle (the work unit binds it); the
+        VALUE is what this pins."""
         from quarry_recon.phases import enrich, vertical
         assert vertical.WILDCARD_WORD_CAP == 5000
+        assert vertical.ZONE_CAP == 5
         assert enrich.A1D_WORD_CAP == 2000        # the A1d spend bound, now owned by its caller
-        assert "ZONE_CAP = 5" in inspect.getsource(vertical._wildcard_differentiate)
