@@ -1228,3 +1228,39 @@ class TestTheAdmissionHook:
                          admit=lambda t: t == "c.com")
         got = [e for e in _events(tmp_path) if e.get("unit") == "admission"][-1]["admission"]
         assert got["targets"] == 2 and len(got["detail"]) == 1 and got["truncated"] is True, got
+
+    def test_an_UNREPRESENTABLE_answer_is_still_contained(self, tmp_path):
+        """v66#1: rendering the returned value's repr outside the protected call let a raising
+        `__repr__` escape the driver at the very boundary that exists to fail closed."""
+        class Hostile:
+            def __repr__(self):
+                raise RuntimeError("repr exploded")
+
+        out, tool = _run(tmp_path, words=["alpha"], admit=lambda _t: Hostile())
+        assert tool.calls == [] and out.stop_kind == "machinery"
+        assert "<unrepresentable>" in " ".join(out.machinery), out.machinery
+
+    def test_a_CANCELLATION_still_flushes_the_refusals_before_it(self, tmp_path):
+        """v66#2: cancellation propagated before the report, so refusals the lifecycle had already made
+        left no record at all."""
+        def admit(target):
+            if target == "a.com":
+                return False
+            raise KeyboardInterrupt("ctrl-c")
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, targets=("a.com", "b.com"), words=["alpha"], admit=admit)
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "admission"]
+        assert len(ev) == 1 and ev[0]["admission"]["detail"] == ["a.com"], ev
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"]
+        assert sel, "the selection record is flushed too"
+
+    def test_a_REPORTING_failure_never_masks_the_cancellation(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "_report",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("event log gone")))
+
+        def admit(_target):
+            raise KeyboardInterrupt("ctrl-c")
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, words=["alpha"], admit=admit)

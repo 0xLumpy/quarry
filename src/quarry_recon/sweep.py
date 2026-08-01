@@ -362,7 +362,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         _report(coverage_lane, out, clock)
         return out
 
-    with contextlib.ExitStack() as stack:
+    try:
+      with contextlib.ExitStack() as stack:
         try:
             progress = stack.enter_context(budget.rotation_session(state_dir, lane, schema=SCHEMA,
                                                                    slot_grammar=slot_id_ok))
@@ -428,7 +429,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     # contact-state string or a tuple would have authorised traffic; the only answers
                     # this hook has are yes and no, and anything else fails closed.
                     out.machinery.append(f"{target}: the admission check answered "
-                                         f"{type(allowed).__name__} {allowed!r}, not True or False")
+                                         f"{type(allowed).__name__} {_safe_repr(allowed)}, "
+                                         f"not True or False")
                     out.stop = "machinery: the admission check gave no usable answer"
                     out.stop_kind = "machinery"
                     break
@@ -540,6 +542,15 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             # no failure and no clock-stopped work: a CAP we chose is what ended the run (v59#1)
             out.stop_kind = "bound"
             out.stop = "; ".join(out.cap_reasons)
+    except (KeyboardInterrupt, SystemExit):
+        # v66#2: the refusals, reservations and outcomes this lifecycle already accumulated are facts.
+        # They are flushed before the cancellation continues; a failure to report them may not MASK the
+        # cancellation, which stays the exception that leaves this function.
+        try:
+            _report(coverage_lane, out, clock)
+        except Exception:
+            pass
+        raise
     out.completion_unpersisted = out.pending_completions
     if out.completion_unpersisted:
         # review v15#2: a counter no emitted fact consumes is still silent loss. These slots RAN and their
@@ -555,6 +566,16 @@ def _rescue(out: "SweepResult") -> None:
     if out.pending_completions:
         out.completions_published += out.pending_completions
         out.pending_completions = 0
+
+
+def _safe_repr(value) -> str:
+    """`repr()` that cannot escape the driver (v66#1). Rendering a returned object's repr outside the
+    protected call let a raising `__repr__` break the "raises nothing but cancellation" contract at the
+    very boundary that exists to fail closed."""
+    try:
+        return repr(value)
+    except Exception:
+        return "<unrepresentable>"
 
 
 def _unit_of(chosen) -> str:
