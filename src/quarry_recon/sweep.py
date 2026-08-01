@@ -457,12 +457,14 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
 
 
         # ── DISPOSITIONS, reconciled from the whole slot set ────────────────────────────────────
+        deferred_slots: set = set()
         if max_targets_per_run and len(started_targets) >= max_targets_per_run:
             # v60#1: the deferral used to be counted only when ranking happened to REACH a disallowed
             # target, so a clock that fired right after the last admitted one left the allowance
             # invisible. Once the allowance is saturated, every unstarted target is deferred by it.
             unstarted = {tgt for tgt, _s in slots if tgt not in started_targets}
             if unstarted:
+                deferred_slots = {s for s in slots if s[0] in unstarted}
                 out.deferred_targets = len(unstarted)
                 out.deferred_pairs = sum(len(words) for (tgt, _s), words in members.items()
                                          if tgt in unstarted)
@@ -475,7 +477,11 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # slots were LEFT — a slot a cap excluded is already classified and was never the clock's to
         # take. Otherwise a run whose last permitted call happened to cross the deadline reported
         # "budget exhausted" for an omission the candidate bound had already explained.
-        stopped_by_clock = clock.exhausted() and len(picked) < len(slots)
+        # v61: a slot the ALLOWANCE deferred is already explained and was never the clock's to take
+        # either — counting it here made a clock that prevented nothing the stop of a run whose whole
+        # remainder belonged to the allowance.
+        stopped_by_clock = clock.exhausted() and any(s not in picked and s not in deferred_slots
+                                                     for s in slots)
         if out.stop_kind is None and stopped_by_clock:
             # FIRST CAUSE WINS (review v15#1). A machinery stop that happened to cross the bound was being
             # relabelled "budget", which reads as an operator cap — laundering a failure into a choice.

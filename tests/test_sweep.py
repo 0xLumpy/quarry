@@ -1107,8 +1107,12 @@ class TestThePerRunTargetAllowance:
                          max_targets_per_run=1, budget_s=10, tool=_Slow())
         assert len(tool.calls) == 1 and out.targets_contacted == 1, tool.calls
         assert out.deferred_targets == 1 and out.deferred_pairs == 1, out
+        # v61: the clock elapsed but took NOTHING — the only omitted pair is the allowance's
+        assert out.stop_kind == "bound" and "allowance (1)" in out.stop, out
+        assert "budget" not in out.stop, out.stop
         sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
         assert "the per-run target allowance (1) was reached" in sel["reason"], sel
+        assert "budget exhausted" not in sel["reason"], sel
 
     def test_an_ELAPSED_clock_that_stopped_NOTHING_is_not_the_cause(self, tmp_path, monkeypatch):
         """v60#2: the last permitted call crossed the deadline, but every omitted pair had already been
