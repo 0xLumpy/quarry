@@ -1091,3 +1091,41 @@ class TestThePerRunTargetAllowance:
         assert tool.calls == [] and out.stop_kind == "machinery"
         assert "the per-run target allowance must be an exact non-negative int" in out.stop, out.stop
         assert out.targets_eligible == 2 and out.eligible_pairs == 4, out
+
+    def test_the_DEFERRAL_is_reconciled_even_when_ranking_never_reached_it(self, tmp_path, monkeypatch):
+        """v60#1: the disposition was counted only when ranking happened to REACH a disallowed target, so
+        a clock firing right after the last admitted one left the allowance invisible."""
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+
+        class _Slow(_Tool):
+            def __call__(self, target, unit, words):
+                ticks["t"] += 20.0
+                return super().__call__(target, unit, words)
+
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha"],
+                         max_targets_per_run=1, budget_s=10, tool=_Slow())
+        assert len(tool.calls) == 1 and out.targets_contacted == 1, tool.calls
+        assert out.deferred_targets == 1 and out.deferred_pairs == 1, out
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "the per-run target allowance (1) was reached" in sel["reason"], sel
+
+    def test_an_ELAPSED_clock_that_stopped_NOTHING_is_not_the_cause(self, tmp_path, monkeypatch):
+        """v60#2: the last permitted call crossed the deadline, but every omitted pair had already been
+        classified by the candidate bound — the clock took nothing."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+
+        class _Slow(_Tool):
+            def __call__(self, target, unit, words):
+                ticks["t"] += 20.0
+                return super().__call__(target, unit, words)
+
+        out, tool = _run(tmp_path, words=["alpha", "beta"], max_pairs_per_target=1, budget_s=10,
+                         tool=_Slow())
+        assert out.attempted_pairs == 1 and out.stop_kind == "bound", out
+        assert "candidate bound (1)" in out.stop and "budget" not in out.stop, out.stop
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "budget exhausted" not in sel["reason"], sel
+        assert sel["kind"] == "cap" and "candidate bound (1)" in sel["reason"], sel

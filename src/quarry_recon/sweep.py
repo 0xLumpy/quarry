@@ -456,18 +456,35 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.pending_completions += len(chosen)
 
 
-        if out.deferred_pairs:
-            out.deferred_targets = len({t for t, _s in slots if t not in started_targets})
-        if out.stop_kind is None and out.cap_reasons and not clock.exhausted():
-            # no failure and no clock: a CAP we chose is what ended the run (v59#1). When something else
-            # did end it, that keeps the sentence and the caps are still rendered beside it.
-            out.stop_kind = "bound"
-            out.stop = "; ".join(out.cap_reasons)
-        if out.stop_kind is None and clock.exhausted() and len(picked) < len(slots):
+        # ── DISPOSITIONS, reconciled from the whole slot set ────────────────────────────────────
+        if max_targets_per_run and len(started_targets) >= max_targets_per_run:
+            # v60#1: the deferral used to be counted only when ranking happened to REACH a disallowed
+            # target, so a clock that fired right after the last admitted one left the allowance
+            # invisible. Once the allowance is saturated, every unstarted target is deferred by it.
+            unstarted = {tgt for tgt, _s in slots if tgt not in started_targets}
+            if unstarted:
+                out.deferred_targets = len(unstarted)
+                out.deferred_pairs = sum(len(words) for (tgt, _s), words in members.items()
+                                         if tgt in unstarted)
+                why = f"the per-run target allowance ({max_targets_per_run}) was reached"
+                if why not in out.cap_reasons:
+                    out.cap_reasons.append(why)
+
+        # ── the STOP: what actually ended the run ───────────────────────────────────────────────
+        # v60#2: an elapsed clock is not automatically the cause. It only stopped work if selectable
+        # slots were LEFT — a slot a cap excluded is already classified and was never the clock's to
+        # take. Otherwise a run whose last permitted call happened to cross the deadline reported
+        # "budget exhausted" for an omission the candidate bound had already explained.
+        stopped_by_clock = clock.exhausted() and len(picked) < len(slots)
+        if out.stop_kind is None and stopped_by_clock:
             # FIRST CAUSE WINS (review v15#1). A machinery stop that happened to cross the bound was being
             # relabelled "budget", which reads as an operator cap — laundering a failure into a choice.
             out.stop = f"budget exhausted after {clock.elapsed()}s of {clock.seconds}s"
             out.stop_kind = "budget"           # a CAP we chose, not a failure (v14#4)
+        elif out.stop_kind is None and out.cap_reasons:
+            # no failure and no clock-stopped work: a CAP we chose is what ended the run (v59#1)
+            out.stop_kind = "bound"
+            out.stop = "; ".join(out.cap_reasons)
     out.completion_unpersisted = out.pending_completions
     if out.completion_unpersisted:
         # review v15#2: a counter no emitted fact consumes is still silent loss. These slots RAN and their
@@ -513,11 +530,9 @@ def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: i
             # this lifecycle has contacted its allowance of TARGETS. The slot is excluded (never silently
             # skipped) so the loop terminates, and the rotation hands this target to a later run — which
             # is what makes an allowance a throughput bound rather than a membership cap.
+            # the slot is EXCLUDED (never silently skipped) so the loop terminates; the disposition
+            # itself is reconciled from the whole slot set after the loop (v60#1).
             picked.add(choice)
-            out.deferred_pairs += len(members[choice])
-            why = f"the per-run target allowance ({max_targets}) was reached"
-            if why not in out.cap_reasons:
-                out.cap_reasons.append(why)
             continue
         this_tier = progress.tier(this_target, bucket, content[choice])
         if chosen and (this_target != target or this_tier != tier):
