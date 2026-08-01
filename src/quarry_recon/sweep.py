@@ -208,6 +208,12 @@ class SweepResult:
     #: that would have made it durable. Different from PENDING, which a later save in the same lifecycle
     #: can still rescue: nothing rescues these, and the slot may run again (v69).
     completion_unknown: int = 0
+    #: completions the run ended before ever STAGING — no `done` tuple exists, so nothing could publish
+    #: them and nothing can rescue them. Distinct from pending, which is a real in-memory tuple (v71#3).
+    completion_unstaged: int = 0
+    #: whether the eligible set was ever established. A `vocabulary()` that raised leaves it UNKNOWN, and
+    #: unknown is not zero (v71#1).
+    eligibility_known: bool = False
     #: ACCOUNTING attribution. `eligible` is the whole corpus; `attempted` is the SCHEDULED PREFIX — the
     #: distribution the timing pass actually needs, since uniform hashing spreads sources over the CORPUS
     #: and says nothing about the first k buckets (review v14#3).
@@ -284,14 +290,25 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     members: dict = {}
     seen_pairs: set = set()
     corpus: dict = {}
-    for target in dict.fromkeys(targets):              # a repeated target is one target
-        per_target: list = []
-        for word in vocabulary(target) or []:
-            if (target, word) in seen_pairs:           # review v14#5: one submission per word per target —
-                continue                               # a duplicate would inflate the denominator, the
-            seen_pairs.add((target, word))             # digest, the attribution AND the active payload
-            per_target.append(word)
-        corpus[target] = per_target
+    try:
+        for target in dict.fromkeys(targets):          # a repeated target is one target
+            per_target: list = []
+            for word in vocabulary(target) or []:
+                if (target, word) in seen_pairs:       # review v14#5: one submission per word per target —
+                    continue                           # a duplicate would inflate the denominator, the
+                seen_pairs.add((target, word))         # digest, the attribution AND the active payload
+                per_target.append(word)
+            corpus[target] = per_target
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        # v71#1: `vocabulary` is the CALLER's callable and it ran outside every boundary. A failure there
+        # left the driver by the back door, and the eligible set is not zero — it is UNKNOWN.
+        out.machinery.append(f"the corpus could not be built ({_safe_exc(e)})")
+        out.stop, out.stop_kind = "machinery: the corpus could not be built", "machinery"
+        _report(coverage_lane, out, clock)
+        return out
+    out.eligibility_known = True
     # the DENOMINATOR is known before the bound is: every eligible pair exists whether or not we can
     # partition it (v27#2). Reporting 0/0 for a lane that had work would hide the omission entirely.
     out.eligible_pairs = sum(len(words) for words in corpus.values())
@@ -343,7 +360,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     # ever lost a word, that has to surface as an unattempted pair, not shrink the denominator to match.
     content = {slot: content_digest(words) for slot, words in members.items()}
     owners: dict = {}
-    if attribution is not None:
+    try:
+      if attribution is not None:
         # ELIGIBLE attribution is over the whole deduplicated corpus, not over what survived partitioning
         # (v35#1): a slot removed as unschedulable is still a pair this lane was eligible to submit, and
         # dropping it made the attribution denominator disagree with the selection record's. SCHEDULED
@@ -352,6 +370,14 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             for word in per_target:
                 owners[word] = src = attribution(word)
                 out.per_source_eligible[src] = out.per_source_eligible.get(src, 0) + 1
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        # v71#1: accounting may not authorise or block work, but it may not escape either.
+        out.machinery.append(f"attribution failed ({_safe_exc(e)})")
+        out.stop, out.stop_kind = "machinery: attribution failed", "machinery"
+        _report(coverage_lane, out, clock)
+        return out
 
     if not members:
         # NOTHING is schedulable — an empty corpus, or one whose every slot the bounds cannot admit. No
@@ -360,11 +386,29 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         _report(coverage_lane, out, clock)
         return out
 
-    if dependency_ok is not None and not dependency_ok():
-        out.stop = "the tool is not installed"          # no reservations at all (design v7#2)
-        out.stop_kind = "dependency"
-        _report(coverage_lane, out, clock)
-        return out
+    if dependency_ok is not None:
+        try:
+            ready = dependency_ok()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            out.machinery.append(f"the dependency check raised ({_safe_exc(e)})")
+            out.stop, out.stop_kind = "machinery: the dependency check raised", "machinery"
+            _report(coverage_lane, out, clock)
+            return out
+        if ready is not True and ready is not False:
+            # v71#1: this gate decides whether ACTIVE work happens. Truthiness let a value like
+            # "missing" authorise it; the only answers are yes and no.
+            out.machinery.append(f"the dependency check answered {_safe_name(ready)} "
+                                 f"{_safe_repr(ready)}, not True or False")
+            out.stop, out.stop_kind = "machinery: the dependency check gave no usable answer", "machinery"
+            _report(coverage_lane, out, clock)
+            return out
+        if ready is False:
+            out.stop = "the tool is not installed"      # no reservations at all (design v7#2)
+            out.stop_kind = "dependency"
+            _report(coverage_lane, out, clock)
+            return out
 
     inflight = 0                          # slots whose publication is unresolved (v69)
     staged = False                        # ...and whether their `done` tuples were ever written (v70)
@@ -404,9 +448,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             # RESERVE THE WHOLE BATCH BEFORE CONTACT, in one save (design v22#3, clause 2).
             try:
                 gens = progress.reserve_batch(target, [b for b, _w in chosen], at=now())
-            except (KeyboardInterrupt, SystemExit, budget.StateBusy):
-                # `StateBusy` from INSIDE the body is the body's own machinery failure and must not be
-                # laundered into a contention gap (v10#2) — it keeps escaping, as it always did.
+            except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as e:
                 # v70: the CLOCK is a caller's callable too, and it was only guarded against the
@@ -605,8 +647,11 @@ def _settle_completions(out: "SweepResult", *, inflight: int = 0, staged: bool =
     if staged:
         out.completion_unknown += max(0, int(inflight))
     else:
-        out.pending_completions += max(0, int(inflight))
-    out.completion_unpersisted = out.pending_completions + out.completion_unknown
+        # v71#3: PENDING means a real in-memory tuple a later save can carry. An unstaged batch has no
+        # tuple at all and the lifecycle is over — definitely unpublished, and nothing will rescue it.
+        out.completion_unstaged += max(0, int(inflight))
+    out.completion_unpersisted = (out.pending_completions + out.completion_unknown
+                                  + out.completion_unstaged)
     if out.completion_unpersisted:
         parts = []
         if out.pending_completions:
@@ -614,6 +659,9 @@ def _settle_completions(out: "SweepResult", *, inflight: int = 0, staged: bool =
         if out.completion_unknown:
             parts.append(f"{out.completion_unknown} completion(s) of UNKNOWN publication (the run ended "
                          f"mid-write)")
+        if out.completion_unstaged:
+            parts.append(f"{out.completion_unstaged} completion(s) never staged (the run ended before "
+                         f"the record was written)")
         out.machinery.append("; ".join(parts) + " — those slot(s) may be selected again")
 
 
@@ -726,6 +774,14 @@ def _rank(progress, slots, content, picked):
 
 def _report(lane: str, out: SweepResult, clock) -> None:
     """SELECTION over candidate-target pairs, OUTCOME over slots — different denominators, never summed."""
+    if not out.eligibility_known:
+        # v71#1: the corpus never finished building, so the eligible set is UNKNOWN — structured but
+        # uncounted, which the reconciler admits as a gap instead of a clean 0/0/0.
+        events.coverage_partial(lane, kind=events.COVERAGE_UNKNOWN, measure="candidate_pairs",
+                                unit="candidate_pairs",
+                                reason=f"{out.stop or 'the eligible set could not be determined'} — no "
+                                       f"candidate denominator exists for this run")
+        return
     # a BUDGET stop keeps `report_selection`'s own CAP wording and kind; every other stop is named and
     # classed as a gap (v14#4).
     budget.report_selection(lane, measure="candidate_pairs", eligible=out.eligible_pairs,
@@ -756,6 +812,7 @@ def _report(lane: str, out: SweepResult, clock) -> None:
         events.ledger(lane, unit="completion", produced=None,
                       completion={"pending": out.pending_completions,
                                   "unknown": out.completion_unknown,
+                                  "unstaged": out.completion_unstaged,
                                   "unpersisted": out.completion_unpersisted})
     if out.targets_refused:
         # v65#2: the counters and names die with the result otherwise, leaving only a generic sentence.

@@ -228,13 +228,19 @@ class TestContentionAndCoverage:
         assert "another lifecycle" in sel["reason"] and sel["kind"] == "timeout", sel
 
     def test_a_body_StateBusy_is_MACHINERY_not_contention(self, tmp_path, monkeypatch):
-        """v10#2: only failing to ENTER the lane lock is contention."""
+        """v10#2: only failing to ENTER the lane lock is contention. v71#2: and a body-raised StateBusy
+        is CONTAINED machinery — escaping broke the driver's raises-nothing-but-cancellation contract
+        and took the accounting with it."""
         def boom(self, *a, **k):
             raise budget.StateBusy("something inside the sweep")
 
         monkeypatch.setattr(budget.RotationProgress, "reserve_batch", boom)
-        with pytest.raises(budget.StateBusy):
-            _run(tmp_path)                     # it is NOT swallowed into a contention gap
+        out, tool = _run(tmp_path)
+        assert out.contended is False, out              # NOT laundered into a contention gap
+        assert out.stop_kind == "machinery" and tool.calls == []
+        assert "StateBusy" in " ".join(out.machinery), out.machinery
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"]
+        assert sel, "the accounting still reaches the log"
 
     def test_a_NON_CONTENTION_acquisition_error_is_not_reported_as_contention(self, tmp_path,
                                                                               monkeypatch):
@@ -1359,7 +1365,8 @@ class TestPublicationIsSettledOnEveryExit:
             _run(tmp_path, words=["alpha"])
         ev = [e for e in _events(tmp_path) if e.get("unit") == "completion"]
         assert len(ev) == 1, ev
-        assert ev[0]["completion"] == {"pending": 0, "unknown": 1, "unpersisted": 1}, ev
+        assert ev[0]["completion"] == {"pending": 0, "unknown": 1, "unstaged": 0,
+                                       "unpersisted": 1}, ev
         assert ev[0].get("produced") is None, ev
         # ...and the disk really does hold only the reservation
         reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
@@ -1455,7 +1462,8 @@ class TestPublicationIsSettledOnEveryExit:
         with pytest.raises(KeyboardInterrupt):
             _run(tmp_path, words=["alpha"], now=now)
         ev = [e for e in _events(tmp_path) if e.get("unit") == "completion"][-1]["completion"]
-        assert ev == {"pending": 1, "unknown": 0, "unpersisted": 1}, ev
+        # v71#3: never STAGED is its own disposition — not pending, which implies a rescuable tuple
+        assert ev == {"pending": 0, "unknown": 0, "unstaged": 1, "unpersisted": 1}, ev
 
     def test_a_CLOCK_that_fails_at_RESERVATION_is_machinery_not_an_escape(self, tmp_path):
         """v70: the reservation guarded only the scheduler's own refusals, so an `OSError` from the
@@ -1466,3 +1474,54 @@ class TestPublicationIsSettledOnEveryExit:
         out, tool = _run(tmp_path, words=["alpha"], now=now)
         assert tool.calls == [] and out.stop_kind == "machinery", out
         assert "reservation refused (OSError: clock exploded)" in " ".join(out.machinery), out.machinery
+
+
+class TestThePreflightCallbacksAreContained:
+    """v71#1: `vocabulary`, `attribution` and `dependency_ok` are the CALLER's callables and ran outside
+    every boundary — a failure left the driver by the back door, and the dependency gate authorised
+    active work on truthiness."""
+
+    @pytest.mark.parametrize("answer", ["missing", 1, 0, None, [], ("ok",)])
+    def test_only_TRUE_or_FALSE_gates_the_dependency(self, tmp_path, answer):
+        out, tool = _run(tmp_path, words=["alpha"], dependency_ok=lambda: answer)
+        assert tool.calls == [], (answer, tool.calls)
+        assert out.stop_kind == "machinery" and "not True or False" in " ".join(out.machinery)
+
+    def test_an_EXACT_False_is_still_the_dependency_stop(self, tmp_path):
+        out, tool = _run(tmp_path, words=["alpha"], dependency_ok=lambda: False)
+        assert tool.calls == [] and out.stop_kind == "dependency"
+        assert out.stop == "the tool is not installed"
+
+    def test_a_RAISING_dependency_check_is_machinery(self, tmp_path):
+        def boom():
+            raise OSError("which() exploded")
+
+        out, tool = _run(tmp_path, words=["alpha"], dependency_ok=boom)
+        assert tool.calls == [] and out.stop_kind == "machinery"
+        assert "dependency check raised (OSError: which() exploded)" in " ".join(out.machinery)
+
+    def test_a_RAISING_vocabulary_leaves_eligibility_UNKNOWN(self, tmp_path):
+        out = sweep.run_sweep(lane=LANE, state_dir=tmp_path, targets=["acme.com"],
+                              vocabulary=lambda t: (_ for _ in ()).throw(OSError("corpus gone")),
+                              execute=_Tool(), budget_s=0, coverage_lane=COV)
+        assert out.stop_kind == "machinery" and out.eligibility_known is False
+        assert "corpus could not be built (OSError: corpus gone)" in " ".join(out.machinery)
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert sel["kind"] == "unknown" and sel.get("eligible") is None, sel
+        assert "no candidate denominator exists" in sel["reason"], sel
+
+    def test_a_RAISING_attribution_is_machinery_with_a_KNOWN_denominator(self, tmp_path):
+        out, tool = _run(tmp_path, words=["alpha", "beta"],
+                         attribution=lambda w: (_ for _ in ()).throw(OSError("owner lookup gone")))
+        assert tool.calls == [] and out.stop_kind == "machinery"
+        assert "attribution failed (OSError: owner lookup gone)" in " ".join(out.machinery)
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert (sel["eligible"], sel["tested"], sel["omitted"]) == (2, 0, 2), sel
+
+    def test_a_HOSTILE_dependency_answer_is_rendered_safely(self, tmp_path):
+        class Hostile:
+            def __repr__(self):
+                raise RuntimeError("repr exploded")
+
+        out, tool = _run(tmp_path, words=["alpha"], dependency_ok=lambda: Hostile())
+        assert tool.calls == [] and "<unrepresentable>" in " ".join(out.machinery), out.machinery
