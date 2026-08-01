@@ -179,6 +179,9 @@ class SweepResult:
     targets_eligible: int = 0               # every target the corpus offered
     targets_admitted: int = 0               # ...that the per-run allowance let this lifecycle start
     targets_refused: int = 0                # ...that the caller's admission check turned away
+    #: admission ANSWERS — either kind — that did not reach disk. `save()` reports durability through its
+    #: RESULT, and ignoring it let the run claim an answer had landed while the older record stood (v81).
+    admission_unpersisted: int = 0
     refused_pairs: int = 0
     refused: list = field(default_factory=list)
     targets_contacted: int = 0              # ...whose invocation actually ran (v59#2: not the same fact)
@@ -519,7 +522,12 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                         # v80#2: PERSISTED here, not left to a later completion save — a raised,
                         # skipped or cancelled invocation would otherwise leave the older refusal
                         # authoritative on disk while the guard had just said yes.
-                        progress.save()
+                        if not progress.save():
+                            # v81: `save()` reports durability through its RESULT. Ignoring it claimed
+                            # the answer had landed while the older refusal stood on disk.
+                            out.admission_unpersisted += 1
+                            out.machinery.append(f"{target}: the admission answer could not be "
+                                                 f"persisted — an older refusal may still stand")
                     except (KeyboardInterrupt, SystemExit):
                         raise
                     except BaseException as e:
@@ -542,7 +550,10 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     # quality, never coverage.
                     try:
                         progress.refuse_target(target, at=now())
-                        progress.save()
+                        if not progress.save():
+                            out.admission_unpersisted += 1
+                            out.machinery.append(f"{target}: the refusal could not be persisted — this "
+                                                 f"target keeps its old rank")
                     except (KeyboardInterrupt, SystemExit):
                         raise
                     except BaseException as e:
@@ -926,12 +937,13 @@ def _report(lane: str, out: SweepResult, clock) -> None:
                                   "unknown": out.completion_unknown,
                                   "unstaged": out.completion_unstaged,
                                   "unpersisted": out.completion_unpersisted})
-    if out.targets_refused:
+    if out.targets_refused or out.admission_unpersisted:
         # v65#2: the counters and names die with the result otherwise, leaving only a generic sentence.
         # Metadata, NOT a fourth coverage denominator — a refusal is already inside the selection record.
         events.ledger(lane, unit="admission", produced=None,
                       admission={"targets": out.targets_refused, "pairs": out.refused_pairs,
                                  "detail": list(out.refused),
+                                 "unpersisted": out.admission_unpersisted,
                                  "truncated": out.targets_refused > len(out.refused)})
     if out.unselectable_pairs:
         # the counters are the fact; this carries the operator detail INTO the run's evidence, because a

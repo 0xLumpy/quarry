@@ -1227,7 +1227,8 @@ class TestTheAdmissionHook:
         ev = [e for e in _events(tmp_path) if e.get("unit") == "admission"]
         assert len(ev) == 1, ev
         got = ev[0]["admission"]
-        assert got == {"targets": 1, "pairs": 2, "detail": ["a.com"], "truncated": False}, got
+        assert got == {"targets": 1, "pairs": 2, "detail": ["a.com"], "unpersisted": 0,
+                       "truncated": False}, got
         assert ev[0].get("produced") is None, ev
 
     def test_a_run_with_NO_refusal_emits_no_admission_record(self, tmp_path):
@@ -1837,3 +1838,26 @@ class TestThePreflightCallbacksAreContained:
                                            slot_grammar=sweep.slot_id_ok)
         assert reopened.targets["a.com"].get("adm_ok"), reopened.targets
         assert reopened.tier("a.com", sweep.bucket_of("alpha"), "members") == 0, reopened.targets
+
+    @pytest.mark.parametrize("what", ["admission", "refusal"])
+    def test_an_admission_answer_that_did_NOT_persist_says_so(self, tmp_path, monkeypatch, what):
+        """v81: `save()` reports durability through its RESULT. Ignoring it let the run claim the answer
+        had landed while the older record stood on disk."""
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+
+        def flaky(self):
+            calls["n"] += 1
+            # 1 = the reservation save, 2 = the admission answer's own save
+            return False if calls["n"] == 2 else real(self)
+
+        if what == "admission":
+            _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
+        monkeypatch.setattr(budget.RotationProgress, "save", flaky)
+        allow = what == "admission"
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: allow,
+                         tool=_Tool(raises=(1, RuntimeError("popen exploded"))))
+        assert out.admission_unpersisted == 1, out
+        assert "could not be persisted" in " ".join(out.machinery), out.machinery
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "admission"][-1]["admission"]
+        assert ev["unpersisted"] == 1, ev
