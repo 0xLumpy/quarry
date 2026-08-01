@@ -423,6 +423,15 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     out.stop = "machinery: the admission check raised"
                     out.stop_kind = "machinery"
                     break
+                if allowed is not True and allowed is not False:
+                    # v65#1: a SAFETY boundary may not run on truthiness. A callback that returned a
+                    # contact-state string or a tuple would have authorised traffic; the only answers
+                    # this hook has are yes and no, and anything else fails closed.
+                    out.machinery.append(f"{target}: the admission check answered "
+                                         f"{type(allowed).__name__} {allowed!r}, not True or False")
+                    out.stop = "machinery: the admission check gave no usable answer"
+                    out.stop_kind = "machinery"
+                    break
                 if not allowed:
                     out.targets_refused += 1
                     if len(out.refused) < _UNSELECTABLE_DETAIL:
@@ -646,6 +655,13 @@ def _report(lane: str, out: SweepResult, clock) -> None:
         budget.report_outcome(lane, measure="tool_invocations", attempted=out.invocations,
                               obtained=out.invocations_obtained,
                               classes=out.invocation_classes or None, noun="invocation")
+    if out.targets_refused:
+        # v65#2: the counters and names die with the result otherwise, leaving only a generic sentence.
+        # Metadata, NOT a fourth coverage denominator — a refusal is already inside the selection record.
+        events.ledger(lane, unit="admission", produced=None,
+                      admission={"targets": out.targets_refused, "pairs": out.refused_pairs,
+                                 "detail": list(out.refused),
+                                 "truncated": out.targets_refused > len(out.refused)})
     if out.unselectable_pairs:
         # the counters are the fact; this carries the operator detail INTO the run's evidence, because a
         # field on a value that disappears with the process is not something an operator retains (v39#2).

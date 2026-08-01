@@ -1195,3 +1195,36 @@ class TestTheAdmissionHook:
     def test_NO_hook_is_the_unchanged_path(self, tmp_path):
         out, tool = _run(tmp_path, words=["alpha", "beta"])
         assert tool.calls and out.targets_refused == 0 and out.refused == []
+
+    @pytest.mark.parametrize("answer", ["private_blocked", 1, 0, None, ("self", True), [], object()])
+    def test_only_TRUE_or_FALSE_is_an_admission_answer(self, tmp_path, answer):
+        """v65#1: a SAFETY boundary ran on truthiness, so a callback returning a contact-state string
+        authorised traffic."""
+        out, tool = _run(tmp_path, words=["alpha"], admit=lambda _t: answer)
+        assert tool.calls == [], (answer, tool.calls)
+        assert out.stop_kind == "machinery" and "not True or False" in " ".join(out.machinery)
+        assert out.targets_refused == 0, out
+
+    def test_an_EXACT_False_is_still_a_refusal(self, tmp_path):
+        out, tool = _run(tmp_path, words=["alpha"], admit=lambda _t: False)
+        assert tool.calls == [] and out.targets_refused == 1 and out.stop_kind != "machinery"
+
+    def test_the_REFUSAL_detail_is_EMITTED_not_only_returned(self, tmp_path):
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha", "beta"],
+                         admit=lambda t: t != "a.com")
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "admission"]
+        assert len(ev) == 1, ev
+        got = ev[0]["admission"]
+        assert got == {"targets": 1, "pairs": 2, "detail": ["a.com"], "truncated": False}, got
+        assert ev[0].get("produced") is None, ev
+
+    def test_a_run_with_NO_refusal_emits_no_admission_record(self, tmp_path):
+        _run(tmp_path, words=["alpha"], admit=lambda _t: True)
+        assert [e for e in _events(tmp_path) if e.get("unit") == "admission"] == []
+
+    def test_a_TRUNCATED_refusal_list_says_so(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "_UNSELECTABLE_DETAIL", 1)
+        out, tool = _run(tmp_path, targets=("a.com", "b.com", "c.com"), words=["alpha"],
+                         admit=lambda t: t == "c.com")
+        got = [e for e in _events(tmp_path) if e.get("unit") == "admission"][-1]["admission"]
+        assert got["targets"] == 2 and len(got["detail"]) == 1 and got["truncated"] is True, got
