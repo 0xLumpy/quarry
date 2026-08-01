@@ -157,34 +157,34 @@ def _a1d_terminal(swept, produced: int):
     review v18#3: derived from what was PRODUCED and from the slot CLASSES, not from "the runner
     returned" — `slots_obtained` counts SUCCESS *and* EMPTY, so an all-empty sweep read SUCCESS and a
     failed one read EMPTY, while failed/timed-out/blocked slots never showed at all."""
+    # every degrading fact is ORTHOGONAL and they ACCUMULATE (v39#1 / v40): a run can lose slots to a
+    # machinery failure, get failures back from the ones it did submit, AND hold candidates no bound can
+    # admit. The REASON is built once, for every path — contention and a missing dependency used to return
+    # early and drop the structured facts they coexisted with — while the STATUS keeps its precedence.
+    facts = []
+    if swept.machinery:
+        facts.append("; ".join(swept.machinery))
+    if swept.classes:
+        # both currencies: with batching, 10 failed slots may be one failed call or ten of them, and the
+        # slot-weighted map alone cannot say which (step 4.2, invocation classes).
+        facts.append(f"slot outcomes {dict(sorted(swept.classes.items()))} in "
+                     f"{swept.invocations} invocation(s) "
+                     f"{dict(sorted(swept.invocation_classes.items()))}")
+    if swept.unselectable_pairs:
+        facts.append(f"{swept.unselectable_pairs} candidate(s) in {swept.unselectable_slots} slot(s) "
+                     f"cannot be scheduled under the current bounds")
+    _why = "; ".join(p for p in ([swept.stop] if swept.stop else []) + facts)
+
     if swept.contended:
-        _st, _why = Status.FAILED, swept.stop
+        _st = Status.FAILED
     elif swept.stop_kind == "dependency" and not swept.slots_attempted:
-        _st, _why = Status.SKIPPED, swept.stop          # nothing ran at all
+        _st = Status.SKIPPED                            # nothing ran at all
+    elif facts or swept.stop_kind == "dependency":
+        # PARTIAL asserts something was PRODUCED — a slot answering "nothing here" is not production (the
+        # audit-7#2 rule). A tool that vanished mid-sweep degrades the same way.
+        _st = Status.PARTIAL if produced else Status.FAILED
     else:
-        # every degrading fact is ORTHOGONAL and they ACCUMULATE (v39#1): a run can lose slots to a
-        # machinery failure, get failures back from the ones it did submit, AND hold candidates no bound
-        # can admit. Reporting only the first of those hid the class maps the terminal promises.
-        facts = []
-        if swept.machinery:
-            facts.append("; ".join(swept.machinery))
-        if swept.classes:
-            # both currencies: with batching, 10 failed slots may be one failed call or ten of them, and
-            # the slot-weighted map alone cannot say which (step 4.2, invocation classes).
-            facts.append(f"slot outcomes {dict(sorted(swept.classes.items()))} in "
-                         f"{swept.invocations} invocation(s) "
-                         f"{dict(sorted(swept.invocation_classes.items()))}")
-        if swept.unselectable_pairs:
-            facts.append(f"{swept.unselectable_pairs} candidate(s) in {swept.unselectable_slots} slot(s) "
-                         f"cannot be scheduled under the current bounds")
-        if facts or swept.stop_kind == "dependency":
-            # PARTIAL asserts something was PRODUCED — a slot answering "nothing here" is not production
-            # (the audit-7#2 rule). A tool that vanished mid-sweep degrades the same way.
-            _st = Status.PARTIAL if produced else Status.FAILED
-            _why = "; ".join(p for p in ([swept.stop] if swept.stop else []) + facts)
-        else:
-            _st = Status.SUCCESS if produced else Status.EMPTY
-            _why = swept.stop
+        _st = Status.SUCCESS if produced else Status.EMPTY
     return _st, _why
 
 

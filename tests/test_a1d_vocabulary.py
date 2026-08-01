@@ -2013,3 +2013,95 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert "5 candidate(s) in 1 slot(s) cannot be scheduled" in reason, reason
         finally:
             events.reset()
+
+    @pytest.mark.parametrize("mode,want_status,want_head", [
+        ("contended", "failed", "another lifecycle"),
+        ("dependency", "skipped", "not installed"),
+    ])
+    def test_an_EARLY_terminal_path_still_carries_the_unschedulable_fact(self, tmp_path, monkeypatch,
+                                                                        mode, want_status, want_head):
+        """v40: contention and a pre-attempt dependency returned their own sentence and dropped the
+        structured facts they coexisted with."""
+        from quarry_recon import budget as _b, store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("\n".join(f"word{i:03d}" for i in range(5)))
+            monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+            # one slot nothing can admit, one the lane could have run — so the dependency and contention
+            # paths are really reached (a wholly unschedulable workload short-circuits before both)
+            monkeypatch.setattr(sweep, "allocate",
+                                lambda words, *, cap: {"000": sorted(words)[:3], "001": sorted(words)[3:]})
+            from quarry_recon.runner import RunResult as _RR
+            monkeypatch.setattr(enrich, "have", lambda t: mode != "dependency")
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
+                                    tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            sched = (pathlib.Path(run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}")
+            sched.mkdir(parents=True, exist_ok=True)
+            if mode == "contended":
+                with _b.state_lock(sched / "a1d_brute.lock"):
+                    enrich._a1d_recursive_brute(ctx)
+            else:
+                enrich._a1d_recursive_brute(ctx)
+            fins = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                    if json.loads(l).get("event") == "tool_finish"
+                    and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(fins) == 1 and fins[0]["status"] == want_status, fins
+            reason = fins[0]["reason"]
+            assert want_head in reason, reason                          # the STOP still leads
+            assert "3 candidate(s) in 1 slot(s) cannot be scheduled" in reason, reason
+        finally:
+            events.reset()
+
+    def test_a_tool_that_VANISHES_mid_sweep_is_not_a_clean_run(self, tmp_path, monkeypatch):
+        """The dependency stop degrades the source even when every slot it DID reach came back clean:
+        `slots_obtained` counts EMPTY, so without this the lane read EMPTY with no gap."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("\n".join(f"word{i:03d}" for i in range(4)))
+            monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)     # one slot per invocation
+            from quarry_recon.runner import RunResult as _RR
+            statuses = [crawl.Status.EMPTY, crawl.Status.SKIPPED]
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
+                                    tool, cmd, statuses.pop(0) if statuses else crawl.Status.SKIPPED,
+                                    0, 0.1, None, 0))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            fins = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                    if json.loads(l).get("event") == "tool_finish"
+                    and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(fins) == 1, fins
+            assert fins[0]["status"] == "failed", fins           # NOT empty: a slot never got a tool
+            assert "the tool did not run" in fins[0]["reason"], fins
+        finally:
+            events.reset()
