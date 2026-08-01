@@ -995,3 +995,51 @@ class TestExecutorBatching:
     def test_a_CLEAN_run_emits_no_unschedulable_record(self, tmp_path):
         _run(tmp_path, words=["alpha", "beta"])
         assert [e for e in _events(tmp_path) if e.get("unit") == "unschedulable"] == []
+
+
+class TestThePerRunTargetAllowance:
+    """A THROUGHPUT bound on how many targets one lifecycle contacts. It never decides WHICH: the
+    rotation does, so every target is eventually covered — the difference between bounding throughput
+    and capping membership, where a fixed "first N by name" cut contacts the same N for ever."""
+
+    def test_ONE_run_contacts_at_most_the_allowance(self, tmp_path):
+        out, tool = _run(tmp_path, targets=("a.com", "b.com", "c.com", "d.com"),
+                         words=["alpha", "beta"], max_targets_per_run=2)
+        assert {c[0] for c in tool.calls} == {"a.com", "b.com"}, tool.calls
+        assert out.targets_eligible == 4 and out.targets_selected == 2
+        assert out.stop_kind == "target_bound" and "allowance (2)" in out.stop
+
+    def test_the_ROTATION_chooses_and_LATER_runs_continue(self, tmp_path):
+        seen = set()
+        for _ in range(2):
+            out, tool = _run(tmp_path, targets=("a.com", "b.com", "c.com", "d.com"),
+                             words=["alpha", "beta"], max_targets_per_run=2)
+            seen |= {c[0] for c in tool.calls}
+        assert seen == {"a.com", "b.com", "c.com", "d.com"}, seen   # membership is NOT capped
+
+    def test_ZERO_is_unbounded(self, tmp_path):
+        out, tool = _run(tmp_path, targets=("a.com", "b.com", "c.com"), words=["alpha"],
+                         max_targets_per_run=0)
+        assert {c[0] for c in tool.calls} == {"a.com", "b.com", "c.com"}
+        assert out.stop_kind is None and out.targets_selected == 3
+
+    def test_the_allowance_is_an_exact_non_negative_int(self, tmp_path):
+        for bad in (-1, True, 1.0, "2"):
+            out, tool = _run(tmp_path, max_targets_per_run=bad)
+            assert tool.calls == [] and out.stop_kind == "machinery", (bad, out)
+
+    def test_the_REMAINDER_is_reported_as_a_CAP_not_a_failure(self, tmp_path):
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha", "beta"],
+                         max_targets_per_run=1)
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert sel["kind"] == "cap", sel                     # a bound we chose, never a gap
+        assert "allowance (1)" in sel["reason"] and "RESUMABLE" in sel["reason"], sel
+        assert (sel["eligible"], sel["tested"], sel["omitted"]) == (4, 2, 2), sel
+
+    def test_a_target_ALREADY_contacted_keeps_its_remaining_slots(self, tmp_path, monkeypatch):
+        """The allowance counts TARGETS, not batches: once a target is in, its own spend bound governs."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha", "beta", "gamma"],
+                         max_targets_per_run=1)
+        assert {c[0] for c in tool.calls} == {"a.com"} and len(tool.calls) == 3, tool.calls
+        assert out.attempted_pairs == 3 and out.targets_selected == 1

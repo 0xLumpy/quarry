@@ -175,6 +175,8 @@ class SweepResult:
     invocations: int = 0                    # runner calls that actually ran — NOT a slot count
     invocations_obtained: int = 0
     invocation_classes: dict = field(default_factory=dict)
+    targets_eligible: int = 0               # every target the corpus offered
+    targets_selected: int = 0               # ...that this run actually contacted
     #: slots no bound can ever admit, and their pairs. NOT a stop: the run was not stopped by them, and
     #: whatever did stop it keeps the sentence. They are an orthogonal REMAINDER DISPOSITION (v34#1) —
     #: reported through `unretriable`, which also forces the coverage record to a gap class.
@@ -234,6 +236,7 @@ _OBTAINED = (Status.SUCCESS, Status.EMPTY)
 
 def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: int,
               coverage_lane: str, dependency_ok=None, attribution=None, max_pairs_per_target: int = 0,
+              max_targets_per_run: int = 0,
               now=time.time) -> SweepResult:
     """Drive one lane's sweep.
 
@@ -241,6 +244,10 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     `max_pairs_per_target` (0 = unbounded) is a SPEND bound in candidates per target: a slot that would
     take a target past it is not submitted, so the bound is never exceeded — a wall-clock budget cannot
     express "no more than N names per apex", which is what an existing lane's posture may already be.
+    `max_targets_per_run` (0 = unbounded) is a THROUGHPUT bound on how many targets ONE lifecycle
+    contacts. It never decides WHICH: the rotation does, so every target is eventually covered and a
+    later run continues where this one stopped. That is the difference between bounding throughput and
+    capping membership — a fixed "first N by name" cut contacts the same N for ever.
     `execute(target, unit, words) -> RunResult` submits ONE INVOCATION, which may carry several slots:
     `unit` names it (a lone slot keeps its own id) and `words` is their union. Its returned status attests
     every slot the invocation carried. `attribution(word) -> source` is optional ACCOUNTING only. Returns
@@ -267,6 +274,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
 
     try:
         max_pairs_per_target = _exact_cap(max_pairs_per_target)
+        max_targets_per_run = _exact_cap(max_targets_per_run)
     except ValueError as e:
         # the driver promises to raise nothing but cancellation, so a nonsense bound is a MACHINERY stop
         # with nothing submitted — never a silent "unbounded" and never a bound nothing can satisfy.
@@ -306,6 +314,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         for slot, group in partition.items():
             members[(target, slot)] = group
     slots = sorted(members)
+    out.targets_eligible = len({t for t, _s in slots})
     # the denominator stays the CORPUS count taken above, not a re-count of the partition: if allocation
     # ever lost a word, that has to surface as an unattempted pair, not shrink the denominator to match.
     content = {slot: content_digest(words) for slot, words in members.items()}
@@ -349,13 +358,17 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         if progress.state_status == "degraded":
             out.machinery.append(f"rotation state degraded: {progress.state_reason}")
         picked: set = set()
+        started_targets: set = set()                       # targets this lifecycle has contacted
         spent: dict = {}                                   # candidates submitted per target
         while not clock.exhausted() and len(picked) < len(slots):
             batch = _next_batch(progress, slots, content, members, picked, spent, out,
-                                cap=max_pairs_per_target, max_words=MAX_BATCH_WORDS)
+                                cap=max_pairs_per_target, max_words=MAX_BATCH_WORDS,
+                                max_targets=max_targets_per_run, started=started_targets)
             if batch is None:
                 break
             target, chosen = batch                         # chosen: [(bucket, words)] — ONE invocation
+            started_targets.add(target)
+            out.targets_selected = len(started_targets)
             total = sum(len(words) for _b, words in chosen)
             unit = _unit_of(chosen)
 
@@ -462,7 +475,8 @@ def _unit_of(chosen) -> str:
     return first if len(chosen) == 1 else f"{first}+{len(chosen) - 1}"
 
 
-def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: int, max_words: int):
+def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: int, max_words: int,
+                max_targets: int = 0, started=frozenset()):
     """The next INVOCATION: the prefix of the GLOBAL rank order that stays inside one target and one tier.
 
     The pinned batch protocol (design v22#3), clause by clause. Ranking is still global and re-evaluated
@@ -478,6 +492,14 @@ def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: i
         if choice is None:
             break
         this_target, bucket = choice
+        if max_targets and this_target not in started and len(started) >= max_targets:
+            # this lifecycle has contacted its allowance of TARGETS. The slot is excluded (never silently
+            # skipped) so the loop terminates, and the rotation hands this target to a later run — which
+            # is what makes an allowance a throughput bound rather than a membership cap.
+            picked.add(choice)
+            out.stop_kind = out.stop_kind or "target_bound"
+            out.stop = out.stop or (f"the per-run target allowance ({max_targets}) was reached")
+            continue
         this_tier = progress.tier(this_target, bucket, content[choice])
         if chosen and (this_target != target or this_tier != tier):
             break                                       # clause 1: one target, one tier
@@ -524,10 +546,11 @@ def _report(lane: str, out: SweepResult, clock) -> None:
     budget.report_selection(lane, measure="candidate_pairs", eligible=out.eligible_pairs,
                             attempted=out.attempted_pairs, budget=clock, noun="candidate",
                             durable=out.durable,
-                            stop=None if out.stop_kind in (None, "budget", "bound") else out.stop,
+                            stop=None if out.stop_kind in (None, "budget", "bound", "target_bound")
+                            else out.stop,
                             # a candidate BOUND is a cap with its own wording: reusing the budget sentence
                             # would report "exhausted after 0s of 0s" on an unbounded clock (v17#5).
-                            cap_reason=out.stop if out.stop_kind == "bound" else None,
+                            cap_reason=out.stop if out.stop_kind in ("bound", "target_bound") else None,
                             # pairs in a slot no bound can admit are not a remainder anyone will retry
                             unretriable=out.unselectable_pairs)
     budget.report_outcome(lane, measure="slot_outcomes", attempted=out.slots_attempted,
