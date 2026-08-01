@@ -1994,3 +1994,37 @@ class TestThePreflightCallbacksAreContained:
                             else real(self))
         out, tool = _run(tmp_path, words=["alpha", "beta"])
         assert out.completion_unpersisted == 0 and out.completions_published == 2, out
+
+    def test_a_CANCELLATION_between_the_save_and_the_rescue_is_UNKNOWN(self, tmp_path, monkeypatch):
+        """v85: the in-flight markers were cleared before the confirmed-success accounting, so a
+        cancellation in that window reached settlement with pending state and no uncertainty — a definite
+        "not persisted" claim for tuples already on disk."""
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+        monkeypatch.setattr(budget.RotationProgress, "save",
+                            lambda self: False if (calls.update(n=calls["n"] + 1) or calls["n"]) == 2
+                            else real(self))
+        real_rescue = sweep._rescue
+        seen = {"n": 0}
+
+        def rescue(out):
+            seen["n"] += 1
+            if seen["n"] == 2:                  # the save that would carry the pending answer
+                raise KeyboardInterrupt("ctrl-c")
+            return real_rescue(out)
+
+        monkeypatch.setattr(sweep, "_rescue", rescue)
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: True)
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "admission"][-1]["admission"]
+        assert ev["unknown"] == 1 and ev["unpersisted"] == 1, ev
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        assert reopened.targets["a.com"].get("adm_ok"), reopened.targets   # it really is on disk
+
+    def test_the_RESCUE_never_counts_a_completion_twice(self, tmp_path):
+        out = sweep.SweepResult()
+        out.pending_completions = 3
+        sweep._rescue(out)
+        sweep._rescue(out)
+        assert out.completions_published == 3 and out.pending_completions == 0, out

@@ -779,9 +779,12 @@ def _persist(out: "SweepResult", progress) -> bool:
     except BaseException:
         out.inflight_completions = out.admission_inflight = 0
         raise                                  # the caller owns its own containment
-    out.inflight_completions = out.admission_inflight = 0
+    # v85: the snapshots stay IN FLIGHT until the confirmed-success accounting has finished. Clearing
+    # them first left a window where a cancellation reached settlement with pending state and no
+    # uncertainty marker — a definite "not persisted" claim for tuples already on disk.
     if ok:
         _rescue(out)                           # this save carried every pending tuple with it
+    out.inflight_completions = out.admission_inflight = 0
     return ok
 
 
@@ -810,10 +813,13 @@ def _record_admission(out: "SweepResult", progress, target: str, now, write, wha
 
 def _rescue(out: "SweepResult") -> None:
     """A successful save writes the WHOLE in-memory map, so it carries every pending completion — and
-    every pending admission answer (v82) — with it."""
-    if out.pending_completions:
-        out.completions_published += out.pending_completions
-        out.pending_completions = 0
+    every pending admission answer (v82) — with it.
+
+    v85: IDEMPOTENT and safe to interrupt. Each counter is moved in one step and cleared immediately, so
+    a cancellation between them can leave work still pending (settled as UNKNOWN, the conservative
+    reading) but can never count the same tuple twice."""
+    carried, out.pending_completions = out.pending_completions, 0
+    out.completions_published += carried
     out.admission_pending = 0
 
 
