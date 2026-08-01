@@ -90,8 +90,11 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
     if loss.get("base_dropped_lines"):
         parts.append(f"{loss['base_dropped_lines']} base wordlist line(s) not valid UTF-8")
     if loss.get("wildcard_withheld"):
-        parts.append(f"{loss['wildcard_withheld']}/{loss.get('after_base', 0)} mined word(s) withheld from "
-                     f"the wildcard differ by its {A1D_WILDCARD_WORD_CAP}-word bound")
+        # v63#1: the differ RETAINS the whole corpus; what a run withholds is candidate-target PAIRS, in
+        # the scheduler's own unit, and the rotation submits them on a later run instead of dropping them.
+        parts.append(f"{loss['wildcard_withheld']}/{loss.get('wildcard_pairs', 0)} wildcard candidate(s) "
+                     f"not submitted this run by the {A1D_WILDCARD_WORD_CAP}-per-zone spend bound and the "
+                     f"per-run zone allowance — they rotate in on a later run")
     if loss.get("unschedulable_pairs"):
         parts.append(f"{loss['unschedulable_pairs']} candidate(s) in {loss['unschedulable_slots']} "
                      f"slot(s) cannot be scheduled under the current bounds and will NOT be retried")
@@ -216,7 +219,10 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     # SELECTION 1 -> puredns (DNS): the SWEEP picks which `A1D_WORD_CAP` candidates per apex, from the
     # whole retained corpus, in rotation. `twords` stays only as the "is there vocabulary at all" answer.
     twords = kept
-    wc_words = sorted(kept[:A1D_WILDCARD_WORD_CAP])            # -> the wildcard differ (HTTP), per zone
+    # v63#1: the COMPLETE retained corpus goes to the differ; `A1D_WILDCARD_WORD_CAP` travels with it as
+    # the per-zone SPEND the scheduler applies, so the tail rotates in on later runs instead of being cut
+    # off for ever.
+    wc_words = sorted(kept)                                    # -> the wildcard differ (HTTP), per zone
     # the DNS withholding is the SWEEP's fact — it knows what it submitted and why it stopped (v19#2).
     # review-step4-remeasure2#1: the wildcard withholding is NOT a fact yet. Words are only withheld from
     # work that EXISTS, and whether any wildcard zone is eligible is something only the pass can say — a
@@ -337,11 +343,13 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     if zones:
         discovered.update(_wildcard_differentiate(ctx, zones, extra_words=wc_words, phase="enrich",
                                                   label="wildcard-a1d", source="wildcard-http-a1d",
-                                                  source_id="enrich.wildcard_a1d", stats=wc))
+                                                  source_id="enrich.wildcard_a1d", stats=wc,
+                                                  word_spend=A1D_WILDCARD_WORD_CAP))
     # ── ONE A1d outcome, chosen AFTER the work (review-B-audit-13#1): the earlier note claimed "the
     #    brute ran with less vocabulary" before anything had run — including when it never ran at all.
     if wc.get("eligible_zones", 0) > 0:
-        wl_loss["wildcard_withheld"] = max(0, len(kept) - A1D_WILDCARD_WORD_CAP)
+        wl_loss["wildcard_withheld"] = wc.get("candidate_pairs_withheld", 0)
+        wl_loss["wildcard_pairs"] = wc.get("candidate_pairs_eligible", 0)
     # review v19#3: `after_base` is the RETAINED WORD count and other wording (wildcard withholding, the
     # unreadable-input sentence) reads it as such — the scheduler's candidate-target PAIRS are a different
     # unit and live in their own fields.
@@ -374,8 +382,6 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     if _vlost:
         parts.append(f"{_vlost} wildcard vocabulary word(s) unusable ({_v.get('undecodable', 0)} not valid "
                      f"UTF-8, {_v.get('rejected', 0)} not a single DNS label)")
-    if _v.get("withheld"):
-        parts.append(f"{_v['withheld']} usable wildcard word(s) withheld by the word cap")
     if parts:
         ran = bool(submitted_apexes or wc_probed)
         why = (f"A1d ran with less than its eligible work ({'; '.join(parts)})" if ran else

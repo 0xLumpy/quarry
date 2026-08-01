@@ -225,6 +225,12 @@ class SweepResult:
     #: work by matching English in a machinery string, which a wording change breaks and an unrelated
     #: error carrying the same phrase defeats (v38).
     unselectable: list = field(default_factory=list)
+    #: STRUCTURED identity for every exception this driver CONTAINED on a caller's behalf, keyed to the
+    #: machinery sentence it produced: `{"index", "target", "unit", "phase", "exc"}`. A caller whose own
+    #: callback raised has to be able to recognise ITS exception — matching the English of the sentence
+    #: breaks on a wording change and catches unrelated errors that happen to share a phrase (v63#4,
+    #: the same rule as `unselectable` above).
+    contained: list = field(default_factory=list)
     slots_attempted: int = 0
     slots_obtained: int = 0             # SUCCESS or EMPTY — a clean answer, including "nothing resolved"
     classes: dict = field(default_factory=dict)
@@ -630,6 +636,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             except (KeyboardInterrupt, SystemExit):
                 raise                                   # cancellation ends the run, never a slot outcome
             except BaseException as e:                  # `runner.run` can raise around Popen (v10#1)
+                out.contained.append({"index": len(out.machinery), "target": target, "unit": unit,
+                                      "phase": "execute", "exc": _safe_name(e)})
                 out.machinery.append(f"{target}/{unit}: {_safe_exc(e)}")
                 out.stop = "machinery: the invocation raised"
                 out.stop_kind = "machinery"

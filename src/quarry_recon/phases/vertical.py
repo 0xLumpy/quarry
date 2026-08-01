@@ -605,7 +605,7 @@ def _wc_artifact_coverage(sid: str, label: str, st: dict) -> None:
     # v47#2: the denominator is every invocation that RETURNED — a FAILED call that wrote no file is a
     # missing artifact too, and counting only clean answers made `omitted > eligible`, which
     # reconciliation rejects as invalid and reports as 0/0/0 beside a reason saying otherwise.
-    returned = st.get("probed_zones", 0)
+    returned = st.get("returned_invocations", 0)
     missing = st.get("missing_artifacts", 0) + st.get("unreadable_artifacts", 0)
     events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT if missing else events.COVERAGE_CAP,
                             unit=f"{label}:artifacts", measure="output_artifacts",
@@ -661,15 +661,25 @@ def _wc_vocab_coverage(sid: str, label: str, vocab: dict) -> None:
                                        f"{vocab['rejected']} not a single DNS label (a URL-shaped word "
                                        f"would introduce another authority); {vocab['usable']} unique "
                                        f"name(s) after canonicalisation")
-    # the CAP is its own fact, under its own stable unit: policy truncation is not parse loss, and one
-    # must never mask the other.
+    # RETENTION is its own fact, under its own stable unit: what the parse produced is not what a bound
+    # submits, and one must never mask the other.
     events.coverage_partial(sid, kind=events.COVERAGE_CAP,
                             unit=f"{label}:vocabulary_cap", measure="vocabulary_words",
                             eligible=vocab["usable"], tested=vocab["selected"], omitted=vocab["withheld"],
-                            # review-B-audit-19#2: this stage is SELECTION, not execution — whether the
-                            # selected names were ever submitted is the `zones` measure's answer.
-                            reason=f"{label}: {vocab['selected']}/{vocab['usable']} usable name(s) SELECTED "
-                                   f"for probing (cap {WILDCARD_WORD_CAP}) — {vocab['withheld']} withheld")
+                            # v63#1: this stage RETAINS; it no longer truncates. The per-zone spend bound
+                            # withholds candidate PAIRS for a later run, and that withholding belongs to
+                            # the scheduler's `candidate_pairs` measure, whose denominator is the pairs.
+                            reason=f"{label}: {vocab['selected']}/{vocab['usable']} usable name(s) RETAINED "
+                                   f"for probing — the per-zone spend bound withholds candidate pairs, not "
+                                   f"vocabulary")
+
+
+class _LedgerStop(RuntimeError):
+    """This lane's OWN stop: an invocation whose result could not be recorded (v56).
+
+    A named type gives the scheduler's contained-exception record a STRUCTURAL identity, so the lane can
+    recognise the machinery entry that repeats a failure it already states — without matching English, and
+    without silencing an unrelated failure that happens to read alike (v63#4)."""
 
 
 def _wc_reject_constant(token: str):
@@ -741,7 +751,8 @@ def _wc_terminal(st: dict, kept: set):
 def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
                             phase: str = "vertical", label: str = "wildcard",
                             source: str = "wildcard-http", stats: dict | None = None,
-                            source_id: str = "vertical.wildcard_http") -> set[str]:
+                            source_id: str = "vertical.wildcard_http",
+                            word_spend: int | None = None) -> set[str]:
     """The differ's own SOURCE LIFECYCLE (step 4.3): registry gate, one start, one terminal, whatever
     happens inside. Until now this was a coverage identity only — it emitted coverage records under
     `source_id` but never a start or a terminal, so a manifest could not tell a pass that never ran from
@@ -776,6 +787,7 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         st["blocked"]["zone_cap"] = max(0, len(eligible) - _allow) if _allow else 0
         # no eligible zone -> nothing to probe WITH either: the vocabulary is not read, so a run with
         # nothing to differentiate does not report parse facts about a list it would never have used.
+        spend = word_spend if word_spend is not None else WILDCARD_WORD_CAP
         words = _wc_vocabulary(extra_words, st) if eligible else []
         # the key binds the vocabulary the invocation really submits, CANONICALISED the way
         # `write_list` canonicalises it (v50#3): the file is sorted and deduplicated, so two selections
@@ -785,13 +797,16 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
                               inputs={"zones": eligible,
                                       "vocabulary": _wc_digest(sorted(set(words)))},
                               config={"zones_per_run": wildcard_zones_per_run(),
-                                  "word_cap": WILDCARD_WORD_CAP},
+                                      # v63#1: the EFFECTIVE per-zone spend — the caller's, when it has
+                                      # one. A hard-coded bound made two runs with different spends share
+                                      # a resume key and claim the same work (A1d spends its own).
+                                      "word_spend": spend},
                               schema_version=WC_PARSER_SCHEMA)
         events.tool_start(source_id, cmd=["httpx", "(wildcard-differ)"], input_total=len(eligible),
                           work_unit=fp)
         started = True
-        _wc_differentiate(ctx, eligible, words=words, phase=phase, label=label,
-                          source=source, st=st, source_id=source_id, kept=kept, novel=novel)
+        _wc_differentiate(ctx, eligible, words=words, phase=phase, label=label, source=source, st=st,
+                          source_id=source_id, kept=kept, novel=novel, word_spend=spend)
         outcome = _wc_terminal(st, kept)
     except (KeyboardInterrupt, SystemExit):
         # v57: the ZONE facts gathered before the exit are real and are stated first — an invocation
@@ -921,15 +936,21 @@ def _wc_vocabulary(extra_words, st: dict) -> list:
     # review-B-audit-17#1: the cap SILENTLY dropped valid labels and then reported the truncated count as
     # "accepted", so thousands of withheld words produced no omission at all. Usable, selected and withheld
     # are three separate facts, and the cap is reported as the POLICY bound it is.
-    words = usable[:WILDCARD_WORD_CAP]
-    vocab["usable"] = len(usable)
-    vocab["accepted"] = vocab["selected"] = len(words)
-    vocab["withheld"] = len(usable) - len(words)
-    return words
+    # v63#1: the whole retained corpus goes to the scheduler. Slicing here made the tail invisible to
+    # the rotation, to candidate coverage and to the work-unit digest — a MEMBERSHIP cap wearing a spend
+    # bound's name, so `charlie` never ran however many times the lane did. The per-zone SPEND is the
+    # sweep's `max_pairs_per_target`, which rotates through the corpus instead of truncating it.
+    # v63#1: the whole retained corpus is RETAINED — nothing is withheld at this stage any more, and the
+    # per-run submission is the `candidate_pairs` measure's fact, which the scheduler owns. Reporting a
+    # per-run number here would state the same withholding twice, in a measure whose denominator is the
+    # corpus rather than the pairs, and an AVERAGE cannot say which words a rotation actually selected.
+    vocab["usable"] = vocab["accepted"] = vocab["selected"] = len(usable)
+    vocab["withheld"] = 0
+    return usable
 
 
 def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: str, source: str,
-                      st: dict, source_id: str, kept: set, novel: set) -> None:
+                      st: dict, source_id: str, kept: set, novel: set, word_spend: int) -> None:
     """A1 — recover the distinct vhosts hidden behind a wildcard zone. A `*.zone` cert makes every
     `<word>.zone` resolve to one IP, so a DNS-gated pipeline strips them all as noise and loses the
     real hosts (CDN / k8s ingress / SaaS). Instead: brute `<word>.zone` + a couple of guaranteed-bogus
@@ -977,7 +998,11 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         return (o.get("status_code"), o.get("content_length"),
                 (o.get("title") or "").strip(), o.get("favicon"))
 
-    zones_probed = 0                       # zones we CONTACTED (an attempt, not an answer)
+    zones_probed = 0                       # DISTINCT zones we contacted (never a call count)
+    contacted_zones: set = set()
+    obtained_zones: set = set()
+    st["invocations"] = 0
+    st["returned_invocations"] = 0
     st["zones_obtained"] = 0               # zones whose invocation came back usable
     st["invocation_classes"] = {}
     st["parse_errors"] = 0
@@ -1040,15 +1065,21 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         # running, and whether it left a readable artifact. A `record()` that raises must not make the
         # run forget what already happened.
         blob = None
+        st["invocations"] = st.get("invocations", 0) + 1
         if r.status is Status.SKIPPED:
             # no process ran: not a zone we contacted, and the tool will not run for the NEXT zone
             # either (v44#3). The remaining zones stay unprobed and the omission is reported as such.
             st["stopped"] = "httpx did not run"
         else:
-            zones_probed += 1                   # a CONTACT is an invocation that returned
+            # v63#2: a zone may take SEVERAL invocations (batching, tiers). Counting one per call let
+            # `tested` exceed `eligible`, which reconciliation discards as invalid.
+            contacted_zones.add(zone)
+            zones_probed = len(contacted_zones)
             st["probed_zones"] = zones_probed
+            st["returned_invocations"] = st.get("returned_invocations", 0) + 1
             if r.status in (Status.SUCCESS, Status.EMPTY):
-                st["zones_obtained"] += 1
+                obtained_zones.add(zone)
+                st["zones_obtained"] = len(obtained_zones)
             else:
                 _k = str(getattr(r.status, "value", r.status))
                 st["invocation_classes"][_k] = st["invocation_classes"].get(_k, 0) + 1
@@ -1078,7 +1109,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             if ledger_error is not None:
                 st["stopped"] = st.get("stopped") or "the invocation could not be recorded"
                 st["ledger_raised"] = True     # the scheduler's machinery detail would repeat this
-                raise ledger_error
+                raise _LedgerStop(str(ledger_error)) from ledger_error
             return r
         # v44#5: bytes, not text — one invalid UTF-8 line used to abort the WHOLE artifact as machinery
         # instead of costing one row. Every row is then validated STRUCTURALLY before it can reach `_sig`
@@ -1187,7 +1218,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             # remaining zones to a later lifecycle, instead of unrecorded traffic now.
             st["stopped"] = st.get("stopped") or "the invocation could not be recorded"
             st["ledger_raised"] = True         # the scheduler's machinery detail would repeat this
-            raise ledger_error
+            raise _LedgerStop(str(ledger_error)) from ledger_error
         return r
 
     # ── SCHEDULING: which zones this lifecycle contacts, and in which order, is the sweep's (v62). The
@@ -1198,8 +1229,14 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}",
         targets=zones, vocabulary=lambda _zone: list(words), execute=_probe, admit=_guard,
         budget_s=budget.budget_seconds("WILDCARD_BUDGET_S"), coverage_lane=source_id,
-        dependency_ok=lambda: have("httpx"), max_pairs_per_target=WILDCARD_WORD_CAP,
+        dependency_ok=lambda: have("httpx"), max_pairs_per_target=word_spend,
         max_targets_per_run=wildcard_zones_per_run())
+    # v63#1: the per-run withholding is a CANDIDATE-PAIR fact, in the unit the scheduler measures — the
+    # vocabulary is retained whole, and the spend bound rotates through it rather than truncating it.
+    st["word_spend"] = word_spend
+    st["candidate_pairs_eligible"] = swept.eligible_pairs
+    st["candidate_pairs_submitted"] = swept.attempted_pairs
+    st["candidate_pairs_withheld"] = max(0, swept.eligible_pairs - swept.attempted_pairs)
     st["sweep_stop"] = swept.stop or ""
     st["sweep_stop_kind"] = swept.stop_kind or ""
     st["admitted_zones"] = swept.targets_admitted
@@ -1209,9 +1246,13 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     # the lane's own cause and the scheduler's DETAIL are both facts — composing them keeps the
     # underlying error text (which the machinery entry carries) beside the lane's sentence.
     if st.get("ledger_raised"):
-        # the exception the scheduler contained IS the ledger failure the lane already names, with the
-        # same text. Composing both would state one fact twice (v62).
-        swept.machinery = []
+        # the exception the scheduler contained IS the ledger failure the lane already names (v62) — but
+        # only THAT entry duplicates it. A degraded rotation state or a completion that could not be
+        # persisted is an unrelated fact and must survive (v63#4), so the duplicate is identified by the
+        # scheduler's STRUCTURED record of what it contained, never by matching the sentence's text.
+        _dupe = {c.get("index") for c in swept.contained
+                 if c.get("phase") == "execute" and c.get("exc") == _LedgerStop.__name__}
+        swept.machinery = [m for i, m in enumerate(swept.machinery) if i not in _dupe]
     _sweep_why = "; ".join(swept.machinery) if swept.machinery else (
         swept.stop or "" if swept.stop_kind in ("machinery", "dependency", "contention", "budget")
         else "")

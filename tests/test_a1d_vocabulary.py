@@ -651,9 +651,13 @@ class TestA1dVocabularyLossReachesTheVerdict:
         assert "only the mined vocabulary was used" in recs[0].note, recs
 
     # ── audit-17 the CAP is a fact, the label check is exact, and a clean pass CLEARS ────────────
-    def test_the_WORD_CAP_is_reported_not_silent(self, tmp_path, monkeypatch):
+    def test_the_VOCABULARY_is_RETAINED_and_the_SPEND_withholds_pairs(self, tmp_path, monkeypatch):
         """review-B-audit-17#1: `words[:5000]` dropped valid labels and then called the truncated count
-        "accepted", so thousands of withheld words produced no omission at all."""
+        "accepted", so thousands of withheld words produced no omission at all.
+
+        v63#1: the slice is gone. The corpus is retained WHOLE — a membership cut would have made `w9`
+        unreachable however many times the lane ran — and what a single run withholds is candidate-target
+        PAIRS, reported in the scheduler's own measure and rotated in on a later run."""
         from quarry_recon import store
         from quarry_recon.phases import vertical
         monkeypatch.setattr(vertical, "WILDCARD_WORD_CAP", 3)
@@ -668,16 +672,21 @@ class TestA1dVocabularyLossReachesTheVerdict:
                                              extra_words=[f"w{i}" for i in range(10)],
                                              label="wildcard", stats=st)
             assert st["vocabulary"]["usable"] == 10, st
-            assert st["vocabulary"]["selected"] == 3 and st["vocabulary"]["withheld"] == 7, st
-            assert st["blocked_reason"] == "", st        # the CAP is a vocabulary fact, not a zone one
+            assert st["vocabulary"]["selected"] == 10 and st["vocabulary"]["withheld"] == 0, st
+            # ...and the per-run bound is a CANDIDATE-PAIR fact, in the scheduler's unit
+            assert st["candidate_pairs_eligible"] == 10 and st["candidate_pairs_submitted"] == 3, st
+            assert st["candidate_pairs_withheld"] == 7 and st["word_spend"] == 3, st
+            assert st["blocked_reason"] == "", st        # the SPEND is not a zone fact
             run.write_manifest({}, ["vertical"])
             summary = json.loads(run.manifest_path.read_text())["summary"]
             assert summary["verdict"] != "complete", summary
             cov = {(c["source_id"], c["measure"]): c for c in summary["coverage"]}
             cap = cov[("vertical.wildcard_http", "vocabulary_words")]
-            assert (cap["eligible"], cap["tested"], cap["omitted"]) == (10, 3, 7), cap
+            assert (cap["eligible"], cap["tested"], cap["omitted"]) == (10, 10, 0), cap
             parse = cov[("vertical.wildcard_http", "vocabulary_entries")]
             assert parse["omitted"] == 0 and parse["eligible"] == 10, parse   # nothing was PARSE-rejected
+            pairs = cov[("vertical.wildcard_http", "candidate_pairs")]
+            assert (pairs["eligible"], pairs["tested"], pairs["omitted"]) == (10, 3, 7), pairs
         finally:
             events.reset()
 
@@ -726,10 +735,13 @@ class TestA1dVocabularyLossReachesTheVerdict:
         finally:
             events.reset()
 
-    def test_A1d_reports_words_WITHHELD_by_the_cap(self, tmp_path, monkeypatch):
-        """The cap is a policy bound on A1d's own vocabulary too — silently applying it hides work."""
-        from quarry_recon.phases import vertical
-        monkeypatch.setattr(vertical, "WILDCARD_WORD_CAP", 1)
+    def test_A1d_reports_candidates_WITHHELD_by_the_spend_bound(self, tmp_path, monkeypatch):
+        """The bound is a policy fact on A1d's own vocabulary too — applying it silently hides work.
+
+        v63#1: A1d spends its OWN per-zone bound, so this patches `A1D_WILDCARD_WORD_CAP` — the value that
+        now travels to the scheduler and into the work unit, rather than the differ's default."""
+        from quarry_recon.phases import enrich, vertical
+        monkeypatch.setattr(enrich, "A1D_WILDCARD_WORD_CAP", 1)
         monkeypatch.setattr(vertical.netguard, "contact_state",
                             lambda host, block_private=False: ("public", False, None))
         monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
@@ -737,7 +749,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
         recs = self._a1d_zones(tmp_path, monkeypatch, httpx=True, puredns=True,
                                generic=b"one\ntwo\nthree\n")
         assert len(recs) == 1 and recs[0].status == "partial", recs
-        assert "usable wildcard word(s) withheld by the word cap" in recs[0].note, recs
+        assert "wildcard candidate(s) not submitted this run" in recs[0].note, recs
+        assert "rotate in on a later run" in recs[0].note, recs
 
     def test_a_MIXED_zone_and_vocabulary_failure_names_each_fact_ONCE(self, tmp_path, monkeypatch):
         """review-B-audit-18#2: the zone reason carried the vocabulary facts too, and A1d appended them
@@ -752,7 +765,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
                                httpx=True, puredns=True, generic=b"one\ntwo\nthree\n")
         assert len(recs) == 1 and recs[0].status == "partial", recs
         note = recs[0].note
-        assert note.count("withheld by the word cap") == 1, note
+        assert note.count("not submitted this run") == 1, note
         assert note.count("zone-zone cap") == 0 and note.count("5-zone per-run allowance") == 1, note
         assert "wildcard zone(s) not differentiated" in note, note
 
@@ -765,7 +778,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
                                          extra_words=["one", "two", "three"], label="wildcard", stats=st)
         assert "guard" in st["blocked_reason"], st
         assert "word" not in st["blocked_reason"] and "vocabulary" not in st["blocked_reason"], st
-        assert st["vocabulary"]["withheld"] == 2, st
+        assert st["vocabulary"]["withheld"] == 0, st            # v63#1: retained whole
+        assert st["candidate_pairs_withheld"] > 0, st           # the per-run bound speaks in PAIRS
 
     def test_PARSE_coverage_counts_ENTRIES_and_selection_counts_NAMES(self, tmp_path, monkeypatch):
         """review-B-audit-19#1: `rejected` counted raw entries while `usable` counted unique canonical
@@ -810,7 +824,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         sel = [e for e in evs if e.get("measure") == "vocabulary_words"][-1]
         zones = [e for e in evs if e.get("measure") == "zones"][-1]
-        assert "SELECTED for probing" in sel["reason"], sel
+        assert "RETAINED for probing" in sel["reason"], sel
         assert "probed" not in sel["reason"].replace("for probing", ""), sel
         assert zones["tested"] == 0, zones
 
@@ -1099,7 +1113,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
             recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
             assert len(recs) == 1 and recs[0].status == "partial", recs
             assert "19/20 candidate(s) withheld by the 1-per-apex A1d spend bound" in recs[0].note, recs
-            assert "17/20 mined word(s) withheld from the wildcard differ" in recs[0].note, recs
+            assert ("17/20 wildcard candidate(s) not submitted this run by the 3-per-zone spend bound"
+                    in recs[0].note), recs
         finally:
             events.reset()
 
@@ -1167,7 +1182,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         """The other half: with real wildcard work, the words its bound withheld are a fact again."""
         recs, summary = self._a1d_brute_only(tmp_path, monkeypatch, words=10, zones=("z.acme.com",))
         assert len(recs) == 1 and recs[0].status == "partial", recs
-        assert "8/10 mined word(s) withheld from the wildcard differ" in recs[0].note, recs
+        assert "8/10 wildcard candidate(s) not submitted this run" in recs[0].note, recs
         assert "A1d spend bound" not in recs[0].note, recs          # the DNS lane took everything
         assert summary["verdict"] != "complete", summary
 
@@ -1691,8 +1706,9 @@ class TestA1dVocabularyLossReachesTheVerdict:
         assert "another lifecycle" in recs[0].note, recs
 
     def test_the_WILDCARD_note_keeps_the_WORD_denominator(self, tmp_path, monkeypatch):
-        """v19#3: `after_base` is retained WORDS; the scheduler's candidate-target pairs are a different
-        unit, and two apexes made the wildcard note read `8/20` for a 10-word corpus."""
+        """v19#3: the DNS lane's candidate-target pairs are a DIFFERENT set, and two apexes made the
+        wildcard note read `8/20` for a 10-word corpus. v63#1: the note now speaks in the DIFFER's own
+        candidate pairs — zones x words — which two apexes in another lane cannot inflate."""
         from quarry_recon.phases import enrich, vertical
         monkeypatch.setattr(enrich, "A1D_WILDCARD_WORD_CAP", 1)
         monkeypatch.setattr(vertical.netguard, "contact_state",
@@ -1701,9 +1717,9 @@ class TestA1dVocabularyLossReachesTheVerdict:
         monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
         recs = self._a1d_zones(tmp_path, monkeypatch, zones=("z.acme.com",), httpx=True, puredns=True)
         assert len(recs) == 1, recs
-        # the mined corpus here is "internal" + "api" = 2 WORDS. With two apexes the scheduler would count
-        # 4 candidate PAIRS; this note must still speak in words.
-        assert "1/2 mined word(s) withheld from the wildcard differ" in recs[0].note, recs
+        # ONE zone x the 3 retained words = 3 candidate pairs, of which the 1-per-zone spend submits one.
+        # With two apexes the DNS lane counts 6 pairs of its own; this note speaks in the DIFFER's.
+        assert "2/3 wildcard candidate(s) not submitted this run" in recs[0].note, recs
 
     def test_the_unreadable_sentence_counts_WORDS_not_candidate_pairs(self, tmp_path, monkeypatch):
         """v19#3 (the other half): `_a1d_loss_why(produced=…)` renders "the readable N yielded X usable
@@ -2178,7 +2194,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
     def _differ(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, words=("api",),
                 sid="enrich.wildcard_a1d", rows=None, caught=None, preload=(), st=None,
                 status=None, raw=None, break_record=None, raw_bytes=None, run=None, statuses=None,
-                no_artifact=False, no_write=False, guard=None, tool=None):
+                no_artifact=False, no_write=False, guard=None, tool=None, spend=None):
         from quarry_recon import store
         from quarry_recon.phases import probe, vertical
         fresh = run is None
@@ -2252,7 +2268,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                 kept = vertical._wildcard_differentiate(ctx, set(zones), extra_words=list(words),
                                                         phase="enrich", label="wildcard-a1d",
                                                         source="wildcard-http-a1d", source_id=sid,
-                                                        stats=st)
+                                                        stats=st, word_spend=spend)
             except BaseException as e:      # `caught` lets a test inspect the LIFECYCLE of a raising run
                 if caught is None:
                     raise
@@ -2359,23 +2375,25 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert kept == {"api.z.acme.com"}, kept
         assert life[-1]["status"] == "success" and life[-1]["produced"] == {"subdomains": 1}, life
 
-    def test_the_WORK_UNIT_binds_the_ORDERED_vocabulary_actually_submitted(self, tmp_path, monkeypatch):
-        """v42#3: a set digest could not tell `["api", "admin"]` from its reverse, and a cap selects a
-        PREFIX — so the two submit different names."""
+    def test_the_WORK_UNIT_binds_the_CORPUS_and_the_EFFECTIVE_SPEND(self, tmp_path, monkeypatch):
+        """v42#3 / v50#3: the key binds what the pass will actually submit.
+
+        v63#1: the corpus is RETAINED whole and the rotation decides order, so two orders of the same words
+        ARE the same work — the ordering difference the old cap created is gone with the cap. What the key
+        must still separate is a different CORPUS and a different effective per-zone SPEND: a run that may
+        submit 5,000 candidates per zone is not the run that may submit one, and sharing a resume key let
+        the smaller one claim the larger one's work."""
         from quarry_recon.phases import vertical
         monkeypatch.setattr(vertical, "WILDCARD_WORD_CAP", 1)
         _k1, life1 = self._differ(tmp_path / "a", monkeypatch, rows=[], words=("api", "admin"))
         _k2, life2 = self._differ(tmp_path / "b", monkeypatch, rows=[], words=("admin", "api"))
-        _k3, life3 = self._differ(tmp_path / "c", monkeypatch, rows=[], words=("api", "admin"))
-        assert life1[0]["work_unit"] != life2[0]["work_unit"], (life1[0], life2[0])
-        assert life1[0]["work_unit"] == life3[0]["work_unit"]
-        # v50#3: with NO cap in the way the two orders submit the SAME file — `write_list` sorts and
-        # deduplicates — so they are the same work, and the key says so. Order only decides WHICH words a
-        # cap selects, and that difference is a difference in MEMBERS (above).
+        assert life1[0]["work_unit"] == life2[0]["work_unit"], (life1[0], life2[0])
+        _k3, life3 = self._differ(tmp_path / "c", monkeypatch, rows=[], words=("api", "admin", "www"))
+        assert life3[0]["work_unit"] != life1[0]["work_unit"], (life3[0], life1[0])   # a different CORPUS
         monkeypatch.setattr(vertical, "WILDCARD_WORD_CAP", 5000)
         _k4, life4 = self._differ(tmp_path / "d", monkeypatch, rows=[], words=("api", "admin"))
-        _k5, life5 = self._differ(tmp_path / "e", monkeypatch, rows=[], words=("admin", "api"))
-        assert life4[0]["work_unit"] == life5[0]["work_unit"], (life4[0], life5[0])
+        assert life4[0]["work_unit"] != life1[0]["work_unit"], (life4[0], life1[0])   # a different SPEND
+
 
     def test_a_REFUSED_lane_leaves_the_carrier_EMPTY(self, tmp_path, monkeypatch):
         """v42#4: eligibility was written before the gate, so a disabled lane made its caller report
@@ -3176,3 +3194,112 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert "1 zone(s) refused by the self/private contact guard" in sel["reason"], sel
         assert "1 zone(s) deferred to a later run" in sel["reason"], sel
         assert life[-1]["status"] in ("skipped", "limited", "failed"), life
+
+
+class TestTheDifferRotatesOverZonesAndWords:
+    """Step 4.3: the differ's SELECTION is the sweep's. Membership is never cut — a per-run allowance
+    bounds how many zones one lifecycle contacts, and a per-zone spend bounds how many candidates it
+    submits. Both rotate, so repeated runs reach every zone and every word."""
+
+    _differ = TestTheWildcardDifferHasItsOwnLifecycle._differ
+    _S = TestTheWildcardDifferHasItsOwnLifecycle._S
+
+    def _zones_contacted(self, tmp_path, monkeypatch, *, run, zones, words=("api",)):
+        """One lifecycle over `zones`; returns the zones it actually CONTACTED, in order."""
+        seen: list = []
+
+        def tool(t, cmd, raw_path=None, timeout=None, **k):
+            from quarry_recon.runner import RunResult as _RR
+            cand = pathlib.Path(cmd[cmd.index("-l") + 1]).read_text().split()
+            seen.append(cand[0].split(".", 1)[1])          # <word>.<zone>
+            if raw_path is not None:
+                raw_path.write_text("")
+            return _RR(t, cmd, crawl.Status.EMPTY, 0, 0.1, raw_path, 0)
+
+        self._differ(tmp_path, monkeypatch, zones=zones, words=words, rows=None, run=run, tool=tool)
+        return seen
+
+    def test_EIGHT_zones_take_TWO_runs_and_the_second_REPEATS_two(self, tmp_path, monkeypatch):
+        """The honest trace, pinned (Lumpy, v63): with the 5-zone allowance, run 1 contacts five and run 2
+        contacts three NEW plus two REPEATS. Rotation guarantees COVERAGE, not a strict continuation — a
+        zone whose slots are all clean is still eligible, so it can come round again while another zone is
+        still waiting. Overstating this as "8 zones in two runs, 5 then 3" is the claim to avoid."""
+        from quarry_recon import store
+        run = store.Run.create(tmp_path, "t")
+        zones = tuple(f"z{i}.acme.com" for i in range(8))
+        first = self._zones_contacted(tmp_path, monkeypatch, run=run, zones=zones)
+        second = self._zones_contacted(tmp_path, monkeypatch, run=run, zones=zones)
+        assert len(first) == 5 and len(set(first)) == 5, first
+        assert len(second) == 5 and len(set(second)) == 5, second
+        new = set(second) - set(first)
+        assert len(new) == 3, (first, second)                    # the three never contacted before
+        assert len(set(second) & set(first)) == 2, (first, second)   # ...and two that had run already
+        assert set(first) | set(second) == set(zones), (first, second)   # every zone COVERED
+
+    def test_the_TAIL_of_the_corpus_is_REACHED_by_repeated_runs(self, tmp_path, monkeypatch):
+        """v63#1: `words[:cap]` was a MEMBERSHIP cut wearing a spend bound's name — the tail was never
+        submitted however many times the lane ran. The corpus is retained whole and the spend rotates."""
+        from quarry_recon import store
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "WILDCARD_WORD_CAP", 1)
+        run = store.Run.create(tmp_path, "t")
+        words = ("alpha", "bravo", "charlie")
+        submitted: set = set()
+        for _ in range(6):                       # rotation, not a guarantee of order
+            seen: list = []
+
+            def tool(t, cmd, raw_path=None, timeout=None, **k):
+                from quarry_recon.runner import RunResult as _RR
+                seen.extend(pathlib.Path(cmd[cmd.index("-l") + 1]).read_text().split())
+                if raw_path is not None:
+                    raw_path.write_text("")
+                return _RR(t, cmd, crawl.Status.EMPTY, 0, 0.1, raw_path, 0)
+
+            _k, life = self._differ(tmp_path, monkeypatch, zones=("z.acme.com",), words=words,
+                                    rows=None, run=run, tool=tool)
+            submitted |= {c.split(".", 1)[0] for c in seen if not c.startswith("quarry-wc-")}
+            # ...and the vocabulary measure states RETENTION, never the per-run bound
+            vocab = [e for e in self._events if e.get("measure") == "vocabulary_words"][-1]
+            assert (vocab["eligible"], vocab["tested"], vocab["omitted"]) == (3, 3, 0), vocab
+        assert submitted == set(words), submitted
+
+    def test_the_LEDGER_duplicate_is_dropped_by_STRUCTURE_not_by_TEXT(self, tmp_path, monkeypatch):
+        """v62 states the ledger failure once. v63#4: the duplicate is the entry the scheduler CONTAINED
+        for this lane's own stop, identified by the structured record it keeps — matching the sentence's
+        text also deleted unrelated machinery that happened to quote the same error."""
+        from quarry_recon import store
+        from quarry_recon.phases import vertical
+        real = store.Run.record
+
+        def _boom(self, phase, result):
+            if result.tool == "httpx":
+                raise OSError("read-only manifest")
+            return real(self, phase, result)
+
+        monkeypatch.setattr(store.Run, "record", _boom, raising=False)
+        real_sweep = vertical.sweep.run_sweep
+
+        def wrapped(**kw):
+            out = real_sweep(**kw)
+            # an UNRELATED fact that quotes the same error text (a degraded rotation state, say)
+            out.machinery.append("rotation state degraded: read-only manifest")
+            return out
+
+        monkeypatch.setattr(vertical.sweep, "run_sweep", wrapped)
+        st: dict = {}
+        _k, life = self._differ(tmp_path, monkeypatch, rows=[], st=st)
+        why = life[-1]["reason"]
+        assert st["ledger_raised"] is True and len(st["ledger_errors"]) == 1, st
+        assert "tool result(s) not recorded" in why, why          # the lane's own sentence...
+        assert "rotation state degraded" in why, why              # ...and the unrelated fact SURVIVES
+        assert why.count("read-only manifest") == 2, why          # once each, never a third time
+
+    def test_the_WORK_UNIT_binds_the_CALLERS_spend_not_the_DEFAULT(self, tmp_path, monkeypatch):
+        """v63#1: A1d spends its own per-zone bound. A work unit built from the module default made two
+        runs that may submit different amounts of work share a resume key, so the smaller one claimed the
+        larger one's work as already done."""
+        _k1, life1 = self._differ(tmp_path / "a", monkeypatch, rows=[], words=("api", "admin"), spend=1)
+        _k2, life2 = self._differ(tmp_path / "b", monkeypatch, rows=[], words=("api", "admin"), spend=2)
+        _k3, life3 = self._differ(tmp_path / "c", monkeypatch, rows=[], words=("api", "admin"), spend=1)
+        assert life1[0]["work_unit"] != life2[0]["work_unit"], (life1[0], life2[0])
+        assert life1[0]["work_unit"] == life3[0]["work_unit"], (life1[0], life3[0])
