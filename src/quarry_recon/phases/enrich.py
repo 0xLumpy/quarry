@@ -123,16 +123,12 @@ def _a1d_sweep(ctx, prof, kept, origins, execute, *, dependency_ok):
         attribution=lambda w: sweep.owner_of(w, sorted(origins.get(w) or ["crawl"])))
 
 
-#: the scheduler names every unschedulable slot in `machinery`; the lane renders that loss ONCE, from its
-#: own counters (v37#2). Folding both produced the same fact twice in one sentence.
-_UNSCHEDULABLE_NOTE = "can never be scheduled"
-
-
 def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
     """Fold the sweep into the lane's reported facts. Fallible on purpose — the caller contains it."""
-    machinery = [m for m in swept.machinery if _UNSCHEDULABLE_NOTE not in m]
-    if machinery:
-        wl_loss["sweep_machinery"] = "; ".join(machinery)
+    # machinery is folded UNCHANGED: unschedulable slots are their own structured fact on the result and
+    # are rendered once from the counters below, so there is nothing to filter out by wording (v38).
+    if swept.machinery:
+        wl_loss["sweep_machinery"] = "; ".join(swept.machinery)
     if swept.stop_kind not in (None, "bound"):
         wl_loss["sweep_stop"] = swept.stop
     if swept.stop_kind == "dependency" and not swept.slots_attempted:
@@ -150,7 +146,7 @@ def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
         wl_loss["sweep_eligible_pairs"] = swept.eligible_pairs
     if swept.unselectable_pairs:
         # NOT a remainder any later run collects, and not the spend bound either: candidates in a slot no
-        # bound can admit. The scheduler names the slots in `machinery`; the verdict carries the size.
+        # bound can admit. The scheduler carries the slots structurally; the verdict carries the size.
         wl_loss["unschedulable_pairs"] = swept.unselectable_pairs
         wl_loss["unschedulable_slots"] = swept.unselectable_slots
 
@@ -168,6 +164,12 @@ def _a1d_terminal(swept, produced: int):
     elif swept.machinery:
         _st = Status.PARTIAL if produced else Status.FAILED
         _why = "; ".join(swept.machinery)
+    elif swept.unselectable_pairs:
+        # a run is not clean while candidates sit in slots no bound can admit — and that fact is carried
+        # by the COUNTER, never by recognising a sentence (v38).
+        _st = Status.PARTIAL if produced else Status.FAILED
+        _why = (f"{swept.unselectable_pairs} candidate(s) in {swept.unselectable_slots} slot(s) cannot be "
+                f"scheduled under the current bounds")
     elif swept.classes or swept.stop_kind == "dependency":
         # some slots did not answer (or the tool vanished mid-sweep): degraded. PARTIAL asserts something
         # was PRODUCED — a slot answering "nothing here" is not production (the audit-7#2 rule).

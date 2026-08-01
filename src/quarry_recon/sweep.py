@@ -55,6 +55,10 @@ EXT_BITS = 64
 #: what is fastest. A capped lane is bounded by its cap long before this.
 MAX_BATCH_WORDS = 25000
 
+#: how many refused slots `SweepResult.unselectable` describes individually. The COUNTERS are the fact;
+#: this is detail for the operator, and an unbounded list of them is not more true.
+_UNSELECTABLE_DETAIL = 20
+
 #: the id grammar schema 2 accepts: a three-digit root, optionally extended by `.` and up to `EXT_BITS`
 #: binary digits. Anything else is not a slot this lane can rank, split or complete.
 SLOT_RX = re.compile(rf"^[0-9]{{3}}(\.[01]{{1,{EXT_BITS}}})?$")
@@ -176,6 +180,11 @@ class SweepResult:
     #: reported through `unretriable`, which also forces the coverage record to a gap class.
     unselectable_slots: int = 0
     unselectable_pairs: int = 0
+    #: STRUCTURED detail per refused slot, `{"target", "slot", "members"}` — bounded, with the counters
+    #: above authoritative. It is deliberately NOT `machinery`: a consumer had to recognise unschedulable
+    #: work by matching English in a machinery string, which a wording change breaks and an unrelated
+    #: error carrying the same phrase defeats (v38).
+    unselectable: list = field(default_factory=list)
     slots_attempted: int = 0
     slots_obtained: int = 0             # SUCCESS or EMPTY — a clean answer, including "nothing resolved"
     classes: dict = field(default_factory=dict)
@@ -287,9 +296,9 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # ordinary cap or a resumable remainder.
         if alloc_cap:
             over = {slot: group for slot, group in partition.items() if len(group) > alloc_cap}
-            for slot, group in sorted(over.items())[:5]:
-                out.machinery.append(f"{target}/{slot}: {len(group)} candidates cannot be split below "
-                                     f"the bound ({alloc_cap}) and can never be scheduled")
+            for slot, group in sorted(over.items())[:_UNSELECTABLE_DETAIL]:
+                out.unselectable.append({"target": target, "slot": slot, "members": len(group),
+                                         "bound": alloc_cap})
             out.unselectable_slots += len(over)
             out.unselectable_pairs += sum(len(group) for group in over.values())
             partition = {slot: group for slot, group in partition.items() if slot not in over}

@@ -1940,3 +1940,33 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert "slot outcomes {'failed': 4}" in fins[0]["reason"], fins[0]["reason"]
         finally:
             events.reset()
+
+    def test_an_ordinary_MACHINERY_error_is_never_hidden_by_its_wording(self, tmp_path, monkeypatch):
+        """v38: unschedulable work used to be recognised by matching English in the machinery list, so an
+        unrelated failure carrying the same phrase would have been filtered out of the verdict."""
+        from quarry_recon.phases import enrich
+        real = enrich._a1d_sweep
+
+        def sweeping(*a, **k):
+            out = real(*a, **k)
+            out.machinery.append("puredns can never be scheduled by this host's cgroup")
+            return out
+
+        monkeypatch.setattr(enrich, "_a1d_sweep", sweeping)
+        _submitted, run = self._scheduled(tmp_path, monkeypatch,
+                                          words=[f"word{i:03d}" for i in range(9)])
+        recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+        assert len(recs) == 1 and "cgroup" in recs[0].note, recs
+
+    def test_UNSCHEDULABLE_work_alone_still_DEGRADES_the_terminal(self, tmp_path, monkeypatch):
+        """The counter drives it, not a machinery sentence: nothing ran, so the source is not clean."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        monkeypatch.setattr(sweep, "allocate", lambda words, *, cap: {"000": list(words)})
+        _submitted, run = self._scheduled(tmp_path, monkeypatch,
+                                          words=[f"word{i:03d}" for i in range(5)])
+        fins = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                if json.loads(l).get("event") == "tool_finish"
+                and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+        assert len(fins) == 1 and fins[0]["status"] == "failed", fins
+        assert fins[0]["reason"] == ("5 candidate(s) in 1 slot(s) cannot be scheduled under the current "
+                                     "bounds"), fins[0]["reason"]

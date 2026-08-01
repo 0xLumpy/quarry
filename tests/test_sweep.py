@@ -767,7 +767,9 @@ class TestExecutorBatching:
         out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)])
         assert all(len(c[2]) <= 2 for c in tool.calls), tool.calls
         assert out.unselectable_slots == 1 and out.unselectable_pairs == 3
-        assert any("can never be scheduled" in m for m in out.machinery), out.machinery
+        # v38: STRUCTURED, never a sentence in `machinery` a consumer has to recognise
+        assert out.machinery == [], out.machinery
+        assert out.unselectable == [{"target": "acme.com", "slot": "000", "members": 3, "bound": 2}]
         assert out.stop_kind is None, "nothing STOPPED the run — the work simply cannot be scheduled"
         assert out.attempted_pairs == 3 and out.eligible_pairs == 6
         sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
@@ -795,7 +797,7 @@ class TestExecutorBatching:
         self._residual(monkeypatch)
         out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)], max_pairs_per_target=2)
         assert out.unselectable_slots == 1 and out.unselectable_pairs == 3
-        assert any("can never be scheduled" in m for m in out.machinery), out.machinery
+        assert out.machinery == [] and out.unselectable[0]["members"] == 3, out
         assert all(len(c[2]) <= 2 for c in tool.calls), tool.calls
 
     def test_a_REAL_stop_still_wins_over_the_residual_sentence(self, tmp_path, monkeypatch):
@@ -804,7 +806,10 @@ class TestExecutorBatching:
         out, tool = _run(tmp_path, words=[f"w{i:03d}" for i in range(6)],
                          tool=_Tool(raises=(1, RuntimeError("popen exploded"))))
         assert out.stop_kind == "machinery" and out.unselectable_pairs == 3
-        assert any("can never be scheduled" in m for m in out.machinery), out.machinery
+        # the ordinary machinery note is the RAISE; the refused slot is its own structured fact
+        assert any("popen exploded" in m for m in out.machinery), out.machinery
+        assert not any("scheduled" in m for m in out.machinery), out.machinery
+        assert out.unselectable[0]["slot"] == "000", out.unselectable
 
     def test_the_batch_policy_still_STOPS_a_batch_from_growing(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
