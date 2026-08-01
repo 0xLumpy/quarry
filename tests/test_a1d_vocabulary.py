@@ -2164,11 +2164,15 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
 
     def _differ(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, words=("api",),
                 sid="enrich.wildcard_a1d", rows=None, caught=None, preload=(), st=None,
-                status=None, raw=None, break_record=None, raw_bytes=None):
+                status=None, raw=None, break_record=None, raw_bytes=None, run=None, statuses=None,
+                no_artifact=False):
         from quarry_recon import store
         from quarry_recon.phases import probe, vertical
-        run = store.Run.create(tmp_path, "t")
-        events.reset(); events.configure(run.dir)
+        fresh = run is None
+        run = run or store.Run.create(tmp_path, "t")
+        if fresh:
+            events.reset()
+        events.configure(run.dir)      # a REUSED run keeps writing to its own event log
         try:
             monkeypatch.setattr(vertical, "have", lambda t: httpx)
             monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
@@ -2178,7 +2182,14 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
             from quarry_recon.runner import RunResult as _RR
 
+            seq = list(statuses or [])
+
             def _tool(tool, cmd, raw_path=None, timeout=None, **k):
+                st_now = seq.pop(0) if seq else None
+                if st_now is crawl.Status.SKIPPED:
+                    return _RR(tool, cmd, st_now, None, 0.0, None, 0)   # no process ran
+                if no_artifact:
+                    return _RR(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, None, 0)  # answered, no output
                 if raw is not None and raw_path is not None:
                     cand = pathlib.Path(cmd[cmd.index("-l") + 1]).read_text().split()
                     # v44#6: the artifact is built from the REAL candidate list, so a baseline row matches
@@ -2198,7 +2209,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                                        "title": "wc", "favicon": "x"}) for b in bogus]
                     out += [json.dumps(r) for r in rows]
                     raw_path.write_text("\n".join(out) + "\n")
-                return _RR(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, raw_path, 0)
+                return _RR(tool, cmd, st_now or crawl.Status.SUCCESS, 0, 0.1, raw_path, 0)
 
             monkeypatch.setattr(vertical, "exec_tool", _tool)
             ctx = _Ctx(run.dir, [])
@@ -2233,7 +2244,8 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             return kept, [e for e in evs if e.get("event") in ("tool_start", "tool_finish")
                           and e.get("source_id") == sid]
         finally:
-            events.reset()
+            if fresh:
+                events.reset()
 
     def test_the_pass_emits_exactly_ONE_start_and_ONE_terminal(self, tmp_path, monkeypatch):
         kept, life = self._differ(tmp_path, monkeypatch, rows=[])
@@ -2501,15 +2513,69 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         cov = [e for e in self._events if e.get("measure") == "output_rows"]
         assert cov and (cov[-1]["eligible"], cov[-1]["tested"], cov[-1]["omitted"]) == (2, 1, 1), cov
         assert cov[-1]["kind"] == "timeout", cov
-        # ...and a CLEAN run still emits the record, so the gap does not stand as current truth
-        _k2, _l2 = self._differ(tmp_path / "clean", monkeypatch, rows=[])
-        cov2 = [e for e in self._events if e.get("measure") == "output_rows"]
-        assert cov2[-1]["omitted"] == 0 and cov2[-1]["kind"] == "cap", cov2
+        # ...and a CLEAN rerun in the SAME run supersedes it: coverage is latest-per-(source, unit), so
+        # the reconciled rollup — not just the raw record — must stop reporting the gap (v45#5).
+        run = self._last_run
+        agg = {(a["source_id"], a["measure"]): a for a in run._run_summary()["coverage"]}
+        assert agg[("enrich.wildcard_a1d", "output_rows")]["omitted"] == 1, agg
+        _k2, _l2 = self._differ(tmp_path, monkeypatch, rows=[], run=run)
+        agg2 = {(a["source_id"], a["measure"]): a for a in run._run_summary()["coverage"]}
+        assert agg2[("enrich.wildcard_a1d", "output_rows")]["omitted"] == 0, agg2
 
-    def test_a_MID_RUN_skip_does_not_count_as_a_contacted_zone(self, tmp_path, monkeypatch):
+    def test_a_FIRST_CALL_skip_contacts_nothing_at_all(self, tmp_path, monkeypatch):
         """v44#3: `probed_zones` advanced before the process could even start, so a SKIPPED invocation
         earned zone-coverage credit and told A1d the pass had run."""
         kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.SKIPPED,
                                   zones=("a.acme.com", "b.acme.com"))
         assert life[-1]["status"] == "skipped", life          # nothing was contacted at all
         assert "httpx did not run" in life[-1]["reason"], life
+
+    def test_a_TRUE_MID_RUN_skip_is_DEPENDENCY_LOSS_not_a_clean_limit(self, tmp_path, monkeypatch):
+        """v45#1: one zone answered, then the tool stopped running. That is not policy bounding — the
+        remainder went unprobed because httpx vanished, and the record must read as a gap."""
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[],
+                                  zones=("a.acme.com", "b.acme.com"),
+                                  statuses=[crawl.Status.SUCCESS, crawl.Status.SKIPPED])
+        assert life[-1]["status"] == "failed", life           # trouble, and nothing was produced
+        assert "httpx did not run" in life[-1]["reason"], life
+        zones = [e for e in self._events if e.get("measure") == "zones"]
+        assert zones[-1]["kind"] == "timeout" and zones[-1]["omitted"] == 1, zones
+
+    def test_a_row_with_NO_status_code_is_not_a_live_host(self, tmp_path, monkeypatch):
+        """v45#2: the signature fields were all optional, so `{"input": "api.z.acme.com"}` was rescued as
+        a live vhost on the strength of the name alone."""
+        kept, life = self._differ(tmp_path, monkeypatch,
+                                  raw=lambda cands: json.dumps({"input": "api.z.acme.com"}))
+        assert kept == set(), kept
+        assert "1 unparseable output row(s)" in life[-1]["reason"], life
+
+    def test_a_STRUCTURED_favicon_is_a_parse_gap_not_a_crash(self, tmp_path, monkeypatch):
+        """`favicon` enters `_sig`'s set, so a list there raised instead of costing one row."""
+        def raw(cands):
+            bogus = [c for c in cands if c.startswith("quarry-wc-")]
+            return "\n".join([json.dumps({"input": bogus[0], "status_code": 200, "content_length": 5,
+                                          "title": "wc", "favicon": "x"}),
+                              json.dumps({"input": "api.z.acme.com", "status_code": 200,
+                                          "content_length": 9, "title": "t", "favicon": [1, 2]}),
+                              json.dumps({"input": "api.z.acme.com", "status_code": 200,
+                                          "content_length": 9, "title": "t", "a": {"not": "a list"}})])
+
+        kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
+        assert kept == set(), kept
+        assert "2 unparseable output row(s)" in life[-1]["reason"], life
+
+    def test_an_ANSWER_with_NO_artifact_is_a_gap_not_a_clean_empty(self, tmp_path, monkeypatch):
+        """v45#4: a returned SUCCESS whose output file never appeared emitted a clean 0/0 row record."""
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], no_artifact=True)
+        assert life[-1]["status"] == "failed", life
+        assert "1 invocation(s) produced no artifact" in life[-1]["reason"], life
+
+    def test_the_PARSER_SCHEMA_is_part_of_the_work_unit(self, tmp_path, monkeypatch):
+        """v45#3: per-line decoding, foreign-row rejection and baseline-less rescue all changed what the
+        same artifact MEANS, so the identity has to change with them."""
+        from quarry_recon.phases import vertical
+        assert vertical.WC_PARSER_SCHEMA == 2
+        _k1, life1 = self._differ(tmp_path / "a", monkeypatch, rows=[])
+        monkeypatch.setattr(vertical, "WC_PARSER_SCHEMA", 3)
+        _k2, life2 = self._differ(tmp_path / "b", monkeypatch, rows=[])
+        assert life1[0]["work_unit"] != life2[0]["work_unit"], (life1[0], life2[0])

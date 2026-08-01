@@ -497,6 +497,11 @@ _DNS_LABEL_RX = _re.compile(r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)")
 #: it is reported separately from what the parser could not use (review-B-audit-17#1).
 WILDCARD_WORD_CAP = 5000
 
+#: bump when the differ's PARSER changes what the same artifact means: per-line decoding, the row shape it
+#: requires, which hosts it will accept, and what an absent wildcard baseline implies. A work unit under a
+#: different parser is a different question (v45#3).
+WC_PARSER_SCHEMA = 2
+
 #: how many eligible wildcard zones one differ run may probe. Module scope since the lane's lifecycle
 #: (its work unit) binds it, not only the body that applies it.
 ZONE_CAP = 5
@@ -582,10 +587,15 @@ def _wc_terminal(st: dict, kept: set):
         return Status.SKIPPED, why or "no zone was probed"
     no_base = st.get("zones_without_baseline", 0)
     facts = [p for p in (why,
+                         f"{st.get('missing_artifacts', 0)} invocation(s) produced no artifact"
+                         if st.get("missing_artifacts") else "",
                          f"{no_base} zone(s) answered with NO wildcard baseline" if no_base else "",
                          f"zone outcomes {dict(sorted(classes.items()))}" if classes else "",
                          f"{parse_errors} unparseable output row(s)" if parse_errors else "") if p]
-    trouble = bool(classes or parse_errors or obtained < probed)
+    # a mid-run SKIP is DEPENDENCY LOSS, not policy: the tool stopped running and the rest of the zones
+    # went unprobed because of it (v45#1). Same for an answer whose artifact never appeared.
+    trouble = bool(classes or parse_errors or obtained < probed or st.get("stopped")
+                   or st.get("missing_artifacts"))
     bounded = bool(probed < eligible or blocked.get("self_or_private") or blocked.get("zone_cap"))
     if trouble:
         # something went wrong: an invocation that did not answer, or output we could not read
@@ -638,7 +648,7 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         # `["api", "admin"]` from its reverse, which probe different names under a cap of one.
         fp = events.work_unit(source_id, inputs={"zones": eligible, "vocabulary": _wc_digest(words)},
                               config={"zone_cap": ZONE_CAP, "word_cap": WILDCARD_WORD_CAP},
-                              schema_version=1)
+                              schema_version=WC_PARSER_SCHEMA)
         events.tool_start(source_id, cmd=["httpx", "(wildcard-differ)"], input_total=len(eligible),
                           work_unit=fp)
         started = True
@@ -823,6 +833,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     st["rows_seen"] = 0
     st["rows_parsed"] = 0
     st["zones_without_baseline"] = 0
+    st["missing_artifacts"] = 0
     st["stopped"] = ""
     for zone in zones:
         # self-attack guard: if the wildcard resolves to the SCAN BOX / metadata, don't vhost-scan the zone
@@ -868,6 +879,9 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             _k = str(getattr(r.status, "value", r.status))
             st["invocation_classes"][_k] = st["invocation_classes"].get(_k, 0) + 1
         if not (r.raw_path and r.raw_path.exists()):
+            # v45#4: the invocation answered but the output we asked for is not there. Missing and
+            # present-but-empty are different facts, and only the second is a clean nothing-found.
+            st["missing_artifacts"] += 1
             continue
         # v44#5: bytes, not text — one invalid UTF-8 line used to abort the WHOLE artifact as machinery
         # instead of costing one row. Every row is then validated STRUCTURALLY before it can reach `_sig`
@@ -895,11 +909,23 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             if not isinstance(host, str) or host.lower().rstrip(".") not in expected:
                 st["parse_errors"] += 1
                 continue
-            shape_ok = True
-            for field, kinds in (("status_code", int), ("content_length", int), ("title", str)):
+            # v45#2: every field `_sig` and the store CONSUME is validated, and the status code is
+            # REQUIRED — without one there is no HTTP signature at all, and `{"input": "api.zone"}` was
+            # being rescued as a live host on the strength of the name alone. `favicon` enters a set, so a
+            # list or dict there raised instead of costing one row.
+            sc = row.get("status_code")
+            shape_ok = isinstance(sc, int) and not isinstance(sc, bool)
+            for field, kinds in (("content_length", int), ("title", str)):
                 v = row.get(field)
                 if v is not None and (isinstance(v, bool) or not isinstance(v, kinds)):
                     shape_ok = False
+            fav = row.get("favicon")
+            if fav is not None and not isinstance(fav, (str, int, float)):
+                shape_ok = False
+            addrs = row.get("a")
+            if addrs is not None and (not isinstance(addrs, list)
+                                      or not all(isinstance(x, str) for x in addrs)):
+                shape_ok = False
             if not shape_ok:
                 st["parse_errors"] += 1
                 continue
@@ -951,8 +977,14 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     # review-B-audit-15#4 / 16#3: the SOURCE and the UNIT are the caller's. Reconciliation keeps the
     # latest per (source, unit) and then aggregates per source — a hard-coded id let the A1d invocation
     # replace the vertical pass's coverage AND file its own work under the vertical lifecycle.
-    events.coverage_partial(source_id, kind=events.COVERAGE_CAP, measure="zones",
-                            unit=label,
+    events.coverage_partial(source_id,
+                            # a policy bound is a CAP; a tool that stopped running, an unusable answer or
+                            # a missing artifact is a GAP (v45#1)
+                            kind=(events.COVERAGE_TIMEOUT
+                                  if (st.get("stopped") or st.get("invocation_classes")
+                                      or st.get("parse_errors") or st.get("missing_artifacts"))
+                                  else events.COVERAGE_CAP),
+                            measure="zones", unit=label,
                             eligible=len(_zones_all), tested=zones_probed,
                             omitted=max(0, len(_zones_all) - zones_probed),
                             reason=f"{label}: wildcard vhost zones {zones_probed}/{len(_zones_all)} probed"
