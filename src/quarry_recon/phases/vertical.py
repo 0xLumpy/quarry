@@ -520,13 +520,15 @@ def _wc_artifact_coverage(sid: str, label: str, st: dict) -> None:
     # missing artifact too, and counting only clean answers made `omitted > eligible`, which
     # reconciliation rejects as invalid and reports as 0/0/0 beside a reason saying otherwise.
     returned = st.get("probed_zones", 0)
-    missing = st.get("missing_artifacts", 0)
+    missing = st.get("missing_artifacts", 0) + st.get("unreadable_artifacts", 0)
     events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT if missing else events.COVERAGE_CAP,
                             unit=f"{label}:artifacts", measure="output_artifacts",
                             eligible=returned, tested=max(0, returned - missing), omitted=missing,
                             reason=(f"{label}: {max(0, returned - missing)}/{returned} returned "
                                     f"invocation(s) left an artifact"
-                                    + (f" — {missing} produced none" if missing else "")))
+                                    + (f" — {st.get('missing_artifacts', 0)} produced none, "
+                                       f"{st.get('unreadable_artifacts', 0)} unreadable" if missing
+                                       else "")))
 
 
 def _wc_rows_coverage(sid: str, label: str, st: dict) -> None:
@@ -616,13 +618,16 @@ def _wc_terminal(st: dict, kept: set):
     facts = [p for p in (why,
                          f"{st.get('missing_artifacts', 0)} invocation(s) produced no artifact"
                          if st.get("missing_artifacts") else "",
+                         f"{st.get('unreadable_artifacts', 0)} artifact(s) present and UNREADABLE "
+                         f"({'; '.join(st.get('artifact_errors') or [])})"
+                         if st.get("unreadable_artifacts") else "",
                          f"{no_base} zone(s) answered with NO wildcard baseline" if no_base else "",
                          f"zone outcomes {dict(sorted(classes.items()))}" if classes else "",
                          f"{parse_errors} unparseable output row(s)" if parse_errors else "") if p]
     # a mid-run SKIP is DEPENDENCY LOSS, not policy: the tool stopped running and the rest of the zones
     # went unprobed because of it (v45#1). Same for an answer whose artifact never appeared.
     trouble = bool(classes or parse_errors or obtained < probed or st.get("stopped")
-                   or st.get("missing_artifacts"))
+                   or st.get("missing_artifacts") or st.get("unreadable_artifacts"))
     bounded = bool(probed < eligible or blocked.get("self_or_private") or blocked.get("zone_cap"))
     if trouble:
         # something went wrong: an invocation that did not answer, or output we could not read
@@ -861,6 +866,8 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     st["rows_parsed"] = 0
     st["zones_without_baseline"] = 0
     st["missing_artifacts"] = 0
+    st["unreadable_artifacts"] = 0
+    st["artifact_errors"] = []
     st["stopped"] = ""
     for zone in zones:
         # self-attack guard: if the wildcard resolves to the SCAN BOX / metadata, don't vhost-scan the zone
@@ -877,7 +884,10 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         bogus = [f"quarry-wc-{_uuid.uuid4().hex[:10]}.{zone}" for _ in range(2)]
         cf = ctx.write_list(f"{label}_cand_{zone.replace('.', '_')}.txt",
                             [f"{w}.{zone}" for w in words] + bogus)
-        hx = ctx.run.raw_path(phase, label, f"{zone}.jsonl")
+        # v49#1: an IMMUTABLE per-invocation path. A stable per-zone one let a timed-out retry that wrote
+        # nothing re-read the PREVIOUS attempt's artifact and report its findings as its own — and a normal
+        # retry overwrote evidence earlier records already point at.
+        hx = ctx.run.raw_path(phase, label, f"{zone}-{_uuid.uuid4().hex[:12]}.jsonl")
         # -follow-redirects so the signature is the FINAL response, not a bare redirect: without it a
         # candidate httpx probes on http gets the wildcard's uniform 308→https (status 308, len 0) —
         # which "differs" from the 200 baseline and floods false positives. Following it collapses
@@ -911,8 +921,14 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         # the one to ask: absent (or unreadable) is loss, present-and-empty is a clean nothing-found.
         try:
             blob = hx.read_bytes()
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError:
             st["missing_artifacts"] += 1
+            continue
+        except OSError as e:
+            # v49#2: an artifact that EXISTS and cannot be read is a different machinery fact from one
+            # that was never written, and it needs its own diagnosis.
+            st["unreadable_artifacts"] += 1
+            st["artifact_errors"].append(f"{zone}: {type(e).__name__}")
             continue
         # v44#5: bytes, not text — one invalid UTF-8 line used to abort the WHOLE artifact as machinery
         # instead of costing one row. Every row is then validated STRUCTURALLY before it can reach `_sig`

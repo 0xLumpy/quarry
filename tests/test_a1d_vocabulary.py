@@ -2165,7 +2165,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
     def _differ(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, words=("api",),
                 sid="enrich.wildcard_a1d", rows=None, caught=None, preload=(), st=None,
                 status=None, raw=None, break_record=None, raw_bytes=None, run=None, statuses=None,
-                no_artifact=False):
+                no_artifact=False, no_write=False):
         from quarry_recon import store
         from quarry_recon.phases import probe, vertical
         fresh = run is None
@@ -2190,6 +2190,9 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                     return _RR(tool, cmd, st_now, None, 0.0, None, 0)   # no process ran
                 if no_artifact:
                     return _RR(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, None, 0)  # answered, no output
+                if no_write:
+                    # a timeout that produced NOTHING: the requested file is never written
+                    return _RR(tool, cmd, status or crawl.Status.TIMED_OUT, None, 0.1, None, 0)
                 if raw is not None and raw_path is not None:
                     cand = pathlib.Path(cmd[cmd.index("-l") + 1]).read_text().split()
                     # v44#6: the artifact is built from the REAL candidate list, so a baseline row matches
@@ -2713,3 +2716,40 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             assert "returned invocation(s)" in art["reason"], art
         finally:
             events.reset()
+
+    def test_a_RETRY_can_never_ingest_a_PREVIOUS_attempt_s_artifact(self, tmp_path, monkeypatch):
+        """v49#1: the requested path was stable per zone, so a timed-out retry that wrote nothing re-read
+        the earlier attempt's file and reported its findings as its own."""
+        rows = [{"input": "api.z.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y"}]
+        kept1, life1 = self._differ(tmp_path, monkeypatch, rows=rows)
+        assert kept1 == {"api.z.acme.com"} and life1[-1]["produced"] == {"subdomains": 1}
+        kept2, life2 = self._differ(tmp_path, monkeypatch, rows=rows, no_write=True,
+                                    run=self._last_run)
+        assert kept2 == set(), kept2                       # nothing was written, so nothing is ingested
+        assert life2[-1]["produced"] == {"subdomains": 0}, life2
+        assert life2[-1]["status"] == "failed", life2
+        art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
+        assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
+
+    def test_two_invocations_of_one_ZONE_keep_SEPARATE_artifacts(self, tmp_path, monkeypatch):
+        rows = [{"input": "api.z.acme.com", "status_code": 200, "content_length": 99,
+                 "title": "real", "favicon": "y"}]
+        self._differ(tmp_path, monkeypatch, rows=rows)
+        run = self._last_run
+        self._differ(tmp_path, monkeypatch, rows=rows, run=run)
+        arts = sorted((run.dir / "raw" / "enrich" / "wildcard-a1d").glob("z.acme.com-*.jsonl"))
+        assert len(arts) == 2, arts                        # one per invocation, never overwritten
+
+    def test_an_UNREADABLE_artifact_is_NOT_a_missing_one(self, tmp_path, monkeypatch):
+        """v49#2: PermissionError and FileNotFoundError were both "produced none"."""
+        real = pathlib.Path.read_bytes
+        monkeypatch.setattr(pathlib.Path, "read_bytes",
+                            lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("denied"))
+                            if self.suffix == ".jsonl" else real(self, *a, **k))
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[])
+        assert life[-1]["status"] == "failed", life
+        assert "1 artifact(s) present and UNREADABLE (z.acme.com: PermissionError)" in life[-1]["reason"]
+        art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
+        assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
+        assert "0 produced none, 1 unreadable" in art["reason"], art
