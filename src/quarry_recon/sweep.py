@@ -101,13 +101,14 @@ def slot_of(word: str, depth: int = 0, buckets: int | None = None) -> str:
     return f"{root % (buckets or BUCKETS):03d}" + (f".{bits}" if bits else "")
 
 
-def _exact_cap(cap) -> int:
-    """The bound is an EXACT non-negative int. `True` is not 1 and `-1` is not "unbounded" (v26#4): the
+def _exact_cap(cap, name: str = "the per-target bound") -> int:
+    """A bound is an EXACT non-negative int. `True` is not 1 and `-1` is not "unbounded" (v26#4): the
     documented contract is 0 = unbounded, and a negative bound meant "unbounded" to the allocator while
-    the driver read it as a bound that nothing can satisfy — two answers to one question."""
+    the driver read it as a bound that nothing can satisfy — two answers to one question.
+
+    v59#3: the message names WHICH bound, so an invalid allowance stops diagnosing the candidate cap."""
     if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
-        raise ValueError(f"the per-target bound must be an exact non-negative int (0 = unbounded), "
-                         f"got {cap!r}")
+        raise ValueError(f"{name} must be an exact non-negative int (0 = unbounded), got {cap!r}")
     return cap
 
 
@@ -176,7 +177,13 @@ class SweepResult:
     invocations_obtained: int = 0
     invocation_classes: dict = field(default_factory=dict)
     targets_eligible: int = 0               # every target the corpus offered
-    targets_selected: int = 0               # ...that this run actually contacted
+    targets_admitted: int = 0               # ...that the per-run allowance let this lifecycle start
+    targets_contacted: int = 0              # ...whose invocation actually ran (v59#2: not the same fact)
+    #: targets the per-run allowance deferred to a later lifecycle, and the pairs they hold. An
+    #: orthogonal DISPOSITION, never the stop: the run carries on with the targets it admitted (v59#1).
+    deferred_targets: int = 0
+    deferred_pairs: int = 0
+    cap_reasons: list = field(default_factory=list)
     #: slots no bound can ever admit, and their pairs. NOT a stop: the run was not stopped by them, and
     #: whatever did stop it keeps the sentence. They are an orthogonal REMAINDER DISPOSITION (v34#1) —
     #: reported through `unretriable`, which also forces the coverage record to a gap class.
@@ -271,10 +278,11 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     # the DENOMINATOR is known before the bound is: every eligible pair exists whether or not we can
     # partition it (v27#2). Reporting 0/0 for a lane that had work would hide the omission entirely.
     out.eligible_pairs = sum(len(words) for words in corpus.values())
+    out.targets_eligible = len([t for t, words in corpus.items() if words])
 
     try:
         max_pairs_per_target = _exact_cap(max_pairs_per_target)
-        max_targets_per_run = _exact_cap(max_targets_per_run)
+        max_targets_per_run = _exact_cap(max_targets_per_run, "the per-run target allowance")
     except ValueError as e:
         # the driver promises to raise nothing but cancellation, so a nonsense bound is a MACHINERY stop
         # with nothing submitted — never a silent "unbounded" and never a bound nothing can satisfy.
@@ -314,7 +322,6 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         for slot, group in partition.items():
             members[(target, slot)] = group
     slots = sorted(members)
-    out.targets_eligible = len({t for t, _s in slots})
     # the denominator stays the CORPUS count taken above, not a re-count of the partition: if allocation
     # ever lost a word, that has to surface as an unattempted pair, not shrink the denominator to match.
     content = {slot: content_digest(words) for slot, words in members.items()}
@@ -358,7 +365,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         if progress.state_status == "degraded":
             out.machinery.append(f"rotation state degraded: {progress.state_reason}")
         picked: set = set()
-        started_targets: set = set()                       # targets this lifecycle has contacted
+        started_targets: set = set()                       # targets the allowance ADMITTED
+        contacted: set = set()                             # ...whose invocation actually ran
         spent: dict = {}                                   # candidates submitted per target
         while not clock.exhausted() and len(picked) < len(slots):
             batch = _next_batch(progress, slots, content, members, picked, spent, out,
@@ -368,7 +376,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 break
             target, chosen = batch                         # chosen: [(bucket, words)] — ONE invocation
             started_targets.add(target)
-            out.targets_selected = len(started_targets)
+            out.targets_admitted = len(started_targets)
             total = sum(len(words) for _b, words in chosen)
             unit = _unit_of(chosen)
 
@@ -404,6 +412,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.stop_kind = "dependency"
                 break
             out.invocations += 1                         # clause 6: invocations are their own measure
+            contacted.add(target)                        # an invocation that RAN, not one we planned
+            out.targets_contacted = len(contacted)
             out.slots_attempted += len(chosen)
             out.attempted_pairs += total
             for _b, words in chosen:
@@ -446,6 +456,13 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.pending_completions += len(chosen)
 
 
+        if out.deferred_pairs:
+            out.deferred_targets = len({t for t, _s in slots if t not in started_targets})
+        if out.stop_kind is None and out.cap_reasons and not clock.exhausted():
+            # no failure and no clock: a CAP we chose is what ended the run (v59#1). When something else
+            # did end it, that keeps the sentence and the caps are still rendered beside it.
+            out.stop_kind = "bound"
+            out.stop = "; ".join(out.cap_reasons)
         if out.stop_kind is None and clock.exhausted() and len(picked) < len(slots):
             # FIRST CAUSE WINS (review v15#1). A machinery stop that happened to cross the bound was being
             # relabelled "budget", which reads as an operator cap — laundering a failure into a choice.
@@ -497,8 +514,10 @@ def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: i
             # skipped) so the loop terminates, and the rotation hands this target to a later run — which
             # is what makes an allowance a throughput bound rather than a membership cap.
             picked.add(choice)
-            out.stop_kind = out.stop_kind or "target_bound"
-            out.stop = out.stop or (f"the per-run target allowance ({max_targets}) was reached")
+            out.deferred_pairs += len(members[choice])
+            why = f"the per-run target allowance ({max_targets}) was reached"
+            if why not in out.cap_reasons:
+                out.cap_reasons.append(why)
             continue
         this_tier = progress.tier(this_target, bucket, content[choice])
         if chosen and (this_target != target or this_tier != tier):
@@ -510,8 +529,9 @@ def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: i
             # and the scan CONTINUES, so a smaller slot behind it can still fill the remaining allowance
             # in the SAME invocation, exactly as the one-slot-per-call driver used to pack it (v31).
             picked.add(choice)
-            out.stop_kind = out.stop_kind or "bound"
-            out.stop = out.stop or f"the per-target candidate bound ({cap}) was reached"
+            why = f"the per-target candidate bound ({cap}) was reached"
+            if why not in out.cap_reasons:
+                out.cap_reasons.append(why)
             continue
         if chosen and max_words and total + len(words) > max_words:
             break                                       # an oversized SLOT never reaches here: the
@@ -546,11 +566,14 @@ def _report(lane: str, out: SweepResult, clock) -> None:
     budget.report_selection(lane, measure="candidate_pairs", eligible=out.eligible_pairs,
                             attempted=out.attempted_pairs, budget=clock, noun="candidate",
                             durable=out.durable,
-                            stop=None if out.stop_kind in (None, "budget", "bound", "target_bound")
-                            else out.stop,
+                            stop=None if out.stop_kind in (None, "budget", "bound") else out.stop,
                             # a candidate BOUND is a cap with its own wording: reusing the budget sentence
                             # would report "exhausted after 0s of 0s" on an unbounded clock (v17#5).
-                            cap_reason=out.stop if out.stop_kind in ("bound", "target_bound") else None,
+                            cap_reason="; ".join(out.cap_reasons) if out.stop_kind == "bound" else None,
+                            # every applicable CAP is named even when something ELSE ended the run
+                            # (v59#1) — a clock that fired must not be blamed on an allowance, nor the
+                            # allowance's remainder be laundered into a timeout.
+                            extra="; ".join(out.cap_reasons) if out.stop_kind != "bound" else None,
                             # pairs in a slot no bound can admit are not a remainder anyone will retry
                             unretriable=out.unselectable_pairs)
     budget.report_outcome(lane, measure="slot_outcomes", attempted=out.slots_attempted,

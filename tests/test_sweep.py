@@ -1006,8 +1006,10 @@ class TestThePerRunTargetAllowance:
         out, tool = _run(tmp_path, targets=("a.com", "b.com", "c.com", "d.com"),
                          words=["alpha", "beta"], max_targets_per_run=2)
         assert {c[0] for c in tool.calls} == {"a.com", "b.com"}, tool.calls
-        assert out.targets_eligible == 4 and out.targets_selected == 2
-        assert out.stop_kind == "target_bound" and "allowance (2)" in out.stop
+        assert out.targets_eligible == 4 and out.targets_admitted == 2
+        assert out.targets_contacted == 2 and out.deferred_targets == 2
+        # v59#1: a CAP we chose ends the run only when nothing else did
+        assert out.stop_kind == "bound" and "allowance (2)" in out.stop
 
     def test_the_ROTATION_chooses_and_LATER_runs_continue(self, tmp_path):
         seen = set()
@@ -1021,7 +1023,7 @@ class TestThePerRunTargetAllowance:
         out, tool = _run(tmp_path, targets=("a.com", "b.com", "c.com"), words=["alpha"],
                          max_targets_per_run=0)
         assert {c[0] for c in tool.calls} == {"a.com", "b.com", "c.com"}
-        assert out.stop_kind is None and out.targets_selected == 3
+        assert out.stop_kind is None and out.targets_admitted == out.targets_contacted == 3
 
     def test_the_allowance_is_an_exact_non_negative_int(self, tmp_path):
         for bad in (-1, True, 1.0, "2"):
@@ -1042,4 +1044,50 @@ class TestThePerRunTargetAllowance:
         out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha", "beta", "gamma"],
                          max_targets_per_run=1)
         assert {c[0] for c in tool.calls} == {"a.com"} and len(tool.calls) == 3, tool.calls
-        assert out.attempted_pairs == 3 and out.targets_selected == 1
+        assert out.attempted_pairs == 3 and out.targets_admitted == out.targets_contacted == 1
+
+    def test_a_CLOCK_that_fired_is_not_blamed_on_the_allowance(self, tmp_path, monkeypatch):
+        """v59#1: the allowance set a scalar stop while the run carried on, so a budget that really
+        expired was reported as an allowance cap."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+
+        class _Slow(_Tool):
+            def __call__(self, target, unit, words):
+                ticks["t"] += 4.0            # the clock fires only after the allowance has deferred
+                return super().__call__(target, unit, words)
+
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=[f"w{i:03d}" for i in range(5)],
+                         max_targets_per_run=1, budget_s=10, tool=_Slow())
+        assert out.stop_kind == "budget" and "budget exhausted" in out.stop, out
+        assert out.deferred_targets == 1 and out.deferred_pairs == 5, out
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "budget exhausted" in sel["reason"], sel
+        assert "also: the per-run target allowance (1) was reached" in sel["reason"], sel
+
+    def test_BOTH_caps_are_named_when_both_applied(self, tmp_path):
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=[f"w{i:03d}" for i in range(6)],
+                         max_targets_per_run=1, max_pairs_per_target=3)
+        assert out.stop_kind == "bound", out
+        assert "candidate bound (3)" in out.stop and "allowance (1)" in out.stop, out.stop
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert sel["kind"] == "cap" and "candidate bound (3)" in sel["reason"], sel
+        assert "allowance (1)" in sel["reason"], sel
+
+    def test_ADMITTED_is_not_CONTACTED(self, tmp_path, monkeypatch):
+        """v59#2: the counter advanced before the reservation was persisted and before the tool ran."""
+        monkeypatch.setattr(budget.RotationProgress, "save", lambda self: False)
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha"], max_targets_per_run=1)
+        assert tool.calls == [] and out.targets_contacted == 0, out
+        assert out.targets_admitted == 1, out                 # the allowance DID admit it
+        assert out.stop_kind == "machinery", out
+
+    def test_an_INVALID_allowance_names_ITS_OWN_bound(self, tmp_path):
+        """v59#3: both bounds shared one message, so an invalid allowance diagnosed the candidate cap —
+        and the exit lost the target denominator it already knew."""
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha", "beta"],
+                         max_targets_per_run=-1)
+        assert tool.calls == [] and out.stop_kind == "machinery"
+        assert "the per-run target allowance must be an exact non-negative int" in out.stop, out.stop
+        assert out.targets_eligible == 2 and out.eligible_pairs == 4, out

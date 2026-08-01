@@ -1125,7 +1125,7 @@ def _remainder_tail(omitted: int, durable: bool, unretriable: int) -> str:
 def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, budget: Budget,
                      noun: str = "item", durable: bool = True, stop: str | None = None,
                      unit: str | None = None, cap_reason: str | None = None,
-                     unretriable: int = 0) -> None:
+                     unretriable: int = 0, extra: str | None = None) -> None:
     """SELECTION coverage: of everything eligible, how much did we get to at all?
 
     Emitted EVERY run (omitted=0 when the whole set was processed) so a later unbounded rerun CLEARS a prior
@@ -1140,12 +1140,15 @@ def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, 
     # unschedulable pairs behind is not a clean sample of the eligible set.
     kind = events.COVERAGE_TIMEOUT if (stop is not None or unretriable) else events.COVERAGE_CAP
     tail = _remainder_tail(omitted, durable, unretriable)
+    # v59#1: causes that ALSO applied but did not end the run — an operator cap alongside a clock that
+    # fired, say. The head names what stopped us; these are named beside it rather than suppressed.
+    also = f" (also: {extra})" if extra and omitted else ""
     if omitted and cap_reason is not None and stop is None:
         # an OPERATOR CAP that is not the wall clock — a per-target candidate bound, say. Still a CAP we
         # chose (never a TIMEOUT-class failure), but "budget exhausted after 0s of 0s" would be a lie.
-        why = f"{cap_reason} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
+        why = f"{cap_reason}{also} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
     elif omitted and stop is not None:
-        why = f"{stop} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
+        why = f"{stop}{also} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
     elif omitted and unretriable == omitted:
         # nothing stopped us and the clock never ran out: the remainder is simply not schedulable, and
         # blaming a budget that did not fire would misname it (v34#1).
@@ -1153,7 +1156,7 @@ def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, 
     elif omitted:
         # review#4 (r7): only call the remainder RESUMABLE when the completion state was actually persisted.
         # Otherwise the next run starts over, and "resumable" is a false promise.
-        why = (f"{noun} budget exhausted after {budget.elapsed()}s of {budget.seconds}s — "
+        why = (f"{noun} budget exhausted after {budget.elapsed()}s of {budget.seconds}s{also} — "
                f"{attempted}/{eligible} processed, {omitted} {tail}")
     else:
         why = f"{attempted}/{eligible} {noun}(s) processed (whole eligible set)"
