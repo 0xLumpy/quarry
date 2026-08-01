@@ -1228,7 +1228,7 @@ class TestTheAdmissionHook:
         assert len(ev) == 1, ev
         got = ev[0]["admission"]
         assert got == {"targets": 1, "pairs": 2, "detail": ["a.com"], "unpersisted": 0,
-                       "truncated": False}, got
+                       "unknown": 0, "truncated": False}, got
         assert ev[0].get("produced") is None, ev
 
     def test_a_run_with_NO_refusal_emits_no_admission_record(self, tmp_path):
@@ -1899,3 +1899,38 @@ class TestThePreflightCallbacksAreContained:
         assert out.admission_pending == 0 and out.admission_unpersisted == 0, out
         assert "the admission could not be recorded (OSError: state gone)" in " ".join(out.machinery)
         assert "admission answer(s) not persisted" not in " ".join(out.machinery), out.machinery
+
+    def test_a_CANCELLED_admission_save_is_UNKNOWN_not_lost(self, tmp_path, monkeypatch):
+        """v83#1: `os.replace` is atomic, so a cancellation arriving after it landed but before the call
+        returned leaves the tuple ON DISK — claiming it was definitely not persisted contradicted the
+        state file."""
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+
+        def interrupted(self):
+            calls["n"] += 1
+            if calls["n"] == 2:                 # 1 = the reservation, 2 = the admission answer
+                real(self)                      # the write LANDS...
+                raise KeyboardInterrupt("ctrl-c")   # ...and then we are interrupted
+            return real(self)
+
+        monkeypatch.setattr(budget.RotationProgress, "save", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "admission"][-1]["admission"]
+        assert ev["unknown"] == 1 and ev["unpersisted"] == 1, ev
+        # the REFUSAL itself is measured, not lost to the interrupted write (v83#2)
+        assert ev["targets"] == 1 and ev["pairs"] == 1 and ev["detail"] == ["a.com"], ev
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        assert reopened.targets["a.com"].get("adm"), reopened.targets   # it really is on disk
+
+    def test_an_ORDINARY_failed_admission_save_is_still_PENDING_not_unknown(self, tmp_path, monkeypatch):
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+        monkeypatch.setattr(budget.RotationProgress, "save",
+                            lambda self: False if (calls.update(n=calls["n"] + 1) or calls["n"]) == 2
+                            else real(self))
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
+        assert out.admission_unknown == 0 and out.admission_unpersisted == 1, out
+        assert "not persisted" in " ".join(out.machinery), out.machinery

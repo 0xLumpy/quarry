@@ -179,6 +179,9 @@ class SweepResult:
     targets_eligible: int = 0               # every target the corpus offered
     targets_admitted: int = 0               # ...that the per-run allowance let this lifecycle start
     targets_refused: int = 0                # ...that the caller's admission check turned away
+    #: admission answers whose save was interrupted: on disk or not, we cannot say (v83#1).
+    admission_unknown: int = 0
+    admission_inflight: int = 0             # transient: answers whose save has not returned yet
     #: admission ANSWERS — either kind — written in memory but not yet durable. Like a completion, a
     #: later successful save writes the WHOLE map and carries them, so this is PENDING, not lost (v82).
     admission_pending: int = 0
@@ -539,8 +542,9 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     # attempted. Without it the target kept the front of tier 0 and starved every dirty
                     # zone, lifecycle after lifecycle. Best effort: losing the note costs ordering
                     # quality, never coverage.
-                    _record_admission(out, progress, target, now, progress.refuse_target,
-                                      "the refusal")
+                    # v83#2: the refusal is KNOWN the moment the hook answered. Its counters are
+                    # committed before the fallible persistence, so a cancellation during that write
+                    # cannot emit a ledger claiming nothing was refused.
                     out.targets_refused += 1
                     if len(out.refused) < _UNSELECTABLE_DETAIL:
                         out.refused.append(target)
@@ -552,6 +556,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     why = "target(s) refused by the caller's admission check"
                     if why not in out.cap_reasons:
                         out.cap_reasons.append(why)
+                    _record_admission(out, progress, target, now, progress.refuse_target,
+                                      "the refusal")
                     continue
 
             try:
@@ -724,10 +730,21 @@ def _settle_completions(out: "SweepResult", *, inflight: int = 0, staged: bool =
         out.completion_unstaged += max(0, int(inflight))
     # v82: admission durability settles the same way — an answer a later save carried is NOT unpersisted,
     # and the machinery sentence is written from the FINAL state rather than the first failed write.
-    out.admission_unpersisted = out.admission_pending
+    if out.admission_inflight:
+        # v83#1: interrupted mid-write. Not "lost" — unknown, and the pending claim it came from is
+        # withdrawn so the two are never counted twice.
+        out.admission_unknown += out.admission_inflight
+        out.admission_pending -= min(out.admission_pending, out.admission_inflight)
+        out.admission_inflight = 0
+    out.admission_unpersisted = out.admission_pending + out.admission_unknown
     if out.admission_unpersisted:
-        out.machinery.append(f"{out.admission_unpersisted} admission answer(s) not persisted — an older "
-                             f"record may still stand for those target(s)")
+        parts = []
+        if out.admission_pending:
+            parts.append(f"{out.admission_pending} admission answer(s) not persisted")
+        if out.admission_unknown:
+            parts.append(f"{out.admission_unknown} admission answer(s) of UNKNOWN publication (the run "
+                         f"ended mid-write)")
+        out.machinery.append("; ".join(parts) + " — an older record may still stand for those target(s)")
     out.completion_unpersisted = (out.pending_completions + out.completion_unknown
                                   + out.completion_unstaged)
     if out.completion_unpersisted:
@@ -758,13 +775,21 @@ def _record_admission(out: "SweepResult", progress, target: str, now, write, wha
         out.machinery.append(f"{target}: {what} could not be recorded ({_safe_exc(e)})")
         return
     out.admission_pending += 1
+    # v83#1: while the save runs, publication is IN FLIGHT. `os.replace` is atomic, so a cancellation
+    # arriving after it landed but before the call returned leaves the tuple ON DISK — claiming it was
+    # definitely not persisted would contradict the state file.
+    out.admission_inflight += 1
     try:
-        if progress.save():
-            _rescue(out)
+        durable = progress.save()
     except (KeyboardInterrupt, SystemExit):
-        raise
+        raise                                  # in flight stays set: settled as UNKNOWN, never as lost
     except BaseException as e:
+        out.admission_inflight -= 1
         out.machinery.append(f"{target}: {what} could not be persisted ({_safe_exc(e)})")
+        return
+    out.admission_inflight -= 1
+    if durable:
+        _rescue(out)
 
 
 def _rescue(out: "SweepResult") -> None:
@@ -958,6 +983,7 @@ def _report(lane: str, out: SweepResult, clock) -> None:
                       admission={"targets": out.targets_refused, "pairs": out.refused_pairs,
                                  "detail": list(out.refused),
                                  "unpersisted": out.admission_unpersisted,
+                                 "unknown": out.admission_unknown,
                                  "truncated": out.targets_refused > len(out.refused)})
     if out.unselectable_pairs:
         # the counters are the fact; this carries the operator detail INTO the run's evidence, because a
