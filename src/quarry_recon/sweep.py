@@ -546,6 +546,10 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # v66#2: the refusals, reservations and outcomes this lifecycle already accumulated are facts.
         # They are flushed before the cancellation continues; a failure to report them may not MASK the
         # cancellation, which stays the exception that leaves this function.
+        if out.stop_kind is None:
+            # v67#1: flushing without settling the disposition let the record claim "budget exhausted
+            # after 0.0s of 0s" as a CAP — for a run a Ctrl-C ended.
+            out.stop, out.stop_kind = "CANCELLED mid-sweep", "cancelled"
         try:
             _report(coverage_lane, out, clock)
         except Exception:
@@ -574,7 +578,11 @@ def _safe_repr(value) -> str:
     very boundary that exists to fail closed."""
     try:
         return repr(value)
-    except Exception:
+    except (KeyboardInterrupt, SystemExit):
+        raise                                  # cancellation is the ONLY thing that leaves this driver
+    except BaseException:
+        # v67#2: `Exception` alone let a hostile `__repr__` raise `GeneratorExit` straight through the
+        # boundary that exists to fail closed.
         return "<unrepresentable>"
 
 

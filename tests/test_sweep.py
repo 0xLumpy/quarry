@@ -1264,3 +1264,34 @@ class TestTheAdmissionHook:
 
         with pytest.raises(KeyboardInterrupt):
             _run(tmp_path, words=["alpha"], admit=admit)
+
+    def test_a_CANCELLED_run_is_reported_as_cancelled_not_as_a_cap(self, tmp_path):
+        """v67#1: the flush ran before any disposition was settled, so the record said "candidate budget
+        exhausted after 0.0s of 0s" — a CAP — for a run a Ctrl-C ended."""
+        def admit(_target):
+            raise KeyboardInterrupt("ctrl-c")
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, words=["alpha", "beta"], admit=admit)
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert "CANCELLED mid-sweep" in sel["reason"], sel
+        assert "budget exhausted" not in sel["reason"], sel
+        assert sel["kind"] == "timeout", sel                  # a gap, never a cap we chose
+
+    def test_a_HOSTILE_repr_raising_a_BaseException_is_contained(self, tmp_path):
+        """v67#2: catching `Exception` alone let `GeneratorExit` through the fail-closed boundary."""
+        class Hostile:
+            def __repr__(self):
+                raise GeneratorExit("not an Exception")
+
+        out, tool = _run(tmp_path, words=["alpha"], admit=lambda _t: Hostile())
+        assert tool.calls == [] and out.stop_kind == "machinery"
+        assert "<unrepresentable>" in " ".join(out.machinery), out.machinery
+
+    def test_CANCELLATION_from_a_repr_still_propagates(self, tmp_path):
+        class Interrupting:
+            def __repr__(self):
+                raise KeyboardInterrupt("ctrl-c")
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, words=["alpha"], admit=lambda _t: Interrupting())
