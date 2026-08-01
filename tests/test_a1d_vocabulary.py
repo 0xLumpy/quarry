@@ -834,16 +834,21 @@ class TestA1dVocabularyLossReachesTheVerdict:
         run, summary = self._vertical_manifest(tmp_path, monkeypatch, wordlist=None)
         assert summary["verdict"] != "complete", summary
         cov = {(c["source_id"], c["measure"]): c for c in summary["coverage"]}
+        # v51#1: SELECTION succeeded — the zone was eligible and chosen — and EXECUTION is the gap.
         zc = cov[("vertical.wildcard_http", "zones")]
-        assert (zc["eligible"], zc["tested"], zc["omitted"]) == (1, 0, 1), zc
-        assert "no usable vocabulary" in str(zc), zc
+        assert (zc["eligible"], zc["tested"], zc["omitted"]) == (1, 1, 0), zc
+        ex = cov[("vertical.wildcard_http", "zone_execution")]
+        assert (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 0, 1), ex
+        assert "no usable vocabulary" in str(ex), ex
 
     def test_a_MISSING_httpx_is_reported_as_a_gap_AND_a_skip(self, tmp_path, monkeypatch):
         run, summary = self._vertical_manifest(tmp_path, monkeypatch, httpx=False)
         assert summary["verdict"] != "complete", summary
         cov = {(c["source_id"], c["measure"]): c for c in summary["coverage"]}
         zc = cov[("vertical.wildcard_http", "zones")]
-        assert (zc["eligible"], zc["tested"], zc["omitted"]) == (1, 0, 1), zc
+        assert (zc["eligible"], zc["tested"], zc["omitted"]) == (1, 1, 0), zc
+        ex = cov[("vertical.wildcard_http", "zone_execution")]
+        assert (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 0, 1), ex
         hx = [r for r in run.tool_runs("vertical") if r.tool == "httpx"]
         assert len(hx) == 1 and hx[0].status == "skipped", hx
         assert "1 wildcard zone(s) undifferentiated" in (hx[0].note or ""), hx
@@ -955,8 +960,10 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert summary["verdict"] != "complete", summary
             cov = {(c["source_id"], c["measure"]): c for c in summary["coverage"]}
             zc = cov[("vertical.wildcard_http", "zones")]
-            assert (zc["eligible"], zc["tested"], zc["omitted"]) == (1, 0, 1), zc
-            assert "no usable vocabulary" in str(zc), zc
+            assert (zc["eligible"], zc["tested"], zc["omitted"]) == (1, 1, 0), zc
+            ex = cov[("vertical.wildcard_http", "zone_execution")]
+            assert (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 0, 1), ex
+            assert "no usable vocabulary" in str(ex), ex
         finally:
             events.reset()
 
@@ -2776,8 +2783,10 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         sel = [e for e in self._events if e.get("measure") == "zones"][-1]
         assert sel["kind"] == "cap" and (sel["eligible"], sel["tested"], sel["omitted"]) == (2, 1, 1), sel
         assert "over the 1-zone cap" in sel["reason"], sel
+        # v51#2: EXECUTION is complete — the one selected zone returned — so it is NOT timeout-class.
+        # The parse loss lives in its own measure.
         ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
-        assert ex["kind"] == "timeout" and (ex["eligible"], ex["tested"]) == (1, 1), ex
+        assert ex["kind"] == "cap" and (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 1, 0), ex
         rows = [e for e in self._events if e.get("measure") == "output_rows"][-1]
         assert rows["omitted"] == 1, rows
 
@@ -2802,3 +2811,24 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert len(cands) == 2 and len(arts) == 2, (cands, arts)
         # the pair shares ONE token, so an artifact can always be traced to the exact list it probed
         assert {c.stem.rsplit("_", 1)[-1] for c in cands} == {a.stem.rsplit("-", 1)[-1] for a in arts}
+
+    def test_a_HARD_GATE_keeps_the_SELECTION_cap_and_the_EXECUTION_gap_apart(self, tmp_path,
+                                                                            monkeypatch):
+        """v51#1: a run capped to one zone AND missing httpx reported the whole eligible set as a
+        timeout, losing the clean one-zone selection."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "ZONE_CAP", 1)
+        kept, life = self._differ(tmp_path, monkeypatch, httpx=False,
+                                  zones=("a.acme.com", "b.acme.com"))
+        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        assert sel["kind"] == "cap" and (sel["eligible"], sel["tested"], sel["omitted"]) == (2, 1, 1), sel
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert ex["kind"] == "timeout" and (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 0, 1), ex
+        assert "httpx is not installed" in ex["reason"], ex
+
+    def test_NO_eligible_zone_reports_a_clean_ZERO_on_both_measures(self, tmp_path, monkeypatch):
+        kept, life = self._differ(tmp_path, monkeypatch, zones=("z.example.org",))
+        for measure in ("zones", "zone_execution"):
+            rec = [e for e in self._events if e.get("measure") == measure][-1]
+            assert (rec["eligible"], rec["tested"], rec["omitted"]) == (0, 0, 0), rec
+            assert rec["kind"] == "cap", rec
