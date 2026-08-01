@@ -516,6 +516,10 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     # target. In memory here; the next save carries it, exactly like a completion.
                     try:
                         progress.admit_target(target, at=now())
+                        # v80#2: PERSISTED here, not left to a later completion save — a raised,
+                        # skipped or cancelled invocation would otherwise leave the older refusal
+                        # authoritative on disk while the guard had just said yes.
+                        progress.save()
                     except (KeyboardInterrupt, SystemExit):
                         raise
                     except BaseException as e:

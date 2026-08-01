@@ -287,6 +287,14 @@ def _acquire_bounded(path: Path):
             time.sleep(_ROTATION_LOCK_POLL_S)
 
 
+#: how many lane GENERATIONS a refused target waits before it is asked again. A refusal must not become a
+#: membership cap: tier 3 alone is permanent exclusion, because clean work is eligible again every
+#: lifecycle and fills a finite allowance for ever (v80#1). Generations advance with every reservation, so
+#: a busy lane cools down quickly and a quiet one — where nothing else competes — never delays anything:
+#: `_rank` picks the lowest tier PRESENT, so an all-refused lane still runs.
+ADMISSION_COOLDOWN_GENS = 16
+
+
 class RotationProgress:
     """PROJECT-LEVEL rotation state for one lane: which slot was RESERVED when, and what it last RAN.
 
@@ -574,7 +582,11 @@ class RotationProgress:
             admitted = int((rec_t.get("adm_ok") or {}).get("gen", 0))
             done = (self._rank_record(target, bucket)[0] or {}).get("done") or {}
             if int(refused["gen"]) > max(admitted, int(done.get("gen", 0))):
-                return 3
+                # v80#1: a COOLDOWN, not an exclusion. While it holds the target ranks last; once the
+                # lane has moved on by `ADMISSION_COOLDOWN_GENS` it returns to its ordinary tier and is
+                # asked again — a transient refusal must not become a permanent membership cap.
+                if int(self.gen) - int(refused["gen"]) < ADMISSION_COOLDOWN_GENS:
+                    return 3
         rec, own = self._rank_record(target, bucket)
         done = rec.get("done")
         if not done:

@@ -1744,7 +1744,8 @@ class TestThePreflightCallbacksAreContained:
         for _ in range(4):                        # b.com is DIRTY from here on
             sweep_once(["beta", "gamma"])
         assert seen[0] == set() and seen[1] == {"b.com"}, seen
-        assert all(s == {"b.com"} for s in seen[2:]), seen   # the refused target never starves it again
+        # the refused target does not starve the dirty one across the cooldown window...
+        assert all(s == {"b.com"} for s in seen[2:]), seen
 
     def test_a_REFUSAL_never_claims_the_slot_RAN(self, tmp_path):
         out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
@@ -1793,3 +1794,46 @@ class TestThePreflightCallbacksAreContained:
         reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
                                            slot_grammar=sweep.slot_id_ok)
         assert reopened.tier("a.com", sweep.bucket_of("beta"), sweep.content_digest(["beta"])) == 3
+
+    def test_a_refused_target_is_ASKED_AGAIN_within_bounded_lifecycles(self, tmp_path, monkeypatch):
+        """v80#1: tier 3 alone is permanent EXCLUSION — clean work is eligible again every lifecycle and
+        fills a finite allowance for ever, so a transient refusal became a membership cap."""
+        monkeypatch.setattr(budget, "ADMISSION_COOLDOWN_GENS", 4)
+        asked, ran = [], []
+        allowed = {"a.com": False}
+
+        def admit(target):
+            asked.append(target)
+            return allowed.get(target, True)
+
+        for _ in range(8):
+            tool = _Tool()
+            sweep.run_sweep(lane=LANE, state_dir=tmp_path, targets=["a.com", "b.com"],
+                            vocabulary=lambda t: ["alpha"], execute=tool, budget_s=0,
+                            coverage_lane=COV, max_targets_per_run=1, admit=admit)
+            ran.append({c[0] for c in tool.calls})
+            allowed["a.com"] = True               # it becomes contactable after the first refusal
+
+        assert asked.count("a.com") >= 2, asked   # asked again, not frozen out
+        assert any(s == {"a.com"} for s in ran), ran
+        assert any(s == {"b.com"} for s in ran), ran
+
+    def test_the_COOLDOWN_holds_while_it_lasts(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(budget, "ADMISSION_COOLDOWN_GENS", 1000)
+        _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        assert reopened.tier("a.com", sweep.bucket_of("alpha"), "members") == 3
+
+    @pytest.mark.parametrize("mode", ["raises", "skipped"])
+    def test_an_ADMISSION_survives_an_invocation_that_never_completed(self, tmp_path, mode):
+        """v80#2: `adm_ok` lived only in memory, so a raised or skipped invocation left the older refusal
+        authoritative on disk while the guard had just said yes."""
+        _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
+        tool = (_Tool(raises=(1, RuntimeError("popen exploded"))) if mode == "raises"
+                else _Tool(statuses=[Status.SKIPPED]))
+        _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: True, tool=tool)
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        assert reopened.targets["a.com"].get("adm_ok"), reopened.targets
+        assert reopened.tier("a.com", sweep.bucket_of("alpha"), "members") == 0, reopened.targets
