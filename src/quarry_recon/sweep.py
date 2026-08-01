@@ -294,6 +294,12 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         for target in dict.fromkeys(targets):          # a repeated target is one target
             per_target: list = []
             for word in vocabulary(target) or []:
+                if isinstance(word, bool) or not isinstance(word, str) or not word:
+                    # v75#1: containing the CALL is not enough — a hashable non-string candidate survived
+                    # corpus building and then crashed the allocator outside every boundary. The
+                    # scheduler hashes and joins these: the contract is an exact non-empty str.
+                    raise TypeError(f"vocabulary returned {_safe_name(word)} {_safe_repr(word)}, "
+                                    f"not a non-empty str")
                 if (target, word) in seen_pairs:       # review v14#5: one submission per word per target —
                     continue                           # a duplicate would inflate the denominator, the
                 seen_pairs.add((target, word))         # digest, the attribution AND the active payload
@@ -524,6 +530,12 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
 
             try:
                 result = execute(target, unit, [word for _b, words in chosen for word in words])
+                if not isinstance(getattr(result, "status", None), Status):
+                    # v75#1: the CALL was guarded, its RESULT was not — `None` reached `result.status`
+                    # after active work had already happened, escaping with only a reservation on disk
+                    # and no coverage at all.
+                    raise TypeError(f"the invocation returned {_safe_name(result)} "
+                                    f"{_safe_repr(result)} with no usable status")
             except (KeyboardInterrupt, SystemExit):
                 raise                                   # cancellation ends the run, never a slot outcome
             except BaseException as e:                  # `runner.run` can raise around Popen (v10#1)

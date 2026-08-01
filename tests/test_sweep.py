@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import types
 
 import pytest
 
@@ -1650,3 +1651,32 @@ class TestThePreflightCallbacksAreContained:
 
         with pytest.raises(SystemExit, match="the original"):
             _run(tmp_path, words=["alpha"], tool=_Cancel())
+
+    @pytest.mark.parametrize("word", [1, None, b"alpha", True, "", ("alpha",)])
+    def test_a_NON_STRING_candidate_is_refused_inside_the_boundary(self, tmp_path, word):
+        """v75#1: containing the CALL is not enough — a hashable non-string candidate survived corpus
+        building and then crashed the allocator outside every boundary."""
+        out = sweep.run_sweep(lane=LANE, state_dir=tmp_path, targets=["acme.com"],
+                              vocabulary=lambda t: ["alpha", word], execute=_Tool(), budget_s=0,
+                              coverage_lane=COV)
+        assert out.stop_kind == "machinery" and out.eligibility_known is False, (word, out)
+        assert "not a non-empty str" in " ".join(out.machinery), out.machinery
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert sel["kind"] == "unknown", sel
+
+    @pytest.mark.parametrize("bad", [None, "success", object(),
+                                     types.SimpleNamespace(status="success"),   # duck-typed status
+                                     types.SimpleNamespace(status=None)])
+    def test_an_INVOCATION_that_returns_nothing_usable_is_contained(self, tmp_path, bad):
+        """v75#1: the call was guarded, its RESULT was not — `result.status` escaped after active work
+        had already happened, leaving only a reservation and no coverage."""
+        out, _t = _run(tmp_path, words=["alpha"], tool=lambda *a: bad)
+        assert out.stop_kind == "machinery", (bad, out)
+        assert "no usable status" in " ".join(out.machinery), out.machinery
+        assert out.reservations_persisted == 1 and out.slots_attempted == 0, out
+        sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
+        assert (sel["eligible"], sel["tested"]) == (1, 0), sel
+
+    def test_a_VALID_RunResult_is_still_accepted(self, tmp_path):
+        out, tool = _run(tmp_path, words=["alpha"])
+        assert out.stop_kind is None and out.slots_attempted == 1 and tool.calls
