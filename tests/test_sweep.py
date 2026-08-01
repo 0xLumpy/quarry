@@ -1133,3 +1133,65 @@ class TestThePerRunTargetAllowance:
         sel = [e for e in _events(tmp_path) if e.get("measure") == "candidate_pairs"][-1]
         assert "budget exhausted" not in sel["reason"], sel
         assert sel["kind"] == "cap" and "candidate bound (1)" in sel["reason"], sel
+
+
+class TestTheAdmissionHook:
+    """v64: work that is itself ACTIVE — a contact guard's live resolution — may not run for every
+    eligible target before the allowance and the clock apply. The scheduler asks once, per admitted
+    target, after the reservation is durable."""
+
+    def test_the_HOOK_runs_after_the_reservation_is_persisted(self, tmp_path, monkeypatch):
+        order = []
+        real = budget.RotationProgress.save
+        monkeypatch.setattr(budget.RotationProgress, "save",
+                            lambda self: (order.append("save"), real(self))[1])
+        out, tool = _run(tmp_path, words=["alpha"], admit=lambda t: order.append("admit") or True)
+        assert order[:2] == ["save", "admit"], order        # reservation first, then anything active
+        assert tool.calls and out.targets_refused == 0
+
+    def test_it_is_asked_ONCE_per_target(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        asked = []
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha", "beta", "gamma"],
+                         admit=lambda t: asked.append(t) or True)
+        assert sorted(asked) == ["a.com", "b.com"], asked   # not once per batch
+        assert len(tool.calls) > 2, tool.calls
+
+    def test_a_REFUSAL_excludes_the_target_and_submits_nothing_for_it(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha", "beta", "gamma"],
+                         admit=lambda t: t != "a.com")
+        assert {c[0] for c in tool.calls} == {"b.com"}, tool.calls
+        assert out.targets_refused == 1 and out.refused == ["a.com"]
+        assert out.refused_pairs == 3 and out.attempted_pairs == 3
+        assert out.targets_contacted == 1                    # a refusal is NOT a contact
+
+    def test_a_REFUSAL_consumes_the_ALLOWANCE_and_never_backfills(self, tmp_path):
+        """Clause 3: otherwise many refusals recreate exactly the traffic the allowance bounds."""
+        out, tool = _run(tmp_path, targets=("a.com", "b.com", "c.com"), words=["alpha"],
+                         max_targets_per_run=1, admit=lambda t: t != "a.com")
+        assert tool.calls == [], tool.calls
+        assert out.targets_admitted == 1 and out.targets_refused == 1
+
+    def test_a_refused_target_moves_to_the_BACK_of_its_tier(self, tmp_path):
+        """Clause 4: the reservation advanced its cursor, so a permanently refused target cannot
+        monopolise the front of the rotation."""
+        seen = []
+        for _ in range(3):
+            out, tool = _run(tmp_path, targets=("a.com", "b.com", "c.com"), words=["alpha"],
+                             max_targets_per_run=1, admit=lambda t: t != "a.com")
+            seen.append({c[0] for c in tool.calls})
+        assert seen[0] == set() and seen[1] and seen[2], seen
+        assert seen[1] | seen[2] == {"b.com", "c.com"}, seen
+
+    def test_a_RAISING_hook_is_machinery_and_submits_nothing_further(self, tmp_path):
+        def boom(target):
+            raise OSError("resolver exploded")
+
+        out, tool = _run(tmp_path, words=["alpha"], admit=boom)
+        assert tool.calls == [] and out.stop_kind == "machinery"
+        assert "admission check raised" in " ".join(out.machinery)
+
+    def test_NO_hook_is_the_unchanged_path(self, tmp_path):
+        out, tool = _run(tmp_path, words=["alpha", "beta"])
+        assert tool.calls and out.targets_refused == 0 and out.refused == []

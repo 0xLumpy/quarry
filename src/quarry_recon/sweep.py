@@ -178,6 +178,9 @@ class SweepResult:
     invocation_classes: dict = field(default_factory=dict)
     targets_eligible: int = 0               # every target the corpus offered
     targets_admitted: int = 0               # ...that the per-run allowance let this lifecycle start
+    targets_refused: int = 0                # ...that the caller's admission check turned away
+    refused_pairs: int = 0
+    refused: list = field(default_factory=list)
     targets_contacted: int = 0              # ...whose invocation actually ran (v59#2: not the same fact)
     #: targets the per-run allowance deferred to a later lifecycle, and the pairs they hold. An
     #: orthogonal DISPOSITION, never the stop: the run carries on with the targets it admitted (v59#1).
@@ -243,7 +246,7 @@ _OBTAINED = (Status.SUCCESS, Status.EMPTY)
 
 def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: int,
               coverage_lane: str, dependency_ok=None, attribution=None, max_pairs_per_target: int = 0,
-              max_targets_per_run: int = 0,
+              max_targets_per_run: int = 0, admit=None,
               now=time.time) -> SweepResult:
     """Drive one lane's sweep.
 
@@ -255,6 +258,16 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     contacts. It never decides WHICH: the rotation does, so every target is eventually covered and a
     later run continues where this one stopped. That is the difference between bounding throughput and
     capping membership — a fixed "first N by name" cut contacts the same N for ever.
+    `admit(target) -> bool` is an optional per-target ADMISSION check for work that is itself active — a
+    contact guard, say. Its contract (design v64):
+      1. it runs AFTER the target's first batch is reserved and persisted, so the reservation exists
+         before anything active happens;
+      2. once per target per lifecycle;
+      3. a refusal CONSUMES the target's allowance and excludes that target's remaining slots for this
+         lifecycle — no backfill, or many refusals would recreate the traffic the allowance bounds;
+      4. the reservation already advanced the target's cursor, so a permanently refused target moves to
+         the BACK of its tier instead of monopolising the front;
+      5. a refusal is recorded on its own — never an invocation, never attempted pairs.
     `execute(target, unit, words) -> RunResult` submits ONE INVOCATION, which may carry several slots:
     `unit` names it (a lone slot keeps its own id) and `words` is their union. Its returned status attests
     every slot the invocation carried. `attribution(word) -> source` is optional ACCOUNTING only. Returns
@@ -367,6 +380,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         picked: set = set()
         started_targets: set = set()                       # targets the allowance ADMITTED
         contacted: set = set()                             # ...whose invocation actually ran
+        checked: set = set()                               # targets the admission hook has answered for
         spent: dict = {}                                   # candidates submitted per target
         while not clock.exhausted() and len(picked) < len(slots):
             batch = _next_batch(progress, slots, content, members, picked, spent, out,
@@ -396,6 +410,32 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.reservations_persisted += len(chosen)
             spent[target] = spent.get(target, 0) + total
             _rescue(out)                       # this save also carried any pending completion (v14#1)
+
+            if admit is not None and target not in checked:
+                # ADMISSION (v64): after the reservation is durable, before anything active happens.
+                checked.add(target)
+                try:
+                    allowed = admit(target)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as e:
+                    out.machinery.append(f"{target}: admission check raised ({type(e).__name__}: {e})")
+                    out.stop = "machinery: the admission check raised"
+                    out.stop_kind = "machinery"
+                    break
+                if not allowed:
+                    out.targets_refused += 1
+                    if len(out.refused) < _UNSELECTABLE_DETAIL:
+                        out.refused.append(target)
+                    for slot in slots:                    # this target is done for THIS lifecycle
+                        if slot[0] == target and slot not in picked:
+                            picked.add(slot)
+                            out.refused_pairs += len(members[slot])
+                    out.refused_pairs += total            # including the batch we had already picked
+                    why = "target(s) refused by the caller's admission check"
+                    if why not in out.cap_reasons:
+                        out.cap_reasons.append(why)
+                    continue
 
             try:
                 result = execute(target, unit, [word for _b, words in chosen for word in words])
