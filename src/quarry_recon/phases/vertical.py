@@ -991,10 +991,11 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     st["ledger_error_ids"] = []
     st["stopped"] = ""
 
-    # ── SELECTION: the contact guard decides which zones may be contacted AT ALL. It is a selection
-    #    fact, so it is settled before the scheduler sees the target list (v62).
-    contactable = []
-    for zone in zones:
+    # ── ADMISSION: the contact guard is ACTIVE work (it resolves a name under the zone), so it runs only
+    #    for the zones the scheduler actually admits — once each, after their reservation is durable and
+    #    before anything else touches them (v77). Running it over every eligible zone made a 50-zone scope
+    #    pay 50 lookups to contact five, outside the run's own bounds.
+    def _guard(zone: str) -> bool:
         # self-attack guard: if the wildcard resolves to the SCAN BOX / metadata, don't vhost-scan the zone
         # (record it as intel). A private wildcard is CONTACTED by default (recorded either way).
         _wstate, _wdeny, _wintel = netguard.contact_state(f"quarry-wc-guard-{_uuid.uuid4().hex[:8]}.{zone}",
@@ -1005,14 +1006,8 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             # review-B-audit-15#3: this omission used to raise the unsubmitted count with no reason, so a
             # capped run blamed the cap for zones the CONTACT GUARD had refused.
             st["blocked"]["self_or_private"] += 1
-            continue
-        contactable.append(zone)
-    # the allowance can only defer what the guard left contactable — an estimate over zones nothing may
-    # contact would blame a deferral for a refusal (v62).
-    _allow_now = wildcard_zones_per_run()
-    st["blocked"]["zone_cap"] = max(0, len(contactable) - _allow_now) if _allow_now else 0
-    if not contactable:
-        return _gate("every eligible zone was refused by the self/private contact guard", selection=True)
+            return False
+        return True
 
     def _probe(zone: str, unit: str, ws):
         """ONE httpx invocation against ONE zone — what the sweep submits for a batch of its slots."""
@@ -1201,7 +1196,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     swept = sweep.run_sweep(
         lane=f"wc_{source_id.replace('.', '_')}",
         state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}",
-        targets=contactable, vocabulary=lambda _zone: list(words), execute=_probe,
+        targets=zones, vocabulary=lambda _zone: list(words), execute=_probe, admit=_guard,
         budget_s=budget.budget_seconds("WILDCARD_BUDGET_S"), coverage_lane=source_id,
         dependency_ok=lambda: have("httpx"), max_pairs_per_target=WILDCARD_WORD_CAP,
         max_targets_per_run=wildcard_zones_per_run())
@@ -1210,6 +1205,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     st["admitted_zones"] = swept.targets_admitted
     st["deferred_zones"] = swept.deferred_targets
     st["blocked"]["zone_cap"] = swept.deferred_targets       # deferred to a LATER run, never dropped
+    st["refused_zones"] = swept.targets_refused              # the guard's own answer, per ADMITTED zone
     # the lane's own cause and the scheduler's DETAIL are both facts — composing them keeps the
     # underlying error text (which the machinery entry carries) beside the lane's sentence.
     if st.get("ledger_raised"):

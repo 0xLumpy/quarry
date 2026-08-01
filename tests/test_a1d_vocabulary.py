@@ -505,11 +505,11 @@ class TestA1dVocabularyLossReachesTheVerdict:
         st = {}
         zones = {f"z{i}.acme.com" for i in range(7)}          # 7 zones, allowance 5, all guard-refused
         vertical._wildcard_differentiate(ctx, zones, extra_words=["api"], stats=st)
-        # v62: the guard is a SELECTION fact settled over every eligible zone, and the allowance can only
-        # defer what the guard leaves contactable — here, nothing.
-        assert st["blocked"] == {"zone_cap": 0, "self_or_private": 7}, st
-        assert "refused by the self/private contact guard" in st["blocked_reason"], st
-        assert "allowance" not in st["blocked_reason"], st
+        # v77: the guard is ACTIVE work, so it runs only for the zones the scheduler ADMITS — five here,
+        # all refused — while the allowance defers the other two. Two facts, each its own count.
+        assert st["blocked"] == {"zone_cap": 2, "self_or_private": 5}, st
+        assert "5 zone(s) refused by the self/private contact guard" in st["blocked_reason"], st
+        assert "2 zone(s) deferred to a later run by the 5-zone per-run allowance" in st["blocked_reason"]
 
     def test_the_A1d_pass_keeps_its_OWN_lifecycle_in_the_MANIFEST(self, tmp_path, monkeypatch):
         """review-B-audit-15#4 / 16#3: distinct units stopped the replacement, but both events still wore
@@ -2189,9 +2189,11 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         try:
             monkeypatch.setattr(vertical, "have", lambda t: httpx)
             monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            self._guard_hosts = []
             monkeypatch.setattr(vertical.netguard, "contact_state",
-                                lambda host, block_private=False: (guard or "public",
-                                                                   guard is not None, None))
+                                lambda host, block_private=False: (
+                                    self._guard_hosts.append(host),
+                                    (guard or "public", guard is not None, None))[1])
             monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
             monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
             from quarry_recon.runner import RunResult as _RR
@@ -3150,3 +3152,27 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         # unrecorded RESULT is named separately — two facts, not one collapsed into the other
         assert "OSError: disk is read-only" in reason, reason
         assert "1 tool result(s) not recorded" in reason, reason
+
+    def test_the_GUARD_only_resolves_for_ADMITTED_zones(self, tmp_path, monkeypatch):
+        """v77: the guard is ACTIVE work — it resolves a name under the zone. Running it over every
+        eligible zone made a 50-zone scope pay 50 lookups to contact five, outside the run's bounds."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "WILDCARD_ZONES_PER_RUN", 2)
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[],
+                                  zones=tuple(f"z{i}.acme.com" for i in range(8)))
+        asked = self._guard_hosts
+        assert len(asked) == 2, asked            # NOT eight
+        probed = {h.split(".", 1)[1] for h in asked}
+        assert len(probed) == 2 and all(z.endswith("acme.com") for z in probed), probed
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert (ex["eligible"], ex["tested"]) == (2, 2), ex
+
+    def test_a_GUARD_REFUSAL_consumes_its_zone_and_nothing_is_probed(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "WILDCARD_ZONES_PER_RUN", 1)
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[], guard="self",
+                                  zones=("a.acme.com", "b.acme.com"))
+        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        assert "1 zone(s) refused by the self/private contact guard" in sel["reason"], sel
+        assert "1 zone(s) deferred to a later run" in sel["reason"], sel
+        assert life[-1]["status"] in ("skipped", "limited", "failed"), life
