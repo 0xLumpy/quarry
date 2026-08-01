@@ -2099,3 +2099,42 @@ class TestThePreflightCallbacksAreContained:
             outcomes.add((out.completions_published, out.pending_completions, out.completion_unknown))
         # not vacuous: the sweep must really cut the transition both before and after it applied
         assert (5, 0, 3) in outcomes and ((8, 0, 0) in outcomes) == saved, outcomes
+
+    def test_a_CLOCK_stop_does_not_absorb_the_BOUND_s_pairs(self, tmp_path, monkeypatch):
+        """v65: two five-word targets, a three-per-target bound, and a clock that expires after the first
+        call. Two pairs are the BOUND's (that target may spend no more) and five are the clock's — the
+        either/or that inferred the split from `eligible - attempted` called all seven the clock's,
+        omitting a cap that fired and overstating what the stop prevented."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 3)
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+
+        class _Slow(_Tool):
+            def __call__(self, target, bucket, words):
+                ticks["t"] += 9.0                       # the first call alone exhausts the 5s budget
+                return super().__call__(target, bucket, words)
+
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=[f"w{i}" for i in range(5)],
+                         tool=_Slow(), budget_s=5, max_pairs_per_target=3)
+        assert out.stop_kind == "budget", (out.stop, out.stop_kind)
+        assert out.attempted_pairs == 3 and out.eligible_pairs == 10, out
+        parts = out.pair_remainder()
+        assert parts["bound"] == 2 and parts["stopped"] == 5, parts
+        assert sum(parts[k] for k in ("refused", "unselectable", "deferred", "stopped", "bound")) == 7
+        assert parts["total"] == 7, parts
+
+    def test_the_PARTITION_holds_for_ANY_counters(self, tmp_path):
+        """v65: `pair_remainder()` is a PARTITION — the parts sum to the total, none is negative, and no
+        pair is counted twice however the counters were reached. Recorded dispositions can overlap (a
+        target whose slots the bound excluded can then be refused), and a residual with no stop belongs to
+        the bound: the last batch simply left the allowance short of another slot, which nothing marks."""
+        out = sweep.SweepResult()
+        out.eligible_pairs, out.attempted_pairs = 10, 3
+        out.stop_kind = None                             # nothing stopped this run
+        parts = out.pair_remainder()
+        assert parts["bound"] == 7 and parts["stopped"] == 0, parts     # the residual is the BOUND's
+        out.refused_pairs, out.bound_pairs, out.deferred_pairs = 9, 9, 9     # deliberately overlapping
+        parts = out.pair_remainder()
+        assert parts["total"] == 7, parts
+        assert sum(parts[k] for k in ("refused", "unselectable", "deferred", "stopped", "bound")) == 7
+        assert all(parts[k] >= 0 for k in parts), parts

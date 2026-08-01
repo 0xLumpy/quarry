@@ -220,6 +220,9 @@ class SweepResult:
     #: reported through `unretriable`, which also forces the coverage record to a gap class.
     unselectable_slots: int = 0
     unselectable_pairs: int = 0
+    #: pairs the per-target SPEND bound excluded from this run, counted AS they were excluded (v65). A
+    #: stop and a bound own different pairs, and only a recorded count can tell them apart.
+    bound_pairs: int = 0
     #: STRUCTURED detail per refused slot, `{"target", "slot", "members"}` — bounded, with the counters
     #: above authoritative. It is deliberately NOT `machinery`: a consumer had to recognise unschedulable
     #: work by matching English in a machinery string, which a wording change breaks and an unrelated
@@ -324,11 +327,17 @@ class SweepResult:
         rest = max(0, self.eligible_pairs - self.attempted_pairs)
         parts = {}
         for key, value in (("refused", self.refused_pairs), ("unselectable", self.unselectable_pairs),
-                           ("deferred", self.deferred_pairs)):
+                           ("deferred", self.deferred_pairs), ("bound", self.bound_pairs)):
             parts[key] = min(rest, max(0, int(value)))
             rest -= parts[key]
-        stopped = self.stop_kind not in (None, "bound")
-        parts["stopped"], parts["bound"] = (rest, 0) if stopped else (0, rest)
+        # v65: what is left after the RECORDED dispositions. A stop owns it when something stopped the
+        # run — and when nothing did, it is the bound's: the last batch simply left the target's
+        # allowance short of another slot, which no exclusion event marks.
+        if self.stop_kind not in (None, "bound"):
+            parts["stopped"] = rest
+        else:
+            parts["stopped"] = 0
+            parts["bound"] += rest
         parts["total"] = max(0, self.eligible_pairs - self.attempted_pairs)
         return parts
 
@@ -1010,6 +1019,11 @@ def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: i
             # and the scan CONTINUES, so a smaller slot behind it can still fill the remaining allowance
             # in the SAME invocation, exactly as the one-slot-per-call driver used to pack it (v31).
             picked.add(choice)
+            # v65: these pairs are the BOUND's, recorded as they are excluded. Inferring them at the end
+            # from `eligible - attempted` cannot tell them from a stop's remainder, so a run that
+            # exhausted one target's bound and then hit the clock reported the whole remainder as the
+            # clock's — omitting a cap that fired and overstating what the stop prevented.
+            out.bound_pairs += len(words)
             why = f"the per-target candidate bound ({cap}) was reached"
             if why not in out.cap_reasons:
                 out.cap_reasons.append(why)
