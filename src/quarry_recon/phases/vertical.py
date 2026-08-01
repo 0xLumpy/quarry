@@ -715,6 +715,9 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         # iterable or an unreadable vocabulary used to escape without a start/terminal pair at all.
         eligible = _wc_eligible_zones(ctx, zones)
         st["eligible_zones"] = len(eligible)
+        # v53#3: the cap belongs to SELECTION and is known the moment eligibility is. Setting it only
+        # inside the body let a setup failure report every eligible zone as selected.
+        st["blocked"]["zone_cap"] = max(0, len(eligible) - ZONE_CAP)
         # no eligible zone -> nothing to probe WITH either: the vocabulary is not read, so a run with
         # nothing to differentiate does not report parse facts about a list it would never have used.
         words = _wc_vocabulary(extra_words, st) if eligible else []
@@ -746,7 +749,12 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         try:
             _wc_report(source_id, label, st)      # every record, on every path (v52#2)
         except Exception as e:
-            st["blocked_reason"] = f"{st.get('blocked_reason') or ''}; coverage not reported ({e})"
+            # v53#1: this only annotated the carrier, so a lane that reported NOTHING still finished
+            # EMPTY with no reason and a `complete` verdict. Losing the accounting is machinery.
+            machinery = machinery or e
+            outcome = ((Status.PARTIAL if kept else Status.FAILED),
+                       "; ".join(p for p in (outcome[1], f"coverage could not be reported "
+                                                         f"({type(e).__name__}: {e})") if p))
         why = outcome[1]
         if machinery is not None:
             # MACHINERY only (v43#1): a capped or guard-refused pass is an omission the coverage record
@@ -950,22 +958,22 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         if ctx.profile.http_rl:                           # honor a configured HTTP rate
             hx_cmd += ["-rl", str(ctx.profile.http_rl)]
         r = exec_tool("httpx", hx_cmd, raw_path=hx, timeout=ctx.http_timeout)
+        # v53#2: the invocation has RETURNED. That fact is committed before the fallible ledger write —
+        # a `record()` that raises used to leave `zone_execution` claiming the call never came back.
+        if r.status is not Status.SKIPPED:
+            zones_probed += 1                   # a CONTACT is an invocation that returned
+            st["probed_zones"] = zones_probed
+            if r.status in (Status.SUCCESS, Status.EMPTY):
+                st["zones_obtained"] += 1
+            else:
+                _k = str(getattr(r.status, "value", r.status))
+                st["invocation_classes"][_k] = st["invocation_classes"].get(_k, 0) + 1
         ctx.run.record(phase, r)
         if r.status is Status.SKIPPED:
             # no process ran: not a zone we contacted, and the tool will not run for the NEXT zone either
             # (v44#3). The remaining zones stay unprobed and the omission is reported as such.
             st["stopped"] = "httpx did not run"
             break
-        zones_probed += 1                       # a CONTACT is an invocation that returned
-        st["probed_zones"] = zones_probed
-        # v43#2: the terminal used to read only "did we contact this zone", so a FAILED, TIMED_OUT or
-        # mid-run SKIPPED invocation left the source reporting a clean EMPTY over full zone coverage.
-        # An ATTEMPT and an ANSWER are different facts and are counted separately.
-        if r.status in (Status.SUCCESS, Status.EMPTY):
-            st["zones_obtained"] += 1
-        else:
-            _k = str(getattr(r.status, "value", r.status))
-            st["invocation_classes"][_k] = st["invocation_classes"].get(_k, 0) + 1
         # v48#1: `RunResult.raw_path` means "captured non-empty stdout", NOT "the requested file exists".
         # `runner.run` writes the file and returns raw_path=None for a clean EMPTY result, so testing it
         # turned every legitimate zero-result invocation into a missing artifact. The REQUESTED path is

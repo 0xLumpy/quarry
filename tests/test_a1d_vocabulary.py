@@ -2879,3 +2879,48 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert ex["kind"] == "timeout", ex
         for measure in ("output_rows", "output_artifacts"):
             assert [e for e in self._events if e.get("measure") == measure], measure
+
+    def test_a_REPORTING_failure_is_MACHINERY_not_a_clean_run(self, tmp_path, monkeypatch):
+        """v53#1: a lane that reported NOTHING still finished EMPTY with no reason and a complete
+        verdict — losing the accounting is machinery, not a footnote."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "_wc_report",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("event log gone")))
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[])
+        assert life[-1]["status"] == "failed", life
+        assert "coverage could not be reported (OSError: event log gone)" in life[-1]["reason"], life
+        summary = self._last_run._run_summary()
+        assert summary["verdict"] != "complete", summary
+        assert any(r.tool == "wildcard-differ" for r in self._last_run.tool_runs("enrich"))
+
+    def test_a_RETURNED_invocation_is_counted_before_the_ledger_write(self, tmp_path, monkeypatch):
+        """v53#2: `record()` raising left `zone_execution` claiming the call never came back."""
+        from quarry_recon.phases import vertical
+        from quarry_recon import store
+        real = store.Run.record
+
+        def _boom(self, phase, result):
+            if result.tool == "httpx":
+                raise OSError("manifest is read-only")
+            return real(self, phase, result)
+
+        monkeypatch.setattr(store.Run, "record", _boom, raising=False)
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[])
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 1, 0), ex
+        assert life[-1]["status"] == "failed" and "read-only" in life[-1]["reason"], life
+
+    def test_a_SETUP_failure_keeps_the_zone_CAP_in_the_denominator(self, tmp_path, monkeypatch):
+        """v53#3: the cap was only set inside the body, so a setup failure reported every eligible zone
+        as selected."""
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(vertical, "ZONE_CAP", 1)
+        monkeypatch.setattr(vertical, "_wc_vocabulary",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("wordlist vanished")))
+        kept, life = self._differ(tmp_path, monkeypatch, rows=[],
+                                  zones=("a.acme.com", "b.acme.com"))
+        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        assert (sel["eligible"], sel["tested"], sel["omitted"]) == (2, 1, 1), sel
+        assert "over the 1-zone cap" in sel["reason"], sel
+        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        assert (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 0, 1), ex
