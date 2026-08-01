@@ -1808,3 +1808,112 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert len(fins) == 1 and "not installed" in fins[0]["reason"], fins
         finally:
             events.reset()
+
+    def test_ONE_puredns_call_now_carries_several_SLOTS(self, tmp_path, monkeypatch):
+        """Step 4.2 batching, at the lane: the spend is unchanged, the number of processes is not. A
+        puredns invocation costs ~1.04s before it resolves anything (measured), which the one-slot-per-call
+        driver paid once per slot."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        monkeypatch.setattr(enrich, "A1D_WORD_CAP", 6)
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("\n".join(f"word{i:03d}" for i in range(30)))
+            from quarry_recon.runner import RunResult as _RR
+            cmds, raws = [], []
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: (
+                                    cmds.append(cmd), raws.append(raw_path),
+                                    _RR(tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))[2])
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            assert len(cmds) == 1, cmds                       # ONE process for the whole allowance
+            submitted = pathlib.Path(cmds[0][2]).read_text().split()
+            assert len(submitted) == 6, submitted             # the spend bound is unchanged
+            # the wordlist and the raw artifact are named by the INVOCATION, not by one of its slots
+            assert "+" in pathlib.Path(cmds[0][2]).name, cmds[0][2]
+            assert len(raws) == 1 and "+" in raws[0].name, raws
+            assert raws[0].name.startswith("a1d-brute-acme.com-"), raws
+        finally:
+            events.reset()
+
+    def test_the_RESUME_KEY_covers_the_invocation_maximum(self, tmp_path, monkeypatch):
+        """The maximum shapes the PARTITION (slots are split against the smaller of it and the spend
+        bound), so a run under a different one is a different question — driven through the LANE, so the
+        key is the one it really emits."""
+        def _key(where, maximum, name):
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(sweep, "MAX_BATCH_WORDS", maximum)
+                _submitted, run = self._scheduled(where, mp, words=[f"word{i:03d}" for i in range(9)],
+                                                  run_name=name)
+            starts = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                      if json.loads(l).get("event") == "tool_start"
+                      and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(starts) == 1, starts
+            return starts[0]["work_unit"]
+
+        wide = _key(tmp_path / "a", 25000, "wide")
+        narrow = _key(tmp_path / "b", 3, "narrow")
+        again = _key(tmp_path / "c", 25000, "again")
+        assert wide != narrow, (wide, narrow)
+        assert wide == again, (wide, again)
+
+    def test_UNSCHEDULABLE_candidates_reach_the_A1d_verdict(self, tmp_path, monkeypatch):
+        """A slot no bound can admit is neither a resumable remainder nor cap withholding, and the lane
+        must say so rather than report a clean run."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        monkeypatch.setattr(sweep, "allocate", lambda words, *, cap: {"000": list(words)})
+        _submitted, run = self._scheduled(tmp_path, monkeypatch,
+                                          words=[f"word{i:03d}" for i in range(5)])
+        recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
+        assert len(recs) == 1, recs
+        assert "cannot be scheduled under the current bounds" in recs[0].note, recs[0].note
+        assert "will NOT be retried" in recs[0].note, recs[0].note
+
+    def test_the_TERMINAL_counts_failures_in_BOTH_currencies(self, tmp_path, monkeypatch):
+        """With batching, ten failed slots may be one failed call or ten — the slot map alone cannot say."""
+        from quarry_recon import store
+        from quarry_recon.phases import enrich, probe, vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
+            wl.mkdir(parents=True, exist_ok=True)
+            (wl / "js_wordlist.txt").write_text("\n".join(f"word{i:03d}" for i in range(4)))
+            from quarry_recon.runner import RunResult as _RR
+            monkeypatch.setattr(enrich, "have", lambda t: True)
+            monkeypatch.setattr(vertical, "have", lambda t: False)
+            monkeypatch.setattr(vertical, "_wordlist", lambda c: None)
+            monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
+            monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
+            monkeypatch.setattr(enrich, "exec_tool",
+                                lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
+                                    tool, cmd, crawl.Status.FAILED, 1, 0.1, None, 0))
+            ctx = _Ctx(run.dir, [])
+            ctx.run = run
+            ctx.scope = self._S()
+            ctx.scope.passive_only = False
+            ctx.scope.is_oos = lambda h: False
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            enrich._a1d_recursive_brute(ctx)
+            fins = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()
+                    if json.loads(l).get("event") == "tool_finish"
+                    and json.loads(l).get("source_id") == "enrich.a1d_brute"]
+            assert len(fins) == 1 and fins[0]["status"] == "failed", fins
+            assert "in 1 invocation(s) {'failed': 1}" in fins[0]["reason"], fins[0]["reason"]
+            assert "slot outcomes {'failed': 4}" in fins[0]["reason"], fins[0]["reason"]
+        finally:
+            events.reset()

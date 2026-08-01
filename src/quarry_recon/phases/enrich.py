@@ -92,6 +92,9 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
     if loss.get("wildcard_withheld"):
         parts.append(f"{loss['wildcard_withheld']}/{loss.get('after_base', 0)} mined word(s) withheld from "
                      f"the wildcard differ by its {A1D_WILDCARD_WORD_CAP}-word bound")
+    if loss.get("unschedulable_pairs"):
+        parts.append(f"{loss['unschedulable_pairs']} candidate(s) in {loss['unschedulable_slots']} "
+                     f"slot(s) cannot be scheduled under the current bounds and will NOT be retried")
     if loss.get("sweep_stop"):
         parts.append(f"the scheduled brute stopped early ({loss['sweep_stop']})")
     if loss.get("sweep_machinery"):
@@ -139,6 +142,11 @@ def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
     if swept.stop_kind == "bound":
         wl_loss["withheld_by_word_cap"] = max(0, swept.eligible_pairs - swept.attempted_pairs)
         wl_loss["sweep_eligible_pairs"] = swept.eligible_pairs
+    if swept.unselectable_pairs:
+        # NOT a remainder any later run collects, and not the spend bound either: candidates in a slot no
+        # bound can admit. The scheduler names the slots in `machinery`; the verdict carries the size.
+        wl_loss["unschedulable_pairs"] = swept.unselectable_pairs
+        wl_loss["unschedulable_slots"] = swept.unselectable_slots
 
 
 def _a1d_terminal(swept, produced: int):
@@ -158,8 +166,14 @@ def _a1d_terminal(swept, produced: int):
         # some slots did not answer (or the tool vanished mid-sweep): degraded. PARTIAL asserts something
         # was PRODUCED — a slot answering "nothing here" is not production (the audit-7#2 rule).
         _st = Status.PARTIAL if produced else Status.FAILED
-        _why = "; ".join(p for p in (swept.stop, f"slot outcomes {dict(sorted(swept.classes.items()))}"
-                                     if swept.classes else "") if p)
+        outcomes = ""
+        if swept.classes:
+            # both currencies: with batching, 10 failed slots may be one failed call or ten of them, and
+            # the slot-weighted map alone cannot say which (step 4.2, invocation classes).
+            outcomes = (f"slot outcomes {dict(sorted(swept.classes.items()))} in "
+                        f"{swept.invocations} invocation(s) "
+                        f"{dict(sorted(swept.invocation_classes.items()))}")
+        _why = "; ".join(p for p in (swept.stop, outcomes) if p)
     else:
         _st = Status.SUCCESS if produced else Status.EMPTY
         _why = swept.stop
@@ -234,19 +248,25 @@ def _a1d_recursive_brute(ctx) -> set[str]:
     # wildcard lane), and `have()` was observed TWICE: False here and True in the scheduler's gate ran
     # puredns with `--resolvers-trusted None`.
     sid = "enrich.a1d_brute"
+    # the resume key covers everything that shapes the PARTITION, not just the spend: the root count, the
+    # invocation maximum (slots are split against the smaller of it and the spend bound) and the slot-space
+    # schema. A run under a different partition is a different question, and must not read as the same one.
     fp = events.work_unit(sid, inputs={"apexes": sorted(prof.apex_domains)},
-                          config={"per_apex": A1D_WORD_CAP, "buckets": sweep.BUCKETS},
+                          config={"per_apex": A1D_WORD_CAP, "buckets": sweep.BUCKETS,
+                                  "invocation_max": sweep.MAX_BATCH_WORDS},
                           schema_version=sweep.SCHEMA)
 
-    def _brute(apex: str, bucket: str, words):
+    def _brute(apex: str, unit: str, words):
+        """ONE puredns invocation. `unit` names it — a lone slot keeps its own id, a batched one reads
+        `<first>+<n>` — and `words` is the union of every slot it carries (step 4.2 batching)."""
         nonlocal submitted_apexes
-        wl_file = ctx.write_list(f"a1d_words_{apex.replace('.', '_')}_{bucket}.txt", sorted(words))
+        wl_file = ctx.write_list(f"a1d_words_{apex.replace('.', '_')}_{unit}.txt", sorted(words))
         cmd = ["puredns", "bruteforce", str(wl_file), apex, "--resolvers-trusted", str(trusted), "-q"]
         if resolvers:
             cmd += ["-r", str(resolvers)]
         if prof.dns_rate:
             cmd += ["--rate-limit", str(prof.dns_rate)]
-        br = ctx.run.raw_path("enrich", "puredns", f"a1d-brute-{apex}-{bucket}.txt")
+        br = ctx.run.raw_path("enrich", "puredns", f"a1d-brute-{apex}-{unit}.txt")
         r = exec_tool("puredns", cmd, raw_path=br, timeout=ctx.http_timeout)
         ctx.run.record("enrich", r)
         if r.status is not Status.SKIPPED and apex not in apexes_run:
