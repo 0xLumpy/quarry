@@ -30,7 +30,7 @@ import contextlib
 import hashlib
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import budget, events
 from .runner import Status
@@ -168,6 +168,25 @@ def content_digest(members) -> str:
     return h.hexdigest()
 
 
+@dataclass(frozen=True)
+class _Books:
+    """The PUBLICATION books, swapped as a whole (v86).
+
+    Two counters cannot be updated together: a cancellation lands between any two stores, and crediting a
+    confirmed publication is exactly such a pair (`published += pending`, then `pending = 0`). Interrupted
+    halfway, the same tuples were both published and — through the in-flight snapshot — unknown.
+
+    So the transition is not a sequence of counter edits. The whole set of publication counters is one
+    IMMUTABLE record, and every transition builds the next record and swaps it in with a single store: the
+    books either still describe the state before the transition or fully describe the state after it.
+    Nothing can observe a half-applied credit, and replaying a transition changes nothing."""
+    published: int = 0
+    pending: int = 0
+    inflight: int = 0
+    adm_pending: int = 0
+    adm_inflight: int = 0
+
+
 @dataclass
 class SweepResult:
     """What the sweep did, in the vocabulary the terminal and the coverage records need."""
@@ -181,11 +200,10 @@ class SweepResult:
     targets_refused: int = 0                # ...that the caller's admission check turned away
     #: admission answers whose save was interrupted: on disk or not, we cannot say (v83#1).
     admission_unknown: int = 0
-    admission_inflight: int = 0             # transient: answers whose save has not returned yet
-    inflight_completions: int = 0           # transient: pending completions a running save could carry
-    #: admission ANSWERS — either kind — written in memory but not yet durable. Like a completion, a
-    #: later successful save writes the WHOLE map and carries them, so this is PENDING, not lost (v82).
-    admission_pending: int = 0
+    #: the publication counters live in one immutable record, so a transition over several of them is a
+    #: single store (v86): `admission_inflight`, `inflight_completions`, `admission_pending`,
+    #: `pending_completions` and `completions_published` below are views onto it.
+    books: _Books = field(default_factory=_Books)
     #: ...and the settled count at the end of the lifecycle. `save()` reports durability through its
     #: RESULT, and ignoring it let the run claim an answer had landed while the older record stood (v81).
     admission_unpersisted: int = 0
@@ -211,8 +229,6 @@ class SweepResult:
     slots_obtained: int = 0             # SUCCESS or EMPTY — a clean answer, including "nothing resolved"
     classes: dict = field(default_factory=dict)
     reservations_persisted: int = 0
-    pending_completions: int = 0        # completions rescued by a later save are counted as published
-    completions_published: int = 0
     completion_unpersisted: int = 0
     #: completions whose publication is UNKNOWN — the run ended between `complete_batch` and the save
     #: that would have made it durable. Different from PENDING, which a later save in the same lifecycle
@@ -238,6 +254,55 @@ class SweepResult:
     stop_kind: str | None = None
     state_status: str = "missing"
     contended: bool = False
+
+    # ── views onto the publication books (v86) ────────────────────────────────────────────────────
+    # Each setter is one store of a NEW record, so `x += n` cannot leave a half-applied state either: an
+    # interruption between the read and the store simply means the increment did not happen.
+    @property
+    def completions_published(self) -> int:
+        """Completions on disk. A pending one rescued by a later save is counted here."""
+        return self.books.published
+
+    @completions_published.setter
+    def completions_published(self, n: int) -> None:
+        self.books = replace(self.books, published=int(n))
+
+    @property
+    def pending_completions(self) -> int:
+        """Real `done` tuples in memory that a later successful save can still carry."""
+        return self.books.pending
+
+    @pending_completions.setter
+    def pending_completions(self, n: int) -> None:
+        self.books = replace(self.books, pending=int(n))
+
+    @property
+    def inflight_completions(self) -> int:
+        """Transient: pending completions a RUNNING save could carry."""
+        return self.books.inflight
+
+    @inflight_completions.setter
+    def inflight_completions(self, n: int) -> None:
+        self.books = replace(self.books, inflight=int(n))
+
+    @property
+    def admission_pending(self) -> int:
+        """Admission ANSWERS — either kind — written in memory but not yet durable. Like a completion, a
+        later successful save writes the WHOLE map and carries them, so this is PENDING, not lost (v82)."""
+        return self.books.adm_pending
+
+    @admission_pending.setter
+    def admission_pending(self, n: int) -> None:
+        self.books = replace(self.books, adm_pending=int(n))
+
+    @property
+    def admission_inflight(self) -> int:
+        """Transient: admission answers whose save has not returned yet."""
+        return self.books.adm_inflight
+
+    @admission_inflight.setter
+    def admission_inflight(self, n: int) -> None:
+        self.books = replace(self.books, adm_inflight=int(n))
 
     @property
     def ran(self) -> bool:
@@ -769,23 +834,29 @@ def _persist(out: "SweepResult", progress) -> bool:
 
     EVERY save writes the WHOLE map, so it can carry every pending tuple — the current answer, older
     pending admission answers and older pending completions alike. While it runs they are all IN FLIGHT:
-    an interruption cannot claim they did not land, and a confirmed success rescues them."""
-    out.inflight_completions = out.pending_completions
-    out.admission_inflight = out.admission_pending
+    an interruption cannot claim they did not land, and a confirmed success rescues them.
+
+    v86: each step is ONE swap of the publication books, so a cancellation between them always lands on a
+    whole state — never on a credit that has been half applied."""
+    b = out.books
+    out.books = replace(b, inflight=b.pending, adm_inflight=b.adm_pending)
     try:
         ok = progress.save()
     except (KeyboardInterrupt, SystemExit):
         raise                                  # in flight stays set: settled as UNKNOWN, never as lost
     except BaseException:
-        out.inflight_completions = out.admission_inflight = 0
+        _land(out)
         raise                                  # the caller owns its own containment
-    # v85: the snapshots stay IN FLIGHT until the confirmed-success accounting has finished. Clearing
-    # them first left a window where a cancellation reached settlement with pending state and no
-    # uncertainty marker — a definite "not persisted" claim for tuples already on disk.
     if ok:
         _rescue(out)                           # this save carried every pending tuple with it
-    out.inflight_completions = out.admission_inflight = 0
+    else:
+        _land(out)
     return ok
+
+
+def _land(out: "SweepResult") -> None:
+    """The save has resolved and nothing is in flight any more — pending stays pending."""
+    out.books = replace(out.books, inflight=0, adm_inflight=0)
 
 
 def _record_admission(out: "SweepResult", progress, target: str, now, write, what: str) -> None:
@@ -815,12 +886,12 @@ def _rescue(out: "SweepResult") -> None:
     """A successful save writes the WHOLE in-memory map, so it carries every pending completion — and
     every pending admission answer (v82) — with it.
 
-    v85: IDEMPOTENT and safe to interrupt. Each counter is moved in one step and cleared immediately, so
-    a cancellation between them can leave work still pending (settled as UNKNOWN, the conservative
-    reading) but can never count the same tuple twice."""
-    carried, out.pending_completions = out.pending_completions, 0
-    out.completions_published += carried
-    out.admission_pending = 0
+    v86: ONE store of the whole record. Crediting the publication and withdrawing the pending and in-flight
+    claims are the SAME transition, so a cancellation can never leave the same tuples counted as published
+    AND as unknown. Replaying it is a no-op: after it, there is nothing pending to credit."""
+    b = out.books
+    out.books = _Books(published=b.published + b.pending, pending=0, inflight=0,
+                       adm_pending=0, adm_inflight=0)
 
 
 def _safe_text(render) -> str:

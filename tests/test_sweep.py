@@ -6,6 +6,7 @@ Every case here is one of the ten review rounds' conclusions, driven through the
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import pathlib
 import types
@@ -14,6 +15,33 @@ import pytest
 
 from quarry_recon import budget, events, sweep
 from quarry_recon.runner import RunResult, Status
+
+
+def _tracer_lines(names):
+    """A context manager factory that raises `KeyboardInterrupt` at the Nth traced line of `names`."""
+    import contextlib
+    import sys
+
+    @contextlib.contextmanager
+    def at(stop_at: int):
+        seen = [0]
+
+        def tracer(frame, event, arg):
+            if frame.f_code.co_name not in names:
+                return None
+            if event == "line":
+                seen[0] += 1
+                if seen[0] == stop_at:
+                    raise KeyboardInterrupt("cancelled mid-transition")
+            return tracer
+
+        sys.settrace(tracer)
+        try:
+            yield
+        finally:
+            sys.settrace(None)
+
+    return at
 
 pytestmark = pytest.mark.offline
 
@@ -2028,3 +2056,46 @@ class TestThePreflightCallbacksAreContained:
         sweep._rescue(out)
         sweep._rescue(out)
         assert out.completions_published == 3 and out.pending_completions == 0, out
+
+    def test_the_BOOKS_are_a_RECORD_a_transition_replaces(self):
+        """v86: the atomicity rests on the record being immutable and swapped, not edited in place."""
+        out = sweep.SweepResult()
+        out.pending_completions = 3
+        snapshot = out.books
+        out.pending_completions = 4
+        assert snapshot.pending == 3 and out.books is not snapshot, (snapshot, out.books)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            snapshot.pending = 9
+
+    @pytest.mark.parametrize("saved", [True, False])
+    def test_an_INTERRUPTION_ANYWHERE_in_the_transition_leaves_ONE_disposition(self, saved):
+        """v86: a clean double call does not exercise interruption BETWEEN the assignments.
+
+        `published += pending` then `pending = 0` is two stores, and a cancellation lands between any two:
+        three tuples were credited as published AND, through the in-flight snapshot, settled as unknown.
+        This raises at every executable line of the publication transition and demands that each tuple end
+        in exactly one disposition — the books either describe the state before it or the state after."""
+        line = _tracer_lines(("_persist", "_rescue", "_land"))
+        outcomes = set()
+        for stop_at in range(1, 40):
+            out = sweep.SweepResult()
+            out.completions_published, out.pending_completions, out.admission_pending = 5, 3, 2
+            with line(stop_at):
+                try:
+                    sweep._persist(out, types.SimpleNamespace(save=lambda: saved))
+                except KeyboardInterrupt:
+                    pass
+            sweep._settle_completions(out)
+            assert out.completions_published + out.pending_completions + out.completion_unknown == 8, (
+                stop_at, out.books, out.completion_unknown)
+            # the SAME transition credits the admission answers, so the two move together or not at all
+            rescued = out.completions_published == 8
+            assert out.admission_pending + out.admission_unknown == (0 if rescued else 2), (
+                stop_at, out.books, out.admission_unknown)
+            assert out.inflight_completions == out.admission_inflight == 0, (stop_at, out.books)
+            # one save, one answer: the snapshot is taken for BOTH kinds at once, so an interruption
+            # cannot leave the completions of that save unknown while its admission answers read pending
+            assert (out.completion_unknown == 3) == (out.admission_unknown == 2), (stop_at, out.books)
+            outcomes.add((out.completions_published, out.pending_completions, out.completion_unknown))
+        # not vacuous: the sweep must really cut the transition both before and after it applied
+        assert (5, 0, 3) in outcomes and ((8, 0, 0) in outcomes) == saved, outcomes
