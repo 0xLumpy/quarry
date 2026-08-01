@@ -1335,3 +1335,74 @@ class TestTheAdmissionHook:
         out, tool = _run(tmp_path, words=["alpha"], admit=admit)
         assert tool.calls == [] and out.stop_kind == "machinery"
         assert "Hostile: <unrepresentable>" in " ".join(out.machinery), out.machinery
+
+
+class TestPublicationIsSettledOnEveryExit:
+    """v69: the tool result is counted BEFORE the completion is durable. A run that ends in between
+    leaves the disk holding only the reservation — the slot will run again, and nothing said so."""
+
+    def _cancel_on_save(self, monkeypatch, nth: int):
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+
+        def save(self):
+            calls["n"] += 1
+            if calls["n"] == nth:
+                raise KeyboardInterrupt("ctrl-c")
+            return real(self)
+
+        monkeypatch.setattr(budget.RotationProgress, "save", save)
+
+    def test_a_CANCELLATION_mid_publication_says_the_slot_may_RUN_AGAIN(self, tmp_path, monkeypatch):
+        self._cancel_on_save(monkeypatch, 2)          # 1 = the reservation, 2 = the completion
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, words=["alpha"])
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "completion"]
+        assert len(ev) == 1, ev
+        assert ev[0]["completion"] == {"pending": 0, "unknown": 1, "unpersisted": 1}, ev
+        assert ev[0].get("produced") is None, ev
+        # ...and the disk really does hold only the reservation
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        slots = [s for t in reopened.targets.values() for s in t["slots"].values()]
+        assert slots and all("done" not in s for s in slots), slots
+
+    def test_a_CANCELLATION_before_any_publication_reports_none(self, tmp_path, monkeypatch):
+        self._cancel_on_save(monkeypatch, 1)          # dies on the RESERVATION save
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, words=["alpha"])
+        assert [e for e in _events(tmp_path) if e.get("unit") == "completion"] == []
+
+    def test_an_ORDINARY_pending_completion_is_still_PENDING_not_unknown(self, tmp_path, monkeypatch):
+        saves = {"n": 0}
+        real = budget.RotationProgress.save
+
+        def flaky(self):
+            saves["n"] += 1
+            return real(self) if saves["n"] == 1 else False
+
+        monkeypatch.setattr(budget.RotationProgress, "save", flaky)
+        out, tool = _run(tmp_path, words=["alpha", "beta"])
+        assert out.completion_unknown == 0 and out.pending_completions == out.completion_unpersisted
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "completion"][-1]
+        assert ev["completion"]["unknown"] == 0 and ev["completion"]["pending"] > 0, ev
+
+    def test_a_CLEAN_run_emits_no_completion_record(self, tmp_path):
+        out, tool = _run(tmp_path, words=["alpha"])
+        assert out.completion_unpersisted == 0
+        assert [e for e in _events(tmp_path) if e.get("unit") == "completion"] == []
+
+    def test_a_RESOLVED_publication_is_not_still_in_flight(self, tmp_path, monkeypatch):
+        """The flag has to be CLEARED once the save resolves: a cancellation in a later batch must not
+        report an earlier, safely published completion as unknown."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+
+        class _Cancel(_Tool):
+            def __call__(self, target, unit, words):
+                if self.calls:                      # the FIRST batch publishes cleanly
+                    raise KeyboardInterrupt("ctrl-c")
+                return super().__call__(target, unit, words)
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, words=["alpha", "beta"], tool=_Cancel())
+        assert [e for e in _events(tmp_path) if e.get("unit") == "completion"] == []

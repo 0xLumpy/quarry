@@ -204,6 +204,10 @@ class SweepResult:
     pending_completions: int = 0        # completions rescued by a later save are counted as published
     completions_published: int = 0
     completion_unpersisted: int = 0
+    #: completions whose publication is UNKNOWN — the run ended between `complete_batch` and the save
+    #: that would have made it durable. Different from PENDING, which a later save in the same lifecycle
+    #: can still rescue: nothing rescues these, and the slot may run again (v69).
+    completion_unknown: int = 0
     #: ACCOUNTING attribution. `eligible` is the whole corpus; `attempted` is the SCHEDULED PREFIX — the
     #: distribution the timing pass actually needs, since uniform hashing spreads sources over the CORPUS
     #: and says nothing about the first k buckets (review v14#3).
@@ -362,6 +366,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         _report(coverage_lane, out, clock)
         return out
 
+    inflight = 0                          # slots whose publication is unresolved (v69)
     try:
       with contextlib.ExitStack() as stack:
         try:
@@ -483,6 +488,10 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 # size — a 10-slot timeout and a 1-slot failure are 10 and 1 there, 1 and 1 here.
                 out.invocation_classes[key] = out.invocation_classes.get(key, 0) + 1
 
+            # v69: from here until the save resolves, this batch's publication is IN FLIGHT. A
+            # cancellation in between leaves the tool result counted while the disk holds only the
+            # reservation — the slot will run again, and nothing said so.
+            inflight = len(chosen)
             try:
                 progress.complete_batch(target, [(b, gens[b], content[(target, b)], len(words))
                                                 for b, words in chosen], at=now())    # clause 5
@@ -490,13 +499,15 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             except (KeyboardInterrupt, SystemExit):
                 raise
             except budget.SchedulerInvariant as e:
-                out.machinery.append(f"scheduler_invariant: {e}")
+                out.machinery.append(f"scheduler_invariant: {_safe_exc(e)}")
                 out.stop = "machinery: scheduler invariant"
                 out.stop_kind = "machinery"
+                inflight = 0
                 break
             except Exception as e:                      # the evidence exists; only the bookkeeping failed
                 out.machinery.append(f"{target}/{unit}: completion not published ({_safe_name(e)})")
                 published = False
+            inflight = 0
             if published:
                 out.completions_published += len(chosen)
                 _rescue(out)
@@ -550,6 +561,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             # v67#1: flushing without settling the disposition let the record claim "budget exhausted
             # after 0.0s of 0s" as a CAP — for a run a Ctrl-C ended.
             out.stop, out.stop_kind = "CANCELLED mid-sweep", "cancelled"
+        _settle_completions(out, inflight=inflight)
         try:
             _report(coverage_lane, out, clock)
         except BaseException:
@@ -557,14 +569,28 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             # handled. The bare `raise` below must always propagate the original one.
             pass
         raise
-    out.completion_unpersisted = out.pending_completions
-    if out.completion_unpersisted:
-        # review v15#2: a counter no emitted fact consumes is still silent loss. These slots RAN and their
-        # evidence stands, but the rotation does not know it — they may be selected again.
-        out.machinery.append(f"{out.completion_unpersisted} completion(s) not published — those slot(s) "
-                             f"may be selected again")
+    _settle_completions(out)
     _report(coverage_lane, out, clock)
     return out
+
+
+def _settle_completions(out: "SweepResult", *, inflight: int = 0) -> None:
+    """Close the books on publication — on EVERY exit (v69).
+
+    review v15#2: a counter no emitted fact consumes is still silent loss. These slots RAN and their
+    evidence stands, but the rotation does not know it, so they may be selected again. A batch caught
+    mid-publication by a cancellation is worse than pending: nothing will rescue it, and whether it
+    landed at all is unknown."""
+    out.completion_unknown += max(0, int(inflight))
+    out.completion_unpersisted = out.pending_completions + out.completion_unknown
+    if out.completion_unpersisted:
+        parts = []
+        if out.pending_completions:
+            parts.append(f"{out.pending_completions} completion(s) not published")
+        if out.completion_unknown:
+            parts.append(f"{out.completion_unknown} completion(s) of UNKNOWN publication (the run ended "
+                         f"mid-write)")
+        out.machinery.append("; ".join(parts) + " — those slot(s) may be selected again")
 
 
 def _rescue(out: "SweepResult") -> None:
@@ -700,6 +726,13 @@ def _report(lane: str, out: SweepResult, clock) -> None:
         budget.report_outcome(lane, measure="tool_invocations", attempted=out.invocations,
                               obtained=out.invocations_obtained,
                               classes=out.invocation_classes or None, noun="invocation")
+    if out.completion_unpersisted:
+        # v69: the counters die with the result, and a cancellation never returns one at all. Metadata,
+        # not a coverage denominator: the slots RAN and their outcome record already says so.
+        events.ledger(lane, unit="completion", produced=None,
+                      completion={"pending": out.pending_completions,
+                                  "unknown": out.completion_unknown,
+                                  "unpersisted": out.completion_unpersisted})
     if out.targets_refused:
         # v65#2: the counters and names die with the result otherwise, leaving only a generic sentence.
         # Metadata, NOT a fourth coverage denominator — a refusal is already inside the selection record.
