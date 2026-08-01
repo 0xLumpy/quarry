@@ -2164,7 +2164,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
 
     def _differ(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, words=("api",),
                 sid="enrich.wildcard_a1d", rows=None, caught=None, preload=(), st=None,
-                status=None, raw=None, break_record=None):
+                status=None, raw=None, break_record=None, raw_bytes=None):
         from quarry_recon import store
         from quarry_recon.phases import probe, vertical
         run = store.Run.create(tmp_path, "t")
@@ -2180,7 +2180,14 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
 
             def _tool(tool, cmd, raw_path=None, timeout=None, **k):
                 if raw is not None and raw_path is not None:
-                    raw_path.write_text(raw)
+                    cand = pathlib.Path(cmd[cmd.index("-l") + 1]).read_text().split()
+                    # v44#6: the artifact is built from the REAL candidate list, so a baseline row matches
+                    # the invocation's own random controls instead of a name it never submitted.
+                    text = (raw(cand) if callable(raw) else raw)
+                    blob = text.encode("utf-8") if isinstance(text, str) else text
+                    if raw_bytes is not None:
+                        blob = raw_bytes + blob            # an undecodable row IN FRONT of readable ones
+                    raw_path.write_bytes(blob)
                     return _RR(tool, cmd, status or crawl.Status.SUCCESS, 0, 0.1, raw_path, 0)
                 if status is not None:
                     return _RR(tool, cmd, status, 1, 0.1, None, 0)
@@ -2222,6 +2229,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                 caught.append(e)
             log = run.dir / "events.jsonl"
             evs = [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
+            self._events = evs
             return kept, [e for e in evs if e.get("event") in ("tool_start", "tool_finish")
                           and e.get("source_id") == sid]
         finally:
@@ -2365,9 +2373,9 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         monkeypatch.setattr(vertical, "ZONE_CAP", 1)
         kept, life = self._differ(tmp_path, monkeypatch, rows=[],
                                   zones=("a.acme.com", "b.acme.com"))
-        # degraded (a zone went undifferentiated) and nothing was produced, so FAILED by the standing
-        # rule that PARTIAL asserts production — but NOT a failed TOOL: nothing failed.
-        assert life[-1]["status"] == "failed" and "over the 1-zone cap" in life[-1]["reason"], life
+        # v44#1: a CLEAN operator boundary is LIMITED — nothing went wrong, and the run behaved exactly
+        # as configured. Not FAILED, and not a failed tool either.
+        assert life[-1]["status"] == "limited" and "over the 1-zone cap" in life[-1]["reason"], life
         summary = self._last_run._run_summary()
         assert summary.get("tools_failed", 0) == 0, summary
         assert not any(r.tool == "wildcard-differ" for r in self._last_run.tool_runs("enrich"))
@@ -2389,24 +2397,35 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert "zone outcomes {'failed': 1}" in life[-1]["reason"], life
 
     def test_a_TIMED_OUT_invocation_that_still_found_a_host_is_PARTIAL(self, tmp_path, monkeypatch):
-        raw = "\n".join([json.dumps({"input": "quarry-wc-x.z.acme.com", "status_code": 200,
-                                     "content_length": 5, "title": "wc", "favicon": "x"}),
-                         json.dumps({"input": "api.z.acme.com", "status_code": 200,
-                                     "content_length": 99, "title": "real", "favicon": "y"})])
+        """v44#6: the old fixture hard-coded a bogus hostname that never matched the invocation's random
+        controls, so it passed on `kept == set()` and proved nothing."""
+        def raw(cands):
+            bogus = [c for c in cands if c.startswith("quarry-wc-")]
+            rows = [json.dumps({"input": b, "status_code": 200, "content_length": 5,
+                                "title": "wc", "favicon": "x"}) for b in bogus]
+            rows.append(json.dumps({"input": "api.z.acme.com", "status_code": 200,
+                                    "content_length": 99, "title": "real", "favicon": "y"}))
+            return "\n".join(rows)
+
         kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.TIMED_OUT, raw=raw)
-        assert kept == set() or life[-1]["status"] in ("partial", "failed"), (kept, life)
-        assert "zone outcomes" in life[-1]["reason"], life
+        assert kept == {"api.z.acme.com"}, kept          # the evidence a timed-out call still returned
+        assert life[-1]["status"] == "partial", life
+        assert "zone outcomes {'timed_out': 1}" in life[-1]["reason"], life
 
     def test_MALFORMED_output_is_a_PARSE_GAP_not_a_clean_answer(self, tmp_path, monkeypatch):
         """v43#3: unreadable rows were discarded silently, so a truncated artifact read EMPTY with full
         coverage."""
-        raw = "\n".join([json.dumps({"input": "quarry-wc-x.z.acme.com", "status_code": 200,
-                                     "content_length": 5, "title": "wc", "favicon": "x"}),
-                         '{"input": "api.z.acme.com", "status_code":',      # truncated
-                         "[1, 2, 3]"])                                      # not an object
+        def raw(cands):
+            bogus = [c for c in cands if c.startswith("quarry-wc-")]
+            return "\n".join([json.dumps({"input": bogus[0], "status_code": 200, "content_length": 5,
+                                          "title": "wc", "favicon": "x"}),
+                              '{"input": "api.z.acme.com", "status_code":',   # truncated
+                              "[1, 2, 3]",                                    # not an object
+                              json.dumps({"input": "api.z.acme.com", "status_code": "200"})])  # bad type
+
         kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
         assert life[-1]["status"] == "failed", life
-        assert "2 unparseable output row(s)" in life[-1]["reason"], life
+        assert "3 unparseable output row(s)" in life[-1]["reason"], life
 
     def test_the_RESOLVED_observation_does_not_depend_on_subdomain_NOVELTY(self, tmp_path, monkeypatch):
         """v43#4: the resolved write sat inside the new-subdomain branch, so a host another source had
@@ -2432,3 +2451,65 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert life[-1]["status"] == "failed" and "could not be recorded" in life[-1]["reason"], life
         assert caught and isinstance(caught[0], RuntimeError), caught
         assert "read-only manifest" in str(caught[0]), caught
+
+    def test_a_LIVE_candidate_survives_an_ABSENT_baseline(self, tmp_path, monkeypatch):
+        """v44#4: the whole zone was discarded when the random controls did not respond — throwing away
+        the very evidence this pass exists to find."""
+        def raw(cands):
+            return json.dumps({"input": "api.z.acme.com", "status_code": 200, "content_length": 99,
+                               "title": "real", "favicon": "y"})
+
+        kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
+        assert kept == {"api.z.acme.com"}, kept
+        # nothing went WRONG — the controls simply did not answer — so the pass stays clean and says so
+        assert life[-1]["status"] == "success", life
+        assert "1 zone(s) answered with NO wildcard baseline" in life[-1]["reason"], life
+
+    def test_an_UNDECODABLE_row_costs_ONE_row_not_the_artifact(self, tmp_path, monkeypatch):
+        """v44#5: `read_text()` made one invalid UTF-8 byte abort the whole artifact as machinery."""
+        def raw(cands):
+            bogus = [c for c in cands if c.startswith("quarry-wc-")]
+            return "\n".join([json.dumps({"input": b, "status_code": 200, "content_length": 5,
+                                          "title": "wc", "favicon": "x"}) for b in bogus] +
+                             [json.dumps({"input": "api.z.acme.com", "status_code": 200,
+                                          "content_length": 99, "title": "real", "favicon": "y"})])
+
+        kept, life = self._differ(tmp_path, monkeypatch, raw=raw, raw_bytes=b"\xff\xfe not utf-8\n")
+        assert kept == {"api.z.acme.com"}, kept          # the readable rows still count
+        assert life[-1]["status"] == "partial" and "1 unparseable output row(s)" in life[-1]["reason"]
+
+    def test_a_row_for_a_name_we_never_SUBMITTED_is_not_our_evidence(self, tmp_path, monkeypatch):
+        def raw(cands):
+            bogus = [c for c in cands if c.startswith("quarry-wc-")]
+            return "\n".join([json.dumps({"input": b, "status_code": 200, "content_length": 5,
+                                          "title": "wc", "favicon": "x"}) for b in bogus] +
+                             [json.dumps({"input": "evil.attacker.example", "status_code": 200,
+                                          "content_length": 99, "title": "x", "favicon": "y"})])
+
+        kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
+        assert kept == set(), kept
+        assert "1 unparseable output row(s)" in life[-1]["reason"], life
+
+    def test_OUTPUT_ROW_coverage_is_emitted_every_run(self, tmp_path, monkeypatch):
+        """v44#2: parse loss reached only the generic terminal, which the manifest does not fold."""
+        def raw(cands):
+            bogus = [c for c in cands if c.startswith("quarry-wc-")]
+            return "\n".join([json.dumps({"input": bogus[0], "status_code": 200, "content_length": 5,
+                                          "title": "wc", "favicon": "x"}), "{oops"])
+
+        kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
+        cov = [e for e in self._events if e.get("measure") == "output_rows"]
+        assert cov and (cov[-1]["eligible"], cov[-1]["tested"], cov[-1]["omitted"]) == (2, 1, 1), cov
+        assert cov[-1]["kind"] == "timeout", cov
+        # ...and a CLEAN run still emits the record, so the gap does not stand as current truth
+        _k2, _l2 = self._differ(tmp_path / "clean", monkeypatch, rows=[])
+        cov2 = [e for e in self._events if e.get("measure") == "output_rows"]
+        assert cov2[-1]["omitted"] == 0 and cov2[-1]["kind"] == "cap", cov2
+
+    def test_a_MID_RUN_skip_does_not_count_as_a_contacted_zone(self, tmp_path, monkeypatch):
+        """v44#3: `probed_zones` advanced before the process could even start, so a SKIPPED invocation
+        earned zone-coverage credit and told A1d the pass had run."""
+        kept, life = self._differ(tmp_path, monkeypatch, status=crawl.Status.SKIPPED,
+                                  zones=("a.acme.com", "b.acme.com"))
+        assert life[-1]["status"] == "skipped", life          # nothing was contacted at all
+        assert "httpx did not run" in life[-1]["reason"], life

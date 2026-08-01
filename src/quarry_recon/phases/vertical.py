@@ -502,6 +502,21 @@ WILDCARD_WORD_CAP = 5000
 ZONE_CAP = 5
 
 
+def _wc_rows_coverage(sid: str, label: str, st: dict) -> None:
+    """Structured OUTPUT-ROW coverage — rows we could not read are evidence we did not get.
+
+    v44#2: `parse_errors` only reached the generic terminal, which the manifest verdict does not fold, so
+    a malformed artifact could leave the run reading `complete` beside a FAILED source. Emitted on EVERY
+    run, including the clean zero, because coverage is latest-per-(source, unit)."""
+    seen, parsed = st.get("rows_seen", 0), st.get("rows_parsed", 0)
+    lost = max(0, seen - parsed)
+    events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT if lost else events.COVERAGE_CAP,
+                            unit=f"{label}:rows", measure="output_rows",
+                            eligible=seen, tested=parsed, omitted=lost,
+                            reason=(f"{label}: {parsed}/{seen} output row(s) parsed"
+                                    + (f" — {lost} unreadable or not this invocation's" if lost else "")))
+
+
 def _wc_vocab_coverage(sid: str, label: str, vocab: dict) -> None:
     """Structured VOCABULARY coverage for a wildcard pass — words we could not use are un-probed surface.
 
@@ -565,15 +580,25 @@ def _wc_terminal(st: dict, kept: set):
     if not probed:
         # nothing was contacted: a mode, a missing tool, no vocabulary, or the contact guard
         return Status.SKIPPED, why or "no zone was probed"
+    no_base = st.get("zones_without_baseline", 0)
     facts = [p for p in (why,
+                         f"{no_base} zone(s) answered with NO wildcard baseline" if no_base else "",
                          f"zone outcomes {dict(sorted(classes.items()))}" if classes else "",
                          f"{parse_errors} unparseable output row(s)" if parse_errors else "") if p]
-    if (probed < eligible or blocked.get("self_or_private") or blocked.get("zone_cap")
-            or classes or parse_errors or obtained < probed):
-        # PARTIAL asserts production; a differ that probed some zones and found nothing is not production
+    trouble = bool(classes or parse_errors or obtained < probed)
+    bounded = bool(probed < eligible or blocked.get("self_or_private") or blocked.get("zone_cap"))
+    if trouble:
+        # something went wrong: an invocation that did not answer, or output we could not read
         return ((Status.PARTIAL if kept else Status.FAILED),
                 "; ".join(facts) or f"{probed}/{eligible} zone(s) probed")
-    return (Status.SUCCESS if kept else Status.EMPTY), why or None
+    if bounded:
+        # a CLEAN operator boundary — a zone cap, a contact-guard refusal. Nothing went wrong, and
+        # calling it FAILED made `quarry status` show a failed source for a run that behaved exactly as
+        # configured (v44#1). LIMITED is the status for exactly this: clean, and deliberately incomplete.
+        return Status.LIMITED, "; ".join(facts) or f"{probed}/{eligible} zone(s) probed"
+    # an absent wildcard baseline is a FACT about the zone, not a failure of this pass — the run stays
+    # clean and still SAYS it (v44#4).
+    return (Status.SUCCESS if kept else Status.EMPTY), "; ".join(facts) or None
 
 
 def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
@@ -795,6 +820,10 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     st["zones_obtained"] = 0               # zones whose invocation came back usable
     st["invocation_classes"] = {}
     st["parse_errors"] = 0
+    st["rows_seen"] = 0
+    st["rows_parsed"] = 0
+    st["zones_without_baseline"] = 0
+    st["stopped"] = ""
     for zone in zones:
         # self-attack guard: if the wildcard resolves to the SCAN BOX / metadata, don't vhost-scan the zone
         # (record it as intel). A private wildcard is CONTACTED by default (recorded either way).
@@ -807,8 +836,6 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             # capped run blamed the cap for zones the CONTACT GUARD had refused.
             st["blocked"]["self_or_private"] += 1
             continue
-        zones_probed += 1
-        st["probed_zones"] = zones_probed
         bogus = [f"quarry-wc-{_uuid.uuid4().hex[:10]}.{zone}" for _ in range(2)]
         cf = ctx.write_list(f"{label}_cand_{zone.replace('.', '_')}.txt",
                             [f"{w}.{zone}" for w in words] + bogus)
@@ -825,6 +852,13 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             hx_cmd += ["-rl", str(ctx.profile.http_rl)]
         r = exec_tool("httpx", hx_cmd, raw_path=hx, timeout=ctx.http_timeout)
         ctx.run.record(phase, r)
+        if r.status is Status.SKIPPED:
+            # no process ran: not a zone we contacted, and the tool will not run for the NEXT zone either
+            # (v44#3). The remaining zones stay unprobed and the omission is reported as such.
+            st["stopped"] = "httpx did not run"
+            break
+        zones_probed += 1                       # a CONTACT is an invocation that returned
+        st["probed_zones"] = zones_probed
         # v43#2: the terminal used to read only "did we contact this zone", so a FAILED, TIMED_OUT or
         # mid-run SKIPPED invocation left the source reporting a clean EMPTY over full zone coverage.
         # An ATTEMPT and an ANSWER are different facts and are counted separately.
@@ -835,24 +869,54 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             st["invocation_classes"][_k] = st["invocation_classes"].get(_k, 0) + 1
         if not (r.raw_path and r.raw_path.exists()):
             continue
+        # v44#5: bytes, not text — one invalid UTF-8 line used to abort the WHOLE artifact as machinery
+        # instead of costing one row. Every row is then validated STRUCTURALLY before it can reach `_sig`
+        # or the store, and a row for a name this invocation never submitted is not our evidence.
+        expected = {f"{w}.{zone}".lower() for w in words} | {b.lower() for b in bogus}
         rows = []
-        for line in r.raw_path.read_text().splitlines():
-            if not line.strip():
+        for chunk in r.raw_path.read_bytes().splitlines():
+            if not chunk.strip():
+                continue
+            st["rows_seen"] += 1
+            try:
+                line = chunk.decode("utf-8")
+            except UnicodeDecodeError:
+                st["parse_errors"] += 1
                 continue
             try:
                 row = _json.loads(line)
             except _json.JSONDecodeError:
-                # v43#3: a truncated or malformed artifact was silently a clean empty answer. The rows we
-                # could not read are a PARSE GAP; the artifact stays on disk to be read again.
                 st["parse_errors"] += 1
                 continue
             if not isinstance(row, dict):
                 st["parse_errors"] += 1
                 continue
+            host = row.get("input") or row.get("host")
+            if not isinstance(host, str) or host.lower().rstrip(".") not in expected:
+                st["parse_errors"] += 1
+                continue
+            shape_ok = True
+            for field, kinds in (("status_code", int), ("content_length", int), ("title", str)):
+                v = row.get(field)
+                if v is not None and (isinstance(v, bool) or not isinstance(v, kinds)):
+                    shape_ok = False
+            if not shape_ok:
+                st["parse_errors"] += 1
+                continue
+            st["rows_parsed"] += 1
             rows.append(row)
-        base = {_sig(o) for o in rows if (o.get("input") or o.get("host") or "") in bogus}
-        if not base:                            # bogus didn't respond → not a live wildcard → skip
-            continue
+        _bogus_lower = {b.lower() for b in bogus}
+        base = {_sig(o) for o in rows
+                if (o.get("input") or o.get("host") or "").lower().rstrip(".") in _bogus_lower}
+        if not base:
+            # v44#4: the whole zone used to be discarded here. But "the random controls did not respond"
+            # is not "nothing here responded" — a candidate that answered while two guaranteed-bogus names
+            # did not is a live host, and dropping it threw away the very evidence this pass exists to
+            # find. With no baseline every response is distinct BY DEFINITION, so the fact is recorded and
+            # the zone is judged on its rows.
+            if any(r_ for r_ in rows if (r_.get("input") or r_.get("host") or "").lower().rstrip(".")
+                   not in _bogus_lower):
+                st["zones_without_baseline"] += 1
         for o in rows:
             host = (o.get("input") or o.get("host") or "").lower().rstrip(".")
             if not host or host in bogus or not scope.in_scope(host) or scope.is_oos(host):
@@ -872,7 +936,9 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
                                          "sources": [source], "raw_ref": str(hx)})
                 kept.add(host)
     _wc_vocab_coverage(source_id, label, vocab)
+    _wc_rows_coverage(source_id, label, st)
     _why = "; ".join(p for p in (
+        st.get("stopped") or "",
         f"{st['blocked']['zone_cap']} zone(s) over the {ZONE_CAP}-zone cap"
         if st["blocked"]["zone_cap"] else "",
         f"{st['blocked']['self_or_private']} zone(s) refused by the self/private contact guard"
