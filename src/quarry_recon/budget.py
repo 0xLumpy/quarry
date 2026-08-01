@@ -441,7 +441,15 @@ class RotationProgress:
                     continue
                 slots[bucket] = {k: v for k, v in (("res", res), ("done", done)) if v is not None}
             highest = max([s["res"]["gen"] for s in slots.values() if "res" in s] or [0])
+            # v78: a TARGET-level admission refusal. It orders (never claims execution), so it is parsed
+            # fail-closed like everything else: unusable means "never refused", which is the safe
+            # direction — the target simply keeps its ordinary tier.
+            adm = cls._tuple(raw_t.get("adm"), with_content=False)
+            if adm is not None and adm["gen"] > gen:
+                adm, dropped = None, dropped + 1
             targets[name] = {"seq": max(seq, highest), "slots": slots}
+            if adm is not None:
+                targets[name]["adm"] = adm
         if dropped or repaired:
             # salvaging the healthy records is right, but the driver must not present the result as an
             # intact rotation: work may repeat, and that is a fact it has to be able to say.
@@ -537,7 +545,19 @@ class RotationProgress:
         return int((rec.get("res") or {}).get("gen", 0))
 
     def tier(self, target: str, bucket: str, content: str) -> int:
-        """0 never ran (including reserved-then-crashed) · 1 DIRTY (membership changed since it ran) · 2 clean."""
+        """0 never ran (including reserved-then-crashed) · 1 DIRTY (membership changed since it ran) ·
+        2 clean · 3 REFUSED by the caller's admission check.
+
+        v78: a refusal left the slot at tier 0, and tier dominates target fairness globally — so a
+        permanently refused target won every lifecycle and starved contactable dirty work for ever. The
+        refusal is a TARGET fact (nothing about the slot's membership changed), it ranks LAST, and it is
+        superseded the moment that slot really runs. A crash BEFORE admission stays never-run: only an
+        explicit refusal writes this."""
+        refused = (self.targets.get(target, {}) or {}).get("adm")
+        if refused:
+            done = (self._rank_record(target, bucket)[0] or {}).get("done") or {}
+            if int(refused["gen"]) > int(done.get("gen", 0)):
+                return 3
         rec, own = self._rank_record(target, bucket)
         done = rec.get("done")
         if not done:
@@ -601,6 +621,21 @@ class RotationProgress:
         t = self.targets.setdefault(target, {"seq": 0, "slots": {}})
         t["slots"].setdefault(bucket, {})["res"] = {"gen": gen, "at": when}
         t["seq"] = max(int(t.get("seq", 0)), gen)           # the cursor advances on every pick
+        return gen
+
+    def refuse_target(self, target: str, *, at: float) -> int:
+        """Record that the caller's admission check REFUSED this target (v78).
+
+        It orders and nothing else: no slot is completed, nothing claims the tool ran, and the next
+        lifecycle still re-asks. What changes is the RANK — a refused target sits behind every target
+        with work that can actually be attempted, instead of holding the front of tier 0 for ever."""
+        if isinstance(target, bool) or not isinstance(target, str) or not target:
+            raise ValueError(f"target must be a non-empty str, got {target!r}")
+        (when,) = self._checked(at=at)
+        gen = self.next_gen()
+        t = self.targets.setdefault(target, {"seq": 0, "slots": {}})
+        t["adm"] = {"gen": gen, "at": when}
+        t["seq"] = max(int(t.get("seq", 0)), gen)
         return gen
 
     def complete(self, target: str, bucket: str, gen: int, *, at: float, content: str, members: int) -> None:
@@ -728,11 +763,15 @@ class RotationProgress:
                     return False                            # unparseable: leave the bytes alone
                 if status == "unusable":
                     return False
-            merged = {name: {"seq": int(t.get("seq", 0)), "slots": dict(t.get("slots", {}))}
+            merged = {name: {k: (dict(v) if k == "slots" else v) for k, v in t.items()
+                             if k in ("seq", "slots", "adm")}
                       for name, t in disk_targets.items()}
             for name, mine in self.targets.items():
                 theirs = merged.setdefault(name, {"seq": 0, "slots": {}})
                 theirs["seq"] = max(int(theirs["seq"]), int(mine.get("seq", 0)))
+                mine_adm, their_adm = mine.get("adm"), theirs.get("adm")
+                if mine_adm and (not their_adm or int(mine_adm["gen"]) > int(their_adm["gen"])):
+                    theirs["adm"] = mine_adm            # newest refusal wins, whole (v78)
                 for bucket, slot in mine.get("slots", {}).items():
                     theirs["slots"][bucket] = self._merge_slot(slot, theirs["slots"].get(bucket, {}))
             gen = max(int(self.gen), int(disk_gen))

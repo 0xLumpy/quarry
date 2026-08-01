@@ -1721,3 +1721,55 @@ class TestThePreflightCallbacksAreContained:
                               vocabulary=lambda t: ["alpha", Hostile("beta")], execute=_Tool(),
                               budget_s=0, coverage_lane=COV)
         assert out.stop_kind == "machinery" and "not a non-empty str" in " ".join(out.machinery)
+
+    def test_a_REFUSED_target_stops_starving_DIRTY_work(self, tmp_path, monkeypatch):
+        """v78: a refusal left the slot at tier 0, and tier dominates fairness globally — so a
+        permanently refused target won every lifecycle while contactable dirty work waited for ever."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        seen = []
+
+        def sweep_once(words_for_b):
+            def vocab(target):
+                return ["alpha"] if target == "a.com" else words_for_b
+
+            tool = _Tool()
+            out = sweep.run_sweep(lane=LANE, state_dir=tmp_path, targets=["a.com", "b.com"],
+                                  vocabulary=vocab, execute=tool, budget_s=0, coverage_lane=COV,
+                                  max_targets_per_run=1, admit=lambda t: t != "a.com")
+            seen.append({c[0] for c in tool.calls})
+            return out
+
+        sweep_once(["beta"])                      # a.com refused; b.com runs next lifecycle
+        sweep_once(["beta"])
+        for _ in range(4):                        # b.com is DIRTY from here on
+            sweep_once(["beta", "gamma"])
+        assert seen[0] == set() and seen[1] == {"b.com"}, seen
+        assert all(s == {"b.com"} for s in seen[2:]), seen   # the refused target never starves it again
+
+    def test_a_REFUSAL_never_claims_the_slot_RAN(self, tmp_path):
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        slots = [s for t in reopened.targets.values() for s in t["slots"].values()]
+        assert slots and all("done" not in s for s in slots), slots     # nothing completed
+        assert reopened.targets["a.com"].get("adm"), reopened.targets
+        assert reopened.tier("a.com", sweep.bucket_of("alpha"), "whatever") == 3
+
+    def test_a_CRASH_before_admission_stays_NEVER_RUN(self, tmp_path):
+        def boom(_target):
+            raise OSError("resolver exploded")
+
+        out, tool = _run(tmp_path, words=["alpha"], admit=boom)
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        assert "adm" not in reopened.targets.get("acme.com", {}), reopened.targets
+        assert reopened.tier("acme.com", sweep.bucket_of("alpha"), "whatever") == 0
+
+    def test_a_target_that_RUNS_after_a_refusal_leaves_tier_3(self, tmp_path):
+        _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: False)
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], admit=lambda t: True)
+        assert tool.calls, "the retry still happens — a refusal orders, it does not exclude"
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        content = sweep.content_digest(["alpha"])
+        assert reopened.tier("a.com", sweep.bucket_of("alpha"), content) == 2

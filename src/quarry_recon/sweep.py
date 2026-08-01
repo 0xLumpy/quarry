@@ -522,6 +522,18 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     out.stop_kind = "machinery"
                     break
                 if not allowed:
+                    # v78: the refusal is RECORDED so it ranks behind work that can actually be
+                    # attempted. Without it the target kept the front of tier 0 and starved every dirty
+                    # zone, lifecycle after lifecycle. Best effort: losing the note costs ordering
+                    # quality, never coverage.
+                    try:
+                        progress.refuse_target(target, at=now())
+                        progress.save()
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except BaseException as e:
+                        out.machinery.append(f"{target}: the refusal could not be recorded "
+                                             f"({_safe_exc(e)})")
                     out.targets_refused += 1
                     if len(out.refused) < _UNSELECTABLE_DETAIL:
                         out.refused.append(target)
