@@ -1406,3 +1406,63 @@ class TestPublicationIsSettledOnEveryExit:
         with pytest.raises(KeyboardInterrupt):
             _run(tmp_path, words=["alpha", "beta"], tool=_Cancel())
         assert [e for e in _events(tmp_path) if e.get("unit") == "completion"] == []
+
+    def test_an_UNSTAGED_completion_is_never_rescued_as_published(self, tmp_path, monkeypatch):
+        """v70: `complete_batch` and the save shared one branch, so a failure BEFORE any `done` tuple
+        existed was called pending — and a later reservation save then `_rescue`d a completion that was
+        never written, leaving the counters disagreeing with the disk."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        clock = {"n": 0}
+
+        def now():
+            clock["n"] += 1
+            if clock["n"] == 2:                 # 1 = the reservation, 2 = the completion's reading
+                raise OSError("clock exploded")
+            return float(clock["n"])
+
+        out, tool = _run(tmp_path, words=["alpha", "beta"], now=now)
+        assert out.stop_kind == "machinery" and "not staged" in " ".join(out.machinery), out
+        assert out.completions_published == 0 and out.pending_completions == 0, out
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        done = [s for t in reopened.targets.values() for s in t["slots"].values() if "done" in s]
+        assert done == [], done                  # nothing completed on disk, and none claimed
+
+    def test_a_PUBLICATION_failure_after_staging_is_still_PENDING(self, tmp_path, monkeypatch):
+        """The other half of the split: the tuples EXIST, so a later save really can carry them."""
+        saves = {"n": 0}
+        real = budget.RotationProgress.save
+
+        def flaky(self):
+            saves["n"] += 1
+            return real(self) if saves["n"] != 2 else False
+
+        monkeypatch.setattr(budget.RotationProgress, "save", flaky)
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        out, tool = _run(tmp_path, words=["alpha", "beta"])
+        assert out.stop_kind is None and out.completions_published >= 1, out
+        assert out.completion_unpersisted == 0, out      # the later save carried it
+
+    def test_a_CANCELLATION_before_STAGING_is_not_UNKNOWN(self, tmp_path, monkeypatch):
+        clock = {"n": 0}
+
+        def now():
+            clock["n"] += 1
+            if clock["n"] == 2:                 # cancelled at the completion's clock reading
+                raise KeyboardInterrupt("ctrl-c")
+            return float(clock["n"])
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(tmp_path, words=["alpha"], now=now)
+        ev = [e for e in _events(tmp_path) if e.get("unit") == "completion"][-1]["completion"]
+        assert ev == {"pending": 1, "unknown": 0, "unpersisted": 1}, ev
+
+    def test_a_CLOCK_that_fails_at_RESERVATION_is_machinery_not_an_escape(self, tmp_path):
+        """v70: the reservation guarded only the scheduler's own refusals, so an `OSError` from the
+        caller's `now()` escaped the driver instead of becoming a machinery stop."""
+        def now():
+            raise OSError("clock exploded")
+
+        out, tool = _run(tmp_path, words=["alpha"], now=now)
+        assert tool.calls == [] and out.stop_kind == "machinery", out
+        assert "reservation refused (OSError: clock exploded)" in " ".join(out.machinery), out.machinery

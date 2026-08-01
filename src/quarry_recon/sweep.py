@@ -367,6 +367,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         return out
 
     inflight = 0                          # slots whose publication is unresolved (v69)
+    staged = False                        # ...and whether their `done` tuples were ever written (v70)
     try:
       with contextlib.ExitStack() as stack:
         try:
@@ -403,8 +404,14 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             # RESERVE THE WHOLE BATCH BEFORE CONTACT, in one save (design v22#3, clause 2).
             try:
                 gens = progress.reserve_batch(target, [b for b, _w in chosen], at=now())
-            except (budget.SchedulerInvariant, ValueError) as e:
-                out.machinery.append(f"{target}/{unit}: reservation refused ({type(e).__name__}: {e})")
+            except (KeyboardInterrupt, SystemExit, budget.StateBusy):
+                # `StateBusy` from INSIDE the body is the body's own machinery failure and must not be
+                # laundered into a contention gap (v10#2) — it keeps escaping, as it always did.
+                raise
+            except Exception as e:
+                # v70: the CLOCK is a caller's callable too, and it was only guarded against the
+                # scheduler's own refusals — an `OSError` from `now()` escaped the driver here.
+                out.machinery.append(f"{target}/{unit}: reservation refused ({_safe_exc(e)})")
                 out.stop = "machinery: the reservation was refused"
                 out.stop_kind = "machinery"
                 break
@@ -492,9 +499,11 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             # cancellation in between leaves the tool result counted while the disk holds only the
             # reservation — the slot will run again, and nothing said so.
             inflight = len(chosen)
+            staged = False
             try:
                 progress.complete_batch(target, [(b, gens[b], content[(target, b)], len(words))
                                                 for b, words in chosen], at=now())    # clause 5
+                staged = True                           # the `done` tuples EXIST in memory from here
                 published = progress.save()
             except (KeyboardInterrupt, SystemExit):
                 raise
@@ -504,9 +513,19 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.stop_kind = "machinery"
                 inflight = 0
                 break
-            except Exception as e:                      # the evidence exists; only the bookkeeping failed
+            except Exception as e:
+                if not staged:
+                    # v70: STAGING and PUBLICATION are different failures. Nothing was written to the
+                    # in-memory map — `now()` raised, or `complete_batch` did — so there is no `done`
+                    # tuple for a later save to carry, and calling it PENDING let `_rescue` publish a
+                    # completion that does not exist.
+                    out.machinery.append(f"{target}/{unit}: completion not staged ({_safe_name(e)})")
+                    out.stop = "machinery: the completion could not be staged"
+                    out.stop_kind = "machinery"
+                    inflight = 0
+                    break
                 out.machinery.append(f"{target}/{unit}: completion not published ({_safe_name(e)})")
-                published = False
+                published = False                       # the evidence exists; the bookkeeping failed
             inflight = 0
             if published:
                 out.completions_published += len(chosen)
@@ -561,7 +580,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             # v67#1: flushing without settling the disposition let the record claim "budget exhausted
             # after 0.0s of 0s" as a CAP — for a run a Ctrl-C ended.
             out.stop, out.stop_kind = "CANCELLED mid-sweep", "cancelled"
-        _settle_completions(out, inflight=inflight)
+        _settle_completions(out, inflight=inflight, staged=staged)
         try:
             _report(coverage_lane, out, clock)
         except BaseException:
@@ -574,14 +593,19 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     return out
 
 
-def _settle_completions(out: "SweepResult", *, inflight: int = 0) -> None:
+def _settle_completions(out: "SweepResult", *, inflight: int = 0, staged: bool = True) -> None:
     """Close the books on publication — on EVERY exit (v69).
 
     review v15#2: a counter no emitted fact consumes is still silent loss. These slots RAN and their
     evidence stands, but the rotation does not know it, so they may be selected again. A batch caught
     mid-publication by a cancellation is worse than pending: nothing will rescue it, and whether it
     landed at all is unknown."""
-    out.completion_unknown += max(0, int(inflight))
+    # v70: a batch cancelled BEFORE its tuples were staged definitely did not publish — that is not
+    # unknown, it is simply not published. Only a staged one leaves the question open.
+    if staged:
+        out.completion_unknown += max(0, int(inflight))
+    else:
+        out.pending_completions += max(0, int(inflight))
     out.completion_unpersisted = out.pending_completions + out.completion_unknown
     if out.completion_unpersisted:
         parts = []
