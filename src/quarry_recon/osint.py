@@ -27,7 +27,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import osint_report, secrets, settings, whoxy_page
+from . import events, osint_report, secrets, settings, whoxy_page
 from .contract import (PROVIDER_PARSE, PROVIDER_TRANSPORT, ProviderBodyError, capture_error_body,
                        provider_error_class, whoxy_envelope)
 from .runner import RunResult, Status, fresh_artifact_dir, have, run as exec_tool, skipped
@@ -529,6 +529,10 @@ def _whoxy_record(s: OsintSession, out, pol, anchors, echo) -> None:
     provider_limit = bool(limits or pol.limit or provider_why)
     operator_limit = bool(operator_why)
     limit_why = limit_why or provider_why or operator_why
+
+    # what this child actually BOUGHT from a Quarry-owned provider path, in the unit Whoxy charges in.
+    # Replayed pages cost nothing, and requests issued are not the bill — the page is (settle D).
+    events.spend("osint.whoxy", provider="whoxy", measure="pages", amount=int(out.pages_bought))
 
     counts = (f"{attempted}/{out.anchors} anchor(s) attempted · {out.pages_bought} page(s) bought"
               f" · {out.pages_replayed} replayed · {out.domains} domain(s)"

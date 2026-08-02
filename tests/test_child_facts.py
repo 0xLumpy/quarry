@@ -143,3 +143,42 @@ class TestProviderSpend:
         src = pathlib.Path(probe.__file__).read_text()
         assert 'events.spend(spec.sid, provider="shodan", measure="pages", amount=int(o.pages_bought))' \
             in src
+
+    def test_the_WHOXY_lane_reports_what_it_bought(self, tmp_path):
+        """A Quarry-owned provider path with its own counters: a child could buy pages while its manifest
+        reported no spend at all. Replayed pages are free, so only the bought ones are the bill."""
+        from quarry_recon import osint, whoxy_page as wp
+        run = _run(tmp_path)
+
+        class _Session:
+            def record(self, _r):
+                pass
+
+        try:
+            out = wp.Outcome(anchors=2, pages_bought=4, pages_replayed=3, domains=9,
+                             requests_issued=11)
+            osint._whoxy_record(_Session(), out, wp.SpendPolicy(), [], lambda _m: None)
+            run.write_manifest(profile_summary={}, phases_run=["osint"])
+        finally:
+            events.reset()
+        rows = json.loads(run.manifest_path.read_text())["summary"]["provider_spend"]
+        assert rows == [{"lane": "osint.whoxy", "provider": "whoxy", "measure": "pages",
+                         "amount": 4, "unknown": 0}], rows      # bought only — never replayed or requests
+
+    def test_a_whoxy_child_that_bought_NOTHING_reports_zero_not_silence(self, tmp_path):
+        from quarry_recon import osint, whoxy_page as wp
+        run = _run(tmp_path)
+
+        class _Session:
+            def record(self, _r):
+                pass
+
+        try:
+            osint._whoxy_record(_Session(), wp.Outcome(anchors=1, pages_replayed=2), wp.SpendPolicy(),
+                                [], lambda _m: None)
+            run.write_manifest(profile_summary={}, phases_run=["osint"])
+        finally:
+            events.reset()
+        rows = json.loads(run.manifest_path.read_text())["summary"]["provider_spend"]
+        assert rows == [{"lane": "osint.whoxy", "provider": "whoxy", "measure": "pages",
+                         "amount": 0, "unknown": 0}], rows
