@@ -110,27 +110,57 @@ class TestEveryDoorIsGated:
         assert recorded and recorded[-1].status is Status.SKIPPED, recorded
         assert "after child 1" in (recorded[-1].note or ""), recorded
 
-    def test_the_DIRECT_TOOL_door_is_gated_too(self, tmp_path, monkeypatch):
-        """`vertical.github_subs` runs its binary through `exec_tool`, so NEITHER registry gate covers it —
-        the door the declaration exposed. We hand it our key, so a closed campaign must stop it here."""
+    def _github(self, tmp_path, monkeypatch, *, closed, token=True):
+        """Drive the REAL github-subdomains lane and report what it did."""
         from quarry_recon import secrets, store
         from quarry_recon.phases import vertical
-        self._log(tmp_path)
         run = store.Run.create(tmp_path, "t")
-        monkeypatch.setattr(secrets, "github_tokens_file", lambda: "/tmp/token")
-        monkeypatch.setattr(vertical.secrets, "github_tokens_file", lambda: "/tmp/token")
-        monkeypatch.setattr(vertical, "exec_tool",
-                            lambda *a, **k: pytest.fail("a closed campaign must not run github-subdomains"))
-        recorded: list = []
-        monkeypatch.setattr(type(run), "record", lambda self, ph, r: recorded.append(r), raising=False)
-        src = pathlib.Path(vertical.__file__).read_text()
-        assert 'campaign.acquisition_allowed("vertical.github_subs")' in src, "the door must gate itself"
+        events.reset()
+        events.configure(run.dir)
+        minted: list = []
+        ran: list = []
+
+        def _mint():
+            if not token:
+                return None
+            path = tmp_path / "gh-token"
+            path.write_text("ghp_x")
+            minted.append(path)
+            return path
+
+        monkeypatch.setattr(vertical.secrets, "github_tokens_file", _mint)
+        monkeypatch.setattr(vertical, "exec_tool", lambda *a, **k: ran.append(a) or (_ for _ in ()).throw(
+            AssertionError("a closed campaign must not run github-subdomains")))
+        prof = type("P", (), {"apex_domains": ["acme.com"]})()
+        scope = type("S", (), {"in_scope": staticmethod(lambda h: True)})()
         try:
-            with campaign.acquisition_closed("after child 1"):
-                allowed, why = campaign.acquisition_allowed("vertical.github_subs")
-                assert not allowed and why == "after child 1", (allowed, why)
+            ctx = type("C", (), {"run": run, "http_timeout": 30})()
+            if closed:
+                with campaign.acquisition_closed("after child 1"):
+                    vertical._github_subs(ctx, prof, scope)
+            else:
+                vertical._github_subs(ctx, prof, scope)
         finally:
             events.reset()
+        return run, minted, ran
+
+    def test_the_DIRECT_TOOL_door_refuses_and_leaves_NOTHING_behind(self, tmp_path, monkeypatch):
+        """`vertical.github_subs` runs its binary through `exec_tool`, so NEITHER registry gate covers it.
+        The gate has to come BEFORE the credential is minted: creating a 0600 token and then declining to
+        use it leaked the file and recorded a SECOND, contradictory skip about a token it had just made."""
+        run, minted, ran = self._github(tmp_path, monkeypatch, closed=True)
+        assert ran == [], "a closed campaign must not execute the tool"
+        assert minted == [], "a closed campaign must not mint a credential it will not use"
+        skips = [r for r in run._tool_runs if r.tool == "github-subdomains"]
+        assert len(skips) == 1, skips                               # ONE skip...
+        assert skips[0].status == "skipped" and "after child 1" in (skips[0].note or ""), skips
+        assert "no GitHub token" not in (skips[0].note or ""), skips  # ...with the REAL cause
+
+    def test_an_open_campaign_with_NO_token_still_says_so(self, tmp_path, monkeypatch):
+        run, minted, ran = self._github(tmp_path, monkeypatch, closed=False, token=False)
+        skips = [r for r in run._tool_runs if r.tool == "github-subdomains"]
+        assert len(skips) == 1 and "no GitHub token" in (skips[0].note or ""), skips
+        assert ran == [] and minted == []
 
     def test_an_OPEN_campaign_still_runs_the_lane(self, tmp_path):
         self._log(tmp_path)

@@ -1349,6 +1349,41 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         ctx.echo(f"  wildcard: {len(kept)} distinct vhost(s) differentiated, {len(novel)} new ({label})")
 
 
+def _github_subs(ctx, prof, scope) -> None:
+    """github-subdomains — its own seam, because it is a DOOR (settle: acquisition closure).
+
+    C06 disposition: an EXTERNAL tool that paginates the GitHub code-search API INTERNALLY (walks all
+    result pages, honours the token's rate limit) — pagination is the tool's responsibility, not ours. It
+    runs through `exec_tool`, so neither registry gate covers it, and Quarry hands it OUR key and enables
+    it itself: that makes it ACQUISITION, and a campaign that closed acquisition stops it here.
+
+    The gate comes BEFORE the token file exists. Minting a 0600 credential and then declining to use it
+    leaked the file (the unlink lives in the run's `finally`) and left the lane recording a second,
+    contradictory skip about a token it had just created."""
+    allowed, why = campaign.acquisition_allowed("vertical.github_subs")
+    if not allowed:
+        events.tool_blocked("vertical.github_subs", reason=why)
+        ctx.run.record("vertical", skipped("github-subdomains", why))   # ONE skip, with the real cause
+        return
+    gh_token = secrets.github_tokens_file()   # 0600 temp file from secrets.yaml; None if unset
+    if not gh_token:
+        ctx.run.record("vertical", skipped("github-subdomains", "no GitHub token in secrets.yaml"))
+        return
+    try:
+        for d in prof.apex_domains:
+            r = exec_tool("github-subdomains",
+                          ["github-subdomains", "-d", d, "-t", str(gh_token)],
+                          raw_path=ctx.run.raw_path("vertical", "github-subdomains", f"{d}.txt"),
+                          timeout=ctx.http_timeout)
+            ctx.run.record("vertical", r)
+            if r.raw_path:
+                for e in normalize.hosts(r.raw_path.read_text(), "github-subdomains", str(r.raw_path)):
+                    if scope.in_scope(e["host"]):
+                        ctx.run.add("subdomain", e)
+    finally:
+        gh_token.unlink(missing_ok=True)
+
+
 def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> None:
     """The recursive permute -> resolve loop, in its own seam (flag-axis step 4).
 
@@ -1584,37 +1619,7 @@ def run(ctx) -> None:
             if n:
                 ctx.echo(f"  censys: +{n} in-scope (Platform cert search)")
 
-    # ── passive: github-subdomains (optional, needs token) ──
-    # C06 disposition: github-subdomains is an EXTERNAL tool that paginates the GitHub code-search API
-    # INTERNALLY (walks all result pages, honors the token's rate limit) — pagination is the tool's
-    # responsibility, not ours. It runs on the contract (exec_tool → recorded), so an auth/rate failure
-    # surfaces as a FAILED tool_run (fail-closed), not a silent empty. No in-process pagination is owed here.
-    gh_token = secrets.github_tokens_file()   # 0600 temp file from secrets.yaml; None if unset
-    # a FOURTH door: this lane runs the tool directly (`exec_tool`), so neither registry gate covers it.
-    # We hand it OUR key and enable it ourselves, which makes it acquisition — and a campaign that closed
-    # acquisition must be able to stop it here (settle: closure).
-    _gh_allowed, _gh_why = campaign.acquisition_allowed("vertical.github_subs")
-    if gh_token and not _gh_allowed:
-        events.tool_blocked("vertical.github_subs", reason=_gh_why)
-        ctx.run.record("vertical", skipped("github-subdomains", _gh_why))
-        gh_token = None
-    if gh_token:
-        try:
-            for d in prof.apex_domains:
-                r = exec_tool("github-subdomains",
-                        ["github-subdomains", "-d", d, "-t", str(gh_token)],
-                        raw_path=ctx.run.raw_path("vertical", "github-subdomains", f"{d}.txt"),
-                        timeout=ctx.http_timeout)
-                ctx.run.record("vertical", r)
-                if r.raw_path:
-                    for e in normalize.hosts(r.raw_path.read_text(), "github-subdomains", str(r.raw_path)):
-                        if scope.in_scope(e["host"]):
-                            ctx.run.add("subdomain", e)
-        finally:
-            gh_token.unlink(missing_ok=True)
-    else:
-        ctx.run.record("vertical", skipped("github-subdomains",
-                       "no GitHub token in secrets.yaml"))
+    _github_subs(ctx, prof, scope)
 
     # ── shosubgo (Shodan subs, optional, needs key) ──
     sho_key = secrets.shodan()
