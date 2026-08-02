@@ -13,6 +13,7 @@ Every normalized entity keeps provenance back to the raw evidence that produced 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -210,6 +211,84 @@ def canonical_key(entity: str, record: dict) -> str:
     if entity in _IP_KEYED:
         return _canon_ip(raw)
     return raw                                              # id/value: case-PRESERVING (strip only)
+
+
+# ── cross-run identity: what a CAMPAIGN needs from a finished run (settle prerequisite A) ─────────────
+#: fields that describe WHERE and WHEN an observation was made, not WHAT is true. A campaign comparing two
+#: children must not see a new artifact path or a fresh timestamp as discovery — every child would then
+#: look like progress and a fixed point could never be reached.
+RUN_SCOPED_FIELDS = ("first_seen", "last_seen", "raw_ref", "raw_refs")
+
+
+def material(entity: str, record: dict) -> dict:
+    """The MATERIAL content of an entity — what it asserts, with run-scoped bookkeeping removed and every
+    list put in a stable order, so two records are comparable across runs.
+
+    `sources` STAYS: a second, independent source for the same host is a fact about the world, not noise.
+    `_alt` stays too — a conflicting observation is knowledge the union did not hold."""
+    if not isinstance(record, dict):
+        return {}
+    out: dict = {}
+    for k, v in record.items():
+        if k in RUN_SCOPED_FIELDS:
+            continue
+        if isinstance(v, list):
+            seen: list = []
+            for x in v:
+                if x not in seen:
+                    seen.append(x)
+            out[k] = sorted(seen, key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=False))
+        elif isinstance(v, dict):
+            out[k] = {kk: (sorted(vv, key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=False))
+                           if isinstance(vv, list) else vv) for kk, vv in sorted(v.items())}
+        else:
+            out[k] = v
+    return out
+
+
+def fingerprint(entity: str, record: dict) -> str:
+    """A stable digest of `material()` — equal iff two records assert the same thing."""
+    return hashlib.sha256(json.dumps(material(entity, record), sort_keys=True,
+                                     ensure_ascii=False).encode("utf-8")).hexdigest()[:32]
+
+
+def merge(entity: str, base: dict, incoming: dict) -> dict:
+    """The store's own MONOTONIC merge, exposed for cross-run use: lists union, empty fields fill, a
+    conflicting scalar keeps the first value and remembers the alternate. Nothing is ever removed."""
+    return _merge_record(base, incoming)
+
+
+def adds_material(entity: str, base: dict, incoming: dict) -> bool:
+    """Whether merging `incoming` into `base` ADDS a material fact — the campaign's progress test.
+
+    Not `fingerprint(incoming) != fingerprint(base)`: a DNS answer, a title or a rotating certificate can
+    alternate between runs for ever, and inequality would score every swing as discovery. This asks the
+    merge, which is monotonic — the first swing records the alternate, and a return to the earlier value
+    adds nothing, because the union already holds both."""
+    return fingerprint(entity, merge(entity, base, incoming)) != fingerprint(entity, base)
+
+
+def fold_observations(path) -> dict:
+    """The MERGED view of one entity's append-only observation log, for a run nobody has open — the same
+    fold `Run._records_for` does, so a finished run reads exactly as it did while it was live."""
+    merged: dict = {}
+    entity = Path(path).stem
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return merged
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        k = canonical_key(entity, rec)
+        if not k:
+            continue
+        merged[k] = _merge_record(merged[k], rec) if k in merged else rec
+    return merged
 
 
 def _utc() -> str:
