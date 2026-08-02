@@ -2138,3 +2138,25 @@ class TestThePreflightCallbacksAreContained:
         assert parts["total"] == 7, parts
         assert sum(parts[k] for k in ("refused", "unselectable", "deferred", "stopped", "bound")) == 7
         assert all(parts[k] >= 0 for k in parts), parts
+
+    def test_a_TIER_boundary_does_not_hide_the_BOUND_s_pairs(self, tmp_path, monkeypatch):
+        """v66: `_next_batch` returns at a tier boundary BEFORE the next slot ever reaches the cap check,
+        so counting only what the scan excluded left work no remaining allowance could admit looking like
+        the clock's. One target, one dirty word and one clean one, a one-per-target bound, and a clock that
+        expires after the dirty invocation: the clean pair is the BOUND's, not the stop's."""
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+        _run(tmp_path, words=["clean-word"])                    # ...now clean, and its slot is tier 2
+
+        class _Slow(_Tool):
+            def __call__(self, target, bucket, words):
+                ticks["t"] += 9.0                               # the first call exhausts the 5s budget
+                return super().__call__(target, bucket, words)
+
+        out, tool = _run(tmp_path, words=["clean-word", "brand-new-word"], tool=_Slow(),
+                         budget_s=5, max_pairs_per_target=1)
+        assert [c[2] for c in tool.calls] == [("brand-new-word",)], tool.calls   # the dirty tier, alone
+        parts = out.pair_remainder()
+        assert parts["bound"] == 1 and parts["stopped"] == 0, (parts, out.stop, out.stop_kind)
+        # ...and with nothing left for the clock to take, the CAP is what ended the run (v60#2)
+        assert out.stop_kind == "bound", (out.stop, out.stop_kind)

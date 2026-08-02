@@ -575,6 +575,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         contacted: set = set()                             # ...whose invocation actually ran
         checked: set = set()                               # targets the admission hook has answered for
         spent: dict = {}                                   # candidates submitted per target
+        submitted: set = set()                             # slots whose pairs went into `spent`
+        refused_targets: set = set()                       # targets the admission hook turned away
         while not clock.exhausted() and len(picked) < len(slots):
             batch = _next_batch(progress, slots, content, members, picked, spent, out,
                                 cap=max_pairs_per_target, max_words=MAX_BATCH_WORDS,
@@ -609,6 +611,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 break
             out.reservations_persisted += len(chosen)
             spent[target] = spent.get(target, 0) + total
+            submitted.update((target, bucket) for bucket, _w in chosen)   # SLOTS, not buckets
 
             if admit is not None and target not in checked:
                 # ADMISSION (v64): after the reservation is durable, before anything active happens.
@@ -648,6 +651,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     # committed before the fallible persistence, so a cancellation during that write
                     # cannot emit a ledger claiming nothing was refused.
                     out.targets_refused += 1
+                    refused_targets.add(target)
                     if len(out.refused) < _UNSELECTABLE_DETAIL:
                         out.refused.append(target)
                     for slot in slots:                    # this target is done for THIS lifecycle
@@ -775,6 +779,27 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 if why not in out.cap_reasons:
                     out.cap_reasons.append(why)
 
+        # ── slots the per-target SPEND bound can no longer admit (v66) ──────────────────────────
+        # Reconciled from the FINAL spend, never from how far the batch scan happened to get: a batch
+        # returns at a tier boundary before the next slot ever reaches the cap check, so counting only
+        # what the scan excluded left work that no remaining allowance could admit looking like the
+        # clock's. What a target may still spend is a fact about the target, not about the scan.
+        bound_slots: set = set()
+        if max_pairs_per_target:
+            for slot in slots:
+                tgt = slot[0]
+                if (slot in submitted or slot in deferred_slots or tgt in refused_targets
+                        or tgt not in started_targets):
+                    continue                    # attempted, or a disposition that already owns it
+                if spent.get(tgt, 0) + len(members[slot]) > max_pairs_per_target:
+                    bound_slots.add(slot)
+        out.bound_pairs = sum(len(members[s]) for s in bound_slots)
+        if bound_slots:
+            # the bound withheld work whether or not the SCAN ever reached it, so it is named either way
+            why = f"the per-target candidate bound ({max_pairs_per_target}) was reached"
+            if why not in out.cap_reasons:
+                out.cap_reasons.append(why)
+
         # ── the STOP: what actually ended the run ───────────────────────────────────────────────
         # v60#2: an elapsed clock is not automatically the cause. It only stopped work if selectable
         # slots were LEFT — a slot a cap excluded is already classified and was never the clock's to
@@ -783,8 +808,9 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # v61: a slot the ALLOWANCE deferred is already explained and was never the clock's to take
         # either — counting it here made a clock that prevented nothing the stop of a run whose whole
         # remainder belonged to the allowance.
+        # v66: a slot the SPEND bound can no longer admit is not the clock's either, by the same rule.
         stopped_by_clock = clock.exhausted() and any(s not in picked and s not in deferred_slots
-                                                     for s in slots)
+                                                     and s not in bound_slots for s in slots)
         if out.stop_kind is None and stopped_by_clock:
             # FIRST CAUSE WINS (review v15#1). A machinery stop that happened to cross the bound was being
             # relabelled "budget", which reads as an operator cap — laundering a failure into a choice.
@@ -1019,11 +1045,6 @@ def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: i
             # and the scan CONTINUES, so a smaller slot behind it can still fill the remaining allowance
             # in the SAME invocation, exactly as the one-slot-per-call driver used to pack it (v31).
             picked.add(choice)
-            # v65: these pairs are the BOUND's, recorded as they are excluded. Inferring them at the end
-            # from `eligible - attempted` cannot tell them from a stop's remainder, so a run that
-            # exhausted one target's bound and then hit the clock reported the whole remainder as the
-            # clock's — omitting a cap that fired and overstating what the stop prevented.
-            out.bound_pairs += len(words)
             why = f"the per-target candidate bound ({cap}) was reached"
             if why not in out.cap_reasons:
                 out.cap_reasons.append(why)
