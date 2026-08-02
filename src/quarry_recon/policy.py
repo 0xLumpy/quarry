@@ -47,7 +47,6 @@ EXCLUSION_KINDS = (
     "rate",         # pressure on the target or this host: the rate axis, never the volume one
     "engagement",   # chosen per engagement in target.yaml, not by a machine-wide flag
     "identity",     # slot / schema identity: versioned, never relaxed
-    "continuation", # a convergence / iteration bound: `--settle`'s business, not `--unbound`'s
     "not_a_bound",  # a sentinel, name or set that merely matches the naming convention
 )
 #: lanes on the ACQUISITION side: what they may obtain is decided by the provider's own enablement,
@@ -137,6 +136,16 @@ BOUNDS: tuple[Bound, ...] = (
                "gap): exactly the PROCESSING side. It is function-local today, so wiring it means "
                "promoting it to a module constant AND teaching the consumer 0 — the widening step's work"),
 
+    Bound(name="MAX_ITERS", reader="module", lane="vertical.permute", default=3, identity="none",
+          const="quarry_recon.phases.vertical:MAX_ITERS", const_local=True,
+          persistence="nothing — the permutation loop is run-scoped",
+          relaxable=True, unbounded_value=0, consumer_honours_unbounded=False,
+          note="rounds of permutation over names ALREADY held. Calling it `--settle`'s business was wrong: "
+               "entities are RUN-scoped (a new Run starts empty, pinned in the registry tests), so a later "
+               "run replays rounds 1-3 and can never reach round 4 — depth would be permanently "
+               "unreachable. The loop already stops when a round adds nothing new, so the unbounded "
+               "meaning is exactly that convergence; the consumer must be taught to read 0 that way"),
+
     # ── the one HELD exception in v1 ─────────────────────────────────────────────────────────────
     Bound(name="A1D_WORD_CAP", reader="module", lane="enrich.a1d_brute", default=2000,
           identity="partition", const="quarry_recon.phases.enrich:A1D_WORD_CAP",
@@ -185,11 +194,6 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.triage:_DNS_PREVIEW_MAX": ("resource", "a digest preview length; evidence keeps all"),
     "quarry_recon.sweep:_UNSELECTABLE_DETAIL": ("resource", "a diagnostic list bound; the counters beside "
                                                             "it are authoritative"),
-
-    # continuation — how many times a convergent loop repeats. `--settle` owns repetition.
-    "quarry_recon.phases.vertical:MAX_ITERS": ("continuation", "permutation rounds in a loop that already "
-                                                               "stops when a round adds nothing new: "
-                                                               "repeating it is `--settle`'s question"),
 
     # rate / concurrency — pressure on the target or on this host
     "ARJUN_TARGETS": ("rate", "how many arjun processes run at once (one per target, host-fair)"),

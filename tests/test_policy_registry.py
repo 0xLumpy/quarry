@@ -211,6 +211,27 @@ class TestTheRegistryTellsTheTruth:
         assert "boundary" in cap.held_reason and "tiers" in cap.held_reason, cap
         assert policy.held() == (cap,), policy.held()      # the one printed exception in v1
 
+    def test_every_EXCLUSION_KIND_is_actually_used(self):
+        """A vocabulary nothing uses is a vocabulary nobody checks — `continuation` sat here claiming a
+        loop `--settle` could not, in fact, continue."""
+        used = {k for k, _ in policy.EXCLUDED.values()}
+        assert used == set(policy.EXCLUSION_KINDS), set(policy.EXCLUSION_KINDS) - used
+
+    def test_REPEATING_a_run_cannot_continue_a_run_scoped_loop(self, tmp_path):
+        """The evidence behind `MAX_ITERS` being `--unbound`'s and not `--settle`'s: entities are
+        RUN-scoped. A second run starts with an empty store, so it replays the permutation rounds from the
+        beginning instead of continuing past the first run's last frontier — round four is unreachable by
+        repetition, however many runs `--settle` creates."""
+        from quarry_recon import store
+        first = store.Run.create(tmp_path, "t")
+        first.add("subdomain", {"host": "a.acme.com", "sources": ["x"]})
+        assert sorted(first.values("subdomain")) == ["a.acme.com"]
+        second = store.Run.create(tmp_path, "t")
+        assert second.project_dir == first.project_dir and second.dir != first.dir
+        assert second.values("subdomain") == [], second.values("subdomain")
+        iters = policy.by_name("MAX_ITERS")
+        assert iters is not None and iters.relaxable and iters.unbounded_value == 0, iters
+
     def test_names_are_unique(self):
         names = [b.name for b in policy.BOUNDS]
         assert len(names) == len(set(names)), sorted(n for n in names if names.count(n) > 1)
@@ -219,4 +240,4 @@ class TestTheRegistryTellsTheTruth:
         """`consumer_honours_unbounded=False` is a promise NOT yet kept — the widening step's checklist,
         stated instead of assumed."""
         pending = [b.name for b in policy.relaxable() if not b.consumer_honours_unbounded]
-        assert pending == ["CLOUD_NAME_CAP", "SPA_CAP"], pending
+        assert pending == ["CLOUD_NAME_CAP", "SPA_CAP", "MAX_ITERS"], pending
