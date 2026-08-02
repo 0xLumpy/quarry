@@ -154,3 +154,86 @@ class TestMaterialIsCanonicalAtEveryDepth:
         one = {"id": "x", "detail": [{"ports": [443]}]}
         other = {"id": "x", "detail": [{"ports": [443, 8443]}]}
         assert store.fingerprint("finding", one) != store.fingerprint("finding", other)
+
+
+class TestTrustIsAnEvidenceClaim:
+    """A parser saying "I read this file cleanly" is not the same as "this is what the run held". A log can
+    be deleted after the manifest was written, or truncated on a line boundary — both parse without a
+    single dropped row, and both would hand a campaign a smaller corpus that looks authoritative."""
+
+    def _run(self, tmp_path, hosts=("a.acme.com", "b.acme.com")):
+        run = store.Run.create(tmp_path, "t")
+        for h in hosts:
+            run.add("subdomain", {"host": h, "sources": ["crtsh"]})
+        run.write_manifest(profile_summary={}, phases_run=["vertical"])
+        return run
+
+    def test_a_clean_run_reconciles(self, tmp_path):
+        run = self._run(tmp_path)
+        folded = store.fold_run_entity(run.dir, "subdomain")
+        assert (folded.status, len(folded.records), folded.trustworthy) == ("valid", 2, True), folded
+
+    def test_a_DELETED_log_is_unusable_not_empty(self, tmp_path):
+        """Absence proves nothing on its own: the manifest says the run held two."""
+        run = self._run(tmp_path)
+        (run.normalized / "subdomain.jsonl").unlink()
+        folded = store.fold_run_entity(run.dir, "subdomain")
+        assert folded.status == "unusable" and not folded.trustworthy, folded
+        assert "the log is gone" in folded.reason and folded.records == {}, folded
+
+    def test_a_TRUNCATED_log_parses_cleanly_and_is_still_degraded(self, tmp_path):
+        """The case a parser can never catch: cut on a line boundary, no dropped row, fewer entities."""
+        run = self._run(tmp_path)
+        f = run.normalized / "subdomain.jsonl"
+        f.write_text(f.read_text().splitlines()[0] + "\n")
+        folded = store.fold_run_entity(run.dir, "subdomain")
+        assert folded.status == "degraded" and not folded.trustworthy, folded
+        assert "the run recorded 2" in folded.reason and len(folded.records) == 1, folded
+
+    def test_a_run_that_held_NOTHING_is_an_authoritative_zero(self, tmp_path):
+        run = store.Run.create(tmp_path, "t")
+        run.write_manifest(profile_summary={}, phases_run=["vertical"])
+        folded = store.fold_run_entity(run.dir, "subdomain")
+        assert (folded.status, folded.records, folded.trustworthy) == ("valid", {}, True), folded
+
+    def test_a_missing_or_broken_MANIFEST_is_UNKNOWN(self, tmp_path):
+        run = self._run(tmp_path)
+        run.manifest_path.unlink()
+        unknown = store.fold_run_entity(run.dir, "subdomain")
+        assert unknown.status == "unknown" and not unknown.trustworthy, unknown
+        run.manifest_path.write_text("{not json")
+        assert store.fold_run_entity(run.dir, "subdomain").status == "unknown"
+        run.manifest_path.write_text(json.dumps({"run_id": "x"}))      # no entity_counts at all
+        assert store.fold_run_entity(run.dir, "subdomain").status == "unknown"
+
+    def test_rows_the_manifest_never_counted_are_degraded(self, tmp_path):
+        """The other direction: a log holding more than the run recorded is not a corpus either."""
+        run = self._run(tmp_path)
+        manifest = json.loads(run.manifest_path.read_text())
+        del manifest["entity_counts"]["subdomain"]
+        run.manifest_path.write_text(json.dumps(manifest))
+        folded = store.fold_run_entity(run.dir, "subdomain")
+        assert folded.status == "degraded" and not folded.trustworthy, folded
+
+
+class TestOneFoldForLiveAndFinished:
+    def test_the_LIVE_reader_survives_the_same_invalid_byte(self, tmp_path):
+        """The live reader had its own whole-file decode, so the byte contained by `fold_observations`
+        still raised here — two implementations, one of them wrong."""
+        run = store.Run.create(tmp_path, "t")
+        run.add("subdomain", {"host": "a.acme.com", "sources": ["x"]})
+        with (run.normalized / "subdomain.jsonl").open("ab") as fh:
+            fh.write(b'{"host":"\xff\xfe.acme.com"}\n')
+            fh.write(json.dumps({"host": "b.acme.com"}).encode() + b"\n")
+        fresh = store.Run.open(tmp_path, run.target, run.run_id)     # a REOPENED run reads the same log
+        assert set(fresh.values("subdomain")) == {"a.acme.com", "b.acme.com"}
+
+    def test_live_and_finished_agree_record_for_record(self, tmp_path):
+        run = store.Run.create(tmp_path, "t")
+        run.add("subdomain", {"host": "a.acme.com", "sources": ["crtsh"], "raw_ref": "/x"})
+        run.add("subdomain", {"host": "A.ACME.com", "sources": ["subfinder"]})
+        live = {store.canonical_key("subdomain", r): r for r in run.read("subdomain")}
+        folded = store.fold_observations(run.normalized / "subdomain.jsonl").records
+        assert set(live) == set(folded)
+        for key in live:
+            assert store.fingerprint("subdomain", live[key]) == store.fingerprint("subdomain", folded[key])

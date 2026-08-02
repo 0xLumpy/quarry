@@ -288,8 +288,49 @@ class FoldedLog:
 
     @property
     def trustworthy(self) -> bool:
-        """Whether this view may stand in for the run's evidence. `degraded` is honest but incomplete."""
+        """Whether this view may stand in for the run's evidence. `degraded` is honest but incomplete, and
+        `unknown` means nobody could say — neither may pass for a corpus."""
         return self.status in ("valid", "absent")
+
+
+def fold_run_entity(run_dir, entity: str) -> FoldedLog:
+    """One entity of a FINISHED run, reconciled against what its manifest says the run held.
+
+    A parser's "I read this file cleanly" is not an evidence claim. A log can be deleted after the manifest
+    was written, or truncated on a line boundary — both parse without a single dropped row, and both would
+    hand a campaign a smaller corpus that looks authoritative. So the count the run itself recorded decides:
+
+        manifest unreadable / missing            -> unknown  (nobody can say; not trustworthy)
+        no count recorded + no log               -> valid    (an authoritative zero)
+        a count recorded + no log                -> unusable (evidence expected, evidence gone)
+        parsed count != the recorded count       -> degraded (something was lost or added since)
+        parsed count == the recorded count       -> the parser's own verdict stands
+    """
+    run_dir = Path(run_dir)
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        counts = manifest.get("entity_counts") if isinstance(manifest, dict) else None
+        if not isinstance(counts, dict):
+            raise ValueError("no entity_counts")
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        return FoldedLog(status="unknown", reason=f"manifest unusable: {type(e).__name__}")
+    expected = counts.get(entity)
+    folded = fold_observations(run_dir / "normalized" / f"{entity}.jsonl")
+    if expected is None:
+        if folded.status == "absent":
+            return FoldedLog(status="valid", reason="the run recorded no entity of this kind")
+        expected = 0                                   # ...a log with rows the manifest never counted
+    if folded.status == "absent":
+        return FoldedLog(status="unusable" if expected else "valid",
+                         reason=(f"the run recorded {expected} but the log is gone" if expected
+                                 else "the run recorded no entity of this kind"))
+    if folded.status == "unusable":
+        return folded
+    if len(folded.records) != expected:
+        return FoldedLog(records=folded.records, status="degraded", dropped=folded.dropped,
+                         reason=(f"the run recorded {expected} entit(ies), the log yields "
+                                 f"{len(folded.records)}"))
+    return folded
 
 
 def fold_observations(path) -> FoldedLog:
@@ -506,23 +547,13 @@ class Run:
 
     def _records_for(self, entity: str) -> dict:
         """Lazily materialize the MERGED view {key: record} for an entity by folding its append-only JSONL
-        observation log (so a reopened run recovers the same merged state). Dict-safe + skips keyless rows."""
+        observation log (so a reopened run recovers the same merged state).
+
+        ONE fold, shared with `fold_observations` — the live and finished views cannot diverge, and the
+        live one inherits per-line byte decoding, so a single invalid byte costs one observation here too
+        rather than raising through whatever asked for the entity."""
         if entity not in self._records:
-            merged: dict[str, dict] = {}
-            f = self._entity_file(entity)
-            if f.exists():
-                for line in f.read_text().splitlines():
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(rec, dict):
-                        continue
-                    k = canonical_key(entity, rec)
-                    if not k:
-                        continue
-                    merged[k] = _merge_record(merged[k], rec) if k in merged else rec
-            self._records[entity] = merged
+            self._records[entity] = fold_observations(self._entity_file(entity)).records
         return self._records[entity]
 
     def _seen_keys(self, entity: str) -> set:
