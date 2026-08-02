@@ -703,16 +703,27 @@ def _wc_continuation(ctx, st: dict, phase: str, label: str) -> str:
     work, so the pair remainder is stated beside the zone one — they are different units."""
     eligible = int(st.get("eligible_zones", 0))
     selected = int(st.get("admitted_zones", 0))
-    completed = int(st.get("zones_obtained", 0))
     pairs_left = int((st.get("candidate_pairs_by_cause") or {}).get("bound", 0))
-    st["zones_selected"], st["zones_completed"] = selected, completed
-    st["zones_remaining"] = remaining = max(0, eligible - completed)
+    st["zones_selected"] = selected
+    if "zones_remaining" not in st:
+        # the sweep never reported, so nothing here knows what is still owed. The terminal already
+        # carries whatever went wrong; a hint invented from this lifecycle's counts would be a guess.
+        st["zones_completed"] = int(st.get("zones_obtained", 0))
+        return ""
+    # TWO facts, kept apart. ANSWERED is this lifecycle's: zones whose invocation came back usable.
+    # OWED is CUMULATIVE, read from the durable rotation — `eligible - answered` counted only this
+    # lifecycle, so the second run of an eight-zone rotation still claimed three remaining after the
+    # rotation had covered everything. A contacted zone whose call failed is covered by the rotation
+    # (outcomes are run-scoped evidence) and its failure is the terminal's to report, not this hint's.
+    answered = int(st.get("zones_obtained", 0))
+    st["zones_completed"] = answered
+    remaining = int(st["zones_remaining"])
     if not remaining and not pairs_left:
         return ""
     target = getattr(getattr(ctx, "profile", None), "target", None) or "<target>"
     more = f" · {pairs_left} candidate pair(s) still owed by contacted zone(s)" if pairs_left else ""
-    return (f"  {label}: {selected}/{eligible} zone(s) selected · {completed} completed · "
-            f"{remaining} remaining{more}\n"
+    return (f"  {label}: {selected}/{eligible} zone(s) selected · {answered} answered this run · "
+            f"{remaining} still owed by the rotation{more}\n"
             f"      continue: quarry run -t {target} --phases {phase}"
             + (f"   (or --unbound to take all {remaining} remaining zone(s) in one run)"
                if remaining else ""))
@@ -1302,6 +1313,9 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     st["sweep_stop"] = swept.stop or ""
     st["sweep_stop_kind"] = swept.stop_kind or ""
     st["admitted_zones"] = swept.targets_admitted
+    # CUMULATIVE, from the rotation ledger — not this lifecycle's arithmetic (step 4 review)
+    st["zones_complete"] = swept.targets_complete
+    st["zones_remaining"] = swept.targets_remaining
     st["deferred_zones"] = swept.deferred_targets
     st["blocked"]["zone_cap"] = swept.deferred_targets       # deferred to a LATER run, never dropped
     st["refused_zones"] = swept.targets_refused              # the guard's own answer, per ADMITTED zone

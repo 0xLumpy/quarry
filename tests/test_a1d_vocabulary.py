@@ -490,7 +490,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
                       "selection_reason": "no in-scope wildcard zone", "gate_reason": "",
                       "eligibility_known": True,
                       # step 4.3: the continuation triple is recomputed on EVERY call, like the rest
-                      "zones_selected": 0, "zones_completed": 0, "zones_remaining": 0,
+                      "zones_selected": 0, "zones_completed": 0,
                       "blocked": {"zone_cap": 0, "self_or_private": 0}}, st
 
     def test_a_GUARD_refusal_says_so_instead_of_blaming_the_cap(self, tmp_path, monkeypatch):
@@ -3410,12 +3410,38 @@ class TestTheDifferRotatesOverZonesAndWords:
         _k, _life = self._differ(tmp_path, monkeypatch, zones=tuple(f"z{i}.acme.com" for i in range(8)),
                                  words=("api", "admin"), rows=[], run=run, st=st, spend=1,
                                  echo=echoed.append, target="acme")
-        assert (st["zones_selected"], st["zones_completed"], st["zones_remaining"]) == (5, 5, 3), st
+        # ANSWERED is this run's; OWED is the ROTATION's — with a 1-per-zone spend over two words, no
+        # zone is finished yet, so all eight are still owed however many answered
+        assert (st["zones_selected"], st["zones_completed"], st["zones_remaining"]) == (5, 5, 8), st
         line = "\n".join(echoed)
-        assert "5/8 zone(s) selected · 5 completed · 3 remaining" in line, line
+        assert "5/8 zone(s) selected · 5 answered this run · 8 still owed by the rotation" in line, line
         assert "5 candidate pair(s) still owed by contacted zone(s)" in line, line
         assert "continue: quarry run -t acme --phases enrich" in line, line
-        assert "--unbound to take all 3 remaining zone(s) in one run" in line, line
+        assert "--unbound to take all 8 remaining zone(s) in one run" in line, line
+
+    def test_the_hint_stops_promising_work_once_the_ROTATION_is_done(self, tmp_path, monkeypatch):
+        """The defect this replaced: `eligible - answered` counted one lifecycle, so run 2 of an eight-zone
+        rotation still claimed three zones remaining after the rotation had covered every one of them."""
+        from quarry_recon import store
+        run = store.Run.create(tmp_path, "t")
+        zones = tuple(f"z{i}.acme.com" for i in range(8))
+        echoed: list = []
+        seen: dict = {}
+
+        def once(label):
+            st: dict = {}
+            self._differ(tmp_path, monkeypatch, zones=zones, words=("api",), rows=[], run=run, st=st,
+                         echo=echoed.append, target="acme")
+            seen[label] = (st["zones_selected"], st["zones_completed"], st["zones_remaining"])
+
+        once("first")
+        assert seen["first"] == (5, 5, 3), seen                  # five answered, three zones still owed
+        assert any("3 still owed by the rotation" in e for e in echoed), echoed
+        echoed.clear()
+        once("second")
+        # run 2 contacts three NEW zones plus two repeats — the rotation is finished, so the hint is silent
+        assert seen["second"][2] == 0, seen
+        assert not [e for e in echoed if "continue:" in str(e)], echoed
 
     def test_a_FINISHED_pass_says_NOTHING(self, tmp_path, monkeypatch):
         """The hint is for work that is LEFT. A pass that took every zone and owed no candidate prints no
@@ -3441,8 +3467,10 @@ class TestTheDifferRotatesOverZonesAndWords:
                      run=run, st=st, echo=echoed.append, target="acme",
                      statuses=[crawl.Status.SUCCESS, crawl.Status.FAILED])
         assert st["probed_zones"] == 2, st                       # both were CONTACTED...
-        assert (st["zones_selected"], st["zones_completed"], st["zones_remaining"]) == (2, 1, 1), st
-        assert "2/2 zone(s) selected · 1 completed · 1 remaining" in "\n".join(echoed), echoed
+        # ...one ANSWERED. The rotation covered both (an outcome is run-scoped evidence, and the failure
+        # is the terminal's to report), so nothing is owed — and the hint says answered, not completed.
+        assert (st["zones_selected"], st["zones_completed"], st["zones_remaining"]) == (2, 1, 0), st
+        assert not [e for e in echoed if "continue:" in str(e)], echoed
 
     def test_the_run_command_wires_UNBOUND_to_the_allowance(self, tmp_path, monkeypatch):
         """The flag is what makes the allowance 0 — pinned through the actual command, since a help string

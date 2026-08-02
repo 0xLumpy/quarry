@@ -196,6 +196,11 @@ class SweepResult:
     invocations_obtained: int = 0
     invocation_classes: dict = field(default_factory=dict)
     targets_eligible: int = 0               # every target the corpus offered
+    #: CUMULATIVE, from the durable rotation: targets whose every slot is clean for its CURRENT content,
+    #: and the ones that still owe work. A per-run count answers "what did this lifecycle do"; a
+    #: continuation hint needs "what is still owed", which only the ledger knows (step 4).
+    targets_complete: int = 0
+    targets_remaining: int = 0
     targets_admitted: int = 0               # ...that the per-run allowance let this lifecycle start
     targets_refused: int = 0                # ...that the caller's admission check turned away
     #: admission answers whose save was interrupted: on disk or not, we cannot say (v83#1).
@@ -818,6 +823,23 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             why = f"the per-target candidate bound ({max_pairs_per_target}) was reached"
             if why not in out.cap_reasons:
                 out.cap_reasons.append(why)
+
+        # ── CUMULATIVE completion, read from the durable rotation ───────────────────────────────
+        # A target is COMPLETE when every slot it holds is clean for the content it holds NOW — so a
+        # repartitioned corpus, a refused target and a deferred one all still owe work. This is what a
+        # continuation hint must speak in: this lifecycle's own counts cannot say what is left.
+        by_target: dict = {}
+        for slot in slots:
+            by_target.setdefault(slot[0], []).append(slot)
+        done_targets = 0
+        for tgt, group in by_target.items():
+            try:
+                if all(progress.tier(tgt, s, content[(tgt, s)]) == 2 for _t, s in group):
+                    done_targets += 1
+            except BaseException:                  # the ledger is best effort: a hint is never a stop
+                break
+        out.targets_complete = done_targets
+        out.targets_remaining = max(0, out.targets_eligible - done_targets)
 
         # ── the STOP: what actually ended the run ───────────────────────────────────────────────
         # v60#2: an elapsed clock is not automatically the cause. It only stopped work if selectable
