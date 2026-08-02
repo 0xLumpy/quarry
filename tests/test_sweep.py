@@ -2160,3 +2160,76 @@ class TestThePreflightCallbacksAreContained:
         assert parts["bound"] == 1 and parts["stopped"] == 0, (parts, out.stop, out.stop_kind)
         # ...and with nothing left for the clock to take, the CAP is what ended the run (v60#2)
         assert out.stop_kind == "bound", (out.stop, out.stop_kind)
+
+    def test_the_REMAINING_capacity_is_consumed_CUMULATIVELY(self, tmp_path, monkeypatch):
+        """v67: four one-word slots, two words per call, a three-per-target bound, and a clock that expires
+        after the first call. Two candidates remain and only ONE of them fits the remaining allowance, so
+        the clock stopped one pair and the cap withheld the other. Testing each remaining slot against the
+        same final `spent` let both "fit" and reported `bound=0, stopped=2`."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+
+        class _Slow(_Tool):
+            def __call__(self, target, bucket, words):
+                ticks["t"] += 9.0
+                return super().__call__(target, bucket, words)
+
+        out, tool = _run(tmp_path, words=[f"w{i}" for i in range(4)], tool=_Slow(),
+                         budget_s=5, max_pairs_per_target=3)
+        assert out.eligible_pairs == 4 and out.attempted_pairs == 2, out
+        parts = out.pair_remainder()
+        assert parts["bound"] == 1 and parts["stopped"] == 1, parts
+        # ...and the unbounded-clock run proves the split: the scheduler submits one more, excludes one
+        ticks["t"] = 0.0
+        again, tool2 = _run(tmp_path / "b", words=[f"w{i}" for i in range(4)], max_pairs_per_target=3)
+        assert again.attempted_pairs == 3 and again.pair_remainder()["bound"] == 1, again.pair_remainder()
+
+    def test_the_dry_run_walks_the_SCHEDULER_s_order(self, tmp_path, monkeypatch):
+        """v67, the other half: WHICH remaining slot the allowance admits depends on the ORDER the
+        selection would have used, not on any walk over the same slots. Two candidates remain — a two-word
+        slot the scheduler reaches first and a one-word slot behind it — and two candidates of room. In the
+        scheduler's order the pair fits and the single is the bound's; in any other order the single fits
+        first and the PAIR is withheld, which is not what the next run will do."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+        # bucket ids: w0001 -> 030, w0003 -> 091 (the first call), w0831 + w1263 -> 101 (ONE slot, two
+        # words), w0000 -> 171. The scheduler takes the lowest slot id inside the tier, so it meets the
+        # two-word slot before the one-word one.
+        words = ["w0001", "w0003", "w0831", "w1263", "w0000"]
+        assert sweep.bucket_of("w0831") == sweep.bucket_of("w1263") == "101", "fixture drifted"
+        assert [sweep.bucket_of(w) for w in ("w0001", "w0003", "w0000")] == ["030", "091", "171"]
+
+        class _Slow(_Tool):
+            def __call__(self, target, bucket, words):
+                ticks["t"] += 9.0                              # one call, then the 5s clock is gone
+                return super().__call__(target, bucket, words)
+
+        out, tool = _run(tmp_path, words=words, tool=_Slow(), budget_s=5, max_pairs_per_target=4)
+        assert out.attempted_pairs == 2, tool.calls
+        parts = out.pair_remainder()
+        assert parts["bound"] == 1 and parts["stopped"] == 2, parts
+
+    def test_the_dry_run_respects_TIER_before_slot_order(self, tmp_path, monkeypatch):
+        """v67: the order is the SCHEDULER's, which is tier first — not the slot set's own order. A clean
+        slot with a low id is met AFTER the dirty work whatever the slot list says, so the dirty two-word
+        slot takes the remaining allowance and the clean single is the bound's."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 2)
+        ticks = {"t": 0.0}
+        monkeypatch.setattr(budget.time, "monotonic", lambda: ticks["t"])
+        assert sweep.bucket_of("w0001") == "030", "fixture drifted"          # the CLEAN slot, lowest id
+        assert [sweep.bucket_of(w) for w in ("w3761", "w3345")] == ["000", "001"]
+        assert sweep.bucket_of("w0831") == sweep.bucket_of("w1263") == "101"
+        _run(tmp_path, words=["w0001"])                                       # ...now clean (tier 2)
+
+        class _Slow(_Tool):
+            def __call__(self, target, bucket, words):
+                ticks["t"] += 9.0
+                return super().__call__(target, bucket, words)
+
+        out, tool = _run(tmp_path, words=["w0001", "w3761", "w3345", "w0831", "w1263"], tool=_Slow(),
+                         budget_s=5, max_pairs_per_target=4)
+        assert [c[2] for c in tool.calls] == [("w3761", "w3345")], tool.calls   # the dirty tier, first
+        parts = out.pair_remainder()
+        assert parts["bound"] == 1 and parts["stopped"] == 2, parts

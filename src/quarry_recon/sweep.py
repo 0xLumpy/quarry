@@ -786,13 +786,27 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # clock's. What a target may still spend is a fact about the target, not about the scan.
         bound_slots: set = set()
         if max_pairs_per_target:
-            for slot in slots:
-                tgt = slot[0]
-                if (slot in submitted or slot in deferred_slots or tgt in refused_targets
-                        or tgt not in started_targets):
-                    continue                    # attempted, or a disposition that already owns it
-                if spent.get(tgt, 0) + len(members[slot]) > max_pairs_per_target:
-                    bound_slots.add(slot)
+            # v67: capacity is consumed CUMULATIVELY, in the scheduler's own order. Testing every
+            # remaining slot against the same final `spent` let two one-word slots both "fit" a single
+            # remaining candidate, so the pair the cap would certainly have withheld was reported as the
+            # stop's. This is a dry run of what the selection would do next: `_rank` picks exactly what
+            # the loop would have picked, each admitted slot spends its own candidates, and the first
+            # slot the remaining allowance cannot fit is the BOUND's — as are all that follow it.
+            room = dict(spent)
+            # everything another disposition already owns, or that ran: the dry run walks the REST
+            trial = {s for s in slots
+                     if s in submitted or s in deferred_slots or s[0] in refused_targets
+                     or s[0] not in started_targets}
+            while True:
+                choice = _rank(progress, slots, content, trial)
+                if choice is None:
+                    break
+                trial.add(choice)
+                tgt, size = choice[0], len(members[choice])
+                if room.get(tgt, 0) + size > max_pairs_per_target:
+                    bound_slots.add(choice)     # this allowance can no longer admit it — nor what follows
+                else:
+                    room[tgt] = room.get(tgt, 0) + size      # the stop took this one, not the bound
         out.bound_pairs = sum(len(members[s]) for s in bound_slots)
         if bound_slots:
             # the bound withheld work whether or not the SCAN ever reached it, so it is named either way
