@@ -297,8 +297,52 @@ class TestTheUnionCarriesItsOwnTrust:
             broken.recover("")                                    # a recovery must say what was lost
         broken.recover("generation truncated to zero records")
         pointer = json.loads(union.path.read_text())
-        assert pointer["recovered"] == "generation truncated to zero records", pointer
+        assert [r["reason"] for r in pointer["recoveries"]] == ["generation truncated to zero records"]
         assert campaign.Union(union.path).status == "valid"
+
+    def test_a_RECOVERY_survives_every_later_publication(self, tmp_path):
+        """The campaign's only durable admission that evidence was lost. Recorded in the pointer that made
+        the recovery and nowhere else, it would vanish on the next ordinary save — and a later supervisor
+        would see a healthy union and declare completion over a corpus that had been rebuilt."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        gen.write_text("")
+        broken = campaign.Union(union.path)
+        broken.recover("lost one entity")
+        assert broken.was_recovered and len(broken.recoveries) == 1, broken.recoveries
+
+        run = _finished(tmp_path, ("subdomain", {"host": "b.acme.com", "sources": ["crtsh"]}))
+        broken.absorb(run.dir, kinds=["subdomain"])               # an ORDINARY publication
+        pointer = json.loads(union.path.read_text())
+        assert pointer["generation"] == 3, pointer
+        assert [r["reason"] for r in pointer["recoveries"]] == ["lost one entity"], pointer
+        reopened = campaign.Union(union.path)
+        assert reopened.was_recovered and reopened.recoveries[0]["generation"] == 2, reopened.recoveries
+
+    def test_recoveries_ACCUMULATE(self, tmp_path):
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        for n, why in ((1, "first loss"), (2, "second loss")):
+            gen = union.dir / json.loads(union.path.read_text())["file"]
+            gen.write_text("")
+            broken = campaign.Union(union.path)
+            broken.recover(why)
+        assert [r["reason"] for r in campaign.Union(union.path).recoveries] == ["first loss", "second loss"]
+
+    @pytest.mark.parametrize("history", ["not a list", [{"reason": "x", "at": "t"}], [{"generation": 0}],
+                                         [{"generation": 1, "reason": "", "at": "t"}],
+                                         [{"generation": 1, "reason": "x"}], [None], [{"generation": True,
+                                                                                       "reason": "x",
+                                                                                       "at": "t"}]])
+    def test_an_UNREADABLE_recovery_history_makes_the_union_unusable(self, tmp_path, history):
+        """If we cannot read the campaign's admission that evidence was lost, we cannot certify the corpus
+        it describes."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        pointer = json.loads(union.path.read_text())
+        pointer["recoveries"] = history
+        union.path.write_text(json.dumps(pointer))
+        reopened = campaign.Union(union.path)
+        assert (reopened.status, reopened.trustworthy) == ("unusable", False), (history, reopened)
+        assert "recovery history" in reopened.reason, reopened
 
 
     def test_CREATE_refuses_over_an_existing_campaign(self, tmp_path):

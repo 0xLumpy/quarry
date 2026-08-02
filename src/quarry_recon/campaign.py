@@ -50,6 +50,23 @@ class AbsorbResult:
         return self.absorbed and not self.unusable and bool(self.new or self.enriched)
 
 
+def _valid_recoveries(history) -> bool:
+    """A recovery entry is `{generation: int > 0, reason: non-empty str, at: str}` — anything else means
+    the history cannot be read, and a history that cannot be read may not be waved through."""
+    if not isinstance(history, list):
+        return False
+    for entry in history:
+        if not isinstance(entry, dict):
+            return False
+        if type(entry.get("generation")) is not int or entry["generation"] <= 0:
+            return False
+        if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
+            return False
+        if not isinstance(entry.get("at"), str):
+            return False
+    return True
+
+
 def _generation_file(generation: int) -> str:
     """The ONE filename a generation may have. Deriving it (rather than trusting the pointer's string) is
     what keeps a generation inside its campaign directory."""
@@ -90,6 +107,9 @@ class Union:
         self.dropped = 0
         self.reason = ""
         self.generation = 0
+        #: every RECOVERY this campaign has ever made, carried forward in the pointer. A union rebuilt
+        #: after evidence loss must never look like one that was only ever accumulated.
+        self.recoveries: list = []
         self._load(create=create)
 
     @classmethod
@@ -99,6 +119,12 @@ class Union:
     @property
     def trustworthy(self) -> bool:
         return self.status in ("valid", "new")
+
+    @property
+    def was_recovered(self) -> bool:
+        """Whether this campaign's corpus was ever rebuilt after a loss. A supervisor may not declare a
+        fixed point over a reconstructed union without saying so."""
+        return bool(self.recoveries)
 
     def require(self) -> None:
         """Refuse to be used when the union is not trustworthy."""
@@ -154,6 +180,13 @@ class Union:
         if type(count) is not int or count < 0 or not isinstance(digest, str):
             self.status, self.reason = "unusable", "pointer does not describe a generation"
             return
+        history = pointer.get("recoveries", [])
+        if not _valid_recoveries(history):
+            # the campaign's own admission that evidence was lost. If we cannot READ it, we certainly
+            # cannot certify the corpus it describes.
+            self.status, self.reason = "unusable", "pointer's recovery history is unreadable"
+            return
+        self.recoveries = [dict(r) for r in history]
         try:
             raw = (self.dir / name).read_bytes()
         except OSError as e:
@@ -230,10 +263,15 @@ class Union:
                 lines.append(json.dumps({"kind": kind, "id": key, "record": rec,
                                          "fp": store.fingerprint(kind, rec)}, ensure_ascii=False))
             body = "\n".join(lines) + ("\n" if lines else "")
-            pointer = {"generation": nxt, "file": name, "count": len(self.records),
-                       "digest": hashlib.sha256(body.encode("utf-8")).hexdigest()}
+            history = [dict(r) for r in self.recoveries]
             if recovered:
-                pointer["recovered"] = recovered
+                history.append({"generation": nxt, "reason": recovered, "at": store._utc()})
+            pointer = {"generation": nxt, "file": name, "count": len(self.records),
+                       "digest": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                       # CARRIED FORWARD, every publication: a recovery recorded only in the pointer that
+                       # made it would vanish on the next ordinary save, and the campaign would go back to
+                       # looking like one that never lost anything.
+                       "recoveries": history}
             store._atomic_write(self.dir / name, body)
             store._atomic_write(self.path, json.dumps(pointer, indent=2))
         except BaseException:
@@ -248,6 +286,7 @@ class Union:
                 self.reason = "publication failed and the pointer could not be re-read"
             raise
         self.generation = nxt
+        self.recoveries = history
         self.status, self.dropped, self.reason = "valid", 0, ""
 
     def _next_generation(self) -> int:
