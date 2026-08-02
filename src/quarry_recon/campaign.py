@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from . import store
@@ -50,20 +51,39 @@ class AbsorbResult:
         return self.absorbed and not self.unusable and bool(self.new or self.enriched)
 
 
-def _valid_recoveries(history) -> bool:
-    """A recovery entry is `{generation: int > 0, reason: non-empty str, at: str}` — anything else means
-    the history cannot be read, and a history that cannot be read may not be waved through."""
+#: exactly the keys a recovery entry may carry. An unknown key is not an extension to shrug at — this is
+#: the campaign's audit record of lost evidence, and anything we cannot account for we do not certify.
+_RECOVERY_KEYS = {"generation", "reason", "at"}
+
+
+def _valid_recoveries(history, pointer_generation: int) -> bool:
+    """A recovery history is readable only when it could actually have HAPPENED.
+
+    `{generation: int > 0, reason: non-empty str, at: an aware ISO-8601 timestamp}`, entries strictly
+    increasing and none from a generation this pointer has not reached. A duplicate, a descending pair or a
+    recovery "from" generation 999 inside generation 3 is not a history — it is something we cannot read,
+    and an audit record we cannot read may not certify a corpus."""
     if not isinstance(history, list):
         return False
+    previous = 0
     for entry in history:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or set(entry) != _RECOVERY_KEYS:
             return False
-        if type(entry.get("generation")) is not int or entry["generation"] <= 0:
+        gen = entry.get("generation")
+        if type(gen) is not int or gen <= 0 or gen <= previous or gen > pointer_generation:
             return False
+        previous = gen
         if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
             return False
-        if not isinstance(entry.get("at"), str):
+        at = entry.get("at")
+        if not isinstance(at, str) or not at.strip():
             return False
+        try:
+            when = datetime.fromisoformat(at)
+        except ValueError:
+            return False
+        if when.tzinfo is None or when.tzinfo.utcoffset(when) is None:
+            return False                                  # a naive stamp says nothing about WHEN
     return True
 
 
@@ -181,7 +201,7 @@ class Union:
             self.status, self.reason = "unusable", "pointer does not describe a generation"
             return
         history = pointer.get("recoveries", [])
-        if not _valid_recoveries(history):
+        if not _valid_recoveries(history, gen):
             # the campaign's own admission that evidence was lost. If we cannot READ it, we certainly
             # cannot certify the corpus it describes.
             self.status, self.reason = "unusable", "pointer's recovery history is unreadable"

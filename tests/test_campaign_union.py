@@ -328,11 +328,25 @@ class TestTheUnionCarriesItsOwnTrust:
             broken.recover(why)
         assert [r["reason"] for r in campaign.Union(union.path).recoveries] == ["first loss", "second loss"]
 
-    @pytest.mark.parametrize("history", ["not a list", [{"reason": "x", "at": "t"}], [{"generation": 0}],
-                                         [{"generation": 1, "reason": "", "at": "t"}],
-                                         [{"generation": 1, "reason": "x"}], [None], [{"generation": True,
-                                                                                       "reason": "x",
-                                                                                       "at": "t"}]])
+    _STAMP = "2026-08-02T14:10:33.442233+00:00"
+
+    @pytest.mark.parametrize("history", [
+        "not a list", [None],
+        [{"reason": "x", "at": _STAMP}],                                   # no generation
+        [{"generation": 0, "reason": "x", "at": _STAMP}],                  # not a generation
+        [{"generation": True, "reason": "x", "at": _STAMP}],               # a bool is not an int
+        [{"generation": 1, "reason": "", "at": _STAMP}],                   # no reason given
+        [{"generation": 1, "reason": "x"}],                                # no timestamp
+        [{"generation": 1, "reason": "x", "at": ""}],                      # ...an empty one
+        [{"generation": 1, "reason": "x", "at": "nonsense"}],              # ...an unparseable one
+        [{"generation": 1, "reason": "x", "at": "2026-08-02T14:10:33"}],   # ...a NAIVE one
+        [{"generation": 1, "reason": "x", "at": _STAMP, "extra": 1}],      # an unaccounted key
+        [{"generation": 1, "reason": "x", "at": _STAMP},
+         {"generation": 1, "reason": "y", "at": _STAMP}],                  # duplicate generations
+        [{"generation": 2, "reason": "x", "at": _STAMP},
+         {"generation": 1, "reason": "y", "at": _STAMP}],                  # descending
+        [{"generation": 999, "reason": "x", "at": _STAMP}],                # from a generation never reached
+    ])
     def test_an_UNREADABLE_recovery_history_makes_the_union_unusable(self, tmp_path, history):
         """If we cannot read the campaign's admission that evidence was lost, we cannot certify the corpus
         it describes."""
