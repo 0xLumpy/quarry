@@ -426,3 +426,161 @@ class Union:
             if run.inherit(kind, record):
                 seeded[kind] = seeded.get(kind, 0) + 1
         return seeded
+
+
+# ── the campaign SUPERVISOR ──────────────────────────────────────────────────────────────────────────
+#: why a campaign stopped. Every one of them is a NAMED outcome — a supervisor that runs out of reasons
+#: and simply stops has told the operator nothing.
+STOPS = ("fixed_point", "terminal", "unknown", "no_progress", "child_fault", "max_runs", "budget")
+#: consecutive children with no new or enriched identity AND no reduction in the retriable remainder
+NO_PROGRESS_LIMIT = 2
+#: how many children one campaign may create before it stops and says so
+MAX_CHILDREN = 10
+
+
+@dataclass
+class Decision:
+    """What the supervisor concluded from one child, and whether another may run."""
+    stop: str | None = None          # a name from STOPS, or None to continue
+    detail: str = ""
+    progressed: bool = False
+    retriable: int = 0
+
+    @property
+    def success(self) -> bool:
+        """Only a FIXED POINT is success. Terminal work, unknown lanes, a fault and every bound are
+        outcomes a campaign must state, not quietly finish on."""
+        return self.stop == "fixed_point"
+
+
+def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_children: int = 0,
+           children: int = 0, max_children: int = MAX_CHILDREN) -> Decision:
+    """The stop rules, read from a child's manifest summary and what it added to the union.
+
+    Order matters and is fixed: a broken child is not continuation, so CHILD FAULT is asked first; then a
+    lane that should have reported and did not (UNKNOWN — silence is not a fixed point); then the bounds we
+    chose; then progress; and only when every expected lane reported a KNOWN zero, with no terminal
+    remainder outstanding and nothing new learned, is it a FIXED POINT."""
+    faults = [f for f in summary.get("faults", [])
+              if f.get("kind") in ("machinery", "phase_exception", "required_tool_missing")]
+    if faults:
+        return Decision(stop="child_fault", detail="; ".join(
+            f"{f.get('kind')}: {f.get('where')}" for f in faults[:4]))
+
+    rows = {r.get("lane"): r for r in summary.get("remainders", []) if isinstance(r, dict)}
+    invalid = sorted(lane for lane, row in rows.items() if "retriable" not in row)
+    silent = sorted(lane for lane in expected_lanes if lane not in rows)
+    if invalid or silent:
+        return Decision(stop="unknown", detail="; ".join(
+            [f"{lane}: reported nothing" for lane in silent]
+            + [f"{lane}: unreadable remainder" for lane in invalid])[:400])
+
+    retriable = 0
+    terminal: dict = {}
+    for lane, row in rows.items():
+        if row.get("model") != "project_progress":
+            continue                                  # repetition cannot advance it — never keeps us alive
+        rt = row.get("retriable") or {}
+        retriable += int(rt.get("now", 0)) + int(rt.get("cooldown", 0))
+        for cause, n in (row.get("terminal") or {}).items():
+            if n:
+                terminal[cause] = terminal.get(cause, 0) + int(n)
+
+    progressed = bool(absorbed.progressed)
+    if absorbed.unusable:
+        return Decision(stop="unknown", progressed=progressed, retriable=retriable,
+                        detail="; ".join(f"{k}: {v}" for k, v in sorted(absorbed.unusable.items()))[:400])
+    if children >= max_children:
+        return Decision(stop="max_runs", progressed=progressed, retriable=retriable,
+                        detail=f"{children} child run(s)")
+    if not progressed and idle_children + 1 >= NO_PROGRESS_LIMIT and retriable:
+        return Decision(stop="no_progress", progressed=False, retriable=retriable,
+                        detail=f"{idle_children + 1} child(ren) added nothing while {retriable} "
+                               f"unit(s) stayed owed")
+    if retriable:
+        return Decision(progressed=progressed, retriable=retriable)     # keep going: work a child can take
+    if terminal:
+        return Decision(stop="terminal", progressed=progressed,
+                        detail="; ".join(f"{c}: {n}" for c, n in sorted(terminal.items())))
+    if progressed:
+        return Decision(progressed=True)          # nothing owed, but this child still learned something
+    return Decision(stop="fixed_point", detail="no retriable work and nothing new")
+
+
+class Campaign:
+    """The supervisor's LEDGER and lock. It creates no runs itself — a caller drives children — but it owns
+    what makes repetition safe: one project may have only one campaign at a time, and every child is
+    recorded BEFORE it starts, so a crash leaves an interrupted child rather than an orphan run directory.
+
+        reserved    an id is allocated and nothing has been launched
+        started     the child's run directory exists
+        manifested  its manifest was read and its deltas computed
+    """
+
+    STATES = ("reserved", "started", "manifested")
+
+    def __init__(self, project_dir, campaign_id: str):
+        self.project_dir = Path(project_dir)
+        self.campaign_id = campaign_id
+        self.dir = self.project_dir / "recon" / "campaigns" / campaign_id
+        self.path = self.dir / "ledger.json"
+        self.children: list = []
+        self.stop: dict | None = None
+        self._lock = None
+        self._load()
+
+    # ── the PROJECT lock: two supervisors on one project would duplicate whole runs ────────────────
+    def acquire(self):
+        """Take the project-wide campaign lock. Scoped to the PROJECT, not this campaign directory: two
+        supervisors that minted different ids would otherwise take different locks and both spawn children
+        against the same rotation."""
+        from . import budget
+        self._lock = budget.state_lock(self.project_dir / "recon" / "campaigns" / ".campaign.lock")
+        return self._lock
+
+    def _load(self) -> None:
+        try:
+            doc = json.loads(self.path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(doc, dict):
+            kids = doc.get("children")
+            self.children = [c for c in kids if isinstance(c, dict)] if isinstance(kids, list) else []
+            self.stop = doc.get("stop") if isinstance(doc.get("stop"), dict) else None
+
+    def _save(self) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        store._atomic_write(self.path, json.dumps(
+            {"campaign_id": self.campaign_id, "children": self.children, "stop": self.stop}, indent=2))
+
+    # ── child states ──────────────────────────────────────────────────────────────────────────────
+    def reserve(self) -> dict:
+        """Record a child BEFORE anything is launched — a crash then leaves an interrupted child in the
+        ledger instead of a run directory nobody knows about."""
+        child = {"index": len(self.children) + 1, "state": "reserved", "run_id": None}
+        self.children.append(child)
+        self._save()
+        return child
+
+    def started(self, child: dict, run_id: str) -> None:
+        child["run_id"], child["state"] = run_id, "started"
+        self._save()
+
+    def manifested(self, child: dict, *, summary: dict, absorbed: "AbsorbResult",
+                   decision: "Decision") -> None:
+        child.update(state="manifested", verdict=summary.get("verdict"),
+                     new_identities=absorbed.new, enriched=absorbed.enriched,
+                     retriable=decision.retriable, progressed=decision.progressed,
+                     provider_spend=summary.get("provider_spend", []),
+                     faults=[f.get("kind") for f in summary.get("faults", [])])
+        self._save()
+
+    def finish(self, decision: "Decision") -> None:
+        self.stop = {"cause": decision.stop or "fixed_point", "detail": decision.detail,
+                     "success": decision.success}
+        self._save()
+
+    @property
+    def interrupted(self) -> list:
+        """Children the ledger recorded and never saw finish — an honest account of a crash."""
+        return [c for c in self.children if c.get("state") != "manifested"]

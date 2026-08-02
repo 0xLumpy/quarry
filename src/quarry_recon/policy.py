@@ -47,6 +47,7 @@ EXCLUSION_KINDS = (
     "rate",         # pressure on the target or this host: the rate axis, never the volume one
     "engagement",   # chosen per engagement in target.yaml, not by a machine-wide flag
     "identity",     # slot / schema identity: versioned, never relaxed
+    "continuation", # how many times a SUPERVISOR repeats a run — `--settle`'s business, not `--unbound`'s
     "not_a_bound",  # a sentinel, name or set that merely matches the naming convention
 )
 #: lanes on the ACQUISITION side: what they may obtain is decided by the provider's own enablement,
@@ -269,6 +270,11 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.triage:_DNS_PREVIEW_MAX": ("resource", "a digest preview length; evidence keeps all"),
     "quarry_recon.sweep:_UNSELECTABLE_DETAIL": ("resource", "a diagnostic list bound; the counters beside "
                                                             "it are authoritative"),
+
+    # continuation — the supervisor's own bounds. `--unbound` is about one run's volume; how many runs a
+    # campaign creates, and when it gives up, is `--settle`'s question and carries its own named stops.
+    "quarry_recon.campaign:MAX_CHILDREN": ("continuation", "children one campaign may create"),
+    "quarry_recon.campaign:NO_PROGRESS_LIMIT": ("continuation", "idle children before a campaign stops"),
 
     # rate / concurrency — pressure on the target or on this host
     "ARJUN_TARGETS": ("rate", "how many arjun processes run at once (one per target, host-fair)"),
