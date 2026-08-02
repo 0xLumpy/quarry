@@ -319,9 +319,11 @@ class TestTheEffectivePolicyIsReportedAndPersisted:
                                      "WILDCARD_ZONES_PER_RUN": True})
         rows = {r["name"]: r for r in policy.snapshot()}
         assert (rows["SUBFINDER_MAX_TIME"]["value"], rows["SUBFINDER_MAX_TIME"]["source"]) == (60, "default")
-        assert rows["SUBFINDER_MAX_TIME"]["rejected"] == "'garbage'", rows["SUBFINDER_MAX_TIME"]
+        assert rows["SUBFINDER_MAX_TIME"]["rejected"] == "str(7 chars)", rows["SUBFINDER_MAX_TIME"]
+        assert rows["SUBFINDER_MAX_TIME"]["rejected_source"] == "config", rows["SUBFINDER_MAX_TIME"]
         budget = rows["WILDCARD_BUDGET_S"]
         assert (budget["value"], budget["source"], budget["rejected"]) == (0, "default", "-1")
+        assert budget["rejected_source"] == "config", budget
         assert budget["unbounded"] is True          # 0 IS unbounded — but by the default, not by config
         zones = rows["WILDCARD_ZONES_PER_RUN"]
         assert (zones["value"], zones["source"], zones["rejected"]) == (5, "default", "True")
@@ -350,7 +352,10 @@ class TestTheEffectivePolicyIsReportedAndPersisted:
         from quarry_recon import policy, settings
         with settings.overrides({"WILDCARD_ZONES_PER_RUN": "nonsense"}):
             row = {r["name"]: r for r in policy.snapshot()}["WILDCARD_ZONES_PER_RUN"]
-        assert (row["value"], row["source"], row["rejected"]) == (5, "default", "'nonsense'"), row
+            line = [ln for ln in policy.render() if "WILDCARD_ZONES_PER_RUN" in ln][0]
+        assert (row["value"], row["source"], row["rejected"]) == (5, "default", "str(8 chars)"), row
+        # ...and a rejected FLAG is not described as a configured value
+        assert row["rejected_source"] == "flag" and "the flag value" in line, (row, line)
 
     def test_a_value_names_WHO_set_it(self, monkeypatch):
         from quarry_recon import policy, settings
@@ -402,3 +407,54 @@ class TestTheEffectivePolicyIsReportedAndPersisted:
         assert stored == rows and len(stored) == len(policy.BOUNDS), stored
         held = [r for r in stored if not r["relaxable"]]
         assert [r["name"] for r in held] == ["A1D_WORD_CAP"] and held[0]["held_reason"], held
+
+
+class TestARejectedValueIsNeverDISCLOSED:
+    """A rejected value is diagnostic text that reaches the console, the event log and `manifest.json`. It
+    may not be an unrestricted echo of whatever the config held: a knob whose value is a pasted token would
+    publish it in three places at once."""
+
+    SECRET = "SUPER-SECRET-KEY-abcdef0123456789"
+
+    def test_the_SECRET_never_reaches_the_report_the_events_or_the_manifest(self, tmp_path, monkeypatch):
+        from quarry_recon import events, policy, settings, store
+        monkeypatch.setattr(settings, "performance", lambda: {"SUBFINDER_MAX_TIME": self.SECRET})
+        rows = policy.snapshot()
+        rendered = "\n".join(policy.render(rows))
+        assert self.SECRET not in json.dumps(rows), rows
+        assert self.SECRET not in rendered, rendered
+        assert f"str({len(self.SECRET)} chars)" in rendered, rendered      # type and SIZE, never content
+
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            events.emit("policy", "run", bounds=rows)
+            run.write_manifest(profile_summary={}, phases_run=["vertical"], policy=rows)
+            log = (run.dir / "events.jsonl").read_text()
+            manifest = run.manifest_path.read_text()
+        finally:
+            events.reset()
+        assert self.SECRET not in log, log
+        assert self.SECRET not in manifest, manifest
+
+    def test_a_CONFIGURED_credential_is_redacted_from_the_manifest_policy_block(self, tmp_path,
+                                                                                monkeypatch):
+        """Belt and braces: the rows are non-disclosing by construction, and the manifest sink redacts them
+        again — a sink that trusts its input is how one leak becomes permanent."""
+        from quarry_recon import secrets, store
+        monkeypatch.setattr(secrets, "values", lambda: ["tok-live-42"])
+        run = store.Run.create(tmp_path, "t")
+        run.write_manifest(profile_summary={}, phases_run=["vertical"],
+                           policy=[{"name": "X", "held_reason": "held because tok-live-42 said so"}])
+        stored = json.loads(run.manifest_path.read_text())["policy"]
+        assert stored == [{"name": "X", "held_reason": "held because *** said so"}], stored
+
+    @pytest.mark.parametrize("raw,expect", [
+        (5000, "5000"), (-1, "-1"), (True, "True"), (60.5, "60.5"),        # numbers describe themselves
+        ("  42  ", "'42'"), ("-7", "'-7'"),                                 # numeric strings are safe
+        ("garbage", "str(7 chars)"), ("", "str(0 chars)"),                  # opaque text: size only
+        (["a", "b"], "list(2 item(s))"), ({"k": "v"}, "dict(1 key(s))"), (None, "NoneType"),
+    ])
+    def test_the_diagnostic_is_bounded_by_TYPE(self, raw, expect):
+        from quarry_recon import settings
+        assert settings._diagnostic(raw) == expect

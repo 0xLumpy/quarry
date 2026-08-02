@@ -264,8 +264,8 @@ def held() -> tuple[Bound, ...]:
 
 
 # ── the EFFECTIVE policy: what this run will actually apply, and where each value came from ──────────
-def effective(bound: Bound) -> tuple[int, str, str | None]:
-    """`(value, source, rejected)` for one bound.
+def effective(bound: Bound) -> tuple[int, str, str | None, str | None]:
+    """`(value, source, rejected, rejected_source)` for one bound.
 
     The source comes out of the same parse as the value: a configured or flagged value the strict parser
     REFUSED is attributed to the default, and what was refused is reported rather than hidden behind an
@@ -279,8 +279,8 @@ def effective(bound: Bound) -> tuple[int, str, str | None]:
     if bound.const and not bound.const_local:
         import importlib
         mod, _, name = bound.const.partition(":")
-        return int(getattr(importlib.import_module(mod), name)), "default", None
-    return bound.default, "default", None    # a function-local constant: not configurable, only relaxable
+        return int(getattr(importlib.import_module(mod), name)), "default", None, None
+    return bound.default, "default", None, None   # a function-local constant: not configurable
 
 
 def snapshot() -> list[dict]:
@@ -288,11 +288,12 @@ def snapshot() -> list[dict]:
     persisted into the manifest: a run's ceilings are EVIDENCE, not shell history."""
     rows = []
     for b in BOUNDS:
-        value, src, rejected = effective(b)
+        value, src, rejected, rejected_src = effective(b)
         rows.append({"name": b.name, "lane": b.lane, "value": value, "default": b.default,
                      "source": src, "relaxable": b.relaxable,
                      "unbounded": b.relaxable and value == b.unbounded_value,
-                     "rejected": rejected, "held_reason": b.held_reason})
+                     "rejected": rejected, "rejected_source": rejected_src,
+                     "held_reason": b.held_reason})
     return rows
 
 
@@ -307,8 +308,8 @@ def render(rows: list[dict] | None = None) -> list[str]:
             out.append(f"  HELD      {r['name']} = {r['value']} ({r['lane']}) — {r['held_reason']}")
         elif r["rejected"] is not None:
             # written, refused, and named: a value the parser threw away must not read as policy
-            out.append(f"  DEFAULT   {r['name']} = {r['value']} ({r['lane']}) — the configured value "
-                       f"{r['rejected']} was REJECTED by the strict parser")
+            out.append(f"  DEFAULT   {r['name']} = {r['value']} ({r['lane']}) — the "
+                       f"{r['rejected_source']} value {r['rejected']} was REJECTED by the strict parser")
         elif r["source"] == "default":
             plain += 1
             free += bool(r["unbounded"])         # unbounded because that IS the default, not by request

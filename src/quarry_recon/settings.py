@@ -112,8 +112,33 @@ def strict_int(key: str, *, default: int, maximum: int) -> int:
     return strict_int_with_source(key, default=default, maximum=maximum)[0]
 
 
-def strict_int_with_source(key: str, *, default: int, maximum: int) -> tuple[int, str, str | None]:
-    """`(value, source, rejected)` — the value, WHO it came from, and what was thrown away getting there.
+def _diagnostic(raw) -> str:
+    """A BOUNDED, non-disclosing description of a value the parser refused.
+
+    A rejected value is diagnostic text that reaches the console and `manifest.json`, so it may not be an
+    unrestricted echo of whatever the config held: a knob whose value is a pasted token would publish it.
+    Numbers describe themselves (`5000` is exactly what an operator needs to see for an oversized bound);
+    any other text is described by TYPE AND SIZE only, never by content, and passed through the
+    configured-credential redactor as a second line of defence."""
+    from . import secrets
+    if isinstance(raw, bool) or isinstance(raw, (int, float)):
+        return repr(raw)
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if stripped and (stripped.isdigit() or (stripped[:1] == "-" and stripped[1:].isdigit())):
+            return secrets.redact(repr(stripped[:24])) or "str"
+        return f"str({len(raw)} chars)"                 # never the CONTENT of an opaque value
+    if isinstance(raw, (list, tuple, set)):
+        return f"{type(raw).__name__}({len(raw)} item(s))"
+    if isinstance(raw, dict):
+        return f"dict({len(raw)} key(s))"
+    return type(raw).__name__
+
+
+def strict_int_with_source(key: str, *, default: int,
+                           maximum: int) -> tuple[int, str, str | None, str | None]:
+    """`(value, source, rejected, rejected_source)` — the value, WHO it came from, what was thrown away
+    getting there, and who had written THAT.
 
     Attribution has to come out of the SAME parse as the value. Asking "is the key present?" separately
     reported `source: config` for a run whose configured value the parser had refused, so the policy
@@ -121,7 +146,7 @@ def strict_int_with_source(key: str, *, default: int, maximum: int) -> tuple[int
     attributed to the DEFAULT and the offending input is kept, so the report can say what was ignored."""
     written = source_of(key)
     if written == "default":
-        return default, "default", None
+        return default, "default", None, None
     raw = _overrides[key] if key in _overrides else performance().get(key)
     value = None
     if isinstance(raw, bool):
@@ -132,8 +157,8 @@ def strict_int_with_source(key: str, *, default: int, maximum: int) -> tuple[int
         v = int(raw.strip())
         value = v if 0 <= v <= maximum else None
     if value is None:
-        return default, "default", repr(raw)          # written, refused, and SAID so
-    return value, written, None
+        return default, "default", _diagnostic(raw), written    # written, refused, and SAID so
+    return value, written, None, None
 
 
 def raw(key: str, default=None):

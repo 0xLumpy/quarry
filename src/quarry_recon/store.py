@@ -688,7 +688,9 @@ class Run:
             # the EFFECTIVE coverage policy this run applied: every registered bound, its value, who set
             # it, and what was HELD. Stored so a manifest can be read without the shell history that
             # produced it (flag-axis step 3).
-            manifest["policy"] = policy
+            # defensively redacted a SECOND time: the rows are already non-disclosing by construction,
+            # and a manifest sink that trusts its input is exactly how one leak becomes permanent.
+            manifest["policy"] = secrets.redact_deep(policy)
         # C11: if any event-sink write FAILED this session, events.jsonl is incomplete — record that fact so
         # a coverage/verdict folded from it is not read as clean truth (the run itself never crashed on it).
         from . import events as _events
