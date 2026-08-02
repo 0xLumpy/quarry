@@ -352,6 +352,17 @@ def tool_blocked(source_id, *, reason=None) -> dict:
     return emit(TOOL_BLOCKED, source_id, reason=reason)
 
 
+def spend(source_id, *, provider: str, measure: str, amount, unit=None) -> dict:
+    """What one ACQUISITION lane actually spent, in the unit it is charged in.
+
+    A campaign that repeats runs has to see spending per child, and there is no single number that means
+    "spend": Shodan charges query credits and hands back pages, Whoxy sells pages, and `pages_bought` is
+    not equivalent to charged requests. So the MEASURE is part of the record and nothing is summed across
+    measures (settle prerequisite D)."""
+    return emit("spend", source_id, provider=provider, measure=measure,
+                amount=amount if type(amount) is int and amount >= 0 else None, unit=unit)
+
+
 def ledger(source_id, *, produced=None, consumed=None, **extra) -> dict:
     """Report REAL produced/consumed counts from the parser/store layer (BBOT scan-stats analog =
     the review-4992 answer). Counts come from the caller's parse/store step, NEVER from stdout.

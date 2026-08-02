@@ -710,6 +710,27 @@ class Run:
                     coverage_limits.append(entry)                     # operator subset / provider limit -> soft
                 else:
                     gaps.append(entry)                                # cap/timeout with omitted>0 -> gap
+        # ── STRUCTURED child faults (settle prerequisite D) ────────────────────────────────────────
+        # A campaign must decide whether repeating a child is continuation or repetition of a broken run,
+        # and `failures` does not separate a machinery break from an optional tool's failure while a
+        # REQUIRED missing tool arrives in `gaps` instead. So the machine-readable version says which is
+        # which, in its own field, and nobody has to match prose.
+        faults = [{"kind": "phase_exception", "where": "run", "detail": note}
+                  for note in phase_exceptions]
+        _optional = set()
+        try:
+            from .registry import load_tools as _load
+            _optional = {t.bin for t in _load() if t.optional}
+        except Exception:                                          # noqa: BLE001 - a report is never a stop
+            _optional = set()
+        for f in failures:
+            faults.append({"kind": "optional_tool_failed" if f.get("tool") in _optional else "machinery",
+                           "where": f.get("tool") or f.get("phase"), "detail": f.get("why")})
+        for g in gaps:
+            if g.get("status") == "missing":
+                faults.append({"kind": "required_tool_missing", "where": g.get("tool"),
+                               "detail": g.get("why")})
+
         # a LIMIT never downgrades a run that also has real gaps — gaps dominate; limits only lift a
         # otherwise-clean run to complete_with_limits so the incompleteness is still stated.
         limits = coverage_limits + provider_limits + operator_limits
@@ -720,7 +741,44 @@ class Run:
                 "coverage": coverage, "coverage_limits": coverage_limits,
                 # what each lane still OWES — the supervisor's input, absent meaning UNKNOWN (settle B)
                 "remainders": self._read_remainders(),
+                # STRUCTURED child faults and provider spend, so a campaign never interprets prose (D)
+                "faults": faults,
+                "provider_spend": self._read_spend(),
                 "provider_limits": provider_limits, "operator_limits": operator_limits}
+
+    def _read_spend(self) -> list[dict]:
+        """Provider spend per (lane, provider, measure), SUMMED — a child's bill, in the units it was
+        charged in. Never summed ACROSS measures: pages and query credits are different currencies, and
+        `pages_bought` is not equivalent to charged requests (settle prerequisite D)."""
+        ev = self.dir / "events.jsonl"
+        if not ev.exists():
+            return []
+        totals: dict = {}
+        try:
+            lines = ev.read_bytes().splitlines()
+        except OSError:
+            return []
+        for chunk in lines:
+            try:
+                rec = json.loads(chunk.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(rec, dict) or rec.get("event") != "spend":
+                continue
+            lane, provider, measure = rec.get("source_id"), rec.get("provider"), rec.get("measure")
+            amount = rec.get("amount")
+            if not all(isinstance(x, str) and x for x in (lane, provider, measure)):
+                continue
+            if type(amount) is not int or amount < 0:
+                # an unusable amount is not zero: the lane spent something nobody can count
+                key = (lane, provider, measure)
+                totals.setdefault(key, {"lane": lane, "provider": provider, "measure": measure,
+                                        "amount": 0, "unknown": 0})["unknown"] += 1
+                continue
+            key = (lane, provider, measure)
+            totals.setdefault(key, {"lane": lane, "provider": provider, "measure": measure,
+                                    "amount": 0, "unknown": 0})["amount"] += amount
+        return [totals[k] for k in sorted(totals)]
 
     def _read_remainders(self) -> list[dict]:
         """The LATEST remainder record per (lane, unit) — what each lane still OWES, for a supervisor that

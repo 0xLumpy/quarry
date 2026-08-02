@@ -891,6 +891,9 @@ def _shodan_result(spec, values, work):
     fail_classes, limit_classes = dict(o.fail_classes), dict(o.limit_classes)
     errored = sum(fail_classes.values()) + sum(limit_classes.values())
     evidence = o.pages_bought + o.pages_replayed
+    # what this lane actually BOUGHT, in the unit it is charged in — a campaign that repeats runs has to
+    # see spend per child, and replayed pages cost nothing (settle prerequisite D)
+    events.spend(spec.sid, provider="shodan", measure="pages", amount=int(o.pages_bought))
     if values and not evidence and not errored:
         stop_cls = _STOP_CLASS.get(bal.stop_kind)          # already canonical: quota / entitlement
         if stop_cls:
