@@ -218,6 +218,29 @@ class TestTheRegistryTellsTheTruth:
         unknown = [lane for lane in policy.PROVIDER_LANES if lane not in known and lane not in outside]
         assert not unknown, unknown
 
+    def test_EVERY_registered_source_is_classified(self):
+        """The completeness mechanism, in the shape of the bound registry's: a hard-coded list cannot find
+        what it omits — `vertical.certspotter` is Quarry's own HTTP with Quarry's token and Quarry's page
+        bound, and it was missing. A new lane fails here until someone says which kind it is."""
+        from quarry_recon import sources
+        registered = set(sources.all_sources())
+        classified = set(policy.SOURCE_OWNERSHIP)
+        assert registered - classified == set(), sorted(registered - classified)
+        assert classified - registered == set(), sorted(classified - registered)
+        assert set(policy.SOURCE_OWNERSHIP.values()) <= set(policy.OWNERSHIP_KINDS)
+        # ...and the two views agree in both directions
+        provider = {k for k, v in policy.SOURCE_OWNERSHIP.items() if v == "quarry_provider"}
+        assert provider == set(policy.PROVIDER_LANES) - set(policy.PROVIDER_LANES_OUTSIDE_REGISTRY)
+
+    def test_CERTSPOTTER_and_crtsh_are_ours(self):
+        """Both are Quarry-implemented HTTP to a third-party CT service — certspotter with Quarry's own
+        token and `PROVIDER_MAX_PAGES`. Free or keyless is not the test; who makes the call is."""
+        for lane in ("vertical.certspotter", "vertical.crtsh"):
+            assert policy.SOURCE_OWNERSHIP[lane] == "quarry_provider", lane
+            assert lane in policy.PROVIDER_LANES, lane
+        src = pathlib.Path(importlib.import_module("quarry_recon.phases.vertical").__file__).read_text()
+        assert "api.certspotter.com" in src and "urllib.request.urlopen" in src
+
     def test_the_boundary_is_OWNERSHIP_not_keyed_ness(self):
         """Quarry owns the call, the key or the budget -> ours. An external tool reading its OWN provider
         configuration (`subfinder -all`) is outside Quarry's accounting model, and a `key` default can mean

@@ -68,9 +68,46 @@ EXCLUSION_KINDS = (
 #: plain HTTP outside the source registry — which is also why an acquisition gate cannot live in one
 #: execution path: `run_providers`, `run_contract` and direct HTTP are three different doors.
 PROVIDER_LANES = ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.censys",
-                  "vertical.shosubgo", "vertical.github_subs", "osint.whoxy")
+                  "vertical.certspotter", "vertical.crtsh", "vertical.shosubgo", "vertical.github_subs",
+                  "osint.whoxy")
 #: ...and the ids above that are NOT in the source registry, listed exactly rather than by prefix.
 PROVIDER_LANES_OUTSIDE_REGISTRY = ("osint.whoxy",)
+
+#: EVERY registered source, classified — the mechanism that finds an OMISSION rather than trusting a
+#: hand-kept list. `vertical.certspotter` satisfied the ownership rule and was missing from
+#: `PROVIDER_LANES`; a hard-coded test could not have noticed. A new lane fails the completeness test
+#: until someone says which kind it is.
+#:
+#:   quarry_provider  Quarry makes the call, or supplies the key and enables it -> `PROVIDER_LANES`
+#:   external_tool    a tool that reaches its OWN sources under its OWN configuration (subfinder's
+#:                    providers, gau/waymore's archives, asnmap/caduceus, smap's Shodan mirror). Outside
+#:                    Quarry's accounting and authorisation model — we neither parse nor police it.
+#:   target_facing    contacts the TARGET (or its infrastructure), not a data provider
+#:   local            local computation, local datasets, or an operator-provided corpus
+SOURCE_OWNERSHIP: dict[str, str] = {
+    **{lane: "quarry_provider" for lane in
+       ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.censys", "vertical.certspotter",
+        "vertical.crtsh", "vertical.shosubgo", "vertical.github_subs")},
+    **{lane: "external_tool" for lane in
+       ("vertical.subfinder", "crawl.gau", "crawl.waymore_urls", "crawl.waymore_responses",
+        "horizontal.caduceus", "horizontal.asnmap", "enrich.smap", "probe.smap", "params.oob_probe")},
+    **{lane: "local" for lane in
+       ("vertical.openintel", "horizontal.kaeferjaeger", "horizontal.mapcidr", "horizontal.csp",
+        "params.gf", "crawl.js_beautify", "crawl.jsluice_urls", "crawl.jsluice_secrets",
+        "crawl.gitleaks", "crawl.trufflehog", "crawl.xnlinkfinder", "crawl.sourcemaps",
+        "origin.correlation", "vertical.alterx_permute")},
+    **{lane: "target_facing" for lane in
+       ("content.ffuf", "crawl.js_fetch", "crawl.katana_headless", "crawl.katana_standard",
+        "dns.dnsx_records", "enrich.a1d_brute", "enrich.dnsx_cname", "enrich.dnsx_resolve",
+        "enrich.gowitness", "enrich.httpx", "enrich.nuclei_waf", "enrich.wildcard_a1d",
+        "horizontal.cloud_buckets", "horizontal.revdns", "horizontal.tlsx_san", "params.arjun",
+        "params.blind_xss", "params.dalfox", "params.dalfox_xss_fast", "params.nuclei_oast",
+        "params.nuclei_scan", "params.nuclei_takeover", "params.redirect_confirm", "probe.ffuf_vhost",
+        "probe.gowitness", "probe.httpx", "probe.naabu_infra", "probe.naabu_web", "probe.nmap_service",
+        "probe.tlsx_certs", "vertical.puredns_brute", "vertical.puredns_resolve",
+        "vertical.wildcard_http")},
+}
+OWNERSHIP_KINDS = ("quarry_provider", "external_tool", "target_facing", "local")
 
 
 @dataclass(frozen=True)
