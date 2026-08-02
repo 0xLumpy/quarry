@@ -729,7 +729,7 @@ def osint(profile_path, timeout):
 @click.option("--phases", help="comma list (default: all). e.g. horizontal,vertical")
 @click.option("--passive", is_flag=True, help="force passive-only (override profile)")
 @click.option("--timeout", default=1800, type=click.IntRange(min=0),
-              help="per-tool OUTER timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests; NEGATIVE is rejected, as it would collapse every tool to an instant timeout). subfinder is separate: it self-bounds via its own -max-time budget per apex (PERFORMANCE.SUBFINDER_MAX_TIME minutes, default 60; 0 or --timeout 0 -> practically unbounded), NOT this flag")
+              help="per-tool OUTER timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests; NEGATIVE is rejected, as it would collapse every tool to an instant timeout). subfinder is separate: it self-bounds via its own -max-time COLLECTION budget per apex (PERFORMANCE.SUBFINDER_MAX_TIME minutes, default 60; only that knob unbinds it, 0 -> practically unbounded 1440m). This flag does NOT change it: --timeout 0 removes the outer kill and leaves the collection budget exactly as configured")
 @click.option("--unbound", is_flag=True,
               help="sweep EVERY eligible wildcard zone in this one run (the per-run zone allowance, "
                    "PERFORMANCE.WILDCARD_ZONES_PER_RUN, becomes 0 for this process). The per-zone spend "

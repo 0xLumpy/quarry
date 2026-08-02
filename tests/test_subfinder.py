@@ -195,3 +195,29 @@ class TestSubfinderProviderFP:
         monkeypatch.setenv("PDCP_API_KEY", "SUPER-SECRET-KEY")
         fp = vertical._subfinder_provider_fp()
         assert "SUPER-SECRET-KEY" not in fp and len(fp) >= 32   # >= 128 bit, raw key never present
+
+
+class TestTheOperatorFacingContractMatchesTheCode:
+    """A help string that promises the old coupling is a defect: an operator reading it asks for
+    `--timeout 0` and gets the default 60-minute collection budget instead of an unbounded one."""
+
+    def _help(self):
+        from click.testing import CliRunner
+        from quarry_recon import cli as cli_mod
+        res = CliRunner().invoke(cli_mod.cli, ["run", "--help"])
+        assert res.exit_code == 0, res.output
+        return " ".join(res.output.split())
+
+    def test_the_HELP_does_not_promise_that_timeout_zero_unbinds_subfinder(self):
+        text = self._help()
+        assert "0 or --timeout 0 -> practically unbounded" not in text, text
+        assert "only that knob unbinds it" in text, text
+        assert "removes the outer kill and leaves the collection budget exactly as configured" in text, text
+
+    def test_the_SOURCE_CONTRACT_says_the_same_thing(self):
+        from importlib import resources
+        doc = resources.files("quarry_recon").joinpath("data/sources.yaml").read_text(encoding="utf-8")
+        line = next(ln for ln in doc.splitlines() if "SUBFINDER_MAX_TIME" in ln)
+        assert "0 or --timeout 0" not in line, line
+        assert "only that knob unbinds it" in line, line
+        assert "removes the KILL only and never the collection budget" in line, line

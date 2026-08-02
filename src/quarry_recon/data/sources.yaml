@@ -73,7 +73,7 @@ sources:
 
   # ── vertical ────────────────────────────────────────────────────────────────────────
   vertical.subfinder:        {tool: subfinder, phase: vertical, tier: core, class: passive, default: on,
-    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: "per-apex: -max-time = PERFORMANCE.SUBFINDER_MAX_TIME min (default 60; 0 or --timeout 0 -> ~unbounded 1440m) + outer backstop budget+60s (0 when --timeout 0); NOT --timeout otherwise",
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: "per-apex: -max-time = PERFORMANCE.SUBFINDER_MAX_TIME min (default 60; only that knob unbinds it, 0 -> ~unbounded 1440m) + outer backstop budget+60s (0 when --timeout 0, which removes the KILL only and never the collection budget)",
     failure: quiet-warn, fallback: skip, parser: normalize.hosts, log: delta,
     notes: "run ONCE PER APEX (subfinder's -max-time is per-domain); reaching the effective budget -> PARTIAL (capped, results kept), natural finish -> SUCCESS. -all sources; effective config (both files, env+XDG) + PDCP key + effective budget fingerprinted into the resume work_unit"}
   vertical.github_subs:      {tool: github-subdomains, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (GitHub PAT)",
