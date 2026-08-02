@@ -112,27 +112,56 @@ def strict_int(key: str, *, default: int, maximum: int) -> int:
     return strict_int_with_source(key, default=default, maximum=maximum)[0]
 
 
-def _diagnostic(raw) -> str:
+def _diagnostic(raw, *, maximum: int | None = None) -> str:
     """A BOUNDED, non-disclosing description of a value the parser refused.
 
     A rejected value is diagnostic text that reaches the console and `manifest.json`, so it may not be an
-    unrestricted echo of whatever the config held: a knob whose value is a pasted token would publish it.
-    Numbers describe themselves (`5000` is exactly what an operator needs to see for an oversized bound);
-    any other text is described by TYPE AND SIZE only, never by content, and passed through the
-    configured-credential redactor as a second line of defence."""
+    unrestricted echo of whatever the config held. Numbers are not exempt: a credential of digits echoes
+    as an int, and truncating a numeric STRING before redacting it defeats the redactor, which matches the
+    whole secret. So the complete representation is redacted FIRST, and a number is only shown when it is
+    short enough to be a bound rather than a secret — otherwise it is described by DIGIT COUNT and how it
+    missed the range, which is what an operator actually needs to find the typo."""
     from . import secrets
-    if isinstance(raw, bool) or isinstance(raw, (int, float)):
+    if isinstance(raw, bool):
         return repr(raw)
-    if isinstance(raw, str):
+    numeric = None
+    if isinstance(raw, (int, float)):
+        text, quoted = repr(raw), False
+        numeric = raw
+    elif isinstance(raw, str):
         stripped = raw.strip()
-        if stripped and (stripped.isdigit() or (stripped[:1] == "-" and stripped[1:].isdigit())):
-            return secrets.redact(repr(stripped[:24])) or "str"
-        return f"str({len(raw)} chars)"                 # never the CONTENT of an opaque value
-    if isinstance(raw, (list, tuple, set)):
+        body = stripped[1:] if stripped[:1] == "-" else stripped
+        if body.isdigit():
+            text, quoted = stripped, True
+            numeric = int(stripped)
+        else:
+            return f"str({len(raw)} chars)"             # never the CONTENT of an opaque value
+    elif isinstance(raw, (list, tuple, set)):
         return f"{type(raw).__name__}({len(raw)} item(s))"
-    if isinstance(raw, dict):
+    elif isinstance(raw, dict):
         return f"dict({len(raw)} key(s))"
-    return type(raw).__name__
+    else:
+        return type(raw).__name__
+    digits = sum(c.isdigit() for c in text)
+    kind = "str" if quoted else type(raw).__name__
+    # the WHOLE representation goes through the redactor before anything is shortened
+    if (secrets.redact(text) or text) != text or digits > _DIAGNOSTIC_DIGITS:
+        return f"{kind}({digits} digits; {_range_note(numeric, maximum)})"
+    return f"'{text}'" if quoted else text
+
+
+#: how many digits a rejected number may show before it is described instead. A bound an operator typed
+#: wrong is short (1440, 5000, 100000); a credential is not.
+_DIAGNOSTIC_DIGITS = 6
+
+
+def _range_note(value, maximum: int | None) -> str:
+    """How a refused number missed the accepted range — the fact, never the value."""
+    if value is not None and value < 0:
+        return "below zero"
+    if maximum is not None and value is not None and value > maximum:
+        return f"above maximum {maximum}"
+    return "outside the accepted range"
 
 
 def strict_int_with_source(key: str, *, default: int,
@@ -157,7 +186,7 @@ def strict_int_with_source(key: str, *, default: int,
         v = int(raw.strip())
         value = v if 0 <= v <= maximum else None
     if value is None:
-        return default, "default", _diagnostic(raw), written    # written, refused, and SAID so
+        return default, "default", _diagnostic(raw, maximum=maximum), written   # refused, and SAID so
     return value, written, None, None
 
 

@@ -450,11 +450,51 @@ class TestARejectedValueIsNeverDISCLOSED:
         assert stored == [{"name": "X", "held_reason": "held because *** said so"}], stored
 
     @pytest.mark.parametrize("raw,expect", [
-        (5000, "5000"), (-1, "-1"), (True, "True"), (60.5, "60.5"),        # numbers describe themselves
-        ("  42  ", "'42'"), ("-7", "'-7'"),                                 # numeric strings are safe
+        (5000, "5000"), (-1, "-1"), (True, "True"), (60.5, "60.5"),        # SHORT numbers describe themselves
+        ("  42  ", "'42'"), ("-7", "'-7'"),                                 # numeric strings, same rule
+        (10 ** 40, "int(41 digits; above maximum 1440)"),                   # a long number is DESCRIBED
+        ("1" * 30, "str(30 digits; above maximum 1440)"),                    # ...in either form
+        (-10 ** 12, "int(13 digits; below zero)"),
         ("garbage", "str(7 chars)"), ("", "str(0 chars)"),                  # opaque text: size only
         (["a", "b"], "list(2 item(s))"), ({"k": "v"}, "dict(1 key(s))"), (None, "NoneType"),
     ])
     def test_the_diagnostic_is_bounded_by_TYPE(self, raw, expect):
         from quarry_recon import settings
-        assert settings._diagnostic(raw) == expect
+        assert settings._diagnostic(raw, maximum=1440) == expect
+
+    @pytest.mark.parametrize("value,maximum,expect", [
+        (-1, 1440, "below zero"), (5000, 1440, "above maximum 1440"),
+        (999, None, "outside the accepted range"),          # no range to name: still no VALUE named
+    ])
+    def test_the_range_note_states_the_MISS_not_the_value(self, value, maximum, expect):
+        from quarry_recon import settings
+        note = settings._range_note(value, maximum)
+        assert note == expect and str(value) not in note.replace(str(maximum or ""), ""), note
+
+    @pytest.mark.parametrize("as_int", [False, True])
+    def test_a_NUMERIC_credential_never_reaches_the_diagnostic(self, as_int, monkeypatch, tmp_path):
+        """A credential of digits is the case both earlier attempts missed: an int bypassed the redactor
+        entirely, and a numeric STRING was truncated to 24 characters BEFORE redaction — which defeats a
+        redactor that matches the whole secret. Not one digit of it may survive, in either form."""
+        from quarry_recon import events, policy, secrets, settings, store
+        digits = "9081726354" * 4                       # a 40-digit credential
+        monkeypatch.setattr(secrets, "values", lambda: [digits])
+        monkeypatch.setattr(settings, "performance",
+                            lambda: {"SUBFINDER_MAX_TIME": int(digits) if as_int else digits})
+        rows = policy.snapshot()
+        rendered = "\n".join(policy.render(rows))
+        row = {r["name"]: r for r in rows}["SUBFINDER_MAX_TIME"]
+        assert row["value"] == 60 and row["source"] == "default", row
+        assert row["rejected"] == f"{'int' if as_int else 'str'}(40 digits; above maximum 1440)", row
+        for probe in (digits, digits[:24], digits[:12]):
+            assert probe not in rendered and probe not in json.dumps(rows), (probe, rendered)
+
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        try:
+            events.emit("policy", "run", bounds=rows)
+            run.write_manifest(profile_summary={}, phases_run=["vertical"], policy=rows)
+            sinks = (run.dir / "events.jsonl").read_text() + run.manifest_path.read_text()
+        finally:
+            events.reset()
+        assert digits[:12] not in sinks, sinks
