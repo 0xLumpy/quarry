@@ -213,12 +213,28 @@ class TestTheRegistryTellsTheTruth:
         missing, so the "no paid lane in the registry" guarantee was weaker than it read."""
         from quarry_recon import sources
         known = set(sources.all_sources())
-        unknown = [lane for lane in policy.PROVIDER_LANES
-                   if lane not in known and not lane.startswith("osint.")]
-        assert not unknown, unknown          # `osint.whoxy` runs outside the source registry (direct HTTP)
-        # every KEYED source that reaches an external provider is accounted for
-        keyed = {k for k, v in sources.all_sources().items() if str(v.get("default")) == "key"}
-        assert keyed - set(policy.PROVIDER_LANES) <= {"params.blind_xss"}, keyed
+        outside = set(policy.PROVIDER_LANES_OUTSIDE_REGISTRY)
+        assert outside == {"osint.whoxy"}, outside      # EXACT, so `osint.typo` cannot slip through
+        unknown = [lane for lane in policy.PROVIDER_LANES if lane not in known and lane not in outside]
+        assert not unknown, unknown
+
+    def test_the_boundary_is_OWNERSHIP_not_keyed_ness(self):
+        """Quarry owns the call, the key or the budget -> ours. An external tool reading its OWN provider
+        configuration (`subfinder -all`) is outside Quarry's accounting model, and a `key` default can mean
+        local dataset SETUP rather than a provider at all."""
+        from quarry_recon import sources
+        reg = sources.all_sources()
+        # `key` is not the test: openintel is key-defaulted for a LOCAL DB and is not an acquisition lane
+        assert str(reg["vertical.openintel"].get("reason", "")).startswith("setup (local DB")
+        assert "vertical.openintel" not in policy.PROVIDER_LANES
+        # ...and a keyed lane whose key WE supply to reach a provider is
+        for lane in ("vertical.shosubgo", "vertical.github_subs"):
+            assert str(reg[lane].get("default")) == "key" and lane in policy.PROVIDER_LANES, lane
+        # every lane Quarry itself calls a provider from is listed
+        for lane in ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.censys"):
+            assert lane in policy.PROVIDER_LANES, lane
+        # aggregators that read their own config are NOT ours to police
+        assert "vertical.subfinder" not in policy.PROVIDER_LANES
 
     def test_RESOURCE_rate_parser_and_engagement_stay_OUT(self):
         """They are exclusions, not entries: lifting them buys coverage nothing and risks the host, the

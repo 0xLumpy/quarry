@@ -54,13 +54,23 @@ EXCLUSION_KINDS = (
 #: `probe.shodan_host`, whose endpoint is MEASURED FREE (`/shodan/host/{ip}`, zero-balance delta 0,
 #: 2026-07-30). Being free is not why it is out; ownership is.
 #:
-#: Every name is a REGISTERED source id (test-enforced): the first cut carried `probe.shodan_search`,
-#: which does not exist, while omitting `probe.favicon` and `probe.cert` — the two lanes that actually
-#: spend Shodan query credits. A phantom name protects nothing, and a missing one protects nothing either.
-#: `osint.whoxy` is the reverse-whois path in `osint.py`; it runs outside `run_contract`/`run_provider`
-#: (direct HTTP), which is why any future acquisition gate cannot live in one execution path alone.
-PROVIDER_LANES = ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.shosubgo",
-                  "vertical.censys", "vertical.github_subs", "vertical.openintel", "osint.whoxy")
+#: The line is OWNERSHIP, not keyed-ness (Lumpy, 2026-08-02): a lane belongs here when QUARRY owns the
+#: provider call, the key or the budget. A lane whose external tool reads its OWN provider configuration —
+#: `subfinder -all` calling whatever the operator configured in subfinder's own config — is outside
+#: Quarry's accounting and authorisation model, and Quarry neither parses nor polices it.
+#:
+#: So: our own HTTP to a provider (`probe.favicon` / `probe.cert` / `probe.shodan_host` and their credit
+#: coordinator, `vertical.censys`, `osint.whoxy`), and tools we hand a key to and enable ourselves
+#: (`vertical.shosubgo`, `vertical.github_subs`). NOT `vertical.openintel`, which is `key`-defaulted for
+#: local dataset SETUP and queries a local DB.
+#:
+#: Every name is a REGISTERED source id (test-enforced) except `osint.whoxy`, which runs in `osint.py` over
+#: plain HTTP outside the source registry — which is also why an acquisition gate cannot live in one
+#: execution path: `run_providers`, `run_contract` and direct HTTP are three different doors.
+PROVIDER_LANES = ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.censys",
+                  "vertical.shosubgo", "vertical.github_subs", "osint.whoxy")
+#: ...and the ids above that are NOT in the source registry, listed exactly rather than by prefix.
+PROVIDER_LANES_OUTSIDE_REGISTRY = ("osint.whoxy",)
 
 
 @dataclass(frozen=True)
