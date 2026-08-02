@@ -207,6 +207,19 @@ class TestTheRegistryTellsTheTruth:
         assert "ownership" in policy.EXCLUDED["SHODAN_HOST_BUDGET_S"][1]
         assert "spends" not in policy.EXCLUDED["SHODAN_HOST_BUDGET_S"][1]
 
+    def test_every_PROVIDER_LANE_is_a_real_source_id(self):
+        """A phantom lane protects nothing. `probe.shodan_search` was listed and does not exist, while
+        `probe.favicon` and `probe.cert` — the two lanes that actually spend Shodan query credits — were
+        missing, so the "no paid lane in the registry" guarantee was weaker than it read."""
+        from quarry_recon import sources
+        known = set(sources.all_sources())
+        unknown = [lane for lane in policy.PROVIDER_LANES
+                   if lane not in known and not lane.startswith("osint.")]
+        assert not unknown, unknown          # `osint.whoxy` runs outside the source registry (direct HTTP)
+        # every KEYED source that reaches an external provider is accounted for
+        keyed = {k for k, v in sources.all_sources().items() if str(v.get("default")) == "key"}
+        assert keyed - set(policy.PROVIDER_LANES) <= {"params.blind_xss"}, keyed
+
     def test_RESOURCE_rate_parser_and_engagement_stay_OUT(self):
         """They are exclusions, not entries: lifting them buys coverage nothing and risks the host, the
         target, or an engagement decision that is not a machine-wide flag's to make."""

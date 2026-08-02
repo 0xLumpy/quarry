@@ -53,8 +53,14 @@ EXCLUSION_KINDS = (
 #: balance, reserve and page policy. Nothing here may ever enter the registry (test-enforced) — including
 #: `probe.shodan_host`, whose endpoint is MEASURED FREE (`/shodan/host/{ip}`, zero-balance delta 0,
 #: 2026-07-30). Being free is not why it is out; ownership is.
-PROVIDER_LANES = ("probe.shodan_host", "probe.shodan_search", "vertical.shosubgo", "horizontal.whoxy",
-                  "horizontal.censys", "vertical.chaos", "horizontal.securitytrails")
+#:
+#: Every name is a REGISTERED source id (test-enforced): the first cut carried `probe.shodan_search`,
+#: which does not exist, while omitting `probe.favicon` and `probe.cert` — the two lanes that actually
+#: spend Shodan query credits. A phantom name protects nothing, and a missing one protects nothing either.
+#: `osint.whoxy` is the reverse-whois path in `osint.py`; it runs outside `run_contract`/`run_provider`
+#: (direct HTTP), which is why any future acquisition gate cannot live in one execution path alone.
+PROVIDER_LANES = ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.shosubgo",
+                  "vertical.censys", "vertical.github_subs", "vertical.openintel", "osint.whoxy")
 
 
 @dataclass(frozen=True)
