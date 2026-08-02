@@ -3470,21 +3470,48 @@ class TestTheDifferRotatesOverZonesAndWords:
 
     def test_the_ALLOWANCE_is_not_part_of_the_work_unit(self, tmp_path, monkeypatch):
         """Flag-axis review: `WILDCARD_ZONES_PER_RUN` only limits how many zones THIS lifecycle admits.
-        The rotation is durable and continues across a change, so changing the allowance must NOT
+        The rotation is durable and CONTINUES across a change, so changing the allowance must not
         re-identify the source — an identity that moves with a per-run throughput knob costs replay dedup
-        and buys nothing."""
-        from quarry_recon import settings
+        and buys nothing.
+
+        Driven through ONE project, so the same ledger is exercised: separate project dirs would create
+        independent rotations and prove only that a digest is stable."""
+        from quarry_recon import settings, store, sweep
         zones = tuple(f"z{i}.acme.com" for i in range(8))
+        run = store.Run.create(tmp_path, "t")
+        ledger = (Path(run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}"
+                  / "wc_enrich_wildcard_a1d.json")
+
+        def _slots():
+            doc = json.loads(ledger.read_text())
+            return doc["gen"], {(tgt, s) for tgt, rec in doc["targets"].items()
+                                for s in (rec.get("slots") or {})}
+
         try:
-            _k1, life1 = self._differ(tmp_path / "a", monkeypatch, zones=zones, words=("api",), rows=[])
+            first = self._zones_contacted(tmp_path, monkeypatch, run=run, zones=zones)
+            gen1, slots1 = _slots()
             settings.override("WILDCARD_ZONES_PER_RUN", 2)
-            _k2, life2 = self._differ(tmp_path / "b", monkeypatch, zones=zones, words=("api",), rows=[])
+            second = self._zones_contacted(tmp_path, monkeypatch, run=run, zones=zones)
+            gen2, slots2 = _slots()
             settings.override("WILDCARD_ZONES_PER_RUN", 0)
-            _k3, life3 = self._differ(tmp_path / "c", monkeypatch, zones=zones, words=("api",), rows=[])
+            third = self._zones_contacted(tmp_path, monkeypatch, run=run, zones=zones)
+            gen3, slots3 = _slots()
         finally:
             settings.clear_overrides()
-        assert life1[0]["work_unit"] == life2[0]["work_unit"] == life3[0]["work_unit"], (
-            life1[0], life2[0], life3[0])
+
+        starts = [e for e in self._events if e.get("event") == "tool_start"
+                  and e.get("source_id") == "enrich.wildcard_a1d"]
+        assert len(starts) == 3, starts
+        assert len({e["work_unit"] for e in starts}) == 1, starts     # ONE identity across 5 -> 2 -> 0
+
+        # ...and the SAME ledger advanced, keeping every record it already held
+        assert gen1 < gen2 < gen3, (gen1, gen2, gen3)
+        assert slots1 and slots1 <= slots2 <= slots3, (slots1, slots2, slots3)
+        # the allowance changed the SIZE of each lifecycle, never where the rotation stood
+        assert len(first) == 5 and len(second) == 2, (first, second)
+        assert not set(second) & set(first), (first, second)          # it CONTINUED, never restarted
+        assert set(first) | set(second) | set(third) == set(zones), (first, second, third)
+        assert set(zones) - set(first) - set(second) <= set(third), (first, second, third)
 
     def test_a_CHANGED_SPEND_re_identifies_the_work_but_keeps_the_LEDGER(self, tmp_path, monkeypatch):
         """The other half: `word_spend` changes `alloc_cap`, so it changes slot boundaries, invocation
