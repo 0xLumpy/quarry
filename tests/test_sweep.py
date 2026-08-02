@@ -2301,3 +2301,59 @@ class TestThePreflightCallbacksAreContained:
                                            slot_grammar=sweep.slot_id_ok)
         for word in ("alpha", "bravo"):
             assert reopened.tier("a.com", sweep.bucket_of(word), sweep.content_digest([word])) == 2
+
+    def test_MIXED_target_dispositions_are_kept_apart(self, tmp_path, monkeypatch):
+        """Pair totals cannot partition target totals. A guard refusal and a machinery stop hold DIFFERENT
+        targets, and inferring either from the pair partition made one class swallow the other."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        asked: list = []
+
+        def admit(target):
+            asked.append(target)
+            return len(asked) != 1                    # refuse whichever target is asked FIRST
+
+        class _Break(_Tool):
+            def __call__(self, target, bucket, words):
+                if asked and target != asked[0]:      # ...and the next one contacted explodes
+                    raise OSError("the tool exploded")
+                return super().__call__(target, bucket, words)
+
+        out = sweep.run_sweep(lane=LANE, state_dir=tmp_path, targets=["a.com", "b.com", "c.com"],
+                              vocabulary=lambda t: ["alpha", "bravo"], execute=_Break(),
+                              budget_s=0, coverage_lane=COV, admit=admit)
+        assert out.stop_kind == "machinery" and out.targets_refused == 1, out
+        assert out.remaining_cooldown == 1, out.remaining_cooldown          # the REFUSED target
+        assert out.remaining_terminal == {"machinery": 2}, out.remaining_terminal
+        assert out.remaining_now == 0, out.remaining_now
+        # the partition is exactly the durable remainder — nothing double-counted, nothing lost
+        assert (out.remaining_now + out.remaining_cooldown
+                + sum(out.remaining_terminal.values())) == out.targets_remaining == 3, out
+
+    def test_a_COMPLETED_target_owes_nothing_in_the_partition(self, tmp_path, monkeypatch):
+        """The partition counts what is OWED, so a target whose rotation finished must leave it — otherwise
+        every clean lane would keep reporting work a later child cannot find."""
+        out, _tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha"])
+        assert out.targets_complete == 2 and out.targets_remaining == 0, out
+        assert (out.remaining_now, out.remaining_cooldown, out.remaining_terminal) == (0, 0, {}), out
+
+    def test_a_REFUSED_target_is_never_claimed_by_the_stop(self, tmp_path, monkeypatch):
+        """The specific collapse: a machinery stop taking every owed target, including one the guard has
+        already put on a cooldown."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)
+        asked: list = []
+
+        def admit(target):
+            asked.append(target)
+            return len(asked) != 1
+
+        class _Break(_Tool):
+            def __call__(self, target, bucket, words):
+                if asked and target != asked[0]:
+                    raise OSError("the tool exploded")
+                return super().__call__(target, bucket, words)
+
+        out = sweep.run_sweep(lane=LANE, state_dir=tmp_path, targets=["a.com", "b.com"],
+                              vocabulary=lambda t: ["alpha"], execute=_Break(),
+                              budget_s=0, coverage_lane=COV, admit=admit)
+        assert out.remaining_cooldown == 1 and out.remaining_terminal.get("machinery") == 1, out
+        assert out.remaining_now == 0, out

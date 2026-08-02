@@ -68,26 +68,27 @@ class TestTheSweepMapsOntoDispositions:
         a deferred-but-since-finished target stayed counted. After the pinned eight-zone trace the rotation
         owes nothing, and the remainder must say so however many pairs this run left behind."""
         finished = _swept(eligible_pairs=16, attempted_pairs=10, deferred_pairs=6,
-                          targets_eligible=8, targets_complete=8, targets_remaining=0)
+                          targets_eligible=8, targets_complete=8, targets_remaining=0,
+                          remaining_now=0)
         rec = remainder.from_sweep("vertical.wildcard_http", finished)
         assert (rec.now, rec.cooldown, rec.terminal) == (0, 0, {}), rec.as_record()
         assert rec.detail["candidate_pairs"]["deferred"] == 6, rec.detail     # kept, never summed
         owing = _swept(eligible_pairs=16, attempted_pairs=10, deferred_pairs=6,
-                       targets_eligible=8, targets_complete=5, targets_remaining=3)
+                       targets_eligible=8, targets_complete=5, targets_remaining=3, remaining_now=3)
         assert remainder.from_sweep("vertical.wildcard_http", owing).now == 3
 
     def test_a_REFUSAL_is_retriable_with_a_COOLDOWN(self):
         """`budget.ADMISSION_COOLDOWN_GENS` asks a refused target again — a transient refusal must not
         become a permanent exclusion, so it is not terminal."""
         out = _swept(eligible_pairs=5, attempted_pairs=0, refused_pairs=5, targets_eligible=2,
-                     targets_remaining=2, targets_refused=2)
+                     targets_remaining=2, targets_refused=2, remaining_cooldown=2)
         rec = remainder.from_sweep("vertical.wildcard_http", out)
         assert (rec.now, rec.cooldown) == (0, 2), rec.as_record()
         assert rec.terminal == {}, rec.terminal
 
     def test_only_UNSCHEDULABLE_work_left_is_terminal(self):
         out = _swept(eligible_pairs=5, attempted_pairs=3, unselectable_pairs=2, targets_eligible=2,
-                     targets_remaining=1)
+                     targets_remaining=1, remaining_terminal={"unschedulable": 1})
         rec = remainder.from_sweep("vertical.wildcard_http", out)
         assert rec.terminal == {"unschedulable": 1}, rec.terminal
         assert (rec.now, rec.cooldown) == (0, 0), rec.as_record()
@@ -95,21 +96,21 @@ class TestTheSweepMapsOntoDispositions:
     @pytest.mark.parametrize("kind", ["machinery", "dependency"])
     def test_a_MACHINERY_or_DEPENDENCY_stop_is_terminal(self, kind):
         out = _swept(eligible_pairs=10, attempted_pairs=6, stop_kind=kind, stop="x",
-                     targets_eligible=3, targets_remaining=2)
+                     targets_eligible=3, targets_remaining=2, remaining_terminal={kind: 2})
         rec = remainder.from_sweep("enrich.a1d_brute", out)
         assert rec.terminal == {kind: 2} and rec.now == 0, rec.as_record()
 
     def test_a_CLOCK_stop_is_retriable(self):
         """A budget stopped this child; the next one simply continues."""
         out = _swept(eligible_pairs=10, attempted_pairs=6, stop_kind="budget", stop="budget exhausted",
-                     targets_eligible=3, targets_remaining=2)
+                     targets_eligible=3, targets_remaining=2, remaining_now=2)
         rec = remainder.from_sweep("enrich.a1d_brute", out)
         assert (rec.now, rec.terminal) == (2, {}), rec.as_record()
 
     def test_the_measure_and_unit_are_STATED(self):
         rec = remainder.from_sweep("vertical.wildcard_http",
                                    _swept(eligible_pairs=1, attempted_pairs=0, targets_eligible=1,
-                                          targets_remaining=1))
+                                          targets_remaining=1, remaining_now=1))
         record = rec.as_record()
         assert record["measure"] == "targets"
         assert record["unit"] == "vertical.wildcard_http:targets"
@@ -146,12 +147,12 @@ class TestTheManifestCarriesIt:
             remainder.emit(remainder.from_sweep("vertical.wildcard_http",
                                                 _swept(eligible_pairs=10, attempted_pairs=3,
                                                        bound_pairs=7, targets_eligible=4,
-                                                       targets_remaining=3)))
+                                                       targets_remaining=3, remaining_now=3)))
             time.sleep(0.005)                              # a DIFFERENT timestamp, same unit
             remainder.emit(remainder.from_sweep("vertical.wildcard_http",      # a later, smaller remainder
                                                 _swept(eligible_pairs=10, attempted_pairs=9,
                                                        bound_pairs=1, targets_eligible=4,
-                                                       targets_remaining=1)))
+                                                       targets_remaining=1, remaining_now=1)))
             run.write_manifest(profile_summary={}, phases_run=["vertical"])
         finally:
             events.reset()

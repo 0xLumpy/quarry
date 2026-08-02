@@ -106,29 +106,21 @@ def from_sweep(lane: str, swept, *, measure: str = "targets") -> Remainder:
     three zones owed when the rotation had covered all eight. `targets_remaining` is the cumulative,
     durability-aware answer (`68195e8`), so that is what says whether repetition would advance anything.
 
-    The pair dispositions are kept as DETAIL, in their own measure, never summed with the target counts:
-
-        refused        the contact guard said no; the rotation asks again after its cooldown
-        unselectable   no bound can ever admit these: TERMINAL when they are all that is left
-        machinery /    what a stop left behind, when the stop was one repetition does not fix
-        dependency
+    The DISPOSITIONS come from the sweep at TARGET level too (`remaining_now` / `remaining_cooldown` /
+    `remaining_terminal`), because pair totals cannot partition target totals: one owed target can be a
+    guard refusal while another holds only work no bound can admit, and translating pair counts into target
+    counts collapsed both into whichever class was checked first. The pair partition is kept as DETAIL, in
+    its own measure, never summed with the target counts.
     """
     parts = swept.pair_remainder()
-    owed = max(0, int(getattr(swept, "targets_remaining", 0)))
-    refused = min(owed, max(0, int(getattr(swept, "targets_refused", 0))))
-    terminal: dict = {}
-    kind = getattr(swept, "stop_kind", None)
-    if owed and kind in ("machinery", "dependency") and int(parts.get("stopped", 0)):
-        terminal[kind] = owed                       # this run ended on something repetition does not fix
-    elif owed and int(parts.get("unselectable", 0)) and not (int(parts.get("bound", 0))
-                                                             + int(parts.get("deferred", 0))
-                                                             + int(parts.get("stopped", 0))):
-        terminal["unschedulable"] = owed            # nothing but work no bound can admit is left
-    now = 0 if terminal else max(0, owed - refused)
+    terminal = {c: int(n) for c, n in (getattr(swept, "remaining_terminal", {}) or {}).items() if n}
     return Remainder(lane=lane, unit=f"{lane}:{measure}", measure=measure,
                      model=LANE_MODEL.get(lane, "project_progress"),
-                     now=now, cooldown=0 if terminal else refused, terminal=terminal,
-                     detail={"candidate_pairs": {k: int(v) for k, v in parts.items()}})
+                     now=max(0, int(getattr(swept, "remaining_now", 0))),
+                     cooldown=max(0, int(getattr(swept, "remaining_cooldown", 0))),
+                     terminal=terminal,
+                     detail={"candidate_pairs": {k: int(v) for k, v in parts.items()},
+                             "targets_remaining": int(getattr(swept, "targets_remaining", 0))})
 
 
 def for_rounds(lane: str, *, stop: str, rounds: int, ran: int, made: bool) -> Remainder:

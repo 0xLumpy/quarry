@@ -201,6 +201,11 @@ class SweepResult:
     #: continuation hint needs "what is still owed", which only the ledger knows (step 4).
     targets_complete: int = 0
     targets_remaining: int = 0
+    #: the DURABLE remainder, split by what actually holds each owed target — pair totals cannot partition
+    #: target totals, and one owed target can be a guard refusal while another is unschedulable.
+    remaining_now: int = 0                  # a later child would attempt it
+    remaining_cooldown: int = 0             # ...once its admission cooldown expires
+    remaining_terminal: dict = field(default_factory=dict)   # {cause: targets}
     targets_admitted: int = 0               # ...that the per-run allowance let this lifecycle start
     targets_refused: int = 0                # ...that the caller's admission check turned away
     #: admission answers whose save was interrupted: on disk or not, we cannot say (v83#1).
@@ -411,6 +416,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     # ── BEFORE the lock: the workload is a pure function of the corpus and the targets, so a CONTENDER can
     #    still report an exact denominator instead of a gap with no arithmetic (design v8#2). ──
     members: dict = {}
+    unselectable_slots: set = set()        # (target, slot) no bound can ever admit — a TERMINAL fact
     seen_pairs: set = set()
     corpus: dict = {}
     try:
@@ -488,6 +494,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                                          "bound": alloc_cap})
             out.unselectable_slots += len(over)
             out.unselectable_pairs += sum(len(group) for group in over.values())
+            unselectable_slots.update((target, slot) for slot in over)
             partition = {slot: group for slot, group in partition.items() if slot not in over}
         for slot, group in partition.items():
             members[(target, slot)] = group
@@ -841,6 +848,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         for slot in slots:
             by_target.setdefault(slot[0], []).append(slot)
         done_targets = 0
+        complete_targets: set = set()
         for tgt, group in by_target.items():
             if tgt in out.pending_targets or tgt in out.unstaged_targets:
                 # v-review: `progress` holds `done` tuples that are staged in MEMORY. When the save that
@@ -851,10 +859,38 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             try:
                 if all(progress.tier(tgt, s, content[(tgt, s)]) == 2 for _t, s in group):
                     done_targets += 1
+                    complete_targets.add(tgt)
             except BaseException:                  # the ledger is best effort: a hint is never a stop
                 break
         out.targets_complete = done_targets
         out.targets_remaining = max(0, out.targets_eligible - done_targets)
+
+        # ...and WHAT holds each owed target, at TARGET level. Inferring this from the pair partition
+        # collapsed mixed dispositions into one class — a refused target beside an unschedulable one
+        # reported both as unschedulable, and a machinery stop claimed every owed target as its own.
+        #
+        # The universe is the CORPUS, not the slot map: an unselectable slot was removed at allocation, so
+        # a target whose only work no bound can admit holds no slots here at all — which is the signal.
+        blocked_targets = {tgt for tgt, _slot in unselectable_slots}
+        cooldown, blocked, live = [], [], []
+        for tgt, words in corpus.items():
+            if not words or tgt in complete_targets:
+                continue
+            if tgt in refused_targets:
+                cooldown.append(tgt)
+            elif not [s for s in by_target.get(tgt, []) if s not in submitted] and tgt in blocked_targets:
+                blocked.append(tgt)            # nothing SCHEDULABLE is left for it
+            else:
+                live.append(tgt)
+        terminal: dict = {}
+        if blocked:
+            terminal["unschedulable"] = len(blocked)
+        if live and out.stop_kind in ("machinery", "dependency"):
+            terminal[out.stop_kind] = len(live)
+            live = []
+        out.remaining_cooldown = len(cooldown)
+        out.remaining_terminal = terminal
+        out.remaining_now = len(live)
 
         # ── the STOP: what actually ended the run ───────────────────────────────────────────────
         # v60#2: an elapsed clock is not automatically the cause. It only stopped work if selectable
