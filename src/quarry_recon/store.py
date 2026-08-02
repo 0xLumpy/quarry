@@ -561,7 +561,10 @@ class Run:
         if not key:
             return False
         records = self._records_for(entity)
-        record = {k: v for k, v in dict(record).items() if k != "_alt"}
+        # `_alt` is stripped from CALLER input (`add`) because an external source could inject it. This is
+        # the TRUSTED campaign path: the alternates were produced by this store's own merge, and they are
+        # material knowledge — dropping them would hand the child less than the campaign holds.
+        record = dict(record)
         record.setdefault("first_seen", _utc())
         record["last_seen"] = _utc()
         if key not in records:

@@ -21,6 +21,7 @@ could not be read is never absorbed as if it were empty.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,22 +50,61 @@ class AbsorbResult:
         return self.absorbed and not self.unusable and bool(self.new or self.enriched)
 
 
-class Union:
-    """The campaign's cumulative entity store, at `<project>/recon/campaigns/<id>/union.jsonl`."""
+class UnionUnusable(RuntimeError):
+    """The union cannot stand in for what the campaign knows — so nothing may be built on it.
 
-    def __init__(self, path):
+    Raised rather than returned: a supervisor that got an empty corpus back would bootstrap a smaller
+    child, absorb its narrower result and call the difference a fixed point. Refusing loudly is the only
+    answer that cannot be mistaken for progress."""
+
+
+class Union:
+    """The campaign's cumulative entity store, at `<project>/recon/campaigns/<id>/union.jsonl`.
+
+    It carries the same trust model as a child's evidence, for the same reason: a deleted, truncated or
+    tampered union would quietly hand the next child LESS than the campaign knows.
+
+        new        deliberately created; empty and authoritative
+        valid      every row loaded and verified, and the content matches what `save()` recorded
+        degraded   rows were dropped, or the content no longer matches the recorded digest
+        unusable   there is no union to read, or it could not be read at all
+        unknown    a union exists but nothing says what it should contain (no metadata)
+    """
+
+    def __init__(self, path, *, create: bool = False):
         self.path = Path(path)
+        self.meta_path = self.path.with_name(self.path.name + ".meta.json")
         self.records: dict = {}          # {(kind, key): record}
-        self._load()
+        self.status = "unusable"
+        self.dropped = 0
+        self.reason = ""
+        self._load(create=create)
 
     @classmethod
-    def for_campaign(cls, project_dir, campaign_id: str) -> "Union":
-        return cls(Path(project_dir) / "recon" / "campaigns" / campaign_id / "union.jsonl")
+    def for_campaign(cls, project_dir, campaign_id: str, *, create: bool = False) -> "Union":
+        return cls(Path(project_dir) / "recon" / "campaigns" / campaign_id / "union.jsonl", create=create)
 
-    def _load(self) -> None:
+    @property
+    def trustworthy(self) -> bool:
+        return self.status in ("valid", "new")
+
+    def require(self) -> None:
+        """Refuse to be used when the union is not trustworthy."""
+        if not self.trustworthy:
+            raise UnionUnusable(f"{self.path}: {self.status} — {self.reason}")
+
+    # ── loading, with everything verified ─────────────────────────────────────────────────────────
+    def _load(self, *, create: bool) -> None:
         try:
             raw = self.path.read_bytes()
-        except OSError:
+        except FileNotFoundError:
+            # an ABSENT union is a new campaign only when someone SAID so. Otherwise it is evidence that
+            # went missing, and reading it as "nothing known yet" is exactly the false fixed point.
+            self.status, self.reason = (("new", "created") if create
+                                        else ("unusable", "no union at this path"))
+            return
+        except OSError as e:
+            self.status, self.reason = "unusable", f"{type(e).__name__}: {e}"
             return
         for chunk in raw.splitlines():
             if not chunk.strip():
@@ -72,26 +112,62 @@ class Union:
             try:
                 row = json.loads(chunk.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
-                continue                                   # one bad row costs itself, never the union
+                self.dropped += 1                          # one bad row costs itself, and is COUNTED
+                continue
             if not isinstance(row, dict):
+                self.dropped += 1
                 continue
             kind, rec = row.get("kind"), row.get("record")
-            if not isinstance(kind, str) or not isinstance(rec, dict):
+            if not isinstance(kind, str) or kind not in store.ENTITY_KEYS or not isinstance(rec, dict):
+                self.dropped += 1                          # an unregistered kind is not an entity
                 continue
             key = store.canonical_key(kind, rec)
-            if not key:
+            # the persisted id and fingerprint are CHECKED, not trusted: a row whose id does not match its
+            # record, or whose fingerprint does not match its content, describes something else
+            if not key or row.get("id") != key or row.get("fp") != store.fingerprint(kind, rec):
+                self.dropped += 1
                 continue
             self.records[(kind, key)] = rec
+        self._reconcile(raw)
+
+    def _reconcile(self, raw: bytes) -> None:
+        """Compare what was read against what `save()` recorded. A clean line-boundary truncation drops no
+        row and raises nothing — only the recorded count and digest can catch it."""
+        if self.dropped:
+            self.status = "degraded"
+            self.reason = f"{self.dropped} unusable union row(s)"
+            return
+        try:
+            meta = json.loads(self.meta_path.read_text())
+            count, digest = meta["count"], meta["digest"]
+            if type(count) is not int or not isinstance(digest, str):
+                raise ValueError("malformed union metadata")
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            self.status = "unknown"
+            self.reason = f"no usable union metadata ({type(e).__name__})"
+            return
+        actual = hashlib.sha256(raw).hexdigest()
+        if len(self.records) != count or actual != digest:
+            self.status = "degraded"
+            self.reason = (f"the union recorded {count} record(s), this file yields {len(self.records)}"
+                           if len(self.records) != count else "the union file changed since it was saved")
+            return
+        self.status, self.reason = "valid", ""
 
     def save(self) -> None:
         """Rewrite the union atomically — it is a MERGED view, not an append-only log, and a half-written
-        one would hand the next child a corpus nobody produced."""
+        one would hand the next child a corpus nobody produced. The sidecar records what was written, so a
+        later truncation cannot pass as a smaller campaign."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lines = []
         for (kind, key), rec in sorted(self.records.items()):
             lines.append(json.dumps({"kind": kind, "id": key, "record": rec,
                                      "fp": store.fingerprint(kind, rec)}, ensure_ascii=False))
-        store._atomic_write(self.path, "\n".join(lines) + ("\n" if lines else ""))
+        body = "\n".join(lines) + ("\n" if lines else "")
+        store._atomic_write(self.path, body)
+        store._atomic_write(self.meta_path, json.dumps(
+            {"count": len(self.records), "digest": hashlib.sha256(body.encode("utf-8")).hexdigest()}))
+        self.status, self.dropped, self.reason = "valid", 0, ""
 
     # ── absorbing a finished child ────────────────────────────────────────────────────────────────
     def absorb(self, run_dir, kinds=None) -> AbsorbResult:
@@ -101,6 +177,7 @@ class Union:
         log is recorded as unusable rather than folded in as an empty corpus, because the difference
         between "this child found nothing" and "we could not read what it found" is the difference between
         a fixed point and a lie."""
+        self.require()
         out = AbsorbResult()
         for kind in (kinds if kinds is not None else sorted(store.ENTITY_KEYS)):
             folded = store.fold_run_entity(run_dir, kind)
@@ -134,6 +211,7 @@ class Union:
 
         Idempotent: seeding twice adds nothing, because the merge is monotonic and the second copy is
         subsumed."""
+        self.require()
         seeded: dict = {}
         for (kind, _key), rec in sorted(self.records.items()):
             record = dict(rec)
