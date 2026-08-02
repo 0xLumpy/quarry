@@ -1,10 +1,17 @@
 """The `--unbound` REGISTRY — the free-tool volume ceilings one run may lift.
 
-`--unbound` is about USING WHAT WE ALREADY HAVE, not buying more. If Quarry holds a million eligible
-candidates, `--unbound` removes the ceilings that would leave part of them unchecked; it still chunks,
-rate-limits and schedules them. It does NOT raise paid page budgets, reduce credit reserves, enable a
-provider that was disabled, broaden scope, bypass a contact guard, remove rate / concurrency / resource
-protection, or imply `--timeout 0` (`notes/FLAG-AXIS-PLAN.md`).
+`--unbound` is about USING WHAT WE ALREADY HAVE, not obtaining more. The boundary is POLICY OWNERSHIP, not
+execution order — it holds however the phases are later reordered (Lumpy, 2026-08-02):
+
+    ACQUISITION   provider enablement, balance, reserve and page policy decide what Quarry may OBTAIN.
+    OWNERSHIP     once evidence is acquired and stored, Quarry HAS it.
+    PROCESSING    `--unbound` may process all eligible RETAINED evidence through free downstream tools
+                  without truncating it.
+
+If Shodan's own policy buys five pages and those yield 100,000 names, `--unbound` does not buy page six —
+and it does let the free downstream lanes work through all 100,000. It never raises a provider page budget,
+reduces a credit reserve, enables a disabled provider, broadens scope, bypasses a contact guard, removes
+rate / concurrency / resource protection, or implies `--timeout 0` (`notes/FLAG-AXIS-PLAN.md`).
 
 So this table is deliberately NARROW. It holds free-tool COVERAGE / THROUGHPUT bounds that participate in
 `--unbound`, plus the held exceptions that must be printed rather than silently skipped. Everything else —
@@ -40,11 +47,15 @@ EXCLUSION_KINDS = (
     "rate",         # pressure on the target or this host: the rate axis, never the volume one
     "engagement",   # chosen per engagement in target.yaml, not by a machine-wide flag
     "identity",     # slot / schema identity: versioned, never relaxed
+    "continuation", # a convergence / iteration bound: `--settle`'s business, not `--unbound`'s
     "not_a_bound",  # a sentinel, name or set that merely matches the naming convention
 )
-#: lanes whose work SPENDS. Nothing here may ever enter the registry (test-enforced).
-PAID_LANES = ("probe.shodan_host", "probe.shodan_search", "vertical.shosubgo", "horizontal.whoxy",
-              "horizontal.censys", "vertical.chaos", "horizontal.securitytrails")
+#: lanes on the ACQUISITION side: what they may obtain is decided by the provider's own enablement,
+#: balance, reserve and page policy. Nothing here may ever enter the registry (test-enforced) — including
+#: `probe.shodan_host`, whose endpoint is MEASURED FREE (`/shodan/host/{ip}`, zero-balance delta 0,
+#: 2026-07-30). Being free is not why it is out; ownership is.
+PROVIDER_LANES = ("probe.shodan_host", "probe.shodan_search", "vertical.shosubgo", "horizontal.whoxy",
+                  "horizontal.censys", "vertical.chaos", "horizontal.securitytrails")
 
 
 @dataclass(frozen=True)
@@ -60,7 +71,8 @@ class Bound:
     unbounded_value: int | None = None   # the value that MEANS unbounded for this knob
     consumer_honours_unbounded: bool = False   # ...and whether the consumer already implements it
     held_reason: str = ""           # why it is NOT lifted — PRINTED, never silent
-    const: str | None = None        # "module:NAME" for a module constant, for the drift check
+    const: str | None = None        # "module:NAME" for a constant, for the drift check
+    const_local: bool = False       # ...defined inside a function today, so it is read from the AST
     note: str = ""
 
 
@@ -117,6 +129,14 @@ BOUNDS: tuple[Bound, ...] = (
                "is a MEMBERSHIP cut (`all_names[:120]`, reported as a coverage gap) and the consumer does "
                "not yet interpret 0, so widening it belongs to the `--unbound` step"),
 
+    Bound(name="SPA_CAP", reader="module", lane="crawl.katana_headless", default=10, identity="none",
+          const="quarry_recon.phases.crawl:SPA_CAP", const_local=True,
+          persistence="nothing — the headless pass has no durable rotation to continue",
+          relaxable=True, unbounded_value=0, consumer_honours_unbounded=False,
+          note="a HIDDEN membership cut on already-retained hosts (`_spa_all[:10]`, reported as a coverage "
+               "gap): exactly the PROCESSING side. It is function-local today, so wiring it means "
+               "promoting it to a module constant AND teaching the consumer 0 — the widening step's work"),
+
     # ── the one HELD exception in v1 ─────────────────────────────────────────────────────────────
     Bound(name="A1D_WORD_CAP", reader="module", lane="enrich.a1d_brute", default=2000,
           identity="partition", const="quarry_recon.phases.enrich:A1D_WORD_CAP",
@@ -131,10 +151,16 @@ BOUNDS: tuple[Bound, ...] = (
 #: module constant, or by the bare PERFORMANCE key for a knob read through the strict parsers.
 EXCLUDED: dict[str, tuple[str, str]] = {
     # paid / external providers — enablement, balance, reserve and page policy own these
-    "SHODAN_HOST_BUDGET_S": ("provider", "the lane spends query credits; its budget belongs to the "
-                                         "provider's own spending policy, separately authorised"),
+    "SHODAN_HOST_BUDGET_S": ("provider", "an ACQUISITION-side lane: external-provider policy retains "
+                                         "ownership of what it may obtain. (The endpoint itself is "
+                                         "MEASURED FREE — that is not the reason; ownership is.)"),
+    "SHODAN_MAX_PAGES": ("provider", "the provider's own page policy — how much Quarry may OBTAIN"),
+    "SHODAN_CREDIT_RESERVE": ("provider", "the operator's credit reserve: a spending control"),
+    "WHOXY_PAGE_BUDGET": ("provider", "the provider's own per-run page policy"),
+    "WHOXY_CREDIT_RESERVE": ("provider", "the operator's credit reserve: a spending control"),
+    "PROVIDER_MAX_PAGES": ("provider", "bounded cursor pagination against an external provider"),
     "quarry_recon.phases.probe:_SHODAN_RESERVE_MAX": ("provider", "the operator's credit reserve"),
-    "quarry_recon.phases.probe:_SHODAN_BACKOFF_MAX_S": ("provider", "paid-provider retry backoff"),
+    "quarry_recon.phases.probe:_SHODAN_BACKOFF_MAX_S": ("provider", "provider retry backoff"),
     "quarry_recon.contract:_WHOXY_TOTAL_MAX_DIGITS": ("provider", "a Whoxy response sanity guard"),
     "quarry_recon.contract:_ERROR_BODY_LIMIT": ("provider", "how much of a provider error body is kept"),
 
@@ -160,10 +186,23 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.sweep:_UNSELECTABLE_DETAIL": ("resource", "a diagnostic list bound; the counters beside "
                                                             "it are authoritative"),
 
+    # continuation — how many times a convergent loop repeats. `--settle` owns repetition.
+    "quarry_recon.phases.vertical:MAX_ITERS": ("continuation", "permutation rounds in a loop that already "
+                                                               "stops when a round adds nothing new: "
+                                                               "repeating it is `--settle`'s question"),
+
     # rate / concurrency — pressure on the target or on this host
+    "ARJUN_TARGETS": ("rate", "how many arjun processes run at once (one per target, host-fair)"),
+    "DALFOX_TARGETS": ("rate", "dalfox pool size"),
+    "DALFOX_CHUNK": ("resource", "targets per dalfox invocation: one process's blast radius"),
+    "KATANA_PARALLELISM": ("rate", "katana's own parallelism"),
+    "NUCLEI_BULK_SIZE": ("rate", "nuclei requests in flight per template"),
+    "NUCLEI_CHUNK_HOSTS": ("resource", "hosts per nuclei invocation: one process's blast radius"),
     "quarry_recon.evidence:MAX_FETCHES": ("rate", "active fetches per finding: request pressure at a "
                                                   "target, which the rate axis owns"),
     "quarry_recon.evidence:_SSTI_MAX_PARAMS": ("rate", "probes per endpoint is request pressure"),
+    "quarry_recon.phases.crawl:MAX_JS": ("resource", "a 15 MB PER-ITEM guard on one downloaded file"),
+    "quarry_recon.phases.crawl:MAX_MAP": ("resource", "a 20 MB PER-ITEM guard on one source map"),
     "quarry_recon.netguard:_MAX_WORKERS": ("rate", "local concurrency"),
     "quarry_recon.settings:_CAP": ("rate", "per-tool worker caps"),
 
@@ -194,6 +233,8 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.phases.probe:SHODAN_RESERVE_INVALID": ("not_a_bound", "a stop-reason name"),
     "quarry_recon.phases.probe:_STOP_LIMITS": ("not_a_bound", "the set of stop-reason names"),
     "quarry_recon.settings:PROFILES": ("not_a_bound", "the concurrency profile names"),
+    "PROFILE": ("not_a_bound", "which concurrency profile is in force — a name, not a ceiling"),
+    "WEB_PORT_PREFILTER": ("not_a_bound", "a feature toggle for the SYN web-port prefilter"),
 }
 
 
