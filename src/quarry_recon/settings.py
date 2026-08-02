@@ -125,13 +125,21 @@ def _diagnostic(raw, *, maximum: int | None = None) -> str:
     if isinstance(raw, bool):
         return repr(raw)
     numeric = None
+    limit = _int_str_limit()
     if isinstance(raw, (int, float)):
+        if isinstance(raw, int) and _digit_count(raw) > limit:
+            # too long even to RENDER: describe it from its bit length, and never build the string
+            return f"int({_digit_count(raw)} digits; {_range_note(raw, maximum)})"
         text, quoted = repr(raw), False
         numeric = raw
     elif isinstance(raw, str):
         stripped = raw.strip()
         body = stripped[1:] if stripped[:1] == "-" else stripped
         if body.isdigit():
+            if len(body) > limit:
+                # a number this long cannot be converted, and cannot be in range either
+                return (f"str({len(body)} digits; "
+                        f"{'below zero' if stripped[:1] == '-' else _range_note(None, maximum)})")
             text, quoted = stripped, True
             numeric = int(stripped)
         else:
@@ -155,12 +163,29 @@ def _diagnostic(raw, *, maximum: int | None = None) -> str:
 _DIAGNOSTIC_DIGITS = 6
 
 
+def _int_str_limit() -> int:
+    """CPython's int<->str conversion limit (4300 by default, 3.11+). Above it, `int("9" * 5000)` and even
+    `repr(10 ** 5000)` RAISE — so a knob holding such a value could abort a run from inside the parser that
+    exists to refuse it, and now does so on every run, since the policy snapshot reads every bound."""
+    import sys
+    getter = getattr(sys, "get_int_max_str_digits", None)
+    return getter() if getter else 4300
+
+
+def _digit_count(raw: int) -> int:
+    """How many decimal digits an int has, WITHOUT converting it to a string (which is what fails)."""
+    n = abs(raw)
+    return n.bit_length() * 30103 // 100000 + 1
+
+
 def _range_note(value, maximum: int | None) -> str:
     """How a refused number missed the accepted range — the fact, never the value."""
     if value is not None and value < 0:
         return "below zero"
     if maximum is not None and value is not None and value > maximum:
         return f"above maximum {maximum}"
+    if maximum is not None and value is None:
+        return f"above maximum {maximum}"      # too long to convert IS above any maximum
     return "outside the accepted range"
 
 
@@ -181,8 +206,10 @@ def strict_int_with_source(key: str, *, default: int,
     if isinstance(raw, bool):
         value = None                                  # a bool is not an int here, ever
     elif isinstance(raw, int):
-        value = raw if 0 <= raw <= maximum else None
-    elif isinstance(raw, str) and raw.strip().isdigit():
+        value = raw if 0 <= raw <= maximum else None  # a comparison never converts, however long it is
+    elif isinstance(raw, str) and raw.strip().isdigit() and len(raw.strip()) <= _int_str_limit():
+        # the LENGTH gate comes first: `int("9" * 5000)` raises, and a parser that exists to refuse a
+        # value may not abort the run with it — every run reads every bound for the policy report.
         v = int(raw.strip())
         value = v if 0 <= v <= maximum else None
     if value is None:

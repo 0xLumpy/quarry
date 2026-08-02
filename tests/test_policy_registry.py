@@ -471,6 +471,40 @@ class TestARejectedValueIsNeverDISCLOSED:
         note = settings._range_note(value, maximum)
         assert note == expect and str(value) not in note.replace(str(maximum or ""), ""), note
 
+    # the raws are BUILT inside the test: pytest renders parametrised values into test ids, and rendering
+    # a 5000-digit int is the very conversion CPython refuses
+    @pytest.mark.parametrize("kind,expect", [
+        ("str_pos", "str(5000 digits; above maximum 1440)"),       # int("9"*5000) RAISES
+        ("str_neg", "str(5000 digits; below zero)"),
+        ("int_pos", "int(5001 digits; above maximum 1440)"),       # even repr() of this RAISES
+        ("int_neg", "int(5001 digits; below zero)"),
+    ])
+    def test_a_value_TOO_LONG_TO_CONVERT_is_still_described(self, kind, expect, monkeypatch):
+        """CPython refuses int<->str conversion above 4300 digits, so the parser that exists to REFUSE a
+        value could abort the run with it — and every run now reads every bound for the policy report. The
+        length gate comes first, and the diagnostic describes an oversized int from its BIT LENGTH rather
+        than building a string it cannot build."""
+        from quarry_recon import policy, settings
+        raw = {"str_pos": "9" * 5000, "str_neg": "-" + "9" * 5000,
+               "int_pos": 10 ** 5000, "int_neg": -(10 ** 5000)}[kind]
+        assert settings._diagnostic(raw, maximum=1440) == expect
+        monkeypatch.setattr(settings, "performance", lambda: {"SUBFINDER_MAX_TIME": raw})
+        # the consumer and the report agree, and neither raises
+        from quarry_recon.phases import vertical
+        assert vertical._subfinder_budget_min(1800) == 60
+        row = {r["name"]: r for r in policy.snapshot()}["SUBFINDER_MAX_TIME"]
+        assert (row["value"], row["source"], row["rejected"]) == (60, "default", expect), row
+        assert len(policy.render()) < 40                            # the report stays BOUNDED
+
+    def test_a_huge_value_through_a_FLAG_is_contained_too(self):
+        from quarry_recon import policy, settings
+        with settings.overrides({"WILDCARD_ZONES_PER_RUN": "9" * 9000}):
+            row = {r["name"]: r for r in policy.snapshot()}["WILDCARD_ZONES_PER_RUN"]
+            from quarry_recon.phases import vertical
+            assert vertical.wildcard_zones_per_run() == 5
+        assert row["rejected"] == "str(9000 digits; above maximum 10000)", row
+        assert row["rejected_source"] == "flag" and row["value"] == 5, row
+
     @pytest.mark.parametrize("as_int", [False, True])
     def test_a_NUMERIC_credential_never_reaches_the_diagnostic(self, as_int, monkeypatch, tmp_path):
         """A credential of digits is the case both earlier attempts missed: an int bypassed the redactor
