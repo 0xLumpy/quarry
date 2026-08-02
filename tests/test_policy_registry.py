@@ -74,9 +74,9 @@ def _knob_calls():
     return calls
 
 
-def _call_site_default(key: str):
-    """The `default=` a `strict_int` call site passes for this PERFORMANCE key, resolved through a
-    module constant when it is one (`_SUBFINDER_DEFAULT_MIN`)."""
+def _call_site_kwarg(key: str, arg: str):
+    """The `default=` / `maximum=` a `strict_int` call site passes for this PERFORMANCE key, resolved
+    through a module constant when it is one (`_SUBFINDER_DEFAULT_MIN`, `_NUCLEI_MHE_MAX`)."""
     for path, mod in _modules():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -86,7 +86,7 @@ def _call_site_default(key: str):
             if not (isinstance(node.args[0], ast.Constant) and node.args[0].value == key):
                 continue
             for kw in node.keywords:
-                if kw.arg != "default":
+                if kw.arg != arg:
                     continue
                 if isinstance(kw.value, ast.Constant):
                     return kw.value.value
@@ -169,7 +169,18 @@ class TestTheRegistryTellsTheTruth:
             # `budget_seconds` fixes the default itself: 0 = process the whole eligible set
             assert bound.default == 0, bound
             return
-        assert _call_site_default(bound.name) == bound.default, bound
+        assert _call_site_kwarg(bound.name, "default") == bound.default, bound
+
+    @pytest.mark.parametrize("bound", policy.BOUNDS, ids=lambda b: b.name)
+    def test_the_parser_RANGE_matches_the_consumer(self, bound):
+        """The registry resolves effective values itself, so its `maximum` must be the one the consumer
+        parses with — otherwise the policy report and the lane can compute different numbers from the same
+        config, and nothing would say so."""
+        if bound.reader == "strict_int":
+            assert bound.maximum == _call_site_kwarg(bound.name, "maximum"), bound
+        else:
+            # `budget_seconds` fixes its own range; a module constant has no parser at all
+            assert bound.maximum is None, bound
 
     @pytest.mark.parametrize("bound", policy.BOUNDS, ids=lambda b: b.name)
     def test_the_classification_is_internally_consistent(self, bound):
@@ -298,6 +309,48 @@ class TestOverridesAreRunScoped:
 class TestTheEffectivePolicyIsReportedAndPersisted:
     """flag-axis step 3: a run's ceilings are EVIDENCE, not shell history. The same table is printed at
     run start, stored in the manifest, and previewable without running anything."""
+
+    def test_a_REJECTED_value_is_attributed_to_the_DEFAULT_and_named(self, monkeypatch):
+        """Presence is not acceptance. A configured value the strict parser refuses must not leave the
+        policy evidence naming an author for a number it did not choose."""
+        from quarry_recon import policy, settings
+        monkeypatch.setattr(settings, "performance",
+                            lambda: {"SUBFINDER_MAX_TIME": "garbage", "WILDCARD_BUDGET_S": -1,
+                                     "WILDCARD_ZONES_PER_RUN": True})
+        rows = {r["name"]: r for r in policy.snapshot()}
+        assert (rows["SUBFINDER_MAX_TIME"]["value"], rows["SUBFINDER_MAX_TIME"]["source"]) == (60, "default")
+        assert rows["SUBFINDER_MAX_TIME"]["rejected"] == "'garbage'", rows["SUBFINDER_MAX_TIME"]
+        budget = rows["WILDCARD_BUDGET_S"]
+        assert (budget["value"], budget["source"], budget["rejected"]) == (0, "default", "-1")
+        assert budget["unbounded"] is True          # 0 IS unbounded — but by the default, not by config
+        zones = rows["WILDCARD_ZONES_PER_RUN"]
+        assert (zones["value"], zones["source"], zones["rejected"]) == (5, "default", "True")
+        lines = "\n".join(policy.render())
+        for name in ("SUBFINDER_MAX_TIME", "WILDCARD_BUDGET_S", "WILDCARD_ZONES_PER_RUN"):
+            assert f"{name} = " in lines and "REJECTED by the strict parser" in lines, lines
+        assert "UNBOUNDED WILDCARD_BUDGET_S" not in lines, lines      # never "unbounded by config"
+
+    def test_the_report_refuses_what_the_CONSUMER_would_refuse(self, monkeypatch):
+        """An OVERSIZED value is the case where a wrong range hides: 5000 minutes is inside any generous
+        ceiling and outside subfinder's real one, so a registry that parsed with its own maximum would
+        report a bound the lane will never apply."""
+        from quarry_recon import policy, settings
+        monkeypatch.setattr(settings, "performance",
+                            lambda: {"SUBFINDER_MAX_TIME": 5000, "WILDCARD_ZONES_PER_RUN": 20000})
+        rows = {r["name"]: r for r in policy.snapshot()}
+        assert (rows["SUBFINDER_MAX_TIME"]["value"], rows["SUBFINDER_MAX_TIME"]["rejected"]) == (60, "5000")
+        assert (rows["WILDCARD_ZONES_PER_RUN"]["value"],
+                rows["WILDCARD_ZONES_PER_RUN"]["rejected"]) == (5, "20000")
+        # ...and the lane agrees, which is the whole point of sharing the range
+        from quarry_recon.phases import vertical
+        assert vertical._subfinder_budget_min(1800) == 60
+        assert vertical.wildcard_zones_per_run() == 5
+
+    def test_a_rejected_FLAG_value_is_attributed_the_same_way(self):
+        from quarry_recon import policy, settings
+        with settings.overrides({"WILDCARD_ZONES_PER_RUN": "nonsense"}):
+            row = {r["name"]: r for r in policy.snapshot()}["WILDCARD_ZONES_PER_RUN"]
+        assert (row["value"], row["source"], row["rejected"]) == (5, "default", "'nonsense'"), row
 
     def test_a_value_names_WHO_set_it(self, monkeypatch):
         from quarry_recon import policy, settings

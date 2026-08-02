@@ -264,21 +264,23 @@ def held() -> tuple[Bound, ...]:
 
 
 # ── the EFFECTIVE policy: what this run will actually apply, and where each value came from ──────────
-def effective(bound: Bound) -> tuple[int, str]:
-    """`(value, source)` for one bound. Source is `flag`, `config` or `default` — an operator reading a
-    ceiling deserves to know WHO set it, not just what it is."""
+def effective(bound: Bound) -> tuple[int, str, str | None]:
+    """`(value, source, rejected)` for one bound.
+
+    The source comes out of the same parse as the value: a configured or flagged value the strict parser
+    REFUSED is attributed to the default, and what was refused is reported rather than hidden behind an
+    author it did not have."""
     from . import budget, settings
-    src = settings.source_of(bound.name) if bound.reader != "module" else "default"
     if bound.reader == "budget_seconds":
-        return budget.budget_seconds(bound.name), src
+        return settings.strict_int_with_source(bound.name, default=0, maximum=budget._MAX_BUDGET_S)
     if bound.reader == "strict_int":
-        return settings.strict_int(bound.name, default=bound.default,
-                                   maximum=bound.maximum or bound.default), src
+        return settings.strict_int_with_source(bound.name, default=bound.default,
+                                               maximum=bound.maximum or bound.default)
     if bound.const and not bound.const_local:
         import importlib
         mod, _, name = bound.const.partition(":")
-        return int(getattr(importlib.import_module(mod), name)), src
-    return bound.default, src        # a function-local constant: not configurable, only relaxable
+        return int(getattr(importlib.import_module(mod), name)), "default", None
+    return bound.default, "default", None    # a function-local constant: not configurable, only relaxable
 
 
 def snapshot() -> list[dict]:
@@ -286,11 +288,11 @@ def snapshot() -> list[dict]:
     persisted into the manifest: a run's ceilings are EVIDENCE, not shell history."""
     rows = []
     for b in BOUNDS:
-        value, src = effective(b)
+        value, src, rejected = effective(b)
         rows.append({"name": b.name, "lane": b.lane, "value": value, "default": b.default,
                      "source": src, "relaxable": b.relaxable,
                      "unbounded": b.relaxable and value == b.unbounded_value,
-                     "held_reason": b.held_reason})
+                     "rejected": rejected, "held_reason": b.held_reason})
     return rows
 
 
@@ -303,6 +305,10 @@ def render(rows: list[dict] | None = None) -> list[str]:
     for r in rows:
         if not r["relaxable"]:
             out.append(f"  HELD      {r['name']} = {r['value']} ({r['lane']}) — {r['held_reason']}")
+        elif r["rejected"] is not None:
+            # written, refused, and named: a value the parser threw away must not read as policy
+            out.append(f"  DEFAULT   {r['name']} = {r['value']} ({r['lane']}) — the configured value "
+                       f"{r['rejected']} was REJECTED by the strict parser")
         elif r["source"] == "default":
             plain += 1
             free += bool(r["unbounded"])         # unbounded because that IS the default, not by request

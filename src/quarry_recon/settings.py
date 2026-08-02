@@ -67,8 +67,10 @@ def overrides(values: dict):
 
 
 def source_of(key: str) -> str:
-    """WHO decided this knob's value: a run `flag`, the machine `config`, or the `default`. The policy
-    report is only useful if a ceiling names its author."""
+    """Where a value for `key` was WRITTEN: a run `flag`, the machine `config`, else `default`.
+
+    Presence is not acceptance — a value the strict parser rejects still leaves the key present here. Ask
+    `strict_int_with_source()` for the ATTRIBUTION of an effective value."""
     if key in _overrides:
         return "flag"
     return "config" if key in performance() else "default"
@@ -107,15 +109,31 @@ def strict_int(key: str, *, default: int, maximum: int) -> int:
     an intentional 0 into 1. Shared because the same parser is needed by every knob that decides how much
     of the eligible input gets processed (SUBFINDER_MAX_TIME, NUCLEI_MAX_HOST_ERROR, the fetch budgets),
     and three hand-rolled copies would drift."""
+    return strict_int_with_source(key, default=default, maximum=maximum)[0]
+
+
+def strict_int_with_source(key: str, *, default: int, maximum: int) -> tuple[int, str, str | None]:
+    """`(value, source, rejected)` — the value, WHO it came from, and what was thrown away getting there.
+
+    Attribution has to come out of the SAME parse as the value. Asking "is the key present?" separately
+    reported `source: config` for a run whose configured value the parser had refused, so the policy
+    evidence named an author for a number it did not choose (flag-axis step 3 review). A rejected value is
+    attributed to the DEFAULT and the offending input is kept, so the report can say what was ignored."""
+    written = source_of(key)
+    if written == "default":
+        return default, "default", None
     raw = _overrides[key] if key in _overrides else performance().get(key)
+    value = None
     if isinstance(raw, bool):
-        return default
-    if isinstance(raw, int):
-        return raw if 0 <= raw <= maximum else default
-    if isinstance(raw, str) and raw.strip().isdigit():
+        value = None                                  # a bool is not an int here, ever
+    elif isinstance(raw, int):
+        value = raw if 0 <= raw <= maximum else None
+    elif isinstance(raw, str) and raw.strip().isdigit():
         v = int(raw.strip())
-        return v if 0 <= v <= maximum else default
-    return default
+        value = v if 0 <= v <= maximum else None
+    if value is None:
+        return default, "default", repr(raw)          # written, refused, and SAID so
+    return value, written, None
 
 
 def raw(key: str, default=None):
