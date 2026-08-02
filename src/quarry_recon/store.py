@@ -747,9 +747,23 @@ class Run:
             lane, unit = rec.get("source_id"), rec.get("unit")
             if not isinstance(lane, str) or not isinstance(unit, str):
                 continue
-            latest[(lane, unit)] = {"lane": lane, "unit": unit, "measure": rec.get("measure"),
-                                    "model": rec.get("model"), "retriable": rec.get("retriable"),
-                                    "terminal": rec.get("terminal")}
+            # RECONSTRUCTED and validated before publication: this feeds a supervisor's arithmetic, and a
+            # malformed payload must arrive as UNKNOWN rather than as numbers nobody checked.
+            from . import remainder as _remainder
+            retriable = rec.get("retriable") if isinstance(rec.get("retriable"), dict) else {}
+            terminal = rec.get("terminal") if isinstance(rec.get("terminal"), dict) else {}
+            try:
+                built = _remainder.Remainder(
+                    lane=lane, unit=unit, measure=rec.get("measure"), model=rec.get("model"),
+                    now=retriable.get("now"), cooldown=retriable.get("cooldown"),
+                    terminal={k: v for k, v in terminal.items() if v},
+                    detail=rec.get("detail") if isinstance(rec.get("detail"), dict) else {})
+                built.validate()
+            except (ValueError, TypeError) as e:
+                latest[(lane, unit)] = {"lane": lane, "unit": unit,
+                                        "invalid": f"{type(e).__name__}: {e}"}
+                continue
+            latest[(lane, unit)] = built.as_record()
         return [latest[k] for k in sorted(latest)]
 
     def _read_coverage(self) -> list[dict]:

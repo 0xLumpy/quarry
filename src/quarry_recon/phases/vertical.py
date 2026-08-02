@@ -1458,6 +1458,13 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
     # needing a hundred more rounds looks exactly like one needing one. Counting that as `3/4` would hand
     # reconciliation an exact denominator nobody measured, so bounded non-convergence is UNKNOWN coverage;
     # exact counters are emitted only when the recursion actually finished.
+    # what the LOOP still owes, for a supervisor: its model already says repetition cannot reach it, and
+    # a lane that never reports reads as UNKNOWN for ever (settle prerequisite B). Best effort.
+    try:
+        remainder.emit(remainder.for_rounds("vertical.alterx_permute", stop=stop, rounds=rounds,
+                                            ran=it, made=made))
+    except Exception:                                        # noqa: BLE001 - a report is never a stop
+        pass
     if stop == "bound" and made:
         events.coverage_partial("vertical.alterx_permute", kind=events.COVERAGE_UNKNOWN,
                                 unit="vertical.permute_rounds", measure="permutation_rounds",

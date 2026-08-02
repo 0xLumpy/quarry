@@ -63,46 +63,79 @@ class TestTheModelIsDeclared:
 
 
 class TestTheSweepMapsOntoDispositions:
-    def test_a_BOUND_and_a_DEFERRAL_are_retriable_now(self):
-        out = _swept(eligible_pairs=10, attempted_pairs=3, bound_pairs=4, deferred_pairs=3,
-                     targets_eligible=2, stop_kind="bound")
-        rec = remainder.from_sweep("vertical.wildcard_http", out)
-        assert (rec.now, rec.cooldown) == (7, 0), rec.as_record()
-        assert rec.terminal == {}, rec.terminal
+    def test_LIVENESS_comes_from_the_DURABLE_rotation(self):
+        """The defect the continuation report already had: the pair partition describes ONE lifecycle, so
+        a deferred-but-since-finished target stayed counted. After the pinned eight-zone trace the rotation
+        owes nothing, and the remainder must say so however many pairs this run left behind."""
+        finished = _swept(eligible_pairs=16, attempted_pairs=10, deferred_pairs=6,
+                          targets_eligible=8, targets_complete=8, targets_remaining=0)
+        rec = remainder.from_sweep("vertical.wildcard_http", finished)
+        assert (rec.now, rec.cooldown, rec.terminal) == (0, 0, {}), rec.as_record()
+        assert rec.detail["candidate_pairs"]["deferred"] == 6, rec.detail     # kept, never summed
+        owing = _swept(eligible_pairs=16, attempted_pairs=10, deferred_pairs=6,
+                       targets_eligible=8, targets_complete=5, targets_remaining=3)
+        assert remainder.from_sweep("vertical.wildcard_http", owing).now == 3
 
     def test_a_REFUSAL_is_retriable_with_a_COOLDOWN(self):
         """`budget.ADMISSION_COOLDOWN_GENS` asks a refused target again — a transient refusal must not
         become a permanent exclusion, so it is not terminal."""
-        out = _swept(eligible_pairs=5, attempted_pairs=0, refused_pairs=5)
+        out = _swept(eligible_pairs=5, attempted_pairs=0, refused_pairs=5, targets_eligible=2,
+                     targets_remaining=2, targets_refused=2)
         rec = remainder.from_sweep("vertical.wildcard_http", out)
-        assert (rec.now, rec.cooldown) == (0, 5), rec.as_record()
+        assert (rec.now, rec.cooldown) == (0, 2), rec.as_record()
         assert rec.terminal == {}, rec.terminal
 
-    def test_UNSCHEDULABLE_work_is_terminal(self):
-        out = _swept(eligible_pairs=5, attempted_pairs=3, unselectable_pairs=2)
+    def test_only_UNSCHEDULABLE_work_left_is_terminal(self):
+        out = _swept(eligible_pairs=5, attempted_pairs=3, unselectable_pairs=2, targets_eligible=2,
+                     targets_remaining=1)
         rec = remainder.from_sweep("vertical.wildcard_http", out)
-        assert rec.terminal == {"unschedulable": 2}, rec.terminal
+        assert rec.terminal == {"unschedulable": 1}, rec.terminal
         assert (rec.now, rec.cooldown) == (0, 0), rec.as_record()
 
-    @pytest.mark.parametrize("kind,expect", [("machinery", {"machinery": 4}),
-                                             ("dependency", {"dependency": 4})])
-    def test_a_MACHINERY_or_DEPENDENCY_stop_is_terminal(self, kind, expect):
-        out = _swept(eligible_pairs=10, attempted_pairs=6, stop_kind=kind, stop="x")
+    @pytest.mark.parametrize("kind", ["machinery", "dependency"])
+    def test_a_MACHINERY_or_DEPENDENCY_stop_is_terminal(self, kind):
+        out = _swept(eligible_pairs=10, attempted_pairs=6, stop_kind=kind, stop="x",
+                     targets_eligible=3, targets_remaining=2)
         rec = remainder.from_sweep("enrich.a1d_brute", out)
-        assert rec.terminal == expect and rec.now == 0, rec.as_record()
+        assert rec.terminal == {kind: 2} and rec.now == 0, rec.as_record()
 
     def test_a_CLOCK_stop_is_retriable(self):
         """A budget stopped this child; the next one simply continues."""
-        out = _swept(eligible_pairs=10, attempted_pairs=6, stop_kind="budget", stop="budget exhausted")
+        out = _swept(eligible_pairs=10, attempted_pairs=6, stop_kind="budget", stop="budget exhausted",
+                     targets_eligible=3, targets_remaining=2)
         rec = remainder.from_sweep("enrich.a1d_brute", out)
-        assert (rec.now, rec.terminal) == (4, {}), rec.as_record()
+        assert (rec.now, rec.terminal) == (2, {}), rec.as_record()
 
     def test_the_measure_and_unit_are_STATED(self):
-        rec = remainder.from_sweep("vertical.wildcard_http", _swept(eligible_pairs=1, attempted_pairs=0))
+        rec = remainder.from_sweep("vertical.wildcard_http",
+                                   _swept(eligible_pairs=1, attempted_pairs=0, targets_eligible=1,
+                                          targets_remaining=1))
         record = rec.as_record()
-        assert record["measure"] == "candidate_pairs"
-        assert record["unit"] == "vertical.wildcard_http:candidate_pairs"
+        assert record["measure"] == "targets"
+        assert record["unit"] == "vertical.wildcard_http:targets"
         assert set(record["terminal"]) == set(remainder.TERMINAL_CAUSES)
+        assert "candidate_pairs" in record["detail"], record
+
+
+class TestTheLoopReportsToo:
+    """`vertical.alterx_permute` declares a model, so it must REPORT — a lane that never does reads as
+    unknown for ever, and the supervisor learns nothing about a loop it was told to expect."""
+
+    def test_a_bound_that_cut_a_producing_loop_short_owes_a_round(self):
+        rec = remainder.for_rounds("vertical.alterx_permute", stop="bound", rounds=3, ran=3, made=True)
+        assert rec.now == 1 and rec.model == "rerun_same_work", rec.as_record()
+        assert rec.retriable == 0, "repetition still cannot reach it"
+        assert rec.detail == {"rounds_ran": 3, "bound": 3, "exit": "bound"}, rec.detail
+
+    @pytest.mark.parametrize("stop", ["converged", "no_candidates", "passive"])
+    def test_a_finished_loop_owes_nothing(self, stop):
+        rec = remainder.for_rounds("vertical.alterx_permute", stop=stop, rounds=3, ran=2, made=False)
+        assert (rec.now, rec.terminal) == (0, {}), rec.as_record()
+
+    def test_a_DEGRADED_stall_is_terminal_not_a_fixed_point(self):
+        rec = remainder.for_rounds("vertical.alterx_permute", stop="no_progress", rounds=0, ran=2,
+                                   made=False)
+        assert rec.terminal == {"machinery": 1} and rec.now == 0, rec.as_record()
 
 
 class TestTheManifestCarriesIt:
@@ -112,18 +145,43 @@ class TestTheManifestCarriesIt:
         try:
             remainder.emit(remainder.from_sweep("vertical.wildcard_http",
                                                 _swept(eligible_pairs=10, attempted_pairs=3,
-                                                       bound_pairs=7)))
+                                                       bound_pairs=7, targets_eligible=4,
+                                                       targets_remaining=3)))
             time.sleep(0.005)                              # a DIFFERENT timestamp, same unit
             remainder.emit(remainder.from_sweep("vertical.wildcard_http",      # a later, smaller remainder
                                                 _swept(eligible_pairs=10, attempted_pairs=9,
-                                                       bound_pairs=1)))
+                                                       bound_pairs=1, targets_eligible=4,
+                                                       targets_remaining=1)))
             run.write_manifest(profile_summary={}, phases_run=["vertical"])
         finally:
             events.reset()
         rows = json.loads(run.manifest_path.read_text())["summary"]["remainders"]
         assert len(rows) == 1, rows                       # latest-per-unit, so a finished rotation CLEARS
         assert rows[0]["retriable"] == {"now": 1, "cooldown": 0}, rows[0]
-        assert rows[0]["model"] == "project_progress" and rows[0]["measure"] == "candidate_pairs"
+        assert rows[0]["model"] == "project_progress" and rows[0]["measure"] == "targets"
+
+    @pytest.mark.parametrize("payload,why", [
+        ({"model": "invented"}, "unknown model"),
+        ({"retriable": {"now": -1, "cooldown": 0}}, "negative"),
+        ({"retriable": {"now": True, "cooldown": 0}}, "a bool is not a count"),
+        ({"retriable": "five"}, "not a mapping"),
+        ({"terminal": {"invented": 2}}, "unknown cause"),
+        ({"measure": ""}, "no measure"),
+    ])
+    def test_a_MALFORMED_record_arrives_as_INVALID_not_as_numbers(self, tmp_path, payload, why):
+        """This feeds a supervisor's arithmetic. A payload nobody validated must not reach it as data."""
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        base = {"unit": "vertical.wildcard_http:targets", "measure": "targets",
+                "model": "project_progress", "retriable": {"now": 1, "cooldown": 0},
+                "terminal": {c: 0 for c in remainder.TERMINAL_CAUSES}}
+        try:
+            events.emit("remainder", "vertical.wildcard_http", **{**base, **payload})
+            run.write_manifest(profile_summary={}, phases_run=["vertical"])
+        finally:
+            events.reset()
+        row = json.loads(run.manifest_path.read_text())["summary"]["remainders"][0]
+        assert "retriable" not in row and row["invalid"], (why, row)
 
     def test_a_lane_that_said_NOTHING_is_absent_not_zero(self, tmp_path):
         run = store.Run.create(tmp_path, "t")
@@ -133,6 +191,19 @@ class TestTheManifestCarriesIt:
         finally:
             events.reset()
         assert json.loads(run.manifest_path.read_text())["summary"]["remainders"] == []
+
+    def test_the_real_PERMUTATION_LOOP_reports_its_remainder(self, tmp_path, monkeypatch):
+        """A lane that declares a model must actually report, or the supervisor's roster reads it as
+        unknown for ever."""
+        from test_a1d_vocabulary import TestTheRecursionRoundsPolicy as L
+        chain = {1: ["a1.acme.com"], 2: ["a2.acme.com"], 3: ["a3.acme.com"], 4: ["a4.acme.com"]}
+        L._drive(L(), tmp_path, monkeypatch, growth=lambda i: chain.get(i, []))
+        log = next((tmp_path / "recon").glob("*/events.jsonl"))
+        rows = [json.loads(l) for l in log.read_text().splitlines()
+                if json.loads(l).get("event") == "remainder"]
+        assert rows and rows[-1]["source_id"] == "vertical.alterx_permute", rows
+        assert rows[-1]["model"] == "rerun_same_work", rows[-1]
+        assert rows[-1]["retriable"]["now"] == 1, rows[-1]      # the 3-round bound cut a producing loop
 
     def test_the_real_DIFFER_reports_its_remainder(self, tmp_path, monkeypatch):
         from test_a1d_vocabulary import TestTheWildcardDifferHasItsOwnLifecycle as L

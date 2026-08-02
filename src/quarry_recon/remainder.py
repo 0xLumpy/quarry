@@ -55,15 +55,18 @@ class Remainder:
     now: int = 0                     # a later child, under the same policy, would attempt this
     cooldown: int = 0                # ...once a cooldown expires (a refusal, not an exclusion)
     terminal: dict = field(default_factory=dict)      # {cause: count}, causes from TERMINAL_CAUSES
+    detail: dict = field(default_factory=dict)        # sub-measure breakdown, never summed with the above
 
     def validate(self) -> None:
+        for name in ("lane", "unit", "measure"):
+            value = getattr(self, name)
+            if type(value) is not str or not value.strip():
+                raise ValueError(f"a remainder needs an exact non-empty {name}")
         if self.model not in MODELS:
             raise ValueError(f"{self.lane}: unknown remainder model {self.model!r}")
         if LANE_MODEL.get(self.lane) != self.model:
             raise ValueError(f"{self.lane}: model {self.model!r} contradicts the declared "
                              f"{LANE_MODEL.get(self.lane)!r}")
-        if not self.unit or not self.measure:
-            raise ValueError(f"{self.lane}: a remainder needs a unit and a measure")
         for name, value in (("now", self.now), ("cooldown", self.cooldown)):
             if type(value) is not int or value < 0:
                 raise ValueError(f"{self.lane}: {name} must be an exact non-negative int")
@@ -81,7 +84,8 @@ class Remainder:
     def as_record(self) -> dict:
         return {"lane": self.lane, "unit": self.unit, "measure": self.measure, "model": self.model,
                 "retriable": {"now": self.now, "cooldown": self.cooldown},
-                "terminal": {c: self.terminal.get(c, 0) for c in TERMINAL_CAUSES}}
+                "terminal": {c: self.terminal.get(c, 0) for c in TERMINAL_CAUSES},
+                "detail": dict(self.detail)}
 
 
 def emit(remainder: Remainder) -> dict:
@@ -89,34 +93,52 @@ def emit(remainder: Remainder) -> dict:
     remainder.validate()
     record = remainder.as_record()
     return events.emit("remainder", remainder.lane, unit=remainder.unit, measure=remainder.measure,
-                       model=remainder.model, retriable=record["retriable"], terminal=record["terminal"])
+                       model=remainder.model, retriable=record["retriable"], terminal=record["terminal"],
+                       detail=record["detail"] or None)
 
 
-def from_sweep(lane: str, swept, *, measure: str = "candidate_pairs") -> Remainder:
-    """The remainder a `run_sweep` result already knows, mapped onto the dispositions.
+def from_sweep(lane: str, swept, *, measure: str = "targets") -> Remainder:
+    """What a `run_sweep` lane still owes — LIVENESS from the durable rotation, dispositions as detail.
 
-    The sweep's partition (`pair_remainder()`, `1a2eefa`) answers this almost directly:
+    The pair partition (`pair_remainder()`, `1a2eefa`) describes THIS LIFECYCLE: a target the allowance
+    deferred is in it, and so is one whose slots a later child already finished. Reading liveness off it
+    repeats the defect the continuation report had — after the pinned eight-zone trace it still claimed
+    three zones owed when the rotation had covered all eight. `targets_remaining` is the cumulative,
+    durability-aware answer (`68195e8`), so that is what says whether repetition would advance anything.
 
-        bound / deferred   the per-run allowance and the spend bound — a later child takes them
-        refused            the contact guard said no; the rotation asks again after its cooldown
-        unselectable       no bound can ever admit these: TERMINAL
-        stopped            depends on what stopped the run — a clock is retriable next child, a machinery
-                           or dependency stop is not
+    The pair dispositions are kept as DETAIL, in their own measure, never summed with the target counts:
+
+        refused        the contact guard said no; the rotation asks again after its cooldown
+        unselectable   no bound can ever admit these: TERMINAL when they are all that is left
+        machinery /    what a stop left behind, when the stop was one repetition does not fix
+        dependency
     """
     parts = swept.pair_remainder()
-    stopped = int(parts.get("stopped", 0))
+    owed = max(0, int(getattr(swept, "targets_remaining", 0)))
+    refused = min(owed, max(0, int(getattr(swept, "targets_refused", 0))))
     terminal: dict = {}
-    now = int(parts.get("bound", 0)) + int(parts.get("deferred", 0))
-    if stopped:
-        kind = getattr(swept, "stop_kind", None)
-        if kind == "machinery":
-            terminal["machinery"] = stopped
-        elif kind == "dependency":
-            terminal["dependency"] = stopped
-        else:
-            now += stopped                     # a clock or a cancellation: the next child simply continues
-    if parts.get("unselectable"):
-        terminal["unschedulable"] = int(parts["unselectable"])
+    kind = getattr(swept, "stop_kind", None)
+    if owed and kind in ("machinery", "dependency") and int(parts.get("stopped", 0)):
+        terminal[kind] = owed                       # this run ended on something repetition does not fix
+    elif owed and int(parts.get("unselectable", 0)) and not (int(parts.get("bound", 0))
+                                                             + int(parts.get("deferred", 0))
+                                                             + int(parts.get("stopped", 0))):
+        terminal["unschedulable"] = owed            # nothing but work no bound can admit is left
+    now = 0 if terminal else max(0, owed - refused)
     return Remainder(lane=lane, unit=f"{lane}:{measure}", measure=measure,
                      model=LANE_MODEL.get(lane, "project_progress"),
-                     now=now, cooldown=int(parts.get("refused", 0)), terminal=terminal)
+                     now=now, cooldown=0 if terminal else refused, terminal=terminal,
+                     detail={"candidate_pairs": {k: int(v) for k, v in parts.items()}})
+
+
+def for_rounds(lane: str, *, stop: str, rounds: int, ran: int, made: bool) -> Remainder:
+    """What a convergent LOOP still owes. Its model decides what that is worth: a `rerun_same_work` lane's
+    remainder is real, and repetition still cannot reach it — the record says both."""
+    owed = 1 if (stop == "bound" and made) else 0        # the bound cut a producing loop short
+    terminal: dict = {}
+    if stop == "no_progress":
+        terminal["machinery"] = 1                        # a degraded batch, not a fixed point
+    return Remainder(lane=lane, unit=f"{lane}:rounds", measure="rounds",
+                     model=LANE_MODEL.get(lane, "rerun_same_work"),
+                     now=0 if terminal else owed, terminal=terminal,
+                     detail={"rounds_ran": int(ran), "bound": int(rounds), "exit": stop})
