@@ -24,7 +24,10 @@ class TestMaterialContent:
                      first_seen="t9", last_seen="t9")
         assert store.fingerprint("resolved", base) == store.fingerprint("resolved", later)
         assert not store.adds_material("resolved", base, later)
-        assert set(store.RUN_SCOPED_FIELDS) == {"first_seen", "last_seen", "raw_ref", "raw_refs"}
+        # `_inherited` joined them with the campaign bootstrap: how a run GOT an entity is bookkeeping,
+        # so an inherited copy fingerprints exactly like the record it came from
+        assert set(store.RUN_SCOPED_FIELDS) == {"first_seen", "last_seen", "raw_ref", "raw_refs",
+                                                "_inherited"}
 
     def test_list_ORDER_is_not_material(self):
         """Two runs can report the same IPs in a different order; that is not discovery."""

@@ -217,7 +217,9 @@ def canonical_key(entity: str, record: dict) -> str:
 #: fields that describe WHERE and WHEN an observation was made, not WHAT is true. A campaign comparing two
 #: children must not see a new artifact path or a fresh timestamp as discovery — every child would then
 #: look like progress and a fixed point could never be reached.
-RUN_SCOPED_FIELDS = ("first_seen", "last_seen", "raw_ref", "raw_refs")
+#: `_inherited` is bookkeeping about HOW a run got an entity (a campaign seeded it), never a fact about
+#: the world — so an inherited copy fingerprints exactly like the record it came from.
+RUN_SCOPED_FIELDS = ("first_seen", "last_seen", "raw_ref", "raw_refs", "_inherited")
 
 
 def material(entity: str, record: dict) -> dict:
@@ -547,6 +549,30 @@ class Run:
             self._append_obs(entity, record)                # keep the raw observation in the immutable log
             records[key] = _merge_record(records[key], record)   # folds max(last_seen) durably
         return False                                        # not a NEW entity (counting semantics preserved)
+
+    def inherit(self, entity: str, record: dict) -> bool:
+        """Record an entity this run was HANDED (a campaign seeded it from earlier children) — present for
+        every downstream lane, and never counted as this run's discovery.
+
+        `add()` answers "is this key NEW?", which is what phases count as production; an inherited entity
+        must not answer yes. Returns whether anything was written (False for a pure duplicate), so a second
+        bootstrap is a no-op rather than a growing log."""
+        key = canonical_key(entity, record)
+        if not key:
+            return False
+        records = self._records_for(entity)
+        record = {k: v for k, v in dict(record).items() if k != "_alt"}
+        record.setdefault("first_seen", _utc())
+        record["last_seen"] = _utc()
+        if key not in records:
+            records[key] = record
+            self._append_obs(entity, record)
+            return True
+        if _subsumed(records[key], record):
+            return False
+        self._append_obs(entity, record)
+        records[key] = _merge_record(records[key], record)
+        return True
 
     def _append_obs(self, entity: str, record: dict) -> None:
         with self._entity_file(entity).open("a") as fh:
