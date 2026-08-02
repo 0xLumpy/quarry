@@ -2357,3 +2357,38 @@ class TestThePreflightCallbacksAreContained:
                               budget_s=0, coverage_lane=COV, admit=admit)
         assert out.remaining_cooldown == 1 and out.remaining_terminal.get("machinery") == 1, out
         assert out.remaining_now == 0, out
+
+    def test_an_EARLY_exit_still_partitions_what_is_owed(self, tmp_path):
+        """Every early return publishes default zeroes unless it classifies — and a supervisor reads
+        zeroes as a fixed point. A missing dependency owes both targets, terminally."""
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha"],
+                         dependency_ok=lambda: False)
+        assert tool.calls == [] and out.stop_kind == "dependency", out
+        assert out.remainder_known and out.targets_remaining == 2, out
+        assert out.remaining_terminal == {"dependency": 2} and out.remaining_now == 0, out
+
+    def test_CONTENTION_leaves_the_targets_retriable(self, tmp_path, monkeypatch):
+        """Another lifecycle is advancing this rotation right now — nothing here is terminal."""
+        monkeypatch.setattr(budget, "rotation_session",
+                            lambda *a, **k: (_ for _ in ()).throw(budget.StateBusy("held")))
+        out, tool = _run(tmp_path, targets=("a.com", "b.com"), words=["alpha"])
+        assert out.contended and out.stop_kind == "contention", out
+        assert out.remainder_known and (out.remaining_now, out.remaining_terminal) == (2, {}), out
+
+    def test_MACHINERY_before_the_rotation_is_terminal(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(budget, "rotation_session",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("read-only state dir")))
+        out, _tool = _run(tmp_path, targets=("a.com",), words=["alpha"])
+        assert out.stop_kind == "machinery" and out.remainder_known, out
+        assert out.remaining_terminal == {"machinery": 1}, out.remaining_terminal
+
+    def test_an_UNKNOWN_eligible_set_leaves_the_remainder_UNKNOWN(self, tmp_path):
+        """`vocabulary()` raised, so nobody knows what was eligible — and a partition of an unknown set is
+        not zero, it is nothing to report at all."""
+        def boom(_target):
+            raise OSError("the corpus could not be read")
+
+        out = sweep.run_sweep(lane=LANE, state_dir=tmp_path, targets=["a.com"], vocabulary=boom,
+                              execute=_Tool(), budget_s=0, coverage_lane=COV)
+        assert not out.eligibility_known and not out.remainder_known, out
+        assert (out.targets_remaining, out.remaining_now, out.remaining_terminal) == (0, 0, {}), out

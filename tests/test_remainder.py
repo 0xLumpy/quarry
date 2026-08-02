@@ -217,3 +217,22 @@ class TestTheManifestCarriesIt:
         assert rows and rows[-1]["source_id"] == "enrich.wildcard_a1d", rows
         assert rows[-1]["model"] == "project_progress"
         assert rows[-1]["retriable"]["now"] > 0, rows[-1]      # a spend of 1 over 8 zones owes plenty
+
+    def test_an_UNKNOWN_remainder_is_NOT_reported(self, tmp_path, monkeypatch):
+        """A lane whose eligible set was never established must read as unknown, not as a clean zero."""
+        from quarry_recon import sweep as _sweep
+        from test_a1d_vocabulary import TestTheWildcardDifferHasItsOwnLifecycle as L
+        real = _sweep.run_sweep
+
+        def unknown(**kw):
+            out = real(**kw)
+            out.remainder_known = False                  # as an unestablished corpus would leave it
+            return out
+
+        monkeypatch.setattr(_sweep, "run_sweep", unknown)
+        st: dict = {}
+        L._differ(L(), tmp_path, monkeypatch, zones=("z.acme.com",), words=("api",), rows=[], st=st)
+        log = next((tmp_path / "recon").glob("*/events.jsonl"))
+        rows = [json.loads(l) for l in log.read_text().splitlines()
+                if json.loads(l).get("event") == "remainder"]
+        assert rows == [], rows

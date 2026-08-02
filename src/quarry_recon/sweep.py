@@ -206,6 +206,9 @@ class SweepResult:
     remaining_now: int = 0                  # a later child would attempt it
     remaining_cooldown: int = 0             # ...once its admission cooldown expires
     remaining_terminal: dict = field(default_factory=dict)   # {cause: targets}
+    #: whether the partition above was actually DETERMINED. False means nobody may read its zeroes as a
+    #: fixed point — an eligible set that was never established, or an exit that could not classify.
+    remainder_known: bool = False
     targets_admitted: int = 0               # ...that the per-run allowance let this lifecycle start
     targets_refused: int = 0                # ...that the caller's admission check turned away
     #: admission answers whose save was interrupted: on disk or not, we cannot say (v83#1).
@@ -448,6 +451,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # left the driver by the back door, and the eligible set is not zero — it is UNKNOWN.
         out.machinery.append(f"the corpus could not be built ({_safe_exc(e)})")
         out.stop, out.stop_kind = "machinery: the corpus could not be built", "machinery"
+        _partition_unrun(out)
         _report_safely(coverage_lane, out, clock)
         return out
     out.eligibility_known = True
@@ -480,6 +484,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.stop = (f"machinery: the slot partition does not cover {target} "
                         f"({len(placed)} placed, {len(set(placed))} distinct, of {len(per_target)})")
             out.stop_kind = "machinery"
+            _partition_unrun(out)
             _report_safely(coverage_lane, out, clock)
             return out
         # v33: a slot the allocator could not split below the bound can never be scheduled — not by this
@@ -532,6 +537,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         # NOTHING is schedulable — an empty corpus, or one whose every slot the bounds cannot admit. No
         # tool could have been invoked and no rotation state is needed, so neither a missing dependency
         # nor a busy lock is the reason for this run's remainder (v35#2).
+        _partition_unrun(out)
         _report_safely(coverage_lane, out, clock)
         return out
 
@@ -543,6 +549,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         except BaseException as e:             # v73#1: only CANCELLATION escapes this driver
             out.machinery.append(f"the dependency check raised ({_safe_exc(e)})")
             out.stop, out.stop_kind = "machinery: the dependency check raised", "machinery"
+            _partition_unrun(out)
             _report_safely(coverage_lane, out, clock)
             return out
         if ready is not True and ready is not False:
@@ -551,11 +558,13 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.machinery.append(f"the dependency check answered {_safe_name(ready)} "
                                  f"{_safe_repr(ready)}, not True or False")
             out.stop, out.stop_kind = "machinery: the dependency check gave no usable answer", "machinery"
+            _partition_unrun(out)
             _report_safely(coverage_lane, out, clock)
             return out
         if ready is False:
             out.stop = "the tool is not installed"      # no reservations at all (design v7#2)
             out.stop_kind = "dependency"
+            _partition_unrun(out)
             _report_safely(coverage_lane, out, clock)
             return out
 
@@ -571,6 +580,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.contended = True
             out.stop = f"another lifecycle owns this rotation ({_safe_exc(e)})"
             out.stop_kind = "contention"       # nothing was submitted and NO completion state was lost
+            _partition_unrun(out)
             _report_safely(coverage_lane, out, clock)
             return out
         except (KeyboardInterrupt, SystemExit):
@@ -582,6 +592,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             out.machinery.append(f"the rotation could not be acquired ({_safe_exc(e)})")
             out.stop = "machinery: the rotation could not be acquired"
             out.stop_kind = "machinery"
+            _partition_unrun(out)
             _report_safely(coverage_lane, out, clock)
             return out
 
@@ -891,6 +902,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         out.remaining_cooldown = len(cooldown)
         out.remaining_terminal = terminal
         out.remaining_now = len(live)
+        out.remainder_known = True
 
         # ── the STOP: what actually ended the run ───────────────────────────────────────────────
         # v60#2: an elapsed clock is not automatically the cause. It only stopped work if selectable
@@ -930,6 +942,10 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             pass
         raise
     _settle_completions(out)
+    if not out.remainder_known:
+        # the body ended before the durable partition ran (a break out of the lock, say) — classify from
+        # what stopped it rather than leaving zeroes that read as a fixed point
+        _partition_unrun(out)
     _report_safely(coverage_lane, out, clock)
     return out
 
@@ -1168,6 +1184,35 @@ def _rank(progress, slots, content, picked):
     target = min({t for t, _ in in_tier}, key=lambda t: (progress.target_seq(t), t))
     return min([s for s in in_tier if s[0] == target],
                key=lambda s: (progress.slot_seq(*s), s[1]))
+
+
+def _partition_unrun(out: "SweepResult") -> None:
+    """Classify a run that ended BEFORE the rotation could be read, from what stopped it.
+
+    Every early exit reaches this: a lane that returns without a partition publishes default zeroes, and a
+    supervisor reads zeroes as a fixed point. Nothing was completed here, so the eligible targets are what
+    is owed — the question is only who holds them.
+
+        dependency / machinery   TERMINAL: repetition does not install a tool or unbreak a broken run
+        contention               RETRIABLE: another lifecycle is advancing this rotation right now
+        nothing schedulable      TERMINAL, as `unschedulable`, when a corpus exists at all
+        anything else            RETRIABLE
+
+    An eligible set that was never established stays UNKNOWN — `remainder_known` is left False."""
+    if not out.eligibility_known:
+        return
+    owed = int(out.targets_eligible)
+    out.targets_remaining = owed
+    out.remaining_now = out.remaining_cooldown = 0
+    out.remaining_terminal = {}
+    if owed:
+        if out.stop_kind in ("dependency", "machinery"):
+            out.remaining_terminal = {out.stop_kind: owed}
+        elif out.stop_kind is None and not out.slots_attempted and out.unselectable_slots:
+            out.remaining_terminal = {"unschedulable": owed}
+        else:
+            out.remaining_now = owed
+    out.remainder_known = True
 
 
 def _report_safely(lane: str, out: SweepResult, clock) -> None:

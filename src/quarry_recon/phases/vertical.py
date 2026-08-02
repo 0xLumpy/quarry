@@ -1315,7 +1315,8 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     # what this lane still OWES, in the supervisor's vocabulary (settle prerequisite B). Best effort: a
     # remainder is a REPORT, and losing it may never cost the run.
     try:
-        remainder.emit(remainder.from_sweep(source_id, swept))
+        if swept.remainder_known:          # UNKNOWN stays unreported: a lane that says nothing is unknown,
+            remainder.emit(remainder.from_sweep(source_id, swept))   # and zeroes would read as a fixed point
     except Exception as _e:                                  # noqa: BLE001 - a report is never a stop
         st.setdefault("machinery", []).append(f"remainder not reported ({type(_e).__name__})")
     st["sweep_stop"] = swept.stop or ""
