@@ -737,15 +737,21 @@ def osint(profile_path, timeout):
                    "removes the ROTATION, not a safety bound")
 def run(profile_path, phases, passive, timeout, unbound):
     """Run recon phases against the confirmed scope. Output lands in the project's recon/ dir."""
+    from . import settings
+
+    # an explicit operator instruction for THIS run: every eligible zone is contacted once, instead of the
+    # allowance handing the rest to a later lifecycle (step 4.3). Entered BEFORE anything reads a bound, so
+    # no lane can start under the rotation the operator just turned off — and RESTORED on the way out, so
+    # one run's instruction never leaks into another sharing this interpreter (step 2).
+    with settings.overrides({"WILDCARD_ZONES_PER_RUN": 0} if unbound else {}):
+        _run_phases(profile_path, phases, passive, timeout)
+
+
+def _run_phases(profile_path, phases, passive, timeout):
+    """The run itself, inside whatever policy overrides the flags established."""
     from .phases import ORDER, REGISTRY, PhaseContext
     from .store import Run
-    from . import checkpoint, exports, triage, settings
-
-    if unbound:
-        # an explicit operator instruction for THIS run: every eligible zone is contacted once, instead
-        # of the allowance handing the rest to a later lifecycle (step 4.3). Applied BEFORE anything
-        # reads a bound, so no lane can start under the rotation the operator just turned off.
-        settings.override("WILDCARD_ZONES_PER_RUN", 0)
+    from . import checkpoint, exports, triage
 
     try:
         profile = TargetProfile.load(_resolve_profile(profile_path))

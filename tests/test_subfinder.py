@@ -45,7 +45,8 @@ class TestSubfinderCeiling:
 
 
 class TestSubfinderBudget:
-    # PERFORMANCE.SUBFINDER_MAX_TIME (minutes); Quarry's 0 = practically unbounded; --timeout 0 -> unbounded too.
+    # PERFORMANCE.SUBFINDER_MAX_TIME (minutes); Quarry's 0 = practically unbounded. Step 2 of the flag axis
+    # SEPARATED it from `--timeout`: the outer kill decides waiting, this knob decides COLLECTION.
     # STRICT parse (review-r2#1): only an exact int / clean int-string in 0..1440; everything else -> 60.
     def _perf(self, monkeypatch, val):
         monkeypatch.setattr(settings, "performance",
@@ -65,9 +66,18 @@ class TestSubfinderBudget:
         self._perf(monkeypatch, raw)
         assert _subfinder_budget_min(1800) == expect                 # bounded outer, so the knob decides
 
-    def test_outer_timeout_zero_forces_unbounded_budget(self, monkeypatch):
+    def test_the_OUTER_kill_no_longer_decides_the_COLLECTION_budget(self, monkeypatch):
+        """flag-axis step 2: `--timeout 0` removes Quarry's outer process kill and NOTHING else. It used to
+        force subfinder's -max-time to 1440m as well — an outer-kill flag deciding coverage, which also
+        moved the resume key, so a run that only wanted no SIGKILL silently re-identified its work. How
+        much subfinder may COLLECT is `SUBFINDER_MAX_TIME`'s answer, and `--unbound`'s to lift."""
         self._perf(monkeypatch, 30)
-        assert _subfinder_budget_min(0) == _SUBFINDER_UNBOUNDED_MIN   # --timeout 0 -> unbounded regardless of knob
+        assert _subfinder_budget_min(0) == 30                        # the knob decides, whatever the outer
+        assert _subfinder_budget_min(1800) == 30
+        self._perf(monkeypatch, _NOKEY)
+        assert _subfinder_budget_min(0) == 60                        # ...including the default
+        self._perf(monkeypatch, 0)
+        assert _subfinder_budget_min(1800) == _SUBFINDER_UNBOUNDED_MIN   # only the KNOB unbinds it
 
     def test_never_zero_to_subfinder(self, monkeypatch):
         self._perf(monkeypatch, 0)
@@ -116,13 +126,14 @@ class TestSubfinderPerApex:
         assert st == {"a.com": Status.PARTIAL, "b.com": Status.SUCCESS}   # capped vs honest finish
         assert set(added) == {"www.a.com", "www.b.com"} and len(recorded) == 2   # ingestion retained
 
-    def test_unbounded_outer_gives_unbounded_budget_and_no_outer_kill(self, monkeypatch, tmp_path):
-        # --timeout 0 -> subfinder budget 1440m + outer subprocess timeout 0 (no kill)
+    def test_unbounded_outer_removes_the_KILL_and_leaves_the_budget_alone(self, monkeypatch, tmp_path):
+        # flag-axis step 2: `--timeout 0` -> outer subprocess timeout 0 (no kill), collection budget still
+        # the configured one. The two axes are separate: waiting vs how much subfinder may collect.
         calls, _, _ = self._wire(monkeypatch, tmp_path, 0, lambda a: 12.0)
         for c in calls:
-            assert c["cmd"][c["cmd"].index("-max-time") + 1] == str(_SUBFINDER_UNBOUNDED_MIN)   # 1440
+            assert c["cmd"][c["cmd"].index("-max-time") + 1] == "60"   # the default budget, untouched
             assert c["timeout"] == 0                                   # no outer kill under --timeout 0
-        assert all(c["status"] == Status.SUCCESS for c in calls)      # 12s << 1440m -> honest SUCCESS
+        assert all(c["status"] == Status.SUCCESS for c in calls)      # 12s << 60m -> honest SUCCESS
 
 
 class TestSubfinderProviderFP:

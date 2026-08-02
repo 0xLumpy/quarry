@@ -241,3 +241,54 @@ class TestTheRegistryTellsTheTruth:
         stated instead of assumed."""
         pending = [b.name for b in policy.relaxable() if not b.consumer_honours_unbounded]
         assert pending == ["CLOUD_NAME_CAP", "SPA_CAP", "MAX_ITERS"], pending
+
+
+class TestOverridesAreRunScoped:
+    """flag-axis step 2: a flag is ONE run's instruction. `override()` alone is process-global and never
+    restored, so an unbound child run would leave its bounds lifted for the next run in the same
+    interpreter — exactly what a `--settle` supervisor will do."""
+
+    def test_the_override_is_RESTORED_on_the_way_out(self):
+        from quarry_recon import settings
+        from quarry_recon.phases import vertical
+        assert vertical.wildcard_zones_per_run() == 5
+        with settings.overrides({"WILDCARD_ZONES_PER_RUN": 0}):
+            assert vertical.wildcard_zones_per_run() == 0
+        assert vertical.wildcard_zones_per_run() == 5
+
+    def test_it_is_restored_even_when_the_run_RAISES(self):
+        from quarry_recon import settings
+        from quarry_recon.phases import vertical
+        with pytest.raises(KeyboardInterrupt):
+            with settings.overrides({"WILDCARD_ZONES_PER_RUN": 0}):
+                raise KeyboardInterrupt("ctrl-c mid-run")
+        assert vertical.wildcard_zones_per_run() == 5
+
+    def test_an_OUTER_override_survives_an_inner_one(self):
+        """Nesting restores the previous value, not "no overrides at all"."""
+        from quarry_recon import settings
+        from quarry_recon.phases import vertical
+        try:
+            with settings.overrides({"WILDCARD_ZONES_PER_RUN": 2}):
+                with settings.overrides({"WILDCARD_ZONES_PER_RUN": 0}):
+                    assert vertical.wildcard_zones_per_run() == 0
+                assert vertical.wildcard_zones_per_run() == 2
+        finally:
+            settings.clear_overrides()
+        assert vertical.wildcard_zones_per_run() == 5
+
+    def test_a_SECOND_run_in_one_interpreter_starts_bounded(self, tmp_path, monkeypatch):
+        """The supervisor case, through the real command: an unbound run must not lift the next one."""
+        from click.testing import CliRunner
+        from quarry_recon import cli as cli_mod
+        from quarry_recon.phases import vertical
+        seen: list = []
+
+        def _boom(*a, **k):
+            seen.append(vertical.wildcard_zones_per_run())
+            raise SystemExit(0)
+
+        monkeypatch.setattr(cli_mod, "_resolve_profile", _boom)
+        CliRunner().invoke(cli_mod.cli, ["run", "-t", "acme", "--unbound"])
+        CliRunner().invoke(cli_mod.cli, ["run", "-t", "acme"])
+        assert seen == [0, 5], seen

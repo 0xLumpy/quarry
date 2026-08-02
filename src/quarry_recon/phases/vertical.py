@@ -32,10 +32,16 @@ def _subfinder_budget_min(http_timeout) -> int:
     STRICT parse (review-r2#1): an EXACT integer (or clean integer string) in 0..1440 only — a bool / float /
     negative / oversized / garbage value falls back to 60 (never a silent 1-min cap from `true`, a 24h run from
     `false`/negatives, or a Go duration overflow). Quarry's 0 = 'practically unbounded' -> 1440m (NEVER 0 to
-    subfinder, which would cancel); `quarry run --timeout 0` likewise forces the practical-unbounded budget."""
+    subfinder, which would cancel).
+
+    flag-axis step 2: `--timeout 0` no longer forces it. That flag removes Quarry's OUTER process kill and
+    nothing else; how much subfinder may COLLECT is a coverage bound, and coverage bounds belong to
+    `--unbound`. An outer-kill flag deciding collection meant two different questions shared one answer —
+    and it changed the resume key, so a run that only wanted no SIGKILL silently re-identified its work.
+    `http_timeout` is still taken (the outer backstop is derived from the effective budget by the caller)."""
     knob = settings.strict_int("SUBFINDER_MAX_TIME",         # shared coverage-knob parser (same semantics)
                                default=_SUBFINDER_DEFAULT_MIN, maximum=_SUBFINDER_UNBOUNDED_MIN)
-    if knob <= 0 or http_timeout == 0:                       # 0 (or unbounded outer) -> practically unbounded
+    if knob <= 0:                                            # 0 -> practically unbounded (never 0 to subfinder)
         return _SUBFINDER_UNBOUNDED_MIN
     return knob
 

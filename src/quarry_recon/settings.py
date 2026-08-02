@@ -13,6 +13,7 @@ created once by bootstrap and never overwritten (same rule as secrets.yaml).
 """
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -46,6 +47,23 @@ def override(key: str, value) -> None:
 def clear_overrides() -> None:
     """Drop every run-scoped override (a fresh process, or a test)."""
     _overrides.clear()
+
+
+@contextlib.contextmanager
+def overrides(values: dict):
+    """Apply flag overrides for ONE run, and restore whatever was there before.
+
+    `override()` alone is process-global and never restored, which is wrong the moment two runs share an
+    interpreter — a `--settle` supervisor drives child runs in one process, and an unbound child would
+    leave its bounds lifted for the next one. Snapshot in, restore in `finally`, so a run's instruction
+    cannot outlive the run (flag-axis step 2)."""
+    before = dict(_overrides)
+    _overrides.update(values)
+    try:
+        yield
+    finally:
+        _overrides.clear()
+        _overrides.update(before)
 
 
 def performance() -> dict:
