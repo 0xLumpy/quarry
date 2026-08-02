@@ -232,6 +232,21 @@ class TestTheRegistryTellsTheTruth:
         provider = {k for k, v in policy.SOURCE_OWNERSHIP.items() if v == "quarry_provider"}
         assert provider == set(policy.PROVIDER_LANES) - set(policy.PROVIDER_LANES_OUTSIDE_REGISTRY)
 
+    def test_every_BOUND_names_a_registered_lane(self):
+        """A bound whose lane is a stale alias misattributes every policy line it prints, and cannot join
+        with the planned-lane roster settle will need. Four were aliases: `crawl.sourcemap`, `probe.vhost`,
+        `params.nuclei` and `vertical.permute`."""
+        from quarry_recon import sources
+        registered = set(sources.all_sources())
+        stale = sorted({b.lane for b in policy.BOUNDS} - registered - {"sweep"})
+        assert not stale, stale
+
+    def test_an_ACTIVE_lane_is_never_classified_local(self):
+        """Completeness cannot catch a category that is merely WRONG: both of these fetch over the network,
+        under scope and rate guards, and were filed as local computation."""
+        for lane in ("horizontal.csp", "crawl.sourcemaps"):
+            assert policy.SOURCE_OWNERSHIP[lane] == "target_facing", lane
+
     def test_CERTSPOTTER_and_crtsh_are_ours(self):
         """Both are Quarry-implemented HTTP to a third-party CT service — certspotter with Quarry's own
         token and `PROVIDER_MAX_PAGES`. Free or keyless is not the test; who makes the call is."""

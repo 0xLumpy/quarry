@@ -92,9 +92,9 @@ SOURCE_OWNERSHIP: dict[str, str] = {
        ("vertical.subfinder", "crawl.gau", "crawl.waymore_urls", "crawl.waymore_responses",
         "horizontal.caduceus", "horizontal.asnmap", "enrich.smap", "probe.smap", "params.oob_probe")},
     **{lane: "local" for lane in
-       ("vertical.openintel", "horizontal.kaeferjaeger", "horizontal.mapcidr", "horizontal.csp",
+       ("vertical.openintel", "horizontal.kaeferjaeger", "horizontal.mapcidr",
         "params.gf", "crawl.js_beautify", "crawl.jsluice_urls", "crawl.jsluice_secrets",
-        "crawl.gitleaks", "crawl.trufflehog", "crawl.xnlinkfinder", "crawl.sourcemaps",
+        "crawl.gitleaks", "crawl.trufflehog", "crawl.xnlinkfinder",
         "origin.correlation", "vertical.alterx_permute")},
     **{lane: "target_facing" for lane in
        ("content.ffuf", "crawl.js_fetch", "crawl.katana_headless", "crawl.katana_standard",
@@ -105,7 +105,11 @@ SOURCE_OWNERSHIP: dict[str, str] = {
         "params.nuclei_scan", "params.nuclei_takeover", "params.redirect_confirm", "probe.ffuf_vhost",
         "probe.gowitness", "probe.httpx", "probe.naabu_infra", "probe.naabu_web", "probe.nmap_service",
         "probe.tlsx_certs", "vertical.puredns_brute", "vertical.puredns_resolve",
-        "vertical.wildcard_http")},
+        "vertical.wildcard_http",
+        # both ACTIVE: the CSP lane fetches the apex itself through `fetch.scoped_headers` (guarded,
+        # paced), and the sourcemap lane fetches scoped `sourceMappingURL` targets. Completeness cannot
+        # catch a category that is merely WRONG.
+        "horizontal.csp", "crawl.sourcemaps")},
 }
 OWNERSHIP_KINDS = ("quarry_provider", "external_tool", "target_facing", "local")
 
@@ -139,8 +143,8 @@ BOUNDS: tuple[Bound, ...] = (
                       ("ARJUN_BUDGET_S", "params.arjun"),
                       ("CONTENT_FFUF_BUDGET_S", "content.ffuf"),
                       ("JS_FETCH_BUDGET_S", "crawl.js_fetch"),
-                      ("SOURCEMAP_BUDGET_S", "crawl.sourcemap"),
-                      ("VHOST_BUDGET_S", "probe.vhost"),
+                      ("SOURCEMAP_BUDGET_S", "crawl.sourcemaps"),
+                      ("VHOST_BUDGET_S", "probe.ffuf_vhost"),
                       ("WILDCARD_BUDGET_S", "vertical.wildcard_http"))),
 
     # ── free-lane coverage knobs read through the strict parser ──────────────────────────────────
@@ -152,7 +156,7 @@ BOUNDS: tuple[Bound, ...] = (
           note="minutes, and the unbounded value is 1440 rather than 0: upstream feeds -max-time into "
                "context.WithTimeout, where 0 CANCELS. Today `--timeout 0` also forces it — the axis model "
                "separates them (plan step 2)"),
-    Bound(name="NUCLEI_MAX_HOST_ERROR", reader="strict_int", lane="params.nuclei", default=0,
+    Bound(name="NUCLEI_MAX_HOST_ERROR", reader="strict_int", lane="params.nuclei_scan", default=0,
           maximum=100000, identity="work_unit",
           persistence="the scan's resume key — -mhe decides which hosts are scanned at all",
           relaxable=True, unbounded_value=0, consumer_honours_unbounded=True,
@@ -190,7 +194,7 @@ BOUNDS: tuple[Bound, ...] = (
                "gap): exactly the PROCESSING side. It is function-local today, so wiring it means "
                "promoting it to a module constant AND teaching the consumer 0 — the widening step's work"),
 
-    Bound(name="MAX_ITERS", reader="module", lane="vertical.permute", default=3, identity="none",
+    Bound(name="MAX_ITERS", reader="module", lane="vertical.alterx_permute", default=3, identity="none",
           const="quarry_recon.phases.vertical:MAX_ITERS",
           persistence="nothing — the permutation loop is run-scoped",
           relaxable=True, unbounded_value=0, consumer_honours_unbounded=True,
