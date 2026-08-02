@@ -8,6 +8,7 @@ entity that is never counted as the child's own discovery.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -409,6 +410,83 @@ class TestTheUnionCarriesItsOwnTrust:
                 union.absorb(run.dir, kinds=["subdomain"])
         assert union.records == published, union.records
         assert campaign.Union(union.path).records == published
+
+    def test_a_failure_in_PREPARATION_settles_too(self, tmp_path):
+        """Serialisation, fingerprinting and the generation choice all happen after the caller mutated the
+        records — a raise there would otherwise leave the object `valid` holding an unpublished record."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        published = dict(union.records)
+        union.records[("subdomain", "ghost.acme.com")] = {"host": "ghost.acme.com", "sources": ["x"]}
+        real, calls = store.fingerprint, {"n": 0}
+
+        def flaky(kind, rec):
+            calls["n"] += 1
+            if calls["n"] == 1:                       # fails while PREPARING, recovers for the re-read
+                raise RuntimeError("boom")
+            return real(kind, rec)
+
+        import unittest.mock as _m
+        with _m.patch.object(store, "fingerprint", flaky):
+            with pytest.raises(RuntimeError):
+                union._publish()
+        assert union.records == published and union.status == "valid", union.records
+        assert campaign.Union(union.path).records == published
+
+    def test_when_SETTLING_also_fails_the_union_says_so(self, tmp_path):
+        """The original failure still propagates — but the object may not keep claiming to be valid."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        union.records[("subdomain", "ghost.acme.com")] = {"host": "ghost.acme.com", "sources": ["x"]}
+        import unittest.mock as _m
+        with _m.patch.object(store, "fingerprint", side_effect=RuntimeError("boom everywhere")):
+            with pytest.raises(RuntimeError, match="boom everywhere"):
+                union._publish()
+        assert union.status == "unusable" and not union.trustworthy, union
+        assert "could not be re-read" in union.reason, union
+
+    def test_RECOVERY_never_overwrites_a_surviving_generation(self, tmp_path):
+        """A malformed pointer leaves `generation = 0`, and `+1` would publish OVER the generation that
+        still holds the campaign's only copy of its evidence."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        gen_one = union.dir / "union-gen000001.jsonl"
+        before = gen_one.read_text()
+        pointer = json.loads(union.path.read_text())
+        pointer["generation"] = "not a generation"
+        union.path.write_text(json.dumps(pointer))
+        broken = campaign.Union(union.path)
+        assert broken.status == "unusable" and broken.generation == 0
+        broken.recover("pointer generation was malformed")
+        assert gen_one.read_text() == before, "the surviving generation was overwritten"
+        assert broken.generation == 2 and json.loads(union.path.read_text())["generation"] == 2
+
+    def test_publication_refuses_when_the_next_generation_NAME_is_taken(self, tmp_path):
+        """The scan counts generation FILES, so something else wearing that name — a directory, say — is
+        invisible to it. Publishing anyway would replace or fail over whatever is there."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        (union.dir / "union-gen000002.jsonl").mkdir()
+        published = dict(union.records)
+        union.records[("subdomain", "b.acme.com")] = {"host": "b.acme.com", "sources": ["x"]}
+        with pytest.raises(OSError, match="already exists"):
+            union._publish()
+        assert union.records == published, union.records
+        assert campaign.Union(union.path).generation == 1
+
+    def test_an_UNINSPECTABLE_directory_is_never_a_new_campaign(self, tmp_path):
+        """"I could not look" must never be mistaken for "nothing is here"."""
+        import unittest.mock as _m
+        with _m.patch.object(pathlib.Path, "glob", side_effect=PermissionError("denied")):
+            union = campaign.Union.for_campaign(tmp_path, "c9", create=True)
+        assert (union.status, union.trustworthy) == ("unusable", False), union
+        assert "could not be inspected" in union.reason, union
+
+    def test_publication_REFUSES_when_the_directory_cannot_be_inspected(self, tmp_path):
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        published = dict(union.records)
+        union.records[("subdomain", "b.acme.com")] = {"host": "b.acme.com", "sources": ["x"]}
+        import unittest.mock as _m
+        with _m.patch.object(pathlib.Path, "glob", side_effect=PermissionError("denied")):
+            with pytest.raises(OSError):
+                union._publish()
+        assert union.records == published, union.records
 
     def test_a_publication_that_LANDED_before_the_interruption_is_adopted(self, tmp_path):
         """The other half: the swap may land a moment before the cancellation. Restoring the old snapshot

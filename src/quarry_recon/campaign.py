@@ -105,11 +105,15 @@ class Union:
         if not self.trustworthy:
             raise UnionUnusable(f"{self.path}: {self.status} — {self.reason}")
 
-    def _generations(self) -> list:
+    def _generations(self):
+        """Every generation file that survives here, or None when the directory cannot be INSPECTED.
+
+        The two answers are different: "nothing is here" licenses creating a campaign, and "I could not
+        look" must never be mistaken for it."""
         try:
-            return sorted(self.dir.glob("union-gen*.jsonl"))
+            return sorted(p for p in self.dir.glob("union-gen*.jsonl") if p.is_file())
         except OSError:
-            return []
+            return None
 
     # ── loading, with everything verified ─────────────────────────────────────────────────────────
     def _load(self, *, create: bool) -> None:
@@ -122,7 +126,10 @@ class Union:
             # earlier campaign survives here. A deleted pointer beside its generations is evidence loss,
             # and blessing it as new is exactly the false fixed point this guards against.
             leftovers = self._generations()
-            if create and not leftovers:
+            if create and leftovers is None:
+                self.status = "unusable"
+                self.reason = "the campaign directory could not be inspected — refusing to create"
+            elif create and not leftovers:
                 self.status, self.reason = "new", "created"
             elif create:
                 self.status = "unusable"
@@ -208,30 +215,57 @@ class Union:
     def _publish(self, recovered: str = "") -> None:
         """Write the generation COMPLETE, then swap the single pointer. Until the pointer lands, the
         previous generation is what the campaign reads; it is left in place, so a failed swap costs
-        nothing."""
-        self.dir.mkdir(parents=True, exist_ok=True)
-        lines = []
-        for (kind, key), rec in sorted(self.records.items()):
-            lines.append(json.dumps({"kind": kind, "id": key, "record": rec,
-                                     "fp": store.fingerprint(kind, rec)}, ensure_ascii=False))
-        body = "\n".join(lines) + ("\n" if lines else "")
-        nxt = int(self.generation) + 1
-        name = _generation_file(nxt)
-        pointer = {"generation": nxt, "file": name, "count": len(self.records),
-                   "digest": hashlib.sha256(body.encode("utf-8")).hexdigest()}
-        if recovered:
-            pointer["recovered"] = recovered
+        nothing.
+
+        EVERYTHING is inside the settlement boundary — the directory, the serialisation, the fingerprints,
+        the generation choice and both writes. A caller has already mutated `self.records` by the time this
+        runs, so anything that raises in preparation would otherwise leave this object `valid` while
+        holding a record no disk published."""
         try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            nxt = self._next_generation()
+            name = _generation_file(nxt)
+            lines = []
+            for (kind, key), rec in sorted(self.records.items()):
+                lines.append(json.dumps({"kind": kind, "id": key, "record": rec,
+                                         "fp": store.fingerprint(kind, rec)}, ensure_ascii=False))
+            body = "\n".join(lines) + ("\n" if lines else "")
+            pointer = {"generation": nxt, "file": name, "count": len(self.records),
+                       "digest": hashlib.sha256(body.encode("utf-8")).hexdigest()}
+            if recovered:
+                pointer["recovered"] = recovered
             store._atomic_write(self.dir / name, body)
             store._atomic_write(self.path, json.dumps(pointer, indent=2))
         except BaseException:
             # ANY interruption leaves publication UNDECIDED — the swap may have landed a moment before a
             # cancellation, or not at all. Guessing either way is how an object keeps records no disk holds
             # (or discards records the disk does hold), so the authoritative pointer is re-read and adopted.
-            self._settle()
+            try:
+                self._settle()
+            except BaseException:
+                # settling failed too: say so, and let the ORIGINAL failure be the one that propagates
+                self.status = "unusable"
+                self.reason = "publication failed and the pointer could not be re-read"
             raise
         self.generation = nxt
         self.status, self.dropped, self.reason = "valid", 0, ""
+
+    def _next_generation(self) -> int:
+        """A generation number strictly ABOVE every one that survives here — never merely `self.generation
+        + 1`, which is 0-based for a malformed pointer and would publish OVER an existing generation. An
+        immutable generation is only immutable if nothing ever replaces it."""
+        surviving = self._generations()
+        if surviving is None:
+            raise OSError(f"{self.dir}: the campaign directory could not be inspected")
+        highest = int(self.generation)
+        for path in surviving:
+            digits = path.name[len("union-gen"):-len(".jsonl")]
+            if digits.isdigit():
+                highest = max(highest, int(digits))
+        nxt = highest + 1
+        if (self.dir / _generation_file(nxt)).exists():          # belt and braces: never replace one
+            raise OSError(f"{self.dir}: generation {nxt} already exists")
+        return nxt
 
     def _settle(self) -> None:
         """Adopt whatever the pointer actually says now — the only authority on what was published."""
