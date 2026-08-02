@@ -198,6 +198,23 @@ def _range_note(value, maximum: int | None) -> str:
     return "outside the accepted range"
 
 
+def flag_int(key: str, *, default: int, maximum: int) -> tuple[int, str, str | None, str | None]:
+    """Like `strict_int_with_source`, but reading ONLY run-scoped flag overrides — never `config.yaml`.
+
+    A module constant is not a PERFORMANCE knob: config has no say over it, and letting the same reader
+    serve both made an ordinary config key change a module bound (and made the policy report claim a HELD
+    cap had moved while the lane went on using its constant)."""
+    if key not in _overrides:
+        return default, "default", None, None
+    saved = dict(_overrides)
+    try:
+        # the same strict parse, over the flag layer alone
+        globals()["_overrides"] = {key: saved[key]}
+        return strict_int_with_source(key, default=default, maximum=maximum)
+    finally:
+        globals()["_overrides"] = saved
+
+
 def strict_int_with_source(key: str, *, default: int,
                            maximum: int) -> tuple[int, str, str | None, str | None]:
     """`(value, source, rejected, rejected_source)` — the value, WHO it came from, what was thrown away

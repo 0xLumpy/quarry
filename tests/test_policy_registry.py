@@ -670,3 +670,37 @@ class TestTheConsumersHonourTheirUnboundedValue:
         assert '_cap = policy.limit("SPA_CAP")' in src, "the lane must READ the policy"
         assert "spa = _spa_all if not _cap else _spa_all[:_cap]" in src, "...and slice with it"
         assert "_spa_all[:SPA_CAP]" not in src, src
+
+
+class TestModuleBoundsAreFLAGOnly:
+    """A module constant is not a PERFORMANCE knob: `config.yaml` has no say over it. One reader serving
+    both let ordinary config change a module bound — and let the policy report claim the HELD `A1D_WORD_CAP`
+    had moved to 0 while A1d went on brute-forcing with 2000."""
+
+    @pytest.mark.parametrize("name,configured,expect", [
+        ("MAX_ITERS", 0, 3), ("CLOUD_NAME_CAP", 1, 120), ("WILDCARD_WORD_CAP", 7, 5000),
+        ("A1D_WORD_CAP", 0, 2000),
+    ])
+    def test_config_cannot_move_a_module_bound(self, name, configured, expect, monkeypatch):
+        from quarry_recon import policy, settings
+        monkeypatch.setattr(settings, "performance", lambda: {name: configured})
+        assert policy.limit(name) == expect
+        row = {r["name"]: r for r in policy.snapshot()}[name]
+        assert (row["value"], row["source"]) == (expect, "default"), row
+
+    def test_the_HELD_cap_the_lane_uses_is_the_one_the_report_shows(self, monkeypatch):
+        """The worst shape of the same defect: a report that disagrees with the lane about a HELD bound."""
+        from quarry_recon import policy, settings
+        from quarry_recon.phases import enrich
+        monkeypatch.setattr(settings, "performance", lambda: {"A1D_WORD_CAP": 0})
+        with settings.overrides(policy.unbound_overrides()):        # even under `--unbound`
+            row = {r["name"]: r for r in policy.snapshot()}["A1D_WORD_CAP"]
+            assert (row["value"], row["source"]) == (2000, "default"), row
+            assert row["value"] == enrich.A1D_WORD_CAP, (row, enrich.A1D_WORD_CAP)
+
+    def test_a_FLAG_still_moves_a_module_bound(self):
+        from quarry_recon import policy, settings
+        with settings.overrides({"WILDCARD_WORD_CAP": 0}):
+            assert policy.limit("WILDCARD_WORD_CAP") == 0
+            row = {r["name"]: r for r in policy.snapshot()}["WILDCARD_WORD_CAP"]
+            assert (row["value"], row["source"], row["unbounded"]) == (0, "flag", True), row

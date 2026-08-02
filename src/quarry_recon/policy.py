@@ -275,7 +275,7 @@ def limit(name: str) -> int:
     if b is None:
         raise KeyError(name)                       # an unregistered bound has no policy to apply
     default = _module_default(b)
-    value, _src, _rej, _rs = settings.strict_int_with_source(
+    value, _src, _rej, _rs = settings.flag_int(
         name, default=default, maximum=max(default, b.unbounded_value or 0, 10 ** 9))
     return value
 
@@ -315,8 +315,9 @@ def effective(bound: Bound) -> tuple[int, str, str | None, str | None]:
     # a module constant is not configurable, but it IS relaxable — so the same override-aware parse runs
     # over it, and the report shows a lifted cap as `flag` exactly like a knob (step 4).
     default = _module_default(bound)
-    return settings.strict_int_with_source(bound.name, default=default,
-                                           maximum=max(default, bound.unbounded_value or 0, 10 ** 9))
+    # FLAG-ONLY: `config.yaml` has no say over a module constant (step 4 review)
+    return settings.flag_int(bound.name, default=default,
+                             maximum=max(default, bound.unbounded_value or 0, 10 ** 9))
 
 
 def snapshot() -> list[dict]:

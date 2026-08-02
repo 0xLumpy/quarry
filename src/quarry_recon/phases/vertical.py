@@ -1333,6 +1333,7 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
     MAX_ITERS to 0 = "until it converges", and an unbounded loop is only safe if its termination is
     tested rather than assumed."""
     rounds = policy.limit("MAX_ITERS")          # 0 = until it converges (`--unbound`)
+    converged = False
     prev = -1
     seen_candidates: set[str] = set()
     it = 0
@@ -1403,7 +1404,10 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
         else:
             seen_candidates.update(resolved_now)
             retryable = len(set(new_cand) - resolved_now)
-            _budget = "retry budget exhausted (final iteration)" if it == MAX_ITERS else "retryable next iteration"
+            # the EFFECTIVE rounds decide, not the module default — and an unbounded run has no final
+            # iteration to exhaust, so it never promises one it will not run (step 4 review)
+            _budget = ("retry budget exhausted (final iteration)" if rounds and it >= rounds
+                       else "retryable next iteration")
             events.coverage_partial("vertical.puredns_resolve", reason=f"iter {it}: puredns {r.status.value} — "
                                     f"{retryable} candidate(s) unresolved, {_budget}")
 
@@ -1411,8 +1415,26 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
         ctx.echo(f"  recursion iter {it}: resolved={cur}"
                  + ("" if prev < 0 else f" (+{cur - prev} new)"))
         if prev >= 0 and cur == prev:
+            converged = True
             break          # converged — nothing new this iteration
         prev = cur
+
+    # ── what ENDED the recursion — a cap or a fixed point (step 4 review) ────────────────────────────
+    # A run whose LAST permitted round still produced new names did not finish: more names are reachable
+    # and this run will not reach them, which is a cap-shaped omission the verdict has to see. Emitting
+    # every run (omitted=0 when converged) keeps the latest-per-unit reconciliation honest.
+    _more = bool(rounds) and not converged and it >= rounds
+    events.coverage_partial("vertical.alterx_permute", kind=events.COVERAGE_CAP,
+                            unit="vertical.permute_rounds", measure="permutation_rounds",
+                            eligible=it + (1 if _more else 0), tested=it, omitted=1 if _more else 0,
+                            reason=(f"{it} permutation round(s) ran and the last one still found new "
+                                    f"names — the {rounds}-round bound stopped the recursion BEFORE it "
+                                    f"converged; at least one more round is reachable work"
+                                    if _more else
+                                    f"{it} permutation round(s) — the recursion CONVERGED"
+                                    if converged else
+                                    f"{it} permutation round(s) — the recursion stopped early "
+                                    f"(no new candidates or a passive/dependency stop)"))
 
 
 def run(ctx) -> None:

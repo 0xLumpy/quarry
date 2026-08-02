@@ -3561,11 +3561,18 @@ class TestTheDifferRotatesOverZonesAndWords:
         assert any(c.startswith("w0831.") or c.startswith("w1263.") for c in seen), seen
 
 
+def _events_of(project) -> list:
+    """Every event a `_drive`d run wrote (the run dir is the only one under the project)."""
+    import pathlib as _p
+    log = next(_p.Path(project).glob("recon/*/events.jsonl"), None)
+    return [json.loads(l) for l in log.read_text().splitlines()] if log else []
+
+
 class TestTheRecursionRoundsPolicy:
     """flag-axis step 4: `MAX_ITERS` is `--unbound`'s (repetition cannot continue a run-scoped loop), so
     `0` means "until it converges". An unbounded loop is only safe if its TERMINATION is tested."""
 
-    def _drive(self, tmp_path, monkeypatch, *, growth, rounds=None):
+    def _drive(self, tmp_path, monkeypatch, *, growth, rounds=None, status=None):
         """Run the real recursion loop with a resolver whose answers `growth(iteration)` decides."""
         from quarry_recon import store
         from quarry_recon.phases import vertical
@@ -3581,7 +3588,8 @@ class TestTheRecursionRoundsPolicy:
             iters.append(len(iters) + 1)
             hosts = growth(len(iters))
             raw_path.write_text("\n".join(hosts) + ("\n" if hosts else ""))
-            return _RR(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, raw_path, len(hosts))
+            st = (status(len(iters)) if callable(status) else status) or crawl.Status.SUCCESS
+            return _RR(tool, cmd, st, 0, 0.1, raw_path, len(hosts))
 
         monkeypatch.setattr(vertical, "exec_tool", fake_exec)
         monkeypatch.setattr(vertical, "have", lambda t: True)
@@ -3648,6 +3656,41 @@ class TestTheRecursionRoundsPolicy:
         finally:
             events.reset()
         assert len(rounds) == 2, rounds        # round 1 resolves nothing, round 2 confirms it -> stop
+
+    def test_a_GENUINELY_degraded_batch_says_retryable_only_when_it_IS(self, tmp_path, monkeypatch):
+        """The degraded branch, driven with real degraded results. Its sentence must follow the EFFECTIVE
+        rounds: a bounded final round has no retry left, and an unbounded run must not promise a next
+        iteration in the very round it stops."""
+        from quarry_recon import policy, settings
+        deg = lambda i: crawl.Status.TIMED_OUT
+        self._drive(tmp_path / "bounded", monkeypatch, growth=lambda i: [f"h{i}.acme.com"], status=deg)
+        reasons = [e.get("reason", "") for e in _events_of(tmp_path / "bounded")
+                   if e.get("source_id") == "vertical.puredns_resolve"]
+        assert len(reasons) == 3, reasons
+        assert "retryable next iteration" in reasons[0], reasons
+        assert "retry budget exhausted (final iteration)" in reasons[-1], reasons
+        with settings.overrides(policy.unbound_overrides()):
+            self._drive(tmp_path / "unbound", monkeypatch,
+                        growth=lambda i: [f"h{i}.acme.com"] if i < 3 else [], status=deg)
+        unb = [e.get("reason", "") for e in _events_of(tmp_path / "unbound")
+               if e.get("source_id") == "vertical.puredns_resolve"]
+        # unbounded: never "exhausted", because there is no final iteration to exhaust
+        assert unb and not any("exhausted" in r for r in unb), unb
+
+    def test_a_BOUNDED_run_that_was_still_finding_names_SAYS_so(self, tmp_path, monkeypatch):
+        """A run whose LAST permitted round still produced new names did not finish, and the manifest must
+        not read `complete` because the loop merely ran out of rounds."""
+        chain = {1: ["a1.acme.com"], 2: ["a2.acme.com"], 3: ["a3.acme.com"], 4: ["a4.acme.com"]}
+        self._drive(tmp_path / "cut", monkeypatch, growth=lambda i: chain.get(i, []))
+        cov = [e for e in _events_of(tmp_path / "cut") if e.get("measure") == "permutation_rounds"][-1]
+        assert (cov["eligible"], cov["tested"], cov["omitted"]) == (4, 3, 1), cov
+        assert "BEFORE it converged" in cov["reason"] and "3-round bound" in cov["reason"], cov
+
+        from quarry_recon import policy, settings
+        with settings.overrides(policy.unbound_overrides()):
+            self._drive(tmp_path / "whole", monkeypatch, growth=lambda i: chain.get(i, []))
+        cov = [e for e in _events_of(tmp_path / "whole") if e.get("measure") == "permutation_rounds"][-1]
+        assert cov["omitted"] == 0 and "CONVERGED" in cov["reason"], cov
 
     def test_a_DEGRADED_resolver_making_no_progress_TERMINATES(self, tmp_path, monkeypatch):
         """The safety half: unbound must not mean forever. A resolver that answers the same thing every
