@@ -136,12 +136,12 @@ def _diagnostic(raw, *, maximum: int | None = None) -> str:
         stripped = raw.strip()
         body = stripped[1:] if stripped[:1] == "-" else stripped
         if body.isdigit():
-            if len(body) > limit:
-                # a number this long cannot be converted, and cannot be in range either
+            if len(_significant(body)) > limit:
+                # this many SIGNIFICANT digits cannot be converted — and is genuinely above any maximum
                 return (f"str({len(body)} digits; "
                         f"{'below zero' if stripped[:1] == '-' else _range_note(None, maximum)})")
             text, quoted = stripped, True
-            numeric = int(stripped)
+            numeric = int(_significant(body) or "0") * (-1 if stripped[:1] == "-" else 1)
         else:
             return f"str({len(raw)} chars)"             # never the CONTENT of an opaque value
     elif isinstance(raw, (list, tuple, set)):
@@ -169,7 +169,16 @@ def _int_str_limit() -> int:
     exists to refuse it, and now does so on every run, since the policy snapshot reads every bound."""
     import sys
     getter = getattr(sys, "get_int_max_str_digits", None)
-    return getter() if getter else 4300
+    limit = getter() if getter else 0
+    # 0 means the interpreter DISABLED the limit (3.11+), not "zero digits allowed". Reading it literally
+    # refused every numeric setting — a configured "10" became the default.
+    return limit if limit > 0 else 4300
+
+
+def _significant(digits: str) -> str:
+    """The digits that decide the VALUE — leading zeroes are representation, not magnitude. `"0" * 5000` is
+    zero, and calling it "above maximum" claims a comparison nobody performed."""
+    return digits.lstrip("0")
 
 
 def _digit_count(raw: int) -> int:
@@ -207,10 +216,14 @@ def strict_int_with_source(key: str, *, default: int,
         value = None                                  # a bool is not an int here, ever
     elif isinstance(raw, int):
         value = raw if 0 <= raw <= maximum else None  # a comparison never converts, however long it is
-    elif isinstance(raw, str) and raw.strip().isdigit() and len(raw.strip()) <= _int_str_limit():
+    elif (isinstance(raw, str) and raw.strip().isdigit()
+            and len(_significant(raw.strip())) <= _int_str_limit()):
         # the LENGTH gate comes first: `int("9" * 5000)` raises, and a parser that exists to refuse a
-        # value may not abort the run with it — every run reads every bound for the policy report.
-        v = int(raw.strip())
+        # value may not abort the run with it — every run reads every bound for the policy report. Leading
+        # zeroes are representation: `"0" * 5000` is zero, and zero is a value this parser accepts.
+        # ...and the SIGNIFICANT part is what gets converted: CPython's limit counts the STRING's length,
+        # so `int("0" * 5000)` raises even though the value is zero.
+        v = int(_significant(raw.strip()) or "0")
         value = v if 0 <= v <= maximum else None
     if value is None:
         return default, "default", _diagnostic(raw, maximum=maximum), written   # refused, and SAID so

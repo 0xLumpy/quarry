@@ -496,6 +496,37 @@ class TestARejectedValueIsNeverDISCLOSED:
         assert (row["value"], row["source"], row["rejected"]) == (60, "default", expect), row
         assert len(policy.render()) < 40                            # the report stays BOUNDED
 
+    def test_a_DISABLED_conversion_limit_does_not_mean_zero_digits(self, monkeypatch):
+        """`sys.get_int_max_str_digits()` returns 0 when the interpreter DISABLED the limit. Reading that
+        literally made every numeric setting fail its length gate — a configured "10" became the default."""
+        import sys as _sys
+        from quarry_recon import settings
+        monkeypatch.setattr(_sys, "get_int_max_str_digits", lambda: 0, raising=False)
+        assert settings._int_str_limit() == 4300
+        monkeypatch.setattr(settings, "performance", lambda: {"SUBFINDER_MAX_TIME": "10"})
+        assert settings.strict_int_with_source("SUBFINDER_MAX_TIME", default=60, maximum=1440) == (
+            10, "config", None, None)
+
+    @pytest.mark.parametrize("kind,expect", [
+        ("zeros", 0),                    # "0" * 5000 IS zero — leading zeroes are representation
+        ("zeros_then_30", 30),           # ...and they do not make a small number unconvertible
+        ("nines", 60),                   # 5000 significant digits: genuinely refused, default kept
+    ])
+    def test_LEADING_ZEROES_are_representation_not_magnitude(self, kind, expect, monkeypatch):
+        """Length alone does not establish range: `"0" * 5000` is numerically zero, and calling it "above
+        maximum" claims a comparison nobody performed. SIGNIFICANT digits decide."""
+        from quarry_recon import settings
+        raw = {"zeros": "0" * 5000, "zeros_then_30": "0" * 5000 + "30", "nines": "9" * 5000}[kind]
+        monkeypatch.setattr(settings, "performance", lambda: {"SUBFINDER_MAX_TIME": raw})
+        value, source, rejected, _rs = settings.strict_int_with_source("SUBFINDER_MAX_TIME", default=60,
+                                                                       maximum=1440)
+        assert value == expect, (kind, value, rejected)
+        assert (source == "default") == (kind == "nines"), (kind, source)
+        if kind == "nines":
+            assert rejected == "str(5000 digits; above maximum 1440)", rejected
+        else:
+            assert rejected is None, rejected
+
     def test_a_huge_value_through_a_FLAG_is_contained_too(self):
         from quarry_recon import policy, settings
         with settings.overrides({"WILDCARD_ZONES_PER_RUN": "9" * 9000}):
