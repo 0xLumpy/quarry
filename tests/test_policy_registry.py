@@ -238,7 +238,7 @@ class TestTheRegistryTellsTheTruth:
         `params.nuclei` and `vertical.permute`."""
         from quarry_recon import sources
         registered = set(sources.all_sources())
-        stale = sorted({b.lane for b in policy.BOUNDS} - registered - {"sweep"})
+        stale = sorted({b.lane for b in policy.BOUNDS} - registered)     # no exceptions
         assert not stale, stale
 
     def test_an_ACTIVE_lane_is_never_classified_local(self):
