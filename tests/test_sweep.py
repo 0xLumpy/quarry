@@ -2282,3 +2282,22 @@ class TestThePreflightCallbacksAreContained:
         out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], tool=_Bad())
         assert out.completion_unstaged and out.stop_kind == "machinery", out
         assert out.targets_complete == 0 and out.targets_remaining == 1, out
+
+    def test_a_RESCUED_completion_stops_owing_its_target(self, tmp_path, monkeypatch):
+        """v-review: the unsettled set only grew. A later successful save writes the WHOLE map and rescues
+        every pending tuple, so a target excluded when its own save failed stayed excluded for the rest of
+        the lifecycle — and the hint kept asking for work the disk already held."""
+        monkeypatch.setattr(sweep, "MAX_BATCH_WORDS", 1)          # two batches, two saves
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+        monkeypatch.setattr(budget.RotationProgress, "save",
+                            lambda self: False if (calls.update(n=calls["n"] + 1) or calls["n"]) == 2
+                            else real(self))
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha", "bravo"])
+        assert len(tool.calls) == 2, tool.calls
+        assert out.pending_completions == 0 and out.completions_published == 2, out
+        assert out.targets_complete == 1 and out.targets_remaining == 0, out
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        for word in ("alpha", "bravo"):
+            assert reopened.tier("a.com", sweep.bucket_of(word), sweep.content_digest([word])) == 2
