@@ -66,6 +66,14 @@ def overrides(values: dict):
         _overrides.update(before)
 
 
+def source_of(key: str) -> str:
+    """WHO decided this knob's value: a run `flag`, the machine `config`, or the `default`. The policy
+    report is only useful if a ceiling names its author."""
+    if key in _overrides:
+        return "flag"
+    return "config" if key in performance() else "default"
+
+
 def performance() -> dict:
     p = load().get("PERFORMANCE")
     return p if isinstance(p, dict) else {}

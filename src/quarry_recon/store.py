@@ -667,7 +667,7 @@ class Run:
         return list(latest.values())
 
     def write_manifest(self, profile_summary: dict, phases_run: list[str],
-                       metrics: dict | None = None) -> None:
+                       metrics: dict | None = None, policy: list | None = None) -> None:
         from . import secrets
         manifest = {
             "run_id": self.run_id,
@@ -684,6 +684,11 @@ class Run:
         }
         if metrics:                                 # pointer + headline totals for the telemetry artifact
             manifest["metrics"] = metrics
+        if policy:
+            # the EFFECTIVE coverage policy this run applied: every registered bound, its value, who set
+            # it, and what was HELD. Stored so a manifest can be read without the shell history that
+            # produced it (flag-axis step 3).
+            manifest["policy"] = policy
         # C11: if any event-sink write FAILED this session, events.jsonl is incomplete — record that fact so
         # a coverage/verdict folded from it is not read as clean truth (the run itself never crashed on it).
         from . import events as _events

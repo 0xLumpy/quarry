@@ -72,6 +72,7 @@ class Bound:
     held_reason: str = ""           # why it is NOT lifted — PRINTED, never silent
     const: str | None = None        # "module:NAME" for a constant, for the drift check
     const_local: bool = False       # ...defined inside a function today, so it is read from the AST
+    maximum: int | None = None      # the strict parser's range for a `strict_int` knob
     note: str = ""
 
 
@@ -91,7 +92,7 @@ BOUNDS: tuple[Bound, ...] = (
 
     # ── free-lane coverage knobs read through the strict parser ──────────────────────────────────
     Bound(name="SUBFINDER_MAX_TIME", reader="strict_int", lane="vertical.subfinder", default=60,
-          identity="work_unit",
+          maximum=1440, identity="work_unit",
           persistence="the per-apex resume key — subfinder folds its EFFECTIVE budget, so a bounded run "
                       "never claims an unbounded one's work",
           relaxable=True, unbounded_value=1440, consumer_honours_unbounded=True,
@@ -99,13 +100,13 @@ BOUNDS: tuple[Bound, ...] = (
                "context.WithTimeout, where 0 CANCELS. Today `--timeout 0` also forces it — the axis model "
                "separates them (plan step 2)"),
     Bound(name="NUCLEI_MAX_HOST_ERROR", reader="strict_int", lane="params.nuclei", default=0,
-          identity="work_unit",
+          maximum=100000, identity="work_unit",
           persistence="the scan's resume key — -mhe decides which hosts are scanned at all",
           relaxable=True, unbounded_value=0, consumer_honours_unbounded=True,
           note="Quarry's default is ALREADY full depth (-nmhe): a nonzero value is an operator-chosen "
                "bound, and `--unbound` returns it to 0"),
     Bound(name="WILDCARD_ZONES_PER_RUN", reader="strict_int", lane="vertical.wildcard_http", default=5,
-          identity="none",
+          maximum=10000, identity="none",
           persistence="nothing — the zone rotation is durable and continues across a change (98a77d4)",
           relaxable=True, unbounded_value=0, consumer_honours_unbounded=True,
           note="`quarry run --unbound` already sets this one"),
@@ -260,3 +261,56 @@ def relaxable() -> tuple[Bound, ...]:
 def held() -> tuple[Bound, ...]:
     """Registry bounds `--unbound` deliberately does NOT lift — printed with their reason, never silent."""
     return tuple(b for b in BOUNDS if not b.relaxable)
+
+
+# ── the EFFECTIVE policy: what this run will actually apply, and where each value came from ──────────
+def effective(bound: Bound) -> tuple[int, str]:
+    """`(value, source)` for one bound. Source is `flag`, `config` or `default` — an operator reading a
+    ceiling deserves to know WHO set it, not just what it is."""
+    from . import budget, settings
+    src = settings.source_of(bound.name) if bound.reader != "module" else "default"
+    if bound.reader == "budget_seconds":
+        return budget.budget_seconds(bound.name), src
+    if bound.reader == "strict_int":
+        return settings.strict_int(bound.name, default=bound.default,
+                                   maximum=bound.maximum or bound.default), src
+    if bound.const and not bound.const_local:
+        import importlib
+        mod, _, name = bound.const.partition(":")
+        return int(getattr(importlib.import_module(mod), name)), src
+    return bound.default, src        # a function-local constant: not configurable, only relaxable
+
+
+def snapshot() -> list[dict]:
+    """The whole effective policy, one row per registered bound. This is what gets printed at run start and
+    persisted into the manifest: a run's ceilings are EVIDENCE, not shell history."""
+    rows = []
+    for b in BOUNDS:
+        value, src = effective(b)
+        rows.append({"name": b.name, "lane": b.lane, "value": value, "default": b.default,
+                     "source": src, "relaxable": b.relaxable,
+                     "unbounded": b.relaxable and value == b.unbounded_value,
+                     "held_reason": b.held_reason})
+    return rows
+
+
+def render(rows: list[dict] | None = None) -> list[str]:
+    """The operator-facing lines: what is unbounded, what a flag or config changed, and what is HELD with
+    the reason it is held. A bound sitting at its default is summarised rather than listed — the point is
+    what is DIFFERENT from the ordinary run, plus every exception we declined to lift."""
+    rows = snapshot() if rows is None else rows
+    out, plain, free = [], 0, 0
+    for r in rows:
+        if not r["relaxable"]:
+            out.append(f"  HELD      {r['name']} = {r['value']} ({r['lane']}) — {r['held_reason']}")
+        elif r["source"] == "default":
+            plain += 1
+            free += bool(r["unbounded"])         # unbounded because that IS the default, not by request
+        elif r["unbounded"]:
+            out.append(f"  UNBOUNDED {r['name']} ({r['lane']}) — by {r['source']}")
+        else:
+            out.append(f"  {r['source'].upper():<9} {r['name']} = {r['value']} "
+                       f"({r['lane']}, default {r['default']})")
+    if plain:
+        out.append(f"  {plain} bound(s) at their default ({free} of them already unbounded)")
+    return out

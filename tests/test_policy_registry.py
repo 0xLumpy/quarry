@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 import pathlib
 
 import pytest
@@ -292,3 +293,59 @@ class TestOverridesAreRunScoped:
         CliRunner().invoke(cli_mod.cli, ["run", "-t", "acme", "--unbound"])
         CliRunner().invoke(cli_mod.cli, ["run", "-t", "acme"])
         assert seen == [0, 5], seen
+
+
+class TestTheEffectivePolicyIsReportedAndPersisted:
+    """flag-axis step 3: a run's ceilings are EVIDENCE, not shell history. The same table is printed at
+    run start, stored in the manifest, and previewable without running anything."""
+
+    def test_a_value_names_WHO_set_it(self, monkeypatch):
+        from quarry_recon import policy, settings
+        monkeypatch.setattr(settings, "performance", lambda: {"SUBFINDER_MAX_TIME": 10})
+        rows = {r["name"]: r for r in policy.snapshot()}
+        assert (rows["SUBFINDER_MAX_TIME"]["value"], rows["SUBFINDER_MAX_TIME"]["source"]) == (10, "config")
+        assert rows["WILDCARD_ZONES_PER_RUN"]["source"] == "default"
+        with settings.overrides({"WILDCARD_ZONES_PER_RUN": 0}):
+            rows = {r["name"]: r for r in policy.snapshot()}
+            zones = rows["WILDCARD_ZONES_PER_RUN"]
+            assert (zones["value"], zones["source"], zones["unbounded"]) == (0, "flag", True)
+
+    def test_the_HELD_bound_is_always_rendered_with_its_reason(self, monkeypatch):
+        """The one exception must never be summarised away — an invisible exception is a silent one."""
+        from quarry_recon import policy
+        lines = policy.render()
+        held = [ln for ln in lines if ln.strip().startswith("HELD")]
+        assert len(held) == 1 and "A1D_WORD_CAP" in held[0], lines
+        assert "boundary" in held[0] and "tiers" in held[0], held[0]
+
+    def test_a_bound_at_its_DEFAULT_is_summarised_not_listed(self):
+        """The point of the print is what is DIFFERENT — plus every exception."""
+        from quarry_recon import policy
+        lines = policy.render()
+        assert not [ln for ln in lines if "A1D_BUDGET_S" in ln], lines
+        assert any("bound(s) at their default" in ln and "already unbounded" in ln for ln in lines), lines
+
+    def test_the_PREVIEW_command_runs_nothing_and_shows_the_flag_s_effect(self, monkeypatch):
+        from click.testing import CliRunner
+        from quarry_recon import cli as cli_mod
+        from quarry_recon.phases import vertical
+        monkeypatch.setattr(cli_mod, "_resolve_profile",
+                            lambda *a, **k: pytest.fail("the preview must not load a profile or run"))
+        plain = CliRunner().invoke(cli_mod.cli, ["policy"])
+        unbound = CliRunner().invoke(cli_mod.cli, ["policy", "--unbound"])
+        assert plain.exit_code == 0 and unbound.exit_code == 0, (plain.output, unbound.output)
+        assert "UNBOUNDED WILDCARD_ZONES_PER_RUN" not in plain.output, plain.output
+        assert "UNBOUNDED WILDCARD_ZONES_PER_RUN" in unbound.output, unbound.output
+        assert "HELD" in plain.output and "A1D_WORD_CAP" in plain.output, plain.output
+        # ...and the preview's own overrides do not outlive it
+        assert vertical.wildcard_zones_per_run() == 5
+
+    def test_the_manifest_STORES_the_policy_it_ran_under(self, tmp_path):
+        from quarry_recon import policy, store
+        run = store.Run.create(tmp_path, "t")
+        rows = policy.snapshot()
+        run.write_manifest(profile_summary={}, phases_run=["vertical"], policy=rows)
+        stored = json.loads(run.manifest_path.read_text())["policy"]
+        assert stored == rows and len(stored) == len(policy.BOUNDS), stored
+        held = [r for r in stored if not r["relaxable"]]
+        assert [r["name"] for r in held] == ["A1D_WORD_CAP"] and held[0]["held_reason"], held

@@ -722,6 +722,27 @@ def osint(profile_path, timeout):
         click.echo(f"     … +{len(apex) - 8} more in the report")
 
 
+# ── policy ───────────────────────────────────────────────────────────────────
+@cli.command()
+@click.option("-t", "--target", "profile_path", required=False,
+              help="project name, project dir, or target.yaml path (optional: the policy is machine-wide)")
+@click.option("--unbound", is_flag=True, help="preview the policy `quarry run --unbound` would apply")
+def policy(profile_path, unbound):
+    """Show the EFFECTIVE coverage policy: every bound, its value, who set it, and what is HELD.
+
+    Runs nothing and contacts nothing — the same table `quarry run` prints and stores, so an operator can
+    check what a run WOULD do before spending an hour finding out."""
+    from . import policy as _policy
+    from . import settings
+    with settings.overrides({"WILDCARD_ZONES_PER_RUN": 0} if unbound else {}):
+        rows = _policy.snapshot()
+        click.echo(_c(f"\n# effective coverage policy{' (--unbound)' if unbound else ''}\n", "cyan"))
+        for line in _policy.render(rows):
+            click.echo(line)
+        click.echo(_c(f"\n{len(rows)} registered bound(s). Provider spending, rate, concurrency, resource "
+                      f"and engagement controls are NOT here — they keep their own policy.\n", "cyan"))
+
+
 # ── run ──────────────────────────────────────────────────────────────────────
 @cli.command()
 @click.option("-t", "--target", "profile_path", required=True,
@@ -796,6 +817,16 @@ def _run_phases(profile_path, phases, passive, timeout):
                   else str(profile.ports))
     click.echo(f"   apexes={len(profile.apex_domains)} cidr={len(profile.cidr)} "
                f"ports={ports_disp} http_rl={profile.http_rl or 'default'}\n")
+
+    # the EFFECTIVE POLICY, printed before any lane reads a bound and persisted with the run: a run's
+    # ceilings are evidence, not shell history — including the ones we deliberately did NOT lift.
+    from . import policy as _policy
+    policy_rows = _policy.snapshot()
+    click.echo(_c("   ── effective coverage policy ──", "cyan"))
+    for line in _policy.render(policy_rows):
+        click.echo(f"   {line}")
+    click.echo("")
+    events.emit("policy", "run", bounds=policy_rows)
 
     # readiness gate: warn (don't block) if a REQUIRED tool for the phases that will ACTUALLY run
     # (mode-gating applied) is missing — better to know before a long run than in the manifest.
@@ -877,7 +908,7 @@ def _run_phases(profile_path, phases, passive, timeout):
     run_obj.write_manifest(
         profile_summary={"apex_domains": profile.apex_domains, "cidr": profile.cidr,
                          "passive_only": profile.passive_only, "ports": profile.ports},
-        phases_run=selected, metrics=metrics_summary)
+        phases_run=selected, metrics=metrics_summary, policy=policy_rows)
 
     # honest run verdict — read the ONE canonical summary (same logic the manifest stores), never recompute
     summ = run_obj._run_summary()
