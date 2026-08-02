@@ -488,6 +488,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
                       # v52#1: selection and execution carry their own causes now
                       "selection_reason": "no in-scope wildcard zone", "gate_reason": "",
                       "eligibility_known": True,
+                      # step 4.3: the continuation triple is recomputed on EVERY call, like the rest
+                      "zones_selected": 0, "zones_completed": 0, "zones_remaining": 0,
                       "blocked": {"zone_cap": 0, "self_or_private": 0}}, st
 
     def test_a_GUARD_refusal_says_so_instead_of_blaming_the_cap(self, tmp_path, monkeypatch):
@@ -2197,7 +2199,8 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
     def _differ(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, words=("api",),
                 sid="enrich.wildcard_a1d", rows=None, caught=None, preload=(), st=None,
                 status=None, raw=None, break_record=None, raw_bytes=None, run=None, statuses=None,
-                no_artifact=False, no_write=False, guard=None, tool=None, spend=None):
+                no_artifact=False, no_write=False, guard=None, tool=None, spend=None, echo=None,
+                target=None):
         from quarry_recon import store
         from quarry_recon.phases import probe, vertical
         fresh = run is None
@@ -2253,7 +2256,10 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             ctx = _Ctx(run.dir, [])
             ctx.run = run
             ctx.scope = self._S()
-            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0})()
+            ctx.profile = type("P", (), {"apex_domains": ["acme.com"], "http_rl": 0, "dns_rate": 0,
+                                         "target": target})()
+            if echo is not None:
+                ctx.echo = echo
             for kind, row in preload:
                 run.add(kind, row)
             self._last_run = run
@@ -3373,3 +3379,90 @@ class TestTheDifferRotatesOverZonesAndWords:
         why = life[-1]["reason"]
         assert "spend bound" not in why and "rotate in" not in why, why
         assert st["stopped"], st                                # the dependency answer names itself
+
+    def test_UNBOUND_takes_every_eligible_zone_in_ONE_run(self, tmp_path, monkeypatch):
+        """Step 4.3: `--unbound` overrides the per-run ALLOWANCE to 0 for this process. It removes the
+        rotation, never a safety bound — the per-zone spend, the scope rules and the contact guard are
+        untouched, and the flag is explicit, never inferred."""
+        from quarry_recon import settings
+        from quarry_recon.phases import vertical
+        zones = tuple(f"z{i}.acme.com" for i in range(8))
+        try:
+            settings.override("WILDCARD_ZONES_PER_RUN", 0)
+            assert vertical.wildcard_zones_per_run() == 0
+            from quarry_recon import store
+            run = store.Run.create(tmp_path, "t")
+            seen = self._zones_contacted(tmp_path, monkeypatch, run=run, zones=zones)
+            assert set(seen) == set(zones) and len(seen) == 8, seen
+        finally:
+            settings.clear_overrides()
+        assert vertical.wildcard_zones_per_run() == 5                  # ...and only for this run
+
+    def test_the_CONTINUATION_reports_selected_completed_and_remaining(self, tmp_path, monkeypatch):
+        """Step 4.3: a bounded pass is only honest if the operator can see what is left and how to take
+        it. Zones a run contacted but whose candidates the spend bound withheld are still owed work, so
+        the pair remainder is stated beside the zone one — different units, never summed."""
+        from quarry_recon import store
+        echoed: list = []
+        run = store.Run.create(tmp_path, "t")
+        st: dict = {}
+        _k, _life = self._differ(tmp_path, monkeypatch, zones=tuple(f"z{i}.acme.com" for i in range(8)),
+                                 words=("api", "admin"), rows=[], run=run, st=st, spend=1,
+                                 echo=echoed.append, target="acme")
+        assert (st["zones_selected"], st["zones_completed"], st["zones_remaining"]) == (5, 5, 3), st
+        line = "\n".join(echoed)
+        assert "5/8 zone(s) selected · 5 completed · 3 remaining" in line, line
+        assert "5 candidate pair(s) still owed by contacted zone(s)" in line, line
+        assert "continue: quarry run -t acme --phases enrich" in line, line
+        assert "--unbound to take all 3 remaining zone(s) in one run" in line, line
+
+    def test_a_FINISHED_pass_says_NOTHING(self, tmp_path, monkeypatch):
+        """The hint is for work that is LEFT. A pass that took every zone and owed no candidate prints no
+        continuation at all — an operator who is told to continue a finished rotation stops trusting it."""
+        from quarry_recon import store
+        echoed: list = []
+        run = store.Run.create(tmp_path, "t")
+        st: dict = {}
+        self._differ(tmp_path, monkeypatch, zones=("z.acme.com",), words=("api",), rows=[], run=run,
+                     st=st, echo=echoed.append, target="acme")
+        assert (st["zones_selected"], st["zones_completed"], st["zones_remaining"]) == (1, 1, 0), st
+        assert not [e for e in echoed if "continue:" in str(e)], echoed
+
+    def test_COMPLETED_means_the_zone_ANSWERED_not_that_we_called_it(self, tmp_path, monkeypatch):
+        """A contacted zone whose invocation failed is not completed work: it still owes an answer, so the
+        rotation still owes the zone. Counting contacts here would tell the operator a zone was done
+        because we dialled it."""
+        from quarry_recon import store
+        echoed: list = []
+        run = store.Run.create(tmp_path, "t")
+        st: dict = {}
+        self._differ(tmp_path, monkeypatch, zones=("a.acme.com", "b.acme.com"), words=("api",), rows=[],
+                     run=run, st=st, echo=echoed.append, target="acme",
+                     statuses=[crawl.Status.SUCCESS, crawl.Status.FAILED])
+        assert st["probed_zones"] == 2, st                       # both were CONTACTED...
+        assert (st["zones_selected"], st["zones_completed"], st["zones_remaining"]) == (2, 1, 1), st
+        assert "2/2 zone(s) selected · 1 completed · 1 remaining" in "\n".join(echoed), echoed
+
+    def test_the_run_command_wires_UNBOUND_to_the_allowance(self, tmp_path, monkeypatch):
+        """The flag is what makes the allowance 0 — pinned through the actual command, since a help string
+        that changes nothing is exactly the failure this is for."""
+        from click.testing import CliRunner
+        from quarry_recon import cli as cli_mod
+        from quarry_recon import settings
+        from quarry_recon.phases import vertical
+        seen: list = []
+
+        def _boom(*a, **k):
+            seen.append(vertical.wildcard_zones_per_run())       # read INSIDE the run, as a lane would
+            raise SystemExit(0)
+
+        monkeypatch.setattr(cli_mod, "_resolve_profile", _boom)
+        try:
+            CliRunner().invoke(cli_mod.cli, ["run", "-t", "acme", "--unbound"])
+            assert seen == [0], seen
+            seen.clear()
+            settings.clear_overrides()
+            CliRunner().invoke(cli_mod.cli, ["run", "-t", "acme"])
+            assert seen == [5], seen                             # ...and only when asked for
+        finally:
+            settings.clear_overrides()

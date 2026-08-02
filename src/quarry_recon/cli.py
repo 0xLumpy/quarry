@@ -730,11 +730,22 @@ def osint(profile_path, timeout):
 @click.option("--passive", is_flag=True, help="force passive-only (override profile)")
 @click.option("--timeout", default=1800, type=click.IntRange(min=0),
               help="per-tool OUTER timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests; NEGATIVE is rejected, as it would collapse every tool to an instant timeout). subfinder is separate: it self-bounds via its own -max-time budget per apex (PERFORMANCE.SUBFINDER_MAX_TIME minutes, default 60; 0 or --timeout 0 -> practically unbounded), NOT this flag")
-def run(profile_path, phases, passive, timeout):
+@click.option("--unbound", is_flag=True,
+              help="sweep EVERY eligible wildcard zone in this one run (the per-run zone allowance, "
+                   "PERFORMANCE.WILDCARD_ZONES_PER_RUN, becomes 0 for this process). The per-zone spend "
+                   "bound, the scope rules, the contact guard and the rate controls are unchanged — this "
+                   "removes the ROTATION, not a safety bound")
+def run(profile_path, phases, passive, timeout, unbound):
     """Run recon phases against the confirmed scope. Output lands in the project's recon/ dir."""
     from .phases import ORDER, REGISTRY, PhaseContext
     from .store import Run
-    from . import checkpoint, exports, triage
+    from . import checkpoint, exports, triage, settings
+
+    if unbound:
+        # an explicit operator instruction for THIS run: every eligible zone is contacted once, instead
+        # of the allowance handing the rest to a later lifecycle (step 4.3). Applied BEFORE anything
+        # reads a bound, so no lane can start under the rotation the operator just turned off.
+        settings.override("WILDCARD_ZONES_PER_RUN", 0)
 
     try:
         profile = TargetProfile.load(_resolve_profile(profile_path))

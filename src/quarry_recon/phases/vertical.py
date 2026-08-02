@@ -510,8 +510,9 @@ WILDCARD_ZONES_PER_RUN = 5
 
 
 def wildcard_zones_per_run() -> int:
-    """The per-run zone allowance, overridable from PERFORMANCE. Read at CALL time so a test or an
-    operator setting is honoured without re-importing the module."""
+    """The per-run zone allowance, overridable from PERFORMANCE — and by `quarry run --unbound`, which
+    sets it to 0 for this process. Read at CALL time so a test or an operator setting is honoured without
+    re-importing the module."""
     from .. import settings as _settings
     return _settings.strict_int("WILDCARD_ZONES_PER_RUN", default=WILDCARD_ZONES_PER_RUN, maximum=10000)
 
@@ -680,6 +681,30 @@ class _LedgerStop(RuntimeError):
     A named type gives the scheduler's contained-exception record a STRUCTURAL identity, so the lane can
     recognise the machinery entry that repeats a failure it already states — without matching English, and
     without silencing an unrelated failure that happens to read alike (v63#4)."""
+
+
+def _wc_continuation(ctx, st: dict, phase: str, label: str) -> str:
+    """SELECTED, COMPLETED and REMAINING zones, plus the command that continues this rotation (step 4.3).
+
+    A bounded pass is only honest if the operator can see what is left and how to take it: the allowance
+    hands the rest to a LATER lifecycle, and without this the only way to learn that was to read a coverage
+    record. Zones a run contacted but whose candidates the per-zone spend bound withheld are still owed
+    work, so the pair remainder is stated beside the zone one — they are different units."""
+    eligible = int(st.get("eligible_zones", 0))
+    selected = int(st.get("admitted_zones", 0))
+    completed = int(st.get("zones_obtained", 0))
+    pairs_left = int((st.get("candidate_pairs_by_cause") or {}).get("bound", 0))
+    st["zones_selected"], st["zones_completed"] = selected, completed
+    st["zones_remaining"] = remaining = max(0, eligible - completed)
+    if not remaining and not pairs_left:
+        return ""
+    target = getattr(getattr(ctx, "profile", None), "target", None) or "<target>"
+    more = f" · {pairs_left} candidate pair(s) still owed by contacted zone(s)" if pairs_left else ""
+    return (f"  {label}: {selected}/{eligible} zone(s) selected · {completed} completed · "
+            f"{remaining} remaining{more}\n"
+            f"      continue: quarry run -t {target} --phases {phase}"
+            + (f"   (or --unbound to take all {remaining} remaining zone(s) in one run)"
+               if remaining else ""))
 
 
 def _wc_reject_constant(token: str):
@@ -863,6 +888,13 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
                               input_total=len(eligible), work_unit=fp or "setup-failed")
         events.tool_finish(source_id, status=outcome[0].value, reason=why, work_unit=fp or "setup-failed",
                            produced={"subdomains": len(kept)})
+        try:
+            # the operator-facing continuation. Contained: a broken echo costs the hint, never the run.
+            line = _wc_continuation(ctx, st, phase, label)
+            if line:
+                ctx.echo(line)
+        except Exception:
+            pass
     if unrecorded is not None:
         # v43#5: the terminal is out, but a generic terminal is not folded into the manifest verdict — so
         # a failure to record the outcome would leave the run reading `complete`. It propagates to the

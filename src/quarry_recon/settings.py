@@ -20,6 +20,10 @@ import yaml
 
 PATH = Path.home() / ".config" / "quarry" / "config.yaml"
 _cache: dict | None = None
+#: RUN-scoped knob overrides set by an explicit operator FLAG. Config is machine policy; a flag is this
+#: run's instruction, and it wins over the file for this process only. Values go through the same strict
+#: readers, so a flag can never introduce a value the file could not hold (step 4.3, `--unbound`).
+_overrides: dict = {}
 
 PROFILES = ("safe", "balanced", "aggressive", "auto")
 
@@ -32,6 +36,16 @@ def load() -> dict:
         except (yaml.YAMLError, OSError):
             _cache = {}
     return _cache
+
+
+def override(key: str, value) -> None:
+    """Set a run-scoped override for one knob. Explicit, per flag, never inferred."""
+    _overrides[key] = value
+
+
+def clear_overrides() -> None:
+    """Drop every run-scoped override (a fresh process, or a test)."""
+    _overrides.clear()
 
 
 def performance() -> dict:
@@ -67,7 +81,7 @@ def strict_int(key: str, *, default: int, maximum: int) -> int:
     an intentional 0 into 1. Shared because the same parser is needed by every knob that decides how much
     of the eligible input gets processed (SUBFINDER_MAX_TIME, NUCLEI_MAX_HOST_ERROR, the fetch budgets),
     and three hand-rolled copies would drift."""
-    raw = performance().get(key)
+    raw = _overrides[key] if key in _overrides else performance().get(key)
     if isinstance(raw, bool):
         return default
     if isinstance(raw, int):
