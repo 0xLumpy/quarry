@@ -314,9 +314,16 @@ def fold_run_entity(run_dir, entity: str) -> FoldedLog:
             raise ValueError("no entity_counts")
     except (OSError, json.JSONDecodeError, ValueError) as e:
         return FoldedLog(status="unknown", reason=f"manifest unusable: {type(e).__name__}")
+    absent_key = entity not in counts
     expected = counts.get(entity)
+    if not absent_key and not (type(expected) is int and expected >= 0):
+        # a count that is not an exact non-negative int certifies nothing. `True == 1` and `1.0 == 1` in
+        # Python, so a malformed manifest would have passed a one-record log off as authoritative, and an
+        # explicit `null` would have read as "the run recorded none of this kind".
+        return FoldedLog(status="unknown",
+                         reason=f"manifest count for {entity!r} is not an exact non-negative int")
     folded = fold_observations(run_dir / "normalized" / f"{entity}.jsonl")
-    if expected is None:
+    if absent_key:
         if folded.status == "absent":
             return FoldedLog(status="valid", reason="the run recorded no entity of this kind")
         expected = 0                                   # ...a log with rows the manifest never counted

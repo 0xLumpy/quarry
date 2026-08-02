@@ -216,6 +216,35 @@ class TestTrustIsAnEvidenceClaim:
         assert folded.status == "degraded" and not folded.trustworthy, folded
 
 
+    @pytest.mark.parametrize("bogus", [True, False, 1.0, 0.0, "1", None, -1, [1], {"n": 1}])
+    def test_a_MALFORMED_count_certifies_nothing(self, tmp_path, bogus):
+        """`True == 1` and `1.0 == 1`, so a malformed count would have passed a one-record log off as
+        authoritative — and an explicit `null` would have read as "the run recorded none of this kind"."""
+        run = self._run(tmp_path, hosts=("a.acme.com",))
+        manifest = json.loads(run.manifest_path.read_text())
+        manifest["entity_counts"]["subdomain"] = bogus
+        run.manifest_path.write_text(json.dumps(manifest))
+        folded = store.fold_run_entity(run.dir, "subdomain")
+        assert folded.status == "unknown" and not folded.trustworthy, (bogus, folded)
+        assert "exact non-negative int" in folded.reason, folded
+
+    def test_an_ABSENT_key_is_still_an_authoritative_zero(self, tmp_path):
+        """Absence of the key is a different statement from a malformed value, and it stays usable."""
+        run = store.Run.create(tmp_path, "t")
+        run.write_manifest(profile_summary={}, phases_run=["vertical"])
+        assert "subdomain" not in json.loads(run.manifest_path.read_text())["entity_counts"]
+        folded = store.fold_run_entity(run.dir, "subdomain")
+        assert (folded.status, folded.trustworthy) == ("valid", True), folded
+
+    def test_an_exact_ZERO_count_is_honoured(self, tmp_path):
+        run = self._run(tmp_path, hosts=())
+        manifest = json.loads(run.manifest_path.read_text())
+        manifest["entity_counts"]["subdomain"] = 0
+        run.manifest_path.write_text(json.dumps(manifest))
+        folded = store.fold_run_entity(run.dir, "subdomain")
+        assert (folded.status, folded.records, folded.trustworthy) == ("valid", {}, True), folded
+
+
 class TestOneFoldForLiveAndFinished:
     def test_the_LIVE_reader_survives_the_same_invalid_byte(self, tmp_path):
         """The live reader had its own whole-file decode, so the byte contained by `fold_observations`
