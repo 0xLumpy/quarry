@@ -11,6 +11,7 @@ import click
 
 from . import __version__, events, secrets
 from .config import ProfileError, TargetProfile
+from .campaign import MAX_CHILDREN as _MAX_CHILDREN
 from .registry import health, install_one, load_tools, tools_by_phase, verify_installed
 
 
@@ -758,9 +759,27 @@ def policy(profile_path, unbound):
                    "budgets are untouched — and it never changes scope, contact guards, rate limits, "
                    "concurrency, per-invocation chunk sizes or the outer timeout. Bounds held by policy "
                    "stay held, and are printed with the reason")
-def run(profile_path, phases, passive, timeout, unbound):
+@click.option("--settle", "settle_flag", is_flag=True,
+              help="keep creating child runs while resumable work still ADVANCES, and stop with a named "
+                   "outcome when it does not (fixed point, terminal remainder, unknown lane, no progress, "
+                   "child fault, or a bound). A supervisor over runs: each child is an ordinary run with "
+                   "its own evidence, seeded from the campaign's union so nothing learned is lost between "
+                   "them. It obtains nothing extra — acquisition is CLOSED from child 2 on, so provider "
+                   "calls are never repeated by a continuation flag — and it changes no other axis: "
+                   "--unbound widens each child, --timeout bounds each child's tools")
+@click.option("--settle-max-runs", type=click.IntRange(min=1), default=None,
+              help=f"how many child runs one campaign may create (default {_MAX_CHILDREN}). Needs --settle")
+@click.option("--settle-budget", type=click.IntRange(min=0), default=None,
+              help="wall-clock seconds after which no FURTHER child is started (0 = none). It never kills "
+                   "a running child — that is --timeout's axis. Needs --settle")
+def run(profile_path, phases, passive, timeout, unbound, settle_flag, settle_max_runs, settle_budget):
     """Run recon phases against the confirmed scope. Output lands in the project's recon/ dir."""
     from . import settings
+
+    # a bound that binds nothing is a lie: refuse the settle bounds without the axis they bound, rather
+    # than accepting a number this run will never apply.
+    if not settle_flag and (settle_max_runs is not None or settle_budget is not None):
+        raise click.UsageError("--settle-max-runs / --settle-budget bound a campaign; they need --settle")
 
     # an explicit operator instruction for THIS run: every eligible zone is contacted once, instead of the
     # allowance handing the rest to a later lifecycle (step 4.3). Entered BEFORE anything reads a bound, so
@@ -768,10 +787,53 @@ def run(profile_path, phases, passive, timeout, unbound):
     # one run's instruction never leaks into another sharing this interpreter (step 2).
     from . import policy as _policy
     with settings.overrides(_policy.unbound_overrides() if unbound else {}):
-        _run_phases(profile_path, phases, passive, timeout)
+        if not settle_flag:
+            _run_phases(profile_path, phases, passive, timeout)
+            return
+        _settle_run(profile_path, phases, passive, timeout,
+                    max_runs=settle_max_runs, budget_s=settle_budget)
 
 
-def _run_phases(profile_path, phases, passive, timeout):
+def _settle_run(profile_path, phases, passive, timeout, *, max_runs, budget_s):
+    """`--settle`: a CAMPAIGN over ordinary runs. The axes compose and imply nothing of each other — each
+    child runs under exactly the policy the other flags established, inside the scope this function is
+    already in, so `--unbound` widens every child and `--timeout` bounds every child's tools."""
+    from . import campaign as _campaign
+    from . import budget, settle as _settle
+
+    try:
+        profile = TargetProfile.load(_resolve_profile(profile_path))
+    except ProfileError as e:
+        raise click.ClickException(str(e))
+    project = _project_dir(profile)
+
+    def launch(index, prepare):
+        return _run_phases(profile_path, phases, passive, timeout, prepare=prepare)
+
+    try:
+        out = _settle.settle(project_dir=project, target=profile.target, launch=launch,
+                             max_runs=max_runs or _campaign.MAX_CHILDREN, budget_s=budget_s or 0,
+                             echo=lambda line: click.echo(_c(line, "cyan")))
+    except budget.StateBusy as e:
+        raise click.ClickException(f"another campaign is already running on this project ({e})")
+    except (_campaign.UnionUnusable, _settle.AlreadyRun) as e:
+        raise click.ClickException(str(e))
+
+    colour = "green" if out.clean else "yellow"
+    click.echo(_c(f"\n══ campaign {out.campaign_id} · {out.stop.replace('_', ' ')} · "
+                  f"{len(out.children)} child run(s) · {out.elapsed_s}s", colour))
+    if out.detail:
+        click.echo(_c(f"   {out.detail}", colour))
+    if out.recovered:
+        click.echo(_c("   ⚠ this campaign's union was rebuilt after an evidence loss — not a clean "
+                      "fixed point", "yellow"))
+    for child in out.children:
+        click.echo(f"   {child.index}. {child.run_id} · {child.verdict} · +{child.new} new / "
+                   f"+{child.enriched} enriched · {child.retriable} owed")
+    click.echo(f"   ledger: {project / 'recon' / 'campaigns' / out.campaign_id / 'ledger.json'}")
+
+
+def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     """The run itself, inside whatever policy overrides the flags established."""
     from .phases import ORDER, REGISTRY, PhaseContext
     from .store import Run
@@ -810,6 +872,12 @@ def _run_phases(profile_path, phases, passive, timeout):
     set_tool_cwd(workdir)   # stray tool files (gowitness db, github-subdomains txt, …) land in the run
     ctx = PhaseContext(run=run_obj, profile=profile, scope=scope, workdir=workdir,
                        echo=click.echo, http_timeout=timeout)
+    # the run directory exists and NOTHING has run yet — the only point where a campaign may seed this
+    # child from what earlier children learned (entities are run-scoped, so an unseeded child starts empty
+    # and its emptiness would read as a fixed point). A seed that fails stops the child: an empty corpus is
+    # not a fixed point.
+    if prepare is not None:
+        prepare(run_obj)
 
     selected = [p.strip() for p in phases.split(",")] if phases else ORDER
     selected = [p for p in selected if p in REGISTRY]
@@ -970,6 +1038,7 @@ def _run_phases(profile_path, phases, passive, timeout):
                             if f.get("severity") in ("critical", "high"))
         if leads:
             notify.send("lead", f"Quarry {profile.target}: {leads} promising lead(s)", summary)
+    return run_obj      # the finished run — a campaign supervisor absorbs its evidence and decides on it
 
 
 # ── report ───────────────────────────────────────────────────────────────────
@@ -1014,7 +1083,10 @@ def plan():
 @click.option("-t", "--target", "profile_path", required=True,
               help="project name, project dir, or target.yaml path")
 @click.option("--run", "run_id", help="run id (default: latest)")
-def status(profile_path, run_id):
+@click.option("--campaign", "campaign_id", is_flag=False, flag_value="", default=None,
+              help="show a `--settle` CAMPAIGN instead of one run: its children, what each added, what is "
+                   "still owed and why it stopped (default: the latest campaign)")
+def status(profile_path, run_id, campaign_id):
     """Render current/last-known per-source state from a run's events.jsonl (no scanning)."""
     from . import views
 
@@ -1023,11 +1095,35 @@ def status(profile_path, run_id):
     except ProfileError as e:
         raise click.ClickException(str(e))
     project = _project_dir(profile)
+    if campaign_id is not None:
+        if run_id:
+            raise click.UsageError("--run names a run and --campaign a campaign; ask for one of them")
+        _echo_campaign(project, campaign_id)
+        return
     run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist (no ghost run)
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
     for line in views.status_lines(run_obj.dir / "events.jsonl"):
         click.echo(line)
+
+
+def _echo_campaign(project, campaign_id: str) -> None:
+    """One campaign, read from its LEDGER — the durable record, so a running, finished and interrupted
+    campaign all read the same way, and an unreadable one says so instead of looking empty."""
+    from . import campaign as _campaign
+    from . import settle as _settle
+
+    if not campaign_id:
+        found = _settle.campaigns(project)
+        if not found:
+            raise click.ClickException(f"no campaigns found under {project}/recon/campaigns/ "
+                                       "(a campaign is created by `quarry run --settle`)")
+        campaign_id = found[-1].parent.name
+    ledger = _campaign.Campaign(project, campaign_id)
+    if ledger.status == "new":
+        raise click.ClickException(f"no campaign {campaign_id} under {project}/recon/campaigns/")
+    for line in _settle.report_lines(ledger):
+        click.echo(_c(line, "yellow" if not ledger.trustworthy else "cyan"))
 
 
 @cli.group()

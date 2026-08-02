@@ -502,13 +502,17 @@ def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_c
     for row in summary.get("remainders", []):
         if isinstance(row, dict) and isinstance(row.get("lane"), str):
             by_lane.setdefault(row["lane"], []).append(row)
-    invalid = sorted(lane for lane, rows in by_lane.items()
-                     if any(not _readable_remainder(r) for r in rows))
+    invalid = {lane: any(isinstance(r, dict) and r.get("invalid") for r in rows)
+               for lane, rows in by_lane.items()
+               if any(not _readable_remainder(r) for r in rows)}
     silent = sorted(lane for lane in expected_lanes if lane not in by_lane)
     if invalid or silent:
         return Decision(stop="unknown", detail="; ".join(
             [f"{lane}: reported nothing" for lane in silent]
-            + [f"{lane}: unreadable remainder" for lane in invalid])[:400])
+            # a lane the manifest itself flagged RAN and could not measure; anything else is a record we
+            # cannot read. Both are unknown, and an operator should not have to guess which happened.
+            + [f"{lane}: {'could not measure its remainder' if flagged else 'unreadable remainder'}"
+               for lane, flagged in sorted(invalid.items())])[:400])
 
     retriable = 0
     terminal: dict = {}

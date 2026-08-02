@@ -139,8 +139,10 @@ def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
     # what the apex brute still OWES, for a supervisor (settle prerequisite B). Best effort: a report is
     # never a stop.
     try:
-        if swept.remainder_known:          # ...UNKNOWN stays unreported (settle prerequisite B)
+        if swept.remainder_known:
             remainder.emit(remainder.from_sweep("enrich.a1d_brute", swept))
+        else:                              # ...ran, but cannot say — which is not the same as not running
+            remainder.unknown("enrich.a1d_brute", why="the eligible set was never established")
     except Exception:                                        # noqa: BLE001
         pass
     """Fold the sweep into the lane's reported facts. Fallible on purpose — the caller contains it."""

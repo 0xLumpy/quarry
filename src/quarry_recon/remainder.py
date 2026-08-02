@@ -97,6 +97,17 @@ def emit(remainder: Remainder) -> dict:
                        detail=record["detail"] or None)
 
 
+def unknown(lane: str, *, measure: str = "targets", why: str = "") -> dict:
+    """A lane that RAN and cannot say what it owes must say THAT.
+
+    Otherwise its silence is indistinguishable from a lane that never ran, and a supervisor whose roster is
+    built from what it has heard would drop it and read the campaign as a fixed point over work nobody
+    measured. The record deliberately carries NO model and no counts, so every consumer classifies it as
+    unreadable — which is what unknown means — while the lane's participation is still on the record."""
+    return events.emit("remainder", lane, unit=f"{lane}:{measure}", measure=measure,
+                       model="unknown", detail={"why": why or "the eligible set was never established"})
+
+
 def from_sweep(lane: str, swept, *, measure: str = "targets") -> Remainder:
     """What a `run_sweep` lane still owes — LIVENESS from the durable rotation, dispositions as detail.
 

@@ -68,7 +68,7 @@ class TestEveryRemainderUNITCounts:
                               "invalid": "unreadable"}]
         d = campaign.decide(_summary(remainders=rows), _absorbed(),
                             expected_lanes=["enrich.a1d_brute"])
-        assert d.stop == "unknown" and "unreadable remainder" in d.detail, d
+        assert d.stop == "unknown" and "could not measure its remainder" in d.detail, d
 
     @pytest.mark.parametrize("row", [
         {"model": "invented"}, {"retriable": {"now": -1, "cooldown": 0}},
@@ -119,9 +119,16 @@ class TestTheStopRules:
         assert d.stop == "unknown" and "vertical.wildcard_http" in d.detail, d
 
     def test_an_UNREADABLE_remainder_is_unknown(self):
+        d = campaign.decide(_summary(remainders=[{"lane": "enrich.a1d_brute", "model": "nonsense"}]),
+                            _absorbed(), expected_lanes=["enrich.a1d_brute"])
+        assert d.stop == "unknown" and "unreadable remainder" in d.detail, d
+
+    def test_a_lane_that_COULD_NOT_MEASURE_says_that_not_merely_unreadable(self):
+        """The manifest already flagged this row: the lane RAN and could not measure. An operator should
+        not have to guess whether the record was corrupt or the measurement never happened."""
         d = campaign.decide(_summary(remainders=[{"lane": "enrich.a1d_brute", "invalid": "bad"}]),
                             _absorbed(), expected_lanes=["enrich.a1d_brute"])
-        assert d.stop == "unknown" and "unreadable" in d.detail, d
+        assert d.stop == "unknown" and "could not measure its remainder" in d.detail, d
 
     def test_UNREADABLE_evidence_stops_the_campaign(self):
         d = campaign.decide(_summary(remainders=[_rem()]), _absorbed(unusable={"subdomain": "unusable"}),

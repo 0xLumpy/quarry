@@ -218,8 +218,10 @@ class TestTheManifestCarriesIt:
         assert rows[-1]["model"] == "project_progress"
         assert rows[-1]["retriable"]["now"] > 0, rows[-1]      # a spend of 1 over 8 zones owes plenty
 
-    def test_an_UNKNOWN_remainder_is_NOT_reported(self, tmp_path, monkeypatch):
-        """A lane whose eligible set was never established must read as unknown, not as a clean zero."""
+    def test_an_UNKNOWN_remainder_is_reported_AS_UNKNOWN(self, tmp_path, monkeypatch):
+        """A lane whose eligible set was never established must read as unknown, not as a clean zero —
+        and SAYING so is what distinguishes it from a lane that never ran at all. Staying silent made the
+        two indistinguishable, so a supervisor's roster simply dropped it (settle step 7)."""
         from quarry_recon import sweep as _sweep
         from test_a1d_vocabulary import TestTheWildcardDifferHasItsOwnLifecycle as L
         real = _sweep.run_sweep
@@ -235,4 +237,6 @@ class TestTheManifestCarriesIt:
         log = next((tmp_path / "recon").glob("*/events.jsonl"))
         rows = [json.loads(l) for l in log.read_text().splitlines()
                 if json.loads(l).get("event") == "remainder"]
-        assert rows == [], rows
+        assert len(rows) == 1 and rows[0]["model"] == "unknown", rows
+        assert "retriable" not in rows[0] and "terminal" not in rows[0], "unknown carries NO counts"
+        assert rows[0]["detail"]["why"], "an unknown says why nobody could measure it"
