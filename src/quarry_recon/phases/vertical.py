@@ -725,8 +725,10 @@ def _wc_continuation(ctx, st: dict, phase: str, label: str) -> str:
     return (f"  {label}: {selected}/{eligible} zone(s) selected · {answered} answered this run · "
             f"{remaining} still owed by the rotation{more}\n"
             f"      continue: quarry run -t {target} --phases {phase}"
-            + (f"   (or --unbound to take all {remaining} remaining zone(s) in one run)"
-               if remaining else ""))
+            # `--unbound` lifts VOLUME bounds only: a guard-refused or unschedulable zone stays out of
+            # reach, so the hint promises the bound it can remove, not every zone in the remainder.
+            + (f"   (or --unbound to sweep the remaining SCHEDULABLE zone(s) in one run, without the "
+               f"per-run volume limits — guards and scope are unchanged)" if remaining else ""))
 
 
 def _wc_reject_constant(token: str):

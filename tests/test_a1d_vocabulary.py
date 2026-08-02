@@ -3417,7 +3417,8 @@ class TestTheDifferRotatesOverZonesAndWords:
         assert "5/8 zone(s) selected · 5 answered this run · 8 still owed by the rotation" in line, line
         assert "5 candidate pair(s) still owed by contacted zone(s)" in line, line
         assert "continue: quarry run -t acme --phases enrich" in line, line
-        assert "--unbound to take all 8 remaining zone(s) in one run" in line, line
+        assert "--unbound to sweep the remaining SCHEDULABLE zone(s) in one run" in line, line
+        assert "guards and scope are unchanged" in line, line
 
     def test_the_hint_stops_promising_work_once_the_ROTATION_is_done(self, tmp_path, monkeypatch):
         """The defect this replaced: `eligible - answered` counted one lifecycle, so run 2 of an eight-zone

@@ -2248,3 +2248,37 @@ class TestThePreflightCallbacksAreContained:
         parts = out.pair_remainder()
         assert parts["refused"] == 5 and parts["bound"] == 0 and parts["stopped"] == 0, parts
         assert "candidate bound" not in (out.stop or ""), out.stop        # it withheld nothing
+
+    def test_an_UNPUBLISHED_completion_leaves_its_target_OWED(self, tmp_path, monkeypatch):
+        """v-review: `progress` holds `done` tuples staged in MEMORY. When the save that would make one
+        durable did not confirm, the next lifecycle reopens a ledger showing tier 0 and selects the slot
+        again — so a target whose completion nobody published is NOT complete, whatever the map says."""
+        real = budget.RotationProgress.save
+        calls = {"n": 0}
+        monkeypatch.setattr(budget.RotationProgress, "save",
+                            lambda self: real(self) if (calls.update(n=calls["n"] + 1) or calls["n"]) < 2
+                            else False)
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"])
+        assert tool.calls and out.pending_completions, out
+        assert out.targets_complete == 0 and out.targets_remaining == 1, out
+        # ...and the ledger really does still owe it
+        reopened = budget.RotationProgress(tmp_path / f"{LANE}.json", lane=LANE, schema=sweep.SCHEMA,
+                                           slot_grammar=sweep.slot_id_ok)
+        assert reopened.tier("a.com", sweep.bucket_of("alpha"), sweep.content_digest(["alpha"])) != 2
+
+    def test_a_PUBLISHED_completion_does_count_as_done(self, tmp_path):
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"])
+        assert out.pending_completions == 0 and out.targets_complete == 1, out
+        assert out.targets_remaining == 0, out
+
+    def test_an_UNSTAGED_completion_leaves_its_target_OWED_too(self, tmp_path):
+        """The other unsettled shape: the invocation returned something that is not a status, so no `done`
+        tuple was ever staged. The slots RAN and nobody holds their completion — the target still owes."""
+        class _Bad(_Tool):
+            def __call__(self, target, bucket, words):
+                super().__call__(target, bucket, words)
+                return "not a status"
+
+        out, tool = _run(tmp_path, targets=("a.com",), words=["alpha"], tool=_Bad())
+        assert out.completion_unstaged and out.stop_kind == "machinery", out
+        assert out.targets_complete == 0 and out.targets_remaining == 1, out

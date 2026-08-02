@@ -581,6 +581,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         checked: set = set()                               # targets the admission hook has answered for
         spent: dict = {}                                   # candidates submitted per target
         submitted: set = set()                             # slots whose pairs went into `spent`
+        unsettled: set = set()                             # targets holding a completion nobody published
         refused_targets: set = set()                       # targets the admission hook turned away
         while not clock.exhausted() and len(picked) < len(slots):
             batch = _next_batch(progress, slots, content, members, picked, spent, out,
@@ -713,6 +714,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 out.classes[key] = out.classes.get(key, 0) + len(chosen)
                 out.invocation_classes[key] = out.invocation_classes.get(key, 0) + 1
                 out.completion_unstaged += len(chosen)
+                unsettled.add(target)
                 out.machinery.append(f"{target}/{unit}: the invocation returned {_safe_name(result)} "
                                      f"{_safe_repr(result)} with no usable status")
                 out.stop = "machinery: the invocation returned no usable status"
@@ -756,6 +758,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     # v72#3: it is still a slot that RAN and whose completion nobody holds — counted as
                     # unstaged rather than cleared and forgotten.
                     out.completion_unstaged += inflight
+                    unsettled.add(target)
                     out.machinery.append(f"{target}/{unit}: completion not staged ({_safe_name(e)})")
                     out.stop = "machinery: the completion could not be staged"
                     out.stop_kind = "machinery"
@@ -771,6 +774,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                 # persists them. They are PENDING, not lost — and reclassified when that happens, instead
                 # of the counters swearing nothing was published while the disk says otherwise.
                 out.pending_completions += len(chosen)
+                unsettled.add(target)
 
 
         # ── DISPOSITIONS, reconciled from the whole slot set ────────────────────────────────────
@@ -833,6 +837,12 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
             by_target.setdefault(slot[0], []).append(slot)
         done_targets = 0
         for tgt, group in by_target.items():
+            if tgt in unsettled:
+                # v-review: `progress` holds `done` tuples that are staged in MEMORY. When the save that
+                # would make one durable did not confirm, the next lifecycle reopens a ledger that still
+                # shows tier 0 and selects the slot again — so a target with an unpublished completion is
+                # not complete, whatever the in-memory map says.
+                continue
             try:
                 if all(progress.tier(tgt, s, content[(tgt, s)]) == 2 for _t, s in group):
                     done_targets += 1
