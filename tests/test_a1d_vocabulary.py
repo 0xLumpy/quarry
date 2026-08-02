@@ -3683,14 +3683,31 @@ class TestTheRecursionRoundsPolicy:
         chain = {1: ["a1.acme.com"], 2: ["a2.acme.com"], 3: ["a3.acme.com"], 4: ["a4.acme.com"]}
         self._drive(tmp_path / "cut", monkeypatch, growth=lambda i: chain.get(i, []))
         cov = [e for e in _events_of(tmp_path / "cut") if e.get("measure") == "permutation_rounds"][-1]
-        assert (cov["eligible"], cov["tested"], cov["omitted"]) == (4, 3, 1), cov
-        assert "BEFORE it converged" in cov["reason"] and "3-round bound" in cov["reason"], cov
+        # how many rounds convergence needs is UNKNOWABLE here — a chain needing a hundred more looks
+        # exactly like one needing one, so no exact denominator is invented
+        assert cov["kind"] == events.COVERAGE_UNKNOWN, cov
+        assert "eligible" not in cov and "omitted" not in cov, cov
+        assert "STILL found new" in cov["reason"] and "3-round bound" in cov["reason"], cov
+        assert "UNKNOWN" in cov["reason"], cov
 
         from quarry_recon import policy, settings
         with settings.overrides(policy.unbound_overrides()):
             self._drive(tmp_path / "whole", monkeypatch, growth=lambda i: chain.get(i, []))
         cov = [e for e in _events_of(tmp_path / "whole") if e.get("measure") == "permutation_rounds"][-1]
-        assert cov["omitted"] == 0 and "CONVERGED" in cov["reason"], cov
+        # ...and a run that FINISHED counts exactly: it rounds, all of them run, nothing omitted
+        assert (cov["kind"], cov["eligible"], cov["tested"], cov["omitted"]) == (
+            events.COVERAGE_CAP, 5, 5, 0), cov
+        assert "CONVERGED" in cov["reason"], cov
+
+    def test_a_bound_that_cost_NOTHING_does_not_claim_a_missing_round(self, tmp_path, monkeypatch):
+        """v-review: reaching the round number proves neither that the last round found anything nor that
+        another round is reachable. One round, a resolver that finds nothing — the old code announced that
+        the last round "still found new names" and promised another."""
+        self._drive(tmp_path / "quiet", monkeypatch, growth=lambda i: [], rounds=1)
+        cov = [e for e in _events_of(tmp_path / "quiet") if e.get("measure") == "permutation_rounds"][-1]
+        assert cov["kind"] == events.COVERAGE_CAP and cov["omitted"] == 0, cov
+        assert "STILL found new" not in cov["reason"], cov
+        assert ("cost nothing" in cov["reason"] or "nothing new was left" in cov["reason"]), cov
 
     def test_a_DEGRADED_resolver_making_no_progress_TERMINATES(self, tmp_path, monkeypatch):
         """The safety half: unbound must not mean forever. A resolver that answers the same thing every
@@ -3701,3 +3718,9 @@ class TestTheRecursionRoundsPolicy:
             none, _run2 = self._drive(tmp_path / "none", monkeypatch, growth=lambda i: [])
         assert len(same) == 2, same          # one productive round, one that repeats -> stop
         assert len(none) == 1, none          # nothing at all -> stop after the first
+        # ...and each exit names ITSELF rather than defaulting to the bound's wording
+        same_cov = [e for e in _events_of(tmp_path / "same") if e.get("measure") == "permutation_rounds"][-1]
+        assert same_cov["omitted"] == 0 and "CONVERGED" in same_cov["reason"], same_cov
+        none_cov = [e for e in _events_of(tmp_path / "none") if e.get("measure") == "permutation_rounds"][-1]
+        assert none_cov["omitted"] == 0, none_cov
+        assert "nothing new was left to submit" in none_cov["reason"], none_cov

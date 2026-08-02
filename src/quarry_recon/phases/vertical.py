@@ -1333,12 +1333,13 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
     MAX_ITERS to 0 = "until it converges", and an unbounded loop is only safe if its termination is
     tested rather than assumed."""
     rounds = policy.limit("MAX_ITERS")          # 0 = until it converges (`--unbound`)
-    converged = False
+    stop, made = "bound", False        # WHY the loop ended, and whether its LAST round found anything
     prev = -1
     seen_candidates: set[str] = set()
     it = 0
     while not rounds or it < rounds:
         it += 1
+        base = ctx.run.count("resolved")           # the baseline THIS round has to beat
         seed = sorted(set(ctx.run.values("subdomain") + prof.apex_domains
                           + ctx.run.values("resolved")))
         known = ctx.write_list(f"known_{it}.txt", seed)
@@ -1359,6 +1360,7 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
             # is skipped: passively-discovered subdomain names are already stored (CT/subfinder/etc above);
             # we simply don't resolve them to A records here. Honest skip, then stop (no active growth).
             ctx.run.record("vertical", skipped("dnsx", "passive-only mode — no recursive DNS resolution"))
+            stop = "passive"
             break
 
         # frontier-only: resolve only candidates NOT already ATTEMPTED-AND-SETTLED (dedup, first-seen order).
@@ -1366,6 +1368,7 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
         _n_all, _n_new = len(set(filter(None, cand))), len(new_cand)
         if not new_cand:
             ctx.echo(f"  recursion iter {it}: no new candidates — converged")
+            stop = "no_candidates"
             break
         candidates = ctx.write_list(f"all_candidates_{it}.txt", new_cand)
         res = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.txt")
@@ -1412,29 +1415,43 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
                                     f"{retryable} candidate(s) unresolved, {_budget}")
 
         cur = ctx.run.count("resolved")
+        made = cur > base                          # did THIS round resolve anything new?
         ctx.echo(f"  recursion iter {it}: resolved={cur}"
                  + ("" if prev < 0 else f" (+{cur - prev} new)"))
         if prev >= 0 and cur == prev:
-            converged = True
+            stop = "converged"
             break          # converged — nothing new this iteration
         prev = cur
 
-    # ── what ENDED the recursion — a cap or a fixed point (step 4 review) ────────────────────────────
-    # A run whose LAST permitted round still produced new names did not finish: more names are reachable
-    # and this run will not reach them, which is a cap-shaped omission the verdict has to see. Emitting
-    # every run (omitted=0 when converged) keeps the latest-per-unit reconciliation honest.
-    _more = bool(rounds) and not converged and it >= rounds
-    events.coverage_partial("vertical.alterx_permute", kind=events.COVERAGE_CAP,
-                            unit="vertical.permute_rounds", measure="permutation_rounds",
-                            eligible=it + (1 if _more else 0), tested=it, omitted=1 if _more else 0,
-                            reason=(f"{it} permutation round(s) ran and the last one still found new "
-                                    f"names — the {rounds}-round bound stopped the recursion BEFORE it "
-                                    f"converged; at least one more round is reachable work"
-                                    if _more else
-                                    f"{it} permutation round(s) — the recursion CONVERGED"
-                                    if converged else
-                                    f"{it} permutation round(s) — the recursion stopped early "
-                                    f"(no new candidates or a passive/dependency stop)"))
+    # ── what ENDED the recursion — a fixed point, or a bound that cut it short (step 4 review) ───────
+    # The DISPOSITION is recorded where it happens, never inferred from the counter: reaching the round
+    # number proves neither that the last round found anything nor that another round is reachable.
+    #
+    # And when a bound stops a run that was still producing, the remaining rounds are UNKNOWABLE — a chain
+    # needing a hundred more rounds looks exactly like one needing one. Counting that as `3/4` would hand
+    # reconciliation an exact denominator nobody measured, so bounded non-convergence is UNKNOWN coverage;
+    # exact counters are emitted only when the recursion actually finished.
+    if stop == "bound" and made:
+        events.coverage_partial("vertical.alterx_permute", kind=events.COVERAGE_UNKNOWN,
+                                unit="vertical.permute_rounds", measure="permutation_rounds",
+                                reason=f"{it} permutation round(s) ran and the last one STILL found new "
+                                       f"names — the {rounds}-round bound stopped the recursion before it "
+                                       f"converged, and how many rounds convergence needs is UNKNOWN")
+    elif stop == "passive":
+        events.coverage_partial("vertical.alterx_permute", kind=events.COVERAGE_UNKNOWN,
+                                unit="vertical.permute_rounds", measure="permutation_rounds",
+                                reason=f"{it} permutation round(s) — PASSIVE mode resolves nothing, so "
+                                       f"whether the recursion would converge is unknown")
+    else:
+        events.coverage_partial("vertical.alterx_permute", kind=events.COVERAGE_CAP,
+                                unit="vertical.permute_rounds", measure="permutation_rounds",
+                                eligible=it, tested=it, omitted=0,
+                                reason=(f"{it} permutation round(s) — the recursion CONVERGED"
+                                        if stop == "converged" else
+                                        f"{it} permutation round(s) — nothing new was left to submit"
+                                        if stop == "no_candidates" else
+                                        f"{it} permutation round(s) — the last round added no resolved "
+                                        f"name, so the {rounds}-round bound cost nothing"))
 
 
 def run(ctx) -> None:
