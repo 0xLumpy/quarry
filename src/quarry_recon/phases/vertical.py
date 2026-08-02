@@ -16,7 +16,7 @@ import urllib.request
 from dataclasses import replace
 from pathlib import Path
 
-from .. import budget, events, netguard, normalize, secrets, settings, sweep
+from .. import budget, events, netguard, normalize, policy, secrets, settings, sweep
 from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, registered, run_contract,
                         run_provider)
 from ..runner import (RunResult, Status, have, reclassify_from_artifact, run as exec_tool,
@@ -514,6 +514,11 @@ WC_PARSER_SCHEMA = 2
 #: a later run continues where this one stopped. `0` removes the per-run limit entirely.
 WILDCARD_ZONES_PER_RUN = 5
 
+#: permutation ROUNDS over names already held. The loop stops on its own when a round adds nothing new;
+#: this bounds how many rounds one run may spend getting there. `--unbound` sets it to 0 = "until it
+#: converges" (flag-axis step 4) — repetition cannot continue it, because entities are run-scoped.
+MAX_ITERS = 3
+
 
 def wildcard_zones_per_run() -> int:
     """The per-run zone allowance, overridable from PERFORMANCE — and by `quarry run --unbound`, which
@@ -828,7 +833,9 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         st["blocked"]["zone_cap"] = max(0, len(eligible) - _allow) if _allow else 0
         # no eligible zone -> nothing to probe WITH either: the vocabulary is not read, so a run with
         # nothing to differentiate does not report parse facts about a list it would never have used.
-        spend = word_spend if word_spend is not None else WILDCARD_WORD_CAP
+        # the caller's spend, or this lane's own registered bound — read through the registry so
+        # `--unbound` can lift it (flag-axis step 4); the constant remains the DEFAULT
+        spend = word_spend if word_spend is not None else policy.limit("WILDCARD_WORD_CAP")
         words = _wc_vocabulary(extra_words, st) if eligible else []
         # the key binds the vocabulary the invocation really submits, CANONICALISED the way
         # `write_list` canonicalises it (v50#3): the file is sorted and deduplicated, so two selections
@@ -1319,6 +1326,95 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         ctx.echo(f"  wildcard: {len(kept)} distinct vhost(s) differentiated, {len(novel)} new ({label})")
 
 
+def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> None:
+    """The recursive permute -> resolve loop, in its own seam (flag-axis step 4).
+
+    Extracted UNCHANGED from `run()` so the rounds policy can be driven directly: `--unbound` sets
+    MAX_ITERS to 0 = "until it converges", and an unbounded loop is only safe if its termination is
+    tested rather than assumed."""
+    rounds = policy.limit("MAX_ITERS")          # 0 = until it converges (`--unbound`)
+    prev = -1
+    seen_candidates: set[str] = set()
+    it = 0
+    while not rounds or it < rounds:
+        it += 1
+        seed = sorted(set(ctx.run.values("subdomain") + prof.apex_domains
+                          + ctx.run.values("resolved")))
+        known = ctx.write_list(f"known_{it}.txt", seed)
+        cand = list(seed)
+
+        # word-cloud permutations (active only): -enrich extracts words from observed names,
+        # -mode both adds default + target-mined patterns. Runs over the FULL known set (word cloud).
+        if not scope.passive_only and have("alterx"):
+            perms = ctx.run.raw_path("vertical", "alterx", f"perms_{it}.txt")
+            r = exec_tool("alterx", ["alterx", "-l", str(known), "-enrich", "-mode", "both",
+                                     "-silent"], raw_path=perms, timeout=600)
+            ctx.run.record("vertical", r)
+            if perms.exists():
+                cand += perms.read_text().splitlines()
+
+        if scope.passive_only:
+            # PASSIVE = no target contact. `dnsx -a` resolves candidates against the target's DNS, so it
+            # is skipped: passively-discovered subdomain names are already stored (CT/subfinder/etc above);
+            # we simply don't resolve them to A records here. Honest skip, then stop (no active growth).
+            ctx.run.record("vertical", skipped("dnsx", "passive-only mode — no recursive DNS resolution"))
+            break
+
+        # frontier-only: resolve only candidates NOT already ATTEMPTED-AND-SETTLED (dedup, first-seen order).
+        new_cand = [c for c in dict.fromkeys(cand) if c and c not in seen_candidates]
+        _n_all, _n_new = len(set(filter(None, cand))), len(new_cand)
+        if not new_cand:
+            ctx.echo(f"  recursion iter {it}: no new candidates — converged")
+            break
+        candidates = ctx.write_list(f"all_candidates_{it}.txt", new_cand)
+        res = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.txt")
+        # --write-massdns captures the A records so `resolved` carries its IPs (was a:[] — puredns
+        # -q emits hostnames only, leaving the host→IP edge to live solely in dns_record; the digest
+        # and the v0.4 relationship layer both want it on `resolved`).
+        md = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.massdns")
+        cmd = ["puredns", "resolve", str(candidates), "--resolvers-trusted", str(trusted),
+               "--write-massdns", str(md), "-q"]
+        if resolvers:
+            cmd += ["-r", str(resolvers)]
+        if prof.dns_rate:
+            cmd += ["--rate-limit", str(prof.dns_rate)]
+        r = exec_tool("puredns", cmd, raw_path=res, timeout=ctx.http_timeout)
+        if _n_all != _n_new:                              # dedup SAVINGS is optimization telemetry, NOT a gap
+            r.note = (f"frontier: {_n_new} new candidate(s), {_n_all - _n_new} already-settled skipped; "
+                      f"{r.note or ''}").strip()
+        ctx.run.record("vertical", r)
+        resolved_now: set[str] = set()
+        if r.raw_path:
+            ips = _massdns_a(md)                # host -> [A records]
+            for e in normalize.hosts(r.raw_path.read_text(), "puredns-resolve", str(res)):
+                resolved_now.add(e["host"])     # every resolved name (in/out of scope) is settled
+                if scope.in_scope(e["host"]):
+                    ctx.run.add("resolved", {"host": e["host"], "a": ips.get(e["host"], []),
+                                             "sources": ["puredns-resolve"], "raw_ref": str(res)})
+                    # newly-resolved permutations are new subdomains → seed next iteration
+                    ctx.run.add("subdomain", {"host": e["host"], "sources": ["puredns-resolve"]})
+        # SETTLE candidates only when the batch is trustworthy: a CLEAN puredns run resolves every attempted
+        # candidate (an unresolved name won't resolve later within the run), so mark ALL new_cand seen. A
+        # DEGRADED batch (timeout/error/partial) settles ONLY the confirmed-resolved names — its UNRESOLVED
+        # candidates stay retryable so a transient resolver failure is re-attempted next iteration (bounded
+        # by MAX_ITERS). This preserves set-equality of the RESOLVED union with the old blanket re-resolution.
+        if r.status in (Status.SUCCESS, Status.EMPTY):
+            seen_candidates.update(new_cand)
+        else:
+            seen_candidates.update(resolved_now)
+            retryable = len(set(new_cand) - resolved_now)
+            _budget = "retry budget exhausted (final iteration)" if it == MAX_ITERS else "retryable next iteration"
+            events.coverage_partial("vertical.puredns_resolve", reason=f"iter {it}: puredns {r.status.value} — "
+                                    f"{retryable} candidate(s) unresolved, {_budget}")
+
+        cur = ctx.run.count("resolved")
+        ctx.echo(f"  recursion iter {it}: resolved={cur}"
+                 + ("" if prev < 0 else f" (+{cur - prev} new)"))
+        if prev >= 0 and cur == prev:
+            break          # converged — nothing new this iteration
+        prev = cur
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
     roots_file = ctx.write_list("roots.txt", prof.apex_domains)
@@ -1499,85 +1595,7 @@ def run(ctx) -> None:
     # would flip on a re-submit — this is validated by benchmark (measure-don't-guess), not set arithmetic.
     # alterx STILL runs over the full known set (its -enrich word cloud is mined from ALL observed names —
     # feeding it only the frontier would shrink the vocabulary and LOSE cross-pollinated permutations).
-    MAX_ITERS = 3
-    prev = -1
-    seen_candidates: set[str] = set()
-    for it in range(1, MAX_ITERS + 1):
-        seed = sorted(set(ctx.run.values("subdomain") + prof.apex_domains
-                          + ctx.run.values("resolved")))
-        known = ctx.write_list(f"known_{it}.txt", seed)
-        cand = list(seed)
-
-        # word-cloud permutations (active only): -enrich extracts words from observed names,
-        # -mode both adds default + target-mined patterns. Runs over the FULL known set (word cloud).
-        if not scope.passive_only and have("alterx"):
-            perms = ctx.run.raw_path("vertical", "alterx", f"perms_{it}.txt")
-            r = exec_tool("alterx", ["alterx", "-l", str(known), "-enrich", "-mode", "both",
-                                     "-silent"], raw_path=perms, timeout=600)
-            ctx.run.record("vertical", r)
-            if perms.exists():
-                cand += perms.read_text().splitlines()
-
-        if scope.passive_only:
-            # PASSIVE = no target contact. `dnsx -a` resolves candidates against the target's DNS, so it
-            # is skipped: passively-discovered subdomain names are already stored (CT/subfinder/etc above);
-            # we simply don't resolve them to A records here. Honest skip, then stop (no active growth).
-            ctx.run.record("vertical", skipped("dnsx", "passive-only mode — no recursive DNS resolution"))
-            break
-
-        # frontier-only: resolve only candidates NOT already ATTEMPTED-AND-SETTLED (dedup, first-seen order).
-        new_cand = [c for c in dict.fromkeys(cand) if c and c not in seen_candidates]
-        _n_all, _n_new = len(set(filter(None, cand))), len(new_cand)
-        if not new_cand:
-            ctx.echo(f"  recursion iter {it}: no new candidates — converged")
-            break
-        candidates = ctx.write_list(f"all_candidates_{it}.txt", new_cand)
-        res = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.txt")
-        # --write-massdns captures the A records so `resolved` carries its IPs (was a:[] — puredns
-        # -q emits hostnames only, leaving the host→IP edge to live solely in dns_record; the digest
-        # and the v0.4 relationship layer both want it on `resolved`).
-        md = ctx.run.raw_path("vertical", "puredns", f"resolved_{it}.massdns")
-        cmd = ["puredns", "resolve", str(candidates), "--resolvers-trusted", str(trusted),
-               "--write-massdns", str(md), "-q"]
-        if resolvers:
-            cmd += ["-r", str(resolvers)]
-        if prof.dns_rate:
-            cmd += ["--rate-limit", str(prof.dns_rate)]
-        r = exec_tool("puredns", cmd, raw_path=res, timeout=ctx.http_timeout)
-        if _n_all != _n_new:                              # dedup SAVINGS is optimization telemetry, NOT a gap
-            r.note = (f"frontier: {_n_new} new candidate(s), {_n_all - _n_new} already-settled skipped; "
-                      f"{r.note or ''}").strip()
-        ctx.run.record("vertical", r)
-        resolved_now: set[str] = set()
-        if r.raw_path:
-            ips = _massdns_a(md)                # host -> [A records]
-            for e in normalize.hosts(r.raw_path.read_text(), "puredns-resolve", str(res)):
-                resolved_now.add(e["host"])     # every resolved name (in/out of scope) is settled
-                if scope.in_scope(e["host"]):
-                    ctx.run.add("resolved", {"host": e["host"], "a": ips.get(e["host"], []),
-                                             "sources": ["puredns-resolve"], "raw_ref": str(res)})
-                    # newly-resolved permutations are new subdomains → seed next iteration
-                    ctx.run.add("subdomain", {"host": e["host"], "sources": ["puredns-resolve"]})
-        # SETTLE candidates only when the batch is trustworthy: a CLEAN puredns run resolves every attempted
-        # candidate (an unresolved name won't resolve later within the run), so mark ALL new_cand seen. A
-        # DEGRADED batch (timeout/error/partial) settles ONLY the confirmed-resolved names — its UNRESOLVED
-        # candidates stay retryable so a transient resolver failure is re-attempted next iteration (bounded
-        # by MAX_ITERS). This preserves set-equality of the RESOLVED union with the old blanket re-resolution.
-        if r.status in (Status.SUCCESS, Status.EMPTY):
-            seen_candidates.update(new_cand)
-        else:
-            seen_candidates.update(resolved_now)
-            retryable = len(set(new_cand) - resolved_now)
-            _budget = "retry budget exhausted (final iteration)" if it == MAX_ITERS else "retryable next iteration"
-            events.coverage_partial("vertical.puredns_resolve", reason=f"iter {it}: puredns {r.status.value} — "
-                                    f"{retryable} candidate(s) unresolved, {_budget}")
-
-        cur = ctx.run.count("resolved")
-        ctx.echo(f"  recursion iter {it}: resolved={cur}"
-                 + ("" if prev < 0 else f" (+{cur - prev} new)"))
-        if prev >= 0 and cur == prev:
-            break          # converged — nothing new this iteration
-        prev = cur
+    _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones)
 
     # ── A1: wildcard-zone brute + HTTP-differentiation (recover distinct vhosts a wildcard hides) ──
     # Runs before the CNAME/takeover pass so recovered vhosts get takeover analysis too.

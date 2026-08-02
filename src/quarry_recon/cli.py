@@ -734,7 +734,7 @@ def policy(profile_path, unbound):
     check what a run WOULD do before spending an hour finding out."""
     from . import policy as _policy
     from . import settings
-    with settings.overrides({"WILDCARD_ZONES_PER_RUN": 0} if unbound else {}):
+    with settings.overrides(_policy.unbound_overrides() if unbound else {}):
         rows = _policy.snapshot()
         click.echo(_c(f"\n# effective coverage policy{' (--unbound)' if unbound else ''}\n", "cyan"))
         for line in _policy.render(rows):
@@ -752,10 +752,12 @@ def policy(profile_path, unbound):
 @click.option("--timeout", default=1800, type=click.IntRange(min=0),
               help="per-tool OUTER timeout floor in seconds; httpx/ffuf/nuclei/naabu scale their wall-clock ceiling above this by workload (0 = fully unbounded, no wall-clock kill — per-probe timeouts still bound individual requests; NEGATIVE is rejected, as it would collapse every tool to an instant timeout). subfinder is separate: it self-bounds via its own -max-time COLLECTION budget per apex (PERFORMANCE.SUBFINDER_MAX_TIME minutes, default 60; only that knob unbinds it, 0 -> practically unbounded 1440m). This flag does NOT change it: --timeout 0 removes the outer kill and leaves the collection budget exactly as configured")
 @click.option("--unbound", is_flag=True,
-              help="sweep EVERY eligible wildcard zone in this one run (the per-run zone allowance, "
-                   "PERFORMANCE.WILDCARD_ZONES_PER_RUN, becomes 0 for this process). The per-zone spend "
-                   "bound, the scope rules, the contact guard and the rate controls are unchanged — this "
-                   "removes the ROTATION, not a safety bound")
+              help="use ALL the eligible work this run already has: every registered coverage/throughput "
+                   "ceiling goes to its unbounded meaning for this process (see `quarry policy "
+                   "--unbound`). It does NOT obtain more — provider enablement, balance, reserve and page "
+                   "budgets are untouched — and it never changes scope, contact guards, rate limits, "
+                   "concurrency, per-invocation chunk sizes or the outer timeout. Bounds held by policy "
+                   "stay held, and are printed with the reason")
 def run(profile_path, phases, passive, timeout, unbound):
     """Run recon phases against the confirmed scope. Output lands in the project's recon/ dir."""
     from . import settings
@@ -764,7 +766,8 @@ def run(profile_path, phases, passive, timeout, unbound):
     # allowance handing the rest to a later lifecycle (step 4.3). Entered BEFORE anything reads a bound, so
     # no lane can start under the rotation the operator just turned off — and RESTORED on the way out, so
     # one run's instruction never leaks into another sharing this interpreter (step 2).
-    with settings.overrides({"WILDCARD_ZONES_PER_RUN": 0} if unbound else {}):
+    from . import policy as _policy
+    with settings.overrides(_policy.unbound_overrides() if unbound else {}):
         _run_phases(profile_path, phases, passive, timeout)
 
 

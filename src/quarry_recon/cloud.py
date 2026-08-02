@@ -13,7 +13,7 @@ import socket
 import urllib.error
 import urllib.request
 
-from . import events
+from . import events, policy
 
 # common bucket-name patterns around a seed (apex label / org / brand).
 _SUFFIXES = ["", "-backup", "-backups", "-dev", "-staging", "-prod", "-assets", "-static",
@@ -79,7 +79,8 @@ def discover(ctx) -> int:
     # name cap) — the C07/C10 resume key.
     wu = events.work_unit("horizontal.cloud_buckets",
                           inputs={"seeds": sorted(_seeds(ctx.profile))},
-                          config={"providers": [p for p, _ in _PROVIDERS], "name_cap": _MAX_NAMES,
+                          config={"providers": [p for p, _ in _PROVIDERS],
+                                  "name_cap": policy.limit("CLOUD_NAME_CAP"),
                                   "suffixes": _SUFFIXES})     # review-r4#4: suffix set is coverage-affecting
     r = run_provider("horizontal.cloud_buckets", lambda: _enumerate(ctx), work_unit=wu)
     return len(r) if r else 0
@@ -92,7 +93,8 @@ def _enumerate(ctx) -> set:
     capped or partly-unreachable enum is an honest gap the verdict sees, not silent."""
     sid = "horizontal.cloud_buckets"
     all_names = _all_candidates(ctx.profile)
-    names = all_names[:_MAX_NAMES]
+    cap = policy.limit("CLOUD_NAME_CAP")        # 0 = every candidate name (`--unbound`)
+    names = all_names if not cap else all_names[:cap]
     total_probes = len(names) * len(_PROVIDERS)
     found_urls: set = set()
     indeterminate = 0

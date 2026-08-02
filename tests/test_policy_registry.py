@@ -12,6 +12,7 @@ import ast
 import importlib
 import json
 import pathlib
+import pathlib
 
 import pytest
 
@@ -252,7 +253,7 @@ class TestTheRegistryTellsTheTruth:
         """`consumer_honours_unbounded=False` is a promise NOT yet kept — the widening step's checklist,
         stated instead of assumed."""
         pending = [b.name for b in policy.relaxable() if not b.consumer_honours_unbounded]
-        assert pending == ["CLOUD_NAME_CAP", "SPA_CAP", "MAX_ITERS"], pending
+        assert pending == [], pending          # step 4 taught the last three
 
 
 class TestOverridesAreRunScoped:
@@ -563,3 +564,109 @@ class TestARejectedValueIsNeverDISCLOSED:
         finally:
             events.reset()
         assert digits[:12] not in sinks, sinks
+
+
+class TestUnboundIsDrivenByTheRegistry:
+    """flag-axis step 4: `--unbound` has no list of its own. It applies the REGISTRY — every relaxable
+    bound at its unbounded value — so a knob that is not registered is not lifted, a HELD one keeps its
+    bound, and provider controls are not touched at all."""
+
+    def test_it_lifts_EVERY_relaxable_bound_and_nothing_else(self):
+        from quarry_recon import policy, settings
+        applied = policy.unbound_overrides()
+        assert set(applied) == {b.name for b in policy.relaxable()}, applied
+        assert all(applied[b.name] == b.unbounded_value for b in policy.relaxable()), applied
+        assert "A1D_WORD_CAP" not in applied                     # HELD by policy
+        for key in ("SHODAN_HOST_BUDGET_S", "SHODAN_MAX_PAGES", "WHOXY_PAGE_BUDGET",
+                    "PROVIDER_MAX_PAGES", "NUCLEI_BULK_SIZE", "ARJUN_TARGETS"):
+            assert key not in applied, key                       # provider / rate: never ours
+        with settings.overrides(applied):
+            rows = {r["name"]: r for r in policy.snapshot()}
+            for b in policy.relaxable():
+                assert rows[b.name]["unbounded"] and rows[b.name]["source"] == "flag", rows[b.name]
+            held = rows["A1D_WORD_CAP"]
+            assert held["value"] == 2000 and held["source"] == "default", held
+
+    def test_the_module_caps_are_read_through_the_registry(self, monkeypatch):
+        """A module constant cannot be read by `settings`, so the consumer asks `policy.limit()` — the
+        constant stays the DEFAULT and the flag layers on top."""
+        from quarry_recon import policy, settings
+        from quarry_recon.phases import vertical
+        assert policy.limit("WILDCARD_WORD_CAP") == 5000
+        monkeypatch.setattr(vertical, "WILDCARD_WORD_CAP", 25)   # the constant is still the default
+        assert policy.limit("WILDCARD_WORD_CAP") == 25
+        with settings.overrides(policy.unbound_overrides()):
+            assert policy.limit("WILDCARD_WORD_CAP") == 0        # ...and `--unbound` wins over it
+
+    def test_the_DIFFER_submits_the_whole_corpus_when_unbound(self, tmp_path, monkeypatch):
+        """The behaviour the flag promises: with the spend bound lifted, one lifecycle submits every
+        candidate it holds for the zone instead of leaving a remainder to rotate."""
+        from quarry_recon import policy, settings, store
+        from test_a1d_vocabulary import TestTheWildcardDifferHasItsOwnLifecycle as L
+        words = tuple(f"w{i}" for i in range(9))
+        monkeypatch.setattr(__import__("quarry_recon.phases.vertical", fromlist=["x"]),
+                            "WILDCARD_WORD_CAP", 2)
+        seen: list = []
+
+        def tool(t_, cmd, raw_path=None, timeout=None, **k):
+            from quarry_recon.runner import RunResult as _RR
+            seen.extend(pathlib.Path(cmd[cmd.index("-l") + 1]).read_text().split())
+            if raw_path is not None:
+                raw_path.write_text("")
+            return _RR(t_, cmd, crawl.Status.EMPTY, 0, 0.1, raw_path, 0)
+
+        bounded = L._differ(L(), tmp_path / "a", monkeypatch, zones=("z.acme.com",), words=words,
+                            rows=None, tool=tool)
+        submitted_bounded = {c.split(".", 1)[0] for c in seen if not c.startswith("quarry-wc-")}
+        seen.clear()
+        with settings.overrides(policy.unbound_overrides()):
+            L._differ(L(), tmp_path / "b", monkeypatch, zones=("z.acme.com",), words=words,
+                      rows=None, tool=tool)
+        submitted_unbound = {c.split(".", 1)[0] for c in seen if not c.startswith("quarry-wc-")}
+        assert len(submitted_bounded) == 2, submitted_bounded          # the 2-per-zone spend
+        assert submitted_unbound == set(words), submitted_unbound      # ...lifted: all nine, one run
+
+
+class TestTheConsumersHonourTheirUnboundedValue:
+    """A registry that says `consumer_honours_unbounded=True` is a promise about BEHAVIOUR."""
+
+    def test_the_CLOUD_name_cap_probes_every_candidate_when_unbound(self, tmp_path, monkeypatch):
+        from quarry_recon import cloud, events, policy, settings, store
+        monkeypatch.setattr(cloud, "_check", lambda url: (False, None))     # nothing exists; no network
+        probed: list = []
+        monkeypatch.setattr(cloud, "_all_candidates", lambda prof: [f"n{i}" for i in range(300)])
+        real = cloud._check
+        monkeypatch.setattr(cloud, "_check", lambda url: (probed.append(url), (False, None))[1])
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        ctx = type("C", (), {"run": run, "profile": type("P", (), {"apex_domains": ["acme.com"]})()})()
+        try:
+            cloud._enumerate(ctx)
+            bounded = len({u for u in probed})
+            probed.clear()
+            with settings.overrides(policy.unbound_overrides()):
+                cloud._enumerate(ctx)
+            unbound = len({u for u in probed})
+        finally:
+            events.reset()
+        assert bounded == 120 * 2, bounded            # 120 names x 2 providers
+        assert unbound == 300 * 2, unbound            # ...every candidate, both providers
+
+    def test_the_SPA_cap_takes_every_app_like_host_when_unbound(self, monkeypatch):
+        """The headless slice reads the policy, and 0 means every app-like host rather than a `[:0]` cut —
+        the failure mode a naive "unbounded = 0" would produce."""
+        from quarry_recon import policy, settings
+        from quarry_recon.phases import crawl
+        hosts = [f"https://app{i}.acme.com" for i in range(25)]
+        assert policy.limit("SPA_CAP") == 10
+        cap = policy.limit("SPA_CAP")
+        assert (hosts if not cap else hosts[:cap]) == hosts[:10]
+        with settings.overrides(policy.unbound_overrides()):
+            cap = policy.limit("SPA_CAP")
+            assert cap == 0 and (hosts if not cap else hosts[:cap]) == hosts
+        # the lane reads the POLICY (not the constant) and slices with it — the headless pass itself is
+        # driven end-to-end in the crawl suite, so what is pinned here is the policy wiring
+        src = pathlib.Path(crawl.__file__).read_text()
+        assert '_cap = policy.limit("SPA_CAP")' in src, "the lane must READ the policy"
+        assert "spa = _spa_all if not _cap else _spa_all[:_cap]" in src, "...and slice with it"
+        assert "_spa_all[:SPA_CAP]" not in src, src

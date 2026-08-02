@@ -124,23 +124,23 @@ BOUNDS: tuple[Bound, ...] = (
     Bound(name="CLOUD_NAME_CAP", reader="module", lane="horizontal.cloud_buckets", default=120,
           identity="work_unit", const="quarry_recon.cloud:_MAX_NAMES",
           persistence="the enumeration's resume key — the cap is folded in as `name_cap`",
-          relaxable=True, unbounded_value=0, consumer_honours_unbounded=False,
+          relaxable=True, unbounded_value=0, consumer_honours_unbounded=True,
           note="free: unauthenticated HTTP probes of candidate bucket URLs, no key and no spend. Today it "
                "is a MEMBERSHIP cut (`all_names[:120]`, reported as a coverage gap) and the consumer does "
                "not yet interpret 0, so widening it belongs to the `--unbound` step"),
 
     Bound(name="SPA_CAP", reader="module", lane="crawl.katana_headless", default=10, identity="none",
-          const="quarry_recon.phases.crawl:SPA_CAP", const_local=True,
+          const="quarry_recon.phases.crawl:SPA_CAP",
           persistence="nothing — the headless pass has no durable rotation to continue",
-          relaxable=True, unbounded_value=0, consumer_honours_unbounded=False,
+          relaxable=True, unbounded_value=0, consumer_honours_unbounded=True,
           note="a HIDDEN membership cut on already-retained hosts (`_spa_all[:10]`, reported as a coverage "
                "gap): exactly the PROCESSING side. It is function-local today, so wiring it means "
                "promoting it to a module constant AND teaching the consumer 0 — the widening step's work"),
 
     Bound(name="MAX_ITERS", reader="module", lane="vertical.permute", default=3, identity="none",
-          const="quarry_recon.phases.vertical:MAX_ITERS", const_local=True,
+          const="quarry_recon.phases.vertical:MAX_ITERS",
           persistence="nothing — the permutation loop is run-scoped",
-          relaxable=True, unbounded_value=0, consumer_honours_unbounded=False,
+          relaxable=True, unbounded_value=0, consumer_honours_unbounded=True,
           note="rounds of permutation over names ALREADY held. Calling it `--settle`'s business was wrong: "
                "entities are RUN-scoped (a new Run starts empty, pinned in the registry tests), so a later "
                "run replays rounds 1-3 and can never reach round 4 — depth would be permanently "
@@ -253,6 +253,42 @@ def knob(name: str) -> Bound | None:
     return b if b is not None and b.reader in ("strict_int", "budget_seconds") else None
 
 
+def _module_default(bound: Bound) -> int:
+    """The DEFAULT of a module-constant bound: the live constant where one exists (the module is still
+    where the default lives, and a test that patches it must keep working), else the declared value for a
+    function-local one. The registry's drift test keeps the two equal."""
+    if bound.const and not bound.const_local:
+        import importlib
+        mod, _, const = bound.const.partition(":")
+        return int(getattr(importlib.import_module(mod), const))
+    return bound.default
+
+
+def limit(name: str) -> int:
+    """The EFFECTIVE value of a module-constant bound — its declared default unless a flag overrode it.
+
+    A module constant cannot be read by `settings`, so a consumer that wants to honour `--unbound` asks
+    here instead of reading the constant directly. The constant stays the DEFAULT (and the registry's drift
+    test keeps them equal); this only adds the flag layer on top."""
+    from . import settings
+    b = by_name(name)
+    if b is None:
+        raise KeyError(name)                       # an unregistered bound has no policy to apply
+    default = _module_default(b)
+    value, _src, _rej, _rs = settings.strict_int_with_source(
+        name, default=default, maximum=max(default, b.unbounded_value or 0, 10 ** 9))
+    return value
+
+
+def unbound_overrides() -> dict:
+    """What `--unbound` sets, straight from the registry: every RELAXABLE bound at its unbounded value.
+
+    The flag has no list of its own — a knob that is not registered is not lifted, a HELD one keeps its
+    bound with the reason printed beside it, and provider controls are not here at all (they are excluded,
+    with their own ownership)."""
+    return {b.name: b.unbounded_value for b in BOUNDS if b.relaxable}
+
+
 def relaxable() -> tuple[Bound, ...]:
     """Everything `--unbound` lifts, in registry order."""
     return tuple(b for b in BOUNDS if b.relaxable)
@@ -276,11 +312,11 @@ def effective(bound: Bound) -> tuple[int, str, str | None, str | None]:
     if bound.reader == "strict_int":
         return settings.strict_int_with_source(bound.name, default=bound.default,
                                                maximum=bound.maximum or bound.default)
-    if bound.const and not bound.const_local:
-        import importlib
-        mod, _, name = bound.const.partition(":")
-        return int(getattr(importlib.import_module(mod), name)), "default", None, None
-    return bound.default, "default", None, None   # a function-local constant: not configurable
+    # a module constant is not configurable, but it IS relaxable — so the same override-aware parse runs
+    # over it, and the report shows a lifted cap as `flag` exactly like a knob (step 4).
+    default = _module_default(bound)
+    return settings.strict_int_with_source(bound.name, default=default,
+                                           maximum=max(default, bound.unbounded_value or 0, 10 ** 9))
 
 
 def snapshot() -> list[dict]:

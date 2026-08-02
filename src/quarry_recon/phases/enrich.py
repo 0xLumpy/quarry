@@ -13,7 +13,7 @@ from pathlib import Path
 
 import json as _json
 
-from .. import normalize
+from .. import normalize, policy
 from .. import settings
 from ..runner import (RunResult, Status, fresh_artifact_dir, have, nuclei_timeout, reclassify_from_files,
                       run as exec_tool, scaled_timeout, skipped)
@@ -353,7 +353,7 @@ def _a1d_recursive_brute(ctx) -> set[str]:
         discovered.update(_wildcard_differentiate(ctx, zones, extra_words=wc_words, phase="enrich",
                                                   label="wildcard-a1d", source="wildcard-http-a1d",
                                                   source_id="enrich.wildcard_a1d", stats=wc,
-                                                  word_spend=A1D_WILDCARD_WORD_CAP))
+                                                  word_spend=policy.limit('A1D_WILDCARD_WORD_CAP')))
     # ── ONE A1d outcome, chosen AFTER the work (review-B-audit-13#1): the earlier note claimed "the
     #    brute ran with less vocabulary" before anything had run — including when it never ran at all.
     if wc.get("eligible_zones", 0) > 0:

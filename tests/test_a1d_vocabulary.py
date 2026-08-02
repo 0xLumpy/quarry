@@ -3559,3 +3559,102 @@ class TestTheDifferRotatesOverZonesAndWords:
         assert {"101", "101.0"} <= after and not {"101.0", "101.1"} <= before, (before, after)
         # the split members were RE-SUBMITTED, not certified from the parent's completion
         assert any(c.startswith("w0831.") or c.startswith("w1263.") for c in seen), seen
+
+
+class TestTheRecursionRoundsPolicy:
+    """flag-axis step 4: `MAX_ITERS` is `--unbound`'s (repetition cannot continue a run-scoped loop), so
+    `0` means "until it converges". An unbounded loop is only safe if its TERMINATION is tested."""
+
+    def _drive(self, tmp_path, monkeypatch, *, growth, rounds=None):
+        """Run the real recursion loop with a resolver whose answers `growth(iteration)` decides."""
+        from quarry_recon import store
+        from quarry_recon.phases import vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        iters: list = []
+
+        def fake_exec(tool, cmd, raw_path=None, timeout=None, **k):
+            from quarry_recon.runner import RunResult as _RR
+            if tool == "alterx":
+                raw_path.write_text("")                       # no permutations: growth is the resolver's
+                return _RR(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, raw_path, 0)
+            iters.append(len(iters) + 1)
+            hosts = growth(len(iters))
+            raw_path.write_text("\n".join(hosts) + ("\n" if hosts else ""))
+            return _RR(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, raw_path, len(hosts))
+
+        monkeypatch.setattr(vertical, "exec_tool", fake_exec)
+        monkeypatch.setattr(vertical, "have", lambda t: True)
+        ctx = _Ctx(run.dir, [])
+        ctx.run = run
+        ctx.scope = type("S", (), {"in_scope": staticmethod(lambda h: True),
+                                   "is_oos": staticmethod(lambda h: False),
+                                   "passive_only": False})()
+        prof = type("P", (), {"apex_domains": ["acme.com"], "dns_rate": 0, "http_rl": 0,
+                              "takeover": False})()
+        try:
+            if rounds is not None:
+                monkeypatch.setattr(vertical, "MAX_ITERS", rounds)
+            vertical._recursive_permute(ctx, prof, ctx.scope, tmp_path / "trusted.txt", None, set())
+        finally:
+            events.reset()
+        return iters, run
+
+    def test_UNBOUND_reaches_round_four_and_then_CONVERGES(self, tmp_path, monkeypatch):
+        """The clean chain: each of the first four rounds resolves something new, so a 3-round bound stops
+        one round short of the discovery. Unbound, the loop reaches round four AND stops itself once a
+        round adds nothing — convergence, not exhaustion."""
+        from quarry_recon import policy, settings
+        chain = {1: ["a1.acme.com"], 2: ["a2.acme.com"], 3: ["a3.acme.com"], 4: ["a4.acme.com"]}
+        iters, run = self._drive(tmp_path / "bounded", monkeypatch, growth=lambda i: chain.get(i, []))
+        assert len(iters) == 3, iters                                   # the 3-round bound
+        assert "a4.acme.com" not in run.values("resolved"), run.values("resolved")
+        with settings.overrides(policy.unbound_overrides()):
+            iters, run = self._drive(tmp_path / "unbound", monkeypatch, growth=lambda i: chain.get(i, []))
+        assert len(iters) == 5, iters               # four productive rounds, then one that adds nothing
+        assert "a4.acme.com" in run.values("resolved"), run.values("resolved")
+
+    def test_CANDIDATES_that_never_RESOLVE_still_terminate(self, tmp_path, monkeypatch):
+        """The case the frontier check cannot catch: alterx keeps producing NEW candidates every round, so
+        there is always new work to submit, and none of it resolves. Only the resolved-count convergence
+        stops that — without it an unbound run loops for ever."""
+        from quarry_recon import policy, settings, store
+        from quarry_recon.phases import vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        rounds: list = []
+
+        def fake_exec(tool, cmd, raw_path=None, timeout=None, **k):
+            from quarry_recon.runner import RunResult as _RR
+            if tool == "alterx":
+                rounds.append(len(rounds) + 1)
+                assert len(rounds) < 25, "the recursion did not terminate"
+                raw_path.write_text("\n".join(f"never{len(rounds)}-{i}.acme.com" for i in range(3)) + "\n")
+                return _RR(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, raw_path, 3)
+            raw_path.write_text("")                    # ...and NOTHING ever resolves
+            return _RR(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, raw_path, 0)
+
+        monkeypatch.setattr(vertical, "exec_tool", fake_exec)
+        monkeypatch.setattr(vertical, "have", lambda t: True)
+        ctx = _Ctx(run.dir, [])
+        ctx.run = run
+        ctx.scope = type("S", (), {"in_scope": staticmethod(lambda h: True),
+                                   "is_oos": staticmethod(lambda h: False), "passive_only": False})()
+        prof = type("P", (), {"apex_domains": ["acme.com"], "dns_rate": 0, "http_rl": 0,
+                              "takeover": False})()
+        try:
+            with settings.overrides(policy.unbound_overrides()):
+                vertical._recursive_permute(ctx, prof, ctx.scope, tmp_path / "tr.txt", None, set())
+        finally:
+            events.reset()
+        assert len(rounds) == 2, rounds        # round 1 resolves nothing, round 2 confirms it -> stop
+
+    def test_a_DEGRADED_resolver_making_no_progress_TERMINATES(self, tmp_path, monkeypatch):
+        """The safety half: unbound must not mean forever. A resolver that answers the same thing every
+        time (or nothing at all) converges immediately instead of looping."""
+        from quarry_recon import policy, settings
+        with settings.overrides(policy.unbound_overrides()):
+            same, _run = self._drive(tmp_path / "same", monkeypatch, growth=lambda i: ["x.acme.com"])
+            none, _run2 = self._drive(tmp_path / "none", monkeypatch, growth=lambda i: [])
+        assert len(same) == 2, same          # one productive round, one that repeats -> stop
+        assert len(none) == 1, none          # nothing at all -> stop after the first

@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
 
-from .. import budget, events, fetch, normalize, registry, secrets, settings
+from .. import budget, events, fetch, normalize, policy, registry, secrets, settings
 from ..contract import registered, run_contract
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
@@ -930,17 +930,18 @@ def run(ctx) -> None:
 
         # headless SPA pass on JS-heavy / app hosts (RAM-heavy; opt-in via MODES.HEADLESS)
         if prof.headless:
-            SPA_CAP = 10
+            _cap = policy.limit("SPA_CAP")
             _spa_all = sorted({u for u in targets.read_text().splitlines()
                                if any(k in u.lower() for k in
                                ("app", "portal", "dashboard", "account", "my-", "/app"))})
-            spa = _spa_all[:SPA_CAP]
+            spa = _spa_all if not _cap else _spa_all[:_cap]
             # MODES.HEADLESS enables headless crawling; it does NOT request "first 10 only" — so the 10-cap is a
             # HIDDEN CAP (gates when it drops hosts), not an operator-chosen sample. Emit every run (clears prior).
             _n_spa = len(_spa_all)
             events.coverage_partial("crawl.katana_headless", kind=events.COVERAGE_CAP, measure="spa_hosts",
-                                    eligible=_n_spa, tested=min(_n_spa, SPA_CAP), omitted=max(0, _n_spa - SPA_CAP),
-                                    reason=f"headless SPA {min(_n_spa, SPA_CAP)}/{_n_spa} app-like hosts (cap {SPA_CAP})")
+                                    eligible=_n_spa, tested=len(spa), omitted=_n_spa - len(spa),
+                                    reason=f"headless SPA {len(spa)}/{_n_spa} app-like hosts "
+                                           f"(cap {_cap or 'none'})")
             if spa:
                 spa_f = ctx.write_list("spa_targets.txt", spa)
                 kh = ctx.run.raw_path("crawl", "katana", "headless.txt")
@@ -1190,6 +1191,9 @@ def run(ctx) -> None:
 #: v2 (step 4.1): RETENTION is complete. The per-call param cap and the derived-wordlist cap are gone, so a
 #: v1 bundle holds a TRUNCATED corpus and must not be replayed as if it answered today's question.
 XNL_PARSER_SCHEMA = 2
+#: app-like hosts the headless SPA pass may take. A HIDDEN cut on hosts already retained (it gates when it
+#: drops any), so `--unbound` lifts it: 0 = every app-like host (flag-axis step 4).
+SPA_CAP = 10
 XNL_MAX_INPUT = 200 * 1024 * 1024      # cap the stdin blob so a huge dir can't blow RAM
 XNL_WORDLIST_LIMIT = 10 * 1024 * 1024  # -owl/-os are permutation timekillers on big input -> small only
 #
