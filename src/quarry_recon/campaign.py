@@ -59,30 +59,36 @@ class UnionUnusable(RuntimeError):
 
 
 class Union:
-    """The campaign's cumulative entity store, at `<project>/recon/campaigns/<id>/union.jsonl`.
+    """The campaign's cumulative entity store, published as immutable GENERATIONS behind one pointer.
 
-    It carries the same trust model as a child's evidence, for the same reason: a deleted, truncated or
-    tampered union would quietly hand the next child LESS than the campaign knows.
+    `<project>/recon/campaigns/<id>/union.json` is the pointer; `union-gen<N>.jsonl` are the generations it
+    names. Two files written separately are not one publication — a crash between them would leave a corpus
+    with metadata describing a different one, and no last-known-good to fall back to. So a generation is
+    written COMPLETE first, and the pointer is replaced last: until that single atomic replace lands, the
+    previous generation is still what the campaign reads.
 
-        new        deliberately created; empty and authoritative
-        valid      every row loaded and verified, and the content matches what `save()` recorded
-        degraded   rows were dropped, or the content no longer matches the recorded digest
-        unusable   there is no union to read, or it could not be read at all
-        unknown    a union exists but nothing says what it should contain (no metadata)
+    Trust states, for the same reason a child's evidence has them — a union that quietly shrank would seed a
+    smaller child, absorb the narrower result and call the difference a fixed point:
+
+        new        deliberately created, with NO prior artifact of any kind; empty and authoritative
+        valid      the pointer's generation loaded and every row verified against it
+        degraded   rows were dropped, or the generation does not match what the pointer recorded
+        unusable   there is no pointer, or nothing it names can be read
     """
 
     def __init__(self, path, *, create: bool = False):
-        self.path = Path(path)
-        self.meta_path = self.path.with_name(self.path.name + ".meta.json")
+        self.path = Path(path)                       # the POINTER
+        self.dir = self.path.parent
         self.records: dict = {}          # {(kind, key): record}
         self.status = "unusable"
         self.dropped = 0
         self.reason = ""
+        self.generation = 0
         self._load(create=create)
 
     @classmethod
     def for_campaign(cls, project_dir, campaign_id: str, *, create: bool = False) -> "Union":
-        return cls(Path(project_dir) / "recon" / "campaigns" / campaign_id / "union.jsonl", create=create)
+        return cls(Path(project_dir) / "recon" / "campaigns" / campaign_id / "union.json", create=create)
 
     @property
     def trustworthy(self) -> bool:
@@ -93,19 +99,57 @@ class Union:
         if not self.trustworthy:
             raise UnionUnusable(f"{self.path}: {self.status} — {self.reason}")
 
+    def _generations(self) -> list:
+        try:
+            return sorted(self.dir.glob("union-gen*.jsonl"))
+        except OSError:
+            return []
+
     # ── loading, with everything verified ─────────────────────────────────────────────────────────
     def _load(self, *, create: bool) -> None:
         try:
-            raw = self.path.read_bytes()
+            pointer = json.loads(self.path.read_text())
+            if not isinstance(pointer, dict):
+                raise ValueError("pointer is not an object")
         except FileNotFoundError:
-            # an ABSENT union is a new campaign only when someone SAID so. Otherwise it is evidence that
-            # went missing, and reading it as "nothing known yet" is exactly the false fixed point.
-            self.status, self.reason = (("new", "created") if create
-                                        else ("unusable", "no union at this path"))
+            # An absent pointer is a NEW campaign only when someone asked for one AND nothing of an
+            # earlier campaign survives here. A deleted pointer beside its generations is evidence loss,
+            # and blessing it as new is exactly the false fixed point this guards against.
+            leftovers = self._generations()
+            if create and not leftovers:
+                self.status, self.reason = "new", "created"
+            elif create:
+                self.status = "unusable"
+                self.reason = f"refusing to create over {len(leftovers)} existing generation(s)"
+            else:
+                self.status, self.reason = "unusable", "no union pointer at this path"
             return
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            self.status, self.reason = "unusable", f"pointer unusable: {type(e).__name__}"
+            return
+        name, count, digest = pointer.get("file"), pointer.get("count"), pointer.get("digest")
+        self.generation = pointer.get("generation") if type(pointer.get("generation")) is int else 0
+        if not isinstance(name, str) or type(count) is not int or count < 0 or not isinstance(digest, str):
+            self.status, self.reason = "unusable", "pointer does not describe a generation"
+            return
+        try:
+            raw = (self.dir / name).read_bytes()
         except OSError as e:
-            self.status, self.reason = "unusable", f"{type(e).__name__}: {e}"
+            self.status, self.reason = "unusable", f"generation {name!r} unreadable: {type(e).__name__}"
             return
+        self._read_rows(raw)
+        if self.dropped:
+            self.status = "degraded"
+            self.reason = f"{self.dropped} unusable union row(s)"
+        elif len(self.records) != count or hashlib.sha256(raw).hexdigest() != digest:
+            self.status = "degraded"
+            self.reason = (f"the pointer records {count} record(s), generation {name!r} yields "
+                           f"{len(self.records)}" if len(self.records) != count
+                           else f"generation {name!r} changed since it was published")
+        else:
+            self.status, self.reason = "valid", ""
+
+    def _read_rows(self, raw: bytes) -> None:
         for chunk in raw.splitlines():
             if not chunk.strip():
                 continue
@@ -128,45 +172,43 @@ class Union:
                 self.dropped += 1
                 continue
             self.records[(kind, key)] = rec
-        self._reconcile(raw)
 
-    def _reconcile(self, raw: bytes) -> None:
-        """Compare what was read against what `save()` recorded. A clean line-boundary truncation drops no
-        row and raises nothing — only the recorded count and digest can catch it."""
-        if self.dropped:
-            self.status = "degraded"
-            self.reason = f"{self.dropped} unusable union row(s)"
-            return
-        try:
-            meta = json.loads(self.meta_path.read_text())
-            count, digest = meta["count"], meta["digest"]
-            if type(count) is not int or not isinstance(digest, str):
-                raise ValueError("malformed union metadata")
-        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-            self.status = "unknown"
-            self.reason = f"no usable union metadata ({type(e).__name__})"
-            return
-        actual = hashlib.sha256(raw).hexdigest()
-        if len(self.records) != count or actual != digest:
-            self.status = "degraded"
-            self.reason = (f"the union recorded {count} record(s), this file yields {len(self.records)}"
-                           if len(self.records) != count else "the union file changed since it was saved")
-            return
-        self.status, self.reason = "valid", ""
-
+    # ── publishing ────────────────────────────────────────────────────────────────────────────────
     def save(self) -> None:
-        """Rewrite the union atomically — it is a MERGED view, not an append-only log, and a half-written
-        one would hand the next child a corpus nobody produced. The sidecar records what was written, so a
-        later truncation cannot pass as a smaller campaign."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        """Publish the current records as the next generation. ORDINARY publication only: a union that is
+        not already trustworthy may not certify itself, or a truncated one would rewrite the pointer for
+        its surviving subset and reappear as a smaller, healthy campaign."""
+        self.require()
+        self._publish()
+
+    def recover(self, reason: str) -> None:
+        """Republish a DEGRADED or UNUSABLE union deliberately, with the loss stated.
+
+        Separate from `save()` and impossible to reach by accident: the caller has to name what was lost,
+        and the pointer records that this generation was recovered rather than accumulated."""
+        if not reason or not reason.strip():
+            raise ValueError("a recovery must state what was lost")
+        self._publish(recovered=reason.strip())
+
+    def _publish(self, recovered: str = "") -> None:
+        """Write the generation COMPLETE, then swap the single pointer. Until the pointer lands, the
+        previous generation is what the campaign reads; it is left in place, so a failed swap costs
+        nothing."""
+        self.dir.mkdir(parents=True, exist_ok=True)
         lines = []
         for (kind, key), rec in sorted(self.records.items()):
             lines.append(json.dumps({"kind": kind, "id": key, "record": rec,
                                      "fp": store.fingerprint(kind, rec)}, ensure_ascii=False))
         body = "\n".join(lines) + ("\n" if lines else "")
-        store._atomic_write(self.path, body)
-        store._atomic_write(self.meta_path, json.dumps(
-            {"count": len(self.records), "digest": hashlib.sha256(body.encode("utf-8")).hexdigest()}))
+        nxt = int(self.generation) + 1
+        name = f"union-gen{nxt:06d}.jsonl"
+        store._atomic_write(self.dir / name, body)
+        pointer = {"generation": nxt, "file": name, "count": len(self.records),
+                   "digest": hashlib.sha256(body.encode("utf-8")).hexdigest()}
+        if recovered:
+            pointer["recovered"] = recovered
+        store._atomic_write(self.path, json.dumps(pointer, indent=2))
+        self.generation = nxt
         self.status, self.dropped, self.reason = "valid", 0, ""
 
     # ── absorbing a finished child ────────────────────────────────────────────────────────────────
@@ -179,6 +221,7 @@ class Union:
         a fixed point and a lie."""
         self.require()
         out = AbsorbResult()
+        published = dict(self.records)            # the last PUBLISHED state, kept until this one lands
         for kind in (kinds if kinds is not None else sorted(store.ENTITY_KEYS)):
             folded = store.fold_run_entity(run_dir, kind)
             if not folded.trustworthy:
@@ -195,8 +238,17 @@ class Union:
                     self.records[slot] = store.merge(kind, held, rec)
                     out.enriched += 1
                     out.kinds.setdefault(kind, {"new": 0, "enriched": 0})["enriched"] += 1
+        try:
+            self._publish()
+        except OSError as e:
+            # nothing was published, so nothing was absorbed: the in-memory view goes back to what the
+            # pointer still describes, rather than seeding a child from records no disk holds.
+            self.records = published
+            self.status = "unusable"
+            self.reason = f"the union could not be published: {type(e).__name__}: {e}"
+            out.unusable["__union__"] = self.reason
+            return out
         out.absorbed = True
-        self.save()
         return out
 
     # ── seeding the next child ────────────────────────────────────────────────────────────────────

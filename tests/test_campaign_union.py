@@ -30,7 +30,9 @@ class TestAbsorbingAChild:
         result = union.absorb(run.dir)
         assert (result.new, result.enriched, result.progressed) == (2, 0, True), result
         assert set(union.records) == {("subdomain", "a.acme.com"), ("subdomain", "b.acme.com")}
-        assert union.path.exists() and union.path.read_text().count("\n") == 2
+        assert union.path.exists() and union.status == "valid"
+        rows = (union.dir / json.loads(union.path.read_text())["file"]).read_text().splitlines()
+        assert len(rows) == 2, rows
 
     def test_absorbing_the_SAME_child_twice_adds_nothing(self, tmp_path):
         run = _finished(tmp_path, ("subdomain", {"host": "a.acme.com", "sources": ["crtsh"]}))
@@ -72,7 +74,8 @@ class TestAbsorbingAChild:
         union = campaign.Union.for_campaign(tmp_path, "c1", create=True)
         run = _finished(tmp_path, ("subdomain", {"host": "a.acme.com", "sources": ["x"]}))
         union.absorb(run.dir)
-        with union.path.open("ab") as fh:
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        with gen.open("ab") as fh:
             fh.write(b"{not json\n[]\n" + json.dumps({"kind": "subdomain", "record": {"no": "key"}}).encode()
                      + b"\n")
         reopened = campaign.Union(union.path)
@@ -170,7 +173,8 @@ class TestTheUnionIsDurable:
         run = _finished(tmp_path, ("subdomain", {"host": "a.acme.com", "sources": ["crtsh"]}))
         union = campaign.Union.for_campaign(tmp_path, "c1", create=True)
         union.absorb(run.dir)
-        row = json.loads(union.path.read_text().splitlines()[0])
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        row = json.loads(gen.read_text().splitlines()[0])
         assert row["kind"] == "subdomain" and row["id"] == "a.acme.com"
         assert row["fp"] == store.fingerprint("subdomain", row["record"])
 
@@ -201,25 +205,39 @@ class TestTheUnionCarriesItsOwnTrust:
         """Cut on a line boundary: every remaining row parses and verifies, and only the recorded count and
         digest can tell that half the campaign's memory is gone."""
         union = self._union(tmp_path)
-        union.path.write_text(union.path.read_text().splitlines()[0] + "\n")
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        gen.write_text(gen.read_text().splitlines()[0] + "\n")
         reopened = campaign.Union(union.path)
         assert reopened.status == "degraded" and not reopened.trustworthy, reopened
-        assert "recorded 2" in reopened.reason and len(reopened.records) == 1
+        assert "records 2" in reopened.reason and len(reopened.records) == 1
+
+    def test_a_SAME_COUNT_rewrite_is_caught_by_the_digest(self, tmp_path):
+        """Swap one record for another, keeping the count: only the published digest can tell."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        rec = {"host": "planted.acme.com", "sources": ["crtsh"]}
+        gen.write_text(json.dumps({"kind": "subdomain", "id": "planted.acme.com", "record": rec,
+                                   "fp": store.fingerprint("subdomain", rec)}) + "\n")
+        reopened = campaign.Union(union.path)
+        assert reopened.dropped == 0 and len(reopened.records) == 1     # every row verifies on its own
+        assert reopened.status == "degraded" and "changed since it was published" in reopened.reason
 
     def test_a_TAMPERED_record_is_dropped_by_its_fingerprint(self, tmp_path):
         union = self._union(tmp_path, hosts=("a.acme.com",))
-        row = json.loads(union.path.read_text().splitlines()[0])
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        row = json.loads(gen.read_text().splitlines()[0])
         row["record"]["sources"] = ["planted"]                    # content changed, `fp` not recomputed
-        union.path.write_text(json.dumps(row) + "\n")
+        gen.write_text(json.dumps(row) + "\n")
         reopened = campaign.Union(union.path)
         assert reopened.status == "degraded" and reopened.dropped == 1, reopened
         assert reopened.records == {}, reopened.records
 
     def test_a_row_whose_ID_does_not_match_its_record_is_dropped(self, tmp_path):
         union = self._union(tmp_path, hosts=("a.acme.com",))
-        row = json.loads(union.path.read_text().splitlines()[0])
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        row = json.loads(gen.read_text().splitlines()[0])
         row["id"] = "somewhere.else.com"
-        union.path.write_text(json.dumps(row) + "\n")
+        gen.write_text(json.dumps(row) + "\n")
         assert campaign.Union(union.path).dropped == 1
 
     def test_an_UNREGISTERED_kind_is_not_an_entity(self, tmp_path):
@@ -230,21 +248,25 @@ class TestTheUnionCarriesItsOwnTrust:
         row = {"kind": "not_an_entity", "id": "whatever", "record": rec,
                "fp": store.fingerprint("not_an_entity", rec)}
         assert store.canonical_key("not_an_entity", rec) == "whatever"      # it WOULD key
-        union.path.write_text(json.dumps(row) + "\n")
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        gen.write_text(json.dumps(row) + "\n")
         reopened = campaign.Union(union.path)
         assert reopened.dropped == 1 and reopened.records == {}, reopened
 
-    def test_a_union_with_NO_metadata_is_unknown(self, tmp_path):
+    def test_a_union_with_NO_POINTER_is_unusable(self, tmp_path):
+        """The generations survive, but nothing says which one is the campaign — and a supervisor may not
+        pick for itself."""
         union = self._union(tmp_path)
-        union.meta_path.unlink()
+        union.path.unlink()
         reopened = campaign.Union(union.path)
-        assert (reopened.status, reopened.trustworthy) == ("unknown", False), reopened
-        assert len(reopened.records) == 2, reopened          # the records are READ, just not certified
+        assert (reopened.status, reopened.trustworthy, reopened.records) == ("unusable", False, {})
+        assert union.dir.glob("union-gen*.jsonl")
 
     def test_an_untrustworthy_union_REFUSES_to_bootstrap_or_absorb(self, tmp_path):
         """Refusing loudly is the only answer that cannot be mistaken for progress."""
         union = self._union(tmp_path)
-        union.path.write_text(union.path.read_text().splitlines()[0] + "\n")
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        gen.write_text(gen.read_text().splitlines()[0] + "\n")
         broken = campaign.Union(union.path)
         child = store.Run.create(tmp_path, "t")
         with pytest.raises(campaign.UnionUnusable):
@@ -253,13 +275,86 @@ class TestTheUnionCarriesItsOwnTrust:
             broken.absorb(child.dir)
         assert child.values("subdomain") == []               # ...and nothing was seeded on the way out
 
-    def test_saving_makes_a_degraded_union_valid_again(self, tmp_path):
+    def test_save_REFUSES_to_certify_a_degraded_union(self, tmp_path):
+        """The false-fixed-point path in its purest form: truncate, republish the survivors, and the
+        campaign reappears as a smaller healthy one. Ordinary publication may not launder a loss."""
         union = self._union(tmp_path)
-        union.meta_path.unlink()
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        gen.write_text("")                                        # every record gone, cleanly
+        broken = campaign.Union(union.path)
+        assert broken.status == "degraded" and broken.records == {}
+        with pytest.raises(campaign.UnionUnusable):
+            broken.save()
+        assert campaign.Union(union.path).status == "degraded"    # ...and nothing was rewritten
+
+    def test_RECOVERY_is_explicit_and_states_the_loss(self, tmp_path):
+        union = self._union(tmp_path)
+        gen = union.dir / json.loads(union.path.read_text())["file"]
+        gen.write_text("")
+        broken = campaign.Union(union.path)
+        with pytest.raises(ValueError):
+            broken.recover("")                                    # a recovery must say what was lost
+        broken.recover("generation truncated to zero records")
+        pointer = json.loads(union.path.read_text())
+        assert pointer["recovered"] == "generation truncated to zero records", pointer
+        assert campaign.Union(union.path).status == "valid"
+
+
+    def test_CREATE_refuses_over_an_existing_campaign(self, tmp_path):
+        """A deleted pointer beside its generations is evidence loss, not a new campaign."""
+        union = self._union(tmp_path)
+        union.path.unlink()
+        orphaned = campaign.Union.for_campaign(tmp_path, "c1", create=True)
+        assert (orphaned.status, orphaned.trustworthy) == ("unusable", False), orphaned
+        assert "existing generation" in orphaned.reason, orphaned
+
+    def test_a_PUBLICATION_is_one_pointer_swap(self, tmp_path):
+        """Two files written separately are not one publication. The generation is written COMPLETE first,
+        so an interruption before the pointer lands leaves the PREVIOUS generation as what the campaign
+        reads — never a corpus described by someone else's metadata."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        first_pointer = json.loads(union.path.read_text())
+        run = _finished(tmp_path, ("subdomain", {"host": "b.acme.com", "sources": ["crtsh"]}))
+        union.records[("subdomain", "b.acme.com")] = {"host": "b.acme.com", "sources": ["crtsh"]}
+        union._publish()
+        second = json.loads(union.path.read_text())
+        assert second["generation"] == first_pointer["generation"] + 1, (first_pointer, second)
+        assert second["file"] != first_pointer["file"]
+        # the earlier generation is still on disk: a failed swap costs nothing
+        assert (union.dir / first_pointer["file"]).exists()
+        assert campaign.Union(union.path).status == "valid"
+
+    def test_an_interrupted_swap_leaves_the_PREVIOUS_generation_readable(self, tmp_path):
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        before = json.loads(union.path.read_text())
+        union.records[("subdomain", "b.acme.com")] = {"host": "b.acme.com", "sources": ["crtsh"]}
+        # write the next generation, then die before the pointer swap
+        body = "\n".join(json.dumps({"kind": k, "id": key, "record": r,
+                                     "fp": store.fingerprint(k, r)})
+                         for (k, key), r in sorted(union.records.items())) + "\n"
+        (union.dir / "union-gen000099.jsonl").write_text(body)
         reopened = campaign.Union(union.path)
-        assert reopened.status == "unknown"
-        reopened.save()
-        assert reopened.status == "valid" and campaign.Union(union.path).status == "valid"
+        assert reopened.status == "valid" and set(reopened.records) == {("subdomain", "a.acme.com")}
+        assert json.loads(union.path.read_text()) == before
+
+    def test_a_FAILED_publication_absorbs_nothing(self, tmp_path):
+        """`absorb` must not leave records in memory that no disk holds — a bootstrap would then seed a
+        child from a corpus that was never committed."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        run = _finished(tmp_path, ("subdomain", {"host": "new.acme.com", "sources": ["crtsh"]}))
+
+        def _boom(path, text):
+            raise OSError("read-only campaign directory")
+
+        import unittest.mock as _m
+        with _m.patch.object(store, "_atomic_write", _boom):
+            result = union.absorb(run.dir, kinds=["subdomain"])
+        assert not result.absorbed and not result.progressed, result
+        assert result.unusable["__union__"], result
+        assert set(union.records) == {("subdomain", "a.acme.com")}, union.records
+        with pytest.raises(campaign.UnionUnusable):
+            union.bootstrap(store.Run.create(tmp_path, "t"))
+        assert campaign.Union(union.path).status == "valid"      # the disk still holds the old generation
 
 
 class TestInheritanceKeepsEveryMaterialFACT:
