@@ -21,6 +21,7 @@ could not be read is never absorbed as if it were empty.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -54,6 +55,36 @@ class AbsorbResult:
 #: exactly the keys a recovery entry may carry. An unknown key is not an extension to shrug at — this is
 #: the campaign's audit record of lost evidence, and anything we cannot account for we do not certify.
 _RECOVERY_KEYS = {"generation", "reason", "at"}
+
+
+# ── acquisition: what a campaign may still OBTAIN ────────────────────────────────────────────────────
+#: whether this process may run ACQUISITION lanes. A campaign closes it after its first child: repeating a
+#: run repeats its provider calls, and a continuation flag may not make that spending decision
+#: (`notes/FLAG-AXIS-PLAN.md` §2). Off by default — an ordinary `quarry run` acquires as it always has.
+_acquisition_closed = False
+#: why it was closed, so a blocked lane can say what stopped it rather than looking broken.
+_acquisition_reason = ""
+
+
+@contextlib.contextmanager
+def acquisition_closed(reason: str = "acquisition is closed for this campaign after its first child"):
+    """Close acquisition for the duration — restored afterwards, like every other run-scoped instruction."""
+    global _acquisition_closed, _acquisition_reason
+    before, before_reason = _acquisition_closed, _acquisition_reason
+    _acquisition_closed, _acquisition_reason = True, reason
+    try:
+        yield
+    finally:
+        _acquisition_closed, _acquisition_reason = before, before_reason
+
+
+def acquisition_allowed(source_id: str) -> tuple[bool, str]:
+    """`(allowed, why_not)` for one lane. Only ACQUISITION lanes are ever refused — everything else is
+    processing, which is exactly what a later child exists to do."""
+    from . import policy
+    if not _acquisition_closed or source_id not in policy.PROVIDER_LANES:
+        return True, ""
+    return False, _acquisition_reason
 
 
 def _valid_recoveries(history, pointer_generation: int) -> bool:

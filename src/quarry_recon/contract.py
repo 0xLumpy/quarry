@@ -657,6 +657,8 @@ def _provider_start(source_id, *, work_unit=None, input_total=None) -> bool:
     if sources.get(source_id) is None:
         events.tool_blocked(source_id, reason=f"unknown source_id {source_id!r} — not in registry; not executed")
         return False
+    if not acquisition_open(source_id):        # a campaign closed acquisition: this lane does not run
+        return False
     # review-r5#1: stamp the generation reset on the START (persisted BEFORE execution) so a crash between
     # start and terminal still supersedes the prior generation, and the un-terminated start reads as
     # INCOMPLETE.
@@ -689,6 +691,10 @@ def run_providers(entries, shared):
     A raise from `shared` is every started lane's failure: none of them can produce a result."""
     live = [(sid, wu, fin) for sid, wu, fin in entries
             if _provider_start(sid, work_unit=wu)]
+    if not live:
+        # every lane was refused — an unknown source id, or a campaign that closed acquisition. The shared
+        # body is what SPENDS, so running it for nobody would buy pages no lane will ever report.
+        return {}
     cancel = failed = None
     try:
         shared()
@@ -800,6 +806,20 @@ def _provider_terminal(source_id, fn, *, work_unit=None):
     return result                                            # None on failure — caller guards (best-effort)
 
 
+def acquisition_open(source_id: str) -> bool:
+    """The ACQUISITION gate, consulted by every execution path (settle: acquisition closure).
+
+    A campaign closes acquisition after its first child, and there are three doors into a provider —
+    `run_provider`, `run_providers` and `run_contract` — so the check lives here, where all three pass, and
+    a closed lane records a SKIP with its cause rather than a silent absence."""
+    from . import campaign
+    allowed, why = campaign.acquisition_allowed(source_id)
+    if allowed:
+        return True
+    events.tool_blocked(source_id, reason=why)
+    return False
+
+
 def registered(source_id: str) -> bool:
     """Whether this source may execute, emitting `tool_blocked` when it may not.
 
@@ -834,6 +854,9 @@ def run_contract(source_id, cmd, *, input_total=None, env=None, reclassify=None,
         reason = f"unknown source_id {source_id!r} — not in registry; not executed"
         events.tool_blocked(source_id, reason=reason)
         return skipped(source_id, reason)
+    if not acquisition_open(source_id):        # a campaign closed acquisition: this lane does not run
+        from . import campaign as _campaign
+        return skipped(source_id, _campaign.acquisition_allowed(source_id)[1])
     tool = src.get("tool") or source_id.split(".", 1)[-1]
 
     events.tool_start(source_id, cmd=cmd, env=env, input_total=input_total, work_unit=work_unit,

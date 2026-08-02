@@ -351,6 +351,14 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
 
     review-B0#4: there is no first-N cap on anchors. Ordering decides what is asked FIRST; the balance
     and the operator's reserve decide how much is asked at all."""
+    # the THIRD door into a provider: this path runs plain HTTP, outside `run_contract`/`run_provider`.
+    # A campaign that closed acquisition must not be able to buy pages through it (settle: closure).
+    from . import campaign as _campaign
+    _allowed, _why = _campaign.acquisition_allowed("osint.whoxy")
+    if not _allowed:
+        events.tool_blocked("osint.whoxy", reason=_why)
+        s.record(skipped("whoxy-revwhois", _why))
+        return
     key = secrets.whoxy()
     if not key:
         s.record(skipped("whoxy", "no Whoxy key in secrets.yaml"))
