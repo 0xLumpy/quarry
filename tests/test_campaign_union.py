@@ -352,9 +352,84 @@ class TestTheUnionCarriesItsOwnTrust:
         assert not result.absorbed and not result.progressed, result
         assert result.unusable["__union__"], result
         assert set(union.records) == {("subdomain", "a.acme.com")}, union.records
-        with pytest.raises(campaign.UnionUnusable):
-            union.bootstrap(store.Run.create(tmp_path, "t"))
+        # ...and the object now holds exactly what the pointer holds, so seeding from it is still correct:
+        # the PUBLISHED corpus, never the one this absorb hoped to add
+        child = store.Run.create(tmp_path, "t")
+        assert union.bootstrap(child) == {"subdomain": 1}
+        assert child.values("subdomain") == ["a.acme.com"]
         assert campaign.Union(union.path).status == "valid"      # the disk still holds the old generation
+
+
+    @pytest.mark.parametrize("gen", [True, False, 0, -1, 1.0, "1", None, [1]])
+    def test_a_MALFORMED_generation_makes_the_pointer_unusable(self, tmp_path, gen):
+        """The generation is IDENTITY. Defaulting a malformed one to 0 let the next publication write
+        `union-gen000001.jsonl` — over the generation the pointer still names, destroying the authoritative
+        corpus before the swap meant to replace it."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        pointer = json.loads(union.path.read_text())
+        pointer["generation"] = gen
+        union.path.write_text(json.dumps(pointer))
+        reopened = campaign.Union(union.path)
+        assert (reopened.status, reopened.trustworthy) == ("unusable", False), (gen, reopened)
+        assert "identify a generation" in reopened.reason, reopened
+
+    @pytest.mark.parametrize("name", ["../escape.jsonl", "union-gen000002.jsonl", "/etc/passwd",
+                                      "sub/union-gen000001.jsonl", "union-gen1.jsonl"])
+    def test_the_FILE_must_be_the_name_the_generation_implies(self, tmp_path, name):
+        """Deriving the filename rather than trusting the pointer's string is what keeps a generation
+        inside its own campaign directory."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        pointer = json.loads(union.path.read_text())
+        pointer["file"] = name
+        union.path.write_text(json.dumps(pointer))
+        assert campaign.Union(union.path).status == "unusable", name
+
+    def test_a_CANCELLED_publication_leaves_the_object_holding_what_the_DISK_holds(self, tmp_path):
+        """A rollback that only caught `OSError` left a cancelled publication with `valid` status and
+        records no disk held — the next bootstrap would seed a child from them."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        published = dict(union.records)
+        union.records[("subdomain", "ghost.acme.com")] = {"host": "ghost.acme.com", "sources": ["x"]}
+
+        import unittest.mock as _m
+        with _m.patch.object(store, "_atomic_write", side_effect=GeneratorExit("cancelled")):
+            with pytest.raises(GeneratorExit):
+                union._publish()
+        assert union.records == published, union.records          # the ghost is gone
+        assert union.status == "valid" and union.generation == 1, union
+        assert campaign.Union(union.path).records == published
+
+    def test_a_cancelled_ABSORB_re_raises_and_settles(self, tmp_path):
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        published = dict(union.records)
+        run = _finished(tmp_path, ("subdomain", {"host": "new.acme.com", "sources": ["crtsh"]}))
+        import unittest.mock as _m
+        with _m.patch.object(store, "_atomic_write", side_effect=KeyboardInterrupt("ctrl-c")):
+            with pytest.raises(KeyboardInterrupt):
+                union.absorb(run.dir, kinds=["subdomain"])
+        assert union.records == published, union.records
+        assert campaign.Union(union.path).records == published
+
+    def test_a_publication_that_LANDED_before_the_interruption_is_adopted(self, tmp_path):
+        """The other half: the swap may land a moment before the cancellation. Restoring the old snapshot
+        blindly would then discard records the disk DOES hold."""
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        union.records[("subdomain", "late.acme.com")] = {"host": "late.acme.com", "sources": ["x"]}
+        real = store._atomic_write
+        calls = {"n": 0}
+
+        def _late(path, text):
+            real(path, text)
+            calls["n"] += 1
+            if calls["n"] == 2:                       # the pointer landed, THEN we are interrupted
+                raise GeneratorExit("cancelled after the swap")
+
+        import unittest.mock as _m
+        with _m.patch.object(store, "_atomic_write", _late):
+            with pytest.raises(GeneratorExit):
+                union._publish()
+        assert ("subdomain", "late.acme.com") in union.records, union.records
+        assert union.status == "valid" and union.generation == 2, union
 
 
 class TestInheritanceKeepsEveryMaterialFACT:

@@ -50,6 +50,12 @@ class AbsorbResult:
         return self.absorbed and not self.unusable and bool(self.new or self.enriched)
 
 
+def _generation_file(generation: int) -> str:
+    """The ONE filename a generation may have. Deriving it (rather than trusting the pointer's string) is
+    what keeps a generation inside its campaign directory."""
+    return f"union-gen{generation:06d}.jsonl"
+
+
 class UnionUnusable(RuntimeError):
     """The union cannot stand in for what the campaign knows — so nothing may be built on it.
 
@@ -128,8 +134,17 @@ class Union:
             self.status, self.reason = "unusable", f"pointer unusable: {type(e).__name__}"
             return
         name, count, digest = pointer.get("file"), pointer.get("count"), pointer.get("digest")
-        self.generation = pointer.get("generation") if type(pointer.get("generation")) is int else 0
-        if not isinstance(name, str) or type(count) is not int or count < 0 or not isinstance(digest, str):
+        gen = pointer.get("generation")
+        # The GENERATION is identity, not decoration. Defaulting a malformed one to 0 let the next
+        # publication write `union-gen000001.jsonl` — over the generation the pointer still names, so the
+        # authoritative corpus would be destroyed BEFORE the swap that was supposed to replace it. And the
+        # file must be exactly the name that generation implies, which also confines it to this directory:
+        # no separators, no traversal, nothing to resolve.
+        if type(gen) is not int or gen <= 0 or name != _generation_file(gen):
+            self.status, self.reason = "unusable", "pointer does not identify a generation"
+            return
+        self.generation = gen
+        if type(count) is not int or count < 0 or not isinstance(digest, str):
             self.status, self.reason = "unusable", "pointer does not describe a generation"
             return
         try:
@@ -201,15 +216,28 @@ class Union:
                                      "fp": store.fingerprint(kind, rec)}, ensure_ascii=False))
         body = "\n".join(lines) + ("\n" if lines else "")
         nxt = int(self.generation) + 1
-        name = f"union-gen{nxt:06d}.jsonl"
-        store._atomic_write(self.dir / name, body)
+        name = _generation_file(nxt)
         pointer = {"generation": nxt, "file": name, "count": len(self.records),
                    "digest": hashlib.sha256(body.encode("utf-8")).hexdigest()}
         if recovered:
             pointer["recovered"] = recovered
-        store._atomic_write(self.path, json.dumps(pointer, indent=2))
+        try:
+            store._atomic_write(self.dir / name, body)
+            store._atomic_write(self.path, json.dumps(pointer, indent=2))
+        except BaseException:
+            # ANY interruption leaves publication UNDECIDED — the swap may have landed a moment before a
+            # cancellation, or not at all. Guessing either way is how an object keeps records no disk holds
+            # (or discards records the disk does hold), so the authoritative pointer is re-read and adopted.
+            self._settle()
+            raise
         self.generation = nxt
         self.status, self.dropped, self.reason = "valid", 0, ""
+
+    def _settle(self) -> None:
+        """Adopt whatever the pointer actually says now — the only authority on what was published."""
+        self.records, self.dropped, self.reason = {}, 0, ""
+        self.status, self.generation = "unusable", 0
+        self._load(create=False)
 
     # ── absorbing a finished child ────────────────────────────────────────────────────────────────
     def absorb(self, run_dir, kinds=None) -> AbsorbResult:
@@ -240,13 +268,16 @@ class Union:
                     out.kinds.setdefault(kind, {"new": 0, "enriched": 0})["enriched"] += 1
         try:
             self._publish()
-        except OSError as e:
-            # nothing was published, so nothing was absorbed: the in-memory view goes back to what the
-            # pointer still describes, rather than seeding a child from records no disk holds.
-            self.records = published
-            self.status = "unusable"
-            self.reason = f"the union could not be published: {type(e).__name__}: {e}"
-            out.unusable["__union__"] = self.reason
+        except (KeyboardInterrupt, SystemExit):
+            raise                                  # `_publish` already settled against the pointer
+        except BaseException as e:
+            # Publication failed or was interrupted, and `_publish` has re-read the pointer — so this
+            # object now holds what the DISK holds, not what this absorb hoped to add. Whether that is the
+            # previous generation or a swap that landed at the last moment, it is authoritative either way.
+            out.unusable["__union__"] = (f"the union could not be published: {type(e).__name__}: {e}"
+                                         if self.trustworthy else self.reason)
+            if self.trustworthy and self.records != published:
+                out.unusable["__union__"] += " (the pointer moved: this view is the published one)"
             return out
         out.absorbed = True
         return out
