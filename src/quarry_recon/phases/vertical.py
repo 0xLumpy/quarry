@@ -1334,6 +1334,7 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
     tested rather than assumed."""
     rounds = policy.limit("MAX_ITERS")          # 0 = until it converges (`--unbound`)
     stop, made = "bound", False        # WHY the loop ended, and whether its LAST round found anything
+    clean_batch = True                 # ...and whether the last resolver batch could be trusted
     prev = -1
     seen_candidates: set[str] = set()
     it = 0
@@ -1402,7 +1403,8 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
         # DEGRADED batch (timeout/error/partial) settles ONLY the confirmed-resolved names — its UNRESOLVED
         # candidates stay retryable so a transient resolver failure is re-attempted next iteration (bounded
         # by MAX_ITERS). This preserves set-equality of the RESOLVED union with the old blanket re-resolution.
-        if r.status in (Status.SUCCESS, Status.EMPTY):
+        clean_batch = r.status in (Status.SUCCESS, Status.EMPTY)
+        if clean_batch:
             seen_candidates.update(new_cand)
         else:
             seen_candidates.update(resolved_now)
@@ -1419,8 +1421,11 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
         ctx.echo(f"  recursion iter {it}: resolved={cur}"
                  + ("" if prev < 0 else f" (+{cur - prev} new)"))
         if prev >= 0 and cur == prev:
-            stop = "converged"
-            break          # converged — nothing new this iteration
+            # an unchanged count is CONVERGENCE only after a clean batch. A degraded one deliberately
+            # leaves its unresolved candidates retryable, so "nothing new" is a failure to resolve, not a
+            # fixed point — calling it converged would report finished work that was never attempted.
+            stop = "converged" if clean_batch else "no_progress"
+            break
         prev = cur
 
     # ── what ENDED the recursion — a fixed point, or a bound that cut it short (step 4 review) ───────
@@ -1437,11 +1442,19 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
                                 reason=f"{it} permutation round(s) ran and the last one STILL found new "
                                        f"names — the {rounds}-round bound stopped the recursion before it "
                                        f"converged, and how many rounds convergence needs is UNKNOWN")
-    elif stop == "passive":
+    elif stop == "no_progress":
         events.coverage_partial("vertical.alterx_permute", kind=events.COVERAGE_UNKNOWN,
                                 unit="vertical.permute_rounds", measure="permutation_rounds",
-                                reason=f"{it} permutation round(s) — PASSIVE mode resolves nothing, so "
-                                       f"whether the recursion would converge is unknown")
+                                reason=f"{it} permutation round(s) — the last round resolved nothing new "
+                                       f"after a DEGRADED batch, whose unresolved candidates stay "
+                                       f"retryable: that is a failure to resolve, not convergence")
+    elif stop == "passive":
+        # PASSIVE deliberately excludes this active work, so the eligible set is ZERO — not unknown. A
+        # gap here would turn a clean passive run into `complete_with_gaps` for work it never owed.
+        events.coverage_partial("vertical.alterx_permute", kind=events.COVERAGE_CAP,
+                                unit="vertical.permute_rounds", measure="permutation_rounds",
+                                eligible=0, tested=0, omitted=0,
+                                reason="PASSIVE mode — recursive DNS resolution is not this run's work")
     else:
         events.coverage_partial("vertical.alterx_permute", kind=events.COVERAGE_CAP,
                                 unit="vertical.permute_rounds", measure="permutation_rounds",

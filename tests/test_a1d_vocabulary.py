@@ -3677,6 +3677,52 @@ class TestTheRecursionRoundsPolicy:
         # unbounded: never "exhausted", because there is no final iteration to exhaust
         assert unb and not any("exhausted" in r for r in unb), unb
 
+    def test_PASSIVE_mode_owes_no_recursion_and_reports_no_gap(self, tmp_path, monkeypatch):
+        """Passive deliberately excludes this active work, so its eligible set is ZERO — not unknown. A
+        gap here turned a clean passive run into `complete_with_gaps` for work it never owed."""
+        from quarry_recon import store
+        from quarry_recon.phases import vertical
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        monkeypatch.setattr(vertical, "have", lambda t_: True)
+        monkeypatch.setattr(vertical, "exec_tool",
+                            lambda *a, **k: pytest.fail("passive mode must contact nothing"))
+        ctx = _Ctx(run.dir, [])
+        ctx.run = run
+        scope = type("S", (), {"in_scope": staticmethod(lambda h: True),
+                               "is_oos": staticmethod(lambda h: False), "passive_only": True})()
+        prof = type("P", (), {"apex_domains": ["acme.com"], "dns_rate": 0, "http_rl": 0,
+                              "takeover": False})()
+        try:
+            vertical._recursive_permute(ctx, prof, scope, tmp_path / "tr.txt", None, set())
+            run.write_manifest({}, ["vertical"])
+            summary = json.loads(run.manifest_path.read_text())["summary"]
+        finally:
+            events.reset()
+        cov = [e for e in _events_of(tmp_path) if e.get("measure") == "permutation_rounds"][-1]
+        assert (cov["kind"], cov["eligible"], cov["tested"], cov["omitted"]) == (
+            events.COVERAGE_CAP, 0, 0, 0), cov
+        assert "PASSIVE" in cov["reason"], cov
+        assert not [g for g in summary.get("gaps", []) if "permutation" in str(g)], summary
+
+    def test_a_DEGRADED_no_progress_round_is_NOT_convergence(self, tmp_path, monkeypatch):
+        """An unchanged resolved count proves convergence only after a CLEAN batch. A degraded one leaves
+        its unresolved candidates retryable, so "nothing new" is a failure to resolve — reporting exact
+        complete counters for it claims finished work that was never attempted."""
+        from quarry_recon import policy, settings
+        with settings.overrides(policy.unbound_overrides()):
+            iters, _run = self._drive(tmp_path / "deg", monkeypatch, growth=lambda i: [],
+                                      status=lambda i: crawl.Status.TIMED_OUT)
+        cov = [e for e in _events_of(tmp_path / "deg") if e.get("measure") == "permutation_rounds"][-1]
+        assert cov["kind"] == events.COVERAGE_UNKNOWN, cov
+        assert "eligible" not in cov and "omitted" not in cov, cov
+        assert "not convergence" in cov["reason"] and "DEGRADED" in cov["reason"], cov
+        # ...and the same shape after a CLEAN batch IS convergence
+        with settings.overrides(policy.unbound_overrides()):
+            self._drive(tmp_path / "clean", monkeypatch, growth=lambda i: ["x.acme.com"] if i == 1 else [])
+        cov = [e for e in _events_of(tmp_path / "clean") if e.get("measure") == "permutation_rounds"][-1]
+        assert cov["kind"] == events.COVERAGE_CAP and cov["omitted"] == 0, cov
+
     def test_a_BOUNDED_run_that_was_still_finding_names_SAYS_so(self, tmp_path, monkeypatch):
         """A run whose LAST permitted round still produced new names did not finish, and the manifest must
         not read `complete` because the loop merely ran out of rounds."""
