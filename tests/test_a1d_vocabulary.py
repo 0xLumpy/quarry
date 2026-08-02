@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+from pathlib import Path
 
 import pytest
 
@@ -3466,3 +3467,68 @@ class TestTheDifferRotatesOverZonesAndWords:
             assert seen == [5], seen                             # ...and only when asked for
         finally:
             settings.clear_overrides()
+
+    def test_the_ALLOWANCE_is_not_part_of_the_work_unit(self, tmp_path, monkeypatch):
+        """Flag-axis review: `WILDCARD_ZONES_PER_RUN` only limits how many zones THIS lifecycle admits.
+        The rotation is durable and continues across a change, so changing the allowance must NOT
+        re-identify the source — an identity that moves with a per-run throughput knob costs replay dedup
+        and buys nothing."""
+        from quarry_recon import settings
+        zones = tuple(f"z{i}.acme.com" for i in range(8))
+        try:
+            _k1, life1 = self._differ(tmp_path / "a", monkeypatch, zones=zones, words=("api",), rows=[])
+            settings.override("WILDCARD_ZONES_PER_RUN", 2)
+            _k2, life2 = self._differ(tmp_path / "b", monkeypatch, zones=zones, words=("api",), rows=[])
+            settings.override("WILDCARD_ZONES_PER_RUN", 0)
+            _k3, life3 = self._differ(tmp_path / "c", monkeypatch, zones=zones, words=("api",), rows=[])
+        finally:
+            settings.clear_overrides()
+        assert life1[0]["work_unit"] == life2[0]["work_unit"] == life3[0]["work_unit"], (
+            life1[0], life2[0], life3[0])
+
+    def test_a_CHANGED_SPEND_re_identifies_the_work_but_keeps_the_LEDGER(self, tmp_path, monkeypatch):
+        """The other half: `word_spend` changes `alloc_cap`, so it changes slot boundaries, invocation
+        contents and artifact grouping — an EXECUTION and EVIDENCE identity. It does not own scheduler
+        state: the same rotation ledger stays in use, and a record that belongs to a CONTAINING slot is
+        never claimed complete (`RotationProgress.tier` -> DIRTY), so the re-partitioned corpus is
+        re-submitted rather than certified from the parent's run."""
+        from quarry_recon import budget, store, sweep
+        run = store.Run.create(tmp_path, "t")
+        # w0831 and w1263 share bucket 101, so a one-per-zone spend SPLITS that slot (alloc_cap 1)
+        assert sweep.bucket_of("w0831") == sweep.bucket_of("w1263") == "101", "fixture drifted"
+        words = ("w0831", "w1263", "w0000")
+        _k1, life1 = self._differ(tmp_path, monkeypatch, zones=("z.acme.com",), words=words, rows=[],
+                                  run=run, spend=6)
+        ledger = (Path(run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}"
+                  / "wc_enrich_wildcard_a1d.json")
+        doc = json.loads(ledger.read_text())
+        before = set(doc["targets"]["z.acme.com"]["slots"])
+        assert doc["targets"]["z.acme.com"]["slots"]["101"].get("done"), doc   # the PARENT completed
+        prog = budget.RotationProgress(ledger, lane="wc_enrich_wildcard_a1d", schema=sweep.SCHEMA,
+                                       slot_grammar=sweep.slot_id_ok)
+        # ...and its children are DIRTY before they ever run, whatever content is offered
+        assert prog.tier("z.acme.com", "101.0", "any-content") == 1, doc
+        assert prog.tier("z.acme.com", "101.1", "any-content") == 1, doc
+
+        seen: list = []
+
+        def tool(t_, cmd, raw_path=None, timeout=None, **k):
+            from quarry_recon.runner import RunResult as _RR
+            seen.extend(pathlib.Path(cmd[cmd.index("-l") + 1]).read_text().split())
+            if raw_path is not None:
+                raw_path.write_text("")
+            return _RR(t_, cmd, crawl.Status.EMPTY, 0, 0.1, raw_path, 0)
+
+        _k2, life2 = self._differ(tmp_path, monkeypatch, zones=("z.acme.com",), words=words, rows=None,
+                                  run=run, spend=1, tool=tool)
+        # the run dir is REUSED, so its log holds both lifecycles: take the two starts in order
+        starts = [e for e in life2 if e["event"] == "tool_start"]
+        assert len(starts) == 2 and starts[0]["work_unit"] != starts[1]["work_unit"], starts
+        doc2 = json.loads(ledger.read_text())
+        after = set(doc2["targets"]["z.acme.com"]["slots"])
+        assert before and before <= after, (before, after)      # the SAME ledger, nothing dropped
+        # the smaller spend split the slot; ONE child ran this lifecycle (spend 1), the other waits its
+        # turn in the rotation — which is the point: the partition changed, coverage did not shrink
+        assert {"101", "101.0"} <= after and not {"101.0", "101.1"} <= before, (before, after)
+        # the split members were RE-SUBMITTED, not certified from the parent's completion
+        assert any(c.startswith("w0831.") or c.startswith("w1263.") for c in seen), seen

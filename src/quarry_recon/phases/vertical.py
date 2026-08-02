@@ -831,11 +831,14 @@ def _wildcard_differentiate(ctx, zones: set, *, extra_words=None,
         fp = events.work_unit(source_id,
                               inputs={"zones": eligible,
                                       "vocabulary": _wc_digest(sorted(set(words)))},
-                              config={"zones_per_run": wildcard_zones_per_run(),
-                                      # v63#1: the EFFECTIVE per-zone spend — the caller's, when it has
-                                      # one. A hard-coded bound made two runs with different spends share
-                                      # a resume key and claim the same work (A1d spends its own).
-                                      "word_spend": spend},
+                              # v69 (flag-axis review): `zones_per_run` is NOT in the identity. It only
+                              # limits how many zones THIS lifecycle admits; the rotation is durable and
+                              # continues across a change, so re-identifying the source would cost replay
+                              # dedup and buy nothing. `word_spend` STAYS: it changes `alloc_cap`, so it
+                              # changes slot boundaries, invocation contents and artifact grouping — an
+                              # EXECUTION and EVIDENCE identity, not a claim on scheduler state, which
+                              # stays the same ledger (an inherited split record is never clean).
+                              config={"word_spend": spend},
                               schema_version=WC_PARSER_SCHEMA)
         events.tool_start(source_id, cmd=["httpx", "(wildcard-differ)"], input_total=len(eligible),
                           work_unit=fp)
