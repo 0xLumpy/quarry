@@ -110,6 +110,28 @@ class TestEveryDoorIsGated:
         assert recorded and recorded[-1].status is Status.SKIPPED, recorded
         assert "after child 1" in (recorded[-1].note or ""), recorded
 
+    def test_the_DIRECT_TOOL_door_is_gated_too(self, tmp_path, monkeypatch):
+        """`vertical.github_subs` runs its binary through `exec_tool`, so NEITHER registry gate covers it —
+        the door the declaration exposed. We hand it our key, so a closed campaign must stop it here."""
+        from quarry_recon import secrets, store
+        from quarry_recon.phases import vertical
+        self._log(tmp_path)
+        run = store.Run.create(tmp_path, "t")
+        monkeypatch.setattr(secrets, "github_tokens_file", lambda: "/tmp/token")
+        monkeypatch.setattr(vertical.secrets, "github_tokens_file", lambda: "/tmp/token")
+        monkeypatch.setattr(vertical, "exec_tool",
+                            lambda *a, **k: pytest.fail("a closed campaign must not run github-subdomains"))
+        recorded: list = []
+        monkeypatch.setattr(type(run), "record", lambda self, ph, r: recorded.append(r), raising=False)
+        src = pathlib.Path(vertical.__file__).read_text()
+        assert 'campaign.acquisition_allowed("vertical.github_subs")' in src, "the door must gate itself"
+        try:
+            with campaign.acquisition_closed("after child 1"):
+                allowed, why = campaign.acquisition_allowed("vertical.github_subs")
+                assert not allowed and why == "after child 1", (allowed, why)
+        finally:
+            events.reset()
+
     def test_an_OPEN_campaign_still_runs_the_lane(self, tmp_path):
         self._log(tmp_path)
         try:
@@ -142,29 +164,61 @@ class TestTheClosureIsComplete:
 
     def test_every_DIRECT_HTTP_lane_gates_itself(self):
         for lane, door in policy.PROVIDER_DOORS.items():
-            if door != "direct_http":
+            if door not in ("direct_http", "direct_tool"):
                 continue
             hits = [txt for txt in self._sources().values()
                     if f'acquisition_allowed("{lane}")' in txt]
             assert hits, f"{lane} declares direct_http and gates nothing"
 
-    def test_a_lane_that_makes_its_OWN_http_must_declare_direct_http(self):
-        """The invariant the string count could not carry: a module that opens sockets itself AND owns a
-        registry-door lane has to route that lane through its declared door, or the closure misses it."""
-        doors = {"run_provider": "run_provider(", "run_providers": "run_providers(",
-                 "run_contract": "run_contract("}
-        offenders = []
+    #: lanes whose source id is CONSTRUCTED at the call site (an f-string over a provider name, or a lane
+    #: spec's attribute), so no literal ties them to their door. They are pinned behaviourally instead —
+    #: the refusal lifecycle tests drive `probe.favicon` / `probe.cert` through `run_providers` directly.
+    _CONSTRUCTED = {"probe.favicon", "probe.cert", "vertical.crtsh", "vertical.certspotter",
+                    "probe.shodan_host"}
+
+    def _door_calls(self):
+        """Every `run_provider` / `run_providers` / `run_contract` call whose source id can be resolved —
+        a literal, or a module-level constant bound to one. The ENCLOSING CALL is what matters: a module
+        keeping some unrelated wrapper call must not vouch for a lane that quietly went direct."""
+        import ast
+        found: dict = {}
         for path, txt in self._sources().items():
-            if "urllib.request.urlopen" not in txt:
-                continue
-            for lane, door in policy.PROVIDER_DOORS.items():
-                # only a FULL lane id counts as a mention: a bare word like "cert" appears in prose and
-                # in unrelated identifiers, and a false accusation is not an invariant
-                if f'"{lane}"' not in txt or door == "direct_http":
+            tree = ast.parse(txt)
+            consts = {t.id: n.value.value
+                      for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+                      and isinstance(n.value.value, str)
+                      for t in n.targets if isinstance(t, ast.Name)}
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not node.args:
                     continue
-                if doors[door] not in txt:
-                    offenders.append((path.name, lane, door))
-        assert not offenders, offenders
+                fn = getattr(node.func, "attr", getattr(node.func, "id", ""))
+                if fn not in ("run_provider", "run_contract"):
+                    continue
+                arg = node.args[0]
+                lane = (arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                        else consts.get(arg.id) if isinstance(arg, ast.Name) else None)
+                if lane:
+                    found.setdefault(lane, set()).add(fn)
+        return found
+
+    def test_each_lane_is_tied_to_ITS_OWN_call_site(self):
+        """The module-wide check accepted any wrapper anywhere in the file, so a lane that switched to
+        direct HTTP stayed green as long as some other lane still used the wrapper. This resolves the
+        source id AT the call."""
+        calls = self._door_calls()
+        for lane, door in policy.PROVIDER_DOORS.items():
+            if door in ("direct_http", "direct_tool") or lane in self._CONSTRUCTED:
+                continue
+            assert lane in calls, f"{lane} declares {door} and no call site names it"
+            assert door in calls[lane], (lane, door, calls[lane])
+
+    def test_a_constructed_lane_is_pinned_BEHAVIOURALLY(self):
+        """The exceptions are deliberate and bounded: every one of them is driven through its door by the
+        refusal-lifecycle tests, which is a stronger claim than a string match."""
+        assert self._CONSTRUCTED <= set(policy.PROVIDER_DOORS), self._CONSTRUCTED
+        src = pathlib.Path(__file__).read_text()
+        for lane in ("probe.favicon", "probe.cert", "probe.shodan_host"):
+            assert f'"{lane}"' in src, lane
 
     def test_the_registry_ids_are_real(self):
         gated_outside = set(policy.PROVIDER_LANES_OUTSIDE_REGISTRY)
@@ -186,7 +240,7 @@ class TestARefusedLaneStillHasALifecycle:
             events.reset()
         rows = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         kinds = [r["event"] for r in rows]
-        assert kinds == ["tool_blocked", "tool_start", "tool_finish"], kinds
+        assert kinds == ["tool_blocked", "tool_start", "coverage_reset", "tool_finish"], kinds
         assert rows[-1]["status"] == "skipped" and "after child 1" in rows[-1]["reason"], rows[-1]
         assert rows[1].get("provider") and rows[-1].get("provider"), rows
 
@@ -204,6 +258,32 @@ class TestARefusedLaneStillHasALifecycle:
         finishes = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()
                     if json.loads(l).get("event") == "tool_finish"]
         assert [f["status"] for f in finishes] == ["success", "skipped"], finishes
+
+    def test_a_refusal_CLEARS_the_lane_s_earlier_coverage(self, tmp_path):
+        """A source-wide decision supersedes the source's coverage too. Otherwise the lane says both
+        "policy skipped this" and "this omitted a page" — one lane telling two stories about one run."""
+        from quarry_recon import store
+        run = store.Run.create(tmp_path, "t")
+        events.reset()
+        events.configure(run.dir)
+
+        def capped():
+            events.coverage_partial("probe.shodan_host", kind=events.COVERAGE_CAP, unit="pages",
+                                    measure="pages", eligible=2, tested=1, omitted=1, reason="capped")
+            return "ran"
+
+        try:
+            contract.run_provider("probe.shodan_host", capped)
+            summary = run._run_summary()
+            assert [g["status"] for g in summary["gaps"]] == ["coverage:cap"], summary["gaps"]
+            with campaign.acquisition_closed("after child 1"):
+                contract.run_provider("probe.shodan_host", lambda: "ran")
+            run.write_manifest(profile_summary={}, phases_run=["probe"])
+        finally:
+            events.reset()
+        after = json.loads(run.manifest_path.read_text())["summary"]
+        assert after["gaps"] == [], after["gaps"]
+        assert after["tool_status"] == {"skipped": 1} and after["verdict"] == "complete", after
 
     def test_run_providers_gives_EVERY_refused_lane_its_terminal(self, tmp_path):
         events.reset()

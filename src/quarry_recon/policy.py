@@ -84,10 +84,11 @@ PROVIDER_DOORS: dict[str, str] = {
     "vertical.certspotter": "run_provider",
     "vertical.crtsh": "run_provider",
     "vertical.shosubgo": "run_contract",       # an external binary we hand a key to
-    "vertical.github_subs": "run_contract",
+    # this one runs the tool DIRECTLY (`exec_tool`), so neither registry gate covers it — it gates itself
+    "vertical.github_subs": "direct_tool",
     "osint.whoxy": "direct_http",              # plain HTTP in `osint.py`, outside the source registry
 }
-DOORS = ("run_provider", "run_providers", "run_contract", "direct_http")
+DOORS = ("run_provider", "run_providers", "run_contract", "direct_http", "direct_tool")
 
 #: EVERY registered source, classified — the mechanism that finds an OMISSION rather than trusting a
 #: hand-kept list. `vertical.certspotter` satisfied the ownership rule and was missing from

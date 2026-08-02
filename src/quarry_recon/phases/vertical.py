@@ -16,7 +16,7 @@ import urllib.request
 from dataclasses import replace
 from pathlib import Path
 
-from .. import budget, events, netguard, normalize, policy, remainder, secrets, settings, sweep
+from .. import budget, campaign, events, netguard, normalize, policy, remainder, secrets, settings, sweep
 from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, registered, run_contract,
                         run_provider)
 from ..runner import (RunResult, Status, have, reclassify_from_artifact, run as exec_tool,
@@ -1590,6 +1590,14 @@ def run(ctx) -> None:
     # responsibility, not ours. It runs on the contract (exec_tool → recorded), so an auth/rate failure
     # surfaces as a FAILED tool_run (fail-closed), not a silent empty. No in-process pagination is owed here.
     gh_token = secrets.github_tokens_file()   # 0600 temp file from secrets.yaml; None if unset
+    # a FOURTH door: this lane runs the tool directly (`exec_tool`), so neither registry gate covers it.
+    # We hand it OUR key and enable it ourselves, which makes it acquisition — and a campaign that closed
+    # acquisition must be able to stop it here (settle: closure).
+    _gh_allowed, _gh_why = campaign.acquisition_allowed("vertical.github_subs")
+    if gh_token and not _gh_allowed:
+        events.tool_blocked("vertical.github_subs", reason=_gh_why)
+        ctx.run.record("vertical", skipped("github-subdomains", _gh_why))
+        gh_token = None
     if gh_token:
         try:
             for d in prof.apex_domains:

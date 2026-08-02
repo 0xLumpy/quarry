@@ -667,6 +667,10 @@ def _provider_start(source_id, *, work_unit=None, input_total=None) -> bool:
         reset = events.mark_provider_generation(source_id)
         events.tool_start(source_id, input_total=input_total, work_unit=work_unit, provider=True,
                           reset_generation=reset)
+        # ...and the COVERAGE generation moves with it, ALWAYS — not only when this is the session's first
+        # terminal. A campaign refusal is a SOURCE-WIDE decision, and leaving the previous snapshot standing
+        # made the lane say both "policy skipped this" and "this omitted a page": one lane, two stories.
+        events.coverage_reset(source_id)
         events.tool_finish(source_id, status=Status.SKIPPED.value, reason=why, work_unit=work_unit,
                            provider=True)
         return False
