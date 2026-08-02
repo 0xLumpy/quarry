@@ -17,7 +17,7 @@ from .. import normalize, policy
 from .. import settings
 from ..runner import (RunResult, Status, fresh_artifact_dir, have, nuclei_timeout, reclassify_from_files,
                       run as exec_tool, scaled_timeout, skipped)
-from .. import budget, events, sweep
+from .. import budget, events, remainder, sweep
 from ..contract import registered
 
 
@@ -136,6 +136,12 @@ def _a1d_sweep(ctx, prof, kept, origins, execute, *, dependency_ok):
 
 
 def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
+    # what the apex brute still OWES, for a supervisor (settle prerequisite B). Best effort: a report is
+    # never a stop.
+    try:
+        remainder.emit(remainder.from_sweep("enrich.a1d_brute", swept))
+    except Exception:                                        # noqa: BLE001
+        pass
     """Fold the sweep into the lane's reported facts. Fallible on purpose — the caller contains it."""
     # machinery is folded UNCHANGED: unschedulable slots are their own structured fact on the result and
     # are rendered once from the counters below, so there is nothing to filter out by wording (v38).

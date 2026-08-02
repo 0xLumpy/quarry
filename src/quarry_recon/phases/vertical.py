@@ -16,7 +16,7 @@ import urllib.request
 from dataclasses import replace
 from pathlib import Path
 
-from .. import budget, events, netguard, normalize, policy, secrets, settings, sweep
+from .. import budget, events, netguard, normalize, policy, remainder, secrets, settings, sweep
 from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, registered, run_contract,
                         run_provider)
 from ..runner import (RunResult, Status, have, reclassify_from_artifact, run as exec_tool,
@@ -1312,6 +1312,12 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     # stop each own their own pairs, and only what is left belongs to the per-zone spend bound — the one
     # disposition that really does rotate in on a later run.
     st["candidate_pairs_by_cause"] = swept.pair_remainder()
+    # what this lane still OWES, in the supervisor's vocabulary (settle prerequisite B). Best effort: a
+    # remainder is a REPORT, and losing it may never cost the run.
+    try:
+        remainder.emit(remainder.from_sweep(source_id, swept))
+    except Exception as _e:                                  # noqa: BLE001 - a report is never a stop
+        st.setdefault("machinery", []).append(f"remainder not reported ({type(_e).__name__})")
     st["sweep_stop"] = swept.stop or ""
     st["sweep_stop_kind"] = swept.stop_kind or ""
     st["admitted_zones"] = swept.targets_admitted

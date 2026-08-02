@@ -828,8 +828,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
         events.configure(tmp_path)
         vertical._wildcard_differentiate(ctx, {"a.acme.com"}, extra_words=["api"], label="wildcard")
         evs = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
-        sel = [e for e in evs if e.get("measure") == "vocabulary_words"][-1]
-        zones = [e for e in evs if e.get("measure") == "zones"][-1]
+        sel = [e for e in evs if e.get("event") == "coverage_partial" and e.get("measure") == "vocabulary_words"][-1]
+        zones = [e for e in evs if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
         assert "RETAINED for probing" in sel["reason"], sel
         assert "probed" not in sel["reason"].replace("for probing", ""), sel
         assert zones["tested"] == 0, zones
@@ -1263,7 +1263,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
             submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(10)])
         assert submitted == [], submitted
         evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
-        sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+        sel = [e for e in evs if e.get("event") == "coverage_partial" and e.get("measure") == "candidate_pairs"][-1]
         assert sel["tested"] == 0 and sel["omitted"] == 10, sel
         assert "another lifecycle" in sel["reason"], sel
 
@@ -1295,7 +1295,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
             assert not (tmp_path / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}"
                     / "a1d_brute.json").exists()
             evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
-            sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+            sel = [e for e in evs if e.get("event") == "coverage_partial" and e.get("measure") == "candidate_pairs"][-1]
             assert (sel["tested"], sel["omitted"]) == (0, 2) and "not installed" in sel["reason"], sel
         finally:
             events.reset()
@@ -1386,7 +1386,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(9)],
                                          cap=4)
         evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
-        sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+        sel = [e for e in evs if e.get("event") == "coverage_partial" and e.get("measure") == "candidate_pairs"][-1]
         recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
         assert len(submitted) == sel["tested"], (submitted, sel)
         assert f"{sel['omitted']}/{sel['eligible']} candidate(s) withheld" in recs[0].note, (recs, sel)
@@ -1395,7 +1395,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         _submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(9)],
                                           cap=4)
         evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
-        sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+        sel = [e for e in evs if e.get("event") == "coverage_partial" and e.get("measure") == "candidate_pairs"][-1]
         assert sel["kind"] == "cap", sel
         assert "per-target candidate bound" in sel["reason"], sel
         assert "0s of 0s" not in sel["reason"], sel
@@ -1459,7 +1459,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(8)],
                                          cap=7)
         evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
-        sel = [e for e in evs if e.get("measure") == "candidate_pairs"][-1]
+        sel = [e for e in evs if e.get("event") == "coverage_partial" and e.get("measure") == "candidate_pairs"][-1]
         recs = [r for r in run.tool_runs("enrich") if r.tool == "a1d"]
         assert len(submitted) == sel["tested"] == 5, (submitted, sel)     # a whole bucket was skipped
         assert sel["omitted"] == 3 != 8 - 7, sel                          # `corpus - cap` would say 1
@@ -1521,6 +1521,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         recs = self._a1d_zones(tmp_path, monkeypatch, zones=("z.acme.com",), httpx=True, puredns=True)
         # the WILDCARD pass ran under its own source even though the brute's source was rejected
         wl_evs = seen
+        # `wl_evs` are captured coverage_partial CALLS, not log lines — they carry no event field
         zones_cov = [e for e in wl_evs if e.get("measure") == "zones"]
         assert zones_cov and zones_cov[-1]["source_id"] == "enrich.wildcard_a1d", wl_evs[-3:]
         assert zones_cov[-1]["tested"] == 1, zones_cov[-1]
@@ -2559,7 +2560,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                                           "title": "wc", "favicon": "x"}), "{oops"])
 
         kept, life = self._differ(tmp_path, monkeypatch, raw=raw)
-        cov = [e for e in self._events if e.get("measure") == "output_rows"]
+        cov = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "output_rows"]
         assert cov and (cov[-1]["eligible"], cov[-1]["tested"], cov[-1]["omitted"]) == (2, 1, 1), cov
         assert cov[-1]["kind"] == "timeout", cov
         # ...and a CLEAN rerun in the SAME run supersedes it: coverage is latest-per-(source, unit), so
@@ -2588,9 +2589,9 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert life[-1]["status"] == "failed", life           # trouble, and nothing was produced
         assert "httpx did not run" in life[-1]["reason"], life
         # v50#2: SELECTION says both zones were chosen (no cap withheld anything); EXECUTION is the gap
-        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        sel = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
         assert sel["kind"] == "cap" and (sel["eligible"], sel["tested"]) == (2, 2), sel
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert ex["kind"] == "timeout" and (ex["eligible"], ex["tested"], ex["omitted"]) == (2, 1, 1), ex
 
     def test_a_row_with_NO_status_code_is_not_a_live_host(self, tmp_path, monkeypatch):
@@ -2760,7 +2761,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
             fin = [e for e in evs if e.get("event") == "tool_finish"][-1]
             assert fin["status"] == "empty", fin            # a clean nothing-found, not a failure
-            art = [e for e in evs if e.get("measure") == "output_artifacts"][-1]
+            art = [e for e in evs if e.get("event") == "coverage_partial" and e.get("measure") == "output_artifacts"][-1]
             assert (art["eligible"], art["tested"], art["omitted"]) == (1, 1, 0), art
             assert "returned invocation(s)" in art["reason"], art
         finally:
@@ -2778,7 +2779,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert kept2 == set(), kept2                       # nothing was written, so nothing is ingested
         assert life2[-1]["produced"] == {"subdomains": 0}, life2
         assert life2[-1]["status"] == "failed", life2
-        art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
+        art = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "output_artifacts"][-1]
         assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
 
     def test_two_invocations_of_one_ZONE_keep_SEPARATE_artifacts(self, tmp_path, monkeypatch):
@@ -2799,7 +2800,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         kept, life = self._differ(tmp_path, monkeypatch, rows=[])
         assert life[-1]["status"] == "failed", life
         assert "1 artifact(s) present and UNREADABLE (z.acme.com: PermissionError)" in life[-1]["reason"]
-        art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
+        art = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "output_artifacts"][-1]
         assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
         assert "0 produced none, 1 unreadable" in art["reason"], art
 
@@ -2816,22 +2817,22 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
 
         kept, life = self._differ(tmp_path, monkeypatch, raw=raw,
                                   zones=("a.acme.com", "b.acme.com"))
-        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        sel = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
         assert sel["kind"] == "cap" and (sel["eligible"], sel["tested"], sel["omitted"]) == (2, 1, 1), sel
         assert "deferred to a later run by the 1-zone per-run allowance" in sel["reason"], sel
         # v51#2: EXECUTION is complete — the one selected zone returned — so it is NOT timeout-class.
         # The parse loss lives in its own measure.
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert ex["kind"] == "cap" and (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 1, 0), ex
-        rows = [e for e in self._events if e.get("measure") == "output_rows"][-1]
+        rows = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "output_rows"][-1]
         assert rows["omitted"] == 1, rows
 
     def test_a_GUARD_refusal_is_a_SELECTION_fact_not_an_execution_one(self, tmp_path, monkeypatch):
         kept, life = self._differ(tmp_path, monkeypatch, rows=[], guard="self")
-        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        sel = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
         assert (sel["eligible"], sel["tested"], sel["omitted"]) == (1, 0, 1), sel
         assert sel["kind"] == "cap" and "contact guard" in sel["reason"], sel
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert (ex["eligible"], ex["tested"], ex["omitted"]) == (0, 0, 0), ex
 
     def test_the_INVOCATION_PAIR_is_kept_whole(self, tmp_path, monkeypatch):
@@ -2856,16 +2857,16 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         monkeypatch.setattr(vertical, "WILDCARD_ZONES_PER_RUN", 1)
         kept, life = self._differ(tmp_path, monkeypatch, httpx=False,
                                   zones=("a.acme.com", "b.acme.com"))
-        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        sel = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
         assert sel["kind"] == "cap" and (sel["eligible"], sel["tested"], sel["omitted"]) == (2, 1, 1), sel
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert ex["kind"] == "timeout" and (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 0, 1), ex
         assert "httpx is not installed" in ex["reason"], ex
 
     def test_NO_eligible_zone_reports_a_clean_ZERO_on_both_measures(self, tmp_path, monkeypatch):
         kept, life = self._differ(tmp_path, monkeypatch, zones=("z.example.org",))
         for measure in ("zones", "zone_execution"):
-            rec = [e for e in self._events if e.get("measure") == measure][-1]
+            rec = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == measure][-1]
             assert (rec["eligible"], rec["tested"], rec["omitted"]) == (0, 0, 0), rec
             assert rec["kind"] == "cap", rec
 
@@ -2875,18 +2876,18 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         monkeypatch.setattr(vertical, "WILDCARD_ZONES_PER_RUN", 1)
         kept, life = self._differ(tmp_path, monkeypatch, httpx=False,
                                   zones=("a.acme.com", "b.acme.com"))
-        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        sel = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
         assert "deferred to a later run by the 1-zone per-run allowance" in sel["reason"], sel
         assert "httpx" not in sel["reason"], sel
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert "httpx is not installed" in ex["reason"], ex
         assert "zone cap" not in ex["reason"], ex
 
     def test_a_GUARD_refusal_is_a_SELECTION_cause(self, tmp_path, monkeypatch):
         kept, life = self._differ(tmp_path, monkeypatch, rows=[], guard="self")
-        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        sel = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
         assert "contact guard" in sel["reason"] and sel["omitted"] == 1, sel
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert "contact guard" not in ex["reason"], ex
 
     @pytest.mark.parametrize("boom,want", [(OSError("differ exploded"), "failed"),
@@ -2905,13 +2906,13 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         kept, life = self._differ(tmp_path, monkeypatch, rows=[], caught=caught,
                                   zones=("a.acme.com", "b.acme.com"))
         assert life[-1]["status"] == want, life
-        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        sel = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert (sel["eligible"], sel["tested"]) == (2, 2), sel
         assert (ex["eligible"], ex["tested"], ex["omitted"]) == (2, 0, 2), ex
         assert ex["kind"] == "timeout", ex
         for measure in ("output_rows", "output_artifacts"):
-            assert [e for e in self._events if e.get("measure") == measure], measure
+            assert [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == measure], measure
 
     def test_a_REPORTING_failure_is_MACHINERY_not_a_clean_run(self, tmp_path, monkeypatch):
         """v53#1: a lane that reported NOTHING still finished EMPTY with no reason and a complete
@@ -2939,7 +2940,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
 
         monkeypatch.setattr(store.Run, "record", _boom, raising=False)
         kept, life = self._differ(tmp_path, monkeypatch, rows=[])
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 1, 0), ex
         assert life[-1]["status"] == "failed" and "read-only" in life[-1]["reason"], life
 
@@ -2952,10 +2953,10 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                             lambda *a, **k: (_ for _ in ()).throw(OSError("wordlist vanished")))
         kept, life = self._differ(tmp_path, monkeypatch, rows=[],
                                   zones=("a.acme.com", "b.acme.com"))
-        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        sel = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
         assert (sel["eligible"], sel["tested"], sel["omitted"]) == (2, 1, 1), sel
         assert "deferred to a later run by the 1-zone per-run allowance" in sel["reason"], sel
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert (ex["eligible"], ex["tested"], ex["omitted"]) == (1, 0, 1), ex
 
     @pytest.mark.parametrize("mode,check", [("no_artifact", "artifacts"), ("skip", "stopped")])
@@ -2978,10 +2979,10 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         if check == "artifacts":
             # v56: this zone's facts are kept, and there is NO further contact after a write we could
             # not make — so exactly one zone was contacted
-            art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
+            art = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "output_artifacts"][-1]
             assert (art["eligible"], art["tested"], art["omitted"]) == (1, 0, 1), art
         else:
-            ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+            ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
             assert "httpx did not run" in ex["reason"], ex
             assert (ex["eligible"], ex["tested"], ex["omitted"]) == (2, 0, 2), ex
             assert "could not be recorded" not in ex["reason"], ex   # the SKIP is the first cause
@@ -2996,7 +2997,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         kept, life = self._differ(tmp_path, monkeypatch, rows=[],
                                   zones=("a.acme.com", "b.acme.com"))
         for measure in ("zones", "zone_execution"):
-            rec = [e for e in self._events if e.get("measure") == measure][-1]
+            rec = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == measure][-1]
             assert rec["kind"] == "unknown", rec
             assert rec.get("eligible") is None, rec
             assert "could not be determined" in rec["reason"], rec
@@ -3020,9 +3021,9 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         kept, life = self._differ(tmp_path, monkeypatch, rows=rows)
         assert kept == {"api.z.acme.com"}, kept                      # the finding survives
         assert list(self._last_run.read("resolved")), "the resolved observation survives too"
-        rowsc = [e for e in self._events if e.get("measure") == "output_rows"][-1]
+        rowsc = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "output_rows"][-1]
         assert (rowsc["eligible"], rowsc["tested"], rowsc["omitted"]) == (3, 3, 0), rowsc
-        art = [e for e in self._events if e.get("measure") == "output_artifacts"][-1]
+        art = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "output_artifacts"][-1]
         assert (art["eligible"], art["tested"], art["omitted"]) == (1, 1, 0), art
         # ...and the run still FAILS on the write it could not make
         assert life[-1]["status"] == "partial" and "read-only" in life[-1]["reason"], life
@@ -3048,7 +3049,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
                                   zones=("a.acme.com", "b.acme.com"))
         assert len(seen) == 1, seen                       # exactly ONE zone was contacted
         assert kept == {"api.a.acme.com"}, kept           # its evidence still landed
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert (ex["eligible"], ex["tested"], ex["omitted"]) == (2, 1, 1), ex
         assert "could not be recorded" in ex["reason"], ex
         assert life[-1]["status"] == "partial" and "read-only" in life[-1]["reason"], life
@@ -3151,7 +3152,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         reason = life[-1]["reason"]
         assert "no in-scope wildcard zone" not in reason, reason
         assert "never determined" in reason, reason
-        rec = [e for e in self._events if e.get("measure") == "zones"][-1]
+        rec = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
         assert rec["kind"] == "unknown", rec
 
     def test_TWO_identical_failures_are_BOTH_named(self, tmp_path, monkeypatch):
@@ -3192,7 +3193,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         assert len(asked) == 2, asked            # NOT eight
         probed = {h.split(".", 1)[1] for h in asked}
         assert len(probed) == 2 and all(z.endswith("acme.com") for z in probed), probed
-        ex = [e for e in self._events if e.get("measure") == "zone_execution"][-1]
+        ex = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zone_execution"][-1]
         assert (ex["eligible"], ex["tested"]) == (2, 2), ex
 
     def test_a_GUARD_REFUSAL_consumes_its_zone_and_nothing_is_probed(self, tmp_path, monkeypatch):
@@ -3200,7 +3201,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
         monkeypatch.setattr(vertical, "WILDCARD_ZONES_PER_RUN", 1)
         kept, life = self._differ(tmp_path, monkeypatch, rows=[], guard="self",
                                   zones=("a.acme.com", "b.acme.com"))
-        sel = [e for e in self._events if e.get("measure") == "zones"][-1]
+        sel = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "zones"][-1]
         assert "1 zone(s) refused by the self/private contact guard" in sel["reason"], sel
         assert "1 zone(s) deferred to a later run" in sel["reason"], sel
         assert life[-1]["status"] in ("skipped", "limited", "failed"), life
@@ -3269,7 +3270,7 @@ class TestTheDifferRotatesOverZonesAndWords:
                                     rows=None, run=run, tool=tool)
             submitted |= {c.split(".", 1)[0] for c in seen if not c.startswith("quarry-wc-")}
             # ...and the vocabulary measure states RETENTION, never the per-run bound
-            vocab = [e for e in self._events if e.get("measure") == "vocabulary_words"][-1]
+            vocab = [e for e in self._events if e.get("event") == "coverage_partial" and e.get("measure") == "vocabulary_words"][-1]
             assert (vocab["eligible"], vocab["tested"], vocab["omitted"]) == (3, 3, 0), vocab
         assert submitted == set(words), submitted
 
@@ -3728,7 +3729,7 @@ class TestTheRecursionRoundsPolicy:
             summary = json.loads(run.manifest_path.read_text())["summary"]
         finally:
             events.reset()
-        cov = [e for e in _events_of(tmp_path) if e.get("measure") == "permutation_rounds"][-1]
+        cov = [e for e in _events_of(tmp_path) if e.get("event") == "coverage_partial" and e.get("measure") == "permutation_rounds"][-1]
         assert (cov["kind"], cov["eligible"], cov["tested"], cov["omitted"]) == (
             events.COVERAGE_CAP, 0, 0, 0), cov
         assert "PASSIVE" in cov["reason"], cov
@@ -3742,14 +3743,14 @@ class TestTheRecursionRoundsPolicy:
         with settings.overrides(policy.unbound_overrides()):
             iters, _run = self._drive(tmp_path / "deg", monkeypatch, growth=lambda i: [],
                                       status=lambda i: crawl.Status.TIMED_OUT)
-        cov = [e for e in _events_of(tmp_path / "deg") if e.get("measure") == "permutation_rounds"][-1]
+        cov = [e for e in _events_of(tmp_path / "deg") if e.get("event") == "coverage_partial" and e.get("measure") == "permutation_rounds"][-1]
         assert cov["kind"] == events.COVERAGE_UNKNOWN, cov
         assert "eligible" not in cov and "omitted" not in cov, cov
         assert "not convergence" in cov["reason"] and "DEGRADED" in cov["reason"], cov
         # ...and the same shape after a CLEAN batch IS convergence
         with settings.overrides(policy.unbound_overrides()):
             self._drive(tmp_path / "clean", monkeypatch, growth=lambda i: ["x.acme.com"] if i == 1 else [])
-        cov = [e for e in _events_of(tmp_path / "clean") if e.get("measure") == "permutation_rounds"][-1]
+        cov = [e for e in _events_of(tmp_path / "clean") if e.get("event") == "coverage_partial" and e.get("measure") == "permutation_rounds"][-1]
         assert cov["kind"] == events.COVERAGE_CAP and cov["omitted"] == 0, cov
 
     def test_a_BOUNDED_run_that_was_still_finding_names_SAYS_so(self, tmp_path, monkeypatch):
@@ -3757,7 +3758,7 @@ class TestTheRecursionRoundsPolicy:
         not read `complete` because the loop merely ran out of rounds."""
         chain = {1: ["a1.acme.com"], 2: ["a2.acme.com"], 3: ["a3.acme.com"], 4: ["a4.acme.com"]}
         self._drive(tmp_path / "cut", monkeypatch, growth=lambda i: chain.get(i, []))
-        cov = [e for e in _events_of(tmp_path / "cut") if e.get("measure") == "permutation_rounds"][-1]
+        cov = [e for e in _events_of(tmp_path / "cut") if e.get("event") == "coverage_partial" and e.get("measure") == "permutation_rounds"][-1]
         # how many rounds convergence needs is UNKNOWABLE here — a chain needing a hundred more looks
         # exactly like one needing one, so no exact denominator is invented
         assert cov["kind"] == events.COVERAGE_UNKNOWN, cov
@@ -3768,7 +3769,7 @@ class TestTheRecursionRoundsPolicy:
         from quarry_recon import policy, settings
         with settings.overrides(policy.unbound_overrides()):
             self._drive(tmp_path / "whole", monkeypatch, growth=lambda i: chain.get(i, []))
-        cov = [e for e in _events_of(tmp_path / "whole") if e.get("measure") == "permutation_rounds"][-1]
+        cov = [e for e in _events_of(tmp_path / "whole") if e.get("event") == "coverage_partial" and e.get("measure") == "permutation_rounds"][-1]
         # ...and a run that FINISHED counts exactly: it rounds, all of them run, nothing omitted
         assert (cov["kind"], cov["eligible"], cov["tested"], cov["omitted"]) == (
             events.COVERAGE_CAP, 5, 5, 0), cov
@@ -3779,7 +3780,7 @@ class TestTheRecursionRoundsPolicy:
         another round is reachable. One round, a resolver that finds nothing — the old code announced that
         the last round "still found new names" and promised another."""
         self._drive(tmp_path / "quiet", monkeypatch, growth=lambda i: [], rounds=1)
-        cov = [e for e in _events_of(tmp_path / "quiet") if e.get("measure") == "permutation_rounds"][-1]
+        cov = [e for e in _events_of(tmp_path / "quiet") if e.get("event") == "coverage_partial" and e.get("measure") == "permutation_rounds"][-1]
         assert cov["kind"] == events.COVERAGE_CAP and cov["omitted"] == 0, cov
         assert "STILL found new" not in cov["reason"], cov
         assert ("cost nothing" in cov["reason"] or "nothing new was left" in cov["reason"]), cov
@@ -3794,8 +3795,8 @@ class TestTheRecursionRoundsPolicy:
         assert len(same) == 2, same          # one productive round, one that repeats -> stop
         assert len(none) == 1, none          # nothing at all -> stop after the first
         # ...and each exit names ITSELF rather than defaulting to the bound's wording
-        same_cov = [e for e in _events_of(tmp_path / "same") if e.get("measure") == "permutation_rounds"][-1]
+        same_cov = [e for e in _events_of(tmp_path / "same") if e.get("event") == "coverage_partial" and e.get("measure") == "permutation_rounds"][-1]
         assert same_cov["omitted"] == 0 and "CONVERGED" in same_cov["reason"], same_cov
-        none_cov = [e for e in _events_of(tmp_path / "none") if e.get("measure") == "permutation_rounds"][-1]
+        none_cov = [e for e in _events_of(tmp_path / "none") if e.get("event") == "coverage_partial" and e.get("measure") == "permutation_rounds"][-1]
         assert none_cov["omitted"] == 0, none_cov
         assert "nothing new was left to submit" in none_cov["reason"], none_cov

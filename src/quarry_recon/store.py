@@ -718,7 +718,39 @@ class Run:
         return {"verdict": verdict, "tool_status": status_counts, "tools_failed": len(failures),
                 "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions,
                 "coverage": coverage, "coverage_limits": coverage_limits,
+                # what each lane still OWES — the supervisor's input, absent meaning UNKNOWN (settle B)
+                "remainders": self._read_remainders(),
                 "provider_limits": provider_limits, "operator_limits": operator_limits}
+
+    def _read_remainders(self) -> list[dict]:
+        """The LATEST remainder record per (lane, unit) — what each lane still OWES, for a supervisor that
+        has to decide whether repeating this run could advance anything (settle prerequisite B).
+
+        Latest-per-unit for the same reason coverage is: a lane re-emits its remainder every run, and a run
+        that finished its rotation must be able to CLEAR the one before it. A lane that emitted nothing is
+        absent here — which a supervisor must read as UNKNOWN, never as zero."""
+        ev = self.dir / "events.jsonl"
+        if not ev.exists():
+            return []
+        latest: dict = {}
+        try:
+            lines = ev.read_bytes().splitlines()
+        except OSError:
+            return []
+        for chunk in lines:
+            try:
+                rec = json.loads(chunk.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(rec, dict) or rec.get("event") != "remainder":
+                continue
+            lane, unit = rec.get("source_id"), rec.get("unit")
+            if not isinstance(lane, str) or not isinstance(unit, str):
+                continue
+            latest[(lane, unit)] = {"lane": lane, "unit": unit, "measure": rec.get("measure"),
+                                    "model": rec.get("model"), "retriable": rec.get("retriable"),
+                                    "terminal": rec.get("terminal")}
+        return [latest[k] for k in sorted(latest)]
 
     def _read_coverage(self) -> list[dict]:
         """Aggregate STRUCTURED coverage_partial events (those carrying eligible/tested/omitted) from
