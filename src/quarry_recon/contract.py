@@ -657,7 +657,18 @@ def _provider_start(source_id, *, work_unit=None, input_total=None) -> bool:
     if sources.get(source_id) is None:
         events.tool_blocked(source_id, reason=f"unknown source_id {source_id!r} — not in registry; not executed")
         return False
-    if not acquisition_open(source_id):        # a campaign closed acquisition: this lane does not run
+    if not acquisition_open(source_id, announce=False):
+        # a campaign closed acquisition. The lane still gets a LIFECYCLE — start, then a skipped terminal
+        # with the reason — because a manifest that simply lacks the lane says "nobody ran it", and an
+        # un-terminated start would leave an earlier generation standing.
+        from . import campaign as _campaign
+        why = _campaign.acquisition_allowed(source_id)[1]
+        events.tool_blocked(source_id, reason=why)
+        reset = events.mark_provider_generation(source_id)
+        events.tool_start(source_id, input_total=input_total, work_unit=work_unit, provider=True,
+                          reset_generation=reset)
+        events.tool_finish(source_id, status=Status.SKIPPED.value, reason=why, work_unit=work_unit,
+                           provider=True)
         return False
     # review-r5#1: stamp the generation reset on the START (persisted BEFORE execution) so a crash between
     # start and terminal still supersedes the prior generation, and the un-terminated start reads as
@@ -806,7 +817,7 @@ def _provider_terminal(source_id, fn, *, work_unit=None):
     return result                                            # None on failure — caller guards (best-effort)
 
 
-def acquisition_open(source_id: str) -> bool:
+def acquisition_open(source_id: str, *, announce: bool = True) -> bool:
     """The ACQUISITION gate, consulted by every execution path (settle: acquisition closure).
 
     A campaign closes acquisition after its first child, and there are three doors into a provider —
@@ -816,7 +827,8 @@ def acquisition_open(source_id: str) -> bool:
     allowed, why = campaign.acquisition_allowed(source_id)
     if allowed:
         return True
-    events.tool_blocked(source_id, reason=why)
+    if announce:
+        events.tool_blocked(source_id, reason=why)
     return False
 
 

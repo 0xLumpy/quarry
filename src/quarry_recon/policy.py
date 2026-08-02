@@ -73,6 +73,22 @@ PROVIDER_LANES = ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.
 #: ...and the ids above that are NOT in the source registry, listed exactly rather than by prefix.
 PROVIDER_LANES_OUTSIDE_REGISTRY = ("osint.whoxy",)
 
+#: WHICH DOOR each acquisition lane executes through. Declared, so the acquisition closure can be checked
+#: against real call sites rather than against the existence of a gate somewhere: a registered provider
+#: that started making its own HTTP calls would otherwise pass a test that only counts gate strings.
+PROVIDER_DOORS: dict[str, str] = {
+    "probe.favicon": "run_providers",          # the shared Shodan credit coordinator
+    "probe.cert": "run_providers",
+    "probe.shodan_host": "run_provider",
+    "vertical.censys": "run_provider",
+    "vertical.certspotter": "run_provider",
+    "vertical.crtsh": "run_provider",
+    "vertical.shosubgo": "run_contract",       # an external binary we hand a key to
+    "vertical.github_subs": "run_contract",
+    "osint.whoxy": "direct_http",              # plain HTTP in `osint.py`, outside the source registry
+}
+DOORS = ("run_provider", "run_providers", "run_contract", "direct_http")
+
 #: EVERY registered source, classified — the mechanism that finds an OMISSION rather than trusting a
 #: hand-kept list. `vertical.certspotter` satisfied the ownership rule and was missing from
 #: `PROVIDER_LANES`; a hard-coded test could not have noticed. A new lane fails the completeness test
