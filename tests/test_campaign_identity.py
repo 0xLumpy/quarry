@@ -89,21 +89,45 @@ class TestIdentityAcrossRuns:
         run.add("subdomain", {"host": "b.acme.com", "sources": ["crtsh"]})
         live = {k: v for k, v in ((store.canonical_key("subdomain", r), r) for r in run.read("subdomain"))}
         folded = store.fold_observations(run.normalized / "subdomain.jsonl")
-        assert set(folded) == set(live) == {"a.acme.com", "b.acme.com"}
-        assert set(folded["a.acme.com"]["sources"]) == {"crtsh", "subfinder"}
+        assert folded.status == "valid" and folded.trustworthy and folded.dropped == 0, folded
+        assert set(folded.records) == set(live) == {"a.acme.com", "b.acme.com"}
+        assert set(folded.records["a.acme.com"]["sources"]) == {"crtsh", "subfinder"}
         for key in live:
-            assert store.fingerprint("subdomain", folded[key]) == store.fingerprint("subdomain", live[key])
+            assert store.fingerprint("subdomain", folded.records[key]) == \
+                store.fingerprint("subdomain", live[key])
 
-    def test_a_CORRUPT_line_costs_one_observation_not_the_run(self, tmp_path):
+    def test_a_CORRUPT_line_costs_one_observation_and_is_COUNTED(self, tmp_path):
         f = tmp_path / "subdomain.jsonl"
         f.write_text(json.dumps({"host": "a.acme.com", "sources": ["x"]}) + "\n"
                      + "{not json\n" + "[]\n" + json.dumps({"no": "key"}) + "\n"
                      + json.dumps({"host": "b.acme.com"}) + "\n")
         folded = store.fold_observations(f)
-        assert set(folded) == {"a.acme.com", "b.acme.com"}
+        assert set(folded.records) == {"a.acme.com", "b.acme.com"}
+        assert (folded.status, folded.dropped, folded.trustworthy) == ("degraded", 3, False), folded
 
-    def test_a_missing_log_is_an_empty_view_not_a_crash(self, tmp_path):
-        assert store.fold_observations(tmp_path / "nope.jsonl") == {}
+    def test_ONE_invalid_byte_costs_ONE_row_not_the_log(self, tmp_path):
+        """`read_text()` decoded the whole file before rows were isolated, so a single 0xff destroyed every
+        valid observation before and after it."""
+        f = tmp_path / "subdomain.jsonl"
+        f.write_bytes(json.dumps({"host": "a.acme.com"}).encode() + b"\n"
+                      + b'{"host":"\xff\xfe.acme.com"}\n'
+                      + json.dumps({"host": "b.acme.com"}).encode() + b"\n")
+        folded = store.fold_observations(f)
+        assert set(folded.records) == {"a.acme.com", "b.acme.com"}, folded
+        assert (folded.status, folded.dropped) == ("degraded", 1), folded
+
+    def test_UNREADABLE_is_never_reported_as_EMPTY(self, tmp_path):
+        """The distinction a campaign lives on: bootstrapping from a lost log would drop evidence silently,
+        and a fixed point declared over it would claim finished work nobody could see."""
+        absent = store.fold_observations(tmp_path / "nope.jsonl")
+        assert (absent.status, absent.records, absent.trustworthy) == ("absent", {}, True)
+        unusable = store.fold_observations(tmp_path)              # a directory, not a log
+        assert unusable.status == "unusable" and not unusable.trustworthy, unusable
+        assert unusable.reason and unusable.records == {}, unusable
+        empty = tmp_path / "subdomain.jsonl"
+        empty.write_text("")
+        clean = store.fold_observations(empty)
+        assert (clean.status, clean.records, clean.trustworthy) == ("valid", {}, True)   # a REAL empty
 
     @pytest.mark.parametrize("entity", sorted(store.ENTITY_KEYS))
     def test_every_entity_kind_has_an_identity_and_a_fingerprint(self, entity):
@@ -115,3 +139,18 @@ class TestIdentityAcrossRuns:
         assert store.fingerprint(entity, rec) and len(store.fingerprint(entity, rec)) == 32
         assert not store.adds_material(entity, rec, dict(rec))
         assert store.adds_material(entity, rec, {field: "value-1", "sources": ["y"]})
+
+
+class TestMaterialIsCanonicalAtEveryDepth:
+    def test_a_NESTED_list_order_is_not_material(self):
+        """The contract says list order is never material; a shallow pass left everything below the first
+        dict order-sensitive, so identical records could fingerprint differently."""
+        one = {"id": "x", "detail": [{"ports": [443, 80], "tags": ["a", "b"]}]}
+        other = {"id": "x", "detail": [{"tags": ["b", "a"], "ports": [80, 443]}]}
+        assert store.fingerprint("finding", one) == store.fingerprint("finding", other)
+        assert not store.adds_material("finding", one, other)
+
+    def test_a_nested_ADDITION_is_still_material(self):
+        one = {"id": "x", "detail": [{"ports": [443]}]}
+        other = {"id": "x", "detail": [{"ports": [443, 8443]}]}
+        assert store.fingerprint("finding", one) != store.fingerprint("finding", other)

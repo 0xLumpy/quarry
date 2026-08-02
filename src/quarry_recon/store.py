@@ -228,22 +228,22 @@ def material(entity: str, record: dict) -> dict:
     `_alt` stays too — a conflicting observation is knowledge the union did not hold."""
     if not isinstance(record, dict):
         return {}
-    out: dict = {}
-    for k, v in record.items():
-        if k in RUN_SCOPED_FIELDS:
-            continue
-        if isinstance(v, list):
-            seen: list = []
-            for x in v:
-                if x not in seen:
-                    seen.append(x)
-            out[k] = sorted(seen, key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=False))
-        elif isinstance(v, dict):
-            out[k] = {kk: (sorted(vv, key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=False))
-                           if isinstance(vv, list) else vv) for kk, vv in sorted(v.items())}
-        else:
-            out[k] = v
-    return out
+    return {k: _canon_value(v) for k, v in record.items() if k not in RUN_SCOPED_FIELDS}
+
+
+def _canon_value(value):
+    """Stable form of any JSON value, at EVERY depth. A shallow pass left lists nested below the first
+    dict order-sensitive, so two records asserting the same thing could fingerprint differently — and a
+    campaign would read that as discovery."""
+    if isinstance(value, list):
+        seen: list = []
+        for x in (_canon_value(i) for i in value):
+            if x not in seen:
+                seen.append(x)
+        return sorted(seen, key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=False))
+    if isinstance(value, dict):
+        return {k: _canon_value(v) for k, v in sorted(value.items())}
+    return value
 
 
 def fingerprint(entity: str, record: dict) -> str:
@@ -268,27 +268,64 @@ def adds_material(entity: str, base: dict, incoming: dict) -> bool:
     return fingerprint(entity, merge(entity, base, incoming)) != fingerprint(entity, base)
 
 
-def fold_observations(path) -> dict:
+@dataclass
+class FoldedLog:
+    """What one entity log actually yielded, and whether it could be trusted.
+
+    A campaign must never read "unreadable" as "empty": bootstrapping from a lost log would drop evidence
+    silently, and a fixed point declared over it would claim finished work nobody could see. So the status
+    is part of the answer:
+
+        absent    no log at all — this run never wrote this entity kind
+        valid     read cleanly, every row usable
+        degraded  read, but rows were dropped (bad JSON, a non-object row, no identity, bad UTF-8)
+        unusable  could not be read at all — the records here are NOT a corpus
+    """
+    records: dict = field(default_factory=dict)
+    status: str = "valid"
+    dropped: int = 0
+    reason: str = ""
+
+    @property
+    def trustworthy(self) -> bool:
+        """Whether this view may stand in for the run's evidence. `degraded` is honest but incomplete."""
+        return self.status in ("valid", "absent")
+
+
+def fold_observations(path) -> FoldedLog:
     """The MERGED view of one entity's append-only observation log, for a run nobody has open — the same
     fold `Run._records_for` does, so a finished run reads exactly as it did while it was live."""
-    merged: dict = {}
     entity = Path(path).stem
     try:
-        lines = Path(path).read_text().splitlines()
-    except OSError:
-        return merged
-    for line in lines:
+        raw = Path(path).read_bytes()
+    except FileNotFoundError:
+        return FoldedLog(status="absent", reason="no observation log")
+    except OSError as e:
+        return FoldedLog(status="unusable", reason=f"{type(e).__name__}: {e}")
+    merged: dict = {}
+    dropped = 0
+    for chunk in raw.splitlines():
+        if not chunk.strip():
+            continue
         try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
+            # DECODE PER LINE: one invalid byte used to abort the whole file, losing every valid
+            # observation before and after it. A bad row costs itself and is COUNTED.
+            rec = json.loads(chunk.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            dropped += 1
             continue
         if not isinstance(rec, dict):
+            dropped += 1
             continue
         k = canonical_key(entity, rec)
         if not k:
+            dropped += 1
             continue
         merged[k] = _merge_record(merged[k], rec) if k in merged else rec
-    return merged
+    if dropped:
+        return FoldedLog(records=merged, status="degraded", dropped=dropped,
+                         reason=f"{dropped} unusable observation row(s)")
+    return FoldedLog(records=merged)
 
 
 def _utc() -> str:
