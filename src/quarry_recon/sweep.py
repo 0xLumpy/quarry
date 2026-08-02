@@ -654,8 +654,13 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
                     refused_targets.add(target)
                     if len(out.refused) < _UNSELECTABLE_DETAIL:
                         out.refused.append(target)
+                    # v68: every SCHEDULABLE pair of this target is the refusal's. Skipping the slots
+                    # already in `picked` missed the ones the candidate bound had excluded on the way —
+                    # so a target the guard turned away without a single call still reported part of its
+                    # work as withheld by the spend bound. Admission is target-wide: nothing was
+                    # contacted, and no other bound got to decide anything here.
                     for slot in slots:                    # this target is done for THIS lifecycle
-                        if slot[0] == target and slot not in picked:
+                        if slot[0] == target and slot not in submitted:
                             picked.add(slot)
                             out.refused_pairs += len(members[slot])
                     out.refused_pairs += total            # including the batch we had already picked
@@ -1058,10 +1063,10 @@ def _next_batch(progress, slots, content, members, picked, spent, out, *, cap: i
             # skipping the pick) keeps the loop terminating and leaves it to the next run's rotation —
             # and the scan CONTINUES, so a smaller slot behind it can still fill the remaining allowance
             # in the SAME invocation, exactly as the one-slot-per-call driver used to pack it (v31).
+            # v68: the bound is NAMED by the reconciliation, which knows whether it really withheld
+            # anything. Naming it here made a target the guard then refused report a spend bound that
+            # decided nothing — the scan reached the check, but no pair was ever the bound's.
             picked.add(choice)
-            why = f"the per-target candidate bound ({cap}) was reached"
-            if why not in out.cap_reasons:
-                out.cap_reasons.append(why)
             continue
         if chosen and max_words and total + len(words) > max_words:
             break                                       # an oversized SLOT never reaches here: the

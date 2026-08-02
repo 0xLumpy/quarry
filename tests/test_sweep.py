@@ -2233,3 +2233,18 @@ class TestThePreflightCallbacksAreContained:
         assert [c[2] for c in tool.calls] == [("w3761", "w3345")], tool.calls   # the dirty tier, first
         parts = out.pair_remainder()
         assert parts["bound"] == 1 and parts["stopped"] == 2, parts
+
+    def test_a_REFUSED_target_owns_every_pair_it_holds(self, tmp_path):
+        """v68: the refusal loop skipped slots already in `picked` — which includes the ones the candidate
+        bound excluded on the way in. A target the guard turned away without a single call reported part of
+        its work as withheld by the spend bound, and the terminal named a bound that decided nothing.
+        Admission is target-wide: nothing was contacted, so every schedulable pair is the refusal's."""
+        # five one-word slots and a three-per-target bound: the batch scan fills the allowance and
+        # EXCLUDES the last two before the admission hook is ever asked
+        out, tool = _run(tmp_path, words=[f"w{i}" for i in range(5)], max_pairs_per_target=3,
+                         admit=lambda t: False)
+        assert tool.calls == [], tool.calls
+        assert out.targets_refused == 1 and out.refused_pairs == 5, out
+        parts = out.pair_remainder()
+        assert parts["refused"] == 5 and parts["bound"] == 0 and parts["stopped"] == 0, parts
+        assert "candidate bound" not in (out.stop or ""), out.stop        # it withheld nothing
