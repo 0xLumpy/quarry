@@ -106,15 +106,43 @@ def _valid_recoveries(history, pointer_generation: int) -> bool:
         previous = gen
         if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
             return False
-        at = entry.get("at")
-        if not isinstance(at, str) or not at.strip():
+        if not _aware_stamp(entry.get("at")):
             return False
-        try:
-            when = datetime.fromisoformat(at)
-        except ValueError:
+    return True
+
+
+def _aware_stamp(at) -> bool:
+    """An audit timestamp is readable only when it says WHEN — a naive stamp does not."""
+    if not isinstance(at, str) or not at.strip():
+        return False
+    try:
+        when = datetime.fromisoformat(at)
+    except ValueError:
+        return False
+    return when.tzinfo is not None and when.tzinfo.utcoffset(when) is not None
+
+
+#: exactly the keys ONE campaign recovery may carry. `reason` is what the operator admits was lost; `cause`
+#: is what the ledger itself said was wrong, kept so the admission cannot outlive its evidence.
+_CAMPAIGN_RECOVERY_KEYS = {"index", "reason", "cause", "at"}
+
+
+def _valid_campaign_recoveries(history) -> bool:
+    """Same rule as the union's (`_valid_recoveries`): an audit record we cannot read may not certify a
+    ledger. Ordered by an explicit ordinal rather than a generation — a campaign recovery ERASES the
+    children, so there is no accumulating number to hang the order on, and a clock is not an order."""
+    if not isinstance(history, list):
+        return False
+    for expected, entry in enumerate(history, start=1):
+        if not isinstance(entry, dict) or set(entry) != _CAMPAIGN_RECOVERY_KEYS:
             return False
-        if when.tzinfo is None or when.tzinfo.utcoffset(when) is None:
-            return False                                  # a naive stamp says nothing about WHEN
+        if entry.get("index") != expected or type(entry["index"]) is not int:
+            return False
+        for name in ("reason", "cause"):
+            if not isinstance(entry.get(name), str) or not entry[name].strip():
+                return False
+        if not _aware_stamp(entry.get("at")):
+            return False
     return True
 
 
@@ -454,7 +482,8 @@ class Decision:
 
 
 def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_children: int = 0,
-           children: int = 0, max_children: int = MAX_CHILDREN) -> Decision:
+           children: int = 0, max_children: int = MAX_CHILDREN,
+           previous_retriable: int | None = None) -> Decision:
     """The stop rules, read from a child's manifest summary and what it added to the union.
 
     Order matters and is fixed: a broken child is not continuation, so CHILD FAULT is asked first; then a
@@ -467,9 +496,15 @@ def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_c
         return Decision(stop="child_fault", detail="; ".join(
             f"{f.get('kind')}: {f.get('where')}" for f in faults[:4]))
 
-    rows = {r.get("lane"): r for r in summary.get("remainders", []) if isinstance(r, dict)}
-    invalid = sorted(lane for lane, row in rows.items() if "retriable" not in row)
-    silent = sorted(lane for lane in expected_lanes if lane not in rows)
+    # remainders are latest per (lane, UNIT, measure) — a lane may report several. Keeping one row per
+    # lane let a valid unit hide an invalid sibling and dropped the others' counts entirely.
+    by_lane: dict = {}
+    for row in summary.get("remainders", []):
+        if isinstance(row, dict) and isinstance(row.get("lane"), str):
+            by_lane.setdefault(row["lane"], []).append(row)
+    invalid = sorted(lane for lane, rows in by_lane.items()
+                     if any(not _readable_remainder(r) for r in rows))
+    silent = sorted(lane for lane in expected_lanes if lane not in by_lane)
     if invalid or silent:
         return Decision(stop="unknown", detail="; ".join(
             [f"{lane}: reported nothing" for lane in silent]
@@ -477,16 +512,21 @@ def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_c
 
     retriable = 0
     terminal: dict = {}
-    for lane, row in rows.items():
-        if row.get("model") != "project_progress":
-            continue                                  # repetition cannot advance it — never keeps us alive
-        rt = row.get("retriable") or {}
-        retriable += int(rt.get("now", 0)) + int(rt.get("cooldown", 0))
-        for cause, n in (row.get("terminal") or {}).items():
-            if n:
-                terminal[cause] = terminal.get(cause, 0) + int(n)
+    for rows in by_lane.values():
+        for row in rows:
+            if row.get("model") != "project_progress":
+                continue                              # repetition cannot advance it — never keeps us alive
+            rt = row.get("retriable") or {}
+            retriable += int(rt.get("now", 0)) + int(rt.get("cooldown", 0))
+            for cause, n in (row.get("terminal") or {}).items():
+                if n:
+                    terminal[cause] = terminal.get(cause, 0) + int(n)
 
-    progressed = bool(absorbed.progressed)
+    # PROGRESS is either new material or a strict reduction in what is owed: a child that discovered no
+    # identity but took half the remaining work forward is not idle, and stopping it would abandon work
+    # this campaign was measurably completing.
+    reduced = previous_retriable is not None and retriable < previous_retriable
+    progressed = bool(absorbed.progressed) or reduced
     if absorbed.unusable:
         return Decision(stop="unknown", progressed=progressed, retriable=retriable,
                         detail="; ".join(f"{k}: {v}" for k, v in sorted(absorbed.unusable.items()))[:400])
@@ -495,8 +535,8 @@ def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_c
                         detail=f"{children} child run(s)")
     if not progressed and idle_children + 1 >= NO_PROGRESS_LIMIT and retriable:
         return Decision(stop="no_progress", progressed=False, retriable=retriable,
-                        detail=f"{idle_children + 1} child(ren) added nothing while {retriable} "
-                               f"unit(s) stayed owed")
+                        detail=f"{idle_children + 1} child(ren) added nothing and reduced nothing while "
+                               f"{retriable} unit(s) stayed owed")
     if retriable:
         return Decision(progressed=progressed, retriable=retriable)     # keep going: work a child can take
     if terminal:
@@ -505,6 +545,59 @@ def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_c
     if progressed:
         return Decision(progressed=True)          # nothing owed, but this child still learned something
     return Decision(stop="fixed_point", detail="no retriable work and nothing new")
+
+
+def _readable_remainder(row: dict) -> bool:
+    """Whether one remainder row can be believed. A row the manifest already marked `invalid`, or one whose
+    counts are not exact non-negative ints, is UNKNOWN — and unknown is never zero."""
+    from . import remainder as _remainder
+    if row.get("model") not in _remainder.MODELS or not isinstance(row.get("unit"), str):
+        return False
+    rt, term = row.get("retriable"), row.get("terminal")
+    if not isinstance(rt, dict) or not isinstance(term, dict):
+        return False
+    for value in (rt.get("now"), rt.get("cooldown"), *term.values()):
+        if type(value) is not int or value < 0:
+            return False
+    return set(term) <= set(_remainder.TERMINAL_CAUSES)
+
+
+def _unreadable_child(child, index: int, states) -> str:
+    """Why one loaded child cannot be believed, or `""`. Types alone are not enough: a `reserved` child
+    holding a run id, or a `manifested` one without the deltas the supervisor decided on, is a CONTRADICTION
+    — the record and the state disagree, and a partially written ledger looks exactly like that."""
+    if not isinstance(child, dict) or child.get("index") != index or type(child["index"]) is not int:
+        return "is not a readable record"
+    state = child.get("state")
+    if state not in states:
+        return f"has an unknown state {state!r}"
+    run_id = child.get("run_id")
+    if state == "reserved":
+        if run_id is not None:
+            return "is reserved but already names a run"
+    elif not isinstance(run_id, str) or not run_id.strip():
+        return f"is {state} without a run id"
+    if state == "manifested":
+        for name in ("new_identities", "enriched", "retriable"):
+            if type(child.get(name)) is not int or child[name] < 0:
+                return f"is manifested without an exact {name}"
+        if type(child.get("progressed")) is not bool:
+            return "is manifested without a progress verdict"
+        for name in ("provider_spend", "faults"):
+            if not isinstance(child.get(name), list):
+                return f"is manifested without its {name}"
+        if not isinstance(child.get("verdict"), (str, type(None))):
+            return "is manifested with an unreadable verdict"
+    return ""
+
+
+def _readable_stop(stop) -> bool:
+    """A stop is the campaign's OUTCOME. An arbitrary object in its place is not a stop we can report."""
+    if stop is None:
+        return True
+    return (isinstance(stop, dict) and set(stop) == {"cause", "detail", "success"}
+            and isinstance(stop["cause"], str) and stop["cause"].strip()
+            and isinstance(stop["detail"], str) and type(stop["success"]) is bool)
 
 
 class Campaign:
@@ -526,8 +619,38 @@ class Campaign:
         self.path = self.dir / "ledger.json"
         self.children: list = []
         self.stop: dict | None = None
+        self.recoveries: list = []   # CHRONOLOGICAL, carried forward by every later publication
+        self.status = "new"          # new | valid | unusable — absence may create, corruption may NOT
+        self.reason = ""
         self._lock = None
         self._load()
+
+    @property
+    def trustworthy(self) -> bool:
+        return self.status in ("new", "valid")
+
+    def require(self) -> None:
+        """Refuse to write over a ledger nobody can read: the next `reserve()` would publish child 1 again
+        and launder a campaign's whole history."""
+        if not self.trustworthy:
+            raise UnionUnusable(f"{self.path}: {self.status} — {self.reason}")
+
+    def recover(self, reason: str) -> None:
+        """Start recording again over an UNREADABLE ledger, deliberately and with the loss stated.
+
+        Only from `unusable`: recovery erases every child, so on a healthy campaign it is not a repair but
+        the exact laundering `require()` exists to prevent. The admission is appended to a durable history
+        (never a replaceable string) — an audit record that the next publication drops never happened."""
+        if not reason or not reason.strip():
+            raise ValueError("a recovery must state what was lost")
+        if self.trustworthy:
+            raise ValueError(f"{self.path}: a {self.status} campaign has nothing to recover — recovery "
+                             f"would erase {len(self.children)} child record(s)")
+        history = [*self.recoveries, {"index": len(self.recoveries) + 1,
+                                      "reason": reason.strip(),
+                                      "cause": self.reason or "unreadable",
+                                      "at": store._utc()}]
+        self._commit([], stop=False, recoveries=history)
 
     # ── the PROJECT lock: two supervisors on one project would duplicate whole runs ────────────────
     def acquire(self):
@@ -540,45 +663,171 @@ class Campaign:
 
     def _load(self) -> None:
         try:
-            doc = json.loads(self.path.read_text())
-        except (OSError, json.JSONDecodeError):
+            raw = self.path.read_text()
+        except FileNotFoundError:
+            self.status, self.reason = "new", "no ledger yet"
             return
-        if isinstance(doc, dict):
-            kids = doc.get("children")
-            self.children = [c for c in kids if isinstance(c, dict)] if isinstance(kids, list) else []
-            self.stop = doc.get("stop") if isinstance(doc.get("stop"), dict) else None
+        except OSError as e:
+            self.status, self.reason = "unusable", f"{type(e).__name__}: {e}"
+            return
+        try:
+            doc = json.loads(raw)
+        except json.JSONDecodeError as e:
+            self.status, self.reason = "unusable", f"ledger is not JSON ({type(e).__name__})"
+            return
+        kids = doc.get("children") if isinstance(doc, dict) else None
+        if isinstance(doc, dict) and _valid_campaign_recoveries(doc.get("recoveries", [])):
+            # salvaged even when the rest is unreadable: the admission chain must outlive the ledger it
+            # admits to losing, or a second corruption quietly erases the first recovery's confession
+            self.recoveries = [dict(r) for r in doc.get("recoveries", [])]
+        if not isinstance(doc, dict) or not isinstance(kids, list):
+            self.status, self.reason = "unusable", "ledger does not describe a campaign"
+            return
+        if not _valid_campaign_recoveries(doc.get("recoveries", [])):
+            self.status, self.reason = "unusable", "recovery history is unreadable"
+            return
+        if doc.get("campaign_id") != self.campaign_id:
+            # a ledger copied from another campaign would otherwise be rewritten under THIS id, with the
+            # other campaign's children counted as ours
+            self.status, self.reason = "unusable", (f"ledger belongs to campaign "
+                                                    f"{doc.get('campaign_id')!r}")
+            return
+        for index, child in enumerate(kids, start=1):
+            # a ledger whose children cannot be read is a ledger that cannot account for its runs
+            bad = _unreadable_child(child, index, self.STATES)
+            if bad:
+                self.status, self.reason = "unusable", f"child {index} {bad}"
+                return
+        stop = doc.get("stop")
+        if not _readable_stop(stop):
+            self.status, self.reason = "unusable", "stop record is unreadable"
+            return
+        self.children = list(kids)
+        self.stop = stop
+        self.status, self.reason = "valid", ""
 
-    def _save(self) -> None:
-        self.dir.mkdir(parents=True, exist_ok=True)
-        store._atomic_write(self.path, json.dumps(
-            {"campaign_id": self.campaign_id, "children": self.children, "stop": self.stop}, indent=2))
+    def _settle(self) -> None:
+        """Adopt whatever the ledger on disk actually says now — the only authority on what was published.
+
+        CONTENT comes from disk; the record OBJECTS are reused per index, so a caller still holding the
+        child it reserved keeps a record this ledger recognises and can retry a transient failure. Identity
+        within a campaign is the index, and rebuilding it from scratch would strand the caller."""
+        previous = self.children
+        self.children, self.stop, self.recoveries = [], None, []
+        self.status, self.reason = "unusable", "publication was interrupted"
+        self._load()
+        if self.status == "valid":
+            reused = []
+            for index, record in enumerate(self.children, start=1):
+                held = previous[index - 1] if index <= len(previous) else None
+                if isinstance(held, dict):
+                    held.clear()
+                    held.update(record)
+                    record = held
+                reused.append(record)
+            self.children = reused
+
+    def _refuse_unpublishable(self, records, stop, recoveries) -> None:
+        """Exactly the loader's own rules, applied to the candidate document before it can reach disk."""
+        if not isinstance(records, list):
+            raise ValueError("a ledger's children must be a list")
+        for index, child in enumerate(records, start=1):
+            bad = _unreadable_child(child, index, self.STATES)
+            if bad:
+                raise ValueError(f"child {index} {bad}")
+        if not _valid_campaign_recoveries(recoveries):
+            raise ValueError(f"a recovery history must be readable to be published: {recoveries!r}")
+        if not _readable_stop(stop):
+            raise ValueError(f"a stop record must be readable to be published: {stop!r}")
+
+    def _commit(self, records: list, *, stop=None, recoveries=None, adopt=None) -> None:
+        """Publish `records` and only THEN let this object believe them.
+
+        Every writer used to mutate memory first, so a write that never landed left a trustworthy campaign
+        holding a child no disk had: the failed `reserve()` stayed as child 1 in memory, and the next
+        successful one published it as a phantom alongside child 2. The whole preparation and the write are
+        inside the boundary, and ANY interruption re-reads the authoritative ledger — an atomic write may
+        have landed a moment before a cancellation, and guessing either way is how the two diverge."""
+        stop = self.stop if stop is None else (None if stop is False else stop)
+        recoveries = self.recoveries if recoveries is None else recoveries
+        # the WHOLE document, at the one boundary every writer passes through. Validating only the record a
+        # transition touched left the rest of the snapshot unchecked, and `reserve()` hands the caller the
+        # live dict: a `reserved` child given a run id by hand was published by the next `finish()` and made
+        # the ledger unusable on reopen. No writer can publish what `_load()` refuses — an invariant here,
+        # not a courtesy of cooperative callers.
+        self._refuse_unpublishable(records, stop, recoveries)
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            doc = {"campaign_id": self.campaign_id, "children": records, "stop": stop,
+                   "recoveries": recoveries}
+            store._atomic_write(self.path, json.dumps(doc, indent=2))
+        except BaseException:
+            try:
+                self._settle()
+            except BaseException:
+                # settling failed too: say so, and let the ORIGINAL failure be the one that propagates
+                self.status = "unusable"
+                self.reason = "publication failed and the ledger could not be re-read"
+            raise
+        if adopt is not None:
+            adopt()
+        self.children, self.stop, self.recoveries = list(records), stop, recoveries
+        self.status, self.reason = "valid", ""
 
     # ── child states ──────────────────────────────────────────────────────────────────────────────
     def reserve(self) -> dict:
         """Record a child BEFORE anything is launched — a crash then leaves an interrupted child in the
         ledger instead of a run directory nobody knows about."""
+        self.require()
         child = {"index": len(self.children) + 1, "state": "reserved", "run_id": None}
-        self.children.append(child)
-        self._save()
+        self._commit([*self.children, child])
         return child
 
+    def _advance(self, child: dict, to: str) -> None:
+        """Every publication is fail-closed and in ORDER. `require()` alone on `reserve()` left three doors
+        open: a reopened corrupt ledger could still be laundered by calling `finish()`. Ownership is checked
+        by IDENTITY — a record from another campaign is not this ledger's to advance."""
+        self.require()
+        index = child.get("index") if isinstance(child, dict) else None
+        if (type(index) is not int or not (1 <= index <= len(self.children))
+                or self.children[index - 1] is not child):
+            raise ValueError("that child record does not belong to this campaign")
+        state = child.get("state")
+        if state not in self.STATES or self.STATES.index(to) != self.STATES.index(state) + 1:
+            raise ValueError(f"child {index}: {state} -> {to} is not a transition this ledger records")
+
+    def _transition(self, child: dict, to: str, **fields) -> None:
+        """Advance one child through a CANDIDATE: the live record is never touched until the candidate has
+        been validated and published. Mutating first meant a rejected manifestation left the child marked
+        `manifested` and malformed in memory, where the next `finish()` published it and made the ledger
+        unusable — the validation refused the write and produced exactly the record it refused."""
+        self._advance(child, to)
+        index = child["index"]
+        candidate = {**child, **fields, "state": to}
+        records = list(self.children)     # `_commit` validates the whole snapshot, candidate included
+        records[index - 1] = candidate
+        # the caller keeps holding the record it reserved, so identity — and every later transition —
+        # survives the swap; the update lands only once the disk has agreed
+        self._commit(records, adopt=lambda: (child.update(candidate), records.__setitem__(index - 1, child)))
+
     def started(self, child: dict, run_id: str) -> None:
-        child["run_id"], child["state"] = run_id, "started"
-        self._save()
+        self.require()                     # trust is checked before anything else, always
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("a started child must name its run")
+        self._transition(child, "started", run_id=run_id)
 
     def manifested(self, child: dict, *, summary: dict, absorbed: "AbsorbResult",
                    decision: "Decision") -> None:
-        child.update(state="manifested", verdict=summary.get("verdict"),
-                     new_identities=absorbed.new, enriched=absorbed.enriched,
-                     retriable=decision.retriable, progressed=decision.progressed,
-                     provider_spend=summary.get("provider_spend", []),
-                     faults=[f.get("kind") for f in summary.get("faults", [])])
-        self._save()
+        self._transition(child, "manifested", verdict=summary.get("verdict"),
+                         new_identities=absorbed.new, enriched=absorbed.enriched,
+                         retriable=decision.retriable, progressed=decision.progressed,
+                         provider_spend=summary.get("provider_spend", []),
+                         faults=[f.get("kind") for f in summary.get("faults", [])])
 
     def finish(self, decision: "Decision") -> None:
-        self.stop = {"cause": decision.stop or "fixed_point", "detail": decision.detail,
-                     "success": decision.success}
-        self._save()
+        self.require()
+        self._commit(self.children, stop={"cause": decision.stop or "fixed_point",
+                                          "detail": decision.detail, "success": decision.success})
 
     @property
     def interrupted(self) -> list:
