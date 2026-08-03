@@ -77,7 +77,7 @@ PROVIDER_LANES_OUTSIDE_REGISTRY = ("osint.whoxy",)
 #: BOUND lanes that are not registered sources, listed EXACTLY (never by prefix — a prefix admits a typo).
 #: The OSINT preflight runs before any phase and has no source registry of its own; `osint.rdap` is a lane
 #: there. Its bound is still a bound: it appears in `quarry policy`, and `--unbound` lifts it.
-BOUND_LANES_OUTSIDE_REGISTRY = ("osint.rdap",)
+BOUND_LANES_OUTSIDE_REGISTRY = ("osint.asrank", "osint.rdap")
 
 #: WHICH DOOR each acquisition lane executes through. Declared, so the acquisition closure can be checked
 #: against real call sites rather than against the existence of a gate somewhere: a registered provider
@@ -209,6 +209,14 @@ BOUNDS: tuple[Bound, ...] = (
                "is a MEMBERSHIP cut (`all_names[:120]`, reported as a coverage gap) and the consumer does "
                "not yet interpret 0, so widening it belongs to the `--unbound` step"),
 
+    Bound(name="ASRANK_ORGS", reader="module", lane="osint.asrank", default=10, identity="none",
+          const="quarry_recon.osint:ASRANK_ORGS",
+          persistence="nothing — the OSINT preflight has no durable rotation to continue",
+          relaxable=True, unbounded_value=0, consumer_honours_unbounded=True,
+          note="free: CAIDA ASRank is public, keyless and unmetered. It bounds how many MATCHING "
+               "organisations one name search materialises; 0 pages through every match. The provider "
+               "reports how many exist, so a withheld remainder is stated as OUR operator limit"),
+
     Bound(name="RDAP_LOOKUPS", reader="module", lane="osint.rdap", default=20, identity="none",
           const="quarry_recon.osint:RDAP_LOOKUPS",
           persistence="nothing — the OSINT preflight has no durable rotation to continue",
@@ -303,6 +311,12 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.evidence:_SSTI_MAX_PARAMS": ("rate", "probes per endpoint is request pressure"),
     "quarry_recon.phases.crawl:MAX_JS": ("resource", "a 15 MB PER-ITEM guard on one downloaded file"),
     "quarry_recon.phases.crawl:MAX_MAP": ("resource", "a 20 MB PER-ITEM guard on one source map"),
+    "quarry_recon.osint:_ASN_MAX": ("not_a_bound", "the largest number a 32-bit AS number can BE — a "
+                                                  "validity range for a provider value, not a ceiling on "
+                                                  "how much work we do"),
+    "quarry_recon.osint:_ASRANK_ASN_PAGE": ("resource", "how many member ASNs ONE request asks for; the "
+                                                        "org's own `numberAsns` drives a follow-up query, "
+                                                        "so membership is never truncated by it"),
     "quarry_recon.notify:_MAX_BULLETS": ("not_a_bound", "how many lines one NOTIFICATION prints before "
                                                       "pointing at the manifest: presentation, not "
                                                       "coverage — nothing is dropped from the evidence"),

@@ -32,6 +32,17 @@ from .contract import (PROVIDER_PARSE, PROVIDER_TRANSPORT, ProviderBodyError, ca
                        provider_error_class, whoxy_envelope)
 from .runner import RunResult, Status, fresh_artifact_dir, have, run as exec_tool, skipped
 
+#: how many ORGANIZATIONS one ASRank name search materialises. A THROUGHPUT bound over the matches the
+#: provider reports, never a membership cut of what we asked for: 0 = every match (paginated), and the
+#: withheld remainder is reported. Registered in `policy.BOUNDS`, so `--unbound` lifts it.
+ASRANK_ORGS = 10
+#: CAIDA ASRank — free, keyless, public. GraphQL only: the RESTful endpoint ignores an `asn=` filter and
+#: returns the global list (MEASURED 2026-08-03).
+_ASRANK_URL = "https://api.asrank.caida.org/v2/graphql"
+#: how many member ASNs one org query REQUESTS. Not a coverage bound: `numberAsns` says how many exist, and
+#: an org holding more than this is re-queried for exactly its own count, so membership is never truncated.
+_ASRANK_ASN_PAGE = 200
+
 #: how many RESOLVED ADDRESSES the RDAP lane looks up in one session. A THROUGHPUT bound over the full
 #: eligible set (host-fair order), never a membership cut: 0 = every eligible address, and the withheld
 #: remainder is reported as an operator limit. Registered in `policy.BOUNDS`, so `--unbound` lifts it.
@@ -71,6 +82,23 @@ def _http(url: str, timeout: int = 25) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "quarry-osint"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
+
+
+def _http_post_json(url: str, payload: dict, timeout: int = 25) -> dict:
+    """POST JSON, return the parsed object. GraphQL errors are RAISED, never returned as an empty result:
+    a query the server rejected is a lane failure, and reading it as "no matches" would report a clean
+    zero over something nobody asked."""
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"User-Agent": "quarry-osint",
+                                          "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        doc = json.loads(r.read().decode("utf-8", "replace"))
+    if isinstance(doc, dict) and doc.get("errors"):
+        raise ValueError("; ".join(str(e.get("message", e)) for e in doc["errors"])[:300])
+    if not isinstance(doc, dict) or not isinstance(doc.get("data"), dict):
+        raise ValueError("response carried no data object")
+    return doc["data"]
 
 
 class OsintSession:
@@ -625,6 +653,278 @@ def _whoxy_record(s: OsintSession, out, pol, anchors, echo) -> None:
                        note=note, meta=meta))
 
 
+_ASRANK_ORG_Q = """
+{ organizations(name: %(name)s, first: %(first)d, offset: %(offset)d) {
+    totalCount
+    edges { node { orgId orgName rank country { iso }
+                   members { numberAsns asns(first: %(asns)d) { edges { node { asn asnName } } } } } } } }
+"""
+_ASRANK_MEMBERS_Q = """
+{ organization(orgId: %(org)s) {
+    orgName members { numberAsns asns(first: %(asns)d) { edges { node { asn asnName } } } } } }
+"""
+
+
+#: the widest ASN a 32-bit AS number can be. AS0 is reserved, so a valid ASN is 1..4294967295.
+_ASN_MAX = 2 ** 32 - 1
+
+
+def _exact_count(value) -> int | None:
+    """A provider count we can do arithmetic with, or None. `int(x)` accepted `True`, `3.9` and `"7"` —
+    and a count nobody validated is what turns a provider shortfall into a confident subtraction."""
+    return value if type(value) is int and value >= 0 else None
+
+
+def _asn_number(value) -> str | None:
+    """The CANONICAL ASN string, or None. `str(x).isdigit()` accepted `"٤٢"` (Arabic-Indic digits, which
+    `int()` then happily parses), `"0"` (reserved), `"007"` (non-canonical, so two spellings of one ASN
+    would become two candidates) and values far outside the 32-bit range."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v.isascii() or not v.isdigit() or v != str(int(v)):
+        return None
+    n = int(v)
+    return v if 0 < n <= _ASN_MAX else None
+
+
+def _obj(value) -> dict:
+    """A nested provider object, or an empty one. `x or {}` returns the LIST when the provider sent a
+    list, and the `.get()` after it raises — outside the query guard, so the lane never emitted its
+    terminal and a malformed row took the whole preflight's account of itself with it."""
+    return value if isinstance(value, dict) else {}
+
+
+def _text(value) -> str:
+    """A provider string, or empty. `.strip()` on a number raises for the same reason."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _readable(value, want) -> bool:
+    """Whether a provider field is USABLE — absent counts as readable, wrong-typed does not.
+
+    The distinction is the whole point: a field the provider did not send is an answer, while a field it
+    sent in a shape we cannot read is evidence we DISCARDED, and the second must never pass silently just
+    because the typed accessor kept it from raising."""
+    return value is None or isinstance(value, want)
+
+
+def _asrank_orgs(name: str, limit: int, timeout: int, save) -> tuple[list, int | None, int | None]:
+    """`(organizations, total_matches, provider_short)` for one org-name search — `total` and `short` are
+    None when the provider's own count could not be read.
+
+    Pages until it HAS what the bound allows — `min(limit, total)`, or everything when `limit <= 0`. The
+    first version stopped after one response in bounded mode, so a provider that returned three of ten
+    admitted results was reported as ten obtained and the rest withheld by OUR cap: our bound got the
+    blame for work the provider never sent. What the provider owed and did not send is returned
+    separately, as its own shortfall.
+
+    Every response is saved as its own immutable artifact and each node carries the path of the page it
+    came from, so a candidate always cites the file that actually contains it.
+    """
+    page = max(1, min(limit, 50)) if limit > 0 else 50
+    nodes: list = []
+    total, offset, guard = None, 0, 0
+    while True:
+        data = _http_post_json(_ASRANK_URL, {"query": _ASRANK_ORG_Q % {
+            "name": json.dumps(name), "first": page, "offset": offset,
+            "asns": _ASRANK_ASN_PAGE}}, timeout=timeout)
+        orgs = (data.get("organizations") or {})
+        ref = save(f"orgs-{offset:05d}", data)
+        if total is None:
+            total = _exact_count(orgs.get("totalCount"))
+        got = [dict(e["node"], _ref=ref) for e in (orgs.get("edges") or [])
+               if isinstance(e, dict) and isinstance(e.get("node"), dict)]
+        nodes += got
+        offset += len(got)
+        guard += 1
+        want = (total if total is not None else len(nodes)) if limit <= 0 else \
+            min(limit, total if total is not None else limit)
+        if not got or len(nodes) >= want or guard >= 40:
+            break
+    if total is None:
+        # an unreadable denominator is UNKNOWN, never `len(nodes)`. Substituting what we happened to
+        # receive turns malformed provider data into a certificate of complete coverage: the shortfall
+        # computes to zero precisely because nobody knows what the total was.
+        return (nodes if limit <= 0 else nodes[:limit]), None, None
+    allowed = total if limit <= 0 else min(limit, total)
+    return nodes[:allowed], total, max(0, allowed - len(nodes))
+
+
+def _asrank_asns(node: dict, timeout: int, save) -> tuple[list, str, str]:
+    """`(member ASNs, shortfall reason, artifact)` for one organisation.
+
+    `numberAsns` is the org's OWN count, so a page that returned fewer is a request-size shortfall we can
+    fix by asking for exactly that many — never a membership decision, and never silently accepted. The
+    follow-up response is saved as its OWN artifact and returned, because the ASNs only that query
+    produced cannot cite a page written before it ran.
+    """
+    members = _obj(node.get("members"))
+    edges = (_obj(members.get("asns")).get("edges") or [])
+    asns = [e["node"] for e in edges if isinstance(e, dict) and isinstance(e.get("node"), dict)]
+    ref = node.get("_ref", "")
+    declared = _exact_count(members.get("numberAsns"))
+    if declared is None:
+        return asns, f"{_text(node.get('orgName')) or '?'}: unreadable member count", ref
+    if declared > len(asns) and node.get("orgId"):
+        try:
+            data = _http_post_json(_ASRANK_URL, {"query": _ASRANK_MEMBERS_Q % {
+                "org": json.dumps(node["orgId"]), "asns": declared}}, timeout=timeout)
+            ref = save(f"members-{re.sub(r'[^A-Za-z0-9]', '_', str(node['orgId']))[:40]}", data)
+            more = _obj(_obj(_obj(data.get("organization")).get("members")).get("asns"))
+            asns = [e["node"] for e in (more.get("edges") or [])
+                    if isinstance(e, dict) and isinstance(e.get("node"), dict)]
+        except Exception as e:                                   # noqa: BLE001
+            return asns, f"{_text(node.get('orgName')) or '?'}: {len(asns)}/{declared} member ASNs ({e})", ref
+    if declared > len(asns):
+        return asns, f"{_text(node.get('orgName')) or '?'}: {len(asns)}/{declared} member ASNs", ref
+    return asns, "", ref
+
+
+def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
+    """ORG NAME -> CAIDA ASRank -> ASN + related-organisation CANDIDATES (review-only).
+
+    This is the ASN DISCOVERY the preflight claimed and never did: `_asn_expand` only expands ASNs the
+    operator already listed, so a target whose ASNs nobody knew stayed invisible. ASRank is free, keyless
+    and public, and its org search is FUZZY — which is exactly why every result is `verify-ownership` and
+    nothing here ever reaches an active lane. Discovering an ASN is a claim about naming, not ownership.
+
+    ORG_NAMES only: brands are marketing terms and would match half the internet.
+    """
+    from . import policy
+    if not profile.org_names:
+        s.record(skipped("asrank", "no ORG_NAMES anchor to search (add one to target.yaml)"))
+        return
+    cap = policy.limit("ASRANK_ORGS")
+    n_orgs = n_asns = withheld = provider_short = bad_asns = bad_orgs = bad_fields = 0
+    short: list = []
+    failed = unknown_total = 0
+    seq = {"n": 0}                 # RUN-WIDE, so no two responses in this lane can share a filename
+    for name in profile.org_names:
+        # the slug is for HUMANS; the digest is what makes the name unique. Sanitising and truncating maps
+        # `a/b`, `a?b` and any two long names with a common prefix onto one slug, and a per-name counter
+        # then had the second anchor overwrite artifacts the first anchor's candidates already cite.
+        slug = (re.sub(r"[^A-Za-z0-9._-]", "_", name)[:40] + "-"
+                + hashlib.sha256(name.encode("utf-8")).hexdigest()[:8])
+
+        def save(kind: str, doc: dict, _slug=slug) -> str:
+            """One IMMUTABLE artifact per response. A candidate must cite the file that actually contains
+            it — a single per-name artifact written before the follow-up query left every ASN that only
+            the follow-up returned pointing at a file it is not in, and those are exactly the biggest
+            organisations."""
+            seq["n"] += 1
+            raw = s.raw_path("asrank", f"{_slug}.{seq['n']:03d}-{kind}.json")
+            raw.write_text(json.dumps(doc, indent=2, ensure_ascii=False))
+            return str(raw)
+
+        try:
+            orgs, total, missing = _asrank_orgs(name, cap, timeout=min(timeout, 30), save=save)
+        except Exception as e:                                   # noqa: BLE001
+            failed += 1
+            echo(f"    asrank[{name}]: {e}")
+            s.note_failure("asrank", f"{name}: {e}")
+            continue
+        # OUR bound and THEIR shortfall are different facts. Blaming our cap for results the provider
+        # never sent is the same blame-shift the limit/gap taxonomy exists to prevent, pointed the other
+        # way: it tells an operator that raising the bound would recover work that is simply not there.
+        if total is None:
+            unknown_total += 1
+            s.note_failure("asrank", f"{name}: the provider's match count was unreadable — coverage of "
+                                     f"this anchor is UNKNOWN, not complete")
+        else:
+            withheld += max(0, total - (total if cap <= 0 else min(cap, total)))
+            if missing:
+                provider_short += missing
+                s.note_failure("asrank", f"{name}: provider returned {missing} fewer organisation(s) "
+                                         f"than the {min(cap, total) if cap > 0 else total} it admitted to")
+        for node in orgs:
+            try:
+                raw_name, raw_country = node.get("orgName"), node.get("country")
+                # the LEAF is what carries the evidence: checking that `country` is a dict says nothing
+                # about `country.iso`, and `{"iso": 7}` passed the container check while the typed read
+                # discarded the value. When the container itself is unreadable the leaf is UNREACHABLE
+                # rather than discarded, so it is reported as absent and counted once, not twice.
+                raw_iso = _obj(raw_country).get("iso") if isinstance(raw_country, dict) else None
+                for field, value, want in (("orgName", raw_name, str),
+                                           ("country", raw_country, dict),
+                                           ("country.iso", raw_iso, str)):
+                    if not _readable(value, want):
+                        # NOT a crash any more, and not silence either: the typed read saved the row, and
+                        # this says what the row cost. A lane that discards provider evidence may not
+                        # report SUCCESS over it.
+                        bad_fields += 1
+                        s.note_failure("asrank", f"{name}: unreadable {field} on organisation "
+                                                 f"{_text(raw_name) or node.get('orgId') or '?'} "
+                                                 f"({type(value).__name__})")
+                org_name = _text(raw_name)
+                iso = _text(raw_iso)
+                asns, shortfall, asn_ref = _asrank_asns(node, timeout=min(timeout, 30), save=save)
+            except Exception as e:                               # noqa: BLE001
+                # ONE unreadable row may not cost the lane its terminal: without this, a numeric orgName
+                # or a list-valued `country` raised past the query guard and the whole preflight lost its
+                # account of what it did.
+                bad_orgs += 1
+                s.note_failure("asrank", f"{name}: unreadable organisation row ({type(e).__name__})")
+                continue
+            if org_name:
+                n_orgs += 1
+                s.candidate(org_name, "org", "asrank", "verify-ownership",
+                            f"CAIDA ASRank organisation matching {name!r}"
+                            + (f" (rank {node['rank']}" if node.get("rank") else " (")
+                            + (f", {iso})" if iso else ")"),
+                            raw_ref=node.get("_ref"),
+                            manual_followup="confirm this org IS the target (ASRank name search is fuzzy)")
+            if shortfall:
+                short.append(shortfall)
+            for a in asns:
+                num = _asn_number(a.get("asn"))
+                if num is None:
+                    # never published — and never silent either: a discarded row is provider evidence we
+                    # could not use, so a response that was partly unreadable may not finish as SUCCESS.
+                    bad_asns += 1
+                    continue
+                n_asns += 1
+                s.candidate(f"AS{num}", "asn", "asrank", "verify-ownership",
+                            f"member ASN of {org_name or name} ({_text(a.get('asnName')) or 'unnamed'}) "
+                            f"per CAIDA ASRank",
+                            raw_ref=asn_ref,
+                            manual_followup="verify ownership on bgp.he.net / RDAP before adding — an "
+                                            "ASN in the profile authorises active range scanning")
+        echo(f"  asrank[{name}]: {len(orgs)}/{total if total is not None else '?'} org(s), "
+             f"{n_asns} member ASN(s)")
+
+    note = f"{n_orgs} org(s), {n_asns} ASN(s) from {len(profile.org_names)} anchor(s)"
+    meta = {"orgs": n_orgs, "asns": n_asns, "withheld_orgs": withheld, "measure": "organizations",
+            "bound": cap, "provider_short_orgs": provider_short,
+            "unknown_total_anchors": unknown_total, "unreadable_asn_rows": bad_asns,
+            "unreadable_org_rows": bad_orgs, "unreadable_fields": bad_fields}
+    if withheld:
+        meta["operator_limit"] = True
+        note += (f" — {withheld} matching org(s) withheld by the ASRANK_ORGS={cap} bound "
+                 f"(`quarry osint --unbound` searches every match)")
+    if provider_short:
+        note += f" — {provider_short} admitted org(s) the provider did not return"
+    if unknown_total:
+        note += f" — {unknown_total} anchor(s) with an UNREADABLE match count (coverage unknown)"
+    if bad_asns:
+        note += f" — {bad_asns} unreadable ASN row(s) discarded"
+    if bad_orgs:
+        note += f" — {bad_orgs} unreadable organisation row(s) discarded"
+    if bad_fields:
+        note += f" — {bad_fields} unreadable field(s) on otherwise usable organisation(s)"
+    if short:
+        meta["incomplete_members"] = short[:8]
+        note += f" — member ASNs incomplete for {len(short)} org(s)"
+    if failed:
+        meta["failed"] = True
+    s.record(RunResult("asrank", ["asrank", f"orgs={cap or 'unbounded'}"],
+                       Status.FAILED if failed and not n_orgs
+                       else Status.PARTIAL if (failed or short or provider_short or unknown_total
+                                               or bad_asns or bad_orgs or bad_fields)
+                       else Status.SUCCESS if n_asns or n_orgs else Status.EMPTY,
+                       0, 0.0, None, n_asns, note=note, meta=meta))
+
+
 def _asn_expand(s: OsintSession, profile, echo, timeout: int) -> None:
     """Profile ASN seeds → CIDR candidates (verify-ownership; high-risk = active scanning)."""
     if not profile.asn or not have("asnmap"):
@@ -825,7 +1125,8 @@ def run(profile, scope, project_dir: Path, echo=print, timeout: int = 1800) -> P
         emails |= _whois(sess, apex, echo, timeout)
         _dmarc(sess, apex, echo, timeout)
     _whoxy(sess, emails, profile.org_names, echo, timeout)
-    _asn_expand(sess, profile, echo, timeout)
+    _asrank(sess, profile, echo, timeout)      # ORG NAME -> ASN candidates (the discovery step)
+    _asn_expand(sess, profile, echo, timeout)  # ...and profile ASN seeds -> CIDR context
     _rdap(sess, profile, echo, timeout)
     _key_health(sess, echo)
     if have("porch-pirate"):

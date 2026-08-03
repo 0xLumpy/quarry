@@ -7,6 +7,7 @@ vocabulary in it. What is pinned here is that nothing is dropped without saying 
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -29,7 +30,8 @@ class _Sess:
         return p / name
 
     def candidate(self, value, ctype, source, hint, reason, raw_ref=None, manual_followup=None):
-        self.cands.append({"value": value, "type": ctype, "source": source, "reason": reason})
+        self.cands.append({"value": value, "type": ctype, "source": source, "reason": reason,
+                           "hint": hint, "followup": manual_followup, "raw_ref": raw_ref})
 
     def intel(self, kind, value, source, **provenance):
         self.intel_rows.append({"kind": kind, "value": value, "source": source, **provenance})
@@ -360,3 +362,401 @@ class TestThePreflightBoundIsReachable:
         osint._rdap(s, type("P", (), {"apex_domains": ["a.com"]})(), lambda _m: None, 30)
         note = [r for r in s.records if r.tool == "rdap"][0].note
         assert "quarry osint --unbound" in note
+
+
+class TestASRankDiscoversASNs:
+    """The preflight CLAIMED ASN discovery and only expanded ASNs the operator already had, so a target
+    whose ASNs nobody knew stayed invisible.
+
+    Shapes are MEASURED against the live API (2026-08-03): `organizations(name:, first:, offset:)` →
+    `totalCount` + `edges[].node{orgId, orgName, rank, country{iso}, members{numberAsns, asns{edges[]}}}`.
+    The RESTful endpoint ignores an `asn=` filter and returns the global list, which is why this is
+    GraphQL.
+    """
+
+    @staticmethod
+    def _org(name="Deutsche Telekom AG", *, org_id="4dab", rank=17, iso="DE", asns=(("3320", "DTAG"),),
+             declared=None):
+        return {"orgId": org_id, "orgName": name, "rank": rank, "country": {"iso": iso},
+                "members": {"numberAsns": declared if declared is not None else len(asns),
+                            "asns": {"edges": [{"node": {"asn": a, "asnName": n}} for a, n in asns]}}}
+
+    def _api(self, monkeypatch, pages):
+        """`pages` is a list of `data` objects returned in order. Once they run out the provider is
+        EXHAUSTED — an empty page, the way a real one behaves — rather than repeating its last answer,
+        which would hide a paging bug behind an infinite supply of results."""
+        calls: list = []
+
+        def fake(url, payload, timeout=25):
+            calls.append(payload["query"])
+            if len(calls) <= len(pages):
+                return pages[len(calls) - 1]
+            last = pages[-1].get("organizations") or {}
+            return {"organizations": {"totalCount": last.get("totalCount", 0), "edges": []}}
+        monkeypatch.setattr(osint, "_http_post_json", fake)
+        return calls
+
+    def _run(self, tmp_path, monkeypatch, pages, orgs=("Deutsche Telekom",)):
+        calls = self._api(monkeypatch, pages)
+        s = _Sess(tmp_path)
+        prof = type("P", (), {"org_names": list(orgs)})()
+        osint._asrank(s, prof, lambda _m: None, 30)
+        return s, calls
+
+    def test_a_member_ASN_becomes_a_review_candidate(self, tmp_path, monkeypatch):
+        s, _ = self._run(tmp_path, monkeypatch,
+                         [{"organizations": {"totalCount": 1, "edges": [{"node": self._org()}]}}])
+        [asn] = [c for c in s.cands if c["type"] == "asn"]
+        assert asn["value"] == "AS3320", "ASNs are written the way target.yaml wants them"
+        assert "DTAG" in asn["reason"] and "ASRank" in asn["reason"]
+        assert "bgp.he.net" in asn["followup"], "an ASN in the profile authorises active range scanning"
+        # the ARTIFACT, not just a path to one: a candidate whose evidence was never written cannot be
+        # reviewed, and a raw_ref pointing at nothing is worse than none at all
+        art = pathlib.Path(asn["raw_ref"])
+        assert art.is_file(), "the provider's response was not retained"
+        node = json.loads(art.read_text())["organizations"]["edges"][0]["node"]
+        assert node["orgName"] == "Deutsche Telekom AG" and node["members"]["asns"]["edges"]
+        [org] = [c for c in s.cands if c["type"] == "org"]
+        assert "ASRank" in org["reason"] and "rank 17" in org["reason"] and "DE" in org["reason"]
+
+    def test_nothing_it_finds_is_ever_IN_SCOPE(self, tmp_path, monkeypatch):
+        """The org search is FUZZY. An ASN in the profile authorises active range scanning, so a name
+        match may never carry more than `verify-ownership`."""
+        s, _ = self._run(tmp_path, monkeypatch,
+                         [{"organizations": {"totalCount": 1, "edges": [{"node": self._org()}]}}])
+        assert s.cands and {c["hint"] for c in s.cands} == {"verify-ownership"}
+        assert all("fuzzy" in c["followup"] or "bgp.he.net" in c["followup"] for c in s.cands)
+
+    def test_OUR_bound_and_THEIR_shortfall_are_different_facts(self, tmp_path, monkeypatch):
+        """42 matches, our cap admits 10, the provider sends 1. Blaming our cap for the 9 it never sent
+        tells an operator that raising the bound would recover work that is simply not there."""
+        s, calls = self._run(tmp_path, monkeypatch,
+                             [{"organizations": {"totalCount": 42, "edges": [{"node": self._org()}]}}])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert rec.meta["withheld_orgs"] == 32, "ours is what the cap refused of the 42"
+        assert rec.meta["provider_short_orgs"] == 9, "theirs is what they admitted and did not send"
+        assert rec.meta["operator_limit"] is True and rec.status is osint.Status.PARTIAL
+        assert "quarry osint --unbound" in rec.note and "did not return" in rec.note
+        assert any("fewer organisation" in f["why"] for f in s.failures), "a shortfall is a GAP"
+        assert len(calls) >= 2, "bounded mode stopped after one page without reaching its allowance"
+
+    def test_a_bound_that_is_FULLY_served_claims_no_shortfall(self, tmp_path, monkeypatch):
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {
+            "totalCount": 12, "edges": [{"node": self._org(f"O{i}", org_id=f"o{i}")} for i in range(10)]}}])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert (rec.meta["withheld_orgs"], rec.meta["provider_short_orgs"]) == (2, 0)
+        assert rec.status is osint.Status.SUCCESS and not s.failures
+
+    def test_UNBOUND_pages_through_every_match(self, tmp_path, monkeypatch):
+        two = {"organizations": {"totalCount": 2, "edges": [{"node": self._org("A", org_id="a")}]}}
+        three = {"organizations": {"totalCount": 2, "edges": [{"node": self._org("B", org_id="b")}]}}
+        calls = self._api(monkeypatch, [two, three])
+        s = _Sess(tmp_path)
+        with settings.overrides(policy.unbound_overrides()):
+            osint._asrank(s, type("P", (), {"org_names": ["x"]})(), lambda _m: None, 30)
+        assert len(calls) == 2, "a second page was never requested"
+        assert {c["value"] for c in s.cands if c["type"] == "org"} == {"A", "B"}
+        assert [r for r in s.records if r.tool == "asrank"][0].meta["withheld_orgs"] == 0
+
+    def test_an_orgs_FULL_membership_is_re_queried_not_truncated(self, tmp_path, monkeypatch):
+        """`numberAsns` is the org's own count: a short page is a request-size shortfall we can fix, never
+        a membership decision."""
+        first = {"organizations": {"totalCount": 1, "edges": [
+            {"node": self._org(asns=(("1", "a"),), declared=3)}]}}
+        follow = {"organization": {"orgName": "x", "members": {"numberAsns": 3, "asns": {"edges": [
+            {"node": {"asn": "1", "asnName": "a"}}, {"node": {"asn": "2", "asnName": "b"}},
+            {"node": {"asn": "3", "asnName": "c"}}]}}}}
+        s, calls = self._run(tmp_path, monkeypatch, [first, follow])
+        assert len(calls) == 2 and "organization(orgId" in calls[1]
+        assert {c["value"] for c in s.cands if c["type"] == "asn"} == {"AS1", "AS2", "AS3"}
+
+    def test_an_INCOMPLETE_membership_is_stated_not_swallowed(self, tmp_path, monkeypatch):
+        first = {"organizations": {"totalCount": 1, "edges": [
+            {"node": self._org(asns=(("1", "a"),), declared=9)}]}}
+        follow = {"organization": {"members": {"numberAsns": 9, "asns": {"edges": [
+            {"node": {"asn": "1", "asnName": "a"}}]}}}}
+        s, _ = self._run(tmp_path, monkeypatch, [first, follow])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert rec.meta["incomplete_members"] and rec.status is osint.Status.PARTIAL
+
+    def test_a_GRAPHQL_error_is_a_failure_not_an_empty_result(self, tmp_path, monkeypatch):
+        def boom(url, payload, timeout=25):
+            raise ValueError("Cannot query field \"asnCount\"")
+        monkeypatch.setattr(osint, "_http_post_json", boom)
+        s = _Sess(tmp_path)
+        osint._asrank(s, type("P", (), {"org_names": ["x"]})(), lambda _m: None, 30)
+        assert s.failures and "asnCount" in s.failures[0]["why"]
+        assert [r for r in s.records if r.tool == "asrank"][0].status is osint.Status.FAILED
+
+    def test_the_POST_helper_RAISES_on_a_graphql_error(self, monkeypatch):
+        """A query the server rejected is a lane failure; reading it as "no matches" reports a clean zero
+        over something nobody asked."""
+        import urllib.request
+
+        class _R:
+            def read(self): return json.dumps({"errors": [{"message": "boom"}], "data": None}).encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _R())
+        with pytest.raises(ValueError, match="boom"):
+            osint._http_post_json("https://x", {"query": "{}"})
+
+    def test_NO_org_anchor_is_a_recorded_skip_not_silence(self, tmp_path, monkeypatch):
+        s = _Sess(tmp_path)
+        osint._asrank(s, type("P", (), {"org_names": []})(), lambda _m: None, 30)
+        assert [r for r in s.records][0].tool == "asrank" and not s.cands
+
+    def test_a_non_numeric_ASN_is_not_invented(self, tmp_path, monkeypatch):
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {"totalCount": 1, "edges": [
+            {"node": self._org(asns=(("not-a-number", "x"), ("64512", "ok")))}]}}])
+        assert {c["value"] for c in s.cands if c["type"] == "asn"} == {"AS64512"}
+
+    def test_the_bound_is_REGISTERED(self):
+        b = policy.by_name("ASRANK_ORGS")
+        assert b and b.relaxable and b.unbounded_value == 0 and b.consumer_honours_unbounded
+        assert b.lane in policy.BOUND_LANES_OUTSIDE_REGISTRY
+
+    def test_the_FOLLOW_UP_evidence_is_retained_with_its_asns(self, tmp_path, monkeypatch):
+        """The ASNs only the full-membership query returned cannot cite a page written before it ran —
+        and those are exactly the biggest organisations."""
+        first = {"organizations": {"totalCount": 1, "edges": [
+            {"node": self._org(asns=(("1", "a"),), declared=3)}]}}
+        follow = {"organization": {"orgName": "x", "members": {"numberAsns": 3, "asns": {"edges": [
+            {"node": {"asn": "1", "asnName": "a"}}, {"node": {"asn": "2", "asnName": "b"}},
+            {"node": {"asn": "3", "asnName": "c"}}]}}}}
+        s, _ = self._run(tmp_path, monkeypatch, [first, follow])
+        for c in [c for c in s.cands if c["type"] == "asn"]:
+            art = json.loads(pathlib.Path(c["raw_ref"]).read_text())
+            got = {e["node"]["asn"] for e in art["organization"]["members"]["asns"]["edges"]}
+            assert c["value"][2:] in got, f"{c['value']} cites a file it is not in"
+
+    def test_each_response_is_its_OWN_immutable_artifact(self, tmp_path, monkeypatch):
+        first = {"organizations": {"totalCount": 1, "edges": [
+            {"node": self._org(asns=(("1", "a"),), declared=2)}]}}
+        follow = {"organization": {"members": {"numberAsns": 2, "asns": {"edges": [
+            {"node": {"asn": "1", "asnName": "a"}}, {"node": {"asn": "2", "asnName": "b"}}]}}}}
+        s, _ = self._run(tmp_path, monkeypatch, [first, follow])
+        files = sorted(pathlib.Path(tmp_path / "asrank").glob("*.json"))
+        assert len(files) == 2, [f.name for f in files]
+        assert any("orgs-" in f.name for f in files) and any("members-" in f.name for f in files)
+        org_ref = [c for c in s.cands if c["type"] == "org"][0]["raw_ref"]
+        assert "orgs-" in org_ref, "the org still cites the page it was listed on"
+
+    @pytest.mark.parametrize("bad", ["0", "007", "٤٢", "4294967296", 3320, True, None, "", "AS15169"])
+    def test_a_malformed_ASN_is_never_published(self, tmp_path, monkeypatch, bad):
+        """`str(x).isdigit()` accepted Arabic-Indic digits (which `int()` then parses), AS0, a
+        non-canonical `007` — two spellings of one ASN become two candidates — and 33-bit values."""
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {"totalCount": 1, "edges": [
+            {"node": self._org(asns=((bad, "x"), ("64512", "ok")))}]}}])
+        assert {c["value"] for c in s.cands if c["type"] == "asn"} == {"AS64512"}
+
+    def test_surrounding_WHITESPACE_is_normalised_not_rejected(self, tmp_path, monkeypatch):
+        """A padded string is not an ambiguous value: `" 15169"` names exactly one ASN. Only spellings
+        that could mean two different things (or none) are refused."""
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {"totalCount": 1, "edges": [
+            {"node": self._org(asns=((" 15169 ", "GOOGLE"),))}]}}])
+        assert {c["value"] for c in s.cands if c["type"] == "asn"} == {"AS15169"}
+
+    @pytest.mark.parametrize("count", [True, 3.9, "7", -1, None])
+    def test_an_unreadable_COUNT_is_UNKNOWN_not_complete(self, tmp_path, monkeypatch, count):
+        """`int(totalCount)` turned `True` into 1 and raised on the rest — and substituting `len(nodes)`
+        for the rejected value was worse: the shortfall then computes to zero precisely because nobody
+        knows what the total was, so malformed provider data certified complete coverage."""
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {
+            "totalCount": count, "edges": [{"node": self._org()}]}}])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert rec.meta["unknown_total_anchors"] == 1
+        assert rec.status is osint.Status.PARTIAL, "an unknown denominator is not a clean success"
+        assert "UNREADABLE match count" in rec.note
+        assert any("unreadable" in f["why"] for f in s.failures), "unknown coverage is a GAP"
+        assert rec.meta["withheld_orgs"] == 0 and rec.meta["provider_short_orgs"] == 0, \
+            "and nothing is subtracted from a number we do not have"
+
+    def test_an_unreadable_count_still_KEEPS_what_it_received(self, tmp_path, monkeypatch):
+        """Unknown coverage is not a reason to throw away the organisations the provider did send."""
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {
+            "totalCount": None, "edges": [{"node": self._org()}]}}])
+        assert {c["value"] for c in s.cands if c["type"] == "asn"} == {"AS3320"}
+
+    def test_an_UNREADABLE_asn_row_is_counted_not_swallowed(self, tmp_path, monkeypatch):
+        """One valid and one malformed ASN in the same response must not finish as SUCCESS claiming only
+        the valid count: provider evidence was discarded and nothing said so."""
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {"totalCount": 1, "edges": [
+            {"node": self._org(asns=(("007", "bad"), ("64512", "ok")))}]}}])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert rec.meta["unreadable_asn_rows"] == 1 and rec.status is osint.Status.PARTIAL
+        assert "unreadable ASN row(s) discarded" in rec.note
+        assert {c["value"] for c in s.cands if c["type"] == "asn"} == {"AS64512"}
+
+    @pytest.mark.parametrize("field", [
+        {"orgName": 7}, {"orgName": None}, {"country": []}, {"country": "DE"}])
+    def test_a_malformed_FIELD_costs_only_that_field(self, tmp_path, monkeypatch, field):
+        """A numeric `orgName` or a list-valued `country` raised OUTSIDE the query guard, so the lane
+        never emitted its terminal. Typed reads make it milder than containment would: the row is still
+        READABLE — its member ASNs are exactly as good — and only the unusable field goes missing."""
+        node = {**self._org(asns=(("64512", "ok"),)), **field}
+        s, _ = self._run(tmp_path, monkeypatch,
+                         [{"organizations": {"totalCount": 1, "edges": [{"node": node}]}}])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert rec.meta["unreadable_org_rows"] == 0, "a bad field is not an unreadable ROW"
+        assert {c["value"] for c in s.cands if c["type"] == "asn"} == {"AS64512"}, \
+            "the org's ASNs are unaffected by its own unreadable name"
+        # ...and the loss is STATED: a field we discarded may not pass as a clean success
+        want = {"orgName": str, "country": dict}
+        wrong_typed = any(v is not None and not isinstance(v, want[k]) for k, v in field.items())
+        if wrong_typed:
+            assert rec.meta["unreadable_fields"] == 1, field
+            assert rec.status is osint.Status.PARTIAL
+            assert "unreadable field(s)" in rec.note
+            assert any("unreadable" in f["why"] for f in s.failures)
+        else:
+            assert rec.meta["unreadable_fields"] == 0, "an ABSENT field is an answer, not a loss"
+
+    @pytest.mark.parametrize("country,expected", [
+        ({"iso": 7}, 1),                 # container fine, the EVIDENCE-BEARING leaf is not
+        ({"iso": None}, 0),              # absent leaf is an answer
+        ({}, 0),                         # ...as is an absent key
+        ([], 1),                         # container unreadable: counted ONCE, leaf is unreachable
+        ({"iso": "DE"}, 0)])
+    def test_the_nested_ISO_is_accounted_like_every_other_field(self, tmp_path, monkeypatch,
+                                                                country, expected):
+        """Checking that `country` is a dict says nothing about the field inside it that carries the
+        evidence."""
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {"totalCount": 1, "edges": [
+            {"node": {**self._org(), "country": country}}]}}])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert rec.meta["unreadable_fields"] == expected, (country, rec.note)
+        assert rec.status is (osint.Status.PARTIAL if expected else osint.Status.SUCCESS)
+        assert {c["value"] for c in s.cands if c["type"] == "asn"} == {"AS3320"}
+
+    def test_an_unreadable_asnName_is_not_RENDERED_into_the_reason(self, tmp_path, monkeypatch):
+        """`x or 'unnamed'` let a non-string through into the f-string, so a reason could quote a value
+        nobody could read as if it were a name."""
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {"totalCount": 1, "edges": [
+            {"node": self._org(asns=(("64512", {"nope": 1}),))}]}}])
+        [asn] = [c for c in s.cands if c["type"] == "asn"]
+        assert "(unnamed)" in asn["reason"] and "nope" not in asn["reason"]
+
+    def test_an_absent_field_is_not_a_LOSS(self, tmp_path, monkeypatch):
+        """A field the provider did not send is an answer; only a shape we could not read is discarded
+        evidence. Counting both would teach an operator to ignore the counter."""
+        node = {k: v for k, v in self._org().items() if k != "country"}
+        s, _ = self._run(tmp_path, monkeypatch,
+                         [{"organizations": {"totalCount": 1, "edges": [{"node": node}]}}])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert rec.meta["unreadable_fields"] == 0 and rec.status is osint.Status.SUCCESS
+
+    @pytest.mark.parametrize("node", [
+        {"orgName": "x", "members": []}, {"orgName": "x", "members": {"asns": "nope"}},
+        {"orgName": "x", "members": {"numberAsns": 0, "asns": []}},
+        {"orgName": None, "country": None, "members": None}])
+    def test_a_malformed_NODE_never_costs_the_lane_its_terminal(self, tmp_path, monkeypatch, node):
+        """A members block of the wrong SHAPE is an org with no readable ASNs — not an exception, and not
+        a reason to lose the row beside it or the lane's own account of itself."""
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {"totalCount": 2, "edges": [
+            {"node": node}, {"node": self._org()}]}}])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert rec.meta["unreadable_org_rows"] == 0, "a shape we can read as empty is not an ERROR row"
+        assert {c["value"] for c in s.cands if c["type"] == "asn"} == {"AS3320"}, \
+            "the readable row beside it must still be published"
+
+    def test_an_unreadable_org_row_is_COUNTED_and_partial(self, tmp_path, monkeypatch):
+        """The typed accessors mean JSON data no longer raises here, so this drives the BACKSTOP itself:
+        whatever goes wrong on one row, the lane keeps the others and still reports what it did."""
+        real = osint._asrank_asns
+
+        def hostile(node, timeout, save):
+            if node.get("orgId") == "boom":
+                raise TypeError("hostile row")
+            return real(node, timeout, save)
+
+        monkeypatch.setattr(osint, "_asrank_asns", hostile)
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {"totalCount": 2, "edges": [
+            {"node": self._org("bad", org_id="boom")}, {"node": self._org()}]}}])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert rec.meta["unreadable_org_rows"] == 1 and rec.status is osint.Status.PARTIAL
+        assert "unreadable organisation row(s) discarded" in rec.note
+        assert any("unreadable organisation row" in f["why"] for f in s.failures)
+        assert {c["value"] for c in s.cands if c["type"] == "asn"} == {"AS3320"}, \
+            "one bad row may not cost the readable ones"
+
+    def test_two_anchors_cannot_OVERWRITE_each_others_artifacts(self, tmp_path, monkeypatch):
+        """`a/b` and `a?b` sanitise to the same slug, and a per-anchor counter restarted at 1 — so the
+        second anchor's first response landed on the file the first anchor's candidates already cite."""
+        calls: list = []
+
+        def fake(url, payload, timeout=25):
+            calls.append(payload["query"])
+            who = "first" if len(calls) == 1 else "second"
+            return {"organizations": {"totalCount": 1, "edges": [
+                {"node": self._org(f"org-{who}", org_id=who)}]}}
+        monkeypatch.setattr(osint, "_http_post_json", fake)
+        s = _Sess(tmp_path)
+        osint._asrank(s, type("P", (), {"org_names": ["a/b", "a?b"]})(), lambda _m: None, 30)
+        refs = {c["raw_ref"] for c in s.cands}
+        assert len(refs) == 2, "both anchors wrote to the same artifact"
+        for c in [c for c in s.cands if c["type"] == "org"]:
+            art = json.loads(pathlib.Path(c["raw_ref"]).read_text())
+            assert art["organizations"]["edges"][0]["node"]["orgName"] == c["value"]
+
+    def test_the_SAME_anchor_twice_does_not_overwrite_itself(self, tmp_path, monkeypatch):
+        """An operator can list one org twice. Same slug, same digest — only a RUN-WIDE sequence keeps the
+        second pass from landing on the first pass's files."""
+        calls: list = []
+
+        def fake(url, payload, timeout=25):
+            calls.append(1)
+            return {"organizations": {"totalCount": 1, "edges": [
+                {"node": self._org(f"pass{len(calls)}", org_id=f"p{len(calls)}")}]}}
+        monkeypatch.setattr(osint, "_http_post_json", fake)
+        s = _Sess(tmp_path)
+        osint._asrank(s, type("P", (), {"org_names": ["Acme", "Acme"]})(), lambda _m: None, 30)
+        assert len({c["raw_ref"] for c in s.cands}) == 2
+        for c in [c for c in s.cands if c["type"] == "org"]:
+            art = json.loads(pathlib.Path(c["raw_ref"]).read_text())
+            assert art["organizations"]["edges"][0]["node"]["orgName"] == c["value"]
+
+    def test_the_artifact_name_IDENTIFIES_its_anchor(self, tmp_path, monkeypatch):
+        """Two anchors that sanitise to one slug must not be distinguishable only by a counter — the name
+        has to say WHICH anchor produced it, or an artifact directory cannot be read by a human."""
+        monkeypatch.setattr(osint, "_http_post_json", lambda url, payload, timeout=25: {
+            "organizations": {"totalCount": 1, "edges": [{"node": self._org()}]}})
+        s = _Sess(tmp_path)
+        osint._asrank(s, type("P", (), {"org_names": ["a/b", "a?b"]})(), lambda _m: None, 30)
+        anchors = {pathlib.Path(c["raw_ref"]).name.split(".")[0] for c in s.cands}
+        assert len(anchors) == 2, f"both anchors share the name prefix {anchors}"
+
+    def test_a_long_anchor_name_stays_DISTINCT(self, tmp_path, monkeypatch):
+        long_a, long_b = "x" * 80 + "alpha", "x" * 80 + "beta"
+        calls: list = []
+
+        def fake(url, payload, timeout=25):
+            calls.append(1)
+            return {"organizations": {"totalCount": 1, "edges": [
+                {"node": self._org(f"o{len(calls)}", org_id=f"o{len(calls)}")}]}}
+        monkeypatch.setattr(osint, "_http_post_json", fake)
+        s = _Sess(tmp_path)
+        osint._asrank(s, type("P", (), {"org_names": [long_a, long_b]})(), lambda _m: None, 30)
+        assert len({c["raw_ref"] for c in s.cands}) == 2
+
+    def test_an_unreadable_MEMBER_count_is_stated(self, tmp_path, monkeypatch):
+        s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {"totalCount": 1, "edges": [
+            {"node": self._org(asns=(("1", "a"),), declared="many")}]}}])
+        [rec] = [r for r in s.records if r.tool == "asrank"]
+        assert any("unreadable member count" in x for x in rec.meta["incomplete_members"])
+        assert rec.status is osint.Status.PARTIAL
+
+    def test_paging_cannot_SPIN_forever(self, tmp_path, monkeypatch):
+        """A provider that keeps answering with a page but never reaches its own total must not hold the
+        preflight open indefinitely."""
+        calls: list = []
+
+        def fake(url, payload, timeout=25):
+            calls.append(1)
+            return {"organizations": {"totalCount": 10 ** 6,
+                                      "edges": [{"node": self._org(org_id=f"o{len(calls)}")}]}}
+        monkeypatch.setattr(osint, "_http_post_json", fake)
+        s = _Sess(tmp_path)
+        with settings.overrides(policy.unbound_overrides()):
+            osint._asrank(s, type("P", (), {"org_names": ["x"]})(), lambda _m: None, 30)
+        assert len(calls) <= 40

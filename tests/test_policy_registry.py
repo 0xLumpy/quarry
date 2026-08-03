@@ -244,7 +244,7 @@ class TestTheRegistryTellsTheTruth:
     def test_the_out_of_registry_bound_lanes_are_EXACT(self):
         """An exception list is a hole in a completeness test, so it is enumerated and justified rather
         than matched by prefix — `osint.*` would admit any typo as a new exemption."""
-        assert policy.BOUND_LANES_OUTSIDE_REGISTRY == ("osint.rdap",)
+        assert policy.BOUND_LANES_OUTSIDE_REGISTRY == ("osint.asrank", "osint.rdap")
         from quarry_recon import sources
         registered = set(sources.all_sources())
         for lane in policy.BOUND_LANES_OUTSIDE_REGISTRY:
