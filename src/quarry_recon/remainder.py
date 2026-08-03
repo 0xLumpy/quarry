@@ -38,6 +38,23 @@ LANE_MODEL: dict[str, str] = {
     # the permutation loop: entities are RUN-scoped, so a later run replays rounds 1..N from an empty
     # frontier — its remainder is `--unbound`'s business, never `--settle`'s
     "vertical.alterx_permute": "rerun_same_work",
+    # the lazy-chunk traversal's DEPTH, for exactly the same reason: a later run rediscovers the root
+    # bundle and repeats rounds 1..N, so repetition cannot reach a chunk deeper than the bound. Raising
+    # the bound (or `--unbound`) is what reaches it — never another child. Its OTHER unit behaves
+    # differently; see `UNIT_MODEL`.
+    "crawl.jxscout_chunks": "rerun_same_work",
+}
+
+#: the model is really a property of the UNIT, not of the lane — one lane can owe two kinds of work whose
+#: repeat behaviour differs. `LANE_MODEL` remains the lane's default; this overrides it per unit, and a
+#: unit listed here must belong to a lane that is declared above.
+UNIT_MODEL: dict[tuple, str] = {
+    # a bundle the analyzer could not read is not the same claim as a traversal cut short by its bound.
+    # A later child re-fetches that bundle and attempts it again — a transient timeout or an unreadable
+    # artifact may simply succeed — so this unit's retriable count is real, and the campaign's
+    # no-progress limit is what stops an endless retry. (Deterministic failures do not become retriable:
+    # they are reported as terminal counts on the same record.)
+    ("crawl.jxscout_chunks", "crawl.jxscout_chunks:bundles"): "project_progress",
 }
 
 #: causes that no repetition resolves. `refused` is deliberately NOT here: an admission refusal cools down
@@ -64,9 +81,10 @@ class Remainder:
                 raise ValueError(f"a remainder needs an exact non-empty {name}")
         if self.model not in MODELS:
             raise ValueError(f"{self.lane}: unknown remainder model {self.model!r}")
-        if LANE_MODEL.get(self.lane) != self.model:
+        declared = UNIT_MODEL.get((self.lane, self.unit), LANE_MODEL.get(self.lane))
+        if declared != self.model:
             raise ValueError(f"{self.lane}: model {self.model!r} contradicts the declared "
-                             f"{LANE_MODEL.get(self.lane)!r}")
+                             f"{declared!r} for unit {self.unit!r}")
         for name, value in (("now", self.now), ("cooldown", self.cooldown)):
             if type(value) is not int or value < 0:
                 raise ValueError(f"{self.lane}: {name} must be an exact non-negative int")

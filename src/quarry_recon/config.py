@@ -35,6 +35,10 @@ class ProfileError(Exception):
 # Content-discovery recursion is capped — content discovery is deliberately conservative. Raise
 # this only for an engagement that truly needs it. Depth 4-5 warns at run time; > MAX fails loud.
 MAX_CONTENT_RECURSION = 5
+#: ceiling for MODES.JS_CHUNK_BRUTE. Guessing chunk ids MANUFACTURES requests for paths no bundle ever
+#: named (measured: 98% of a 3000-guess run is enumeration), so it is an engagement decision with a cage
+#: around it — never a machine-wide setting and never something a flag can lift.
+MAX_JS_CHUNK_BRUTE = 3000
 
 # ── profile-input validation (T1.7 / C04) — conservative hardening of MALFORMED/DANGEROUS input only;
 # it never narrows WHAT can be targeted, only rejects garbage that would otherwise misfire silently. ──
@@ -253,6 +257,20 @@ class TargetProfile:
             return 0
 
     @property
+    def js_chunk_brute(self) -> int:
+        """How many chunk ids the JS-chunk analyzer may GUESS (0 = never, the default).
+
+        Derived chunk names — the ones a bundle's own map declares — are free processing of evidence we
+        already hold and always run. Guessed integers are new requests to the target, so they need the
+        operator's explicit consent per engagement."""
+        v = self.modes.get("JS_CHUNK_BRUTE", 0)
+        if v is True:
+            return 1
+        # EXACT int only. `int("50")`/`int(1.9)` would let a value that never passed validation authorise
+        # manufactured requests — and this is the one knob where that matters most.
+        return min(MAX_JS_CHUNK_BRUTE, max(0, v)) if type(v) is int else 0
+
+    @property
     def deep_evidence(self) -> bool:
         """Opt-in DOWNLOAD of heavy artifacts (actuator heapdump/threaddump/DB dump). OFF by default:
         a GET to a heapdump forces server-side generation, so pulling it is DELIBERATE human intent.
@@ -340,6 +358,15 @@ class TargetProfile:
         if not 0 <= cr_i <= MAX_CONTENT_RECURSION:     # caged: a typo like 20 must fail, not roar
             raise ProfileError(
                 f"MODES.CONTENT_RECURSION {cr_i} out of range (0-{MAX_CONTENT_RECURSION}; content discovery is capped)")
+        jcb = (raw.get("MODES") or {}).get("JS_CHUNK_BRUTE", 0)
+        jcb = 1 if jcb is True else (0 if jcb is False else jcb)
+        if type(jcb) is not int:                       # a float or a quoted string is a TYPO, not a policy
+            raise ProfileError(f"invalid MODES.JS_CHUNK_BRUTE {jcb!r} — an exact int 0-{MAX_JS_CHUNK_BRUTE} "
+                               f"or true (every unit of it is a request for a path no bundle named)")
+        jcb_i = jcb
+        if not 0 <= jcb_i <= MAX_JS_CHUNK_BRUTE:
+            raise ProfileError(f"MODES.JS_CHUNK_BRUTE {jcb_i} out of range (0-{MAX_JS_CHUNK_BRUTE}; every "
+                               f"guess is a request for a path the bundle never named)")
         # ports: strict int + valid range (1..65535) — a typo'd 99999 / 0 / -1 must fail loud, not be
         # silently handed to a scanner as a nonsense target.
         ports = []

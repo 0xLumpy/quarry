@@ -12,12 +12,14 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
 
-from .. import budget, events, fetch, normalize, policy, registry, secrets, settings
+from .. import budget, events, fetch, normalize, policy, registry, remainder, secrets, settings
 from ..contract import registered, run_contract
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
@@ -364,6 +366,389 @@ def _stage_dir(active):
         except OSError:
             return None                       # permission / disk / anything else: no stage, no publication
     return None
+
+
+#: how many ROUNDS of chunk discovery one run performs. A chunk can name another chunk, so this bounds
+#: the DEPTH of that traversal — throughput over work we already hold, which is what `--unbound` lifts
+#: (0 = until no new chunk appears). It never decides WHICH chunks are eligible.
+JXSCOUT_ROUNDS = 3
+#: integers the analyzer may GUESS when a bundle's loader concatenates an identifier it cannot resolve.
+#: 0 = never guess, and that is the default forever: every guess is a NEW REQUEST to the target for a path
+#: the bundle never named (MEASURED on upstream's own corpus: 543 derived candidates vs 24 498 at 3000 —
+#: 98% enumeration). So this is an ENGAGEMENT decision in `target.yaml`, never a flag: `--unbound` uses the
+#: work a run already has and may not manufacture contact. Registered as EXCLUDED for exactly that reason.
+JXSCOUT_BRUTE_LIMIT = 0
+#: the engine, installed beside its whole pinned tree (GPL-3.0, invoked as a separate program).
+JXSCOUT_SHIM = "jxscout-chunks"
+#: the file the shim execs. Bound explicitly, because the shim is a two-line wrapper and the sandbox
+#: mounts an ALLOW-LIST rather than the host root.
+JXSCOUT_ENGINE = Path.home() / ".local" / "share" / "quarry" / "jxscout-chunk-discoverer.cjs"
+#: `__webpack_require__.p = "…"` — the loader's public path. The analyzer evaluates only the chunk-name
+#: function, so a candidate comes back WITHOUT this prefix; reading it here is what turns
+#: `static/js/143.hash.chunk.js` into the URL that actually serves.
+_WEBPACK_PUBLIC_PATH = re.compile(r"""\.p\s*=\s*["']([^"']{0,200})["']""")
+
+
+#: the analyzer's ceilings, measured by the contract probe (`scripts/probe-jxscout-chunks.py`):
+#: the largest legitimate bundle in upstream's own corpus needs ~931 MB, so the heap sits above that and
+#: the address space above the heap — a cap under the legitimate corpus reports gaps on ordinary files.
+_JXSCOUT_HEAP_MB = 2048
+_JXSCOUT_ADDRESS_SPACE_MB = 4096
+#: what the analyzer may WRITE. A memory cap does not bound what a program PRINTS, and the runner reads
+#: stdout into THIS process — so the output is bounded at the source, in the child, by a file limit.
+_JXSCOUT_OUTPUT_MB = 64
+#: how much of the analyzer's stderr we READ back for a diagnostic. The file is bounded; our memory is
+#: only bounded by reading a tail rather than the whole thing.
+_JXSCOUT_STDERR_TAIL = 4096
+
+
+#: everything the analyzer needs to EXECUTE, and nothing else. `--ro-bind / /` stopped writes and left
+#: every readable file on the host available to code we are deliberately evaluating: Quarry's own
+#: `secrets.yaml`, SSH material, prior engagements' evidence, the source tree. Read-only is not
+#: unavailable, and the sandbox has to hold even if the interpreter itself is escaped.
+_JXSCOUT_RUNTIME_PATHS = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ld.so.cache",
+                          "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/alternatives")
+
+
+def _jxscout_sandbox(cmd: list, out_file, err_file) -> list:
+    """Wrap the analyzer in every containment the probe proved necessary, or return nothing.
+
+    It does not merely parse: it EVALUATES the bundle's chunk-name function through an interpreter
+    (MEASURED: a plain counting loop inside that function runs until something stops it — 120 s+ with no
+    memory growth, so a wall clock is the only thing that ends it). Isolation alone is not containment:
+
+        filesystem       an ALLOW-LIST — the runtime, the pinned engine, the one input bundle, and THIS
+                         invocation's private scratch. HOME, /etc secrets, /root, /var, the project tree
+                         and every other bundle's evidence are simply not in the namespace. The writable
+                         path is per-invocation on purpose: a shared output directory would let one
+                         hostile bundle rewrite, truncate or delete another's artifacts
+        environment      `--clearenv`: Quarry exports provider keys into its own env (PDCP_API_KEY), and
+                         an inherited env is a credential handed to target code
+        network          `--unshare-all`, no network namespace
+        address space    `ulimit -v`, above the legitimate corpus
+        JS heap          NODE_OPTIONS, so V8 fails gracefully before the hard limit
+        OUTPUT           `ulimit -f` on FILES the child writes — the runner captures both streams into
+                         Quarry's own memory, where no child limit applies
+        wall clock       the runner's timeout
+
+    Without bwrap the lane does not run at all; refusing is the safe direction."""
+    if not shutil.which("bwrap"):
+        return []
+    engine = shutil.which(cmd[0])
+    bundle = cmd[1] if len(cmd) > 1 else None
+    if not engine or not bundle:
+        return []
+    scratch = str(Path(out_file).parent)
+    args = ["bwrap", "--unshare-all", "--die-with-parent", "--clearenv", "--chdir", "/",
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    for path in _JXSCOUT_RUNTIME_PATHS:
+        args += ["--ro-bind-try", path, path]
+    args += ["--ro-bind", engine, engine,                     # the shim and, through it, the pinned tree
+             "--ro-bind", str(JXSCOUT_ENGINE), str(JXSCOUT_ENGINE),
+             "--ro-bind", str(bundle), str(bundle),           # THE one input
+             "--bind", scratch, scratch,                      # THIS call's scratch, and nothing else
+             "--setenv", "NODE_OPTIONS", f"--max-old-space-size={_JXSCOUT_HEAP_MB}",
+             "--setenv", "PATH", "/usr/bin:/bin",
+             # the shim resolves the engine through $HOME. The VARIABLE is set; the directory is not
+             # mounted — only the one engine file inside it is, so this names a path and grants nothing.
+             "--setenv", "HOME", str(Path.home())]
+    inner = ("ulimit -v %d; ulimit -f %d; exec %s > %s 2> %s"
+             % (_JXSCOUT_ADDRESS_SPACE_MB * 1024, _JXSCOUT_OUTPUT_MB * 2048,
+                " ".join(shlex.quote(c) for c in [engine] + list(cmd[1:])),
+                shlex.quote(str(out_file)), shlex.quote(str(err_file))))
+    return args + ["sh", "-c", inner]
+
+
+def _jxscout_public_path(text: str) -> str:
+    """The loader's public path, or "". Never absolute-URL, never traversal: a bundle is untrusted input,
+    and a `p` of `https://evil/` or `../../` would move the fetch off the origin we resolved against."""
+    m = _WEBPACK_PUBLIC_PATH.search(text)
+    p = (m.group(1) if m else "").strip()
+    if not p or "://" in p or p.startswith("//") or ".." in p:
+        return ""
+    return p if p.startswith("/") else "/" + p
+
+
+def _jxscout_resolve(js_url: str, candidate: str, public_path: str) -> str | None:
+    """The candidate's URL, resolved against the bundle that named it.
+
+    The analyzer returns what the loader COMPUTES (`static/js/143.hash.chunk.js`), not a URL: no scheme,
+    no host, and no public path — that prefix lives in a different expression it never evaluates. So the
+    origin comes from the bundle's own URL (PORT INCLUDED — upstream's own resolver drops it via
+    `Hostname()`), the prefix from the bundle's text, and the query string is preserved because a chunk
+    path may legitimately carry one (`app_Login.js?id=8dc7d97f`).
+    """
+    cand = (candidate or "").strip()
+    if not cand or len(cand) > 2048 or any(c in cand for c in "\r\n\t \"'<>"):
+        return None
+    if cand.startswith(("http://", "https://")):
+        return cand                                    # already absolute: scope decides, not us
+    if cand.startswith("//"):
+        return None                                    # protocol-relative: an origin we never resolved
+    parts = _urlsplit(js_url)
+    if not parts.scheme or not parts.netloc:
+        return None
+    if cand.startswith("/"):
+        path = cand                                    # root-relative: the public path is already in it
+    else:
+        path = (public_path.rstrip("/") + "/" + cand) if public_path else \
+            (parts.path.rsplit("/", 1)[0] + "/" + cand)
+    path, _, query = path.partition("?")
+    if ".." in path:
+        return None                                    # never let a bundle walk us out of its own tree
+    return _urlunsplit((parts.scheme, parts.netloc, "/" + path.lstrip("/"), query, ""))
+
+
+def _jxscout_analyze(ctx, artifact, limit: int, timeout: int = 60) -> tuple:
+    """`(candidates, disposition, result)` for ONE bundle — THROUGH the runner, so the invocation is
+    recorded like every other tool (status, cpu/rss, stderr tail) instead of being a raw subprocess this
+    phase hides.
+
+    Dispositions are the point. A memory or output kill can be entirely SILENT (measured), so an empty
+    result is only an answer when the process ended cleanly — and even then it is an ambiguous one: the
+    parser is error-TOLERANT, so a bundle it could not understand exits 0 with nothing, exactly like a
+    bundle that genuinely declares no chunks."""
+    stem = Path(artifact).stem[:32]
+    # a PRIVATE scratch per invocation. One shared output directory meant bundle N's evaluated code could
+    # rewrite, truncate or delete bundle N-1's artifacts — inventing candidates attributed to another
+    # bundle, inside the very evidence trail the sandbox exists to protect. Mutually untrusted executions
+    # get mutually invisible directories, and the run dir is not in the namespace at all.
+    with tempfile.TemporaryDirectory(prefix="quarry-jxscout-") as _scratch:
+        out, err = Path(_scratch) / "out.txt", Path(_scratch) / "err.txt"
+        cmd = _jxscout_sandbox([JXSCOUT_SHIM, str(artifact), str(max(0, limit))], out, err)
+        if not cmd:
+            return [], "no-sandbox", skipped(JXSCOUT_SHIM,
+                                             "no bwrap: the analyzer EVALUATES target code, so it does "
+                                             "not run uncontained")
+        # THROUGH the registered source (`crawl.jxscout_chunks`), like every other tool in this phase:
+        # the contract emits the source-level events and the ledger, and a direct runner call would
+        # bypass both. The work unit is the ARTIFACT's content plus the guess limit — re-analysing the
+        # same bytes under the same policy is the same work, and changing the limit is not.
+        wu = events.work_unit("crawl.jxscout_chunks", inputs={"bundle": str(artifact)},
+                              config={"brute_limit": max(0, limit)})
+        res = run_contract("crawl.jxscout_chunks", cmd, work_unit=wu, timeout=timeout)
+        lines: list = []
+        ceiling = _JXSCOUT_OUTPUT_MB * 1024 * 1024
+        at_ceiling = False
+        try:
+            # BOTH files: node swallows an EFBIG write and exits 0 (measured for stdout on the probe), so
+            # a bundle that fills either stream would otherwise be classified success or empty. What
+            # stdout did manage to write is kept as partial evidence — the ANSWER is what is incomplete.
+            for f in (out, err):
+                if f.exists() and f.stat().st_size >= ceiling:
+                    at_ceiling = True
+            raw_out = out.read_bytes() if out.exists() else b""
+            lines = [l.strip() for l in raw_out.decode("utf-8", "replace").splitlines() if l.strip()]
+        except OSError:
+            return [], "unreadable", res
+        blob = b""
+        if err.exists():
+            try:                                    # a TAIL only: the file is bounded, our memory is not
+                with err.open("rb") as fh:
+                    fh.seek(max(0, err.stat().st_size - _JXSCOUT_STDERR_TAIL))
+                    blob = fh.read(_JXSCOUT_STDERR_TAIL)   # READ the tail; never the whole file
+            except OSError:
+                blob = b""
+        # PUBLISH out of the private scratch into the run's evidence tree, atomically and content-bound.
+        # The scratch dies with this call, so nothing the next bundle runs can reach what this one wrote.
+        published = ctx.run.raw_path("crawl", "jxscout", f"{stem}.txt")
+        kept = budget.publish_bytes(published, raw_out, digest=hashlib.sha256(raw_out).hexdigest())
+        if blob:
+            kept = budget.publish_bytes(ctx.run.raw_path("crawl", "jxscout", f"{stem}.stderr.txt"), blob,
+                                        digest=hashlib.sha256(blob).hexdigest()) and kept
+        res.raw_path = published if kept else None      # never NAME an artifact we could not prove landed
+    if blob:
+        # the note SAYS how much was read, so "we only ever read the tail" is a checkable claim rather
+        # than a comment — the display slice would hide a full-file read otherwise.
+        res.note = (res.note or "") + f" [stderr {len(blob)}B tail] " + secrets.redact(
+            blob.decode("utf-8", "replace").strip()[-400:])
+    if res.status is Status.TIMED_OUT:
+        return [], "timeout", res
+    if at_ceiling:
+        # NOT success with fewer rows: the write was cut at the ceiling, so what else the bundle named is
+        # UNKNOWN. Certifying the truncated set would report a coverage number nobody measured.
+        return lines, "truncated", res
+    if not kept:
+        # AFTER the content verdicts on purpose: a timeout or a ceiling hit is what the bundle DOES, and
+        # repeating it gives the same answer, so a failed evidence copy must not relabel a deterministic
+        # verdict as retriable work. Below them it is the honest one — the ANSWER survived (these candidates are real, and suppressing them would lose discovery over a
+        # disk fault), but its evidence did not. So it is never counted analysed: the bundle stays owed,
+        # retriable, and a later child re-runs it into a tree that can hold the artifact.
+        return lines, "unpublished", res
+    if res.exit_code == 0:
+        return lines, ("success" if lines else "empty"), res
+    if res.exit_code == 1:
+        return [], "engine-error", res
+    return [], "killed", res                        # signal / OOM — a GAP, never "no chunks"
+
+
+def _jxscout_coverage(stats: dict) -> None:
+    """What this lane has READ, cumulatively. `tested` is what produced a clean answer — never "eligible
+    minus the failures we happened to count" — and the dispositions accumulate across rounds, because
+    folding keeps the latest record per (lane, unit, measure)."""
+    events.coverage_partial("crawl.jxscout_chunks", kind=events.COVERAGE_TIMEOUT, measure="bundles",
+                            unit="bundles", eligible=stats["eligible"], tested=stats["analysed"],
+                            omitted=max(0, stats["eligible"] - stats["analysed"]),
+                            reason="; ".join(f"{d}={n}" for d, n in sorted(stats["dispositions"].items()))
+                                   or "no bundles analysed")
+
+
+def _jxscout_chunks(ctx, ledger) -> int:
+    """ONE round of lazy-chunk discovery over the JS already downloaded. Returns how many NEW `js_url`
+    entities it added; the caller re-runs the fetch lane so the next round sees the new bundles.
+
+    Quarry owns everything the upstream tool would have done for us: resolution (with the port and the
+    query the tool's own resolver drops), scope, rate, fetching, evidence and resume. The analyzer is a
+    CANDIDATE PRODUCER and nothing else."""
+    stats = getattr(ctx, "_jxscout_stats", None)
+    if stats is None:
+        stats = ctx._jxscout_stats = {"dispositions": {}, "eligible": 0, "attempted": 0, "analysed": 0}
+    seen_art = getattr(ctx, "_jxscout_seen", None)
+    if seen_art is None:
+        seen_art = ctx._jxscout_seen = set()
+    dispositions = stats["dispositions"]
+
+    # WORK FIRST, capability second. Asking `have()` before establishing eligibility made an absent
+    # OPTIONAL tool a dependency failure on every run with no JS at all — a passive run would have owed
+    # work it never had. An empty eligible set is a clean zero; a missing capability only matters when
+    # there are bundles it would have read.
+    eligible = [(u, art) for u, art in ledger.items() if art and art.suffix == ".js"]
+    fresh = [(u, art) for u, art in eligible if str(art) not in seen_art]
+    if not fresh:
+        return 0
+    stats["eligible"] += len(fresh)
+    if not have(JXSCOUT_SHIM):
+        # NOT the numeric zero of a clean convergence: these bundles went unread, and a supervisor
+        # reading only "0 added" would call that a fixed point over a lane that never ran. The count is
+        # in BUNDLES, the unit this remainder is measured in — one missing binary leaves N bundles owed.
+        ctx.run.record("crawl", skipped(JXSCOUT_SHIM, "not installed (optional)"))
+        dispositions["missing-tool"] = dispositions.get("missing-tool", 0) + len(fresh)
+        seen_art.update(str(a) for _u, a in fresh)
+        _jxscout_coverage(stats)
+        return 0
+    # the ENGAGEMENT knob, straight from target.yaml — not a flag, not machine config. It was read
+    # through a `settings` helper that does not exist, so the fallback silently pinned it to 0 and
+    # MODES.JS_CHUNK_BRUTE did nothing at all.
+    limit = int(getattr(ctx.profile, "js_chunk_brute", JXSCOUT_BRUTE_LIMIT) or 0)
+    added, produced = 0, 0
+    for url, art in fresh:
+        seen_art.add(str(art))
+        try:
+            text = art.read_text("utf-8", "replace")
+        except OSError:
+            dispositions["unreadable"] = dispositions.get("unreadable", 0) + 1
+            continue
+        stats["attempted"] += 1
+        cands, disp, res = _jxscout_analyze(ctx, art, limit)
+        dispositions[disp] = dispositions.get(disp, 0) + 1
+        if disp in ("success", "empty"):
+            stats["analysed"] += 1
+        if res is not None:
+            ctx.run.record("crawl", res)                 # every invocation is observable in the manifest
+        if disp in ("no-sandbox", "unreadable"):
+            # the same fault stops every remaining bundle, so it is THEIR disposition too. Counting only
+            # the one we tried would report nine of ten bundles as covered when none was analysed.
+            rest = len(fresh) - (fresh.index((url, art)) + 1)
+            if rest:
+                dispositions[disp] = dispositions.get(disp, 0) + rest
+                seen_art.update(str(a) for _u, a in fresh[-rest:])
+            break
+        public = _jxscout_public_path(text)
+        for cand in cands:
+            produced += 1
+            resolved = _jxscout_resolve(url, cand, public)
+            if not resolved:
+                continue
+            host = normalize.host_of_url(resolved)
+            if not host or not ctx.scope.in_scope(host):
+                continue                                # OOS chunk references stay observed, never fetched
+            # PROVENANCE is the bundle that named it: a chunk nothing links to is only explicable by the
+            # loader it came from, and `raw_ref` points at that artifact.
+            entity = {"url": resolved, "sources": ["jxscout-chunks"], "raw_ref": str(art),
+                      "discovered_from": url}
+            if ctx.run.add("js_url", entity):
+                added += 1
+                ctx.run.add("url", dict(entity))
+                if host:
+                    ctx.run.add("subdomain", {"host": host, "sources": ["jxscout-chunks"]})
+    # coverage is per DISPOSITION, because "no candidates" is not one fact: a clean empty answer, a
+    # silent kill and an unreadable bundle look identical in a count.
+    _jxscout_coverage(stats)
+    # the console shows the LIFECYCLE delta, the same number the manifest carries: a shared refusal
+    # leaves untouched bundles unanalysed too, and `attempted - analysed` counted only the one we tried.
+    _short = stats["eligible"] - stats["analysed"]
+    ctx.echo(f"  jxscout chunks: {added} new JS URL(s) from {produced} candidate(s) "
+             f"over {len(fresh)} bundle(s)" + (f" — {_short} not analysed" if _short else ""))
+    return added
+
+
+def _jxscout_traverse(ctx, ledger, raw_dir):
+    """Analyse, queue, re-fetch, repeat — until a round adds nothing (the fixed point) or the bound stops
+    us. Returns the ledger/dir the later lanes read, so a chunk fetched in the last round is mined like
+    any other bundle."""
+    rounds = policy.limit("JXSCOUT_ROUNDS")
+    rnd, owed = 0, 0
+    while rounds <= 0 or rnd < rounds:
+        rnd += 1
+        owed = _jxscout_chunks(ctx, ledger)
+        if not owed:
+            break                                    # a round that adds nothing IS the fixed point
+        ledger, raw_dir = _js_download(ctx)
+    # what this lane still OWES, in the supervisor's vocabulary — on EVERY exit, so a converged traversal
+    # CLEARS the remainder a bounded one left. A lane that only reports when it fails reads as unknown
+    # for ever (settle prerequisite B). Best effort: a report is never a stop.
+    #
+    # TWO units, because a round count cannot express a bundle nobody analysed. `owed == 0` means only
+    # that the last round added no URL — a timeout, a kill, a missing sandbox or a truncated answer all
+    # add none either, so reporting rounds ALONE would tell the supervisor this lane owes nothing while
+    # the coverage record beside it says a bundle was never read. That contradiction is how a campaign
+    # reaches a fixed point over work it never did.
+    _stats = getattr(ctx, "_jxscout_stats", {}) or {}
+    _disp = _stats.get("dispositions", {})
+    try:
+        remainder.emit(remainder.for_rounds("crawl.jxscout_chunks",
+                                            stop="bound" if owed else "converged",
+                                            rounds=rounds, ran=rnd, made=bool(owed)))
+        # a bundle we could not analyse splits in two, because the two halves have different repeat
+        # behaviour and calling both terminal forbade a recovery that genuinely works:
+        #   RETRIABLE   a timeout, a kill, an unreadable artifact — another child re-fetches that bundle
+        #               and attempts it again, and it may simply succeed. The campaign's no-progress
+        #               limit is what stops an endless retry, not a permanent verdict from us.
+        #   TERMINAL    a missing tool or sandbox (`dependency` — fixable, but never by repetition), and
+        #               a deterministic refusal or overflow (`unschedulable` — the same bytes under the
+        #               same policy give the same answer every time).
+        _terminal: dict = {}
+        _retriable = 0
+        for _d, _n in _disp.items():
+            if _d in ("missing-tool", "no-sandbox"):
+                _terminal["dependency"] = _terminal.get("dependency", 0) + _n
+            elif _d in ("engine-error", "truncated"):
+                _terminal["unschedulable"] = _terminal.get("unschedulable", 0) + _n
+            elif _d in ("timeout", "killed", "unreadable", "unpublished"):
+                _retriable += _n
+        remainder.emit(remainder.Remainder(
+            lane="crawl.jxscout_chunks", unit="crawl.jxscout_chunks:bundles", measure="bundles",
+            model=remainder.UNIT_MODEL[("crawl.jxscout_chunks", "crawl.jxscout_chunks:bundles")],
+            now=_retriable, cooldown=0, terminal=_terminal,
+            detail={"eligible": _stats.get("eligible", 0), "attempted": _stats.get("attempted", 0),
+                    "analysed": _stats.get("analysed", 0),
+                    "dispositions": {k: v for k, v in sorted(_disp.items())}}))
+    except Exception:                                            # noqa: BLE001
+        pass
+    if owed:
+        # UNKNOWN, with no counters. A round still producing proves another round is REACHABLE and
+        # nothing about how many remain: a chain needing a hundred more looks exactly like one needing
+        # one, so an exact denominator would certify a depth nobody measured (the same correction the
+        # permutation loop carries). And it does NOT resume: entities are run-scoped, so a later run
+        # rediscovers the root and repeats rounds 1..N.
+        events.coverage_partial("crawl.jxscout_chunks", kind=events.COVERAGE_UNKNOWN, measure="rounds",
+                                unit="rounds",
+                                reason=f"chunk traversal stopped by JXSCOUT_ROUNDS={rounds} while still "
+                                       f"producing ({owed} newly-queued bundle(s) never analysed) — the "
+                                       f"remaining depth is UNKNOWN, and a later run repeats rounds "
+                                       f"1..{rounds} rather than continuing (raise it, or --unbound, to "
+                                       f"reach the fixed point)")
+    return ledger, raw_dir
 
 
 def _js_publish_derived(ctx, ledger, raw_dir):
@@ -1006,6 +1391,12 @@ def run(ctx) -> None:
 
     # ── download JS, dedup, beautify ──
     js_ledger, js_raw_dir = _js_download(ctx)
+
+    # ── LAZY CHUNKS: bundles name JS that nothing links to, so nothing else in the crawl can reach it.
+    # Analyse what we just downloaded, resolve the candidates ourselves, then re-run the fetch lane —
+    # which RESUMES, so it only pays for the new URLs. A chunk can name another chunk, hence rounds; the
+    # loop ends when a round adds nothing, and `JXSCOUT_ROUNDS` bounds the depth (0 = to the fixed point).
+    js_ledger, js_raw_dir = _jxscout_traverse(ctx, js_ledger, js_raw_dir)
 
     # review#1/#2: the mineable tree is a STAGED generation, beautified before publication and swapped in
     # atomically — so what the miners and secret scanners read is exactly this run's validated evidence, or

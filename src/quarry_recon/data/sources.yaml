@@ -166,6 +166,19 @@ sources:
       atomically). Miners/scanners read js_derived/, which is STAGED from validated evidence only, beautified
       while staged, then swapped in atomically — exact by construction, and NOT mined at all if it cannot be
       published exactly (measure: js_mineable)."}
+  crawl.jxscout_chunks:      {tool: jxscout-chunks, phase: crawl, tier: optional, class: passive, default: on,
+    input: "downloaded JS bundles", output: "candidate lazy-chunk URLs -> js_url", workers: n/a, rate: n/a, timeout: 60s, failure: quiet-warn, fallback: skip, parser: stdout-lines, log: delta,
+    notes: "PASSIVE by class: the analyzer reads bundles already on disk and contacts nothing — fetching an
+      accepted chunk is crawl.js_fetch's job, under its rate and budget. Webpack/vite loaders name chunks
+      that nothing links to, so no crawler reaches them. Quarry owns resolution (port AND query preserved —
+      the upstream tool's own resolver drops the port), scope, rate, evidence and resume; the tool is a
+      candidate producer only. Sandboxed (bwrap: read-only FS, no network) because it EVALUATES the
+      bundle's chunk-name function; no sandbox -> the lane does not run. Derived candidates only by
+      default: MODES.JS_CHUNK_BRUTE (engagement, default 0) is what allows guessing ids, and no flag can
+      lift it. JXSCOUT_ROUNDS bounds traversal depth. An empty result is AMBIGUOUS (the parser is
+      error-tolerant, so an unparseable bundle looks exactly like one with no chunks) and is never read as
+      proof that a bundle has none."}
+
   crawl.sourcemaps:          {tool: internal, phase: crawl, tier: core, class: active, default: on,
     input: js_sourceMappingURL, output: "recovered sources → sourcemaps dir", workers: n/a, rate: http_rl, timeout: http, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "internal sourcemap fetcher (scoped_get); off-scope map-URL guarded. NO fetch cap (the old

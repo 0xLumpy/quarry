@@ -518,10 +518,15 @@ def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_c
     terminal: dict = {}
     for rows in by_lane.values():
         for row in rows:
-            if row.get("model") != "project_progress":
-                continue                              # repetition cannot advance it — never keeps us alive
-            rt = row.get("retriable") or {}
-            retriable += int(rt.get("now", 0)) + int(rt.get("cooldown", 0))
+            # RETRIABLE work is model-dependent: on a `rerun_same_work` lane repetition replays the same
+            # prefix, so it can never advance and must not keep a campaign alive.
+            if row.get("model") == "project_progress":
+                rt = row.get("retriable") or {}
+                retriable += int(rt.get("now", 0)) + int(rt.get("cooldown", 0))
+            # TERMINAL work is NOT. The model answers "can another child advance this?", never "does this
+            # work exist?" — skipping the whole row dropped the terminal counts of every rerun_same_work
+            # lane, so a bundle nobody could read, or a loop that stopped on machinery, vanished and the
+            # campaign declared a FIXED POINT over it.
             for cause, n in (row.get("terminal") or {}).items():
                 if n:
                     terminal[cause] = terminal.get(cause, 0) + int(n)

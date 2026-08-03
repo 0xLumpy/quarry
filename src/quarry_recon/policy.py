@@ -118,7 +118,10 @@ SOURCE_OWNERSHIP: dict[str, str] = {
        ("vertical.openintel", "horizontal.kaeferjaeger", "horizontal.mapcidr",
         "params.gf", "crawl.js_beautify", "crawl.jsluice_urls", "crawl.jsluice_secrets",
         "crawl.gitleaks", "crawl.trufflehog", "crawl.xnlinkfinder",
-        "origin.correlation", "vertical.alterx_permute")},
+        "origin.correlation", "vertical.alterx_permute",
+        # reads bundles ALREADY on disk and contacts nothing; the fetch of an accepted chunk is
+        # `crawl.js_fetch`, which is where the rate and the budget live
+        "crawl.jxscout_chunks")},
     **{lane: "target_facing" for lane in
        ("content.ffuf", "crawl.js_fetch", "crawl.katana_headless", "crawl.katana_standard",
         "dns.dnsx_records", "enrich.a1d_brute", "enrich.dnsx_cname", "enrich.dnsx_resolve",
@@ -227,6 +230,17 @@ BOUNDS: tuple[Bound, ...] = (
                "full eligible set in host-fair order, with the withheld remainder recorded as an "
                "operator limit"),
 
+    Bound(name="JXSCOUT_ROUNDS", reader="module", lane="crawl.jxscout_chunks", default=3, identity="none",
+          const="quarry_recon.phases.crawl:JXSCOUT_ROUNDS",
+          persistence="NOTHING carries: entities are run-scoped, so a later run rediscovers the root "
+                      "bundle and repeats rounds 1..N. A traversal the bound cut short is an unresolved "
+                      "remainder (reported as one), never resumable progress",
+          relaxable=True, unbounded_value=0, consumer_honours_unbounded=True,
+          note="free: how DEEP the chunk->chunk traversal goes over bundles the run already downloaded. "
+               "Fetching each accepted chunk is the JS lane's own rate/budget; this only decides how many "
+               "rounds of ANALYSIS we do over evidence in hand. The brute-force knob is NOT here: "
+               "guessing ids manufactures target requests, so it is engagement policy (MODES.JS_CHUNK_BRUTE)"),
+
     Bound(name="SPA_CAP", reader="module", lane="crawl.katana_headless", default=10, identity="none",
           const="quarry_recon.phases.crawl:SPA_CAP",
           persistence="nothing — the headless pass has no durable rotation to continue",
@@ -311,6 +325,10 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.evidence:_SSTI_MAX_PARAMS": ("rate", "probes per endpoint is request pressure"),
     "quarry_recon.phases.crawl:MAX_JS": ("resource", "a 15 MB PER-ITEM guard on one downloaded file"),
     "quarry_recon.phases.crawl:MAX_MAP": ("resource", "a 20 MB PER-ITEM guard on one source map"),
+    "quarry_recon.phases.crawl:JXSCOUT_BRUTE_LIMIT": ("engagement", "chunk-id GUESSING manufactures "
+        "requests for paths no bundle named, so it is chosen per engagement (MODES.JS_CHUNK_BRUTE, "
+        "default 0) and `--unbound` may never lift it — that flag uses work a run already has"),
+    "quarry_recon.config:MAX_JS_CHUNK_BRUTE": ("engagement", "the CEILING on that engagement knob"),
     "quarry_recon.osint:_ASN_MAX": ("not_a_bound", "the largest number a 32-bit AS number can BE — a "
                                                   "validity range for a provider value, not a ceiling on "
                                                   "how much work we do"),

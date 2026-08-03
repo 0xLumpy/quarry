@@ -585,3 +585,37 @@ class TestAFailedPublicationSettles:
             broken.recover("lost it")
         assert broken.recoveries == [], "a recovery nobody recorded was claimed in memory"
         assert not broken.trustworthy
+
+
+class TestTerminalWorkIsNotModelDependent:
+    """The MODEL answers "can another child advance this?" — never "does this work exist?". Skipping a
+    `rerun_same_work` row entirely dropped its terminal counts too, so a lane that could not read its
+    input, or a loop that stopped on machinery, vanished and the campaign called it a fixed point."""
+
+    @staticmethod
+    def _rerun(terminal):
+        return {"lane": "vertical.alterx_permute", "unit": "vertical.alterx_permute:rounds",
+                "measure": "rounds", "model": "rerun_same_work",
+                "retriable": {"now": 0, "cooldown": 0},
+                "terminal": {**{c: 0 for c in ("unschedulable", "entitlement", "dependency", "machinery")},
+                             **terminal}}
+
+    @pytest.mark.parametrize("cause", ["unschedulable", "dependency", "machinery", "entitlement"])
+    def test_a_rerun_lane_s_TERMINAL_work_blocks_the_fixed_point(self, cause):
+        d = campaign.decide(_summary(remainders=[self._rerun({cause: 1})]), _absorbed(),
+                            expected_lanes=["vertical.alterx_permute"])
+        assert d.stop == "terminal" and cause in d.detail, d
+        assert not d.success
+
+    def test_its_RETRIABLE_work_still_cannot_keep_a_campaign_alive(self):
+        """The other half of the rule, unchanged: repetition replays the same prefix."""
+        row = self._rerun({})
+        row["retriable"] = {"now": 99, "cooldown": 5}
+        d = campaign.decide(_summary(remainders=[row]), _absorbed(),
+                            expected_lanes=["vertical.alterx_permute"])
+        assert d.stop == "fixed_point" and d.retriable == 0, d
+
+    def test_a_clean_rerun_lane_is_still_a_fixed_point(self):
+        d = campaign.decide(_summary(remainders=[self._rerun({})]), _absorbed(),
+                            expected_lanes=["vertical.alterx_permute"])
+        assert d.stop == "fixed_point" and d.success
