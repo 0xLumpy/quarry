@@ -144,6 +144,48 @@ tools:
     deps: [build-essential, git]   # gcc + make to compile
     notes: Built from source (gcc+make) at a pinned commit; installed to ~/.local/bin. puredns needs it at runtime.
 
+  - bin: jxscout-chunks
+    maintenance_state: frozen
+    phase: crawl
+    role: lazy-CHUNK candidate discovery from an already-downloaded JS bundle (webpack/vite loaders)
+    # The upstream project is a Burp/Caido-style intercepting proxy with its own SQLite event bus that
+    # FETCHES what it finds. We use none of that: the piece with value is one embedded script, invoked
+    # `<file> <bruteForceLimit>` -> candidate paths on stdout. Quarry keeps ownership of resolution,
+    # scope, rate, fetching, evidence and resume — a producer, never a crawler.
+    #
+    # Installed from PINNED SOURCE rather than `go install`: the Go binary is scaffolding for a workflow
+    # Quarry does not have (it would build ~30 MB to give us none of it), and the tree carries COPYING
+    # plus its dependency notices, which a cherry-picked build artifact would strip. GPL-3.0 upstream:
+    # Quarry distributes nothing and invokes it as a separate program (see docs/design/JXSCOUT.md).
+    #
+    # ARCHIVED upstream (2026-04-12) — `frozen` is not a policy choice here, it is the fact: no release
+    # will ever move this pin, so `quarry lock --refresh` has nothing to check for this entry.
+    ref: 3a1018a694fd630137b1c19525abcb47315404d4
+    repo: francisconeves97/jxscout
+    runtime: source
+    # clone at the exact ref -> VERIFY the engine's own sha256 -> stage a shim that runs it under node.
+    # The GPL file is never modified: the shim is ours, the tree stays whole beside it.
+    install: 'set -e; rm -rf /tmp/_jxscout; git clone -q https://github.com/francisconeves97/jxscout /tmp/_jxscout && git -C /tmp/_jxscout checkout -q {ref} && echo "157118f58497a8f1208e80bb24f58aa1b25e3847898d07a414cd473a6d0f6f81  /tmp/_jxscout/internal/modules/chunk-discoverer/chunk-discoverer.js" | sha256sum -c - >/dev/null && mkdir -p ~/.local/share/quarry && rm -rf ~/.local/share/quarry/jxscout && mv /tmp/_jxscout ~/.local/share/quarry/jxscout && rm -rf ~/.local/share/quarry/jxscout/.git && cp ~/.local/share/quarry/jxscout/internal/modules/chunk-discoverer/chunk-discoverer.js ~/.local/share/quarry/jxscout-chunk-discoverer.cjs && mkdir -p ~/.local/bin/.stage && printf ''#!/bin/sh\nexec node "$HOME/.local/share/quarry/jxscout-chunk-discoverer.cjs" "$@"\n'' > ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin}'
+    # The engine is CommonJS while the tree's package.json declares `"type": "module"` for its own build,
+    # so node refuses it IN PLACE. The byte-identical `.cjs` copy beside the tree is what makes the module
+    # system unambiguous — the file's CONTENT is untouched (same sha256 the install just verified), only
+    # its name says how to load it. Upstream never hits this: its Go binary extracts the embedded script
+    # to ~/.jxscout/extracted/, outside that package.json's scope.
+    # The capability probe RUNS THE ENGINE on one of upstream's own fixtures (installed with the tree) and
+    # requires exit 0 — proof that node executed it and that it still extracts from a known bundle, not
+    # merely that a file exists on PATH. `0` as the limit keeps the probe derived-only, so a health check
+    # can never enumerate anything.
+    capability: 'jxscout-chunks $HOME/.local/share/quarry/jxscout/pkg/chunk-discoverer/tests/files/2.js 0'
+    version_cmd: 'jxscout-chunks $HOME/.local/share/quarry/jxscout/pkg/chunk-discoverer/tests/files/2.js 0'
+    cap_codes: [0]
+    doc: https://github.com/francisconeves97/jxscout
+    deps: [git, nodejs]
+    optional: true
+    notes: 'MEASURED: needs node only (no Bun, no npm, no native deps) — that holds for THIS script; the
+      tree''s ast-analyzer and sourcemaps bundles do need bun/native bindings and are a separate
+      evaluation. Default brute-force limit is 0 (derived candidates only): integer enumeration
+      manufactures new target requests, so it is an ENGAGEMENT decision, never an --unbound one.'
+
   - bin: alterx
     maintenance_state: active
     version: "v0.1.0"
