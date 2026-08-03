@@ -22,6 +22,9 @@ CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "s
                     "graphql", "actuator", "websocket", "api-base",
                     # out-of-band callbacks imported from interactsh (OOB.3; uncorrelated in Phase 1):
                     "oob",
+                    # chain MATERIAL, deliberately separate from every queue above: those rank things to
+                    # VERIFY, this remembers primitives that are not findings on their own (`gadgets.py`):
+                    "gadgets",
                     # DNS-record context (notable records only — a/cname excluded as noise):
                     "dns",
                     # name-based virtual hosts served by an origin IP (may not resolve in DNS):
@@ -320,6 +323,25 @@ def build(run, scope) -> str:
                 A(f"- … {len(items) - 15} more — full list in normalized/review.jsonl")
             A("")
 
+    gadgets = [g for g in run.read("gadget_candidate") if isinstance(g, dict)]
+    if gadgets:
+        A(f"## Gadgets ({len(gadgets)}) — chain material, NOT findings")
+        A("> Primitives that prove nothing on their own: malformed redirects, auth-flow redirect "
+          "parameters, cross-host hops. Keep them for step two of a chain — never report one as an "
+          "impact. Nothing here was probed; every row is evidence another lane already collected.\n")
+        by_klass: dict[str, list] = {}
+        for g in gadgets:
+            by_klass.setdefault(g.get("klass") or "other", []).append(g)
+        for klass in sorted(by_klass):
+            rows = by_klass[klass]
+            A(f"### {klass.upper()}  ({len(rows)})")
+            for g in rows[:10]:
+                chains = ", ".join(g.get("chain_potential") or []) or "unclassified"
+                A(f"- {g.get('value')} — {g.get('observed_behavior')}  ·  chains: {chains}")
+            if len(rows) > 10:
+                A(f"- … {len(rows) - 10} more — full list in normalized/gadget_candidate.jsonl")
+            A("")
+
     A("## Review order")
     A("1. secrets — exports/secrets.jsonl")
     A("2. origin hosts above (no WAF)")
@@ -511,6 +533,22 @@ def collect(run, scope) -> dict:
         add("oob", _item("oob_interaction", f"{proto} · {dom} · from {o.get('remote_address', '?')}",
             why, "candidate", o.get("sources"), "normalized/oob_interaction.jsonl", tags,
             location=o.get("raw_ref")))
+
+    # ── GADGETS: chain material, never a finding ────────────────────────────────────────────────
+    # Deliberately its own queue. Every queue above ranks things to VERIFY; this one remembers primitives
+    # that are worthless alone and decisive as step two — and mixing them would teach a reviewer to skim
+    # both. `impact_state` rides along so a consumer can never mistake one for a claim.
+    for g in run.read("gadget_candidate"):
+        if not isinstance(g, dict):
+            continue
+        chains = [c for c in (g.get("chain_potential") or []) if isinstance(c, str)]
+        add("gadgets", _item("gadget_candidate", g.get("value"),
+            f"{g.get('why') or g.get('klass')} — observed: {g.get('observed_behavior') or 'n/a'}",
+            g.get("confidence") or "low", g.get("sources"), "normalized/gadget_candidate.jsonl",
+            ["gadget", g.get("klass"), g.get("subtype"),
+             f"impact:{g.get('impact_state') or 'none_proven'}"]
+            + [f"chain:{c}" for c in chains],
+            location=g.get("raw_ref") or None))
 
     for q in queues:                                # dedup by item id (keys already canonical)
         queues[q] = list({it["id"]: it for it in queues[q]}.values())

@@ -971,6 +971,17 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
         for cp in cps:
             click.echo("   " + _c(cp.line(), "yellow" if cp.level == "warn" else "white"))
 
+    # GADGET CANDIDATES — chain material from evidence the run already holds. Runs before the reports so
+    # the digest and the hotlist can carry it; contacts nothing, so it can never change what a run did to
+    # a target. Best effort: a classifier is a REPORT, and losing it may never cost the run.
+    from . import gadgets
+    try:
+        n_gadgets = gadgets.classify(run_obj, scope)
+        if n_gadgets:
+            click.echo(_c(f"   ⛓ {n_gadgets} gadget candidate(s) — chain material, not findings", "cyan"))
+    except Exception as e:                                    # noqa: BLE001
+        run_obj.notes.append(f"gadgets: EXCEPTION {secrets.redact(str(e))}")
+
     # reports + exports
     exp = exports.write_all(run_obj)
     exports.write_delta(run_obj)

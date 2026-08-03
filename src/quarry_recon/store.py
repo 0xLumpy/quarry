@@ -54,6 +54,9 @@ ENTITY_KEYS = {
     "review": "id",
     "wildcard_zone": "value",   # A1: cert-derived *.X.apex brute-zones (persisted vertical→enrich for A1d)
     "web_port": "id",           # v0.3.5: open web port per host:ip (naabu SYN prefilter) — host→ip→port edge
+    "gadget_candidate": "id",   # chain MATERIAL: weird primitives that are not findings and not noise
+                                # (`gadgets.py`); never promoted to `finding`, impact_state always
+                                # `none_proven`
     "oob_interaction": "id",    # OOB.1: imported out-of-band callbacks (interactsh); raw in raw/oob/,
                                 # uncorrelated by default until Quarry owns the token namespace (Phase 2)
 }
