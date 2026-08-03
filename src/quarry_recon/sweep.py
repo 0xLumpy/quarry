@@ -4,7 +4,7 @@
 harder half for lanes whose eligible set is a VOCABULARY crossed with TARGETS: which words does a bounded
 run actually submit, in what order, and how does the next run continue rather than repeat?
 
-The contract, argued out over ten review rounds (`notes/STEP4-SCHEDULING-DESIGN.md`):
+The contract, argued out over ten review rounds (`docs/design/STEP4-SCHEDULING-DESIGN.md`):
 
   SLOT       (target, bucket), where `bucket = sha256(word) % BUCKETS`. A word's bucket depends on the WORD
              alone, so adding one word never moves another — the defect that made ordinal chunks

@@ -3,7 +3,7 @@
 Entities are RUN-SCOPED: a second `Run.create` in the same project starts empty. A supervisor that repeats
 runs therefore needs somewhere for what earlier children learned to live, and — the part that is easy to
 miss — every later child must START from it. Once acquisition closes after child 1
-(`notes/SETTLE-DESIGN.md` §4), the hosts a provider found would otherwise simply be ABSENT from child 2's
+(`docs/design/SETTLE-DESIGN.md` §4), the hosts a provider found would otherwise simply be ABSENT from child 2's
 corpus, the processing lanes would have nothing to work through, and the campaign would read that as a
 fixed point: `--settle` forgetting the very evidence it exists to finish processing.
 
@@ -60,7 +60,7 @@ _RECOVERY_KEYS = {"generation", "reason", "at"}
 # ── acquisition: what a campaign may still OBTAIN ────────────────────────────────────────────────────
 #: whether this process may run ACQUISITION lanes. A campaign closes it after its first child: repeating a
 #: run repeats its provider calls, and a continuation flag may not make that spending decision
-#: (`notes/FLAG-AXIS-PLAN.md` §2). Off by default — an ordinary `quarry run` acquires as it always has.
+#: (`docs/design/FLAG-AXIS-PLAN.md` §2). Off by default — an ordinary `quarry run` acquires as it always has.
 _acquisition_closed = False
 #: why it was closed, so a blocked lane can say what stopped it rather than looking broken.
 _acquisition_reason = ""

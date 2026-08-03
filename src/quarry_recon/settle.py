@@ -1,6 +1,6 @@
 """`--settle` — the CONTINUATION axis: keep creating runs while resumable work still advances.
 
-A supervisor OVER runs, never a knob inside one (`notes/SETTLE-DESIGN.md`). Quarry's evidence contract is
+A supervisor OVER runs, never a knob inside one (`docs/design/SETTLE-DESIGN.md`). Quarry's evidence contract is
 one run = one run dir = one manifest = one verdict, and a campaign preserves exactly that: each child is an
 ordinary run with its own evidence, and the campaign adds only a ledger over child run ids plus the union
 that carries what they learned between them.
@@ -11,7 +11,7 @@ The loop, per child:
                 child, never an orphan run directory)
     BOOTSTRAP   every child after the first is seeded from the union, provenance intact — entities are
                 RUN-SCOPED, so an unseeded child 2 would start empty and its emptiness would read as a
-                fixed point (`notes/SETTLE-DESIGN.md` §2.3)
+                fixed point (`docs/design/SETTLE-DESIGN.md` §2.3)
     CLOSE       acquisition is closed from child 2 onward: repeating a run repeats its provider calls, and
                 a continuation flag may not make a spending decision (§4)
     ABSORB      the child's trustworthy entities are merged into the union, and the delta is the campaign's

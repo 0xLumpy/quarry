@@ -11,7 +11,7 @@ execution order — it holds however the phases are later reordered (Lumpy, 2026
 If Shodan's own policy buys five pages and those yield 100,000 names, `--unbound` does not buy page six —
 and it does let the free downstream lanes work through all 100,000. It never raises a provider page budget,
 reduces a credit reserve, enables a disabled provider, broadens scope, bypasses a contact guard, removes
-rate / concurrency / resource protection, or implies `--timeout 0` (`notes/FLAG-AXIS-PLAN.md`).
+rate / concurrency / resource protection, or implies `--timeout 0` (`docs/design/FLAG-AXIS-PLAN.md`).
 
 So this table is deliberately NARROW. It holds free-tool COVERAGE / THROUGHPUT bounds that participate in
 `--unbound`, plus the held exceptions that must be printed rather than silently skipped. Everything else —

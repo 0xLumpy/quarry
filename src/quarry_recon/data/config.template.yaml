@@ -86,7 +86,7 @@ PERFORMANCE:
 
 # ── Advanced local tool paths (NOT credentials — paths, so they live here, not in secrets.yaml) ──
 # openintel-subs: extra PASSIVE subdomain source, silently unused unless BOTH paths are set AND
-# present. You provide the binary + local subs.db. See notes/OPENINTEL-OPTIONAL.md.
+# present. You provide the binary + local subs.db. See docs/design/OPENINTEL-OPTIONAL.md.
 # (Legacy: an `openintel:` block in secrets.yaml is still read for back-compat, but config.yaml is
 #  its proper home — this is a path pair, not a credential.)
 # openintel:
