@@ -19,6 +19,16 @@ import urllib.request
 from . import secrets
 
 EVENTS = ("complete", "error", "lead")     # run finished · phase/tool error · promising lead
+
+#: how a run VERDICT is said to a human. `complete_with_gaps` is Quarry's internal vocabulary — it tells an
+#: operator nothing about what to do, and shipping internal tokens outward is how a tool teaches its user
+#: its own jargon instead of its state.
+VERDICT_WORDS = {"complete": "run completed",
+                 "complete_with_limits": "run completed, with expected limits",
+                 "complete_with_gaps": "run completed; coverage needs attention"}
+#: at most this many bullets per section, then a pointer at the manifest — a notification is a summons to
+#: the evidence, not the evidence.
+_MAX_BULLETS = 5
 CHANNELS = ("slack", "discord", "telegram", "webhook")
 
 
@@ -81,6 +91,77 @@ def send(event: str, title: str, body: str = "") -> int:
         except Exception:
             continue
     return sent
+
+
+def _bullets(summary: dict) -> tuple[list, list]:
+    """(needs_attention, expected_limits), from the manifest's OWN structured fields.
+
+    Two categories, never merged: a failure or a coverage gap is something WRONG, while a provider's quota
+    or an operator's own budget is an expected boundary that nothing can retry. Conflating them is the
+    blame-shift the limit/gap taxonomy exists to prevent — and it is also what makes an operator ignore
+    the message, because everything looks equally alarming.
+    """
+    fails, gaps = summary.get("failures") or [], summary.get("gaps") or []
+    pexc = summary.get("phase_exceptions") or []
+    attention: list = []
+    if fails:
+        tools = sorted({f.get("tool", "?") for f in fails})
+        attention.append(f"{len(fails)} tool run(s) failed ({', '.join(tools[:4])})")
+    if gaps:
+        tools = sorted({g.get("tool", "?") for g in gaps})
+        attention.append(f"{len(gaps)} degraded run(s) across {len(tools)} tool(s) "
+                         f"({', '.join(tools[:4])}) — coverage incomplete")
+    if pexc:
+        attention.append(f"{len(pexc)} phase exception(s)")
+    limits: list = []
+    for row in (summary.get("provider_limits") or []):
+        limits.append(f"{row.get('tool', '?')} — {row.get('why') or row.get('error_class') or 'provider limit'}")
+    for row in (summary.get("operator_limits") or []):
+        limits.append(f"{row.get('tool', '?')} — {row.get('why') or 'withheld by our own budget'} (our bound)")
+    return attention, limits
+
+
+def completion_message(*, target: str, run_id: str, summary: dict, totals: str = "",
+                       leads: int = 0) -> tuple[str, str]:
+    """The ONE rendering of a finished run, shared by every outbound channel.
+
+    `notify` used to build its own sentence and send it TWICE — once as `complete`, once as `lead`, with an
+    identical body — which reads as a loop and says nothing the other message did not. One message, and
+    every future transport (messenger adapters) renders from here rather than inventing its own wording.
+    """
+    verdict = summary.get("verdict", "")
+    title = f"Quarry {target}: {VERDICT_WORDS.get(verdict, 'run finished')}"
+    if leads:
+        title += f" — {leads} promising lead(s)"
+    lines = [f"run {run_id}"]
+    if totals:
+        lines.append(totals)
+    attention, limits = _bullets(summary)
+    for label, rows in (("Needs attention", attention), ("Expected limits", limits)):
+        if not rows:
+            continue
+        lines += ["", f"{label}:"] + [f"• {r}" for r in rows[:_MAX_BULLETS]]
+        if len(rows) > _MAX_BULLETS:
+            lines.append(f"  +{len(rows) - _MAX_BULLETS} more in manifest.json")
+    return title, "\n".join(lines)
+
+
+def send_completion(*, target: str, run_id: str, summary: dict, totals: str = "", leads: int = 0) -> int:
+    """Send ONE consolidated run-completion message, whichever of `complete`/`lead` is enabled.
+
+    Both enabled -> one message carrying the lead headline. Only `lead` enabled -> the same message, sent
+    only when there ARE leads (that is what subscribing to leads alone means). Only `complete` -> always.
+    """
+    events = enabled_events()
+    if "complete" in events:
+        event = "complete"
+    elif "lead" in events and leads:
+        event = "lead"
+    else:
+        return 0
+    title, body = completion_message(target=target, run_id=run_id, summary=summary,
+                                     totals=totals, leads=leads)
+    return send(event, title, body)
 
 
 def send_test() -> int:

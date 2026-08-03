@@ -673,7 +673,14 @@ def oos(profile_path, hosts):
 @click.option("-t", "--target", "profile_path", required=True,
               help="project name, project dir, or target.yaml path")
 @click.option("--timeout", default=1800, help="per-lookup ceiling (seconds) for the OSINT HTTP/whois/dig lookups — each also has its own shorter default, so this only TIGHTENS them. Must be > 0 (osint has no unbounded mode; 0 would collapse every lookup to a 0-second timeout)")
-def osint(profile_path, timeout):
+@click.option("--unbound", is_flag=True,
+              help="use ALL the eligible work this preflight already has: every registered "
+                   "coverage/throughput ceiling in these lanes goes to its unbounded meaning (today: "
+                   "RDAP_LOOKUPS — every address the apexes resolve to, instead of the first batch). It "
+                   "obtains nothing extra: provider enablement, credit reserves and page budgets are "
+                   "untouched, and scope, contact guards and rate limits never change. This is the "
+                   "VOLUME axis, not the waiting one — see `quarry policy --unbound`")
+def osint(profile_path, timeout, unbound):
     """Pre-flight OSINT: discover scope CANDIDATES + intel. Review-only — never edits scope.
 
     Workflow: init → fill anchors → `quarry osint` → review report + suggested.yaml →
@@ -696,7 +703,16 @@ def osint(profile_path, timeout):
     click.echo(f"   project: {project}")
     click.echo(f"   anchors: apex={len(profile.apex_domains)} asn={len(profile.asn)} "
                f"org={len(profile.org_names)} brands={len(profile.brands)}\n")
-    report = osint_mod.run(profile, scope, project, echo=click.echo, timeout=timeout)
+    # the SAME axis as `quarry run --unbound`, entered before any lane reads a bound and restored on the
+    # way out. Without it the preflight's own bound was unreachable — `--unbound` lived on `run`, which
+    # never calls these lanes, so a withheld remainder named an action no operator could take.
+    from . import policy as _policy
+    from . import settings as _settings
+    with _settings.overrides(_policy.unbound_overrides() if unbound else {}):
+        if unbound:
+            click.echo(_c("   --unbound: every registered preflight ceiling at its unbounded value\n",
+                          "cyan"))
+        report = osint_mod.run(profile, scope, project, echo=click.echo, timeout=timeout)
 
     cdir = report.parent
     cfile = cdir / "candidates.jsonl"
@@ -1030,14 +1046,14 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
         n_sec = run_obj.count("secret")
         n_conf = sum(1 for f in _fnds if f.get("confirmed"))
         n_cand = len(_fnds) - n_conf
-        summary = (f"{verdict} · live={len(run_obj.read('live'))} urls={run_obj.count('url')} "
-                   f"secrets={n_sec} confirmed={n_conf} candidates={n_cand} "
-                   f"gaps={len(gaps)} phase_exceptions={len(pexc)} failed_tools={len(fails)}")
-        notify.send("complete", f"Quarry {run_obj.run_id} · {profile.target} {verdict}", summary)
-        leads = n_sec + sum(1 for f in run_obj.read("finding")
-                            if f.get("severity") in ("critical", "high"))
-        if leads:
-            notify.send("lead", f"Quarry {profile.target}: {leads} promising lead(s)", summary)
+        totals = (f"live={len(run_obj.read('live'))} urls={run_obj.count('url')} "
+                  f"secrets={n_sec} confirmed={n_conf} candidates={n_cand}")
+        leads = n_sec + sum(1 for f in _fnds if f.get("severity") in ("critical", "high"))
+        # ONE consolidated message, rendered from the manifest's own structured fields — `complete` and
+        # `lead` used to be sent separately with an identical body (which reads as a loop), and the body
+        # shipped the internal verdict token to the operator.
+        notify.send_completion(target=profile.target, run_id=run_obj.run_id, summary=summ,
+                               totals=totals, leads=leads)
     return run_obj      # the finished run — a campaign supervisor absorbs its evidence and decides on it
 
 

@@ -27,10 +27,15 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import events, osint_report, secrets, settings, whoxy_page
+from . import budget, events, osint_report, secrets, settings, whoxy_page
 from .contract import (PROVIDER_PARSE, PROVIDER_TRANSPORT, ProviderBodyError, capture_error_body,
                        provider_error_class, whoxy_envelope)
 from .runner import RunResult, Status, fresh_artifact_dir, have, run as exec_tool, skipped
+
+#: how many RESOLVED ADDRESSES the RDAP lane looks up in one session. A THROUGHPUT bound over the full
+#: eligible set (host-fair order), never a membership cut: 0 = every eligible address, and the withheld
+#: remainder is reported as an operator limit. Registered in `policy.BOUNDS`, so `--unbound` lifts it.
+RDAP_LOOKUPS = 20
 
 # Full email (no inner capture group) — findall returns the whole address.
 _EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", re.IGNORECASE)
@@ -42,7 +47,7 @@ _DMARC_PROCESSORS = ("dmarcian", "proofpoint", "agari", "valimail", "easydmarc",
                      "ondmarc", "mxtoolbox", "fraudmarc", "dmarcadvisor", "redsift")
 
 # source reliability for confidence scoring
-_RELIABLE = {"whoxy-revwhois": 2, "azmap-tenant": 2, "asnmap": 1,
+_RELIABLE = {"whoxy-revwhois": 2, "azmap-tenant": 2, "azmap-tenant-email": 2, "asnmap": 1,
              "dmarc": 1, "dmarc-3rdparty": 0}
 _HINT_RANK = {"noise": 0, "verify-ownership": 1, "related": 2, "in-scope-likely": 3}
 
@@ -128,8 +133,11 @@ class OsintSession:
                                 "raw_refs": [raw_ref] if raw_ref else [],
                                 "manual_followup": manual_followup}
 
-    def intel(self, kind: str, value: str, source: str) -> None:
-        self._intel.append({"kind": kind, "value": value, "sources": [source]})
+    def intel(self, kind: str, value: str, source: str, **provenance) -> None:
+        """One intel row. `provenance` carries whatever the lane knows about WHERE the value came from —
+        a value whose origin was parsed and then dropped is evidence nobody can return to."""
+        self._intel.append({"kind": kind, "value": value, "sources": [source],
+                            **{k: v for k, v in provenance.items() if v not in (None, "")}})
 
     def _confidence(self, sources: list[str]) -> str:
         score = sum(_RELIABLE.get(s, 1) for s in sources)
@@ -220,14 +228,27 @@ def _azmap(s: OsintSession, apex: str, echo, timeout: int) -> None:
         raw = s.raw_path("azmap", f"{apex}.json")
         raw.write_text(data)
         obj = json.loads(data)
-        for d in (obj.get("related_domains") or obj.get("email_domains") or []):
-            if d != apex:
-                s.candidate(d, "apex", "azmap-tenant", "related",
-                            f"M365 tenant of {apex}", raw_ref=str(raw))
+        # UNION, never `or`: `related_domains or email_domains` short-circuited, so every tenant that
+        # returned related domains silently DROPPED its e-mail domains. TBHM treats them as ADDITIONAL
+        # evidence, not as a fallback — and the two carry different reasons, so a reviewer can tell which
+        # kind of tenant link they are looking at.
+        related = [d for d in (obj.get("related_domains") or []) if d != apex]
+        by_email = [d for d in (obj.get("email_domains") or []) if d != apex]
+        # DISTINCT source ids, not one: `candidate()` merges by (type, value) and keeps only the first
+        # reason at equal rank, so a domain listed in BOTH lists recorded only the related-domain link and
+        # the e-mail relationship vanished. Two ids means the merged candidate carries both in `sources`,
+        # and a reader can see it was reached two independent ways — which is stronger evidence, not
+        # duplicate noise.
+        for d in related:
+            s.candidate(d, "apex", "azmap-tenant", "related",
+                        f"M365 tenant of {apex}", raw_ref=str(raw))
+        for d in by_email:
+            s.candidate(d, "apex", "azmap-tenant-email", "related",
+                        f"M365 tenant e-mail domain of {apex}", raw_ref=str(raw))
         if obj.get("tenant_name"):
             s.candidate(obj["tenant_name"], "org", "azmap-tenant", "related",
                         f"M365 tenant name for {apex}", raw_ref=str(raw))
-        echo(f"  azmap[{apex}]: {len(obj.get('related_domains') or [])} related domains")
+        echo(f"  azmap[{apex}]: {len(related)} related + {len(by_email)} e-mail domain(s)")
     except Exception as e:
         echo(f"    azmap[{apex}]: {e}")
         s.note_failure("azmap", f"{apex}: {e}")
@@ -622,19 +643,67 @@ def _asn_expand(s: OsintSession, profile, echo, timeout: int) -> None:
                             manual_followup="verify ownership on bgp.he.net / RDAP before adding")
 
 
+#: strips the tool's ANSI colouring so its output can be parsed as text. porch-pirate always colours, has
+#: no `--no-color`, and its `--raw` flag does not apply to the globals path (MEASURED against v1.x: the
+#: globals view prints `- Author: / - Key: / - Value:` triples, coloured, never JSON).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _porch_globals(text: str) -> list[dict]:
+    """`{author, key, value}` per workspace global variable, from the tool's own coloured output.
+
+    The VALUE is preserved EXACTLY as the tool printed it — a Postman global is where a public workspace
+    leaks its API keys, and a truncated or masked secret is not evidence. Only Quarry's OWN configured
+    credentials are ever redacted, and that happens at the manifest sink, not here."""
+    out: list = []
+    author = ""
+    pending_key = None
+    for line in _ANSI_RE.sub("", text).splitlines():
+        line = line.strip()
+        if line.startswith("- Author:"):
+            author, pending_key = line.split(":", 1)[1].strip(), None
+        elif line.startswith("- Key:"):
+            pending_key = line.split(":", 1)[1].strip()
+        elif line.startswith("- Value:") and pending_key is not None:
+            out.append({"author": author, "key": pending_key,
+                        "value": line.split(":", 1)[1].strip()})
+            pending_key = None
+    return out
+
+
 def _porch_pirate(s: OsintSession, apex: str, echo, timeout: int) -> None:
-    """Public Postman API leaks → INTEL (endpoints), not scope."""
+    """Public Postman leaks → INTEL. TWO views, because the tool exposes two different things and the
+    documented one (secrets) was never collected: `--urls` gives endpoints, `--globals` gives workspace
+    GLOBAL VARIABLES — which is where a public workspace leaks its API keys and tokens.
+
+    Both are intel, never scope. A global with an empty value is still recorded: "this workspace defines
+    `apiKey`" is a finding about the workspace even when the value is withheld."""
     pp = s.raw_path("porch-pirate", f"{apex}.txt")
     r = exec_tool("porch-pirate", ["porch-pirate", "-s", apex, "--urls"],
                   raw_path=pp, timeout=timeout)
     s.record(r)
+    n_urls = 0
     if r.raw_path:
-        n = 0
-        for u in set(re.findall(r"https?://[^\s\"'<>]+", r.raw_path.read_text())):
+        for u in sorted(set(re.findall(r"https?://[^\s\"'<>]+", r.raw_path.read_text()))):
             s.intel("postman-endpoint", u, "porch-pirate")
-            n += 1
-        if n:
-            echo(f"  porch-pirate[{apex}]: {n} postman endpoints (intel)")
+            n_urls += 1
+
+    gl = s.raw_path("porch-pirate", f"{apex}.globals.txt")
+    rg = exec_tool("porch-pirate", ["porch-pirate", "-s", apex, "--globals"],
+                   raw_path=gl, timeout=timeout)
+    s.record(rg)
+    n_globals = 0
+    if rg.raw_path:
+        for g in _porch_globals(rg.raw_path.read_text()):
+            # VERBATIM, and WITH the workspace it came from: several public workspaces define the same
+            # key names, so `apiKey=…` without its author is evidence nobody can go back to. The author
+            # rides as its own field rather than being glued into the value, which stays exactly what the
+            # tool printed.
+            s.intel("postman-global", f"{g['key']}={g['value']}", "porch-pirate",
+                    workspace_author=g["author"] or "unknown", key=g["key"])
+            n_globals += 1
+    if n_urls or n_globals:
+        echo(f"  porch-pirate[{apex}]: {n_urls} endpoint(s), {n_globals} workspace global(s) (intel)")
 
 
 def _rdap_org(obj: dict) -> str:
@@ -650,20 +719,48 @@ def _rdap_org(obj: dict) -> str:
     return ""
 
 
+def _rdap_addresses(profile, s: OsintSession) -> dict:
+    """Every address each apex resolves to — v4 AND v6.
+
+    `gethostbyname_ex` is IPv4-ONLY, so a v6-only apex resolved to nothing and its netblock was invisible;
+    `getaddrinfo` asks for both families. Returns `{apex: [ip, ...]}` so the lane can order host-FAIRLY
+    rather than letting one apex's address set crowd out every other apex."""
+    import socket
+    per_apex: dict = {}
+    for apex in profile.apex_domains:
+        found: set = set()
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                for info in socket.getaddrinfo(apex, None, family, socket.SOCK_STREAM):
+                    found.add(info[4][0])
+            except OSError:
+                continue          # one family missing is normal; only a COMPLETE failure is a gap
+        per_apex[apex] = sorted(found)
+        if not found:
+            # review-B0r4#2: an apex we could not resolve must contribute to the verdict, never a silent
+            # `continue` under a clean completion.
+            s.note_failure("rdap", f"{apex}: resolved to no address (v4 or v6)")
+    return per_apex
+
+
 def _rdap(s: OsintSession, profile, echo, timeout: int) -> None:
     """Resolved apex IPs -> RDAP netblock/org -> CIDR/org CANDIDATES (suggest-only). Never adds
-    scope or scans; a resolved IP may be a CDN/shared host, so everything is verify-ownership."""
-    import socket
-    ips: set[str] = set()
-    for apex in profile.apex_domains:
-        try:
-            ips.update(socket.gethostbyname_ex(apex)[2])
-        except Exception as e:
-            # review-B0r4#2: a silent `continue` meant an apex we could not resolve contributed NOTHING
-            # to the verdict — the RDAP lane then reported clean completion over an unexamined apex.
-            s.note_failure("rdap", f"{apex}: resolve failed — {e}")
-            continue
-    for ip in sorted(ips)[:20]:                       # bound RDAP lookups
+    scope or scans; a resolved IP may be a CDN/shared host, so everything is verify-ownership.
+
+    The lookup count is a THROUGHPUT bound, never a membership cut. `sorted(ips)[:20]` silently deleted
+    every address after the twentieth — sorted, so biased toward low first octets — and reported nothing
+    about what it dropped. Now the full eligible set is established, ordered host-FAIRLY (one address per
+    apex per round, so a big apex cannot crowd out a small one), bounded by `RDAP_LOOKUPS` (0 = every
+    eligible address, which is exactly what `--unbound` sets), and whatever the bound withholds is
+    reported as OUR OWN operator limit, with its remainder."""
+    from . import policy
+    per_apex = _rdap_addresses(profile, s)
+    owner = {ip: apex for apex, ips in per_apex.items() for ip in ips}
+    eligible = budget.order_fairly(sorted(owner), lambda ip: owner[ip])
+    cap = policy.limit("RDAP_LOOKUPS")
+    chosen = eligible if cap <= 0 else eligible[:cap]
+    withheld = len(eligible) - len(chosen)
+    for ip in chosen:
         try:
             data = _http(f"https://rdap.org/ip/{ip}", timeout=min(timeout, 30))
             raw = s.raw_path("rdap", f"{ip}.json")
@@ -686,6 +783,18 @@ def _rdap(s: OsintSession, profile, echo, timeout: int) -> None:
             s.candidate(org, "org", "rdap", "verify-ownership",
                         f"RDAP org for resolved IP {ip}", raw_ref=str(raw))
         echo(f"  rdap[{ip}]: {netname or org or 'no netblock'}")
+    # OUR bound, so OUR limit — never a provider limit, and never silence: a withheld remainder nobody
+    # reports is indistinguishable from an address that does not exist.
+    note = f"{len(chosen)}/{len(eligible)} resolved address(es) looked up"
+    meta = {"eligible": len(eligible), "tested": len(chosen), "withheld": withheld,
+            "measure": "addresses", "bound": cap}
+    if withheld:
+        meta["operator_limit"] = True
+        note += (f" — {withheld} withheld by the RDAP_LOOKUPS={cap} throughput bound "
+                 f"(`quarry osint --unbound` covers every eligible address)")
+    s.record(RunResult("rdap", ["rdap", f"lookups={cap or 'unbounded'}"],
+                       Status.SUCCESS if chosen else Status.EMPTY,
+                       0, 0.0, None, len(chosen), note=note, meta=meta))
 
 
 def _key_health(s: OsintSession, echo) -> None:

@@ -986,12 +986,24 @@ class TestNativeLaneOutcomes:
 
     def test_unresolvable_apex_is_a_gap_not_a_silent_continue(self, tmp_path, monkeypatch):
         import socket
-        monkeypatch.setattr(socket, "gethostbyname_ex",
-                            lambda h: (_ for _ in ()).throw(OSError("nxdomain")))
+        monkeypatch.setattr(socket, "getaddrinfo",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("nxdomain")))
         s = self._sess(tmp_path)
         prof = type("P", (), {"apex_domains": ["acme.com"]})()
         osint._rdap(s, prof, lambda m: None, 30)
         assert s.outcome()["verdict"] == "complete_with_gaps"
+
+    def test_a_v6_ONLY_apex_is_not_invisible(self, tmp_path, monkeypatch):
+        """`gethostbyname_ex` is IPv4-only, so a v6-only apex resolved to nothing, contributed no
+        netblock, and was recorded as a resolve failure it never had."""
+        import socket
+        monkeypatch.setattr(socket, "getaddrinfo", lambda host, _p, family, *a, **k:
+                            [] if family == socket.AF_INET
+                            else [(family, None, None, "", ("2606:4700::1111", 0, 0, 0))])
+        s = self._sess(tmp_path)
+        prof = type("P", (), {"apex_domains": ["acme.com"]})()
+        assert osint._rdap_addresses(prof, s) == {"acme.com": ["2606:4700::1111"]}
+        assert s.outcome()["gaps"] == []
 
 
 class TestGenerationsMoveTogether:

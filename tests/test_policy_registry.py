@@ -237,9 +237,19 @@ class TestTheRegistryTellsTheTruth:
         with the planned-lane roster settle will need. Four were aliases: `crawl.sourcemap`, `probe.vhost`,
         `params.nuclei` and `vertical.permute`."""
         from quarry_recon import sources
-        registered = set(sources.all_sources())
-        stale = sorted({b.lane for b in policy.BOUNDS} - registered)     # no exceptions
+        registered = set(sources.all_sources()) | set(policy.BOUND_LANES_OUTSIDE_REGISTRY)
+        stale = sorted({b.lane for b in policy.BOUNDS} - registered)
         assert not stale, stale
+
+    def test_the_out_of_registry_bound_lanes_are_EXACT(self):
+        """An exception list is a hole in a completeness test, so it is enumerated and justified rather
+        than matched by prefix — `osint.*` would admit any typo as a new exemption."""
+        assert policy.BOUND_LANES_OUTSIDE_REGISTRY == ("osint.rdap",)
+        from quarry_recon import sources
+        registered = set(sources.all_sources())
+        for lane in policy.BOUND_LANES_OUTSIDE_REGISTRY:
+            assert lane not in registered, f"{lane} IS registered — drop the exemption"
+            assert lane.startswith("osint."), lane
 
     def test_an_ACTIVE_lane_is_never_classified_local(self):
         """Completeness cannot catch a category that is merely WRONG: both of these fetch over the network,

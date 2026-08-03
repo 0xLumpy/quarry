@@ -74,6 +74,11 @@ PROVIDER_LANES = ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.
 #: ...and the ids above that are NOT in the source registry, listed exactly rather than by prefix.
 PROVIDER_LANES_OUTSIDE_REGISTRY = ("osint.whoxy",)
 
+#: BOUND lanes that are not registered sources, listed EXACTLY (never by prefix — a prefix admits a typo).
+#: The OSINT preflight runs before any phase and has no source registry of its own; `osint.rdap` is a lane
+#: there. Its bound is still a bound: it appears in `quarry policy`, and `--unbound` lifts it.
+BOUND_LANES_OUTSIDE_REGISTRY = ("osint.rdap",)
+
 #: WHICH DOOR each acquisition lane executes through. Declared, so the acquisition closure can be checked
 #: against real call sites rather than against the existence of a gate somewhere: a registered provider
 #: that started making its own HTTP calls would otherwise pass a test that only counts gate strings.
@@ -204,6 +209,16 @@ BOUNDS: tuple[Bound, ...] = (
                "is a MEMBERSHIP cut (`all_names[:120]`, reported as a coverage gap) and the consumer does "
                "not yet interpret 0, so widening it belongs to the `--unbound` step"),
 
+    Bound(name="RDAP_LOOKUPS", reader="module", lane="osint.rdap", default=20, identity="none",
+          const="quarry_recon.osint:RDAP_LOOKUPS",
+          persistence="nothing — the OSINT preflight has no durable rotation to continue",
+          relaxable=True, unbounded_value=0, consumer_honours_unbounded=True,
+          note="free: unauthenticated RDAP lookups of addresses the apexes ALREADY resolve to (no key, "
+               "no spend, no target contact beyond the DNS resolution that produced them). It was a "
+               "MEMBERSHIP cut (`sorted(ips)[:20]`) with no remainder; now a throughput bound over the "
+               "full eligible set in host-fair order, with the withheld remainder recorded as an "
+               "operator limit"),
+
     Bound(name="SPA_CAP", reader="module", lane="crawl.katana_headless", default=10, identity="none",
           const="quarry_recon.phases.crawl:SPA_CAP",
           persistence="nothing — the headless pass has no durable rotation to continue",
@@ -288,6 +303,9 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.evidence:_SSTI_MAX_PARAMS": ("rate", "probes per endpoint is request pressure"),
     "quarry_recon.phases.crawl:MAX_JS": ("resource", "a 15 MB PER-ITEM guard on one downloaded file"),
     "quarry_recon.phases.crawl:MAX_MAP": ("resource", "a 20 MB PER-ITEM guard on one source map"),
+    "quarry_recon.notify:_MAX_BULLETS": ("not_a_bound", "how many lines one NOTIFICATION prints before "
+                                                      "pointing at the manifest: presentation, not "
+                                                      "coverage — nothing is dropped from the evidence"),
     "quarry_recon.netguard:_MAX_WORKERS": ("rate", "local concurrency"),
     "quarry_recon.settings:_CAP": ("rate", "per-tool worker caps"),
 
