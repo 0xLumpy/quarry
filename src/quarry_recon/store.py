@@ -57,6 +57,10 @@ ENTITY_KEYS = {
     "gadget_candidate": "id",   # chain MATERIAL: weird primitives that are not findings and not noise
                                 # (`gadgets.py`); never promoted to `finding`, impact_state always
                                 # `none_proven`
+    "path_observation": "id",   # step 4: path-like strings an ast-analyzer artifact contained, with
+                                # provenance, shape tags and incumbent corroboration. EVIDENCE, not a
+                                # finding and not an endpoint: nothing is requested because one exists
+                                # (notes/current/AST-ANALYZER-LANE-DESIGN.md)
     "oob_interaction": "id",    # OOB.1: imported out-of-band callbacks (interactsh); raw in raw/oob/,
                                 # uncorrelated by default until Quarry owns the token namespace (Phase 2)
 }

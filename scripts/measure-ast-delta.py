@@ -55,66 +55,13 @@ def _load_probe():
     return mod
 
 
-#: an endpoint is compared by its PATH. The tools disagree about scheme, host and query on purpose —
-#: katana emits absolute URLs, jsluice emits what the source literally wrote, xnLinkFinder emits
-#: `host/path` — so anything else would report differences in FORMAT as differences in COVERAGE.
-_TRAILING = re.compile(r"[)\]\}>,;'\"]+$")
+# The path normalisation and the plausibility rule live in `quarry_recon.ast_obs` now that the LANE uses
+# them too. A second copy here would drift the moment either side is corrected — and both were corrected
+# three times already (source-aware relatives, case preservation, tool failures as unreadable).
+from quarry_recon import ast_obs                                              # noqa: E402
 
-
-def path_key(value: str, *, host_prefixed: bool = False) -> str | None:
-    """Compare endpoints by PATH — SOURCE-AWARE, and case-preserving.
-
-    Two corrections that changed the numbers, not just the code:
-
-    * a relative path written in SOURCE (`api/users`, `v1/admin/roles`) keeps every segment. Treating any
-      value containing `/` as `host/path` amputated the first segment, which manufactured overlap and
-      quietly destroyed the api-shaped signal the whole verdict rests on. Only xnLinkFinder emits
-      `host/path`, and only that source may drop a leading host.
-    * the path keeps its CASE. `/API` and `/api` are different resources to a server, and Quarry's own
-      canonicalisation preserves path case deliberately; lowercasing merged them into fake agreement.
-    """
-    v = (value or "").strip().strip("'\"`")
-    v = _TRAILING.sub("", v)
-    if not v or len(v) > 512 or any(c in v for c in " \t\n<>"):
-        return None
-    if "://" in v:
-        v = urlsplit(v).path or "/"
-    elif v.startswith("//"):
-        v = urlsplit("https:" + v).path or "/"
-    else:
-        v = v.split("?", 1)[0].split("#", 1)[0]
-        if host_prefixed and not v.startswith("/") and "/" in v:
-            head, _, rest = v.partition("/")
-            v = "/" + rest if "." in head else "/" + v      # a HOST only when it looks like one
-        elif not v.startswith("/"):
-            v = "/" + v                                     # source-relative: every segment survives
-    v = v.split("?", 1)[0].split("#", 1)[0].rstrip("/") or "/"
-    if not v.startswith("/") or v in ("/", "/.", "/./"):
-        return None
-    while "/./" in v:
-        v = v.replace("/./", "/")
-    v = v.replace("//", "/")
-    return v if v != "/" else None
-
-
-#: BOTH sides emit strings that are not paths. jsluice replaces dynamic segments with an `EXPR`
-#: placeholder and happily reports regex fragments (`/a/i`, `/-`); the analyzer's `robust-paths` reports
-#: AST node names and format strings (`/*expr`, `/callexpression/...`). Counting those as endpoints on
-#: either side measures the extractors' noise floor, not coverage — so the headline numbers are the
-#: PLAUSIBLE ones, with the raw counts kept beside them.
-_META = set("*?[]()|\\{}^$+<>")
-
-
-def plausible_path(key: str) -> bool:
-    if not key or any(c in _META for c in key):
-        return False
-    segs = [s for s in key.strip("/").split("/") if s]
-    if not segs or len(segs) > 8:
-        return False
-    if any(s.lower() in ("expr", "*expr") or s.lower().startswith("expr") for s in segs):
-        return False
-    # at least one segment that reads like a name, not a single character or a bare number
-    return any(len(s) >= 3 and any(c.isalpha() for c in s) and not s.isdigit() for s in segs)
+path_key = ast_obs.path_key
+plausible_path = ast_obs.plausible
 
 
 def secret_key(value) -> str | None:

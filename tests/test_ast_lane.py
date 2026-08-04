@@ -452,3 +452,209 @@ class TestTheLaneReportsWhatItDidNotRead:
         ctx, run = _ctx(tmp_path)
         crawl._ast_bundles(ctx, _ledger([("https://acme.com/b.js", _bundle(tmp_path))]))
         assert run.values("js_url") == [] and run.values("url") == []
+
+
+class TestNormalisationIsCompleteAndDescriptive:
+    """Step 4: every readable observation an artifact contains becomes a `path_observation`. The analysis
+    is already paid for, so a partial normalisation would be a partial view of work that succeeded — and
+    nothing here promotes, requests or names a finding."""
+
+    @staticmethod
+    def _run_with(monkeypatch, tmp_path, doc):
+        import json as _json
+        TestTheWorkUnitMakesARerunSKIP._fake(monkeypatch, tmp_path, out=_json.dumps(doc))
+        monkeypatch.setattr(crawl, "have", lambda b: True)
+        ctx, run = _ctx(tmp_path)
+        crawl._ast_bundles(ctx, _ledger([("https://acme.com/b.js", _bundle(tmp_path))]))
+        return ctx, run, list(run.read("path_observation"))
+
+    def test_every_path_like_match_becomes_an_observation(self, tmp_path, monkeypatch):
+        doc = [{"analyzerName": "robust-paths", "value": "/api/users", "start": {"line": 1, "column": 0}},
+               {"analyzerName": "fetch", "value": "/api/orders", "start": {"line": 1, "column": 0}},
+               {"analyzerName": "graphql", "value": "/graphql", "start": {"line": 1, "column": 0}}]
+        _ctxo, _run, rows = self._run_with(monkeypatch, tmp_path, doc)
+        assert {r["id"] for r in rows} == {"/api/users", "/api/orders", "/graphql"}
+        assert all(r["sources"] == ["jxscout-ast"] and r["raw_ref"] for r in rows)
+
+    def test_the_counts_separate_DISTINCT_keys_from_sightings(self, tmp_path, monkeypatch):
+        """Two bundles naming the same path is one observation with two provenance sites — reporting the
+        sighting count as the observation count overstates what was found."""
+        import json as _json
+        doc = [{"analyzerName": "fetch", "value": "/api/x", "start": {"line": 1, "column": 0}}]
+        TestTheWorkUnitMakesARerunSKIP._fake(monkeypatch, tmp_path, out=_json.dumps(doc))
+        monkeypatch.setattr(crawl, "have", lambda b: True)
+        ctx, run = _ctx(tmp_path)
+        arts = [(f"https://acme.com/{i}.js", _bundle(tmp_path, f"{i}.js", size=100 + i)) for i in range(2)]
+        crawl._ast_bundles(ctx, _ledger(arts))
+        assert ctx._ast_stats["observations"] == 2, "two artifacts each contained it"
+        assert ctx._ast_stats["distinct"] == 1, "and it is ONE path"
+        row = next(iter(run.read("path_observation")))
+        assert sum(s["n"] for s in row["sightings"]) >= 2, \
+            "the raw match count lives per bundle, where it can be summed"
+        assert len(list(run.read("path_observation"))) == 1
+
+    def test_counts_are_PER_BUNDLE_so_the_store_can_merge_them(self, tmp_path, monkeypatch):
+        """The store unions lists and treats differing scalars as ALTERNATES: a scalar count merged 3 and
+        2 into "3, alt 2" rather than 5. Per-bundle rows survive the merge and a consumer can sum them."""
+        import json as _json
+        doc = [{"analyzerName": "fetch", "value": "/api/x", "start": {"line": 1, "column": 0}}] * 3
+        TestTheWorkUnitMakesARerunSKIP._fake(monkeypatch, tmp_path, out=_json.dumps(doc))
+        monkeypatch.setattr(crawl, "have", lambda b: True)
+        ctx, run = _ctx(tmp_path)
+        arts = [(f"https://acme.com/{i}.js", _bundle(tmp_path, f"{i}.js", size=100 + i)) for i in range(2)]
+        crawl._ast_bundles(ctx, _ledger(arts))
+        row = next(iter(run.read("path_observation")))
+        assert len(row["sightings"]) == 2, "one entry per bundle, unioned by the store"
+        assert sum(s["n"] for s in row["sightings"]) == 6
+        assert "occurrences" not in row, "a scalar the merger cannot add is worse than no number"
+
+    def test_same_ORIGIN_means_scheme_host_and_port(self, tmp_path, monkeypatch):
+        """`external` must mean a different ORIGIN. A host comparison alone called
+        `http://acme.com:9000` same-origin with a bundle from `https://acme.com:8443` — a different
+        service — while tagging the target's own fully-qualified routes external."""
+        import json as _json
+        vals = {"/api/self": "https://acme.com:8443/api/self",       # exactly this origin
+                "/api/implicit": "https://acme.com:8443/api/implicit",
+                "/api/rel": "//acme.com:8443/api/rel",               # inherits the bundle's scheme
+                "/api/otherport": "http://acme.com:9000/api/otherport",
+                "/api/otherscheme": "http://acme.com:8443/api/otherscheme",
+                "/api/them": "https://cdn.other/api/them"}
+        doc = [{"analyzerName": "fetch", "value": v, "start": {"line": 1, "column": 0}}
+               for v in vals.values()]
+        TestTheWorkUnitMakesARerunSKIP._fake(monkeypatch, tmp_path, out=_json.dumps(doc))
+        monkeypatch.setattr(crawl, "have", lambda b: True)
+        ctx, run = _ctx(tmp_path)
+        crawl._ast_bundles(ctx, _ledger([("https://acme.com:8443/b.js", _bundle(tmp_path))]))
+        rows = {r["id"]: set(r["tags"]) for r in run.read("path_observation")}
+        for same in ("/api/self", "/api/implicit", "/api/rel"):
+            assert "external" not in rows[same], f"{same} is the bundle's own origin"
+        for other in ("/api/otherport", "/api/otherscheme", "/api/them"):
+            assert "external" in rows[other], f"{other} is a different origin"
+
+    def test_a_default_port_is_the_same_origin_as_none(self):
+        from quarry_recon import ast_obs
+        assert ast_obs.origin_of("https://acme.com/x") == ast_obs.origin_of("https://acme.com:443/x")
+
+    def test_an_EMPTY_artifact_still_counts_as_normalised(self, tmp_path, monkeypatch):
+        """A published artifact that declares nothing is a measured zero. Skipping it made the
+        observations denominator smaller than the artifact denominator — and larger on the next run,
+        when the same bundle came back resumed."""
+        TestTheWorkUnitMakesARerunSKIP._fake(monkeypatch, tmp_path, out="[]")
+        monkeypatch.setattr(crawl, "have", lambda b: True)
+        ctx, _run = _ctx(tmp_path)
+        crawl._ast_bundles(ctx, _ledger([("https://acme.com/b.js", _bundle(tmp_path))]))
+        assert ctx._ast_stats["normalised"] == 1 and ctx._ast_stats["observations"] == 0
+
+    @pytest.mark.parametrize("start", [{"line": True, "column": 0}, {"line": 1, "column": "x"},
+                                       {"line": 1, "column": {}}, {"line": -3, "column": 0}, "nope"])
+    def test_a_malformed_position_does_not_take_the_phase_down(self, tmp_path, monkeypatch, start):
+        import json as _json
+        doc = [{"analyzerName": "fetch", "value": "/api/x", "start": start}]
+        TestTheWorkUnitMakesARerunSKIP._fake(monkeypatch, tmp_path, out=_json.dumps(doc))
+        monkeypatch.setattr(crawl, "have", lambda b: True)
+        ctx, run = _ctx(tmp_path)
+        crawl._ast_bundles(ctx, _ledger([("https://acme.com/b.js", _bundle(tmp_path))]))
+        rows = list(run.read("path_observation"))
+        assert [r["id"] for r in rows] == ["/api/x"]
+        # …and the broken position is NOT persisted as evidence: a reader must not have to re-validate
+        site = rows[0]["sites"][0]
+        assert site["line"] is None or (isinstance(site["line"], int) and site["line"] >= 1)
+        assert site["column"] is None or (isinstance(site["column"], int) and site["column"] >= 0)
+        assert not isinstance(site["line"], bool) and not isinstance(site["column"], bool)
+
+    def test_repeat_sightings_UNION_rather_than_duplicate(self, tmp_path, monkeypatch):
+        doc = [{"analyzerName": "robust-paths", "value": "/api/x", "start": {"line": 1, "column": 0}},
+               {"analyzerName": "fetch", "value": "/api/x", "start": {"line": 2, "column": 4}},
+               {"analyzerName": "fetch", "value": "/api/x", "start": {"line": 3, "column": 4}}]
+        _ctxo, _run, rows = self._run_with(monkeypatch, tmp_path, doc)
+        assert len(rows) == 1 and sum(s["n"] for s in rows[0]["sightings"]) == 3
+        assert sorted(rows[0]["analyzers"]) == ["fetch", "robust-paths"]
+        assert len(rows[0]["sites"]) == 3, "a few representative sites are kept, not the whole file"
+
+    def test_DOM_sink_matches_are_not_folded_in(self, tmp_path, monkeypatch):
+        """Sources and sinks are their own observation type (step 6). Quietly turning `postMessage` into
+        a path observation would put a data-flow finding in the wrong bucket."""
+        doc = [{"analyzerName": "postmessage", "value": "window.postMessage(x)", "start": {}},
+               {"analyzerName": "robust-paths", "value": "/api/x", "start": {"line": 1, "column": 0}}]
+        _ctxo, _run, rows = self._run_with(monkeypatch, tmp_path, doc)
+        assert [r["id"] for r in rows] == ["/api/x"]
+
+    def test_the_shape_tags_are_DESCRIPTIVE_and_deterministic(self, tmp_path, monkeypatch):
+        doc = [{"analyzerName": "robust-paths", "value": v, "start": {"line": 1, "column": 0}}
+               for v in ("/api/v2/users", "/Africa/Nairobi", "text/plain", "@sentry/browser",
+                         "https://cdn.example/app.js", "http://localhost:9/dev")]
+        _ctxo, _run, rows = self._run_with(monkeypatch, tmp_path, doc)
+        tags = {r["id"]: set(r["tags"]) for r in rows}
+        assert "api-shaped" in tags["/api/v2/users"]
+        assert "tz-database" in tags["/Africa/Nairobi"]
+        assert "mime" in tags["/text/plain"]
+        assert "module" in tags["/@sentry/browser"]
+        assert {"asset", "external"} <= tags["/app.js"]
+        assert {"external", "localhost"} <= tags["/dev"]
+
+    def test_an_implausible_string_is_KEPT_and_tagged_not_dropped(self, tmp_path, monkeypatch):
+        """The raw artifact holds everything; the observation layer holds everything it can normalise.
+        Filtering is a VIEW's job — dropping here would delete evidence a later pass cannot recover."""
+        doc = [{"analyzerName": "robust-paths", "value": 'e.plugins.get("X")',
+                "start": {"line": 1, "column": 0}}]
+        _ctxo, _run, rows = self._run_with(monkeypatch, tmp_path, doc)
+        assert len(rows) == 1 and "implausible" in rows[0]["tags"]
+
+    def test_corroboration_NAMES_who_and_only_for_that_path(self, tmp_path, monkeypatch):
+        import json as _json
+        TestTheWorkUnitMakesARerunSKIP._fake(
+            monkeypatch, tmp_path,
+            out=_json.dumps([{"analyzerName": "robust-paths", "value": "/api/known",
+                              "start": {"line": 1, "column": 0}},
+                             {"analyzerName": "robust-paths", "value": "/api/new",
+                              "start": {"line": 1, "column": 0}}]))
+        monkeypatch.setattr(crawl, "have", lambda b: True)
+        ctx, run = _ctx(tmp_path)
+        run.add("url", {"url": "https://acme.com/api/known", "sources": ["katana"]})
+        run.add("url", {"url": "https://acme.com/api/unrelated", "sources": ["gau"]})
+        crawl._ast_bundles(ctx, _ledger([("https://acme.com/b.js", _bundle(tmp_path))]))
+        rows = {r["id"]: r for r in run.read("path_observation")}
+        assert rows["/api/known"]["corroborated_by"] == ["katana"], \
+            "the row must name WHO corroborates it, not carry the whole corroborated set"
+        assert rows["/api/new"]["corroborated_by"] == []
+
+    def test_an_unreadable_artifact_is_a_declared_gap(self, tmp_path, monkeypatch):
+        from quarry_recon import events, store
+        run = store.Run.create(tmp_path, "acme.com")
+        events.configure(run.dir)
+        try:
+            TestTheWorkUnitMakesARerunSKIP._fake(monkeypatch, tmp_path, out='[{"analyzerName":"fetch",'
+                                                                           '"value":"/api/x"}]')
+            monkeypatch.setattr(crawl, "have", lambda b: True)
+            monkeypatch.setattr(crawl.Path, "read_text",
+                                lambda self, *a, **k: (_ for _ in ()).throw(OSError("gone")))
+            ctx = type("C", (), {"run": run, "scope": _Scope(), "echo": lambda *a, **k: None,
+                                 "profile": type("P", (), {})()})()
+            crawl._ast_bundles(ctx, _ledger([("https://acme.com/b.js", _bundle(tmp_path))]))
+            # the patch is GLOBAL on pathlib.Path, so it has to come off before the manifest is written —
+            # otherwise the reader cannot read the events either and the row vanishes for the wrong reason
+            monkeypatch.undo()
+            run.write_manifest(profile_summary={}, phases_run=["crawl"])
+            rows = {c["measure"]: c for c in run._run_summary()["coverage"]
+                    if c["source_id"] == "crawl.jxscout_ast"}
+            assert ctx._ast_stats["unnormalised"] == 1
+            assert rows["observations"]["omitted"] == 1 and rows["observations"]["tested"] == 0
+        finally:
+            events.reset()
+
+    def test_normalising_twice_adds_nothing(self, tmp_path, monkeypatch):
+        """A resumed bundle re-normalises from its durable artifact; that must be idempotent."""
+        import json as _json
+        TestTheWorkUnitMakesARerunSKIP._fake(
+            monkeypatch, tmp_path,
+            out=_json.dumps([{"analyzerName": "fetch", "value": "/api/x",
+                              "start": {"line": 1, "column": 0}}]))
+        monkeypatch.setattr(crawl, "have", lambda b: True)
+        ctx, run = _ctx(tmp_path)
+        art = _bundle(tmp_path)
+        crawl._ast_bundles(ctx, _ledger([("https://acme.com/b.js", art)]))
+        fresh = type("C", (), {"run": run, "scope": _Scope(), "echo": lambda *a, **k: None,
+                               "profile": type("P", (), {})()})()
+        crawl._ast_bundles(fresh, _ledger([("https://acme.com/b.js", art)]))
+        assert fresh._ast_stats["dispositions"] == {"resumed": 1}
+        assert len(list(run.read("path_observation"))) == 1

@@ -20,8 +20,8 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
 
-from .. import (budget, cgroup, events, fetch, normalize, policy, registry, remainder,
-                secrets, settings)
+from .. import (ast_obs, budget, cgroup, events, fetch, normalize, policy, registry,
+                remainder, secrets, settings, store)
 from ..contract import registered, run_contract
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
@@ -885,6 +885,69 @@ def _ast_analyze(ctx, artifact: Path, digest: str, engine: str, ledger=None) -> 
         return ("success" if doc else "empty"), res, meta
 
 
+def _ast_corroboration(ctx) -> dict:
+    """`{path key: [sources that already have it]}` — WHO corroborates each path, not merely that
+    something does. A set of keys put the whole set into every matching row and still named nobody.
+
+    Corroboration is confidence; it is deliberately not part of "what the analyzer added", which is about
+    the paths nobody else found.
+    """
+    seen: dict = {}
+    for entity in ("url", "js_url", "endpoint"):
+        for rec in ctx.run.read(entity):
+            if not isinstance(rec, dict):
+                continue
+            k = ast_obs.path_key(str(rec.get(store.ENTITY_KEYS.get(entity, "value"), "")))
+            if not k:
+                continue
+            names = seen.setdefault(k, [])
+            for s in (rec.get("sources") or []):
+                if isinstance(s, str) and s not in names:
+                    names.append(s)
+    return {k: sorted(v) for k, v in seen.items()}
+
+
+def _ast_normalise(ctx, artifact: Path, bundle: Path, digest: str, url: str, corroborated: set) -> tuple:
+    """Turn ONE published artifact into `path_observation` records. `(added, total, error)`.
+
+    EVERY readable observation from the artifact — the analysis is already paid for, so normalising only
+    part of what it produced would leave a partial view of work that succeeded. Nothing here is promoted,
+    requested or named as a finding.
+    """
+    try:
+        doc = json.loads(artifact.read_text("utf-8", "replace"))
+    except (OSError, ValueError):
+        return 0, 0, "unreadable-artifact"
+    if not isinstance(doc, list):
+        return 0, 0, "unreadable-artifact"
+    lines: dict = {}
+
+    def context(m):
+        # ONE validator for every consumer (`ast_obs.position`): a hostile or simply broken artifact can
+        # carry `true` or a dict where a number belongs, and `bool` IS an int in Python.
+        ln, col = ast_obs.position(m.get("start"))
+        if ln is None:
+            return ""
+        col = col or 0
+        if not lines:
+            try:
+                with bundle.open("r", encoding="utf-8", errors="replace") as fh:
+                    for n, text in enumerate(fh, 1):
+                        lines[n] = text
+            except OSError:
+                lines[0] = ""
+        text = lines.get(ln, "")
+        return text[max(0, col - 120): col + 120].strip()
+
+    try:
+        recs = ast_obs.observations(doc, bundle=bundle.name, bundle_digest=digest, bundle_url=url,
+                                    artifact=str(artifact), corroborated=corroborated, context=context)
+    except (TypeError, ValueError, OSError):
+        return 0, 0, "unreadable-artifact"       # a malformed record is a gap in ONE bundle, not a crash
+    added = sum(1 for r in recs if ctx.run.add("path_observation", r))
+    return added, len(recs), ""
+
+
 def _ast_bundles(ctx, ledger) -> int:
     """Analyse every eligible bundle ONCE and publish its artifact. Returns the number published.
 
@@ -894,7 +957,9 @@ def _ast_bundles(ctx, ledger) -> int:
     """
     stats = getattr(ctx, "_ast_stats", None)
     if stats is None:
-        stats = ctx._ast_stats = {"eligible": 0, "published": 0, "dispositions": {}, "peaks": []}
+        stats = ctx._ast_stats = {"eligible": 0, "published": 0, "dispositions": {}, "peaks": [],
+                                  "observations": 0, "distinct": 0, "normalised": 0,
+                                  "unnormalised": 0}
     engine = _ast_engine_digest()
     disp = stats["dispositions"]
     seen = getattr(ctx, "_ast_seen", None)
@@ -916,6 +981,9 @@ def _ast_bundles(ctx, ledger) -> int:
     # the completion ledger lives beside the artifacts but NOT inside the directory a later miner walks
     state = ctx.run.raw_path("crawl", "ast", "x.json").parent.parent / "ast.state.json"
     led = budget.Ledger(state, lane="crawl.jxscout_ast")
+    # what tools Quarry ALREADY runs have found this run, read ONCE: corroboration is confidence, and it
+    # is never counted as something the analyzer added
+    corroborated = _ast_corroboration(ctx)
     published = 0
     for _url, art in eligible:
         seen.add(str(art))
@@ -932,6 +1000,25 @@ def _ast_bundles(ctx, ledger) -> int:
             # requested AND actual, per bundle: the ratio is PROVISIONAL and this is what revises it
             stats["peaks"].append({"bytes": meta["bundle_bytes"], "request_mb": meta["mem_request_mb"],
                                    "peak_mb": meta["mem_peak_mb"], "wall_s": meta.get("wall_s")})
+        # `empty` too: a published artifact that declares nothing is a MEASURED zero, and leaving it out
+        # made the observations denominator smaller than the artifact denominator — and larger on the
+        # next run, when the same bundle came back as `resumed`.
+        if d in ("success", "empty", "resumed") and meta.get("artifact"):
+            # NORMALISE EVERY readable observation the artifact contains. The artifact is published and
+            # content-bound first, so an interrupted normalisation re-runs from durable evidence rather
+            # than re-paying for the analysis.
+            n_add, n_tot, err = _ast_normalise(ctx, Path(meta["artifact"]), art, digest, _url,
+                                               corroborated)
+            if err:
+                stats["unnormalised"] += 1
+                disp[err] = disp.get(err, 0) + 1
+            else:
+                stats["normalised"] += 1
+                # what this artifact contributed: DISTINCT paths within it, not raw matches. The raw
+                # count lives per bundle in each record's `sightings`, where a consumer can sum it.
+                stats["observations"] += n_tot
+                stats["distinct"] += n_add              # keys this artifact contributed that were NEW
+                meta["observations"] = n_tot
         if d == "success":
             published += 1
             stats["published"] += 1
@@ -961,7 +1048,8 @@ def _ast_bundles(ctx, ledger) -> int:
                                        f"all {stats['published']} of them")
         disp["ledger-unsaved"] = disp.get("ledger-unsaved", 0) + 1
     _ast_coverage(ctx, stats)
-    ctx.echo(f"  ast analysis: {published} artifact(s) from {len(eligible)} bundle(s)"
+    ctx.echo(f"  ast analysis: {published} artifact(s), {stats['distinct']} path observation(s) "
+             f"from {len(eligible)} bundle(s)"
              + (f" — {stats['eligible'] - stats['published']} not analysed" if
                 stats["eligible"] - stats["published"] else ""))
     return published
@@ -975,6 +1063,22 @@ def _ast_coverage(ctx, stats: dict) -> None:
                             omitted=max(0, stats["eligible"] - stats["published"]),
                             reason="; ".join(f"{d}={n}" for d, n in sorted(stats["dispositions"].items()))
                                    or "no bundles analysed")
+    if stats["normalised"] or stats["unnormalised"]:
+        # a DISTINCT unit again: reconciliation keeps the latest record per (source, unit), and this must
+        # not replace the bundles row. An artifact that could not be normalised is a gap in the EVIDENCE,
+        # even though the analysis itself succeeded and its artifact is on disk.
+        # TIMEOUT, not UNKNOWN: the denominator IS known (artifacts published) and the loss is ours in
+        # flight, not an unmeasurable one. An UNKNOWN record carries no counters by contract, so emitting
+        # it here silently dropped the numbers this row exists to carry.
+        events.coverage_partial("crawl.jxscout_ast", kind=events.COVERAGE_TIMEOUT, measure="observations",
+                                unit="observations",
+                                eligible=stats["normalised"] + stats["unnormalised"],
+                                tested=stats["normalised"], omitted=stats["unnormalised"],
+                                reason=f"{stats['distinct']} distinct path(s) from "
+                                       f"{stats['observations']} bundle-path pair(s) across "
+                                       f"{stats['normalised']} artifact(s)"
+                                       + (f"; {stats['unnormalised']} artifact(s) could not be read back"
+                                          if stats["unnormalised"] else ""))
     if stats["peaks"]:
         hi = max(stats["peaks"], key=lambda p: p["peak_mb"])
         # a DISTINCT unit: reconciliation keeps only the latest record per (source, unit), so sharing
