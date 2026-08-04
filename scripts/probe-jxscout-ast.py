@@ -483,7 +483,11 @@ def main() -> int:
                     # so the number in a lane comes from this line and not from intuition.
                     for mb in (8192, 16384, 32768):
                         rr = analyze(p, scratch, address_space_mb=mb)
-                        if rr["disposition"] not in ("killed", "timeout"):
+                        # climb until it ANSWERS: at an intermediate bound the analyzer catches its own
+                        # allocation failure and exits 1, which is a different SHAPE of the same fault,
+                        # not a result (measured on a 27 MB bundle: killed at 4/8 GB, analyzer-error at
+                        # 16 GB, success at 32 GB in 92 s).
+                        if rr["disposition"] in ("success", "empty"):
                             rr["file"], rr["size"] = p.name, p.stat().st_size
                             rr["bound_needed_mb"], r = mb, rr
                             break

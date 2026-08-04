@@ -142,16 +142,48 @@ def fold_occurrence(agg: dict, key: str, *, readable: bool, has_it: bool, prov: 
     return e
 
 
+def allocate(strata: dict, n: int, census_max: int = 30) -> dict:
+    """Spend the whole label budget: CENSUS the small strata, sample the rest.
+
+    Two failures this replaces. An even `n // len(strata)` wasted the quota of any stratum smaller than
+    its share — the first POAB draw asked for 100 and produced 85. Plain round-robin then spent the
+    leftovers but still left a 25-item family one short, which is the worst outcome available: a family
+    small enough to label COMPLETELY gains nothing from being sampled, and leaves a population estimate
+    where a census was free.
+    """
+    names = sorted(strata, key=lambda k: (len(strata[k]), k))
+    alloc = {k: 0 for k in names}
+    left = n
+    rest = []
+    for k in names:                                   # census: take the whole family
+        if len(strata[k]) <= census_max and len(strata[k]) <= left:
+            alloc[k] = len(strata[k])
+            left -= alloc[k]
+        else:
+            rest.append(k)
+    while left > 0 and any(alloc[k] < len(strata[k]) for k in rest):   # round-robin the remainder
+        for k in rest:
+            if left == 0:
+                break
+            if alloc[k] < len(strata[k]):
+                alloc[k] += 1
+                left -= 1
+    return alloc
+
+
 def build_worksheet(args) -> int:
     probe, delta = _load("probe-jxscout-ast"), _load("measure-ast-delta")
     run = Path(args.run)
-    corpus = run / "raw" / "crawl" / "js_files"
+    corpus = Path(args.corpus_dir) if args.corpus_dir else (run / "raw" / "crawl" / "js_files")
     if not corpus.is_dir():
         print(f"no corpus at {corpus}", file=sys.stderr)
         return 2
-    files = [f for f in sorted(corpus.glob("*.js")) if split_of(f.name) == args.slice]
-    print(f"slice {args.slice!r}: {len(files)} bundles (of {len(sorted(corpus.glob('*.js')))}) — "
-          f"EXPLORATORY: this corpus was already inspected in step 2, so nothing here is held out")
+    all_files = sorted(corpus.glob("*.js"))
+    files = [f for f in all_files if split_of(f.name) == args.slice] if args.slice else all_files
+    print(f"corpus {corpus} — {len(files)} bundle(s)"
+          + (f" in slice {args.slice!r} of {len(all_files)}" if args.slice else " (whole corpus)"))
+    if not args.unseen:
+        print("  EXPLORATORY: pass --unseen only for a corpus whose candidates have NOT been inspected")
 
     # AGGREGATE BY KEY FIRST. Keeping only a key's first occurrence let one bundle decide its fate: a key
     # first seen in a bundle jsluice could not read stayed `uncomparable` even though a later readable
@@ -159,19 +191,30 @@ def build_worksheet(args) -> int:
     # It also made the strata depend on filename order. Comparability and agreement are properties of the
     # KEY across every occurrence, so they are folded before anything is classified.
     agg: dict = {}
+    unreadable: list = []
     with tempfile.TemporaryDirectory(prefix="quarry-astlabel-") as tmp:
         scratch = Path(tmp)
         if not probe.sandbox(["true"], scratch):
             print("REFUSING: bwrap unavailable", file=sys.stderr)
             return 2
         for i, f in enumerate(files, 1):
-            r = probe.analyze(f, scratch, keep_doc=True)
+            r = probe.analyze(f, scratch, keep_doc=True, wall_s=args.timeout)
             if r["disposition"] == "killed":
                 for mb in (8192, 16384, 32768):
-                    r = probe.analyze(f, scratch, keep_doc=True, address_space_mb=mb)
-                    if r["disposition"] not in ("killed", "timeout"):
+                    r = probe.analyze(f, scratch, keep_doc=True, wall_s=args.timeout,
+                                      address_space_mb=mb)
+                    # climb until the analyzer actually ANSWERS. Stopping at "not killed" left the two
+                    # 27 MB POAB bundles excluded as `analyzer-error`: at 16 GB the analyzer catches its
+                    # own allocation failure and exits 1, which is not a refusal — at 32 GB the same
+                    # bytes parse cleanly in 92 s. A rung that merely changes the SHAPE of the failure is
+                    # not a result.
+                    if r["disposition"] in ("success", "empty"):
                         break
             if r["disposition"] not in ("success", "empty"):
+                # EXCLUDED EVIDENCE, counted and named. A validation that quietly calls 144 of 148 "the
+                # corpus" is overstating its own population.
+                unreadable.append({"bundle": f.name, "disposition": r["disposition"],
+                                   "size": f.stat().st_size})
                 continue
             js_ok, js_keys = delta.jsluice_file(f, "urls")
             for m in (r.get("doc") or []):
@@ -213,10 +256,10 @@ def build_worksheet(args) -> int:
         else:
             strata[f"net-new/{row['bucket']}"].append(row)
     rng = random.Random(args.seed)
-    per = max(1, args.n // max(1, len(strata)))
+    alloc = allocate(strata, args.n, args.census_max)
     sample: list = []
     for name, items in sorted(strata.items()):
-        pick = rng.sample(items, min(per, len(items)))
+        pick = rng.sample(items, alloc[name])
         for row in pick:
             row["stratum"] = name
             row["label"] = None                          # ← the human fills this in
@@ -230,9 +273,20 @@ def build_worksheet(args) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     meta = {"purpose": "hand-label each row's `label` field", "labels": list(LABELS),
             "slice": args.slice,
-            "status": "EXPLORATORY — the rules were derived from this corpus; validation needs an "
-                      "unseen one",
+            "status": ("UNSEEN — drawn before any candidate from this corpus was inspected"
+                       if args.unseen else
+                       "EXPLORATORY — the rules were derived from this corpus; validation needs an "
+                       "unseen one"),
             "seed": args.seed, "corpus": str(corpus),
+            # the POLICY this draw was made under. A filter validated at 60 s is validated on a
+            # NARROWER population than a lane that runs at 300 s would process — and the bundles the
+            # short wall excludes are the 30 MB ones where jsluice gives up, i.e. exactly where the
+            # analyzer is supposed to earn its place.
+            "policy": {"timeout_s": args.timeout, "address_space_ladder_mb": [4096, 8192, 16384, 32768],
+                       "census_max": args.census_max},
+            "population": {"files_offered": len(files),
+                           "files_read": len(files) - len(unreadable),
+                           "excluded_unreadable": unreadable},
             "strata": {k: len(v) for k, v in sorted(strata.items())},
             "rule_digests": rule_digests(delta),
             "editable_fields": list(EDITABLE), "sampled": len(sample)}
@@ -241,6 +295,9 @@ def build_worksheet(args) -> int:
         fh.write(json.dumps({"_meta": meta}) + "\n")
         for row in sample:
             fh.write(json.dumps(row) + "\n")
+    if unreadable:
+        print(f"  EXCLUDED as unreadable: {len(unreadable)} bundle(s) — "
+              f"{collections.Counter(u['disposition'] for u in unreadable)}")
     print(f"\nwrote {out} — {len(sample)} rows to label, drawn from {len(rows)} candidates")
     for name, items in sorted(strata.items()):
         print(f"  {name:<28} population {len(items):>5}  sampled {sum(1 for r in sample if r['stratum'] == name)}")
@@ -424,7 +481,18 @@ def main() -> int:
                                         "20260725-143341-1a636b47"))
     w.add_argument("--n", type=int, default=100, help="rows to label in total")
     w.add_argument("--seed", type=int, default=20260804)
-    w.add_argument("--slice", choices=("a", "b"), default="b", help="which half of the corpus to sample")
+    w.add_argument("--slice", choices=("a", "b"), default=None,
+                   help="sample one deterministic half (omit to use the whole corpus)")
+    w.add_argument("--corpus-dir", help="a bare directory of .js bodies, instead of <run>/raw/crawl/js_files")
+    w.add_argument("--census-max", type=int, default=30,
+                   help="strata at or below this size are labelled COMPLETELY rather than sampled")
+    w.add_argument("--timeout", type=int, default=300,
+                   help="per-bundle wall, in seconds. Default is the intended PRODUCTION policy: the "
+                        "four 27-30 MB POAB bundles need 96-102 s (measured), so 60 s silently drops "
+                        "the corpus's largest evidence")
+    w.add_argument("--unseen", action="store_true",
+                   help="mark this draw as UNSEEN — only truthful when no candidate from this corpus has "
+                        "been inspected")
     w.add_argument("-o", "--out", default="ast-endpoint-worksheet.jsonl")
     s = sub.add_parser("score", help="score the candidate rules against a hand-labelled sample")
     s.add_argument("worksheet")

@@ -383,17 +383,24 @@ def main() -> int:
     ap.add_argument("-n", "--sample", type=int, default=0, help="0 = the whole corpus")
     ap.add_argument("--seed", type=int, default=20260804)
     ap.add_argument("--json", dest="json_out")
+    ap.add_argument("--corpus-dir", help="a bare directory of .js bodies, instead of <run>/raw/crawl/js_files")
+    ap.add_argument("--only", choices=("all", "secrets", "endpoints", "sinks"), default="all",
+                    help="report one family. `secrets` prints NO endpoint or sink values — used when the "
+                         "same corpus is being kept unseen for an endpoint-rule worksheet")
     args = ap.parse_args()
 
     probe = _load_probe()
     run = Path(args.run)
-    corpus = run / "raw" / "crawl" / "js_files"
+    corpus = Path(args.corpus_dir) if args.corpus_dir else (run / "raw" / "crawl" / "js_files")
     if not corpus.is_dir():
         print(f"no corpus at {corpus}", file=sys.stderr)
         return 2
     if not shutil.which("jsluice"):
         print("jsluice is required for the endpoint/secret comparison", file=sys.stderr)
         return 2
+    want_ep = args.only in ("all", "endpoints")
+    want_sec = args.only in ("all", "secrets")
+    want_sinks = args.only in ("all", "sinks")
     files = sorted(corpus.glob("*.js"))
     if args.sample:
         files = random.Random(args.seed).sample(files, min(args.sample, len(files)))
@@ -418,7 +425,12 @@ def main() -> int:
             if r["disposition"] == "killed":
                 for mb in (8192, 16384, 32768):      # the step-1 ladder: our bound, not the tool's
                     r = probe.analyze(f, scratch, keep_doc=True, address_space_mb=mb)
-                    if r["disposition"] not in ("killed", "timeout"):
+                    # climb until the analyzer actually ANSWERS. Stopping at "not killed" left the two
+                    # 27 MB POAB bundles excluded as `analyzer-error`: at 16 GB the analyzer catches its
+                    # own allocation failure and exits 1, which is not a refusal — at 32 GB the same
+                    # bytes parse cleanly in 92 s. A rung that merely changes the SHAPE of the failure is
+                    # not a result.
+                    if r["disposition"] in ("success", "empty"):
                         laddered += 1
                         break
             dispositions[r["disposition"]] += 1
@@ -433,17 +445,21 @@ def main() -> int:
             for m in (r.get("doc") or []):
                 name = m.get("analyzerName", "")
                 if name in SINK_ANALYZERS:
-                    f_sinks[name] += 1
-                elif name in ENDPOINT_ANALYZERS:
+                    if want_sinks:
+                        f_sinks[name] += 1
+                elif name in ENDPOINT_ANALYZERS and want_ep:
                     k = path_key((m.get("extra") or {}).get("pathname") or m.get("value", ""))
                     if k:
                         f_endpoints.add(k)
-                elif name == "secrets":
+                elif name == "secrets" and want_sec:
                     k = secret_key(m.get("value", ""))
                     if k:
                         f_secrets.add(k)
-            js_ok, here_js = jsluice_file(f, "urls")
-            js_sec_ok, here_sec = jsluice_file(f, "secrets")
+            # a family that was not requested is not measured either: `--only secrets` must not leave
+            # endpoint candidates anywhere, and computing them "just for the JSON" is exactly how the
+            # POAB run persisted 120 net-new paths for a corpus being kept unseen.
+            js_ok, here_js = jsluice_file(f, "urls") if want_ep else (True, set())
+            js_sec_ok, here_sec = jsluice_file(f, "secrets") if want_sec else (True, set())
             js_unreadable += 0 if (js_ok and js_sec_ok) else 1
             if ast_ok:
                 # the sink INVENTORY is analyzer-only (no incumbent produces these), so its denominator
@@ -456,7 +472,7 @@ def main() -> int:
                 paired.append(f)
                 ast_endpoints |= f_endpoints
                 js_endpoints |= here_js
-                if not (r.get("doc") or []) and here_js:
+                if want_ep and not (r.get("doc") or []) and here_js:
                     silent_on.append(f.name)
             if ast_ok and js_sec_ok:
                 paired_sec.append(f)
@@ -472,17 +488,19 @@ def main() -> int:
     same_sec = {"jsluice(re-run)": js_secrets}
     # staged over the SECRETS-paired files, not the corpus: the moment either tool cannot read a bundle,
     # scanning it anyway would compare two different input sets again.
-    scanners = _dir_scanners(paired_sec)
+    scanners = _dir_scanners(paired_sec) if want_sec else {}
     scanner_status = {k: {"ok": v["ok"], "why": v["why"]} for k, v in scanners.items()}
     for name, res in scanners.items():
         if res["ok"]:
             same_sec[name] = res["values"]
     # EVERY expected scanner, present AND readable. `bool(scanners)` only proved one of them ran.
-    secrets_measurable = all(scanners.get(name, {}).get("ok") for name in EXPECTED_SCANNERS)
+    secrets_measurable = want_sec and all(scanners.get(name, {}).get("ok") for name in EXPECTED_SCANNERS)
     for name in EXPECTED_SCANNERS:
         scanner_status.setdefault(name, {"ok": False, "why": "not reported by the scanner pass"})
-    context_ep = incumbent_endpoints(run)
-    context_sec = incumbent_secrets(run)
+    # a bare corpus has no run beside it, so there is nothing to show as context — and nothing is
+    # invented to fill the gap
+    context_ep = incumbent_endpoints(run) if not args.corpus_dir else {}
+    context_sec = incumbent_secrets(run) if not args.corpus_dir else {}
     union_ep = set().union(*same_ep.values()) if same_ep else set()
     ast_ep_p = {k for k in ast_endpoints if plausible_path(k)}
     union_ep_p = {k for k in union_ep if plausible_path(k)}
@@ -496,10 +514,11 @@ def main() -> int:
         "scanner_status": scanner_status, "secrets_measurable": secrets_measurable,
         "dispositions": dict(dispositions), "laddered": laddered,
         "silent_on_n": len(silent_on),
-        "sinks": {"total": sum(ast_sinks.values()), "files_with_sinks": len(ast_sink_files),
-                  "by_class": dict(ast_sinks.most_common())},
-        "silent_on": silent_on,
-        "endpoints": {"ast": len(ast_endpoints),
+        "sinks": ({"total": sum(ast_sinks.values()), "files_with_sinks": len(ast_sink_files),
+                   "by_class": dict(ast_sinks.most_common())}
+                  if want_sinks else {"disposition": "not_requested"}),
+        "silent_on": silent_on if want_ep else [],
+        "endpoints": {"disposition": "not_requested"} if not want_ep else {"ast": len(ast_endpoints),
                       "same_input": {k: len(v) for k, v in same_ep.items()},
                       "context_whole_corpus": {k: len(v) for k, v in context_ep.items()},
                       "union_incumbent": len(union_ep),
@@ -519,7 +538,8 @@ def main() -> int:
         # a REFUSED delta publishes no comparison integers. They are the numbers a consumer would read
         # first, and a separate top-level flag is too easy to miss — so the disposition lives inside this
         # block and the metrics are null, with what WAS observed kept under a name that says so.
-        "secrets": ({"disposition": "measured", "ast": len(ast_secrets),
+        "secrets": ({"disposition": "not_requested"} if not want_sec else
+                    {"disposition": "measured", "ast": len(ast_secrets),
                      "same_input": {k: len(v) for k, v in same_sec.items()},
                      "context_whole_corpus": {k: len(v) for k, v in context_sec.items()},
                      "union_incumbent": len(union_sec),
@@ -541,60 +561,63 @@ def main() -> int:
           f"unreadable {js_unreadable}); every comparison below is over its own paired set only. The "
           f"sink inventory is analyzer-only: its denominator is the {ast_readable_files} bundles the "
           f"analyzer read.")
-    print(f"\nast produced NOTHING on {len(silent_on)} of {len(paired)} PAIRED bundles where jsluice found "
-          f"endpoints in the same bytes")
-    print(f"\nSINKS — nothing in Quarry emits these:")
-    dom_n = sum(n for k, n in ast_sinks.items() if k in DOM_SINKS)
-    report["sinks"]["dom_flow"] = dom_n
-    report["sinks"]["informational"] = report["sinks"]["total"] - dom_n
-    print(f"  {report['sinks']['total']} in {report['sinks']['files_with_sinks']} of "
-          f"{ast_readable_files} bundles the analyzer READ — {dom_n} are DOM source/sink, "
-          f"{report['sinks']['total'] - dom_n} informational (regex/hostname)")
-    for name, n in ast_sinks.most_common(12):
-        print(f"    {name:<34} {n}")
-    print(f"\nENDPOINTS — same input set ({len(paired)} paired bundles): ast {len(ast_endpoints)} vs "
-          f"incumbent union {len(union_ep)}")
-    for k, v in sorted(same_ep.items()):
-        print(f"    {k:<20} {len(v)}")
-    print("  context only (WHOLE corpus, a different input set — not in the arithmetic):")
-    for k, v in sorted(context_ep.items()):
-        print(f"    {k:<20} {len(v)}")
-    ep = report["endpoints"]
-    print(f"  PLAUSIBLE paths only (no regex/placeholder noise): ast {ep['ast_plausible']} vs "
-          f"incumbent {ep['union_plausible']}")
-    print(f"    ast net-new {ep['plausible_net_new_n']} · missed by ast {ep['plausible_missed_n']}")
-    print(f"    net-new by CATEGORY (descriptive for THIS corpus, not a validated filter): "
-          f"{ep['net_new_buckets']}")
-    for s in ep["net_new_api_shaped"][:8]:
-        print(f"      + (api-shaped) {s[:88]}")
-    for s in ep["plausible_missed"][:6]:
-        print(f"      - {s[:96]}")
-    nn, ms = report["endpoints"]["ast_net_new"], report["endpoints"]["missed_by_ast"]
-    print(f"  ast NET-NEW: {report['endpoints']['ast_net_new_n']} "
-          f"({nn['other_n']} non-asset, {nn['asset_or_module_n']} asset/module)")
-    for s in nn["other"][:6]:
-        print(f"    + {s[:100]}")
-    print(f"  MISSED by ast: {report['endpoints']['missed_by_ast_n']} "
-          f"({ms['other_n']} non-asset, {ms['asset_or_module_n']} asset/module — the latter is mostly "
-          f"jsluice counting import specifiers)")
-    for s in ms["other"][:6]:
-        print(f"    - {s[:100]}")
-    if not secrets_measurable:
-        print(f"\nSECRETS — DELTA REFUSED: a scanner did not complete readably {scanner_status}. "
-              f"Reporting the incumbents as zero here would be inventing the answer.")
-    print(f"\nSECRETS — same input set ({len(paired_sec)} bundles): ast {len(ast_secrets)} vs "
-          f"incumbent union {len(union_sec)}"
-          + ("" if secrets_measurable else "  [NOT A VERDICT — see the refusal above]"))
-    for k, v in sorted(same_sec.items()):
-        print(f"    {k:<20} {len(v)}")
-    print("  context only (whole corpus):")
-    for k, v in sorted(context_sec.items()):
-        print(f"    {k:<20} {len(v)}")
-    print(f"  ast NET-NEW: {report['secrets']['ast_net_new_n']} · "
-          f"missed by ast: {report['secrets']['missed_by_ast_n']}")
-    for s in sorted(ast_secrets - union_sec)[:8]:
-        print(f"    + {s[:80]}")
-
+    if args.only in ("all", "endpoints"):
+        print(f"\nast produced NOTHING on {len(silent_on)} of {len(paired)} PAIRED bundles where jsluice found "
+              f"endpoints in the same bytes")
+    if args.only in ("all", "sinks"):
+        print(f"\nSINKS — nothing in Quarry emits these:")
+        dom_n = sum(n for k, n in ast_sinks.items() if k in DOM_SINKS)
+        report["sinks"]["dom_flow"] = dom_n
+        report["sinks"]["informational"] = report["sinks"]["total"] - dom_n
+        print(f"  {report['sinks']['total']} in {report['sinks']['files_with_sinks']} of "
+              f"{ast_readable_files} bundles the analyzer READ — {dom_n} are DOM source/sink, "
+              f"{report['sinks']['total'] - dom_n} informational (regex/hostname)")
+        for name, n in ast_sinks.most_common(12):
+            print(f"    {name:<34} {n}")
+    if args.only in ("all", "endpoints"):
+        print(f"\nENDPOINTS — same input set ({len(paired)} paired bundles): ast {len(ast_endpoints)} vs "
+              f"incumbent union {len(union_ep)}")
+        for k, v in sorted(same_ep.items()):
+            print(f"    {k:<20} {len(v)}")
+        print("  context only (WHOLE corpus, a different input set — not in the arithmetic):")
+        for k, v in sorted(context_ep.items()):
+            print(f"    {k:<20} {len(v)}")
+        ep = report["endpoints"]
+        print(f"  PLAUSIBLE paths only (no regex/placeholder noise): ast {ep['ast_plausible']} vs "
+              f"incumbent {ep['union_plausible']}")
+        print(f"    ast net-new {ep['plausible_net_new_n']} · missed by ast {ep['plausible_missed_n']}")
+        print(f"    net-new by CATEGORY (descriptive for THIS corpus, not a validated filter): "
+              f"{ep['net_new_buckets']}")
+        for s in ep["net_new_api_shaped"][:8]:
+            print(f"      + (api-shaped) {s[:88]}")
+        for s in ep["plausible_missed"][:6]:
+            print(f"      - {s[:96]}")
+        nn, ms = report["endpoints"]["ast_net_new"], report["endpoints"]["missed_by_ast"]
+        print(f"  ast NET-NEW: {report['endpoints']['ast_net_new_n']} "
+              f"({nn['other_n']} non-asset, {nn['asset_or_module_n']} asset/module)")
+        for s in nn["other"][:6]:
+            print(f"    + {s[:100]}")
+        print(f"  MISSED by ast: {report['endpoints']['missed_by_ast_n']} "
+              f"({ms['other_n']} non-asset, {ms['asset_or_module_n']} asset/module — the latter is mostly "
+              f"jsluice counting import specifiers)")
+        for s in ms["other"][:6]:
+            print(f"    - {s[:100]}")
+    if want_sec:
+        if not secrets_measurable:
+            print(f"\nSECRETS — DELTA REFUSED: a scanner did not complete readably {scanner_status}. "
+                  f"Reporting the incumbents as zero here would be inventing the answer.")
+        print(f"\nSECRETS — same input set ({len(paired_sec)} bundles): ast {len(ast_secrets)} vs "
+              f"incumbent union {len(union_sec)}"
+              + ("" if secrets_measurable else "  [NOT A VERDICT — see the refusal above]"))
+        for k, v in sorted(same_sec.items()):
+            print(f"    {k:<20} {len(v)}")
+        print("  context only (whole corpus):")
+        for k, v in sorted(context_sec.items()):
+            print(f"    {k:<20} {len(v)}")
+        print(f"  ast NET-NEW: {report['secrets']['ast_net_new_n']} · "
+              f"missed by ast: {report['secrets']['missed_by_ast_n']}")
+        for s in sorted(ast_secrets - union_sec)[:8]:
+            print(f"    + {s[:80]}")
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(report, indent=2))
         print(f"\nwrote {args.json_out}")
