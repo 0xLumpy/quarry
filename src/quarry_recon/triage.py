@@ -48,6 +48,9 @@ CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "s
                     # path-like strings an AST pass read out of JS bundles: EVIDENCE with a ranking,
                     # never a queue of things to fetch (`ast_obs.priority_view`):
                     "path_observations",
+                    # DOM sources and sinks read out of the same bundles — a surface Quarry did not have
+                    # before, and still evidence: where data ENTERS or LANDS, never a proven flow:
+                    "sink_observations",
                     # chain MATERIAL, deliberately separate from every queue above: those rank things to
                     # VERIFY, this remembers primitives that are not findings on their own (`gadgets.py`):
                     "gadgets",
@@ -389,6 +392,31 @@ def build(run, scope) -> str:
             A(f"- ({len(obs) - len(top)} further observation(s) kept as evidence, not prioritised)")
         A("")
 
+    sinks = [s for s in run.read("sink_observation") if isinstance(s, dict)]
+    if sinks:
+        from . import ast_obs
+        flow = ast_obs.flow_view(sinks)
+        A(f"## DOM sources & sinks ({len(sinks)}) — evidence, {len(flow)} data-flow")
+        A("> Where attacker-controllable data can ENTER a page and where it can LAND, read out of the "
+          "JS. A source and a sink in the same bundle is not a flow: proving one reaches the other "
+          "means following assignments through minified code, which nothing here does. The regex and "
+          "hostname families are NOT normalised — they are 13,953 of ~14,000 matches in two bundles — "
+          "and stay complete in the raw artifact.\n")
+        by_role: dict[str, list] = {}
+        for s in flow:
+            by_role.setdefault(s.get("role") or "other", []).append(s)
+        for role in sorted(by_role):
+            rows = by_role[role]
+            A(f"### {role.upper()}  ({len(rows)})")
+            for s in rows[:8]:
+                seen = sum(x.get("n", 0) for x in (s.get("sightings") or []) if isinstance(x, dict))
+                A(f"- `{(s.get('value') or '')[:110]}`  ·  {s.get('analyzer')}  ·  x{seen}")
+            if len(rows) > 8:
+                A(f"- … {len(rows) - 8} more — full list in normalized/sink_observation.jsonl")
+            A("")
+        if len(sinks) > len(flow):
+            A(f"({len(sinks) - len(flow)} observation(s) of another role kept as evidence)\n")
+
     A("## Review order")
     A("1. secrets — exports/secrets.jsonl")
     A("2. origin hosts above (no WAF)")
@@ -407,11 +435,15 @@ def build(run, scope) -> str:
 # present as empty placeholder keys (filled by tag-only classifiers in M2.2).
 
 def _item(type_: str, value, why: str, confidence: str, sources, raw_ref: str, tags,
-          location: str | None = None) -> dict:
+          location: str | None = None, identity: str | None = None) -> dict:
     val = _sanitize_url(secrets.redact(value)) if isinstance(value, str) else value
     # hash the SANITIZED value: keeps raw tokens out of the id AND dedups the same endpoint
     # that differs only by a one-time code/state.
-    iid = f"{type_}:{hashlib.sha1(str(val).encode('utf-8', 'replace')).hexdigest()[:10]}"
+    #
+    # `identity` overrides it for a type whose DISPLAY is bounded: hashing a truncated string collapses
+    # two distinct records that happen to share a prefix, and dedup below is by item id.
+    iid = (f"{type_}:{identity}" if identity else
+           f"{type_}:{hashlib.sha1(str(val).encode('utf-8', 'replace')).hexdigest()[:10]}")
     item = {"id": iid, "type": type_, "value": val, "why": why,
             "confidence": confidence, "sources": list(sources or []),
             "raw_ref": raw_ref, "tags": [t for t in (tags or []) if t]}
@@ -615,6 +647,18 @@ def collect(run, scope) -> dict:
             ["observation", "path", "impact:none_proven"] + sorted(o.get("tags") or [])
             + [f"corroborated:{w}" for w in who],
             location=o.get("raw_ref") or None))
+
+    for s in _ast_obs.flow_view([s for s in run.read("sink_observation") if isinstance(s, dict)]):
+        seen = sum(x.get("n", 0) for x in (s.get("sightings") or []) if isinstance(x, dict))
+        add("sink_observations", _item(
+            "sink_observation", (s.get("value") or "")[:160],
+            f"{s.get('role')} — {s.get('analyzer')}, seen {seen}x in "
+            f"{len(s.get('bundles') or []) or 1} JS bundle(s); a source and a sink are not a flow",
+            "candidate", s.get("sources"), "normalized/sink_observation.jsonl",
+            ["observation", "dom", "impact:none_proven"] + sorted(s.get("tags") or []),
+            location=s.get("raw_ref") or None,
+            # the ENTITY's id: the display is truncated, the identity must not be
+            identity=str(s.get("id") or "")))
 
     for q in queues:                                # dedup by item id (keys already canonical)
         queues[q] = list({it["id"]: it for it in queues[q]}.values())

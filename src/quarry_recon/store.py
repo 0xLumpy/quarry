@@ -61,6 +61,10 @@ ENTITY_KEYS = {
                                 # provenance, shape tags and incumbent corroboration. EVIDENCE, not a
                                 # finding and not an endpoint: nothing is requested because one exists
                                 # (notes/current/AST-ANALYZER-LANE-DESIGN.md)
+    "sink_observation": "id",   # step 6: DOM sources/sinks an ast artifact contained (postMessage,
+                                # innerHTML, eval, location, storage, cookie…). Nothing in Quarry emitted
+                                # this class before; it is EVIDENCE of where attacker-controllable data
+                                # enters or lands, never a proven flow
     "oob_interaction": "id",    # OOB.1: imported out-of-band callbacks (interactsh); raw in raw/oob/,
                                 # uncorrelated by default until Quarry owns the token namespace (Phase 2)
 }

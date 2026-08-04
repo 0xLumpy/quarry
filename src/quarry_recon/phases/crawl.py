@@ -908,7 +908,7 @@ def _ast_corroboration(ctx) -> dict:
 
 
 def _ast_normalise(ctx, artifact: Path, bundle: Path, digest: str, url: str, corroborated: set) -> tuple:
-    """Turn ONE published artifact into `path_observation` records. `(added, total, error)`.
+    """Turn ONE published artifact into observations. `(added, total, error, sinks)`.
 
     EVERY readable observation from the artifact — the analysis is already paid for, so normalising only
     part of what it produced would leave a partial view of work that succeeded. Nothing here is promoted,
@@ -917,9 +917,9 @@ def _ast_normalise(ctx, artifact: Path, bundle: Path, digest: str, url: str, cor
     try:
         doc = json.loads(artifact.read_text("utf-8", "replace"))
     except (OSError, ValueError):
-        return 0, 0, "unreadable-artifact"
+        return 0, 0, "unreadable-artifact", 0
     if not isinstance(doc, list):
-        return 0, 0, "unreadable-artifact"
+        return 0, 0, "unreadable-artifact", 0
     lines: dict = {}
 
     def context(m):
@@ -942,10 +942,20 @@ def _ast_normalise(ctx, artifact: Path, bundle: Path, digest: str, url: str, cor
     try:
         recs = ast_obs.observations(doc, bundle=bundle.name, bundle_digest=digest, bundle_url=url,
                                     artifact=str(artifact), corroborated=corroborated, context=context)
+        # the SAME artifact, read once for both families: sources and sinks are a different kind of
+        # evidence from paths and get their own type, but re-reading the file to split them would be
+        # paying twice for one answer.
+        sinks = ast_obs.sink_observations(doc, bundle=bundle.name, bundle_digest=digest,
+                                          bundle_url=url, artifact=str(artifact), context=context)
     except (TypeError, ValueError, OSError):
-        return 0, 0, "unreadable-artifact"       # a malformed record is a gap in ONE bundle, not a crash
+        # a malformed record is a gap in ONE bundle, not a crash — and the shape must match the promise,
+        # or the caller dies unpacking it instead of recording the gap
+        return 0, 0, "unreadable-artifact", 0
     added = sum(1 for r in recs if ctx.run.add("path_observation", r))
-    return added, len(recs), ""
+    # `add` is True only for a key the run had not seen: a sink in two bundles is ONE observation, and
+    # summing per-artifact counts would report it twice while the store and the report show it once
+    new_sinks = sum(1 for s in sinks if ctx.run.add("sink_observation", s))
+    return added, len(recs), "", new_sinks
 
 
 def _ast_bundles(ctx, ledger) -> int:
@@ -958,7 +968,7 @@ def _ast_bundles(ctx, ledger) -> int:
     stats = getattr(ctx, "_ast_stats", None)
     if stats is None:
         stats = ctx._ast_stats = {"eligible": 0, "published": 0, "dispositions": {}, "peaks": [],
-                                  "observations": 0, "distinct": 0, "normalised": 0,
+                                  "observations": 0, "distinct": 0, "sinks": 0, "normalised": 0,
                                   "unnormalised": 0}
     engine = _ast_engine_digest()
     disp = stats["dispositions"]
@@ -1007,8 +1017,8 @@ def _ast_bundles(ctx, ledger) -> int:
             # NORMALISE EVERY readable observation the artifact contains. The artifact is published and
             # content-bound first, so an interrupted normalisation re-runs from durable evidence rather
             # than re-paying for the analysis.
-            n_add, n_tot, err = _ast_normalise(ctx, Path(meta["artifact"]), art, digest, _url,
-                                               corroborated)
+            n_add, n_tot, err, n_sink = _ast_normalise(ctx, Path(meta["artifact"]), art, digest, _url,
+                                                       corroborated)
             if err:
                 stats["unnormalised"] += 1
                 disp[err] = disp.get(err, 0) + 1
@@ -1018,6 +1028,7 @@ def _ast_bundles(ctx, ledger) -> int:
                 # count lives per bundle in each record's `sightings`, where a consumer can sum it.
                 stats["observations"] += n_tot
                 stats["distinct"] += n_add              # keys this artifact contributed that were NEW
+                stats["sinks"] += n_sink
                 meta["observations"] = n_tot
         if d == "success":
             published += 1
@@ -1048,8 +1059,8 @@ def _ast_bundles(ctx, ledger) -> int:
                                        f"all {stats['published']} of them")
         disp["ledger-unsaved"] = disp.get("ledger-unsaved", 0) + 1
     _ast_coverage(ctx, stats)
-    ctx.echo(f"  ast analysis: {published} artifact(s), {stats['distinct']} path observation(s) "
-             f"from {len(eligible)} bundle(s)"
+    ctx.echo(f"  ast analysis: {published} artifact(s), {stats['distinct']} path + {stats['sinks']} "
+             f"sink observation(s) from {len(eligible)} bundle(s)"
              + (f" — {stats['eligible'] - stats['published']} not analysed" if
                 stats["eligible"] - stats["published"] else ""))
     return published
@@ -1074,7 +1085,8 @@ def _ast_coverage(ctx, stats: dict) -> None:
                                 unit="observations",
                                 eligible=stats["normalised"] + stats["unnormalised"],
                                 tested=stats["normalised"], omitted=stats["unnormalised"],
-                                reason=f"{stats['distinct']} distinct path(s) from "
+                                reason=f"{stats['distinct']} distinct path(s) and {stats['sinks']} "
+                                       f"source/sink observation(s) from "
                                        f"{stats['observations']} bundle-path pair(s) across "
                                        f"{stats['normalised']} artifact(s)"
                                        + (f"; {stats['unnormalised']} artifact(s) could not be read back"

@@ -278,3 +278,95 @@ def priority_view(records, fresh=None) -> list:
                                        -sum(s.get("n", 0) for s in (r.get("sightings") or [])
                                             if isinstance(s, dict)),
                                        str(r.get("id", ""))))
+
+
+# ── DOM sources and sinks ────────────────────────────────────────────────────────────────────────────
+#: analyzer -> role. MEASURED against real artifacts: the names are the analyzer's own
+#: (`dangerouslySetInnerHTML`, `regex`), not the file names they live in, and getting that wrong would
+#: silently classify nothing.
+#:
+#: The roles are deliberately coarse. This layer knows WHERE a source or a sink is, never that one
+#: reaches the other — proving a flow means following assignments across a minified bundle, which is the
+#: v0.4 skill layer's work. `storage` is its own role because localStorage/sessionStorage/cookie are both
+#: an input and an output depending on direction, and the analyzer's own tags (`property-getItem` vs
+#: `property-setItem`, `cookie-read` vs `cookie-assignment`) are what say which — so they ride along.
+SINK_ROLES = {
+    "inner-html": "sink", "dangerouslySetInnerHTML": "sink", "eval": "sink",
+    "window-open": "sink", "document-domain": "sink", "postmessage": "sink",
+    "location": "source", "url-search-params": "source", "window-name": "source",
+    "onhashchange": "source", "onmessage": "source",
+    "local-storage": "storage", "session-storage": "storage", "cookie": "storage",
+    "add-event-listener": "channel",
+    "regex": "informational", "regex-match": "informational", "hostname": "informational",
+}
+#: what a hunter would call DOM data-flow surface — everything except the informational families, which
+#: are useful context and dominate the raw count (7075 regex patterns against 42 innerHTML in one bundle)
+FLOW_ROLES = frozenset(("sink", "source", "storage", "channel"))
+
+
+def sink_observations(doc, *, bundle: str, bundle_digest: str, bundle_url: str, artifact: str,
+                      context=None) -> list:
+    """Every DOM source/sink match in one artifact, as `sink_observation` records.
+
+    Keyed by (analyzer, matched text) so the same construct in two bundles is ONE observation with two
+    sightings — the same aggregation the path layer uses, for the same reason: a vendor bundle shipped
+    twice is not two findings.
+
+    Only the DATA-FLOW roles are normalised. `regex` and `hostname` are 13,953 of the 14,000-odd matches
+    in two POAB bundles — at corpus scale that is a million rows of context nobody queries as an entity,
+    and the architecture already says the raw artifact is the complete record (it holds every one of
+    them, digest-bound, for anything that wants them). Storing them twice buys nothing.
+    """
+    import hashlib
+    out: dict = {}
+    for m in (doc if isinstance(doc, list) else []):
+        if not isinstance(m, dict):
+            continue
+        name = m.get("analyzerName")
+        role = SINK_ROLES.get(name)
+        if role not in FLOW_ROLES:
+            continue
+        # ONE line: a match can span a formatted block, and a record that breaks a report's markdown is
+        # a record nobody reads.
+        full = " ".join(str(m.get("value", "")).split())
+        if not full:
+            continue
+        # the IDENTITY is the complete value; only the stored preview is capped. Hashing the truncation
+        # collapsed two distinct expressions that happened to share their first 400 characters — which is
+        # exactly what minified code looks like.
+        key = hashlib.sha256(f"{name}\x00{full}".encode()).hexdigest()[:16]
+        value = full[:400]
+        rec = out.get(key)
+        if rec is None:
+            rec = out[key] = {
+                "id": key, "value": value, "value_len": len(full), "truncated": len(full) > 400,
+                "sources": ["jxscout-ast"], "analyzer": name, "role": role,
+                "tags": [role] + sorted(m.get("tags") or {}),
+                "bundles": [bundle], "bundle_digests": [bundle_digest],
+                "raw_ref": artifact, "discovered_from": bundle_url,
+                "sightings": [{"bundle": bundle, "digest": bundle_digest, "n": 0}],
+                "sites": [],
+            }
+        rec["sightings"][0]["n"] += 1
+        for tag in sorted(m.get("tags") or {}):
+            if tag not in rec["tags"]:
+                rec["tags"].append(tag)
+        if len(rec["sites"]) < 3:
+            line, col = position(m.get("start"))
+            rec["sites"].append({"bundle": bundle, "line": line, "column": col,
+                                 "context": (context(m) if context else "")[:240]})
+    return list(out.values())
+
+
+def flow_view(records) -> list:
+    """The DOM data-flow rows, most-sighted first, then stable.
+
+    A no-op filter today, because only flow roles are normalised — it stays because the role field is
+    what a consumer keys on, and an informational row arriving from an older run must not silently rank
+    beside a sink.
+    """
+    rows = [r for r in records
+            if isinstance(r, dict) and r.get("role") in FLOW_ROLES]
+    return sorted(rows, key=lambda r: (-sum(s.get("n", 0) for s in (r.get("sightings") or [])
+                                            if isinstance(s, dict)),
+                                       str(r.get("analyzer", "")), str(r.get("id", ""))))
