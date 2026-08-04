@@ -48,11 +48,29 @@ def sandbox(cmd: list) -> list:
     path the user can write to reachable by the evaluated code. Calling that "contained" would be the
     dangerous half of a promise — the engine runs the TARGET's code through Sval, so an escape writes to
     the operator's home directory. No bwrap, no probe.
+
+    `--ro-bind / /` was here too, and is gone for the same reason the LANE stopped using it: read-only is
+    not absent. It left secrets.yaml, SSH material and every previous engagement's evidence readable by
+    code we deliberately evaluate. The allow-list below is the runtime, the engine, and the pinned
+    upstream tree the fixtures live in — nothing of the operator's. Output never needs a bind: the child
+    writes to inherited FDs, not to paths inside the namespace.
     """
-    if shutil.which("bwrap"):
-        return ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--tmpfs", "/run",
-                "--unshare-net", "--die-with-parent", "--chdir", "/"] + cmd
-    return []
+    if not shutil.which("bwrap"):
+        return []
+    node = shutil.which("node")
+    if not node:
+        return []
+    args = ["bwrap", "--unshare-all", "--die-with-parent", "--clearenv", "--chdir", "/",
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ld.so.cache", "/etc/ld.so.conf",
+                 "/etc/ld.so.conf.d", "/etc/alternatives"):
+        args += ["--ro-bind-try", path, path]
+    args += ["--ro-bind", node, node,
+             "--ro-bind-try", str(ENGINE), str(ENGINE),
+             "--ro-bind-try", str(TREE), str(TREE),          # the pinned upstream fixtures, read-only
+             "--setenv", "PATH", "/usr/bin:/bin",
+             "--setenv", "HOME", "/tmp"]
+    return args + cmd
 
 
 def run_one(fixture: Path, limit: int, *, contained: bool = True, heap_mb: int = HEAP_MB) -> dict:
