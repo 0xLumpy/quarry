@@ -1808,12 +1808,6 @@ def run(ctx) -> None:
     # loop ends when a round adds nothing, and `JXSCOUT_ROUNDS` bounds the depth (0 = to the fixed point).
     js_ledger, js_raw_dir = _jxscout_traverse(ctx, js_ledger, js_raw_dir)
 
-    # ── AST ANALYSIS (MODES.JS_AST, default off): collect once, interpret later. Runs AFTER the chunk
-    # traversal so the bundles it discovered are analysed too. Publishes artifacts and nothing else — no
-    # entity, no request — because the observation layer is a later step.
-    if getattr(ctx.profile, "js_ast", False):
-        _ast_bundles(ctx, js_ledger)
-
     # review#1/#2: the mineable tree is a STAGED generation, beautified before publication and swapped in
     # atomically — so what the miners and secret scanners read is exactly this run's validated evidence, or
     # nothing at all. `None` means it could not be published exactly, and NOTHING is mined from it.
@@ -1987,6 +1981,13 @@ def run(ctx) -> None:
 
     # ── xnLinkFinder: ONE lifecycle over every collected input, LAST so each input is complete ──
     _xnl_lane(ctx, xnl_units)
+
+    # ── AST ANALYSIS (MODES.JS_AST, default off): collect once, interpret later.
+    # LAST in the phase, for the same reason xnLinkFinder is: an observation records which incumbents
+    # already have a path, and jsluice / xnLinkFinder / the sourcemap re-mine all publish AFTER the chunk
+    # traversal. Running earlier froze that field before the tools it names had produced anything.
+    if getattr(ctx.profile, "js_ast", False):
+        _ast_bundles(ctx, js_ledger)
 
     ctx.echo(f"  urls: {ctx.run.count('url')}  js: {ctx.run.count('js_url')}  "
              f"endpoints: {ctx.run.count('endpoint')}  params: {ctx.run.count('parameter')}  "

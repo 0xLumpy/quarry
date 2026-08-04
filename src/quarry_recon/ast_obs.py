@@ -215,3 +215,66 @@ def observations(doc, *, bundle: str, bundle_digest: str, bundle_url: str, artif
                                  "value": str(m.get("value", ""))[:200],
                                  "context": (context(m) if context else "")[:240]})
     return list(out.values())
+
+
+# ── the high-priority VIEW ───────────────────────────────────────────────────────────────────────────
+#: shape tags that keep an observation OUT of the endpoint queue. From the architecture decision, not
+#: from a measurement: a static asset, another origin's service, a dev-server call, a MIME value, a
+#: package specifier and a tz entry are all real strings a bundle contains, and none is an application
+#: route on the target. They stay in the evidence; they are simply not prioritised.
+EXCLUDED_TAGS = frozenset(("asset", "external", "localhost", "mime", "module", "tz-database"))
+
+
+def high_priority(record) -> bool:
+    """Whether a `path_observation` belongs in the prioritised view.
+
+    `plausible AND api-shaped` is the part that was MEASURED — on an unseen corpus, with the rule frozen
+    before the labels, it scored precision 0.90 / recall 0.90 over net-new paths (the labels were the
+    model's, corrected by the operator; see notes/current/AST-ANALYZER-LANE-DESIGN.md). The tag alone is
+    not the rule: on one POAB bundle 214 of 254 api-shaped rows were also `implausible`
+    (`/this.http.get("/portalapi/...`), so the conjunction is what carries the precision.
+
+    The EXCLUDED_TAGS subtraction on top is a design decision rather than a measured one, and it is
+    deliberately conservative in the direction that keeps evidence: an excluded row is still stored, still
+    queryable, and still in the raw artifact.
+
+    This is PRIORITISATION, not promotion. Nothing here says the route exists, nothing is requested
+    because it matched, and no entity is created — following `A.listBrands()` or reconstructing
+    `/api/${...}/${id}/logo` is the v0.4 skill layer's work.
+    """
+    if not isinstance(record, dict):
+        return False
+    tags = set(record.get("tags") or [])
+    if "api-shaped" not in tags or "implausible" in tags:
+        return False
+    return not (tags & EXCLUDED_TAGS)
+
+
+def corroborators(record, fresh=None) -> list:
+    """Who corroborates this path — the record's snapshot UNIONED with a fresher map when one is given.
+
+    The stored field is a snapshot taken when the artifact was normalised; corroboration is a run-wide
+    relation that keeps changing until the run ends (params, content and enrich all publish later). A
+    union rather than a replacement, because a RESUMED observation can carry a snapshot from a run whose
+    urls this store never held — dropping it would lose evidence, and corroboration only ever accumulates.
+    """
+    names = list(record.get("corroborated_by") or [])
+    if isinstance(fresh, dict):
+        for s in fresh.get(str(record.get("id", "")), ()) or ():
+            if s not in names:
+                names.append(s)
+    return names
+
+
+def priority_view(records, fresh=None) -> list:
+    """The prioritised rows, most-corroborated first, then most-sighted, then stable by path.
+
+    Corroboration ORDERS but never gates: a path only this analyzer found is exactly the interesting
+    case, so it must not sort itself out of sight — and it is never counted as something an incumbent
+    contributed.
+    """
+    rows = [r for r in records if high_priority(r)]
+    return sorted(rows, key=lambda r: (-len(corroborators(r, fresh)),
+                                       -sum(s.get("n", 0) for s in (r.get("sightings") or [])
+                                            if isinstance(s, dict)),
+                                       str(r.get("id", ""))))

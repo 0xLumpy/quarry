@@ -14,6 +14,29 @@ from . import secrets
 from .normalize import host_of_url
 
 DIGEST_SCHEMA = "1.0"
+
+
+def _corroboration_now(run) -> dict:
+    """`{path: [sources]}` as the store stands NOW.
+
+    An observation's own `corroborated_by` is a snapshot from the moment its artifact was normalised, and
+    later lanes keep publishing. Recomputing here means the report ranks on what the run actually knows,
+    without rewriting evidence that was true when it was written.
+    """
+    from . import ast_obs, store
+    out: dict = {}
+    for entity in ("url", "js_url", "endpoint"):
+        for rec in run.read(entity):
+            if not isinstance(rec, dict):
+                continue
+            key = ast_obs.path_key(str(rec.get(store.ENTITY_KEYS.get(entity, "value"), "")))
+            if not key:
+                continue
+            names = out.setdefault(key, [])
+            for s in (rec.get("sources") or []):
+                if isinstance(s, str) and s not in names:
+                    names.append(s)
+    return {k: sorted(v) for k, v in out.items()}
 # Canonical queue keys — ALWAYS present in the contract (empty list if nothing landed) so
 # consumers can rely on a stable shape.
 CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "ssrf", "sqli",
@@ -22,6 +45,9 @@ CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "s
                     "graphql", "actuator", "websocket", "api-base",
                     # out-of-band callbacks imported from interactsh (OOB.3; uncorrelated in Phase 1):
                     "oob",
+                    # path-like strings an AST pass read out of JS bundles: EVIDENCE with a ranking,
+                    # never a queue of things to fetch (`ast_obs.priority_view`):
+                    "path_observations",
                     # chain MATERIAL, deliberately separate from every queue above: those rank things to
                     # VERIFY, this remembers primitives that are not findings on their own (`gadgets.py`):
                     "gadgets",
@@ -342,6 +368,27 @@ def build(run, scope) -> str:
                 A(f"- … {len(rows) - 10} more — full list in normalized/gadget_candidate.jsonl")
             A("")
 
+    obs = [o for o in run.read("path_observation") if isinstance(o, dict)]
+    if obs:
+        from . import ast_obs
+        top = ast_obs.priority_view(obs, _corroboration_now(run))
+        A(f"## Path observations ({len(obs)}) — evidence, {len(top)} prioritised")
+        A("> Path-like strings an AST pass read out of JS bundles. NOT endpoints and NOT findings: "
+          "nothing here was requested, and no lane fetches one because it appeared. The prioritised "
+          "subset is plausible + api-shaped and excludes assets, other origins, dev-server calls, MIME "
+          "values, package specifiers and tz entries — a ranking over evidence, never a promotion.\n")
+        fresh = _corroboration_now(run)
+        for o in top[:15]:
+            seen = sum(s.get("n", 0) for s in (o.get("sightings") or []) if isinstance(s, dict))
+            who = ", ".join(ast_obs.corroborators(o, fresh)) or "ast only"
+            A(f"- {o.get('id')}  ·  x{seen}  ·  {who}")
+        if len(top) > 15:
+            # a DISPLAY may be bounded; the stored evidence never is
+            A(f"- … {len(top) - 15} more prioritised — full list in normalized/path_observation.jsonl")
+        if len(obs) > len(top):
+            A(f"- ({len(obs) - len(top)} further observation(s) kept as evidence, not prioritised)")
+        A("")
+
     A("## Review order")
     A("1. secrets — exports/secrets.jsonl")
     A("2. origin hosts above (no WAF)")
@@ -549,6 +596,25 @@ def collect(run, scope) -> dict:
              f"impact:{g.get('impact_state') or 'none_proven'}"]
             + [f"chain:{c}" for c in chains],
             location=g.get("raw_ref") or None))
+
+    # ── PATH OBSERVATIONS: prioritised EVIDENCE, never a queue of things to fetch ────────────────
+    # Its own queue for the same reason gadgets have one: everything above ranks things to VERIFY, and
+    # these are strings a parser read out of a bundle. `impact_state` and the "observation" tag ride
+    # along so no consumer — including a v0.4 skill — can mistake one for a claim that the route exists.
+    from . import ast_obs as _ast_obs
+    _obs = [o for o in run.read("path_observation") if isinstance(o, dict)]
+    _fresh = _corroboration_now(run)
+    for o in _ast_obs.priority_view(_obs, _fresh):
+        who = _ast_obs.corroborators(o, _fresh)
+        seen = sum(s.get("n", 0) for s in (o.get("sightings") or []) if isinstance(s, dict))
+        add("path_observations", _item(
+            "path_observation", o.get("id"),
+            f"path-like string read out of {len(o.get('bundles') or []) or 1} JS bundle(s), seen {seen}x"
+            + (f" — corroborated by {', '.join(who)}" if who else " — not seen by any other tool"),
+            "candidate", o.get("sources"), "normalized/path_observation.jsonl",
+            ["observation", "path", "impact:none_proven"] + sorted(o.get("tags") or [])
+            + [f"corroborated:{w}" for w in who],
+            location=o.get("raw_ref") or None))
 
     for q in queues:                                # dedup by item id (keys already canonical)
         queues[q] = list({it["id"]: it for it in queues[q]}.values())
