@@ -186,6 +186,39 @@ tools:
       evaluation. Default brute-force limit is 0 (derived candidates only): integer enumeration
       manufactures new target requests, so it is an ENGAGEMENT decision, never an --unbound one.'
 
+  - bin: jxscout-ast
+    maintenance_state: frozen
+    phase: crawl
+    role: AST analysis of an already-downloaded JS bundle — DOM sources/sinks and path-like strings
+    # The OTHER half of the same pinned tree the chunk engine comes from, and it needs a different
+    # runtime: MEASURED, `ast-analyzer.js` runs under BUN and fails under node ("Failed to load native
+    # binding" — the bundler stubbed every native require, so the parser can only arrive through
+    # NAPI_RS_NATIVE_LIBRARY_PATH). Upstream's own Go code shells out to `bun run` with exactly that
+    # variable. There is no npm/bun install: the analyzer bundle and the native parser are both shipped
+    # PREBUILT in the tree, and both are sha256-verified here.
+    #
+    # Quarry does deterministic COLLECTION with this: raw artifact + path observations. It never fetches
+    # what the analyzer names, and the interpretation (following `A.listBrands()`, reconstructing
+    # `/api/${...}/${id}/logo`) belongs to the v0.4 skill layer — see
+    # notes/current/AST-ANALYZER-LANE-DESIGN.md.
+    ref: 3a1018a694fd630137b1c19525abcb47315404d4
+    repo: francisconeves97/jxscout
+    runtime: source
+    install: 'set -e; if ! command -v bun >/dev/null; then echo "jxscout-ast needs bun (the analyzer fails under node): install bun first" >&2; exit 1; fi; if [ ! -d ~/.local/share/quarry/jxscout ]; then rm -rf /tmp/_jxscout_ast; git clone -q https://github.com/francisconeves97/jxscout /tmp/_jxscout_ast && git -C /tmp/_jxscout_ast checkout -q {ref} && mkdir -p ~/.local/share/quarry && rm -rf ~/.local/share/quarry/jxscout && mv /tmp/_jxscout_ast ~/.local/share/quarry/jxscout && rm -rf ~/.local/share/quarry/jxscout/.git; fi; printf ''d1531754a223b21f4c49c2eaed2d16dbef552fac4ebbd69b62739c7c6c48ab65  %s/.local/share/quarry/jxscout/internal/modules/ast-analyzer/ast-analyzer.js\n8a8a0259a16112e633ecd54013ac15c00d24a9d54ec566404ce7d5e66e1d3d54  %s/.local/share/quarry/jxscout/internal/modules/ast-analyzer/parser.linux-x64-gnu.node\n'' "$HOME" "$HOME" | sha256sum -c - >/dev/null && mkdir -p ~/.local/bin/.stage && printf ''#!/bin/sh\nA="$HOME/.local/share/quarry/jxscout/internal/modules/ast-analyzer"\nNAPI_RS_NATIVE_LIBRARY_PATH="$A/parser.linux-x64-gnu.node" exec bun run "$A/ast-analyzer.js" "$@"\n'' > ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin}'
+    # RUNS the analyzer on upstream's own example file: proof that bun executed it and that the native
+    # parser loaded, not merely that a shim exists on PATH.
+    capability: 'jxscout-ast $HOME/.local/share/quarry/jxscout/internal/modules/ast-analyzer/example/test.js'
+    version_cmd: 'sha256sum $HOME/.local/share/quarry/jxscout/internal/modules/ast-analyzer/ast-analyzer.js'
+    cap_codes: [0]
+    doc: https://github.com/francisconeves97/jxscout
+    deps: [git]
+    optional: true
+    notes: 'MEASURED on 148 real bundles: needs BUN (not node) + the prebuilt native parser; physical
+      memory runs 165-225x the bundle size (a 30 MB bundle peaks at 5.3 GB) and a 27-30 MB bundle takes
+      93-102 s, so the lane runs one bundle at a time under a per-bundle cgroup and a 300 s wall. bun is
+      NOT installed by this entry: a curl-pipe-shell of a third-party runtime is the operator''s
+      decision, not an install script''s.'
+
   - bin: alterx
     maintenance_state: active
     version: "v0.1.0"

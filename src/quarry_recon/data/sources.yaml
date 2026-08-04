@@ -166,6 +166,18 @@ sources:
       atomically). Miners/scanners read js_derived/, which is STAGED from validated evidence only, beautified
       while staged, then swapped in atomically — exact by construction, and NOT mined at all if it cannot be
       published exactly (measure: js_mineable)."}
+  crawl.jxscout_ast:         {tool: jxscout-ast, phase: crawl, tier: optional, class: passive, default: off, reason: "collection-only (MODES.JS_AST); artifacts nothing reads yet",
+    input: "downloaded JS bundles", output: "raw analyzer artifact (JSON) per bundle", workers: 1, rate: n/a, timeout: 300s, failure: quiet-warn, fallback: skip, parser: none, log: delta,
+    notes: "COLLECT ONCE, INTERPRET LATER (notes/current/AST-ANALYZER-LANE-DESIGN.md). This lane analyses
+      each bundle exactly once and publishes the COMPLETE immutable artifact; normalising it into
+      observations, and any interpretation of them, is a separate step. It fetches nothing and names no
+      entity: what the analyzer emitted is evidence, not a finding.
+      Resumable work unit is the BUNDLE (content digest + engine digest + policy), so a re-run skips
+      bundles whose artifact already landed. MEASURED: physical memory is 165-225x the bundle size (a
+      30 MB bundle peaks at 5.3 GB) and 27-30 MB bundles take 93-102 s, so each invocation gets its own
+      cgroup (MemoryMax=max(1 GB, 300x size) up to a ceiling, MemorySwapMax=0) and runs ONE AT A TIME.
+      No bwrap or no cgroup -> the lane does not run: it parses attacker-controlled bytes with 1609
+      regexes and can take gigabytes doing it. DEFAULT OFF until the observation layer exists."}
   crawl.jxscout_chunks:      {tool: jxscout-chunks, phase: crawl, tier: optional, class: passive, default: on,
     input: "downloaded JS bundles", output: "candidate lazy-chunk URLs -> js_url", workers: n/a, rate: n/a, timeout: 60s, failure: quiet-warn, fallback: skip, parser: stdout-lines, log: delta,
     notes: "PASSIVE by class: the analyzer reads bundles already on disk and contacts nothing — fetching an

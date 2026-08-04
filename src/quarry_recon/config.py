@@ -223,6 +223,13 @@ class TargetProfile:
         return _flag(self.modes.get("HEADLESS"), False)
 
     @property
+    def js_ast(self) -> bool:
+        """MODES.JS_AST — the ast-analyzer COLLECTION lane. Default off: it publishes artifacts nothing
+        reads yet (the observation layer is a later step), and one bundle can want gigabytes of memory
+        for a minute and a half."""
+        return _flag(self.modes.get("JS_AST"), False)
+
+    @property
     def screenshots(self) -> bool:
         return _flag(self.modes.get("SCREENSHOTS"), True)
 

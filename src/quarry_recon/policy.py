@@ -121,7 +121,9 @@ SOURCE_OWNERSHIP: dict[str, str] = {
         "origin.correlation", "vertical.alterx_permute",
         # reads bundles ALREADY on disk and contacts nothing; the fetch of an accepted chunk is
         # `crawl.js_fetch`, which is where the rate and the budget live
-        "crawl.jxscout_chunks")},
+        "crawl.jxscout_chunks",
+        # analyses bundles already on disk, publishes an artifact, contacts nothing
+        "crawl.jxscout_ast")},
     **{lane: "target_facing" for lane in
        ("content.ffuf", "crawl.js_fetch", "crawl.katana_headless", "crawl.katana_standard",
         "dns.dnsx_records", "enrich.a1d_brute", "enrich.dnsx_cname", "enrich.dnsx_resolve",

@@ -16,10 +16,12 @@ import shlex
 import shutil
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
 
-from .. import budget, events, fetch, normalize, policy, registry, remainder, secrets, settings
+from .. import (budget, cgroup, events, fetch, normalize, policy, registry, remainder,
+                secrets, settings)
 from ..contract import registered, run_contract
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
 
@@ -680,6 +682,310 @@ def _jxscout_chunks(ctx, ledger) -> int:
     ctx.echo(f"  jxscout chunks: {added} new JS URL(s) from {produced} candidate(s) "
              f"over {len(fresh)} bundle(s)" + (f" — {_short} not analysed" if _short else ""))
     return added
+
+
+# ── AST analysis: COLLECT ONCE, INTERPRET LATER ─────────────────────────────────────────────────────
+#: the OTHER half of the same pinned tree, and a different runtime: MEASURED, it runs under bun and fails
+#: under node. The shim carries the napi variable; see tools.yaml.
+AST_SHIM = "jxscout-ast"
+AST_ENGINE = Path.home() / ".local" / "share" / "quarry" / "jxscout" / "internal" / "modules" / \
+    "ast-analyzer" / "ast-analyzer.js"
+AST_NATIVE = AST_ENGINE.parent / "parser.linux-x64-gnu.node"
+#: MEASURED on 148 real bundles: 27-30 MB bundles take 93-102 s. A 60 s wall silently dropped 23,186
+#: matches — from exactly the files jsluice gives up on, which is where this analyzer earns its place.
+_AST_WALL_S = 300
+#: MEASURED physical peak / bundle size: 165x, 166x, 175x, 176x, 201x, 211x, 225x. A first run at 250x
+#: left only 11% margin over the worst case (a 12.8 MB bundle asked 3055 MB and used 2577), and an
+#: under-request is not a smaller answer — the cgroup kills the analysis and the whole 100 s is wasted.
+#: 300x keeps a third in hand. PROVISIONAL, from one corpus: the lane records what it asked for AND what
+#: was used, so this number is revised from data rather than intuition.
+_AST_MEM_PER_MB = 300
+_AST_MEM_FLOOR_MB = 1024
+#: the configured maximum for ONE invocation. A bundle needing more is a structured GAP, never a silent
+#: skip: at 300x this is a ~40 MB bundle.
+_AST_MEM_CEILING_MB = 12288
+_AST_OUTPUT_MB = 64
+_AST_ADDRESS_SPACE_MB = 65536              # a SECONDARY guard: address space is not the production cap
+
+
+def _ast_engine_digest() -> str:
+    """The EXECUTABLE's identity — analyzer bundle AND native parser.
+
+    Both can change the answer, so both are in it, and it is computed when the lane runs rather than at
+    import: a module-level constant would pin whatever was on disk when the process started and survive
+    an install that replaced the engine underneath it.
+    """
+    h = hashlib.sha256()
+    for f in (AST_ENGINE, AST_NATIVE):
+        try:
+            h.update(f.read_bytes())
+        except OSError:
+            h.update(b"absent:" + str(f).encode())
+    return h.hexdigest()
+
+
+def _ast_identity(bundle_digest: str, engine: str, mem_mb: int) -> dict:
+    """Everything that can change what the analysis says. A policy input left out here is a policy change
+    that silently resumes as already done."""
+    return {"bundle": bundle_digest, "engine": engine, "wall_s": _AST_WALL_S,
+            "mem_request_mb": mem_mb, "output_ceiling_mb": _AST_OUTPUT_MB,
+            "address_space_mb": _AST_ADDRESS_SPACE_MB}
+
+
+def _ast_mem_request_mb(size_bytes: int) -> int:
+    """What this bundle is allowed to use, in physical memory."""
+    return max(_AST_MEM_FLOOR_MB, int(_AST_MEM_PER_MB * (size_bytes / (1 << 20))))
+
+
+def _ast_headroom_mb() -> int:
+    """MemAvailable, for ADMISSION only. It does not guarantee the memory will still be free a moment
+    later — another process can take it — so the cgroup remains the enforcement boundary and this only
+    avoids launches that are obviously doomed."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _ast_command(bundle: Path, out: Path, err: Path, peak: Path, mem_mb: int, scratch: Path,
+                 unit: str) -> list:
+    """The full containment, or nothing: a per-invocation cgroup OUTSIDE, an allow-list bwrap INSIDE.
+
+        cgroup      MemoryMax + MemorySwapMax=0 — the enforcement boundary. `RLIMIT_AS` is an
+                    ADDRESS-SPACE measure (this analyzer needs 32 GB of it to use 5 GB of memory), so it
+                    is kept high as a secondary guard and is not the cap.
+        bwrap       an allow-list: the runtime, the engine, the native parser, the one bundle, and this
+                    invocation's scratch. No network, no operator files, cleared environment.
+        output      to FILES the child cannot overrun; the runner would otherwise capture
+                    attacker-controlled bytes into Quarry's own memory.
+        peak        the unit's own `memory.peak`, read by the shell INSIDE the cgroup but OUTSIDE bwrap,
+                    where /sys/fs/cgroup is readable. systemd garbage-collects a successful transient
+                    unit before its MemoryPeak can be queried, so the number is taken while it exists.
+    """
+    if not (shutil.which("bwrap") and cgroup.available()):
+        return []
+    exe = shutil.which(AST_SHIM)
+    bun = shutil.which("bun")
+    if not exe or not bun or not AST_ENGINE.is_file() or not AST_NATIVE.is_file():
+        return []
+    args = ["bwrap", "--unshare-all", "--die-with-parent", "--clearenv", "--chdir", "/",
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    for path in _JXSCOUT_RUNTIME_PATHS:
+        args += ["--ro-bind-try", path, path]
+    args += ["--ro-bind", str(Path(bun).resolve()), str(Path(bun).resolve()),
+             "--ro-bind", str(AST_ENGINE), str(AST_ENGINE),
+             "--ro-bind", str(AST_NATIVE), str(AST_NATIVE),
+             "--ro-bind", str(bundle), str(bundle),
+             "--bind", str(scratch), str(scratch),
+             "--setenv", "NAPI_RS_NATIVE_LIBRARY_PATH", str(AST_NATIVE),
+             "--setenv", "PATH", "/usr/bin:/bin",
+             "--setenv", "HOME", str(scratch),
+             "--setenv", "TMPDIR", str(scratch),
+             str(Path(bun).resolve()), "run", str(AST_ENGINE), str(bundle)]
+    inner = (f"ulimit -v {_AST_ADDRESS_SPACE_MB * 1024}; ulimit -f {_AST_OUTPUT_MB * 2048}; "
+             + " ".join(shlex.quote(c) for c in args)
+             + f" > {shlex.quote(str(out))} 2> {shlex.quote(str(err))}; rc=$?; "
+             + "cg=$(awk -F: '/^0::/{print $3}' /proc/self/cgroup); "
+             + f"cat /sys/fs/cgroup$cg/memory.peak > {shlex.quote(str(peak))} 2>/dev/null; exit $rc")
+    return cgroup.wrap(unit, ["/bin/sh", "-c", inner], memory_max_mb=mem_mb)
+
+
+def _ast_analyze(ctx, artifact: Path, digest: str, engine: str, ledger=None) -> tuple:
+    """Analyse ONE bundle and publish its complete artifact. `(disposition, result, meta)`.
+
+    The artifact is the product: everything the analyzer emitted, immutable and content-bound. Nothing is
+    normalised here and nothing is named as a finding — that is a later step, deliberately, so the
+    expensive part is paid once and interpreted many times.
+    """
+    size = artifact.stat().st_size
+    want_mb = _ast_mem_request_mb(size)
+    ident = _ast_identity(digest, engine, want_mb)
+    key = hashlib.sha256(json.dumps(ident, sort_keys=True).encode()).hexdigest()
+    meta = {"bundle_bytes": size, "mem_request_mb": want_mb, "mem_peak_mb": None,
+            "wall_s": None, "engine": engine[:16], "work_key": key[:16]}
+    # RESUME. `run_contract` emits the work unit as evidence; it does not skip anything, so the lane keeps
+    # its own completion ledger. The item is the FULL identity, so a new engine or a changed policy is new
+    # work rather than a silent reuse of an artifact produced under different rules.
+    if ledger is not None and ledger.has(key):
+        prior = ledger.artifact(key)
+        if prior and prior.exists():
+            meta["artifact"] = str(prior)
+            return "resumed", None, meta
+    if want_mb > _AST_MEM_CEILING_MB:
+        # a GAP with a number attached, not a silent skip: at this ratio, the bundle needs more than the
+        # configured maximum for one invocation.
+        return "over-memory-policy", None, meta
+    head = _ast_headroom_mb()
+    if head and head < want_mb:
+        return "insufficient-headroom", None, dict(meta, headroom_mb=head)
+    unit = f"quarry-ast-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    cgroup.clear(unit)                       # a stale unit of this name would make systemd-run refuse
+    with tempfile.TemporaryDirectory(prefix="quarry-ast-") as tmp:
+        scratch = Path(tmp)
+        out, err, peak = scratch / "out.json", scratch / "err.txt", scratch / "peak"
+        cmd = _ast_command(artifact, out, err, peak, want_mb, scratch, unit)
+        if not cmd:
+            return "no-containment", skipped(AST_SHIM, "needs bwrap AND a user cgroup (systemd-run): "
+                                                       "this parses hostile bytes and can take "
+                                                       "gigabytes doing it"), meta
+        wu = events.work_unit("crawl.jxscout_ast", inputs={"bundle": digest}, config=ident)
+        try:
+            res = run_contract("crawl.jxscout_ast", cmd, work_unit=wu, timeout=_AST_WALL_S + 30)
+        finally:
+            # ALWAYS: a timeout kills the systemd-run client, never the service it started.
+            meta["unit_settled"] = cgroup.stop(unit)
+        meta["wall_s"] = round(getattr(res, "duration", 0.0), 1)
+        with contextlib.suppress(OSError, ValueError):
+            meta["mem_peak_mb"] = int(peak.read_text().strip()) // (1 << 20)
+        ceiling = _AST_OUTPUT_MB * 1024 * 1024
+        try:
+            out_bytes = out.stat().st_size if out.exists() else 0
+            err_bytes = err.stat().st_size if err.exists() else 0
+            raw = out.read_bytes() if 0 < out_bytes < ceiling else b""
+        except OSError:
+            return "unreadable", res, meta
+        if err_bytes:
+            with contextlib.suppress(OSError), err.open("rb") as fh:
+                fh.seek(max(0, err_bytes - 4096))
+                res.note = (res.note or "") + " " + secrets.redact(
+                    fh.read(4096).decode("utf-8", "replace").strip()[-400:])
+        if not meta["unit_settled"]:
+            # the analysis may still be running and still holding its cap: nothing here is a result
+            return "unit-unsettled", res, meta
+        if res.status is Status.TIMED_OUT:
+            return "timeout", res, meta
+        if out_bytes >= ceiling or err_bytes >= ceiling:
+            # ONE JSON document: a cut is not a shorter answer, it is an unparseable one, so there is no
+            # partial evidence to keep and the bundle stays owed.
+            return "truncated", res, meta
+        if res.exit_code != 0:
+            # 137/-9 is the cgroup killing it; the analyzer also catches its own allocation failure and
+            # exits 1. Neither is "this bundle contains nothing".
+            return ("oom-killed" if res.exit_code in (137, -9, 134) else "analyzer-error"), res, meta
+        try:
+            doc = json.loads(raw.decode("utf-8", "replace")) if raw else []
+        except ValueError:
+            return "unparseable", res, meta
+        if not isinstance(doc, list):
+            return "unparseable", res, meta
+        meta["matches"] = len(doc)
+        # the path carries the WORK identity, not just the bundle: two runs under different engines or
+        # policies are different work and must not overwrite each other's evidence.
+        dest = ctx.run.raw_path("crawl", "ast", f"{digest[:32]}.{key[:16]}.json")
+        art_digest = hashlib.sha256(raw).hexdigest()
+        if not budget.publish_bytes(dest, raw, digest=art_digest):
+            return "unpublished", res, meta
+        res.raw_path = dest
+        meta["artifact"] = str(dest)
+        if ledger is not None:
+            ledger.record(key, dest, digest=art_digest)
+        return ("success" if doc else "empty"), res, meta
+
+
+def _ast_bundles(ctx, ledger) -> int:
+    """Analyse every eligible bundle ONCE and publish its artifact. Returns the number published.
+
+    Bundle-level work unit — `(bundle content digest, engine digest, policy)` — so a re-run skips what
+    already landed and resumes the rest. One at a time on purpose: two 30 MB bundles want 10.6 GB of real
+    memory between them (measured), and this lane's job is collection, not speed.
+    """
+    stats = getattr(ctx, "_ast_stats", None)
+    if stats is None:
+        stats = ctx._ast_stats = {"eligible": 0, "published": 0, "dispositions": {}, "peaks": []}
+    engine = _ast_engine_digest()
+    disp = stats["dispositions"]
+    seen = getattr(ctx, "_ast_seen", None)
+    if seen is None:
+        seen = ctx._ast_seen = set()
+
+    # WORK FIRST, capability second: an absent optional tool with no JS to read is a clean zero, not a
+    # dependency failure.
+    eligible = [(u, a) for u, a in ledger.items() if a and a.suffix == ".js" and str(a) not in seen]
+    if not eligible:
+        return 0
+    stats["eligible"] += len(eligible)
+    if not have(AST_SHIM):
+        ctx.run.record("crawl", skipped(AST_SHIM, "not installed (optional)"))
+        disp["missing-tool"] = disp.get("missing-tool", 0) + len(eligible)
+        seen.update(str(a) for _u, a in eligible)
+        _ast_coverage(ctx, stats)
+        return 0
+    # the completion ledger lives beside the artifacts but NOT inside the directory a later miner walks
+    state = ctx.run.raw_path("crawl", "ast", "x.json").parent.parent / "ast.state.json"
+    led = budget.Ledger(state, lane="crawl.jxscout_ast")
+    published = 0
+    for _url, art in eligible:
+        seen.add(str(art))
+        try:
+            digest = hashlib.sha256(art.read_bytes()).hexdigest()
+        except OSError:
+            disp["unreadable"] = disp.get("unreadable", 0) + 1
+            continue
+        d, res, meta = _ast_analyze(ctx, art, digest, engine, ledger=led)
+        disp[d] = disp.get(d, 0) + 1
+        if res is not None:
+            ctx.run.record("crawl", res)
+        if meta.get("mem_peak_mb"):
+            # requested AND actual, per bundle: the ratio is PROVISIONAL and this is what revises it
+            stats["peaks"].append({"bytes": meta["bundle_bytes"], "request_mb": meta["mem_request_mb"],
+                                   "peak_mb": meta["mem_peak_mb"], "wall_s": meta.get("wall_s")})
+        if d == "success":
+            published += 1
+            stats["published"] += 1
+        elif d in ("empty", "resumed"):
+            # a resumed bundle is COVERED — its artifact is on disk and content-verified; re-analysing it
+            # would pay 100 s to produce the same bytes
+            stats["published"] += 1
+        if d == "no-containment":
+            # the same refusal stops every remaining bundle, so it is THEIR disposition too
+            rest = len(eligible) - (eligible.index((_url, art)) + 1)
+            if rest:
+                disp[d] = disp.get(d, 0) + rest
+                seen.update(str(a) for _u, a in eligible[-rest:])
+            break
+    # DURABILITY is part of the claim. A suppressed save let coverage report every artifact as covered
+    # while the next run re-analysed all of it — 100 s a bundle on the big ones — with nothing saying so.
+    saved = False
+    try:
+        saved = bool(led.save())
+    except OSError:
+        saved = False
+    if not saved and stats["published"]:
+        events.coverage_partial("crawl.jxscout_ast", kind=events.COVERAGE_UNKNOWN, measure="resume",
+                                unit="ledger",
+                                reason=f"completion ledger did NOT persist ({state}): the artifacts "
+                                       f"landed, but the next run cannot know that and will re-analyse "
+                                       f"all {stats['published']} of them")
+        disp["ledger-unsaved"] = disp.get("ledger-unsaved", 0) + 1
+    _ast_coverage(ctx, stats)
+    ctx.echo(f"  ast analysis: {published} artifact(s) from {len(eligible)} bundle(s)"
+             + (f" — {stats['eligible'] - stats['published']} not analysed" if
+                stats["eligible"] - stats["published"] else ""))
+    return published
+
+
+def _ast_coverage(ctx, stats: dict) -> None:
+    """What was READ, cumulatively, and why the rest was not. `tested` counts bundles whose artifact
+    landed — an analysis nobody can read afterwards is not coverage."""
+    events.coverage_partial("crawl.jxscout_ast", kind=events.COVERAGE_TIMEOUT, measure="bundles",
+                            unit="bundles", eligible=stats["eligible"], tested=stats["published"],
+                            omitted=max(0, stats["eligible"] - stats["published"]),
+                            reason="; ".join(f"{d}={n}" for d, n in sorted(stats["dispositions"].items()))
+                                   or "no bundles analysed")
+    if stats["peaks"]:
+        hi = max(stats["peaks"], key=lambda p: p["peak_mb"])
+        # a DISTINCT unit: reconciliation keeps only the latest record per (source, unit), so sharing
+        # "bundles" here silently replaced the eligible/tested row this lane exists to publish.
+        events.coverage_partial("crawl.jxscout_ast", kind=events.COVERAGE_UNKNOWN, measure="memory",
+                                unit="memory",
+                                reason=f"memory policy is PROVISIONAL: requested "
+                                       f"{_AST_MEM_PER_MB}x bundle size, peak observed "
+                                       f"{hi['peak_mb']} MB on {hi['bytes']} B "
+                                       f"({round(hi['peak_mb'] / max(1, hi['bytes'] / (1 << 20)))}x) "
+                                       f"over {len(stats['peaks'])} bundle(s)")
 
 
 def _jxscout_traverse(ctx, ledger, raw_dir):
@@ -1397,6 +1703,12 @@ def run(ctx) -> None:
     # which RESUMES, so it only pays for the new URLs. A chunk can name another chunk, hence rounds; the
     # loop ends when a round adds nothing, and `JXSCOUT_ROUNDS` bounds the depth (0 = to the fixed point).
     js_ledger, js_raw_dir = _jxscout_traverse(ctx, js_ledger, js_raw_dir)
+
+    # ── AST ANALYSIS (MODES.JS_AST, default off): collect once, interpret later. Runs AFTER the chunk
+    # traversal so the bundles it discovered are analysed too. Publishes artifacts and nothing else — no
+    # entity, no request — because the observation layer is a later step.
+    if getattr(ctx.profile, "js_ast", False):
+        _ast_bundles(ctx, js_ledger)
 
     # review#1/#2: the mineable tree is a STAGED generation, beautified before publication and swapped in
     # atomically — so what the miners and secret scanners read is exactly this run's validated evidence, or
