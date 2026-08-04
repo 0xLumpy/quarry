@@ -305,8 +305,8 @@ def build_worksheet(args) -> int:
     return 0
 
 
-def _context(path: Path, start: dict) -> str:
-    """±120 characters around the match, so a row can be judged without opening a 5 MB bundle."""
+def _context(path: Path, start: dict, span: int = 120) -> str:
+    """±`span` characters around the match, so a row can be judged without opening a 5 MB bundle."""
     line = (start or {}).get("line")
     if not isinstance(line, int):
         return ""
@@ -315,10 +315,103 @@ def _context(path: Path, start: dict) -> str:
             for n, text in enumerate(fh, 1):
                 if n == line:
                     col = (start or {}).get("column") or 0
-                    return text[max(0, col - 120): col + 120].strip()
+                    return text[max(0, col - span): col + span].strip()
     except OSError:
         return ""
     return ""
+
+
+SHORT = {"e": "endpoint", "n": "not-endpoint", "u": "unsure",
+         "endpoint": "endpoint", "not-endpoint": "not-endpoint", "unsure": "unsure"}
+
+
+def _read(path: str) -> tuple:
+    meta, rows = {}, []
+    for i, line in enumerate(Path(path).read_text().splitlines()):
+        if not line.strip():
+            continue
+        d = json.loads(line)
+        if i == 0 and "_meta" in d:
+            meta = d["_meta"]
+            continue
+        rows.append(d)
+    return meta, rows
+
+
+def show(args) -> int:
+    """A readable view of the rows, so labelling does not mean hand-editing JSON. It renders; it never
+    decides — the whole point of the exercise is that the labels are the operator's."""
+    meta, rows = _read(args.worksheet)
+    width = args.width
+    want = {int(x) for x in args.rows.split(",")} if args.rows else None
+    corpus = Path(meta.get("corpus", ""))
+    for i, r in enumerate(rows, 1):
+        if want is not None and i not in want:
+            continue
+        if args.unlabelled and r.get("label") in LABELS:
+            continue
+        if args.stratum and args.stratum not in r.get("stratum", ""):
+            continue
+        mark = {"endpoint": "E", "not-endpoint": "N", "unsure": "?"}.get(r.get("label"), " ")
+        print(f"[{mark}] {i:>3}. {r['key'][:72]}")
+        print(f"        {r.get('stratum','?'):<28} {r.get('analyzer','?')}  "
+              f"x{r.get('occurrences', 1)}  jsluice={'yes' if r.get('jsluice_has_it') else 'no'}")
+        ctx = (r.get("context") or "").replace("\n", " ")
+        if ctx:
+            print(f"        ctx: {ctx[:width]}")
+        if r.get("value") and r["value"][:width] != ctx[:width]:
+            print(f"        val: {r['value'][:width]}")
+        if args.expand:
+            # a judgement call deserves more than the ±120 chars captured at draw time, so the source is
+            # re-read for THIS row only. It changes nothing in the worksheet.
+            for site in (r.get("provenance") or [])[:args.sites]:
+                wide = _context(corpus / site["bundle"], site.get("start") or {}, args.expand)
+                if wide:
+                    print(f"        [{site['bundle']}:{(site.get('start') or {}).get('line')}] "
+                          f"{wide[:args.expand * 2]}")
+        print()
+    left = sum(1 for r in rows if r.get("label") not in LABELS)
+    print(f"{len(rows) - left}/{len(rows)} labelled — apply with: "
+          f"./scripts/label-ast-endpoints.py apply {args.worksheet} 1=e 2=n 3=u")
+    return 0
+
+
+def apply_labels(args) -> int:
+    """Write labels by row number. Only `label` and `note` are touched, so the worksheet digest — which
+    binds everything else — still verifies afterwards."""
+    meta, rows = _read(args.worksheet)
+    before = worksheet_digest(meta, rows)
+    if meta.get("worksheet_digest") and before != meta["worksheet_digest"]:
+        print("REFUSING: this worksheet no longer matches its digest before any edit", file=sys.stderr)
+        return 3
+    changed = 0
+    for token in args.assignments:
+        if "=" not in token:
+            print(f"REFUSING: {token!r} is not `<row>=<label>`", file=sys.stderr)
+            return 2
+        idx, _, lab = token.partition("=")
+        if not idx.isdigit() or not 1 <= int(idx) <= len(rows):
+            print(f"REFUSING: row {idx!r} is out of range 1..{len(rows)}", file=sys.stderr)
+            return 2
+        if lab not in SHORT:
+            print(f"REFUSING: {lab!r} is not one of {sorted(set(SHORT))}", file=sys.stderr)
+            return 2
+        rows[int(idx) - 1]["label"] = SHORT[lab]
+        if args.note:
+            rows[int(idx) - 1]["note"] = args.note
+        changed += 1
+    after = worksheet_digest(meta, rows)
+    if after != before:
+        print("REFUSING: applying labels changed a bound field — this is a bug, not a label",
+              file=sys.stderr)
+        return 3
+    with Path(args.worksheet).open("w") as fh:
+        fh.write(json.dumps({"_meta": meta}) + "\n")
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    left = sum(1 for r in rows if r.get("label") not in LABELS)
+    print(f"{changed} label(s) applied · {len(rows) - left}/{len(rows)} done · {left} left")
+    return 0
 
 
 def score(args) -> int:
@@ -457,6 +550,35 @@ def score(args) -> int:
         rband = (f"{rec_hi:.2f}" if fully_resolved else f"{rec_lo:.2f}-{rec_hi:.2f}")
         print(f"  {name:<16} {len(kept):>5} {tp:>4} {fp:>4} {fn_:>4} {prec:>10.2f} {rec:>8.2f}"
               f"   {w_kept:>10.0f} {band:>12} {rband:>14}")
+    # SEGMENTS, because "overall recall" answers the wrong adoption question: an endpoint jsluice
+    # already retains is not something the analyzer would ADD, and mixing the two hides both.
+    segments = {
+        "net-new/* (all)": lambda r: r["stratum"].startswith("net-new/"),
+        "  net-new/api-shaped": lambda r: r["stratum"] == "net-new/api-shaped",
+        "  net-new/other": lambda r: r["stratum"] == "net-new/other",
+        "  net-new/single-word": lambda r: r["stratum"] == "net-new/single-word",
+        "  net-new/implausible": lambda r: r["stratum"] == "net-new/implausible",
+        "also-in-jsluice (overlap)": lambda r: r["stratum"] == "also-in-jsluice",
+    }
+    print("\n  by SEGMENT — precision/recall over the labelled rows of each (raw counts, unweighted):")
+    for seg, pred in segments.items():
+        here = [r for r in labelled if pred(r)]
+        pos = [r for r in here if r["label"] == "endpoint"]
+        if not here:
+            continue
+        unres = sum(1 for r in rows if pred(r) and r.get("label") not in ("endpoint", "not-endpoint"))
+        line = f"    {seg:<27} n={len(here):>3} endpoints={len(pos):>3}"
+        for name in frozen_rules:
+            kept = [r for r in here if r["predictions"][name]]
+            tp = sum(1 for r in kept if r["label"] == "endpoint")
+            prec = (tp / len(kept)) if kept else float("nan")
+            rec = (tp / len(pos)) if pos else float("nan")
+            line += f"   {name} p={prec:.2f} r={rec:.2f}"
+        print(line + (f"   [{unres} unresolved]" if unres else ""))
+    assisted = [r for r in rows if r.get("label") == "unsure"]
+    if assisted:
+        print(f"    {'unsure (excluded above)':<27} n={len(assisted):>3}  "
+              f"{[r['key'][:40] for r in assisted]}")
     new_rules = [k for k in FILTERS if k not in frozen_rules]
     if new_rules:
         print(f"\n  rules that exist NOW but were not predeclared here: {new_rules} — each needs its own "
@@ -466,8 +588,13 @@ def score(args) -> int:
     for s, items in sorted(by_stratum.items()):
         print(f"    {s:<28} labelled {len(items):>3} of population {pops.get(s, '?')}"
               f" → weight {weight(s):.1f}")
-    print("\nEXPLORATORY. The rules were derived from this corpus, so these numbers cannot validate them "
-          "— they say whether a rule is worth carrying to a corpus nobody has looked at yet.")
+    # the footer must say what THIS worksheet is, not what the first one was
+    if str(meta.get("status", "")).startswith("UNSEEN"):
+        print("\nUNSEEN corpus, rules frozen before the draw — these numbers are a validation result. "
+              "Read them with the labeller in mind: they are only as good as the labels.")
+    else:
+        print("\nEXPLORATORY. The rules were derived from this corpus, so these numbers cannot validate "
+              "them — they say whether a rule is worth carrying to a corpus nobody has looked at yet.")
     return 0
 
 
@@ -494,12 +621,26 @@ def main() -> int:
                    help="mark this draw as UNSEEN — only truthful when no candidate from this corpus has "
                         "been inspected")
     w.add_argument("-o", "--out", default="ast-endpoint-worksheet.jsonl")
+    l = sub.add_parser("list", help="render the rows for labelling (decides nothing)")
+    l.add_argument("worksheet")
+    l.add_argument("--unlabelled", action="store_true", help="only rows still to label")
+    l.add_argument("--stratum", help="filter by stratum substring")
+    l.add_argument("--width", type=int, default=150, help="context characters to show")
+    l.add_argument("--rows", help="comma-separated row numbers, e.g. 3,7,12")
+    l.add_argument("--expand", type=int, default=0, metavar="CHARS",
+                   help="re-read the bundle and show this many characters either side of the match")
+    l.add_argument("--sites", type=int, default=1, help="how many occurrence sites to expand")
+    a = sub.add_parser("apply", help="set labels by row number: `apply ws.jsonl 1=e 2=n 3=u`")
+    a.add_argument("worksheet")
+    a.add_argument("assignments", nargs="+")
+    a.add_argument("--note", help="attach the same note to each row in this call")
     s = sub.add_parser("score", help="score the candidate rules against a hand-labelled sample")
     s.add_argument("worksheet")
     s.add_argument("--allow-rule-drift", action="store_true",
                    help="score anyway when the rules changed since the draw (marks it post-hoc)")
     args = ap.parse_args()
-    return build_worksheet(args) if args.cmd == "worksheet" else score(args)
+    return {"worksheet": build_worksheet, "list": show, "apply": apply_labels,
+            "score": score}[args.cmd](args)
 
 
 if __name__ == "__main__":
