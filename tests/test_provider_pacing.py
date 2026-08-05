@@ -226,3 +226,140 @@ class TestTheLaneReportsARefusalAsAGap:
         assert contract.provider_error_class(e) == "pace_busy"
         assert not contract.is_provider_limit("pace_busy"), "ours, not a provider limit"
         assert "pace_busy" in contract.PROVIDER_CLASSES
+
+
+class TestARefusalIsNotAnIssuedRequest:
+    """review#1 (Lumpy): the refusal arrived as an error tuple and `_work` then ran `spent += 1` — a
+    credit charged for a socket that never opened, withholding later pivots as though the balance had
+    moved. "Contact refused" must stay distinct from "request issued" through the whole accounting."""
+
+    @staticmethod
+    def _lane(tmp_path, *, refuse_after=0, spendable=5):
+        from quarry_recon import budget, shodan_sched as S
+        base = S.state_dir(tmp_path)
+        attempt = base / "pages" / "a0"
+        attempt.mkdir(parents=True, exist_ok=True)
+        led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
+                            lane="probe.shodan")
+        states = [S.PivotState(pivot=S.Pivot("probe.favicon", "http.favicon.hash", v))
+                  for v in ("1", "2", "3")]
+        res = S.WorkResult()
+        res.lanes.setdefault("probe.favicon", S.LaneOutcome(lane="probe.favicon"))
+        issued: list = []
+
+        def search(pivot, page):
+            if len(issued) >= refuse_after:
+                raise pace.PaceBusy("another process holds this account's pacing slot")
+            issued.append((pivot.value, page))
+            raw = attempt / "raw" / f"{S.item_key(pivot, page)}.json"
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw.write_bytes(b'{"total": 1, "matches": []}')
+            return ([], 1, None)
+
+        S._work(states, res,
+                balance=type("B", (), {"spendable": spendable, "may_spend": True, "reserve": 0})(),
+                search=search, ingest=lambda *a: 0, ledger=led, attempt_dir=attempt,
+                max_pages=1, is_limit=lambda cls: False)
+        return res, issued
+
+    def test_a_refusal_on_the_FIRST_pivot_spends_nothing(self, tmp_path):
+        res, issued = self._lane(tmp_path, refuse_after=0)
+        o = res.lanes["probe.favicon"]
+        assert issued == [], "no socket opened"
+        assert o.pages_bought == 0 and o.pace_refused == 1
+        assert res.stop_cause.startswith("pace_busy")
+
+    def test_a_refusal_does_not_consume_the_remaining_budget(self, tmp_path):
+        """The distortion: a refusal that charges a credit makes the NEXT pivot look unaffordable."""
+        res, issued = self._lane(tmp_path, refuse_after=1, spendable=2)
+        o = res.lanes["probe.favicon"]
+        assert len(issued) == 1, issued
+        assert o.pages_bought == 1, "the one real purchase stands"
+        assert o.pace_refused == 1
+        # one credit was spendable AFTER that purchase; the refusal must not have eaten it. The pivot is
+        # left as an unbought REMAINDER, which a later lifecycle can buy — not as a budget exhaustion.
+        assert "budget" not in res.stop_cause, res.stop_cause
+        assert res.stop_cause.startswith("pace_busy")
+
+    def test_the_refused_page_is_not_marked_as_tried(self, tmp_path):
+        """A page nobody asked for must stay askable: it is a remainder, not a completed attempt."""
+        res, _ = self._lane(tmp_path, refuse_after=0)
+        st_pages = {p for st in [] for p in st.pages_done}
+        assert not st_pages
+        assert res.lanes["probe.favicon"].pages_bought == 0
+
+
+class TestTheBalancePathRefusalIsClassified:
+    """review#2: a refusal before `/api-info` returned None and `run_work` skipped quietly, while the
+    balance claimed an operator RESERVE. Nothing carried `pace_busy`."""
+
+    def test_the_lane_reports_pace_busy_and_contacts_nobody(self, tmp_path, monkeypatch):
+        from quarry_recon import budget, shodan_sched as S
+        base = S.state_dir(tmp_path)
+        attempt = base / "pages" / "a0"
+        attempt.mkdir(parents=True, exist_ok=True)
+        led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
+                            lane="probe.shodan")
+        states = [S.PivotState(pivot=S.Pivot("probe.favicon", "http.favicon.hash", "1"))]
+
+        def refused():
+            raise pace.PaceBusy("pacing state unreadable")
+
+        res = S.run_work(None, states=states, balance=refused,
+                         search=lambda pv, pg: pytest.fail("a request was issued after a refusal"),
+                         ingest=lambda *a: 0, ledger=led, attempt_dir=attempt, max_pages=1)
+        assert res.stop_cause.startswith("pace_busy"), res.stop_cause
+        assert res.lanes["probe.favicon"].pace_refused == 1
+        assert res.lanes["probe.favicon"].pages_bought == 0
+
+    def test_it_is_neither_a_provider_limit_nor_a_reserve(self):
+        from quarry_recon import contract, events, shodan_sched as S
+        assert not contract.is_provider_limit(contract.PROVIDER_PACE_BUSY)
+        # the coverage KIND for work we never reached must read as a gap of ours, never a soft limit
+        assert S._unqueried_kind(None, f"{S.PACE_BUSY}:slot held") == events.COVERAGE_TIMEOUT
+
+    def test_the_reported_balance_makes_no_reserve_claim(self, tmp_path, monkeypatch):
+        """`SHODAN_UNKNOWN_WITH_RESERVE` would say the OPERATOR withheld credits. Nobody did."""
+        import inspect
+        src = inspect.getsource(probe._shodan_work_locked)
+        idx = src.index('if paid["pace_busy"]:')
+        block = src[idx:idx + 700]
+        assert "SHODAN_UNKNOWN_WITH_RESERVE" not in block
+        # the ASSIGNMENT, not the word: the comment above it explains why `stop_kind` stays unset, and a
+        # test that matches prose passes for the wrong reason.
+        assert "stop_kind=" not in block, "an empty stop_kind is the honest answer here"
+        assert "may_spend=False" in block, "…but nothing may be spent either"
+
+
+class TestAnUnsharedPenaltyStopsFurtherContact:
+    """review#3: `note_penalty` swallowed a publish failure, so an older valid state file kept the next
+    process going without the new `Retry-After` — while the comment claimed the opposite."""
+
+    def test_note_penalty_reports_whether_it_shared(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        key = pace.account("shodan", "K")
+        assert pace.note_penalty(key, time.time() + 60) is True
+        monkeypatch.setattr(Path, "write_text",
+                            lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+        assert pace.note_penalty(key, time.time() + 120) is False
+
+    def test_an_unshared_penalty_ends_provider_contact_for_this_lifecycle(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        monkeypatch.setattr(pace, "note_penalty", lambda *a, **k: False)
+        c = probe._ProviderCooldown("K")
+        err = Exception("429")
+        err.headers = {"Retry-After": "60"}
+        c.note(err)
+        assert c.unshared_penalty, "the loss of coordination is recorded"
+        with pytest.raises(pace.PaceBusy):
+            c.wait()
+
+    def test_a_SHARED_penalty_leaves_the_lifecycle_working(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        monkeypatch.setattr(pace.time, "sleep", lambda s: None)
+        c = probe._ProviderCooldown("K")
+        err = Exception("429")
+        err.headers = {"Retry-After": "1"}
+        c.note(err)
+        assert not c.unshared_penalty
+        c.wait()                                    # honoured, not refused

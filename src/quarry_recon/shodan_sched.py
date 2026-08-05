@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import budget, events
+from . import budget, events, pace
 
 #: v2: pages carry `bought_at` and live in a PROJECT-scoped store. A schema bump isolates the previous
 #: generation rather than deleting it — paid evidence is never pruned automatically.
@@ -357,6 +357,8 @@ class LaneOutcome:
     #: OWNED acquisition keys whose receipt would not validate. Untrusted ownership evidence: it blocks
     #: a purchase exactly like a good receipt, because it cannot prove the page was NOT bought.
     acquisition_invalid: int = 0
+    #: requests OUR rate boundary declined to issue. No socket opened and no credit moved.
+    pace_refused: int = 0
     #: pages recovered by parsing bytes we already owned — no provider contact, no credit
     pages_parsed_late: int = 0
     pages_rejected: int = 0
@@ -629,6 +631,9 @@ ACQ_UNPARSED = "complete_unparsed"
 ACQ_INCOMPLETE = "incomplete_paid"
 #: acquisition items share the ledger with page items and must never collide with them
 ACQ_PREFIX = "acq:"
+#: our own rate boundary declined to let a request out. Not the provider's answer and not a limit it
+#: imposed — a gap of ours that a later lifecycle closes for free.
+PACE_BUSY = "pace_busy"
 
 
 def acq_key(pivot: Pivot, page: int) -> str:
@@ -903,7 +908,15 @@ def run_work(ctx, *, states, balance, search, ingest, ledger, attempt_dir,
             # pagination is found, and an old completion is not permanent. What changed is the ORDER —
             # a cooldown governs provider contact, and replay is not provider contact.
             if callable(balance):
-                balance = balance()
+                try:
+                    balance = balance()
+                except pace.PaceBusy as e:
+                    # OUR boundary refused before any contact. Replay above already happened; the
+                    # remainder is reported and a later lifecycle closes it for free (review#2, Lumpy).
+                    balance = None
+                    res.stop_cause = res.stop_cause or f"{PACE_BUSY}:{e}"
+                    for st in states:
+                        res.lanes[st.pivot.lane].pace_refused += 1
             try:
                 if balance is not None:
                     _work(states, res, balance=balance, search=search, ingest=ingest, ledger=ledger,
@@ -1355,7 +1368,19 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
             if not sinks_ok():
                 break                                     # nothing paid for yet; stop_cause is set
             tried.add(attempt)
-            matches, total, err = search(st.pivot, page)
+            try:
+                matches, total, err = search(st.pivot, page)
+            except pace.PaceBusy as e:
+                # NO REQUEST WAS ISSUED. review#1 (Lumpy): the refusal used to arrive as an error tuple,
+                # after which `spent += 1` charged a credit that no socket ever spent — withholding
+                # later pivots as though the balance had moved. "Contact refused" must stay distinct
+                # from "request issued" all the way through accounting, so it is caught BEFORE the
+                # boundary below, and purchasing ends: the next pivot would be refused identically.
+                o.pace_refused += 1
+                st.stopped = PACE_BUSY
+                res.stop_cause = res.stop_cause or f"{PACE_BUSY}:{e}"
+                tried.discard(attempt)
+                break
             spent += 1                                    # a request was ISSUED — that is the credit
             st.attempted = True
             progressed = True
@@ -1516,8 +1541,9 @@ def _unqueried_kind(balance, stop_cause: str = "") -> str:
         if stop_cause == "budget_provider" or stop_cause.startswith("provider_limit:"):
             return events.COVERAGE_PROVIDER              # the provider's balance was the boundary
         # provider_stop:* is a FAILURE we stopped requesting through — a gap, never a soft limit.
-        # publish_failed / ledger_unwritable / scheduler_invariant / ownership_unreadable — all OURS,
-        # all defects
+        # publish_failed / ledger_unwritable / scheduler_invariant / ownership_unreadable / pace_busy —
+        # all OURS. `pace_busy` is the one that is not a defect: a boundary declining to burst is
+        # working, and the remainder it leaves is free to collect later.
         return events.COVERAGE_TIMEOUT
     kind = getattr(balance, "stop_kind", "") or ""
     if kind in (SHODAN_PROVIDER_EXHAUSTED, SHODAN_ENTITLEMENT):

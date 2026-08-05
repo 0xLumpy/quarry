@@ -191,12 +191,16 @@ def wait(key: str, interval_s: float, *, penalty_until: float = 0.0) -> float:
     return slept
 
 
-def note_penalty(key: str, until_wall: float) -> None:
-    """Persist a provider-imposed slowdown for this ACCOUNT, so the next run honours what this one earned.
+def note_penalty(key: str, until_wall: float) -> bool:
+    """Persist a provider-imposed slowdown for this ACCOUNT. True when it was actually SHARED.
 
-    A 429 is a statement about the credential, not about the process that happened to receive it."""
+    A 429 is a statement about the credential, not about the process that happened to receive it. But a
+    penalty we could not publish is not enforced anywhere else: an older, perfectly valid state file
+    stays readable, so the next process proceeds without it (review#3, Lumpy). This never raises — the
+    request already happened and the caller is on a failure path — and it never CLAIMS the sharing
+    worked. The caller stops contacting the provider for the rest of its lifecycle instead."""
     if not isinstance(until_wall, (int, float)) or isinstance(until_wall, bool):
-        return
+        return False
     path = _state_path(key)
     try:
         PACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -207,10 +211,8 @@ def note_penalty(key: str, until_wall: float) -> None:
             doc.update({"until": keep,
                         "last": _stamp(doc.get("last"), now=now) if "last" in doc else 0.0})
             _publish(path, doc)
+            return True
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
-        # RECORDING a penalty is the one thing that must not raise: the request already happened, the
-        # 429 is already in hand, and the caller is on a failure path. The penalty still applies
-        # in-process; what is lost is sharing it, which the next `wait()` will refuse over anyway.
-        return
+        return False

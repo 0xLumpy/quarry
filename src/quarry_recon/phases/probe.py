@@ -131,6 +131,9 @@ class _ProviderCooldown:
         # against whatever ran a moment before it, and two processes had independent clocks. The shared
         # boundary is keyed by a FINGERPRINT of the credential — never the credential itself.
         self.account = pace.account("shodan", key)
+        #: set when a provider penalty could NOT be shared with the account. Nothing else enforces it,
+        #: so this lifecycle stops contacting the provider rather than pretending it is coordinated.
+        self.unshared_penalty = ""
 
     def note(self, err) -> None:
         self.hits += 1
@@ -150,7 +153,9 @@ class _ProviderCooldown:
         self.until = max(self.until, _time.monotonic() + wait)
         # a 429 is a statement about the CREDENTIAL, not about the process that happened to receive it:
         # persist it so the next run — and any concurrent one — honours what this one earned.
-        pace.note_penalty(self.account, _time.time() + wait)
+        if not pace.note_penalty(self.account, _time.time() + wait):
+            self.unshared_penalty = (f"a {wait:g}s provider slowdown could not be shared with this "
+                                     f"account — other runs would not honour it")
 
     def wait(self) -> None:
         """Honour this ACCOUNT's slowdown and minimum interval, then mark the request.
@@ -160,6 +165,11 @@ class _ProviderCooldown:
 
         The account boundary is authoritative and shared installation-wide; the in-process interval below
         remains as a fallback for the case where that state cannot be read or written at all."""
+        if self.unshared_penalty:
+            # we know the provider asked us to slow down and we could not tell the account. Continuing
+            # would be this process honouring a penalty it cannot coordinate — exactly the burst the
+            # boundary exists to prevent.
+            raise pace.PaceBusy(self.unshared_penalty)
         penalty = self.until - _time.monotonic()
         pace.wait(self.account, _SHODAN_MIN_INTERVAL_S,
                   penalty_until=(_time.time() + penalty) if penalty > 0 else 0.0)
@@ -741,9 +751,12 @@ def _shodan_work_locked(ctx, key, lanes):
         if paid["bal"] is not None:
             return paid["bal"]
         if paid["pace_busy"]:
+            # NOT a reserve and NOT a provider limit: our own rate boundary declined to let a request
+            # out. `stop_kind` stays empty so nothing reads this as an operator withholding credits or
+            # as the account being exhausted; the lane's `pace_busy` stop cause carries the meaning.
             return ShodanBalance(
                 remaining=None, allowance=None, reserve=_shodan_reserve_setting(), spendable=0,
-                may_spend=False, stop_kind=SHODAN_UNKNOWN_WITH_RESERVE,
+                may_spend=False,
                 reason=f"no provider contact this lifecycle — {paid['pace_busy']}")
         return ShodanBalance(
             remaining=None, allowance=None, reserve=_shodan_reserve_setting(), spendable=None,
@@ -896,9 +909,11 @@ def _shodan_work_locked(ctx, key, lanes):
                 cooldown.wait()          # the balance read is provider contact like any other
             except pace.PaceBusy as e:
                 # no contact at all this lifecycle. Replay has already happened and is unaffected; the
-                # unbought remainder is reported and a later run closes it for free.
+                # unbought remainder is reported and a later run closes it for free. RAISED, not
+                # returned as None: the coordinator records `pace_busy` as the stop cause, so this reads
+                # as OUR gap rather than a quiet skip (review#2, Lumpy).
                 paid["pace_busy"] = str(e)
-                return None
+                raise
             bal = _read_shodan_balance(key, cooldown=cooldown)
             # held IMMEDIATELY: review-B1.5r5#3 — a failure in sizing (or anywhere after) must still
             # leave exactly one balance record per lane, which is the missing-lifecycle hole this
