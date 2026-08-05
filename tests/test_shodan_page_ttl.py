@@ -1069,16 +1069,69 @@ class TestAcquisitionIsCommittedBeforeInterpretation:
                 max_pages=1, is_limit=lambda cls: False)
         assert res.stop_cause.startswith("ownership_uninspectable:")
 
-    def test_an_unwalkable_paid_store_also_stops_acquisition(self, tmp_path, monkeypatch):
+    def test_a_REAL_unreadable_subtree_stops_acquisition(self, tmp_path):
+        """review#1 (Lumpy, measured; reproduced here): `Path.rglob` SILENTLY OMITS a subtree it cannot
+        read — a directory at mode 000 yields nothing and raises nothing, so the scan looks clean and an
+        orphaned purchase inside it is invisible. This is pinned against the real filesystem, not a
+        monkeypatched traversal: the previous version faked the exception that never happens."""
+        import os
         from quarry_recon import budget
         base = S.state_dir(tmp_path)
-        base.mkdir(parents=True, exist_ok=True)
+        attempt = base / "pages" / "a0"
+        (attempt / "raw").mkdir(parents=True, exist_ok=True)
+        pivot = Pivot(FAV, "http.favicon.hash", "1")
+        # an ORPHANED paid response, hidden inside a directory we cannot enter
+        (attempt / "raw" / f"{S.item_key(pivot, 1)}.json").write_bytes(b'{"total": 1, "matches": []}')
         led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
                             lane="probe.shodan")
-        monkeypatch.setattr(Path, "rglob",
-                            lambda self, pat: (_ for _ in ()).throw(OSError("permission denied")))
-        view = S.ownership_view(base, led)
-        assert view.error and "could not be inspected" in view.error
+        assert S.item_key(pivot, 1) in S.ownership_view(base, led).orphans, "visible while readable"
+
+        mode = (attempt / "raw").stat().st_mode
+        os.chmod(attempt / "raw", 0o000)
+        try:
+            if os.access(attempt / "raw", os.R_OK):
+                pytest.skip("running as root: an unreadable subtree cannot be simulated")
+            # the artifact is now unreachable — and the walk must SAY SO rather than report a clean store
+            view = S.ownership_view(base, led)
+            assert view.error and "could not be fully inspected" in view.error, view
+            assert not view.orphans, "it must not report a partial picture as the whole one"
+
+            st = PivotState(pivot=pivot)
+            res = S.WorkResult()
+            res.lanes.setdefault(FAV, S.LaneOutcome(lane=FAV))
+            S._work([st], res,
+                    balance=type("B", (), {"spendable": 5, "may_spend": True, "reserve": 0})(),
+                    search=lambda pv, pg: pytest.fail("bought a page we could not rule out owning"),
+                    ingest=lambda *a: 0, ledger=led, attempt_dir=attempt, max_pages=1,
+                    is_limit=lambda cls: False)
+            assert res.stop_cause.startswith("ownership_uninspectable:")
+        finally:
+            os.chmod(attempt / "raw", mode)
+
+    def test_a_receipt_from_another_SCHEMA_blocks_but_is_not_interpreted(self, tmp_path):
+        """review#2: `schema` was never checked, so a receipt from a generation we do not speak could
+        enter `by_page` and reach deferred parsing. It still proves a PURCHASE — it just may not be
+        read — so it belongs in `invalid`."""
+        import json as _json
+        run = self._lane(tmp_path, response=b'{"total": 3, "matches": []}',
+                         err=("oversize", "deferred"))
+        led = self._fresh_ledger(run)
+        art = led.artifact(S.acq_key(run["pivot"], 1))
+        doc = _json.loads(art.read_text())
+        doc["schema"] = S.SHODAN_WORK_SCHEMA + 1
+        art.write_text(_json.dumps(doc))
+        led.record(S.acq_key(run["pivot"], 1), art)
+        led.save()
+
+        view = S.ownership_view(S.state_dir(tmp_path), self._fresh_ledger(run))
+        assert S.item_key(run["pivot"], 1) in view.invalid
+        assert not view.by_page, "a receipt we cannot read must never feed deferred parsing"
+
+        parsed = []
+        second = self._lane(tmp_path, response=b"unused",
+                            parse=lambda p: parsed.append(p) or ([], 0))
+        assert second["issued"] == [] and second["outcome"].acquisition_invalid == 1
+        assert parsed == [], "…and its bytes are not interpreted either"
 
     def test_an_orphaned_PARTIAL_response_is_seen_and_refused(self, tmp_path):
         """review#2: a broken stream leaves `<key>.json.part`. The scan matched only `raw/*.json`, so a

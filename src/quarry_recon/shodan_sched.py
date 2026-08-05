@@ -23,6 +23,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -736,6 +737,11 @@ def ownership_view(base, ledger) -> OwnershipView:
         if not isinstance(doc, dict) or doc.get("kind") != "acquisition":
             view.invalid[key] = "receipt is not an acquisition document"
             continue
+        if doc.get("schema") != SHODAN_WORK_SCHEMA:
+            # a receipt from a generation we do not speak still PROVES A PURCHASE — it just may not be
+            # interpreted. Invalid blocks the spend without feeding deferred parsing (review#2).
+            view.invalid[key] = f"receipt schema {doc.get('schema')!r} is not v{SHODAN_WORK_SCHEMA}"
+            continue
         if doc.get("state") not in (ACQ_PARSED, ACQ_UNPARSED, ACQ_INCOMPLETE):
             view.invalid[key] = f"receipt state {doc.get('state')!r} is not one we issue"
             continue
@@ -756,23 +762,42 @@ def ownership_view(base, ledger) -> OwnershipView:
     # its journal fails leaves the receipt — or the paid bytes — invisible, and the next run buys again.
     # `.part` counts too: a partial response is a paid acquisition that did not finish (review#2).
     root = Path(base)
+    walk_errors: list = []
+    files: list = []
     try:
-        for pattern, what in (("acq/*.acq.json", "receipt"), ("raw/*.json", "paid response"),
-                              ("raw/*.json.part", "PARTIAL paid response")):
-            for art in root.rglob(pattern):
-                name = art.name
-                key = (name[:-len(".acq.json")] if name.endswith(".acq.json") else
-                       name[:-len(".json.part")] if name.endswith(".json.part") else art.stem)
-                if not key or key in view.orphans:
-                    continue
-                if ACQ_PREFIX + key in owned or key in owned:
-                    continue
-                view.orphans[key] = f"{what} without an ownership entry ({art})"
+        # MEASURED 2026-08-05 (Lumpy, then reproduced here): `Path.rglob` SILENTLY OMITS a subtree it
+        # cannot read — a directory at mode 000 yielded no entries, raised nothing, and the scan looked
+        # clean. An orphaned purchase inside it would have been invisible and the page bought again.
+        # `os.walk(onerror=…)` is the traversal that can report what it could not enter.
+        for dirpath, _dirnames, filenames in os.walk(root, onerror=walk_errors.append):
+            for name in filenames:
+                files.append(Path(dirpath) / name)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
-        # a store we cannot WALK cannot rule out a prior purchase either
         view.error = view.error or f"paid store could not be inspected: {e}"
+        return view
+    if walk_errors:
+        # a store we cannot fully READ cannot rule out a prior purchase
+        first = "; ".join(str(e) for e in walk_errors[:3])
+        view.error = view.error or (f"paid store could not be fully inspected "
+                                    f"({len(walk_errors)} unreadable location(s)): {first}")
+        return view
+    for art in files:
+        name, parent = art.name, art.parent.name
+        if parent == "acq" and name.endswith(".acq.json"):
+            key, what = name[:-len(".acq.json")], "receipt"
+        elif parent == "raw" and name.endswith(".json.part"):
+            key, what = name[:-len(".json.part")], "PARTIAL paid response"
+        elif parent == "raw" and name.endswith(".json"):
+            key, what = name[:-len(".json")], "paid response"
+        else:
+            continue
+        if not key or key in view.orphans:
+            continue
+        if ACQ_PREFIX + key in owned or key in owned:
+            continue
+        view.orphans[key] = f"{what} without an ownership entry ({art})"
     return view
 
 
