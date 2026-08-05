@@ -80,8 +80,12 @@ class TestSecretsHiddenInsideValues:
                      "# example: password=YOUR_PASSWORD_HERE"):
             assert "connection-string-password" not in kinds(text), text
 
-    def test_a_bare_Key_field_with_a_long_value_is_extracted(self):
-        assert kinds(self.APPSETTINGS)["json:Key"] == "super-secret-signing-value-1234"
+    def test_a_bare_Key_field_is_a_secret_IN_THAT_FORMAT(self):
+        """`appsettings.json` is where .NET writes the symmetric signing secret. The same body from an
+        unknown path is signing CONTEXT only — see `TestTheBareKeyRuleNeedsContextToo`."""
+        got = kinds(self.APPSETTINGS, "https://t/appsettings.json")
+        assert got["json:Key"] == "super-secret-signing-value-1234"
+        assert kinds(self.APPSETTINGS)["signing-key"] == "super-secret-signing-value-1234"
 
     def test_a_bare_key_field_with_a_SHORT_value_is_not(self):
         """`"key": "name"` is how a thousand harmless config blocks are written. The value's length is
@@ -404,9 +408,11 @@ class TestTheBareKeyRuleNeedsContextToo:
         for path in ("https://t/appsettings.json", "https://t/appsettings.Production.json"):
             assert kinds(f'{{"key": "{self.LONG}"}}', path) == {"json:key": self.LONG}, path
 
-    def test_a_named_signing_parent_is_trusted_anywhere(self):
+    def test_a_named_signing_parent_is_an_observation_without_the_format(self):
+        """DOCTRINE (review#9): a JWT parent says what the key is FOR, not that it is private. A JWKS
+        document has the same shape and is published on purpose."""
         got = kinds(f'{{"Jwt": {{"Issuer": "me", "Key": "{self.LONG}"}}}}', "https://t/api/v1/config")
-        assert got == {"json:Key": self.LONG}
+        assert got == {"signing-key": self.LONG}
 
     def test_an_unrelated_parent_is_not(self):
         assert kinds(f'{{"Pagination": {{"Key": "{self.LONG}"}}}}', "https://t/api/v1/x") == {}
@@ -419,13 +425,36 @@ class TestTheBareKeyRuleNeedsContextToo:
         assert kinds(f'{{"{parent}": {{"key": "{self.LONG}"}}}}', "https://t/api/v1/x") == {}, parent
 
     @pytest.mark.parametrize("body", [
-        '{{"key": "{v}", "algorithm": "HS256"}}',
         '{{"key": "{v}", "kid": "k1"}}',
         '{{"issuer": "https://idp", "key": "{v}"}}',
         '{{"audience": "api", "key": "{v}"}}',
+        '{{"key": "{v}", "kid": "k1", "algorithm": "RS256"}}',
     ])
-    def test_a_companion_signing_field_carries_it_in_either_order(self, body):
+    def test_signing_CONTEXT_is_an_observation_not_a_secret(self, body):
+        """review#9 (Lumpy): `kid`, `issuer`, `audience` and `RS256` accompany PUBLIC verification keys
+        as readily as private ones — a JWKS entry is published material by design. It is preserved and
+        routed as an observation, not as a leaked credential."""
+        assert kinds(body.format(v=self.LONG), "https://t/api/v1/x") == {"signing-key": self.LONG}, body
+
+    @pytest.mark.parametrize("body", [
+        '{{"key": "{v}", "algorithm": "HS256"}}',
+        '{{"alg": "HS512", "key": "{v}"}}',
+        '{{"key": "{v}", "alg": "dir"}}',
+    ])
+    def test_SYMMETRIC_material_is_a_secret(self, body):
+        """A symmetric algorithm means the signing key and the verifying key are the same string, so
+        publishing it IS the leak."""
         assert kinds(body.format(v=self.LONG), "https://t/api/v1/x") == {"json:key": self.LONG}, body
+
+    def test_an_ASYMMETRIC_algorithm_stays_an_observation(self):
+        for alg in ("RS256", "ES256", "PS384", "EdDSA"):
+            body = f'{{"kid": "k9", "key": "{self.LONG}", "alg": "{alg}"}}'
+            assert kinds(body, "https://t/api/v1/x") == {"signing-key": self.LONG}, alg
+
+    def test_the_FORMAT_still_makes_it_a_secret(self):
+        """`appsettings.json` is where .NET writes the symmetric signing secret."""
+        assert kinds(f'{{"Jwt": {{"Key": "{self.LONG}"}}}}', "https://t/appsettings.json") \
+            == {"json:Key": self.LONG}
 
     def test_a_long_public_identifier_is_still_not_a_secret(self):
         assert kinds(f'{{"key": "{self.LONG}", "label": "public"}}', "https://t/api/v1/x") == {}
@@ -445,3 +474,43 @@ class TestConnectionStringsRegardlessOfFieldOrder:
 
     def test_a_semicolon_list_with_no_connection_anchor_is_not_one(self):
         assert kinds('note = "password=changeme;remember=false;theme=dark"') == {}
+
+
+class TestSigningObservationsAreRouted:
+    """A key in signing context is preserved with its provenance and does NOT enter the secret queue."""
+
+    @staticmethod
+    def _ctx():
+        from types import SimpleNamespace
+        added: list = []
+        return SimpleNamespace(run=SimpleNamespace(
+            add=lambda k, r: (added.append((k, r)), True)[1])), added
+
+    def test_it_goes_to_review_as_a_signing_key(self):
+        ctx, added = self._ctx()
+        got = evidence.publish_finding(ctx, "signing-key", "public-material-1234567890", 4,
+                                       url="https://t/.well-known/jwks.json", dest="/raw/j",
+                                       source="exposed-fetch")
+        assert got == "observation"
+        kind, rec = added[0]
+        assert kind == "review" and rec["klass"] == "signing-key"
+        assert rec["value"] == "public-material-1234567890", "kept whole"
+        assert "not evidence of a leaked secret" in rec["note"]
+
+    def test_it_is_not_counted_as_a_secret(self, tmp_path, monkeypatch):
+        from quarry_recon import fetch
+        from types import SimpleNamespace
+        added: list = []
+        run = SimpleNamespace(
+            raw_path=lambda ph, sub, nm: (tmp_path / ph / sub).joinpath(nm)
+            if (tmp_path / ph / sub).mkdir(parents=True, exist_ok=True) or True else None,
+            add=lambda kind, rec: (added.append((kind, rec)), True)[1])
+        ctx = SimpleNamespace(run=run, scope=SimpleNamespace(
+            in_scope=lambda h: True, is_oos=lambda h: False, active_allowed=lambda h: True))
+        body = b'{"key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa", "kid": "k1", "alg": "RS256"}'
+        monkeypatch.setattr(fetch, "scoped_get",
+                            lambda *a, **k: (body, "https://t/.well-known/jwks.json", 200))
+        res = evidence.fetch_and_extract(ctx, "https://t/.well-known/jwks.json",
+                                         source="exposed-fetch", subdir="exposed")
+        assert res["secrets"] == 0, res
+        assert [r for kind, r in added if kind == "review" and r.get("klass") == "signing-key"]

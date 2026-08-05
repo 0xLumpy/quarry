@@ -87,6 +87,15 @@ def _connstring_passwords(text: str):
 #: offline-crackable, which is worth reporting as its own thing rather than as a recovered secret
 #: (review#2, Lumpy). Kinds listed here are published as `credential-hash` review evidence.
 HASH_KINDS = frozenset({"bcrypt-hash"})
+#: kinds that are SIGNING CONTEXT, not proven secrets. review#9 (Lumpy): `kid`, `issuer`, `audience`,
+#: `algorithm` and `expiry` accompany PUBLIC verification keys as readily as private ones — a JWKS entry
+#: (`{"key": …, "kid": "k1", "algorithm": "RS256"}`) is published material by design. The value is worth
+#: keeping and is not evidence of a leaked secret, so it is routed as an observation.
+OBSERVATION_KINDS = frozenset({"signing-key"})
+#: what DOES establish secret material in that context: a symmetric algorithm means the signing key and
+#: the verifying key are the same string, so publishing it would be the leak.
+_SYMMETRIC_ALG_RX = re.compile(r'"(?:alg|algorithm)"\s*:\s*"(?:HS(?:256|384|512)|A\d{3}(?:GCM)?KW|'
+                               r'dir|symmetric)"', re.I)
 _HASH_RX = [
     ("bcrypt-hash", re.compile(r"\$2[abxy]?\$\d{2}\$[./A-Za-z0-9]{53}")),
 ]
@@ -179,18 +188,35 @@ def mine(text: str, *, source_path: str | None = None) -> list[tuple[str, str, i
         if _SECRETISH_KEY.search(key) and val not in seen_vals:   # already caught as a typed token
             seen_vals.add(val)
             out.append((f"dotenv:{key}", val, text.count("\n", 0, m.start()) + 1))
-    bare_key_rules = [_JSON_SIGNING_CONTEXT_RX,                     # a named signing parent, anywhere
-                      _JSON_SIGNING_COMPANION_AFTER_RX,             # …or the object says how it is
-                      _JSON_SIGNING_COMPANION_BEFORE_RX]            # used, in either order
-    if path and _JSON_BARE_KEY_PATHS.search(path):                  # …or the format that writes them
-        bare_key_rules.append(_JSON_BARE_KEY_RX)
-    for rx_set in (_JSON_SECRET_RX, *bare_key_rules):
+    # A bare `"key"` is a SECRET only where the FORMAT says so — .NET writes the symmetric signing secret
+    # into `appsettings*.json` — or where the material is symmetric. Signing CONTEXT alone (`kid`,
+    # `issuer`, `audience`, `RS256`) describes a PUBLIC verification key just as well: a JWKS entry has
+    # exactly that shape and is published on purpose (review#9, Lumpy). Context without proof of secrecy
+    # is kept as an observation, never as a leaked credential.
+    by_format = bool(path and _JSON_BARE_KEY_PATHS.search(path))
+    secret_key_rules = [_JSON_SIGNING_CONTEXT_RX, _JSON_BARE_KEY_RX] if by_format else []
+    for rx_set in (_JSON_SECRET_RX, *secret_key_rules):
         for m in rx_set.finditer(text):                           # JSON config (actuator env, .NET…)
             key, val = m.group(1), m.group(2)
             if (val not in seen_vals and not _MASKED_RX.match(val)
                     and val.lower() not in ("null", "true", "false")):
                 seen_vals.add(val)
                 out.append((f"json:{key}", val, text.count("\n", 0, m.start()) + 1))
+    for rx_set in (_JSON_SIGNING_CONTEXT_RX, _JSON_SIGNING_COMPANION_AFTER_RX,
+                   _JSON_SIGNING_COMPANION_BEFORE_RX):
+        for m in rx_set.finditer(text):
+            key, val = m.group(1), m.group(2)
+            if val in seen_vals or _MASKED_RX.match(val) or val.lower() in ("null", "true", "false"):
+                continue
+            seen_vals.add(val)
+            # a SYMMETRIC algorithm means the signing key and the verifying key are the same string, so
+            # publishing it would be the leak. Anything else stays an observation.
+            # the algorithm's VALUE often sits just past the match (`…"key": "x", "algorithm"` ends the
+            # companion pattern), so the window is the surrounding object, not the match alone.
+            window = text[max(0, m.start() - 200):m.end() + 200]
+            symmetric = bool(_SYMMETRIC_ALG_RX.search(window))
+            out.append((f"json:{key}" if symmetric else "signing-key", val,
+                        text.count("\n", 0, m.start()) + 1))
     for val, at in _connstring_passwords(text):                    # a password inside a connection string
         if val and val not in seen_vals:
             seen_vals.add(val)
@@ -228,6 +254,19 @@ def publish_finding(ctx, kind: str, val: str, line, *, url: str, dest, source: s
     # `b.example.com/real.env` puts the credential on b, and recording it against a points the report at
     # the wrong asset (review#1, Lumpy). The requested URL stays in `location` as provenance.
     where = normalize.host_of_url(final_url or url) or host or normalize.host_of_url(url)
+    if kind in OBSERVATION_KINDS:
+        # signing CONTEXT, not a proven secret: a JWKS entry publishes exactly this shape. Kept whole,
+        # with its provenance, in the review queue — where an operator decides whether the material is
+        # private (review#9, Lumpy).
+        ok = ctx.run.add("review", {
+            "id": f"signing-key:{secrets.fingerprint(val)}", "klass": "signing-key",
+            "value": val, "host": where, "raw_ref": str(dest) if dest else None, "location": url,
+            **({"final": final_url} if final_url and final_url != url else {}),
+            "line": line,
+            "note": "a key in a SIGNING context (kid/issuer/audience/algorithm). Public verification "
+                    "material has this shape too — not evidence of a leaked secret on its own.",
+            "sources": [source]})
+        return "observation" if ok else ""
     if kind in HASH_KINDS:
         ok = ctx.run.add("review", {
             "id": f"credential-hash:{secrets.fingerprint(val)}", "klass": "credential-hash",
