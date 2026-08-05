@@ -19,6 +19,7 @@ construction rather than by patching the network.
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
@@ -336,6 +337,11 @@ class LaneOutcome:
     #: altered, or filed without a digest). The completion is dropped by the ledger and the evidence is
     #: genuinely gone — but it is NOT bought again: an evidence loss is not a spending permission.
     pages_lost: int = 0
+    #: paid responses we refused to treat as pages. The credit is spent either way, so the bytes are kept
+    #: (see `publish_rejected`) and the objection is NAMED — a bare class counter left "provider drifted"
+    #: and "our contract is wrong" equally unprovable.
+    pages_rejected: int = 0
+    reject_reasons: list = field(default_factory=list)     # bounded; first objections, in order
     #: a lost page the pivot would otherwise have asked for, that this run declined to re-buy. Sibling of
     #: `refresh_refused`: repairing paid evidence is an explicit operator decision Quarry cannot make for
     #: itself, and `--unbound` is not that decision — it never authorises spending.
@@ -491,6 +497,34 @@ def valid_total(total) -> bool:
     return not isinstance(total, bool) and isinstance(total, int) and total >= 0
 
 
+def reject_reason(matches, total) -> "str | None":
+    """WHY a page cannot be treated as complete, or None when it can.
+
+    The predicate below used to be the whole story, and a rejected page therefore left a counter reading
+    `{'parse': 1}` and nothing else — measured 2026-08-05, where Shodan billed a credit for a response we
+    threw away and no artifact could say whether the PROVIDER had drifted or our own contract was wrong.
+    A validator that cannot name its objection makes both answers equally unavailable.
+
+    Structural only: type names, a row index and the offending `total`. Never a hostname or a row's
+    contents — the reason travels into telemetry, the EVIDENCE travels into the artifact."""
+    if not valid_total(total):
+        return f"total is not a usable count ({total!r})"
+    if not isinstance(matches, list):
+        return f"matches is {type(matches).__name__}, not a list"
+    for i, m in enumerate(matches):
+        if not isinstance(m, dict):                       # a null/scalar row is corruption, not empty
+            return f"match row {i} is {type(m).__name__}, not an object"
+        hns = m.get("hostnames")
+        if hns is None:
+            continue
+        if not isinstance(hns, list):
+            return f"row {i} hostnames is {type(hns).__name__}, not a list"
+        for h in hns:
+            if not isinstance(h, str):
+                return f"row {i} has a {type(h).__name__} hostname, not a string"
+    return None
+
+
 def valid_fresh(matches, total) -> bool:
     """Whether a page may be treated as complete — the ONE contract for fresh output and replayed
     evidence alike, since `valid_page` delegates here.
@@ -505,19 +539,67 @@ def valid_fresh(matches, total) -> bool:
     rather than bumping SHODAN_WORK_SCHEMA is deliberate: a bump invalidates every page already bought,
     including the valid ones, and would have us re-pay for them. A malformed old page simply stops being
     owned, so it is repurchased on its own."""
-    if not valid_total(total):
-        return False
-    if not isinstance(matches, list):
-        return False
-    for m in matches:
-        if not isinstance(m, dict):                       # a null/scalar row is corruption, not empty
-            return False
-        hns = m.get("hostnames")
-        if hns is None:
-            continue
-        if not isinstance(hns, list) or any(not isinstance(h, str) for h in hns):
-            return False
-    return True
+    return reject_reason(matches, total) is None
+
+
+#: an error body is a sentence and a rejected page is a page: enough to diagnose, never a second store
+REJECTED_BYTES_LIMIT = 512 * 1024
+
+
+def publish_rejected(attempt_dir, pivot: Pivot, page: int, *, reason: str, body=None,
+                     matches=None, total=None):
+    """Keep what a PAID request actually returned when we refuse to treat it as a page.
+
+    A credit was spent, so the response is evidence regardless of whether our contract accepts it. It is
+    written OUTSIDE the ledger — a rejected page is never owned, never replayed, and cannot be mistaken
+    for one — and the exact bytes are preserved when we have them, because a lossy re-encode of the thing
+    under dispute is not evidence of what arrived.
+
+    Best-effort by construction: this runs on the failure path and must never replace one problem with
+    another. Returns the artifact path, or None."""
+    try:
+        d = Path(attempt_dir) / "rejected"
+        d.mkdir(parents=True, exist_ok=True)
+        doc = {"schema": SHODAN_WORK_SCHEMA, "lane": pivot.lane, "facet": pivot.facet,
+               "value": pivot.value, "page": page, "at": time.time(), "reason": reason,
+               "owned": False}
+        if isinstance(body, (bytes, bytearray)) and body:
+            doc["body_b64"] = base64.b64encode(bytes(body)[:REJECTED_BYTES_LIMIT]).decode()
+            doc["body_bytes"] = len(body)
+        elif matches is not None or total is not None:
+            # no raw bytes to keep (the page parsed and then failed the CONTRACT): record what we were
+            # handed, best-effort, so the shape that was rejected is still inspectable.
+            doc["payload"] = json.loads(json.dumps({"total": total, "matches": matches}, default=repr))
+        art = d / f"{item_key(pivot, page)}.rejected.json"
+        art.write_text(json.dumps(doc))
+        return art
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return None
+
+
+#: how many objections a lane keeps. The first ones diagnose the contract; the thousandth is noise, and
+#: an unbounded list on a failure path is a memory leak with a story attached.
+MAX_REJECT_REASONS = 5
+
+
+def note_rejected(o, pivot: Pivot, page: int, *, reason: str, attempt_dir, body=None,
+                  matches=None, total=None, count: bool = True) -> None:
+    """Keep a paid response's bytes, and — when the objection is OURS — count it and remember why.
+
+    One place, so the two rejection paths cannot drift apart. `count=False` preserves evidence for a
+    provider-side refusal without claiming our contract rejected anything."""
+    if not count:
+        publish_rejected(attempt_dir, pivot, page, reason=reason, body=body,
+                         matches=matches, total=total)
+        return
+    o.pages_rejected += 1
+    art = publish_rejected(attempt_dir, pivot, page, reason=reason, body=body,
+                           matches=matches, total=total)
+    if len(o.reject_reasons) < MAX_REJECT_REASONS:
+        o.reject_reasons.append(f"{pivot.facet}:{pivot.value} p{page}: {reason}"
+                                + (f" [kept: {art.name}]" if art is not None else " [BYTES NOT KEPT]"))
 
 
 def _read_page(path, pivot: Pivot, page: int):
@@ -890,6 +972,12 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
             progressed = True
             if err is not None:
                 cls = getattr(err, "error_class", None) or "error"
+                # the body is kept for EVERY provider error — that is how a Cloudflare interstitial or a
+                # quota sentence stays inspectable — but only a `parse` failure is an objection of OURS,
+                # and only that one moves the rejection counters. An auth or quota refusal is already
+                # counted by its class and explained by the terminal's `error_detail`.
+                note_rejected(o, st.pivot, page, reason=f"{cls}: {err}", attempt_dir=attempt_dir,
+                              body=getattr(err, "body_bytes", None), count=(cls == "parse"))
                 st.stopped = cls
                 limit = is_limit(cls)
                 bucket = o.limit_classes if limit else o.fail_classes
@@ -911,10 +999,14 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
                     # as the gap it is and the remainder is counted like any other.
                     res.stop_cause = f"provider_stop:{cls}"
                 continue
-            if not valid_fresh(matches, total):
-                # the provider answered, but not with something we can call a page.
+            why = reject_reason(matches, total)
+            if why is not None:
+                # the provider answered, but not with something we can call a page. The credit is gone;
+                # the response is not — it is written outside the ledger and the objection is recorded.
                 st.stopped = "parse"
                 o.fail_classes["parse"] = o.fail_classes.get("parse", 0) + 1
+                note_rejected(o, st.pivot, page, reason=why, attempt_dir=attempt_dir,
+                              matches=matches, total=total)
                 continue
             observe_total(st, o, total)
             raw = attempt_dir / f"{item_key(st.pivot, page)}.json"
@@ -1116,6 +1208,17 @@ def report(lane: str, outcome: LaneOutcome, *, balance, persisted: bool = True,
                                 tested=piv - n, omitted=n,
                                 reason=(f"{n}/{piv} pivot(s) {phrase} {dict(classes)}" if n
                                         else f"no pivot {phrase.split(' (')[0]}"))
+    # A PAID RESPONSE WE REFUSED. Its own measure, deliberately: the position measures answer "which
+    # pivots failed, first or later, broken or refused", and an objection about a page's SHAPE is neither
+    # — attaching it there made a first-position reason quote a later-page class, which is the exact
+    # confusion those four measures exist to prevent (caught by their own tests). The credit is spent
+    # either way, so this is emitted every lifecycle and says where the bytes went.
+    rej = outcome.pages_rejected
+    events.coverage_partial(lane, kind=events.COVERAGE_TIMEOUT, measure="shodan_pages_rejected",
+                            unit=f"{lane}.pages_rejected", eligible=done + rej, tested=done, omitted=rej,
+                            reason=(f"{rej} paid response(s) refused as unusable — "
+                                    + "; ".join(outcome.reject_reasons) if rej else
+                                    "no paid response was refused"))
     # PROVIDER DRIFT: Shodan's index is live, so two pages of one pivot can report different totals. We
     # keep the maximum, so nothing is omitted and the remainder is never understated.
     #

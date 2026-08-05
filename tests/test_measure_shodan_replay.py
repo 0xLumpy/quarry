@@ -282,7 +282,10 @@ class TestAMustBeExactlyTheExperimentBeforeBRuns:
         assert "B" not in rep, "an unexplained failure must stop the experiment on its own"
         a = rep["A"]
         assert a["credits_spent"] == 2 and harness._emitted_spend(a) == 2, "the counts AGREED"
-        assert a["exception"]["type"] == "RuntimeError"
+        # inside `run_provider` the failure is a FAILED TERMINAL, not an exception — and the terminal
+        # carries the provider's own words via `contract.error_detail`
+        assert a["terminal_status"] == "failed"
+        assert "failed after the accounting was emitted" in (a["terminal_reason"] or "")
 
 
 class TestAPaidFailureStillLeavesARecord:
@@ -345,7 +348,7 @@ class TestARepurchaseNeedsMoreThanACleanLookingSlate:
         rep = _report(tmp_path / "p")
         assert "B" not in rep, "B must not start after an unexplained paid failure"
         a = rep["A"]
-        assert a["exception"] and a["exception"]["type"] and a["exception"]["traceback"]
+        assert a["terminal_status"] == "failed" or a["exception"], "the failure must be RECORDED"
         assert a["credits_spent"] == 1, "the balance delta proves a credit left the account"
         assert a["run_id"] and a["balance_before"] and a["balance_after"]
         assert a["provider_spend"] is not None, "Quarry's own books are kept even on the failing run"

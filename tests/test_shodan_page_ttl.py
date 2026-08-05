@@ -613,3 +613,90 @@ class TestAnUntrustedStoreIsREADONLY:
             assert reopened.save() is False
         finally:
             os.chmod(d, mode)
+
+
+class TestAPaidResponseWeRefuseIsStillEvidence:
+    """Measured 2026-08-05: Shodan billed two credits, one page was accepted and the other was rejected
+    as `parse`. The run kept the accepted page and, for the rejected one, a single counter reading
+    `{'parse': 1}` — no bytes, no objection, no artifact. Provider drift and a wrong contract of ours were
+    equally unprovable, and only one of those two is something we can fix."""
+
+    @staticmethod
+    def _run(tmp_path, *, matches, total, err=None):
+        from quarry_recon import budget
+        base = S.state_dir(tmp_path)
+        base.mkdir(parents=True, exist_ok=True)
+        led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
+                            lane="probe.shodan")
+        st = PivotState(pivot=Pivot(FAV, "http.favicon.hash", "1"))
+        res = S.WorkResult()
+        res.lanes.setdefault(FAV, S.LaneOutcome(lane=FAV))
+        bal = type("B", (), {"spendable": 5, "may_spend": True, "reserve": 0})()
+        attempt = base / "pages" / "a0"
+        attempt.mkdir(parents=True, exist_ok=True)
+        S._work([st], res, balance=bal, search=lambda pivot, page: (matches, total, err),
+                ingest=lambda *a: 0, ledger=led, attempt_dir=attempt,
+                max_pages=1, is_limit=lambda cls: False)
+        return res.lanes[FAV], attempt
+
+    def test_the_objection_is_NAMED_not_just_classified(self, tmp_path):
+        o, _ = self._run(tmp_path, matches=[{"hostnames": [None]}], total=5)
+        assert o.fail_classes.get("parse") == 1
+        assert o.pages_rejected == 1
+        assert o.reject_reasons and "hostname" in o.reject_reasons[0], o.reject_reasons
+
+    @pytest.mark.parametrize("matches,total,want", [
+        ([], "many", "total"),
+        ("not a list", 5, "matches is str"),
+        ([42], 5, "match row 0"),
+        ([{"hostnames": "a.example"}], 5, "hostnames is str"),
+        ([{"hostnames": ["ok.example", 7]}], 5, "int hostname"),
+    ])
+    def test_every_rejection_says_which_check_failed(self, matches, total, want):
+        why = S.reject_reason(matches, total)
+        assert why and want in why, why
+
+    def test_a_valid_page_has_no_objection(self):
+        assert S.reject_reason([{"ip_str": "203.0.113.1", "hostnames": ["a.example"]}], 5) is None
+        assert S.valid_fresh([{"hostnames": ["a.example"]}], 5) is True
+
+    def test_the_BYTES_are_kept_outside_the_ledger(self, tmp_path):
+        import json as _json
+        o, attempt = self._run(tmp_path, matches=[{"hostnames": [None]}], total=5)
+        arts = list((attempt / "rejected").glob("*.rejected.json"))
+        assert len(arts) == 1, "a paid response must survive our refusal of it"
+        doc = _json.loads(arts[0].read_text())
+        assert doc["owned"] is False and doc["page"] == 1 and doc["value"] == "1"
+        assert "hostname" in doc["reason"]
+        assert doc["payload"]["total"] == 5, "what we were handed is inspectable"
+        assert o.pages_bought == 0
+
+    def test_a_provider_ERROR_body_is_kept_without_claiming_WE_rejected_it(self, tmp_path):
+        """An auth or quota refusal is the provider's decision, already counted by its class. Keep the
+        bytes — that is how a Cloudflare interstitial stays inspectable — but do not call it ours."""
+        import json as _json
+        err = RuntimeError("HTTP Error 401: Unauthorized")
+        err.error_class = "quota"
+        err.body_bytes = b'{"error": "Zero Account Balance"}'
+        o, attempt = self._run(tmp_path, matches=[], total=None, err=err)
+        assert o.pages_rejected == 0 and not o.reject_reasons
+        arts = list((attempt / "rejected").glob("*.rejected.json"))
+        assert len(arts) == 1
+        doc = _json.loads(arts[0].read_text())
+        import base64
+        assert base64.b64decode(doc["body_b64"]) == err.body_bytes, "the EXACT bytes, not our reading"
+
+    def test_the_rejection_reaches_telemetry_on_its_own_measure(self, tmp_path):
+        import json as _json
+        from quarry_recon import events
+        events.reset(); events.configure(tmp_path)
+        o, _ = self._run(tmp_path, matches=[{"hostnames": [None]}], total=5)
+        S.report(FAV, o, balance=type("B", (), {"reason": "ok", "stop_kind": ""})(), max_pages=1)
+        evs = [_json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
+        rej = [e for e in evs if e.get("measure") == "shodan_pages_rejected"]
+        assert rej and rej[-1]["omitted"] == 1
+        assert "hostname" in rej[-1]["reason"]
+        # the POSITION measures stay clean: a page's shape is not a pivot's position
+        pos = [e for e in evs if e.get("measure") == "shodan_pivots"]
+        assert pos and "hostname" not in (pos[-1]["reason"] or "")
+        events.reset()

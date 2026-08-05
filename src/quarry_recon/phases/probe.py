@@ -193,10 +193,12 @@ def _shodan_page(key, facet, v, page):
     clean empty. `{"total":1,"matches":[null]}` therefore fails."""
     url = (f"https://api.shodan.io/shodan/host/search?key={key}"
            f"&query={urllib.parse.quote(f'{facet}:{v}')}&page={page}")
+    raw = b""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=20) as r:
-            data = _json.loads(r.read(4 * 1024 * 1024).decode("utf-8", "replace"))
+            raw = r.read(4 * 1024 * 1024)
+        data = _json.loads(raw.decode("utf-8", "replace"))
         if not isinstance(data, dict):
             raise ValueError("shodan: non-object response — not a valid empty result")
         page_total = data.get("total")
@@ -227,6 +229,16 @@ def _shodan_page(key, facet, v, page):
         # 401 + HTML, so the status code alone would report every exhausted account as a broken
         # credential. Capturing later is unreliable: an HTTPError wraps a live socket.
         capture_error_body(e, provider="shodan")
+        # a PAID request that we refuse to parse still cost a credit, and the coordinator can only
+        # preserve what it is handed. `capture_error_body` covers an HTTPError's body; a validation
+        # raise has no body of its own, so the bytes we actually read travel on the exception the same
+        # way (measured 2026-08-05: a page rejected as `parse` left no artifact and no message, so
+        # neither provider drift nor a wrong contract could be shown).
+        if getattr(e, "body_bytes", None) is None and raw:
+            try:
+                e.body_bytes = raw
+            except Exception:
+                pass
         return [], None, _classified(e)
     return page_rows, page_total, None
 

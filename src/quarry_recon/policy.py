@@ -292,6 +292,15 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.phases.probe:_SHODAN_BACKOFF_MAX_S": ("provider", "provider retry backoff"),
     "quarry_recon.contract:_WHOXY_TOTAL_MAX_DIGITS": ("provider", "a Whoxy response sanity guard"),
     "quarry_recon.contract:_ERROR_BODY_LIMIT": ("provider", "how much of a provider error body is kept"),
+    "quarry_recon.contract:_DETAIL_CHARS": ("provider", "a terminal REASON is one line; the body itself is "
+                                            "kept whole by _ERROR_BODY_LIMIT above"),
+    "quarry_recon.shodan_sched:REJECTED_BYTES_LIMIT": (
+        "provider", "how much of a REFUSED paid response is stored beside the run. It bounds a diagnostic "
+        "copy of something we did not accept as evidence — not evidence itself: an accepted page is "
+        "stored whole, and nothing here can shrink what a lane may discover"),
+    "quarry_recon.shodan_sched:MAX_REJECT_REASONS": (
+        "not_a_bound", "how many objections a coverage REASON quotes. Prose in a telemetry line; the "
+        "count is exact in `pages_rejected` and every refused response is kept on disk"),
 
     # engagement settings — chosen in target.yaml, per engagement
     "quarry_recon.config:MAX_CONTENT_RECURSION": ("engagement", "content-discovery depth is an engagement "

@@ -33,7 +33,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from quarry_recon import budget, events, secrets, settings, shodan_sched, store  # noqa: E402
+from quarry_recon import (budget, contract, events, secrets, settings,        # noqa: E402
+                          shodan_sched, store)
 from quarry_recon.phases import probe                                          # noqa: E402
 
 #: the WHOLE experiment's ceiling. Two pivots, one page each, twice — B is expected to buy nothing, so
@@ -156,8 +157,7 @@ def preflight(project: Path) -> dict:
     return facts
 
 
-def _spend_events(run_dir: Path) -> list:
-    """QUARRY's own accounting for this run: every `spend` event the lane emitted."""
+def _events(run_dir: Path) -> list:
     path = run_dir / "events.jsonl"
     if not path.is_file():
         return []
@@ -167,9 +167,15 @@ def _spend_events(run_dir: Path) -> list:
             e = json.loads(line)
         except ValueError:
             continue
-        if isinstance(e, dict) and e.get("event") == "spend" and e.get("provider") == "shodan":
+        if isinstance(e, dict):
             out.append(e)
     return out
+
+
+def _spend_events(run_dir: Path) -> list:
+    """QUARRY's own accounting for this run: every `spend` event the lane emitted."""
+    return [e for e in _events(run_dir)
+            if e.get("event") == "spend" and e.get("provider") == "shodan"]
 
 
 def _run_one(project: Path, key, label: str, report: dict, save) -> dict:
@@ -198,7 +204,13 @@ def _run_one(project: Path, key, label: str, report: dict, save) -> dict:
             # dispositions are emitted there, not by the coordinator. Driving acquisition alone left
             # `emitted_spend=None`, i.e. the experiment could not cross-check the provider's balance
             # against Quarry's own books at all (review#3).
-            rec["terminal"] = repr(probe._shodan_result(LANE, sorted(VALUES), work))
+            #
+            # …and it runs inside `run_provider`, which is where a TERMINAL is emitted. Called bare, the
+            # 2026-08-05 run recorded coverage and no terminal at all, so the provider's own explanation
+            # of a failure — the whole point of `contract.error_detail` — reached nothing an operator or
+            # this report could read.
+            rec["terminal"] = repr(contract.run_provider(
+                LANE.sid, lambda: probe._shodan_result(LANE, sorted(VALUES), work)))
         except BaseException as e:                       # noqa: BLE001 — recorded, then re-raised below
             rec["exception"] = {"type": type(e).__name__, "message": str(e),
                                 "traceback": traceback.format_exc()}
@@ -224,6 +236,15 @@ def _run_one(project: Path, key, label: str, report: dict, save) -> dict:
                                "oldest_replay_s": round(o.oldest_replay_s, 1)}
                         for name, o in (res.lanes.items() if res is not None else ())}
         rec["provider_spend"] = _spend_events(run.dir)
+        terms = [e for e in _events(run.dir) if e.get("event") == "tool_finish"]
+        rec["terminals"] = terms
+        # `run_provider` turns a lane failure into a TERMINAL instead of an exception, so "no exception"
+        # stopped meaning "nothing went wrong" the moment the harness started using it. The terminal is
+        # now a precondition in its own right.
+        rec["terminal_status"] = terms[-1].get("status") if terms else None
+        rec["terminal_reason"] = terms[-1].get("reason") if terms else None
+        rec["rejected"] = [e for e in _events(run.dir)
+                           if e.get("measure") in ("shodan_pages_rejected", "shodan_pivots")]
         # the docstring promised BOTH run manifests and nothing wrote them. A manifest is the run's own
         # account of itself — entity counts, notes, tool runs — and the measurement is worth exactly what
         # it can show afterwards (review#3).
@@ -312,6 +333,11 @@ def main() -> int:
     if a["exception"]:
         print(f"STOP: run A raised {a['exception']['type']}: {a['exception']['message']}. "
               f"Run B is NOT started; the partial record is in {out}", file=sys.stderr)
+        return 1
+    if a["terminal_status"] not in ("success", "empty"):
+        # a degraded/limited/failed terminal means the lane did not do what B is supposed to replay
+        print(f"STOP: run A's terminal is {a['terminal_status']!r}: {a['terminal_reason']}. "
+              f"Run B is NOT started; see {out}", file=sys.stderr)
         return 1
     if not (spent_a == bought_a == emitted_a == expected):
         print(f"STOP: run A must buy exactly {expected} page(s) with balance, lane and emitted spend "
