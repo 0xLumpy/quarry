@@ -350,6 +350,9 @@ class LaneOutcome:
     pages_incomplete: int = 0
     #: a purchase this run DECLINED because a previous run already paid for those bytes
     acquisition_refused: int = 0
+    #: receipts or paid responses found on disk with no ownership entry behind them. Not "never bought":
+    #: refused, counted, and left for an operator to reconcile.
+    acquisition_orphans: int = 0
     #: pages recovered by parsing bytes we already owned — no provider contact, no credit
     pages_parsed_late: int = 0
     pages_rejected: int = 0
@@ -645,6 +648,39 @@ def publish_acquisition(attempt_dir, pivot: Pivot, page: int, *, state: str, raw
     return (art, dig, body) if budget.publish_bytes(art, body, digest=dig) else (None, None, body)
 
 
+def orphan_index(base, ledger) -> dict:
+    """Item keys whose RECEIPT or RAW response is on disk while the ledger owns no entry for them.
+
+    review#3 (Lumpy): `commit_acquisition` publishes the receipt and then journals it. If the publish
+    lands and the journal does not, the next run indexes only ledger items, sees nothing, and buys the
+    page again — while the receipt and the paid bytes sit right there. The generation-store lesson
+    applies: a surviving artifact beside a missing ownership entry is not evidence that nothing was
+    bought. It is refused and kept for an operator, never guessed at.
+
+    Returns {item_key: reason}. A best-effort walk: a store we cannot list yields no orphans rather than
+    an exception on the acquisition path."""
+    out: dict = {}
+    try:
+        owned = {k for k, _ in ledger.items()}
+    except Exception:
+        return out
+    root = Path(base)
+    try:
+        for art in root.rglob("acq/*.acq.json"):
+            key = art.name[:-len(".acq.json")]
+            if key and ACQ_PREFIX + key not in owned:
+                out[key] = f"receipt without an ownership entry ({art})"
+        for art in root.rglob("raw/*.json"):
+            key = art.stem
+            if key and key not in out and ACQ_PREFIX + key not in owned and key not in owned:
+                out[key] = f"paid response without an ownership entry ({art})"
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return out
+    return out
+
+
 def acquisition_index(ledger) -> dict:
     """Every acquisition receipt this ledger holds, read ONCE: {(lane, facet, value, page): doc}.
 
@@ -677,6 +713,46 @@ def acquisition_index(ledger) -> dict:
             continue
         out[(lane, facet, value, page)] = doc
     return out
+
+
+def verified_raw(acq: dict, *, base) -> "Path | None":
+    """The receipt's raw artifact, or None when it cannot prove it is the response we paid for.
+
+    review#2 (Lumpy): the receipt carries `raw_digest` and `raw_bytes` and nothing checked either, so a
+    modified or substituted artifact would have become normalized evidence on the deferred-parse path.
+    A digest we store and never verify is decoration.
+
+    Four questions, all of which must answer yes: is the path CONFINED to the paid store, is it a REGULAR
+    FILE (not a symlink out of it), is the byte count EXACT, is the digest EXACT."""
+    ref = acq.get("raw_ref")
+    if not isinstance(ref, str) or not ref:
+        return None
+    want_digest, want_bytes = acq.get("raw_digest"), acq.get("raw_bytes")
+    if not (isinstance(want_digest, str) and want_digest):
+        return None
+    if isinstance(want_bytes, bool) or not isinstance(want_bytes, int) or want_bytes < 0:
+        return None
+    try:
+        p = Path(ref)
+        root = Path(base).resolve()
+        if p.is_symlink():
+            return None                       # a link may point anywhere, including outside the store
+        real = p.resolve()
+        if not real.is_relative_to(root):
+            return None                       # confined to the store that paid for it
+        if not real.is_file():
+            return None
+        if real.stat().st_size != want_bytes:
+            # a CHEAP pre-filter the digest below subsumes: it rejects a substituted artifact without
+            # hashing it, which matters when "it" is gigabytes. Not a separate guarantee.
+            return None
+        if events.file_digest(real) != want_digest:
+            return None
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return None
+    return p
 
 
 def read_acquisition(ledger, pivot: Pivot, page: int) -> "dict | None":
@@ -1102,6 +1178,8 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
     probed: list = []
     # every receipt, read once for the whole run (see `acquisition_index`)
     acquired = acquisition_index(ledger)
+    # …and every artifact that survived WITHOUT one (see `orphan_index`)
+    orphans = orphan_index(Path(ledger.path).parent, ledger)
 
     def sinks_ok() -> bool:
         """Prove BOTH sinks once, immediately before the first purchase.
@@ -1147,29 +1225,47 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
             # a surprise charge afterwards does not authorise it (review#1, Lumpy). It is refused on
             # exactly the terms an AGED page is — the loss is admitted, the pivot moves on, and repair
             # waits for an explicit operator refresh/repair policy that does not exist yet.
-            # ALREADY PAID FOR? A receipt outranks every reason to buy. `complete_unparsed` is parsed
-            # here from the bytes we hold — no provider contact — and `incomplete_paid` is refused.
+            # ALREADY PAID FOR? EVERY valid receipt blocks acquisition — review#1 (Lumpy): a
+            # `complete_parsed` receipt used to be skipped here, so a page whose completion document had
+            # gone missing while its receipt survived could still reach the purchase path. A receipt
+            # without a usable page is EVIDENCE LOSS plus a refused repair, never permission to buy.
             acq = acquired.get((st.pivot.lane, st.pivot.facet, st.pivot.value, page))
-            if acq is not None and acq.get("state") != ACQ_PARSED:
+            if acq is not None:
                 state = acq.get("state")
-                raw_ref = acq.get("raw_ref")
-                if state == ACQ_UNPARSED and parse is not None and raw_ref:
-                    got = parse(Path(raw_ref))
+                # bytes we already own may only be interpreted once they PROVE they are the bytes we
+                # bought: confined, regular, exact length, exact digest (review#2).
+                raw = verified_raw(acq, base=Path(ledger.path).parent)
+                if state == ACQ_UNPARSED and parse is not None and raw is not None:
+                    got = parse(raw)
                     if got is not None:
                         p_matches, p_total = got
                         if reject_reason(p_matches, p_total) is None:
                             o.pages_parsed_late += 1
                             if _commit_page(st, o, res, page=page, matches=p_matches, total=p_total,
                                             ledger=ledger, attempt_dir=attempt_dir, ingest=ingest,
-                                            raw_path=Path(raw_ref), late=True):
+                                            raw_path=raw, late=True):
                                 progressed = True
                                 continue
                 if state == ACQ_INCOMPLETE:
                     o.pages_incomplete += 1
+                elif state == ACQ_PARSED or (state == ACQ_UNPARSED and raw is None):
+                    # the receipt stands and the evidence does not: a parsed page whose document is gone,
+                    # or purchased bytes that no longer verify. Both are losses we admit and refuse to
+                    # repair by spending again.
+                    o.pages_lost += 1
+                    o.repair_refused += 1
                 else:
                     o.pages_unparsed += 1
                 o.acquisition_refused += 1
                 st.lost_pages.add(page)          # never scheduled again: it is BOUGHT, not missing
+                continue
+            # a receipt or a paid response on disk with NO ownership entry is not "never bought"
+            orphan = orphans.get(item_key(st.pivot, page))
+            if orphan is not None:
+                o.acquisition_orphans += 1
+                o.acquisition_refused += 1
+                st.lost_pages.add(page)
+                res.stop_cause = res.stop_cause or "acquisition_orphan"
                 continue
             if item_key(st.pivot, page) in getattr(ledger, "lost", {}):
                 o.pages_lost += 1

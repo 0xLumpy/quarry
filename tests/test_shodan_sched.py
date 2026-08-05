@@ -1180,7 +1180,12 @@ class TestRowContractOnReplay:
         assert valid_fresh(doc["matches"], doc["total"]) is False
         assert owned_index(_ledger(tmp_path)) == {}, "a malformed page was still owned"
 
-    def test_a_malformed_recorded_page_is_REPURCHASED(self, tmp_path):
+    def test_a_malformed_recorded_page_is_REFUSED_not_repurchased(self, tmp_path):
+        """DOCTRINE CHANGE (Lumpy, review#1, 2026-08-05). This test previously asserted the opposite:
+        a recorded page whose rows are malformed was BOUGHT AGAIN. Acquisition is now committed
+        separately from interpretation, so the receipt for that purchase survives the page's contents —
+        and a receipt without a usable page is evidence loss plus a refused repair, never permission to
+        spend. The page stays unusable; what changed is who pays for that."""
         led = _ledger(tmp_path)
         _res(tmp_path, _states((FAV, "a")), _Provider(totals={"a": 100}), balance=_Bal(spendable=1),
              ledger=led)
@@ -1194,8 +1199,10 @@ class TestRowContractOnReplay:
         p = _Provider(totals={"a": 100})
         res, _ = _res(tmp_path, _states((FAV, "a")), p, balance=_Bal(spendable=None),
                       ledger=_ledger(tmp_path))
-        assert (FAV, "a", 1) in p.calls, "the unusable page was never re-bought"
-        assert res.lanes[FAV].pages_bought == 1
+        assert p.calls == [], "a page this project already paid for must never be re-bought"
+        o = res.lanes[FAV]
+        assert o.pages_bought == 0
+        assert o.pages_lost == 1 and o.repair_refused == 1 and o.acquisition_refused == 1
 
     def test_a_VALID_recorded_page_still_replays_FREE(self, tmp_path):
         """The control that keeps the fix from being a schema bump in disguise."""

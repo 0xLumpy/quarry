@@ -18,6 +18,16 @@ from quarry_recon.shodan_sched import Pivot, PivotState
 FAV = "probe.shodan_favicon"
 
 
+def _json_load(path):
+    import json
+    return json.loads(Path(path).read_text())
+
+
+def _json_dump(path, doc):
+    import json
+    Path(path).write_text(json.dumps(doc))
+
+
 def _doc(page=1, total=5, matches=(), age_days=0.0, now=1_000_000.0):
     return S._page_doc(Pivot(FAV, "http.favicon.hash", "1"), page, total, list(matches),
                        bought_at=now - age_days * 86400.0)
@@ -359,7 +369,7 @@ class TestLostEvidenceIsNotASpendingPermission:
         import json as _json
         led, first = self._buy(tmp_path)
         assert first.pages_bought == 1
-        art = next(iter(dict(led.items()).values()))
+        art = next(a for i, a in led.items() if not i.startswith(S.ACQ_PREFIX))
         doc = _json.loads(art.read_text())
         doc["matches"] = []                                  # same identity, different bytes
         art.write_text(_json.dumps(doc))
@@ -371,7 +381,7 @@ class TestLostEvidenceIsNotASpendingPermission:
 
     def test_a_vanished_artifact_is_admitted_as_lost_and_NOT_re_bought(self, tmp_path):
         led, _first = self._buy(tmp_path)
-        next(iter(dict(led.items()).values())).unlink()
+        next(a for i, a in led.items() if not i.startswith(S.ACQ_PREFIX)).unlink()
         issued = []
         _led2, o = self._buy(tmp_path, issued=issued)
         assert issued == [] and o.pages_bought == 0
@@ -380,7 +390,11 @@ class TestLostEvidenceIsNotASpendingPermission:
     def test_every_lost_page_is_refused_not_just_the_first(self, tmp_path):
         import json as _json
         led, _ = self._buy(tmp_path, values=("1", "2"))
-        for art in dict(led.items()).values():
+        # PAGE documents only: the ledger also holds acquisition receipts, and damaging those is a
+        # different scenario (an orphaned purchase, pinned separately).
+        for item, art in led.items():
+            if item.startswith(S.ACQ_PREFIX):
+                continue
             doc = _json.loads(art.read_text()); doc["matches"] = []
             art.write_text(_json.dumps(doc))
         issued = []
@@ -923,3 +937,106 @@ class TestAcquisitionIsCommittedBeforeInterpretation:
         assert acq[-1]["eligible"] == 1 and acq[-1]["tested"] == 0 and acq[-1]["omitted"] == 1
         assert "complete_unparsed=1" in acq[-1]["reason"] and "never re-bought" in acq[-1]["reason"]
         events.reset()
+
+    def test_a_PARSED_receipt_blocks_purchase_even_with_the_page_gone(self, tmp_path):
+        """review#1: the receipt check skipped `complete_parsed`, so a page whose completion document
+        had vanished while its receipt survived could still reach the purchase path."""
+        run = self._lane(tmp_path, response=b'{"total": 3, "matches": []}')
+        assert run["outcome"].pages_bought == 1
+        page = run["attempt"] / f"{S.item_key(run['pivot'], 1)}.json"
+        page.unlink()                                    # the PAGE is gone; the receipt is not
+
+        second = self._lane(tmp_path, response=b"unused", parse=lambda p: None)
+        assert second["issued"] == [], "a receipt is a receipt whatever state it carries"
+        assert second["outcome"].pages_bought == 0
+        assert second["outcome"].pages_lost == 1 and second["outcome"].repair_refused == 1
+
+    def test_TAMPERED_purchased_bytes_are_never_parsed_into_evidence(self, tmp_path):
+        """review#2: the receipt carries a digest and a byte count, and nothing checked either — a
+        substituted artifact would have become normalized evidence on the deferred-parse path."""
+        import json as _json
+        body = b'{"total": 3, "matches": [{"hostnames": ["a.example"]}]}'
+        run = self._lane(tmp_path, response=body, err=("oversize", "deferred"))
+        acq = S.read_acquisition(self._fresh_ledger(run), run["pivot"], 1)
+        raw = Path(acq["raw_ref"])
+        raw.write_bytes(_json.dumps({"total": 3, "matches": [{"hostnames": ["attacker.example"]}]},
+                                    separators=(",", ":")).encode())
+
+        ingested = []
+        second = self._lane(tmp_path, response=b"unused",
+                            parse=lambda p: (_json.loads(Path(p).read_text())["matches"], 3))
+        assert second["ingested"] == [], "substituted bytes must never reach the store"
+        assert second["issued"] == [], "…and must not be re-bought either"
+        assert second["outcome"].pages_lost == 1 and second["outcome"].repair_refused == 1
+        assert ingested == []
+
+    def test_a_SAME_LENGTH_substitution_is_caught_by_the_digest(self, tmp_path):
+        """The byte count alone would pass this: only the digest can tell two same-sized responses
+        apart, which is why the receipt carries one."""
+        body = b'{"total": 3, "matches": [{"hostnames": ["aaa.example"]}]}'
+        run = self._lane(tmp_path, response=body, err=("oversize", "deferred"))
+        acq = S.read_acquisition(self._fresh_ledger(run), run["pivot"], 1)
+        raw = Path(acq["raw_ref"])
+        swapped = b'{"total": 3, "matches": [{"hostnames": ["bbb.example"]}]}'
+        assert len(swapped) == len(body), "the fixture must keep the length identical"
+        raw.write_bytes(swapped)
+        assert acq["raw_bytes"] == raw.stat().st_size, "the byte count still agrees…"
+        assert S.verified_raw(acq, base=run["base"]) is None, "…and the digest does not"
+
+    def test_a_TRUNCATED_purchased_artifact_fails_its_byte_count(self, tmp_path):
+        body = b'{"total": 3, "matches": [{"hostnames": ["a.example"]}]}'
+        run = self._lane(tmp_path, response=body, err=("oversize", "deferred"))
+        acq = S.read_acquisition(self._fresh_ledger(run), run["pivot"], 1)
+        assert S.verified_raw(acq, base=run["base"]) is not None, "the untouched artifact verifies"
+        Path(acq["raw_ref"]).write_bytes(body[:-1])
+        assert S.verified_raw(acq, base=run["base"]) is None, "one byte short is not what we bought"
+
+    def test_a_raw_pointer_may_not_ESCAPE_the_paid_store(self, tmp_path):
+        """A confined path is checked before the digest: a link out of the store is refused on sight."""
+        import hashlib as _h
+        outside = tmp_path / "elsewhere.json"
+        outside.write_bytes(b"{}")
+        acq = {"raw_ref": str(outside), "raw_bytes": 2,
+               "raw_digest": _h.sha256(b"{}").hexdigest()}
+        assert S.verified_raw(acq, base=S.state_dir(tmp_path)) is None
+        link = S.state_dir(tmp_path) / "linked.json"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(outside)
+        acq["raw_ref"] = str(link)
+        assert S.verified_raw(acq, base=S.state_dir(tmp_path)) is None, "a symlink is not a regular file"
+
+    def test_an_ORPHANED_purchase_is_refused_not_bought_again(self, tmp_path):
+        """review#3: publish lands, journal fails. The next run indexes only ledger items, sees nothing,
+        and would buy the page again while the receipt and the paid bytes sit right there."""
+        run = self._lane(tmp_path, response=b'{"total": 3, "matches": []}',
+                         err=("oversize", "deferred"))
+        led = self._fresh_ledger(run)
+        acq_art = led.artifact(S.acq_key(run["pivot"], 1))
+        assert acq_art is not None and acq_art.is_file()
+
+        # simulate the lost ownership entry: the ledger forgets, the artifacts survive
+        state = _json_load(led.path)
+        state["done"] = {k: v for k, v in state["done"].items() if not k.startswith(S.ACQ_PREFIX)}
+        _json_dump(led.path, state)
+        led.journal.unlink(missing_ok=True)
+
+        second = self._lane(tmp_path, response=b"unused", parse=lambda p: None)
+        assert second["issued"] == [], "a surviving receipt is not evidence that nothing was bought"
+        assert second["outcome"].acquisition_orphans == 1
+        assert second["outcome"].acquisition_refused == 1
+        assert acq_art.is_file(), "the orphan is PRESERVED for an operator, not cleaned up"
+
+    def test_an_orphaned_RAW_response_alone_is_also_refused(self, tmp_path):
+        """The raw bytes can survive without a receipt at all — same rule."""
+        from quarry_recon import budget
+        base = S.state_dir(tmp_path)
+        attempt = base / "pages" / "a0"
+        (attempt / "raw").mkdir(parents=True, exist_ok=True)
+        pivot = Pivot(FAV, "http.favicon.hash", "1")
+        (attempt / "raw" / f"{S.item_key(pivot, 1)}.json").write_bytes(b'{"total": 1, "matches": []}')
+        led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
+                            lane="probe.shodan")
+        assert S.orphan_index(base, led), "a paid response with no ownership entry is an orphan"
+
+        run = self._lane(tmp_path, response=b"unused", parse=lambda p: None)
+        assert run["issued"] == [] and run["outcome"].acquisition_orphans == 1
