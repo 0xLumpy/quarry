@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -66,6 +68,42 @@ def _main(m, monkeypatch, project: Path, *extra) -> int:
 
 def _report(project: Path) -> dict:
     return json.loads((project / "measurement.json").read_text())
+
+
+class TestItRunsAtAllAsAPROGRAM:
+    """Every other test in this file calls `main()` on the imported module, which is exactly how a
+    script can pass its whole suite while doing NOTHING when executed: the `if __name__ == "__main__"`
+    entrypoint was deleted by an edit that rewrote `main()` to end-of-file, and `--preflight` on the VPS
+    printed nothing and exited 0. A program is only proven by running it as one."""
+
+    def _run(self, *args, cwd=None):
+        env = dict(os.environ, HOME=str(cwd)) if cwd else dict(os.environ)
+        return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True,
+                              env=env, timeout=120)
+
+    def test_the_entrypoint_exists(self):
+        src = SCRIPT.read_text()
+        assert 'if __name__ == "__main__":' in src and "sys.exit(main())" in src
+
+    @pytest.mark.integration
+    def test_help_is_a_real_program_invocation(self):
+        r = self._run("--help")
+        assert r.returncode == 0 and "--preflight" in r.stdout and "--run" in r.stdout
+
+    @pytest.mark.integration
+    def test_executing_it_PRODUCES_OUTPUT_and_a_meaningful_exit(self, tmp_path):
+        """With no key configured this must ABORT loudly — never exit 0 in silence."""
+        r = self._run("--preflight", "--project", str(tmp_path / "p"), cwd=tmp_path)
+        assert (r.stdout + r.stderr).strip(), "a run that says nothing cannot be trusted with money"
+        assert r.returncode in (0, 2), f"unexpected exit {r.returncode}: {r.stderr}"
+        if r.returncode == 2:
+            assert "ABORT" in r.stderr
+        else:
+            assert "preflight OK" in r.stdout
+
+    def test_it_is_executable_with_a_shebang(self):
+        assert SCRIPT.read_text().startswith("#!/usr/bin/env python3")
+        assert os.access(SCRIPT, os.X_OK), "the operator runs ./scripts/…, not python scripts/…"
 
 
 class TestItMeasuresTheClaim:

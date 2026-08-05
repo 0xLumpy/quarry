@@ -341,3 +341,7 @@ def main() -> int:
               "one of them is missing.", file=sys.stderr)
     print(f"\nVERDICT: {'REPLAY WORKS' if report['verdict']['replay_works'] else 'NOT PROVEN'}  →  {out}")
     return 0 if report["verdict"]["replay_works"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
