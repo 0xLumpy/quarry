@@ -300,6 +300,11 @@ EXCLUDED: dict[str, tuple[str, str]] = {
         "resource", "one provider response is read into memory; hitting it RAISES (`oversize`)"),
     "quarry_recon.phases.vertical:CERTSPOTTER_READ_LIMIT": (
         "resource", "one provider response is read into memory; hitting it RAISES (`oversize`)"),
+    "quarry_recon.pace:LOCK_WAIT_S": (
+        "rate", "how long a request queues for its ACCOUNT's pacing slot before proceeding unpaced. It "
+        "bounds waiting, never work: politeness must not become a hang"),
+    "quarry_recon.pace:CLOCK_SKEW_S": (
+        "not_a_bound", "tolerance for a shared wall-clock timestamp; beyond it the stamp is unusable"),
     "quarry_recon.phases.probe:_SHODAN_MIN_INTERVAL_S": (
         "rate", "the minimum gap between two SHODAN requests — pressure on a THIRD-PARTY API, not on a "
         "target (RATELIMIT.HTTP). It paces provider contact only; replaying owned evidence never waits"),

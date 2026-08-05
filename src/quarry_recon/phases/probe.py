@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .. import (budget, contract, events, netguard, normalize, secrets, settings, shodan_host,
+from .. import (budget, contract, events, netguard, normalize, pace, secrets, settings, shodan_host,
                 shodan_sched, store)
 from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PARSE, PROVIDER_RATE_LIMIT,
                         ProviderResult, ProviderSkip, ResponseTooLarge, capture_error_body,
@@ -115,16 +115,21 @@ _SHODAN_BACKOFF_MAX_S = 300.0
 
 
 class _ProviderCooldown:
-    """A provider-imposed slowdown, honored by EVERY Shodan request that follows it.
+    """This ACCOUNT's rate boundary — honored by every Shodan request, from any lane or process.
 
     review-B1.5r1#2: issuing counts serially is not pacing, and stopping sizing on a 429 while entering
     paid search immediately means the provider's "slow down" was heard and ignored. One cooldown, shared
     by sizing and purchasing, so honoring it is not something a caller can forget."""
 
-    def __init__(self):
+    def __init__(self, key=None):
         self.until = 0.0
         self.hits = 0
-        self.last = 0.0                 # when the last request was ISSUED (monotonic)
+        self.last = 0.0                 # when THIS object last issued a request (monotonic, fallback)
+        # review (Lumpy): pacing belongs to the provider ACCOUNT, not to a lifecycle. Every
+        # `_ProviderCooldown()` started at `last = 0`, so the first request of each lane was unpaced
+        # against whatever ran a moment before it, and two processes had independent clocks. The shared
+        # boundary is keyed by a FINGERPRINT of the credential — never the credential itself.
+        self.account = pace.account("shodan", key)
 
     def note(self, err) -> None:
         self.hits += 1
@@ -142,12 +147,21 @@ class _ProviderCooldown:
         except (TypeError, ValueError):
             pass
         self.until = max(self.until, _time.monotonic() + wait)
+        # a 429 is a statement about the CREDENTIAL, not about the process that happened to receive it:
+        # persist it so the next run — and any concurrent one — honours what this one earned.
+        pace.note_penalty(self.account, _time.time() + wait)
 
     def wait(self) -> None:
-        """Honour a provider-imposed slowdown AND our own minimum interval, then mark the request.
+        """Honour this ACCOUNT's slowdown and minimum interval, then mark the request.
 
         Called immediately before PROVIDER CONTACT and nowhere else: replaying owned evidence touches no
-        provider, so it never waits here (Lumpy, 2026-08-05)."""
+        provider, so it never waits here (Lumpy, 2026-08-05).
+
+        The account boundary is authoritative and shared installation-wide; the in-process interval below
+        remains as a fallback for the case where that state cannot be read or written at all."""
+        penalty = self.until - _time.monotonic()
+        pace.wait(self.account, _SHODAN_MIN_INTERVAL_S,
+                  penalty_until=(_time.time() + penalty) if penalty > 0 else 0.0)
         now = _time.monotonic()
         left = max(self.until - now, (self.last + _SHODAN_MIN_INTERVAL_S) - now if self.last else 0.0)
         if left > 0:
@@ -728,9 +742,9 @@ def _shodan_work_locked(ctx, key, lanes):
         return ShodanBalance(
             remaining=None, allowance=None, reserve=_shodan_reserve_setting(), spendable=None,
             may_spend=True,
-            reason="balance not consulted — every requested page was already owned by this project")
+            reason="balance not consulted — the run ended before any provider contact was needed")
 
-    cooldown = _ProviderCooldown()
+    cooldown = _ProviderCooldown(key)
     # THE BALANCE IS PROVIDER CONTACT and is therefore read lazily, after replay, and only if pages
     # remain to buy (Lumpy, 2026-08-05). A run whose project already owns everything it needs now issues
     # NO request at all — not a balance read, not a free count.
@@ -860,7 +874,7 @@ def _shodan_work_locked(ctx, key, lanes):
                   for spec, vals in lanes for v in vals]
 
         def enter_paid_phase():
-            """Everything that touches Shodan, entered ONLY once replay has finished and pages remain.
+            """Everything that touches Shodan, entered once replay has finished — and only then.
 
             Balance first (free, and it decides whether spending is permitted at all), then sizing —
             both paced by the same cooldown as purchasing, because both are provider contact."""
@@ -2138,7 +2152,7 @@ def shodan_host_lane(ctx) -> None:
         # rather than asking again for nothing (agreed for B1.7).
         ledger = budget.Ledger(budget.state_path(sbase, _SHODAN_HOST_SID, cfg_fp), lane=_SHODAN_HOST_SID)
         attempt_dir = fresh_artifact_dir(sbase / "shodan-host" / cfg_fp[:16])
-        cooldown = _ProviderCooldown()
+        cooldown = _ProviderCooldown(key)      # the SAME account boundary as the paid pivot lanes
         timeout = min(getattr(ctx, "http_timeout", 20) or 20, 30)
 
         def fetch(ip):

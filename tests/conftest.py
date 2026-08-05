@@ -108,3 +108,15 @@ def _no_provider_pacing(request, monkeypatch):
     except Exception:
         return
     monkeypatch.setattr(probe, "_SHODAN_MIN_INTERVAL_S", 0.0, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_pace_state(tmp_path_factory, monkeypatch):
+    """The provider pacing state is INSTALLATION-WIDE (`~/.config/quarry/pace`) — which is exactly why a
+    test must never write to it: one test's persisted 429 penalty would pace every later test, and the
+    suite would be editing the operator's real account state. Each test gets its own directory."""
+    try:
+        from quarry_recon import pace
+    except Exception:
+        return
+    monkeypatch.setattr(pace, "PACE_DIR", tmp_path_factory.mktemp("pace"), raising=False)
