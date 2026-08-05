@@ -355,8 +355,6 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "KATANA_PARALLELISM": ("rate", "katana's own parallelism"),
     "NUCLEI_BULK_SIZE": ("rate", "nuclei requests in flight per template"),
     "NUCLEI_CHUNK_HOSTS": ("resource", "hosts per nuclei invocation: one process's blast radius"),
-    "quarry_recon.evidence:MAX_FETCHES": ("rate", "active fetches per finding: request pressure at a "
-                                                  "target, which the rate axis owns"),
     "quarry_recon.evidence:_SSTI_MAX_PARAMS": ("rate", "probes per endpoint is request pressure"),
     "quarry_recon.phases.crawl:MAX_JS": ("resource", "a 15 MB PER-ITEM guard on one downloaded file"),
     "quarry_recon.phases.crawl:MAX_MAP": ("resource", "a 20 MB PER-ITEM guard on one source map"),

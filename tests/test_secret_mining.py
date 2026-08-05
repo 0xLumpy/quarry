@@ -606,3 +606,62 @@ class TestLocalEvidenceIsREADABLE:
         from quarry_recon import secrets as sec
         assert sec.redact("token=ABC") is not None
         assert callable(sec.mask), "masking still exists for channels that leave the box"
+
+
+class TestNothingIsHiddenByAPresentationCap:
+    """Lumpy, 2026-08-05: HOTLIST showed `secrets[:25]`, and `evidence.MAX_FETCHES = 50` silently sliced
+    the candidate set before anything was even fetched. Both hide findings — one after collection, one
+    before it."""
+
+    @staticmethod
+    def _run(tmp_path, n):
+        from quarry_recon import store
+        run = store.Run.create(tmp_path, "caps")
+        for i in range(n):
+            run.add("secret", {"id": f"s{i}", "kind": "aws-access-key",
+                               "value": f"AKIA{i:016d}", "sources": ["exposed-fetch"]})
+        return run
+
+    def test_the_HOTLIST_prints_EVERY_secret(self, tmp_path):
+        from quarry_recon import triage
+        from quarry_recon.config import ScopeMatcher
+        md = triage.build(self._run(tmp_path, 40), ScopeMatcher([], [], [], False))
+        for i in (0, 24, 25, 39):
+            assert f"AKIA{i:016d}" in md, i
+
+    def test_a_display_cap_that_remains_says_what_it_holds_back(self, tmp_path):
+        """Context lists still cap for readability — and must never look complete while doing it."""
+        import inspect
+        from quarry_recon import triage
+        src = inspect.getsource(triage)
+        assert src.count("_more(A,") >= 8, "every remaining display cap announces itself"
+        assert "not shown here" in inspect.getsource(triage._more)
+
+    def test_fetching_has_no_membership_cap(self):
+        from quarry_recon import evidence
+        import inspect
+        assert not hasattr(evidence, "MAX_FETCHES")
+        src = inspect.getsource(evidence)
+        assert "[:MAX_FETCHES]" not in src
+
+    def test_the_fetch_lane_reports_what_it_looked_at(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from quarry_recon import events, evidence, fetch
+        events.reset()
+        events.configure(tmp_path)
+        added: list = []
+        run = SimpleNamespace(
+            raw_path=lambda ph, sub, nm: (tmp_path / ph / sub).joinpath(nm)
+            if (tmp_path / ph / sub).mkdir(parents=True, exist_ok=True) or True else None,
+            add=lambda kind, rec: (added.append((kind, rec)), True)[1])
+        ctx = SimpleNamespace(run=run, scope=SimpleNamespace(
+            in_scope=lambda h: True, is_oos=lambda h: False, active_allowed=lambda h: True))
+        monkeypatch.setattr(fetch, "scoped_get", lambda *a, **k: (b"x", "", 200))
+        urls = [f"https://t/f{i}" for i in range(60)]
+        evidence.fetch_exposed(ctx, urls)
+        import json as _json
+        evs = [_json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
+        cov = [e for e in evs if e.get("measure") == "evidence_fetches"]
+        assert cov and cov[-1]["eligible"] == 60 and cov[-1]["tested"] == 60, cov
+        assert len([r for k, r in added if k == "review"]) == 60, "the 51st was fetched too"
+        events.reset()

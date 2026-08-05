@@ -14,7 +14,7 @@ import json
 import re
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
-from . import fetch, normalize, secrets
+from . import events, fetch, normalize, secrets
 
 # Exposed files worth fetching: secret/config stores, VCS metadata, key material, dumps.
 SENSITIVE_FILE_RX = re.compile(r"""
@@ -204,7 +204,21 @@ _JSON_SIGNING_COMPANION_BEFORE_RX = re.compile(
 _MASKED_RX = re.compile(r"^[*•]+$")             # actuator sanitizes sensitive values to ******
 
 MAX_BODY = 2 * 1024 * 1024    # 2 MB cap per exposed resource (RAM/disk guard)
-MAX_FETCHES = 50              # bound how many exposed resources we fetch
+#: REMOVED as a membership bound (Lumpy, 2026-08-05). `urls[:50]` silently dropped the 51st exposed
+#: file, GraphQL endpoint, actuator base, OpenAPI document and framework candidate — never fetched,
+#: never reported, and directly capable of hiding a secret-bearing file. Membership is not the control:
+#: request PRESSURE is `RATELIMIT.HTTP`, which every fetch already goes through. What each lane owes is
+#: an honest count of what it looked at, which `_fetched()` emits.
+
+
+def _fetched(sid: str, eligible: int, tested: int, what: str) -> None:
+    """Say how much of the candidate set was actually fetched. Nothing is sliced, so these agree — and
+    if a future throughput budget ever stops one short, it will say so here rather than silently."""
+    events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, measure="evidence_fetches",
+                            unit=f"{sid}.candidates", eligible=eligible, tested=tested,
+                            omitted=max(0, eligible - tested),
+                            reason=(f"{tested}/{eligible} {what} fetched"
+                                    + ("" if tested >= eligible else " — the rest were NOT looked at")))
 
 
 def mine(text: str, *, source_path: str | None = None) -> list[tuple[str, str, int]]:
@@ -392,7 +406,8 @@ def fetch_exposed(ctx, urls: list[str]) -> int:
     """GET each exposed in-scope resource (an instance of fetch_and_extract), extract its secrets +
     links, and raise a reviewable exposure marker. Returns count of NEW secret entities added."""
     added = 0
-    for u in urls[:MAX_FETCHES]:
+    _fetched("evidence.exposed", len(urls), len(urls), "exposed resource(s)")
+    for u in urls:
         r = fetch_and_extract(ctx, u, source="exposed-fetch", subdir="exposed")
         if r["off_scope"]:                         # off-scope redirect — record, no extraction
             ctx.run.add("review", {
@@ -438,7 +453,7 @@ def probe_graphql(ctx, endpoints: list[str]) -> int:
     the schema is dumped to raw + a review is raised (hand-off to the attack layer). Returns the
     count of endpoints with introspection ENABLED."""
     enabled_n = 0
-    for u in endpoints[:MAX_FETCHES]:
+    for u in endpoints:
         host = normalize.host_of_url(u)
         if not ctx.scope.active_allowed(host):
             continue
@@ -550,7 +565,7 @@ def probe_actuator(ctx, bases: list[str]) -> int:
     / not advertised = benign (the Test-5 triage-precision case). Mutating endpoints never touched.
     Returns the count of bases with >=1 sensitive endpoint exposed."""
     found = 0
-    for base in bases[:MAX_FETCHES]:
+    for base in bases:
         host = normalize.host_of_url(base)
         if not ctx.scope.active_allowed(host):
             continue
@@ -642,7 +657,7 @@ def parse_openapi(ctx, urls: list[str]) -> int:
     themselves. Only in-scope endpoints are kept (a doc can advertise other hosts). Returns the
     count of NEW endpoint entities added."""
     added_ep = 0
-    for u in urls[:MAX_FETCHES]:
+    for u in urls:
         host = normalize.host_of_url(u)
         if not ctx.scope.active_allowed(host):
             continue
@@ -728,7 +743,7 @@ def probe_framework_endpoints(ctx, candidates: list[dict]) -> int:
     only — no payloads/creds/state change; exploitation (Werkzeug PIN, CFIDE/H2/Jolokia/Ignition RCE)
     is the attack layer. `candidates` = [{url, framework, note}]. Returns the count of EXPOSED (200)."""
     exposed_n = 0
-    for c in candidates[:MAX_FETCHES]:
+    for c in candidates:
         u = c.get("url", "")
         host = normalize.host_of_url(u)
         if not ctx.scope.active_allowed(host):
@@ -781,7 +796,7 @@ def probe_ssti(ctx, urls: list[str]) -> int:
     literal expression absent). A hit is a CANDIDATE ("manual validation required"), not proof of
     impact — payload tuning / exploitation is the attack layer. Returns count of confirmed primitives."""
     found = 0
-    for u in urls[:MAX_FETCHES]:
+    for u in urls:
         host = normalize.host_of_url(u)
         if not ctx.scope.active_allowed(host):
             continue

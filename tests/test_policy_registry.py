@@ -288,10 +288,19 @@ class TestTheRegistryTellsTheTruth:
         """They are exclusions, not entries: lifting them buys coverage nothing and risks the host, the
         target, or an engagement decision that is not a machine-wide flag's to make."""
         for ref in ("quarry_recon.sweep:MAX_BATCH_WORDS", "quarry_recon.netguard:_MAX_WORKERS",
-                    "quarry_recon.budget:_MAX_BUDGET_S", "quarry_recon.config:MAX_CONTENT_RECURSION",
-                    "quarry_recon.evidence:MAX_FETCHES"):
+                    "quarry_recon.budget:_MAX_BUDGET_S", "quarry_recon.config:MAX_CONTENT_RECURSION"):
             assert ref in policy.EXCLUDED, ref
             assert ref not in {b.const for b in policy.BOUNDS}, ref
+
+    def test_evidence_fetching_has_no_MEMBERSHIP_cap_to_classify(self):
+        """`evidence:MAX_FETCHES = 50` was registered as a `rate` exclusion and was really a MEMBERSHIP
+        bound: the 51st exposed file, GraphQL endpoint, actuator base, OpenAPI document or framework
+        candidate was never fetched and never reported (Lumpy, 2026-08-05). Request PRESSURE is
+        `RATELIMIT.HTTP`, which every fetch already goes through — so the constant is gone, not
+        reclassified."""
+        from quarry_recon import evidence
+        assert not hasattr(evidence, "MAX_FETCHES")
+        assert "quarry_recon.evidence:MAX_FETCHES" not in policy.EXCLUDED
 
     def test_the_A1d_word_cap_is_the_ONE_held_entry(self):
         """Lumpy's deferral, encoded where the flag will read it: `--unbound` must not land the strict `0`

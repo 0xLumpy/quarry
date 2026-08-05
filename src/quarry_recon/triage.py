@@ -210,6 +210,14 @@ def _params_of(url: str) -> list[str]:
     return out
 
 
+def _more(add, shown: int, total: int, where: str = "normalized/ + digest.json") -> None:
+    """Say what a DISPLAY cap is holding back. A section that simply stops looks COMPLETE, which is how
+    a cap hides in plain sight. Secrets are not capped at all; these are context lists, and even those
+    must state what they are not showing (Lumpy, 2026-08-05)."""
+    if total > shown:
+        add(f"- … and {total - shown} more not shown here — all of them in `{where}`")
+
+
 def build(run, scope) -> str:
     live = run.read("live")
     urls = run.values("url")
@@ -251,6 +259,7 @@ def build(run, scope) -> str:
         A(_hdr)
         for f in findings[:30]:
             A(f"- [{f.get('severity')}] {f.get('template')} @ {f.get('matched')}  (src: {','.join(f.get('sources', []))})")
+        _more(A, 30, len(findings))
         A("")
 
     if origins:
@@ -258,6 +267,7 @@ def build(run, scope) -> str:
         for l in origins[:40]:
             A(f"- {l['url']}  [{l.get('status_code')}] {l.get('title') or ''} "
               f"{','.join(l.get('tech') or [])}")
+        _more(A, 40, len(origins))
         A("")
 
     for name, label in [("auth", "Auth / SSO / register"),
@@ -269,6 +279,7 @@ def build(run, scope) -> str:
             A(f"## {label}  ({len(items)})")
             for u in items[:25]:
                 A(f"- {u}")
+            _more(A, 25, len(items))
             A("")
 
     for cls in ("idor", "ssrf", "sqli", "xss"):
@@ -277,11 +288,14 @@ def build(run, scope) -> str:
             A(f"## {cls.upper()} candidate params  ({len(items)}) — common-vuln params present")
             for u in items[:20]:
                 A(f"- {u}")
+            _more(A, 20, len(items))
             A("")
 
     if secrets:
         A(f"## Secret candidates ({len(secrets)}) — review before any validation")
-        for s in secrets[:25]:
+        # NO CAP. A finding the report does not print is a finding an operator has to go looking for,
+        # and secrets are the reason the run happened (Lumpy, 2026-08-05).
+        for s in secrets:
             verified = " VERIFIED" if s.get("verified") else ""
             loc = f"  @ {s.get('file')}" if s.get("file") else ""
             where = f":{s.get('line')}" if s.get("line") else ""
@@ -310,6 +324,7 @@ def build(run, scope) -> str:
             else:
                 dom = o.get("interaction_domain") or o.get("correlation_id") or o.get("id")
                 A(f"- [{o.get('protocol')}] {dom}  from {o.get('remote_address', '?')}  (uncorrelated)")
+        _more(A, 25, len(oob_rows))
         A("")
 
     dns_recs = [d for d in run.read("dns_record") if d.get("type") in NOTABLE_DNS_TYPES]
@@ -324,6 +339,7 @@ def build(run, scope) -> str:
                 A(f"### {t.upper()}  ({len(items)})")
                 for d in items[:12]:
                     A(f"- {d.get('host')} → {str(d.get('value', ''))}")
+                _more(A, 12, len(items))
                 A("")
 
     # gf / sourcemap candidates (review entities)
@@ -344,6 +360,7 @@ def build(run, scope) -> str:
             A(f"### {klass.upper()}  ({len(items)}) — {label}")
             for v in items[:15]:
                 A(f"- {v}")
+            _more(A, 15, len(items))
             if len(items) > 15:
                 # B1.5b: a DISPLAY may be bounded; the stored evidence never is. Say so, or a reader
                 # takes the preview for the whole queue — which is how a cap hides in plain sight.
@@ -365,6 +382,7 @@ def build(run, scope) -> str:
             for g in rows[:10]:
                 chains = ", ".join(g.get("chain_potential") or []) or "unclassified"
                 A(f"- {g.get('value')} — {g.get('observed_behavior')}  ·  chains: {chains}")
+            _more(A, 10, len(rows))
             if len(rows) > 10:
                 A(f"- … {len(rows) - 10} more — full list in normalized/gadget_candidate.jsonl")
             A("")
@@ -383,6 +401,7 @@ def build(run, scope) -> str:
             seen = sum(s.get("n", 0) for s in (o.get("sightings") or []) if isinstance(s, dict))
             who = ", ".join(ast_obs.corroborators(o, fresh)) or "ast only"
             A(f"- {o.get('id')}  ·  x{seen}  ·  {who}")
+        _more(A, 15, len(top))
         if len(top) > 15:
             # a DISPLAY may be bounded; the stored evidence never is
             A(f"- … {len(top) - 15} more prioritised — full list in normalized/path_observation.jsonl")
@@ -409,6 +428,7 @@ def build(run, scope) -> str:
             for s in rows[:8]:
                 seen = sum(x.get("n", 0) for x in (s.get("sightings") or []) if isinstance(x, dict))
                 A(f"- `{(s.get('value') or '')[:110]}`  ·  {s.get('analyzer')}  ·  x{seen}")
+            _more(A, 8, len(rows))
             if len(rows) > 8:
                 A(f"- … {len(rows) - 8} more — full list in normalized/sink_observation.jsonl")
             A("")
