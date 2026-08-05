@@ -116,6 +116,10 @@ PROVIDER_PARSE = "parse"
 #: the privilege. The distinction is the whole point of this taxonomy: `parse` sends you reading the
 #: provider's schema, `oversize` sends you to our own constant.
 PROVIDER_OVERSIZE = "oversize"
+#: OUR rate boundary refused to let this request out — the account's pacing state could not be honoured
+#: (another process holds the slot, or the shared state is damaged). Not the provider's answer and not a
+#: limit it imposed: a gap of ours, and one a later lifecycle can close for free.
+PROVIDER_PACE_BUSY = "pace_busy"
 PROVIDER_HTTP = "http"
 PROVIDER_ERROR = "error"
 
@@ -126,7 +130,8 @@ PROVIDER_LIMITS = frozenset({PROVIDER_QUOTA, PROVIDER_ENTITLEMENT})
 #: than accepting any non-empty string — "quota " or "Quota" would compare unequal everywhere it matters.
 PROVIDER_CLASSES = frozenset({PROVIDER_AUTH, PROVIDER_FORBIDDEN, PROVIDER_ENTITLEMENT,
                               PROVIDER_RATE_LIMIT, PROVIDER_QUOTA, PROVIDER_TRANSPORT, PROVIDER_SERVER,
-                              PROVIDER_PARSE, PROVIDER_OVERSIZE, PROVIDER_HTTP, PROVIDER_ERROR})
+                              PROVIDER_PARSE, PROVIDER_OVERSIZE, PROVIDER_PACE_BUSY, PROVIDER_HTTP,
+                              PROVIDER_ERROR})
 
 
 def is_provider_limit(error_class) -> bool:

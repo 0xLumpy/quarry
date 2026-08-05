@@ -10,6 +10,10 @@
 
 set -uo pipefail
 QUARRY_SRC="${QUARRY_SRC:-$HOME/workspace/quarry/src}"
+# the checks drive the real provider lanes against fakes; their PACING state must
+# not land in the operator's installation (~/.config/quarry/pace).
+export QUARRY_PACE_DIR="$(mktemp -d)"
+trap 'rm -rf "$QUARRY_PACE_DIR"' EXIT
 RANGE_APEX="${RANGE_APEX:-0xlumpy.cc}"
 PY="python3"
 pass=0; fail=0; skip=0

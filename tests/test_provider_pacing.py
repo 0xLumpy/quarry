@@ -112,15 +112,98 @@ class TestAPenaltyOutlivesTheProcessThatEarnedIt:
         assert doc["until"] > time.time() + 60
 
 
-class TestPolitenessNeverBecomesAHang:
-    def test_an_unusable_state_directory_does_not_stop_a_run(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(pace, "PACE_DIR", tmp_path / "nope" / "\0bad")
-        assert pace.wait(pace.account("shodan", "K"), 1.05) == 0.0
-        pace.note_penalty(pace.account("shodan", "K"), time.time() + 10)   # must not raise
+class TestABoundaryRefusesRatherThanFailsOpen:
+    """review#2 (Lumpy): the first version proceeded UNPACED whenever the slot was held, the state was
+    malformed or a write failed — it stopped coordinating exactly when coordination mattered, and two
+    processes could burst together. A fail-open pacer is advisory telemetry, not a boundary.
 
-    def test_a_FUTURE_timestamp_is_not_trusted(self, tmp_path, monkeypatch):
-        """A clock that ran backwards must not let the next request through unpaced… nor stall it for
-        the difference: an unusable stamp means wait the interval, no more."""
+    Refusing costs no evidence: replay is untouched and the pages we did not buy are still there."""
+
+    def test_a_held_slot_REFUSES_instead_of_proceeding(self, tmp_path, monkeypatch):
+        from quarry_recon import budget
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        monkeypatch.setattr(pace, "LOCK_WAIT_S", 0.1)
+        key = pace.account("shodan", "K")
+        lock = pace._state_path(key).with_suffix(".lock")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        started = time.perf_counter()
+        with budget.state_lock(lock):                    # another process holds the slot
+            with pytest.raises(pace.PaceBusy):
+                pace.wait(key, 1.05)
+        assert time.perf_counter() - started < 5.0, "the WAIT is bounded; the boundary is not abandoned"
+
+    def test_malformed_state_refuses(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        key = pace.account("shodan", "K")
+        pace._state_path(key).parent.mkdir(parents=True, exist_ok=True)
+        pace._state_path(key).write_text("{ half a write")
+        with pytest.raises(pace.PaceBusy):
+            pace.wait(key, 1.05)
+
+    def test_a_non_object_state_refuses(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        key = pace.account("shodan", "K")
+        pace._state_path(key).parent.mkdir(parents=True, exist_ok=True)
+        pace._state_path(key).write_text("[]")
+        with pytest.raises(pace.PaceBusy):
+            pace.wait(key, 1.05)
+
+    def test_an_unusable_state_directory_refuses(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path / "nope" / "\0bad")
+        with pytest.raises(pace.PaceBusy):
+            pace.wait(pace.account("shodan", "K"), 1.05)
+
+    def test_a_failed_write_refuses(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        key = pace.account("shodan", "K")
+
+        def boom(self, *a, **k):
+            raise OSError("disk full")
+        monkeypatch.setattr(Path, "write_text", boom)
+        with pytest.raises(pace.PaceBusy):
+            pace.wait(key, 0.0)
+
+    def test_the_state_is_published_ATOMICALLY(self, tmp_path, monkeypatch):
+        """`write_text` can leave a fragment behind, which the next process would read as "no pacing
+        history" — the very failure this module exists to prevent."""
+        import inspect
+        src = inspect.getsource(pace._publish)
+        assert "os.replace" in src and ".tmp" in src
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        key = pace.account("shodan", "K")
+        pace.wait(key, 0.0)
+        assert not list(tmp_path.glob("*.tmp")), "no fragment is left behind"
+
+    def test_a_MISSING_state_is_a_first_request_not_a_refusal(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        assert pace.wait(pace.account("shodan", "NEW"), 1.05) == 0.0
+
+    def test_recording_a_penalty_never_raises(self, tmp_path, monkeypatch):
+        """The request already happened and the 429 is in hand — the caller is on a failure path. What
+        is lost is SHARING the penalty, which the next `wait()` refuses over anyway."""
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        key = pace.account("shodan", "K")
+        pace._state_path(key).parent.mkdir(parents=True, exist_ok=True)
+        pace._state_path(key).write_text("{ broken")
+        pace.note_penalty(key, time.time() + 60)          # must not raise
+
+
+class TestAnUnusableStampWaitsTheInterval:
+    """review#3 (Lumpy): `_stamp` returned 0.0 for an unusable value, so `last + interval` landed near
+    the Unix epoch and the request went out IMMEDIATELY — the opposite of the documented behaviour."""
+
+    @pytest.mark.parametrize("bad", [float("inf"), float("nan"), "soon", None, True])
+    def test_an_unusable_last_stamp_waits_a_FULL_interval(self, tmp_path, monkeypatch, bad):
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
+        key = pace.account("shodan", "K")
+        pace._state_path(key).parent.mkdir(parents=True, exist_ok=True)
+        pace._state_path(key).write_text(json.dumps({"last": bad}))
+        slept: list = []
+        monkeypatch.setattr(pace.time, "sleep", lambda s: slept.append(s))
+        pace.wait(key, 1.05)
+        assert slept and 1.0 <= slept[0] <= 1.1, (bad, slept)
+
+    def test_a_FUTURE_stamp_waits_one_interval_not_the_difference(self, tmp_path, monkeypatch):
         monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
         key = pace.account("shodan", "K")
         pace._state_path(key).parent.mkdir(parents=True, exist_ok=True)
@@ -128,16 +211,18 @@ class TestPolitenessNeverBecomesAHang:
         slept: list = []
         monkeypatch.setattr(pace.time, "sleep", lambda s: slept.append(s))
         pace.wait(key, 1.05)
-        assert slept == [] or slept[0] <= 1.1, slept
+        assert slept and 1.0 <= slept[0] <= 1.1, slept
 
-    def test_a_held_slot_does_not_park_the_run_forever(self, tmp_path, monkeypatch):
-        from quarry_recon import budget
-        monkeypatch.setattr(pace, "PACE_DIR", tmp_path)
-        monkeypatch.setattr(pace, "LOCK_WAIT_S", 0.1)
-        key = pace.account("shodan", "K")
-        path = pace._state_path(key).with_suffix(".lock")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        started = time.perf_counter()
-        with budget.state_lock(path):                 # another process holds the slot
-            pace.wait(key, 1.05)
-        assert time.perf_counter() - started < 5.0, "a busy slot must not stall the run"
+
+class TestTheLaneReportsARefusalAsAGap:
+    def test_a_refused_search_is_a_classified_error_not_a_crash(self, monkeypatch, tmp_path):
+        from quarry_recon import contract
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path / "x" / "\0bad")
+        c = probe._ProviderCooldown("K")
+        with pytest.raises(pace.PaceBusy):
+            c.wait()
+        e = pace.PaceBusy("slot held")
+        e.error_class = contract.PROVIDER_PACE_BUSY
+        assert contract.provider_error_class(e) == "pace_busy"
+        assert not contract.is_provider_limit("pace_busy"), "ours, not a provider limit"
+        assert "pace_busy" in contract.PROVIDER_CLASSES

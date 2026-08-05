@@ -22,7 +22,8 @@ from pathlib import Path
 
 from .. import (budget, contract, events, netguard, normalize, pace, secrets, settings, shodan_host,
                 shodan_sched, store)
-from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PARSE, PROVIDER_RATE_LIMIT,
+from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PACE_BUSY, PROVIDER_PARSE,
+                        PROVIDER_RATE_LIMIT,
                         ProviderResult, ProviderSkip, ResponseTooLarge, capture_error_body,
                         is_provider_limit, provider_error_class, read_bounded, run_contract,
                         run_provider, stream_to_file)
@@ -739,6 +740,11 @@ def _shodan_work_locked(ctx, key, lanes):
         nothing was withheld."""
         if paid["bal"] is not None:
             return paid["bal"]
+        if paid["pace_busy"]:
+            return ShodanBalance(
+                remaining=None, allowance=None, reserve=_shodan_reserve_setting(), spendable=0,
+                may_spend=False, stop_kind=SHODAN_UNKNOWN_WITH_RESERVE,
+                reason=f"no provider contact this lifecycle — {paid['pace_busy']}")
         return ShodanBalance(
             remaining=None, allowance=None, reserve=_shodan_reserve_setting(), spendable=None,
             may_spend=True,
@@ -748,7 +754,7 @@ def _shodan_work_locked(ctx, key, lanes):
     # THE BALANCE IS PROVIDER CONTACT and is therefore read lazily, after replay, and only if pages
     # remain to buy (Lumpy, 2026-08-05). A run whose project already owns everything it needs now issues
     # NO request at all — not a balance read, not a free count.
-    paid: dict = {"bal": None, "sizing": None, "consulted": False}
+    paid: dict = {"bal": None, "sizing": None, "consulted": False, "pace_busy": ""}
     try:
         found: dict = {spec.sid: set() for spec, _vals in lanes}
         oos: dict = {spec.sid: {"seen": 0, "invalid": 0, "kept": set()} for spec, _vals in lanes}
@@ -782,10 +788,17 @@ def _shodan_work_locked(ctx, key, lanes):
         errs: dict = {spec.sid: {"last": None, "last_fail": None} for spec, _vals in lanes}
 
         def search(pivot, page):
+            # `cooldown.wait()` may REFUSE (PaceBusy) when this account's boundary cannot be honoured.
+            # That is a gap of OURS: no request goes out, nothing is spent, and a later lifecycle can
+            # close it for free.
             # review-B1.5r3#1: only ONE wait ran, before the whole paid loop, so a 429 mid-purchase was
             # neither recorded nor honored and the scheduler went straight to the next pivot. Every paid
             # request now passes through the same cooldown that sizing uses.
-            cooldown.wait()
+            try:
+                cooldown.wait()
+            except pace.PaceBusy as e:
+                e.error_class = PROVIDER_PACE_BUSY
+                return [], None, e
             # the RAW response is streamed here, under the ledger's own directory, so a page we paid for
             # exists on disk before anything decides whether we can use it.
             sink = attempt_dir / "raw" / f"{shodan_sched.item_key(pivot, page)}.json"
@@ -879,6 +892,13 @@ def _shodan_work_locked(ctx, key, lanes):
             Balance first (free, and it decides whether spending is permitted at all), then sizing —
             both paced by the same cooldown as purchasing, because both are provider contact."""
             paid["consulted"] = True
+            try:
+                cooldown.wait()          # the balance read is provider contact like any other
+            except pace.PaceBusy as e:
+                # no contact at all this lifecycle. Replay has already happened and is unaffected; the
+                # unbought remainder is reported and a later run closes it for free.
+                paid["pace_busy"] = str(e)
+                return None
             bal = _read_shodan_balance(key, cooldown=cooldown)
             # held IMMEDIATELY: review-B1.5r5#3 — a failure in sizing (or anywhere after) must still
             # leave exactly one balance record per lane, which is the missing-lifecycle hole this
@@ -989,7 +1009,16 @@ def _size_pivots(key, states, *, ledger, attempt_dir, cooldown, refused=None) ->
         if stopped:
             stat(sid)["not_attempted"] += 1
             continue
-        cooldown.wait()                              # honor any slowdown already in force
+        try:
+            cooldown.wait()                          # honor any slowdown already in force
+        except pace.PaceBusy as e:
+            # the account boundary refused: this pivot is NOT attempted, and neither is any that follows
+            # — the next one would be refused identically. Counted, never disguised as a zero count.
+            stat(sid)["not_attempted"] += 1
+            stat(sid)["stop_reason"] = PROVIDER_PACE_BUSY
+            stopped = True
+            del e
+            continue
         stat(sid)["attempted"] += 1
         total, raw, err = _shodan_count(key, st.pivot.facet, st.pivot.value)
         if err is not None:
