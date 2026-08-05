@@ -129,3 +129,76 @@ class TestQuarryIdentifiesItselfToShodan:
             src = inspect.getsource(fn)
             assert "Mozilla" not in src, f"{fn.__name__} still asks as a browser"
             assert "User-Agent" not in src or "SHODAN_UA" in src, f"{fn.__name__} sets its own identity"
+
+
+class TestOurOwnCeilingIsNotTheProvidersFault:
+    """MEASURED 2026-08-05, twice, with two credits spent on it: a 4 MiB read cap truncated Shodan's page
+    mid-string and the fragment went straight to `json.loads`, so the run reported
+
+        JSONDecodeError: Unterminated string starting at: line 1 column 4194270 (char 4194269)
+
+    4194304 is 4 MiB. Quarry called its own constant a provider defect, and every artifact agreed with
+    it. A search page carries up to 100 banners with base64 favicon and certificate blobs; the cap was
+    the wrong order of magnitude, and the misattribution was the more expensive half."""
+
+    class _Response:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self, n=None):
+            return self._payload[:n] if n else self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _serve(self, monkeypatch, payload: bytes):
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda req, timeout=None: self._Response(payload))
+
+    def test_the_cap_is_large_enough_for_a_real_page(self):
+        assert probe.SHODAN_READ_LIMIT >= 32 * 1024 * 1024, "4 MiB truncated ordinary favicon pages"
+
+    def test_an_oversize_response_is_classed_as_OURS_not_as_a_parse_failure(self, monkeypatch):
+        monkeypatch.setattr(probe, "SHODAN_READ_LIMIT", 512)
+        self._serve(monkeypatch, b'{"total": 5, "matches": [' + b'"x" ' * 500 + b']}')
+        rows, total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1)
+        assert rows == [] and total is None and err is not None
+        assert contract.provider_error_class(err) == contract.PROVIDER_OVERSIZE
+        assert contract.provider_error_class(err) != contract.PROVIDER_PARSE
+        assert "read cap" in str(err) and "SHODAN_READ_LIMIT" in str(err)
+
+    def test_it_says_nothing_was_dropped_silently(self, monkeypatch):
+        monkeypatch.setattr(probe, "SHODAN_READ_LIMIT", 64)
+        self._serve(monkeypatch, b"x" * 5000)
+        _rows, _total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1)
+        assert "NOT parsed" in str(err), "a truncated page must never look like an empty one"
+
+    def test_what_we_DID_read_travels_with_the_error(self, monkeypatch):
+        monkeypatch.setattr(probe, "SHODAN_READ_LIMIT", 100)
+        self._serve(monkeypatch, b"y" * 5000)
+        _rows, _total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1)
+        assert getattr(err, "body_bytes", None), "a paid response's bytes are evidence"
+        assert err.body_bytes.startswith(b"yyy")
+
+    def test_a_page_that_FITS_is_unaffected(self, monkeypatch):
+        monkeypatch.setattr(probe, "SHODAN_READ_LIMIT", 4096)
+        self._serve(monkeypatch, json.dumps(
+            {"total": 2, "matches": [{"ip_str": "203.0.113.1", "hostnames": ["a.example"]}]}).encode())
+        rows, total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1)
+        assert err is None and total == 2 and len(rows) == 1
+
+    def test_the_count_endpoint_reads_through_the_same_bound(self, monkeypatch):
+        monkeypatch.setattr(probe, "SHODAN_READ_LIMIT", 32)
+        self._serve(monkeypatch, b'{"total": 12345678901234567890}' * 10)
+        total, _raw, err = probe._shodan_count("K", "http.favicon.hash", "1")
+        assert total is None and err is not None
+        assert contract.provider_error_class(err) == contract.PROVIDER_OVERSIZE
+
+    def test_oversize_is_a_DEFECT_not_a_provider_limit(self):
+        """It is our constant, so it must read as a gap to be fixed — never as an external boundary that
+        makes an incomplete run look complete_with_limits."""
+        assert contract.PROVIDER_OVERSIZE in contract.PROVIDER_CLASSES
+        assert not contract.is_provider_limit(contract.PROVIDER_OVERSIZE)

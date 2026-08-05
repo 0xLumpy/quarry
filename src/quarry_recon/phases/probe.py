@@ -149,6 +149,43 @@ class _ProviderCooldown:
 #: paid path is now the same client. This is an API we identify ourselves to, not a target we blend into.
 SHODAN_UA = "quarry-recon"
 
+#: How much of ONE Shodan response we are willing to hold. MEASURED 2026-08-05: the previous 4 MiB cap
+#: truncated both pivots' page 1 mid-string (`Unterminated string ... char 4194269`, and 4194304 = 4 MiB),
+#: and the truncated fragment was then handed to `json.loads` — so Quarry called ITS OWN ceiling a
+#: provider parse failure, twice, having paid for both. A Shodan search page carries up to 100 banners
+#: with base64 favicon and certificate blobs; 4 MiB is simply the wrong order of magnitude for it.
+#:
+#: The cap is a RESOURCE bound (one response is read into memory), never a coverage policy: hitting it
+#: does not silently drop rows, it raises `ShodanResponseTooLarge` and the page is reported as OURS.
+SHODAN_READ_LIMIT = 64 * 1024 * 1024
+
+
+class ShodanResponseTooLarge(ValueError):
+    """A response longer than `SHODAN_READ_LIMIT`. Carries its own class so it can never be mistaken for
+    the provider having sent us something malformed."""
+
+    error_class = "oversize"
+
+
+def _read_bounded(r, limit: "int | None" = None) -> bytes:
+    """Read a response, and KNOW whether it was complete. Reading exactly `limit` bytes cannot tell a
+    response that just fits from one that was cut — so read one byte past and treat that as the signal.
+
+    The bound is read AT CALL TIME, not captured as a default argument: a module constant frozen into a
+    signature at import cannot be changed by anything — not the policy report, not a test, not a future
+    setting — while still looking like a knob."""
+    limit = SHODAN_READ_LIMIT if limit is None else limit
+    raw = r.read(limit + 1)
+    if len(raw) > limit:
+        e = ShodanResponseTooLarge(
+            f"shodan: response exceeds our {limit // (1024 * 1024)} MiB read cap "
+            f"(SHODAN_READ_LIMIT) — the page was NOT parsed and nothing was dropped silently")
+        # the head of what we DID read travels with it: a request that hit our ceiling was still paid
+        # for, and the coordinator can only preserve what it is handed.
+        e.body_bytes = bytes(raw)
+        raise e
+    return raw
+
 
 def _shodan_count(key, facet, v):
     """ONE free `/shodan/host/count` -> `(total, error)`. NEVER raises.
@@ -167,7 +204,7 @@ def _shodan_count(key, facet, v):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=20) as r:
-            raw = r.read(4 * 1024 * 1024)
+            raw = _read_bounded(r)
         data = _json.loads(raw.decode("utf-8", "replace"))
         if not isinstance(data, dict):
             raise ValueError("shodan: non-object count response")
@@ -197,7 +234,7 @@ def _shodan_page(key, facet, v, page):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=20) as r:
-            raw = r.read(4 * 1024 * 1024)
+            raw = _read_bounded(r)
         data = _json.loads(raw.decode("utf-8", "replace"))
         if not isinstance(data, dict):
             raise ValueError("shodan: non-object response — not a valid empty result")

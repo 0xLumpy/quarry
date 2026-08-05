@@ -107,6 +107,12 @@ PROVIDER_QUOTA = "quota"
 PROVIDER_TRANSPORT = "transport"
 PROVIDER_SERVER = "server"
 PROVIDER_PARSE = "parse"
+#: OUR ceiling, not the provider's answer. A response we refused to read past is not malformed — measured
+#: 2026-08-05: a 4 MiB read cap truncated two Shodan pages mid-string and the run reported
+#: `JSONDecodeError` twice, i.e. Quarry called its own limit a provider defect and billed 2 credits for
+#: the privilege. The distinction is the whole point of this taxonomy: `parse` sends you reading the
+#: provider's schema, `oversize` sends you to our own constant.
+PROVIDER_OVERSIZE = "oversize"
 PROVIDER_HTTP = "http"
 PROVIDER_ERROR = "error"
 
@@ -117,7 +123,7 @@ PROVIDER_LIMITS = frozenset({PROVIDER_QUOTA, PROVIDER_ENTITLEMENT})
 #: than accepting any non-empty string — "quota " or "Quota" would compare unequal everywhere it matters.
 PROVIDER_CLASSES = frozenset({PROVIDER_AUTH, PROVIDER_FORBIDDEN, PROVIDER_ENTITLEMENT,
                               PROVIDER_RATE_LIMIT, PROVIDER_QUOTA, PROVIDER_TRANSPORT, PROVIDER_SERVER,
-                              PROVIDER_PARSE, PROVIDER_HTTP, PROVIDER_ERROR})
+                              PROVIDER_PARSE, PROVIDER_OVERSIZE, PROVIDER_HTTP, PROVIDER_ERROR})
 
 
 def is_provider_limit(error_class) -> bool:

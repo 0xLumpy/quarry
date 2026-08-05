@@ -294,6 +294,9 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.contract:_ERROR_BODY_LIMIT": ("provider", "how much of a provider error body is kept"),
     "quarry_recon.contract:_DETAIL_CHARS": ("provider", "a terminal REASON is one line; the body itself is "
                                             "kept whole by _ERROR_BODY_LIMIT above"),
+    "quarry_recon.phases.probe:SHODAN_READ_LIMIT": (
+        "resource", "one provider response is read into memory. Hitting it RAISES (class `oversize`) and "
+        "the page is reported as ours — it never drops rows from a page we keep"),
     "quarry_recon.shodan_sched:REJECTED_BYTES_LIMIT": (
         "provider", "how much of a REFUSED paid response is stored beside the run. It bounds a diagnostic "
         "copy of something we did not accept as evidence — not evidence itself: an accepted page is "
