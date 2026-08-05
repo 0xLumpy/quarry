@@ -634,7 +634,14 @@ class TestNothingIsHiddenByAPresentationCap:
         import inspect
         from quarry_recon import triage
         src = inspect.getsource(triage)
-        assert src.count("_more(A,") >= 8, "every remaining display cap announces itself"
+        # every capped section says what it holds back — either through `_more` or with its own line
+        # naming the exact store. What must never happen is a section that simply stops.
+        import re
+        # LOOPS that display a slice — not `hexdigest()[:10]` and friends
+        capped = len(re.findall(r"for \w+ in [\w\.\(\)]+\[:\d+\]:", src))
+        announced = src.count("_more(A,") + src.count("more — full list in") \
+            + src.count("more prioritised")
+        assert announced >= capped, (announced, capped)
         assert "not shown here" in inspect.getsource(triage._more)
 
     def test_fetching_has_no_membership_cap(self):
@@ -664,4 +671,54 @@ class TestNothingIsHiddenByAPresentationCap:
         cov = [e for e in evs if e.get("measure") == "evidence_fetches"]
         assert cov and cov[-1]["eligible"] == 60 and cov[-1]["tested"] == 60, cov
         assert len([r for k, r in added if k == "review"]) == 60, "the 51st was fetched too"
+        events.reset()
+
+    def test_the_fetch_count_is_MEASURED_not_intended(self, tmp_path, monkeypatch):
+        """review#11 (Lumpy): the record was emitted BEFORE the loop with `tested=len(urls)`, so a run
+        whose every candidate was out of scope, refused or threw still published `60/60 fetched`."""
+        from types import SimpleNamespace
+        from quarry_recon import events, evidence, fetch
+        events.reset()
+        events.configure(tmp_path)
+        run = SimpleNamespace(
+            raw_path=lambda ph, sub, nm: (tmp_path / ph / sub).joinpath(nm)
+            if (tmp_path / ph / sub).mkdir(parents=True, exist_ok=True) or True else None,
+            add=lambda kind, rec: True)
+        # nothing is in scope: nothing is eligible and nothing was tested
+        ctx = SimpleNamespace(run=run, scope=SimpleNamespace(
+            in_scope=lambda h: False, is_oos=lambda h: True, active_allowed=lambda h: False))
+        monkeypatch.setattr(fetch, "scoped_get",
+                            lambda *a, **k: pytest.fail("a request was issued for an out-of-scope host"))
+        evidence.fetch_exposed(ctx, [f"https://t/f{i}" for i in range(60)])
+        import json as _json
+        evs = [_json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
+        cov = [e for e in evs if e.get("measure") == "evidence_fetches"]
+        assert cov and cov[-1]["eligible"] == 0 and cov[-1]["tested"] == 0, cov
+        events.reset()
+
+    def test_a_candidate_that_THREW_is_not_counted_as_fetched(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from quarry_recon import events, evidence, fetch
+        events.reset()
+        events.configure(tmp_path)
+        run = SimpleNamespace(
+            raw_path=lambda ph, sub, nm: (tmp_path / ph / sub).joinpath(nm)
+            if (tmp_path / ph / sub).mkdir(parents=True, exist_ok=True) or True else None,
+            add=lambda kind, rec: True)
+        ctx = SimpleNamespace(run=run, scope=SimpleNamespace(
+            in_scope=lambda h: True, is_oos=lambda h: False, active_allowed=lambda h: True))
+        calls = {"n": 0}
+
+        def flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] % 2:
+                raise OSError("connection refused")
+            return (b"body", "", 200)
+        monkeypatch.setattr(fetch, "scoped_get", flaky)
+        evidence.fetch_exposed(ctx, [f"https://t/f{i}" for i in range(10)])
+        import json as _json
+        evs = [_json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
+        cov = [e for e in evs if e.get("measure") == "evidence_fetches"][-1]
+        assert cov["eligible"] == 10 and cov["tested"] == 5, cov
+        assert cov["omitted"] == 5 and "NOT looked at" in cov["reason"]
         events.reset()

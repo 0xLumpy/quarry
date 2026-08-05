@@ -360,7 +360,6 @@ def build(run, scope) -> str:
             A(f"### {klass.upper()}  ({len(items)}) — {label}")
             for v in items[:15]:
                 A(f"- {v}")
-            _more(A, 15, len(items))
             if len(items) > 15:
                 # B1.5b: a DISPLAY may be bounded; the stored evidence never is. Say so, or a reader
                 # takes the preview for the whole queue — which is how a cap hides in plain sight.
@@ -382,7 +381,6 @@ def build(run, scope) -> str:
             for g in rows[:10]:
                 chains = ", ".join(g.get("chain_potential") or []) or "unclassified"
                 A(f"- {g.get('value')} — {g.get('observed_behavior')}  ·  chains: {chains}")
-            _more(A, 10, len(rows))
             if len(rows) > 10:
                 A(f"- … {len(rows) - 10} more — full list in normalized/gadget_candidate.jsonl")
             A("")
@@ -401,7 +399,6 @@ def build(run, scope) -> str:
             seen = sum(s.get("n", 0) for s in (o.get("sightings") or []) if isinstance(s, dict))
             who = ", ".join(ast_obs.corroborators(o, fresh)) or "ast only"
             A(f"- {o.get('id')}  ·  x{seen}  ·  {who}")
-        _more(A, 15, len(top))
         if len(top) > 15:
             # a DISPLAY may be bounded; the stored evidence never is
             A(f"- … {len(top) - 15} more prioritised — full list in normalized/path_observation.jsonl")
@@ -428,7 +425,6 @@ def build(run, scope) -> str:
             for s in rows[:8]:
                 seen = sum(x.get("n", 0) for x in (s.get("sightings") or []) if isinstance(x, dict))
                 A(f"- `{(s.get('value') or '')[:110]}`  ·  {s.get('analyzer')}  ·  x{seen}")
-            _more(A, 8, len(rows))
             if len(rows) > 8:
                 A(f"- … {len(rows) - 8} more — full list in normalized/sink_observation.jsonl")
             A("")

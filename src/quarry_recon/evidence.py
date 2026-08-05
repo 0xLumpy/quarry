@@ -212,8 +212,12 @@ MAX_BODY = 2 * 1024 * 1024    # 2 MB cap per exposed resource (RAM/disk guard)
 
 
 def _fetched(sid: str, eligible: int, tested: int, what: str) -> None:
-    """Say how much of the candidate set was actually fetched. Nothing is sliced, so these agree — and
-    if a future throughput budget ever stops one short, it will say so here rather than silently."""
+    """Say how much of the candidate set was actually fetched.
+
+    MEASURED, never intended (review#11, Lumpy): the first version emitted `tested=len(urls)` BEFORE the
+    loop, so a run whose every candidate was out of scope, refused or threw still published `60/60
+    fetched`. `eligible` is counted AFTER scope gating, `tested` at the point a request was really
+    issued, and the record is emitted when the loop is done."""
     events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, measure="evidence_fetches",
                             unit=f"{sid}.candidates", eligible=eligible, tested=tested,
                             omitted=max(0, eligible - tested),
@@ -405,10 +409,14 @@ def fetch_and_extract(ctx, url: str, *, source: str, subdir: str) -> dict:
 def fetch_exposed(ctx, urls: list[str]) -> int:
     """GET each exposed in-scope resource (an instance of fetch_and_extract), extract its secrets +
     links, and raise a reviewable exposure marker. Returns count of NEW secret entities added."""
-    added = 0
-    _fetched("evidence.exposed", len(urls), len(urls), "exposed resource(s)")
+    added = eligible = tested = 0
     for u in urls:
+        if not ctx.scope.active_allowed(normalize.host_of_url(u)):
+            continue                               # not ours to request: never part of the denominator
+        eligible += 1
         r = fetch_and_extract(ctx, u, source="exposed-fetch", subdir="exposed")
+        if r["status"] is not None or r["off_scope"]:
+            tested += 1                            # a request was actually issued
         if r["off_scope"]:                         # off-scope redirect — record, no extraction
             ctx.run.add("review", {
                 "id": f"exposed-redirect:{u}", "klass": "exposure", "value": u,
@@ -437,6 +445,7 @@ def fetch_exposed(ctx, urls: list[str]) -> int:
             "id": f"exposed:{u}", "klass": "exposure", "value": u,
             "host": normalize.host_of_url(u), "raw_ref": r["dest"],
             "note": note, "sources": ["exposed-fetch"]})
+    _fetched("evidence.exposed", eligible, tested, "in-scope exposed resource(s)")
     return added
 
 
