@@ -23,6 +23,10 @@ SENSITIVE_FILE_RX = re.compile(r"""
       | \.git/config | \.git/HEAD | \.git/credentials
       | \.aws/credentials | \.s3cfg | \.netrc | \.htpasswd | \.dockercfg | \.npmrc | \.pypirc
       | config\.(?:json|ya?ml|php|inc) | settings\.py | secrets\.ya?ml | wp-config\.php
+      | master\.key                                # Rails: decrypts credentials.yml.enc outright
+      | credentials\.yml\.enc
+      | appsettings(?:\.[\w-]+)?\.json            # .NET: connection strings + signing keys
+      | web\.config
       | \.DS_Store
       | id_rsa | id_dsa | id_ecdsa | id_ed25519 | [\w.-]+\.pem
       | (?:db|database|dump|backup)\.sql
@@ -39,10 +43,38 @@ _TOKEN_RX = [
     ("google-api-key", re.compile(r"AIza[0-9A-Za-z_\-]{35}")),
     ("jwt",            re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")),
     ("private-key",    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
+    # a password hash is not a password, and it is still evidence: it proves the store leaked and it is
+    # offline-crackable. The shape is exact (algo, cost, 22-char salt + 31-char digest), so it does not
+    # collide with ordinary text.
+    ("bcrypt-hash",    re.compile(r"\$2[abxy]?\$\d{2}\$[./A-Za-z0-9]{53}")),
+    # .NET / ADO connection strings carry the password INSIDE the value, under a key like
+    # `DefaultConnection` that no secret-ish key pattern will ever match (measured 2026-08-05).
+    ("connection-string-password",
+     re.compile(r"(?i)\b(?:password|pwd)\s*=\s*([^;\"'\r\n]{4,})")),
+]
+
+#: Files whose ENTIRE BODY is the secret. A Rails `master.key` is 32 hex characters and nothing else —
+#: no assignment, no key name, nothing for a `KEY=value` or JSON rule to catch, so it was fetched, saved
+#: and mined for nothing (measured 2026-08-05). Matching a bare 32-hex string ANYWHERE would flag every
+#: MD5 and every git blob id, so these rules apply only when the whole body IS the value.
+_WHOLE_BODY_RX = [
+    ("rails-master-key", re.compile(r"\A[0-9a-f]{32}\Z")),
+    ("hex-key-64",       re.compile(r"\A[0-9a-f]{64}\Z")),
 ]
 
 # dotenv / config assignment `KEY = value`; captures a secret-looking VALUE on a secret-looking KEY.
-_DOTENV_RX = re.compile(r"""(?m)^\s*(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*[=:]\s*['"]?([^'"\r\n#]{6,}?)['"]?\s*$""")
+#
+# The value is read in three shapes, because the previous single pattern excluded `#` from the value and
+# therefore DROPPED — not truncated, dropped — every password containing one, quoted or not (measured
+# 2026-08-05: `DB_PASSWORD='P@ss...!#$%'` yielded nothing at all). A quoted value is taken whole, `#`
+# included; an unquoted one keeps its `#` unless it starts an inline comment, which by dotenv convention
+# needs preceding whitespace.
+_DOTENV_RX = re.compile(r"""(?m)^\s*(?:export\s+)?([A-Z][A-Z0-9_]{2,})\s*[=:]\s*(?:
+      '([^'\r\n]{4,})'                      # 'single quoted, # and " allowed'
+    | "([^"\r\n]{4,})"                      # "double quoted"
+    | ([^'"\r\n]{6,}?)                      # bare, inline comment stripped below
+    )\s*$""", re.VERBOSE)
+_INLINE_COMMENT_RX = re.compile(r"\s+#.*$")
 _SECRETISH_KEY = re.compile(r"(?i)(key|secret|token|pass|pwd|api|auth|cred|private|access)")
 
 # JSON config assignment on a secret-looking KEY: `"x.password": "val"` and the actuator/env wrap
@@ -52,6 +84,10 @@ _JSON_SECRET_RX = re.compile(
     r'"([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|signing[_-]?key|api[_-]?key|apikey|'
     r'access[_-]?key|private[_-]?key|token|credential)[A-Za-z0-9_.\-]*)"'
     r'\s*:\s*(?:\{\s*"value"\s*:\s*)?"([^"]{4,})"', re.I)
+#: A bare `"Key"` is how .NET writes a JWT signing secret (`"Jwt": {"Key": "..."}`) and how a thousand
+#: harmless config blocks write an identifier. The VALUE carries the distinction: a signing key is long,
+#: so the floor is what keeps this from reporting every `"key": "name"` in a JSON document.
+_JSON_BARE_KEY_RX = re.compile(r'"(key)"\s*:\s*"([^"]{20,})"', re.I)
 _MASKED_RX = re.compile(r"^[*•]+$")             # actuator sanitizes sensitive values to ******
 
 MAX_BODY = 2 * 1024 * 1024    # 2 MB cap per exposed resource (RAM/disk guard)
@@ -69,16 +105,28 @@ def mine(text: str) -> list[tuple[str, str, int]]:
             out.append((kind, val, text.count("\n", 0, m.start()) + 1))
             seen_vals.add(val)
     for m in _DOTENV_RX.finditer(text):
-        key, val = m.group(1), m.group(2).strip()
+        key = m.group(1)
+        quoted, val = (m.group(2) or m.group(3)), (m.group(2) or m.group(3) or m.group(4) or "")
+        if quoted is None:
+            val = _INLINE_COMMENT_RX.sub("", val)
+        val = val.strip() if quoted is None else val
         if _SECRETISH_KEY.search(key) and val not in seen_vals:   # already caught as a typed token
             seen_vals.add(val)
             out.append((f"dotenv:{key}", val, text.count("\n", 0, m.start()) + 1))
-    for m in _JSON_SECRET_RX.finditer(text):                      # JSON config (actuator env/configprops)
-        key, val = m.group(1), m.group(2)
-        if (val not in seen_vals and not _MASKED_RX.match(val)
-                and val.lower() not in ("null", "true", "false")):
-            seen_vals.add(val)
-            out.append((f"json:{key}", val, text.count("\n", 0, m.start()) + 1))
+    for rx_set in (_JSON_SECRET_RX, _JSON_BARE_KEY_RX):
+        for m in rx_set.finditer(text):                           # JSON config (actuator env, .NET…)
+            key, val = m.group(1), m.group(2)
+            if (val not in seen_vals and not _MASKED_RX.match(val)
+                    and val.lower() not in ("null", "true", "false")):
+                seen_vals.add(val)
+                out.append((f"json:{key}", val, text.count("\n", 0, m.start()) + 1))
+    # …and the file that IS a secret, with no key to hang it on
+    body = text.strip()
+    if body and body not in seen_vals:
+        for kind, rx in _WHOLE_BODY_RX:
+            if rx.match(body):
+                out.append((kind, body, 1))
+                break
     return out
 
 
