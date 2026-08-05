@@ -1520,7 +1520,11 @@ class TestShodanPivot:
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe, "_size_pivots",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("setup exploded")))
-        with pytest.raises(RuntimeError):
+        # the balance read and sizing now run INSIDE the coordinator, after replay, so a failure there
+        # reaches the lane through its machinery boundary (evidence kept, remainder reported) instead of
+        # escaping raw. The property this test exists for is unchanged: exactly one balance record per
+        # lane, on every path.
+        with pytest.raises(Exception):
             self._sized(monkeypatch, tmp_path, counts={"*": 10}, pivots=("hA",))
         bal = self._ledger_events(tmp_path, "balance")
         assert len(bal) == 1 and bal[0]["provider"] == "shodan", bal

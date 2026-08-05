@@ -102,6 +102,11 @@ def _dns_owner_name(h: str):
 #: NOT an operator knob and NOT the target rate limit (`RATELIMIT.HTTP` is pressure on the target; using
 #: it for a third-party API would be a category error).
 _SHODAN_BACKOFF_S = 5.0
+#: the minimum gap between two Shodan requests. Shodan documents ~1 request/second and answers a burst
+#: with 429 + a `Retry-After` we honour up to 300 s — so with no pacing at all we generated the very
+#: penalty we then waited out (MEASURED 2026-08-05: four requests in ~3 s, then a 301 s sleep). Pacing is
+#: the CONTROL; a shorter backoff would only argue with the provider about its own rule.
+_SHODAN_MIN_INTERVAL_S = 1.05
 #: the longest slowdown we will honor from a header. Beyond this the value is not usable as pacing — a
 #: run must not silently stall for an hour on one — so the fallback applies and the class still stops
 #: work by its own rules.
@@ -119,6 +124,7 @@ class _ProviderCooldown:
     def __init__(self):
         self.until = 0.0
         self.hits = 0
+        self.last = 0.0                 # when the last request was ISSUED (monotonic)
 
     def note(self, err) -> None:
         self.hits += 1
@@ -138,9 +144,15 @@ class _ProviderCooldown:
         self.until = max(self.until, _time.monotonic() + wait)
 
     def wait(self) -> None:
-        left = self.until - _time.monotonic()
+        """Honour a provider-imposed slowdown AND our own minimum interval, then mark the request.
+
+        Called immediately before PROVIDER CONTACT and nowhere else: replaying owned evidence touches no
+        provider, so it never waits here (Lumpy, 2026-08-05)."""
+        now = _time.monotonic()
+        left = max(self.until - now, (self.last + _SHODAN_MIN_INTERVAL_S) - now if self.last else 0.0)
         if left > 0:
             _time.sleep(left)
+        self.last = _time.monotonic()
 
 
 #: MEASURED 2026-08-05: `Mozilla/5.0` on `/shodan/host/search` is answered by Cloudflare's "Just a
@@ -706,8 +718,23 @@ def _shodan_work_locked(ctx, key, lanes):
     own `run_provider` bracket, so per-source telemetry and coverage generations are unchanged."""
     max_pages = settings.concurrency("SHODAN_MAX_PAGES", 0)
     scope = ctx.scope
+
+    def settled_balance():
+        """The balance as it FINALLY stood — or an explicit "not consulted" when the run never needed
+        to ask. Saying "unknown" there would be wrong in the other direction: nothing was refused and
+        nothing was withheld."""
+        if paid["bal"] is not None:
+            return paid["bal"]
+        return ShodanBalance(
+            remaining=None, allowance=None, reserve=_shodan_reserve_setting(), spendable=None,
+            may_spend=True,
+            reason="balance not consulted — every requested page was already owned by this project")
+
     cooldown = _ProviderCooldown()
-    bal = _read_shodan_balance(key, cooldown=cooldown)
+    # THE BALANCE IS PROVIDER CONTACT and is therefore read lazily, after replay, and only if pages
+    # remain to buy (Lumpy, 2026-08-05). A run whose project already owns everything it needs now issues
+    # NO request at all — not a balance read, not a free count.
+    paid: dict = {"bal": None, "sizing": None, "consulted": False}
     try:
         found: dict = {spec.sid: set() for spec, _vals in lanes}
         oos: dict = {spec.sid: {"seen": 0, "invalid": 0, "kept": set()} for spec, _vals in lanes}
@@ -831,16 +858,34 @@ def _shodan_work_locked(ctx, key, lanes):
 
         states = [shodan_sched.PivotState(shodan_sched.Pivot(spec.sid, spec.facet, v))
                   for spec, vals in lanes for v in vals]
-        sizing, refused = _size_pivots(key, states, ledger=ledger, attempt_dir=attempt_dir,
-                                       cooldown=cooldown, refused=_SIZING_REFUSED.get(bal.stop_kind))
-        if refused:
-            # a count PROVED the credential is refused. /api-info may well have SUCCEEDED — a key can be
-            # revoked between the two — so spending stops while the measured balance and `read_error` are
-            # left exactly as /api-info reported them. review-B1.5r4#3: overwriting `read_error` made
-            # reconciliation announce "balance read failed" about a read that worked.
-            bal = dataclasses.replace(bal, may_spend=False, spendable=0, count_refused=refused,
-                                      stop_kind=SHODAN_AUTH_REFUSED,
-                                      reason=f"shodan refused the credential on /host/count ({refused})")
+
+        def enter_paid_phase():
+            """Everything that touches Shodan, entered ONLY once replay has finished and pages remain.
+
+            Balance first (free, and it decides whether spending is permitted at all), then sizing —
+            both paced by the same cooldown as purchasing, because both are provider contact."""
+            paid["consulted"] = True
+            bal = _read_shodan_balance(key, cooldown=cooldown)
+            # held IMMEDIATELY: review-B1.5r5#3 — a failure in sizing (or anywhere after) must still
+            # leave exactly one balance record per lane, which is the missing-lifecycle hole this
+            # telemetry exists to close. Reading it lazily must not reopen that.
+            paid["bal"] = bal
+            sizing, refused = _size_pivots(key, states, ledger=ledger, attempt_dir=attempt_dir,
+                                           cooldown=cooldown,
+                                           refused=_SIZING_REFUSED.get(bal.stop_kind))
+            paid["sizing"] = sizing
+            if refused:
+                # a count PROVED the credential is refused. /api-info may well have SUCCEEDED — a key can
+                # be revoked between the two — so spending stops while the measured balance and
+                # `read_error` are left exactly as /api-info reported them. review-B1.5r4#3: overwriting
+                # `read_error` made reconciliation announce "balance read failed" about a working read.
+                bal = dataclasses.replace(bal, may_spend=False, spendable=0, count_refused=refused,
+                                          stop_kind=SHODAN_AUTH_REFUSED,
+                                          reason=f"shodan refused the credential on /host/count "
+                                                 f"({refused})")
+            paid["bal"] = bal
+            return bal
+
         def should_stop(cls):
             """Failures further requests cannot get past. NOT a reclassification (review-B1.5r4#1): these
             stay exactly what they are — gaps — and only stop us ASKING.
@@ -851,19 +896,21 @@ def _shodan_work_locked(ctx, key, lanes):
             """
             return cls in ("auth", "forbidden") or (cls == PROVIDER_RATE_LIMIT and cooldown.hits > 1)
 
-        res = shodan_sched.run_work(ctx, states=states, balance=bal, search=search, ingest=ingest,
+        res = shodan_sched.run_work(ctx, states=states, balance=enter_paid_phase, search=search,
+                                    ingest=ingest,
                                     parse=_parse_owned_page,
                                     ledger=ledger, attempt_dir=attempt_dir, max_pages=max_pages,
                                     should_stop=should_stop, ttl_days=page_ttl)
-        return _SharedWork(balance=bal, result=res, found=found, errs=errs, oos=oos, names=hostnames,
-                           sizing=sizing, max_pages=max_pages)
+        return _SharedWork(balance=settled_balance(), result=res, found=found, errs=errs, oos=oos, names=hostnames,
+                           sizing=paid["sizing"] or {}, max_pages=max_pages)
     finally:
         # review-B1.5r5#3: emitting after sizing made the record reflect what the run ACTED on, but
         # also meant a failure in state setup, the cooldown or sizing itself left NO balance event —
         # reopening the missing-lifecycle hole this telemetry exists to close. Exactly one record per
         # lane, on every path, carrying the final state of `bal`.
+        settled = settled_balance()
         for spec, _vals in lanes:
-            _emit_shodan_balance(spec.sid, bal)
+            _emit_shodan_balance(spec.sid, settled)
 
 
 def _hostname_facts(nm: dict) -> list:

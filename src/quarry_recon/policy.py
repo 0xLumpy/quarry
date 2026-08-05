@@ -300,6 +300,9 @@ EXCLUDED: dict[str, tuple[str, str]] = {
         "resource", "one provider response is read into memory; hitting it RAISES (`oversize`)"),
     "quarry_recon.phases.vertical:CERTSPOTTER_READ_LIMIT": (
         "resource", "one provider response is read into memory; hitting it RAISES (`oversize`)"),
+    "quarry_recon.phases.probe:_SHODAN_MIN_INTERVAL_S": (
+        "rate", "the minimum gap between two SHODAN requests — pressure on a THIRD-PARTY API, not on a "
+        "target (RATELIMIT.HTTP). It paces provider contact only; replaying owned evidence never waits"),
     "quarry_recon.phases.probe:SHODAN_PARSE_LIMIT": (
         "resource", "how large an artifact we PARSE in one process. The bytes are still acquired, owned "
         "and published beyond it — this bounds RAM, never what a paid response may contain"),

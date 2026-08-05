@@ -887,14 +887,28 @@ def run_work(ctx, *, states, balance, search, ingest, ledger, attempt_dir,
         o.pivots += 1
     try:
         try:
+            # REPLAY FIRST, ALWAYS. Owned evidence is on disk: it contacts nobody, spends nothing, and
+            # must not wait behind a provider's slowdown (Lumpy, 2026-08-05 — measured: run B slept 301 s
+            # honouring a 429 raised by the FREE sizing pass, and only then replayed two pages it already
+            # owned). Replay happens whenever a project owns pages: a resumed run, a NEW run over the
+            # same project, a campaign child, another lane's lifecycle — not just crash recovery.
             _replay_indexed(states, res, ledger=ledger, ingest=ingest, ttl_days=ttl_days)
             _apply_cardinality(states, res)
             for st in states:                      # what aging DECLINED to buy, per lane
                 res.lanes[st.pivot.lane].refresh_refused += st.refused_refresh(max_pages)
+            # …and ONLY NOW is the provider consulted. `balance` may be a CALLABLE so that the balance
+            # read and the free `/host/count` sizing pass happen AFTER replay rather than in front of it.
+            #
+            # They are not skipped when everything is owned: counting is how GROWTH beyond a completed
+            # pagination is found, and an old completion is not permanent. What changed is the ORDER —
+            # a cooldown governs provider contact, and replay is not provider contact.
+            if callable(balance):
+                balance = balance()
             try:
-                _work(states, res, balance=balance, search=search, ingest=ingest, ledger=ledger,
-                      attempt_dir=attempt_dir, max_pages=max_pages, is_limit=is_limit,
-                      should_stop=should_stop)
+                if balance is not None:
+                    _work(states, res, balance=balance, search=search, ingest=ingest, ledger=ledger,
+                          attempt_dir=attempt_dir, max_pages=max_pages, is_limit=is_limit,
+                          should_stop=should_stop, parse=parse)
             except LaneMachineryError as e:
                 # review-B1.7a#6: a bought page one lane could not ingest ends PURCHASING — which the
                 # stop cause already says — but it must not skip the FREE sweep of pages other lanes

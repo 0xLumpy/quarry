@@ -1189,3 +1189,109 @@ class TestAcquisitionIsCommittedBeforeInterpretation:
         led.save()
         second = self._lane(tmp_path, response=b"unused", parse=lambda p: None)
         assert second["issued"] == [] and second["outcome"].acquisition_invalid == 1
+
+
+class TestCooldownGovernsProviderContactOnly:
+    """Lumpy, 2026-08-05, from the §5 measurement: run B slept 301 s honouring a 429 raised by the FREE
+    sizing pass and only then replayed two pages it already owned (`oldest_replay_s: 302.3` — they aged
+    by exactly the sleep).
+
+    Replay is LOCAL. It happens whenever a project owns pages — a resumed run, a new run over the same
+    project, a campaign child, another lane's lifecycle — and a penalty recorded seconds earlier can
+    still be in force. None of that is a reason to delay reading a file we already paid for."""
+
+    @staticmethod
+    def _owned(tmp_path):
+        """A project that already owns page 1 of one pivot."""
+        from quarry_recon import budget
+        base = S.state_dir(tmp_path)
+        attempt = base / "pages" / "a0"
+        attempt.mkdir(parents=True, exist_ok=True)
+        pivot = Pivot(FAV, "http.favicon.hash", "1")
+        doc = S._page_doc(pivot, 1, 3, [{"ip_str": "203.0.113.1", "hostnames": ["a.example"]}])
+        art = attempt / f"{S.item_key(pivot, 1)}.json"
+        art.write_text(__import__("json").dumps(doc))
+        led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
+                            lane="probe.shodan")
+        led.record(S.item_key(pivot, 1), art)
+        led.save()
+        return led, attempt, pivot
+
+    def test_owned_pages_replay_BEFORE_the_provider_is_consulted(self, tmp_path):
+        """The ordering, asserted as an ORDER: every replay happens before the balance is read."""
+        led, attempt, pivot = self._owned(tmp_path)
+        order = []
+
+        def balance():
+            order.append("provider")
+            return type("B", (), {"spendable": 0, "may_spend": False, "reserve": 0})()
+
+        res = S.run_work(None, states=[PivotState(pivot=pivot)], balance=balance,
+                         search=lambda pv, pg: pytest.fail("no purchase was needed"),
+                         ingest=lambda pv, pg, ms, art: order.append("replay") or len(ms),
+                         ledger=led, attempt_dir=attempt, max_pages=1)
+        assert order and order[0] == "replay", order
+        assert res.lanes[FAV].pages_replayed == 1
+
+    def test_a_LIVE_penalty_does_not_delay_replay(self, tmp_path, monkeypatch):
+        """A resume may start seconds after the failure that earned a 300 s penalty. The owned page must
+        come back instantly anyway — it costs no request and no credit."""
+        import time as _t
+        from quarry_recon.phases import probe
+        led, attempt, pivot = self._owned(tmp_path)
+        cooldown = probe._ProviderCooldown()
+        cooldown.until = _t.monotonic() + 300.0          # a penalty recorded moments ago
+        slept: list = []
+        monkeypatch.setattr(probe._time, "sleep", lambda s: slept.append(s))
+
+        events: list = []
+
+        def balance():
+            # the provider phase still runs — the free count is how GROWTH beyond a completed
+            # pagination is found — and it honours the penalty. It simply no longer runs FIRST.
+            events.append(("provider", list(slept)))
+            cooldown.wait()
+            return type("B", (), {"spendable": 0, "may_spend": False, "reserve": 0})()
+
+        started = _t.perf_counter()
+        res = S.run_work(None, states=[PivotState(pivot=pivot)], balance=balance,
+                         search=lambda pv, pg: pytest.fail("a request was issued"),
+                         ingest=lambda pv, pg, ms, art: events.append(("replay", list(slept))) or len(ms),
+                         ledger=led, attempt_dir=attempt, max_pages=1)
+        assert res.lanes[FAV].pages_replayed == 1
+        assert [k for k, _ in events][:2] == ["replay", "provider"], events
+        assert events[0][1] == [], "replay must not wait on a provider slowdown"
+        assert slept and slept[0] > 200, "…and the penalty is still honoured for provider contact"
+        assert _t.perf_counter() - started < 5.0, "the wait was recorded, not actually slept in the test"
+
+    def test_the_cooldown_paces_requests_it_does_not_only_react(self, monkeypatch):
+        """review (Lumpy): with no minimum interval we generated the 429 ourselves — four requests in
+        ~3 s — and then honoured a penalty of up to 300 s for it. Pacing is the control."""
+        import time as _t
+        from quarry_recon.phases import probe
+        slept: list = []
+        monkeypatch.setattr(probe._time, "sleep", lambda s: slept.append(s))
+        monkeypatch.setattr(probe, "_SHODAN_MIN_INTERVAL_S", 1.05)   # offline runs disable pacing
+        c = probe._ProviderCooldown()
+        c.wait()                                          # the first request waits for nothing
+        assert slept == []
+        c.wait()                                          # the second is paced behind it
+        assert slept and slept[0] > 0.5, slept
+
+    def test_the_shipped_interval_matches_the_providers_own_rule(self):
+        """Asserted against the SOURCE, because the offline suite deliberately zeroes the live value."""
+        import inspect
+        from quarry_recon.phases import probe
+        src = inspect.getsource(probe)
+        line = next(ln for ln in src.splitlines() if ln.startswith("_SHODAN_MIN_INTERVAL_S ="))
+        assert float(line.split("=")[1].strip()) >= 1.0, "Shodan documents about one request per second"
+
+    def test_a_provider_penalty_still_outranks_the_pacing_interval(self, monkeypatch):
+        import time as _t
+        from quarry_recon.phases import probe
+        slept: list = []
+        monkeypatch.setattr(probe._time, "sleep", lambda s: slept.append(s))
+        c = probe._ProviderCooldown()
+        c.until = _t.monotonic() + 42.0
+        c.wait()
+        assert slept and slept[0] > 40, "the provider's own slowdown is the longer of the two"

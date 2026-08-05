@@ -91,3 +91,20 @@ def profile(tmp_path):
         return TargetProfile.load(p)
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _no_provider_pacing(request, monkeypatch):
+    """Offline tests have no provider to be polite to, so they must not SLEEP for one.
+
+    Shodan requests are paced at ~1/s in production (we generated our own 429s without it, and paid up
+    to 300 s for each). Offline the network is blocked outright, so the interval protects nothing and
+    only makes the suite three times slower. Tests that assert the pacing MECHANISM set the interval
+    themselves; `live`/`integration` tests keep the real one."""
+    if request.node.get_closest_marker("live") or request.node.get_closest_marker("integration"):
+        return
+    try:
+        from quarry_recon.phases import probe
+    except Exception:
+        return
+    monkeypatch.setattr(probe, "_SHODAN_MIN_INTERVAL_S", 0.0, raising=False)
