@@ -937,12 +937,19 @@ def _shodan_result(spec, values, work):
     # the four page dispositions, named so a reader can tell CURRENT evidence from history and from a
     # purchase this run declined to make. `replayed_fresh` carries its age because "current" without an
     # age is exactly the eternal-cache claim this policy exists to prevent.
-    if o.pages_bought or o.pages_replayed or o.pages_aged or o.refresh_refused:
+    if (o.pages_bought or o.pages_replayed or o.pages_aged or o.refresh_refused
+            or o.pages_lost):
         events.coverage_partial(
             spec.sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_pages", unit=f"{spec.sid}.pages",
-            eligible=o.pages_bought + o.pages_replayed + o.pages_aged,
-            tested=o.pages_bought + o.pages_replayed, omitted=o.pages_aged,
-            reason=(f"bought={o.pages_bought}; replayed_fresh={o.pages_replayed}"
+            # a LOST page is eligible evidence this project paid for and cannot show, so it belongs in
+            # the denominator and in `omitted` beside the aged ones — not quietly outside both.
+            eligible=o.pages_bought + o.pages_replayed + o.pages_aged + o.pages_lost,
+            tested=o.pages_bought + o.pages_replayed, omitted=o.pages_aged + o.pages_lost,
+            reason=(f"bought={o.pages_bought}"
+                    + (f"; lost={o.pages_lost} (already paid for; the stored artifact no longer "
+                       f"verifies), repair_refused={o.repair_refused} (NOT re-bought: an evidence "
+                       f"loss is not a spending permission)" if o.pages_lost else "")
+                    + f"; replayed_fresh={o.pages_replayed}"
                     + (f" (oldest {o.oldest_replay_s / 86400:.1f}d)" if o.pages_replayed else "")
                     + f"; aged_available={o.pages_aged} (kept as history, excluded from current "
                       f"evidence); refresh_refused={o.refresh_refused} (a purchase this run did NOT "

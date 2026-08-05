@@ -64,6 +64,9 @@ class PivotState:
     #: are not current evidence — and apart from "missing", because they were paid for and must never be
     #: silently re-bought.
     aged_pages: set = field(default_factory=set)
+    #: pages we own on paper and cannot prove. Skipped by `next_page` for the same reason aged pages are:
+    #: scheduling one means buying it, and this run has no authority to repair paid evidence.
+    lost_pages: set = field(default_factory=set)
     attempted: bool = False                 # a request was ISSUED for this pivot (a credit was spent)
     cardinality: "int | None" = None      # /host/count sizing, held SEPARATELY from `total` so neither
                                           # can contaminate the other (review-B1.5r1#1)
@@ -106,7 +109,8 @@ class PivotState:
             return None
         # an AGED page is skipped, never scheduled: it is already paid for, and buying it again merely
         # because time passed is a spend the operator did not ask for. The refusal is counted, not hidden.
-        while self._cursor in self.pages_done or self._cursor in self.aged_pages:
+        while (self._cursor in self.pages_done or self._cursor in self.aged_pages
+               or self._cursor in self.lost_pages):
             self._cursor += 1
         pages = self.page_count()
         if pages is None:
@@ -328,6 +332,14 @@ class LaneOutcome:
     pivots: int = 0
     pivots_touched: int = 0                 # at least one page bought or replayed
     pages_bought: int = 0
+    #: pages this project ALREADY PAID FOR whose stored artifact can no longer be proven (deleted,
+    #: altered, or filed without a digest). The completion is dropped by the ledger and the evidence is
+    #: genuinely gone — but it is NOT bought again: an evidence loss is not a spending permission.
+    pages_lost: int = 0
+    #: a lost page the pivot would otherwise have asked for, that this run declined to re-buy. Sibling of
+    #: `refresh_refused`: repairing paid evidence is an explicit operator decision Quarry cannot make for
+    #: itself, and `--unbound` is not that decision — it never authorises spending.
+    repair_refused: int = 0
     pages_replayed: int = 0                 # replayed FRESH: inside the TTL, used as current evidence
     #: owned, but older than the TTL. The artifact is KEPT and reported as historical evidence; it is not
     #: ingested as a current result, and it is never re-bought merely because time passed.
@@ -786,6 +798,14 @@ def _apply_cardinality(states, res) -> None:
 def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_pages, is_limit,
           should_stop=None) -> None:
     should_stop = should_stop or (lambda cls: False)
+    # An ownership index that EXISTS and cannot be trusted is not an empty one. Reading it as empty makes
+    # a corrupt file into permission to buy every page again — the same laundering route as a lost
+    # artifact, one level up (review#1, Lumpy). Nothing is bought until an operator resolves it; replay
+    # has already taken whatever could still be proven.
+    unreadable = getattr(ledger, "unreadable", "")
+    if unreadable:
+        res.stop_cause = res.stop_cause or f"ownership_unreadable:{unreadable}"
+        return
     spendable = balance.spendable
     if not balance.may_spend:
         spendable = 0
@@ -840,6 +860,16 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
             replayed = _replay_one(st, o, page=page, ledger=ledger, ingest=ingest)
             if replayed:
                 progressed = True
+                continue
+            # a page this project ALREADY PAID FOR whose artifact no longer verifies. The evidence is
+            # gone, but "gone" is not an authorisation: buying it again is a fresh charge, and reporting
+            # a surprise charge afterwards does not authorise it (review#1, Lumpy). It is refused on
+            # exactly the terms an AGED page is — the loss is admitted, the pivot moves on, and repair
+            # waits for an explicit operator refresh/repair policy that does not exist yet.
+            if item_key(st.pivot, page) in getattr(ledger, "lost", {}):
+                o.pages_lost += 1
+                o.repair_refused += 1
+                st.lost_pages.add(page)
                 continue
             if spendable is not None and spent >= spendable:
                 continue                                  # no credit for this page; remainder reports it
@@ -1006,7 +1036,8 @@ def _unqueried_kind(balance, stop_cause: str = "") -> str:
         if stop_cause == "budget_provider" or stop_cause.startswith("provider_limit:"):
             return events.COVERAGE_PROVIDER              # the provider's balance was the boundary
         # provider_stop:* is a FAILURE we stopped requesting through — a gap, never a soft limit.
-        # publish_failed / ledger_unwritable / scheduler_invariant — all OURS, all defects
+        # publish_failed / ledger_unwritable / scheduler_invariant / ownership_unreadable — all OURS,
+        # all defects
         return events.COVERAGE_TIMEOUT
     kind = getattr(balance, "stop_kind", "") or ""
     if kind in (SHODAN_PROVIDER_EXHAUSTED, SHODAN_ENTITLEMENT):

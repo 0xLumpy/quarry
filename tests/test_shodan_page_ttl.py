@@ -313,3 +313,303 @@ class TestTheSharedStoreIsLocked:
         cov = [e for e in evs if e["event"] == "coverage_partial" and e.get("measure") == "shodan_pages"]
         assert cov and "another run holds this project's purchased-page store" in cov[0]["reason"]
         events.reset()
+
+
+class TestLostEvidenceIsNotASpendingPermission:
+    """`Ledger` drops an unverifiable completion silently ("unverifiable -> redo", `budget.py`). Redo is
+    free for an unpaid lane and a CHARGE here.
+
+    review#1 (Lumpy): counting the charge afterwards does not authorise it. A lost page is refused on the
+    same terms as an AGED one — the loss is admitted, the page is never scheduled again, and repair waits
+    for an explicit operator policy. An earlier version of this class asserted the opposite (it pinned
+    the automatic repurchase as correct), which is why the tests below assert `search` is never called."""
+
+    @staticmethod
+    def _buy(tmp_path, *, values=("1",), pages=1, issued=None):
+        """Drive the REAL purchase path against a real Ledger, and return (ledger, outcome).
+
+        `issued` collects every page the lane actually ASKED the provider for — the only evidence that
+        distinguishes "refused" from "reported"."""
+        import json as _json
+        from quarry_recon import budget
+        base = S.state_dir(tmp_path)
+        base.mkdir(parents=True, exist_ok=True)
+        led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
+                            lane="probe.shodan")
+        states = [PivotState(pivot=Pivot(FAV, "http.favicon.hash", v)) for v in values]
+        res = S.WorkResult()
+        res.lanes.setdefault(FAV, S.LaneOutcome(lane=FAV))
+        bal = type("B", (), {"spendable": 10, "may_spend": True, "reserve": 0})()
+        def _search(pivot, page):
+            if issued is not None:
+                issued.append((pivot.value, page))
+            return ([{"ip_str": "203.0.113.1"}], pages, None)
+        S._work(states, res, balance=bal, search=_search,
+                ingest=lambda *a: 0, ledger=led, attempt_dir=base / "pages",
+                max_pages=pages, is_limit=lambda cls: False)
+        del _json
+        return led, res.lanes[FAV]
+
+    def test_a_first_purchase_is_not_a_loss(self, tmp_path):
+        _led, o = self._buy(tmp_path)
+        assert o.pages_bought == 1 and o.pages_lost == 0 and o.repair_refused == 0
+
+    def test_an_altered_artifact_is_admitted_as_lost_and_NOT_re_bought(self, tmp_path):
+        import json as _json
+        led, first = self._buy(tmp_path)
+        assert first.pages_bought == 1
+        art = next(iter(dict(led.items()).values()))
+        doc = _json.loads(art.read_text())
+        doc["matches"] = []                                  # same identity, different bytes
+        art.write_text(_json.dumps(doc))
+        issued = []
+        _led2, o = self._buy(tmp_path, issued=issued)
+        assert issued == [], "no request may be issued to repair evidence this run cannot authorise"
+        assert o.pages_bought == 0
+        assert o.pages_lost == 1 and o.repair_refused == 1
+
+    def test_a_vanished_artifact_is_admitted_as_lost_and_NOT_re_bought(self, tmp_path):
+        led, _first = self._buy(tmp_path)
+        next(iter(dict(led.items()).values())).unlink()
+        issued = []
+        _led2, o = self._buy(tmp_path, issued=issued)
+        assert issued == [] and o.pages_bought == 0
+        assert o.pages_lost == 1 and o.repair_refused == 1
+
+    def test_every_lost_page_is_refused_not_just_the_first(self, tmp_path):
+        import json as _json
+        led, _ = self._buy(tmp_path, values=("1", "2"))
+        for art in dict(led.items()).values():
+            doc = _json.loads(art.read_text()); doc["matches"] = []
+            art.write_text(_json.dumps(doc))
+        issued = []
+        _led2, o = self._buy(tmp_path, values=("1", "2"), issued=issued)
+        assert issued == [] and o.pages_bought == 0
+        assert o.pages_lost == 2 and o.repair_refused == 2
+
+    def test_a_lost_page_is_never_scheduled_again_inside_the_run(self, tmp_path):
+        """Refusing without removing the page from selection would loop the scheduler over it."""
+        st = PivotState(pivot=Pivot(FAV, "http.favicon.hash", "1"), total=250)
+        st.lost_pages.add(1)
+        assert st.next_page(max_pages=0) == 2, "a lost page is skipped, like an aged one"
+
+    def test_a_healthy_neighbour_still_buys(self, tmp_path):
+        """The refusal is per PAGE. A loss must not stop the pivot beside it from working."""
+        import json as _json
+        led, _ = self._buy(tmp_path, values=("1", "2"))
+        art = dict(led.items())[S.item_key(Pivot(FAV, "http.favicon.hash", "1"), 1)]
+        doc = _json.loads(art.read_text()); doc["matches"] = []
+        art.write_text(_json.dumps(doc))
+        art.with_name(art.name)                              # only pivot "1" is damaged
+        (led.path.parent / "pages").mkdir(exist_ok=True)
+        issued = []
+        _led2, o = self._buy(tmp_path, values=("1", "2"), issued=issued)
+        assert o.pages_lost == 1 and o.repair_refused == 1
+        assert issued == [], "pivot 2 still OWNS its page, so it replays rather than buying"
+        assert o.pages_replayed == 1
+
+    def test_the_ledger_records_which_items_it_could_not_verify(self, tmp_path):
+        import json as _json
+        from quarry_recon import budget
+        led, _ = self._buy(tmp_path)
+        item, art = next(iter(led.items()))
+        doc = _json.loads(art.read_text()); doc["total"] = 999
+        art.write_text(_json.dumps(doc))
+        reopened = budget.Ledger(led.path, lane="probe.shodan")
+        assert item in reopened.lost, "a dropped completion must leave a trace, not vanish"
+        assert not reopened.has(item), "…and it must still fail CLOSED, i.e. be redone"
+
+    def test_a_clean_store_loses_nothing(self, tmp_path):
+        from quarry_recon import budget
+        led, _ = self._buy(tmp_path)
+        reopened = budget.Ledger(led.path, lane="probe.shodan")
+        assert reopened.lost == {}, "an intact store must never accuse itself of a loss"
+
+    def test_a_completion_filed_without_a_digest_counts_as_lost_too(self, tmp_path):
+        """The other unverifiable shape: `done` names an artifact the snapshot never hashed. It is redone
+        for the same reason, so it is the same kind of spend."""
+        import json as _json
+        from quarry_recon import budget
+        led, _ = self._buy(tmp_path)
+        led.save()                                           # the snapshot, not just the journal
+        snap = _json.loads(led.path.read_text())
+        snap["digests"] = {}                                 # recorded as done, never hashed
+        led.path.write_text(_json.dumps(snap))
+        led.journal.unlink(missing_ok=True)                  # replay would re-add the digest
+        reopened = budget.Ledger(led.path, lane="probe.shodan")
+        assert list(reopened.lost) == list(snap["done"]) and not reopened.done
+
+
+class TestAnUnreadableOwnershipStoreIsNotAnEmptyOne:
+    """review#1 (Lumpy): `_read_snapshot()` returned `{}, {}` for a file that could not be parsed, was
+    the wrong shape, or was unreadable — indistinguishable from "no store yet". A PAID lane then saw a
+    clean slate and could buy every page again. `Ledger.lost` only ever covered item-level artifact
+    failures; this is the same laundering route one level up."""
+
+    @staticmethod
+    def _seed(tmp_path):
+        return TestLostEvidenceIsNotASpendingPermission._buy(tmp_path)
+
+    @pytest.mark.parametrize("corrupt,why", [
+        (lambda p: p.write_text("{not json"), "not valid JSON"),
+        (lambda p: p.write_text("[]"), "root is a list"),
+        (lambda p: p.write_text('{"lane": "probe.shodan", "done": "nope", "digests": {}}'),
+         "done is not an index"),
+        (lambda p: p.write_text('{"lane": "probe.shodan", "done": {}, "digests": 7}'),
+         "digests is not an index"),
+    ])
+    def test_a_corrupt_state_file_is_reported_not_treated_as_empty(self, tmp_path, corrupt, why):
+        from quarry_recon import budget
+        led, _ = self._seed(tmp_path)
+        led.save()
+        led.journal.unlink(missing_ok=True)
+        corrupt(led.path)
+        reopened = budget.Ledger(led.path, lane="probe.shodan")
+        assert reopened.unreadable, f"{why}: an existing store that cannot be read must say so"
+        assert not reopened.done
+
+    def test_a_store_that_was_never_written_is_simply_absent(self, tmp_path):
+        from quarry_recon import budget
+        led = budget.Ledger(tmp_path / "never-written.json", lane="probe.shodan")
+        assert led.unreadable == "", "absent is not corrupt; a first run must not be blocked"
+
+    def test_a_clean_store_is_not_accused(self, tmp_path):
+        from quarry_recon import budget
+        led, _ = self._seed(tmp_path)
+        led.save()
+        assert budget.Ledger(led.path, lane="probe.shodan").unreadable == ""
+
+    def test_a_torn_journal_TAIL_is_not_corruption(self, tmp_path):
+        """A crash mid-append is expected and costs nothing: the record was never complete."""
+        from quarry_recon import budget
+        led, _ = self._seed(tmp_path)
+        with led.journal.open("a") as fh:
+            fh.write('{"v": 1, "l": "probe.shodan", "i": "x"')      # no terminator
+        assert budget.Ledger(led.path, lane="probe.shodan").unreadable == ""
+
+    def test_a_garbled_journal_record_BEFORE_the_end_is_corruption(self, tmp_path):
+        """Intact records behind a bad one mean a completion was destroyed, not merely half-written."""
+        from quarry_recon import budget
+        led, _ = self._seed(tmp_path)
+        lines = led.journal.read_text().splitlines()
+        led.journal.write_text("\n".join(["{garbled", *lines]) + "\n")
+        assert budget.Ledger(led.path, lane="probe.shodan").unreadable
+
+    def test_the_paid_lane_BUYS_NOTHING_against_an_untrusted_store(self, tmp_path):
+        """The whole point: refusal happens before the provider call, not in the report afterwards."""
+        from quarry_recon import budget
+        led, first = self._seed(tmp_path)
+        assert first.pages_bought == 1
+        led.save()
+        led.journal.unlink(missing_ok=True)
+        led.path.write_text("{ this is not a ledger")
+        issued = []
+        _led2, o = TestLostEvidenceIsNotASpendingPermission._buy(tmp_path, issued=issued)
+        assert issued == [], "a corrupt index must never authorise a purchase"
+        assert o.pages_bought == 0
+
+    def test_the_refusal_names_itself_in_the_run(self, tmp_path):
+        from quarry_recon import budget
+        base = S.state_dir(tmp_path)
+        base.mkdir(parents=True, exist_ok=True)
+        path = budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}")
+        path.write_text("{ nope")
+        led = budget.Ledger(path, lane="probe.shodan")
+        st = PivotState(pivot=Pivot(FAV, "http.favicon.hash", "1"))
+        res = S.WorkResult()
+        res.lanes.setdefault(FAV, S.LaneOutcome(lane=FAV))
+        bal = type("B", (), {"spendable": 10, "may_spend": True, "reserve": 0})()
+        S._work([st], res, balance=bal,
+                search=lambda pivot, page: pytest.fail("a purchase was attempted"),
+                ingest=lambda *a: 0, ledger=led, attempt_dir=base / "pages",
+                max_pages=1, is_limit=lambda cls: False)
+        assert res.stop_cause.startswith("ownership_unreadable:")
+
+
+class TestAnUntrustedStoreIsREADONLY:
+    """review#1 (Lumpy): both lanes refused to BUY against an unreadable store and then called
+    `ledger.save()` in their `finally`, which compacted this run's empty maps over the corrupt snapshot.
+    The next run opened a healthy, empty ownership index and could buy everything — the original
+    repurchase route one lifecycle later, with the evidence that should have blocked it destroyed on the
+    way. A refusal that the next write launders is not a refusal."""
+
+    @staticmethod
+    def _corrupt(tmp_path, *, kind="snapshot"):
+        """A store with one page really bought, then damaged. Returns (ledger_path, bytes-before)."""
+        from quarry_recon import budget
+        led, o = TestLostEvidenceIsNotASpendingPermission._buy(tmp_path)
+        assert o.pages_bought == 1
+        led.save()
+        if kind == "snapshot":
+            led.journal.unlink(missing_ok=True)
+            led.path.write_text('{"lane": "probe.shodan", "done": "not an index", "digests": {}}')
+            target = led.path
+        else:                                            # a garbled record BEFORE the end of the journal
+            lines = led.journal.read_text().splitlines() if led.journal.exists() else []
+            led.journal.write_text("\n".join(["{garbled", *lines]) + "\n")
+            target = led.journal
+        return led.path, target, target.read_bytes()
+
+    @pytest.mark.parametrize("kind", ["snapshot", "journal"])
+    def test_a_refused_run_leaves_the_STORE_BYTE_IDENTICAL(self, tmp_path, kind):
+        from quarry_recon import budget
+        path, target, before = self._corrupt(tmp_path, kind=kind)
+        led = budget.Ledger(path, lane="probe.shodan")
+        assert led.unreadable
+        assert led.save() is False, "compaction would overwrite the corrupt state with an empty one"
+        assert led.checkpoint() is False and led.record.__name__ == "record"
+        assert target.read_bytes() == before, "an untrusted store must not be modified at all"
+
+    @pytest.mark.parametrize("kind", ["snapshot", "journal"])
+    def test_the_refusal_SURVIVES_a_second_lifecycle(self, tmp_path, kind):
+        """The end-to-end shape: refuse, change nothing, and still refuse when reopened."""
+        from quarry_recon import budget
+        path, target, before = self._corrupt(tmp_path, kind=kind)
+        for cycle in (1, 2):
+            issued = []
+            _led, o = TestLostEvidenceIsNotASpendingPermission._buy(tmp_path, issued=issued)
+            assert issued == [], f"cycle {cycle}: a corrupt store authorised a purchase"
+            assert o.pages_bought == 0
+            assert budget.Ledger(path, lane="probe.shodan").unreadable, \
+                f"cycle {cycle}: the store healed itself instead of staying refused"
+            assert target.read_bytes() == before, f"cycle {cycle}: the store was rewritten"
+
+    def test_a_garbled_journal_record_is_NOT_repaired_away(self, tmp_path):
+        """review#2: the repair path rewrote the journal from `kept`, deleting the damaged record — the
+        one piece of evidence that proved the history is incomplete."""
+        from quarry_recon import budget
+        path, journal, before = self._corrupt(tmp_path, kind="journal")
+        led = budget.Ledger(path, lane="probe.shodan")
+        assert led.unreadable and journal.read_bytes() == before
+        assert b"{garbled" in journal.read_bytes()
+
+    def test_a_torn_TAIL_is_still_repaired(self, tmp_path):
+        """The benign case keeps its automatic repair: a crash mid-append destroyed nothing."""
+        from quarry_recon import budget
+        led, _ = TestLostEvidenceIsNotASpendingPermission._buy(tmp_path)
+        with led.journal.open("a") as fh:
+            fh.write('{"v": 1, "l": "probe.shodan", "i": "half-written"')
+        reopened = budget.Ledger(led.path, lane="probe.shodan")
+        assert reopened.unreadable == ""
+        assert reopened.journal.read_text().endswith("\n"), "the intact prefix is restored"
+        assert reopened.save() is True
+
+    def test_an_unreadable_PATH_is_not_read_as_absent(self, tmp_path):
+        """review#3: `Path.exists()` returns False for a path we may not inspect, so using it as the
+        discriminator cleared `unreadable` on exactly the permission failure it exists to catch."""
+        import os
+        from quarry_recon import budget
+        led, _ = TestLostEvidenceIsNotASpendingPermission._buy(tmp_path)
+        led.save()
+        led.journal.unlink(missing_ok=True)
+        d = led.path.parent
+        mode = d.stat().st_mode
+        os.chmod(d, 0o000)
+        try:
+            if os.access(led.path, os.R_OK):
+                pytest.skip("running as root: an unreadable path cannot be simulated")
+            reopened = budget.Ledger(led.path, lane="probe.shodan")
+            assert reopened.unreadable, "a path we cannot inspect is UNKNOWN, never empty"
+            assert reopened.save() is False
+        finally:
+            os.chmod(d, mode)

@@ -898,6 +898,18 @@ class Ledger:
         self._journal_unsafe = False          # set when the journal may not be APPENDED to
         self._journal_lost = False            # set when the journal can no longer be REPLAYED
         self.foreign = False                  # set when this PATH belongs to a DIFFERENT lane
+        #: items the snapshot RECORDED as done whose artifact no longer verifies (missing, altered, or
+        #: filed without a digest). They are correctly redone — the evidence really is gone — but for a
+        #: PAID lane "redo" means BUY AGAIN, and a repurchase that looks identical to a first purchase is
+        #: the accidental spend the ownership store exists to prevent. Kept as a fact so a caller can
+        #: report it; this class never decides what a lost item costs.
+        self.lost: dict[str, str] = {}        # item -> the artifact path it was filed under ("" if none)
+        #: set when an ownership index EXISTS and cannot be trusted — unreadable, garbled, or shaped
+        #: wrong. ABSENT and UNUSABLE are different states and were previously the same empty dict: a
+        #: corrupt snapshot read as a clean store, so a PAID lane saw nothing owned and bought every page
+        #: again. That is the same laundering route as a lost artifact, one level up. The reason is kept
+        #: as prose because the caller has to be able to say WHY it refused.
+        self.unreadable: str = ""
         self._raw_evid: dict[str, list] = {}  # unvalidated evidence lists from the snapshot
         self._load()
 
@@ -920,10 +932,20 @@ class Ledger:
     def _read_snapshot(self) -> tuple[dict, dict]:
         try:
             raw = json.loads(self.path.read_text())
-        except (OSError, json.JSONDecodeError):
+        except FileNotFoundError:
+            return {}, {}                     # ABSENT: a first run must not be blocked
+        except OSError as e:
+            # a file we cannot READ is not a file that is not there. `Path.exists()` cannot make that
+            # call — it returns False for a path we lack permission to inspect, which would have cleared
+            # `unreadable` on exactly the permission failure it exists to catch (review#3).
+            self.unreadable = f"state file unreadable: {e}"
+            return {}, {}
+        except json.JSONDecodeError as e:
+            self.unreadable = f"state file is not valid JSON: {e}"
             return {}, {}
         if not isinstance(raw, dict):
-            return {}, {}                     # garbled state: start clean rather than guess
+            self.unreadable = f"state root is {type(raw).__name__}, not an object"
+            return {}, {}
         if raw.get("lane") != self.lane:
             # review#3 (r5): a snapshot belonging to ANOTHER lane must not merely be ignored — save() would
             # then overwrite it and destroy that lane's completions. Mark the path foreign and refuse to write.
@@ -931,6 +953,8 @@ class Ledger:
             return {}, {}
         done, digests = raw.get("done"), raw.get("digests")
         if not (isinstance(done, dict) and isinstance(digests, dict)):
+            self.unreadable = ("state has no usable completion index "
+                               f"(done={type(done).__name__}, digests={type(digests).__name__})")
             return {}, {}
         ev = raw.get("evidence")
         if isinstance(ev, dict):
@@ -955,20 +979,34 @@ class Ledger:
         refuse to append (an append onto a fragment corrupts the next record too)."""
         try:
             text = self.journal.read_text()
-        except OSError:
+        except FileNotFoundError:
+            return                                 # ABSENT: nothing was appended since the last compact
+        except OSError as e:
+            self.unreadable = self.unreadable or f"journal unreadable: {e}"
             return
         lines = text.splitlines()
         kept: list[str] = []
         pending: list[tuple] = []
         damaged = not text.endswith("\n")          # a partial last write leaves no terminator
-        for line in lines:
+        last = len(lines) - 1
+
+        def _lost_record(i: int, why: str) -> None:
+            """A torn TAIL is what a crash mid-append looks like and costs nothing. A bad record with
+            intact records BEHIND it means a completion was destroyed, and this store must not read that
+            as "never owned"."""
+            if i != last or text.endswith("\n"):
+                self.unreadable = self.unreadable or f"journal record {i + 1} {why}"
+
+        for i, line in enumerate(lines):
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 damaged = True
+                _lost_record(i, "is not valid JSON")
                 continue
             if not isinstance(rec, dict):
                 damaged = True
+                _lost_record(i, "is not an object")
                 continue
             if rec.get("v") != self.JOURNAL_SCHEMA or rec.get("l") != self.lane:
                 # NOT OURS. Leave the file completely alone and take nothing from it.
@@ -987,10 +1025,17 @@ class Ledger:
                 kept.append(line)                  # durability probe: carries no state, repairs nothing
             else:
                 damaged = True
+                _lost_record(i, "carries no usable completion")
         for item, rel, dig in pending:
             done[item] = rel
             digests[rel] = dig
-        if damaged:
+        if damaged and self.unreadable:
+            # UNTRUSTED history is EVIDENCE. Rewriting it from `kept` deletes the very record that proved
+            # the store cannot be trusted, and a later run would then find a tidy journal and buy again
+            # (review#2). Nothing is appended either: the bytes stay exactly as they are until an operator
+            # decides what happened.
+            self._journal_unsafe = True
+        elif damaged:
             try:                                    # truncate to the intact prefix so the next append is clean
                 tmp = self.journal.with_name(self.journal.name + ".repair")
                 tmp.write_text("".join(ln + "\n" for ln in kept))
@@ -1009,6 +1054,7 @@ class Ledger:
                 continue
             want = digests.get(rel) if isinstance(rel, str) else None
             if not (isinstance(want, str) and want):
+                self.lost[item] = rel if isinstance(rel, str) else ""
                 continue                       # unverifiable -> redo (fails CLOSED)
             ok = verified.get(rel)
             if ok is None:
@@ -1029,6 +1075,8 @@ class Ledger:
                 self._raw_evid.setdefault(item, [])
                 if rel not in self._raw_evid[item]:
                     self._raw_evid[item].insert(0, rel)
+            else:
+                self.lost[item] = rel          # recorded as done; the bytes do not match what we filed
         # review#2 (A1 r3): retained EVIDENCE is digest-bound too. Replaying whatever matched a glob under
         # attempt-*/ trusted mutable, unbound files — a tampered, planted or symlinked artifact could inject
         # fabricated findings into normalized data. "Immutable" has to be VERIFIED, not assumed.
@@ -1130,7 +1178,9 @@ class Ledger:
         """True when the record is DURABLY journaled. review-B1.3r4: this swallowed OSError silently and
         left both safety flags clear, so a caller could not tell an appended completion from one that
         exists only in memory — and for PAID work that difference is money."""
-        if self.foreign or self._journal_unsafe:
+        if self.foreign or self._journal_unsafe or self.unreadable:
+            # an UNTRUSTED store is read-only. Appending to it would build a healthy-looking history on
+            # top of one we already know is broken.
             return False                       # never append onto a foreign or fragmented journal
         try:
             self.journal.parent.mkdir(parents=True, exist_ok=True)
@@ -1153,8 +1203,13 @@ class Ledger:
         A crash mid-write leaves the previous snapshot AND its journal intact, so nothing is lost.
 
         Returns False without writing anything when the path is FOREIGN (review#3 r5) — overwriting another
-        lane's state would destroy its completions, and the caller reports the failure instead."""
-        if self.foreign:
+        lane's state would destroy its completions, and the caller reports the failure instead.
+
+        The same is true of an UNTRUSTED store, and for the same reason one level down: compaction would
+        write this run's empty maps over the corrupt snapshot, so the NEXT run would open a healthy,
+        empty ownership index and buy every page again — the original repurchase route, one lifecycle
+        later, with the evidence that should have blocked it destroyed on the way (review#1, Lumpy)."""
+        if self.foreign or self.unreadable:
             return False
         # review#3 (r7): the contract is "returns success, never raises". mkdir / write / os.replace can all
         # fail on a full or read-only filesystem, and callers only handled a returned False — so a real IO

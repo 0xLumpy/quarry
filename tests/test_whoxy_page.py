@@ -1297,3 +1297,29 @@ class TestMachineryFailuresPreserveTheOutcome:
         out, _ = _run(tmp_path, _states((COMPANY, "a")), _Provider(totals={"a": 250}), spend=5)
         assert out.unopened == [f"{COMPANY}=a"], out.unopened
         assert out.persisted is not None
+
+
+class TestAnUnreadableOwnershipStoreBlocksPurchase:
+    """review#1 (Lumpy, on the Shodan store): `Ledger._read_snapshot()` returned an empty index for a
+    file that EXISTS and cannot be parsed, so a corrupt ledger read as "nothing owned". This cache is
+    PERMANENT — a page bought here is meant to be paid for once, ever — so an unnoticed re-buy is worse
+    here than anywhere else."""
+
+    def test_a_corrupt_ledger_buys_NOTHING(self, tmp_path):
+        led = _ledger(tmp_path)
+        provider = _Provider()
+        out, seen = _run(tmp_path, _states((COMPANY, "a")), provider, spend=5, ledger=led)
+        assert out.pages_bought >= 1 and seen, "baseline: a clean store buys"
+
+        led.save()
+        led.journal.unlink(missing_ok=True)
+        led.path.write_text("{ this is not a ledger")
+        corrupt = budget.Ledger(led.path, lane="osint.whoxy")
+        assert corrupt.unreadable, "the file exists and cannot be trusted"
+
+        before = len(provider.calls) if hasattr(provider, "calls") else None
+        out2, _ = _run(tmp_path, _states((COMPANY, "a")), provider, spend=5, ledger=corrupt)
+        assert out2.pages_bought == 0, "a corrupt index must never authorise a purchase"
+        assert out2.stop_cause.startswith("ownership_unreadable:")
+        if before is not None:
+            assert len(provider.calls) == before, "no provider call may be made at all"

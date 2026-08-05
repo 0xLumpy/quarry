@@ -722,7 +722,14 @@ def run_pages(states, *, paid, fetch, ingest, read, ledger, attempt_dir, is_limi
     try:
         try:
             _replay(states, o, ledger=ledger, ingest=ingest, read=read)
-            if schedule(states):
+            # An ownership index that EXISTS and cannot be trusted must never read as an empty one: a
+            # corrupt file would otherwise be permission to buy every page of this account again. Same
+            # laundering route as the Shodan store (review#1, Lumpy) — this one holds a PERMANENT cache,
+            # so an unnoticed re-buy here is charged for evidence the project already owns for ever.
+            unreadable = getattr(ledger, "unreadable", "")
+            if unreadable and schedule(states):
+                o.stop_cause = o.stop_cause or f"ownership_unreadable:{unreadable}"
+            elif schedule(states):
                 # PENDING WORK ONLY. A run that owns everything never enters the paid phase, so it never
                 # waits on the account and never reports a gap for access it did not need.
                 try:
