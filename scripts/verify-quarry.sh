@@ -1465,7 +1465,11 @@ class Scope:
 class Run:
     # B1.4: the Shodan lane runs on the shodan_sched coordinator, whose ledger + page artifacts live
     # under the run directory — so a Run stub now has to have one.
-    def __init__(self): self.subs = []; self.revs = []; self.dir = Path(tempfile.mkdtemp())
+    def __init__(self):
+        self.subs = []; self.revs = []; self.dir = Path(tempfile.mkdtemp())
+        # purchased pivot pages are PROJECT-scoped now (a run-scoped store made the next run
+        # pay again), so a Run stub needs the project the way the real one has it
+        self.project_dir = self.dir
     def read(self, e): return [{"favicon": "123"}] if e == "live" else []
     def add(self, e, r): (self.subs if e == "subdomain" else self.revs).append(r); return True
     def raw_path(self, a, b, n): return Path(tempfile.mkdtemp()) / n
@@ -1528,7 +1532,11 @@ class Scope:
     def in_scope(self, h): return h.endswith("acme.com")
     def is_oos(self, h): return False
 class Run:
-    def __init__(self): self.subs = []; self.revs = []; self.dir = Path(tempfile.mkdtemp())
+    def __init__(self):
+        self.subs = []; self.revs = []; self.dir = Path(tempfile.mkdtemp())
+        # purchased pivot pages are PROJECT-scoped now (a run-scoped store made the next run
+        # pay again), so a Run stub needs the project the way the real one has it
+        self.project_dir = self.dir
     def read(self, e): return [{"sha1": "DEADBEEF"}] if e == "certificate" else []
     def add(self, e, r): (self.subs if e == "subdomain" else self.revs).append(r); return True
     def raw_path(self, a, b, n): return Path(tempfile.mkdtemp()) / n
@@ -2506,7 +2514,7 @@ refs = [p.name for p in phase_dir.glob("*.py")
 sys.exit(0 if (ok_valid and ok_decisions and ok_keying and not refs) else 1)
 PYEOF
 
-echo "[89] control-plane step 2 — run_contract() + events (events.py + contract.py): thin wrapper over runner.run emits tool_start/tool_finish around an unchanged RunResult; events.jsonl round-trips; None optional fields dropped (no fake precision); produced/consumed only via ledger() real counts (never stdout); UNKNOWN source_id never reaches _run (fail loud); ALL event fields redacted at sink; the CONTRACT execution wrapper stays wired one phase at a time (only crawl/params import contract) — `import events` for coverage telemetry is allowed (see [116]/[117])"
+echo "[89] control-plane step 2 — run_contract() + events (events.py + contract.py): thin wrapper over runner.run emits tool_start/tool_finish around an unchanged RunResult; events.jsonl round-trips; None optional fields dropped (no fake precision); produced/consumed only via ledger() real counts (never stdout); UNKNOWN source_id never reaches _run (fail loud); ALL event fields redacted at sink; the CONTRACT execution wrapper stays wired one phase at a time (only crawl/params import contract) — 'import events' for coverage telemetry is allowed (see [116]/[117])"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "run_contract wraps runner.run (RunResult unchanged); events round-trip; None fields dropped; ledger() real counts; unknown source_id never executes (SKIPPED + tool_blocked); every event field redacted at sink; step-2 declarative (no phase imports contract/events)" || no "control-plane step 2 broken"
 import sys, json, tempfile, inspect, pathlib
 from quarry_recon import events, contract, sources
@@ -3597,7 +3605,7 @@ c_survives = ("api.acme.com" in ctx.run.values("subdomain"))
 sys.exit(0 if (c_no_active and c_skips and c_survives) else 1)
 PYEOF
 
-echo "[111] scope safety (audit #6) — katana never CRAWLS an OOS host: _katana_scope_flags translates Quarry OOS host patterns into katana -cos (URL regex) on BOTH main + headless passes. Anchors are translated for URL context: host-start `^` -> `://`, host-end `$` -> a host-terminator `(?:[:/?#]|$)` (NOT bare `$`, which would demand the URL end at the hostname and let a path/port/query ESCAPE). Verified: `^jobs\\.`, `jobs\\.example`, and `^jobs\\.example\\.com$` all exclude URLs with path / port / query; empty OOS -> no flags."
+echo "[111] scope safety (audit #6) — katana never CRAWLS an OOS host: _katana_scope_flags translates Quarry OOS host patterns into katana -cos (URL regex) on BOTH main + headless passes. Anchors are translated for URL context: host-start '^' -> '://', host-end '$' -> a host-terminator '(?:[:/?#]|$)' (NOT bare '$', which would demand the URL end at the hostname and let a path/port/query ESCAPE). Verified: '^jobs\\.', 'jobs\\.example', and '^jobs\\.example\\.com$' all exclude URLs with path / port / query; empty OOS -> no flags."
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "OOS -> katana -cos with correct anchor translation (^-> ://, trailing \$ -> host-terminator); all 3 anchor forms exclude path/port/query URLs; in-scope path not excluded; main+headless identical; empty->none" || no "katana OOS scope enforcement broken"
 import sys, re, inspect
 from types import SimpleNamespace
@@ -3685,8 +3693,8 @@ c_oob = ("runner.terminate_group" in inspect.getsource(oob.close_session))
 sys.exit(0 if (c_timeout and c_leader_first and c_sigkill and c_sns and c_ki and c_oob) else 1)
 PYEOF
 
-echo "[113] ingestion (run-audit #6/#7) — file-output tools that were recorded-raw-only now INGESTED: shosubgo writes its names to the -o FILE (not stdout, so exec_tool's r.raw_path was None and 392 names were dropped) -> vertical reads the -o file directly; smap emits nmap-style text (was 505 lines / 0 entities) -> probe parses 'Nmap scan report for <host> (<ip>)' + '<n>/tcp open <svc>' into scoped `port` entities (passive, Shodan-backed)."
-PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "shosubgo reads its -o file (not r.raw_path) -> names ingested; smap nmap-text parsed into ip:port `port` entities, scope-gated; both no longer recorded-raw-only" || no "shosubgo/smap ingestion broken"
+echo "[113] ingestion (run-audit #6/#7) — file-output tools that were recorded-raw-only now INGESTED: shosubgo writes its names to the -o FILE (not stdout, so exec_tool's r.raw_path was None and 392 names were dropped) -> vertical reads the -o file directly; smap emits nmap-style text (was 505 lines / 0 entities) -> probe parses 'Nmap scan report for <host> (<ip>)' + '<n>/tcp open <svc>' into scoped 'port' entities (passive, Shodan-backed)."
+PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "shosubgo reads its -o file (not r.raw_path) -> names ingested; smap nmap-text parsed into ip:port 'port' entities, scope-gated; both no longer recorded-raw-only" || no "shosubgo/smap ingestion broken"
 import sys, re, inspect
 from quarry_recon.phases import vertical, probe
 from quarry_recon import normalize
@@ -4693,7 +4701,7 @@ sys.exit(0 if (c_struct and c_capability and c_suspicious and c_wl_ok and c_byte
          else 1)
 PYEOF
 
-echo "[116] coverage counters (reconcile event-level input omissions into the verdict) — TRUTH policy, not a threshold: any CAP or TIMEOUT with omitted>0 is a GAP (complete_with_gaps) regardless of fraction; an operator SAMPLE with omitted>0 is a soft LIMIT (complete_with_limits); an INCONSISTENT triple is coverage:unknown (gap, never a crash). Aggregation is rerun/resume-safe (LATEST per (source,unit); a coverage_reset GENERATION drops units that vanished on rerun) and NEVER sums incompatible measures (files vs params are separate (source,measure) rollups); keeps a by_kind breakdown (a mixed source reports sample AND timeout distinctly — no relabeling). The 10%/100 rule survives only as a `priority` label. Regressions: cap-any-omit gates, cap-zero-omit clears, disappeared-unit clears, measures-not-summed, mixed distinct, malformed no-crash, sample->limits, priority."
+echo "[116] coverage counters (reconcile event-level input omissions into the verdict) — TRUTH policy, not a threshold: any CAP or TIMEOUT with omitted>0 is a GAP (complete_with_gaps) regardless of fraction; an operator SAMPLE with omitted>0 is a soft LIMIT (complete_with_limits); an INCONSISTENT triple is coverage:unknown (gap, never a crash). Aggregation is rerun/resume-safe (LATEST per (source,unit); a coverage_reset GENERATION drops units that vanished on rerun) and NEVER sums incompatible measures (files vs params are separate (source,measure) rollups); keeps a by_kind breakdown (a mixed source reports sample AND timeout distinctly — no relabeling). The 10%/100 rule survives only as a 'priority' label. Regressions: cap-any-omit gates, cap-zero-omit clears, disappeared-unit clears, measures-not-summed, mixed distinct, malformed no-crash, sample->limits, priority."
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "cap-any-omit gates + zero-omit clears + mixed by_kind distinct + malformed no-crash + sample->limits + priority label" || no "coverage reconciliation wrong"
 import sys, tempfile, pathlib
 from quarry_recon.store import Run, _coverage_gates
@@ -5225,7 +5233,7 @@ r = run_naabu(Status.SUCCESS, b'\xff\xfe not utf8'); s11 = (r is None)          
 sys.exit(0 if (s1 and s2 and s3 and s4 and s5 and s6 and s7 and s8 and s9 and s10 and s11) else 1)
 PYEOF
 
-echo "[130] subfinder runs ALL sources, not the recursive subset (T1.2) — upstream `-recursive` means 'use ONLY recursive-capable sources' (subfinder v2.14.0 -h), so the old `-all -recursive` RESTRICTED to that subset and silently dropped the other providers (coverage loss). The passive pass now uses `-all` with NO `-recursive` (selected provider SET is a superset of the old recursive-only subset; observed results still vary run-to-run as passive APIs do); `-stats` (present on v2.14.0) kept for per-source/key health."
+echo "[130] subfinder runs ALL sources, not the recursive subset (T1.2) — upstream '-recursive' means 'use ONLY recursive-capable sources' (subfinder v2.14.0 -h), so the old '-all -recursive' RESTRICTED to that subset and silently dropped the other providers (coverage loss). The passive pass now uses '-all' with NO '-recursive' (selected provider SET is a superset of the old recursive-only subset; observed results still vary run-to-run as passive APIs do); '-stats' (present on v2.14.0) kept for per-source/key health."
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "subfinder cmd has -all, NOT -recursive (all sources, not recursive-only subset); -stats kept" || no "subfinder -recursive still narrowing sources"
 import sys, inspect
 from quarry_recon.phases import vertical
@@ -5241,7 +5249,7 @@ ok = ('"-all"' in region and '"-recursive"' not in region and '"-stats"' in regi
 sys.exit(0 if ok else 1)
 PYEOF
 
-echo "[131] gitleaks `dir` + hardened file-output adapter (T1.3) — migrated `detect --no-git -s <path>` to `dir <path>` (positional; verified `gitleaks dir --help`). Stale report unlinked before the run. _gitleaks_status validates the -f json report FULLY (list-of-dict root, else None — never item.get()s a bad row) and applies the file-output matrix: clean+findings->SUCCESS, clean+[]->EMPTY, clean+missing/malformed->PARTIAL, HARD (FAILED/TIMED_OUT)+findings->PARTIAL (never laundered to SUCCESS), hard+empty/absent->PARTIAL or kept hard. Live [6] runs the real `dir` as the oracle."
+echo "[131] gitleaks 'dir' + hardened file-output adapter (T1.3) — migrated 'detect --no-git -s <path>' to 'dir <path>' (positional; verified 'gitleaks dir --help'). Stale report unlinked before the run. _gitleaks_status validates the -f json report FULLY (list-of-dict root, else None — never item.get()s a bad row) and applies the file-output matrix: clean+findings->SUCCESS, clean+[]->EMPTY, clean+missing/malformed->PARTIAL, HARD (FAILED/TIMED_OUT)+findings->PARTIAL (never laundered to SUCCESS), hard+empty/absent->PARTIAL or kept hard. Live [6] runs the real 'dir' as the oracle."
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "dir+positional (no detect/-s/--no-git); stale unlinked; matrix (clean/hard × findings/empty/missing/malformed) never crashes or launders a hard state" || no "gitleaks migration / adapter broken"
 import sys, tempfile, pathlib, inspect
 from quarry_recon.phases import crawl
@@ -5647,7 +5655,7 @@ else
 fi
 
 
-echo "[143] v0.3.9 lock-robustness schema — maintenance_state (active/monitor/frozen/distro) + release (human tag, kept SEPARATE from a pseudo-version/commit pin) are REFRESH-POLICY metadata: validated at load, planning-only (never gate verify/drift/install/runtime). Every registry tool is classified; release rejected when a sentinel / missing pin / == pin; distro state <=> policy:distro (both or neither). `quarry lock --maintenance` renders the grouped refresh view WITHOUT probing installed tools. js-beautify 2.0.3 + porch-pirate repo=WatchDogSecurity (verified upstream)."
+echo "[143] v0.3.9 lock-robustness schema — maintenance_state (active/monitor/frozen/distro) + release (human tag, kept SEPARATE from a pseudo-version/commit pin) are REFRESH-POLICY metadata: validated at load, planning-only (never gate verify/drift/install/runtime). Every registry tool is classified; release rejected when a sentinel / missing pin / == pin; distro state <=> policy:distro (both or neither). 'quarry lock --maintenance' renders the grouped refresh view WITHOUT probing installed tools. js-beautify 2.0.3 + porch-pirate repo=WatchDogSecurity (verified upstream)."
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "maintenance/release schema validated + planning-only + every tool classified + --maintenance probe-free" || no "v0.3.9 lock-robustness schema broken"
 import sys
 from quarry_recon import registry
@@ -5685,7 +5693,7 @@ c_view = (r.exit_code == 0 and not probed and "refresh-policy view" in r.output
 sys.exit(0 if (c_reject and c_complete and c_release and c_distro and c_planning and c_view) else 1)
 PYEOF
 
-echo "[144] install.sh control-flow — PATH is persisted BEFORE tool provisioning, so a REQUIRED-tool failure (or a host below minimum) does NOT abort the bootstrap before the rc-file PATH block is written. The failing run still exits nonzero, and the printed recovery hint (`quarry install --only <tool>`) is runnable in a new shell. Simulated with fake pipx (ok) + fake quarry (exit 1)."
+echo "[144] install.sh control-flow — PATH is persisted BEFORE tool provisioning, so a REQUIRED-tool failure (or a host below minimum) does NOT abort the bootstrap before the rc-file PATH block is written. The failing run still exits nonzero, and the printed recovery hint ('quarry install --only <tool>') is runnable in a new shell. Simulated with fake pipx (ok) + fake quarry (exit 1)."
 _t144=$(mktemp -d); _fb="$_t144/bin"; mkdir -p "$_fb" "$_t144/home"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$_fb/pipx"; chmod +x "$_fb/pipx"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$_fb/quarry"; chmod +x "$_fb/quarry"   # a required tool failed
@@ -5700,7 +5708,7 @@ else
   no "install.sh control-flow: rc=$_rc / rc-file / recovery hint (see $_t144/out)"
 fi
 rm -rf "$_t144"
-echo "[145] nuclei EXECUTION vs COVERAGE split — status now tracks whether nuclei reached its OWN terminal (`Scan completed in` + exit 0), so a chunk with degraded request coverage is recorded DONE and a resume skips it; request coverage rides separate structured counters (measure=requests, one unit per chunk) parsed from nuclei -stats. Replays a REAL 2026-07-25 nuclei stderr capture: 10/10 chunks execution-complete (the old generic stderr signature marked all 10 degraded, left chunks={} and a resume would have repeated 8.5h) and coverage 5624634/6084564 = 92.44%, 459930 skipped by -mhe. Also: -mhe policy (PERFORMANCE.NUCLEI_MAX_HOST_ERROR, 0 -> -nmhe full depth) is folded into the resume work_unit."
+echo "[145] nuclei EXECUTION vs COVERAGE split — status now tracks whether nuclei reached its OWN terminal ('Scan completed in' + exit 0), so a chunk with degraded request coverage is recorded DONE and a resume skips it; request coverage rides separate structured counters (measure=requests, one unit per chunk) parsed from nuclei -stats. Replays a REAL 2026-07-25 nuclei stderr capture: 10/10 chunks execution-complete (the old generic stderr signature marked all 10 degraded, left chunks={} and a resume would have repeated 8.5h) and coverage 5624634/6084564 = 92.44%, 459930 skipped by -mhe. Also: -mhe policy (PERFORMANCE.NUCLEI_MAX_HOST_ERROR, 0 -> -nmhe full depth) is folded into the resume work_unit."
 # Point NUCLEI_STDERR_FIXTURE (or the legacy OTC_NUCLEI_LOG) at a real nuclei run log to exercise this
 # check; unset it SKIPS. No engagement path is baked in — this script is versioned with the repo.
 _OTC_NUCLEI_LOG="${NUCLEI_STDERR_FIXTURE:-${OTC_NUCLEI_LOG:-}}"
@@ -5798,7 +5806,7 @@ sys.exit(0 if all((c_blocks, c_done, c_cov, c_tail, c_zero, c_bool, c_explicit, 
 PYEOF
 fi
 
-echo "[146] arjun completion contract + per-target lane (A2) — arjun 2.2.7 PROBED (source read + executed): main() returns None on every ordinary path so EXIT 0 is not an execution oracle (an all-skipped run exits 0), exporter() runs only inside `elif these_params:` so a no-parameter target writes NO -oT AT ALL, and an unhandled `.status_code` on a dict crashes the process on any 400/413/418/429/503 target — which in a batched `-i` run abandons every REMAINING target (measured: 3 targets, 429 second, target 3 never scanned). Lane is now ONE TARGET PER PROCESS in a BOUNDED CONCURRENT pool (ARJUN_TARGETS, default 5, at most one active target per HOST) — isolation is one process per target and never implied one at a time; --rate-limit is per-process, so RATELIMIT.HTTP is a GLOBAL lane cap PARTITIONED across workers (_arjun_rate_shares sums to exactly R, never 0 which arjun reads as unlimited, and a rate below the pool size shrinks the POOL not the rate), full guarded endpoint set (ARJUN_CAP 40 GONE) in host-fair order under ARJUN_BUDGET_S (0=unbounded), never-attempted ranked BEFORE previously skipped/crashed (retry starvation), and completion claimed only when exit code + stdout terminal line + artifact AGREE — bound by a manifest covering ALL THREE evidence channels (stdout/stderr/-oT)."
+echo "[146] arjun completion contract + per-target lane (A2) — arjun 2.2.7 PROBED (source read + executed): main() returns None on every ordinary path so EXIT 0 is not an execution oracle (an all-skipped run exits 0), exporter() runs only inside 'elif these_params:' so a no-parameter target writes NO -oT AT ALL, and an unhandled '.status_code' on a dict crashes the process on any 400/413/418/429/503 target — which in a batched '-i' run abandons every REMAINING target (measured: 3 targets, 429 second, target 3 never scanned). Lane is now ONE TARGET PER PROCESS in a BOUNDED CONCURRENT pool (ARJUN_TARGETS, default 5, at most one active target per HOST) — isolation is one process per target and never implied one at a time; --rate-limit is per-process, so RATELIMIT.HTTP is a GLOBAL lane cap PARTITIONED across workers (_arjun_rate_shares sums to exactly R, never 0 which arjun reads as unlimited, and a rate below the pool size shrinks the POOL not the rate), full guarded endpoint set (ARJUN_CAP 40 GONE) in host-fair order under ARJUN_BUDGET_S (0=unbounded), never-attempted ranked BEFORE previously skipped/crashed (retry starvation), and completion claimed only when exit code + stdout terminal line + artifact AGREE — bound by a manifest covering ALL THREE evidence channels (stdout/stderr/-oT)."
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "verdict matrix (empty/success/skipped/failed/unknown); contradictory+duplicate+missing signals -> unknown; \\r progress never hides the terminal line; no membership cap; bounded concurrency 1-per-host; GLOBAL rate partitioned across workers" || no "arjun contract/lane broken"
 import sys, inspect
 from quarry_recon.phases import params as P
