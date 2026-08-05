@@ -363,3 +363,82 @@ class TestAnUnsharedPenaltyStopsFurtherContact:
         c.note(err)
         assert not c.unshared_penalty
         c.wait()                                    # honoured, not refused
+
+
+class TestTheREALLaneNotJustTheScheduler:
+    """review#5 (Lumpy): the scheduler caught `PaceBusy` before its "request ISSUED" line, and the
+    production `search()` wrapper caught it FIRST and handed back an error tuple — so the phantom credit
+    survived in production while the scheduler's fix looked complete. My tests injected a `search`
+    callable that raises directly and never drove the real wrapper.
+
+    Same seam as the deferred-parse wiring: fix the coordinator, let the adapter mask the signal.
+    Everything here goes through `probe._shodan_pivot`, the production entry point."""
+
+    @staticmethod
+    def _ctx(tmp_path):
+        from types import SimpleNamespace
+        from quarry_recon import events
+        events.reset()
+        events.configure(tmp_path)
+        added: list = []
+        run = SimpleNamespace(
+            raw_path=lambda ph, lb, nm: (tmp_path / ph / lb).joinpath(nm)
+            if (tmp_path / ph / lb).mkdir(parents=True, exist_ok=True) or True else None,
+            dir=tmp_path, project_dir=tmp_path,
+            add=lambda e, r: (added.append((e, r)), True)[1], read=lambda e: [])
+        scope = SimpleNamespace(in_scope=lambda h: h.endswith("acme.com"), is_oos=lambda h: False)
+        return SimpleNamespace(run=run, scope=scope, echo=lambda *a: None), added
+
+    def test_a_refusal_during_PAID_SEARCH_issues_nothing_and_spends_nothing(self, monkeypatch,
+                                                                           tmp_path):
+        from quarry_recon import events, shodan_sched
+        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
+        monkeypatch.setattr(pace, "PACE_DIR", tmp_path / "pace")
+
+        # pacing lets the FREE phase through (balance + counts) and refuses at the first paid search
+        calls = {"n": 0}
+        real_wait = pace.wait
+
+        def wait(key, interval, **kw):
+            calls["n"] += 1
+            if calls["n"] > 2:                       # 1: /api-info, 2: /host/count, 3: the purchase
+                raise pace.PaceBusy("another process holds this account's pacing slot")
+            return real_wait(key, 0.0, **kw)
+        monkeypatch.setattr(pace, "wait", wait)
+
+        pages: list = []
+        monkeypatch.setattr(probe, "_shodan_page",
+                            lambda *a, **k: pages.append(a) or ([], None, None))
+        monkeypatch.setattr(probe, "_read_shodan_balance",
+                            lambda key, timeout=15, cooldown=None: probe.ShodanBalance(
+                                remaining=100, allowance=100, reserve=0, spendable=100,
+                                may_spend=True, reason="ok"))
+        monkeypatch.setattr(probe, "_shodan_count", lambda k, f, v: (250, b'{"total": 250}', None))
+
+        ctx, _added = self._ctx(tmp_path)
+        probe._shodan_pivot(ctx, "KEY", ["hA"], "http.favicon.hash", "favicon-shodan",
+                            "probe.favicon", "{}")
+
+        assert pages == [], "the paid search must never be reached after a refusal"
+        evs = [json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
+        spend = [e for e in evs if e.get("event") == "spend" and e.get("provider") == "shodan"]
+        assert spend and all(e["amount"] == 0 for e in spend), spend
+
+        cov = [e for e in evs if e.get("event") == "coverage_partial"]
+        unq = [e for e in cov if e.get("measure") == "shodan_pivots_unqueried"]
+        assert unq, cov
+        # a GAP of ours, and explicitly NOT the budget running out
+        assert shodan_sched.PACE_BUSY in (unq[-1].get("reason") or ""), unq[-1]
+        assert "budget" not in (unq[-1].get("reason") or "")
+        assert unq[-1]["kind"] == events.COVERAGE_TIMEOUT
+        events.reset()
+
+    def test_the_wrapper_does_not_swallow_the_refusal(self):
+        """The defect itself, pinned in the source: an adapter that converts `PaceBusy` into a returned
+        error tuple hides it from the accounting that must see it."""
+        import inspect
+        src = inspect.getsource(probe._shodan_work_locked)
+        start = src.index("def search(pivot, page):")
+        body = src[start:src.index("def ingest(", start)]
+        assert "cooldown.wait()" in body
+        assert "except pace.PaceBusy" not in body, "the refusal must reach the coordinator unchanged"

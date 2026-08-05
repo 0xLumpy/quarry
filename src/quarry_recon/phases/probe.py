@@ -802,16 +802,15 @@ def _shodan_work_locked(ctx, key, lanes):
 
         def search(pivot, page):
             # `cooldown.wait()` may REFUSE (PaceBusy) when this account's boundary cannot be honoured.
-            # That is a gap of OURS: no request goes out, nothing is spent, and a later lifecycle can
-            # close it for free.
+            # It PROPAGATES: the coordinator has to see it BEFORE it crosses its own "a request was
+            # ISSUED" line, or it charges a credit for a socket that never opened. review#5 (Lumpy):
+            # this wrapper used to catch it and hand back an error tuple, which left the phantom-credit
+            # defect in production while the scheduler's own fix looked complete — the same
+            # adapter-masks-the-signal seam as the deferred-parse wiring.
             # review-B1.5r3#1: only ONE wait ran, before the whole paid loop, so a 429 mid-purchase was
             # neither recorded nor honored and the scheduler went straight to the next pivot. Every paid
             # request now passes through the same cooldown that sizing uses.
-            try:
-                cooldown.wait()
-            except pace.PaceBusy as e:
-                e.error_class = PROVIDER_PACE_BUSY
-                return [], None, e
+            cooldown.wait()
             # the RAW response is streamed here, under the ledger's own directory, so a page we paid for
             # exists on disk before anything decides whether we can use it.
             sink = attempt_dir / "raw" / f"{shodan_sched.item_key(pivot, page)}.json"
