@@ -33,6 +33,13 @@ SENSITIVE_FILE_RX = re.compile(r"""
     )(?:$|\?)
 """, re.IGNORECASE | re.VERBOSE)
 
+#: Files that ARE credential stores but hold ciphertext. Fetching one is worth it — it is exposed, it is
+#: the real store, and it becomes plaintext the moment its key leaks (Rails ships exactly that pairing).
+#: But nothing was MINED from it, and "fetched; no secret pattern" reads as "nothing here" (review#4,
+#: Lumpy). It is reported as what it is: an exposed encrypted credential store.
+ENCRYPTED_STORE_RX = re.compile(r"(?:^|/)(?:credentials(?:\.[\w-]+)?\.yml\.enc|secrets\.yml\.enc)$",
+                                re.IGNORECASE)
+
 # Provider-shaped / structured tokens. lastindex group (if any) is the value, else the whole match.
 _TOKEN_RX = [
     ("aws-access-key", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -43,23 +50,35 @@ _TOKEN_RX = [
     ("google-api-key", re.compile(r"AIza[0-9A-Za-z_\-]{35}")),
     ("jwt",            re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")),
     ("private-key",    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
-    # a password hash is not a password, and it is still evidence: it proves the store leaked and it is
-    # offline-crackable. The shape is exact (algo, cost, 22-char salt + 31-char digest), so it does not
-    # collide with ordinary text.
-    ("bcrypt-hash",    re.compile(r"\$2[abxy]?\$\d{2}\$[./A-Za-z0-9]{53}")),
-    # .NET / ADO connection strings carry the password INSIDE the value, under a key like
-    # `DefaultConnection` that no secret-ish key pattern will ever match (measured 2026-08-05).
-    ("connection-string-password",
-     re.compile(r"(?i)\b(?:password|pwd)\s*=\s*([^;\"'\r\n]{4,})")),
 ]
 
-#: Files whose ENTIRE BODY is the secret. A Rails `master.key` is 32 hex characters and nothing else —
-#: no assignment, no key name, nothing for a `KEY=value` or JSON rule to catch, so it was fetched, saved
-#: and mined for nothing (measured 2026-08-05). Matching a bare 32-hex string ANYWHERE would flag every
-#: MD5 and every git blob id, so these rules apply only when the whole body IS the value.
-_WHOLE_BODY_RX = [
-    ("rails-master-key", re.compile(r"\A[0-9a-f]{32}\Z")),
-    ("hex-key-64",       re.compile(r"\A[0-9a-f]{64}\Z")),
+#: .NET / ADO connection strings carry the password INSIDE the value, under a key like
+#: `DefaultConnection` that no secret-ish key pattern will ever match (measured 2026-08-05). The match
+#: requires CONNECTION-STRING STRUCTURE around it — a `Server=`/`Data Source=`/`Host=` style field in the
+#: same value — because `password=` on its own appears in documentation, examples, query strings and
+#: ordinary prose, and calling those database credentials is a claim we cannot support (review#6, Lumpy).
+_CONNSTR_RX = re.compile(
+    r"(?i)(?:(?:data\s+source|server|host|initial\s+catalog|database|dsn)\s*=\s*[^;\"'\r\n]{1,120};"
+    r"[^\"'\r\n]{0,400}?)(?:password|pwd)\s*=\s*([^;\"'\r\n]{4,})")
+
+#: password VERIFIERS. A hash is not a credential value: it proves the store leaked and it is
+#: offline-crackable, which is worth reporting as its own thing rather than as a recovered secret
+#: (review#2, Lumpy). Kinds listed here are published as `credential-hash` review evidence.
+HASH_KINDS = frozenset({"bcrypt-hash"})
+_HASH_RX = [
+    ("bcrypt-hash", re.compile(r"\$2[abxy]?\$\d{2}\$[./A-Za-z0-9]{53}")),
+]
+
+#: FORMAT rules: (path pattern, kind, body pattern). A Rails `master.key` is 32 hex characters and
+#: nothing else — no assignment, no key name, nothing for a `KEY=value` or JSON rule to catch, so it was
+#: fetched, saved and mined for nothing (measured 2026-08-05).
+#:
+#: They are gated on the SOURCE PATH, because the body alone cannot carry the claim: 32 lowercase hex is
+#: also every MD5, every git blob id and half the ETags on the internet (review#1, Lumpy). A rule with no
+#: named file format behind it does not belong here at all — a generic 64-hex "key" was exactly that and
+#: is gone (review#3).
+_FORMAT_RULES = [
+    (re.compile(r"(?:^|/)master\.key$", re.I), "rails-master-key", re.compile(r"\A[0-9a-f]{32}\Z")),
 ]
 
 # dotenv / config assignment `KEY = value`; captures a secret-looking VALUE on a secret-looking KEY.
@@ -94,9 +113,16 @@ MAX_BODY = 2 * 1024 * 1024    # 2 MB cap per exposed resource (RAM/disk guard)
 MAX_FETCHES = 50              # bound how many exposed resources we fetch
 
 
-def mine(text: str) -> list[tuple[str, str, int]]:
+def mine(text: str, *, source_path: str | None = None) -> list[tuple[str, str, int]]:
     """(kind, raw_value, line) for each secret found in `text`. Read-only — no exploit.
-    Provider-shaped tokens win over the generic dotenv catch for the same value (more specific)."""
+
+    Provider-shaped tokens win over the generic dotenv catch for the same value (more specific).
+
+    `source_path` is the URL or path the body came from. Generic token rules run everywhere; FORMAT
+    rules run only against the file format they describe, because a body alone cannot carry that claim —
+    32 lowercase hex is a Rails master key in `config/master.key` and an MD5 everywhere else (review#1,
+    Lumpy). Without a path, format rules simply do not fire: an unclassified body is not a Rails secret.
+    """
     out: list[tuple[str, str, int]] = []
     seen_vals: set[str] = set()
     for kind, rx in _TOKEN_RX:
@@ -120,14 +146,51 @@ def mine(text: str) -> list[tuple[str, str, int]]:
                     and val.lower() not in ("null", "true", "false")):
                 seen_vals.add(val)
                 out.append((f"json:{key}", val, text.count("\n", 0, m.start()) + 1))
-    # …and the file that IS a secret, with no key to hang it on
+    for m in _CONNSTR_RX.finditer(text):                           # a password inside a connection string
+        val = m.group(1).strip()
+        if val and val not in seen_vals:
+            seen_vals.add(val)
+            out.append(("connection-string-password", val, text.count("\n", 0, m.start()) + 1))
+    for kind, rx in _HASH_RX:                                      # verifiers, not credential values
+        for m in rx.finditer(text):
+            val = m.group(0)
+            if val not in seen_vals:
+                seen_vals.add(val)
+                out.append((kind, val, text.count("\n", 0, m.start()) + 1))
+    # …and the file that IS a secret, with no key to hang it on. FORMAT-gated: see the docstring.
     body = text.strip()
-    if body and body not in seen_vals:
-        for kind, rx in _WHOLE_BODY_RX:
-            if rx.match(body):
+    path = urlsplit(source_path).path if source_path else ""
+    if body and path and body not in seen_vals:
+        for path_rx, kind, body_rx in _FORMAT_RULES:
+            if path_rx.search(path) and body_rx.match(body):
                 out.append((kind, body, 1))
                 break
     return out
+
+
+def publish_finding(ctx, kind: str, val: str, line, *, url: str, dest, source: str,
+                    host: str | None = None) -> str:
+    """Route ONE mined finding to the entity that describes it. Returns "secret", "hash" or "".
+
+    One place decides what a kind IS, because five call sites deciding separately is how a password
+    VERIFIER ends up in the secret queue on four of them (review#2, Lumpy). A hash proves the store
+    leaked and is offline-crackable; it is not a recovered credential and must not be counted as one.
+    The complete value is retained either way — only Quarry's own credentials are ever redacted."""
+    where = host or normalize.host_of_url(url)
+    if kind in HASH_KINDS:
+        ok = ctx.run.add("review", {
+            "id": f"credential-hash:{secrets.fingerprint(val)}", "klass": "credential-hash",
+            "value": val, "host": where, "raw_ref": str(dest) if dest else None, "location": url,
+            "line": line,
+            "note": f"{kind}: a password verifier, offline-crackable — NOT the password. Its presence "
+                    f"proves the credential store leaked.",
+            "sources": [source]})
+        return "hash" if ok else ""
+    ok = ctx.run.add("secret", {
+        "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{url}|{line}')}",
+        "kind": kind, "preview": secrets.mask(val),
+        "file": str(dest) if dest else None, "location": url, "line": line, "sources": [source]})
+    return "secret" if ok else ""
 
 
 def fetch_and_extract(ctx, url: str, *, source: str, subdir: str) -> dict:
@@ -159,12 +222,12 @@ def fetch_and_extract(ctx, url: str, *, source: str, subdir: str) -> dict:
     dest.write_bytes(data)
     res["dest"] = str(dest)
     res["ok"] = True
-    for kind, val, ln in mine(text):               # secrets (redacted, provenance, raw_ref)
-        if ctx.run.add("secret", {
-                "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{url}|{ln}')}",
-                "kind": kind, "preview": secrets.mask(val),
-                "file": str(dest), "location": url, "line": ln, "sources": [source]}):
+    for kind, val, ln in mine(text, source_path=url):   # secrets (redacted, provenance, raw_ref)
+        got = publish_finding(ctx, kind, val, ln, url=url, dest=dest, source=source, host=host)
+        if got == "secret":
             res["secrets"] += 1
+        elif got == "hash":
+            res["hashes"] = res.get("hashes", 0) + 1
     for e in normalize.urls(text, source, str(dest)):   # in-scope absolute links → corpus
         lu = e.get("url", "")
         lh = normalize.host_of_url(lu)
@@ -190,7 +253,16 @@ def fetch_exposed(ctx, urls: list[str]) -> int:
         if not r["ok"]:
             continue
         added += r["secrets"]
-        note = f"{r['secrets']} secret(s) extracted" if r["secrets"] else "fetched; no secret pattern"
+        if ENCRYPTED_STORE_RX.search(urlsplit(u).path):
+            note = ("exposed ENCRYPTED credential store — ciphertext, nothing decrypted here. It becomes "
+                    "plaintext with its key (Rails: config/master.key), so the two together are the "
+                    "finding")
+        elif r["secrets"]:
+            note = f"{r['secrets']} secret(s) extracted"
+        else:
+            note = "fetched; no secret pattern"
+        if r.get("hashes"):
+            note += f", {r['hashes']} password hash(es) — verifiers, not credentials"
         if r["links"]:
             note += f", {r['links']} in-scope link(s)"
         # The exposure itself as reviewable evidence (raw_ref → saved body). confirmed:false —
@@ -308,11 +380,8 @@ def _deep_download(ctx, url: str, host: str, kind: str) -> bool:
                             f"{host}-{kind}-{hashlib.md5(url.encode()).hexdigest()[:8]}.bin")
     dest.write_bytes(data)
     nsec = 0
-    for k, val, ln in mine(data.decode("utf-8", "replace")):
-        if ctx.run.add("secret", {
-                "id": f"exposed:{k}:{secrets.fingerprint(val or f'{k}|{url}|{ln}')}",
-                "kind": k, "preview": secrets.mask(val),
-                "file": str(dest), "location": url, "sources": ["deep-evidence"]}):
+    for k, val, ln in mine(data.decode("utf-8", "replace"), source_path=url):
+        if publish_finding(ctx, k, val, ln, url=url, dest=dest, source="deep-evidence") == "secret":
             nsec += 1
     ctx.run.add("review", {
         "id": f"actuator-heavy:{url}", "klass": "actuator", "value": url, "host": host,
@@ -366,12 +435,9 @@ def probe_actuator(ctx, bases: list[str]) -> int:
                 dest = ctx.run.raw_path("params", "actuator",
                                         f"{host}-{sp}-{hashlib.md5(u.encode()).hexdigest()[:8]}")
                 dest.write_bytes(data)
-                for kind, val, ln in mine(data.decode("utf-8", "replace")):
-                    ctx.run.add("secret", {
-                        "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{u}|{ln}')}",
-                        "kind": kind, "preview": secrets.mask(val),
-                        "file": str(dest), "location": u, "line": ln,
-                        "sources": ["actuator-probe"]})
+                for kind, val, ln in mine(data.decode("utf-8", "replace"), source_path=u):
+                    publish_finding(ctx, kind, val, ln, url=u, dest=dest, source="actuator-probe",
+                                    host=host)
         reachable = exposed + [f"{h}(advertised)" for h in heavy_exposed]
         if reachable:
             found += 1
@@ -475,11 +541,8 @@ def parse_openapi(ctx, urls: list[str]) -> int:
                     if ctx.run.add("parameter", {"value": f"{full}?{name}=",
                                                  "sources": ["openapi"]}):
                         n_pa += 1
-        for kind, val, ln in mine(text):           # specs sometimes embed example keys
-            ctx.run.add("secret", {
-                "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{u}|{ln}')}",
-                "kind": kind, "preview": secrets.mask(val),
-                "file": str(dest), "location": u, "line": ln, "sources": ["openapi"]})
+        for kind, val, ln in mine(text, source_path=u):     # specs sometimes embed example keys
+            publish_finding(ctx, kind, val, ln, url=u, dest=dest, source="openapi", host=host)
         added_ep += n_ep
         ctx.run.add("review", {
             "id": f"api-doc:{u}", "klass": "api-doc", "value": u, "host": host, "raw_ref": str(dest),
@@ -530,11 +593,9 @@ def probe_framework_endpoints(ctx, candidates: list[dict]) -> int:
                                     f"{host}-{hashlib.md5(u.encode()).hexdigest()[:8]}")
             dest.write_bytes(data)
             nsec = 0
-            for kind, val, ln in mine(data.decode("utf-8", "replace")):
-                if ctx.run.add("secret", {
-                        "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{u}|{ln}')}",
-                        "kind": kind, "preview": secrets.mask(val),
-                        "file": str(dest), "location": u, "line": ln, "sources": ["framework-probe"]}):
+            for kind, val, ln in mine(data.decode("utf-8", "replace"), source_path=u):
+                if publish_finding(ctx, kind, val, ln, url=u, dest=dest,
+                                   source="framework-probe", host=host) == "secret":
                     nsec += 1
             exposed_n += 1
             ctx.run.add("review", {

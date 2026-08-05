@@ -16,30 +16,46 @@ from __future__ import annotations
 from quarry_recon import evidence
 
 
-def kinds(text: str) -> dict:
-    return {k: v for k, v, _ln in evidence.mine(text)}
+def self_appsettings() -> str:
+    return TestSecretsHiddenInsideValues.APPSETTINGS
 
 
-class TestTheFileIsTheSecret:
-    """A Rails master key is 32 hex characters and nothing else: no assignment for a `KEY=value` rule and
-    no field for a JSON rule. It decrypts `credentials.yml.enc` outright."""
+def kinds(text: str, path: str | None = None) -> dict:
+    return {k: v for k, v, _ln in evidence.mine(text, source_path=path)}
 
-    def test_a_rails_master_key_is_extracted(self):
-        got = kinds("a1b2c3d4e5f60718293a4b5c6d7e8f90\n")
-        assert got == {"rails-master-key": "a1b2c3d4e5f60718293a4b5c6d7e8f90"}
 
-    def test_a_64_hex_key_file_is_extracted(self):
-        body = "0" * 63 + "f"
-        assert kinds(body) == {"hex-key-64": body}
+class TestAFormatClaimNeedsTheFILE:
+    """review#1 (Lumpy): 32 lowercase hex is a Rails master key in `config/master.key` and an MD5, a git
+    blob id or an ETag everywhere else. The BODY cannot carry that claim, so format rules are gated on
+    the source path — and a body with no path is not classified at all."""
+
+    KEY = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+    def test_a_rails_master_key_is_extracted_from_its_own_file(self):
+        assert kinds(self.KEY + "\n", "https://t/config/master.key") == {"rails-master-key": self.KEY}
+
+    def test_the_SAME_body_elsewhere_is_not_a_secret(self):
+        for path in ("https://t/checksums.txt", "https://t/api/v1/objects/abc", "https://t/index.html"):
+            assert kinds(self.KEY + "\n", path) == {}, path
+
+    def test_without_a_path_no_format_rule_fires(self):
+        """An unclassified body is not a Rails secret. Silence is the honest answer."""
+        assert kinds(self.KEY + "\n") == {}
 
     def test_a_hash_INSIDE_a_document_is_not_a_key_file(self):
-        """Matching a bare 32-hex string anywhere would flag every MD5 and every git blob id. The rule is
-        deliberately whole-body only."""
-        assert kinds("the checksum is a1b2c3d4e5f60718293a4b5c6d7e8f90 for that file") == {}
-        assert kinds('{"etag": "a1b2c3d4e5f60718293a4b5c6d7e8f90"}') == {}
+        assert kinds(f"the checksum is {self.KEY} for that file", "https://t/config/master.key") == {}
+        assert kinds(f'{{"etag": "{self.KEY}"}}', "https://t/config/master.key") == {}
 
     def test_surrounding_whitespace_does_not_hide_it(self):
-        assert "rails-master-key" in kinds("\n  a1b2c3d4e5f60718293a4b5c6d7e8f90  \n")
+        assert "rails-master-key" in kinds(f"\n  {self.KEY}  \n", "https://t/config/master.key")
+
+    def test_there_is_no_unnamed_generic_hex_rule(self):
+        """review#3: a whole-body 64-hex "key" had no named format, no expected path and no way to tell a
+        key from a checksum. A rule with nothing behind it does not belong in the miner."""
+        body = "0" * 63 + "f"
+        assert kinds(body, "https://t/config/master.key") == {}
+        assert not any(kind == "hex-key-64" for kind, *_ in evidence.mine(body, source_path="/x"))
+        assert len(evidence._FORMAT_RULES) == 1, "every format rule names a file format"
 
 
 class TestSecretsHiddenInsideValues:
@@ -52,6 +68,15 @@ class TestSecretsHiddenInsideValues:
 
     def test_a_connection_string_password_is_extracted(self):
         assert kinds(self.APPSETTINGS)["connection-string-password"] == "P@ssw0rd123"
+
+    def test_a_bare_password_assignment_is_NOT_called_a_database_credential(self):
+        """review#6 (Lumpy): `password=` appears in documentation, examples, query strings and prose.
+        Calling those database credentials is a claim we cannot support, so the match requires
+        connection-string STRUCTURE around it."""
+        for text in ("to log in, use password=changeme in the form",
+                     "GET /login?user=bob&password=hunter2 HTTP/1.1",
+                     "# example: password=YOUR_PASSWORD_HERE"):
+            assert "connection-string-password" not in kinds(text), text
 
     def test_a_bare_Key_field_with_a_long_value_is_extracted(self):
         assert kinds(self.APPSETTINGS)["json:Key"] == "super-secret-signing-value-1234"
@@ -74,7 +99,7 @@ class TestSecretsHiddenInsideValues:
 
 class TestPasswordHashes:
     """A hash is not a password, and it is still evidence: it proves the store leaked and it is
-    offline-crackable."""
+    offline-crackable. review#2 (Lumpy): it must therefore NOT be published as a recovered secret."""
 
     HASH = "$2y$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
 
@@ -126,15 +151,129 @@ class TestWhatWeFETCHIsWhatWeCanMINE:
                      "/web.config", "/config/credentials.yml.enc"):
             assert evidence.SENSITIVE_FILE_RX.search(path), path
 
-    def test_the_content_wordlist_and_the_fetcher_agree(self):
-        """Every one of these is already in `content-configleak.txt`, i.e. Quarry ASKS for them."""
+    def test_probing_a_path_is_not_a_sensitivity_claim(self):
+        """review#5 (Lumpy): discovery wordlists carry paths worth COLLECTING for many reasons —
+        metadata, debugging, technology identification. Membership establishes collection interest, not
+        evidence classification, so the fetcher keeps its own explicit list."""
         from pathlib import Path
         import quarry_recon
         words = (Path(quarry_recon.__file__).parent / "data" / "content-configleak.txt").read_text()
-        for probe in ("config/master.key", "appsettings.json"):
-            assert probe in words, probe
-            assert evidence.SENSITIVE_FILE_RX.search("/" + probe), probe
+        probed = [w.strip() for w in words.splitlines() if w.strip() and not w.startswith("#")]
+        assert probed, "the wordlist is not empty"
+        assert any(not evidence.SENSITIVE_FILE_RX.search("/" + w) for w in probed), \
+            "not everything we probe is a secret store — and the fetcher must not assume it is"
+
+    def test_the_named_formats_map_to_their_expected_evidence(self):
+        """The mapping, stated explicitly rather than derived from a wordlist."""
+        expect = {
+            "https://t/config/master.key": "rails-master-key",     # the file IS the key
+            "https://t/appsettings.json": "connection-string-password",
+        }
+        bodies = {"https://t/config/master.key": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+                  "https://t/appsettings.json": self_appsettings()}
+        for url, kind in expect.items():
+            assert evidence.SENSITIVE_FILE_RX.search("/" + url.split("/", 3)[3]), url
+            assert kind in kinds(bodies[url], url), (url, kind)
 
     def test_ordinary_pages_are_still_not_sensitive_files(self):
         for path in ("/index.html", "/about", "/static/app.js", "/api/v1/users"):
             assert not evidence.SENSITIVE_FILE_RX.search(path), path
+
+
+class TestAHashIsNotARecoveredCredential:
+    """review#2 (Lumpy): every mined kind was added as a `secret`, so a bcrypt hash entered the secret
+    queues, counters and reports as though Quarry had recovered a password. Five call sites each decided
+    that separately — which is how four of them got it wrong."""
+
+    @staticmethod
+    def _ctx():
+        from types import SimpleNamespace
+        added: list = []
+        run = SimpleNamespace(add=lambda kind, rec: (added.append((kind, rec)), True)[1])
+        return SimpleNamespace(run=run), added
+
+    HASH = "$2y$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+
+    def test_a_hash_goes_to_REVIEW_not_to_the_secret_queue(self):
+        ctx, added = self._ctx()
+        got = evidence.publish_finding(ctx, "bcrypt-hash", self.HASH, 3, url="https://t/dump.sql",
+                                       dest="/raw/x", source="exposed-fetch")
+        assert got == "hash"
+        kind, rec = added[0]
+        assert kind == "review" and rec["klass"] == "credential-hash"
+        assert rec["value"] == self.HASH, "the COMPLETE hash is retained"
+        assert "NOT the password" in rec["note"]
+        assert rec["raw_ref"] == "/raw/x" and rec["location"] == "https://t/dump.sql"
+
+    def test_a_real_secret_still_goes_to_the_secret_queue(self):
+        ctx, added = self._ctx()
+        got = evidence.publish_finding(ctx, "aws-access-key", "AKIAIOSFODNN7EXAMPLE", 1,
+                                       url="https://t/.env", dest="/raw/y", source="exposed-fetch")
+        assert got == "secret" and added[0][0] == "secret"
+
+    def test_EVERY_call_site_routes_through_the_same_decision(self):
+        """One place decides what a kind IS. Five call sites deciding separately is the defect."""
+        import inspect
+        src = inspect.getsource(evidence)
+        body = src[src.index("def publish_finding"):]
+        after = body[body.index("def fetch_and_extract"):]
+        assert 'add("secret"' not in after, "a call site is publishing secrets on its own again"
+        assert src.count("publish_finding(ctx") >= 5, "every mining site uses the router"
+
+
+class TestEncryptedStoresAreNotMinedSecrets:
+    """review#4 (Lumpy): `credentials.yml.enc` is worth fetching and preserving — it IS the credential
+    store — but it is ciphertext. Reporting it as "fetched; no secret pattern" says "nothing here"; it is
+    an exposed encrypted store, and it becomes plaintext the moment its key leaks."""
+
+    def test_the_encrypted_store_is_recognised(self):
+        for path in ("/config/credentials.yml.enc", "/config/credentials.production.yml.enc",
+                     "/config/secrets.yml.enc"):
+            assert evidence.ENCRYPTED_STORE_RX.search(path), path
+
+    def test_an_ordinary_yaml_is_not(self):
+        for path in ("/config/database.yml", "/credentials.yml", "/app.enc.js"):
+            assert not evidence.ENCRYPTED_STORE_RX.search(path), path
+
+    def test_it_is_still_fetched_as_a_sensitive_file(self):
+        assert evidence.SENSITIVE_FILE_RX.search("/config/credentials.yml.enc")
+
+    def test_mining_ciphertext_claims_nothing(self):
+        assert kinds("\x00\x01binary-ciphertext-garbage\x02", "https://t/config/credentials.yml.enc") == {}
+
+    def test_the_REVIEW_note_says_it_is_encrypted(self, tmp_path, monkeypatch):
+        """The note is what an operator reads. "fetched; no secret pattern" over a credential store is
+        technically true and actively misleading."""
+        from types import SimpleNamespace
+        from quarry_recon import fetch
+        added: list = []
+        run = SimpleNamespace(
+            raw_path=lambda ph, sub, nm: (tmp_path / ph / sub).joinpath(nm)
+            if (tmp_path / ph / sub).mkdir(parents=True, exist_ok=True) or True else None,
+            add=lambda kind, rec: (added.append((kind, rec)), True)[1])
+        ctx = SimpleNamespace(run=run,
+                              scope=SimpleNamespace(in_scope=lambda h: True, is_oos=lambda h: False,
+                                                    active_allowed=lambda h: True))
+        monkeypatch.setattr(fetch, "scoped_get",
+                            lambda *a, **k: (b"\x00encrypted-blob", a[1] if len(a) > 1 else "", 200))
+        evidence.fetch_exposed(ctx, ["https://t/config/credentials.yml.enc"])
+        notes = [r["note"] for kind, r in added if kind == "review" and r.get("klass") == "exposure"]
+        assert notes, added
+        assert "ENCRYPTED credential store" in notes[0], notes
+        assert "no secret pattern" not in notes[0]
+
+    def test_an_ordinary_exposed_file_keeps_its_plain_note(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from quarry_recon import fetch
+        added: list = []
+        run = SimpleNamespace(
+            raw_path=lambda ph, sub, nm: (tmp_path / ph / sub).joinpath(nm)
+            if (tmp_path / ph / sub).mkdir(parents=True, exist_ok=True) or True else None,
+            add=lambda kind, rec: (added.append((kind, rec)), True)[1])
+        ctx = SimpleNamespace(run=run,
+                              scope=SimpleNamespace(in_scope=lambda h: True, is_oos=lambda h: False,
+                                                    active_allowed=lambda h: True))
+        monkeypatch.setattr(fetch, "scoped_get", lambda *a, **k: (b"nothing here", "", 200))
+        evidence.fetch_exposed(ctx, ["https://t/.env"])
+        notes = [r["note"] for kind, r in added if kind == "review" and r.get("klass") == "exposure"]
+        assert notes and "no secret pattern" in notes[0], notes
