@@ -493,9 +493,18 @@ class TestGhostCompletions:
         assert valid_page(doc, Pivot(FAV, "facet", "a"), 1) is None
 
     def test_a_valid_page_is_accepted(self):
-        doc = {"schema": 1, "lane": FAV, "facet": "facet", "value": "a", "page": 1, "total": 5,
-               "matches": []}
+        from quarry_recon.shodan_sched import SHODAN_WORK_SCHEMA
+        doc = {"schema": SHODAN_WORK_SCHEMA, "lane": FAV, "facet": "facet", "value": "a", "page": 1,
+               "total": 5, "matches": [], "bought_at": 1.0}
         assert valid_page(doc, Pivot(FAV, "facet", "a"), 1) is doc
+
+    def test_a_PREVIOUS_generation_page_is_not_accepted(self):
+        """A schema bump ISOLATES the older generation rather than deleting it: paid evidence is never
+        pruned automatically, but it also cannot answer for a schema it was not written under."""
+        from quarry_recon.shodan_sched import SHODAN_WORK_SCHEMA
+        doc = {"schema": SHODAN_WORK_SCHEMA - 1, "lane": FAV, "facet": "facet", "value": "a", "page": 1,
+               "total": 5, "matches": []}
+        assert valid_page(doc, Pivot(FAV, "facet", "a"), 1) is None
 
     def test_a_DIGEST_VALID_ghost_page_is_rejected_and_re_bought(self, tmp_path):
         """A digest-bound `{}` was replayed forever: never re-bought, contributing nothing.

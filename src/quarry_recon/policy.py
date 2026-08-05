@@ -280,6 +280,11 @@ EXCLUDED: dict[str, tuple[str, str]] = {
                                          "MEASURED FREE — that is not the reason; ownership is.)"),
     "SHODAN_MAX_PAGES": ("provider", "the provider's own page policy — how much Quarry may OBTAIN"),
     "SHODAN_CREDIT_RESERVE": ("provider", "the operator's credit reserve: a spending control"),
+    "SHODAN_PAGE_TTL_DAYS": ("provider", "how long a PURCHASED page may stand in for a fresh one. It "
+                             "governs SPENDING (a shorter TTL buys more often), so it is the provider "
+                             "axis and never `--unbound`'s — the flag authorises no purchase. Past the "
+                             "TTL a page is kept as history, excluded from current coverage, and NOT "
+                             "re-bought merely because time passed"),
     "WHOXY_PAGE_BUDGET": ("provider", "the provider's own per-run page policy"),
     "WHOXY_CREDIT_RESERVE": ("provider", "the operator's credit reserve: a spending control"),
     "PROVIDER_MAX_PAGES": ("provider", "bounded cursor pagination against an external provider"),

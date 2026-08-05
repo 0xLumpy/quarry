@@ -649,6 +649,9 @@ class TestShodanPivot:
             raw_path=lambda ph, lb, nm: (tmp_path / ph / lb).joinpath(nm) if
             (tmp_path / ph / lb).mkdir(parents=True, exist_ok=True) or True else None,
             dir=tmp_path,                 # B1.4: the coordinator's ledger/attempt tree lives under it
+            # PROJECT-scoped now: purchased pages outlive the run directory, so the fake has to have a
+            # project the way a real `Run` does (`Run.dir == project_dir/recon/<run_id>`)
+            project_dir=tmp_path,
             add=lambda e, r: (added.append((e, r)), True)[1],
             read=lambda e: [])
         scope = SimpleNamespace(in_scope=lambda h: h.endswith("acme.com"), is_oos=lambda h: False)
@@ -747,7 +750,9 @@ class TestShodanPivot:
         # host's row — never sliced, never truncated.
         # B1.5: the attempt dir also holds free /host/count sizing evidence — the provider's EXACT
         # bytes, which carry no `matches`. Select the PAGE doc.
-        art = [q for q in (tmp_path / "raw" / "probe" / "shodan").rglob("*.json")
+        # the purchased-page tree is PROJECT-scoped now (`state/shodan-pivot/v<schema>/pages/…`), because
+        # a run-scoped one made the next run pay for pages it already owned
+        art = [q for q in (tmp_path / "state" / "shodan-pivot").rglob("pages/**/*.json")
                if q.name != ".quarry-write-probe" and "matches" in json.loads(q.read_text())]
         assert len(art) == 1, [str(q) for q in art]
         rows = json.loads(art[0].read_text())["matches"]
@@ -1564,7 +1569,7 @@ class TestShodanPivot:
         """review-B1.5r1#3: the bytes were parsed, discarded, and a fresh document synthesized in their
         place — the "raw evidence" was Quarry's account of the answer, not the answer."""
         self._sized(monkeypatch, tmp_path, counts={"*": 250}, pivots=("hA",))
-        raws = [q.read_bytes() for q in (tmp_path / "raw" / "probe" / "shodan").rglob("*.json")
+        raws = [q.read_bytes() for q in (tmp_path / "state" / "shodan-pivot").rglob("pages/**/*.json")
                 if q.name != ".quarry-write-probe" and "matches" not in json.loads(q.read_text())]
         assert raws == [json.dumps({"total": 250}).encode()], raws
         ev = self._ledger_events(tmp_path, "shodan_count")

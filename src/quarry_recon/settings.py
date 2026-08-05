@@ -258,6 +258,28 @@ def raw(key: str, default=None):
     return default if v in (None, "") else v
 
 
+def policy_days(key: str, default: float) -> float:
+    """A non-negative DURATION in days from PERFORMANCE, exactly as written: an int or a float, and `0`
+    is a real value. A string, a boolean, a negative or a non-finite value falls back to the default.
+
+    `concurrency()` cannot serve this: it clamps to at least 1, because a tool with zero lanes does
+    nothing — and a freshness policy of zero means something entirely different ("never replay"). Reading
+    a duration through the concurrency reader silently made `0` into `1`, so the documented policy could
+    not be configured at all. A malformed or negative value falls back to the default rather than
+    becoming a permissive one.
+    """
+    v = performance().get(key)
+    # EXACT: an int or a float, never a bool (an int subclass), never a string. `float("7")` succeeded, so
+    # the contract said "as written" while quietly coercing — and a policy that accepts `"7"` today has to
+    # decide what `"7 days"` means tomorrow. YAML already gives a number for a number.
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return float(default)
+    f = float(v)
+    if f != f or f in (float("inf"), float("-inf")) or f < 0:
+        return float(default)
+    return f
+
+
 def concurrency(key: str, default: int) -> int:
     """An explicit per-tool concurrency override from PERFORMANCE (e.g. `NUCLEI_CONCURRENCY`,
     `HTTPX_THREADS`), else `default`. This is the explicit-override floor; the auto/core-scaling

@@ -19,14 +19,23 @@ construction rather than by patching the network.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import budget, events
 
-SHODAN_WORK_SCHEMA = 1
+#: v2: pages carry `bought_at` and live in a PROJECT-scoped store. A schema bump isolates the previous
+#: generation rather than deleting it — paid evidence is never pruned automatically.
+SHODAN_WORK_SCHEMA = 2
+#: POLICY, not a measurement: how long a purchased search page may stand in for a fresh one. A Shodan
+#: search result is LIVE intelligence — unlike a WHOIS record, which is why whoxy's cache is permanent
+#: and this one is not. 7 days is a default chosen for the operator to change, and the effective value
+#: travels with the evidence so a report never implies it was measured.
+PAGE_TTL_DAYS_DEFAULT = 7
 SHODAN_PAGE_SIZE = 100                      # Shodan returns up to 100 matches per page
 
 
@@ -51,6 +60,10 @@ class PivotState:
     pivot: Pivot
     total: "int | None" = None              # the provider's own match count; None until page 1 answers
     pages_done: set = field(default_factory=set)
+    #: pages this pivot OWNS but which are older than the TTL. Kept apart from `pages_done` because they
+    #: are not current evidence — and apart from "missing", because they were paid for and must never be
+    #: silently re-bought.
+    aged_pages: set = field(default_factory=set)
     attempted: bool = False                 # a request was ISSUED for this pivot (a credit was spent)
     cardinality: "int | None" = None      # /host/count sizing, held SEPARATELY from `total` so neither
                                           # can contaminate the other (review-B1.5r1#1)
@@ -91,13 +104,27 @@ class PivotState:
         monotonic, so the completed prefix is walked once in total."""
         if self.stopped:
             return None
-        while self._cursor in self.pages_done:
+        # an AGED page is skipped, never scheduled: it is already paid for, and buying it again merely
+        # because time passed is a spend the operator did not ask for. The refusal is counted, not hidden.
+        while self._cursor in self.pages_done or self._cursor in self.aged_pages:
             self._cursor += 1
         pages = self.page_count()
         if pages is None:
             return self._cursor if self._cursor == 1 else None
         limit = pages if not max_pages else min(pages, max_pages)
         return self._cursor if self._cursor <= limit else None
+
+    def refused_refresh(self, max_pages: int = 0) -> int:
+        """Aged pages this pivot would otherwise have asked for. Each one is a purchase the run DECLINED
+        to make on its own: refreshing paid evidence is an explicit operator decision, and `--unbound`
+        is not that decision — it never authorises spending."""
+        if not self.aged_pages:
+            return 0
+        pages = self.page_count()
+        limit = pages if pages is not None else max(self.aged_pages)
+        if max_pages:
+            limit = min(limit, max_pages)
+        return sum(1 for p in self.aged_pages if p <= limit)
 
     def withheld_pages(self, max_pages: int = 0) -> int:
         """Pages this pivot HAS, that an operator page policy keeps us from buying, and that we do NOT
@@ -128,6 +155,73 @@ def item_key(pivot: Pivot, page: int) -> str:
     genuinely invalidates the artifact.)"""
     raw = f"{SHODAN_WORK_SCHEMA}|{pivot.lane}|{pivot.facet}|{pivot.value}|p{page}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def provider_dir(project_dir) -> Path:
+    """`<project>/state/shodan-pivot` — the PROVIDER level, above the schema generation."""
+    return Path(project_dir) / "state" / "shodan-pivot"
+
+
+def state_dir(project_dir) -> Path:
+    """The DURABLE home for purchased pivot pages: `<project>/state/shodan-pivot/v<schema>/`.
+
+    A run directory is timestamped, so state kept inside one dies with it and the NEXT run buys the same
+    pages again — measured in code before this change: the ledger lived under `ctx.run.dir/raw/probe`,
+    replay read only that ledger, and nothing project-scoped carried ownership. Two separate `quarry run`
+    invocations therefore paid twice for identical pages; a campaign only avoided it by closing
+    acquisition after child 1, which is not replay, it is not acquiring at all.
+
+    The ledger and the page artifacts live under the SAME directory because `Ledger.record` stores paths
+    relative to its own parent — an artifact outside that tree cannot be owned at all.
+
+    The generation is the WORK SCHEMA and nothing else: not the API key (a page's bytes do not depend on
+    which credential paid for it), not the page budget or the reserve (folding those in would make
+    lowering a spending policy re-buy pages already paid for). Durability is NOT permanence — a Shodan
+    search page is live intelligence, so `PAGE_TTL_DAYS_DEFAULT` decides how long it may stand in for a
+    fresh one, and an aged page is kept as history rather than replayed as current.
+    """
+    return provider_dir(project_dir) / f"v{SHODAN_WORK_SCHEMA}"
+
+
+class StoreBusy(RuntimeError):
+    """Another lifecycle holds this project's purchased-page store. CONTENTION ONLY."""
+
+
+@contextlib.contextmanager
+def lifecycle_lock(project_dir):
+    """Exclusive, ADVISORY, OS-RELEASED lock over a project's purchased Shodan pages.
+
+    Without it two runs of the same project load the same snapshot, both see a page as unowned, and both
+    spend a credit for identical bytes — then race while journaling and compacting, which is how
+    ownership is lost outright. The store only became shareable when it became project-scoped, so the
+    lock arrives with it.
+
+    Held across LOAD, REPLAY, PURCHASE, RECORD and SAVE. Contention raises `StoreBusy` BEFORE any of
+    that, so a blocked run issues zero paid requests — it refuses acquisition rather than waiting, and
+    waiting for a lock is not a spending policy.
+
+    At the PROVIDER level, above the schema generation: two builds on different schemas still share one
+    account and must not spend at once (the whoxy precedent, review-B1.6b2#1).
+
+    `flock`, not lockfile existence: a stale file from a killed run would block the project for ever,
+    while an flock is released by the kernel when the holder dies, however it dies.
+
+    NOT the account-wide spending lock. Credits are account-wide, so two runs in DIFFERENT projects can
+    still each spend toward the same reserve — whoxy solves that with a second, installation-wide
+    `spend_lock`, and this lane owes the same (filed, not built here).
+    """
+    base = provider_dir(project_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(budget.state_lock(base / ".lock"))
+        except budget.StateBusy as e:
+            raise StoreBusy(str(e)) from e
+        # ONLY the acquisition is translated. Wrapping the body too meant a `StateBusy` raised INSIDE —
+        # another lane's ledger, a nested lifecycle — came back out as this lock's contention, and the
+        # caller then reported "another run holds this project's store" about a lock it was holding
+        # itself (the whoxy precedent, review-B-audit-7#7).
+        yield base
 
 
 def owned_index(ledger) -> dict:
@@ -234,7 +328,15 @@ class LaneOutcome:
     pivots: int = 0
     pivots_touched: int = 0                 # at least one page bought or replayed
     pages_bought: int = 0
-    pages_replayed: int = 0
+    pages_replayed: int = 0                 # replayed FRESH: inside the TTL, used as current evidence
+    #: owned, but older than the TTL. The artifact is KEPT and reported as historical evidence; it is not
+    #: ingested as a current result, and it is never re-bought merely because time passed.
+    pages_aged: int = 0
+    #: an aged page whose pivot then wanted it: purchasing it again is an explicit operator decision, so
+    #: the run records the refusal instead of spending
+    refresh_refused: int = 0
+    #: the oldest replayed page's age, so a report can say "current, 2 days old" rather than "current"
+    oldest_replay_s: float = 0.0
     matches: int = 0
     fail_classes: dict = field(default_factory=dict)
     limit_classes: dict = field(default_factory=dict)
@@ -300,9 +402,52 @@ def observe_total(st, o, total) -> None:
     compare_count(st, o)
 
 
-def _page_doc(pivot: Pivot, page: int, total, matches) -> dict:
+def _page_doc(pivot: Pivot, page: int, total, matches, *, bought_at=None) -> dict:
+    """The page as stored. `bought_at` rides INSIDE the document on purpose: it is content-addressed and
+    digest-verified, so the purchase time is bound to the evidence by the same hash that proves ownership
+    — a sidecar could drift from the page it describes."""
     return {"schema": SHODAN_WORK_SCHEMA, "lane": pivot.lane, "facet": pivot.facet,
-            "value": pivot.value, "page": page, "total": total, "matches": matches}
+            "value": pivot.value, "page": page, "total": total, "matches": matches,
+            "bought_at": float(time.time() if bought_at is None else bought_at)}
+
+
+#: tolerance for ordinary clock skew between the machine that bought a page and the one reading it.
+#: Beyond this a "bought in the future" timestamp is not skew, it is a page that cannot prove its age.
+CLOCK_SKEW_S = 300.0
+
+
+def page_age_s(doc, *, now=None) -> float | None:
+    """How old a stored page is, or None when it cannot say.
+
+    An unreadable age is NEVER treated as fresh: the caller ages it out, because a page that cannot prove
+    when it was bought cannot prove it is current. That includes a NaN or infinite timestamp (which
+    arithmetic would otherwise collapse into a plausible number) and one dated in the FUTURE beyond
+    ordinary clock skew — clamping those to "age zero" made an impossible timestamp certify freshness.
+    """
+    at = doc.get("bought_at") if isinstance(doc, dict) else None
+    if isinstance(at, bool) or not isinstance(at, (int, float)):
+        return None
+    at = float(at)
+    if at != at or at in (float("inf"), float("-inf")):
+        return None
+    ref = float(now if now is not None else time.time())
+    age = ref - at
+    if age < -CLOCK_SKEW_S:
+        return None                    # dated in the future: not skew, not provable
+    return max(0.0, age)
+
+
+def page_fresh(doc, *, ttl_days: float, now=None) -> bool:
+    """Whether a stored page may stand in for a fresh purchase.
+
+    `ttl_days <= 0` means NEVER REPLAY: every owned page is treated as aged, so it is retained as history
+    and its refresh is REFUSED. It does not mean "always buy" — nothing here spends, and the scheduler
+    skips an aged page precisely so that time passing can never authorise a purchase.
+    """
+    age = page_age_s(doc, now=now)
+    if age is None or ttl_days <= 0:
+        return False
+    return age <= ttl_days * 86400.0
 
 
 def valid_page(doc, pivot: Pivot, page: int):
@@ -372,7 +517,8 @@ def _read_page(path, pivot: Pivot, page: int):
 
 
 def run_work(ctx, *, states, balance, search, ingest, ledger, attempt_dir,
-             max_pages: int = 0, is_limit=None, should_stop=None) -> WorkResult:
+             max_pages: int = 0, is_limit=None, should_stop=None,
+             ttl_days: float = PAGE_TTL_DAYS_DEFAULT) -> WorkResult:
     """Buy pages under the balance, replaying anything already owned.
 
     `search(pivot, page) -> (matches, total, error)` and `ingest(pivot, page, matches, raw_path) -> int`
@@ -392,8 +538,10 @@ def run_work(ctx, *, states, balance, search, ingest, ledger, attempt_dir,
         o.pivots += 1
     try:
         try:
-            _replay_indexed(states, res, ledger=ledger, ingest=ingest)
+            _replay_indexed(states, res, ledger=ledger, ingest=ingest, ttl_days=ttl_days)
             _apply_cardinality(states, res)
+            for st in states:                      # what aging DECLINED to buy, per lane
+                res.lanes[st.pivot.lane].refresh_refused += st.refused_refresh(max_pages)
             try:
                 _work(states, res, balance=balance, search=search, ingest=ingest, ledger=ledger,
                       attempt_dir=attempt_dir, max_pages=max_pages, is_limit=is_limit,
@@ -563,7 +711,8 @@ def _replay_lane_safe(states, res, replay_one) -> None:
             _machinery(res, e)                 # the lane keeps the fault; the STOP is global
 
 
-def _replay_indexed(states, res, *, ledger, ingest) -> None:
+def _replay_indexed(states, res, *, ledger, ingest, ttl_days: float = PAGE_TTL_DAYS_DEFAULT,
+                    now=None) -> None:
     """Replay every page we demonstrably own, BEFORE any scheduling.
 
     review-r3#3: purchased evidence must replay whether or not an earlier hole is repaired this
@@ -577,6 +726,15 @@ def _replay_indexed(states, res, *, ledger, ingest) -> None:
         for page, art, doc in index.get((st.pivot.lane, st.pivot.facet, st.pivot.value), ()):
             if page in st.pages_done:
                 continue
+            if not page_fresh(doc, ttl_days=ttl_days, now=now):
+                # AGED, not gone: a Shodan search page is live intelligence, so replaying a stale one as
+                # a current result would be the "eternal cache" the free-host lane warns about. The
+                # artifact stays owned and reportable as history; it just does not stand in for today.
+                o.pages_aged += 1
+                st.aged_pages.add(page)
+                continue
+            age = page_age_s(doc, now=now) or 0.0
+            o.oldest_replay_s = max(o.oldest_replay_s, age)
             _replay_one(st, o, page=page, ledger=ledger, ingest=ingest, owned=(art, doc))
 
     _replay_lane_safe(states, res, one)

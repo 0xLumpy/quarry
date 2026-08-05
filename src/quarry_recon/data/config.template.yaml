@@ -45,6 +45,15 @@ PERFORMANCE:
                              # Membership is never capped: every OBSERVED in-scope address is eligible,
                              # ordered fairly across /24 (v4) and /48 (v6) netblocks so one dense block
                              # cannot monopolise a bound
+  SHODAN_PAGE_TTL_DAYS:      # how long a PURCHASED Shodan search page may stand in for a fresh one.
+                             # DEFAULT 7 — a POLICY choice, not a measurement: a search result is LIVE
+                             # intelligence (unlike a WHOIS record, which is why the whoxy page cache is
+                             # permanent). Pages are stored per PROJECT so a second run never re-buys
+                             # them; past the TTL a page is kept as HISTORICAL evidence, excluded from
+                             # current coverage, and NOT re-bought automatically — refreshing paid
+                             # evidence is an explicit operator decision, never a side effect of time
+                             # passing or of `--unbound` (which authorises no purchase at all).
+                             # 0 = never replay (always buy).
   SHODAN_MAX_PAGES:          # pages bought per Shodan pivot. DEFAULT 0 = UNBOUNDED (page until the pivot
                              # is exhausted) — the CREDIT BALANCE is what bounds the spend, not an
                              # arbitrary page number. A nonzero value is a hard CAP on eligible input and

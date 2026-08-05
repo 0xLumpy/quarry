@@ -593,6 +593,24 @@ _SHODAN_LANES = (
 
 
 def _shodan_work(ctx, key, lanes):
+    """See `_shodan_work_locked`. The PROJECT lock wraps the whole page lifecycle: two runs of one
+    project would otherwise both see a page as unowned and both pay for it."""
+    try:
+        with shodan_sched.lifecycle_lock(ctx.run.project_dir):
+            return _shodan_work_locked(ctx, key, lanes)
+    except shodan_sched.StoreBusy as e:
+        # REFUSE, never wait: waiting for a lock is not a spending policy, and this run issues zero paid
+        # requests. It is a GAP local to this run — the holder's evidence is not ours, its eligible set
+        # may differ, and it may fail before covering anything.
+        for spec, _vals in lanes:
+            events.coverage_partial(
+                spec.sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_pages", unit=f"{spec.sid}.pages",
+                reason=f"no page queried — another run holds this project's purchased-page store ({e})")
+        raise ShodanPageError("busy", RuntimeError(
+            f"shodan: another run holds this project's purchased-page store ({e})"))
+
+
+def _shodan_work_locked(ctx, key, lanes):
     """Spend ONE credit budget across ALL Shodan pivot lanes, under ONE coordinator.
 
     review-B1.4r2#1: each lane used to build its own balance, ledger and coordinator run, and they were
@@ -615,11 +633,23 @@ def _shodan_work(ctx, key, lanes):
         # by the pivot's lane, so a favicon page and a cert page are distinct identities by construction.
         cfg_fp = events.work_unit("probe.shodan", inputs={}, config={"facets": [s.facet for s, _v in lanes]},
                                   schema_version=shodan_sched.SHODAN_WORK_SCHEMA)
-        sbase = ctx.run.dir / "raw" / "probe"
+        # PROJECT-scoped, not run-scoped: purchased pages are the one kind of evidence a new run must not
+        # pay for twice. `state_dir` explains the generation rule; the TTL below is what keeps it from
+        # becoming the eternal cache the free `shodan_host` lane warns about.
+        sbase = shodan_sched.state_dir(ctx.run.project_dir)
         sbase.mkdir(parents=True, exist_ok=True)
-        budget.prune_state(sbase, "probe.shodan", cfg_fp)
-        ledger = budget.Ledger(budget.state_path(sbase, "probe.shodan", cfg_fp), lane="probe.shodan")
-        attempt_dir = fresh_artifact_dir(sbase / "shodan" / cfg_fp[:16])
+        # the durable ledger's identity is the SCHEMA, never the enabled pivot set. `cfg_fp` folds in the
+        # current facet list, so running favicon alone and then favicon+cert changed the filename — and
+        # `prune_state` then DELETED the only ownership index for pages already paid for, leaving their
+        # artifacts unreplayable and buyable again. Per-page keys already separate lane/facet/value, so
+        # one ledger per generation is the correct grain; nothing is pruned here, because pruning a
+        # durable purchase record is exactly the loss this store exists to prevent.
+        ledger = budget.Ledger(
+            budget.state_path(sbase, "probe.shodan", f"v{shodan_sched.SHODAN_WORK_SCHEMA}"),
+            lane="probe.shodan")
+        # the artifacts live UNDER the ledger's own directory, or they cannot be owned at all
+        attempt_dir = fresh_artifact_dir(sbase / "pages" / cfg_fp[:16])
+        page_ttl = _shodan_page_ttl()
         by_sid = {spec.sid: spec for spec, _vals in lanes}
         # review-B1.4r3#2: ONE global last-error let a failure in one lane decide another lane's terminal —
         # cert taking a 500 and favicon a quota reported BOTH as FAILED/server. Error evidence is per SOURCE,
@@ -736,7 +766,7 @@ def _shodan_work(ctx, key, lanes):
 
         res = shodan_sched.run_work(ctx, states=states, balance=bal, search=search, ingest=ingest,
                                     ledger=ledger, attempt_dir=attempt_dir, max_pages=max_pages,
-                                    should_stop=should_stop)
+                                    should_stop=should_stop, ttl_days=page_ttl)
         return _SharedWork(balance=bal, result=res, found=found, errs=errs, oos=oos, names=hostnames,
                            sizing=sizing, max_pages=max_pages)
     finally:
@@ -762,6 +792,16 @@ def _hostname_facts(nm: dict) -> list:
         facts.append(f"{nm['noncanonical']} valid DNS owner name(s) retained as PASSIVE evidence "
                      f"(not hostnames, never actively expanded)")
     return facts
+
+
+def _shodan_page_ttl() -> float:
+    """How long a purchased page may stand in for a fresh one, as CONFIGURED.
+
+    Its own seam so the reading can be tested at the consumer rather than only at the reader: a DURATION
+    is not a lane count, and reading it through `settings.concurrency()` (which clamps to >= 1) made the
+    documented `0 = never replay` unreachable while every direct test of the parser still passed.
+    """
+    return settings.policy_days("SHODAN_PAGE_TTL_DAYS", shodan_sched.PAGE_TTL_DAYS_DEFAULT)
 
 
 def _size_pivots(key, states, *, ledger, attempt_dir, cooldown, refused=None) -> tuple:
@@ -894,6 +934,19 @@ def _shodan_result(spec, values, work):
     # what this lane actually BOUGHT, in the unit it is charged in — a campaign that repeats runs has to
     # see spend per child, and replayed pages cost nothing (settle prerequisite D)
     events.spend(spec.sid, provider="shodan", measure="pages", amount=int(o.pages_bought))
+    # the four page dispositions, named so a reader can tell CURRENT evidence from history and from a
+    # purchase this run declined to make. `replayed_fresh` carries its age because "current" without an
+    # age is exactly the eternal-cache claim this policy exists to prevent.
+    if o.pages_bought or o.pages_replayed or o.pages_aged or o.refresh_refused:
+        events.coverage_partial(
+            spec.sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_pages", unit=f"{spec.sid}.pages",
+            eligible=o.pages_bought + o.pages_replayed + o.pages_aged,
+            tested=o.pages_bought + o.pages_replayed, omitted=o.pages_aged,
+            reason=(f"bought={o.pages_bought}; replayed_fresh={o.pages_replayed}"
+                    + (f" (oldest {o.oldest_replay_s / 86400:.1f}d)" if o.pages_replayed else "")
+                    + f"; aged_available={o.pages_aged} (kept as history, excluded from current "
+                      f"evidence); refresh_refused={o.refresh_refused} (a purchase this run did NOT "
+                      f"make: refreshing paid evidence is an explicit operator decision)"))
     if values and not evidence and not errored:
         stop_cls = _STOP_CLASS.get(bal.stop_kind)          # already canonical: quota / entitlement
         if stop_cls:

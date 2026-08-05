@@ -1503,7 +1503,8 @@ class TestShodanPivotUsesTheProvenClass:
         # coordinator can act on, so the pivot never re-derives one.
         src = inspect.getsource(probe._classified)
         assert "provider_error_class(e)" in src and "classify_provider_error(" not in src
-        piv = inspect.getsource(probe._shodan_work)
+        # the lane BODY moved under a project lock wrapper; the classification claim is about the body
+        piv = inspect.getsource(probe._shodan_work_locked)
         assert "provider_error_class(err)" in piv and "classify_provider_error(" not in piv
 
 
