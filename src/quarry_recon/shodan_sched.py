@@ -353,6 +353,9 @@ class LaneOutcome:
     #: receipts or paid responses found on disk with no ownership entry behind them. Not "never bought":
     #: refused, counted, and left for an operator to reconcile.
     acquisition_orphans: int = 0
+    #: OWNED acquisition keys whose receipt would not validate. Untrusted ownership evidence: it blocks
+    #: a purchase exactly like a good receipt, because it cannot prove the page was NOT bought.
+    acquisition_invalid: int = 0
     #: pages recovered by parsing bytes we already owned — no provider contact, no credit
     pages_parsed_late: int = 0
     pages_rejected: int = 0
@@ -648,73 +651,6 @@ def publish_acquisition(attempt_dir, pivot: Pivot, page: int, *, state: str, raw
     return (art, dig, body) if budget.publish_bytes(art, body, digest=dig) else (None, None, body)
 
 
-def orphan_index(base, ledger) -> dict:
-    """Item keys whose RECEIPT or RAW response is on disk while the ledger owns no entry for them.
-
-    review#3 (Lumpy): `commit_acquisition` publishes the receipt and then journals it. If the publish
-    lands and the journal does not, the next run indexes only ledger items, sees nothing, and buys the
-    page again — while the receipt and the paid bytes sit right there. The generation-store lesson
-    applies: a surviving artifact beside a missing ownership entry is not evidence that nothing was
-    bought. It is refused and kept for an operator, never guessed at.
-
-    Returns {item_key: reason}. A best-effort walk: a store we cannot list yields no orphans rather than
-    an exception on the acquisition path."""
-    out: dict = {}
-    try:
-        owned = {k for k, _ in ledger.items()}
-    except Exception:
-        return out
-    root = Path(base)
-    try:
-        for art in root.rglob("acq/*.acq.json"):
-            key = art.name[:-len(".acq.json")]
-            if key and ACQ_PREFIX + key not in owned:
-                out[key] = f"receipt without an ownership entry ({art})"
-        for art in root.rglob("raw/*.json"):
-            key = art.stem
-            if key and key not in out and ACQ_PREFIX + key not in owned and key not in owned:
-                out[key] = f"paid response without an ownership entry ({art})"
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except Exception:
-        return out
-    return out
-
-
-def acquisition_index(ledger) -> dict:
-    """Every acquisition receipt this ledger holds, read ONCE: {(lane, facet, value, page): doc}.
-
-    Per-page reads would be correct and wasteful — resume already enumerates the ledger once for pages
-    (`owned_index`), and a test pins one read per resumed page. Receipts follow the same rule."""
-    out: dict = {}
-    try:
-        items = list(ledger.items())
-    except Exception:
-        return out
-    for item, art in items:
-        if not (isinstance(item, str) and item.startswith(ACQ_PREFIX)):
-            continue
-        try:
-            doc = json.loads(Path(art).read_text())
-        except Exception:
-            continue
-        if not isinstance(doc, dict) or doc.get("kind") != "acquisition":
-            continue
-        if doc.get("state") not in (ACQ_PARSED, ACQ_UNPARSED, ACQ_INCOMPLETE):
-            continue
-        lane, facet, value, page = (doc.get("lane"), doc.get("facet"), doc.get("value"),
-                                    doc.get("page"))
-        if not (isinstance(lane, str) and isinstance(facet, str) and isinstance(value, str)):
-            continue
-        if isinstance(page, bool) or not isinstance(page, int):
-            continue
-        # the receipt must be filed under the identity it claims, exactly like a page
-        if item != ACQ_PREFIX + item_key(Pivot(lane, facet, value), page):
-            continue
-        out[(lane, facet, value, page)] = doc
-    return out
-
-
 def verified_raw(acq: dict, *, base) -> "Path | None":
     """The receipt's raw artifact, or None when it cannot prove it is the response we paid for.
 
@@ -753,6 +689,91 @@ def verified_raw(acq: dict, *, base) -> "Path | None":
     except Exception:
         return None
     return p
+
+
+@dataclass
+class OwnershipView:
+    """What this project can PROVE about pages it may have paid for.
+
+    review#3 (Lumpy): every one of these facts is a reason NOT to spend, and each was previously
+    expressed as an absence — a receipt that would not validate was skipped, an unreadable store returned
+    an empty index, and both then read as "never purchased". Failure to inspect ownership must block
+    spending, never erase ownership from the decision."""
+
+    by_page: dict = field(default_factory=dict)      # (lane, facet, value, page) -> receipt
+    invalid: dict = field(default_factory=dict)      # item_key -> why an OWNED receipt is untrusted
+    orphans: dict = field(default_factory=dict)      # item_key -> artifact with no ownership entry
+    error: str = ""                                  # ownership could not be inspected AT ALL
+
+
+def ownership_view(base, ledger) -> OwnershipView:
+    """Every ownership fact, from ONE enumeration of the ledger and one walk of the store.
+
+    `error` is set when the inspection itself failed. For a PAID store an uninspectable answer is not an
+    empty one: the caller stops rather than treating "we could not look" as "there is nothing there".
+    """
+    view = OwnershipView()
+    try:
+        items = list(ledger.items())
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        view.error = f"ledger could not be enumerated: {e}"
+        return view
+    owned = {k for k, _ in items}
+
+    for item, art in items:
+        if not (isinstance(item, str) and item.startswith(ACQ_PREFIX)):
+            continue
+        key = item[len(ACQ_PREFIX):]
+        try:
+            doc = json.loads(Path(art).read_text())
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            view.invalid[key] = f"receipt unreadable: {e}"
+            continue
+        if not isinstance(doc, dict) or doc.get("kind") != "acquisition":
+            view.invalid[key] = "receipt is not an acquisition document"
+            continue
+        if doc.get("state") not in (ACQ_PARSED, ACQ_UNPARSED, ACQ_INCOMPLETE):
+            view.invalid[key] = f"receipt state {doc.get('state')!r} is not one we issue"
+            continue
+        lane, facet, value, page = (doc.get("lane"), doc.get("facet"), doc.get("value"),
+                                    doc.get("page"))
+        if not (isinstance(lane, str) and isinstance(facet, str) and isinstance(value, str)) \
+                or isinstance(page, bool) or not isinstance(page, int):
+            view.invalid[key] = "receipt does not name a pivot and page"
+            continue
+        if item != ACQ_PREFIX + item_key(Pivot(lane, facet, value), page):
+            # filed under one identity, describing another: it proves nothing about EITHER, and it is
+            # certainly not evidence that this page was never bought.
+            view.invalid[key] = "receipt is filed under a different identity than it claims"
+            continue
+        view.by_page[(lane, facet, value, page)] = doc
+
+    # artifacts that survived WITHOUT an ownership entry. review#3 (Lumpy): a publish that lands while
+    # its journal fails leaves the receipt — or the paid bytes — invisible, and the next run buys again.
+    # `.part` counts too: a partial response is a paid acquisition that did not finish (review#2).
+    root = Path(base)
+    try:
+        for pattern, what in (("acq/*.acq.json", "receipt"), ("raw/*.json", "paid response"),
+                              ("raw/*.json.part", "PARTIAL paid response")):
+            for art in root.rglob(pattern):
+                name = art.name
+                key = (name[:-len(".acq.json")] if name.endswith(".acq.json") else
+                       name[:-len(".json.part")] if name.endswith(".json.part") else art.stem)
+                if not key or key in view.orphans:
+                    continue
+                if ACQ_PREFIX + key in owned or key in owned:
+                    continue
+                view.orphans[key] = f"{what} without an ownership entry ({art})"
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        # a store we cannot WALK cannot rule out a prior purchase either
+        view.error = view.error or f"paid store could not be inspected: {e}"
+    return view
 
 
 def read_acquisition(ledger, pivot: Pivot, page: int) -> "dict | None":
@@ -1176,10 +1197,14 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
     # bound no other layer provides.
     tried: set = set()
     probed: list = []
-    # every receipt, read once for the whole run (see `acquisition_index`)
-    acquired = acquisition_index(ledger)
-    # …and every artifact that survived WITHOUT one (see `orphan_index`)
-    orphans = orphan_index(Path(ledger.path).parent, ledger)
+    # every ownership fact, from one enumeration and one walk (see `ownership_view`)
+    own = ownership_view(Path(ledger.path).parent, ledger)
+    if own.error:
+        # UNKNOWN is not EMPTY. An ownership store we could not inspect cannot rule out a prior
+        # purchase, so nothing is bought until an operator can say what is in it (review#1, Lumpy).
+        res.stop_cause = res.stop_cause or f"ownership_uninspectable:{own.error}"
+        return
+    acquired = own.by_page
 
     def sinks_ok() -> bool:
         """Prove BOTH sinks once, immediately before the first purchase.
@@ -1259,8 +1284,14 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
                 o.acquisition_refused += 1
                 st.lost_pages.add(page)          # never scheduled again: it is BOUGHT, not missing
                 continue
+            # an OWNED receipt we cannot validate is untrusted ownership evidence — never an absence
+            if item_key(st.pivot, page) in own.invalid:
+                o.acquisition_invalid += 1
+                o.acquisition_refused += 1
+                st.lost_pages.add(page)
+                continue
             # a receipt or a paid response on disk with NO ownership entry is not "never bought"
-            orphan = orphans.get(item_key(st.pivot, page))
+            orphan = own.orphans.get(item_key(st.pivot, page))
             if orphan is not None:
                 o.acquisition_orphans += 1
                 o.acquisition_refused += 1

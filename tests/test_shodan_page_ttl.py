@@ -1036,7 +1036,103 @@ class TestAcquisitionIsCommittedBeforeInterpretation:
         (attempt / "raw" / f"{S.item_key(pivot, 1)}.json").write_bytes(b'{"total": 1, "matches": []}')
         led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
                             lane="probe.shodan")
-        assert S.orphan_index(base, led), "a paid response with no ownership entry is an orphan"
+        assert S.ownership_view(base, led).orphans, \
+            "a paid response with no ownership entry is an orphan"
 
         run = self._lane(tmp_path, response=b"unused", parse=lambda p: None)
         assert run["issued"] == [] and run["outcome"].acquisition_orphans == 1
+
+    def test_an_UNINSPECTABLE_store_stops_acquisition_globally(self, tmp_path):
+        """review#1: `orphan_index` was best-effort, so a failed walk or a ledger that would not
+        enumerate returned an EMPTY index — and empty read as "no prior purchase". For a paid store,
+        unknown is not empty."""
+        from quarry_recon import budget
+        base = S.state_dir(tmp_path)
+        base.mkdir(parents=True, exist_ok=True)
+
+        class _Blind(budget.Ledger):
+            def items(self):
+                raise OSError("the ownership store cannot be enumerated")
+
+        led = _Blind(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
+                     lane="probe.shodan")
+        view = S.ownership_view(base, led)
+        assert view.error and "enumerated" in view.error
+        assert view.by_page == {} and view.orphans == {}, "and it says nothing else, either"
+
+        st = PivotState(pivot=Pivot(FAV, "http.favicon.hash", "1"))
+        res = S.WorkResult()
+        res.lanes.setdefault(FAV, S.LaneOutcome(lane=FAV))
+        S._work([st], res, balance=type("B", (), {"spendable": 5, "may_spend": True, "reserve": 0})(),
+                search=lambda pv, pg: pytest.fail("a purchase was attempted against an unreadable store"),
+                ingest=lambda *a: 0, ledger=led, attempt_dir=base / "pages" / "a0",
+                max_pages=1, is_limit=lambda cls: False)
+        assert res.stop_cause.startswith("ownership_uninspectable:")
+
+    def test_an_unwalkable_paid_store_also_stops_acquisition(self, tmp_path, monkeypatch):
+        from quarry_recon import budget
+        base = S.state_dir(tmp_path)
+        base.mkdir(parents=True, exist_ok=True)
+        led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
+                            lane="probe.shodan")
+        monkeypatch.setattr(Path, "rglob",
+                            lambda self, pat: (_ for _ in ()).throw(OSError("permission denied")))
+        view = S.ownership_view(base, led)
+        assert view.error and "could not be inspected" in view.error
+
+    def test_an_orphaned_PARTIAL_response_is_seen_and_refused(self, tmp_path):
+        """review#2: a broken stream leaves `<key>.json.part`. The scan matched only `raw/*.json`, so a
+        partial whose receipt never published was invisible and the page could be bought again."""
+        from quarry_recon import budget
+        base = S.state_dir(tmp_path)
+        attempt = base / "pages" / "a0"
+        (attempt / "raw").mkdir(parents=True, exist_ok=True)
+        pivot = Pivot(FAV, "http.favicon.hash", "1")
+        partial = attempt / "raw" / f"{S.item_key(pivot, 1)}.json.part"
+        partial.write_bytes(b'{"total": 3, "matches": [{"hostna')      # the stream died here
+        led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
+                            lane="probe.shodan")
+        view = S.ownership_view(base, led)
+        assert S.item_key(pivot, 1) in view.orphans
+        assert "PARTIAL" in view.orphans[S.item_key(pivot, 1)]
+
+        run = self._lane(tmp_path, response=b"unused", parse=lambda p: None)
+        assert run["issued"] == [], "a partial we paid for is not evidence that nothing was bought"
+        assert run["outcome"].acquisition_orphans == 1
+        assert partial.read_bytes().startswith(b'{"total"'), "the partial is PRESERVED"
+
+    def test_an_OWNED_but_invalid_receipt_blocks_the_purchase(self, tmp_path):
+        """review#3: a receipt that would not validate was silently skipped, while its `acq:` key stayed
+        owned — so the orphan scan did not see it either and the scheduler reached the purchase path.
+        Driven end to end through `_work`, not through `read_acquisition` against a stub."""
+        import json as _json
+        run = self._lane(tmp_path, response=b'{"total": 3, "matches": []}',
+                         err=("oversize", "deferred"))
+        led = self._fresh_ledger(run)
+        art = led.artifact(S.acq_key(run["pivot"], 1))
+        doc = _json.loads(art.read_text())
+        doc["state"] = "something we never issue"
+        art.write_text(_json.dumps(doc))
+        # re-own it: the ledger's digest binding would otherwise drop it and make it a LOST item
+        led.record(S.acq_key(run["pivot"], 1), art)
+        led.save()
+
+        view = S.ownership_view(S.state_dir(tmp_path), self._fresh_ledger(run))
+        assert S.item_key(run["pivot"], 1) in view.invalid
+
+        second = self._lane(tmp_path, response=b"unused", parse=lambda p: None)
+        assert second["issued"] == [], "untrusted ownership evidence is not an absence"
+        assert second["outcome"].acquisition_invalid == 1
+        assert second["outcome"].acquisition_refused == 1
+        assert second["outcome"].pages_bought == 0
+
+    def test_an_unreadable_owned_receipt_blocks_the_purchase_too(self, tmp_path):
+        run = self._lane(tmp_path, response=b'{"total": 3, "matches": []}',
+                         err=("oversize", "deferred"))
+        led = self._fresh_ledger(run)
+        art = led.artifact(S.acq_key(run["pivot"], 1))
+        art.write_bytes(b"{ not json at all")
+        led.record(S.acq_key(run["pivot"], 1), art)
+        led.save()
+        second = self._lane(tmp_path, response=b"unused", parse=lambda p: None)
+        assert second["issued"] == [] and second["outcome"].acquisition_invalid == 1
