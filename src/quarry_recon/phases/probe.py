@@ -22,8 +22,9 @@ import urllib.request
 from .. import (budget, contract, events, netguard, normalize, secrets, settings, shodan_host,
                 shodan_sched, store)
 from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PARSE, PROVIDER_RATE_LIMIT,
-                        ProviderResult, ProviderSkip, capture_error_body, is_provider_limit,
-                        provider_error_class, run_contract, run_provider)
+                        ProviderResult, ProviderSkip, ResponseTooLarge, capture_error_body,
+                        is_provider_limit, provider_error_class, read_bounded, run_contract,
+                        run_provider)
 from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir, have,
                       nuclei_timeout, reclassify_ffuf,
                       reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
@@ -160,31 +161,18 @@ SHODAN_UA = "quarry-recon"
 SHODAN_READ_LIMIT = 64 * 1024 * 1024
 
 
-class ShodanResponseTooLarge(ValueError):
-    """A response longer than `SHODAN_READ_LIMIT`. Carries its own class so it can never be mistaken for
-    the provider having sent us something malformed."""
-
-    error_class = "oversize"
+#: kept as an alias so a caller can name the Shodan case specifically; the machinery is shared
+ShodanResponseTooLarge = ResponseTooLarge
 
 
 def _read_bounded(r, limit: "int | None" = None) -> bytes:
-    """Read a response, and KNOW whether it was complete. Reading exactly `limit` bytes cannot tell a
-    response that just fits from one that was cut — so read one byte past and treat that as the signal.
+    """`contract.read_bounded` with this lane's bound, read AT CALL TIME.
 
-    The bound is read AT CALL TIME, not captured as a default argument: a module constant frozen into a
-    signature at import cannot be changed by anything — not the policy report, not a test, not a future
-    setting — while still looking like a knob."""
-    limit = SHODAN_READ_LIMIT if limit is None else limit
-    raw = r.read(limit + 1)
-    if len(raw) > limit:
-        e = ShodanResponseTooLarge(
-            f"shodan: response exceeds our {limit // (1024 * 1024)} MiB read cap "
-            f"(SHODAN_READ_LIMIT) — the page was NOT parsed and nothing was dropped silently")
-        # the head of what we DID read travels with it: a request that hit our ceiling was still paid
-        # for, and the coordinator can only preserve what it is handed.
-        e.body_bytes = bytes(raw)
-        raise e
-    return raw
+    Not captured as a default argument: a module constant frozen into a signature at import cannot be
+    changed by anything — not the policy report, not a test, not a future setting — while still looking
+    like a knob."""
+    return read_bounded(r, SHODAN_READ_LIMIT if limit is None else limit, provider="shodan",
+                        bound="SHODAN_READ_LIMIT")
 
 
 def _shodan_count(key, facet, v):

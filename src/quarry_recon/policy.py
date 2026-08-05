@@ -294,6 +294,12 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.contract:_ERROR_BODY_LIMIT": ("provider", "how much of a provider error body is kept"),
     "quarry_recon.contract:_DETAIL_CHARS": ("provider", "a terminal REASON is one line; the body itself is "
                                             "kept whole by _ERROR_BODY_LIMIT above"),
+    "quarry_recon.phases.vertical:CENSYS_READ_LIMIT": (
+        "resource", "one provider response is read into memory; hitting it RAISES (`oversize`)"),
+    "quarry_recon.phases.vertical:CRTSH_READ_LIMIT": (
+        "resource", "one provider response is read into memory; hitting it RAISES (`oversize`)"),
+    "quarry_recon.phases.vertical:CERTSPOTTER_READ_LIMIT": (
+        "resource", "one provider response is read into memory; hitting it RAISES (`oversize`)"),
     "quarry_recon.phases.probe:SHODAN_READ_LIMIT": (
         "resource", "one provider response is read into memory. Hitting it RAISES (class `oversize`) and "
         "the page is reported as ours — it never drops rows from a page we keep"),

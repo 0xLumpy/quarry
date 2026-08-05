@@ -17,7 +17,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from .. import budget, campaign, events, netguard, normalize, policy, remainder, secrets, settings, sweep
-from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, registered, run_contract,
+from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, read_bounded,
+                        registered, run_contract,
                         run_provider)
 from ..runner import (RunResult, Status, have, reclassify_from_artifact, run as exec_tool,
                        skipped)
@@ -267,7 +268,7 @@ def _censys(cfg: dict, apex: str, timeout: int = 30, max_pages: int = 5) -> set:
             # review#2/r3#2: fetch AND validate/extract inside ONE protected block — do NOT swallow HTTP/transport
             # errors, and a later-page SCHEMA/parse error must ALSO preserve earlier pages (not propagate + lose).
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read(8 * 1024 * 1024).decode("utf-8", "replace")
+                raw = read_bounded(r, CENSYS_READ_LIMIT, provider="censys", bound="CENSYS_READ_LIMIT").decode("utf-8", "replace")
             doc = _json.loads(raw)
             # review#3 + P2 + r4#5: a success carries a `result` OBJECT whose `hits` is a LIST — anything else
             # (a bare object, a non-list hits) is malformed, an error, NOT a clean-EMPTY.
@@ -303,6 +304,15 @@ def _censys(cfg: dict, apex: str, timeout: int = 30, max_pages: int = 5) -> set:
     return ProviderResult(hosts, partial=truncated, cursor=page_token, pages=pages)   # ALWAYS PR (complete clears)
 
 
+#: How much of ONE response each free source may hand us. MEASURED 2026-08-05 on the Shodan lane: a bare
+#: `r.read(N)` truncates mid-document and the fragment is then reported as the PROVIDER's malformed JSON.
+#: crt.sh answers a busy apex with a very large array, so this is the source most likely to meet its cap;
+#: hitting one now raises `oversize` (ours) instead of `parse` (theirs).
+CENSYS_READ_LIMIT = 64 * 1024 * 1024
+CRTSH_READ_LIMIT = 64 * 1024 * 1024
+CERTSPOTTER_READ_LIMIT = 64 * 1024 * 1024
+
+
 def _crtsh(apex: str, timeout: int = 30) -> set:
     """Direct crt.sh CT-log pull for `%.apex` → set of hostnames (SANs, wildcards stripped).
     Best-effort + no key: complements subfinder's CT sources (coverage) and is a fallback when
@@ -311,7 +321,7 @@ def _crtsh(apex: str, timeout: int = 30) -> set:
     # review#2: errors propagate to run_provider (FAILED terminal, not fake-empty).
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = r.read(8 * 1024 * 1024)              # bounded read
+        data = read_bounded(r, CRTSH_READ_LIMIT, provider="crt.sh", bound="CRTSH_READ_LIMIT")
     rows = _json.loads(data.decode("utf-8", "replace"))
     # review#3: crt.sh's success shape is a JSON ARRAY. A non-list root (error page / schema drift) is NOT
     # zero results — raise into run_provider (FAILED), never launder it to a clean EMPTY.
@@ -351,7 +361,8 @@ def _certspotter(apex: str, token: str | None = None, timeout: int = 30, max_pag
             # error (not just network) must ALSO preserve earlier pages, not propagate and discard them.
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                rows = _json.loads(r.read(8 * 1024 * 1024).decode("utf-8", "replace"))
+                rows = _json.loads(read_bounded(r, CERTSPOTTER_READ_LIMIT, provider="certspotter", bound="CERTSPOTTER_READ_LIMIT")
+                                   .decode("utf-8", "replace"))
             # review#3: certspotter's success shape is a JSON ARRAY of issuances; a non-list root is an error.
             if not isinstance(rows, list):
                 raise ValueError("certspotter: non-list JSON root — not a valid empty result")

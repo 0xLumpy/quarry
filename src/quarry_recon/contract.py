@@ -208,6 +208,43 @@ def error_detail(exc) -> "str | None":
     return (reason[:_DETAIL_CHARS] + "…") if len(reason) > _DETAIL_CHARS else reason
 
 
+class ResponseTooLarge(ValueError):
+    """A response longer than the caller's read bound. Its class is OURS, never the provider's."""
+
+    error_class = PROVIDER_OVERSIZE
+
+
+def read_bounded(r, limit: int, *, provider: str = "", bound: str = "") -> bytes:
+    """Read a response and KNOW whether it was complete.
+
+    Reading exactly `limit` bytes cannot distinguish a response that just fits from one that was cut, so
+    this reads one byte past and treats that as the signal. MEASURED 2026-08-05 on the Shodan pivot lane:
+    a bare `r.read(4 MiB)` truncated a page mid-string, the fragment went to `json.loads`, and the run
+    reported `JSONDecodeError` — our own ceiling, billed to the provider's reputation and to two credits.
+    Every provider read shares this helper so the next one cannot repeat it.
+
+    The bytes actually read travel on the exception: a request that hit our ceiling still happened, and
+    the caller can only preserve what it is handed.
+
+    `bound` names the CONSTANT that stopped us. An operator reading "our read cap" still has to go
+    looking; the whole value of separating `oversize` from `parse` is that it points at a specific line
+    of ours, so the message carries the name."""
+    raw = r.read(limit + 1)
+    if len(raw) > limit:
+        size = (f"{limit // (1024 * 1024)} MiB" if limit >= 1024 * 1024 else
+                f"{limit // 1024} KiB" if limit >= 1024 else f"{limit} bytes")
+        e = ResponseTooLarge(
+            f"{provider + ': ' if provider else ''}response exceeds our {size} read cap"
+            f"{f' ({bound})' if bound else ''} — the body was NOT parsed and nothing was dropped "
+            f"silently")
+        try:
+            e.body_bytes = bytes(raw)
+        except Exception:
+            pass
+        raise e
+    return raw
+
+
 def error_body_reason(exc) -> "str | None":
     """The provider's own reason string from a JSON error body, or None when the body is not that shape.
 

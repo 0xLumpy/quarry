@@ -202,3 +202,48 @@ class TestOurOwnCeilingIsNotTheProvidersFault:
         makes an incomplete run look complete_with_limits."""
         assert contract.PROVIDER_OVERSIZE in contract.PROVIDER_CLASSES
         assert not contract.is_provider_limit(contract.PROVIDER_OVERSIZE)
+
+
+class TestEveryProviderReadSharesTheBound:
+    """The Shodan cap was not a Shodan problem: `vertical.py` read censys, crt.sh and certspotter through
+    bare 8 MiB caps with the same shape, and crt.sh answers a busy apex with a very large array. One
+    helper, so the next provider added cannot reinvent the silent truncation."""
+
+    class _Big:
+        def read(self, n=None):
+            return b"x" * (n or 1)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def test_no_provider_read_is_a_bare_slice_any_more(self):
+        import inspect
+        from quarry_recon.phases import vertical
+        for mod in (vertical, probe):
+            src = inspect.getsource(mod)
+            assert "r.read(8 * 1024 * 1024)" not in src
+            assert "r.read(4 * 1024 * 1024)" not in src, f"{mod.__name__} still truncates in place"
+
+    def test_each_source_declares_its_own_named_bound(self):
+        from quarry_recon.phases import vertical
+        for const in ("CENSYS_READ_LIMIT", "CRTSH_READ_LIMIT", "CERTSPOTTER_READ_LIMIT"):
+            assert getattr(vertical, const) >= 32 * 1024 * 1024
+
+    def test_the_message_names_the_constant_that_stopped_us(self):
+        with pytest.raises(contract.ResponseTooLarge) as caught:
+            contract.read_bounded(self._Big(), 10, provider="crt.sh", bound="CRTSH_READ_LIMIT")
+        msg = str(caught.value)
+        assert "crt.sh" in msg and "CRTSH_READ_LIMIT" in msg and "10 bytes" in msg
+
+    def test_a_sub_megabyte_bound_is_not_reported_as_zero(self):
+        with pytest.raises(contract.ResponseTooLarge) as caught:
+            contract.read_bounded(self._Big(), 4096, provider="p")
+        assert "4 KiB" in str(caught.value)
+
+    def test_the_bytes_read_are_carried_for_preservation(self):
+        with pytest.raises(contract.ResponseTooLarge) as caught:
+            contract.read_bounded(self._Big(), 64, provider="p")
+        assert len(caught.value.body_bytes) == 65
