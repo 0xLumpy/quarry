@@ -57,9 +57,31 @@ _TOKEN_RX = [
 #: requires CONNECTION-STRING STRUCTURE around it — a `Server=`/`Data Source=`/`Host=` style field in the
 #: same value — because `password=` on its own appears in documentation, examples, query strings and
 #: ordinary prose, and calling those database credentials is a claim we cannot support (review#6, Lumpy).
-_CONNSTR_RX = re.compile(
-    r"(?i)(?:(?:data\s+source|server|host|initial\s+catalog|database|dsn)\s*=\s*[^;\"'\r\n]{1,120};"
-    r"[^\"'\r\n]{0,400}?)(?:password|pwd)\s*=\s*([^;\"'\r\n]{4,})")
+#: one candidate value: a semicolon-delimited run of `field=value` pairs. Which pairs it holds is
+#: decided AFTER splitting, because requiring the anchor to come first missed
+#: `Password=x;User ID=sa;Server=db` — a perfectly ordinary connection string (review#4, Lumpy).
+_CONNSTR_CANDIDATE_RX = re.compile(r"[^\"'\r\n]{0,400}?=[^\"'\r\n]{0,400}")
+_CONNSTR_ANCHOR = re.compile(r"(?i)\A\s*(?:data\s+source|server|host|initial\s+catalog|database|dsn|"
+                             r"user\s*id|uid|integrated\s+security|provider)\s*\Z")
+_CONNSTR_PASSWORD = re.compile(r"(?i)\A\s*(?:password|pwd)\s*\Z")
+
+
+def _connstring_passwords(text: str):
+    """(password, offset) for every value that is REALLY a connection string.
+
+    A `password=` on its own appears in documentation, examples, query strings and prose; the claim
+    "database credential" needs an ANCHOR field beside it (`Server`, `Data Source`, `User ID`…). Fields
+    are split first, so the two may appear in any order."""
+    for m in _CONNSTR_CANDIDATE_RX.finditer(text):
+        chunk = m.group(0)
+        if ";" not in chunk:
+            continue
+        fields = [f.split("=", 1) for f in chunk.split(";") if "=" in f]
+        if not any(_CONNSTR_ANCHOR.match(k) for k, _v in fields):
+            continue
+        for k, v in fields:
+            if _CONNSTR_PASSWORD.match(k) and len(v.strip()) >= 4:
+                yield v.strip(), m.start()
 
 #: password VERIFIERS. A hash is not a credential value: it proves the store leaked and it is
 #: offline-crackable, which is worth reporting as its own thing rather than as a recovered secret
@@ -103,10 +125,16 @@ _JSON_SECRET_RX = re.compile(
     r'"([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|signing[_-]?key|api[_-]?key|apikey|'
     r'access[_-]?key|private[_-]?key|token|credential)[A-Za-z0-9_.\-]*)"'
     r'\s*:\s*(?:\{\s*"value"\s*:\s*)?"([^"]{4,})"', re.I)
-#: A bare `"Key"` is how .NET writes a JWT signing secret (`"Jwt": {"Key": "..."}`) and how a thousand
-#: harmless config blocks write an identifier. The VALUE carries the distinction: a signing key is long,
-#: so the floor is what keeps this from reporting every `"key": "name"` in a JSON document.
+#: A bare `"Key"` is how .NET writes a JWT signing secret and how a thousand harmless config blocks
+#: write an identifier — an OpenAPI example, a package manifest, a public id, an ordinary API response.
+#: Length alone is not a claim (review#1, Lumpy), so this needs one of two contexts: the FILE FORMAT that
+#: writes signing keys that way, or a JWT/signing parent right beside it.
 _JSON_BARE_KEY_RX = re.compile(r'"(key)"\s*:\s*"([^"]{20,})"', re.I)
+_JSON_BARE_KEY_PATHS = re.compile(r"(?:^|/)(?:appsettings(?:\.[\w-]+)?\.json|web\.config)$", re.I)
+#: `"Jwt": { … "Key": "…" }` / `"TokenSigning": {"key": …}` — the parent names what the key is FOR.
+_JSON_SIGNING_CONTEXT_RX = re.compile(
+    r'"[A-Za-z0-9_.\-]*(?:jwt|signing|token|auth|bearer)[A-Za-z0-9_.\-]*"\s*:\s*\{[^{}]{0,300}?'
+    r'"(key)"\s*:\s*"([^"]{20,})"', re.I)
 _MASKED_RX = re.compile(r"^[*•]+$")             # actuator sanitizes sensitive values to ******
 
 MAX_BODY = 2 * 1024 * 1024    # 2 MB cap per exposed resource (RAM/disk guard)
@@ -125,6 +153,7 @@ def mine(text: str, *, source_path: str | None = None) -> list[tuple[str, str, i
     """
     out: list[tuple[str, str, int]] = []
     seen_vals: set[str] = set()
+    path = urlsplit(source_path).path if source_path else ""
     for kind, rx in _TOKEN_RX:
         for m in rx.finditer(text):
             val = m.group(m.lastindex) if m.lastindex else m.group(0)
@@ -139,18 +168,20 @@ def mine(text: str, *, source_path: str | None = None) -> list[tuple[str, str, i
         if _SECRETISH_KEY.search(key) and val not in seen_vals:   # already caught as a typed token
             seen_vals.add(val)
             out.append((f"dotenv:{key}", val, text.count("\n", 0, m.start()) + 1))
-    for rx_set in (_JSON_SECRET_RX, _JSON_BARE_KEY_RX):
+    bare_key_rules = [_JSON_SIGNING_CONTEXT_RX]                     # a named signing parent, anywhere
+    if path and _JSON_BARE_KEY_PATHS.search(path):                  # …or the format that writes them
+        bare_key_rules.append(_JSON_BARE_KEY_RX)
+    for rx_set in (_JSON_SECRET_RX, *bare_key_rules):
         for m in rx_set.finditer(text):                           # JSON config (actuator env, .NET…)
             key, val = m.group(1), m.group(2)
             if (val not in seen_vals and not _MASKED_RX.match(val)
                     and val.lower() not in ("null", "true", "false")):
                 seen_vals.add(val)
                 out.append((f"json:{key}", val, text.count("\n", 0, m.start()) + 1))
-    for m in _CONNSTR_RX.finditer(text):                           # a password inside a connection string
-        val = m.group(1).strip()
+    for val, at in _connstring_passwords(text):                    # a password inside a connection string
         if val and val not in seen_vals:
             seen_vals.add(val)
-            out.append(("connection-string-password", val, text.count("\n", 0, m.start()) + 1))
+            out.append(("connection-string-password", val, text.count("\n", 0, at) + 1))
     for kind, rx in _HASH_RX:                                      # verifiers, not credential values
         for m in rx.finditer(text):
             val = m.group(0)
@@ -159,7 +190,6 @@ def mine(text: str, *, source_path: str | None = None) -> list[tuple[str, str, i
                 out.append((kind, val, text.count("\n", 0, m.start()) + 1))
     # …and the file that IS a secret, with no key to hang it on. FORMAT-gated: see the docstring.
     body = text.strip()
-    path = urlsplit(source_path).path if source_path else ""
     if body and path and body not in seen_vals:
         for path_rx, kind, body_rx in _FORMAT_RULES:
             if path_rx.search(path) and body_rx.match(body):
@@ -169,18 +199,24 @@ def mine(text: str, *, source_path: str | None = None) -> list[tuple[str, str, i
 
 
 def publish_finding(ctx, kind: str, val: str, line, *, url: str, dest, source: str,
-                    host: str | None = None) -> str:
+                    host: str | None = None, final_url: str | None = None) -> str:
     """Route ONE mined finding to the entity that describes it. Returns "secret", "hash" or "".
 
     One place decides what a kind IS, because five call sites deciding separately is how a password
-    VERIFIER ends up in the secret queue on four of them (review#2, Lumpy). A hash proves the store
-    leaked and is offline-crackable; it is not a recovered credential and must not be counted as one.
-    The complete value is retained either way — only Quarry's own credentials are ever redacted."""
+    VERIFIER ends up in the secret queue on four of them. A hash proves the store leaked and is
+    offline-crackable; it is not a recovered credential and must not be counted as one.
+
+    The COMPLETE value is stored on the entity (`value`), and `preview` stays masked for every prose
+    channel — report lines, digests, messenger. The entity is local project data next to the raw
+    artifact it came from; the preview is what travels. Storing only a preview was the older behaviour
+    and it lost the finding itself: one artifact can hold many values, and "grep the raw file" is not
+    the same as reporting the secret you found (review#3, Lumpy)."""
     where = host or normalize.host_of_url(url)
     if kind in HASH_KINDS:
         ok = ctx.run.add("review", {
             "id": f"credential-hash:{secrets.fingerprint(val)}", "klass": "credential-hash",
             "value": val, "host": where, "raw_ref": str(dest) if dest else None, "location": url,
+            **({"final": final_url} if final_url and final_url != url else {}),
             "line": line,
             "note": f"{kind}: a password verifier, offline-crackable — NOT the password. Its presence "
                     f"proves the credential store leaked.",
@@ -188,8 +224,10 @@ def publish_finding(ctx, kind: str, val: str, line, *, url: str, dest, source: s
         return "hash" if ok else ""
     ok = ctx.run.add("secret", {
         "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{url}|{line}')}",
-        "kind": kind, "preview": secrets.mask(val),
-        "file": str(dest) if dest else None, "location": url, "line": line, "sources": [source]})
+        "kind": kind, "value": val, "preview": secrets.mask(val),
+        "file": str(dest) if dest else None, "location": url,
+        **({"final": final_url} if final_url and final_url != url else {}),
+        "line": line, "sources": [source]})
     return "secret" if ok else ""
 
 
@@ -222,8 +260,14 @@ def fetch_and_extract(ctx, url: str, *, source: str, subdir: str) -> dict:
     dest.write_bytes(data)
     res["dest"] = str(dest)
     res["ok"] = True
-    for kind, val, ln in mine(text, source_path=url):   # secrets (redacted, provenance, raw_ref)
-        got = publish_finding(ctx, kind, val, ln, url=url, dest=dest, source=source, host=host)
+    # CLASSIFY BY WHAT ANSWERED. `scoped_get` follows redirects per hop, so a request for
+    # `/config/master.key` can be answered by `/checksums.txt` — and a format rule keyed on the
+    # REQUESTED path would call that body a Rails master key (review#2, Lumpy). Provenance keeps both:
+    # `location` is what we asked for, `final` is what replied.
+    final_url = res["final"] or url
+    for kind, val, ln in mine(text, source_path=final_url):   # secrets (provenance, raw_ref)
+        got = publish_finding(ctx, kind, val, ln, url=url, dest=dest, source=source, host=host,
+                              final_url=final_url)
         if got == "secret":
             res["secrets"] += 1
         elif got == "hash":
@@ -253,7 +297,7 @@ def fetch_exposed(ctx, urls: list[str]) -> int:
         if not r["ok"]:
             continue
         added += r["secrets"]
-        if ENCRYPTED_STORE_RX.search(urlsplit(u).path):
+        if ENCRYPTED_STORE_RX.search(urlsplit(r["final"] or u).path):
             note = ("exposed ENCRYPTED credential store — ciphertext, nothing decrypted here. It becomes "
                     "plaintext with its key (Rails: config/master.key), so the two together are the "
                     "finding")

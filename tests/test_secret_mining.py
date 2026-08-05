@@ -277,3 +277,124 @@ class TestEncryptedStoresAreNotMinedSecrets:
         evidence.fetch_exposed(ctx, ["https://t/.env"])
         notes = [r["note"] for kind, r in added if kind == "review" and r.get("klass") == "exposure"]
         assert notes and "no secret pattern" in notes[0], notes
+
+
+class TestClassificationFollowsWhatANSWERED:
+    """review#2 (Lumpy): `scoped_get` follows redirects per hop, so a request for `/config/master.key`
+    can be answered by `/checksums.txt`. Classifying on the REQUESTED path calls that body a Rails
+    master key. Provenance keeps both — `location` is what we asked for, `final` is what replied."""
+
+    KEY = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+    @staticmethod
+    def _ctx(tmp_path):
+        from types import SimpleNamespace
+        added: list = []
+        run = SimpleNamespace(
+            raw_path=lambda ph, sub, nm: (tmp_path / ph / sub).joinpath(nm)
+            if (tmp_path / ph / sub).mkdir(parents=True, exist_ok=True) or True else None,
+            add=lambda kind, rec: (added.append((kind, rec)), True)[1])
+        return SimpleNamespace(run=run, scope=SimpleNamespace(
+            in_scope=lambda h: True, is_oos=lambda h: False, active_allowed=lambda h: True)), added
+
+    def test_a_redirect_away_from_the_key_path_is_not_a_key(self, tmp_path, monkeypatch):
+        from quarry_recon import fetch
+        ctx, added = self._ctx(tmp_path)
+        monkeypatch.setattr(fetch, "scoped_get",
+                            lambda *a, **k: (self.KEY.encode(), "https://t/checksums.txt", 200))
+        evidence.fetch_and_extract(ctx, "https://t/config/master.key",
+                                   source="exposed-fetch", subdir="exposed")
+        assert not [r for kind, r in added if kind == "secret"], added
+
+    def test_the_key_path_answering_itself_still_classifies(self, tmp_path, monkeypatch):
+        from quarry_recon import fetch
+        ctx, added = self._ctx(tmp_path)
+        monkeypatch.setattr(fetch, "scoped_get",
+                            lambda *a, **k: (self.KEY.encode(), "https://t/config/master.key", 200))
+        evidence.fetch_and_extract(ctx, "https://t/config/master.key",
+                                   source="exposed-fetch", subdir="exposed")
+        secs = [r for kind, r in added if kind == "secret"]
+        assert secs and secs[0]["kind"] == "rails-master-key"
+
+    def test_the_encrypted_store_label_also_follows_the_final_url(self, tmp_path, monkeypatch):
+        from quarry_recon import fetch
+        ctx, added = self._ctx(tmp_path)
+        monkeypatch.setattr(fetch, "scoped_get",
+                            lambda *a, **k: (b"plain page", "https://t/login", 200))
+        evidence.fetch_exposed(ctx, ["https://t/config/credentials.yml.enc"])
+        notes = [r["note"] for kind, r in added if kind == "review" and r.get("klass") == "exposure"]
+        assert notes and "ENCRYPTED credential store" not in notes[0], notes
+
+    def test_provenance_keeps_BOTH_urls(self, tmp_path, monkeypatch):
+        from quarry_recon import fetch
+        ctx, added = self._ctx(tmp_path)
+        monkeypatch.setattr(fetch, "scoped_get",
+                            lambda *a, **k: (b"AWS_KEY=AKIAIOSFODNN7EXAMPLE\n", "https://t/real.env",
+                                             200))
+        evidence.fetch_and_extract(ctx, "https://t/.env", source="exposed-fetch", subdir="exposed")
+        sec = [r for kind, r in added if kind == "secret"][0]
+        assert sec["location"] == "https://t/.env" and sec["final"] == "https://t/real.env"
+
+
+class TestTheFindingItselfIsRetained:
+    """review#3 (Lumpy): the helper promised the complete value was retained and the entity stored only
+    a masked preview. "Grep the raw artifact" is not reporting the secret you found — one artifact can
+    hold many values."""
+
+    def test_the_entity_carries_the_COMPLETE_value(self):
+        from types import SimpleNamespace
+        added: list = []
+        ctx = SimpleNamespace(run=SimpleNamespace(add=lambda k, r: (added.append((k, r)), True)[1]))
+        raw = "AKIAIOSFODNN7EXAMPLE"
+        evidence.publish_finding(ctx, "aws-access-key", raw, 2, url="https://t/.env", dest="/raw/z",
+                                 source="exposed-fetch")
+        rec = added[0][1]
+        assert rec["value"] == raw, "the finding is the value"
+        assert rec["preview"] != raw and "…" in rec["preview"], "…and the PREVIEW is what travels"
+
+    def test_report_prose_still_shows_only_the_preview(self):
+        """The masked preview is what report lines and digests read; nothing in prose gets the value."""
+        import inspect
+        from quarry_recon import triage
+        src = inspect.getsource(triage)
+        assert "s.get('preview', '')" in src or 's.get("preview"' in src
+        assert 's.get("value")' not in src.split("secrets")[-1][:400]
+
+
+class TestTheBareKeyRuleNeedsContextToo:
+    """review#1 (Lumpy): `"key": "<20+ chars>"` anywhere made OpenAPI examples, package manifests,
+    public ids and ordinary API responses into secrets — the same format-attribution problem already
+    fixed for `master.key`."""
+
+    LONG = "super-secret-signing-value-1234"
+
+    def test_a_bare_key_in_an_arbitrary_response_is_not_a_secret(self):
+        for path in ("https://t/api/v1/items", "https://t/openapi.json", "https://t/package.json"):
+            assert kinds(f'{{"key": "{self.LONG}"}}', path) == {}, path
+
+    def test_the_FORMAT_that_writes_signing_keys_is_trusted(self):
+        for path in ("https://t/appsettings.json", "https://t/appsettings.Production.json"):
+            assert kinds(f'{{"key": "{self.LONG}"}}', path) == {"json:key": self.LONG}, path
+
+    def test_a_named_signing_parent_is_trusted_anywhere(self):
+        got = kinds(f'{{"Jwt": {{"Issuer": "me", "Key": "{self.LONG}"}}}}', "https://t/api/v1/config")
+        assert got == {"json:Key": self.LONG}
+
+    def test_an_unrelated_parent_is_not(self):
+        assert kinds(f'{{"Pagination": {{"Key": "{self.LONG}"}}}}', "https://t/api/v1/x") == {}
+
+
+class TestConnectionStringsRegardlessOfFieldOrder:
+    """review#4 (Lumpy): requiring the anchor BEFORE the password missed
+    `Password=x;User ID=sa;Server=db;Database=app`, which is a perfectly ordinary connection string."""
+
+    def test_password_first_is_still_a_connection_string(self):
+        got = kinds('cs = "Password=Sup3rS3cret;User ID=sa;Server=db;Database=app"')
+        assert got["connection-string-password"] == "Sup3rS3cret"
+
+    def test_password_last_still_works(self):
+        got = kinds('cs = "Server=db;Database=app;User Id=sa;Password=Sup3rS3cret"')
+        assert got["connection-string-password"] == "Sup3rS3cret"
+
+    def test_a_semicolon_list_with_no_connection_anchor_is_not_one(self):
+        assert kinds('note = "password=changeme;remember=false;theme=dark"') == {}
