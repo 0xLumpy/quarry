@@ -216,6 +216,53 @@ def _shodan_count(key, facet, v):
     return total, raw, None
 
 
+def _parse_page_bytes(raw: bytes):
+    """Validate one page's BYTES into `(rows, total)`. Raises on anything we will not call a page.
+
+    Split out so a response we already own can be interpreted later without contacting Shodan: a page
+    bought on a small box and deferred (`complete_unparsed`) is parsed from its artifact on the next run,
+    for no credit (review#1, Lumpy)."""
+    data = _json.loads(raw.decode("utf-8", "replace"))
+    if not isinstance(data, dict):
+        raise ValueError("shodan: non-object response — not a valid empty result")
+    page_total = data.get("total")
+    if not isinstance(page_total, int) or page_total < 0:
+        raise ValueError(f"shodan: invalid total {page_total!r}")
+    page_matches = data.get("matches")
+    if not isinstance(page_matches, list):
+        raise ValueError("shodan: matches is not a list")
+    page_rows = []
+    for m in page_matches:
+        if not isinstance(m, dict):                       # a null/scalar row is corruption, not empty
+            raise ValueError("shodan: non-object match row")
+        hns = m.get("hostnames")
+        if hns is not None and not isinstance(hns, list):
+            raise ValueError(f"shodan: non-list hostnames {type(hns).__name__}")
+        # review-B1.5br1#1: the LIST was validated and its MEMBERS were not, so the ingest side
+        # stringified whatever arrived. A non-string member is corruption, exactly like a non-dict row.
+        for _h in (hns or []):
+            if not isinstance(_h, str):
+                raise ValueError(f"shodan: non-string hostname {type(_h).__name__}")
+        page_rows.append(m)
+    return page_rows, page_total
+
+
+def _parse_owned_page(path):
+    """`(rows, total)` from bytes we already paid for, or None when they still cannot be read.
+
+    Never raises and never contacts the provider: this is the deferred-interpretation path, and a page
+    that still will not parse simply stays owned and unparsed."""
+    try:
+        p = Path(path)
+        if p.stat().st_size > SHODAN_PARSE_LIMIT:
+            return None                                   # still too large for this box
+        return _parse_page_bytes(p.read_bytes())
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return None
+
+
 def _shodan_page(key, facet, v, page, *, sink):
     """ONE page of a Shodan search, as the coordinator's `(matches, total, error)` triple. NEVER raises.
 
@@ -240,31 +287,7 @@ def _shodan_page(key, facet, v, page, *, sink):
             raise ShodanPageTooLargeToParse(
                 f"shodan: page is {size} bytes, beyond SHODAN_PARSE_LIMIT ({SHODAN_PARSE_LIMIT}) — the "
                 f"response is KEPT and owned; its rows are not ingested by this process")
-        data = _json.loads(sink.read_bytes().decode("utf-8", "replace"))
-        if not isinstance(data, dict):
-            raise ValueError("shodan: non-object response — not a valid empty result")
-        page_total = data.get("total")
-        if not isinstance(page_total, int) or page_total < 0:
-            raise ValueError(f"shodan: invalid total {page_total!r}")
-        page_matches = data.get("matches")
-        if not isinstance(page_matches, list):
-            raise ValueError("shodan: matches is not a list")
-        page_rows = []
-        for m in page_matches:
-            if not isinstance(m, dict):                       # a null/scalar row is corruption, not empty
-                raise ValueError("shodan: non-object match row")
-            hns = m.get("hostnames")
-            if hns is not None and not isinstance(hns, list):
-                raise ValueError(f"shodan: non-list hostnames {type(hns).__name__}")
-            # review-B1.5br1#1: the LIST was validated and its MEMBERS were not, so the ingest side
-            # stringified whatever arrived. `{"x": "a.evil.com"}` became the literal `"{'x': ...}"`,
-            # kept because it contains a dot; `null` and `123` vanished before any counter moved. A
-            # non-string member is corruption, exactly like a non-dict row — fail closed here rather
-            # than guess downstream.
-            for _h in (hns or []):
-                if not isinstance(_h, str):
-                    raise ValueError(f"shodan: non-string hostname {type(_h).__name__}")
-            page_rows.append(m)
+        page_rows, page_total = _parse_page_bytes(sink.read_bytes())
     except Exception as e:
         # B1.1: read the error BODY here, while it is still readable, and stamp the refined class onto
         # the exception. Shodan answers a spent balance with HTTP 401 + JSON and a bad key with HTTP
@@ -829,6 +852,7 @@ def _shodan_work_locked(ctx, key, lanes):
             return cls in ("auth", "forbidden") or (cls == PROVIDER_RATE_LIMIT and cooldown.hits > 1)
 
         res = shodan_sched.run_work(ctx, states=states, balance=bal, search=search, ingest=ingest,
+                                    parse=_parse_owned_page,
                                     ledger=ledger, attempt_dir=attempt_dir, max_pages=max_pages,
                                     should_stop=should_stop, ttl_days=page_ttl)
         return _SharedWork(balance=bal, result=res, found=found, errs=errs, oos=oos, names=hostnames,

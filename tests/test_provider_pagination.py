@@ -786,7 +786,9 @@ class TestShodanPivot:
         rows = doc["matches"]
         assert len(rows) == 1000                              # COMPLETE — no truncation
         assert "h999.acme.com" in found and rows[-1]["hostnames"] == ["h999.acme.com"]
-        raw = docs[0].parent / "raw" / doc["raw_ref"]
+        # `raw_ref` is stored RELATIVE TO THE PAGE DOCUMENT's directory and must resolve from it. It
+        # used to store just the basename, which resolved to the page document itself (review#2).
+        raw = docs[0].parent / doc["raw_ref"]
         assert raw.is_file() and raw.stat().st_size == doc["raw_bytes"]
         assert len(json.loads(raw.read_text())["matches"]) == 1000, "the RESPONSE is kept whole too"
 
@@ -1601,8 +1603,12 @@ class TestShodanPivot:
         """review-B1.5r1#3: the bytes were parsed, discarded, and a fresh document synthesized in their
         place — the "raw evidence" was Quarry's account of the answer, not the answer."""
         self._sized(monkeypatch, tmp_path, counts={"*": 250}, pivots=("hA",))
+        # count evidence only: the tree also holds page docs, streamed raw responses and ACQUISITION
+        # RECEIPTS (`kind: acquisition`), each of which is a different artifact class.
         raws = [q.read_bytes() for q in (tmp_path / "state" / "shodan-pivot").rglob("pages/**/*.json")
-                if q.name != ".quarry-write-probe" and "matches" not in json.loads(q.read_text())]
+                if q.name != ".quarry-write-probe"
+                and "matches" not in json.loads(q.read_text())
+                and json.loads(q.read_text()).get("kind") != "acquisition"]
         assert raws == [json.dumps({"total": 250}).encode()], raws
         ev = self._ledger_events(tmp_path, "shodan_count")
         assert len(ev) == 1 and ev[0]["value"] == "hA" and ev[0]["total"] == 250
@@ -1921,7 +1927,10 @@ class TestShodanPivot:
             return False                         # the SECOND append is refused; the snapshot still writes
 
         evs = self._ledger_lane(monkeypatch, tmp_path, record=append)
-        assert len(seen) == 2, seen              # both lanes bought their page
+        # PAGE completions only. Each purchase also records an `acq:` receipt — acquisition is committed
+        # separately from interpretation, so a page we cannot read is still owned (review#1).
+        pages = [i for i in seen if not i.startswith("acq:")]
+        assert len(pages) == 2, seen             # both lanes bought their page
         for sid in ("probe.favicon", "probe.cert"):
             term = self._terminals(evs, sid)
             assert term, (sid, evs)
@@ -1933,7 +1942,9 @@ class TestShodanPivot:
         assert state, list((tmp_path).rglob("*.json"))
         reopened = budget.Ledger(state[0], lane="probe.shodan")
         owned = dict(reopened.items())
-        assert len(seen) == 2 and all(k in owned for k in seen), (seen, owned)
+        # both namespaces survive the reopen: the page completions AND their acquisition receipts
+        assert len(pages) == 2 and all(k in owned for k in seen), (seen, owned)
+        assert sum(1 for k in owned if k.startswith("acq:")) == 2, owned
 
     def test_a_lane_LEFT_UNQUERIED_by_a_ledger_stop_still_reports_it(self, monkeypatch, tmp_path):
         """The counterpart: the FIRST append fails, so the second lane never gets its page. A rescued

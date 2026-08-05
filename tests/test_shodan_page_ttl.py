@@ -8,6 +8,7 @@ again) and bounded by a TTL (a stale page is history, not a current answer).
 from __future__ import annotations
 
 import contextlib
+from pathlib import Path
 
 import pytest
 
@@ -738,3 +739,187 @@ class TestWePayForBytesSoWeKeepThem:
         assert doc["raw_ref"] == "abc.json" and doc["raw_bytes"] == 123
         assert S.valid_page(doc, Pivot(FAV, "http.favicon.hash", "1"), 1) is not None, \
             "the extra fields must not make a valid page unreadable"
+
+
+class TestAcquisitionIsCommittedBeforeInterpretation:
+    """review#1 (Lumpy, 2026-08-05, P0): "bytes landing on disk is not ownership".
+
+    A response we paid for and could not parse was published as a rejection and never RECORDED, so the
+    next run saw the page as unowned and bought it again — the double spend this store exists to prevent,
+    reintroduced by the streaming repair itself. Acquisition is now committed independently of parse
+    success, in three states:
+
+        complete_parsed     the page is ours and readable
+        complete_unparsed   the whole response is ours; this box would not parse it. Parsed later FROM
+                            THE ARTIFACT, never re-bought.
+        incomplete_paid     the body did not arrive whole. Automatic retry refused.
+    """
+
+    @staticmethod
+    def _lane(tmp_path, *, response, parse=None, parse_ok=True, err=None):
+        """One paid lifecycle over one pivot, through the REAL scheduler."""
+        from quarry_recon import budget
+        base = S.state_dir(tmp_path)
+        attempt = base / "pages" / "a0"
+        (attempt / "raw").mkdir(parents=True, exist_ok=True)
+        led = budget.Ledger(budget.state_path(base, "probe.shodan", f"v{S.SHODAN_WORK_SCHEMA}"),
+                            lane="probe.shodan")
+        pivot = Pivot(FAV, "http.favicon.hash", "1")
+        st = PivotState(pivot=pivot)
+        res = S.WorkResult()
+        res.lanes.setdefault(FAV, S.LaneOutcome(lane=FAV))
+        issued = []
+
+        def search(pv, page):
+            issued.append(page)
+            raw = attempt / "raw" / f"{S.item_key(pv, page)}.json"
+            raw.write_bytes(response)
+            if err is not None:
+                e = RuntimeError(err[1])
+                e.error_class = err[0]
+                e.raw_path = raw
+                return ([], None, e)
+            return ([{"ip_str": "203.0.113.1", "hostnames": ["a.example"]}], 3, None)
+
+        ingested = []
+        S._work([st], res, balance=type("B", (), {"spendable": 5, "may_spend": True, "reserve": 0})(),
+                search=search, ingest=lambda pv, pg, ms, art: ingested.append(pg) or len(ms),
+                ledger=led, attempt_dir=attempt, max_pages=1, is_limit=lambda cls: False,
+                parse=parse)
+        led.save()
+        return {"outcome": res.lanes[FAV], "issued": issued, "ingested": ingested, "ledger": led,
+                "attempt": attempt, "pivot": pivot, "base": base}
+
+    @staticmethod
+    def _fresh_ledger(run):
+        from quarry_recon import budget
+        return budget.Ledger(run["ledger"].path, lane="probe.shodan")
+
+    def test_an_UNPARSED_purchase_is_owned_and_never_re_bought(self, tmp_path):
+        """buy once -> parse deferred -> fresh run -> ZERO provider calls -> bytes still addressable."""
+        body = b'{"total": 3, "matches": [{"hostnames": ["a.example"]}]}'
+        first = self._lane(tmp_path, response=body, err=("oversize", "too large to parse here"))
+        assert first["issued"] == [1], "the page was bought exactly once"
+        assert first["outcome"].pages_unparsed == 1 and first["outcome"].pages_bought == 0
+
+        acq = S.read_acquisition(self._fresh_ledger(first), first["pivot"], 1)
+        assert acq and acq["state"] == S.ACQ_UNPARSED, acq
+        raw = Path(acq["raw_ref"])
+        assert raw.is_file() and raw.read_bytes() == body, "the bytes we paid for are addressable"
+        assert acq["raw_digest"] == __import__("hashlib").sha256(body).hexdigest()
+
+        # a FRESH lifecycle over the same project, with no ability to parse: it must still not buy
+        second = self._lane(tmp_path, response=b"unused", parse=lambda p: None)
+        assert second["issued"] == [], "a page this project already paid for must never be re-bought"
+        assert second["outcome"].acquisition_refused == 1
+        assert second["outcome"].pages_unparsed == 1 and second["outcome"].pages_bought == 0
+
+    def test_deferred_bytes_are_PARSED_later_for_no_credit(self, tmp_path):
+        body = b'{"total": 3, "matches": [{"hostnames": ["a.example"]}]}'
+        first = self._lane(tmp_path, response=body, err=("oversize", "too large to parse here"))
+        assert first["issued"] == [1]
+
+        import json as _json
+
+        def parse(path):
+            doc = _json.loads(Path(path).read_text())
+            return doc["matches"], doc["total"]
+
+        second = self._lane(tmp_path, response=b"unused", parse=parse)
+        assert second["issued"] == [], "interpretation must not contact the provider"
+        assert second["outcome"].pages_parsed_late == 1
+        assert second["ingested"] == [1], "the rows finally reach the store"
+        assert second["outcome"].pages_bought == 0, "a late parse is not a purchase"
+
+        # …and now it is an ordinary owned page: a third run replays it
+        third = self._lane(tmp_path, response=b"unused", parse=parse)
+        assert third["issued"] == [] and third["outcome"].pages_replayed == 1
+
+    def test_an_INCOMPLETE_paid_response_refuses_an_automatic_retry(self, tmp_path):
+        partial = b'{"total": 3, "matches": [{"hostna'
+        first = self._lane(tmp_path, response=partial,
+                           err=("incomplete", "paid response incomplete after 33 byte(s)"))
+        assert first["issued"] == [1] and first["outcome"].pages_incomplete == 1
+
+        acq = S.read_acquisition(self._fresh_ledger(first), first["pivot"], 1)
+        assert acq and acq["state"] == S.ACQ_INCOMPLETE
+        assert Path(acq["raw_ref"]).read_bytes() == partial, "what DID arrive is kept and addressable"
+
+        second = self._lane(tmp_path, response=b"unused", parse=lambda p: None)
+        assert second["issued"] == [], "nothing retries a paid, incomplete acquisition automatically"
+        assert second["outcome"].pages_incomplete == 1 and second["outcome"].acquisition_refused == 1
+
+    def test_a_receipt_must_match_the_identity_it_claims(self, tmp_path):
+        """A transplanted receipt cannot donate ownership to a different pivot or page."""
+        body = b'{"total": 3, "matches": []}'
+        run = self._lane(tmp_path, response=body, err=("oversize", "deferred"))
+        led = self._fresh_ledger(run)
+        assert S.read_acquisition(led, run["pivot"], 2) is None, "another PAGE is not covered"
+        assert S.read_acquisition(led, Pivot(FAV, "http.favicon.hash", "other"), 1) is None
+
+    def test_a_PARSED_purchase_also_leaves_a_receipt(self, tmp_path):
+        run = self._lane(tmp_path, response=b'{"total": 3, "matches": []}')
+        assert run["outcome"].pages_bought == 1
+        acq = S.read_acquisition(self._fresh_ledger(run), run["pivot"], 1)
+        assert acq and acq["state"] == S.ACQ_PARSED
+
+    def test_the_page_doc_points_at_the_RESPONSE_not_at_itself(self, tmp_path):
+        """review#2: `raw_ref` stored only the basename, which resolved to the page document's own
+        sibling — the doc claimed its own completion artifact was the provider's answer."""
+        import json as _json
+        body = b'{"total": 3, "matches": [{"hostnames": ["a.example"]}]}'
+        run = self._lane(tmp_path, response=body)
+        page = run["attempt"] / f"{S.item_key(run['pivot'], 1)}.json"
+        doc = _json.loads(page.read_text())
+        resolved = page.parent / doc["raw_ref"]
+        assert resolved.resolve() != page.resolve(), "it must not point at the page document"
+        assert resolved.read_bytes() == body and doc["raw_bytes"] == len(body)
+
+    def test_a_receipt_whose_CONTENTS_name_another_page_is_refused(self, tmp_path):
+        """Defence against our own writer: a document filed under this page's key that describes a
+        different one proves nothing about this page, and must not read as a purchase.
+
+        Driven through a stub store because a real `Ledger` is digest-bound — this is the case where the
+        bytes are intact and the CLAIM is wrong."""
+        import json as _json
+        pivot = Pivot(FAV, "http.favicon.hash", "1")
+        art = tmp_path / "receipt.json"
+        art.write_text(_json.dumps({"schema": S.SHODAN_WORK_SCHEMA, "kind": "acquisition",
+                                    "state": S.ACQ_UNPARSED, "lane": FAV,
+                                    "facet": "http.favicon.hash", "value": "SOMEONE_ELSE",
+                                    "page": 1, "at": 0.0}))
+
+        class _Stub:
+            def artifact(self, item):
+                return art
+        assert S.read_acquisition(_Stub(), pivot, 1) is None, "a receipt for another pivot is not ours"
+
+        art.write_text(_json.dumps({"schema": S.SHODAN_WORK_SCHEMA, "kind": "acquisition",
+                                    "state": S.ACQ_UNPARSED, "lane": FAV,
+                                    "facet": "http.favicon.hash", "value": "1", "page": 7, "at": 0.0}))
+        assert S.read_acquisition(_Stub(), pivot, 1) is None, "a receipt for another PAGE is not ours"
+
+        art.write_text(_json.dumps({"schema": S.SHODAN_WORK_SCHEMA, "kind": "acquisition",
+                                    "state": "invented", "lane": FAV, "facet": "http.favicon.hash",
+                                    "value": "1", "page": 1, "at": 0.0}))
+        assert S.read_acquisition(_Stub(), pivot, 1) is None, "an unknown state is not a purchase"
+
+        art.write_text(_json.dumps({"schema": S.SHODAN_WORK_SCHEMA, "kind": "acquisition",
+                                    "state": S.ACQ_UNPARSED, "lane": FAV, "facet": "http.favicon.hash",
+                                    "value": "1", "page": 1, "at": 0.0}))
+        assert S.read_acquisition(_Stub(), pivot, 1) is not None, "…and a matching one IS"
+
+    def test_the_acquisition_states_reach_telemetry(self, tmp_path):
+        import json as _json
+        from quarry_recon import events
+        run = self._lane(tmp_path, response=b'{"total": 3, "matches": []}',
+                         err=("oversize", "deferred"))
+        events.reset(); events.configure(tmp_path)
+        S.report(FAV, run["outcome"], balance=type("B", (), {"reason": "ok", "stop_kind": ""})(),
+                 max_pages=1)
+        evs = [_json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
+        acq = [e for e in evs if e.get("measure") == "shodan_pages_acquired"]
+        assert acq, "a purchase we could not interpret must still be reported as a purchase"
+        assert acq[-1]["eligible"] == 1 and acq[-1]["tested"] == 0 and acq[-1]["omitted"] == 1
+        assert "complete_unparsed=1" in acq[-1]["reason"] and "never re-bought" in acq[-1]["reason"]
+        events.reset()

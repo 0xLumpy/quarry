@@ -249,6 +249,8 @@ def owned_index(ledger) -> dict:
     each page so replay consumes it directly: one JSON read per resumed page."""
     out: dict = {}
     for item, art in ledger.items():
+        if isinstance(item, str) and item.startswith(ACQ_PREFIX):
+            continue                      # a receipt is not a page; parsing it here would read it twice
         try:
             doc = json.loads(art.read_text())
         except Exception:
@@ -340,6 +342,16 @@ class LaneOutcome:
     #: paid responses we refused to treat as pages. The credit is spent either way, so the bytes are kept
     #: (see `publish_rejected`) and the objection is NAMED — a bare class counter left "provider drifted"
     #: and "our contract is wrong" equally unprovable.
+    #: pages bought whose COMPLETE response this box would not parse. Owned, never re-bought, and
+    #: eligible for a later run to interpret from the artifact.
+    pages_unparsed: int = 0
+    #: pages whose paid response did not arrive whole. Owned as far as it got; retry is an operator's
+    #: decision, never ours.
+    pages_incomplete: int = 0
+    #: a purchase this run DECLINED because a previous run already paid for those bytes
+    acquisition_refused: int = 0
+    #: pages recovered by parsing bytes we already owned — no provider contact, no credit
+    pages_parsed_late: int = 0
     pages_rejected: int = 0
     reject_reasons: list = field(default_factory=list)     # bounded; first objections, in order
     #: a lost page the pivot would otherwise have asked for, that this run declined to re-buy. Sibling of
@@ -595,6 +607,111 @@ def publish_rejected(attempt_dir, pivot: Pivot, page: int, *, reason: str, body=
         return None
 
 
+#: ACQUISITION is committed separately from INTERPRETATION. review#1 (Lumpy, 2026-08-05): bytes landing
+#: on disk is not ownership. A response we paid for and could not parse was published as a rejection and
+#: never recorded as bought, so the next run saw the page as unowned and BOUGHT IT AGAIN — the exact
+#: double spend this store exists to prevent, reintroduced by the streaming repair itself.
+#:
+#:   complete_parsed     the page is ours and readable         (normal completion)
+#:   complete_unparsed   the whole response is ours; this box would not parse it. Eligible for later
+#:                       processing FROM THE ARTIFACT, never re-bought.
+#:   incomplete_paid     the transport or the disk broke mid-body. The partial bytes are ours, and an
+#:                       automatic retry is REFUSED — an operator decides whether to pay again.
+ACQ_PARSED = "complete_parsed"
+ACQ_UNPARSED = "complete_unparsed"
+ACQ_INCOMPLETE = "incomplete_paid"
+#: acquisition items share the ledger with page items and must never collide with them
+ACQ_PREFIX = "acq:"
+
+
+def acq_key(pivot: Pivot, page: int) -> str:
+    return ACQ_PREFIX + item_key(pivot, page)
+
+
+def publish_acquisition(attempt_dir, pivot: Pivot, page: int, *, state: str, raw_path=None,
+                        reason: str = ""):
+    """Record WHAT WE BOUGHT, before anything decides whether we can read it. Returns (path, digest)."""
+    doc = {"schema": SHODAN_WORK_SCHEMA, "kind": "acquisition", "state": state, "lane": pivot.lane,
+           "facet": pivot.facet, "value": pivot.value, "page": page, "at": time.time(),
+           "reason": reason}
+    if raw_path is not None and Path(raw_path).is_file():
+        rp = Path(raw_path)
+        doc["raw_ref"] = str(rp)
+        doc["raw_bytes"] = rp.stat().st_size
+        doc["raw_digest"] = events.file_digest(rp)
+    body = json.dumps(doc).encode()
+    dig = hashlib.sha256(body).hexdigest()
+    art = Path(attempt_dir) / "acq" / f"{item_key(pivot, page)}.acq.json"
+    return (art, dig, body) if budget.publish_bytes(art, body, digest=dig) else (None, None, body)
+
+
+def acquisition_index(ledger) -> dict:
+    """Every acquisition receipt this ledger holds, read ONCE: {(lane, facet, value, page): doc}.
+
+    Per-page reads would be correct and wasteful — resume already enumerates the ledger once for pages
+    (`owned_index`), and a test pins one read per resumed page. Receipts follow the same rule."""
+    out: dict = {}
+    try:
+        items = list(ledger.items())
+    except Exception:
+        return out
+    for item, art in items:
+        if not (isinstance(item, str) and item.startswith(ACQ_PREFIX)):
+            continue
+        try:
+            doc = json.loads(Path(art).read_text())
+        except Exception:
+            continue
+        if not isinstance(doc, dict) or doc.get("kind") != "acquisition":
+            continue
+        if doc.get("state") not in (ACQ_PARSED, ACQ_UNPARSED, ACQ_INCOMPLETE):
+            continue
+        lane, facet, value, page = (doc.get("lane"), doc.get("facet"), doc.get("value"),
+                                    doc.get("page"))
+        if not (isinstance(lane, str) and isinstance(facet, str) and isinstance(value, str)):
+            continue
+        if isinstance(page, bool) or not isinstance(page, int):
+            continue
+        # the receipt must be filed under the identity it claims, exactly like a page
+        if item != ACQ_PREFIX + item_key(Pivot(lane, facet, value), page):
+            continue
+        out[(lane, facet, value, page)] = doc
+    return out
+
+
+def read_acquisition(ledger, pivot: Pivot, page: int) -> "dict | None":
+    """The committed acquisition state for one page, or None when we never bought it.
+
+    Bound to its identity like every other artifact: a document that names a different pivot or page is
+    not this page's receipt."""
+    try:
+        art = ledger.artifact(acq_key(pivot, page))
+        if art is None or not art.is_file():
+            return None
+        doc = json.loads(art.read_text())
+    except Exception:
+        return None
+    if not isinstance(doc, dict) or doc.get("kind") != "acquisition":
+        return None
+    if (doc.get("lane"), doc.get("facet"), doc.get("value"), doc.get("page")) != (
+            pivot.lane, pivot.facet, pivot.value, page):
+        return None
+    if doc.get("state") not in (ACQ_PARSED, ACQ_UNPARSED, ACQ_INCOMPLETE):
+        return None
+    return doc
+
+
+def commit_acquisition(o, ledger, attempt_dir, pivot: Pivot, page: int, *, state: str, raw_path=None,
+                       reason: str = "") -> bool:
+    """Own what we paid for, whatever happens next. A failure to record it is a GLOBAL problem: the next
+    run would buy the same page again."""
+    art, dig, _body = publish_acquisition(attempt_dir, pivot, page, state=state, raw_path=raw_path,
+                                          reason=reason)
+    if art is None:
+        return False
+    return bool(ledger.record(acq_key(pivot, page), art, digest=dig))
+
+
 #: how many objections a lane keeps. The first ones diagnose the contract; the thousandth is noise, and
 #: an unbounded list on a failure path is a memory leak with a story attached.
 MAX_REJECT_REASONS = 5
@@ -627,7 +744,7 @@ def _read_page(path, pivot: Pivot, page: int):
 
 
 def run_work(ctx, *, states, balance, search, ingest, ledger, attempt_dir,
-             max_pages: int = 0, is_limit=None, should_stop=None,
+             max_pages: int = 0, is_limit=None, should_stop=None, parse=None,
              ttl_days: float = PAGE_TTL_DAYS_DEFAULT) -> WorkResult:
     """Buy pages under the balance, replaying anything already owned.
 
@@ -893,8 +1010,72 @@ def _apply_cardinality(states, res) -> None:
         compare_count(st, res.lanes[st.pivot.lane])
 
 
+def _commit_page(st, o, res, *, page, matches, total, ledger, attempt_dir, ingest, raw_path=None,
+                 late: bool = False) -> bool:
+    """Publish one page, OWN it, and ingest its rows. True when the page is ours.
+
+    One place for both routes into ownership: a fresh purchase, and a page recovered later by parsing
+    bytes we already hold (`late=True`, which spends nothing and is not counted as a purchase)."""
+    pivot = st.pivot
+    raw_meta = None
+    if raw_path is not None and Path(raw_path).is_file():
+        rp = Path(raw_path)
+        # review#2 (Lumpy): the reference must RESOLVE. Storing `rp.name` produced `<key>.json`, which
+        # relative to the page document is the page document itself — the doc pointed at its own sibling
+        # completion artifact and called it the provider's response.
+        try:
+            ref = str(rp.relative_to(Path(attempt_dir)))
+        except ValueError:
+            ref = str(rp)
+        raw_meta = {"raw_ref": ref, "raw_bytes": rp.stat().st_size,
+                    "raw_digest": events.file_digest(rp)}
+    art = Path(attempt_dir) / f"{item_key(pivot, page)}.json"
+    # review-B1.3r8#1: this serialized the RECONCILED total, so the artifact reported something Shodan
+    # never said for that page and the drift disappeared on resume. Evidence records what the provider
+    # ANSWERED; reconciliation is a derived view and lives only in `PivotState`.
+    body = json.dumps(_page_doc(pivot, page, total, matches, raw=raw_meta)).encode()
+    dig = hashlib.sha256(body).hexdigest()
+    # atomic + content-verified: a torn write at a content-addressed name would otherwise be reused
+    # later as if it were the page we meant to buy.
+    if not budget.publish_bytes(art, body, digest=dig):
+        # review-r2#1: leaving the page PENDING scheduled it again — the same page bought over and over,
+        # unbounded when the balance is unknown. A store we cannot write to is a GLOBAL problem.
+        o.publish_failed += 1
+        st.stopped = "publish_failed"
+        res.stop_cause = "publish_failed"
+        return False
+    if not st.pages_done:
+        o.pivots_touched += 1                 # ANY page counts as touching the pivot
+    st.pages_done.add(page)
+    if not late:
+        o.pages_bought += 1
+    journaled = ledger.record(item_key(pivot, page), art, digest=dig)
+    # ACQUISITION is committed too, and separately: the page doc proves we can READ it, this proves we
+    # BOUGHT it. Without the second fact a page we could not parse was never owned at all.
+    commit_acquisition(o, ledger, attempt_dir, pivot, page, state=ACQ_PARSED, raw_path=raw_path)
+    if raw_meta is not None:
+        # EVIDENCE, not the completion artifact: replay reads the page doc, and this is what the
+        # provider actually sent. Retained so it survives beside the page it paid for.
+        try:
+            ledger.add_evidence(item_key(pivot, page), Path(raw_path), digest=raw_meta["raw_digest"])
+        except Exception as e:
+            _lane_machinery(o, e)
+    # review-B1.3r6#1: a readable journal proves OLD content survives, not that THIS page reached it.
+    res.records_journaled = res.records_journaled and journaled
+    try:
+        o.matches += ingest(pivot, page, matches, art)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        # the credit is spent and the page is owned; its rows are not. Raises the carrier.
+        _lane_machinery(o, e)
+    if not journaled or not ledger_writable(ledger):
+        res.stop_cause = "ledger_unwritable"
+    return True
+
+
 def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_pages, is_limit,
-          should_stop=None) -> None:
+          should_stop=None, parse=None) -> None:
     should_stop = should_stop or (lambda cls: False)
     # An ownership index that EXISTS and cannot be trusted is not an empty one. Reading it as empty makes
     # a corrupt file into permission to buy every page again — the same laundering route as a lost
@@ -919,6 +1100,8 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
     # bound no other layer provides.
     tried: set = set()
     probed: list = []
+    # every receipt, read once for the whole run (see `acquisition_index`)
+    acquired = acquisition_index(ledger)
 
     def sinks_ok() -> bool:
         """Prove BOTH sinks once, immediately before the first purchase.
@@ -964,6 +1147,30 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
             # a surprise charge afterwards does not authorise it (review#1, Lumpy). It is refused on
             # exactly the terms an AGED page is — the loss is admitted, the pivot moves on, and repair
             # waits for an explicit operator refresh/repair policy that does not exist yet.
+            # ALREADY PAID FOR? A receipt outranks every reason to buy. `complete_unparsed` is parsed
+            # here from the bytes we hold — no provider contact — and `incomplete_paid` is refused.
+            acq = acquired.get((st.pivot.lane, st.pivot.facet, st.pivot.value, page))
+            if acq is not None and acq.get("state") != ACQ_PARSED:
+                state = acq.get("state")
+                raw_ref = acq.get("raw_ref")
+                if state == ACQ_UNPARSED and parse is not None and raw_ref:
+                    got = parse(Path(raw_ref))
+                    if got is not None:
+                        p_matches, p_total = got
+                        if reject_reason(p_matches, p_total) is None:
+                            o.pages_parsed_late += 1
+                            if _commit_page(st, o, res, page=page, matches=p_matches, total=p_total,
+                                            ledger=ledger, attempt_dir=attempt_dir, ingest=ingest,
+                                            raw_path=Path(raw_ref), late=True):
+                                progressed = True
+                                continue
+                if state == ACQ_INCOMPLETE:
+                    o.pages_incomplete += 1
+                else:
+                    o.pages_unparsed += 1
+                o.acquisition_refused += 1
+                st.lost_pages.add(page)          # never scheduled again: it is BOUGHT, not missing
+                continue
             if item_key(st.pivot, page) in getattr(ledger, "lost", {}):
                 o.pages_lost += 1
                 o.repair_refused += 1
@@ -992,10 +1199,27 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
                 # quota sentence stays inspectable — but only a `parse` failure is an objection of OURS,
                 # and only that one moves the rejection counters. An auth or quota refusal is already
                 # counted by its class and explained by the terminal's `error_detail`.
+                err_raw = getattr(err, "raw_path", None)
                 note_rejected(o, st.pivot, page, reason=f"{cls}: {err}", attempt_dir=attempt_dir,
-                              body=getattr(err, "body_bytes", None),
-                              raw_path=getattr(err, "raw_path", None),
+                              body=getattr(err, "body_bytes", None), raw_path=err_raw,
                               count=(cls in ("parse", "oversize", "incomplete")))
+                # review#1 (Lumpy): bytes on disk is not ownership. A response we paid for and could not
+                # read was published as a rejection and never RECORDED, so the next run bought it again.
+                # The receipt is committed here, before any judgement about readability.
+                if err_raw is not None and Path(err_raw).is_file():
+                    state = ACQ_INCOMPLETE if cls == "incomplete" else (
+                        ACQ_UNPARSED if cls == "oversize" else None)
+                    if state is not None:
+                        if state == ACQ_INCOMPLETE:
+                            o.pages_incomplete += 1
+                        else:
+                            o.pages_unparsed += 1
+                        if not commit_acquisition(o, ledger, attempt_dir, st.pivot, page, state=state,
+                                                  raw_path=err_raw, reason=f"{cls}: {err}"):
+                            # a purchase we cannot record is a purchase the next run repeats
+                            o.publish_failed += 1
+                            res.stop_cause = "ledger_unwritable"
+                        st.lost_pages.add(page)      # bought, not missing: never scheduled again
                 st.stopped = cls
                 limit = is_limit(cls)
                 bucket = o.limit_classes if limit else o.fail_classes
@@ -1023,62 +1247,26 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
                 # the response is not — it is written outside the ledger and the objection is recorded.
                 st.stopped = "parse"
                 o.fail_classes["parse"] = o.fail_classes.get("parse", 0) + 1
+                # review#3 (Lumpy): the complete response is on disk here too. Binding it beats keeping
+                # a reconstructed, truncated copy of what we rejected.
+                rejected_raw = Path(attempt_dir) / "raw" / f"{item_key(st.pivot, page)}.json"
                 note_rejected(o, st.pivot, page, reason=why, attempt_dir=attempt_dir,
-                              matches=matches, total=total)
+                              matches=matches, total=total,
+                              raw_path=rejected_raw if rejected_raw.is_file() else None)
+                if rejected_raw.is_file():
+                    # we bought these bytes. They are ours whether or not they are a page we accept.
+                    commit_acquisition(o, ledger, attempt_dir, st.pivot, page, state=ACQ_UNPARSED,
+                                       raw_path=rejected_raw, reason=f"rejected: {why}")
+                    st.lost_pages.add(page)
                 continue
             observe_total(st, o, total)
-            raw = attempt_dir / f"{item_key(st.pivot, page)}.json"
-            # review-B1.3r8#1: this serialized the RECONCILED total, so the artifact reported something
-            # Shodan never said for that page and the drift disappeared on resume (stored 500/500 for a
-            # measured 500/200; drift 1 fresh, 0 resumed). Evidence records what the provider ANSWERED;
-            # reconciliation is a derived view and lives only in `PivotState`.
-            # the streamed provider bytes, if the adapter put them where we asked. Named INSIDE the
-            # page doc so ownership and the raw response are bound by the same digest, and retained as
-            # ledger evidence so a later run can prove what was actually delivered.
-            raw_art = Path(attempt_dir) / "raw" / f"{item_key(st.pivot, page)}.json"
-            raw_meta = None
-            if raw_art.is_file():
-                raw_meta = {"raw_ref": raw_art.name, "raw_bytes": raw_art.stat().st_size,
-                            "raw_digest": events.file_digest(raw_art)}
-            body = json.dumps(_page_doc(st.pivot, page, total, matches, raw=raw_meta)).encode()
-            dig = hashlib.sha256(body).hexdigest()
-            # atomic + content-verified: a torn write at a content-addressed name would otherwise be
-            # reused later as if it were the page we meant to buy.
-            if not budget.publish_bytes(raw, body, digest=dig):
-                # review-r2#1: leaving the page PENDING scheduled it again — the same page bought over
-                # and over, unbounded when the balance is unknown. A store we cannot write to is a
-                # GLOBAL problem: every further purchase would be unrecordable too, so stop paying.
-                o.publish_failed += 1
-                st.stopped = "publish_failed"
-                res.stop_cause = "publish_failed"
+            if not _commit_page(st, o, res, page=page, matches=matches, total=total, ledger=ledger,
+                                attempt_dir=attempt_dir, ingest=ingest,
+                                raw_path=Path(attempt_dir) / "raw" / f"{item_key(st.pivot, page)}.json"):
                 continue
-            if not st.pages_done:
-                o.pivots_touched += 1         # ANY page counts as touching the pivot
-            st.pages_done.add(page)
-            o.pages_bought += 1
-            # the completion and its durability are ONE fact: a page we cannot journal is a page the
-            # next run will buy again, so stop paying the moment that becomes true.
-            journaled = ledger.record(item_key(st.pivot, page), raw, digest=dig)
-            if raw_meta is not None:
-                # EVIDENCE, not the completion artifact: replay reads the page doc, and this is what the
-                # provider actually sent. Retained so it survives beside the page it paid for.
-                try:
-                    ledger.add_evidence(item_key(st.pivot, page), raw_art,
-                                        digest=raw_meta["raw_digest"])
-                except Exception as e:
-                    _lane_machinery(o, e)
-            # review-B1.3r6#1: a readable journal proves OLD content survives, not that THIS page reached
-            # it. Both facts are needed, and only the record itself carries the second one.
-            res.records_journaled = res.records_journaled and journaled
-            try:
-                o.matches += ingest(st.pivot, page, matches, raw)
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception as e:
-                # the credit is spent and the page is owned; its rows are not. Raises the carrier.
-                _lane_machinery(o, e)
-            if not journaled or not ledger_writable(ledger):
-                res.stop_cause = "ledger_unwritable"
+            progressed = True
+            continue
+
         if not progressed:
             # nothing moved: the budget is gone (or every remaining page is unbuyable).
             if spendable is not None and spent >= spendable and not res.stop_cause:
@@ -1242,6 +1430,25 @@ def report(lane: str, outcome: LaneOutcome, *, balance, persisted: bool = True,
                                 tested=piv - n, omitted=n,
                                 reason=(f"{n}/{piv} pivot(s) {phrase} {dict(classes)}" if n
                                         else f"no pivot {phrase.split(' (')[0]}"))
+    # WHAT WE BOUGHT vs WHAT WE COULD READ. Acquisition is committed separately from interpretation, so
+    # it is reported separately too: a page whose bytes we own but could not parse is COVERAGE we do not
+    # have and MONEY we will not spend again, and one number cannot say both.
+    owned_paid = (outcome.pages_bought + outcome.pages_parsed_late + outcome.pages_unparsed
+                  + outcome.pages_incomplete)
+    if owned_paid or outcome.acquisition_refused:
+        interpreted = outcome.pages_bought + outcome.pages_parsed_late
+        events.coverage_partial(
+            lane, kind=events.COVERAGE_TIMEOUT, measure="shodan_pages_acquired",
+            unit=f"{lane}.pages_acquired", eligible=owned_paid, tested=interpreted,
+            omitted=outcome.pages_unparsed + outcome.pages_incomplete,
+            reason=(f"acquired={owned_paid} (interpreted={interpreted}"
+                    + (f", of which {outcome.pages_parsed_late} parsed later from bytes already owned"
+                       if outcome.pages_parsed_late else "")
+                    + f"); complete_unparsed={outcome.pages_unparsed} (OWNED, eligible for a later run, "
+                      f"never re-bought); incomplete_paid={outcome.pages_incomplete} (partial response "
+                      f"kept; an automatic retry is refused)"
+                    + (f"; {outcome.acquisition_refused} purchase(s) declined because this project had "
+                       f"already paid for those bytes" if outcome.acquisition_refused else "")))
     # A PAID RESPONSE WE REFUSED. Its own measure, deliberately: the position measures answer "which
     # pivots failed, first or later, broken or refused", and an objection about a page's SHAPE is neither
     # — attaching it there made a first-position reason quote a later-page class, which is the exact

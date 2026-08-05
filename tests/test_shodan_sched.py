@@ -1661,7 +1661,13 @@ class TestReadsPerResumedPage:
         res, _ = _res(tmp_path, _states((FAV, "a")), _Provider(totals={"a": 300}),
                       balance=_Bal(spendable=None), ledger=_ledger(tmp_path))
         assert res.lanes[FAV].pages_replayed == 3
-        assert len(reads) == 3, f"{len(reads)} reads for 3 resumed pages: {reads}"
+        # ONE read per ARTIFACT. A resumed page's bytes were read three times (here, in `_read_page`
+        # and again in `_replay_one`) — that is the defect this pins. Acquisition receipts are separate,
+        # much smaller artifacts and are likewise read once each, so the property is "nothing is read
+        # twice", not "only pages exist".
+        assert len(reads) == len(set(reads)), f"an artifact was read more than once: {reads}"
+        pages = [r for r in reads if "/acq/" not in r]
+        assert len(pages) == 3, f"{len(pages)} page reads for 3 resumed pages: {pages}"
 
 
 class TestDurabilityHandshake:
