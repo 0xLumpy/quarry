@@ -700,3 +700,41 @@ class TestAPaidResponseWeRefuseIsStillEvidence:
         pos = [e for e in evs if e.get("measure") == "shodan_pivots"]
         assert pos and "hostname" not in (pos[-1]["reason"] or "")
         events.reset()
+
+
+class TestWePayForBytesSoWeKeepThem:
+    """Lumpy, 2026-08-05, after a 4 MiB cap truncated two paid pages and a 64 MiB one replaced it:
+
+        "if we are already paying, i want to get EVERYTHING i pay for … Stream provider responses to
+        disk … Preserve the complete raw response atomically … Bound memory and execution time, not
+        evidence membership or response bytes."
+
+    A cap on a bought response is not a safety guard: the credit is gone before it can help, so it only
+    converts money into incomplete evidence and invites a second purchase."""
+
+    def test_a_rejected_page_POINTS_at_the_whole_response(self, tmp_path):
+        import json as _json
+        pivot = Pivot(FAV, "http.favicon.hash", "1")
+        raw = tmp_path / "raw" / f"{S.item_key(pivot, 1)}.json"
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_bytes(b'{"total": 1, "matches": [{"hostnames": [null]}]}')
+        art = S.publish_rejected(tmp_path, pivot, 1, reason="parse: bad row", raw_path=raw)
+        doc = _json.loads(art.read_text())
+        assert doc["raw_ref"] == str(raw) and doc["raw_bytes"] == raw.stat().st_size
+        assert doc["raw_digest"], "the pointer is digest-bound"
+        assert "body_b64" not in doc, "a truncated second copy would be the worse artifact"
+
+    def test_it_still_keeps_bytes_when_there_is_no_artifact(self, tmp_path):
+        import base64, json as _json
+        pivot = Pivot(FAV, "http.favicon.hash", "1")
+        art = S.publish_rejected(tmp_path, pivot, 1, reason="quota", body=b'{"error": "no balance"}')
+        doc = _json.loads(art.read_text())
+        assert base64.b64decode(doc["body_b64"]) == b'{"error": "no balance"}'
+
+    def test_the_page_doc_NAMES_the_raw_response(self, tmp_path):
+        """Ownership and the provider's exact bytes are bound by the same digest."""
+        doc = S._page_doc(Pivot(FAV, "http.favicon.hash", "1"), 1, 5, [],
+                          raw={"raw_ref": "abc.json", "raw_bytes": 123, "raw_digest": "d" * 64})
+        assert doc["raw_ref"] == "abc.json" and doc["raw_bytes"] == 123
+        assert S.valid_page(doc, Pivot(FAV, "http.favicon.hash", "1"), 1) is not None, \
+            "the extra fields must not make a valid page unreadable"

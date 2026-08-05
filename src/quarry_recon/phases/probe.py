@@ -18,13 +18,14 @@ import re as _re
 import time as _time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from .. import (budget, contract, events, netguard, normalize, secrets, settings, shodan_host,
                 shodan_sched, store)
 from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PARSE, PROVIDER_RATE_LIMIT,
                         ProviderResult, ProviderSkip, ResponseTooLarge, capture_error_body,
                         is_provider_limit, provider_error_class, read_bounded, run_contract,
-                        run_provider)
+                        run_provider, stream_to_file)
 from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir, have,
                       nuclei_timeout, reclassify_ffuf,
                       reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
@@ -150,19 +151,29 @@ class _ProviderCooldown:
 #: paid path is now the same client. This is an API we identify ourselves to, not a target we blend into.
 SHODAN_UA = "quarry-recon"
 
-#: How much of ONE Shodan response we are willing to hold. MEASURED 2026-08-05: the previous 4 MiB cap
-#: truncated both pivots' page 1 mid-string (`Unterminated string ... char 4194269`, and 4194304 = 4 MiB),
-#: and the truncated fragment was then handed to `json.loads` — so Quarry called ITS OWN ceiling a
-#: provider parse failure, twice, having paid for both. A Shodan search page carries up to 100 banners
-#: with base64 favicon and certificate blobs; 4 MiB is simply the wrong order of magnitude for it.
+#: A PAID response has NO byte ceiling. It is streamed to disk in chunks and kept whole (Lumpy,
+#: 2026-08-05: "if we are already paying, I want to get EVERYTHING I pay for"). First a 4 MiB cap
+#: truncated two pages mid-string and reported the fragment as the provider's malformed JSON; then I
+#: replaced it with 64 MiB, which is the same mistake with a bigger number. A cap on something already
+#: bought converts money into incomplete evidence and invites a second purchase.
 #:
-#: The cap is a RESOURCE bound (one response is read into memory), never a coverage policy: hitting it
-#: does not silently drop rows, it raises `ShodanResponseTooLarge` and the page is reported as OURS.
+#: What IS bounded is memory: this is how large an artifact we will PARSE in one process. Beyond it the
+#: bytes are still acquired, owned and published — only the ingest of that page waits for a bigger box,
+#: and the run says so. It bounds what we hold in RAM, never what we keep.
+SHODAN_PARSE_LIMIT = 256 * 1024 * 1024
+#: how much of a FREE endpoint's response we hold in memory (nothing is bought, so a re-read is free)
 SHODAN_READ_LIMIT = 64 * 1024 * 1024
 
 
 #: kept as an alias so a caller can name the Shodan case specifically; the machinery is shared
 ShodanResponseTooLarge = ResponseTooLarge
+
+
+class ShodanPageTooLargeToParse(ValueError):
+    """The page was ACQUIRED and KEPT; this process will not parse it in memory. Not a provider defect
+    and not a lost purchase — the artifact is on disk and owned."""
+
+    error_class = "oversize"
 
 
 def _read_bounded(r, limit: "int | None" = None) -> bytes:
@@ -205,25 +216,31 @@ def _shodan_count(key, facet, v):
     return total, raw, None
 
 
-def _shodan_page(key, facet, v, page):
+def _shodan_page(key, facet, v, page, *, sink):
     """ONE page of a Shodan search, as the coordinator's `(matches, total, error)` triple. NEVER raises.
 
-    B1.4: pagination, retention and position accounting used to live here (`_shodan_search` looped pages
-    and decided whether a failure discarded evidence). All of that is now the coordinator's, which owns
-    ordering, budget, replay and durability across lanes. What is left is exactly one HTTP exchange and
-    its validation — the part that is genuinely Shodan-specific.
+    The response is STREAMED to `sink` and kept WHOLE — a paid page has no byte ceiling (see
+    `SHODAN_PARSE_LIMIT`). Parsing then reads that file, so the artifact is the evidence of record and
+    our contract checks are applied to something we still hold. Every error carries the artifact it was
+    raised over, so the coordinator can publish the bytes whatever the outcome.
 
-    FULLY FAIL-CLOSED, unchanged from `_shodan_search`: a non-object body, a non-int/negative `total`, a
-    non-list `matches`, a NON-DICT row, or a NON-LIST `hostnames` is an ERROR, never laundered into a
-    clean empty. `{"total":1,"matches":[null]}` therefore fails."""
+    FULLY FAIL-CLOSED, unchanged: a non-object body, a non-int/negative `total`, a non-list `matches`, a
+    NON-DICT row, or a NON-LIST `hostnames` is an ERROR, never laundered into a clean empty.
+    `{"total":1,"matches":[null]}` therefore fails — and its bytes are still on disk."""
     url = (f"https://api.shodan.io/shodan/host/search?key={key}"
            f"&query={urllib.parse.quote(f'{facet}:{v}')}&page={page}")
-    raw = b""
+    sink = Path(sink)
+    size = 0
+    digest = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=20) as r:
-            raw = _read_bounded(r)
-        data = _json.loads(raw.decode("utf-8", "replace"))
+            size, digest = stream_to_file(r, sink)
+        if size > SHODAN_PARSE_LIMIT:
+            raise ShodanPageTooLargeToParse(
+                f"shodan: page is {size} bytes, beyond SHODAN_PARSE_LIMIT ({SHODAN_PARSE_LIMIT}) — the "
+                f"response is KEPT and owned; its rows are not ingested by this process")
+        data = _json.loads(sink.read_bytes().decode("utf-8", "replace"))
         if not isinstance(data, dict):
             raise ValueError("shodan: non-object response — not a valid empty result")
         page_total = data.get("total")
@@ -254,14 +271,12 @@ def _shodan_page(key, facet, v, page):
         # 401 + HTML, so the status code alone would report every exhausted account as a broken
         # credential. Capturing later is unreliable: an HTTPError wraps a live socket.
         capture_error_body(e, provider="shodan")
-        # a PAID request that we refuse to parse still cost a credit, and the coordinator can only
-        # preserve what it is handed. `capture_error_body` covers an HTTPError's body; a validation
-        # raise has no body of its own, so the bytes we actually read travel on the exception the same
-        # way (measured 2026-08-05: a page rejected as `parse` left no artifact and no message, so
-        # neither provider drift nor a wrong contract could be shown).
-        if getattr(e, "body_bytes", None) is None and raw:
+        # the ARTIFACT travels with the failure. A paid response that we could not use is still a paid
+        # response, and the coordinator publishes what it is handed.
+        for attr, val in (("raw_path", sink if size else getattr(e, "partial", None)),
+                          ("raw_digest", digest), ("raw_bytes", size)):
             try:
-                e.body_bytes = raw
+                setattr(e, attr, val)
             except Exception:
                 pass
         return [], None, _classified(e)
@@ -707,7 +722,10 @@ def _shodan_work_locked(ctx, key, lanes):
             # neither recorded nor honored and the scheduler went straight to the next pivot. Every paid
             # request now passes through the same cooldown that sizing uses.
             cooldown.wait()
-            matches, total, err = _shodan_page(key, pivot.facet, pivot.value, page)
+            # the RAW response is streamed here, under the ledger's own directory, so a page we paid for
+            # exists on disk before anything decides whether we can use it.
+            sink = attempt_dir / "raw" / f"{shodan_sched.item_key(pivot, page)}.json"
+            matches, total, err = _shodan_page(key, pivot.facet, pivot.value, page, sink=sink)
             if err is not None and provider_error_class(err) == PROVIDER_RATE_LIMIT:
                 cooldown.note(err)
             if err is not None:

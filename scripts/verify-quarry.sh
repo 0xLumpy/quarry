@@ -493,7 +493,10 @@ def resp_factory(body):
         url = "https://api.inscope.test/graphql"; status = 200; headers = {}
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def read(self, n): return body
+        def read(self, n=None):
+            if getattr(self, '_eof', False): return b''   # STREAM: body once, then EOF
+            self._eof = True
+            return body
         def close(self): pass
     return lambda req, timeout=20: R()
 
@@ -539,7 +542,10 @@ class R:
     url = "https://a.inscope.test/.env"; status = 200
     def __enter__(self): return self
     def __exit__(self, *a): return False
-    def read(self, n): return b"NOTHING=here\n"
+    def read(self, n=None):
+        if getattr(self, '_eof', False): return b''   # STREAM: body once, then EOF
+        self._eof = True
+        return b"NOTHING=here\n"
 urllib.request.urlopen = lambda req, timeout=20: R()
 # scoped_get follows via fetch._NO_REDIRECT_OPENER now — bridge it to the patched urlopen
 f._NO_REDIRECT_OPENER = type("_O", (), {"open": staticmethod(lambda req, timeout=None: urllib.request.urlopen(req, timeout))})()
@@ -1375,7 +1381,10 @@ class R:
     status = 200
     def __enter__(self): return self
     def __exit__(self, *a): return False
-    def read(self, n): return json.dumps([
+    def read(self, n=None):
+        if getattr(self, '_eof', False): return b''   # STREAM: body once, then EOF
+        self._eof = True
+        return json.dumps([
         {"name_value": "www.acme.com\n*.acme.com"},
         {"name_value": "api.acme.com"},
         {"name_value": "mail.acme.com\nftp.acme.com"}]).encode()
@@ -1400,7 +1409,10 @@ fail_ok = propagate_ok and none_ok and len(_fin)==1 and _fin[0]["status"]=="fail
 class C:
     def __enter__(self): return self
     def __exit__(self, *a): return False
-    def read(self, n): return json.dumps([{"dns_names": ["a.acme.com", "*.acme.com"]},
+    def read(self, n=None):
+        if getattr(self, '_eof', False): return b''   # STREAM: body once, then EOF
+        self._eof = True
+        return json.dumps([{"dns_names": ["a.acme.com", "*.acme.com"]},
                                           {"dns_names": ["b.acme.com"]}]).encode()
 urllib.request.urlopen = lambda req, timeout=30: C()
 cs_ok = v._certspotter("acme.com") == {"a.acme.com", "*.acme.com", "b.acme.com"}
@@ -1497,7 +1509,10 @@ def mk(total):
     class R:
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def read(self, n): return json.dumps({"total": total,
+        def read(self, n=None):
+            if getattr(self, '_eof', False): return b''   # STREAM: body once, then EOF
+            self._eof = True
+            return json.dumps({"total": total,
             "matches": [{"hostnames": ["new.acme.com", "evil.other.com"]}]}).encode()
     return lambda req, timeout=20: R()
 urllib.request.urlopen = mk(10)
@@ -1560,7 +1575,10 @@ def mk(total):
     class R:
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def read(self, n): return json.dumps({"total": total,
+        def read(self, n=None):
+            if getattr(self, '_eof', False): return b''   # STREAM: body once, then EOF
+            self._eof = True
+            return json.dumps({"total": total,
             "matches": [{"hostnames": ["new.acme.com", "evil.other.com"]}]}).encode()
     return lambda req, timeout=20: R()
 urllib.request.urlopen = mk(10)
@@ -1592,7 +1610,10 @@ class R:
     def __exit__(self, *a): return False
     # review-r6#2: names come from the STRUCTURED hit path certificate_v1.resource.names (NOT a regex over the
     # hit JSON — a message/error field inside a hit must never yield a phantom host).
-    def read(self, n): return (b'{"result":{"hits":[{"certificate_v1":{"resource":{"names":'
+    def read(self, n=None):
+        if getattr(self, '_eof', False): return b''   # STREAM: body once, then EOF
+        self._eof = True
+        return (b'{"result":{"hits":[{"certificate_v1":{"resource":{"names":'
         b'["www.acme.com","*.acme.com","api.acme.com","evil-acme.com","x.foo.acme.com"]}}}]}}')
 urllib.request.urlopen = lambda req, timeout=30: R()
 got = vertical._censys({"token": "t", "org": "o"}, "acme.com")

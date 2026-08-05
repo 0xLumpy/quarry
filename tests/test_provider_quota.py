@@ -1350,6 +1350,9 @@ class _Body:
         self._payload = payload.encode() if isinstance(payload, str) else payload
 
     def read(self, n=None):
+        if getattr(self, '_eof', False):
+            return b''                      # STREAM: the body once, then EOF
+        self._eof = True
         return self._payload
 
     def __enter__(self):
@@ -1751,6 +1754,12 @@ class TestRealShodanLaneUnderQuota:
         ok_body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
 
         class _Resp:
+            """A STREAM: the body once, then EOF. A fake that answers every `read()` with the whole body
+            never terminates a chunked reader — it hung the suite when the paid page started streaming."""
+
+            def __init__(self):
+                self._left = ok_body
+
             def __enter__(self):
                 return self
 
@@ -1758,7 +1767,8 @@ class TestRealShodanLaneUnderQuota:
                 return False
 
             def read(self, n=None):
-                return ok_body
+                out, self._left = (self._left, b"") if n is None else (self._left[:n], self._left[n:])
+                return out
 
         # B1.4: the limit can no longer OUTNUMBER the failure — the first provider limit stops
         # purchasing, so at most one is ever recorded per run. The property under test is unchanged
@@ -1843,7 +1853,9 @@ class TestLaterPagePositionAccounting:
             return False
 
         def read(self, n=None):
-            return self._b
+            out, self._b = ((self._b, b'') if n is None
+                            else (self._b[:n], self._b[n:]))   # STREAM, then EOF
+            return out
 
     def test_page_one_evidence_then_page_two_quota_is_a_LIMIT(self, tmp_path, monkeypatch):
         """Page-1 data is kept and the later quota is a soft limit — NOT Quarry's page cap, and not a gap."""

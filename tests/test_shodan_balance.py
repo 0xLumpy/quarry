@@ -259,6 +259,9 @@ class TestLiveRead:
                 return False
 
             def read(self, n=None):
+                if getattr(self, '_eof', False):
+                    return b''                      # STREAM: the body once, then EOF
+                self._eof = True
                 return json.dumps(MEASURED).encode()
 
         monkeypatch.setattr(probe.urllib.request, "urlopen", lambda *a, **k: _R())
@@ -369,6 +372,9 @@ class TestReadOutcomeSurvives:
                 return False
 
             def read(self, n=None):
+                if getattr(self, '_eof', False):
+                    return b''                      # STREAM: the body once, then EOF
+                self._eof = True
                 return b"<html>not json</html>"
 
         monkeypatch.setattr(probe.settings, "performance", lambda: {})
@@ -385,6 +391,9 @@ class TestReadOutcomeSurvives:
                 return False
 
             def read(self, n=None):
+                if getattr(self, '_eof', False):
+                    return b''                      # STREAM: the body once, then EOF
+                self._eof = True
                 return json.dumps(MEASURED).encode()
 
         monkeypatch.setattr(probe.settings, "performance", lambda: {})
@@ -479,6 +488,9 @@ class TestProvenRefusalBlocksSpending:
                 return False
 
             def read(self, n=None):
+                if getattr(self, '_eof', False):
+                    return b''                      # STREAM: the body once, then EOF
+                self._eof = True
                 return body.encode()
 
         monkeypatch.setattr(probe.settings, "performance", lambda: {})
@@ -496,6 +508,9 @@ class TestProvenRefusalBlocksSpending:
                 return False
 
             def read(self, n=None):
+                if getattr(self, '_eof', False):
+                    return b''                      # STREAM: the body once, then EOF
+                self._eof = True
                 return b'{"query_credits": 85, "usage_limits": "broken"}'
 
         monkeypatch.setattr(probe.settings, "performance", lambda: {})
@@ -533,6 +548,9 @@ class TestAReadFailureIsNotMaskedByTheReserve:
                 return False
 
             def read(self, n=None):
+                if getattr(self, '_eof', False):
+                    return b''                      # STREAM: the body once, then EOF
+                self._eof = True
                 return b"<html>not json</html>"
 
         monkeypatch.setattr(probe.settings, "performance", lambda: {"SHODAN_CREDIT_RESERVE": 10})

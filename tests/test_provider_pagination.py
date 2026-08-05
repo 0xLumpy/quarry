@@ -24,10 +24,24 @@ pytestmark = pytest.mark.offline
 
 
 class _Resp:
-    def __init__(self, body): self._b = body
+    """A minimal STREAM: hands out the body once, then EOF — the shape a chunked reader expects."""
+
+    def __init__(self, body):
+        self._b = body
+        self._done = False
+
     def __enter__(self): return self
     def __exit__(self, *a): return False
-    def read(self, n=None): return self._b
+
+    def read(self, n=None):
+        if self._done:
+            return b""
+        if n is None or n >= len(self._b):
+            self._done = True
+            return self._b
+        head, self._b = self._b[:n], self._b[n:]
+        return head
+
     status = 200
 
 
@@ -604,7 +618,13 @@ def _with_balance(responder, *, credits=100):
         def __exit__(self, *a):
             return False
 
+        _done = False
+
         def read(self, n=None):
+            if self._done:
+                return b""
+            self.__class__._done = False
+            self._done = True
             return json.dumps({"total": 10}).encode()
 
     class _Bal:
@@ -615,6 +635,9 @@ def _with_balance(responder, *, credits=100):
             return False
 
         def read(self, n=None):
+            if getattr(self, '_eof', False):
+                return b''                      # STREAM: the body once, then EOF
+            self._eof = True
             return json.dumps({"query_credits": credits, "scan_credits": 0,
                                "usage_limits": {"query_credits": credits}}).encode()
 
@@ -752,12 +775,20 @@ class TestShodanPivot:
         # bytes, which carry no `matches`. Select the PAGE doc.
         # the purchased-page tree is PROJECT-scoped now (`state/shodan-pivot/v<schema>/pages/…`), because
         # a run-scoped one made the next run pay for pages it already owned
-        art = [q for q in (tmp_path / "state" / "shodan-pivot").rglob("pages/**/*.json")
-               if q.name != ".quarry-write-probe" and "matches" in json.loads(q.read_text())]
-        assert len(art) == 1, [str(q) for q in art]
-        rows = json.loads(art[0].read_text())["matches"]
+        # a paid page is kept TWICE now: the page doc (owned, replayed) and the provider's EXACT bytes
+        # streamed to `raw/` — neither truncated. Lumpy, 2026-08-05: "if we are already paying, I want to
+        # get EVERYTHING I pay for".
+        docs = [q for q in (tmp_path / "state" / "shodan-pivot").rglob("pages/**/*.json")
+                if q.name != ".quarry-write-probe" and q.parent.name != "raw"
+                and "matches" in json.loads(q.read_text())]
+        assert len(docs) == 1, [str(q) for q in docs]
+        doc = json.loads(docs[0].read_text())
+        rows = doc["matches"]
         assert len(rows) == 1000                              # COMPLETE — no truncation
         assert "h999.acme.com" in found and rows[-1]["hostnames"] == ["h999.acme.com"]
+        raw = docs[0].parent / "raw" / doc["raw_ref"]
+        assert raw.is_file() and raw.stat().st_size == doc["raw_bytes"]
+        assert len(json.loads(raw.read_text())["matches"]) == 1000, "the RESPONSE is kept whole too"
 
     def test_high_total_still_ingests_in_scope(self, monkeypatch, tmp_path):
         # review-r2#3: a generic high-`total` pivot must NOT drop valid in-scope hosts. B1.5b: off-scope
@@ -965,7 +996,8 @@ class TestShodanPivot:
             monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
                 lambda req, timeout=20, b=bad: _Resp(json.dumps(
                     {"total": 1, "matches": [{"hostnames": b}]}).encode())))
-            ms, total, err = probe._shodan_page("k", "http.favicon.hash", "hX", 1)
+            ms, total, err = probe._shodan_page("k", "http.favicon.hash", "hX", 1,
+                                                sink=tmp_path / f"raw-{bad!r:.12}.json")
             assert err is not None, f"{bad} was accepted as a valid page"
             assert "non-string hostname" in str(err), (bad, err)
 
@@ -1704,9 +1736,10 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(paged))
         # B1.4: the adapter fetches ONE page and never raises — it hands the coordinator a classified
         # error instead, and the coordinator decides what that costs.
-        ms, total, err = probe._shodan_page("k", "http.favicon.hash", "hX", 1)
+        ms, total, err = probe._shodan_page("k", "http.favicon.hash", "hX", 1, sink=tmp_path / "p1.json")
         assert len(ms) == 100 and total == 500 and err is None
-        ms2, total2, err2 = probe._shodan_page("k", "http.favicon.hash", "hX", 2)
+        ms2, total2, err2 = probe._shodan_page("k", "http.favicon.hash", "hX", 2,
+                                               sink=tmp_path / "p2.json")
         assert ms2 == [] and total2 is None and isinstance(err2, urllib.error.HTTPError)
         assert err2.error_class, "the error reached the coordinator unclassified"
         ctx, _ = self._ctx(tmp_path)

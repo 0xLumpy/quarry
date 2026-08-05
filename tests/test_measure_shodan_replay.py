@@ -44,12 +44,19 @@ def harness(monkeypatch, tmp_path):
         return probe.ShodanBalance(remaining=state["bal"], allowance=100, reserve=0,
                                    spendable=state["bal"], may_spend=True, reason="ok")
 
-    def page(key, facet, value, pg):
+    def page(key, facet, value, pg, *, sink=None):
         state["pages"] += 1
         state["bal"] -= 1                                  # a search page costs ONE query credit
         if state["raise_after"] and state["pages"] >= state["raise_after"]:
             raise RuntimeError("provider exploded after the credit was spent")
-        return ([{"ip_str": "203.0.113.9", "hostnames": [f"h.{value}.example"], "port": 443}], 3, None)
+        rows = [{"ip_str": "203.0.113.9", "hostnames": [f"h.{value}.example"], "port": 443}]
+        if sink is not None:
+            # the real adapter STREAMS the response here before anything judges it; the stub keeps the
+            # same contract so the coordinator's raw-evidence handling is exercised, not bypassed.
+            sink = Path(sink)
+            sink.parent.mkdir(parents=True, exist_ok=True)
+            sink.write_text(json.dumps({"total": 3, "matches": rows}))
+        return (rows, 3, None)
 
     monkeypatch.setattr(probe, "_read_shodan_balance", balance)
     monkeypatch.setattr(probe, "_shodan_count", lambda k, f, v: (3, b'{"total": 3}', None))
@@ -177,8 +184,8 @@ class TestItCannotPassWithoutProof:
         catch. It must stop at A, not average the two numbers into a verdict."""
         real = probe._shodan_page
 
-        def double_charge(key, facet, value, pg):
-            out = real(key, facet, value, pg)
+        def double_charge(key, facet, value, pg, *, sink=None):
+            out = real(key, facet, value, pg, sink=sink)
             harness.state["bal"] -= 1                       # a second credit Quarry never recorded
             return out
         monkeypatch.setattr(probe, "_shodan_page", double_charge)
@@ -255,12 +262,12 @@ class TestAMustBeExactlyTheExperimentBeforeBRuns:
         real = probe._shodan_page
         seen = {"n": 0}
 
-        def flaky(key, facet, value, pg):
+        def flaky(key, facet, value, pg, *, sink=None):
             seen["n"] += 1
             if seen["n"] == 2:
                 err = RuntimeError("second pivot refused"); err.error_class = "server"
                 return ([], None, err)
-            return real(key, facet, value, pg)
+            return real(key, facet, value, pg, sink=sink)
         monkeypatch.setattr(probe, "_shodan_page", flaky)
         assert harness.run_in(tmp_path / "p", "--run") == 1
         rep = _report(tmp_path / "p")

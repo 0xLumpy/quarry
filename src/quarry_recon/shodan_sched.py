@@ -420,13 +420,20 @@ def observe_total(st, o, total) -> None:
     compare_count(st, o)
 
 
-def _page_doc(pivot: Pivot, page: int, total, matches, *, bought_at=None) -> dict:
+def _page_doc(pivot: Pivot, page: int, total, matches, *, bought_at=None, raw=None) -> dict:
     """The page as stored. `bought_at` rides INSIDE the document on purpose: it is content-addressed and
     digest-verified, so the purchase time is bound to the evidence by the same hash that proves ownership
-    — a sidecar could drift from the page it describes."""
-    return {"schema": SHODAN_WORK_SCHEMA, "lane": pivot.lane, "facet": pivot.facet,
-            "value": pivot.value, "page": page, "total": total, "matches": matches,
-            "bought_at": float(time.time() if bought_at is None else bought_at)}
+    — a sidecar could drift from the page it describes.
+
+    `raw` names the provider's EXACT bytes, streamed to disk and kept whole. This document is our reading
+    of the response; that file is the response. A paid acquisition keeps both, and neither is ever
+    truncated to fit a cap (Lumpy, 2026-08-05)."""
+    doc = {"schema": SHODAN_WORK_SCHEMA, "lane": pivot.lane, "facet": pivot.facet,
+           "value": pivot.value, "page": page, "total": total, "matches": matches,
+           "bought_at": float(time.time() if bought_at is None else bought_at)}
+    if raw:
+        doc.update(raw)
+    return doc
 
 
 #: tolerance for ordinary clock skew between the machine that bought a page and the one reading it.
@@ -547,7 +554,7 @@ REJECTED_BYTES_LIMIT = 512 * 1024
 
 
 def publish_rejected(attempt_dir, pivot: Pivot, page: int, *, reason: str, body=None,
-                     matches=None, total=None):
+                     matches=None, total=None, raw_path=None):
     """Keep what a PAID request actually returned when we refuse to treat it as a page.
 
     A credit was spent, so the response is evidence regardless of whether our contract accepts it. It is
@@ -563,6 +570,15 @@ def publish_rejected(attempt_dir, pivot: Pivot, page: int, *, reason: str, body=
         doc = {"schema": SHODAN_WORK_SCHEMA, "lane": pivot.lane, "facet": pivot.facet,
                "value": pivot.value, "page": page, "at": time.time(), "reason": reason,
                "owned": False}
+        if raw_path is not None and Path(raw_path).is_file():
+            # the COMPLETE response is already on disk (streamed there before anything judged it), so
+            # this record POINTS at it instead of keeping a truncated second copy. A rejected page is
+            # still a page we paid for, and it is kept whole.
+            rp = Path(raw_path)
+            doc["raw_ref"] = str(rp)
+            doc["raw_bytes"] = rp.stat().st_size
+            doc["raw_digest"] = events.file_digest(rp)
+            body = None
         if isinstance(body, (bytes, bytearray)) and body:
             doc["body_b64"] = base64.b64encode(bytes(body)[:REJECTED_BYTES_LIMIT]).decode()
             doc["body_bytes"] = len(body)
@@ -585,18 +601,18 @@ MAX_REJECT_REASONS = 5
 
 
 def note_rejected(o, pivot: Pivot, page: int, *, reason: str, attempt_dir, body=None,
-                  matches=None, total=None, count: bool = True) -> None:
+                  matches=None, total=None, count: bool = True, raw_path=None) -> None:
     """Keep a paid response's bytes, and — when the objection is OURS — count it and remember why.
 
     One place, so the two rejection paths cannot drift apart. `count=False` preserves evidence for a
     provider-side refusal without claiming our contract rejected anything."""
     if not count:
         publish_rejected(attempt_dir, pivot, page, reason=reason, body=body,
-                         matches=matches, total=total)
+                         matches=matches, total=total, raw_path=raw_path)
         return
     o.pages_rejected += 1
     art = publish_rejected(attempt_dir, pivot, page, reason=reason, body=body,
-                           matches=matches, total=total)
+                           matches=matches, total=total, raw_path=raw_path)
     if len(o.reject_reasons) < MAX_REJECT_REASONS:
         o.reject_reasons.append(f"{pivot.facet}:{pivot.value} p{page}: {reason}"
                                 + (f" [kept: {art.name}]" if art is not None else " [BYTES NOT KEPT]"))
@@ -977,7 +993,9 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
                 # and only that one moves the rejection counters. An auth or quota refusal is already
                 # counted by its class and explained by the terminal's `error_detail`.
                 note_rejected(o, st.pivot, page, reason=f"{cls}: {err}", attempt_dir=attempt_dir,
-                              body=getattr(err, "body_bytes", None), count=(cls == "parse"))
+                              body=getattr(err, "body_bytes", None),
+                              raw_path=getattr(err, "raw_path", None),
+                              count=(cls in ("parse", "oversize", "incomplete")))
                 st.stopped = cls
                 limit = is_limit(cls)
                 bucket = o.limit_classes if limit else o.fail_classes
@@ -1014,7 +1032,15 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
             # Shodan never said for that page and the drift disappeared on resume (stored 500/500 for a
             # measured 500/200; drift 1 fresh, 0 resumed). Evidence records what the provider ANSWERED;
             # reconciliation is a derived view and lives only in `PivotState`.
-            body = json.dumps(_page_doc(st.pivot, page, total, matches)).encode()
+            # the streamed provider bytes, if the adapter put them where we asked. Named INSIDE the
+            # page doc so ownership and the raw response are bound by the same digest, and retained as
+            # ledger evidence so a later run can prove what was actually delivered.
+            raw_art = Path(attempt_dir) / "raw" / f"{item_key(st.pivot, page)}.json"
+            raw_meta = None
+            if raw_art.is_file():
+                raw_meta = {"raw_ref": raw_art.name, "raw_bytes": raw_art.stat().st_size,
+                            "raw_digest": events.file_digest(raw_art)}
+            body = json.dumps(_page_doc(st.pivot, page, total, matches, raw=raw_meta)).encode()
             dig = hashlib.sha256(body).hexdigest()
             # atomic + content-verified: a torn write at a content-addressed name would otherwise be
             # reused later as if it were the page we meant to buy.
@@ -1033,6 +1059,14 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
             # the completion and its durability are ONE fact: a page we cannot journal is a page the
             # next run will buy again, so stop paying the moment that becomes true.
             journaled = ledger.record(item_key(st.pivot, page), raw, digest=dig)
+            if raw_meta is not None:
+                # EVIDENCE, not the completion artifact: replay reads the page doc, and this is what the
+                # provider actually sent. Retained so it survives beside the page it paid for.
+                try:
+                    ledger.add_evidence(item_key(st.pivot, page), raw_art,
+                                        digest=raw_meta["raw_digest"])
+                except Exception as e:
+                    _lane_machinery(o, e)
             # review-B1.3r6#1: a readable journal proves OLD content survives, not that THIS page reached
             # it. Both facts are needed, and only the record itself carries the second one.
             res.records_journaled = res.records_journaled and journaled

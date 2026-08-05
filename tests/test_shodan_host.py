@@ -38,6 +38,9 @@ class _Resp:
         return False
 
     def read(self, n=None):
+        if getattr(self, '_eof', False):
+            return b''                      # STREAM: the body once, then EOF
+        self._eof = True
         return self._body
 
 

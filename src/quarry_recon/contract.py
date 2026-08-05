@@ -15,10 +15,13 @@ phase makes AFTER it parses. We never guess counts from stdout. See [[quarry-bbo
 """
 from __future__ import annotations
 
+import hashlib as _hashlib
 import json as _json
+import os as _os
 import re as _re
 import socket as _socket
 import urllib.error as _urlerr
+from pathlib import Path as _Path
 
 from . import events, normalize, sources
 from .runner import Status, run as _run, skipped
@@ -206,6 +209,69 @@ def error_detail(exc) -> "str | None":
         return None
     reason = secrets.redact(reason) or ""
     return (reason[:_DETAIL_CHARS] + "…") if len(reason) > _DETAIL_CHARS else reason
+
+
+class IncompleteAcquisition(RuntimeError):
+    """A PAID response that did not arrive whole — the transport broke, or the disk did.
+
+    Its own class, because the consequence is unlike every other failure: the credit is gone and the
+    evidence is incomplete, so retrying spends again for something we may already hold most of. Nothing
+    retries on this automatically; an operator decides."""
+
+    error_class = "incomplete"
+
+    def __init__(self, message: str, *, bytes_written: int = 0, partial=None):
+        super().__init__(message)
+        self.bytes_written = bytes_written
+        self.partial = partial
+
+
+def stream_to_file(r, dest, *, chunk: int = 1024 * 1024, deadline_s: float = 300.0) -> "tuple[int, str]":
+    """Stream a response to `dest` ATOMICALLY and return (bytes, sha256). NO byte ceiling.
+
+    Lumpy, 2026-08-05, after a 4 MiB cap truncated two paid Shodan pages and a 64 MiB one replaced it:
+    "if we are already paying, I want to get EVERYTHING I pay for". A cap on a paid response is not a
+    safety guard — the credit is already spent, so the guard converts money into incomplete evidence and
+    invites a second purchase. Bound MEMORY and TIME, never the bytes we keep: this holds one chunk at a
+    time, so a 2 GiB response costs 1 MiB of RAM and its full size on disk.
+
+    The complete body lands in one `os.replace`, so a reader never sees a half-written artifact. A break
+    mid-stream leaves the partial bytes beside it (`.part`) as the evidence of what did arrive, and
+    raises `IncompleteAcquisition` — which nothing retries automatically.
+
+    TIME is the other legitimate bound: a socket that never reaches EOF would otherwise stream forever
+    while the run holds this project's spend lock. `deadline_s` ends that as an incomplete acquisition —
+    honest about having paid, and never a silent truncation dressed up as a page.
+
+    `chunk` is what we hold in RAM: a 2 GiB response costs 1 MiB of memory and its full size on disk."""
+    import time as _time
+    dest = _Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    digest = _hashlib.sha256()
+    written = 0
+    end = _time.monotonic() + deadline_s if deadline_s and deadline_s > 0 else None
+    try:
+        with open(part, "wb") as fh:
+            while True:
+                if end is not None and _time.monotonic() > end:
+                    raise TimeoutError(f"still receiving after {deadline_s:g}s")
+                buf = r.read(chunk)
+                if not buf:
+                    break
+                fh.write(buf)
+                digest.update(buf)
+                written += len(buf)
+            fh.flush()
+            _os.fsync(fh.fileno())
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        # the partial file STAYS: a paid request that half-arrived is evidence of what we bought
+        raise IncompleteAcquisition(f"paid response incomplete after {written} byte(s): {e}",
+                                    bytes_written=written, partial=part) from e
+    _os.replace(part, dest)
+    return written, digest.hexdigest()
 
 
 class ResponseTooLarge(ValueError):

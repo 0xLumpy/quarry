@@ -300,6 +300,9 @@ EXCLUDED: dict[str, tuple[str, str]] = {
         "resource", "one provider response is read into memory; hitting it RAISES (`oversize`)"),
     "quarry_recon.phases.vertical:CERTSPOTTER_READ_LIMIT": (
         "resource", "one provider response is read into memory; hitting it RAISES (`oversize`)"),
+    "quarry_recon.phases.probe:SHODAN_PARSE_LIMIT": (
+        "resource", "how large an artifact we PARSE in one process. The bytes are still acquired, owned "
+        "and published beyond it — this bounds RAM, never what a paid response may contain"),
     "quarry_recon.phases.probe:SHODAN_READ_LIMIT": (
         "resource", "one provider response is read into memory. Hitting it RAISES (class `oversize`) and "
         "the page is reported as ours — it never drops rows from a page we keep"),

@@ -12,6 +12,7 @@ import io
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -105,7 +106,7 @@ class TestQuarryIdentifiesItselfToShodan:
         assert "Mozilla" not in probe.SHODAN_UA
 
     @pytest.mark.parametrize("call", [
-        lambda: probe._shodan_page("K", "http.favicon.hash", "1", 1),
+        lambda: probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=Path("/tmp/x.json")),
         lambda: probe._shodan_count("K", "http.favicon.hash", "1"),
         lambda: probe._read_shodan_balance("K", timeout=1),
     ])
@@ -132,21 +133,26 @@ class TestQuarryIdentifiesItselfToShodan:
 
 
 class TestOurOwnCeilingIsNotTheProvidersFault:
-    """MEASURED 2026-08-05, twice, with two credits spent on it: a 4 MiB read cap truncated Shodan's page
-    mid-string and the fragment went straight to `json.loads`, so the run reported
-
-        JSONDecodeError: Unterminated string starting at: line 1 column 4194270 (char 4194269)
-
-    4194304 is 4 MiB. Quarry called its own constant a provider defect, and every artifact agreed with
-    it. A search page carries up to 100 banners with base64 favicon and certificate blobs; the cap was
-    the wrong order of magnitude, and the misattribution was the more expensive half."""
+    """MEASURED 2026-08-05, twice, two credits: a 4 MiB read cap truncated Shodan's page mid-string and
+    the fragment went to `json.loads`, so the run reported `JSONDecodeError` — Quarry calling its own
+    constant a provider defect. The first fix raised the cap to 64 MiB, which is the same mistake with a
+    bigger number. A PAID response now has no byte ceiling at all: it is streamed to disk and kept whole.
+    What remains bounded is MEMORY (what we will parse in one process) and the FREE endpoints, whose
+    responses can be re-read for nothing."""
 
     class _Response:
+        """A STREAM: hands out the body in chunks, then EOF. A fake that returns the whole body on every
+        `read()` spins forever against a chunked reader — and pins the buffered shape we removed."""
+
         def __init__(self, payload: bytes):
             self._payload = payload
 
         def read(self, n=None):
-            return self._payload[:n] if n else self._payload
+            if n is None:
+                out, self._payload = self._payload, b""
+                return out
+            out, self._payload = self._payload[:n], self._payload[n:]
+            return out
 
         def __enter__(self):
             return self
@@ -158,50 +164,81 @@ class TestOurOwnCeilingIsNotTheProvidersFault:
         monkeypatch.setattr(urllib.request, "urlopen",
                             lambda req, timeout=None: self._Response(payload))
 
-    def test_the_cap_is_large_enough_for_a_real_page(self):
-        assert probe.SHODAN_READ_LIMIT >= 32 * 1024 * 1024, "4 MiB truncated ordinary favicon pages"
+    def test_a_PAID_page_has_no_byte_ceiling_at_all(self):
+        """"If we are already paying, I want to get EVERYTHING I pay for" — the credit is spent before
+        any cap can help, so a cap only converts money into incomplete evidence."""
+        import inspect
+        src = inspect.getsource(probe._shodan_page)
+        assert "SHODAN_READ_LIMIT" not in src, "a paid response must not be capped"
+        assert "stream_to_file" in src, "it must be streamed to disk, not buffered in memory"
 
-    def test_an_oversize_response_is_classed_as_OURS_not_as_a_parse_failure(self, monkeypatch):
-        monkeypatch.setattr(probe, "SHODAN_READ_LIMIT", 512)
-        self._serve(monkeypatch, b'{"total": 5, "matches": [' + b'"x" ' * 500 + b']}')
-        rows, total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1)
+    def test_a_large_page_arrives_WHOLE_and_is_kept(self, monkeypatch, tmp_path):
+        big = {"total": 3, "matches": [{"hostnames": [f"h{i}.example"], "pad": "x" * 4096}
+                                       for i in range(300)]}
+        payload = json.dumps(big).encode()
+        assert len(payload) > 1024 * 1024, "the fixture must exceed one streaming chunk"
+        self._serve(monkeypatch, payload)
+        sink = tmp_path / "page.json"
+        rows, total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=sink)
+        assert err is None and total == 3 and len(rows) == 300
+        assert sink.read_bytes() == payload, "the artifact IS the response, byte for byte"
+
+    def test_the_artifact_is_published_atomically(self, monkeypatch, tmp_path):
+        self._serve(monkeypatch, json.dumps({"total": 1, "matches": []}).encode())
+        sink = tmp_path / "page.json"
+        probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=sink)
+        assert sink.is_file() and not list(tmp_path.glob("*.part")), "no half-written artifact remains"
+
+    def test_a_broken_transport_reports_an_INCOMPLETE_PAID_acquisition(self, monkeypatch, tmp_path):
+        """The credit is gone and the bytes are partial. That is its own outcome — not a parse failure,
+        and never something to retry automatically."""
+        class _Dies:
+            def __init__(self):
+                self._sent = False
+
+            def read(self, n=None):
+                if self._sent:
+                    raise OSError("connection reset mid-body")
+                self._sent = True
+                return b'{"total": 1, "matches": [' + b"x" * 1000
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _Dies())
+        sink = tmp_path / "page.json"
+        _rows, _total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=sink)
+        assert isinstance(err, contract.IncompleteAcquisition)
+        assert contract.provider_error_class(err) == "incomplete"
+        assert err.bytes_written > 0 and Path(err.partial).is_file(), "what DID arrive is kept"
+        assert not sink.is_file(), "an incomplete body must never be published as the page"
+
+    def test_a_page_too_large_to_PARSE_is_still_acquired_and_kept(self, monkeypatch, tmp_path):
+        """The memory bound stops us reading it into RAM; it does not throw the purchase away."""
+        monkeypatch.setattr(probe, "SHODAN_PARSE_LIMIT", 256)
+        payload = json.dumps({"total": 1, "matches": [{"hostnames": ["a.example"], "pad": "y" * 4096}]})
+        self._serve(monkeypatch, payload.encode())
+        sink = tmp_path / "page.json"
+        rows, total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=sink)
         assert rows == [] and total is None and err is not None
         assert contract.provider_error_class(err) == contract.PROVIDER_OVERSIZE
-        assert contract.provider_error_class(err) != contract.PROVIDER_PARSE
-        assert "read cap" in str(err) and "SHODAN_READ_LIMIT" in str(err)
+        assert "KEPT" in str(err) and "SHODAN_PARSE_LIMIT" in str(err)
+        assert sink.read_text() == payload, "the bytes we paid for are on disk, complete"
+        assert getattr(err, "raw_path", None) and getattr(err, "raw_bytes", 0) == len(payload)
 
-    def test_it_says_nothing_was_dropped_silently(self, monkeypatch):
+    def test_a_FREE_endpoint_keeps_its_memory_bound(self, monkeypatch):
+        """Nothing was bought, so re-reading costs nothing and a memory bound is honest there."""
         monkeypatch.setattr(probe, "SHODAN_READ_LIMIT", 64)
-        self._serve(monkeypatch, b"x" * 5000)
-        _rows, _total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1)
-        assert "NOT parsed" in str(err), "a truncated page must never look like an empty one"
-
-    def test_what_we_DID_read_travels_with_the_error(self, monkeypatch):
-        monkeypatch.setattr(probe, "SHODAN_READ_LIMIT", 100)
-        self._serve(monkeypatch, b"y" * 5000)
-        _rows, _total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1)
-        assert getattr(err, "body_bytes", None), "a paid response's bytes are evidence"
-        assert err.body_bytes.startswith(b"yyy")
-
-    def test_a_page_that_FITS_is_unaffected(self, monkeypatch):
-        monkeypatch.setattr(probe, "SHODAN_READ_LIMIT", 4096)
-        self._serve(monkeypatch, json.dumps(
-            {"total": 2, "matches": [{"ip_str": "203.0.113.1", "hostnames": ["a.example"]}]}).encode())
-        rows, total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1)
-        assert err is None and total == 2 and len(rows) == 1
-
-    def test_the_count_endpoint_reads_through_the_same_bound(self, monkeypatch):
-        monkeypatch.setattr(probe, "SHODAN_READ_LIMIT", 32)
-        self._serve(monkeypatch, b'{"total": 12345678901234567890}' * 10)
+        self._serve(monkeypatch, b"z" * 5000)
         total, _raw, err = probe._shodan_count("K", "http.favicon.hash", "1")
-        assert total is None and err is not None
-        assert contract.provider_error_class(err) == contract.PROVIDER_OVERSIZE
+        assert total is None and contract.provider_error_class(err) == contract.PROVIDER_OVERSIZE
 
     def test_oversize_is_a_DEFECT_not_a_provider_limit(self):
-        """It is our constant, so it must read as a gap to be fixed — never as an external boundary that
-        makes an incomplete run look complete_with_limits."""
         assert contract.PROVIDER_OVERSIZE in contract.PROVIDER_CLASSES
         assert not contract.is_provider_limit(contract.PROVIDER_OVERSIZE)
+        assert not contract.is_provider_limit("incomplete")
 
 
 class TestEveryProviderReadSharesTheBound:
@@ -211,6 +248,9 @@ class TestEveryProviderReadSharesTheBound:
 
     class _Big:
         def read(self, n=None):
+            if getattr(self, '_eof', False):
+                return b''                      # STREAM: the body once, then EOF
+            self._eof = True
             return b"x" * (n or 1)
 
         def __enter__(self):
