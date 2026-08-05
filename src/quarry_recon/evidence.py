@@ -147,6 +147,52 @@ _JSON_BARE_KEY_PATHS = re.compile(r"(?:^|/)(?:appsettings(?:\.[\w-]+)?\.json|web
 _JSON_SIGNING_CONTEXT_RX = re.compile(
     r'"[A-Za-z0-9_.\-]*(?:jwt|jws|signing|signature)[A-Za-z0-9_.\-]*"\s*:\s*\{[^{}]{0,300}?'
     r'"(key)"\s*:\s*"([^"]{20,})"', re.I)
+#: STRUCTURAL scan: parse the document and look at the object a key actually lives in. Text proximity
+#: does not establish a relationship — a ±200-char window promoted a PUBLIC key to a secret because a
+#: NEIGHBOURING object mentioned HS256 (review#1, Lumpy). The regexes below remain for bodies that do not
+#: parse as JSON (XML `web.config`, truncated or templated config), where they stay observations only.
+_SIGNING_FIELDS = {"alg", "algorithm", "iss", "issuer", "aud", "audience", "kid",
+                   "expiry", "expires_in", "lifetime"}
+_SYMMETRIC_ALGS = re.compile(r"\A(?:HS(?:256|384|512)|A\d{3}(?:GCM)?KW|dir|symmetric)\Z", re.I)
+_SIGNING_PARENT = re.compile(r"(?:jwt|jws|signing|signature)", re.I)
+
+
+def _json_key_findings(doc, *, parent_key: str = "", by_format: bool = False):
+    """Walk a parsed document and classify every bare `key` by the OBJECT it lives in.
+
+    Yields (kind, value). Three answers, and the object decides all three:
+
+      symmetric algorithm in the SAME object  -> a secret (signing and verifying key are one string)
+      signing PARENT + the format that stores signing secrets -> a secret (.NET writes it there)
+      signing context otherwise               -> an observation (a JWKS entry looks exactly like this)
+    """
+    if isinstance(doc, list):
+        for item in doc:
+            yield from _json_key_findings(item, parent_key=parent_key, by_format=by_format)
+        return
+    if not isinstance(doc, dict):
+        return
+    lower = {str(k).lower(): v for k, v in doc.items()}
+    companions = {k for k in lower if k in _SIGNING_FIELDS}
+    symmetric = any(isinstance(lower.get(a), str) and _SYMMETRIC_ALGS.match(lower[a].strip())
+                    for a in ("alg", "algorithm"))
+    signing_parent = bool(_SIGNING_PARENT.search(parent_key))
+    for k, v in doc.items():
+        if str(k).lower() == "key" and isinstance(v, str) and len(v) >= 20:
+            if symmetric:
+                yield f"json:{k}", v
+            elif by_format and (signing_parent or companions):
+                # the FORMAT stores signing secrets AND this object is a signing config. `appsettings`
+                # also holds cache keys, public ids and nested app config, so the format alone is not
+                # the claim (review#2, Lumpy).
+                yield f"json:{k}", v
+            elif signing_parent or companions:
+                yield "signing-key", v
+    for k, v in doc.items():
+        if isinstance(v, (dict, list)):
+            yield from _json_key_findings(v, parent_key=str(k), by_format=by_format)
+
+
 #: the same object naming HOW the key is used: `{"key": "…", "algorithm": "HS256", "issuer": "…"}`.
 #: TWO patterns rather than one alternation: every rule in this list must yield (key, value) as groups
 #: 1 and 2, and an alternation renumbers them — the first version handed `None` to the loop.
@@ -188,35 +234,41 @@ def mine(text: str, *, source_path: str | None = None) -> list[tuple[str, str, i
         if _SECRETISH_KEY.search(key) and val not in seen_vals:   # already caught as a typed token
             seen_vals.add(val)
             out.append((f"dotenv:{key}", val, text.count("\n", 0, m.start()) + 1))
-    # A bare `"key"` is a SECRET only where the FORMAT says so — .NET writes the symmetric signing secret
-    # into `appsettings*.json` — or where the material is symmetric. Signing CONTEXT alone (`kid`,
-    # `issuer`, `audience`, `RS256`) describes a PUBLIC verification key just as well: a JWKS entry has
-    # exactly that shape and is published on purpose (review#9, Lumpy). Context without proof of secrecy
-    # is kept as an observation, never as a leaked credential.
     by_format = bool(path and _JSON_BARE_KEY_PATHS.search(path))
-    secret_key_rules = [_JSON_SIGNING_CONTEXT_RX, _JSON_BARE_KEY_RX] if by_format else []
-    for rx_set in (_JSON_SECRET_RX, *secret_key_rules):
+    for rx_set in (_JSON_SECRET_RX,):
         for m in rx_set.finditer(text):                           # JSON config (actuator env, .NET…)
             key, val = m.group(1), m.group(2)
             if (val not in seen_vals and not _MASKED_RX.match(val)
                     and val.lower() not in ("null", "true", "false")):
                 seen_vals.add(val)
                 out.append((f"json:{key}", val, text.count("\n", 0, m.start()) + 1))
-    for rx_set in (_JSON_SIGNING_CONTEXT_RX, _JSON_SIGNING_COMPANION_AFTER_RX,
-                   _JSON_SIGNING_COMPANION_BEFORE_RX):
-        for m in rx_set.finditer(text):
-            key, val = m.group(1), m.group(2)
-            if val in seen_vals or _MASKED_RX.match(val) or val.lower() in ("null", "true", "false"):
+    # bare `"key"` fields, decided STRUCTURALLY where the body parses. Text proximity does not
+    # establish a relationship: a ±200-char window promoted a PUBLIC key to a secret because a
+    # NEIGHBOURING object mentioned HS256 (review#1, Lumpy).
+    parsed = None
+    if text.lstrip()[:1] in ("{", "["):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+    if parsed is not None:
+        for kind, val in _json_key_findings(parsed, by_format=by_format):
+            if val in seen_vals or _MASKED_RX.match(val):
                 continue
             seen_vals.add(val)
-            # a SYMMETRIC algorithm means the signing key and the verifying key are the same string, so
-            # publishing it would be the leak. Anything else stays an observation.
-            # the algorithm's VALUE often sits just past the match (`…"key": "x", "algorithm"` ends the
-            # companion pattern), so the window is the surrounding object, not the match alone.
-            window = text[max(0, m.start() - 200):m.end() + 200]
-            symmetric = bool(_SYMMETRIC_ALG_RX.search(window))
-            out.append((f"json:{key}" if symmetric else "signing-key", val,
-                        text.count("\n", 0, m.start()) + 1))
+            at = text.find(val)
+            out.append((kind, val, text.count("\n", 0, at) + 1 if at >= 0 else 1))
+    else:
+        # a body whose object boundaries we cannot read (XML `web.config`, a template, a truncated
+        # dump) never promotes: observation only.
+        for rx_set in (_JSON_SIGNING_CONTEXT_RX, _JSON_SIGNING_COMPANION_AFTER_RX,
+                       _JSON_SIGNING_COMPANION_BEFORE_RX):
+            for m in rx_set.finditer(text):
+                val = m.group(2)
+                if val in seen_vals or _MASKED_RX.match(val):
+                    continue
+                seen_vals.add(val)
+                out.append(("signing-key", val, text.count("\n", 0, m.start()) + 1))
     for val, at in _connstring_passwords(text):                    # a password inside a connection string
         if val and val not in seen_vals:
             seen_vals.add(val)

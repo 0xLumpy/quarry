@@ -404,9 +404,11 @@ class TestTheBareKeyRuleNeedsContextToo:
         for path in ("https://t/api/v1/items", "https://t/openapi.json", "https://t/package.json"):
             assert kinds(f'{{"key": "{self.LONG}"}}', path) == {}, path
 
-    def test_the_FORMAT_that_writes_signing_keys_is_trusted(self):
+    def test_the_FORMAT_ALONE_is_no_longer_enough(self):
+        """DOCTRINE (review#2): the format says signing secrets CAN live there, not that this key is
+        one. It needs the signing context too — see `test_the_format_needs_SIGNING_CONTEXT_too`."""
         for path in ("https://t/appsettings.json", "https://t/appsettings.Production.json"):
-            assert kinds(f'{{"key": "{self.LONG}"}}', path) == {"json:key": self.LONG}, path
+            assert kinds(f'{{"key": "{self.LONG}"}}', path) == {}, path
 
     def test_a_named_signing_parent_is_an_observation_without_the_format(self):
         """DOCTRINE (review#9): a JWT parent says what the key is FOR, not that it is private. A JWKS
@@ -451,10 +453,13 @@ class TestTheBareKeyRuleNeedsContextToo:
             body = f'{{"kid": "k9", "key": "{self.LONG}", "alg": "{alg}"}}'
             assert kinds(body, "https://t/api/v1/x") == {"signing-key": self.LONG}, alg
 
-    def test_the_FORMAT_still_makes_it_a_secret(self):
-        """`appsettings.json` is where .NET writes the symmetric signing secret."""
-        assert kinds(f'{{"Jwt": {{"Key": "{self.LONG}"}}}}', "https://t/appsettings.json") \
-            == {"json:Key": self.LONG}
+    def test_the_format_needs_SIGNING_CONTEXT_too(self):
+        """review#2 (Lumpy): `appsettings.json` also holds cache keys, public ids and nested app config.
+        The measured format was a JWT signing-key CONFIG, not every bare `Key` in the file."""
+        app = "https://t/appsettings.json"
+        assert kinds(f'{{"Jwt": {{"Key": "{self.LONG}"}}}}', app) == {"json:Key": self.LONG}
+        assert kinds(f'{{"Cache": {{"Key": "{self.LONG}"}}}}', app) == {}, "a cache key is not a secret"
+        assert kinds(f'{{"Key": "{self.LONG}"}}', app) == {}, "…nor a bare top-level Key"
 
     def test_a_long_public_identifier_is_still_not_a_secret(self):
         assert kinds(f'{{"key": "{self.LONG}", "label": "public"}}', "https://t/api/v1/x") == {}
@@ -514,3 +519,90 @@ class TestSigningObservationsAreRouted:
                                          source="exposed-fetch", subdir="exposed")
         assert res["secrets"] == 0, res
         assert [r for kind, r in added if kind == "review" and r.get("klass") == "signing-key"]
+
+
+class TestClassificationIsSTRUCTURAL:
+    """review#1 (Lumpy): a ±200-character window promoted a PUBLIC key to a secret because a
+    NEIGHBOURING object mentioned HS256. Text proximity does not establish a relationship."""
+
+    LONG = "public-material-long-enough-1234"
+
+    def test_a_neighbouring_objects_algorithm_does_not_bleed(self):
+        body = ('{"published": {"key": "%s", "kid": "k1"}, "session": {"algorithm": "HS256"}}'
+                % self.LONG)
+        assert kinds(body, "https://t/api") == {"signing-key": self.LONG}
+
+    def test_the_SAME_objects_algorithm_does_decide(self):
+        body = '{"session": {"key": "%s", "algorithm": "HS256"}}' % self.LONG
+        assert kinds(body, "https://t/api") == {"json:key": self.LONG}
+
+    def test_a_jwks_array_entry_is_an_observation(self):
+        body = '{"keys": [{"key": "%s", "kid": "k1", "alg": "RS256"}]}' % self.LONG
+        assert kinds(body, "https://t/.well-known/jwks.json") == {"signing-key": self.LONG}
+
+    def test_a_body_that_does_not_parse_never_promotes(self):
+        """XML, templates and truncated dumps have no readable object boundaries, so the fallback stays
+        an observation — it cannot prove which fields belong together."""
+        xml = ('<add key="Jwt:Key" value="%s" /><add key="alg" value="HS256" />' % self.LONG)
+        assert "json:key" not in kinds(xml, "https://t/web.config")
+        broken = '{"Jwt": {"Key": "%s", "algorithm": "HS256"' % self.LONG      # truncated
+        assert kinds(broken, "https://t/appsettings.json") == {"signing-key": self.LONG}
+
+
+class TestLocalEvidenceIsREADABLE:
+    """Lumpy, 2026-08-05: "All reports and hotlists should have the data clearly readable (not masked or
+    redacted). I don't want to jump between 11 files to eventually find a false positive."
+
+    Quarry's OWN configured credentials are still redacted everywhere. A DISCOVERED secret is the
+    finding, and the report is where the operator reads it."""
+
+    RAW = "AKIAIOSFODNN7EXAMPLE"
+
+    @staticmethod
+    def _run(tmp_path, rows):
+        from quarry_recon import store
+        run = store.Run.create(tmp_path, "readable")
+        for r in rows:
+            run.add("secret", r)
+        return run
+
+    def test_the_HOTLIST_prints_the_VALUE_not_a_preview(self, tmp_path):
+        from quarry_recon import secrets as sec, triage
+        from quarry_recon.config import ScopeMatcher
+        run = self._run(tmp_path, [{"id": "s1", "kind": "aws-access-key", "value": self.RAW,
+                                    "preview": sec.mask(self.RAW), "file": "/raw/x",
+                                    "sources": ["exposed-fetch"]}])
+        md = triage.build(run, ScopeMatcher([], [], [], False))
+        assert self.RAW in md, "the operator must be able to read the finding"
+        assert sec.mask(self.RAW) not in md, "…and not have to decode a preview"
+
+    def test_the_DIGEST_carries_the_value(self, tmp_path):
+        from quarry_recon import secrets as sec, triage
+        from quarry_recon.config import ScopeMatcher
+        run = self._run(tmp_path, [{"id": "s1", "kind": "aws-access-key", "value": self.RAW,
+                                    "preview": sec.mask(self.RAW), "sources": ["exposed-fetch"]}])
+        d = triage.digest_json(run, ScopeMatcher([], [], [], False))
+        blob = __import__("json").dumps(d)
+        assert self.RAW in blob, "digest.json is LOCAL — it is the recon->attack contract"
+
+    def test_a_legacy_entity_with_no_value_still_shows_something(self, tmp_path):
+        from quarry_recon import secrets as sec, triage
+        from quarry_recon.config import ScopeMatcher
+        run = self._run(tmp_path, [{"id": "s2", "kind": "old", "preview": sec.mask(self.RAW),
+                                    "sources": ["legacy"]}])
+        md = triage.build(run, ScopeMatcher([], [], [], False))
+        assert sec.mask(self.RAW) in md, "a pre-value run still reports what it has"
+
+    def test_no_producer_throws_the_value_away(self):
+        """Every secret producer stores the complete value on the entity. `pop("data")` deleted it."""
+        import inspect
+        from quarry_recon.phases import crawl
+        src = inspect.getsource(crawl)
+        assert 'e.pop("data"' not in src, "the value was popped off the entity"
+        assert src.count('e["value"] = d') >= 2, "jsluice + sourcemap both keep it"
+        assert '"value": sec,' in src and '"value": raw_s,' in src, "gitleaks + trufflehog keep it"
+
+    def test_OUR_credentials_are_still_redacted(self):
+        from quarry_recon import secrets as sec
+        assert sec.redact("token=ABC") is not None
+        assert callable(sec.mask), "masking still exists for channels that leave the box"

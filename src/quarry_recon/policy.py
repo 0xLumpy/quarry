@@ -340,7 +340,6 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.evidence:_OPENAPI_MAX_PATHS": ("resource", "one document's path table in memory"),
     "quarry_recon.evidence:MAX_BODY": ("resource", "one exposed resource is read into memory"),
     "quarry_recon.bootstrap:DISK_MIN": ("resource", "a run that fills the disk loses evidence it has"),
-    "quarry_recon.triage:_DNS_PREVIEW_MAX": ("resource", "a digest preview length; evidence keeps all"),
     "quarry_recon.sweep:_UNSELECTABLE_DETAIL": ("resource", "a diagnostic list bound; the counters beside "
                                                             "it are authoritative"),
 

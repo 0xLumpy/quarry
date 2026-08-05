@@ -206,8 +206,8 @@ PYEOF
 # ── Check 9: digest.json contract (triage.digest_json) — hermetic ─────────────────────
 # M2.1 contract: schema 1.0, placeholder queues present+empty, every item has provenance,
 # no raw secret in the output (preview only).
-echo "[9] digest.json contract (schema 1.0, provenance, redacted, placeholders)"
-PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "schema 1.0 · stable keys · real url provenance · raw_ref consistent · redacted" || no "digest contract broken"
+echo "[9] digest.json contract (schema 1.0, provenance, findings READABLE, placeholders)"
+PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "schema 1.0 · stable keys · real url provenance · raw_ref consistent · discovered secret READABLE" || no "digest contract broken"
 import sys, json
 from quarry_recon import triage
 class Shim:
@@ -234,7 +234,11 @@ ok = (d["digest_schema"]=="1.0"
       and auth["sources"]==["katana","gau"]                         # real url provenance kept
       and sec["raw_ref"]=="normalized/secret.jsonl"                 # raw_ref = immutable store
       and sec.get("location")=="/x/app.js"                          # file evidence not overloaded
-      and "AKIAREALSECRET123456" not in json.dumps(d)
+      # DOCTRINE (Lumpy, 2026-08-05): `digest.json` is LOCAL — the recon->attack contract and the file
+      # an operator triages from. A DISCOVERED secret is the finding and must be readable; hunting for
+      # weeks and then reading `AKIA…J4L (20 chars)` is not evidence. Quarry's OWN configured
+      # credentials are still redacted everywhere (see check 7).
+      and "AKIAREALSECRET123456" in json.dumps(d)
       and len(q["takeover"])==1)
 sys.exit(0 if ok else 1)
 PYEOF
@@ -1244,9 +1248,10 @@ ok = (len(dq) == 7 and types == {"mx", "ns", "txt", "caa", "asn", "cdn"} and len
       and d["digest_schema"] == "1.0"
       and "DNS context" in hot and "AS13335" in hot
       and all(i.get("raw_ref") for i in dq)
-      # long TXT (dkim) capped with an ellipsis in the digest, and NOT dumped in full in HOTLIST
-      and len(dkim) == 1 and "…" in dkim[0]["value"] and len(dkim[0]["value"]) < 260
-      and "A" * 400 not in hot)
+      # a long TXT (DKIM) is shown IN FULL, in the digest and in the HOTLIST: truncating it in the one
+      # place an operator reads is how a leaked key hides in plain sight (Lumpy, 2026-08-05).
+      and len(dkim) == 1 and "…" not in dkim[0]["value"] and "A" * 400 in dkim[0]["value"]
+      and "A" * 400 in hot)
 sys.exit(0 if ok else 1)
 PYEOF
 

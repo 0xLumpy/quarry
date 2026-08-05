@@ -96,15 +96,6 @@ def _framework_cve() -> dict:
 NOTABLE_DNS_TYPES = ("mx", "ns", "txt", "caa", "asn", "cdn")
 
 
-_DNS_PREVIEW_MAX = 200      # TXT (DKIM keys/SPF chains/verification blobs) can be long → preview only
-
-
-def _dns_preview(value: str) -> str:
-    """Cap a DNS value for the digest/HOTLIST display — the full value stays in
-    normalized/dns_record.jsonl (raw_ref)."""
-    return value if len(value) <= _DNS_PREVIEW_MAX else value[:_DNS_PREVIEW_MAX] + "…"
-
-
 # TXT intelligence — map a needle in the TXT value to the org's provider/vendor (SPF includes +
 # domain-verification tokens). OSINT pivots: which SaaS/mail/cloud a target actually uses.
 _TXT_PROVIDERS = [
@@ -293,7 +284,14 @@ def build(run, scope) -> str:
         for s in secrets[:25]:
             verified = " VERIFIED" if s.get("verified") else ""
             loc = f"  @ {s.get('file')}" if s.get("file") else ""
-            A(f"- [{s.get('kind')}{verified}] {s.get('preview', '')}{loc}  (src: {','.join(s.get('sources', []))})")
+            where = f":{s.get('line')}" if s.get("line") else ""
+            # THE VALUE, READABLE. This report is LOCAL evidence for the operator doing the hunting: a
+            # masked finding means opening the raw artifact before you can even tell a false positive
+            # from a live credential (Lumpy, 2026-08-05). `preview` exists for channels that leave the
+            # box; it is the fallback here only when a producer stored no value at all.
+            shown = s.get("value") or s.get("data") or s.get("preview", "")
+            A(f"- [{s.get('kind')}{verified}] {shown}{loc}{where}  "
+              f"(src: {','.join(s.get('sources', []))})")
         A("")
 
     oob_rows = run.read("oob_interaction")
@@ -325,7 +323,7 @@ def build(run, scope) -> str:
             if items:
                 A(f"### {t.upper()}  ({len(items)})")
                 for d in items[:12]:
-                    A(f"- {d.get('host')} → {_dns_preview(str(d.get('value', '')))}")
+                    A(f"- {d.get('host')} → {str(d.get('value', ''))}")
                 A("")
 
     # gf / sourcemap candidates (review entities)
@@ -579,14 +577,18 @@ def collect(run, scope) -> dict:
             continue
         val = str(d.get("value", ""))
         tags = ["dns", t] + (_txt_intel(val) if t == "txt" else [])   # tag from the FULL value
-        add("dns", _item("dns", f"{d.get('host')} · {t}={_dns_preview(val)}", f"{t} record (DNS context)",
+        # the FULL record: a DKIM/verification blob is long, and truncating it in the one place an
+        # operator reads is how a leaked key hides in plain sight.
+        add("dns", _item("dns", f"{d.get('host')} · {t}={val}", f"{t} record (DNS context)",
             "low", d.get("sources"), "normalized/dns_record.jsonl", tags))
 
-    for s in secrets_e:                             # secrets (redacted — preview only)
-        # preview is the redacted form; fall back to masking a legacy `data` field (pre-redaction
-        # runs) so the value is never blank AND never raw.
-        preview = s.get("preview") or secrets.mask(s.get("data", ""))
-        add("secrets", _item("secret", preview,
+    for s in secrets_e:
+        # THE VALUE. `digest.json` is LOCAL — it is the recon->attack contract, and an attack layer (or
+        # an operator triaging a false positive) cannot work from `AKIA…MPLE (20 chars)`. Quarry's OWN
+        # configured credentials are still redacted inside `_item`; a DISCOVERED secret is the finding
+        # (Lumpy, 2026-08-05). `preview` remains for channels that leave the box.
+        shown = s.get("value") or s.get("data") or s.get("preview") or ""
+        add("secrets", _item("secret", shown,
             f"{s.get('kind')} secret candidate", "high" if s.get("verified") else "medium",
             s.get("sources"), "normalized/secret.jsonl",
             ["secret", s.get("kind", "")], location=s.get("file")))

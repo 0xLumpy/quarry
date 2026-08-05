@@ -1849,8 +1849,12 @@ def run(ctx) -> None:
                         ctx.run.add("endpoint", {"value": e["url"],
                                                  **{k: v for k, v in e.items() if k != "url"}})
                     else:
-                        d = e.pop("data", "")
+                        d = e.get("data", "")
                         basis = d or f"{e.get('kind', 'secret')}|{e.get('id', '')}"
+                        # the VALUE stays on the entity. A local finding an operator cannot read is a
+                        # finding they have to reconstruct from raw files, which is how a false positive
+                        # costs an hour (Lumpy, 2026-08-05). `preview` is for channels that LEAVE the box.
+                        e["value"] = d
                         e["preview"] = secrets.mask(d)
                         e["id"] = f"jsluice-sourcemap:{e.get('kind', 'secret')}:{secrets.fingerprint(basis)}"
                         e["location"] = "raw/crawl/sourcemaps/recovered"   # recovered-source origin hint
@@ -1882,8 +1886,12 @@ def run(ctx) -> None:
                         ctx.run.add("endpoint", {"value": e["url"],
                                                  **{k: v for k, v in e.items() if k != "url"}})
                     else:
-                        d = e.pop("data", "")          # don't store the raw secret in normalized
+                        d = e.get("data", "")
                         basis = d or f"{e.get('kind', 'secret')}|{e.get('id', '')}"
+                        # KEEP the value: this is local evidence for the operator who is hunting, and a
+                        # masked finding forces them to reconstruct it from raw files before they can
+                        # even tell a false positive (Lumpy, 2026-08-05).
+                        e["value"] = d
                         e["preview"] = secrets.mask(d)
                         e["id"] = f"jsluice:{e.get('kind', 'secret')}:{secrets.fingerprint(basis)}"
                         ctx.run.add("secret", e)
@@ -1948,8 +1956,10 @@ def run(ctx) -> None:
                 # can't collapse distinct findings to fingerprint("").
                 basis = sec or f"{item.get('RuleID')}|{item.get('File')}|{item.get('StartLine')}"
                 ctx.run.add("secret", {"id": f"gitleaks:{item.get('RuleID')}:{secrets.fingerprint(basis)}",
-                                       "kind": item.get("RuleID"), "preview": secrets.mask(sec),
-                                       "file": item.get("File"), "sources": ["gitleaks"]})
+                                       "kind": item.get("RuleID"), "value": sec,
+                                       "preview": secrets.mask(sec),
+                                       "file": item.get("File"), "line": item.get("StartLine"),
+                                       "sources": ["gitleaks"]})
             ctx.run.record("crawl", r)
 
     if scan_dirs and have("trufflehog"):
@@ -1987,7 +1997,8 @@ def run(ctx) -> None:
                     verified = None
                     verification = "not_checked"
                 ctx.run.add("secret", {"id": f"trufflehog:{det}:{secrets.fingerprint(basis)}",
-                                       "kind": det, "preview": red or secrets.mask(raw_s),
+                                       "kind": det, "value": raw_s,
+                                       "preview": red or secrets.mask(raw_s),
                                        "verified": verified, "verification": verification,
                                        "sources": ["trufflehog"]})
 
