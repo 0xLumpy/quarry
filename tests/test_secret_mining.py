@@ -696,7 +696,10 @@ class TestNothingIsHiddenByAPresentationCap:
         assert cov and cov[-1]["eligible"] == 0 and cov[-1]["tested"] == 0, cov
         events.reset()
 
-    def test_a_candidate_that_THREW_is_not_counted_as_fetched(self, tmp_path, monkeypatch):
+    def test_a_candidate_that_THREW_was_ATTEMPTED_not_ignored(self, tmp_path, monkeypatch):
+        """review#12 (Lumpy): a refused connection, a TLS error or a timeout happened AFTER contact was
+        made. The gap count is right either way; calling it "never looked at" describes the run
+        wrongly."""
         from types import SimpleNamespace
         from quarry_recon import events, evidence, fetch
         events.reset()
@@ -720,5 +723,33 @@ class TestNothingIsHiddenByAPresentationCap:
         evs = [_json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
         cov = [e for e in evs if e.get("measure") == "evidence_fetches"][-1]
         assert cov["eligible"] == 10 and cov["tested"] == 5, cov
-        assert cov["omitted"] == 5 and "NOT looked at" in cov["reason"]
+        assert cov["omitted"] == 5
+        assert "5 attempted without a readable response" in cov["reason"], cov["reason"]
+        assert "never requested" not in cov["reason"], "they WERE requested"
+        events.reset()
+
+    def test_a_host_we_never_requested_is_described_as_such(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from quarry_recon import events, evidence, fetch
+        events.reset()
+        events.configure(tmp_path)
+        run = SimpleNamespace(
+            raw_path=lambda ph, sub, nm: (tmp_path / ph / sub).joinpath(nm)
+            if (tmp_path / ph / sub).mkdir(parents=True, exist_ok=True) or True else None,
+            add=lambda kind, rec: True)
+        allowed = {"https://t/f0", "https://t/f1"}
+        ctx = SimpleNamespace(run=run, scope=SimpleNamespace(
+            in_scope=lambda h: True, is_oos=lambda h: False, active_allowed=lambda h: True))
+        # in scope for the lane, refused by the FETCHER's own guard (passive host, netguard, …)
+        monkeypatch.setattr(evidence, "fetch_and_extract",
+                            lambda ctx, u, **k: {"ok": False, "off_scope": False, "final": u,
+                                                 "status": None, "attempted": u in allowed,
+                                                 "error": None, "dest": None, "secrets": 0,
+                                                 "links": 0})
+        evidence.fetch_exposed(ctx, [f"https://t/f{i}" for i in range(4)])
+        import json as _json
+        evs = [_json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
+        cov = [e for e in evs if e.get("measure") == "evidence_fetches"][-1]
+        assert "2 never requested" in cov["reason"], cov["reason"]
+        assert "2 attempted without a readable response" in cov["reason"], cov["reason"]
         events.reset()

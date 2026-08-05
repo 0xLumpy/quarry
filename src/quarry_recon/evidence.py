@@ -211,18 +211,27 @@ MAX_BODY = 2 * 1024 * 1024    # 2 MB cap per exposed resource (RAM/disk guard)
 #: an honest count of what it looked at, which `_fetched()` emits.
 
 
-def _fetched(sid: str, eligible: int, tested: int, what: str) -> None:
-    """Say how much of the candidate set was actually fetched.
+def _fetched(sid: str, eligible: int, attempted: int, completed: int, what: str) -> None:
+    """Say what the lane actually got, in the three dispositions that differ.
 
-    MEASURED, never intended (review#11, Lumpy): the first version emitted `tested=len(urls)` BEFORE the
-    loop, so a run whose every candidate was out of scope, refused or threw still published `60/60
-    fetched`. `eligible` is counted AFTER scope gating, `tested` at the point a request was really
-    issued, and the record is emitted when the loop is done."""
+    MEASURED, never intended (review#11): the first version emitted `tested=len(urls)` BEFORE the loop,
+    so a run whose every candidate was out of scope still published `60/60 fetched`.
+
+    And ATTEMPTED is not COMPLETED (review#12): a refused connection, a TLS error or a timeout happened
+    after contact was made. The coverage number is the readable responses; the remainder is split into
+    what we asked for and could not read, and what we never requested at all."""
+    unreadable = max(0, attempted - completed)
+    unrequested = max(0, eligible - attempted)
+    detail = []
+    if unreadable:
+        detail.append(f"{unreadable} attempted without a readable response")
+    if unrequested:
+        detail.append(f"{unrequested} never requested")
     events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, measure="evidence_fetches",
-                            unit=f"{sid}.candidates", eligible=eligible, tested=tested,
-                            omitted=max(0, eligible - tested),
-                            reason=(f"{tested}/{eligible} {what} fetched"
-                                    + ("" if tested >= eligible else " — the rest were NOT looked at")))
+                            unit=f"{sid}.candidates", eligible=eligible, tested=completed,
+                            omitted=max(0, eligible - completed),
+                            reason=(f"{completed}/{eligible} {what} returned a readable response"
+                                    + (" — " + "; ".join(detail) if detail else "")))
 
 
 def mine(text: str, *, source_path: str | None = None) -> list[tuple[str, str, int]]:
@@ -365,13 +374,18 @@ def fetch_and_extract(ctx, url: str, *, source: str, subdir: str) -> dict:
     `ok` False = not fetched (out of scope / non-200 / oversized / error). `off_scope` = the FINAL
     host (after redirect) was off-scope, so nothing was read."""
     host = normalize.host_of_url(url)
-    res = {"ok": False, "off_scope": False, "final": url, "status": None,
-           "dest": None, "secrets": 0, "links": 0}
+    res = {"ok": False, "off_scope": False, "final": url, "status": None, "attempted": False,
+           "error": None, "dest": None, "secrets": 0, "links": 0}
     if not ctx.scope.active_allowed(host):         # in-scope + not-passive + not-OOS
         return res
+    # ATTEMPTED is its own fact. A refused connection, a TLS failure or a timeout happened AFTER we
+    # made contact — the body just never arrived — and counting that as "never looked at" describes the
+    # run wrongly even when the gap count is right (review#12, Lumpy).
+    res["attempted"] = True
     try:
         data, final, status = fetch.scoped_get(ctx, url, host, max_body=MAX_BODY)
-    except Exception:
+    except Exception as e:
+        res["error"] = type(e).__name__
         return res
     res["final"], res["status"] = final, status
     if data is None:                               # off-scope redirect — caller records context
@@ -409,14 +423,14 @@ def fetch_and_extract(ctx, url: str, *, source: str, subdir: str) -> dict:
 def fetch_exposed(ctx, urls: list[str]) -> int:
     """GET each exposed in-scope resource (an instance of fetch_and_extract), extract its secrets +
     links, and raise a reviewable exposure marker. Returns count of NEW secret entities added."""
-    added = eligible = tested = 0
+    added = eligible = attempted = completed = 0
     for u in urls:
         if not ctx.scope.active_allowed(normalize.host_of_url(u)):
             continue                               # not ours to request: never part of the denominator
         eligible += 1
         r = fetch_and_extract(ctx, u, source="exposed-fetch", subdir="exposed")
-        if r["status"] is not None or r["off_scope"]:
-            tested += 1                            # a request was actually issued
+        attempted += 1 if r["attempted"] else 0    # contact was made
+        completed += 1 if (r["status"] is not None or r["off_scope"]) else 0   # …and it answered
         if r["off_scope"]:                         # off-scope redirect — record, no extraction
             ctx.run.add("review", {
                 "id": f"exposed-redirect:{u}", "klass": "exposure", "value": u,
@@ -445,7 +459,7 @@ def fetch_exposed(ctx, urls: list[str]) -> int:
             "id": f"exposed:{u}", "klass": "exposure", "value": u,
             "host": normalize.host_of_url(u), "raw_ref": r["dest"],
             "note": note, "sources": ["exposed-fetch"]})
-    _fetched("evidence.exposed", eligible, tested, "in-scope exposed resource(s)")
+    _fetched("evidence.exposed", eligible, attempted, completed, "in-scope exposed resource(s)")
     return added
 
 
