@@ -16,6 +16,7 @@ phase makes AFTER it parses. We never guess counts from stdout. See [[quarry-bbo
 from __future__ import annotations
 
 import json as _json
+import re as _re
 import socket as _socket
 import urllib.error as _urlerr
 
@@ -170,6 +171,35 @@ def capture_error_body(exc, *, provider: str = "", limit: int = _ERROR_BODY_LIMI
         except Exception:
             pass
     return exc
+
+
+_DETAIL_CHARS = 160                                          # a terminal reason is a line, not a document
+
+
+def error_detail(exc) -> "str | None":
+    """A SHORT, redacted summary of what the provider actually said, for the operator-visible reason.
+
+    `error_body_reason` covers JSON error bodies and returns None for anything else, which is most of a
+    refusal's interesting cases. Measured 2026-08-05: Shodan's paid search endpoint answered our
+    `Mozilla/5.0` User-Agent with Cloudflare's HTML interstitial, and the terminal read
+    `HTTPError: HTTP Error 403: Forbidden` — the status code alone, while the body on the exception said
+    "Just a moment..." and would have named the cause immediately. A captured body nobody surfaces is a
+    body nobody has.
+
+    HTML is summarised by its <title>, because that is where an interstitial states its business.
+    Redacted through the same sink as every other prose channel: an error body can echo a request that
+    carried our key."""
+    from . import secrets
+    reason = error_body_reason(exc)
+    text = getattr(exc, "body_text", None)
+    if reason is None and isinstance(text, str) and text.strip():
+        title = _re.search(r"<title[^>]*>(.*?)</title>", text, _re.I | _re.S)
+        stripped = _re.sub(r"<[^>]+>", " ", title.group(1) if title else text)
+        reason = _re.sub(r"\s+", " ", stripped).strip() or None
+    if not reason:
+        return None
+    reason = secrets.redact(reason) or ""
+    return (reason[:_DETAIL_CHARS] + "…") if len(reason) > _DETAIL_CHARS else reason
 
 
 def error_body_reason(exc) -> "str | None":
@@ -779,7 +809,9 @@ def _provider_terminal(source_id, fn, *, work_unit=None):
     except ProviderSkip as e:                                # did not run and did not fail
         status, reason, result = Status.SKIPPED.value, e.reason, None
     except Exception as e:                                   # ordinary provider error — record FAILED, don't crash phase
-        reason, result = f"{type(e).__name__}: {e}", None
+        # the provider's OWN words, when it gave any. A status code is what happened; the body is why.
+        _detail = error_detail(e)
+        reason, result = f"{type(e).__name__}: {e}" + (f" — {_detail}" if _detail else ""), None
         # B0: a ProviderBodyError already carries a class PROVEN from the provider's own body, which the
         # generic HTTP/type mapping cannot see (it would flatten a measured "Zero Account Balance" into
         # `error`) — so a body-proven LIMIT could never reach the terminal or the verdict. The proven

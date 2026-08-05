@@ -141,6 +141,15 @@ class _ProviderCooldown:
             _time.sleep(left)
 
 
+#: MEASURED 2026-08-05: `Mozilla/5.0` on `/shodan/host/search` is answered by Cloudflare's "Just a
+#: moment..." interstitial (HTTP 403) while the same key, query and encoding succeed with an ordinary
+#: client identifier — a browser User-Agent without a browser's TLS and headers is exactly what a bot
+#: filter looks for. `/shodan/host/count` was not challenged, so the lane sized its pivots correctly and
+#: then could not buy a single page. The free `shodan_host` lane below already sent `quarry-recon`; the
+#: paid path is now the same client. This is an API we identify ourselves to, not a target we blend into.
+SHODAN_UA = "quarry-recon"
+
+
 def _shodan_count(key, facet, v):
     """ONE free `/shodan/host/count` -> `(total, error)`. NEVER raises.
 
@@ -156,7 +165,7 @@ def _shodan_count(key, facet, v):
            f"&query={urllib.parse.quote(f'{facet}:{v}')}")
     raw = b""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=20) as r:
             raw = r.read(4 * 1024 * 1024)
         data = _json.loads(raw.decode("utf-8", "replace"))
@@ -185,7 +194,7 @@ def _shodan_page(key, facet, v, page):
     url = (f"https://api.shodan.io/shodan/host/search?key={key}"
            f"&query={urllib.parse.quote(f'{facet}:{v}')}&page={page}")
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=20) as r:
             data = _json.loads(r.read(4 * 1024 * 1024).decode("utf-8", "replace"))
         if not isinstance(data, dict):
@@ -504,7 +513,7 @@ def _read_shodan_balance(key, timeout: int = 15, cooldown=None) -> ShodanBalance
     facts with different consequences."""
     try:
         url = f"https://api.shodan.io/api-info?key={urllib.parse.quote(str(key))}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read(64 * 1024).decode("utf-8", "replace")
     except Exception as e:
@@ -1746,7 +1755,7 @@ def _shodan_host_get(url: str, timeout: int):
     measured "no information available" answer lives. Without the body a 404 is indistinguishable from a
     failure, and every address Shodan has never seen would report as a lane gap."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "quarry-recon"})
+        req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             # review-B1.7r9#1: the STATUS travels with the body. The no-data contract is `404 + wording` and
             # the record contract is `200 + shape`; assuming 200 for anything that did not raise would have
