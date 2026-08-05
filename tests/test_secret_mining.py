@@ -13,6 +13,8 @@ A secret Quarry fetched, saved and could not read is a finding it paid for and t
 """
 from __future__ import annotations
 
+import pytest
+
 from quarry_recon import evidence
 
 
@@ -325,6 +327,32 @@ class TestClassificationFollowsWhatANSWERED:
         notes = [r["note"] for kind, r in added if kind == "review" and r.get("klass") == "exposure"]
         assert notes and "ENCRYPTED credential store" not in notes[0], notes
 
+    def test_the_finding_is_attributed_to_the_host_that_ANSWERED(self, tmp_path, monkeypatch):
+        """review#1 (Lumpy): an in-scope redirect from `a.example.com/.env` to `b.example.com/real.env`
+        puts the credential on b. Recording it against a points the report at the wrong asset."""
+        from quarry_recon import fetch
+        ctx, added = self._ctx(tmp_path)
+        monkeypatch.setattr(fetch, "scoped_get",
+                            lambda *a, **k: (b"AWS_KEY=AKIAIOSFODNN7EXAMPLE\n",
+                                             "https://b.example.com/real.env", 200))
+        evidence.fetch_and_extract(ctx, "https://a.example.com/.env",
+                                   source="exposed-fetch", subdir="exposed")
+        sec = [r for kind, r in added if kind == "secret"][0]
+        assert sec["host"] == "b.example.com", sec
+        assert sec["location"] == "https://a.example.com/.env", "…and what we ASKED for is kept"
+        assert sec["final"] == "https://b.example.com/real.env"
+
+    def test_a_hash_follows_the_same_attribution(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        added: list = []
+        ctx = SimpleNamespace(run=SimpleNamespace(add=lambda k, r: (added.append((k, r)), True)[1]))
+        evidence.publish_finding(ctx, "bcrypt-hash",
+                                 "$2y$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", 1,
+                                 url="https://a.example.com/dump.sql", dest="/raw/x",
+                                 source="exposed-fetch", host="a.example.com",
+                                 final_url="https://b.example.com/dump.sql")
+        assert added[0][1]["host"] == "b.example.com"
+
     def test_provenance_keeps_BOTH_urls(self, tmp_path, monkeypatch):
         from quarry_recon import fetch
         ctx, added = self._ctx(tmp_path)
@@ -382,6 +410,25 @@ class TestTheBareKeyRuleNeedsContextToo:
 
     def test_an_unrelated_parent_is_not(self):
         assert kinds(f'{{"Pagination": {{"Key": "{self.LONG}"}}}}', "https://t/api/v1/x") == {}
+
+    @pytest.mark.parametrize("parent", ["authorization", "token", "bearer", "auth"])
+    def test_an_AUTH_FLAVOURED_word_is_not_a_signing_context(self, parent):
+        """review#2 (Lumpy): `{"authorization": {"key": "public-resource-identifier…"}}` is an ordinary
+        API response. Only an explicit JWT/signing parent — or a companion signing field — carries the
+        claim."""
+        assert kinds(f'{{"{parent}": {{"key": "{self.LONG}"}}}}', "https://t/api/v1/x") == {}, parent
+
+    @pytest.mark.parametrize("body", [
+        '{{"key": "{v}", "algorithm": "HS256"}}',
+        '{{"key": "{v}", "kid": "k1"}}',
+        '{{"issuer": "https://idp", "key": "{v}"}}',
+        '{{"audience": "api", "key": "{v}"}}',
+    ])
+    def test_a_companion_signing_field_carries_it_in_either_order(self, body):
+        assert kinds(body.format(v=self.LONG), "https://t/api/v1/x") == {"json:key": self.LONG}, body
+
+    def test_a_long_public_identifier_is_still_not_a_secret(self):
+        assert kinds(f'{{"key": "{self.LONG}", "label": "public"}}', "https://t/api/v1/x") == {}
 
 
 class TestConnectionStringsRegardlessOfFieldOrder:

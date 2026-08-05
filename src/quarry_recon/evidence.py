@@ -132,9 +132,20 @@ _JSON_SECRET_RX = re.compile(
 _JSON_BARE_KEY_RX = re.compile(r'"(key)"\s*:\s*"([^"]{20,})"', re.I)
 _JSON_BARE_KEY_PATHS = re.compile(r"(?:^|/)(?:appsettings(?:\.[\w-]+)?\.json|web\.config)$", re.I)
 #: `"Jwt": { … "Key": "…" }` / `"TokenSigning": {"key": …}` — the parent names what the key is FOR.
+#: `auth`, `token` and `bearer` are NOT enough on their own: `{"authorization": {"key": "public-id…"}}`
+#: is an ordinary API response (review#2, Lumpy). Either the parent explicitly says JWT/signing, or the
+#: object carries a companion signing field — an algorithm, an issuer, an audience, a key id.
 _JSON_SIGNING_CONTEXT_RX = re.compile(
-    r'"[A-Za-z0-9_.\-]*(?:jwt|signing|token|auth|bearer)[A-Za-z0-9_.\-]*"\s*:\s*\{[^{}]{0,300}?'
+    r'"[A-Za-z0-9_.\-]*(?:jwt|jws|signing|signature)[A-Za-z0-9_.\-]*"\s*:\s*\{[^{}]{0,300}?'
     r'"(key)"\s*:\s*"([^"]{20,})"', re.I)
+#: the same object naming HOW the key is used: `{"key": "…", "algorithm": "HS256", "issuer": "…"}`.
+#: TWO patterns rather than one alternation: every rule in this list must yield (key, value) as groups
+#: 1 and 2, and an alternation renumbers them — the first version handed `None` to the loop.
+_SIGNING_COMPANION = (r"alg|algorithm|iss|issuer|aud|audience|kid|expiry|expires_in|lifetime")
+_JSON_SIGNING_COMPANION_AFTER_RX = re.compile(
+    r'\{[^{}]{0,300}?"(key)"\s*:\s*"([^"]{20,})"[^{}]{0,300}?"(?:' + _SIGNING_COMPANION + r')"', re.I)
+_JSON_SIGNING_COMPANION_BEFORE_RX = re.compile(
+    r'\{[^{}]{0,300}?"(?:' + _SIGNING_COMPANION + r')"[^{}]{0,300}?"(key)"\s*:\s*"([^"]{20,})"', re.I)
 _MASKED_RX = re.compile(r"^[*•]+$")             # actuator sanitizes sensitive values to ******
 
 MAX_BODY = 2 * 1024 * 1024    # 2 MB cap per exposed resource (RAM/disk guard)
@@ -168,7 +179,9 @@ def mine(text: str, *, source_path: str | None = None) -> list[tuple[str, str, i
         if _SECRETISH_KEY.search(key) and val not in seen_vals:   # already caught as a typed token
             seen_vals.add(val)
             out.append((f"dotenv:{key}", val, text.count("\n", 0, m.start()) + 1))
-    bare_key_rules = [_JSON_SIGNING_CONTEXT_RX]                     # a named signing parent, anywhere
+    bare_key_rules = [_JSON_SIGNING_CONTEXT_RX,                     # a named signing parent, anywhere
+                      _JSON_SIGNING_COMPANION_AFTER_RX,             # …or the object says how it is
+                      _JSON_SIGNING_COMPANION_BEFORE_RX]            # used, in either order
     if path and _JSON_BARE_KEY_PATHS.search(path):                  # …or the format that writes them
         bare_key_rules.append(_JSON_BARE_KEY_RX)
     for rx_set in (_JSON_SECRET_RX, *bare_key_rules):
@@ -211,7 +224,10 @@ def publish_finding(ctx, kind: str, val: str, line, *, url: str, dest, source: s
     artifact it came from; the preview is what travels. Storing only a preview was the older behaviour
     and it lost the finding itself: one artifact can hold many values, and "grep the raw file" is not
     the same as reporting the secret you found (review#3, Lumpy)."""
-    where = host or normalize.host_of_url(url)
+    # the host that ANSWERED owns the finding. An in-scope redirect from `a.example.com/.env` to
+    # `b.example.com/real.env` puts the credential on b, and recording it against a points the report at
+    # the wrong asset (review#1, Lumpy). The requested URL stays in `location` as provenance.
+    where = normalize.host_of_url(final_url or url) or host or normalize.host_of_url(url)
     if kind in HASH_KINDS:
         ok = ctx.run.add("review", {
             "id": f"credential-hash:{secrets.fingerprint(val)}", "klass": "credential-hash",
@@ -224,7 +240,7 @@ def publish_finding(ctx, kind: str, val: str, line, *, url: str, dest, source: s
         return "hash" if ok else ""
     ok = ctx.run.add("secret", {
         "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{url}|{line}')}",
-        "kind": kind, "value": val, "preview": secrets.mask(val),
+        "kind": kind, "value": val, "preview": secrets.mask(val), "host": where,
         "file": str(dest) if dest else None, "location": url,
         **({"final": final_url} if final_url and final_url != url else {}),
         "line": line, "sources": [source]})
