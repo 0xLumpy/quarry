@@ -335,10 +335,22 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.phases.crawl:XNL_WORDLIST_LIMIT": ("resource", "-owl/-os are permutation timekillers"),
     "quarry_recon.fetch:DEFAULT_MAX_BODY": ("resource", "one response is read into memory"),
     "quarry_recon.fetch:DEFAULT_MAX_REDIRECTS": ("resource", "a redirect chain is not coverage"),
-    "quarry_recon.evidence:_DEEP_MAX_BODY": ("resource", "one artifact is read into memory"),
-    "quarry_recon.evidence:_OPENAPI_MAX_BODY": ("resource", "one document is parsed in memory"),
-    "quarry_recon.evidence:_OPENAPI_MAX_PATHS": ("resource", "one document's path table in memory"),
-    "quarry_recon.evidence:MAX_BODY": ("resource", "one exposed resource is read into memory"),
+    # the acquisition caps that used to live here (MAX_BODY, _DEEP_MAX_BODY, _OPENAPI_MAX_BODY) are GONE
+    # — a response is streamed to disk whole. What is left bounds MEMORY over an artifact we already
+    # hold, never which bytes we keep, so `--unbound` has nothing to lift here (review#21, Lumpy).
+    "quarry_recon.evidence:MAX_PARSE": ("resource", "the artifact is stored WHOLE either way; this is the "
+                                        "ceiling on holding one as a str, above which interpretation is "
+                                        "deferred and recorded, never dropped"),
+    "quarry_recon.evidence:STREAM_CHUNK": ("resource", "bytes held in RAM while streaming to disk"),
+    "quarry_recon.evidence:STREAM_DEADLINE_S": ("resource", "wall clock on a socket that never reaches "
+                                                "EOF; the partial bytes are kept and the gap reported"),
+    "quarry_recon.evidence:_DEEP_SCAN_WINDOW": ("resource", "bytes held in RAM per mining window over a "
+                                                "stored artifact of any size"),
+    "quarry_recon.evidence:_SHAPE_HIGH_MIN": ("resource", "a PRESENTATION threshold: shorter values "
+                                              "sort below the interesting ones in the review queue and "
+                                              "are retained exactly the same"),
+    "quarry_recon.evidence:_DEEP_SCAN_OVERLAP": ("resource", "bytes carried between windows so a secret "
+                                                 "on a boundary is not cut in half"),
     "quarry_recon.bootstrap:DISK_MIN": ("resource", "a run that fills the disk loses evidence it has"),
     "quarry_recon.sweep:_UNSELECTABLE_DETAIL": ("resource", "a diagnostic list bound; the counters beside "
                                                             "it are authoritative"),

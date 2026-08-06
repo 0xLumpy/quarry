@@ -52,6 +52,11 @@ ENTITY_KEYS = {
     "screenshot": "url",
     "tech": "id",
     "review": "id",
+    # review#34 (Lumpy): acquisition-ownership TRANSITIONS get their own log. They shared `review` with
+    # unclassified matches, source maps, debug endpoints and API documents — so one unreadable line
+    # anywhere in that file froze ownership globally, and the report could not honestly say which kind
+    # of row had been lost. A separate entity makes the blast radius the thing that was actually damaged.
+    "ownership_transition": "id",
     "wildcard_zone": "value",   # A1: cert-derived *.X.apex brute-zones (persisted vertical→enrich for A1d)
     "web_port": "id",           # v0.3.5: open web port per host:ip (naabu SYN prefilter) — host→ip→port edge
     "gadget_candidate": "id",   # chain MATERIAL: weird primitives that are not findings and not noise
@@ -449,6 +454,7 @@ class Run:
         self._tool_runs: list[ToolRunRecord] = []
         self._counts_cache: dict[str, int] = {}
         self._records: dict[str, dict] = {}   # entity -> {canonical_key: MERGED record} (C09b; instance-local)
+        self._folded: dict[str, FoldedLog] = {}   # entity -> the SAME fold, with its trust status
         # C10a/review#7: OPENING an existing run must NOT fabricate a fresh start time (a ghost). It reads
         # `started` from the IMMUTABLE run.json written at CREATE — which survives a crash even when the final
         # manifest was never written (the exact resume situation). Manifest is only a fallback; a fresh
@@ -600,7 +606,9 @@ class Run:
         live one inherits per-line byte decoding, so a single invalid byte costs one observation here too
         rather than raising through whatever asked for the entity."""
         if entity not in self._records:
-            self._records[entity] = fold_observations(self._entity_file(entity)).records
+            folded = fold_observations(self._entity_file(entity))
+            self._folded[entity] = folded
+            self._records[entity] = folded.records
         return self._records[entity]
 
     def _seen_keys(self, entity: str) -> set:
@@ -609,6 +617,18 @@ class Run:
     def read(self, entity: str) -> list[dict]:
         """The MERGED entities (one per canonical key, provenance unioned) — not the raw observation lines."""
         return list(self._records_for(entity).values())
+
+    def read_folded(self, entity: str) -> "FoldedLog":
+        """The merged view WITH its trust status (`absent`/`valid`/`degraded`/`unusable`).
+
+        `read()` throws the status away, so a caller cannot tell "this entity has no rows" from "the log
+        could not be read" or "rows were dropped as unreadable". For an ordinary corpus that is a fair
+        simplification; for a record that decides whether we may act — the acquisition-ownership
+        transition log — it is the whole question (review#31, Lumpy)."""
+        if entity not in self._folded:
+            self._folded[entity] = fold_observations(self._entity_file(entity))
+            self._records[entity] = self._folded[entity].records
+        return self._folded[entity]
 
     def count(self, entity: str) -> int:
         return len(self._records_for(entity))

@@ -278,6 +278,14 @@ COVERAGE_TOOL_OMISSION = "tool_omission"   # the TOOL deterministically declined
                               # content-type refusal reported as `timeout` is misleading in the manifest,
                               # which is operator evidence — the label must not become permanent
                               # vocabulary by accident.
+COVERAGE_OWNERSHIP = "ownership"  # OUR OWN storage/ownership state withheld the input — a receipt that could
+                              # not be written, an artifact we cannot prove we own, a state we cannot
+                              # inspect. review#26 (Lumpy): reporting these as `cap` called an internal
+                              # durability failure "a hard ceiling of ours", which is the same class of
+                              # mislabel that `provider` and `tool_omission` exist to prevent. It GATES
+                              # (only sample/provider are soft) and nothing about it is a ceiling: no
+                              # eligible input was truncated by policy, and an operator clears it by
+                              # resolving the files, not by raising a number.
 COVERAGE_UNKNOWN = "unknown"  # the source RAN but its coverage is UNMEASURABLE (stats missing/corrupt). Carries NO
                               # counters, so it is never summed — it forces coverage_valid=False, which the verdict
                               # reads as a GAP. Unmeasured must never be indistinguishable from fully covered.

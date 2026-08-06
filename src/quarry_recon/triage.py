@@ -73,6 +73,9 @@ _REVIEW_LABELS = {
     "sourcemap": "fetch .map -> unminified source",
     "related-host": "PASSIVE off-scope evidence — observed, never actively expanded",
     "dns-owner-name": "PASSIVE DNS owner evidence (not a hostname) — never actively expanded",
+    "unclassified": "matched by a detector, NOT classified — kept whole, no secrecy claim; "
+                    "shape-interesting first",
+    "deferred-interpretation": "artifact stored COMPLETE; in-process extraction deferred — re-runnable",
 }
 
 
@@ -344,15 +347,50 @@ def build(run, scope) -> str:
 
     # gf / sourcemap candidates (review entities)
     reviews = run.read("review")
+    # OWNERSHIP LIFECYCLE rows are an append-only transition log (`state_key`/`state_seq`), because an
+    # ownership problem can open, be resolved, and open AGAIN — a mutable flag on a merged entity cannot
+    # say that, and once set it never cleared (review#29, Lumpy). Only the LATEST transition per path is
+    # the current state; the earlier ones stay in the log as history.
+    # ONE resolver, shared with the lane (review#32, Lumpy): picking the current transition here
+    # through the trust-blind read gave two answers to one question — a log the lane refuses to act on
+    # was still rendered as fact.
+    from .evidence import current_ownership_rows
+    _own_rows, _own_ok = current_ownership_rows(run)
+    reviews = list(reviews) + _own_rows          # transitions live in their OWN entity now
+    if not _own_ok:
+        # review#33 (Lumpy): a log that is wholly lost leaves NO surviving row to hang a per-path
+        # warning on, so the report said nothing at all — while the lane was refusing to write new
+        # refusals into it. The warning is section-level for exactly that case.
+        A("## ⚠ Acquisition-ownership log NOT AUTHORITATIVE")
+        A("> Its transitions could not be read as a trustworthy history, so **no path's current "
+          "acquisition state is known** and new ownership transitions are NOT being recorded. This log "
+          "is `normalized/ownership_transition.jsonl` and holds nothing else, so raw artifacts, "
+          "findings and the other review queues are unaffected — what is unknown is which paths are "
+          "currently refused. See the `ownership_state` coverage record for the cause.")
+        A("")
+
     by_klass: dict[str, list[str]] = {}
-    for r in reviews:
-        by_klass.setdefault(r.get("klass", "other"), []).append(r.get("value", ""))
+    # `unclassified` is ordered SHAPE-INTERESTING FIRST so the 15 shown are the ones worth a look. The
+    # order is presentation; every row is in the queue either way (review#21, Lumpy).
+    for r in sorted(reviews, key=lambda x: (x.get("interest") != "high", str(x.get("value", "")))):
+        v = r.get("value", "")
+        if r.get("undecidable"):
+            v = (f"[STATE UNKNOWN] {v} — the ownership transition log could not be read as "
+                 f"authoritative; this path's current state is undecidable")
+        elif r.get("state") == "ok":
+            v = f"[RESOLVED] {v} — {r.get('note', 'no longer applies')}"
+        if r.get("klass") == "unclassified" and r.get("key"):
+            v = f"{r['key']} = {v}   [{r.get('interest', 'low')}: {r.get('reason', '')}]"
+        by_klass.setdefault(r.get("klass", "other"), []).append(v)
     if reviews:
         # review-B1.5br4#3: the class headings became truthful while this one still said every queue was
         # a gf bucket or a source map. Some of them are evidence Quarry OBSERVED and will not act on.
         A(f"## Review queues ({len(reviews)}) — candidates and passive evidence")
         for klass in sorted(by_klass):
-            items = sorted(set(by_klass[klass]))
+            # dict.fromkeys keeps FIRST-SEEN order (so `unclassified` stays interest-ordered) while
+            # still de-duplicating; `sorted(set(...))` threw that ordering away.
+            items = list(dict.fromkeys(by_klass[klass])) if klass == "unclassified" \
+                else sorted(set(by_klass[klass]))
             # every non-sourcemap class was labelled "gf match", which is wrong for anything that did
             # not come from a gf bucket — and actively misleading for PASSIVE evidence, which an operator
             # must not read as something Quarry probed.

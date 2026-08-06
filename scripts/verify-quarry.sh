@@ -457,7 +457,9 @@ class Ctx: scope, run, profile = Scope(), Run(), None
 # the in-scope .env 302's off-scope; scoped_get must NOT contact/read evil.test (it would serve the key)
 class Resp:
     def __init__(s, status, headers=None, body=b""): s.status=status; s.headers=headers or {}; s._b=body
-    def read(s, n=None): return s._b
+    def read(s, n=None):                       # behave like a SOCKET: the body arrives once, in slices
+        out, s._b = (s._b if n in (None, -1) else s._b[:n]), (b"" if n in (None, -1) else s._b[n:])
+        return out
     def close(s): pass
 class FakeOpener:
     def __init__(s, script): s.script=script; s.contacted=[]
@@ -602,7 +604,12 @@ def router(req, timeout=20):
         r.status = 200; body = b"DB_PASSWORD=hunter2super\n"
     else:
         r.status = 404; body = b"Whitelabel Error"
-    r.read = lambda n, _b=body: _b
+    r._left = body                                                 # a socket returns the body ONCE
+    def _read(n=None, _r=r):
+        out, _r._left = (_r._left if n in (None, -1) else _r._left[:n]), \
+                        (b"" if n in (None, -1) else _r._left[n:])
+        return out
+    r.read = _read
     r.headers = {}; r.close = lambda: None
     return r
 urllib.request.urlopen = router
@@ -638,7 +645,10 @@ class Ctx: scope = Scope(); profile = None
 READN = []
 class Resp:
     def __init__(s, status, headers=None, body=b""): s.status=status; s.headers=headers or {}; s._b=body
-    def read(s, n=None): READN.append(n); return s._b
+    def read(s, n=None):
+        READN.append(n)
+        out, s._b = (s._b if n in (None, -1) else s._b[:n]), (b"" if n in (None, -1) else s._b[n:])
+        return out
     def close(s): pass
 class FakeOpener:
     def __init__(s, script): s.script=script; s.contacted=[]
@@ -710,18 +720,27 @@ def doc(*servers):
                                                      {"name": "x", "in": "header"}]}}}}).encode()
 
 # in-scope server
-f.scoped_get = lambda ctx, u, host=None, **kw: (doc("https://api.inscope.test/v1"), u, 200)
+import hashlib as _h
+from pathlib import Path as _P
+def _streamed(body, status=200, final=None):
+    """the lane STREAMS now: write where it asked, hand back an Acquisition"""
+    def _fn(ctx, u, dest, *a, **kw):
+        d = _P(dest); d.parent.mkdir(parents=True, exist_ok=True); d.write_bytes(body)
+        return (f.Acquisition(d, len(body), _h.sha256(body).hexdigest(), True),
+                u if final is None else final, status)
+    return _fn
+f.scoped_get_file = _streamed(doc("https://api.inscope.test/v1"))
 c1 = Ctx(); n1 = e.parse_openapi(c1, ["https://api.inscope.test/openapi.json"])
 eps = [r for k, r in c1.run.ents if k == "endpoint"]
 pas = [r for k, r in c1.run.ents if k == "parameter"]
 rev = [r for k, r in c1.run.ents if k == "review" and r.get("klass") == "api-doc"]
 # off-scope server -> every path dropped
-f.scoped_get = lambda ctx, u, host=None, **kw: (doc("https://evil.test/v1"), u, 200)
+f.scoped_get_file = _streamed(doc("https://evil.test/v1"))
 c2 = Ctx(); n2 = e.parse_openapi(c2, ["https://api.inscope.test/openapi.json"])
 eps2 = [r for k, r in c2.run.ents if k == "endpoint"]
 # multiple servers: off-scope FIRST, in-scope second -> in-scope endpoints still built
-f.scoped_get = lambda ctx, u, host=None, **kw: (doc("https://staging.evil.test/v1",
-                                                    "https://api.inscope.test/v1"), u, 200)
+f.scoped_get_file = _streamed(doc("https://staging.evil.test/v1",
+                                  "https://api.inscope.test/v1"))
 c3 = Ctx(); n3 = e.parse_openapi(c3, ["https://api.inscope.test/openapi.json"])
 eps3 = [r for k, r in c3.run.ents if k == "endpoint"]
 
@@ -740,6 +759,17 @@ from pathlib import Path
 from quarry_recon import evidence as e
 from quarry_recon import fetch as f
 
+import hashlib as _h
+from pathlib import Path as _P
+def _streamed(body, status=200, final=None):
+    """the evidence lanes STREAM now: write the body where the lane asked, return an Acquisition."""
+    def _fn(ctx, u, dest, *a, **kw):
+        d = _P(dest); d.parent.mkdir(parents=True, exist_ok=True); d.write_bytes(body)
+        return (f.Acquisition(d, len(body), _h.sha256(body).hexdigest(), True),
+                u if final is None else final, status)
+    return _fn
+
+
 class Scope:
     def active_allowed(self, host): return host.endswith("inscope.test")
 class Run:
@@ -752,12 +782,12 @@ class Ctx:
 URL = ["https://api.inscope.test/render?template=x&q=y"]
 
 # engine EVALUATED the expression -> computed value present, literal absent
-f.scoped_get = lambda ctx, u, host=None, **kw: (b"<html>out: 7006652 done</html>", u, 200)
+f.scoped_get_file = _streamed(b"<html>out: 7006652 done</html>")
 c1 = Ctx(); n1 = e.probe_ssti(c1, URL)
 fnd = [r for k, r in c1.run.ents if k == "finding"]
 
 # only REFLECTED (literal echoed, not evaluated) -> not SSTI
-f.scoped_get = lambda ctx, u, host=None, **kw: (b"you searched for {{1234*5678}}", u, 200)
+f.scoped_get_file = _streamed(b"you searched for {{1234*5678}}")
 c2 = Ctx(); n2 = e.probe_ssti(c2, URL)
 
 ok = (n1 == 1 and len(fnd) == 1 and fnd[0]["template"] == "ssti-candidate"
@@ -886,6 +916,17 @@ from pathlib import Path
 from quarry_recon import evidence as e
 from quarry_recon import fetch as f
 
+import hashlib as _h
+from pathlib import Path as _P
+def _streamed(body, status=200, final=None):
+    """the evidence lanes STREAM now: write the body where the lane asked, return an Acquisition."""
+    def _fn(ctx, u, dest, *a, **kw):
+        d = _P(dest); d.parent.mkdir(parents=True, exist_ok=True); d.write_bytes(body)
+        return (f.Acquisition(d, len(body), _h.sha256(body).hexdigest(), True),
+                u if final is None else final, status)
+    return _fn
+
+
 class Scope:
     def active_allowed(self, h): return h.endswith("inscope.test")
     def in_scope(self, h): return h.endswith("inscope.test")
@@ -899,7 +940,7 @@ class Ctx:
 
 body = (b"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYzEXAMPLEKEY0\n"
         b"https://api.inscope.test/v2/x\nhttps://evil.test/y\n")
-f.scoped_get = lambda ctx, u, host=None, **kw: (body, u, 200)
+f.scoped_get_file = _streamed(body)
 c = Ctx(); r = e.fetch_and_extract(c, "https://a.inscope.test/config.json", source="test", subdir="extract")
 secs = [x for k, x in c.run.ents if k == "secret"]
 urls = [x for k, x in c.run.ents if k == "url"]
@@ -908,7 +949,7 @@ ok1 = (r["ok"] and r["secrets"] == 1 and r["links"] == 1 and len(secs) == 1
        and not any("evil.test" in x["url"] for x in urls)
        and all(x.get("raw_ref") for x in urls))            # normalize provenance kept
 
-f.scoped_get = lambda ctx, u, host=None, **kw: (None, "https://evil.test/x", 302)
+f.scoped_get_file = lambda ctx, u, dest, *a, **kw: (None, "https://evil.test/x", 302)
 c2 = Ctx(); r2 = e.fetch_and_extract(c2, "https://a.inscope.test/config.json", source="test", subdir="extract")
 ok2 = (r2["off_scope"] and not r2["ok"] and r2["secrets"] == 0
        and not [x for k, x in c2.run.ents if k == "secret"])
@@ -1079,8 +1120,8 @@ sys.exit(0 if ok else 1)
 PYEOF
 
 # ── Check 41: deep-evidence mode — config parse + heapdump download/mine (opt-in) — offline ──
-echo "[41] deep-evidence: DEEP_EVIDENCE true->downloads+mines heapdump; default (off) never fetches it"
-PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "config parses off/on; deep mode downloads heapdump + mines AKIA; review=DOWNLOADED (deep-evidence)" || no "deep-evidence broken"
+echo "[41] deep-evidence: DEEP_EVIDENCE true->downloads+mines heapdump; default (off) never fetches it; NO acquisition cap — the dump is streamed whole and mined in overlapping windows (a secret on a boundary survives, and is published once)"
+PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "config parses off/on; deep mode downloads heapdump + mines AKIA; review=DOWNLOADED (deep-evidence); no size cap: 8-byte windows still find the key once and keep the artifact whole" || no "deep-evidence broken"
 import sys, os, tempfile, urllib.request
 from quarry_recon import netguard as _NG; _NG.resolve = lambda h, timeout=5: (["93.184.216.34"], "ok")  # audit#1: hosts resolve GLOBAL (guard passes)
 from pathlib import Path
@@ -1117,7 +1158,12 @@ def router(req, timeout=20):
         r.status = 200; body = b"binary\x00blob AKIAIOSFODNN7EXAMPLE trailing"
     else:
         r.status = 404; body = b"no"
-    r.read = lambda n, _b=body: _b
+    r._left = body                                                 # a socket returns the body ONCE
+    def _read(n=None, _r=r):
+        out, _r._left = (_r._left if n in (None, -1) else _r._left[:n]), \
+                        (b"" if n in (None, -1) else _r._left[n:])
+        return out
+    r.read = _read
     r.headers = {}; r.close = lambda: None
     return r
 urllib.request.urlopen = router
@@ -1132,13 +1178,23 @@ beh_ok = (any(u.endswith("/heapdump") for u in REQ)
           and heavy[0]["sources"] == ["deep-evidence"]
           and any(s["kind"] == "aws-access-key" for s in secs))
 
-# oversized: shrink the cap so the heapdump exceeds it -> "exceeds cap" review, NOT saved/mined
-e._DEEP_MAX_BODY = 5
+# SIZE NO LONGER DECIDES (review#21, Lumpy). `_DEEP_MAX_BODY = 64 MiB` used to REFUSE TO SAVE a heap
+# dump over the cap — the most secret-dense artifact recon can obtain, already fetched, then discarded
+# with a note telling the operator to raise a number and pay for the request again. The dump is now
+# streamed to disk whole and mined in windows, so memory is bounded and the evidence is not.
+assert not hasattr(e, "_DEEP_MAX_BODY"), "the acquisition cap is gone, not renamed"
+# force MANY windows over the same body, with the AWS key STRADDLING a boundary. The overlap is what
+# bounds the longest token that can survive one: it must exceed the value, or no window ever holds it.
+e._DEEP_SCAN_WINDOW = 24
+e._DEEP_SCAN_OVERLAP = 20
 c2 = Ctx(); e.probe_actuator(c2, ["https://mgmt.inscope.test/actuator"])
 h2 = [x for k, x in c2.run.ents if k == "review" and str(x.get("id", "")).startswith("actuator-heavy")]
-over_ok = (len(h2) == 1 and "exceeds" in h2[0]["note"]
-           and not [x for k, x in c2.run.ents if k == "secret"])
-sys.exit(0 if (cfg_ok and beh_ok and over_ok) else 1)
+s2 = [x for k, x in c2.run.ents if k == "secret"]
+big_ok = (len(h2) == 1 and "DOWNLOADED" in h2[0]["note"]
+          and len(s2) == 1 and s2[0]["kind"] == "aws-access-key"   # found ACROSS window boundaries…
+          and s2[0]["value"] == "AKIAIOSFODNN7EXAMPLE"             # …complete, and published ONCE
+          and Path(h2[0]["raw_ref"]).read_bytes().endswith(b"trailing"))   # artifact kept WHOLE
+sys.exit(0 if (cfg_ok and beh_ok and big_ok) else 1)
 PYEOF
 
 # ── Check 45: nuclei runtime line = severity breakdown, drops redundant UNCONFIRMED — offline ──
@@ -1745,7 +1801,13 @@ class Ctx2:
 resp = {"https://app.acme.com/telescope": (b"AKIAABCDEFGHIJKLMNOP", "https://app.acme.com/telescope", 200),
         "https://app.acme.com/horizon": (b"login", "https://app.acme.com/horizon", 403),
         "https://app.acme.com/nova": (b"", "https://app.acme.com/nova", 404)}
-fetch.scoped_get = lambda ctx,u,h,**k: resp.get(u,(b"",u,404))
+import hashlib as _h
+from pathlib import Path as _P
+def _sg_file(ctx, u, dest, *a, **k):
+    body, fin, st = resp.get(u, (b"", u, 404))
+    d = _P(dest); d.parent.mkdir(parents=True, exist_ok=True); d.write_bytes(body)
+    return fetch.Acquisition(d, len(body), _h.sha256(body).hexdigest(), True), fin, st
+fetch.scoped_get_file = _sg_file
 c2 = Ctx2()
 n = evidence.probe_framework_endpoints(c2, [{"url":u,"framework":"laravel","note":"n"} for u in resp])
 klass = [(rv["value"].split("/")[-1], "EXPOSED" in rv["note"], rv.get("priority")) for rv in c2.run.reviews]

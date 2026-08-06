@@ -13,6 +13,8 @@ A secret Quarry fetched, saved and could not read is a finding it paid for and t
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from quarry_recon import evidence
@@ -24,6 +26,24 @@ def self_appsettings() -> str:
 
 def kinds(text: str, path: str | None = None) -> dict:
     return {k: v for k, v, _ln in evidence.mine(text, source_path=path)}
+
+
+
+def stream_fake(body: bytes = b"", final=None, status: int = 200, complete: bool = True):
+    """A fake `fetch.scoped_get_file`: writes `body` to the caller's `dest` and hands back an
+    `Acquisition`, exactly as the real one does. The lane reads the ARTIFACT now, so a fake that only
+    returns bytes would leave every mining site with an empty file to read (2026-08-06)."""
+    import hashlib as _h
+    from pathlib import Path as _P
+    from quarry_recon import fetch as _f
+
+    def _fake(ctx, url, dest, *a, **k):
+        d = _P(dest)
+        d.parent.mkdir(parents=True, exist_ok=True)
+        d.write_bytes(body)
+        return (_f.Acquisition(d, len(body), _h.sha256(body).hexdigest(), complete),
+                url if final is None else final, status)
+    return _fake
 
 
 class TestAFormatClaimNeedsTheFILE:
@@ -224,7 +244,11 @@ class TestAHashIsNotARecoveredCredential:
         body = src[src.index("def publish_finding"):]
         after = body[body.index("def fetch_and_extract"):]
         assert 'add("secret"' not in after, "a call site is publishing secrets on its own again"
-        assert src.count("publish_finding(ctx") >= 5, "every mining site uses the router"
+        # sites now reach the router either directly or through `_mine_file` (which scans an artifact of
+        # any size in windows and calls it per match). Both are the SAME decision point; what must never
+        # come back is a site that publishes a secret itself, asserted above.
+        assert src.count("publish_finding(ctx") + src.count("_mine_file(ctx") >= 5, \
+            "every mining site goes through the router"
 
 
 class TestEncryptedStoresAreNotMinedSecrets:
@@ -260,8 +284,7 @@ class TestEncryptedStoresAreNotMinedSecrets:
         ctx = SimpleNamespace(run=run,
                               scope=SimpleNamespace(in_scope=lambda h: True, is_oos=lambda h: False,
                                                     active_allowed=lambda h: True))
-        monkeypatch.setattr(fetch, "scoped_get",
-                            lambda *a, **k: (b"\x00encrypted-blob", a[1] if len(a) > 1 else "", 200))
+        monkeypatch.setattr(fetch, "scoped_get_file", stream_fake(b"\x00encrypted-blob"))
         evidence.fetch_exposed(ctx, ["https://t/config/credentials.yml.enc"])
         notes = [r["note"] for kind, r in added if kind == "review" and r.get("klass") == "exposure"]
         assert notes, added
@@ -279,7 +302,7 @@ class TestEncryptedStoresAreNotMinedSecrets:
         ctx = SimpleNamespace(run=run,
                               scope=SimpleNamespace(in_scope=lambda h: True, is_oos=lambda h: False,
                                                     active_allowed=lambda h: True))
-        monkeypatch.setattr(fetch, "scoped_get", lambda *a, **k: (b"nothing here", "", 200))
+        monkeypatch.setattr(fetch, "scoped_get_file", stream_fake(b"nothing here"))
         evidence.fetch_exposed(ctx, ["https://t/.env"])
         notes = [r["note"] for kind, r in added if kind == "review" and r.get("klass") == "exposure"]
         assert notes and "no secret pattern" in notes[0], notes
@@ -306,8 +329,8 @@ class TestClassificationFollowsWhatANSWERED:
     def test_a_redirect_away_from_the_key_path_is_not_a_key(self, tmp_path, monkeypatch):
         from quarry_recon import fetch
         ctx, added = self._ctx(tmp_path)
-        monkeypatch.setattr(fetch, "scoped_get",
-                            lambda *a, **k: (self.KEY.encode(), "https://t/checksums.txt", 200))
+        monkeypatch.setattr(fetch, "scoped_get_file",
+                            stream_fake(self.KEY.encode(), final="https://t/checksums.txt"))
         evidence.fetch_and_extract(ctx, "https://t/config/master.key",
                                    source="exposed-fetch", subdir="exposed")
         assert not [r for kind, r in added if kind == "secret"], added
@@ -315,8 +338,8 @@ class TestClassificationFollowsWhatANSWERED:
     def test_the_key_path_answering_itself_still_classifies(self, tmp_path, monkeypatch):
         from quarry_recon import fetch
         ctx, added = self._ctx(tmp_path)
-        monkeypatch.setattr(fetch, "scoped_get",
-                            lambda *a, **k: (self.KEY.encode(), "https://t/config/master.key", 200))
+        monkeypatch.setattr(fetch, "scoped_get_file",
+                            stream_fake(self.KEY.encode(), final="https://t/config/master.key"))
         evidence.fetch_and_extract(ctx, "https://t/config/master.key",
                                    source="exposed-fetch", subdir="exposed")
         secs = [r for kind, r in added if kind == "secret"]
@@ -325,8 +348,8 @@ class TestClassificationFollowsWhatANSWERED:
     def test_the_encrypted_store_label_also_follows_the_final_url(self, tmp_path, monkeypatch):
         from quarry_recon import fetch
         ctx, added = self._ctx(tmp_path)
-        monkeypatch.setattr(fetch, "scoped_get",
-                            lambda *a, **k: (b"plain page", "https://t/login", 200))
+        monkeypatch.setattr(fetch, "scoped_get_file",
+                            stream_fake(b"plain page", final="https://t/login"))
         evidence.fetch_exposed(ctx, ["https://t/config/credentials.yml.enc"])
         notes = [r["note"] for kind, r in added if kind == "review" and r.get("klass") == "exposure"]
         assert notes and "ENCRYPTED credential store" not in notes[0], notes
@@ -336,9 +359,9 @@ class TestClassificationFollowsWhatANSWERED:
         puts the credential on b. Recording it against a points the report at the wrong asset."""
         from quarry_recon import fetch
         ctx, added = self._ctx(tmp_path)
-        monkeypatch.setattr(fetch, "scoped_get",
-                            lambda *a, **k: (b"AWS_KEY=AKIAIOSFODNN7EXAMPLE\n",
-                                             "https://b.example.com/real.env", 200))
+        monkeypatch.setattr(fetch, "scoped_get_file",
+                            stream_fake(b"AWS_KEY=AKIAIOSFODNN7EXAMPLE\n",
+                                        final="https://b.example.com/real.env"))
         evidence.fetch_and_extract(ctx, "https://a.example.com/.env",
                                    source="exposed-fetch", subdir="exposed")
         sec = [r for kind, r in added if kind == "secret"][0]
@@ -360,9 +383,8 @@ class TestClassificationFollowsWhatANSWERED:
     def test_provenance_keeps_BOTH_urls(self, tmp_path, monkeypatch):
         from quarry_recon import fetch
         ctx, added = self._ctx(tmp_path)
-        monkeypatch.setattr(fetch, "scoped_get",
-                            lambda *a, **k: (b"AWS_KEY=AKIAIOSFODNN7EXAMPLE\n", "https://t/real.env",
-                                             200))
+        monkeypatch.setattr(fetch, "scoped_get_file",
+                            stream_fake(b"AWS_KEY=AKIAIOSFODNN7EXAMPLE\n", final="https://t/real.env"))
         evidence.fetch_and_extract(ctx, "https://t/.env", source="exposed-fetch", subdir="exposed")
         sec = [r for kind, r in added if kind == "secret"][0]
         assert sec["location"] == "https://t/.env" and sec["final"] == "https://t/real.env"
@@ -513,8 +535,8 @@ class TestSigningObservationsAreRouted:
         ctx = SimpleNamespace(run=run, scope=SimpleNamespace(
             in_scope=lambda h: True, is_oos=lambda h: False, active_allowed=lambda h: True))
         body = b'{"key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa", "kid": "k1", "alg": "RS256"}'
-        monkeypatch.setattr(fetch, "scoped_get",
-                            lambda *a, **k: (body, "https://t/.well-known/jwks.json", 200))
+        monkeypatch.setattr(fetch, "scoped_get_file",
+                            stream_fake(body, final="https://t/.well-known/jwks.json"))
         res = evidence.fetch_and_extract(ctx, "https://t/.well-known/jwks.json",
                                          source="exposed-fetch", subdir="exposed")
         assert res["secrets"] == 0, res
@@ -663,7 +685,7 @@ class TestNothingIsHiddenByAPresentationCap:
             add=lambda kind, rec: (added.append((kind, rec)), True)[1])
         ctx = SimpleNamespace(run=run, scope=SimpleNamespace(
             in_scope=lambda h: True, is_oos=lambda h: False, active_allowed=lambda h: True))
-        monkeypatch.setattr(fetch, "scoped_get", lambda *a, **k: (b"x", "", 200))
+        monkeypatch.setattr(fetch, "scoped_get_file", stream_fake(b"x"))
         urls = [f"https://t/f{i}" for i in range(60)]
         evidence.fetch_exposed(ctx, urls)
         import json as _json
@@ -687,7 +709,7 @@ class TestNothingIsHiddenByAPresentationCap:
         # nothing is in scope: nothing is eligible and nothing was tested
         ctx = SimpleNamespace(run=run, scope=SimpleNamespace(
             in_scope=lambda h: False, is_oos=lambda h: True, active_allowed=lambda h: False))
-        monkeypatch.setattr(fetch, "scoped_get",
+        monkeypatch.setattr(fetch, "scoped_get_file",
                             lambda *a, **k: pytest.fail("a request was issued for an out-of-scope host"))
         evidence.fetch_exposed(ctx, [f"https://t/f{i}" for i in range(60)])
         import json as _json
@@ -712,12 +734,14 @@ class TestNothingIsHiddenByAPresentationCap:
             in_scope=lambda h: True, is_oos=lambda h: False, active_allowed=lambda h: True))
         calls = {"n": 0}
 
+        _ok = stream_fake(b"body")
+
         def flaky(*a, **k):
             calls["n"] += 1
             if calls["n"] % 2:
                 raise OSError("connection refused")
-            return (b"body", "", 200)
-        monkeypatch.setattr(fetch, "scoped_get", flaky)
+            return _ok(*a, **k)
+        monkeypatch.setattr(fetch, "scoped_get_file", flaky)
         evidence.fetch_exposed(ctx, [f"https://t/f{i}" for i in range(10)])
         import json as _json
         evs = [_json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
@@ -753,3 +777,66 @@ class TestNothingIsHiddenByAPresentationCap:
         assert "2 never requested" in cov["reason"], cov["reason"]
         assert "2 attempted without a readable response" in cov["reason"], cov["reason"]
         events.reset()
+
+
+class TestTheConnectionStringScanIsLinear:
+    """MEASURED 2026-08-06: `mine()` spent 3.7 s per MiB inside `_connstring_passwords`, and 99% of that
+    was one candidate pattern — a LAZY 400-character prefix retried at every offset, so a long line with
+    no `=` cost ~400 character tests per position. The 2 MiB body cap had been hiding it; removing the cap
+    made it the dominant cost of interpreting an artifact.
+
+    The rewrite anchors on `=` and expands a bounded window. Same answers, ~300x faster."""
+
+    #: the ORIGINAL implementation, kept as the ORACLE. Equivalence is the claim being made, so the claim
+    #: needs the thing it is equivalent to — not a hand-written expectation of what it probably did.
+    _OLD_RX = re.compile(r"[^\"'\r\n]{0,400}?=[^\"'\r\n]{0,400}")
+
+    @classmethod
+    def _old(cls, text):
+        out = []
+        for m in cls._OLD_RX.finditer(text):
+            chunk = m.group(0)
+            if ";" not in chunk:
+                continue
+            fields = [f.split("=", 1) for f in chunk.split(";") if "=" in f]
+            if not any(evidence._CONNSTR_ANCHOR.match(k) for k, _v in fields):
+                continue
+            for k, v in fields:
+                if evidence._CONNSTR_PASSWORD.match(k) and len(v.strip()) >= 4:
+                    out.append(v.strip())
+        return sorted(set(out))
+
+    @pytest.mark.parametrize("text", [
+        "Server=db;Database=app;User ID=sa;Password=Sup3rSecret!;",
+        "Password=x;User ID=sa;Server=db",                       # anchor AFTER the password
+        'cfg = "Data Source=h;Initial Catalog=c;pwd=hunter22;"',
+        "password=notacredential",                               # no anchor, no claim
+        "a=b;c=d;",                                              # neither
+        "Server=db;Password=abc",                                # too short to publish
+        "x" * 500 + ";Server=db;Password=longenough;",           # past the 400-char window
+        # the anchor and the password are 120 chars apart: inside the 400-char window the scan is
+        # specified to use, and outside any narrower one. A shrunken window silently stops calling these
+        # database credentials at all.
+        "Server=db;" + ";".join(f"Opt{i}=v{i}" for i in range(15)) + ";Password=hunter22;",
+        "Password=hunter22;" + ";".join(f"Opt{i}=v{i}" for i in range(15)) + ";Data Source=db;",
+    ])
+    def test_it_answers_exactly_what_the_old_scan_answered(self, text):
+        assert sorted({v for v, _ in evidence._connstring_passwords(text)}) == self._old(text)
+
+    def test_equivalence_over_random_input(self):
+        import random
+        import string
+        random.seed(7)
+        alpha = (list(string.ascii_letters + string.digits + "=;'\" \t\r\n_.-")
+                 + ["Server", "Password", "User ID", "pwd", "Data Source", "Database"])
+        for _ in range(2000):
+            text = "".join(random.choice(alpha) for _ in range(random.randint(1, 300)))
+            assert sorted({v for v, _ in evidence._connstring_passwords(text)}) == self._old(text), text
+
+    def test_a_long_line_without_an_equals_is_not_quadratic(self):
+        import time
+        body = "x" * (2 * 1024 * 1024)
+        t = time.perf_counter()
+        evidence.mine(body)
+        took = time.perf_counter() - t
+        assert took < 1.0, f"{took:.2f}s for 2 MiB — the quadratic scan is back"
