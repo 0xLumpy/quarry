@@ -436,3 +436,172 @@ class TestTheCapCannotDecideOurMembership:
 
     def test_it_is_never_zero(self):
         assert int(self._cmd(0)[self._cmd(0).index("--max-targets-per-host") + 1]) >= 1
+
+
+class TestARetryOwesOnlyWhatFailed:
+    """review#14 (Lumpy, P1): a chunk that failed on ONE `SESSION_LOST` target re-ran its whole input
+    file on resume — re-requesting every target that had already succeeded. That is someone else's site
+    hit again for nothing.
+
+    dalfox names the affected URLs in `target_summary`, so the persisted remainder is exactly those:
+    covered targets stay covered, deterministic omissions stay terminal, and only retriable/unknown
+    omissions are rescheduled."""
+
+    A, B, C = "http://h/a?q=", "http://h/b?q=", "http://h/c?q="
+
+    @staticmethod
+    def _art(entries, count=0, incomplete=False):
+        import json as _json
+        return _json.dumps({"meta": {
+            "dalfox_version": "3.2.0", "findings_count": count, "incomplete": incomplete,
+            "target_summary": entries}}) + "\n"
+
+    @staticmethod
+    def _t(url, status="clean", code=None):
+        d = {"target": url, "status": status, "findings_count": 0}
+        if code:
+            d["error_code"] = code
+        return d
+
+    def _lane(self, monkeypatch, tmp_path, chunk=3):
+        monkeypatch.setattr(settings, "concurrency",
+                            lambda k, d=None: {"DALFOX_CHUNK": chunk, "DALFOX_TARGETS": 4}.get(k, d))
+        monkeypatch.setattr(settings, "workers", lambda t, d: d)
+        monkeypatch.setattr(secrets, "oob", lambda: {})
+        monkeypatch.setattr(params, "_dalfox_engine_id", lambda: "v3.2.0")
+        events.reset(); events.configure(tmp_path)
+        return _C(tmp_path)
+
+    @staticmethod
+    def _exec_capture(artifact, rc, seen):
+        def fx(t, cmd, timeout=None, **k):
+            bf = pathlib.Path(cmd[cmd.index("file") + 1])
+            seen.append([u for u in bf.read_text().splitlines() if u])
+            cf = pathlib.Path(cmd[cmd.index("-o") + 1]); cf.parent.mkdir(parents=True, exist_ok=True)
+            cf.write_text(artifact)
+            return RunResult("dalfox", cmd, Status.SUCCESS if rc in (0, 1) else Status.FAILED, rc, 0.1,
+                             cf, 0)
+        return fx
+
+    def test_only_the_RETRIABLE_target_is_re_requested(self, monkeypatch, tmp_path):
+        c = self._lane(monkeypatch, tmp_path)
+        cands = [self.A, self.B, self.C]
+        first = self._art([self._t(self.A), self._t(self.B),
+                           self._t(self.C, "skipped", "SESSION_LOST")])
+        seen: list = []
+        monkeypatch.setattr(params, "exec_tool", self._exec_capture(first, 0, seen))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        assert seen == [cands], "the first attempt scans the whole chunk"
+        st = _state(c)
+        assert st["remainder"]["0"] == [self.C], st.get("remainder")
+        assert "0" not in st["chunks"], "the chunk is not done"
+
+        # …resume: ONLY the owed target goes back out
+        seen2: list = []
+        monkeypatch.setattr(params, "exec_tool",
+                            self._exec_capture(self._art([self._t(self.C)]), 0, seen2))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        assert seen2 == [[self.C]], seen2
+        st2 = _state(c)
+        assert "0" in st2["chunks"], "the chunk settles clean once the owed target lands"
+        assert "0" not in st2.get("remainder", {}), "…and owes nothing"
+
+    def test_a_DETERMINISTIC_omission_is_never_rescheduled(self, monkeypatch, tmp_path):
+        """Retrying omits exactly the same target for ever. It is a terminal coverage gap."""
+        c = self._lane(monkeypatch, tmp_path)
+        cands = [self.A, self.B]
+        art = self._art([self._t(self.A), self._t(self.B, "skipped", "TRUNCATED_PER_HOST_CAP")])
+        seen: list = []
+        monkeypatch.setattr(params, "exec_tool", self._exec_capture(art, 0, seen))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        st = _state(c)
+        assert "0" in st["chunks"], "execution IS done — nothing to retry"
+        assert not st.get("remainder", {}).get("0"), "and nothing is owed"
+
+    def test_an_UNKNOWN_code_is_owed_too(self, monkeypatch, tmp_path):
+        c = self._lane(monkeypatch, tmp_path)
+        cands = [self.A, self.B]
+        art = self._art([self._t(self.A), self._t(self.B, "skipped", "SOMETHING_NEW")])
+        monkeypatch.setattr(params, "exec_tool", self._exec_capture(art, 0, []))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        assert _state(c)["remainder"]["0"] == [self.B]
+
+    def test_an_UNREADABLE_artifact_owes_the_WHOLE_chunk(self, monkeypatch, tmp_path):
+        """An artifact we could not read says nothing about individual targets. Naming a subset there
+        would silently drop the rest."""
+        c = self._lane(monkeypatch, tmp_path)
+        cands = [self.A, self.B]
+        monkeypatch.setattr(params, "exec_tool",
+                            self._exec_capture('{"meta":{"findings_count":9}}\n', 0, []))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        st = _state(c)
+        assert not st.get("remainder", {}).get("0"), "no named remainder"
+        assert "0" not in st["chunks"], "…so the whole chunk is still owed"
+        seen: list = []
+        monkeypatch.setattr(params, "exec_tool",
+                            self._exec_capture(self._art([self._t(self.A), self._t(self.B)]), 0, seen))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        assert seen == [cands], "the full chunk re-runs, because we never learned which target failed"
+
+    def test_findings_from_the_partial_attempt_are_RETAINED_and_deduped(self, monkeypatch, tmp_path):
+        c = self._lane(monkeypatch, tmp_path)
+        cands = [self.A, self.B]
+        first = (self._art([self._t(self.A, "findings"), self._t(self.B, "skipped", "SESSION_LOST")],
+                           count=1) + R_ROW)
+        monkeypatch.setattr(params, "exec_tool", self._exec_capture(first, 1, []))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        n_after_first = len([a for a in c.run.added if a.get("template")])
+        assert n_after_first >= 1, "the partial attempt's finding is evidence and is kept"
+        # the retry re-reports the SAME finding: it must not double-count
+        monkeypatch.setattr(params, "exec_tool",
+                            self._exec_capture(self._art([self._t(self.B, "findings")], count=1)
+                                               + R_ROW, 1, []))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        ids = [a["id"] for a in c.run.added if a.get("template")]
+        assert len(ids) == len(set(ids)), ids
+
+    def test_a_stale_remainder_naming_nothing_falls_back_to_the_chunk(self, monkeypatch, tmp_path):
+        """The candidate set changed under us: a remembered URL is gone. Re-run the chunk rather than
+        scan nothing and call it done."""
+        c = self._lane(monkeypatch, tmp_path)
+        art = self._art([self._t(self.A), self._t(self.B, "skipped", "SESSION_LOST")])
+        monkeypatch.setattr(params, "exec_tool", self._exec_capture(art, 0, []))
+        params._dalfox_xss_fast(c, [self.A, self.B], _Prof())
+        assert _state(c)["remainder"]["0"] == [self.B]
+        seen: list = []
+        monkeypatch.setattr(params, "exec_tool",
+                            self._exec_capture(self._art([self._t(self.A), self._t(self.C)]), 0, seen))
+        params._dalfox_xss_fast(c, [self.A, self.C], _Prof())      # B no longer a candidate
+        assert seen == [[self.A, self.C]], seen
+
+    def test_a_MIXED_chunk_owes_only_the_retriable_one(self, monkeypatch, tmp_path):
+        """Both kinds in one chunk: the deterministic omission is terminal coverage and must NOT be
+        rescheduled alongside the retriable one."""
+        c = self._lane(monkeypatch, tmp_path)
+        cands = [self.A, self.B, self.C]
+        art = self._art([self._t(self.A),
+                         self._t(self.B, "skipped", "TRUNCATED_PER_HOST_CAP"),
+                         self._t(self.C, "skipped", "SESSION_LOST")])
+        monkeypatch.setattr(params, "exec_tool", self._exec_capture(art, 0, []))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        st = _state(c)
+        assert "0" not in st["chunks"], "a retriable omission keeps the chunk unfinished"
+        assert st["remainder"]["0"] == [self.C], st["remainder"]
+
+    def test_an_unreadable_artifact_owes_the_chunk_even_WITH_a_target_summary(self, monkeypatch,
+                                                                             tmp_path):
+        """The meta row can name a skip while the artifact is still torn (count disagreement). We do not
+        know what the rest of the file lost, so the whole chunk stays owed."""
+        c = self._lane(monkeypatch, tmp_path)
+        cands = [self.A, self.B]
+        torn = self._art([self._t(self.A), self._t(self.B, "skipped", "SESSION_LOST")], count=7)
+        monkeypatch.setattr(params, "exec_tool", self._exec_capture(torn, 0, []))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        st = _state(c)
+        assert "0" not in st["chunks"]
+        assert not st.get("remainder", {}).get("0"), "an unreadable artifact names no remainder"
+        seen: list = []
+        monkeypatch.setattr(params, "exec_tool",
+                            self._exec_capture(self._art([self._t(self.A), self._t(self.B)]), 0, seen))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        assert seen == [cands], "so the FULL chunk re-runs"

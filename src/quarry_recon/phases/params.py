@@ -1693,9 +1693,26 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                     out[str(k)] = kept
         return out
 
+    def _load_remainder(prev) -> dict:
+        """{ci: [url, …]} — the targets a prior attempt still owes, and ONLY those.
+
+        review#14 (Lumpy): a chunk that failed on one `SESSION_LOST` target used to re-run its whole
+        input file, re-requesting every target that had already succeeded — someone else's site, hit
+        again for nothing. dalfox names the affected URLs in `target_summary`, so the remainder can be
+        exactly those."""
+        m = (prev or {}).get("remainder")
+        out: dict[str, list] = {}
+        if isinstance(m, dict):
+            for k, v in m.items():
+                urls = [str(u) for u in v if isinstance(u, str) and u] if isinstance(v, list) else []
+                if urls:
+                    out[str(k)] = urls
+        return out
+
     _pv = _prev()
     completion: dict[str, dict] = _load_completion(_pv)      # controls SKIP (revalidated each run)
     evidence_map: dict[str, list[dict]] = _load_evidence(_pv)
+    remainder: dict[str, list] = _load_remainder(_pv)         # controls WHAT a retry re-runs
 
     def _add_evidence(ci_str, rel, sha):                     # append-only, unique-by-rel, per chunk; digest recorded
         lst = evidence_map.setdefault(ci_str, [])
@@ -1707,7 +1724,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
 
     def _save():
         state_f.write_text(json.dumps(
-            {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": completion, "evidence": evidence_map}))
+            {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": completion, "evidence": evidence_map,
+             "remainder": remainder}))
 
     events.tool_start(sid, cmd=["dalfox", "scan", "-i", "file", "<chunk>", "-f", "jsonl", "--skip-mining"],
                       input_total=len(cands), work_unit=scan_wu)
@@ -1723,6 +1741,18 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                              work_unit=chunk_wu)
         if str(ci) in completion:                         # resume: CLEAN in a prior attempt (revalidated on load)
             continue
+        # RESUME ONLY WHAT IS OWED. A prior attempt that named its retriable targets re-runs those and
+        # nothing else, so a chunk's successful targets are never re-requested (review#14, Lumpy). The
+        # remainder is intersected with this run's batch: a candidate set that changed cannot smuggle a
+        # URL back in, and a stale entry naming nothing simply falls back to the full chunk.
+        owed = [u for u in batch if u in set(remainder.get(str(ci), []))]
+        batch = owed or batch
+        if owed and len(owed) < len(batches[ci]):
+            events.coverage_partial(
+                sid, kind=events.COVERAGE_TIMEOUT, measure="dalfox_resume", unit=f"{sid}.chunk{ci}",
+                eligible=len(batches[ci]), tested=len(batches[ci]) - len(owed), omitted=len(owed),
+                reason=(f"chunk {ci + 1}/{len(batches)}: resuming {len(owed)} owed target(s) only — "
+                        f"{len(batches[ci]) - len(owed)} already covered are NOT re-requested"))
         bf = ctx.write_list(f"dalfox_xss_{ci}.txt", batch)
         attempt_dir.mkdir(parents=True, exist_ok=True)     # created lazily, only if a chunk actually runs
         cf = attempt_dir / f"findings_{ci}.jsonl"          # IMMUTABLE per-attempt artifact (never overwritten)
@@ -1752,9 +1782,14 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                     unit=f"{sid}.chunk{ci}", eligible=len(batch), tested=covered,
                     omitted=len(art.skipped),
                     reason=f"chunk {ci + 1}/{len(batches)}: {art.coverage_reason()}")
+            # WHAT THIS ATTEMPT STILL OWES: the targets dalfox named as retriable or unexplained, and
+            # only those. Deterministic omissions are NEVER rescheduled — retrying omits exactly the same
+            # targets for ever — and covered targets are not re-requested (review#14, Lumpy).
+            owed_next = [t[0] for t in (art.retriable + art.unclassified) if t[0]]
             if clean:
                 completion[str(ci)] = {"rel": rel, "outcome": "SUCCESS" if findings else "EMPTY",
                                        "sha256": cf_sha}      # outcome + digest -> revalidated on resume
+                remainder.pop(str(ci), None)                  # nothing owed once the chunk lands clean
                 _add_evidence(str(ci), rel, cf_sha)          # ...and joins this chunk's evidence history
                 _save()
             else:
@@ -1764,8 +1799,16 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                        art.coverage_reason() if not art.execution_done else
                        f"exit {rc} disagrees with {len(findings)} finding(s)")
                 events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {why}")
+                # A named remainder only when dalfox told us WHICH targets: an artifact we could not
+                # read, or an exit-code disagreement, says nothing about individual targets, so the whole
+                # chunk stays owed. Naming a subset there would silently drop the rest.
+                if art.readable and owed_next:
+                    remainder[str(ci)] = owed_next
+                else:
+                    remainder.pop(str(ci), None)
                 if cf.exists() and cf.stat().st_size > 0:    # a degraded chunk WITH output keeps its evidence
-                    _add_evidence(str(ci), rel, cf_sha); _save()   # (PARTIAL(A) then empty retry never erases A)
+                    _add_evidence(str(ci), rel, cf_sha)
+                _save()
             chunk_status = (Status.SUCCESS if clean and findings
                             else Status.EMPTY if clean else Status.PARTIAL).value
         finally:
