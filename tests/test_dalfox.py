@@ -605,3 +605,82 @@ class TestARetryOwesOnlyWhatFailed:
                             self._exec_capture(self._art([self._t(self.A), self._t(self.B)]), 0, seen))
         params._dalfox_xss_fast(c, cands, _Prof())
         assert seen == [cands], "so the FULL chunk re-runs"
+
+    def _cov(self, tmp_path, tag, measure):
+        evs = [json.loads(x) for x in (tmp_path / tag / "events.jsonl").read_text().splitlines()]
+        return [e for e in evs if e.get("measure") == measure]
+
+    def _lane_in(self, monkeypatch, tmp_path, tag):
+        """A FRESH lifecycle over the same project: new events sink, same chunk state on disk."""
+        monkeypatch.setattr(settings, "concurrency",
+                            lambda k, d=None: {"DALFOX_CHUNK": 3, "DALFOX_TARGETS": 4}.get(k, d))
+        monkeypatch.setattr(settings, "workers", lambda t, d: d)
+        monkeypatch.setattr(secrets, "oob", lambda: {})
+        monkeypatch.setattr(params, "_dalfox_engine_id", lambda: "v3.2.0")
+        events.reset(); events.configure(tmp_path / tag)
+        return _C(tmp_path)
+
+    def test_a_terminal_gap_SURVIVES_the_successful_retry(self, monkeypatch, tmp_path):
+        """review#15 (Lumpy, P1): attempt 1 truncates `b` and loses `c`; attempt 2 re-runs `c` alone and
+        succeeds. `b`'s omission must still be named — in a FRESH process — and neither `a` nor `b` may
+        be requested again."""
+        cands = [self.A, self.B, self.C]
+        seen: list = []
+
+        c1 = self._lane_in(monkeypatch, tmp_path, "run1")
+        monkeypatch.setattr(params, "exec_tool", self._exec_capture(
+            self._art([self._t(self.A),
+                       self._t(self.B, "skipped", "TRUNCATED_PER_HOST_CAP"),
+                       self._t(self.C, "skipped", "SESSION_LOST")]), 0, seen))
+        params._dalfox_xss_fast(c1, cands, _Prof())
+
+        c2 = self._lane_in(monkeypatch, tmp_path, "run2")     # fresh lifecycle, same state file
+        monkeypatch.setattr(params, "exec_tool",
+                            self._exec_capture(self._art([self._t(self.C)]), 0, seen))
+        params._dalfox_xss_fast(c2, cands, _Prof())
+
+        assert seen == [cands, [self.C]], seen
+        assert not any(self.A in b for b in seen[1:]), "a must not be re-requested"
+        assert not any(self.B in b for b in seen[1:]), "b must not be re-requested"
+
+        rows = self._cov(tmp_path, "run2", "dalfox_targets")
+        assert rows, "the terminal gap must be re-reported by the run that did NOT observe it"
+        assert rows[-1]["omitted"] == 1 and self.B in rows[-1]["reason"]
+        assert "TRUNCATED_PER_HOST_CAP" in rows[-1]["reason"]
+        assert rows[-1]["kind"] == events.COVERAGE_TIMEOUT, "an omitted TIMEOUT row is the GAP signal"
+
+        st = _state(c2)
+        assert st["terminal"]["0"] == [{"url": self.B, "code": "TRUNCATED_PER_HOST_CAP"}]
+        assert "0" in st["chunks"] and not st.get("remainder", {}).get("0")
+
+    def test_the_terminal_set_does_not_double_count_across_attempts(self, monkeypatch, tmp_path):
+        """Two attempts observing the SAME truncation must leave one row, not two."""
+        cands = [self.A, self.B, self.C]
+        art = self._art([self._t(self.A),
+                         self._t(self.B, "skipped", "TRUNCATED_PER_HOST_CAP"),
+                         self._t(self.C, "skipped", "SESSION_LOST")])
+        for tag in ("r1", "r2"):
+            c = self._lane_in(monkeypatch, tmp_path, tag)
+            monkeypatch.setattr(params, "exec_tool", self._exec_capture(art, 0, []))
+            params._dalfox_xss_fast(c, cands, _Prof())
+        st = _state(self._lane_in(monkeypatch, tmp_path, "r3"))
+        assert len(st["terminal"]["0"]) == 1, st["terminal"]
+
+    def test_a_run_that_scans_NOTHING_still_reports_the_gap(self, monkeypatch, tmp_path):
+        """Everything already complete: the chunk is skipped entirely, and the terminal gap must still
+        reach this run's manifest."""
+        cands = [self.A, self.B]
+        c1 = self._lane_in(monkeypatch, tmp_path, "a1")
+        monkeypatch.setattr(params, "exec_tool", self._exec_capture(
+            self._art([self._t(self.A), self._t(self.B, "skipped", "TRUNCATED_PER_HOST_CAP")]), 0, []))
+        params._dalfox_xss_fast(c1, cands, _Prof())
+        assert "0" in _state(c1)["chunks"], "deterministic-only -> the chunk IS done"
+
+        called: list = []
+        c2 = self._lane_in(monkeypatch, tmp_path, "a2")
+        monkeypatch.setattr(params, "exec_tool",
+                            lambda *a, **k: called.append(1) or pytest.fail("re-scanned a done chunk"))
+        params._dalfox_xss_fast(c2, cands, _Prof())
+        assert called == []
+        rows = self._cov(tmp_path, "a2", "dalfox_targets")
+        assert rows and rows[-1]["omitted"] == 1 and self.B in rows[-1]["reason"]

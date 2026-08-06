@@ -1709,10 +1709,28 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                     out[str(k)] = urls
         return out
 
+    def _load_terminal(prev) -> dict:
+        """{ci: [{url, code}, …]} — omissions NO retry can close, accumulated across attempts.
+
+        review#15 (Lumpy): a clean retry used to erase them. Attempt 1 truncates `b` and loses `c` to a
+        dead session; attempt 2 re-runs `c` alone, succeeds, emits no omission — and `b`'s truncation
+        vanished from the run entirely. A terminal gap is a FACT ABOUT THE TARGET SET, not about the
+        attempt that happened to observe it, so it is persisted and re-reported every run."""
+        m = (prev or {}).get("terminal")
+        out: dict[str, list] = {}
+        if isinstance(m, dict):
+            for k, v in m.items():
+                rows = [{"url": str(x.get("url") or ""), "code": str(x.get("code") or "")}
+                        for x in v if isinstance(x, dict) and x.get("url")] if isinstance(v, list) else []
+                if rows:
+                    out[str(k)] = rows
+        return out
+
     _pv = _prev()
     completion: dict[str, dict] = _load_completion(_pv)      # controls SKIP (revalidated each run)
     evidence_map: dict[str, list[dict]] = _load_evidence(_pv)
     remainder: dict[str, list] = _load_remainder(_pv)         # controls WHAT a retry re-runs
+    terminal: dict[str, list] = _load_terminal(_pv)           # gaps no retry can close — never cleared
 
     def _add_evidence(ci_str, rel, sha):                     # append-only, unique-by-rel, per chunk; digest recorded
         lst = evidence_map.setdefault(ci_str, [])
@@ -1725,7 +1743,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     def _save():
         state_f.write_text(json.dumps(
             {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": completion, "evidence": evidence_map,
-             "remainder": remainder}))
+             "remainder": remainder, "terminal": terminal}))
 
     events.tool_start(sid, cmd=["dalfox", "scan", "-i", "file", "<chunk>", "-f", "jsonl", "--skip-mining"],
                       input_total=len(cands), work_unit=scan_wu)
@@ -1773,14 +1791,22 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             # for ever — and its gap is a counter, not a retry (review#13, Lumpy).
             clean = art.execution_done and ((rc == 0 and not findings) or (rc == 1 and bool(findings)))
             cf_sha = _sha256_file(cf) if cf.exists() else None
-            # COVERAGE, always — a chunk can be execution-done and still have omitted targets. Emitted
-            # whenever dalfox reported an omission, whichever way `clean` went.
-            if art.skipped or art.incomplete_flag:
-                covered = max(0, len(batch) - len(art.skipped))
+            # ACCUMULATE the gaps no retry can close, unioned by URL. A repeat observation does not
+            # double-count and a CLEAN RETRY CANNOT ERASE an earlier one (review#15, Lumpy). The
+            # coverage record is emitted once per chunk AFTER the loop, from this union — one record
+            # per (source_id, unit) is what reconciliation keeps, and it must outlive the attempt.
+            if art.deterministic:
+                rows = terminal.setdefault(str(ci), [])
+                have = {r["url"] for r in rows}
+                rows.extend({"url": t[0], "code": t[2]} for t in art.deterministic
+                            if t[0] and t[0] not in have)
+            # a RETRIABLE/unknown omission is this attempt's story and is reported as it happens
+            if art.retriable or art.unclassified or art.incomplete_flag:
+                still = len(art.retriable) + len(art.unclassified)
                 events.coverage_partial(
-                    sid, kind=events.COVERAGE_TIMEOUT, measure="dalfox_targets",
-                    unit=f"{sid}.chunk{ci}", eligible=len(batch), tested=covered,
-                    omitted=len(art.skipped),
+                    sid, kind=events.COVERAGE_TIMEOUT, measure="dalfox_pending",
+                    unit=f"{sid}.chunk{ci}.pending", eligible=len(batch),
+                    tested=max(0, len(batch) - still), omitted=still,
                     reason=f"chunk {ci + 1}/{len(batches)}: {art.coverage_reason()}")
             # WHAT THIS ATTEMPT STILL OWES: the targets dalfox named as retriable or unexplained, and
             # only those. Deterministic omissions are NEVER rescheduled — retrying omits exactly the same
@@ -1819,6 +1845,23 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
       # pre-add dedup). A separate GLOBAL id set drives only the `matched` (distinct findings) counter; `produced`
       # counts NEW entities (Run.add True). Falls back to THIS attempt's file for a chunk just run but not yet
       # recorded. Verdict: any degraded this run -> PARTIAL; else any distinct finding -> SUCCESS; else EMPTY.
+      # TERMINAL COVERAGE, re-reported EVERY run from the persisted union — not from this attempt.
+      # A gap no retry can close is a fact about the TARGET SET, so it must outlive the attempt that
+      # observed it and reach a fresh process's manifest and verdict (review#15, Lumpy). `_save()` has
+      # already persisted it, so the record survives even if this run adds nothing.
+      _save()
+      for _ci, _rows in sorted(terminal.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
+          if not _rows:
+              continue
+          _n = len(batches[int(_ci)]) if _ci.isdigit() and int(_ci) < len(batches) else len(_rows)
+          _codes = sorted({r["code"] or "?" for r in _rows})
+          events.coverage_partial(
+              sid, kind=events.COVERAGE_TIMEOUT, measure="dalfox_targets",
+              unit=f"{sid}.chunk{_ci}", eligible=_n, tested=max(0, _n - len(_rows)),
+              omitted=len(_rows),
+              reason=(f"chunk {int(_ci) + 1}/{len(batches)}: {len(_rows)} target(s) permanently "
+                      f"omitted ({', '.join(_codes)}) — no retry can cover them: "
+                      + "; ".join(r["url"] for r in _rows)))
       produced = matched = 0
       tiers = {"xss-verified": 0, "xss-candidate": 0, "dom-xss-static": 0}
       seen_ids: set[str] = set()                            # GLOBAL — for the matched counter ONLY (not dedup)
