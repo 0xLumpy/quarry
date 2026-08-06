@@ -1312,53 +1312,80 @@ def sweep_stale_oob_creds(max_age_s: float = 3600.0) -> int:
     return removed
 
 
+class OobCredentialError(RuntimeError):
+    """The armed OOB channel's credential could not be transported. The scan does NOT run unauthenticated.
+
+    review#19 (Lumpy): yielding None on failure meant `_dalfox_cmd` still emitted `--blind-oob=<server>`
+    while dropping `--config` — so an operator who configured an AUTHENTICATED backend silently got a
+    different configuration, which finishes cleanly with no callbacks and looks valid."""
+
+
+def _make_oob_credential(secret: str):
+    """Create the 0600 credential file and return (dir, path), or raise `OobCredentialError`.
+
+    ACQUISITION ONLY. It is deliberately not a context manager: `shodan_host._open_lock` records what
+    happens when one `try` covers both acquisition and the protected body — an exception thrown by the
+    BODY is caught here, the generator yields a second time, and `contextlib` replaces the real failure
+    with `RuntimeError: generator didn't stop after throw()`. The body's exceptions are none of this
+    function's business (review#19, Lumpy)."""
+    import tempfile
+    d = path = None
+    try:
+        # 0700 and ours alone: `mkdtemp` refuses to reuse, so no other user can pre-create it
+        d = Path(tempfile.mkdtemp(prefix=_OOB_CRED_PREFIX))
+        path = d / ("cfg" + _OOB_CRED_SUFFIX)
+        # O_EXCL|O_NOFOLLOW: an existing path — or a symlink planted at it — is REFUSED, never followed
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            # dalfox reads TOML **or JSON**, so a SERIALIZER escapes the value rather than interpolation
+            json.dump({"scan": {"blind_oob_secret": secret}}, fh)
+        return d, path
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        # `path` is passed so a REFUSED symlink is unlinked too — otherwise it and its directory
+        # survive for ever, and the sweep cannot see through a dangling link either.
+        _drop_oob_credential(d, path)
+        raise OobCredentialError(f"the OOB credential could not be written: {e}") from e
+
+
+def _drop_oob_credential(d, path) -> None:
+    """Destroy exactly what one invocation created. Never raises."""
+    try:
+        # `unlink` on a SYMLINK removes the link, never its target — so a path we REFUSED to write
+        # through is still cleaned up. Leaving it behind kept the planted link and its directory around
+        # for ever, since the sweep cannot see through a dangling one either.
+        if path is not None and (Path(path).is_symlink() or Path(path).is_file()):
+            Path(path).unlink()
+    except OSError:
+        pass
+    try:
+        if d is not None:
+            Path(d).rmdir()
+    except OSError:
+        pass
+
+
 @contextlib.contextmanager
 def blind_oob_credential(secret: str):
     """Yield a path to dalfox's `--config` carrying ONLY the OOB secret, then destroy it.
 
     review#18 (Lumpy): a 0600 file is right DURING execution and wrong afterwards. This one lived in the
     run's raw artifact tree, where it would have reached publication, manifests, exports, digests and
-    resume artifacts — the credential becoming permanent local evidence.
+    resume artifacts — the credential becoming permanent local evidence. It lives OUTSIDE the run, and
+    the `finally` covers success, timeout, a parse failure and any runner exception.
 
-    So it lives OUTSIDE the run entirely, in a private 0700 directory under the system temp dir, and it
-    is removed in a `finally` that covers success, timeout, a parse failure and any runner exception.
-    Created with `O_CREAT | O_EXCL` so an existing path — or a symlink planted at it — is refused rather
-    than followed, and written by `json.dumps` (dalfox reads TOML **or JSON**), so the value is escaped
-    by a serializer rather than interpolated into a string.
-
-    Yields None when no file could be made: the lane then runs unauthenticated rather than not at all."""
-    import tempfile
+    Yields None only when there is NO secret to carry. A secret that cannot be written raises
+    `OobCredentialError`: running the armed channel unauthenticated is a different scan than the one the
+    operator configured."""
     if not secret:
         yield None
         return
-    d = path = None
+    d, path = _make_oob_credential(secret)     # settled BEFORE the protected body — see `_make_…`
     try:
-        # 0700 and ours alone: `mkdtemp` refuses to reuse, so no other user can pre-create it
-        d = Path(tempfile.mkdtemp(prefix=_OOB_CRED_PREFIX))
-        path = d / ("cfg" + _OOB_CRED_SUFFIX)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump({"scan": {"blind_oob_secret": secret}}, fh)
         yield path
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except Exception:
-        yield None
     finally:
-        # EXACTLY what this invocation made, whatever happened above
-        try:
-            # `unlink` on a SYMLINK removes the link, never its target — so a path we REFUSED to write
-            # through is still cleaned up. Leaving it behind kept the planted link and its directory
-            # around for ever, since the sweep below could not see through a dangling one either.
-            if path is not None and (path.is_symlink() or path.is_file()):
-                path.unlink()
-        except OSError:
-            pass
-        try:
-            if d is not None:
-                d.rmdir()
-        except OSError:
-            pass
+        _drop_oob_credential(d, path)
 
 
 def _blind_oob_plan(prof) -> dict:
@@ -1769,6 +1796,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     # a SIGKILLed run skips every `finally`, so a credential-transport file can outlive the process that
     # needed it. Sweep before we make another one (review#18, Lumpy).
     sweep_stale_oob_creds()
+    _plan_for_run = _blind_oob_plan(prof)     # resolved ONCE: the command, the identity and the report
     chunk_n = max(1, settings.concurrency("DALFOX_CHUNK", 40))
     batches = [cands[i:i + chunk_n] for i in range(0, len(cands), chunk_n)]
     state_f = ctx.run.raw_path("params", "dalfox", "chunks.state.json")
@@ -1783,6 +1811,17 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             "targets": settings.concurrency("DALFOX_TARGETS", 4),
             "rate_limit": prof.http_rl,
             "blind": secrets.fingerprint(bx) if bx else None,
+            # THE NATIVE OOB POLICY IS PART OF THE WORK'S IDENTITY (review#19, Lumpy). Fingerprinting
+            # only the legacy collector meant arming blind XSS after a completed reflected scan reused
+            # the old chunks and injected NO blind payload at all — a lane that looks done and never ran
+            # what was just enabled. Switching backend (public <-> self-hosted, or one server to
+            # another) has the same effect. The SERVER is fingerprinted, never named: a work unit is
+            # reported and must not carry infrastructure, and the token is not in here at all.
+            "oob_channel": _plan_for_run["channel"],
+            "oob_backend": _plan_for_run["backend"],
+            "oob_server": (secrets.fingerprint(_plan_for_run["server"])
+                           if _plan_for_run["server"] else None),
+            "oob_authenticated": bool(_plan_for_run["secret"]),
             "chunk": chunk_n}
     scan_wu = events.work_unit(sid, inputs={"cands": cands}, config=_cfg)
     # review-r9#1/r10#1: nuclei's proven resume contract (not just its dir layout). Immutable per-attempt
@@ -1971,10 +2010,25 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         try:                                                 # review#1: chunk terminal ALWAYS fires (finally)
             # the credential exists ONLY around the exec: created here, destroyed in the context
             # manager's `finally` whether the run succeeds, times out, or raises (review#18, Lumpy).
-            with blind_oob_credential(_blind_oob_plan(prof)["secret"]) as _cred:
-                res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof, len(batch), _cred),
-                                ok_codes=(0, 1),
-                                timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
+            try:
+                with blind_oob_credential(_plan_for_run["secret"]) as _cred:
+                    res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof, len(batch), _cred),
+                                    ok_codes=(0, 1),
+                                    timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
+            except OobCredentialError as e:
+                # REFUSE, never fall back. Running the armed channel unauthenticated is a DIFFERENT scan
+                # from the one the operator configured, and it finishes cleanly with no callbacks —
+                # looking valid while proving nothing (review#19, Lumpy).
+                degraded += 1
+                events.coverage_partial(
+                    sid, kind=events.COVERAGE_TIMEOUT, measure="dalfox_targets",
+                    unit=f"{sid}.chunk{ci}.credential", eligible=len(batch), tested=0,
+                    omitted=len(batch),
+                    reason=(f"chunk {ci + 1}/{len(batches)}: NOT SCANNED — the armed blind-XSS channel's "
+                            f"credential could not be transported ({e}); refusing to run it "
+                            f"unauthenticated"))
+                chunk_status = Status.PARTIAL.value
+                continue
             # dalfox v3 EXIT CONTRACT (measured): 0 = clean/no-findings, 1 = clean/WITH-findings, >=2 = error.
             # review-r9#2: exit code and parsed artifact must AGREE — CLEAN only for (0 + valid empty) or
             # (1 + valid findings). Any disagreement / hard exit / malformed artifact -> PARTIAL, retryable.
@@ -2048,7 +2102,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
       # `-S`. Asserting "registered" or "polled" from a stderr substring is exactly the oracle this
       # codebase stopped trusting. A callback that ARRIVES is observable — it lands as a `V` finding with
       # `detection_method: oob` — so findings prove the channel worked; their absence proves nothing.
-      _plan = _blind_oob_plan(prof)
+      _plan = _plan_for_run
       events.coverage_partial(
           sid, kind=(events.COVERAGE_SAMPLE if not _plan["armed"] else events.COVERAGE_TIMEOUT),
           measure="blind_xss_channel", unit=f"{sid}.blind_oob",

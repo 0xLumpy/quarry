@@ -724,6 +724,10 @@ class TestARetryOwesOnlyWhatFailed:
         assert events.COVERAGE_TOOL_OMISSION not in (events.COVERAGE_SAMPLE, events.COVERAGE_PROVIDER)
 
 
+def _pytest_raises(exc):
+    return pytest.raises(exc)
+
+
 class TestBlindXssChannel:
     """4.3.D under the agreed contract (review#12, Lumpy):
 
@@ -938,8 +942,10 @@ class TestBlindXssChannel:
         monkeypatch.setattr(_tf, "mkdtemp", lambda *a, **k: str(d))
         monkeypatch.setattr(params.__dict__.get("tempfile", _tf), "mkdtemp",
                             lambda *a, **k: str(d), raising=False)
-        with params.blind_oob_credential("SEKRET") as cfg:
-            assert cfg is None, "a pre-existing path must be refused"
+        # DOCTRINE (review#19): a refused path RAISES — it must not degrade into an unauthenticated run
+        with _pytest_raises(params.OobCredentialError):
+            with params.blind_oob_credential("SEKRET"):
+                pass
         assert victim.read_text() == "untouched", "the symlink target was written through"
         # …and the refusal leaves NO litter: unlinking a symlink removes the link, not its target
         assert not d.exists(), "a refused creation left its directory behind"
@@ -994,3 +1000,96 @@ class TestBlindXssChannel:
         import inspect
         src = inspect.getsource(params._dalfox_xss_fast)
         assert "sweep_stale_oob_creds()" in src
+
+    def test_a_credential_failure_REFUSES_rather_than_running_unauthenticated(self, monkeypatch):
+        """review#19 (Lumpy): yielding None on failure still emitted `--blind-oob=<server>` without
+        `--config`, so an operator who configured an AUTHENTICATED backend silently got a different
+        scan — one that finishes with no callbacks and looks valid."""
+        import tempfile as _tf
+        monkeypatch.setattr(_tf, "mkdtemp",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("read-only /tmp")))
+        with pytest.raises(params.OobCredentialError) as caught:
+            with params.blind_oob_credential("SEKRET"):
+                pytest.fail("the body must never run without the credential")
+        assert "could not be written" in str(caught.value)
+
+    def test_the_lane_reports_the_refusal_as_a_GAP_and_scans_nothing(self, monkeypatch, tmp_path):
+        c = TestARetryOwesOnlyWhatFailed._lane_in(TestARetryOwesOnlyWhatFailed(),
+                                                  monkeypatch, tmp_path, "cred")
+        monkeypatch.setattr(secrets, "oob",
+                            lambda: {"interactsh_server": "oob.mine.test", "interactsh_token": "T0K"})
+        monkeypatch.setattr(params, "_make_oob_credential",
+                            lambda s: (_ for _ in ()).throw(params.OobCredentialError("disk full")))
+        monkeypatch.setattr(params, "exec_tool",
+                            lambda *a, **k: pytest.fail("dalfox ran without its credential"))
+        prof = type("P", (), {"http_rl": 0, "blind_xss": True, "blind_xss_public": False,
+                              "blind_xss_dual": False})()
+        params._dalfox_xss_fast(c, ["http://h/a?q="], prof)
+        evs = [json.loads(x) for x in (tmp_path / "cred" / "events.jsonl").read_text().splitlines()]
+        rows = [e for e in evs if e.get("measure") == "dalfox_targets"
+                and "credential" in (e.get("unit") or "")]
+        assert rows and rows[-1]["omitted"] == 1 and rows[-1]["tested"] == 0
+        assert "refusing to run it unauthenticated" in rows[-1]["reason"]
+
+    def test_an_exception_from_the_BODY_propagates_unchanged(self):
+        """`shodan_host._open_lock` records this exact defect: one `try` over acquisition AND the
+        protected body means a body exception is caught, the generator yields twice, and contextlib
+        replaces the real failure with `generator didn't stop after throw()`."""
+        class _Boom(Exception):
+            pass
+        with pytest.raises(_Boom, match="the REAL failure"):
+            with params.blind_oob_credential("SEKRET"):
+                raise _Boom("the REAL failure from exec_tool")
+
+    def test_acquisition_is_settled_before_the_protected_yield(self):
+        import inspect
+        src = inspect.getsource(params.blind_oob_credential)
+        body = src[src.index("if not secret"):]
+        assert "except Exception" not in body, "the yield must sit in try/FINALLY only"
+        assert "_make_oob_credential" in body and body.index("_make_oob_credential") < body.index("yield path")
+
+
+class TestTheOobPolicyIsPartOfTheWorkIdentity:
+    """review#19 (Lumpy): the work unit fingerprinted only the legacy collector, so arming native OOB
+    after a completed reflected scan reused the old chunks and injected NO blind payload — a lane that
+    looks done and never ran what was just enabled."""
+
+    @staticmethod
+    def _wu(monkeypatch, tmp_path, tag, oob, **modes):
+        monkeypatch.setattr(settings, "concurrency",
+                            lambda k, d=None: {"DALFOX_CHUNK": 1, "DALFOX_TARGETS": 4}.get(k, d))
+        monkeypatch.setattr(settings, "workers", lambda t, d: d)
+        monkeypatch.setattr(secrets, "oob", lambda: oob)
+        monkeypatch.setattr(params, "_dalfox_engine_id", lambda: "v3.2.0")
+        monkeypatch.setattr(params, "exec_tool", _exec(META0, 0))
+        events.reset(); events.configure(tmp_path / tag)
+        c = _C(tmp_path / tag)
+        prof = type("P", (), {"http_rl": 0, "blind_xss": False, "blind_xss_public": False,
+                              "blind_xss_dual": False, **modes})()
+        params._dalfox_xss_fast(c, ["http://h/a?q="], prof)
+        st = json.loads((c.run.raw_path("params", "dalfox", "chunks.state.json")).read_text())
+        return st["work_unit"]
+
+    def test_arming_native_OOB_invalidates_a_reflected_only_resume(self, monkeypatch, tmp_path):
+        off = self._wu(monkeypatch, tmp_path, "a", {})
+        on = self._wu(monkeypatch, tmp_path, "b", {"interactsh_server": "s.test"}, blind_xss=True)
+        assert off != on, "the old chunks would have been reused and no blind payload sent"
+
+    def test_switching_BACKEND_invalidates_it_too(self, monkeypatch, tmp_path):
+        pub = self._wu(monkeypatch, tmp_path, "c", {}, blind_xss=True, blind_xss_public=True)
+        own = self._wu(monkeypatch, tmp_path, "d", {"interactsh_server": "s.test"}, blind_xss=True)
+        assert pub != own
+
+    def test_switching_SERVER_invalidates_it_too(self, monkeypatch, tmp_path):
+        s1 = self._wu(monkeypatch, tmp_path, "e", {"interactsh_server": "s1.test"}, blind_xss=True)
+        s2 = self._wu(monkeypatch, tmp_path, "f", {"interactsh_server": "s2.test"}, blind_xss=True)
+        assert s1 != s2
+
+    def test_the_identity_carries_NO_secret_and_NO_server_name(self, monkeypatch, tmp_path):
+        """A work unit is reported. It must not carry infrastructure, and never the token."""
+        import inspect
+        src = inspect.getsource(params._dalfox_xss_fast)
+        seg = src[src.index('"oob_channel"'):src.index('"chunk": chunk_n')]
+        assert "fingerprint" in seg and '_plan_for_run["secret"]' not in seg.replace(
+            'bool(_plan_for_run["secret"])', "")
+        assert 'secrets.fingerprint(_plan_for_run["server"])' in seg
