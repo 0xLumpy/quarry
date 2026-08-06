@@ -1272,6 +1272,44 @@ def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
     return reps, stats
 
 
+#: what the blind-XSS channel resolved to, so the DECISION is evidence and not an inference from flags
+def _blind_oob_plan(prof) -> dict:
+    """Decide the blind/stored-XSS OOB channel: {armed, backend, server, secret, reason}.
+
+    The contract (review#12, Lumpy), in order:
+
+      * OFF unless `MODES.BLIND_XSS` explicitly arms it. A blind payload persists on the target and
+        fires later in someone else's browser — a heavier engagement decision than a reflected probe.
+      * A self-hosted `oob.interactsh_server` is used when present, with `interactsh_token` as
+        `--blind-oob-secret`. Quarry owns the server and the credentials.
+      * With NO self-hosted server the backend is PUBLIC, and that needs its own permission
+        (`MODES.BLIND_XSS_PUBLIC`). "Quarry's own OOB already defaults public" is not consent to open
+        another external channel. Refused otherwise — and the refusal is REPORTED, not silent.
+
+    Ownership stays dalfox's either way: it mints the per-payload nonce, registers, polls, waits and
+    maps the callback back to target/param/location/method/payload. Quarry imports that correlation.
+    """
+    o = secrets.oob() or {}
+    if not getattr(prof, "blind_xss", False):
+        return {"armed": False, "backend": "", "server": "", "secret": "",
+                "reason": "MODES.BLIND_XSS is off — the blind/stored-XSS channel was not armed"}
+    server = str(o.get("interactsh_server") or "").strip()
+    if server:
+        return {"armed": True, "backend": "self-hosted", "server": server,
+                "secret": str(o.get("interactsh_token") or "").strip(),
+                "reason": f"blind XSS armed on the configured interactsh server ({server}); "
+                          f"correlation is owned by DALFOX and imported"}
+    if not getattr(prof, "blind_xss_public", False):
+        return {"armed": False, "backend": "public", "server": "", "secret": "",
+                "reason": "blind XSS REFUSED: no `oob.interactsh_server` is configured, so callbacks "
+                          "would land on a PUBLIC third-party backend carrying the target host and the "
+                          "victim's browser context. Set MODES.BLIND_XSS_PUBLIC to permit that "
+                          "deliberately, or configure your own server"}
+    return {"armed": True, "backend": "public", "server": "", "secret": "",
+            "reason": "blind XSS armed on the PUBLIC interactsh backend (MODES.BLIND_XSS_PUBLIC) — "
+                      "callbacks reach a third party; correlation is owned by DALFOX and imported"}
+
+
 def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0) -> list[str]:
     """dalfox v3 (Rust) reflected-XSS scan (v0.3.8). v3 replaced the headless browser with static AST DOM
     analysis, so v2's --skip-headless timekiller is GONE; params are pre-discovered (arjun/gf), so --skip-mining
@@ -1291,9 +1329,23 @@ def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0) -> list[str]:
            "--max-targets-per-host", str(per_host),
            "--workers", str(max(1, settings.workers("dalfox", 30))),          # per-target; v2 -w 100 NOT carried
            "--max-concurrent-targets", str(max(1, settings.concurrency("DALFOX_TARGETS", 4)))]  # OTC-tunable
+    # BLIND / STORED XSS. `--blind-oob` is the primary channel: dalfox mints a fresh callback per
+    # PAYLOAD and correlates each interaction back to target/param/location/method/payload — attribution
+    # a single `-b` URL cannot give, since one URL covers the whole invocation.
+    plan = _blind_oob_plan(prof)
+    if plan["armed"]:
+        # ONE argv token when a server is given: the flag is `--blind-oob[=<domains>]`, so a separate
+        # `=host` argument would be parsed as a TARGET, not as the backend.
+        cmd += [f"--blind-oob={plan['server']}" if plan["server"] else "--blind-oob"]
+        if plan["secret"]:
+            cmd += ["--blind-oob-secret", plan["secret"]]
+    # `-b` is an operator's OWN legacy collector (XSS Hunter et al) and is opt-in, NEVER paired
+    # automatically: dalfox fires BOTH channels when both are set (`CallbackSource::Both`), which means
+    # duplicate blind payloads, extra requests and two callback lifecycles for one finding
+    # (review#12, Lumpy).
     bx = secrets.oob().get("blind_xss_url")
     if bx:
-        cmd += ["-b", str(bx)]                             # blind/stored XSS OOB beacon (kept; 4.3.D gates)
+        cmd += ["-b", str(bx)]
     if prof.http_rl:
         # v3 has a REAL global rate cap (req/s, shared across workers AND targets) — supersedes v2's per-host
         # --delay math and its per-target-limiter caveat. Bound the aggregate stream directly to the RoE rate.
@@ -1395,7 +1447,16 @@ def _dalfox_finding(obj) -> "dict | None":
             "dalfox_type": ftype, "param": param, "payload": obj.get("payload") if isinstance(obj.get("payload"), str) else None,
             "location": _dstr(obj.get("location")) or _dstr(obj.get("inject_type")) or None,
             "evidence": _dstr(obj.get("evidence")) or None, "poc": poc,
-            "cwe": _dstr(obj.get("cwe")) or None}
+            "cwe": _dstr(obj.get("cwe")) or None,
+            # 3.2.0 splits confidence / detection-method / impact into their own axes; carry them rather
+            # than flattening to our single tier. `detection_method: "oob"` is a BLIND callback that
+            # actually arrived — the one observable proof that channel worked.
+            "detection_method": _dstr(obj.get("detection_method")) or None,
+            "confidence_reason": _dstr(obj.get("confidence_reason")) or None,
+            "inject_type": _dstr(obj.get("inject_type")) or None,
+            # correlation for an OOB hit is dalfox's: it minted the nonce, registered, polled and mapped
+            # it back. Quarry imports that — it did not issue the token (review#12, Lumpy).
+            **({"oob_owner": "dalfox"} if _dstr(obj.get("detection_method")) == "oob" else {})}
 
 
 #: dalfox's own per-target error codes, split by WHAT A RETRY WOULD DO. review#13 (Lumpy): "retriable
@@ -1850,6 +1911,26 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
       # pre-add dedup). A separate GLOBAL id set drives only the `matched` (distinct findings) counter; `produced`
       # counts NEW entities (Run.add True). Falls back to THIS attempt's file for a chunk just run but not yet
       # recorded. Verdict: any degraded this run -> PARTIAL; else any distinct finding -> SUCCESS; else EMPTY.
+      # THE BLIND-XSS DECISION, every run, whichever way it went — armed or refused. Lumpy required the
+      # backend to be recorded BEFORE execution; this is that record, and it is Quarry's own decision, so
+      # it is fully knowable.
+      #
+      # What is NOT claimed: dalfox's session lifecycle. Registration, poll completion and the final wait
+      # are written to its STDERR (`ceprintln!`), not to the JSONL artifact, and Quarry runs it under
+      # `-S`. Asserting "registered" or "polled" from a stderr substring is exactly the oracle this
+      # codebase stopped trusting. A callback that ARRIVES is observable — it lands as a `V` finding with
+      # `detection_method: oob` — so findings prove the channel worked; their absence proves nothing.
+      _plan = _blind_oob_plan(prof)
+      events.coverage_partial(
+          sid, kind=(events.COVERAGE_SAMPLE if not _plan["armed"] else events.COVERAGE_TIMEOUT),
+          measure="blind_xss_channel", unit=f"{sid}.blind_oob",
+          eligible=1, tested=1 if _plan["armed"] else 0, omitted=0 if _plan["armed"] else 1,
+          reason=(f"{_plan['reason']}"
+                  + (f" [backend: {_plan['backend']}, owner: dalfox]" if _plan["armed"] else "")
+                  + ("; dalfox's registration/poll/final-wait are stderr-only under -S and are NOT "
+                     "asserted here — an arriving callback is a `V` finding with detection_method=oob"
+                     if _plan["armed"] else "")))
+
       # TERMINAL COVERAGE, re-reported EVERY run from the persisted union — not from this attempt.
       # A gap no retry can close is a fact about the TARGET SET, so it must outlive the attempt that
       # observed it and reach a fresh process's manifest and verdict (review#15, Lumpy). `_save()` has

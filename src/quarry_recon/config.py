@@ -219,6 +219,35 @@ class TargetProfile:
         return self.modes.get("SECRET_VERIFICATION", False) is True
 
     @property
+    def blind_xss(self) -> bool:
+        """MODES.BLIND_XSS — arm the blind/stored-XSS OOB channel (dalfox `--blind-oob`).
+
+        Default OFF. Blind XSS PERSISTS a payload on the target that fires later, in someone else's
+        browser, and phones home to a callback host — a heavier engagement decision than a reflected
+        probe, and one an operator makes deliberately. Discovery is unaffected either way: reflected and
+        DOM XSS are found regardless.
+
+        Ownership note (review#12, Lumpy): with `--blind-oob`, DALFOX owns the nonce, the registration,
+        the polling schedule, the final wait and the nonce->injection map. Quarry owns the SERVER and the
+        credentials and imports dalfox's correlation — so findings from this channel are recorded with
+        `oob_owner: dalfox`, not as Quarry-issued tokens.
+
+        Strict `is True`, like every other arming flag: it must not fail open on quoted YAML."""
+        return self.modes.get("BLIND_XSS", False) is True
+
+    @property
+    def blind_xss_public(self) -> bool:
+        """MODES.BLIND_XSS_PUBLIC — permit the blind-XSS channel to use a PUBLIC interactsh backend.
+
+        Default OFF and required on top of `BLIND_XSS`. Without a self-hosted `oob.interactsh_server`,
+        every callback — carrying the target's host, the victim's browser context and the page it fired
+        on — lands on infrastructure a third party runs. Quarry's own OOB layer already defaults public,
+        but "we do it elsewhere" is not consent to open ANOTHER external channel (review#12, Lumpy).
+
+        Strict `is True`: an arming flag must not fail open."""
+        return self.modes.get("BLIND_XSS_PUBLIC", False) is True
+
+    @property
     def headless(self) -> bool:
         return _flag(self.modes.get("HEADLESS"), False)
 
@@ -404,6 +433,10 @@ class TargetProfile:
         if "SECRET_VERIFICATION" in modes and not isinstance(modes["SECRET_VERIFICATION"], bool):
             raise ProfileError(f"MODES.SECRET_VERIFICATION must be a bare boolean true/false "
                                f"(got {modes['SECRET_VERIFICATION']!r})")
+        for _arm in ("BLIND_XSS", "BLIND_XSS_PUBLIC"):
+            if _arm in modes and not isinstance(modes[_arm], bool):
+                raise ProfileError(f"MODES.{_arm} must be a bare boolean true/false "
+                                   f"(got {modes[_arm]!r})")
         if "DEEP_EVIDENCE" in modes:
             dv = modes["DEEP_EVIDENCE"]
             if not (isinstance(dv, bool) or str(dv).strip().lower() in _TRUE_STRS | _FALSE_STRS | {"deep"}):

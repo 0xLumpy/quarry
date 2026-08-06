@@ -722,3 +722,109 @@ class TestARetryOwesOnlyWhatFailed:
         i = src.index("COVERAGE_SAMPLE, events.COVERAGE_PROVIDER")
         assert "coverage_limits.append" in src[i:i + 200]
         assert events.COVERAGE_TOOL_OMISSION not in (events.COVERAGE_SAMPLE, events.COVERAGE_PROVIDER)
+
+
+class TestBlindXssChannel:
+    """4.3.D under the agreed contract (review#12, Lumpy):
+
+      * `--blind-oob` is the primary channel — dalfox mints a callback PER PAYLOAD and correlates each
+        interaction to target/param/location/method/payload. One `-b` URL covers a whole invocation and
+        cannot do that.
+      * OWNERSHIP IS DALFOX'S. It mints the nonce, registers, polls, waits and maps the hit back. Quarry
+        owns the server + credentials and imports the correlation, so findings carry `oob_owner: dalfox`.
+      * Never auto-enabled: `MODES.BLIND_XSS` arms it, and a PUBLIC backend needs its own permission.
+      * `-b` is an opt-in legacy collector, never paired automatically.
+    """
+
+    class _P:
+        http_rl = 0
+        blind_xss = False
+        blind_xss_public = False
+
+    @staticmethod
+    def _oob(monkeypatch, **kw):
+        monkeypatch.setattr(secrets, "oob", lambda: dict(kw))
+
+    def _cmd(self, monkeypatch, prof, **oob):
+        self._oob(monkeypatch, **oob)
+        return params._dalfox_cmd("b.txt", "o.jsonl", prof, 1)
+
+    def test_it_is_OFF_unless_explicitly_armed(self, monkeypatch):
+        cmd = self._cmd(monkeypatch, self._P(), interactsh_server="oob.mine.test")
+        assert not any(c.startswith("--blind-oob") for c in cmd), cmd
+        plan = params._blind_oob_plan(self._P())
+        assert not plan["armed"] and "MODES.BLIND_XSS is off" in plan["reason"]
+
+    def test_a_self_hosted_server_is_used_with_its_secret(self, monkeypatch):
+        p = self._P(); p.blind_xss = True
+        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test", interactsh_token="T0K")
+        assert "--blind-oob=oob.mine.test" in cmd, cmd
+        assert cmd[cmd.index("--blind-oob-secret") + 1] == "T0K"
+
+    def test_the_server_is_ONE_argv_token(self, monkeypatch):
+        """`--blind-oob[=<domains>]` takes its value attached. A separate `=host` argument would be
+        parsed as a TARGET — measured against the 3.2.0 binary."""
+        p = self._P(); p.blind_xss = True
+        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test")
+        assert "=oob.mine.test" not in cmd, cmd
+        assert not any(c.startswith("=") for c in cmd)
+
+    def test_a_PUBLIC_backend_is_REFUSED_without_its_own_permission(self, monkeypatch):
+        p = self._P(); p.blind_xss = True
+        cmd = self._cmd(monkeypatch, p)                     # no interactsh_server configured
+        assert not any(c.startswith("--blind-oob") for c in cmd), cmd
+        plan = params._blind_oob_plan(p)
+        assert not plan["armed"] and plan["backend"] == "public"
+        assert "REFUSED" in plan["reason"] and "BLIND_XSS_PUBLIC" in plan["reason"]
+
+    def test_public_is_used_once_explicitly_permitted(self, monkeypatch):
+        p = self._P(); p.blind_xss = True; p.blind_xss_public = True
+        cmd = self._cmd(monkeypatch, p)
+        assert "--blind-oob" in cmd and not any(c.startswith("--blind-oob=") for c in cmd)
+        assert "--blind-oob-secret" not in cmd, "no secret for a public backend"
+
+    def test_a_self_hosted_server_needs_no_public_permission(self, monkeypatch):
+        p = self._P(); p.blind_xss = True                   # blind_xss_public stays False
+        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test")
+        assert "--blind-oob=oob.mine.test" in cmd
+
+    def test_b_is_NOT_paired_automatically(self, monkeypatch):
+        """dalfox fires BOTH channels when both are set — duplicate payloads, extra requests, two
+        callback lifecycles. `-b` stays an explicit operator choice."""
+        p = self._P(); p.blind_xss = True
+        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test")
+        assert "-b" not in cmd, cmd
+
+    def test_b_still_works_as_an_opt_in_legacy_collector(self, monkeypatch):
+        cmd = self._cmd(monkeypatch, self._P(), blind_xss_url="https://col.example")
+        assert cmd[cmd.index("-b") + 1] == "https://col.example"
+        assert not any(c.startswith("--blind-oob") for c in cmd), "…and does not arm the OOB channel"
+
+    def test_the_arming_flags_do_not_fail_open_on_quoted_yaml(self):
+        """An arming flag must never be enabled by a QUOTED string, and a quoted value must fail LOUD in
+        validation rather than silently leave the lane disabled against operator intent."""
+        import pytest as _pt
+        from quarry_recon.config import ProfileError, TargetProfile
+        prof = TargetProfile.__new__(TargetProfile)
+        prof.modes = {"BLIND_XSS": "true", "BLIND_XSS_PUBLIC": "true"}
+        assert prof.blind_xss is False and prof.blind_xss_public is False
+        # …and a quoted value fails LOUD through the real loader
+        import tempfile as _tf
+        for bad in ("BLIND_XSS", "BLIND_XSS_PUBLIC"):
+            f = pathlib.Path(_tf.mkdtemp()) / "target.yaml"
+            f.write_text("target: acme.com\nscope:\n  in: [acme.com]\n"
+                         f"MODES:\n  {bad}: \"true\"\n")
+            with _pt.raises(ProfileError):
+                TargetProfile.load(f)
+
+    def test_an_OOB_finding_records_dalfox_as_the_OWNER(self):
+        row = ('{"type":"V","param":"q","data":"http://h/p?q=1","method":"GET","location":"Query",'
+               '"detection_method":"oob","confidence_reason":"callback received","inject_type":"inHTML"}\n')
+        f, art = _art('{"meta":{"findings_count":1,"incomplete":false}}\n' + row)
+        assert art.readable and f[0]["oob_owner"] == "dalfox"
+        assert f[0]["detection_method"] == "oob"
+        assert f[0]["confidence_reason"] == "callback received" and f[0]["inject_type"] == "inHTML"
+
+    def test_a_NON_oob_finding_claims_no_oob_owner(self):
+        f, _art_ = _art(META1 + R_ROW)
+        assert "oob_owner" not in f[0]

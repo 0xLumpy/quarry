@@ -70,6 +70,17 @@ MODES:
                         # APIs (active credential use against a third party — RoE/legal concern). Discovery
                         # is unaffected either way (every secret is still found/reported). Set true only when
                         # the engagement explicitly authorizes credential verification.
+  BLIND_XSS: false      # default false: arm the blind/stored-XSS OOB channel (dalfox --blind-oob).
+                        # A blind payload PERSISTS on the target and fires later in someone else's
+                        # browser, phoning home to a callback host — a heavier engagement decision than a
+                        # reflected probe. Reflected + DOM XSS are found either way. Correlation is owned
+                        # by DALFOX (it mints the per-payload nonce, registers, polls and maps it back);
+                        # Quarry owns the server + credentials and imports the result.
+  BLIND_XSS_PUBLIC: false  # default false: additionally permit a PUBLIC interactsh backend when no
+                        # `oob.interactsh_server` is configured. Every callback then lands on a third
+                        # party's infrastructure carrying the target host and the victim's browser
+                        # context. With BLIND_XSS on and this off, the lane REFUSES the channel and says
+                        # so rather than silently opening it.
   CONTENT_DISCOVERY: "off"  # off | light | balanced | deep — candidate-driven path brute (default off)
   CONTENT_RECURSION: 0    # recursion depth for content discovery (0 = off; pairs with balanced/deep)
   DEEP_EVIDENCE: false    # true => DOWNLOAD + mine heavy artifacts (actuator heapdump) instead of just
