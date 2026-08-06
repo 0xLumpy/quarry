@@ -7,6 +7,7 @@ confirmation (design §7) — entities carry confirmed:false.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -1273,28 +1274,91 @@ def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
 
 
 #: what the blind-XSS channel resolved to, so the DECISION is evidence and not an inference from flags
-def _blind_oob_config(out_file, secret: str):
-    """Write dalfox's `scan.blind_oob_secret` to a 0600 TOML beside the run's artifact, or None.
+#: credential-transport files are named so a sweep can find them without guessing
+_OOB_CRED_PREFIX = "quarry-dalfox-oob-"
+_OOB_CRED_SUFFIX = ".cred.json"
 
-    The credential must not appear in argv: `/proc/<pid>/cmdline` is readable by every process of this
-    user and by anything reading a process listing, and no amount of redaction in our own logs changes
-    that (review#17, Lumpy). dalfox reads the same value from a `--config` file, so that is how it gets
-    there. The file is created 0600 BEFORE the secret is written — never written and chmod'ed after.
 
-    Same-user processes can still read the file, and dalfox's own argv still names it. That is the
-    residual limitation of authenticated native OOB, and it is documented rather than papered over."""
+def sweep_stale_oob_creds(max_age_s: float = 3600.0) -> int:
+    """Remove credential-transport files a KILLED Quarry could not clean up. Returns how many went.
+
+    A SIGKILL skips every `finally`, so the file outlives the process that needed it (review#18, Lumpy).
+    Only files this module creates are touched — matched by prefix AND suffix inside the private 0700
+    directory pattern, never a glob over somebody else's temp files — and only ones old enough that no
+    live scan can still be using them."""
+    import tempfile
+    removed = 0
+    root = Path(tempfile.gettempdir())
     try:
-        cfg = Path(out_file).with_name(Path(out_file).name + ".dalfox.toml")
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        # O_EXCL-style create with the mode already restrictive: a 0644 window is a leak, however brief
-        fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write("[scan]\nblind_oob_secret = " + json.dumps(secret) + "\n")
-        return cfg
+        for d in root.glob(_OOB_CRED_PREFIX + "*"):
+            if not d.is_dir() or d.is_symlink():
+                continue
+            try:
+                if time.time() - d.stat().st_mtime < max_age_s:
+                    continue                       # a live scan may still hold it
+                for f in d.glob("*" + _OOB_CRED_SUFFIX):
+                    # a SYMLINK (dangling or not) is unlinked as the link it is: `is_file()` alone
+                    # follows it and answers False for a dangling one, which left the litter for ever.
+                    if f.is_symlink() or f.is_file():
+                        f.unlink()
+                        removed += 1
+                d.rmdir()
+            except OSError:
+                continue                           # someone else's, or already gone
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
-        return None                      # no config -> no secret; the lane still runs, unauthenticated
+        return removed
+    return removed
+
+
+@contextlib.contextmanager
+def blind_oob_credential(secret: str):
+    """Yield a path to dalfox's `--config` carrying ONLY the OOB secret, then destroy it.
+
+    review#18 (Lumpy): a 0600 file is right DURING execution and wrong afterwards. This one lived in the
+    run's raw artifact tree, where it would have reached publication, manifests, exports, digests and
+    resume artifacts — the credential becoming permanent local evidence.
+
+    So it lives OUTSIDE the run entirely, in a private 0700 directory under the system temp dir, and it
+    is removed in a `finally` that covers success, timeout, a parse failure and any runner exception.
+    Created with `O_CREAT | O_EXCL` so an existing path — or a symlink planted at it — is refused rather
+    than followed, and written by `json.dumps` (dalfox reads TOML **or JSON**), so the value is escaped
+    by a serializer rather than interpolated into a string.
+
+    Yields None when no file could be made: the lane then runs unauthenticated rather than not at all."""
+    import tempfile
+    if not secret:
+        yield None
+        return
+    d = path = None
+    try:
+        # 0700 and ours alone: `mkdtemp` refuses to reuse, so no other user can pre-create it
+        d = Path(tempfile.mkdtemp(prefix=_OOB_CRED_PREFIX))
+        path = d / ("cfg" + _OOB_CRED_SUFFIX)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"scan": {"blind_oob_secret": secret}}, fh)
+        yield path
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        yield None
+    finally:
+        # EXACTLY what this invocation made, whatever happened above
+        try:
+            # `unlink` on a SYMLINK removes the link, never its target — so a path we REFUSED to write
+            # through is still cleaned up. Leaving it behind kept the planted link and its directory
+            # around for ever, since the sweep below could not see through a dangling one either.
+            if path is not None and (path.is_symlink() or path.is_file()):
+                path.unlink()
+        except OSError:
+            pass
+        try:
+            if d is not None:
+                d.rmdir()
+        except OSError:
+            pass
 
 
 def _blind_oob_plan(prof) -> dict:
@@ -1363,7 +1427,7 @@ def _blind_oob_plan(prof) -> dict:
                       "callbacks reach a third party; correlation is owned by DALFOX and imported"}
 
 
-def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0) -> list[str]:
+def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0, cred_path=None) -> list[str]:
     """dalfox v3 (Rust) reflected-XSS scan (v0.3.8). v3 replaced the headless browser with static AST DOM
     analysis, so v2's --skip-headless timekiller is GONE; params are pre-discovered (arjun/gf), so --skip-mining
     stays. Output is structured JSONL to the -o file; -S keeps captured output minimal (status is read from the
@@ -1390,14 +1454,13 @@ def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0) -> list[str]:
         # ONE argv token when a server is given: the flag is `--blind-oob[=<domains>]`, so a separate
         # `=host` argument would be parsed as a TARGET, not as the backend.
         cmd += [f"--blind-oob={plan['server']}" if plan["server"] else "--blind-oob"]
-        if plan["secret"]:
+        if plan["secret"] and cred_path is not None:
             # NEVER `--blind-oob-secret <token>`: argv is world-readable through /proc/<pid>/cmdline and
             # every process listing, and a display-level redaction does not fix that (review#17, Lumpy).
-            # dalfox reads `scan.blind_oob_secret` from a `--config` TOML, so the credential reaches it
-            # through a 0600 file instead.
-            cfg = _blind_oob_config(out_file, plan["secret"])
-            if cfg is not None:
-                cmd += ["--config", str(cfg)]
+            # dalfox reads `scan.blind_oob_secret` from a `--config` file, so the credential reaches it
+            # through an EPHEMERAL 0600 one whose lifetime the CALLER owns (review#18): the command
+            # builder must not create a file it cannot destroy.
+            cmd += ["--config", str(cred_path)]
     if plan["channel"] == "dual":
         cmd += ["-b", str(secrets.oob().get("blind_xss_url") or "")]
     elif plan["channel"] == "legacy":
@@ -1703,6 +1766,9 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     (V verified / R reflected / A AST-DOM) into confidence, but stay confirmed:false — the map-don't-exploit
     boundary holds (Quarry-owned impact validation is separate). Findings go straight to the store (deduped by id)."""
     sid = "params.dalfox_xss_fast"
+    # a SIGKILLed run skips every `finally`, so a credential-transport file can outlive the process that
+    # needed it. Sweep before we make another one (review#18, Lumpy).
+    sweep_stale_oob_creds()
     chunk_n = max(1, settings.concurrency("DALFOX_CHUNK", 40))
     batches = [cands[i:i + chunk_n] for i in range(0, len(cands), chunk_n)]
     state_f = ctx.run.raw_path("params", "dalfox", "chunks.state.json")
@@ -1903,8 +1969,12 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         res = None
         chunk_status = Status.FAILED.value                   # review#1: promoted ONLY after ALL bookkeeping below
         try:                                                 # review#1: chunk terminal ALWAYS fires (finally)
-            res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof, len(batch)), ok_codes=(0, 1),
-                            timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
+            # the credential exists ONLY around the exec: created here, destroyed in the context
+            # manager's `finally` whether the run succeeds, times out, or raises (review#18, Lumpy).
+            with blind_oob_credential(_blind_oob_plan(prof)["secret"]) as _cred:
+                res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof, len(batch), _cred),
+                                ok_codes=(0, 1),
+                                timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
             # dalfox v3 EXIT CONTRACT (measured): 0 = clean/no-findings, 1 = clean/WITH-findings, >=2 = error.
             # review-r9#2: exit code and parsed artifact must AGREE — CLEAN only for (0 + valid empty) or
             # (1 + valid findings). Any disagreement / hard exit / malformed artifact -> PARTIAL, retryable.

@@ -768,9 +768,14 @@ class TestBlindXssChannel:
         assert "--blind-oob=oob.mine.test" in cmd, cmd
         assert "--blind-oob-secret" not in cmd, "the secret must never be an argument"
         assert not any("T0K" in c for c in cmd), cmd
-        cfg = pathlib.Path(cmd[cmd.index("--config") + 1])
-        assert cfg.is_file() and "T0K" in cfg.read_text()
-        assert stat.S_IMODE(cfg.stat().st_mode) == 0o600, oct(cfg.stat().st_mode)
+        assert "--config" not in cmd, "the builder must not create a file it cannot destroy"
+        # …the CALLER owns the credential's lifetime, so the flag only appears when it hands one over
+        with params.blind_oob_credential("T0K") as cred:
+            with_cred = params._dalfox_cmd(tmp_path / "b.txt", out, p, 1, cred)
+            assert with_cred[with_cred.index("--config") + 1] == str(cred)
+            assert not any("T0K" in c for c in with_cred), with_cred
+            assert stat.S_IMODE(cred.stat().st_mode) == 0o600, oct(cred.stat().st_mode)
+        del stat
 
     def test_no_config_file_is_written_without_a_secret(self, monkeypatch, tmp_path):
         self._oob(monkeypatch, interactsh_server="oob.mine.test")     # server, no token
@@ -892,3 +897,100 @@ class TestBlindXssChannel:
     def test_a_NON_oob_finding_claims_no_oob_owner(self):
         f, _art_ = _art(META1 + R_ROW)
         assert "oob_owner" not in f[0]
+
+    def test_the_credential_file_is_DESTROYED_after_the_run(self):
+        """review#18 (Lumpy): a 0600 file is right DURING execution and wrong afterwards."""
+        import stat
+        with params.blind_oob_credential("SEKRET") as cfg:
+            assert cfg.is_file() and stat.S_IMODE(cfg.stat().st_mode) == 0o600
+            assert json.loads(cfg.read_text()) == {"scan": {"blind_oob_secret": "SEKRET"}}
+            kept = cfg
+        assert not kept.exists(), "the credential outlived the scan"
+        assert not kept.parent.exists(), "…and so did its directory"
+
+    def test_it_is_destroyed_even_when_the_body_RAISES(self):
+        kept = None
+        with pytest.raises(RuntimeError):
+            with params.blind_oob_credential("SEKRET") as cfg:
+                kept = cfg
+                raise RuntimeError("timeout / parse failure / runner exception")
+        assert kept is not None and not kept.exists()
+
+    def test_it_never_lives_in_the_RUN_directory(self, tmp_path):
+        """It would otherwise reach raw publication, manifests, exports, digests and resume artifacts."""
+        with params.blind_oob_credential("SEKRET") as cfg:
+            assert tmp_path not in cfg.parents, cfg
+            assert "raw" not in cfg.parts and "recon" not in cfg.parts, cfg
+
+    def test_the_value_is_SERIALIZED_not_interpolated(self):
+        """A token with quotes and backslashes must survive intact — escaping is the serializer's job."""
+        nasty = 'tok"with\\quotes\nand\tcontrol'
+        with params.blind_oob_credential(nasty) as cfg:
+            assert json.loads(cfg.read_text())["scan"]["blind_oob_secret"] == nasty
+
+    def test_an_EXISTING_path_or_symlink_is_refused_not_followed(self, tmp_path, monkeypatch):
+        """`O_CREAT | O_EXCL | O_NOFOLLOW`: a planted symlink must not be written through."""
+        import tempfile as _tf
+        victim = tmp_path / "victim"
+        victim.write_text("untouched")
+        d = pathlib.Path(_tf.mkdtemp(prefix=params._OOB_CRED_PREFIX))
+        (d / ("cfg" + params._OOB_CRED_SUFFIX)).symlink_to(victim)
+        monkeypatch.setattr(_tf, "mkdtemp", lambda *a, **k: str(d))
+        monkeypatch.setattr(params.__dict__.get("tempfile", _tf), "mkdtemp",
+                            lambda *a, **k: str(d), raising=False)
+        with params.blind_oob_credential("SEKRET") as cfg:
+            assert cfg is None, "a pre-existing path must be refused"
+        assert victim.read_text() == "untouched", "the symlink target was written through"
+        # …and the refusal leaves NO litter: unlinking a symlink removes the link, not its target
+        assert not d.exists(), "a refused creation left its directory behind"
+        assert victim.exists(), "…and it must not have deleted the target"
+
+    def test_no_file_at_all_without_a_secret(self):
+        with params.blind_oob_credential("") as cfg:
+            assert cfg is None
+
+    def test_a_stale_DANGLING_link_is_swept_too(self):
+        """A refused creation, or a killed run, can leave a symlink whose target is gone. `is_file()`
+        follows the link and answers False for a dangling one — which left the litter for ever."""
+        import tempfile as _tf, os as _os, time as _t
+        d = pathlib.Path(_tf.mkdtemp(prefix=params._OOB_CRED_PREFIX))
+        (d / ("cfg" + params._OOB_CRED_SUFFIX)).symlink_to(d / "does-not-exist")
+        old = _t.time() - 7200
+        _os.utime(d, (old, old))
+        assert params.sweep_stale_oob_creds() >= 1
+        assert not d.exists(), "a dangling link kept its directory alive"
+
+    def test_a_stale_credential_from_a_KILLED_run_is_swept(self):
+        import tempfile as _tf, os as _os, time as _t
+        d = pathlib.Path(_tf.mkdtemp(prefix=params._OOB_CRED_PREFIX))
+        f = d / ("cfg" + params._OOB_CRED_SUFFIX)
+        f.write_text('{"scan":{"blind_oob_secret":"LEFTOVER"}}')
+        old = _t.time() - 7200
+        _os.utime(d, (old, old))
+        assert params.sweep_stale_oob_creds() >= 1
+        assert not f.exists() and not d.exists()
+
+    def test_the_sweep_leaves_a_LIVE_scans_credential_alone(self):
+        with params.blind_oob_credential("SEKRET") as cfg:
+            params.sweep_stale_oob_creds()
+            assert cfg.is_file(), "a running scan's credential must not be swept"
+
+    def test_the_sweep_touches_nothing_it_did_not_create(self):
+        import tempfile as _tf
+        other = pathlib.Path(_tf.mkdtemp(prefix="someone-elses-"))
+        keep = other / "important.json"
+        keep.write_text("x")
+        import os as _os, time as _t
+        old = _t.time() - 7200
+        _os.utime(other, (old, old))
+        # …and an EMPTY foreign directory must survive too: a broad glob would rmdir it
+        empty = pathlib.Path(_tf.mkdtemp(prefix="someone-elses-empty-"))
+        _os.utime(empty, (old, old))
+        params.sweep_stale_oob_creds()
+        assert keep.exists(), "the sweep is not a glob over the temp dir"
+        assert empty.is_dir(), "the sweep removed a directory it did not create"
+
+    def test_the_lane_sweeps_before_it_writes_a_new_one(self):
+        import inspect
+        src = inspect.getsource(params._dalfox_xss_fast)
+        assert "sweep_stale_oob_creds()" in src
