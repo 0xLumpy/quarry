@@ -386,6 +386,16 @@ class RunResult:
     meta: dict = field(default_factory=dict)
 
     @property
+    def started(self) -> bool:
+        """Whether the PROCESS demonstrably started — a pid existed.
+
+        review#21 (Lumpy): "the credential is in hand" proves READINESS, not launch. A caller that
+        counts an invocation as having run needs the runner to say so: a missing binary, a cancelled
+        launch or a `Popen` that raised must never read as a process that ran. Set ONLY where a pid was
+        obtained, so absence is the safe answer."""
+        return self.meta.get("started") is True
+
+    @property
     def ok(self) -> bool:
         """Ran acceptably. review-B0r4#3: LIMITED belongs here — the execution was CLEAN and a provider
         cut it short, so excluding it would make an external limit read as 'did not run acceptably'."""
@@ -666,11 +676,13 @@ def run(
     # left the token in _CPU_INFLIGHT forever, so EVERY later tool looked concurrent and permanently
     # reported its CPU as unmeasured. A telemetry leak that outlives the failure that caused it.
     proc = None
+    started = False                               # review#21: proven by a pid, never inferred
     live_token = None
     group_settled = False                         # True once this run's process group needs no teardown
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 env=proc_env, cwd=_TOOL_CWD, start_new_session=True, **stdin_kw)
+        started = True                            # a pid exists: the process really did launch
         live_token = _register(proc)              # reachable by cancel_all() from the main thread
         if _CANCELLED.is_set():
             # cancellation latched between the check above and the launch: don't leave a new process
@@ -760,7 +772,7 @@ def run(
             wrote = True
         return RunResult(tool, cmd, Status.TIMED_OUT, None, dur, raw_path if wrote else None,
                          len(out.splitlines()), note=f"timed out after {timeout}s",
-                         cpu_s=cpu_s, peak_rss_mb=rss_mb)
+                         cpu_s=cpu_s, peak_rss_mb=rss_mb, meta={"started": started})
 
     if raw_path is not None:
         raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -772,6 +784,7 @@ def run(
         tool=tool, cmd=cmd, status=status, exit_code=proc.returncode, duration=dur,
         raw_path=raw_path if out else None, stdout_lines=len(out.splitlines()),
         stderr_tail=err_tail, note=note, cpu_s=cpu_s, peak_rss_mb=rss_mb,
+        meta={"started": started},
     )
 
 

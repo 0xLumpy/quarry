@@ -1977,6 +1977,16 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": completion, "evidence": evidence_map,
              "remainder": remainder, "terminal": terminal}))
 
+    # THE DECISION, recorded BEFORE execution — which is what it is: knowable up front, and it must
+    # survive a run that raises anywhere in the loop (review#21, Lumpy). `omitted=0` keeps it inert in
+    # the verdict: telemetry about a choice, never a coverage claim.
+    events.coverage_partial(
+        sid, kind=events.COVERAGE_SAMPLE, measure="blind_xss_policy", unit=f"{sid}.blind_oob.policy",
+        eligible=1, tested=1, omitted=0,
+        reason=(f"channel={_plan_for_run['channel']}"
+                + (f" backend={_plan_for_run['backend']} owner=dalfox"
+                   if _plan_for_run["armed"] else "")
+                + f": {_plan_for_run['reason']}"))
     events.tool_start(sid, cmd=["dalfox", "scan", "-i", "file", "<chunk>", "-f", "jsonl", "--skip-mining"],
                       input_total=len(cands), work_unit=scan_wu)
     t0 = time.monotonic()
@@ -2017,11 +2027,16 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 _oob["attempted"] += 1
             try:
                 with blind_oob_credential(_plan_for_run["secret"]) as _cred:
-                    if _plan_for_run["armed"]:
-                        _oob["launched"] += 1     # the credential is in hand; dalfox starts with it
                     res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof, len(batch), _cred),
                                     ok_codes=(0, 1),
                                     timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
+                    # PROVEN by the runner, never inferred: "the credential is in hand" is readiness,
+                    # and a missing binary, a cancelled launch or a Popen that raised must not read as a
+                    # process that ran with the armed channel (review#21, Lumpy).
+                    if _plan_for_run["armed"] and getattr(res, "started", False):
+                        _oob["launched"] += 1
+                    elif _plan_for_run["armed"]:
+                        _oob["why"] = _oob["why"] or f"dalfox did not start ({res.note or res.status})"
             except OobCredentialError as e:
                 # REFUSE, never fall back. Running the armed channel unauthenticated is a DIFFERENT scan
                 # from the one the operator configured, and it finishes cleanly with no callbacks —
@@ -2110,37 +2125,6 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
       # `-S`. Asserting "registered" or "polled" from a stderr substring is exactly the oracle this
       # codebase stopped trusting. A callback that ARRIVES is observable — it lands as a `V` finding with
       # `detection_method: oob` — so findings prove the channel worked; their absence proves nothing.
-      _plan = _plan_for_run
-      # TWO RECORDS, because they answer different questions (review#20, Lumpy). `armed` describes the
-      # POLICY the operator chose; it says nothing about whether any invocation actually ran with that
-      # channel. Emitting one record off `armed` let a run say both "not scanned, credential transport
-      # failed" and "the armed channel was tested" — in the same manifest.
-      #
-      # 1) THE DECISION. Knowable before execution, which is where Lumpy required it recorded. `omitted=0`
-      #    keeps it inert in the verdict: it is telemetry about a choice, never a coverage claim.
-      events.coverage_partial(
-          sid, kind=events.COVERAGE_SAMPLE, measure="blind_xss_policy", unit=f"{sid}.blind_oob.policy",
-          eligible=1, tested=1, omitted=0,
-          reason=(f"channel={_plan['channel']}"
-                  + (f" backend={_plan['backend']} owner=dalfox" if _plan["armed"] else "")
-                  + f": {_plan['reason']}"))
-      # 2) THE EXECUTION. Only ever about invocations this lifecycle actually attempted, and driven by
-      #    whether dalfox STARTED with the intended channel — not by what policy asked for. A lifecycle
-      #    that ran no chunk at all (everything already complete) asserts nothing here.
-      if _plan["armed"] and _oob["attempted"]:
-          _missed = _oob["attempted"] - _oob["launched"]
-          events.coverage_partial(
-              sid, kind=events.COVERAGE_TIMEOUT, measure="blind_xss_channel",
-              unit=f"{sid}.blind_oob", eligible=_oob["attempted"], tested=_oob["launched"],
-              omitted=_missed,
-              reason=(f"{_oob['launched']}/{_oob['attempted']} invocation(s) started with the armed "
-                      f"blind-XSS channel (backend={_plan['backend']}, owner=dalfox)"
-                      + (f" — {_missed} did NOT run it: {_oob['why'] or 'see the chunk records'}"
-                         if _missed else "")
-                      + "; dalfox's registration/poll/final-wait are stderr-only under -S and are NOT "
-                        "asserted here — an arriving callback is a `V` finding with "
-                        "detection_method=oob"))
-
       # TERMINAL COVERAGE, re-reported EVERY run from the persisted union — not from this attempt.
       # A gap no retry can close is a fact about the TARGET SET, so it must outlive the attempt that
       # observed it and reach a fresh process's manifest and verdict (review#15, Lumpy). `_save()` has
@@ -2186,6 +2170,28 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                     tiers[rec["template"]] = tiers.get(rec["template"], 0) + 1
       status = Status.PARTIAL if degraded else (Status.SUCCESS if matched else Status.EMPTY)
     finally:
+        # EXECUTION ACCOUNTING for the OOB channel, from a `finally` so an exception anywhere in the loop
+        # still leaves what was ATTEMPTED on the record (review#21, Lumpy). It never masks that
+        # exception: its own failure is swallowed, and the original propagates untouched.
+        try:
+            if _plan_for_run["armed"] and _oob["attempted"]:
+                _missed = _oob["attempted"] - _oob["launched"]
+                events.coverage_partial(
+                    sid, kind=events.COVERAGE_TIMEOUT, measure="blind_xss_channel",
+                    unit=f"{sid}.blind_oob", eligible=_oob["attempted"], tested=_oob["launched"],
+                    omitted=_missed,
+                    reason=(f"{_oob['launched']}/{_oob['attempted']} dalfox invocation(s) STARTED with "
+                            f"the armed blind-XSS channel (backend={_plan_for_run['backend']}, "
+                            f"owner=dalfox)"
+                            + (f" — {_missed} did not: {_oob['why'] or 'see the chunk records'}"
+                               if _missed else "")
+                            + "; dalfox's registration/poll/final-wait are stderr-only under -S and are "
+                              "NOT asserted here — an arriving callback is a `V` finding with "
+                              "detection_method=oob"))
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            pass                       # accounting must never replace the failure it is describing
         # C07 inc4: source terminal ALWAYS fires (even if the loop raised) — one source lifecycle, no dup.
         events.tool_finish(sid, status=status.value, work_unit=scan_wu,
                            reason=(f"{degraded}/{len(batches)} chunk(s) degraded" if degraded else None),

@@ -123,10 +123,16 @@ def _fresh(monkeypatch, tmp_path, engine="v3.1.2"):
     return _C(tmp_path)
 
 
-def _exec(artifact, rc):
+def _exec(artifact, rc, started=True):
+    """A fake runner result that carries the runner's OWN contract.
+
+    `meta["started"]` is how `runner.run` proves a process really launched (review#21): a fake that
+    omits it claims a launch the real runner would not, and any caller counting invocations would be
+    tested against a lie. `started=False` models a missing binary / refused launch."""
     def fx(t, cmd, timeout=None, **k):
         cf = pathlib.Path(cmd[cmd.index("-o") + 1]); cf.parent.mkdir(parents=True, exist_ok=True); cf.write_text(artifact)
-        return RunResult("dalfox", cmd, Status.SUCCESS if rc in (0, 1) else Status.FAILED, rc, 0.1, cf, 0)
+        return RunResult("dalfox", cmd, Status.SUCCESS if rc in (0, 1) else Status.FAILED, rc, 0.1, cf, 0,
+                         meta={"started": started})
     return fx
 
 
@@ -480,7 +486,7 @@ class TestARetryOwesOnlyWhatFailed:
             cf = pathlib.Path(cmd[cmd.index("-o") + 1]); cf.parent.mkdir(parents=True, exist_ok=True)
             cf.write_text(artifact)
             return RunResult("dalfox", cmd, Status.SUCCESS if rc in (0, 1) else Status.FAILED, rc, 0.1,
-                             cf, 0)
+                             cf, 0, meta={"started": True})
         return fx
 
     def test_only_the_RETRIABLE_target_is_re_requested(self, monkeypatch, tmp_path):
@@ -1144,7 +1150,7 @@ class TestPolicyIsNotExecution:
         params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
         chan = self._cov(tmp_path, "ok", "blind_xss_channel")
         assert chan[-1]["tested"] == 1 and chan[-1]["omitted"] == 0
-        assert "1/1 invocation(s) started with the armed blind-XSS channel" in chan[-1]["reason"]
+        assert "1/1 dalfox invocation(s) STARTED with the armed blind-XSS channel" in chan[-1]["reason"]
 
     def test_a_lifecycle_that_RAN_NOTHING_asserts_no_execution(self, monkeypatch, tmp_path):
         """Everything already complete: policy is still stated, execution claims nothing."""
@@ -1168,3 +1174,84 @@ class TestPolicyIsNotExecution:
         assert self._cov(tmp_path, "off", "blind_xss_channel") == []
         pol = self._cov(tmp_path, "off", "blind_xss_policy")
         assert pol and "channel=off" in pol[-1]["reason"] and pol[-1]["omitted"] == 0
+
+    def test_a_launch_that_never_happened_is_NOT_counted(self, monkeypatch, tmp_path):
+        """review#21 (Lumpy): `launched` incremented before `exec_tool`, so a missing binary, a refused
+        launch or a `Popen` that raised all counted as a process that ran with the armed channel."""
+        c = self._lane(monkeypatch, tmp_path, "nolaunch")
+        monkeypatch.setattr(secrets, "oob", lambda: {"interactsh_server": "oob.mine.test"})
+        monkeypatch.setattr(params, "exec_tool", _exec(META0, 0, started=False))
+        params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
+        chan = self._cov(tmp_path, "nolaunch", "blind_xss_channel")
+        assert chan and chan[-1]["tested"] == 0 and chan[-1]["omitted"] == 1, chan[-1]
+        assert "did not:" in chan[-1]["reason"] and "dalfox did not start" in chan[-1]["reason"]
+
+    def test_the_runner_only_claims_started_without_a_pid(self):
+        """The contract behind the counter. The paths that need no subprocess are asserted here; the
+        real-launch half is `integration` because spawning is blocked offline."""
+        from quarry_recon import runner
+        assert runner.skipped("x", "no key").started is False
+        assert runner.RunResult("t", [], Status.SUCCESS, 0, 0.0, None, 0).started is False, \
+            "absence must be the safe answer — a result that never says so did NOT start"
+        assert runner.RunResult("t", [], Status.SUCCESS, 0, 0.0, None, 0,
+                                meta={"started": True}).started is True
+
+    def test_a_missing_binary_never_claims_started(self, monkeypatch):
+        """No subprocess involved: `run` refuses before Popen when the binary is not on PATH."""
+        from quarry_recon import runner
+        monkeypatch.setattr(runner, "have", lambda b: False)
+        r = runner.run("nope-xyz-not-a-binary", ["nope-xyz-not-a-binary"])
+        assert r.status == Status.SKIPPED and r.started is False
+
+    def test_started_is_set_ONLY_once_Popen_returns(self, monkeypatch, tmp_path):
+        """Drives the REAL `runner.run` with a faked `Popen`, so the contract is exercised without
+        spawning anything — the offline gate blocks subprocess outright, marker or not."""
+        import subprocess as _sp
+        from quarry_recon import runner
+
+        class _Proc:
+            pid = 4242
+            returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return ("", "")
+
+            def poll(self):
+                return 0
+
+        monkeypatch.setattr(runner, "have", lambda b: True)
+        monkeypatch.setattr(_sp, "Popen", lambda *a, **k: _Proc())
+        assert runner.run("fake", ["fake"]).started is True
+
+        # …and a launch that RAISES must not claim it
+        def boom(*a, **k):
+            raise OSError("exec format error")
+        monkeypatch.setattr(_sp, "Popen", boom)
+        with pytest.raises(OSError):
+            runner.run("fake", ["fake"])
+
+    def test_BOTH_records_survive_an_exception_in_the_loop(self, monkeypatch, tmp_path):
+        """The policy is knowable before execution and the attempt is a fact — an exception must take
+        neither with it, and must itself arrive unchanged."""
+        c = self._lane(monkeypatch, tmp_path, "boom")
+        monkeypatch.setattr(secrets, "oob", lambda: {"interactsh_server": "oob.mine.test"})
+
+        def explode(*a, **k):
+            raise RuntimeError("bookkeeping blew up mid-loop")
+        monkeypatch.setattr(params, "exec_tool", explode)
+        with pytest.raises(RuntimeError, match="bookkeeping blew up"):
+            params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
+        assert self._cov(tmp_path, "boom", "blind_xss_policy"), "the decision was lost"
+        chan = self._cov(tmp_path, "boom", "blind_xss_channel")
+        assert chan and chan[-1]["tested"] == 0 and chan[-1]["omitted"] == 1, "the attempt was lost"
+
+    def test_the_policy_record_precedes_the_first_chunk(self, monkeypatch, tmp_path):
+        c = self._lane(monkeypatch, tmp_path, "order")
+        monkeypatch.setattr(secrets, "oob", lambda: {"interactsh_server": "oob.mine.test"})
+        monkeypatch.setattr(params, "exec_tool", _exec(META0, 0))
+        params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
+        evs = [json.loads(x) for x in (tmp_path / "order" / "events.jsonl").read_text().splitlines()]
+        pol = next(i for i, e in enumerate(evs) if e.get("measure") == "blind_xss_policy")
+        first_chunk = next(i for i, e in enumerate(evs)
+                           if e.get("event") == "tool_start" and e.get("input_total") == 1)
+        assert pol < first_chunk, "the decision must be on the record before anything runs"
