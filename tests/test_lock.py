@@ -220,9 +220,17 @@ class TestRealPins:
         nmap = next(t for t in registry.load_tools() if t.bin == "nmap")
         assert nmap.policy == "distro" and nmap.pin is None
 
+    def test_the_artifact_URL_CARRIES_the_pin(self):
+        """A half-done bump — `version:` moved, URLs left behind — installs the OLD release and then
+        rejects it as drift. The pin and the bytes it names have to agree in the file itself."""
+        for t in registry.load_tools():
+            for plat, a in (t.artifacts or {}).items():
+                assert t.pin, f"{t.bin} has artifacts but no pin"
+                assert t.pin in a["url"], f"{t.bin} {plat}: pin {t.pin} not in {a['url']}"
+
     def test_binary_tools_pinned_with_artifacts(self):
         ts = {t.bin: t for t in registry.load_tools()}
-        for b in ("gitleaks", "trufflehog"):
+        for b in ("gitleaks", "trufflehog", "dalfox"):
             t = ts[b]
             assert t.pin and t.repo and t.runtime == "binary"
             assert set(t.artifacts) >= {"linux/amd64", "linux/arm64"}
@@ -254,6 +262,18 @@ class TestBinarySourceInstall:
         cmd = registry.pinned_install(t)
         assert "gl_amd64.tgz" in cmd and _VALID_SHA in cmd and "sha256sum -c" in cmd
         assert "gl_arm64.tgz" not in cmd                      # only THIS platform's artifact
+
+    def test_every_REAL_binary_install_verifies_its_digest_before_use(self):
+        """What actually protects a MISTYPED sha256: nothing in this suite can know the true digest of a
+        remote artifact, so the guarantee has to be that a wrong one FAILS CLOSED. Every real binary
+        install pipes the pinned digest through `sha256sum -c -` before the tarball is opened, so a typo
+        aborts the install instead of activating unverified bytes."""
+        for t in registry.load_tools():
+            if t.runtime != "binary":
+                continue
+            cmd = t.install or ""
+            assert "{sha256}" in cmd and "sha256sum -c" in cmd, f"{t.bin} installs without checking a digest"
+            assert cmd.index("sha256sum -c") < cmd.index("tar -xzf"), f"{t.bin} unpacks BEFORE verifying"
 
     def test_binary_missing_platform_returns_none(self, monkeypatch):
         monkeypatch.setattr(registry, "current_platform", lambda: "linux/riscv64")
@@ -394,7 +414,14 @@ class TestInstallOne:
                 stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text(stage_content)
             return (0, "")
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: probe)   # capability rc + version text
+        # a LIST of results is consumed one per call, so a test can make the capability probe succeed and
+        # the SECOND (version) invocation fail — they are separate process runs, not one fact.
+        if isinstance(probe, list):
+            seq = list(probe)
+            monkeypatch.setattr(registry, "_probe",
+                                lambda c, timeout=15: seq.pop(0) if seq else (127, ""))
+        else:
+            monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: probe)
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(dest))     # managed dest resolves (no shadow)
         t = _tool(bin="gitleaks", runtime="binary", pin="v8.30.1", version_cmd="gitleaks version",
                   artifacts={"linux/amd64": {"url": "https://x/g.tgz", "sha256": _VALID_SHA}},
@@ -416,6 +443,53 @@ class TestInstallOne:
         t, stage, dest = self._binary(monkeypatch, tmp_path, probe=(0, "v1.2.3"), old="OLD-WORKING")
         assert registry.install_one(t, lambda m: None) is False
         assert dest.read_text() == "OLD-WORKING" and not stage.exists()
+
+    def test_a_FAILING_SECOND_probe_cannot_launder_a_scraped_token_into_the_pin(self, monkeypatch, tmp_path):
+        """review#20 (Lumpy), and I had this wrong: I argued the capability probe already gated this,
+        because it runs first with the same accepted set. It does not. It is a SEPARATE INVOCATION — and
+        for the 5 tools with a distinct `capability` it is not even the same command. Capability can
+        succeed and the version run that follows can fail, print help, and hand over a version-shaped
+        token (`Mozilla/5.0`) that COINCIDES with the pin — activating a binary whose version command
+        does not work."""
+        t, stage, dest = self._binary(
+            monkeypatch, tmp_path, old="OLD-WORKING",
+            probe=[(0, "gitleaks v5.0"),                                  # capability: succeeds
+                   (1, "Error: unknown flag\n --user-agent 'Mozilla/5.0'\n")])  # version: FAILS, scrapes 5.0
+        assert registry.install_one(replace(t, pin="v5.0"), lambda m: None) is False
+        assert dest.read_text() == "OLD-WORKING" and not stage.exists()
+
+    def test_declaring_cap_codes_does_not_widen_the_STAGED_version_check(self, monkeypatch, tmp_path):
+        """The install-side half of review#20's second point. A help-probe tool declares `cap_codes:
+        [0, 1]`; if the staged version check reused that set, its failing version run would be accepted
+        and the scraped `Mozilla/5.0` would satisfy a `v5.0` pin. `version_codes` is the axis, and it
+        still defaults to {0} no matter what capability accepts."""
+        t, stage, dest = self._binary(
+            monkeypatch, tmp_path, old="OLD-WORKING",
+            probe=[(1, "usage: gitleaks [command]"),                      # capability: DECLARED success
+                   (1, "Error: unknown flag\n --user-agent 'Mozilla/5.0'\n")])   # version: failed
+        t = replace(t, pin="v5.0", cap_codes=[0, 1])
+        assert registry.install_one(t, lambda m: None) is False
+        assert dest.read_text() == "OLD-WORKING" and not stage.exists()
+
+    def test_declaring_version_codes_DOES_accept_that_exit_code(self, monkeypatch, tmp_path):
+        """The other half, and the reason nothing declares it: `version_codes: [0, 1]` is an operator
+        statement that THIS tool's version output is trustworthy on exit 1 — after which the scrape is
+        accepted like any other version. The field is deliberately narrow, not a general loosening.
+        (Fresh harness: the probe results are consumed one per call, so reusing an exhausted sequence
+        would make a second install fail for an unrelated reason and pass this test by accident.)"""
+        t, stage, dest = self._binary(
+            monkeypatch, tmp_path,
+            probe=[(1, "usage: gitleaks [command]"), (1, "gitleaks version v5.0")])
+        assert registry.install_one(replace(t, pin="v5.0", cap_codes=[0, 1],
+                                            version_codes=[0, 1]), lambda m: None) is True
+        assert dest.read_text() == "NEW"
+
+    def test_the_same_sequence_activates_once_the_version_probe_SUCCEEDS(self, monkeypatch, tmp_path):
+        """The control: it is the failing exit code that stops it, not the help text or the pin value."""
+        t, stage, dest = self._binary(monkeypatch, tmp_path,
+                                      probe=[(0, "gitleaks v5.0"), (0, "gitleaks v5.0")])
+        assert registry.install_one(replace(t, pin="v5.0"), lambda m: None) is True
+        assert dest.read_text() == "NEW"
 
     def test_source_receipt_write_failure_fails_verification(self, monkeypatch, tmp_path):
         # review-C08.2r2#4/r4#2: a receipt-write failure (after activation) must FAIL verification, not report
@@ -764,6 +838,48 @@ class TestIdentityR6:
         assert registry.install_one(t, msgs.append) is False
         assert not (tmp_path / ".local" / "bin" / ".gitleaks.lock").exists()   # no receipt written
         assert any("hash" in m for m in msgs)
+
+
+class TestAFailedProbeHasNoVersionToReport:
+    """dalfox v2 answered `--version` with `Error: unknown flag: --version` and then its HELP text, whose
+    first version-shaped token is the `Mozilla/5.0` in a default User-Agent. Quarry reported that tool as
+    version "5.0" — a confident number scraped out of an error, which then hid the real defect (the wrong
+    binary was on PATH). A probe that failed knows nothing about the version."""
+
+    V2_HELP = ("Error: unknown flag: --version\n"
+               "Usage:\n  dalfox [command]\n"
+               "  --user-agent string   User-Agent (default \"Mozilla/5.0 (Windows NT 10.0)\")\n")
+
+    def _probe(self, monkeypatch, rc, out):
+        monkeypatch.setattr(registry, "_probe", lambda *a, **k: (rc, out))
+        monkeypatch.setattr(Tool, "installed", property(lambda self: True))
+
+    def test_the_old_defect_verbatim(self, monkeypatch):
+        assert registry._parse_version(self.V2_HELP) == "5.0", "fixture must reproduce the scrape"
+        self._probe(monkeypatch, 1, self.V2_HELP)
+        assert _tool(bin="dalfox", version_cmd="dalfox --version").version() == ""
+
+    def test_a_successful_probe_still_reports(self, monkeypatch):
+        self._probe(monkeypatch, 0, "dalfox 3.2.0\n")
+        assert _tool(bin="dalfox", version_cmd="dalfox --version").version() == "3.2.0"
+
+    def test_cap_codes_do_NOT_unlock_a_version(self, monkeypatch):
+        """review#20 (Lumpy): `cap_codes: [0, 1]` — declared by 14 tools whose probe is a help screen —
+        says the BINARY RUNS. It does not say a failed command's output carries a version. Two questions,
+        two fields; overloading one of them is how a scraped token gets a second chance."""
+        self._probe(monkeypatch, 1, "gau version 2.2.4\n")
+        assert _tool(bin="gau", version_cmd="gau --version", cap_codes=[0, 1]).version() == ""
+        assert _tool(bin="gau", version_cmd="gau --version",
+                     version_codes=[0, 1]).version() == "2.2.4", "the version axis is the one that unlocks it"
+
+    def test_nothing_declares_version_codes_yet_and_that_is_measured(self):
+        """The field is an escape hatch, not a knob in use: 0 of 29 installed tools with a version probe
+        exit non-zero (measured 2026-08-06). If the fresh-install box meets one, it is a yaml line."""
+        assert [t.bin for t in registry.load_tools() if t.version_codes] == []
+
+    def test_a_probe_that_never_RAN_is_uncapturable(self, monkeypatch):
+        self._probe(monkeypatch, registry._PROBE_NOT_RUN, "")
+        assert _tool(bin="x", version_cmd="x --version", version_codes=[0, 1]).version() == ""
 
 
 class TestDoctorVersion:

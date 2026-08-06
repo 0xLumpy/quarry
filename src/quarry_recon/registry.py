@@ -51,11 +51,12 @@ def _validate_lock(bin_: str, t: dict) -> None:
             _bad("source `ref` must be a non-empty commit/tag")
         if str(ref).strip().lower() in _SENTINEL_PINS:      # review-C08.2r4#6: `ref: main` is a FLOATING ref
             _bad(f"ref {ref!r} is a floating sentinel — pin an exact commit/tag")
-    cc = t.get("cap_codes")
-    if cc is not None:                                       # review-C08.2r3/r4#6: unique STRICT ints (not bool!) 0..255
-        if (not isinstance(cc, list) or not cc or len(cc) != len(set(cc))
-                or not all(type(x) is int and 0 <= x <= 255 for x in cc)):   # bool is an int subclass -> type() is
-            _bad(f"cap_codes must be a non-empty list of unique ints (not bools) in 0..255, got {cc!r}")
+    for _codes_key in ("cap_codes", "version_codes"):        # review-C08.2r3/r4#6 + review#20: same shape rules
+        cc = t.get(_codes_key)
+        if cc is not None:                                   # unique STRICT ints (not bool!) 0..255
+            if (not isinstance(cc, list) or not cc or len(cc) != len(set(cc))
+                    or not all(type(x) is int and 0 <= x <= 255 for x in cc)):  # bool is an int subclass
+                _bad(f"{_codes_key} must be a non-empty list of unique ints (not bools) in 0..255, got {cc!r}")
     for key in ("ref", "policy", "capability", "release"):
         val = t.get(key)
         if val is not None and (not isinstance(val, str) or not val.strip()):
@@ -123,6 +124,12 @@ class Tool:
     policy: str | None = None              # e.g. "distro" — pinning delegated (apt)
     capability: str | None = None
     cap_codes: list | None = None          # accepted capability exit codes (default [0]); explicit per tool
+    # accepted exit codes for the VERSION probe, default exactly [0] — a SEPARATE axis from `cap_codes`
+    # (review#20, Lumpy). `cap_codes: [0, 1]` says "this tool's help screen exits 1 and that still proves
+    # the binary runs". It does NOT say the output of a failed version command carries a trustworthy
+    # version. Nothing declares this today: measured 2026-08-06, 0 of 29 installed tools with a version
+    # probe exit non-zero. It exists so meeting one is a yaml line, not a reason to loosen `cap_codes`.
+    version_codes: list | None = None
     # `repo` = the upstream "owner/name" for binary/source tools — the UPSTREAM IDENTITY a future automated
     # `quarry lock --refresh` reads to discover release/commit candidates via the GitHub API (go/pipx identities
     # are parseable from the install string, so they don't need it). Structured so refresh stays one-command.
@@ -147,10 +154,21 @@ class Tool:
 
     def version(self) -> str:
         """A clean version string ('v2.14.0', '2.2.4') — never the tool's ASCII banner. review-C08.1#1: "" when
-        no version token parses (UNCAPTURABLE — never a trusted pin)."""
+        no version token parses (UNCAPTURABLE — never a trusted pin).
+
+        The EXIT CODE gates the parse (2026-08-06). A probe that FAILED prints whatever the tool prints on
+        failure, and that is usually its help text — dalfox v2 answers `--version` with `Error: unknown flag`
+        followed by help, and the first version-shaped token in it is the `Mozilla/5.0` in a default
+        User-Agent. Quarry reported that tool as version "5.0": a confident number, scraped from an error.
+        A failed probe knows NOTHING about the version, so it says nothing.
+
+        Gated on `version_codes` (default `{0}`), NOT on `cap_codes` (review#20, Lumpy): the 14 tools that
+        declare `[0, 1]` are saying a help screen exiting 1 proves the BINARY RUNS, which is a different
+        claim from "this output carries a version"."""
         if not self.installed or not self.version_cmd:
             return ""
-        return _parse_version(_probe(self.version_cmd)[1])
+        rc, out = _probe(self.version_cmd)
+        return _parse_version(out) if _version_ok(rc, self.version_codes) else ""
 
 
 _PROBE_NOT_RUN = -1     # review-C08.2r3#1: a DISTINCT "not executed / timed out" state — never an accepted cap code
@@ -193,6 +211,7 @@ def load_tools() -> list[Tool]:
             pin=t.get("version"), artifacts=t.get("artifacts"), ref=t.get("ref"),
             policy=t.get("policy"), capability=t.get("capability"), cap_codes=t.get("cap_codes"),
             repo=t.get("repo"), maintenance_state=t.get("maintenance_state"), release=t.get("release"),
+            version_codes=t.get("version_codes"),
         ))
     return tools
 
@@ -464,6 +483,15 @@ def _capability_ok(rc: int, accepted=None) -> bool:
     return rc in (accepted or {0})
 
 
+def _version_ok(rc: int, declared=None) -> bool:
+    """May a version be READ out of a probe that exited `rc`? Default exactly {0}.
+
+    review#20 (Lumpy): reusing `cap_codes` here gave that field two meanings. Capability asks "does this
+    binary run at all" — a help screen exiting 1 answers yes. Version asks "is this output a version
+    statement", and a command that failed did not make one. Separate question, separate codes."""
+    return rc in (set(declared) if declared else {0})
+
+
 def health(t: Tool) -> dict:
     """The SINGLE-probe health snapshot shared by `verify_installed` (install) and `doctor` (audit) — so
     doctor's ✓ means EXACTLY what install's verify means (identity drift 'ok'/'distro' AND capability pass),
@@ -527,7 +555,13 @@ def install_one(t: Tool, echo, dry_run: bool = False) -> bool:
         # review-C08.2r2#4: a WORKING binary from the WRONG release must not pass — parse the staged binary's
         # version and require it to match the pin (binary tools; source uses the receipt below).
         if t.pin and t.runtime == "binary" and t.version_cmd:
-            sv = _parse_version(_probe(t.version_cmd.replace(t.bin, str(stage), 1))[1])
+            # review#20 (Lumpy): this is a SECOND, INDEPENDENT invocation — the capability probe succeeding
+            # says nothing about whether THIS one did, and for the 5 tools with a distinct `capability` it
+            # is not even the same command. An ungated parse here recreates the laundering defect at
+            # install time: a failed version command prints help, and a version-shaped token in that help
+            # can coincide with the pin, activating a binary whose version command does not work.
+            _rc, _out = _probe(t.version_cmd.replace(t.bin, str(stage), 1))
+            sv = _parse_version(_out) if _version_ok(_rc, t.version_codes) else ""
             if not version_eq(sv, t.pin):
                 stage.unlink(missing_ok=True)
                 echo(f"{t.bin}: staged version {sv!r} != pin {t.pin} — wrong release, NOT activated")

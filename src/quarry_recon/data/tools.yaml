@@ -504,12 +504,16 @@ tools:
     # (no glibc/Rust dep at runtime, cross-distro) with per-platform sha256 artifacts -> C08 `binary` runtime; go
     # install no longer applies. The tarball nests the binary under a versioned dir, so the stage step strips it
     # (--strip-components=1 --wildcards "*/{bin}"). v3 flags + JSONL parse live in params.py (_dalfox_cmd + _parse_dalfox_jsonl).
-    version: "v3.1.2"
+    # 3.2.0 (2026-08-02). Bumped because the lane now READS the meta row: 3.2.0 emits
+    # meta.incomplete / target_summary[] (status + error_code) / total_requests / targets_deduplicated,
+    # which is how the lane tells a SKIPPED target from a clean one, plus native --blind-oob for 4.3.D.
+    # Both artifact digests were computed from the downloaded bytes, not copied from the sidecar file.
+    version: "v3.2.0"
     repo: hahwul/dalfox
     runtime: binary
     artifacts:
-      linux/amd64: {url: "https://github.com/hahwul/dalfox/releases/download/v3.1.2/dalfox-v3.1.2-linux-x86_64-musl.tar.gz",  sha256: "0818b75082bf8527c5c4b6f4ed0f745f393290637328335788c9eadfea6cf0b2"}
-      linux/arm64: {url: "https://github.com/hahwul/dalfox/releases/download/v3.1.2/dalfox-v3.1.2-linux-aarch64-musl.tar.gz", sha256: "d21f541038a40d8dd5c4b655fb88159a4b9a75c63f61c3e244647326a5199bc2"}
+      linux/amd64: {url: "https://github.com/hahwul/dalfox/releases/download/v3.2.0/dalfox-v3.2.0-linux-x86_64-musl.tar.gz",  sha256: "4664e8dac304d35f4537655bf9b64ef6c529d47c485ec2610112b3328b3e51f9"}
+      linux/arm64: {url: "https://github.com/hahwul/dalfox/releases/download/v3.2.0/dalfox-v3.2.0-linux-aarch64-musl.tar.gz", sha256: "e64e585f9bec69b6f40380c7be57de3b49131560c744f9bc9d71789afb5604a2"}
     install: 'mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o /tmp/{bin}.tgz && echo "{sha256}  /tmp/{bin}.tgz" | sha256sum -c - && tar -xzf /tmp/{bin}.tgz -C ~/.local/bin/.stage --strip-components=1 --wildcards "*/{bin}" && chmod +x ~/.local/bin/.stage/{bin} && rm -f /tmp/{bin}.tgz'
     version_cmd: dalfox --version
     doc: https://github.com/hahwul/dalfox
