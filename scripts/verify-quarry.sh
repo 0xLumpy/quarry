@@ -2854,13 +2854,41 @@ c_flags = (cmd[:5]==["dalfox","scan","-i","file","i"] and cmd[cmd.index("-f")+1]
            and cmd[cmd.index("-b")+1]=="https://col.example" and cmd[cmd.index("--rate-limit")+1]=="7"
            and "-w" not in cmd and "--max-cpu" not in cmd and "--skip-headless" not in cmd and "--delay" not in cmd)
 def _p(txt):
+    # review#13: the parser returns a STRUCTURED artifact, not one boolean. `.readable` is the
+    # structural verdict these cases assert; completeness is a separate question (c_meta below).
     p=pathlib.Path(tempfile.mktemp()); p.write_text(txt); return _parse_dalfox_jsonl(p)
-fnd, okp = _p('{"meta":{"findings_count":1}}\n{"type":"V","param":"q","data":"http://h/search?q=1","method":"GET","location":"Query"}\n')
-c_parse=(okp and len(fnd)==1 and fnd[0]["template"]=="xss-verified" and fnd[0]["confidence"]=="verified" and fnd[0]["confirmed"] is False)
-c_failclosed=(not _p('{"meta":{"findings_count":2}}\n{"type":"R","param":"q","data":"http://h/p?q=1"}\n')[1]
-              and not _p('{"type":"R","param":"q","data":"http://h/p?q=1"}\n')[1]
-              and not _p('{"meta":{"findings_count":1}}\n{"type":"Z","param":"q","data":"http://h/p?q=1"}\n')[1]
-              and not _p('{"meta":{"findings_count":1}}\n{"type":"R","param":"q","data":"http://h:bad/p?q=1"}\n')[1])
+fnd, art = _p('{"meta":{"findings_count":1}}\n{"type":"V","param":"q","data":"http://h/search?q=1","method":"GET","location":"Query"}\n')
+c_parse=(art.readable and len(fnd)==1 and fnd[0]["template"]=="xss-verified" and fnd[0]["confidence"]=="verified" and fnd[0]["confirmed"] is False)
+c_failclosed=(not _p('{"meta":{"findings_count":2}}\n{"type":"R","param":"q","data":"http://h/p?q=1"}\n')[1].readable
+              and not _p('{"type":"R","param":"q","data":"http://h/p?q=1"}\n')[1].readable
+              and not _p('{"meta":{"findings_count":1}}\n{"type":"Z","param":"q","data":"http://h/p?q=1"}\n')[1].readable
+              and not _p('{"meta":{"findings_count":1}}\n{"type":"R","param":"q","data":"http://h:bad/p?q=1"}\n')[1].readable)
+# review#13 (Lumpy, P1): the META ROW is read, not just counted. A batch dalfox flagged incomplete, or
+# whose targets it SKIPPED, used to parse as clean and become resumably complete. Structural validity
+# and scan completeness are DIFFERENT questions and must not collapse into one boolean again.
+def _meta(**kw):
+    m={"dalfox_version":"3.2.0","findings_count":0,"incomplete":False,
+       "target_summary":[{"target":"http://h/a","status":"clean","findings_count":0}]}
+    m.update(kw); return json.dumps({"meta":m})+"\n"
+def _sk(code,status="skipped"):
+    return _meta(target_summary=[{"target":"http://h/b","status":status,"error_code":code,"findings_count":0}])
+a_clean=_p(_meta())[1]; a_inc=_p(_meta(incomplete=True))[1]
+a_retry=_p(_sk("SESSION_LOST"))[1]; a_det=_p(_sk("TRUNCATED_PER_HOST_CAP"))[1]
+a_unk=_p(_sk("SOMETHING_NEW"))[1]
+c_meta=(a_clean.complete and a_clean.execution_done and a_clean.version=="3.2.0"
+        # `incomplete` is dalfox's own "do not trust this run" -> readable, but NOT finished
+        and a_inc.readable and not a_inc.complete and not a_inc.execution_done
+        # RETRIABLE: a later attempt may cover it -> the chunk stays unfinished
+        and a_retry.retriable and not a_retry.execution_done
+        # DETERMINISTIC: retrying omits the same targets for ever -> execution done, gap is COVERAGE
+        and a_det.deterministic and a_det.execution_done and not a_det.complete
+        # an omission we cannot explain must never become a finished chunk
+        and a_unk.unclassified and not a_unk.execution_done
+        and "TRUNCATED_PER_HOST_CAP" in a_det.coverage_reason())
+# PREVENTATIVE: dalfox's own membership cap (--max-targets-per-host, default 100) must never decide
+# Quarry's membership — pass a value that cannot truncate the chunk we submitted.
+_c250 = _dalfox_cmd("i","o",prof,250)
+c_hostcap = int(_c250[_c250.index("--max-targets-per-host")+1]) >= 250
 class _R:
     def __init__(s,d): s.dir=d; s.added=[]
     def raw_path(s,ph,tl,nm):
@@ -2901,7 +2929,7 @@ _dxf=sources.get("params.dalfox_xss_fast"); _rs=str(_dxf.get("notes",""))+str(_d
 c_regtruth=("--mass" not in _rs and "--max-cpu" not in _rs and "--format json" not in _rs and "--skip-headless" not in _rs)
 psrc=inspect.getsource(params)
 c_src=("_parse_dalfox_jsonl" in psrc and "attempt_" in psrc and "_dalfox_engine_id" in psrc and '"chunks"' in psrc and '"evidence"' in psrc)
-sys.exit(0 if (c_reg and c_flags and c_parse and c_failclosed and c_success and c_empty and c_disagree and c_ledger and c_regtruth and c_src) else 1)
+sys.exit(0 if (c_reg and c_flags and c_parse and c_failclosed and c_meta and c_hostcap and c_success and c_empty and c_disagree and c_ledger and c_regtruth and c_src) else 1)
 PYEOF
 echo "[95] control-plane step 4.3.C — params.redirect_confirm NATIVE open-redirect probe (no dalfox): inject a canary host into the redirect param, read Location WITHOUT following (fetch.redirect_location, scoped + rate-paced + non-mutating); confirmed only when the Location HOST is the canary (relative/same-host Location is NOT a finding); candidate wording (open-redirect-candidate, confirmed:false); source-level events + ledger(raw->canonical->confirmed). Legacy dalfox redirect pass removed; registry flipped pending->wired; dalfox no longer touches redirect"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "redirect_confirm native probe: canary-host Location confirms, relative/same-host does NOT, out-of-scope skipped; open-redirect-candidate confirmed:false; source events; no dalfox; registry wired (not pending); fetch.redirect_location no-follow" || no "step 4.3.C redirect_confirm broken"

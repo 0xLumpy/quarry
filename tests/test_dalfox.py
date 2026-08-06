@@ -20,6 +20,16 @@ R_ROW = '{"type":"R","param":"q","data":"http://h/p?q=1","method":"GET","locatio
 
 
 def _p(txt):
+    """(findings, READABLE) — the structural verdict this suite was written against.
+
+    review#13 (Lumpy) split the parser's single boolean into separate facts: `readable` is the
+    structural one these cases assert, and completeness/skips are asked separately (see
+    `TestMetaRowIsRead`). `_art` returns the whole record for the tests that need it."""
+    f, art = _art(txt)
+    return f, art.readable
+
+
+def _art(txt):
     p = pathlib.Path(tempfile.mktemp()); p.write_text(txt)
     return params._parse_dalfox_jsonl(p)
 
@@ -49,7 +59,8 @@ class TestParserMatrix:
         assert ok is False
 
     def test_missing_file(self):
-        assert params._parse_dalfox_jsonl(pathlib.Path("/nonexistent/x.jsonl")) == ([], False)
+        f, art = params._parse_dalfox_jsonl(pathlib.Path("/nonexistent/x.jsonl"))
+        assert f == [] and art.readable is False
 
     def test_bad_port_row_dropped_but_valid_row_kept(self):
         # review-r9#3: a bad-port row is rejected (ok=False) but MUST NOT abort the parse — a valid row survives
@@ -305,3 +316,123 @@ class TestProvenance:
         params._dalfox_xss_fast(c, ["http://h/p?q="], _Prof())
         raw_refs = {rr for (i, rr) in calls if i.startswith("xss-candidate:")}
         assert len(raw_refs) == 2 and len(c.run.added) == 1   # both attempts' raw_refs reached add(); deduped to 1 entity
+
+
+class TestMetaRowIsRead:
+    """review#13 (Lumpy, P1): `_parse_dalfox_jsonl` validated only `findings_count`, so a batch with
+    `meta.incomplete=true`, `SESSION_LOST` or `TRUNCATED_PER_HOST_CAP` parsed as clean and became
+    resumably complete. dalfox reports those honestly — Quarry threw them away.
+
+    Field names and values taken from a REAL 3.2.0 artifact and from dalfox's own source
+    (`src/cmd/mod.rs` error codes, `src/cmd/scan/output.rs` statuses)."""
+
+    @staticmethod
+    def _meta(**kw):
+        import json
+        m = {"dalfox_version": "3.2.0", "findings_count": 0, "incomplete": False,
+             "total_requests": 21, "targets_deduplicated": 0,
+             "target_summary": [{"target": "http://h/a", "status": "clean", "findings_count": 0}]}
+        m.update(kw)
+        return json.dumps({"meta": m}) + "\n"
+
+    @staticmethod
+    def _t(target, status, code=None):
+        d = {"target": target, "status": status, "findings_count": 0}
+        if code:
+            d["error_code"] = code
+        return d
+
+    def test_a_clean_batch_is_complete_and_execution_done(self):
+        _f, art = _art(self._meta())
+        assert art.readable and art.complete and art.execution_done
+        assert art.skipped == () and art.version == "3.2.0"
+        assert art.total_requests == 21 and art.deduplicated == 0
+        assert art.coverage_reason() == "every target covered"
+
+    def test_meta_incomplete_is_NOT_a_finished_batch(self):
+        """`meta.incomplete` is dalfox's own "do not trust this run" flag."""
+        _f, art = _art(self._meta(incomplete=True))
+        assert art.readable, "the artifact still PARSES — that is a separate question"
+        assert not art.complete and not art.execution_done
+        assert "session died" in art.coverage_reason()
+
+    def test_a_SKIPPED_target_is_not_covered(self):
+        _f, art = _art(self._meta(target_summary=[
+            self._t("http://h/a", "clean"), self._t("http://h/b", "skipped", "SESSION_LOST")]))
+        assert art.readable and not art.complete
+        assert len(art.skipped) == 1 and art.skipped[0][0] == "http://h/b"
+
+    def test_a_RETRIABLE_omission_keeps_the_chunk_unfinished(self):
+        """The environment failed; a later attempt may cover it. The chunk must NOT be recorded done."""
+        for code in ("CONNECTION_FAILED", "DNS_RESOLUTION_FAILED", "TLS_HANDSHAKE_FAILED",
+                     "REQUEST_TIMEOUT", "SESSION_LOST"):
+            _f, art = _art(self._meta(target_summary=[self._t("http://h/b", "skipped", code)]))
+            assert art.retriable and not art.execution_done, code
+            assert code in art.coverage_reason()
+
+    def test_a_DETERMINISTIC_omission_finishes_the_chunk_and_is_REPORTED(self):
+        """Retrying omits exactly the same targets for ever, so execution is done — and the gap is
+        coverage, not a retry (`quarry-execution-vs-coverage`)."""
+        for code in ("CONTENT_TYPE_MISMATCH", "TRUNCATED_PER_HOST_CAP"):
+            _f, art = _art(self._meta(target_summary=[self._t("http://h/b", "skipped", code)]))
+            assert art.deterministic and art.execution_done, code
+            assert not art.complete, "…but the batch is NOT complete"
+            assert code in art.coverage_reason()
+
+    def test_an_UNKNOWN_code_is_treated_as_retriable(self):
+        """dalfox may gain other incomplete states. An omission we cannot explain must not silently
+        become a finished chunk."""
+        _f, art = _art(self._meta(target_summary=[self._t("http://h/b", "skipped", "SOMETHING_NEW")]))
+        assert art.unclassified and not art.execution_done
+        assert "unclassified" in art.coverage_reason()
+
+    def test_status_incomplete_counts_as_not_covered(self):
+        """dalfox: "the distinction that matters to a consumer: neither is `clean`"."""
+        _f, art = _art(self._meta(target_summary=[
+            self._t("http://h/b", "incomplete", "SESSION_LOST")]))
+        assert len(art.skipped) == 1 and not art.execution_done
+
+    def test_a_TORN_artifact_is_unreadable_regardless_of_meta(self):
+        """Structural validity and scan completeness are DIFFERENT questions — the whole point of the
+        split. A perfect meta row does not rescue a torn artifact."""
+        _f, art = _art(self._meta(findings_count=5))          # count disagrees with 0 findings
+        assert not art.readable and not art.execution_done
+
+    def test_findings_survive_an_incomplete_batch(self):
+        """Valid findings are kept whatever the batch's disposition — they are evidence we paid for."""
+        f, art = _art(self._meta(findings_count=1, incomplete=True) + R_ROW)
+        assert len(f) == 1 and art.readable and not art.execution_done
+
+    def test_the_REAL_302_artifact_shape_parses(self):
+        """The exact meta row a 3.2.0 run produced on this box."""
+        real = ('{"meta":{"dalfox_version":"3.2.0","dedup_mode":"exact","findings_count":0,'
+                '"incomplete":false,"scan_duration_ms":1044,"target_summary":[{"findings_count":0,'
+                '"status":"clean","target":"http://127.0.0.1:8731/?q=1"}],"targets":["batch.txt"],'
+                '"targets_deduplicated":0,"total_requests":21}}\n')
+        _f, art = _art(real)
+        assert art.readable and art.complete and art.execution_done and art.version == "3.2.0"
+
+
+class TestTheCapCannotDecideOurMembership:
+    """dalfox's `--max-targets-per-host` (default 100) DROPS targets past it. Preventative (Lumpy): pass
+    a value that cannot truncate the chunk we submitted, so the cap can never decide Quarry's membership
+    whatever `DALFOX_CHUNK` is set to. The meta row is still parsed — dalfox may gain other states."""
+
+    @staticmethod
+    def _cmd(batch_len):
+        prof = type("P", (), {"http_rl": 0})()
+        return params._dalfox_cmd("b.txt", "o.jsonl", prof, batch_len)
+
+    def test_the_per_host_value_covers_the_whole_chunk(self):
+        for n in (1, 40, 250, 5000):
+            cmd = self._cmd(n)
+            i = cmd.index("--max-targets-per-host")
+            assert int(cmd[i + 1]) >= n, n
+
+    def test_a_chunk_LARGER_than_dalfox_default_is_not_truncated(self):
+        """The case that bites: an operator raises DALFOX_CHUNK past dalfox's default of 100."""
+        cmd = self._cmd(250)
+        assert int(cmd[cmd.index("--max-targets-per-host") + 1]) == 250
+
+    def test_it_is_never_zero(self):
+        assert int(self._cmd(0)[self._cmd(0).index("--max-targets-per-host") + 1]) >= 1

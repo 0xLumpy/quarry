@@ -7,12 +7,14 @@ confirmation (design §7) — entities carry confirmed:false.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
 import re
 import time
 from bisect import insort
+from dataclasses import dataclass, field
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -1270,7 +1272,7 @@ def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
     return reps, stats
 
 
-def _dalfox_cmd(batch_file, out_file, prof) -> list[str]:
+def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0) -> list[str]:
     """dalfox v3 (Rust) reflected-XSS scan (v0.3.8). v3 replaced the headless browser with static AST DOM
     analysis, so v2's --skip-headless timekiller is GONE; params are pre-discovered (arjun/gf), so --skip-mining
     stays. Output is structured JSONL to the -o file; -S keeps captured output minimal (status is read from the
@@ -1278,8 +1280,15 @@ def _dalfox_cmd(batch_file, out_file, prof) -> list[str]:
     --max-concurrent-targets is target parallelism — carrying v2's -w 100 forward would explode a 40-target
     chunk's fan-out, so BOTH are governed with CONSERVATIVE defaults (roughly v2's per-host blast radius, more
     hosts sequential) pending OTC measurement, and the global --rate-limit caps the aggregate rps when RoE is set."""
+    # dalfox has its OWN membership cap: `--max-targets-per-host`, default 100. Targets past it are
+    # dropped from the scan — reported honestly by dalfox (status `skipped`, error_code
+    # TRUNCATED_PER_HOST_CAP) and, until review#13, thrown away by us. PREVENTATIVE (Lumpy): pass a
+    # value that cannot truncate the chunk we submitted, so the cap can never decide our membership
+    # whatever `DALFOX_CHUNK` is set to. The meta row is still parsed — dalfox may gain other states.
+    per_host = max(1, int(batch_len or settings.concurrency("DALFOX_CHUNK", 40)))
     cmd = ["dalfox", "scan", "-i", "file", str(batch_file), "-o", str(out_file),
            "-f", "jsonl", "-S", "--skip-mining",
+           "--max-targets-per-host", str(per_host),
            "--workers", str(max(1, settings.workers("dalfox", 30))),          # per-target; v2 -w 100 NOT carried
            "--max-concurrent-targets", str(max(1, settings.concurrency("DALFOX_TARGETS", 4)))]  # OTC-tunable
     bx = secrets.oob().get("blind_xss_url")
@@ -1389,20 +1398,130 @@ def _dalfox_finding(obj) -> "dict | None":
             "cwe": _dstr(obj.get("cwe")) or None}
 
 
-def _parse_dalfox_jsonl(cf) -> "tuple[list, bool]":
-    """FAIL-CLOSED parse of a dalfox v3 JSONL artifact -> (valid_findings, artifact_ok). Keeps every VALID
+#: dalfox's own per-target error codes, split by WHAT A RETRY WOULD DO. review#13 (Lumpy): "retriable
+#: remainder versus deterministic terminal omission" — collapsing both into one boolean is how a chunk
+#: either retries for ever or is marked done over evidence nobody collected.
+#:
+#: RETRIABLE — the environment failed and a later attempt may succeed. The chunk is NOT done.
+_DALFOX_RETRIABLE = frozenset({"CONNECTION_FAILED", "DNS_RESOLUTION_FAILED", "TLS_HANDSHAKE_FAILED",
+                               "REQUEST_TIMEOUT", "SESSION_LOST"})
+#: DETERMINISTIC — the same input under the same config omits the same targets, for ever. The chunk IS
+#: execution-complete (retrying changes nothing); the omission is COVERAGE and is reported as such.
+#: `TRUNCATED_PER_HOST_CAP` is dalfox's own membership cap (`--max-targets-per-host`, default 100) and
+#: `CONTENT_TYPE_MISMATCH` is a target that is not scannable content.
+_DALFOX_DETERMINISTIC = frozenset({"CONTENT_TYPE_MISMATCH", "TRUNCATED_PER_HOST_CAP"})
+
+
+@dataclass(frozen=True)
+class DalfoxArtifact:
+    """What ONE dalfox JSONL artifact says about itself — as separate facts.
+
+    review#13 (Lumpy): "don't reduce all metadata problems to one `artifact_ok=False`", because
+    "valid artifact" and "complete scan" then become the same boolean again. They are different
+    questions and the answers drive different machinery:
+
+      readable    the artifact PARSES to our contract (one meta row first, counts agree, every row
+                  valid). Drives resume validation: an unreadable artifact proves nothing.
+      complete    dalfox says it finished the batch — `meta.incomplete` false and no target skipped.
+      skipped     every target NOT scanned or not trusted, with dalfox's own reason.
+      retriable   a later attempt could still cover those targets  -> the chunk is not done.
+      deterministic  the same input+config omits them for ever      -> the chunk IS done, and the
+                  omission is reported as coverage rather than retried into eternity.
+    """
+
+    readable: bool
+    incomplete_flag: bool = False
+    skipped: tuple = ()          # ((target, status, error_code), ...)
+    total_requests: "int | None" = None
+    deduplicated: "int | None" = None
+    version: str = ""
+
+    @property
+    def complete(self) -> bool:
+        """dalfox covered every target it was given."""
+        return not self.incomplete_flag and not self.skipped
+
+    @property
+    def retriable(self) -> tuple:
+        return tuple(x for x in self.skipped if x[2] in _DALFOX_RETRIABLE)
+
+    @property
+    def deterministic(self) -> tuple:
+        return tuple(x for x in self.skipped if x[2] in _DALFOX_DETERMINISTIC)
+
+    @property
+    def unclassified(self) -> tuple:
+        """A code we do not know. Treated as RETRIABLE by `execution_done` — an omission we cannot
+        explain must not silently become a finished chunk."""
+        return tuple(x for x in self.skipped
+                     if x[2] not in _DALFOX_RETRIABLE and x[2] not in _DALFOX_DETERMINISTIC)
+
+    @property
+    def execution_done(self) -> bool:
+        """Whether a RETRY of this exact chunk could cover anything more. Coverage is a separate fact:
+        a chunk can be execution-done and still have omitted targets (see `deterministic`)."""
+        return self.readable and not self.incomplete_flag and not self.retriable \
+            and not self.unclassified
+
+    def coverage_reason(self) -> str:
+        """One line naming every disposition, for the operator and the coverage record."""
+        bits = []
+        if self.incomplete_flag:
+            bits.append("dalfox flagged the RUN incomplete (a target's session died)")
+        for label, rows in (("retriable", self.retriable), ("deterministic", self.deterministic),
+                            ("unclassified", self.unclassified)):
+            if rows:
+                codes = sorted({r[2] or "?" for r in rows})
+                bits.append(f"{len(rows)} target(s) {label}: {', '.join(codes)}")
+        return "; ".join(bits) or "every target covered"
+
+
+def _dalfox_meta(m: dict) -> "tuple[int | None, DalfoxArtifact | None]":
+    """Read the meta row -> (findings_count, partially-built artifact). `None` count = unusable."""
+    c = m.get("findings_count")
+    count = c if type(c) is int and c >= 0 else None          # STRICT int (not bool), non-negative
+    skipped = []
+    ts = m.get("target_summary")
+    if isinstance(ts, list):
+        for t in ts:
+            if not isinstance(t, dict):
+                continue
+            status = t.get("status")
+            # `findings` and `clean` are covered targets; anything else is not (dalfox's own words:
+            # "the distinction that matters to a consumer: neither is `clean`")
+            if status in ("findings", "clean"):
+                continue
+            skipped.append((str(t.get("target") or ""), str(status or ""),
+                            str(t.get("error_code") or "")))
+    inc = m.get("incomplete")
+    return count, DalfoxArtifact(
+        readable=True, incomplete_flag=inc is True, skipped=tuple(skipped),
+        total_requests=m.get("total_requests") if type(m.get("total_requests")) is int else None,
+        deduplicated=m.get("targets_deduplicated")
+        if type(m.get("targets_deduplicated")) is int else None,
+        version=str(m.get("dalfox_version") or ""))
+
+
+def _parse_dalfox_jsonl(cf) -> "tuple[list, DalfoxArtifact]":
+    """FAIL-CLOSED parse of a dalfox v3 JSONL artifact -> (valid_findings, DalfoxArtifact). Keeps every VALID
     finding as evidence, but artifact_ok is False on ANY inconsistency: missing/unreadable file, a decode error,
     a meta row NOT in first position or MORE than one, a non-int/negative/bool findings_count (review-r10#3:
     bool subclasses int, so `type(x) is int`), finding-count != meta count, a torn/non-object line, an unknown
     type, or a row missing its identity fields. The caller ingests the valid findings but marks a not-ok chunk
-    PARTIAL/retryable (never 'done'), so incomplete work can't be permanently skipped on resume."""
+    PARTIAL/retryable (never 'done'), so incomplete work can't be permanently skipped on resume.
+
+    review#13 (Lumpy): the meta row is READ, not just counted. dalfox reports `incomplete` and a
+    per-target `status`/`error_code`, so a batch where a target was SKIPPED used to parse as clean and
+    become resumably complete. Those facts ride on the returned `DalfoxArtifact`: `readable` is the
+    structural verdict this function always gave, and completeness is a separate question."""
     if not cf.exists():
-        return [], False
+        return [], DalfoxArtifact(readable=False)
     try:
         raw = cf.read_text(encoding="utf-8")                  # strict decode: a bad byte = malformed, not silent
     except (OSError, UnicodeError):
-        return [], False
+        return [], DalfoxArtifact(readable=False)
     findings, ok, meta_rows, meta_count, row_idx = [], True, 0, None, 0
+    art = DalfoxArtifact(readable=True)
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -1418,10 +1537,9 @@ def _parse_dalfox_jsonl(cf) -> "tuple[list, bool]":
             if row_idx != 0:                                  # review-r10#3: meta must be the FIRST row
                 ok = False
             m = obj.get("meta")
-            c = m.get("findings_count") if isinstance(m, dict) else None
-            if type(c) is int and c >= 0:                     # STRICT int (not bool), non-negative
-                meta_count = c
-            else:
+            if isinstance(m, dict):
+                meta_count, art = _dalfox_meta(m)
+            if meta_count is None:
                 ok = False
             row_idx += 1
             continue
@@ -1438,7 +1556,9 @@ def _parse_dalfox_jsonl(cf) -> "tuple[list, bool]":
         ok = False
     if meta_count is not None and meta_count != len(findings):
         ok = False                                            # count mismatch -> torn/partial artifact
-    return findings, ok
+    # `readable` is the STRUCTURAL verdict; the dispositions dalfox reported ride along untouched, so a
+    # torn artifact never masquerades as a complete scan and vice versa.
+    return findings, dataclasses.replace(art, readable=ok)
 
 
 def _sha256_file(p) -> str:
@@ -1533,8 +1653,11 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 return False
         except OSError:
             return False
-        fnds, ok = _parse_dalfox_jsonl(p)                    # re-parses (as the comment promises)
-        return ok and ((outcome == "EMPTY" and not fnds) or (outcome == "SUCCESS" and bool(fnds)))
+        fnds, art = _parse_dalfox_jsonl(p)                   # re-parses (as the comment promises)
+        # a recorded completion is only trusted when the artifact is still STRUCTURALLY sound and dalfox
+        # itself had nothing left to retry on it
+        return art.execution_done and ((outcome == "EMPTY" and not fnds)
+                                       or (outcome == "SUCCESS" and bool(fnds)))
 
     def _load_completion(prev) -> dict:                      # {ci: {rel, outcome, sha256}} — each FULLY validated
         m = (prev or {}).get("chunks"); out: dict[str, dict] = {}
@@ -1608,15 +1731,27 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         res = None
         chunk_status = Status.FAILED.value                   # review#1: promoted ONLY after ALL bookkeeping below
         try:                                                 # review#1: chunk terminal ALWAYS fires (finally)
-            res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof), ok_codes=(0, 1),
+            res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof, len(batch)), ok_codes=(0, 1),
                             timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
             # dalfox v3 EXIT CONTRACT (measured): 0 = clean/no-findings, 1 = clean/WITH-findings, >=2 = error.
             # review-r9#2: exit code and parsed artifact must AGREE — CLEAN only for (0 + valid empty) or
             # (1 + valid findings). Any disagreement / hard exit / malformed artifact -> PARTIAL, retryable.
-            findings, artifact_ok = _parse_dalfox_jsonl(cf)
+            findings, art = _parse_dalfox_jsonl(cf)
             rc = res.exit_code
-            clean = artifact_ok and ((rc == 0 and not findings) or (rc == 1 and bool(findings)))
+            # EXECUTION completion decides resume; COVERAGE is reported separately below. A chunk whose
+            # only omissions are DETERMINISTIC is done — retrying it would omit exactly the same targets
+            # for ever — and its gap is a counter, not a retry (review#13, Lumpy).
+            clean = art.execution_done and ((rc == 0 and not findings) or (rc == 1 and bool(findings)))
             cf_sha = _sha256_file(cf) if cf.exists() else None
+            # COVERAGE, always — a chunk can be execution-done and still have omitted targets. Emitted
+            # whenever dalfox reported an omission, whichever way `clean` went.
+            if art.skipped or art.incomplete_flag:
+                covered = max(0, len(batch) - len(art.skipped))
+                events.coverage_partial(
+                    sid, kind=events.COVERAGE_TIMEOUT, measure="dalfox_targets",
+                    unit=f"{sid}.chunk{ci}", eligible=len(batch), tested=covered,
+                    omitted=len(art.skipped),
+                    reason=f"chunk {ci + 1}/{len(batches)}: {art.coverage_reason()}")
             if clean:
                 completion[str(ci)] = {"rel": rel, "outcome": "SUCCESS" if findings else "EMPTY",
                                        "sha256": cf_sha}      # outcome + digest -> revalidated on resume
@@ -1625,7 +1760,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             else:
                 degraded += 1
                 why = (f"exit {rc}" if rc not in (0, 1) else
-                       "artifact malformed/mismatched" if not artifact_ok else
+                       "artifact malformed/mismatched" if not art.readable else
+                       art.coverage_reason() if not art.execution_done else
                        f"exit {rc} disagrees with {len(findings)} finding(s)")
                 events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {why}")
                 if cf.exists() and cf.stat().st_size > 0:    # a degraded chunk WITH output keeps its evidence
