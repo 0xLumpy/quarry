@@ -370,6 +370,29 @@ def doctor(phase):
         click.echo(f"  {_c('·', 'yellow')} backend: public interactsh (set oob.interactsh_server to use your own)")
     if ob.get("blind_xss_url"):
         click.echo(f"  {_c('✓', 'green')} blind XSS: dalfox -b → {ob['blind_xss_url']}")
+    # doctor is INSTALLATION-scoped, so it cannot read a target's `MODES.BLIND_XSS`. What it CAN say is
+    # which channel arming would select from this box's keys — resolved by the real planner, so the two
+    # never drift — and whether the legacy key would collide with it.
+    try:
+        from .phases.params import _blind_oob_plan
+        _bp = _blind_oob_plan(type("_Armed", (), {"blind_xss": True, "blind_xss_dual": False})())
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:                   # doctor stays operational — but SAYS the diagnosis is gone.
+        # review#19 (Lumpy): swallowing this printed nothing at all, so a broken planner/config seam
+        # looked exactly like a healthy box with nothing to report. A missing line is not a diagnosis.
+        _bp = None
+        click.echo(f"  {_c('⚠', 'yellow')} unable to resolve the blind-XSS channel: {e}")
+    if _bp is not None:
+        if _bp["channel"] == "conflict":
+            click.echo(f"  {_c('⚠', 'yellow')} if MODES.BLIND_XSS is armed: REFUSED — `oob.blind_xss_url` "
+                       f"also set; drop one, or set MODES.BLIND_XSS_DUAL to run both deliberately")
+        else:
+            click.echo(f"  {_c('·', 'yellow')} if MODES.BLIND_XSS is armed: {_bp['channel']} channel on the "
+                       f"{_bp['backend']} backend"
+                       + (f" ({_bp['server']})" if _bp["server"] else "")
+                       + (" — ProjectDiscovery's pool, correlation owned by dalfox"
+                          if _bp["backend"] == "public" else " — correlation owned by dalfox"))
 
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
     scope_note = f" for phase {phase}" if phase else ""

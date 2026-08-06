@@ -2397,7 +2397,7 @@ psrc=inspect.getsource(PA)
 # BEHAVIOURAL, not a source literal: 4.3.D made channel selection explicit, so assert what the lane
 # EMITS. `-b` is the legacy collector and is chosen only when the native OOB channel is not armed.
 class _P:
-    http_rl = 0; blind_xss = False; blind_xss_public = False; blind_xss_dual = False
+    http_rl = 0; blind_xss = False; blind_xss_dual = False
 _real_oob = secrets.oob          # restored below: `secrets.values()` reads oob() for the redaction guard
 secrets.oob = lambda: {"blind_xss_url": "https://col.example"}
 _cmd = PA._dalfox_cmd("i", "/tmp/_vq_dalfox.jsonl", _P(), 1)

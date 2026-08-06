@@ -227,25 +227,27 @@ class TargetProfile:
         probe, and one an operator makes deliberately. Discovery is unaffected either way: reflected and
         DOM XSS are found regardless.
 
-        Ownership note (review#12, Lumpy): with `--blind-oob`, DALFOX owns the nonce, the registration,
-        the polling schedule, the final wait and the nonce->injection map. Quarry owns the SERVER and the
-        credentials and imports dalfox's correlation — so findings from this channel are recorded with
-        `oob_owner: dalfox`, not as Quarry-issued tokens.
+        ONE gate, deliberately (Lumpy, 2026-08-06). An earlier version needed a second flag before the
+        default PUBLIC interactsh backend could be used. That was inconsistent — nuclei's OAST and
+        Quarry's own SSRF probes already use public interactsh ungated — and it put the common case
+        (no self-hosted server) behind two flags, which mostly means no blind XSS at all. Arming this IS
+        the consent; `oob.interactsh_server` (+ optional `interactsh_token`) moves the backend to your
+        own box when you have one.
+
+        Ownership, precisely (review#12 + review#19, Lumpy). CORRELATION is dalfox's in every case: it
+        mints the nonce, registers, polls, waits and maps the nonce back to the injection, so findings
+        from this channel are recorded `oob_owner: dalfox`, never as Quarry-issued tokens. The SERVER is
+        a separate question and depends on the backend:
+
+          * public backend (no `oob.interactsh_server`) — the server is ProjectDiscovery's public
+            interactsh pool. Quarry owns NOTHING here: not the host, not the credentials, and the
+            operator of that pool sees the raw callbacks, which is the same exposure nuclei's OAST and
+            Quarry's own SSRF probes already accept.
+          * self-hosted backend — you own the host, and Quarry owns the credential handling for it
+            (`interactsh_token` in an ephemeral 0600 `--config` file, never argv).
 
         Strict `is True`, like every other arming flag: it must not fail open on quoted YAML."""
         return self.modes.get("BLIND_XSS", False) is True
-
-    @property
-    def blind_xss_public(self) -> bool:
-        """MODES.BLIND_XSS_PUBLIC — permit the blind-XSS channel to use a PUBLIC interactsh backend.
-
-        Default OFF and required on top of `BLIND_XSS`. Without a self-hosted `oob.interactsh_server`,
-        every callback — carrying the target's host, the victim's browser context and the page it fired
-        on — lands on infrastructure a third party runs. Quarry's own OOB layer already defaults public,
-        but "we do it elsewhere" is not consent to open ANOTHER external channel (review#12, Lumpy).
-
-        Strict `is True`: an arming flag must not fail open."""
-        return self.modes.get("BLIND_XSS_PUBLIC", False) is True
 
     @property
     def blind_xss_dual(self) -> bool:
@@ -443,7 +445,7 @@ class TargetProfile:
         if "SECRET_VERIFICATION" in modes and not isinstance(modes["SECRET_VERIFICATION"], bool):
             raise ProfileError(f"MODES.SECRET_VERIFICATION must be a bare boolean true/false "
                                f"(got {modes['SECRET_VERIFICATION']!r})")
-        for _arm in ("BLIND_XSS", "BLIND_XSS_PUBLIC", "BLIND_XSS_DUAL"):
+        for _arm in ("BLIND_XSS", "BLIND_XSS_DUAL"):
             if _arm in modes and not isinstance(modes[_arm], bool):
                 raise ProfileError(f"MODES.{_arm} must be a bare boolean true/false "
                                    f"(got {modes[_arm]!r})")

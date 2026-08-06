@@ -71,16 +71,17 @@ MODES:
                         # is unaffected either way (every secret is still found/reported). Set true only when
                         # the engagement explicitly authorizes credential verification.
   BLIND_XSS: false      # default false: arm the blind/stored-XSS OOB channel (dalfox --blind-oob).
+                        # ONE gate — arming it IS the consent. Backend: `oob.interactsh_server` when
+                        # set (with `oob.interactsh_token` only if your server needs auth), else the
+                        # public interactsh pool, same as nuclei's OAST and Quarry's SSRF probes.
                         # A blind payload PERSISTS on the target and fires later in someone else's
                         # browser, phoning home to a callback host — a heavier engagement decision than a
                         # reflected probe. Reflected + DOM XSS are found either way. Correlation is owned
-                        # by DALFOX (it mints the per-payload nonce, registers, polls and maps it back);
-                        # Quarry owns the server + credentials and imports the result.
-  BLIND_XSS_PUBLIC: false  # default false: additionally permit a PUBLIC interactsh backend when no
-                        # `oob.interactsh_server` is configured. Every callback then lands on a third
-                        # party's infrastructure carrying the target host and the victim's browser
-                        # context. With BLIND_XSS on and this off, the lane REFUSES the channel and says
-                        # so rather than silently opening it.
+                        # by DALFOX in every case (it mints the per-payload nonce, registers, polls and
+                        # maps it back); Quarry imports that result. The SERVER is separate: on the public
+                        # backend it is ProjectDiscovery's pool and its operator sees the raw callbacks;
+                        # only a self-hosted `oob.interactsh_server` is yours, and only then does Quarry
+                        # hold a credential for it.
   BLIND_XSS_DUAL: false # default false: permit the native OOB channel AND a legacy `-b` collector at
                         # the same time. dalfox injects a blind payload for EACH, so this doubles the
                         # blind payloads and the requests they cost. With BLIND_XSS armed and

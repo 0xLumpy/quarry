@@ -1395,28 +1395,30 @@ def _blind_oob_plan(prof) -> dict:
 
       * OFF unless `MODES.BLIND_XSS` explicitly arms it. A blind payload persists on the target and
         fires later in someone else's browser — a heavier engagement decision than a reflected probe.
-      * A self-hosted `oob.interactsh_server` is used when present, with `interactsh_token` as
-        `--blind-oob-secret`. Quarry owns the server and the credentials.
-      * With NO self-hosted server the backend is PUBLIC, and that needs its own permission
-        (`MODES.BLIND_XSS_PUBLIC`). "Quarry's own OOB already defaults public" is not consent to open
-        another external channel. Refused otherwise — and the refusal is REPORTED, not silent.
+      * A self-hosted `oob.interactsh_server` is used when present, with `interactsh_token` carried in
+        an ephemeral 0600 `--config` file. The token is OPTIONAL: plenty of instances run open.
+      * With no server configured the backend is the public interactsh pool — dalfox's own default, and
+        the same posture as nuclei's OAST and Quarry's SSRF probes. ONE arming flag is the consent
+        (Lumpy, 2026-08-06); a second gate for the common case just meant no blind XSS at all.
 
-    Ownership stays dalfox's either way: it mints the per-payload nonce, registers, polls, waits and
-    maps the callback back to target/param/location/method/payload. Quarry imports that correlation.
+    CORRELATION is dalfox's either way: it mints the per-payload nonce, registers, polls, waits and maps
+    the callback back to target/param/location/method/payload. Quarry imports it. The SERVER is a
+    separate ownership question — ProjectDiscovery's pool on the public backend (its operator sees the
+    raw callbacks), yours when `oob.interactsh_server` is set. `backend` in the returned plan is the
+    field that answers it; do not read `armed` as "we own the channel" (review#19, Lumpy).
     """
     o = secrets.oob() or {}
     legacy = str(o.get("blind_xss_url") or "").strip()
     native = bool(getattr(prof, "blind_xss", False))
     if native and legacy and getattr(prof, "blind_xss_dual", False):
         server = str(o.get("interactsh_server") or "").strip()
-        if server or getattr(prof, "blind_xss_public", False):
-            return {"armed": True, "channel": "dual",
-                    "backend": "self-hosted" if server else "public", "server": server,
-                    "secret": str(o.get("interactsh_token") or "").strip() if server else "",
-                    "reason": "blind XSS armed on BOTH channels (MODES.BLIND_XSS_DUAL): native OOB "
-                              + ("on the configured server" if server else "on the PUBLIC backend")
-                              + " plus the legacy `-b` collector — dalfox injects a payload for each, "
-                                "so this DOUBLES the blind payloads and the requests they cost"}
+        return {"armed": True, "channel": "dual",
+                "backend": "self-hosted" if server else "public", "server": server,
+                "secret": str(o.get("interactsh_token") or "").strip() if server else "",
+                "reason": "blind XSS armed on BOTH channels (MODES.BLIND_XSS_DUAL): native OOB "
+                          + ("on the configured server" if server else "on the public backend")
+                          + " plus the legacy `-b` collector — dalfox injects a payload for each, "
+                            "so this DOUBLES the blind payloads and the requests they cost"}
     if native and legacy and not getattr(prof, "blind_xss_dual", False):
         # BOTH requested. dalfox fires both channels (`CallbackSource::Both`) — duplicate blind
         # payloads, extra requests and two callback lifecycles for one finding. Refuse and say which
@@ -1442,16 +1444,13 @@ def _blind_oob_plan(prof) -> dict:
                 "secret": str(o.get("interactsh_token") or "").strip(),
                 "reason": f"blind XSS armed on the configured interactsh server ({server}); "
                           f"correlation is owned by DALFOX and imported"}
-    if not getattr(prof, "blind_xss_public", False):
-        return {"armed": False, "channel": "refused-public", "backend": "public", "server": "",
-                "secret": "",
-                "reason": "blind XSS REFUSED: no `oob.interactsh_server` is configured, so callbacks "
-                          "would land on a PUBLIC third-party backend carrying the target host and the "
-                          "victim's browser context. Set MODES.BLIND_XSS_PUBLIC to permit that "
-                          "deliberately, or configure your own server"}
+    # No self-hosted server: dalfox's own default, the public interactsh pool. Stated, not warned about
+    # — it is what nuclei's OAST and Quarry's own SSRF probes already do, and what an operator reaching
+    # for Burp Collaborator does without ceremony (Lumpy, 2026-08-06).
     return {"armed": True, "channel": "native", "backend": "public", "server": "", "secret": "",
-            "reason": "blind XSS armed on the PUBLIC interactsh backend (MODES.BLIND_XSS_PUBLIC) — "
-                      "callbacks reach a third party; correlation is owned by DALFOX and imported"}
+            "reason": "blind XSS armed on ProjectDiscovery's PUBLIC interactsh pool (set "
+                      "`oob.interactsh_server` to use your own) — its operator sees the raw callbacks; "
+                      "correlation is owned by DALFOX and imported"}
 
 
 def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0, cred_path=None) -> list[str]:
