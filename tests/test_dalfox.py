@@ -1093,3 +1093,78 @@ class TestTheOobPolicyIsPartOfTheWorkIdentity:
         assert "fingerprint" in seg and '_plan_for_run["secret"]' not in seg.replace(
             'bool(_plan_for_run["secret"])', "")
         assert 'secrets.fingerprint(_plan_for_run["server"])' in seg
+
+
+class TestPolicyIsNotExecution:
+    """review#20 (Lumpy): `armed` describes the POLICY the operator chose; it says nothing about whether
+    any invocation actually ran with that channel. One record driven off `armed` let a single run say
+    both "not scanned, credential transport failed" AND "the armed channel was tested"."""
+
+    @staticmethod
+    def _lane(monkeypatch, tmp_path, tag):
+        monkeypatch.setattr(settings, "concurrency",
+                            lambda k, d=None: {"DALFOX_CHUNK": 1, "DALFOX_TARGETS": 4}.get(k, d))
+        monkeypatch.setattr(settings, "workers", lambda t, d: d)
+        monkeypatch.setattr(params, "_dalfox_engine_id", lambda: "v3.2.0")
+        events.reset(); events.configure(tmp_path / tag)
+        return _C(tmp_path / tag)
+
+    @staticmethod
+    def _cov(tmp_path, tag, measure):
+        evs = [json.loads(x) for x in (tmp_path / tag / "events.jsonl").read_text().splitlines()]
+        return [e for e in evs if e.get("measure") == measure]
+
+    @staticmethod
+    def _prof(**kw):
+        return type("P", (), {"http_rl": 0, "blind_xss": False, "blind_xss_public": False,
+                              "blind_xss_dual": False, **kw})()
+
+    def test_a_credential_refusal_does_NOT_also_claim_the_channel_was_tested(self, monkeypatch,
+                                                                            tmp_path):
+        c = self._lane(monkeypatch, tmp_path, "r")
+        monkeypatch.setattr(secrets, "oob",
+                            lambda: {"interactsh_server": "oob.mine.test", "interactsh_token": "T0K"})
+        monkeypatch.setattr(params, "_make_oob_credential",
+                            lambda s: (_ for _ in ()).throw(params.OobCredentialError("disk full")))
+        monkeypatch.setattr(params, "exec_tool",
+                            lambda *a, **k: pytest.fail("dalfox ran without its credential"))
+        params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
+        chan = self._cov(tmp_path, "r", "blind_xss_channel")
+        assert chan, "an attempted invocation must still report its execution outcome"
+        assert chan[-1]["tested"] == 0 and chan[-1]["omitted"] == 1, chan[-1]
+        assert "credential transport failed" in chan[-1]["reason"]
+        # …and the DECISION is recorded separately, inert in the verdict
+        pol = self._cov(tmp_path, "r", "blind_xss_policy")
+        assert pol and pol[-1]["omitted"] == 0 and "channel=native" in pol[-1]["reason"]
+
+    def test_a_launched_invocation_reports_the_channel_as_run(self, monkeypatch, tmp_path):
+        c = self._lane(monkeypatch, tmp_path, "ok")
+        monkeypatch.setattr(secrets, "oob", lambda: {"interactsh_server": "oob.mine.test"})
+        monkeypatch.setattr(params, "exec_tool", _exec(META0, 0))
+        params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
+        chan = self._cov(tmp_path, "ok", "blind_xss_channel")
+        assert chan[-1]["tested"] == 1 and chan[-1]["omitted"] == 0
+        assert "1/1 invocation(s) started with the armed blind-XSS channel" in chan[-1]["reason"]
+
+    def test_a_lifecycle_that_RAN_NOTHING_asserts_no_execution(self, monkeypatch, tmp_path):
+        """Everything already complete: policy is still stated, execution claims nothing."""
+        c = self._lane(monkeypatch, tmp_path, "a")
+        monkeypatch.setattr(secrets, "oob", lambda: {"interactsh_server": "oob.mine.test"})
+        monkeypatch.setattr(params, "exec_tool", _exec(META0, 0))
+        params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
+        c2 = self._lane(monkeypatch, tmp_path, "b")
+        c2.run.dir = c.run.dir
+        monkeypatch.setattr(params, "exec_tool",
+                            lambda *a, **k: pytest.fail("a completed chunk was re-scanned"))
+        params._dalfox_xss_fast(c2, ["http://h/a?q="], self._prof(blind_xss=True))
+        assert self._cov(tmp_path, "b", "blind_xss_channel") == [], "nothing ran; nothing to claim"
+        assert self._cov(tmp_path, "b", "blind_xss_policy"), "…but the decision is still recorded"
+
+    def test_an_unarmed_run_claims_no_execution_either(self, monkeypatch, tmp_path):
+        c = self._lane(monkeypatch, tmp_path, "off")
+        monkeypatch.setattr(secrets, "oob", lambda: {})
+        monkeypatch.setattr(params, "exec_tool", _exec(META0, 0))
+        params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof())
+        assert self._cov(tmp_path, "off", "blind_xss_channel") == []
+        pol = self._cov(tmp_path, "off", "blind_xss_policy")
+        assert pol and "channel=off" in pol[-1]["reason"] and pol[-1]["omitted"] == 0
