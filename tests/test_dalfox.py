@@ -647,7 +647,9 @@ class TestARetryOwesOnlyWhatFailed:
         assert rows, "the terminal gap must be re-reported by the run that did NOT observe it"
         assert rows[-1]["omitted"] == 1 and self.B in rows[-1]["reason"]
         assert "TRUNCATED_PER_HOST_CAP" in rows[-1]["reason"]
-        assert rows[-1]["kind"] == events.COVERAGE_TIMEOUT, "an omitted TIMEOUT row is the GAP signal"
+        # review#16 (Lumpy): a truncating ceiling is NOT a timeout. The manifest is operator evidence,
+        # so each code carries the kind that describes it — and both still fold as gaps.
+        assert rows[-1]["kind"] == events.COVERAGE_CAP, rows[-1]["kind"]
 
         st = _state(c2)
         assert st["terminal"]["0"] == [{"url": self.B, "code": "TRUNCATED_PER_HOST_CAP"}]
@@ -684,3 +686,39 @@ class TestARetryOwesOnlyWhatFailed:
         assert called == []
         rows = self._cov(tmp_path, "a2", "dalfox_targets")
         assert rows and rows[-1]["omitted"] == 1 and self.B in rows[-1]["reason"]
+
+    def test_each_terminal_code_carries_the_kind_that_DESCRIBES_it(self, monkeypatch, tmp_path):
+        """review#16 (Lumpy): `TRUNCATED_PER_HOST_CAP` and `CONTENT_TYPE_MISMATCH` are not timeouts, and
+        the manifest is operator evidence — a misleading label must not become permanent vocabulary."""
+        cands = [self.A, self.B, self.C]
+        c = self._lane_in(monkeypatch, tmp_path, "k1")
+        monkeypatch.setattr(params, "exec_tool", self._exec_capture(
+            self._art([self._t(self.A),
+                       self._t(self.B, "skipped", "TRUNCATED_PER_HOST_CAP"),
+                       self._t(self.C, "skipped", "CONTENT_TYPE_MISMATCH")]), 0, []))
+        params._dalfox_xss_fast(c, cands, _Prof())
+        rows = self._cov(tmp_path, "k1", "dalfox_targets")
+        by_kind = {r["kind"]: r for r in rows}
+        assert events.COVERAGE_TIMEOUT not in by_kind, "neither of these is a timeout"
+        assert by_kind[events.COVERAGE_CAP]["omitted"] == 1
+        assert self.B in by_kind[events.COVERAGE_CAP]["reason"]
+        assert by_kind[events.COVERAGE_TOOL_OMISSION]["omitted"] == 1
+        assert self.C in by_kind[events.COVERAGE_TOOL_OMISSION]["reason"]
+        # distinct UNITS, or reconciliation (latest per source+unit) would drop one of them
+        assert len({r["unit"] for r in rows}) == 2, [r["unit"] for r in rows]
+
+    def test_a_RETRIABLE_failure_keeps_the_timeout_kind(self):
+        """`timeout` is right for these: input the target/network cost us."""
+        from quarry_recon.phases import params as P
+        assert set(P._DALFOX_RETRIABLE) >= {"REQUEST_TIMEOUT", "CONNECTION_FAILED", "SESSION_LOST"}
+        assert set(P._DALFOX_TERMINAL_KIND) == set(P._DALFOX_DETERMINISTIC)
+        assert events.COVERAGE_TIMEOUT not in P._DALFOX_TERMINAL_KIND.values()
+
+    def test_a_tool_omission_still_gates_the_verdict_as_a_GAP(self):
+        """Renaming the disposition must not soften it: only SAMPLE and PROVIDER are soft limits."""
+        import inspect
+        from quarry_recon import store
+        src = inspect.getsource(store)
+        i = src.index("COVERAGE_SAMPLE, events.COVERAGE_PROVIDER")
+        assert "coverage_limits.append" in src[i:i + 200]
+        assert events.COVERAGE_TOOL_OMISSION not in (events.COVERAGE_SAMPLE, events.COVERAGE_PROVIDER)

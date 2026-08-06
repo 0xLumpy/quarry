@@ -1407,9 +1407,14 @@ _DALFOX_RETRIABLE = frozenset({"CONNECTION_FAILED", "DNS_RESOLUTION_FAILED", "TL
                                "REQUEST_TIMEOUT", "SESSION_LOST"})
 #: DETERMINISTIC — the same input under the same config omits the same targets, for ever. The chunk IS
 #: execution-complete (retrying changes nothing); the omission is COVERAGE and is reported as such.
-#: `TRUNCATED_PER_HOST_CAP` is dalfox's own membership cap (`--max-targets-per-host`, default 100) and
-#: `CONTENT_TYPE_MISMATCH` is a target that is not scannable content.
-_DALFOX_DETERMINISTIC = frozenset({"CONTENT_TYPE_MISMATCH", "TRUNCATED_PER_HOST_CAP"})
+#:
+#: Each maps to the coverage KIND that actually describes it, because the manifest is operator evidence
+#: and `timeout` was misleading for both (review#16, Lumpy):
+#:   TRUNCATED_PER_HOST_CAP  a hard ceiling truncated eligible input      -> COVERAGE_CAP
+#:   CONTENT_TYPE_MISMATCH   the tool declined it as unscannable content  -> COVERAGE_TOOL_OMISSION
+_DALFOX_TERMINAL_KIND = {"TRUNCATED_PER_HOST_CAP": events.COVERAGE_CAP,
+                         "CONTENT_TYPE_MISMATCH": events.COVERAGE_TOOL_OMISSION}
+_DALFOX_DETERMINISTIC = frozenset(_DALFOX_TERMINAL_KIND)
 
 
 @dataclass(frozen=True)
@@ -1854,14 +1859,22 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
           if not _rows:
               continue
           _n = len(batches[int(_ci)]) if _ci.isdigit() and int(_ci) < len(batches) else len(_rows)
-          _codes = sorted({r["code"] or "?" for r in _rows})
-          events.coverage_partial(
-              sid, kind=events.COVERAGE_TIMEOUT, measure="dalfox_targets",
-              unit=f"{sid}.chunk{_ci}", eligible=_n, tested=max(0, _n - len(_rows)),
-              omitted=len(_rows),
-              reason=(f"chunk {int(_ci) + 1}/{len(batches)}: {len(_rows)} target(s) permanently "
-                      f"omitted ({', '.join(_codes)}) — no retry can cover them: "
-                      + "; ".join(r["url"] for r in _rows)))
+          # ONE record per KIND, each on its own unit: a truncating ceiling and an unscannable
+          # content-type are different dispositions, and reconciliation keeps the latest record per
+          # (source_id, unit) — sharing a unit would drop one of them (review#16, Lumpy).
+          _by_kind: dict = {}
+          for _r in _rows:
+              _by_kind.setdefault(
+                  _DALFOX_TERMINAL_KIND.get(_r["code"], events.COVERAGE_TOOL_OMISSION), []).append(_r)
+          for _kind, _krows in sorted(_by_kind.items()):
+              _codes = sorted({r["code"] or "?" for r in _krows})
+              events.coverage_partial(
+                  sid, kind=_kind, measure="dalfox_targets",
+                  unit=f"{sid}.chunk{_ci}.{_kind}", eligible=_n,
+                  tested=max(0, _n - len(_krows)), omitted=len(_krows),
+                  reason=(f"chunk {int(_ci) + 1}/{len(batches)}: {len(_krows)} target(s) permanently "
+                          f"omitted ({', '.join(_codes)}) — no retry can cover them: "
+                          + "; ".join(r["url"] for r in _krows)))
       produced = matched = 0
       tiers = {"xss-verified": 0, "xss-candidate": 0, "dom-xss-static": 0}
       seen_ids: set[str] = set()                            # GLOBAL — for the matched counter ONLY (not dedup)

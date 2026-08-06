@@ -270,6 +270,14 @@ COVERAGE_TIMEOUT = "timeout"  # input the TARGET/network cost us — a per-item 
                               # nuclei -mhe dropping a host after N request errors), a deps-fail: ALWAYS feeds
                               # the verdict. The name is narrower than the bucket; the bucket is "not our
                               # ceiling, not the operator's choice — it was lost in flight".
+COVERAGE_TOOL_OMISSION = "tool_omission"   # the TOOL deterministically declined part of the input for a
+                              # stated reason of its own — not our ceiling (`cap`), not the target/network
+                              # costing us the item (`timeout`), not an operator subset (`sample`) and not
+                              # an external provider limit (`provider`). We submitted it and it was not
+                              # examined, so it is a GAP whenever omitted>0. review#16 (Lumpy): a
+                              # content-type refusal reported as `timeout` is misleading in the manifest,
+                              # which is operator evidence — the label must not become permanent
+                              # vocabulary by accident.
 COVERAGE_UNKNOWN = "unknown"  # the source RAN but its coverage is UNMEASURABLE (stats missing/corrupt). Carries NO
                               # counters, so it is never summed — it forces coverage_valid=False, which the verdict
                               # reads as a GAP. Unmeasured must never be indistinguishable from fully covered.
