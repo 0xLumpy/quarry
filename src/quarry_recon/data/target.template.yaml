@@ -81,6 +81,14 @@ MODES:
                         # party's infrastructure carrying the target host and the victim's browser
                         # context. With BLIND_XSS on and this off, the lane REFUSES the channel and says
                         # so rather than silently opening it.
+  BLIND_XSS_DUAL: false # default false: permit the native OOB channel AND a legacy `-b` collector at
+                        # the same time. dalfox injects a blind payload for EACH, so this doubles the
+                        # blind payloads and the requests they cost. With BLIND_XSS armed and
+                        # `oob.blind_xss_url` also set, the lane REFUSES until this says it is intended.
+                        # NOTE on the interactsh token: it is passed to dalfox in a 0600 `--config`
+                        # file, never as an argument — argv is readable via /proc by any process of this
+                        # user. A same-user process can still read that file, which is the residual
+                        # limitation of authenticated native OOB.
   CONTENT_DISCOVERY: "off"  # off | light | balanced | deep — candidate-driven path brute (default off)
   CONTENT_RECURSION: 0    # recursion depth for content discovery (0 = off; pairs with balanced/deep)
   DEEP_EVIDENCE: false    # true => DOWNLOAD + mine heavy artifacts (actuator heapdump) instead of just

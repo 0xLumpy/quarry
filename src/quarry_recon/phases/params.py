@@ -1273,8 +1273,32 @@ def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
 
 
 #: what the blind-XSS channel resolved to, so the DECISION is evidence and not an inference from flags
+def _blind_oob_config(out_file, secret: str):
+    """Write dalfox's `scan.blind_oob_secret` to a 0600 TOML beside the run's artifact, or None.
+
+    The credential must not appear in argv: `/proc/<pid>/cmdline` is readable by every process of this
+    user and by anything reading a process listing, and no amount of redaction in our own logs changes
+    that (review#17, Lumpy). dalfox reads the same value from a `--config` file, so that is how it gets
+    there. The file is created 0600 BEFORE the secret is written — never written and chmod'ed after.
+
+    Same-user processes can still read the file, and dalfox's own argv still names it. That is the
+    residual limitation of authenticated native OOB, and it is documented rather than papered over."""
+    try:
+        cfg = Path(out_file).with_name(Path(out_file).name + ".dalfox.toml")
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        # O_EXCL-style create with the mode already restrictive: a 0644 window is a leak, however brief
+        fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write("[scan]\nblind_oob_secret = " + json.dumps(secret) + "\n")
+        return cfg
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return None                      # no config -> no secret; the lane still runs, unauthenticated
+
+
 def _blind_oob_plan(prof) -> dict:
-    """Decide the blind/stored-XSS OOB channel: {armed, backend, server, secret, reason}.
+    """Decide the blind/stored-XSS OOB channel: {armed, channel, backend, server, secret, reason}.
 
     The contract (review#12, Lumpy), in order:
 
@@ -1290,22 +1314,51 @@ def _blind_oob_plan(prof) -> dict:
     maps the callback back to target/param/location/method/payload. Quarry imports that correlation.
     """
     o = secrets.oob() or {}
-    if not getattr(prof, "blind_xss", False):
-        return {"armed": False, "backend": "", "server": "", "secret": "",
+    legacy = str(o.get("blind_xss_url") or "").strip()
+    native = bool(getattr(prof, "blind_xss", False))
+    if native and legacy and getattr(prof, "blind_xss_dual", False):
+        server = str(o.get("interactsh_server") or "").strip()
+        if server or getattr(prof, "blind_xss_public", False):
+            return {"armed": True, "channel": "dual",
+                    "backend": "self-hosted" if server else "public", "server": server,
+                    "secret": str(o.get("interactsh_token") or "").strip() if server else "",
+                    "reason": "blind XSS armed on BOTH channels (MODES.BLIND_XSS_DUAL): native OOB "
+                              + ("on the configured server" if server else "on the PUBLIC backend")
+                              + " plus the legacy `-b` collector — dalfox injects a payload for each, "
+                                "so this DOUBLES the blind payloads and the requests they cost"}
+    if native and legacy and not getattr(prof, "blind_xss_dual", False):
+        # BOTH requested. dalfox fires both channels (`CallbackSource::Both`) — duplicate blind
+        # payloads, extra requests and two callback lifecycles for one finding. Refuse and say which
+        # knob resolves it, rather than silently doubling the traffic (review#17, Lumpy).
+        return {"armed": False, "channel": "conflict", "backend": "", "server": "", "secret": "",
+                "reason": "blind XSS REFUSED: MODES.BLIND_XSS arms the native channel while "
+                          "`oob.blind_xss_url` also configures a legacy collector. dalfox would inject "
+                          "BOTH — duplicate payloads and extra requests for one finding. Set "
+                          "MODES.BLIND_XSS_DUAL to accept that deliberately, or drop one of them"}
+    if not native:
+        if legacy:
+            # an EXPLICIT legacy choice: the operator configured a collector and did not arm the native
+            # channel. It is not a fallback for a native channel that was refused.
+            return {"armed": False, "channel": "legacy", "backend": "operator-collector",
+                    "server": legacy, "secret": "",
+                    "reason": f"legacy blind-XSS collector only (`oob.blind_xss_url`) — dalfox -b, no "
+                              f"per-payload correlation; MODES.BLIND_XSS is off"}
+        return {"armed": False, "channel": "off", "backend": "", "server": "", "secret": "",
                 "reason": "MODES.BLIND_XSS is off — the blind/stored-XSS channel was not armed"}
     server = str(o.get("interactsh_server") or "").strip()
     if server:
-        return {"armed": True, "backend": "self-hosted", "server": server,
+        return {"armed": True, "channel": "native", "backend": "self-hosted", "server": server,
                 "secret": str(o.get("interactsh_token") or "").strip(),
                 "reason": f"blind XSS armed on the configured interactsh server ({server}); "
                           f"correlation is owned by DALFOX and imported"}
     if not getattr(prof, "blind_xss_public", False):
-        return {"armed": False, "backend": "public", "server": "", "secret": "",
+        return {"armed": False, "channel": "refused-public", "backend": "public", "server": "",
+                "secret": "",
                 "reason": "blind XSS REFUSED: no `oob.interactsh_server` is configured, so callbacks "
                           "would land on a PUBLIC third-party backend carrying the target host and the "
                           "victim's browser context. Set MODES.BLIND_XSS_PUBLIC to permit that "
                           "deliberately, or configure your own server"}
-    return {"armed": True, "backend": "public", "server": "", "secret": "",
+    return {"armed": True, "channel": "native", "backend": "public", "server": "", "secret": "",
             "reason": "blind XSS armed on the PUBLIC interactsh backend (MODES.BLIND_XSS_PUBLIC) — "
                       "callbacks reach a third party; correlation is owned by DALFOX and imported"}
 
@@ -1329,7 +1382,7 @@ def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0) -> list[str]:
            "--max-targets-per-host", str(per_host),
            "--workers", str(max(1, settings.workers("dalfox", 30))),          # per-target; v2 -w 100 NOT carried
            "--max-concurrent-targets", str(max(1, settings.concurrency("DALFOX_TARGETS", 4)))]  # OTC-tunable
-    # BLIND / STORED XSS. `--blind-oob` is the primary channel: dalfox mints a fresh callback per
+    # BLIND / STORED XSS. `--blind-oob` is the channel: dalfox mints a fresh callback per
     # PAYLOAD and correlates each interaction back to target/param/location/method/payload — attribution
     # a single `-b` URL cannot give, since one URL covers the whole invocation.
     plan = _blind_oob_plan(prof)
@@ -1338,14 +1391,19 @@ def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0) -> list[str]:
         # `=host` argument would be parsed as a TARGET, not as the backend.
         cmd += [f"--blind-oob={plan['server']}" if plan["server"] else "--blind-oob"]
         if plan["secret"]:
-            cmd += ["--blind-oob-secret", plan["secret"]]
-    # `-b` is an operator's OWN legacy collector (XSS Hunter et al) and is opt-in, NEVER paired
-    # automatically: dalfox fires BOTH channels when both are set (`CallbackSource::Both`), which means
-    # duplicate blind payloads, extra requests and two callback lifecycles for one finding
-    # (review#12, Lumpy).
-    bx = secrets.oob().get("blind_xss_url")
-    if bx:
-        cmd += ["-b", str(bx)]
+            # NEVER `--blind-oob-secret <token>`: argv is world-readable through /proc/<pid>/cmdline and
+            # every process listing, and a display-level redaction does not fix that (review#17, Lumpy).
+            # dalfox reads `scan.blind_oob_secret` from a `--config` TOML, so the credential reaches it
+            # through a 0600 file instead.
+            cfg = _blind_oob_config(out_file, plan["secret"])
+            if cfg is not None:
+                cmd += ["--config", str(cfg)]
+    if plan["channel"] == "dual":
+        cmd += ["-b", str(secrets.oob().get("blind_xss_url") or "")]
+    elif plan["channel"] == "legacy":
+        # `-b` is an operator's OWN legacy collector (XSS Hunter et al): an EXPLICIT channel choice, not
+        # a fallback that activates because a dormant setting exists (review#17, Lumpy).
+        cmd += ["-b", plan["server"]]
     if prof.http_rl:
         # v3 has a REAL global rate cap (req/s, shared across workers AND targets) — supersedes v2's per-host
         # --delay math and its per-target-limiter caveat. Bound the aggregate stream directly to the RoE rate.

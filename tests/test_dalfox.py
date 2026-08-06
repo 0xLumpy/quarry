@@ -740,6 +740,7 @@ class TestBlindXssChannel:
         http_rl = 0
         blind_xss = False
         blind_xss_public = False
+        blind_xss_dual = False
 
     @staticmethod
     def _oob(monkeypatch, **kw):
@@ -755,11 +756,34 @@ class TestBlindXssChannel:
         plan = params._blind_oob_plan(self._P())
         assert not plan["armed"] and "MODES.BLIND_XSS is off" in plan["reason"]
 
-    def test_a_self_hosted_server_is_used_with_its_secret(self, monkeypatch):
+    def test_a_self_hosted_server_is_used_with_its_secret(self, monkeypatch, tmp_path):
+        """review#17 (Lumpy): the token must NOT reach argv — `/proc/<pid>/cmdline` is readable by every
+        process of this user, and redacting our own logs does not change that. dalfox reads
+        `scan.blind_oob_secret` from a `--config` TOML, so it travels in a 0600 file."""
+        import stat
+        self._oob(monkeypatch, interactsh_server="oob.mine.test", interactsh_token="T0K")
         p = self._P(); p.blind_xss = True
-        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test", interactsh_token="T0K")
+        out = tmp_path / "findings.jsonl"
+        cmd = params._dalfox_cmd(tmp_path / "b.txt", out, p, 1)
         assert "--blind-oob=oob.mine.test" in cmd, cmd
-        assert cmd[cmd.index("--blind-oob-secret") + 1] == "T0K"
+        assert "--blind-oob-secret" not in cmd, "the secret must never be an argument"
+        assert not any("T0K" in c for c in cmd), cmd
+        cfg = pathlib.Path(cmd[cmd.index("--config") + 1])
+        assert cfg.is_file() and "T0K" in cfg.read_text()
+        assert stat.S_IMODE(cfg.stat().st_mode) == 0o600, oct(cfg.stat().st_mode)
+
+    def test_no_config_file_is_written_without_a_secret(self, monkeypatch, tmp_path):
+        self._oob(monkeypatch, interactsh_server="oob.mine.test")     # server, no token
+        p = self._P(); p.blind_xss = True
+        cmd = params._dalfox_cmd(tmp_path / "b.txt", tmp_path / "o.jsonl", p, 1)
+        assert "--config" not in cmd and not list(tmp_path.glob("*.toml"))
+
+    def test_the_secret_never_reaches_the_recorded_command(self, monkeypatch, tmp_path):
+        """The work-unit config and every telemetry copy of the command must be secret-free too."""
+        self._oob(monkeypatch, interactsh_server="oob.mine.test", interactsh_token="T0K")
+        p = self._P(); p.blind_xss = True
+        cmd = params._dalfox_cmd(tmp_path / "b.txt", tmp_path / "o.jsonl", p, 1)
+        assert "T0K" not in " ".join(str(c) for c in cmd)
 
     def test_the_server_is_ONE_argv_token(self, monkeypatch):
         """`--blind-oob[=<domains>]` takes its value attached. A separate `=host` argument would be
@@ -795,6 +819,35 @@ class TestBlindXssChannel:
         cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test")
         assert "-b" not in cmd, cmd
 
+    def test_a_dormant_legacy_url_does_not_silently_double_the_channels(self, monkeypatch):
+        """review#17 (Lumpy): with BLIND_XSS armed AND a historical `blind_xss_url` present, the lane
+        emitted BOTH — duplicate payloads because a dormant setting existed, not because anyone chose
+        it. It refuses and names the knob instead."""
+        p = self._P(); p.blind_xss = True
+        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test",
+                        blind_xss_url="https://col.example")
+        assert not any(c.startswith("--blind-oob") for c in cmd) and "-b" not in cmd, cmd
+        plan = params._blind_oob_plan(p)
+        assert plan["channel"] == "conflict" and not plan["armed"]
+        assert "BLIND_XSS_DUAL" in plan["reason"] and "REFUSED" in plan["reason"]
+
+    def test_dual_mode_runs_BOTH_only_when_explicitly_permitted(self, monkeypatch):
+        p = self._P(); p.blind_xss = True; p.blind_xss_dual = True
+        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test",
+                        blind_xss_url="https://col.example")
+        assert "--blind-oob=oob.mine.test" in cmd and cmd[cmd.index("-b") + 1] == "https://col.example"
+        plan = params._blind_oob_plan(p)
+        assert plan["channel"] == "dual" and "DOUBLES" in plan["reason"]
+
+    def test_a_legacy_channel_is_an_explicit_CHOICE_not_a_fallback(self, monkeypatch):
+        """A refused native channel must not fall back to the collector: the operator armed the native
+        one, and quietly using a different channel is not what they asked for."""
+        p = self._P(); p.blind_xss = True                    # no server, no public permission
+        cmd = self._cmd(monkeypatch, p, blind_xss_url="https://col.example")
+        plan = params._blind_oob_plan(p)
+        assert plan["channel"] == "conflict", plan["channel"]
+        assert "-b" not in cmd, "a refusal is not a fallback"
+
     def test_b_still_works_as_an_opt_in_legacy_collector(self, monkeypatch):
         cmd = self._cmd(monkeypatch, self._P(), blind_xss_url="https://col.example")
         assert cmd[cmd.index("-b") + 1] == "https://col.example"
@@ -803,19 +856,30 @@ class TestBlindXssChannel:
     def test_the_arming_flags_do_not_fail_open_on_quoted_yaml(self):
         """An arming flag must never be enabled by a QUOTED string, and a quoted value must fail LOUD in
         validation rather than silently leave the lane disabled against operator intent."""
+        import tempfile as _tf
         import pytest as _pt
         from quarry_recon.config import ProfileError, TargetProfile
         prof = TargetProfile.__new__(TargetProfile)
-        prof.modes = {"BLIND_XSS": "true", "BLIND_XSS_PUBLIC": "true"}
+        prof.modes = {"BLIND_XSS": "true", "BLIND_XSS_PUBLIC": "true", "BLIND_XSS_DUAL": "true"}
         assert prof.blind_xss is False and prof.blind_xss_public is False
+        assert prof.blind_xss_dual is False
         # …and a quoted value fails LOUD through the real loader
-        import tempfile as _tf
-        for bad in ("BLIND_XSS", "BLIND_XSS_PUBLIC"):
+        for bad in ("BLIND_XSS", "BLIND_XSS_PUBLIC", "BLIND_XSS_DUAL"):
             f = pathlib.Path(_tf.mkdtemp()) / "target.yaml"
             f.write_text("target: acme.com\nscope:\n  in: [acme.com]\n"
                          f"MODES:\n  {bad}: \"true\"\n")
             with _pt.raises(ProfileError):
                 TargetProfile.load(f)
+
+    def test_every_arming_flag_defaults_to_OFF(self):
+        """An absent mode must never arm a lane: dual mode doubles blind payloads, and public OOB sends
+        callbacks to a third party. Neither may happen because a key was missing."""
+        from quarry_recon.config import TargetProfile
+        prof = TargetProfile.__new__(TargetProfile)
+        prof.modes = {}
+        assert prof.blind_xss is False
+        assert prof.blind_xss_public is False
+        assert prof.blind_xss_dual is False
 
     def test_an_OOB_finding_records_dalfox_as_the_OWNER(self):
         row = ('{"type":"V","param":"q","data":"http://h/p?q=1","method":"GET","location":"Query",'

@@ -248,6 +248,16 @@ class TargetProfile:
         return self.modes.get("BLIND_XSS_PUBLIC", False) is True
 
     @property
+    def blind_xss_dual(self) -> bool:
+        """MODES.BLIND_XSS_DUAL — permit the native OOB channel AND a legacy `-b` collector together.
+
+        Default OFF. dalfox injects a blind payload for EACH channel, so dual mode doubles the blind
+        payloads, adds requests and runs two callback lifecycles for one finding. With BLIND_XSS armed
+        and `oob.blind_xss_url` also set, the lane REFUSES until this says the duplication is intended
+        (review#17, Lumpy). Strict `is True`: an arming flag must not fail open."""
+        return self.modes.get("BLIND_XSS_DUAL", False) is True
+
+    @property
     def headless(self) -> bool:
         return _flag(self.modes.get("HEADLESS"), False)
 
@@ -433,7 +443,7 @@ class TargetProfile:
         if "SECRET_VERIFICATION" in modes and not isinstance(modes["SECRET_VERIFICATION"], bool):
             raise ProfileError(f"MODES.SECRET_VERIFICATION must be a bare boolean true/false "
                                f"(got {modes['SECRET_VERIFICATION']!r})")
-        for _arm in ("BLIND_XSS", "BLIND_XSS_PUBLIC"):
+        for _arm in ("BLIND_XSS", "BLIND_XSS_PUBLIC", "BLIND_XSS_DUAL"):
             if _arm in modes and not isinstance(modes[_arm], bool):
                 raise ProfileError(f"MODES.{_arm} must be a bare boolean true/false "
                                    f"(got {modes[_arm]!r})")

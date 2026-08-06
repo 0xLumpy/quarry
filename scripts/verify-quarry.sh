@@ -2388,13 +2388,31 @@ wired = "--write-massdns" in src and 'ips.get(e["host"]' in src
 sys.exit(0 if (parse and wired) else 1)
 PYEOF
 
-echo "[84] v0.3.3 blind XSS (reconftw XSS_SERVER parity): dalfox gets -b <collector> when secrets oob.blind_xss_url is set (else reflected-only); nuclei OOB already default-on via built-in interactsh; doctor shows it wired to dalfox -b (not 'reserved')"
-PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "params dalfox reads secrets.oob().blind_xss_url and appends -b; secrets.oob docstring no longer 'reserved'; doctor line says 'dalfox -b'; template documents interactsh-client URL" || no "v0.3.3 blind XSS wiring broken"
+echo "[84] blind XSS channel selection (v0.3.3 -b + 4.3.D native OOB): -b is the LEGACY collector, chosen only when MODES.BLIND_XSS is off; an armed native channel alongside a dormant blind_xss_url REFUSES rather than doubling payloads; the interactsh secret travels in a 0600 --config file and NEVER in argv; collector URL redacted from the manifest cmd"
+PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "-b only as the explicit legacy channel; armed native + dormant collector -> REFUSED (no doubled payloads); secret via 0600 --config, never argv; doctor line says 'dalfox -b'; collector URL redacted" || no "v0.3.3 blind XSS wiring broken"
 import sys, inspect
 import quarry_recon.phases.params as PA
 from quarry_recon import cli, secrets
 psrc=inspect.getsource(PA)
-wired = 'secrets.oob().get("blind_xss_url")' in psrc and '"-b", str(bx)' in psrc
+# BEHAVIOURAL, not a source literal: 4.3.D made channel selection explicit, so assert what the lane
+# EMITS. `-b` is the legacy collector and is chosen only when the native OOB channel is not armed.
+class _P:
+    http_rl = 0; blind_xss = False; blind_xss_public = False; blind_xss_dual = False
+_real_oob = secrets.oob          # restored below: `secrets.values()` reads oob() for the redaction guard
+secrets.oob = lambda: {"blind_xss_url": "https://col.example"}
+_cmd = PA._dalfox_cmd("i", "/tmp/_vq_dalfox.jsonl", _P(), 1)
+wired = _cmd[_cmd.index("-b") + 1] == "https://col.example"
+# …and a DORMANT collector must not silently double the channels once the native one is armed
+_P.blind_xss = True
+secrets.oob = lambda: {"blind_xss_url": "https://col.example", "interactsh_server": "oob.mine.test"}
+_dual = PA._dalfox_cmd("i", "/tmp/_vq_dalfox.jsonl", _P(), 1)
+wired = wired and "-b" not in _dual and not any(c.startswith("--blind-oob") for c in _dual)
+# …and the interactsh SECRET never reaches argv (/proc/<pid>/cmdline is world-readable to this user)
+secrets.oob = lambda: {"interactsh_server": "oob.mine.test", "interactsh_token": "T0KVALUE"}
+_nat = PA._dalfox_cmd("i", "/tmp/_vq_dalfox.jsonl", _P(), 1)
+wired = (wired and "--blind-oob=oob.mine.test" in _nat
+         and not any("T0KVALUE" in c for c in _nat) and "--blind-oob-secret" not in _nat)
+secrets.oob = _real_oob          # the redaction guard below needs the REAL reader
 doc = "dalfox -b" in inspect.getsource(cli)
 notreserved = "reserved" not in inspect.getsource(secrets.oob)
 # REDACTION guard: the -b collector URL is sensitive operational metadata (correlation) — it MUST be
