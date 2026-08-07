@@ -1243,6 +1243,135 @@ def _ssti_targets(ctx, scope) -> list[str]:
     return out
 
 
+def _dalfox_signature(u: str) -> tuple:
+    """The identity dalfox deduplicates on under `--dedup-urls signature`: method+host+path+parameter
+    NAMES. Every target we submit is a GET, so method is constant here — and this is deliberately the
+    same key `_canonicalize_candidates` uses, because that is what makes the two agree."""
+    from urllib.parse import urlsplit, parse_qsl
+    sp = urlsplit(u)
+    names = tuple(sorted({k for k, _ in parse_qsl(sp.query, keep_blank_values=True)}))
+    return (sp.scheme.lower(), sp.netloc.lower(), sp.path, names)
+
+
+def _dalfox_identity_fn(mode: str):
+    """The identity dalfox is deduplicating on, PER MODE — and whether multiplicity matters.
+
+    review#39 (Lumpy): the reconciliation applied signature semantics unconditionally, so a fully
+    covered `exact` scan of `a?q=1` and `a?q=2` read as one signature reported twice and returned
+    PARTIAL on every lifecycle — with no remainder, so it re-sent the whole batch for ever. `off` scans
+    every input line, so multiplicity IS the identity there."""
+    if mode in ("exact", "off"):
+        return (lambda u: u), (mode == "off")                  # exact: the URL; off: URL x multiplicity
+    # `signature`, and an UNKNOWN mode: the least demanding identity, so "never mentioned" means
+    # never mentioned under ANY policy. What that identity cannot settle is handled separately as
+    # UNDECIDABLE membership rather than being asserted either way (review#40, Lumpy).
+    return _dalfox_signature, False
+
+
+def _dedupe_owed(named, mode) -> list:
+    """Collapse the targets dalfox NAMED as failed, under the identity THAT MODE scans by.
+
+    review#44 (Lumpy): this used `dict.fromkeys`, i.e. the exact URL, while claiming "one signature
+    identity owes one retry" — so `/a?q=1` and `/a?q=2`, one signature and both `SESSION_LOST`, were
+    owed twice under `dedup_mode=signature`. The previous test only repeated an identical URL, which
+    exact-URL dedup passes.
+
+      off      every occurrence is its own scan          -> collapse nothing
+      signature  method+host+path+param names            -> one retry per signature
+      exact      the URL                                 -> one retry per URL
+      unknown    no identity we can trust                -> collapse nothing (re-scanning is the safe
+                                                            error; dropping an owed scan is not)"""
+    if mode == "off" or mode not in _DALFOX_DEDUP_MODES:
+        return list(named)
+    key = _dalfox_signature if mode == "signature" else (lambda u: u)
+    seen, out = set(), []
+    for u in named:
+        k = key(u)
+        if k not in seen:
+            seen.add(k)
+            out.append(u)
+    return out
+
+
+def _dalfox_accounting(batch, art) -> "tuple[list, dict]":
+    """Reconcile dalfox's `target_summary` against the batch we submitted — by MEMBERSHIP, under the
+    mode dalfox SAYS it used. Returns `(owed_urls, info)` where `info` carries:
+
+        retryable   membership failures a RETRY could cover — the chunk stays owed
+        terminal    membership we cannot DECIDE — retrying changes nothing, and it is a coverage gap
+        mode        the mode the reconciliation was performed under
+
+    review#38 (Lumpy): comparing counts let `[a,b]` be answered by `[a,a]`, by `[a,c]`, or by nothing at
+    all with `deduplicated=99`. So `expected` is the multiset of identities in the batch UNDER THE
+    REPORTED MODE — exactly what dalfox scans — and the dedup count is DERIVED rather than believed.
+
+    review#40 (Lumpy): an UNKNOWN mode has no identity to reconcile under, and signature is the LEAST
+    demanding one — using it certified coverage that `exact`/`off` would have denied ("only a?q=1 was
+    reported" is complete under signature and short under exact). Two facts are separated instead:
+    anything missing even by SIGNATURE was never mentioned under any policy and is genuinely owed;
+    anything present by signature but not as the exact URL is UNDECIDABLE — recorded as coverage-unknown
+    and left terminal, because a retry under the same unknown policy produces the same ambiguity. An
+    unreadable POLICY must not become either a clean claim or an endless retry."""
+    from collections import Counter
+    mode = art.dedup_mode
+    keyfn, multiplicity = _dalfox_identity_fn(mode)
+    known = mode in _DALFOX_DEDUP_MODES
+    expected: dict = {}
+    for u in batch:
+        expected.setdefault(keyfn(u), []).append(u)
+    reported = [keyfn(t) for t in art.summary_targets]
+    rep_count = Counter(reported)
+    foreign = [t for t, k in zip(art.summary_targets, reported) if k not in expected]
+
+    retryable, terminal, owed, ambiguous = [], [], [], []
+    if multiplicity:
+        # `off` scans every input LINE: two identical lines owe two reports, and one report leaves one
+        # occurrence unaccounted (review#40 — the set intersection could not see that).
+        short = {k: len(v) - rep_count.get(k, 0) for k, v in expected.items()
+                 if rep_count.get(k, 0) < len(v)}
+        if short:
+            names = [f"{expected[k][0]} x{n}" for k, n in list(short.items())[:20]]
+            retryable.append(f"{sum(short.values())} submitted occurrence(s) were never reported under "
+                             f"dedup_mode=off: " + ", ".join(names))
+            owed = [u for k, n in short.items() for u in expected[k][:n]]
+    else:
+        unlisted = [k for k in expected if k not in rep_count]
+        if unlisted:
+            names = [expected[k][0] for k in unlisted]
+            retryable.append(f"{len(unlisted)} submitted target(s) were never reported in any state: "
+                             + ", ".join(names[:20])
+                             + (f" (+{len(names) - 20} more)" if len(names) > 20 else ""))
+            owed = [u for k in unlisted for u in expected[k]]
+    if not known:
+        # present by signature, but NOT as the exact URL dalfox would have had to scan under `exact`
+        # or `off`. Whether those were covered is not knowable from this artifact.
+        rep_urls = set(art.summary_targets)
+        ambiguous = [u for u in batch if u not in rep_urls and _dalfox_signature(u) in rep_count]
+        if ambiguous:
+            terminal.append(f"dedup_mode is {mode}, so membership cannot be decided: "
+                            f"{len(ambiguous)} submitted target(s) share a reported SIGNATURE but were "
+                            f"not reported as themselves — covered under `signature`, short under "
+                            f"`exact`/`off`: " + ", ".join(ambiguous[:20]))
+    if foreign:
+        retryable.append(f"{len(foreign)} reported target(s) were NOT in this batch: "
+                         + ", ".join(foreign[:20]))
+    if known:
+        over = [k for k, n in rep_count.items()
+                if k in expected and n > (len(expected[k]) if multiplicity else 1)]
+        if over:
+            retryable.append(f"{len(over)} target(s) reported more times than dedup_mode={mode} allows, "
+                             f"which that mode should have collapsed")
+        claimed = art.deduplicated
+        derived = 0 if multiplicity else len(batch) - len(expected)
+        if claimed is not None and claimed != derived:
+            retryable.append(f"dalfox claims {claimed} target(s) collapsed; under dedup_mode={mode} "
+                             f"this batch has {derived} duplicate(s)")
+    return owed, {"retryable": retryable, "terminal": terminal, "mode": mode,
+                  # the ambiguous TARGETS, not the sentence about them: a doubt is cleared per identity
+                  # by an attempt that actually scanned it (review#42, Lumpy).
+                  "ambiguous": ambiguous}
+
+
 def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
     """Collapse XSS/redirect candidate URLs to unique (host, path, sorted param-NAMES) shapes, keeping
     ONE representative URL per shape. dalfox's reflected-XSS selection depends on the param SHAPE, not
@@ -1469,6 +1598,26 @@ def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0, cred_path=None) 
     per_host = max(1, int(batch_len or settings.concurrency("DALFOX_CHUNK", 40)))
     cmd = ["dalfox", "scan", "-i", "file", str(batch_file), "-o", str(out_file),
            "-f", "jsonl", "-S", "--skip-mining",
+           # 3.2.0 adoption (MEASURED against the real binary, 2026-08-07):
+           #
+           # `--dedup-urls signature` keys on method+host+path+parameter NAMES and is COUNTED in
+           # meta.targets_deduplicated, so it can never hide what it collapsed. It is the same identity
+           # `_canonicalize_candidates` already computes — verified, including that it does NOT collapse
+           # across SCHEME (http and https stay two targets, as ours does). So on this lane it should
+           # find almost nothing left to collapse; it is here as a second net for any caller that feeds
+           # raw URLs, and `targets_deduplicated` is reported so the residual is measurable rather than
+           # assumed.
+           "--dedup-urls", "signature",
+           # the finding IS the product: carry the exact request that produced it and the response that
+           # proved it, so a candidate is auditable without re-running anything. Measured field names:
+           # `request` / `response`, both plain strings on the finding row.
+           "--include-request", "--include-response",
+           #
+           # `--scan-timeout` is DELIBERATELY NOT PASSED (measured): a target whose injection stage it
+           # cuts is reported `status: "clean", incomplete: false` — byte-identical to a target that was
+           # genuinely scanned and found nothing. Quarry cannot report coverage it cannot observe, and a
+           # silent false negative is exactly the failure `quarry-subfinder-ceiling-honesty` is about.
+           # Revisit if dalfox surfaces the cut in the artifact.
            "--max-targets-per-host", str(per_host),
            "--workers", str(max(1, settings.workers("dalfox", 30))),          # per-target; v2 -w 100 NOT carried
            "--max-concurrent-targets", str(max(1, settings.concurrency("DALFOX_TARGETS", 4)))]  # OTC-tunable
@@ -1601,6 +1750,11 @@ def _dalfox_finding(obj) -> "dict | None":
             "detection_method": _dstr(obj.get("detection_method")) or None,
             "confidence_reason": _dstr(obj.get("confidence_reason")) or None,
             "inject_type": _dstr(obj.get("inject_type")) or None,
+            # `--include-request/--include-response`: the exact request that produced the finding and the
+            # response that proved it. Stored WHOLE — this is the evidence, not a preview of it — and
+            # only when dalfox actually emitted a string (a missing one must not become "None").
+            "request": obj.get("request") if isinstance(obj.get("request"), str) else None,
+            "response": obj.get("response") if isinstance(obj.get("response"), str) else None,
             # correlation for an OOB hit is dalfox's: it minted the nonce, registered, polled and mapped
             # it back. Quarry imports that — it did not issue the token (review#12, Lumpy).
             **({"oob_owner": "dalfox"} if _dstr(obj.get("detection_method")) == "oob" else {})}
@@ -1647,12 +1801,26 @@ class DalfoxArtifact:
     skipped: tuple = ()          # ((target, status, error_code), ...)
     total_requests: "int | None" = None
     deduplicated: "int | None" = None
+    #: what dalfox says it ACTUALLY did about duplicates. We ask for `signature`; a build that ignored
+    #: the flag, or a future default change, would silently scan a different target set than the one we
+    #: think we asked for — so the artifact's own word is read rather than assumed (2026-08-07).
+    #: every target dalfox ACCOUNTED FOR, whatever its disposition. review#37 (Lumpy): `complete` meant
+    #: "no listed target was skipped", which is silent about targets that were never listed — an empty
+    #: summary certified a whole batch. Membership is reconciled against the submitted batch by the lane,
+    #: which is the only place that knows what was submitted.
+    summary_targets: tuple = ()
+    #: one of `_DALFOX_DEDUP_MODES`, or "unknown" when the artifact does not establish it.
+    dedup_mode: str = "unknown"
     version: str = ""
 
     @property
     def complete(self) -> bool:
-        """dalfox covered every target it was given."""
-        return not self.incomplete_flag and not self.skipped
+        """dalfox covered every target it was given — and SAID SO in a form we could read.
+
+        review#36 (Lumpy): coverage was derived from two fields while the row carrying them might be
+        malformed, so `{"incomplete": "true"}` produced `complete=True` on an artifact whose own meta
+        could not be trusted. An unreadable claim is not a claim of coverage."""
+        return self.readable and not self.incomplete_flag and not self.skipped
 
     @property
     def retriable(self) -> tuple:
@@ -1689,89 +1857,157 @@ class DalfoxArtifact:
         return "; ".join(bits) or "every target covered"
 
 
+#: what dalfox can legitimately say it did about duplicates. review#35 (Lumpy): `str(x or "")` turned a
+#: dict into `"{'mode': 'signature'}"` and an absent field into `""` — one is malformed input dressed as
+#: a policy, the other is no claim at all. Anything not in this set is `unknown`: the findings are still
+#: evidence, but WHICH TARGET SET produced them is not established, and the lane says so.
+_DALFOX_DEDUP_MODES = frozenset({"signature", "exact", "off"})
+
+
+def _dedup_mode(v) -> str:
+    return v if isinstance(v, str) and v in _DALFOX_DEDUP_MODES else "unknown"
+
+
 def _dalfox_meta(m: dict) -> "tuple[int | None, DalfoxArtifact | None]":
     """Read the meta row -> (findings_count, partially-built artifact). `None` count = unusable."""
+    def _nonneg(v):
+        # review#35 (Lumpy): these numbers become OPERATOR-FACING MEASUREMENT — "37 requests, 4 targets
+        # collapsed" — so `-7` and `-3` were being summed and shown. A count that cannot be true is not
+        # a count; it is an unreadable field, and `None` says exactly that.
+        return v if type(v) is int and v >= 0 else None
+
     c = m.get("findings_count")
-    count = c if type(c) is int and c >= 0 else None          # STRICT int (not bool), non-negative
-    skipped = []
+    count = _nonneg(c)                                        # STRICT int (not bool), non-negative
+    # review#36 (Lumpy): these fields DRIVE THE VERDICT — `incomplete` decides whether the chunk may be
+    # marked resumably complete, and `target_summary` is where a SKIPPED target is named. Both were
+    # permissive: `"incomplete": "true"` is not `True`, so it read as "not incomplete", and a
+    # dict-valued `target_summary` failed the `isinstance(list)` check and became "no targets skipped".
+    # Malformed input must not be able to say a scan finished cleanly, so it invalidates the meta row
+    # (count None -> artifact not readable -> chunk PARTIAL/retryable) rather than defaulting to clean.
+    # review#37 (Lumpy): the checks only rejected these when PRESENT, so `{"findings_count": 0}` — no
+    # `incomplete`, no `target_summary` — still certified a clean, resumably complete chunk. 3.2.0
+    # always emits both (measured), so their ABSENCE is not "nothing to report", it is an artifact that
+    # does not implement the contract this lane resumes on.
+    malformed = False
+    skipped, summary_targets = [], []
     ts = m.get("target_summary")
-    if isinstance(ts, list):
+    if not isinstance(ts, list):
+        malformed = True                                      # absent OR wrong type: no accounting at all
+    else:
         for t in ts:
             if not isinstance(t, dict):
+                malformed = True                              # a non-object row is not a target record
                 continue
-            status = t.get("status")
+            status, target, code = t.get("status"), t.get("target"), t.get("error_code")
+            if not isinstance(status, str) or not isinstance(target, str) \
+                    or (code is not None and not isinstance(code, str)):
+                malformed = True                              # never str()-coerced into a fake record
+                continue
             # `findings` and `clean` are covered targets; anything else is not (dalfox's own words:
             # "the distinction that matters to a consumer: neither is `clean`")
+            summary_targets.append(target)                # ACCOUNTED FOR, whatever the disposition
             if status in ("findings", "clean"):
                 continue
-            skipped.append((str(t.get("target") or ""), str(status or ""),
-                            str(t.get("error_code") or "")))
+            skipped.append((target, status, code or ""))
     inc = m.get("incomplete")
+    if type(inc) is not bool:
+        malformed = True                                      # absent OR wrong type
+    if malformed:
+        count = None
     return count, DalfoxArtifact(
         readable=True, incomplete_flag=inc is True, skipped=tuple(skipped),
-        total_requests=m.get("total_requests") if type(m.get("total_requests")) is int else None,
-        deduplicated=m.get("targets_deduplicated")
-        if type(m.get("targets_deduplicated")) is int else None,
+        summary_targets=tuple(summary_targets),
+        total_requests=_nonneg(m.get("total_requests")),
+        deduplicated=_nonneg(m.get("targets_deduplicated")),
+        dedup_mode=_dedup_mode(m.get("dedup_mode")),
         version=str(m.get("dalfox_version") or ""))
 
 
-def _parse_dalfox_jsonl(cf) -> "tuple[list, DalfoxArtifact]":
-    """FAIL-CLOSED parse of a dalfox v3 JSONL artifact -> (valid_findings, DalfoxArtifact). Keeps every VALID
-    finding as evidence, but artifact_ok is False on ANY inconsistency: missing/unreadable file, a decode error,
-    a meta row NOT in first position or MORE than one, a non-int/negative/bool findings_count (review-r10#3:
-    bool subclasses int, so `type(x) is int`), finding-count != meta count, a torn/non-object line, an unknown
-    type, or a row missing its identity fields. The caller ingests the valid findings but marks a not-ok chunk
-    PARTIAL/retryable (never 'done'), so incomplete work can't be permanently skipped on resume.
+def scan_dalfox_jsonl(cf, sink=None) -> "tuple[int, DalfoxArtifact]":
+    """FAIL-CLOSED, STREAMING parse of a dalfox v3 JSONL artifact -> (valid_finding_count, DalfoxArtifact).
+
+    Every valid finding is handed to `sink` AS IT IS READ and never retained here. review#35 (Lumpy):
+    with `--include-response` a finding carries a whole HTTP response, and the old shape read the entire
+    file into a str, copied it again through `splitlines()`, and held every finding at once — so the
+    artifact dalfox had already written successfully could OOM the process that came to read it, and do
+    it again on resume. The bytes are preserved in full; what is bounded is how many of them we hold at
+    the same time. That is the same split the acquisition side settled on: keep everything, hold one
+    piece at a time.
+
+    `artifact_ok` is False on ANY inconsistency: missing/unreadable file, a decode error, a meta row NOT
+    in first position or MORE than one, a non-int/negative/bool findings_count (review-r10#3: bool
+    subclasses int, so `type(x) is int`), finding-count != meta count, a torn/non-object line, an unknown
+    type, or a row missing its identity fields. The caller ingests the valid findings but marks a not-ok
+    chunk PARTIAL/retryable (never 'done'), so incomplete work can't be permanently skipped on resume.
+
+    A DECODE ERROR is now per LINE rather than per file: the artifact is opened in binary and each line
+    is decoded strictly, so one bad byte costs that row (and the artifact's `readable` verdict, exactly
+    as before) instead of discarding every finding beside it.
 
     review#13 (Lumpy): the meta row is READ, not just counted. dalfox reports `incomplete` and a
     per-target `status`/`error_code`, so a batch where a target was SKIPPED used to parse as clean and
     become resumably complete. Those facts ride on the returned `DalfoxArtifact`: `readable` is the
     structural verdict this function always gave, and completeness is a separate question."""
     if not cf.exists():
-        return [], DalfoxArtifact(readable=False)
-    try:
-        raw = cf.read_text(encoding="utf-8")                  # strict decode: a bad byte = malformed, not silent
-    except (OSError, UnicodeError):
-        return [], DalfoxArtifact(readable=False)
-    findings, ok, meta_rows, meta_count, row_idx = [], True, 0, None, 0
+        return 0, DalfoxArtifact(readable=False)
+    kept, ok, meta_rows, meta_count, row_idx = 0, True, 0, None, 0
+    in_sink = False                                           # see the OSError handler: whose failure it is
     art = DalfoxArtifact(readable=True)
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            ok = False; row_idx += 1; continue                # torn line -> not trustworthy
-        if not isinstance(obj, dict):
-            ok = False; row_idx += 1; continue
-        if "meta" in obj:
-            meta_rows += 1
-            if row_idx != 0:                                  # review-r10#3: meta must be the FIRST row
-                ok = False
-            m = obj.get("meta")
-            if isinstance(m, dict):
-                meta_count, art = _dalfox_meta(m)
-            if meta_count is None:
-                ok = False
-            row_idx += 1
-            continue
-        try:
-            rec = _dalfox_finding(obj)
-        except Exception:
-            rec = None                                        # defensive: a row can NEVER abort the whole parse
-        if rec is None:
-            ok = False                                        # malformed/unknown row -> chunk not trustworthy
-        else:
-            findings.append(rec)
-        row_idx += 1
+    try:
+        with open(cf, "rb") as fh:
+            for raw_line in fh:
+                try:
+                    line = raw_line.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    ok = False; row_idx += 1; continue        # a bad byte costs THIS row, not the file
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    ok = False; row_idx += 1; continue        # torn line -> not trustworthy
+                if not isinstance(obj, dict):
+                    ok = False; row_idx += 1; continue
+                if "meta" in obj:
+                    meta_rows += 1
+                    if row_idx != 0:                          # review-r10#3: meta must be the FIRST row
+                        ok = False
+                    m = obj.get("meta")
+                    if isinstance(m, dict):
+                        meta_count, art = _dalfox_meta(m)
+                    if meta_count is None:
+                        ok = False
+                    row_idx += 1
+                    continue
+                try:
+                    rec = _dalfox_finding(obj)
+                except Exception:
+                    rec = None                                # defensive: a row can NEVER abort the parse
+                if rec is None:
+                    ok = False                                # malformed/unknown row -> not trustworthy
+                else:
+                    kept += 1
+                    if sink is not None:
+                        # review#36 (Lumpy): the sink STORES the finding, and an OSError from that is a
+                        # STORAGE failure, not an unreadable artifact — swallowing it returned
+                        # `(0, readable=False)` while earlier rows had already landed, and the real
+                        # failure disappeared. It is re-raised through the artifact-I/O boundary below.
+                        in_sink = True
+                        sink(rec)
+                        in_sink = False
+                    del rec                                   # one finding held at a time, not all of them
+                row_idx += 1
+    except OSError:
+        if in_sink:
+            raise                                             # the caller's failure, reported as its own
+        return 0, DalfoxArtifact(readable=False)
     if meta_rows != 1:                                        # review-r10#3: EXACTLY one meta summary row
         ok = False
-    if meta_count is not None and meta_count != len(findings):
+    if meta_count is not None and meta_count != kept:
         ok = False                                            # count mismatch -> torn/partial artifact
     # `readable` is the STRUCTURAL verdict; the dispositions dalfox reported ride along untouched, so a
     # torn artifact never masquerades as a complete scan and vice versa.
-    return findings, dataclasses.replace(art, readable=ok)
+    return kept, dataclasses.replace(art, readable=ok)
 
 
 def _sha256_file(p) -> str:
@@ -1808,7 +2044,12 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     # concurrency + rate-limit (fan-out/pacing), a FINGERPRINT of the blind collector (never the raw URL), and
     # chunk size. `mode` v3-fast invalidates any in-progress v2 state.
     bx = secrets.oob().get("blind_xss_url")
-    _cfg = {"mode": "v3-fast-reflected", "engine": _dalfox_engine_id(),
+    # `mode` carries the SCAN CONTRACT, not just the engine generation (review#36, Lumpy): the 3.2.0
+    # adoption changed WHAT AN ARTIFACT CONTAINS (full request/response evidence) and WHICH TARGET SET
+    # was scanned (signature dedup). A chunk completed before it is structurally valid and would be
+    # accepted on resume — skipping work whose evidence we just decided we need. Changing this string
+    # invalidates that state, which is exactly what should happen.
+    _cfg = {"mode": "v3-fast-reflected+evidence+sigdedup", "engine": _dalfox_engine_id(),
             "workers": settings.workers("dalfox", 30),
             "targets": settings.concurrency("DALFOX_TARGETS", 4),
             "rate_limit": prof.http_rl,
@@ -1884,11 +2125,12 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 return False
         except OSError:
             return False
-        fnds, art = _parse_dalfox_jsonl(p)                   # re-parses (as the comment promises)
+        n_f, art = scan_dalfox_jsonl(p)                      # re-scans (as the comment promises); the
+                                                             # findings themselves are not needed here
         # a recorded completion is only trusted when the artifact is still STRUCTURALLY sound and dalfox
         # itself had nothing left to retry on it
-        return art.execution_done and ((outcome == "EMPTY" and not fnds)
-                                       or (outcome == "SUCCESS" and bool(fnds)))
+        return art.execution_done and ((outcome == "EMPTY" and not n_f)
+                                       or (outcome == "SUCCESS" and n_f > 0))
 
     def _load_completion(prev) -> dict:                      # {ci: {rel, outcome, sha256}} — each FULLY validated
         m = (prev or {}).get("chunks"); out: dict[str, dict] = {}
@@ -1922,6 +2164,21 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                         for e in (v if isinstance(v, list) else [v]) if _valid_evidence(str(k), e)]
                 if kept:
                     out[str(k)] = kept
+        return out
+
+    def _load_membership(prev) -> dict:
+        """{ci: [reason, …]} — membership this lane could not DECIDE (an unreadable dedup policy).
+
+        review#41 (Lumpy): it was emitted once and the chunk was recorded complete, so the next
+        lifecycle skipped the chunk, re-derived nothing, and the fresh coverage generation retired the
+        record — an unresolved doubt that quietly became a clean run."""
+        m = (prev or {}).get("membership")
+        out: dict[str, list] = {}
+        if isinstance(m, dict):
+            for k, v in m.items():
+                rows = [str(x) for x in v if isinstance(x, str) and x] if isinstance(v, list) else []
+                if rows:
+                    out[str(k)] = rows
         return out
 
     def _load_remainder(prev) -> dict:
@@ -1961,6 +2218,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     completion: dict[str, dict] = _load_completion(_pv)      # controls SKIP (revalidated each run)
     evidence_map: dict[str, list[dict]] = _load_evidence(_pv)
     remainder: dict[str, list] = _load_remainder(_pv)         # controls WHAT a retry re-runs
+    membership: dict[str, list] = _load_membership(_pv)       # UNDECIDABLE coverage, outliving attempts
     terminal: dict[str, list] = _load_terminal(_pv)           # gaps no retry can close — never cleared
 
     def _add_evidence(ci_str, rel, sha):                     # append-only, unique-by-rel, per chunk; digest recorded
@@ -1974,7 +2232,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     def _save():
         state_f.write_text(json.dumps(
             {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": completion, "evidence": evidence_map,
-             "remainder": remainder, "terminal": terminal}))
+             "remainder": remainder, "terminal": terminal, "membership": membership}))
 
     # THE DECISION, recorded BEFORE execution — which is what it is: knowable up front, and it must
     # survive a run that raises anywhere in the loop (review#21, Lumpy). `omitted=0` keeps it inert in
@@ -1990,6 +2248,9 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                       input_total=len(cands), work_unit=scan_wu)
     t0 = time.monotonic()
     degraded = produced = matched = 0                      # defined up-front: the finally ledger must not NameError
+    #: what the scan COST and what dalfox COLLAPSED, accumulated across chunks. Defined here for the
+    #: same reason as the counters above: the result note must not NameError on an early failure.
+    cost = {"requests": 0, "deduplicated": 0, "dedup_disagreement": set()}
     tiers = {"xss-verified": 0, "xss-candidate": 0, "dom-xss-static": 0}   # if the loop raises before the aggregate
     status = Status.FAILED                                 # exception mid-loop must NOT emit scan-level success
     try:
@@ -2004,7 +2265,16 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         # nothing else, so a chunk's successful targets are never re-requested (review#14, Lumpy). The
         # remainder is intersected with this run's batch: a candidate set that changed cannot smuggle a
         # URL back in, and a stale entry naming nothing simply falls back to the full chunk.
-        owed = [u for u in batch if u in set(remainder.get(str(ci), []))]
+        # COUNTED, not set-membership (review#41, Lumpy): the state correctly stored two owed
+        # occurrences of one URL under `dedup_mode=off`, and `set()` then selected all three originals —
+        # so a retry re-requested a target that had already answered. The remainder is consumed.
+        from collections import Counter as _Counter
+        _owed_count = _Counter(remainder.get(str(ci), []))
+        owed = []
+        for u in batch:
+            if _owed_count.get(u, 0) > 0:
+                _owed_count[u] -= 1
+                owed.append(u)
         batch = owed or batch
         if owed and len(owed) < len(batches[ci]):
             events.coverage_partial(
@@ -2054,13 +2324,66 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             # dalfox v3 EXIT CONTRACT (measured): 0 = clean/no-findings, 1 = clean/WITH-findings, >=2 = error.
             # review-r9#2: exit code and parsed artifact must AGREE — CLEAN only for (0 + valid empty) or
             # (1 + valid findings). Any disagreement / hard exit / malformed artifact -> PARTIAL, retryable.
-            findings, art = _parse_dalfox_jsonl(cf)
+            # the findings are INGESTED below from the retained artifacts; here only the count and the
+            # artifact's own verdict are needed, so nothing is held.
+            n_findings, art = scan_dalfox_jsonl(cf)
             rc = res.exit_code
             # EXECUTION completion decides resume; COVERAGE is reported separately below. A chunk whose
             # only omissions are DETERMINISTIC is done — retrying it would omit exactly the same targets
             # for ever — and its gap is a counter, not a retry (review#13, Lumpy).
-            clean = art.execution_done and ((rc == 0 and not findings) or (rc == 1 and bool(findings)))
+            # MEMBERSHIP RECONCILIATION (review#37, Lumpy). `execution_done` only says nothing dalfox
+            # LISTED still needs retrying; it is silent about targets it never listed. With signature
+            # dedup the expected accounting is (submitted - collapsed), so a shortfall means dalfox
+            # never told us what happened to those URLs — and a chunk marked done over them would drop
+            # them for ever. Unaccounted targets keep the chunk retryable.
+            # review#38 (Lumpy): counting is not reconciling. `[a,b]` answered by `[a,a]`, by `[a,c]`,
+            # or by an empty summary with `deduplicated=99` all balanced arithmetically and were marked
+            # done. Membership is computed from the batch's OWN signatures — the identity dalfox
+            # deduplicates on, which is the identity `_canonicalize_candidates` already uses — and every
+            # disagreement is named.
+            _owed_unlisted, _acct = _dalfox_accounting(batch, art)
+
+            if _acct["retryable"]:
+                events.coverage_partial(
+                    sid, kind=events.COVERAGE_UNKNOWN, measure="dalfox_accounting",
+                    unit=f"{sid}.chunk{ci}.accounting",
+                    reason=(f"chunk {ci + 1}/{len(batches)}: dalfox's target accounting does not "
+                            f"reconcile with the batch submitted — " + "; ".join(_acct["retryable"])
+                            + "; the chunk stays RETRYABLE rather than done over it"))
+            # UNDECIDABLE, not unfinished (review#40, Lumpy): a retry under the same unknown policy
+            # produces the same ambiguity, so the chunk is execution-complete and the doubt is carried
+            # as coverage. ACCUMULATED rather than emitted here (review#41): the chunk is recorded
+            # COMPLETE, so a fresh lifecycle skips it and never re-derives the doubt, and the new
+            # coverage generation would retire the old record.
+            #
+            # CLEARED PER IDENTITY (review#42, Lumpy): `pop()` cleared doubt about targets this attempt
+            # never touched — a retry narrowed to the remainder, or an artifact we could not even read,
+            # both wiped an unresolved question about the rest of the original batch. Only a target this
+            # attempt actually SCANNED, and reconciled unambiguously, resolves.
+            _prior = set(membership.get(str(ci), []))
+            if art.readable:
+                _prior -= {u for u in batch if u not in set(_acct["ambiguous"])}
+            _amb_now = sorted(_prior | set(_acct["ambiguous"]))
+            if _amb_now:
+                membership[str(ci)] = _amb_now
+            else:
+                membership.pop(str(ci), None)
+            clean = (art.execution_done and not _acct["retryable"]
+                     and ((rc == 0 and not n_findings) or (rc == 1 and n_findings > 0)))
             cf_sha = _sha256_file(cf) if cf.exists() else None
+            # what the scan COST and what it COLLAPSED — parsed since 4.3 and never surfaced, which made
+            # the meta row half-read. Accumulated here and reported on the lane's result, so the residual
+            # duplicate rate over our own canonicalizer is a MEASURED number at the next OTC run rather
+            # than an assumption (2026-08-07).
+            if type(art.total_requests) is int:
+                cost["requests"] += art.total_requests
+            if type(art.deduplicated) is int:
+                cost["deduplicated"] += art.deduplicated
+            if art.dedup_mode != "signature":
+                # we asked for `signature`; the artifact says otherwise. Not a failure of THIS chunk —
+                # the scan is what it is — but the target set is not the one we asked for, and an
+                # operator reading "N targets scanned" deserves to know which policy produced it.
+                cost["dedup_disagreement"].add(art.dedup_mode)
             # ACCUMULATE the gaps no retry can close, unioned by URL. A repeat observation does not
             # double-count and a CLEAN RETRY CANNOT ERASE an earlier one (review#15, Lumpy). The
             # coverage record is emitted once per chunk AFTER the loop, from this union — one record
@@ -2081,9 +2404,27 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             # WHAT THIS ATTEMPT STILL OWES: the targets dalfox named as retriable or unexplained, and
             # only those. Deterministic omissions are NEVER rescheduled — retrying omits exactly the same
             # targets for ever — and covered targets are not re-requested (review#14, Lumpy).
-            owed_next = [t[0] for t in (art.retriable + art.unclassified) if t[0]]
+            # review#38 (Lumpy): a target dalfox never mentioned is owed too. Without it the remainder
+            # held only the rows dalfox NAMED, so an unlisted target cleared the remainder and the next
+            # lifecycle re-sent the whole batch — someone else's site, hit again for targets that had
+            # already answered.
+            # WHAT THE RETRY OWES, in the arithmetic of the mode dalfox reported.
+            #
+            # Under `off` each target_summary row IS an occurrence: three identical inputs where one
+            # comes back SESSION_LOST owe 1 named failure + 2 never-reported = 3 scans, and any
+            # set-dedup of either half collapses that to 1 (review#43, Lumpy). The two halves are
+            # disjoint by construction — a NAMED row was reported, so it is not part of the unlisted
+            # shortfall, which is computed from (expected - reported) counts.
+            #
+            # Under `signature`/`exact` one identity is one scan, so deduping is right there.
+            _named_owed = _dedupe_owed([t[0] for t in (art.retriable + art.unclassified) if t[0]],
+                                       art.dedup_mode)
+            _key = _dalfox_identity_fn(art.dedup_mode)[0]
+            _have = {_key(u) for u in _named_owed}
+            owed_next = _named_owed + [u for u in _owed_unlisted
+                                       if art.dedup_mode == "off" or _key(u) not in _have]
             if clean:
-                completion[str(ci)] = {"rel": rel, "outcome": "SUCCESS" if findings else "EMPTY",
+                completion[str(ci)] = {"rel": rel, "outcome": "SUCCESS" if n_findings else "EMPTY",
                                        "sha256": cf_sha}      # outcome + digest -> revalidated on resume
                 remainder.pop(str(ci), None)                  # nothing owed once the chunk lands clean
                 _add_evidence(str(ci), rel, cf_sha)          # ...and joins this chunk's evidence history
@@ -2093,7 +2434,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 why = (f"exit {rc}" if rc not in (0, 1) else
                        "artifact malformed/mismatched" if not art.readable else
                        art.coverage_reason() if not art.execution_done else
-                       f"exit {rc} disagrees with {len(findings)} finding(s)")
+                       f"exit {rc} disagrees with {n_findings} finding(s)")
                 events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {why}")
                 # A named remainder only when dalfox told us WHICH targets: an artifact we could not
                 # read, or an exit-code disagreement, says nothing about individual targets, so the whole
@@ -2105,7 +2446,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 if cf.exists() and cf.stat().st_size > 0:    # a degraded chunk WITH output keeps its evidence
                     _add_evidence(str(ci), rel, cf_sha)
                 _save()
-            chunk_status = (Status.SUCCESS if clean and findings
+            chunk_status = (Status.SUCCESS if clean and n_findings
                             else Status.EMPTY if clean else Status.PARTIAL).value
         finally:
             _chunk_terminal(sid, chunk_wu, res, cf, status=chunk_status)   # FAILED if exec OR bookkeeping raised
@@ -2129,6 +2470,23 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
       # observed it and reach a fresh process's manifest and verdict (review#15, Lumpy). `_save()` has
       # already persisted it, so the record survives even if this run adds nothing.
       _save()
+      for _ci, _rows in sorted(membership.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
+          if not _rows:
+              continue
+          # UNDECIDABLE membership is a fact about the TARGET SET under a policy we could not read, so
+          # like a deterministic omission it must outlive the attempt that saw it and reach a fresh
+          # process's verdict — the chunk itself is complete and will be skipped (review#41, Lumpy).
+          _n = len(batches[int(_ci)]) if _ci.isdigit() and int(_ci) < len(batches) else len(_rows)
+          events.coverage_partial(
+              sid, kind=events.COVERAGE_UNKNOWN, measure="dalfox_membership",
+              unit=f"{sid}.chunk{_ci}.membership",
+              reason=(f"chunk {int(_ci) + 1 if _ci.isdigit() else _ci}/{len(batches)}: dalfox reported "
+                      f"a dedup policy this lane cannot read, so membership cannot be decided for "
+                      f"{len(_rows)} of {_n} submitted target(s) — covered under `signature`, short "
+                      f"under `exact`/`off`: " + ", ".join(_rows[:20])
+                      + (f" (+{len(_rows) - 20} more)" if len(_rows) > 20 else "")
+                      + "; the chunk is NOT retried (the same policy would be as unreadable), and its "
+                        "coverage is UNKNOWN rather than clean"))
       for _ci, _rows in sorted(terminal.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
           if not _rows:
               continue
@@ -2159,14 +2517,18 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         for p in paths:
             if not (p.exists() and p.stat().st_size > 0):
                 continue
-            fnds, _ok = _parse_dalfox_jsonl(p)
-            for rec in fnds:
-                rec["raw_ref"] = str(p)
+            # STREAMED into the store: one finding is held at a time, whatever the artifact weighs
+            # (review#35, Lumpy). The counters below are closed over deliberately — the alternative is
+            # a list of every finding with its full request and response in it.
+            def _ingest(rec, _p=p):
+                nonlocal matched, produced
+                rec["raw_ref"] = str(_p)
                 if rec["id"] not in seen_ids:
                     seen_ids.add(rec["id"]); matched += 1    # distinct finding first-seen
                 if ctx.run.add("finding", rec):              # ALWAYS add -> provenance merge (raw_refs union)
                     produced += 1
                     tiers[rec["template"]] = tiers.get(rec["template"], 0) + 1
+            scan_dalfox_jsonl(p, _ingest)
       status = Status.PARTIAL if degraded else (Status.SUCCESS if matched else Status.EMPTY)
     finally:
         # EXECUTION ACCOUNTING for the OOB channel, from a `finally` so an exception anywhere in the loop
@@ -2201,9 +2563,16 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                                      "xss_candidate": tiers["xss-candidate"],
                                      "dom_xss_static": tiers["dom-xss-static"], "matched": matched},
                       consumed={"shape": len(cands)})
+    _cost = (f", {cost['requests']} request(s)" if cost["requests"] else "")
+    _dedup = (f", {cost['deduplicated']} duplicate target(s) collapsed by dalfox"
+              if cost["deduplicated"] else "")
+    _dis = (f" [dalfox reports dedup_mode={'/'.join(sorted(cost['dedup_disagreement']))}, NOT the "
+            f"`signature` we asked for — the target set these findings came from is not the one this "
+            f"command specified]" if cost["dedup_disagreement"] else "")
     return RunResult("dalfox", ["dalfox", "scan", "-i", "file", "<chunked-xss-fast>"], status, 0,
                      round(time.monotonic() - t0, 2), None, produced,
-                     note=f"{len(batches)} chunk(s), {produced} new / {matched} matched, {degraded} degraded")
+                     note=(f"{len(batches)} chunk(s), {produced} new / {matched} matched, "
+                           f"{degraded} degraded{_cost}{_dedup}{_dis}"))
 
 
 _REDIR_PARAMS = {"url", "redirect", "redirect_url", "redirecturl", "redir", "redirect_uri", "return",

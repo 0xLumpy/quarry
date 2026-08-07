@@ -2920,7 +2920,7 @@ import sys, json, tempfile, inspect, pathlib
 from types import SimpleNamespace
 from quarry_recon import events, sources, settings, secrets
 from quarry_recon.phases import params
-from quarry_recon.phases.params import _dalfox_cmd, _dalfox_xss_fast, _parse_dalfox_jsonl
+from quarry_recon.phases.params import _dalfox_cmd, _dalfox_xss_fast, scan_dalfox_jsonl
 from quarry_recon.runner import RunResult, Status
 c_reg = sources.get("params.dalfox_xss_fast") is not None
 settings.concurrency = lambda k, d=None: {"DALFOX_CHUNK":2,"DALFOX_TARGETS":4}.get(k, d)
@@ -2936,13 +2936,24 @@ c_flags = (cmd[:5]==["dalfox","scan","-i","file","i"] and cmd[cmd.index("-f")+1]
 def _p(txt):
     # review#13: the parser returns a STRUCTURED artifact, not one boolean. `.readable` is the
     # structural verdict these cases assert; completeness is a separate question (c_meta below).
-    p=pathlib.Path(tempfile.mktemp()); p.write_text(txt); return _parse_dalfox_jsonl(p)
-fnd, art = _p('{"meta":{"findings_count":1}}\n{"type":"V","param":"q","data":"http://h/search?q=1","method":"GET","location":"Query"}\n')
+    # STREAMING parser (review#35): the findings go to a sink as they are read; nothing is
+    # materialized inside it, so a caller that wants a list builds its own.
+    p=pathlib.Path(tempfile.mktemp()); p.write_text(txt)
+    out=[]; n, art = scan_dalfox_jsonl(p, out.append)
+    assert n == len(out), "streamed count must agree with the sink"
+    return out, art
+# 3.2.0 CONTRACT: `incomplete` AND `target_summary` are required for an artifact to be readable at all
+# (review#37) — a meta row without them does not implement what this lane resumes on.
+_M='"incomplete":false,"target_summary":[{"target":"http://h/x","status":"clean","findings_count":0}]'
+fnd, art = _p('{"meta":{"findings_count":1,' + _M + '}}\n{"type":"V","param":"q","data":"http://h/search?q=1","method":"GET","location":"Query"}\n')
 c_parse=(art.readable and len(fnd)==1 and fnd[0]["template"]=="xss-verified" and fnd[0]["confidence"]=="verified" and fnd[0]["confirmed"] is False)
-c_failclosed=(not _p('{"meta":{"findings_count":2}}\n{"type":"R","param":"q","data":"http://h/p?q=1"}\n')[1].readable
+c_failclosed=(not _p('{"meta":{"findings_count":2,' + _M + '}}\n{"type":"R","param":"q","data":"http://h/p?q=1"}\n')[1].readable
               and not _p('{"type":"R","param":"q","data":"http://h/p?q=1"}\n')[1].readable
-              and not _p('{"meta":{"findings_count":1}}\n{"type":"Z","param":"q","data":"http://h/p?q=1"}\n')[1].readable
-              and not _p('{"meta":{"findings_count":1}}\n{"type":"R","param":"q","data":"http://h:bad/p?q=1"}\n')[1].readable)
+              and not _p('{"meta":{"findings_count":1,' + _M + '}}\n{"type":"Z","param":"q","data":"http://h/p?q=1"}\n')[1].readable
+              and not _p('{"meta":{"findings_count":1,' + _M + '}}\n{"type":"R","param":"q","data":"http://h:bad/p?q=1"}\n')[1].readable
+              # …and the CONTRACT itself: a meta row missing either verdict field is not readable
+              and not _p('{"meta":{"findings_count":0}}\n')[1].readable
+              and not _p('{"meta":{"findings_count":0,"incomplete":false}}\n')[1].readable)
 # review#13 (Lumpy, P1): the META ROW is read, not just counted. A batch dalfox flagged incomplete, or
 # whose targets it SKIPPED, used to parse as clean and become resumably complete. Structural validity
 # and scan completeness are DIFFERENT questions and must not collapse into one boolean again.
@@ -2985,7 +2996,10 @@ def _mk(rc, art):
         cf=pathlib.Path(cmd[cmd.index("-o")+1]); cf.parent.mkdir(parents=True,exist_ok=True); cf.write_text(art)
         return RunResult("dalfox",cmd,Status.SUCCESS if rc in (0,1) else Status.FAILED,rc,0.1,cf,0)
     return fx
-R='{"meta":{"findings_count":1}}\n{"type":"R","param":"q","data":"http://%s.x/p?q=1","method":"GET","location":"Query"}\n'
+# the lane RECONCILES the summary against the batch it submitted (review#37): an artifact that does not
+# account for the one target below leaves the chunk retryable, so the fixture accounts for it.
+_TS='"incomplete":false,"target_summary":[{"target":"http://a.x/p?q=","status":"%s","findings_count":%d}]'
+R='{"meta":{"findings_count":1,' + (_TS % ("findings",1)) + '}}\n{"type":"R","param":"q","data":"http://%s.x/p?q=1","method":"GET","location":"Query"}\n'
 def _run(rc, artf):
     d=pathlib.Path(tempfile.mkdtemp()); events.reset(); events.configure(d); c=_C(d)
     params.exec_tool=lambda t,cmd,timeout=None,**k: _mk(rc, artf(pathlib.Path(cmd[cmd.index("-o")+1]).stem))(t,cmd,timeout,**k)
@@ -2995,7 +3009,7 @@ def _run(rc, artf):
 r1,st1,c1=_run(1, lambda stem: R % stem)                     # 1 + findings -> SUCCESS, outcome recorded
 c_success=(r1.status==Status.SUCCESS and "0" in st1["chunks"] and len(c1.run.added)==1
            and c1.run.added[0]["template"]=="xss-candidate")
-r2,st2,_=_run(0, lambda stem: '{"meta":{"findings_count":0}}\n')   # 0 + empty -> EMPTY
+r2,st2,_=_run(0, lambda stem: '{"meta":{"findings_count":0,' + (_TS % ("clean",0)) + '}}\n')   # 0 + empty -> EMPTY
 c_empty=(r2.status==Status.EMPTY and "0" in st2["chunks"])
 r3,st3,_=_run(0, lambda stem: R % stem)                      # 0 WITH findings -> disagreement -> PARTIAL, not done
 c_disagree=(r3.status==Status.PARTIAL and "0" not in st3["chunks"])
@@ -3008,7 +3022,8 @@ c_ledger=(lg and set(lg[0]["produced"]) >= {"xss_verified","xss_candidate","dom_
 _dxf=sources.get("params.dalfox_xss_fast"); _rs=str(_dxf.get("notes",""))+str(_dxf.get("workers",""))
 c_regtruth=("--mass" not in _rs and "--max-cpu" not in _rs and "--format json" not in _rs and "--skip-headless" not in _rs)
 psrc=inspect.getsource(params)
-c_src=("_parse_dalfox_jsonl" in psrc and "attempt_" in psrc and "_dalfox_engine_id" in psrc and '"chunks"' in psrc and '"evidence"' in psrc)
+c_src=("scan_dalfox_jsonl" in psrc and "attempt_" in psrc and "_dalfox_engine_id" in psrc and '"chunks"' in psrc and '"evidence"' in psrc
+       and "_parse_dalfox_jsonl" not in psrc)   # the materializing parser is GONE, not merely unused
 sys.exit(0 if (c_reg and c_flags and c_parse and c_failclosed and c_meta and c_hostcap and c_success and c_empty and c_disagree and c_ledger and c_regtruth and c_src) else 1)
 PYEOF
 echo "[95] control-plane step 4.3.C — params.redirect_confirm NATIVE open-redirect probe (no dalfox): inject a canary host into the redirect param, read Location WITHOUT following (fetch.redirect_location, scoped + rate-paced + non-mutating); confirmed only when the Location HOST is the canary (relative/same-host Location is NOT a finding); candidate wording (open-redirect-candidate, confirmed:false); source-level events + ledger(raw->canonical->confirmed). Legacy dalfox redirect pass removed; registry flipped pending->wired; dalfox no longer touches redirect"
