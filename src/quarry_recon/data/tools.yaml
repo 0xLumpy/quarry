@@ -555,7 +555,10 @@ tools:
   - bin: interactsh-client
     maintenance_state: active
     version: "v1.3.1"
-    phase: params
+    # `oob`, not `params` (Lumpy, 2026-08-07): params.oob_probe is ONE consumer of the callback layer,
+    # not what the tool is for — `quarry oob poll` and the SSRF probes use it too. Filing it under a
+    # phase put it in the wrong group in `doctor` and in `install --phase params`.
+    phase: oob
     role: Quarry-owned OOB callback backend (params.oob_probe issues+correlates; quarry oob poll)
     install: go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest
     version_cmd: interactsh-client -version

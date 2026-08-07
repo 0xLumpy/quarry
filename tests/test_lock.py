@@ -5,7 +5,9 @@ post-install `capability` smoke test. `quarry lock` captures the installed versi
 flags an installed version that no longer matches the pin (a reproducibility break).
 """
 import pathlib
+import re
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -1296,3 +1298,247 @@ class TestBunIsProvisionedLikeAnyOtherTool:
     def test_jxscout_ast_no_longer_needs_a_hand_installed_runtime(self):
         """Its guard stays — it just stops being the thing that fails a fresh install."""
         assert "command -v bun" in self._tools()["jxscout-ast"].install
+
+
+class TestTheChromiumLineSaysWhatTheLaneWillGet:
+    """Lumpy, 2026-08-07: "check log (some libs optional)" told the operator neither what failed nor
+    which log — and it appeared on a box where the only thing that happened was the EXPECTED rename
+    fallback (libasound2 -> libasound2t64 on 24.04+; measured: the first apt attempt exits 100 there and
+    the fallback succeeds). Exit codes describe the package manager. What matters is whether the
+    screenshot lane will work, so chromium is asked."""
+
+    @staticmethod
+    def _state(monkeypatch, *, exe="/usr/bin/chromium", rc=0, stderr="", boom=None, cc=0, lc=100,
+               tail="E: Package 'libasound2' has no installation candidate"):
+        from quarry_recon import bootstrap
+        monkeypatch.setattr(bootstrap.shutil, "which", lambda b: exe if b == "chromium" else None)
+
+        def _run(cmd, **k):
+            if boom:
+                raise boom
+            return SimpleNamespace(returncode=rc, stdout="", stderr=stderr)
+        monkeypatch.setattr(bootstrap.subprocess, "run", _run)
+        return bootstrap._chromium_state(False, cc, lc, tail)
+
+    def test_a_working_headless_chromium_is_simply_ok(self, monkeypatch):
+        """The rename fallback having fired is NOT a thing to report."""
+        assert self._state(monkeypatch) == "ok"
+        assert "check log" not in self._state(monkeypatch)
+
+    def test_a_MISSING_chromium_says_what_it_costs_and_how_to_fix_it(self, monkeypatch):
+        s = self._state(monkeypatch, exe=None, cc=100, tail="E: Unable to locate package chromium")
+        assert "MISSING" in s and "screenshots" in s
+        assert "Unable to locate package chromium" in s, "the package manager's own reason"
+        assert "quarry install" in s
+
+    def test_an_INSTALLED_but_broken_chromium_names_the_reason_it_gave(self, monkeypatch):
+        """A missing .so lands here verbatim — the only thing an operator can act on."""
+        s = self._state(monkeypatch, rc=127,
+                        stderr="error while loading shared libraries: libnss3.so: cannot open "
+                               "shared object file")
+        assert "headless FAILED (exit 127)" in s and "libnss3.so" in s
+        assert "screenshots will fail" in s
+
+    def test_a_launch_that_RAISES_is_reported_not_swallowed(self, monkeypatch):
+        s = self._state(monkeypatch, boom=OSError("Exec format error"))
+        assert "WOULD NOT START" in s and "Exec format error" in s
+
+    def test_a_dry_run_probes_nothing(self, monkeypatch):
+        from quarry_recon import bootstrap
+        monkeypatch.setattr(bootstrap.subprocess, "run",
+                            lambda *a, **k: pytest.fail("a dry run must not launch chromium"))
+        assert bootstrap._chromium_state(True, 0, 0, "") == "(dry-run)"
+
+    def test_there_are_only_THREE_outcomes(self, monkeypatch):
+        """ok / missing / present-but-broken. No fourth state that means "look somewhere else"."""
+        outcomes = [self._state(monkeypatch),
+                    self._state(monkeypatch, exe=None),
+                    self._state(monkeypatch, rc=1)]
+        assert outcomes[0] == "ok"
+        assert all(o != "ok" and ("MISSING" in o or "FAILED" in o or "WOULD NOT START" in o)
+                   for o in outcomes[1:])
+        assert not any("check log" in o for o in outcomes)
+
+
+class TestTheGoLineSaysOnlyWhatIsHappening:
+    """Lumpy, 2026-08-07: "[declared version, sha256-verified; min 1.25]" restated guarantees that are
+    unconditional in the code. An install line that recites its own invariants on every run is noise;
+    the case an operator needs is the REFUSAL, which prints its own line."""
+
+    @staticmethod
+    def _run(monkeypatch, *, code=0, tail="", sha_ok=True):
+        from quarry_recon import bootstrap
+        msgs = []
+        monkeypatch.setattr(bootstrap.shutil, "which", lambda b: None)     # nothing installed
+        monkeypatch.setattr(bootstrap, "_sh", lambda *a, **k: (code, tail))
+        if not sha_ok:
+            real = bootstrap.load_bootstrap
+
+            def _no_sha():
+                bs = dict(real())
+                bs["golang"] = dict(bs["golang"], sha256={})
+                return bs
+            monkeypatch.setattr(bootstrap, "load_bootstrap", _no_sha)
+        ok = bootstrap.ensure_golang(msgs.append, dry=False)
+        return ok, msgs
+
+    def test_the_line_is_version_and_platform(self, monkeypatch):
+        _ok, msgs = self._run(monkeypatch)
+        line = next(m for m in msgs if "installing Go" in m)
+        assert re.fullmatch(r"  installing Go \d+\.\d+(\.\d+)? \w+/\w+", line), line
+
+    def test_the_recited_guarantees_are_gone(self, monkeypatch):
+        _ok, msgs = self._run(monkeypatch)
+        joined = " ".join(msgs)
+        for noise in ("declared version", "sha256-verified", "min "):
+            assert noise not in joined, joined
+
+    def test_the_outcome_line_is_unchanged(self, monkeypatch):
+        ok, msgs = self._run(monkeypatch)
+        assert ok and "  go install: ok" in msgs
+
+    def test_a_FAILURE_still_says_why(self, monkeypatch):
+        ok, msgs = self._run(monkeypatch, code=1, tail="sha256sum: WARNING: 1 computed checksum did NOT match")
+        assert ok is False
+        assert any("go install: FAILED" in m and "did NOT match" in m for m in msgs), msgs
+
+    def test_an_UNPINNED_archive_still_refuses_loudly(self, monkeypatch):
+        """The guarantee is enforced by the code, not by the sentence — and when it bites, it speaks."""
+        ok, msgs = self._run(monkeypatch, sha_ok=False)
+        assert ok is False
+        assert any("not pinned" in m and "UNVERIFIED" in m for m in msgs), msgs
+        assert not any("installing Go" in m for m in msgs), "it must not claim to install anything"
+
+
+class TestTheToolsSectionIsOneLinePerTool:
+    """Lumpy, 2026-08-07: `nmap present + verified (distro) ✓` read as work happening twice — apt
+    provisions it in [1/6], and the tools section then restated its own premise for every tool that was
+    already there. The ✓ IS "present and verified"."""
+
+    @staticmethod
+    def _install(monkeypatch, verified=lambda t: True):
+        from click.testing import CliRunner
+        from quarry_recon import bootstrap, cli
+        tools = [t for t in cli.load_tools() if t.bin in ("nmap", "dalfox")]
+        monkeypatch.setattr(cli, "load_tools", lambda: tools)
+        monkeypatch.setattr(cli, "verify_installed", verified)
+        monkeypatch.setattr(Tool, "installed", property(lambda self: True))
+        monkeypatch.setattr(cli, "_run_tool", lambda t, m, d: True)
+        for fn in ("install_system_packages", "ensure_golang", "install_data_files", "run_extras",
+                   "cleanup"):
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: True)
+        monkeypatch.setattr(bootstrap, "system_report",
+                            lambda ctx="install": {"level": "ok", "checks": []})
+        return CliRunner().invoke(cli.install, ["--include-optional"]).output
+
+    def test_a_present_tool_is_name_and_a_tick(self, monkeypatch):
+        out = self._install(monkeypatch)
+        assert "→ nmap ✓" in out and "→ dalfox ✓" in out, out
+        assert "present + verified" not in out and "(distro)" not in out
+
+    def test_a_tool_that_FAILS_verification_still_says_so(self, monkeypatch):
+        """The quiet line is for the boring case only; the loud one is untouched."""
+        out = self._install(monkeypatch, verified=lambda t: t.bin != "dalfox")
+        assert "dalfox present but FAILED verification — reinstalling pin" in out, out
+        assert "→ nmap ✓" in out
+
+    def test_doctor_still_carries_the_detail(self, monkeypatch):
+        """Lumpy: "in quarry doctor, we can keep the list as is" — the version and the distro tag live
+        THERE, which is where an operator goes to ask what is installed. Asserted through the renderer
+        doctor uses, not through the source of the command."""
+        from quarry_recon import cli
+        t = next(x for x in registry.load_tools() if x.bin == "nmap")
+        monkeypatch.setattr(Tool, "version", lambda self: "")
+        assert "distro" in cli._doctor_version(t, "distro")
+        monkeypatch.setattr(Tool, "version", lambda self: "7.95")
+        assert cli._doctor_version(t, "distro") == "7.95", "…and its real banner when it has one"
+
+
+class TestTheSecretsBlockSaysTheKeysSTATE:
+    """Lumpy, 2026-08-07: every key here is optional, so "(optional)" on every row said nothing — and
+    certspotter carried a sentence about its free tier that belongs in the docs. A row now says one of
+    three things: not set · set · malformed."""
+
+    @staticmethod
+    def _block(monkeypatch, **keys):
+        from click.testing import CliRunner
+        from quarry_recon import cli, secrets
+        monkeypatch.setattr(secrets, "github_tokens", lambda: keys.get("github", []))
+        for k in ("shodan", "whoxy", "chaos", "certspotter"):
+            monkeypatch.setattr(secrets, k, lambda k=k: keys.get(k) or None)
+        monkeypatch.setattr(cli, "load_tools", lambda *a, **k: [])
+        monkeypatch.setattr(cli, "tools_by_phase", lambda *a, **k: [])
+        out = CliRunner().invoke(cli.doctor, []).output
+        return out[out.index("[secrets]"):out.index("[config]")]
+
+    def test_the_optional_noise_is_gone(self, monkeypatch):
+        blk = self._block(monkeypatch)
+        assert "(optional)" not in blk and "free tier keyless" not in blk, blk
+        assert "· shodan" in blk and "not set" in blk
+
+    def test_a_well_shaped_key_is_a_tick_with_nothing_after_it(self, monkeypatch):
+        blk = self._block(monkeypatch, shodan="Z" * 32)
+        line = next(l for l in blk.splitlines() if "shodan" in l)
+        assert line.strip().endswith("shodan"), line
+
+    def test_github_still_counts_its_tokens(self, monkeypatch):
+        blk = self._block(monkeypatch, github=["ghp_" + "a" * 36, "b" * 40])
+        assert "2 token(s)" in blk, blk
+
+    def test_a_MALFORMED_key_is_named_as_such(self, monkeypatch):
+        """"wrong shape" already says it was not tested; the explanation was longer than the fact."""
+        blk = self._block(monkeypatch, shodan="nope")
+        line = next(l for l in blk.splitlines() if "shodan" in l)
+        assert line.strip() == "✗ shodan                   wrong shape for this provider", repr(line)
+
+    def test_one_bad_token_among_several_is_counted(self, monkeypatch):
+        blk = self._block(monkeypatch, github=["ghp_" + "a" * 36, "not a token"])
+        assert "1 of 2 wrong shape for this provider" in blk, blk
+
+    def test_a_provider_whose_format_we_do_NOT_know_is_never_called_malformed(self, monkeypatch):
+        """Inventing a shape would reject a perfectly good key. `whoxy` has no documented pattern here,
+        so a set key is simply set."""
+        blk = self._block(monkeypatch, whoxy="whatever-they-issue-42")
+        assert "✓" in blk and "wrong shape" not in blk, blk
+
+    def test_the_KEY_ITSELF_is_never_printed(self, monkeypatch):
+        blk = self._block(monkeypatch, shodan="Z" * 32, whoxy="wx-SECRET-VALUE",
+                          github=["ghp_" + "a" * 36])
+        for v in ("Z" * 32, "wx-SECRET-VALUE", "ghp_" + "a" * 36):
+            assert v not in blk, blk
+
+    def test_the_check_is_LOCAL_and_never_a_request(self, monkeypatch):
+        """"not by pinging, and accidentally create costs" — the whole point."""
+        import inspect
+        from quarry_recon import secrets
+        src = inspect.getsource(secrets.key_shape) + inspect.getsource(secrets)[:0]
+        assert "requests" not in src and "urlopen" not in src and "http" not in src.lower()
+
+
+class TestTheLocalKeyShapeCheck:
+    def test_documented_shapes_are_accepted(self):
+        from quarry_recon.secrets import key_shape
+        assert key_shape("shodan", "A" * 32) == "ok"
+        assert key_shape("github", "ghp_" + "a" * 36) == "ok"
+        assert key_shape("github", "github_pat_" + "a" * 30) == "ok"
+        assert key_shape("github", "f" * 40) == "ok", "the pre-2021 40-hex tokens still exist"
+
+    def test_a_wrong_shape_for_a_KNOWN_provider_is_malformed(self):
+        from quarry_recon.secrets import key_shape
+        assert key_shape("shodan", "A" * 31) == "malformed"
+        assert key_shape("github", "ghp_short") == "malformed"
+
+    def test_an_UNKNOWN_provider_never_gets_a_verdict_on_its_pattern(self):
+        from quarry_recon.secrets import key_shape
+        assert key_shape("whoxy", "anything-they-issue") == "unknown"
+        assert key_shape("certspotter", "some_token_value") == "unknown"
+
+    def test_placeholders_and_whitespace_are_malformed_for_EVERY_provider(self):
+        """These are never a key, whatever the provider's format is."""
+        from quarry_recon.secrets import key_shape
+        for bad in ("<your-token>", "changeme", "xxx", "TODO", "has space", 'has"quote', " padded "):
+            assert key_shape("whoxy", bad) == "malformed", bad
+
+    def test_an_EMPTY_value_is_not_a_complaint(self):
+        from quarry_recon.secrets import key_shape
+        assert key_shape("shodan", "") == "unknown" and key_shape("shodan", None) == "unknown"

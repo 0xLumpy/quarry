@@ -88,6 +88,41 @@ def _tool_deps(mgr: str) -> list[str]:
     return sorted(out)
 
 
+def _chromium_bin() -> "str | None":
+    for b in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome"):
+        p = shutil.which(b)
+        if p:
+            return p
+    return None
+
+
+def _chromium_state(dry: bool, cc: int, lc: int, tail: str) -> str:
+    """What the screenshot lane will actually get — measured, then said in one line.
+
+    Three outcomes and no fourth: it runs, it is missing, or it is installed and cannot start. The last
+    one names the reason chromium itself gave (a missing .so lands here verbatim), because that is the
+    only thing an operator can act on."""
+    if dry:
+        return "(dry-run)"
+    exe = _chromium_bin()
+    if not exe:
+        why = (tail or "").strip().splitlines()
+        return ("MISSING — screenshots/headless will be skipped"
+                + (f" ({why[-1][:100]})" if why else "")
+                + "; install it and re-run `quarry install`")
+    try:
+        r = subprocess.run([exe, "--headless", "--no-sandbox", "--disable-gpu",
+                            "--dump-dom", "about:blank"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"{exe} present but WOULD NOT START ({type(e).__name__}: {e}) — screenshots will fail"
+    if r.returncode == 0:
+        return "ok"
+    err = [l for l in (r.stderr or "").strip().splitlines() if l.strip()]
+    return (f"{exe} present but headless FAILED (exit {r.returncode}) — screenshots will fail"
+            + (f": {err[-1][:120]}" if err else ""))
+
+
 def install_system_packages(echo, dry: bool) -> bool:
     bs = load_bootstrap()
     mgr, prefix = detect_pkg_manager()
@@ -116,10 +151,16 @@ def install_system_packages(echo, dry: bool) -> bool:
             cc, _ = _sh(f"{_sudo()}{prefix} {' '.join(cg['fallback'])}", dry, 600)
         libs = cg.get("libs", [])
         if libs:
-            lc, _ = _sh(f"{_sudo()}{prefix} {' '.join(libs + cg.get('libs_primary_extra', []))}", dry, 900)
+            lc, tail = _sh(f"{_sudo()}{prefix} {' '.join(libs + cg.get('libs_primary_extra', []))}", dry, 900)
             if lc != 0 and cg.get("libs_fallback"):
-                lc, _ = _sh(f"{_sudo()}{prefix} {' '.join(libs + cg['libs_fallback'])}", dry, 900)
-            echo(f"  chromium + headless libs: {'ok' if (cc == 0 and lc == 0) else 'check log (some libs optional)'}")
+                # the renamed-package fallback (24.04 libasound2 -> libasound2t64). The FIRST attempt
+                # failing is the NORMAL path on a modern release, not a problem to report.
+                lc, tail = _sh(f"{_sudo()}{prefix} {' '.join(libs + cg['libs_fallback'])}", dry, 900)
+            # ASK CHROMIUM, don't infer from apt (Lumpy, 2026-08-07). "check log (some libs optional)"
+            # told the operator neither what failed nor which log, and it appeared on a box where the
+            # only thing that happened was the expected rename fallback. Exit codes describe the package
+            # manager; a headless launch describes what the SCREENSHOT LANE will actually get.
+            echo(f"  chromium + headless libs: {_chromium_state(dry, cc, lc, tail)}")
         else:
             echo(f"  chromium: {'ok' if cc == 0 else 'manual install needed'}")
     return code == 0
@@ -156,7 +197,10 @@ def ensure_golang(echo, dry: bool) -> bool:
         echo(f"  Go archive sha256 not pinned for {plat} — refusing an UNVERIFIED /usr/local/go replacement (C08)")
         return False
     url = bs["url"].format(version=f"go{target}", os=osname, arch=arch)
-    echo(f"  installing Go {target} ({osname}-{arch}) [declared version, sha256-verified; min {bs['min_version']}]")
+    # the LINE says what is happening; the guarantees are the code above it (Lumpy, 2026-08-07). The
+    # pin and the sha256 check are unconditional — announcing them on every install is noise, and the
+    # one case an operator needs to see is the refusal, which prints its own line and returns.
+    echo(f"  installing Go {target} {osname}/{arch}")
     cmd = (f"wget -q {url} -O /tmp/go.tgz && echo '{sha}  /tmp/go.tgz' | sha256sum -c - && "
            f"{_sudo()}rm -rf /usr/local/go && "
            f"{_sudo()}tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz && "

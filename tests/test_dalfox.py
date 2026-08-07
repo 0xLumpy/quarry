@@ -1312,50 +1312,78 @@ class TestPolicyIsNotExecution:
         assert pol < first_chunk, "the decision must be on the record before anything runs"
 
 
-class TestDoctorReportsTheResolvedChannel:
-    """`quarry doctor` is INSTALLATION-scoped, so it cannot read a target's `MODES.BLIND_XSS`. It can
-    still say which channel arming WOULD select from this box's keys — and it must get that from the
-    lane's own planner, because a second description of the same rules is a second thing to drift."""
+class TestDoctorHasONEOobSection:
+    """Lumpy, 2026-08-07: the tool sat in the phase-grouped list and the callback backend had its own
+    block further down, so one output carried two `[oob]` headers saying half a thing each. One
+    section: the tool that makes the callbacks, and the server they come back to.
+
+    The blind-XSS channel is deliberately absent — it is resolved from a TARGET's `MODES.BLIND_XSS`, so
+    it is armed for one engagement and not the next, and doctor is installation-scoped. The how and the
+    why live in the docs; `_blind_oob_plan` is still the single resolver and the lane reports it when it
+    runs (`TestBlindXssChannel`)."""
 
     @staticmethod
-    def _oob_lines(monkeypatch, oob):
+    def _doctor(monkeypatch, oob, *, installed=True, tools=("interactsh-client",)):
+        """Doctor PROBES every tool, and an offline test may not spawn processes — so the registry is
+        narrowed to the tools under test and their health is stated rather than measured. What is being
+        asserted here is the RENDERING."""
         from click.testing import CliRunner
         from quarry_recon import cli
-        # only the TOOL inventory is faked away (slow, and irrelevant here). `system_report` stays real:
-        # a stub of it returned {} and doctor died on KeyError BEFORE the oob section, which a laxer
-        # assertion would have read as "no line printed".
-        monkeypatch.setattr(cli, "load_tools", lambda *a, **k: [])
-        monkeypatch.setattr(cli, "tools_by_phase", lambda *a, **k: [])
+        from quarry_recon.registry import Tool, load_tools
+        sel = [t for t in load_tools() if t.bin in tools]
+        monkeypatch.setattr(cli, "load_tools", lambda *a, **k: sel)
+        monkeypatch.setattr(cli, "tools_by_phase", lambda *a, **k: sel)
+        monkeypatch.setattr(Tool, "installed", property(lambda self: installed))
+        monkeypatch.setattr(cli, "health", lambda t: {"installed": installed, "identity": t.pin or "",
+                                                      "drift": "ok", "capability": True, "ok": True})
+        monkeypatch.setattr(cli, "_doctor_version", lambda t, ident: t.pin or "")
         monkeypatch.setattr(secrets, "oob", lambda: dict(oob))
         res = CliRunner().invoke(cli.doctor, [])
         assert res.exception is None or isinstance(res.exception, SystemExit), res.exception
-        body = res.output.split("[oob]", 1)[1]
-        return [l for l in body.splitlines()
-                if "MODES.BLIND_XSS" in l or "unable to resolve" in l]
+        return res.output
 
-    def test_it_names_the_public_backend_plainly_and_WHOSE_it_is(self, monkeypatch):
-        line, = self._oob_lines(monkeypatch, {})
-        assert "native channel on the public backend" in line and "REFUSED" not in line
-        assert "ProjectDiscovery" in line, "the public pool is somebody else's server; say so"
+    def _block(self, monkeypatch, oob):
+        out = self._doctor(monkeypatch, oob)
+        assert out.count("[oob]") == 1, out
+        return [l for l in out[out.index("[oob]"):].splitlines()[1:] if l.strip()][:2]
 
-    def test_a_planner_failure_is_ANNOUNCED_not_swallowed(self, monkeypatch):
-        """A missing line is not a diagnosis: a broken planner seam would read as a healthy box."""
-        from quarry_recon.phases import params as _params
-        def _boom(_prof):
-            raise RuntimeError("planner seam broken")
-        monkeypatch.setattr(_params, "_blind_oob_plan", _boom)
-        line, = self._oob_lines(monkeypatch, {})
-        assert "unable to resolve the blind-XSS channel" in line and "planner seam broken" in line
+    def test_there_is_exactly_one_oob_header(self, monkeypatch):
+        assert self._doctor(monkeypatch, {}).count("[oob]") == 1
 
-    def test_a_configured_server_is_shown_with_its_host(self, monkeypatch):
-        line, = self._oob_lines(monkeypatch, {"interactsh_server": "oob.mine.test"})
-        assert "self-hosted backend (oob.mine.test)" in line
+    def test_it_holds_the_tool_and_the_server(self, monkeypatch):
+        first, second = self._block(monkeypatch, {})
+        assert "interactsh-client" in first and "v1.3.1" in first, first
+        assert "callback server:" in second and "not set" in second, second
 
-    def test_a_dormant_legacy_key_is_reported_as_the_COLLISION_it_would_cause(self, monkeypatch):
-        """The legacy key is installation-scoped, so doctor is exactly where this is visible BEFORE a
-        run refuses."""
-        line, = self._oob_lines(monkeypatch, {"blind_xss_url": "https://col.example"})
-        assert "REFUSED" in line and "BLIND_XSS_DUAL" in line
+    def test_the_tool_is_no_longer_in_the_phase_list(self, monkeypatch):
+        """It was under [params] — one consumer of the callback layer, not the tool's purpose."""
+        from quarry_recon.registry import load_tools
+        t = next(x for x in load_tools() if x.bin == "interactsh-client")
+        assert t.phase == "oob"
+        out = self._doctor(monkeypatch, {})
+        assert out.index("interactsh-client") > out.index("[oob]"), "printed in the oob block only"
+
+    def test_a_configured_server_shows_its_ADDRESS(self, monkeypatch):
+        """Not a secret, and seeing it is how an operator confirms the one they set is the one in use."""
+        _tool, srv = self._block(monkeypatch, {"interactsh_server": "oob.mine.test"})
+        assert "callback server:" in srv and "oob.mine.test" in srv, srv
+
+    def test_the_TOKEN_never_appears(self, monkeypatch):
+        out = self._doctor(monkeypatch, {"interactsh_server": "oob.mine.test",
+                                         "interactsh_token": "SUPERSECRETTOKEN"})
+        assert "SUPERSECRETTOKEN" not in out
+
+    def test_no_per_TARGET_channel_and_no_how_to_prose(self, monkeypatch):
+        out = self._doctor(monkeypatch, {"blind_xss_url": "https://col.example"})
+        blk = out[out.index("[oob]"):]
+        for noise in ("MODES.BLIND_XSS", "channel", "correlation owned by", "to use your own"):
+            assert noise not in blk, (noise, blk[:400])
+
+    def test_a_MISSING_required_oob_tool_is_still_a_blocker(self, monkeypatch):
+        """It is printed elsewhere now; it must not stop being COUNTED."""
+        out = self._doctor(monkeypatch, {}, installed=False)
+        assert "MISSING — quarry install --only interactsh-client" in out
+        assert "NOT READY" in out, out[-400:]
 
 
 class TestThe320AdoptionIsMEASURED:

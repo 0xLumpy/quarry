@@ -3228,10 +3228,15 @@ from click.testing import CliRunner
 from quarry_recon import cli, sources as S
 from importlib import resources
 out = CliRunner().invoke(cli.cli, ["doctor"]).output
+# ONE [oob] section (Lumpy 2026-08-07): the tool that makes the callbacks AND the server they come back
+# to. `params` was one consumer of the callback layer, not the tool's purpose, so it no longer sits in
+# that phase group — and two [oob] headers in one output is the thing this asserts against.
 oob = out[out.find("[oob]"):out.find("[oob]") + 400] if "[oob]" in out else ""
 # doctor [oob] = READINESS ONLY (terse operator status, not the OOB model essay — that lives in README):
-# interactsh-client present/missing + which backend. No taxonomy prose.
-c_doctor = ("interactsh-client" in oob and "backend:" in oob
+# the tool, and which server a callback returns to. No taxonomy prose, and NO per-target channel (armed
+# for one engagement, not the next — it is decided in target.yaml, not on this box).
+c_doctor = (out.count("[oob]") == 1 and "interactsh-client" in oob and "callback server:" in oob
+            and "MODES.BLIND_XSS" not in oob
             and all(k not in oob for k in ("owned probes", "import (compat)", "nuclei",   # essay lines removed
                                            "Quarry-owned OOB layer", "3 channels", "evidence substrate")))
 tmpl = resources.files("quarry_recon.data").joinpath("secrets.template.yaml").read_text(encoding="utf-8")
@@ -3374,7 +3379,7 @@ c_reg = not sources.get("params.oob_probe").get("pending")
 # optional, or plain `quarry install` skips it and the default-on source silently degrades.
 _tools = {t.bin: t for t in load_tools()}
 c_tool = ("interactsh-client" in _tools and _tools["interactsh-client"].optional is False
-          and _tools["interactsh-client"].phase == "params"
+          and _tools["interactsh-client"].phase == "oob"
           and "interactsh-client" in [t.bin for t in load_tools() if not t.optional])   # in plain-install set
 psrc = inspect.getsource(params)
 c_run = ("_oob_probe(ctx, scope, prof)" in psrc)

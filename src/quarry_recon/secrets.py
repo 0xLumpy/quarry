@@ -10,6 +10,7 @@ Missing/unset keys are not an error: the consuming step is skipped gracefully.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -43,6 +44,36 @@ def _as_list(v) -> list[str]:
 def _scalar(v) -> str | None:
     items = _as_list(v)
     return items[0] if items else None
+
+
+#: LOCAL shape checks — never a network call (Lumpy, 2026-08-07: "not by pinging, and accidentally
+#: create costs"). A pattern is declared ONLY where the provider's format is actually known; everywhere
+#: else the answer is "set", with no claim about validity, because inventing a shape would reject a
+#: perfectly good key. `doctor` reports the shape; nothing here ever gates a lane — a key we cannot
+#: parse is still the operator's key, and the provider is the authority on whether it works.
+_KEY_SHAPES = {
+    # classic PAT `ghp_` + 36, fine-grained `github_pat_` + 82, and the pre-2021 40-hex tokens
+    "github": re.compile(r"\A(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|[a-f0-9]{40})\Z"),
+    "shodan": re.compile(r"\A[A-Za-z0-9]{32}\Z"),
+}
+#: what a key is NEVER: an unedited template placeholder, or a value with whitespace/quotes in it.
+_PLACEHOLDER = re.compile(r"(?i)\A(<.*>|your[-_ ]?|changeme|xxx+|todo|none|null|example)")
+
+
+def key_shape(kind: str, value: str) -> str:
+    """"ok" | "malformed" | "unknown" — a LOCAL verdict on one key's shape.
+
+    "unknown" is the honest default: it means we hold no documented format for that provider, so the
+    key is reported as set and nothing is claimed about it."""
+    v = (value or "").strip()
+    if not v:
+        return "unknown"
+    if v != value or _PLACEHOLDER.match(v) or any(c.isspace() or c in "\"'" for c in v):
+        return "malformed"
+    rx = _KEY_SHAPES.get(kind)
+    if rx is None:
+        return "unknown"
+    return "ok" if rx.match(v) else "malformed"
 
 
 def github_tokens() -> list[str]:

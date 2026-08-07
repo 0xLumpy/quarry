@@ -239,8 +239,14 @@ def doctor(phase):
     ok = warn = miss = 0
     click.echo(_c(f"\nQuarry doctor — {len(tools)} tools\n", "cyan"))
     cur_phase = None
+    oob_lines: list[str] = []                # rendered here, printed in the ONE [oob] section below
     for t in sorted(tools, key=lambda x: (x.phase, x.bin)):
-        if t.phase != cur_phase:
+        # `oob` tools are ACCOUNTED for here (a missing required one is still a blocker) but PRINTED in
+        # the [oob] block, next to the callback server they need. Two [oob] headers in one output was
+        # the tool list and the environment blocks being separate sequences (Lumpy, 2026-08-07).
+        _oob = t.phase == "oob"
+        _say = oob_lines.append if _oob else click.echo
+        if t.phase != cur_phase and not _oob:
             cur_phase = t.phase
             click.echo(_c(f"[{cur_phase}]", "magenta"))
         if t.installed:
@@ -248,18 +254,18 @@ def doctor(phase):
             ver = _doctor_version(t, h["identity"])
             if h["ok"]:
                 ok += 1
-                click.echo(f"  {_c('✓', 'green')} {t.bin:<20} {ver}")
+                _say(f"  {_c('✓', 'green')} {t.bin:<20} {ver}")
             else:
                 warn += 1                                        # present but UNVERIFIED — ✓ would be a lie
-                click.echo(f"  {_c('⚠', 'yellow')} {t.bin:<20} {ver}  "
-                           f"{_c('unverified: ' + _health_reason(h, t), 'yellow')}")
+                _say(f"  {_c('⚠', 'yellow')} {t.bin:<20} {ver}  "
+                     f"{_c('unverified: ' + _health_reason(h, t), 'yellow')}")
         elif t.optional:
-            click.echo(f"  {_c('·', 'yellow')} {t.bin:<20} optional, not installed")
+            _say(f"  {_c('·', 'yellow')} {t.bin:<20} optional, not installed")
         else:
             miss += 1
-            click.echo(f"  {_c('✗', 'red')} {t.bin:<20} MISSING — quarry install --only {t.bin}")
+            _say(f"  {_c('✗', 'red')} {t.bin:<20} MISSING — quarry install --only {t.bin}")
         if t.needs_chromium and t.installed and not _chromium():
-            click.echo(f"      {_c('⚠ needs chromium — not found; screenshots/headless will fail', 'red')}")
+            _say(f"      {_c('⚠ needs chromium — not found; screenshots/headless will fail', 'red')}")
 
     # environment checks
     click.echo(_c("\n[environment]", "magenta"))
@@ -300,15 +306,31 @@ def doctor(phase):
     if not secrets_present:
         click.echo(f"  {_c('✗', 'red')} secrets.yaml NOT FOUND — run `quarry install` to recreate it "
                    f"from the template (or restore a backup); keys read as unset until it exists")
-    n_gh = len(secrets.github_tokens())
-    rows = [("github tokens", bool(n_gh), f"{n_gh} token(s)" if n_gh else ""),
-            ("shodan", bool(secrets.shodan()), ""),
-            ("whoxy", bool(secrets.whoxy()), ""),
-            ("projectdiscovery/chaos", bool(secrets.chaos()), ""),
-            ("certspotter", bool(secrets.certspotter()), "CT (optional; free tier keyless)")]
-    for label, present, extra in rows:
-        mark = _c("✓", "green") if present else _c("·", "yellow")
-        click.echo(f"  {mark} {label:<24} {extra or ('' if present else '(optional) not set')}")
+    # Every key here is optional, so saying "(optional)" on each row said nothing (Lumpy, 2026-08-07).
+    # What a row DOES say now: not set · set · malformed. The shape check is LOCAL — a regex, never a
+    # request — so `doctor` cannot spend a credit, and it only claims malformed for providers whose
+    # format is actually documented (see `secrets.key_shape`). Values are never printed.
+    gh = secrets.github_tokens()
+    rows = [("github tokens", gh, "github"),
+            ("shodan", [secrets.shodan()], "shodan"),
+            ("whoxy", [secrets.whoxy()], "whoxy"),
+            ("projectdiscovery/chaos", [secrets.chaos()], "chaos"),
+            ("certspotter", [secrets.certspotter()], "certspotter")]
+    for label, vals, kind in rows:
+        vals = [v for v in vals if v]
+        if not vals:
+            click.echo(f"  {_c('·', 'yellow')} {label:<24} not set")
+            continue
+        bad = [v for v in vals if secrets.key_shape(kind, v) == "malformed"]
+        note = f"{len(vals)} token(s)" if kind == "github" else ""
+        if bad:
+            # "wrong shape" already says it was not tested — a shape check cannot report a rejection
+            # (Lumpy, 2026-08-07: the explanation was longer than the fact).
+            click.echo(f"  {_c('✗', 'red')} {label:<24} "
+                       + (f"{len(bad)} of {len(vals)} wrong shape for this provider"
+                          if len(vals) > 1 else "wrong shape for this provider"))
+        else:
+            click.echo(f"  {_c('✓', 'green')} {label:<24} {note}".rstrip())
     # Censys Platform — ADVANCED opt-in; shown ONLY when configured (silent otherwise, by design)
     cen = secrets.censys()
     if cen.get("token") and cen.get("org"):
@@ -358,41 +380,21 @@ def doctor(phase):
     # oob — readiness only: is the tool present + which backend. (The OOB model lives in README, not here.)
     ob = secrets.oob()
     _have_ic = shutil.which("interactsh-client") is not None
-    click.echo(_c("\n[oob]", "magenta") + "  (out-of-band interaction)")
-    if _have_ic:
-        click.echo(f"  {_c('✓', 'green')} interactsh-client present (probes + poll)")
+    # ONE [oob] section: the tool that does the callbacks, and the server they come back to (Lumpy,
+    # 2026-08-07). The server ADDRESS is shown — it is not a secret, and seeing it is how an operator
+    # confirms the one they configured is the one in use. The token never appears.
+    #
+    # What is NOT here: the blind-XSS channel. It is resolved from a TARGET's `MODES.BLIND_XSS`, so it
+    # is armed for one engagement and not the next — doctor is installation-scoped and cannot answer it
+    # for "the box". The how and the why live in the docs.
+    click.echo(_c("\n[oob]", "magenta"))
+    for _l in oob_lines:
+        click.echo(_l)
+    srv = str(ob.get("interactsh_server") or "").strip()
+    if srv:
+        click.echo(f"  {_c('✓', 'green')} {'callback server:':<20} {srv}")
     else:
-        click.echo(f"  {_c('✗', 'red')} interactsh-client MISSING — quarry install --only interactsh-client")
-    if ob.get("interactsh_server"):
-        tok = " +token" if ob.get("interactsh_token") else " (no token)"
-        click.echo(f"  {_c('✓', 'green')} backend: self-hosted {ob['interactsh_server']}{tok}")
-    else:
-        click.echo(f"  {_c('·', 'yellow')} backend: public interactsh (set oob.interactsh_server to use your own)")
-    if ob.get("blind_xss_url"):
-        click.echo(f"  {_c('✓', 'green')} blind XSS: dalfox -b → {ob['blind_xss_url']}")
-    # doctor is INSTALLATION-scoped, so it cannot read a target's `MODES.BLIND_XSS`. What it CAN say is
-    # which channel arming would select from this box's keys — resolved by the real planner, so the two
-    # never drift — and whether the legacy key would collide with it.
-    try:
-        from .phases.params import _blind_oob_plan
-        _bp = _blind_oob_plan(type("_Armed", (), {"blind_xss": True, "blind_xss_dual": False})())
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except Exception as e:                   # doctor stays operational — but SAYS the diagnosis is gone.
-        # review#19 (Lumpy): swallowing this printed nothing at all, so a broken planner/config seam
-        # looked exactly like a healthy box with nothing to report. A missing line is not a diagnosis.
-        _bp = None
-        click.echo(f"  {_c('⚠', 'yellow')} unable to resolve the blind-XSS channel: {e}")
-    if _bp is not None:
-        if _bp["channel"] == "conflict":
-            click.echo(f"  {_c('⚠', 'yellow')} if MODES.BLIND_XSS is armed: REFUSED — `oob.blind_xss_url` "
-                       f"also set; drop one, or set MODES.BLIND_XSS_DUAL to run both deliberately")
-        else:
-            click.echo(f"  {_c('·', 'yellow')} if MODES.BLIND_XSS is armed: {_bp['channel']} channel on the "
-                       f"{_bp['backend']} backend"
-                       + (f" ({_bp['server']})" if _bp["server"] else "")
-                       + (" — ProjectDiscovery's pool, correlation owned by dalfox"
-                          if _bp["backend"] == "public" else " — correlation owned by dalfox"))
+        click.echo(f"  {_c('·', 'yellow')} {'callback server:':<20} not set")
 
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
     scope_note = f" for phase {phase}" if phase else ""
@@ -530,10 +532,12 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
             # review-C08.2r4#1: a PRESENT tool is left as-is ONLY if it VERIFIES (identity + capability); a wrong
             # binary from a failed prior update no longer passes — it is reinstalled to the pin.
             if verify_installed(t):
-                # user-facing install output omits the version (noise here — it lives in `doctor`/`lock`); keep
-                # the distro tag (an explicit policy/state, not the absence of a pin).
-                distro = " (distro)" if t.policy == "distro" else ""
-                click.echo(f"  {_c('→', 'cyan')} {t.bin} present + verified{distro} {_c('✓', 'green')}")
+                # ONE line, one mark (Lumpy, 2026-08-07). "present + verified (distro)" restated the
+                # section's own premise for every already-installed tool — and for the distro-managed
+                # ones, which apt provisions in [1/6], it read as redundant work happening twice. The
+                # ✓ IS "present and verified"; nothing else here has changed, so a tool that fails
+                # verification still says so on the next line and is reinstalled.
+                click.echo(f"  {_c('→', 'cyan')} {t.bin} {_c('✓', 'green')}")
                 continue
             click.echo(f"  {_c('⚠', 'yellow')} {t.bin} present but FAILED verification — reinstalling pin")
         if not _run_tool(t, "→", dry_run):
