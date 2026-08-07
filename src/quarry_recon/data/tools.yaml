@@ -189,6 +189,12 @@ tools:
   - bin: bun
     maintenance_state: active
     phase: crawl
+    # NOT a recon tool — a runtime jxscout-ast needs (Lumpy, 2026-08-07: a dependency does not belong in
+    # the crawl tool list). `dependency: true` moves it to the toolchain step of `install` and to
+    # [environment] in `doctor`, next to go/pipx/chromium. It is still provisioned by the SAME machinery
+    # (pin, per-platform digest, staged) and `phase` still names the tool that needs it, so
+    # `quarry install --phase crawl` provisions it and the file-order dependency below is preserved.
+    dependency: true
     role: JS runtime for the jxscout AST analyzer (its prebuilt native parser loads only under bun)
     # PROVISIONED LIKE ANY OTHER TOOL (Lumpy, 2026-08-07). It used to be "the operator's decision", which
     # made it the ONE prerequisite a fresh box had to satisfy by hand — while Quarry bootstraps pipx and

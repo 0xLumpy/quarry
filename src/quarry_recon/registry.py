@@ -109,6 +109,11 @@ class Tool:
     runtime: str = "go"            # go | pipx | source | binary — toolchain it needs
     deps: list[str] | None = None  # extra apt packages this specific tool needs
     needs_chromium: bool = False   # runtime needs a chromium browser
+    # A language RUNTIME another tool needs (bun), not a recon tool. It is provisioned through this
+    # same machinery — pinned, digest-verified, staged — but it belongs with go/pipx/chromium in the
+    # output, never in the tool list of a phase it does no work in (Lumpy, 2026-08-07). `phase` stays
+    # the tool that needs it, so `--phase crawl` still provisions it and dependency order is preserved.
+    dependency: bool = False
     # C08 compatibility lock — STRATEGY-AWARE (review-C08.1#2), one shape per install runtime:
     #   go / pipx : `pin` = the module/package version (go verifies via the checksum DB, pip via PyPI hashes —
     #               no artifact sha needed).
@@ -208,6 +213,7 @@ def load_tools() -> list[Tool]:
             keys=t.get("keys"), optional=bool(t.get("optional", False)),
             notes=t.get("notes"), runtime=t.get("runtime", "go"),
             deps=t.get("deps") or [], needs_chromium=bool(t.get("needs_chromium", False)),
+            dependency=bool(t.get("dependency", False)),
             pin=t.get("version"), artifacts=t.get("artifacts"), ref=t.get("ref"),
             policy=t.get("policy"), capability=t.get("capability"), cap_codes=t.get("cap_codes"),
             repo=t.get("repo"), maintenance_state=t.get("maintenance_state"), release=t.get("release"),

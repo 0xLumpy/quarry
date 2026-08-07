@@ -236,34 +236,42 @@ def _health_reason(h: dict, t) -> str:
 def doctor(phase):
     """Audit local setup: tools, versions, API keys, resolvers, wordlists."""
     tools = tools_by_phase(phase) if phase else load_tools()
+    # A `dependency` (bun) is a RUNTIME, not a recon tool: it is audited here but printed with
+    # go/pipx/chromium under [environment], and it is not part of the tool count (Lumpy, 2026-08-07).
+    # A broken one still degrades the verdict — it is only `ok` that counts tools, so the READY line
+    # and the header always quote the same population.
+    deps = [t for t in tools if t.dependency]
+    tools = [t for t in tools if not t.dependency]
     ok = warn = miss = 0
     click.echo(_c(f"\nQuarry doctor — {len(tools)} tools\n", "cyan"))
     cur_phase = None
     oob_lines: list[str] = []                # rendered here, printed in the ONE [oob] section below
-    for t in sorted(tools, key=lambda x: (x.phase, x.bin)):
+    dep_lines: list[str] = []                # ditto, printed in [environment]
+    for t in sorted(tools + deps, key=lambda x: (x.phase, x.bin)):
         # `oob` tools are ACCOUNTED for here (a missing required one is still a blocker) but PRINTED in
         # the [oob] block, next to the callback server they need. Two [oob] headers in one output was
         # the tool list and the environment blocks being separate sequences (Lumpy, 2026-08-07).
         _oob = t.phase == "oob"
-        _say = oob_lines.append if _oob else click.echo
-        if t.phase != cur_phase and not _oob:
+        _say = dep_lines.append if t.dependency else (oob_lines.append if _oob else click.echo)
+        _w = 24 if t.dependency else 20   # [environment] column, not the tool-list one
+        if t.phase != cur_phase and not _oob and not t.dependency:
             cur_phase = t.phase
             click.echo(_c(f"[{cur_phase}]", "magenta"))
         if t.installed:
             h = health(t)                                        # verify-grade verdict, identity probed once
             ver = _doctor_version(t, h["identity"])
             if h["ok"]:
-                ok += 1
-                _say(f"  {_c('✓', 'green')} {t.bin:<20} {ver}")
+                ok += 0 if t.dependency else 1
+                _say(f"  {_c('✓', 'green')} {t.bin:<{_w}} {ver}")
             else:
                 warn += 1                                        # present but UNVERIFIED — ✓ would be a lie
-                _say(f"  {_c('⚠', 'yellow')} {t.bin:<20} {ver}  "
+                _say(f"  {_c('⚠', 'yellow')} {t.bin:<{_w}} {ver}  "
                      f"{_c('unverified: ' + _health_reason(h, t), 'yellow')}")
         elif t.optional:
-            _say(f"  {_c('·', 'yellow')} {t.bin:<20} optional, not installed")
+            _say(f"  {_c('·', 'yellow')} {t.bin:<{_w}} optional, not installed")
         else:
             miss += 1
-            _say(f"  {_c('✗', 'red')} {t.bin:<20} MISSING — quarry install --only {t.bin}")
+            _say(f"  {_c('✗', 'red')} {t.bin:<{_w}} MISSING — quarry install --only {t.bin}")
         if t.needs_chromium and t.installed and not _chromium():
             _say(f"      {_c('⚠ needs chromium — not found; screenshots/headless will fail', 'red')}")
 
@@ -294,6 +302,10 @@ def doctor(phase):
                   (shutil.which("chromium-browser") or shutil.which("google-chrome")))
         mark = _c("✓", "green") if present else _c("✗", "red")
         click.echo(f"  {mark} {label}")
+    # runtimes Quarry provisions itself (bun) — same audit as any tool, printed where the operator
+    # looks for a runtime, not in the tool list of a phase it does no work in.
+    for _l in dep_lines:
+        click.echo(_l)
 
     from . import bootstrap
     click.echo(_c("\n[system]", "magenta"))
@@ -488,6 +500,24 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
 
     # ── 1. system packages + Go toolchain + data (unless --tools-only / --only / --phase) ──
     full = not (only or phase or tools_only)
+
+    # Selection happens FIRST because a `dependency` tool (bun) is a runtime, not a recon tool: it is
+    # provisioned in the toolchain step below and never listed under [3/6] (Lumpy, 2026-08-07). The
+    # filters here read only static fields, so nothing observes the host before it is provisioned.
+    tools = load_tools()
+    if only:
+        tools = [t for t in tools if t.bin == only]
+    elif phase:
+        tools = [t for t in tools if t.phase == phase]
+    if not include_optional and not only:
+        tools = [t for t in tools if not t.optional]
+    # A NARROWED run (--only bun / --phase crawl / --tools-only) has no toolchain step, so there the
+    # dependency stays in the selection it was asked for — it must still be installed.
+    runtimes = [t for t in tools if t.dependency] if full else []
+    if full:
+        tools = [t for t in tools if not t.dependency]
+    failed = []
+
     if full:
         # install.sh prints this banner FIRST (before the quiet dependency install), so don't duplicate it there
         if not os.environ.get("QUARRY_FROM_INSTALLER"):
@@ -507,7 +537,7 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
             click.echo(_c("  below recommended — the run may be slow or unstable; continuing.", "yellow"))
         click.echo(_c("\n[1/6] system packages", "magenta"))
         bootstrap.install_system_packages(click.echo, dry_run)
-        click.echo(_c("\n[2/6] Go toolchain", "magenta"))
+        click.echo(_c("\n[2/6] runtimes", "magenta"))
         bootstrap.ensure_golang(click.echo, dry_run)
 
     # make freshly-installed Go/pipx bins visible to subsequent tool installs
@@ -516,18 +546,8 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
         if p not in os.environ.get("PATH", ""):
             os.environ["PATH"] = p + os.pathsep + os.environ.get("PATH", "")
 
-    # ── 2. tools from the registry ──
-    tools = load_tools()
-    if only:
-        tools = [t for t in tools if t.bin == only]
-    elif phase:
-        tools = [t for t in tools if t.phase == phase]
-    if not include_optional and not only:
-        tools = [t for t in tools if not t.optional]
-
-    click.echo(_c(f"\n[3/6] tools ({len(tools)})", "magenta"))
-    failed = []
-    for t in tools:
+    def _provision(t) -> bool:
+        """Install one registry entry, ONE line of output. Shared by the runtime step and [3/6]."""
         if t.installed and not only and not dry_run:
             # review-C08.2r4#1: a PRESENT tool is left as-is ONLY if it VERIFIES (identity + capability); a wrong
             # binary from a failed prior update no longer passes — it is reinstalled to the pin.
@@ -538,9 +558,20 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
                 # ✓ IS "present and verified"; nothing else here has changed, so a tool that fails
                 # verification still says so on the next line and is reinstalled.
                 click.echo(f"  {_c('→', 'cyan')} {t.bin} {_c('✓', 'green')}")
-                continue
+                return True
             click.echo(f"  {_c('⚠', 'yellow')} {t.bin} present but FAILED verification — reinstalling pin")
-        if not _run_tool(t, "→", dry_run):
+        return _run_tool(t, "→", dry_run)
+
+    # runtimes still belong to the [2/6] section above — they run here only because they need the PATH
+    # the block above just set (a version/capability probe calls the binary by name).
+    for t in runtimes:
+        if not _provision(t):
+            failed.append(t)
+
+    # ── 2. tools from the registry ──
+    click.echo(_c(f"\n[3/6] tools ({len(tools)})", "magenta"))
+    for t in tools:
+        if not _provision(t):
             failed.append(t)
 
     # ── 3. data files + extras + cleanup ──

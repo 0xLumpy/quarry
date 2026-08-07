@@ -1300,6 +1300,102 @@ class TestBunIsProvisionedLikeAnyOtherTool:
         assert "command -v bun" in self._tools()["jxscout-ast"].install
 
 
+class TestARuntimeDependencyIsNotAToolInTheOutput:
+    """Lumpy, 2026-08-07, after the fresh proxmox install: "bun is now mentioned while installing in
+    tools, and with doctor in crawl. as it is not a tool, but a dependency, it should not be listed
+    there." It is provisioned by the SAME machinery (that part was the point) — only WHERE it is
+    reported changes: with the toolchains, and with go/pipx/chromium."""
+
+    @staticmethod
+    def _tools():
+        return {t.bin: t for t in registry.load_tools()}
+
+    def test_bun_is_the_dependency_and_nothing_else_is(self):
+        deps = [t.bin for t in registry.load_tools() if t.dependency]
+        assert deps == ["bun"]
+
+    def test_its_phase_still_names_the_tool_that_needs_it(self):
+        """`phase` is not the display axis here — it is the dependency relation. Changing it would make
+        `quarry install --phase crawl` stop provisioning the runtime jxscout-ast needs."""
+        t = self._tools()
+        assert t["bun"].phase == t["jxscout-ast"].phase == "crawl"
+
+    # ── install ──────────────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _install(monkeypatch, tmp_path, argv):
+        from click.testing import CliRunner
+        from quarry_recon import cli as cli_mod, bootstrap
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(Tool, "installed", property(lambda self: False))
+        monkeypatch.setattr(bootstrap, "system_report", lambda who="install": {"level": "ok", "checks": []})
+        monkeypatch.setattr(cli_mod, "_echo_syscheck", lambda rep: None)
+        for fn in ("install_system_packages", "ensure_golang", "install_data_files", "run_extras", "cleanup"):
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: True)
+        done = []
+        monkeypatch.setattr(cli_mod, "install_one",
+                            lambda t, echo, dry_run=False: (done.append(t.bin), True)[1])
+        res = CliRunner().invoke(cli_mod.cli, ["install", "--yes", *argv])
+        return res, done
+
+    def test_a_full_install_provisions_it_with_the_TOOLCHAINS_not_the_tools(self, monkeypatch, tmp_path):
+        res, done = self._install(monkeypatch, tmp_path, ["--include-optional"])
+        assert res.exit_code == 0 and "bun" in done, res.output      # still installed
+        head, _, tail = res.output.partition("[3/6] tools")
+        assert "[2/6] runtimes" in head and "bun" in head, "reported in the toolchain step"
+        assert "bun" not in tail.split("[4/6]")[0], "…and never in the tool list"
+
+    def test_the_tool_count_counts_tools(self, monkeypatch, tmp_path):
+        res, _ = self._install(monkeypatch, tmp_path, ["--include-optional"])
+        listed = len([t for t in registry.load_tools() if not t.dependency])
+        assert f"[3/6] tools ({listed})" in res.output, res.output
+
+    def test_it_is_provisioned_BEFORE_the_tool_that_needs_it(self, monkeypatch, tmp_path):
+        """Moving it out of the list must not move it out of the ORDER."""
+        _, done = self._install(monkeypatch, tmp_path, ["--include-optional"])
+        assert done.index("bun") < done.index("jxscout-ast")
+
+    @pytest.mark.parametrize("argv", [["--phase", "crawl", "--include-optional"],
+                                      ["--tools-only", "--include-optional"],
+                                      ["--only", "bun"]])
+    def test_a_NARROWED_run_still_installs_it(self, monkeypatch, tmp_path, argv):
+        """A narrowed run has no toolchain step at all — there the dependency stays in the selection the
+        operator asked for, or `quarry install --only bun` would print success and install nothing."""
+        res, done = self._install(monkeypatch, tmp_path, argv)
+        assert "bun" in done, (argv, res.output)
+
+    # ── doctor ───────────────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _doctor(monkeypatch, installed=True, ok=True):
+        from click.testing import CliRunner
+        from quarry_recon import cli as cli_mod
+        monkeypatch.setattr(Tool, "installed", property(lambda self: installed))
+        monkeypatch.setattr(Tool, "version", lambda self: "1.2.3")
+        monkeypatch.setattr(cli_mod, "health",
+                            lambda t: {"ok": ok if t.dependency else True, "identity": "pin",
+                                       "drift": "DRIFT", "capability": True})
+        monkeypatch.setattr(cli_mod, "_chromium", lambda: True)
+        return CliRunner().invoke(cli_mod.cli, ["doctor"]).output
+
+    def test_it_is_reported_with_the_other_runtimes_not_under_crawl(self, monkeypatch):
+        out = self._doctor(monkeypatch)
+        crawl = out.split("[crawl]")[1].split("[")[0]
+        assert "bun" not in crawl, crawl
+        env = out.split("[environment]")[1].split("[system]")[0]
+        assert "bun" in env and env.index("pipx") < env.index("bun"), env
+
+    def test_the_header_and_the_verdict_quote_the_same_population(self, monkeypatch):
+        out = self._doctor(monkeypatch)
+        listed = len([t for t in registry.load_tools() if not t.dependency])
+        assert f"— {listed} tools" in out, out
+        assert f"{listed} tools installed + verified" in out, out
+
+    def test_a_BROKEN_runtime_still_degrades_the_verdict(self, monkeypatch):
+        """Not counting it as a tool is a display decision, not an amnesty: a runtime that does not
+        verify is exactly why the lane that needs it will fail."""
+        out = self._doctor(monkeypatch, ok=False)
+        assert "DEGRADED" in out and "1 present but UNVERIFIED" in out, out
+
+
 class TestTheChromiumLineSaysWhatTheLaneWillGet:
     """Lumpy, 2026-08-07: "check log (some libs optional)" told the operator neither what failed nor
     which log — and it appeared on a box where the only thing that happened was the EXPECTED rename
