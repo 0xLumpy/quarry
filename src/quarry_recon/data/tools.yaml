@@ -186,6 +186,38 @@ tools:
       evaluation. Default brute-force limit is 0 (derived candidates only): integer enumeration
       manufactures new target requests, so it is an ENGAGEMENT decision, never an --unbound one.'
 
+  - bin: bun
+    maintenance_state: active
+    phase: crawl
+    role: JS runtime for the jxscout AST analyzer (its prebuilt native parser loads only under bun)
+    # PROVISIONED LIKE ANY OTHER TOOL (Lumpy, 2026-08-07). It used to be "the operator's decision", which
+    # made it the ONE prerequisite a fresh box had to satisfy by hand — while Quarry bootstraps pipx and
+    # the Go toolchain and puts both on PATH itself. That inconsistency is what made `jxscout-ast` fail
+    # on every fresh VPS. It installs into ~/.local/bin, which install.sh already exports AND persists to
+    # the rc file, so there is no new PATH plumbing and nothing for the operator to source.
+    #
+    # `optional: true` for the same reason jxscout-ast is: nothing else needs a 90 MB JS runtime, so a
+    # minimal install skips both. `install.sh` passes --include-optional, so a full bootstrap gets them.
+    # Ordered BEFORE jxscout-ast because the registry installs in file order and that entry probes for
+    # `bun` on PATH.
+    version: "v1.3.14"
+    repo: oven-sh/bun
+    runtime: binary
+    # The BASELINE x64 build on purpose: the default x64 build requires AVX2, and a VPS CPU is not
+    # something an install script gets to assume (measured: both run here; baseline runs everywhere).
+    # The analyzer lane is bounded by memory and a 300 s wall, not by the runtime's vector width.
+    # Digests computed from the downloaded bytes and cross-checked against upstream's SHASUMS256.txt.
+    artifacts:
+      linux/amd64: {url: "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64-baseline.zip", sha256: "a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7"}
+      linux/arm64: {url: "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-aarch64.zip",       sha256: "a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b"}
+    install: 'set -e; mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o /tmp/_bun.zip && echo "{sha256}  /tmp/_bun.zip" | sha256sum -c - >/dev/null && rm -rf /tmp/_bun && unzip -q -o /tmp/_bun.zip -d /tmp/_bun && cp "$(find /tmp/_bun -type f -name bun | head -1)" ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin} && rm -rf /tmp/_bun.zip /tmp/_bun'
+    version_cmd: bun --version
+    doc: https://bun.sh
+    deps: [curl, unzip]
+    optional: true
+    notes: 'Installed ONLY as the jxscout-ast runtime — Quarry runs no other JS. The zip nests the binary
+      under a build-named directory, so the install finds it by name rather than assuming the path.'
+
   - bin: jxscout-ast
     maintenance_state: frozen
     phase: crawl

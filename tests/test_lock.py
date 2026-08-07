@@ -4,6 +4,7 @@ The lock makes installs reproducible: each tool carries a PINNED version (`pin`)
 post-install `capability` smoke test. `quarry lock` captures the installed versions on a validated host; `drift`
 flags an installed version that no longer matches the pin (a reproducibility break).
 """
+import pathlib
 from dataclasses import replace
 
 import pytest
@@ -211,9 +212,10 @@ class TestPinnedInstall:
 
 class TestRealPins:
     def test_version_pinned_tools_have_no_sentinels(self):
-        # 31 go/pipx + gitleaks + trufflehog = 33 carry an exact `version:` pin (massdns uses ref; nmap distro)
+        # 31 go/pipx + gitleaks + trufflehog + dalfox + bun = 34 carry an exact `version:` pin
+        # (massdns uses ref; nmap is distro-managed)
         pinned = [t for t in registry.load_tools() if t.pin]
-        assert len(pinned) == 33
+        assert len(pinned) == 34
         assert all(t.pin.lower() not in registry._SENTINEL_PINS for t in pinned)
 
     def test_nmap_is_distro_policy_not_pinned(self):
@@ -273,7 +275,10 @@ class TestBinarySourceInstall:
                 continue
             cmd = t.install or ""
             assert "{sha256}" in cmd and "sha256sum -c" in cmd, f"{t.bin} installs without checking a digest"
-            assert cmd.index("sha256sum -c") < cmd.index("tar -xzf"), f"{t.bin} unpacks BEFORE verifying"
+            # whichever unpacker it uses, verification comes FIRST
+            unpack = next((u for u in ("tar -xzf", "unzip") if u in cmd), None)
+            assert unpack, f"{t.bin} has no recognised unpack step to order against"
+            assert cmd.index("sha256sum -c") < cmd.index(unpack), f"{t.bin} unpacks BEFORE verifying"
 
     def test_binary_missing_platform_returns_none(self, monkeypatch):
         monkeypatch.setattr(registry, "current_platform", lambda: "linux/riscv64")
@@ -1181,3 +1186,113 @@ class TestOsintTimeout:
         from quarry_recon import cli as cli_mod
         res = CliRunner().invoke(cli_mod.cli, ["run", "-t", "no-such-project-xyz", "--timeout", "-1"])
         assert res.exit_code == 2 and "timeout" in res.output.lower()   # click usage error, body never ran
+
+
+class TestAnInstallFailureSAYSWhatHappened:
+    """review#45 (Lumpy, from a real install on a fresh box): `jxscout-ast` exits with "needs bun (the
+    analyzer fails under node)" and the operator was told "install/stage FAILED (checksum or build)" —
+    the command's own output was discarded and the message guessed. Debugging the wrong thing is the
+    cost of a message that does not know why it is printing."""
+
+    def _binary(self, monkeypatch, tmp_path, *, code, out, stage=False):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(registry, "current_platform", lambda: "linux/amd64")
+        stage_p = tmp_path / ".local" / "bin" / ".stage" / "gitleaks"
+
+        def rs(c, d):
+            if stage:
+                stage_p.parent.mkdir(parents=True, exist_ok=True)
+                stage_p.write_text("NEW")
+            return (code, out)
+        monkeypatch.setattr(registry, "run_shell", rs)
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, "v8.30.1"))
+        monkeypatch.setattr(registry.shutil, "which", lambda b: str(tmp_path / ".local/bin/gitleaks"))
+        t = _tool(bin="gitleaks", runtime="binary", pin="v8.30.1", version_cmd="gitleaks version",
+                  artifacts={"linux/amd64": {"url": "https://x/g.tgz", "sha256": _VALID_SHA}},
+                  install="curl {url} ... ~/.local/bin/.stage {bin}")
+        msgs: list = []
+        ok = registry.install_one(t, msgs.append)
+        return ok, " ".join(msgs)
+
+    def test_the_scripts_OWN_reason_reaches_the_operator(self, monkeypatch, tmp_path):
+        ok, msg = self._binary(monkeypatch, tmp_path, code=1,
+                               out="jxscout-ast needs bun (the analyzer fails under node): "
+                                   "install bun first")
+        assert ok is False
+        assert "needs bun" in msg, msg
+        assert "checksum or build" not in msg, "it no longer guesses"
+
+    def test_the_EXIT_CODE_is_named(self, monkeypatch, tmp_path):
+        _ok, msg = self._binary(monkeypatch, tmp_path, code=7, out="boom")
+        assert "exit 7" in msg, msg
+
+    def test_a_command_that_SUCCEEDS_but_stages_nothing_is_its_own_state(self, monkeypatch, tmp_path):
+        """Both are failures; only one of them is the script's fault."""
+        _ok, msg = self._binary(monkeypatch, tmp_path, code=0, out="all good!", stage=False)
+        assert "exited 0 but staged no binary" in msg, msg
+        assert "all good!" in msg, "…and it still shows what the command said"
+
+    def test_a_SILENT_failure_says_that_rather_than_nothing(self, monkeypatch, tmp_path):
+        _ok, msg = self._binary(monkeypatch, tmp_path, code=1, out="")
+        assert "produced no output" in msg, msg
+
+    def test_a_successful_install_is_unaffected(self, monkeypatch, tmp_path):
+        ok, msg = self._binary(monkeypatch, tmp_path, code=0, out="", stage=True)
+        assert ok is True and "FAILED" not in msg, msg
+
+
+class TestBunIsProvisionedLikeAnyOtherTool:
+    """Lumpy, 2026-08-07: `jxscout-ast` failed on every fresh box because bun was the ONE prerequisite
+    the operator had to satisfy by hand — while Quarry bootstraps pipx and the Go toolchain and puts
+    both on PATH itself. "The operator's decision" was an inconsistency, not a policy."""
+
+    @staticmethod
+    def _tools():
+        return {t.bin: t for t in registry.load_tools()}
+
+    def test_bun_is_in_the_registry_and_pinned(self):
+        b = self._tools()["bun"]
+        assert b.runtime == "binary" and b.pin == "v1.3.14" and b.repo == "oven-sh/bun"
+        assert set(b.artifacts) >= {"linux/amd64", "linux/arm64"}
+        for a in b.artifacts.values():
+            assert a["url"].startswith("https://github.com/oven-sh/bun/releases/download/")
+            assert len(a["sha256"]) == 64
+
+    def test_it_installs_into_the_path_install_sh_already_persists(self):
+        """No new PATH plumbing and nothing for the operator to source: `~/.local/bin` is exported by
+        install.sh AND written to the rc file before tools are provisioned."""
+        cmd = self._tools()["bun"].install
+        assert "~/.local/bin/.stage/{bin}" in cmd
+        rc = pathlib.Path("install.sh").read_text()
+        assert '$HOME/.local/bin' in rc and '>>> quarry path >>>' in rc
+
+    def test_it_is_installed_BEFORE_the_tool_that_needs_it(self):
+        """The registry installs in file order, and `jxscout-ast` probes for `bun` on PATH."""
+        names = [t.bin for t in registry.load_tools()]
+        assert names.index("bun") < names.index("jxscout-ast")
+
+    def test_the_x64_build_is_the_BASELINE_one(self):
+        """The default x64 build requires AVX2 and a VPS CPU is not something an install script gets to
+        assume. Measured: both run here; only baseline runs everywhere."""
+        assert "baseline" in self._tools()["bun"].artifacts["linux/amd64"]["url"]
+
+    def test_it_is_optional_like_the_lane_it_serves(self):
+        """Nothing else needs a 90 MB JS runtime; a minimal install skips both, and install.sh passes
+        --include-optional so a full bootstrap gets them."""
+        t = self._tools()
+        assert t["bun"].optional and t["jxscout-ast"].optional
+        assert "--include-optional" in pathlib.Path("install.sh").read_text()
+
+    def test_the_digest_is_verified_before_the_zip_is_opened(self):
+        cmd = self._tools()["bun"].install
+        assert cmd.index("sha256sum -c") < cmd.index("unzip")
+
+    def test_the_binary_is_found_by_NAME_inside_the_zip(self):
+        """The archive nests it under a build-named directory (`bun-linux-x64-baseline/bun`), which
+        differs per artifact — assuming the path would break on the other platform."""
+        cmd = self._tools()["bun"].install
+        assert "-name bun" in cmd and "bun-linux-x64-baseline/bun" not in cmd
+
+    def test_jxscout_ast_no_longer_needs_a_hand_installed_runtime(self):
+        """Its guard stays — it just stops being the thing that fails a fresh install."""
+        assert "command -v bun" in self._tools()["jxscout-ast"].install

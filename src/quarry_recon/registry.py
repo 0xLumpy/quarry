@@ -541,9 +541,19 @@ def install_one(t: Tool, echo, dry_run: bool = False) -> bool:
         stage.parent.mkdir(parents=True, exist_ok=True)
         if stage.exists():
             stage.unlink()
-        code, _ = run_shell(cmd, False)
+        code, out = run_shell(cmd, False)
         if code != 0 or not stage.exists():
-            echo(f"{t.bin}: install/stage FAILED (checksum or build)")
+            # SAY WHAT HAPPENED. review#45 (Lumpy, from a real install): the command's own output was
+            # discarded and the message guessed "(checksum or build)" for every failure — so
+            # `jxscout-ast`, whose script exits with "needs bun (the analyzer fails under node)", was
+            # reported as a checksum or build problem. The operator then debugs the wrong thing.
+            #
+            # The two states are also distinct: a command that FAILED, and one that returned 0 while
+            # staging nothing. Both are failures; only one of them is the script's fault.
+            why = (f"exit {code}" if code != 0 else "exited 0 but staged no binary")
+            detail = (out or "").strip()
+            echo(f"{t.bin}: install FAILED ({why})"
+                 + (f" — {detail}" if detail else " — the command produced no output"))
             return False
         # verify the STAGED binary BEFORE replacing the working one (review#5)
         if t.capability or t.version_cmd:
