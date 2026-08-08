@@ -97,3 +97,124 @@ class TestApexOf:
     def test_longest_match_order_independent(self, apexes):
         from quarry_recon.phases.dns import _apex_of
         assert _apex_of("x.dev.example.com", apexes) == "dev.example.com"
+
+
+class TestEveryModeIsDiscoverable:
+    """`MODES.JS_AST` and `MODES.JS_CHUNK_BRUTE` existed in `config.py` and in NO template, so an
+    operator could not find them: the OTC run of 2026-08-07 went out without the AST lane because
+    nothing on disk said it existed. The template is the only discovery surface a profile has, so
+    the two lists are compared structurally — the mode keys the code READS, against the mode keys
+    the template OFFERS.
+
+    Read from the AST, not from a grep: a comment, a docstring or a string in an unrelated file
+    would satisfy a text search and prove nothing about what `TargetProfile` actually reads.
+    """
+
+    @staticmethod
+    def _modes_read_by_code() -> set:
+        """Literal keys in `self.modes.get("X", …)` / `modes.get("X", …)` across config.py."""
+        import ast
+        import pathlib
+
+        import quarry_recon.config as cfg
+
+        def _is_modes(node) -> bool:
+            return (getattr(node, "attr", None) or getattr(node, "id", None)) == "modes"
+
+        tree = ast.parse(pathlib.Path(cfg.__file__).read_text())
+        keys = set()
+        for node in ast.walk(tree):
+            key = None
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get" and node.args and _is_modes(node.func.value)):
+                key = node.args[0]                       # self.modes.get("X", …) / modes.get("X", …)
+            elif isinstance(node, ast.Subscript) and _is_modes(node.value):
+                key = node.slice                         # self.modes["X"] — a future consumer
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                keys.add(key.value)
+        return keys
+
+    @staticmethod
+    def _template_modes() -> dict:
+        import yaml
+        from importlib import resources
+
+        doc = yaml.safe_load(
+            resources.files("quarry_recon.data").joinpath("target.template.yaml").read_text()) or {}
+        return doc.get("MODES") or {}
+
+    @staticmethod
+    def _modes_offered_by_template() -> set:
+        import yaml
+        from importlib import resources
+
+        raw = resources.files("quarry_recon.data").joinpath("target.template.yaml").read_text()
+        doc = yaml.safe_load(raw) or {}
+        return set((doc.get("MODES") or {}).keys())
+
+    def test_the_two_lists_are_the_same(self):
+        code, template = self._modes_read_by_code(), self._modes_offered_by_template()
+        assert code, "parsed no modes out of config.py — the AST walk broke, not the template"
+        missing = code - template
+        assert not missing, (
+            f"MODES read by TargetProfile but absent from target.template.yaml: {sorted(missing)}. "
+            f"A mode nobody can find is a mode nobody uses.")
+        extra = template - code
+        assert not extra, (
+            f"MODES offered by target.template.yaml that TargetProfile never reads: {sorted(extra)}. "
+            f"A profile key with no consumer reads as a setting and does nothing.")
+
+    #: The shipped profile, frozen. `false`/`0`/`"off"` here is a SAFETY position, not a formatting
+    #: choice: a template that arms BLIND_XSS or SECRET_VERIFICATION would put a stored payload — or
+    #: someone else's credentials — on the wire for every operator who ran `quarry init` and read no
+    #: further. Changing a value here is a deliberate act and has to edit this table to land.
+    SHIPPED_DEFAULTS = {
+        "PASSIVE_ONLY": False,
+        "HEADLESS": False,
+        "SCREENSHOTS": True,
+        "TAKEOVER": True,
+        "PORTSCAN": False,
+        "BLOCK_PRIVATE_TARGETS": False,
+        "CONTENT_DISCOVERY": "off",
+        "CONTENT_RECURSION": 0,
+        "JS_AST": False,
+        "SECRET_VERIFICATION": False,
+        "BLIND_XSS": False,
+        "BLIND_XSS_DUAL": False,
+        "DEEP_EVIDENCE": False,
+        "JS_CHUNK_BRUTE": 0,
+    }
+
+    def test_the_shipped_defaults_are_exactly_these(self):
+        assert self._modes_offered_by_template() == set(self.SHIPPED_DEFAULTS)
+        template = self._template_modes()
+        assert template == self.SHIPPED_DEFAULTS, (
+            "target.template.yaml no longer ships the reviewed defaults: "
+            f"{ {k: v for k, v in template.items() if self.SHIPPED_DEFAULTS.get(k) != v} }")
+
+    def test_a_generated_profile_READS_those_defaults(self, tmp_path):
+        """The table above pins the FILE; this pins what `TargetProfile` makes of it. The accessors
+        are not a straight passthrough — each mode has its own reader (`_flag`, a strict `is True`,
+        an exact-int check), so a reader could change meaning while the file stays byte-identical.
+        Asserted on a profile written the way `quarry init` writes one."""
+        from importlib import resources
+
+        from quarry_recon.config import TargetProfile
+
+        raw = resources.files("quarry_recon.data").joinpath("target.template.yaml").read_text()
+        prof_file = tmp_path / "target.yaml"
+        prof_file.write_text(raw.replace("TARGET: example", "TARGET: t"))
+        p = TargetProfile.load(str(prof_file))
+        for attr, expect in (("passive_only", False), ("headless", False), ("screenshots", True),
+                             ("takeover", True), ("portscan", False),
+                             ("block_private_targets", False), ("content_discovery", "off"),
+                             ("content_recursion", 0), ("js_ast", False),
+                             ("verify_secrets", False), ("blind_xss", False),
+                             ("blind_xss_dual", False), ("deep_evidence", False),
+                             ("js_chunk_brute", 0)):
+            assert getattr(p, attr) == expect, f"{attr} reads {getattr(p, attr)!r}, expected {expect!r}"
+
+    def test_no_mode_is_offered_without_a_value(self):
+        """A commented-out or valueless mode is not offered."""
+        blank = sorted(k for k, v in self._template_modes().items() if v is None)
+        assert not blank, f"MODES with no value: {blank}"

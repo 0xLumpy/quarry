@@ -1,100 +1,68 @@
-# Quarry — Target Profile
-# Compiles into the scope matchers used by every phase. Empty sections skip cleanly.
-# Edit this file per engagement. NEVER commit API keys here — keys live in tool configs.
+# Quarry target profile — one per engagement. Empty sections skip cleanly.
+# Reference: docs/target-prep.md
 
 TARGET: example
 
-# In-scope APEX roots. Vertical discovery is anchored to these (suffix match).
+# In-scope apex roots. Discovery is anchored here (suffix match).
 APEX_DOMAINS:
   - example.com
 
-# Out-of-scope patterns (regex, matched against full host). Collected passively, never actively scanned.
-# Add with `quarry oos -t <project> <host|regex>…`, or uncomment/edit the examples below.
+# Out-of-scope patterns (regex against the full host). Collected passively, never contacted.
+# Add from the CLI: quarry oos -t <project> <host|regex>
 OOS:
   # - '^jobs\.'
-  # - '^careers\.'
 
-# In-scope IP ranges. If empty, horizontal IP/port scanning is SKIPPED.
+# In-scope IP ranges. Empty: no range expansion and no infra port scan.
 CIDR:
   # - 192.0.2.0/24
 
-# Manual ASN seeds. If empty, ASN discovery only SUGGESTS candidates for review;
-# active range scanning happens only for ASNs/CIDRs explicitly listed here.
+# ASN seeds. Context only — active range scanning still needs CIDR.
 ASN:
   # - AS12345
 
-# Optional anchors for the OSINT pre-flight (`quarry osint`). Not used by the recon run.
-# ORG_NAMES → whoxy reverse-whois by company (finds sibling apexes). Needs whoxy key.
-# BRANDS  → reserved for future dork-based sources (parsed, not yet used).
+# Organisation names anchor `quarry osint`; both fields seed cloud-bucket
+# candidates during active recon.
 ORG_NAMES:
   # - Example Inc
 BRANDS:
   # - Example
 
+# Pressure on the target. Empty: each tool's own default.
+# Set only when the program's rules of engagement cap you.
 RATELIMIT:
-  # HTTP req/s for httpx/katana/nuclei/dalfox. EMPTY => tool defaults (fast — recommended). When set it
-  # must be a POSITIVE integer (a 0/negative/non-integer rate is rejected at load, not silently applied).
-  # Set ONLY when a program's RoE caps you: a low cap (e.g. 5) makes nuclei very slow, since
-  # its work = templates x hosts (thousands of templates). Example for a 5 req/s program:
-  #   HTTP: 5
-  HTTP:
-  # DNS qps for puredns/massdns (public resolvers — VPS only, can be high). empty => tool default.
-  DNS:
-  # Port-scan packet rate for naabu. empty => tool default.
-  PORTSCAN:
+  HTTP:                 # req/s for httpx, katana, nuclei, dalfox
+  DNS:                  # qps for puredns, massdns
+  PORTSCAN:             # naabu packet rate
 
+# HTTP probe ports. Empty: the full methodology set.
 PORTS:
-  # HTTP probe ports. Empty => full methodology set.
-  # Populate only to narrow or override for an engagement.
   HTTP:
 
 LIMITS:
-  # Max archived responses waymore downloads per apex (waymore -l). 0 = ALL (heavy).
-  WAYMORE_RESPONSES: 5000
+  WAYMORE_RESPONSES: 5000     # archived responses per apex (0 = all, heavy)
 
 MODES:
-  PASSIVE_ONLY: false   # true => no active probing/scanning at all (OSINT only)
-  HEADLESS: false       # true => katana headless SPA crawl (RAM-heavy)
+  PASSIVE_ONLY: false         # no active probing or scanning at all
+  HEADLESS: false             # katana headless SPA crawl (RAM-heavy)
   SCREENSHOTS: true
-  PORTSCAN: false       # INFRA port scan ONLY: naabu top-1000 over CIDR -> nmap -sV (the slow, weeks-long
-                        # side-stream). OFF by default — set true AND provide CIDR to opt in deliberately.
-                        # Does NOT control the fast web-port SYN prefilter (naabu over resolved host IPs
-                        # -> httpx on open ports only): that is main-river and always on when naabu exists.
-  TAKEOVER: true        # true => collect CNAMEs + run nuclei takeover templates
-  BLOCK_PRIVATE_TARGETS: false  # default false: a name resolving to RFC1918/CGNAT/ULA is a LEAD — RECORDED
-                        # as a finding AND contacted (offensive; evidence validates ownership). Set true for a
-                        # conservative VPS-external posture (don't touch private space). The scan box itself +
-                        # cloud metadata (169.254.169.254 etc) are ALWAYS withheld from contact regardless.
-  SECRET_VERIFICATION: false  # default false: discovered secrets are reported UNVERIFIED. trufflehog's
-                        # default verification sends found TARGET credentials to their THIRD-PARTY provider
-                        # APIs (active credential use against a third party — RoE/legal concern). Discovery
-                        # is unaffected either way (every secret is still found/reported). Set true only when
-                        # the engagement explicitly authorizes credential verification.
-  BLIND_XSS: false      # default false: arm the blind/stored-XSS OOB channel (dalfox --blind-oob).
-                        # ONE gate — arming it IS the consent. Backend: `oob.interactsh_server` when
-                        # set (with `oob.interactsh_token` only if your server needs auth), else the
-                        # public interactsh pool, same as nuclei's OAST and Quarry's SSRF probes.
-                        # A blind payload PERSISTS on the target and fires later in someone else's
-                        # browser, phoning home to a callback host — a heavier engagement decision than a
-                        # reflected probe. Reflected + DOM XSS are found either way. Correlation is owned
-                        # by DALFOX in every case (it mints the per-payload nonce, registers, polls and
-                        # maps it back); Quarry imports that result. The SERVER is separate: on the public
-                        # backend it is ProjectDiscovery's pool and its operator sees the raw callbacks;
-                        # only a self-hosted `oob.interactsh_server` is yours, and only then does Quarry
-                        # hold a credential for it.
-  BLIND_XSS_DUAL: false # default false: permit the native OOB channel AND a legacy `-b` collector at
-                        # the same time. dalfox injects a blind payload for EACH, so this doubles the
-                        # blind payloads and the requests they cost. With BLIND_XSS armed and
-                        # `oob.blind_xss_url` also set, the lane REFUSES until this says it is intended.
-                        # NOTE on the interactsh token: it is passed to dalfox in a 0600 `--config`
-                        # file, never as an argument — argv is readable via /proc by any process of this
-                        # user. A same-user process can still read that file, which is the residual
-                        # limitation of authenticated native OOB.
-  CONTENT_DISCOVERY: "off"  # off | light | balanced | deep — candidate-driven path brute (default off)
-  CONTENT_RECURSION: 0    # recursion depth for content discovery (0 = off; pairs with balanced/deep)
-  DEEP_EVIDENCE: false    # true => DOWNLOAD + mine heavy artifacts (actuator heapdump) instead of just
-                          # flagging them. A heapdump GET triggers server-side generation — opt-in only.
+  TAKEOVER: true              # collect CNAMEs, run takeover templates
+  PORTSCAN: false             # infra scan (naabu top-1000 -> nmap): needs true AND CIDR.
+                              # The web-port SYN prefilter runs separately during active
+                              # recon when naabu is available.
+  BLOCK_PRIVATE_TARGETS: false  # false: in-scope names resolving to private, CGNAT or ULA
+                              # addresses are contacted and recorded as leads. The scan host
+                              # itself and cloud metadata are always withheld.
+  CONTENT_DISCOVERY: "off"    # off | light | balanced | deep
+  CONTENT_RECURSION: 0        # depth for balanced/deep
+  JS_AST: false               # AST analysis of downloaded JS bundles (local, memory-hungry)
 
-# Free-text program rules for the analyst (and the run manifest).
+  # The options below add active or credential-using work. Arm them per engagement.
+  SECRET_VERIFICATION: false  # sends discovered TARGET credentials to their providers
+  BLIND_XSS: false            # stored payload; can fire later in someone else's browser
+  BLIND_XSS_DUAL: false       # also inject for a legacy -b collector (doubles blind payloads)
+  DEEP_EVIDENCE: false        # downloads heapdumps and similar (the GET forces generation)
+  JS_CHUNK_BRUTE: 0           # guessed chunk ids; each guess requests a path no bundle named
+
+# Free-form engagement notes, recorded in the run manifest.
 NOTES:
-  # - e.g. program caps requests at 5 req/s -> set RATELIMIT.HTTP: 5
+  # - Add any context you want to preserve with the run.
