@@ -773,24 +773,23 @@ def _pytest_raises(exc):
 class TestBlindXssChannel:
     """4.3.D under the agreed contract (review#12, Lumpy):
 
-      * `--blind-oob` is the primary channel — dalfox mints a callback PER PAYLOAD and correlates each
-        interaction to target/param/location/method/payload. One `-b` URL covers a whole invocation and
-        cannot do that.
+      * `--blind-oob` is the channel — dalfox mints a callback PER PAYLOAD and correlates each
+        interaction to target/param/location/method/payload, so a beacon names the injection that
+        produced it.
       * CORRELATION IS DALFOX'S, always. It mints the nonce, registers, polls, waits and maps the hit
         back; Quarry imports it, so findings carry `oob_owner: dalfox`. The SERVER is a separate
         ownership question: ProjectDiscovery's public pool by default (its operator sees the raw
-        callbacks, and Quarry holds no credential for it), yours when `oob.interactsh_server` is set —
+        callbacks, and Quarry holds no credential for it), yours when `oob.callback_server` is set —
         and only then does Quarry own credential handling (review#19, Lumpy).
       * Never auto-enabled, but ONE gate: `MODES.BLIND_XSS` arms it, and the backend follows the
-        configured keys (self-hosted when `oob.interactsh_server` is set, public otherwise). The second
-        flag the public backend used to need was dropped (Lumpy, 2026-08-06).
-      * `-b` is an opt-in legacy collector, never paired automatically.
+        configured keys (self-hosted when `oob.callback_server` is set, public otherwise).
+      * Exactly ONE channel: `--blind-oob`. Nothing else is emitted, and no configuration adds a
+        second one, so a finding has one callback lifecycle and one correlation owner.
     """
 
     class _P:
         http_rl = 0
         blind_xss = False
-        blind_xss_dual = False
 
     @staticmethod
     def _oob(monkeypatch, **kw):
@@ -805,7 +804,7 @@ class TestBlindXssChannel:
         return params._dalfox_cmd("b.txt", "o.jsonl", prof, 1)
 
     def test_it_is_OFF_unless_explicitly_armed(self, monkeypatch):
-        cmd = self._cmd(monkeypatch, self._P(), interactsh_server="oob.mine.test")
+        cmd = self._cmd(monkeypatch, self._P(), callback_server="oob.mine.test")
         assert not any(c.startswith("--blind-oob") for c in cmd), cmd
         plan = params._blind_oob_plan(self._P())
         assert not plan["armed"] and "MODES.BLIND_XSS is off" in plan["reason"]
@@ -815,7 +814,7 @@ class TestBlindXssChannel:
         process of this user, and redacting our own logs does not change that. dalfox reads
         `scan.blind_oob_secret` from a `--config` TOML, so it travels in a 0600 file."""
         import stat
-        self._oob(monkeypatch, interactsh_server="oob.mine.test", interactsh_token="T0K")
+        self._oob(monkeypatch, callback_server="oob.mine.test", auth_token="T0K")
         p = self._P(); p.blind_xss = True
         out = tmp_path / "findings.jsonl"
         cmd = params._dalfox_cmd(tmp_path / "b.txt", out, p, 1)
@@ -832,14 +831,14 @@ class TestBlindXssChannel:
         del stat
 
     def test_no_config_file_is_written_without_a_secret(self, monkeypatch, tmp_path):
-        self._oob(monkeypatch, interactsh_server="oob.mine.test")     # server, no token
+        self._oob(monkeypatch, callback_server="oob.mine.test")     # server, no token
         p = self._P(); p.blind_xss = True
         cmd = params._dalfox_cmd(tmp_path / "b.txt", tmp_path / "o.jsonl", p, 1)
         assert "--config" not in cmd and not list(tmp_path.glob("*.toml"))
 
     def test_the_secret_never_reaches_the_recorded_command(self, monkeypatch, tmp_path):
         """The work-unit config and every telemetry copy of the command must be secret-free too."""
-        self._oob(monkeypatch, interactsh_server="oob.mine.test", interactsh_token="T0K")
+        self._oob(monkeypatch, callback_server="oob.mine.test", auth_token="T0K")
         p = self._P(); p.blind_xss = True
         cmd = params._dalfox_cmd(tmp_path / "b.txt", tmp_path / "o.jsonl", p, 1)
         assert "T0K" not in " ".join(str(c) for c in cmd)
@@ -848,7 +847,7 @@ class TestBlindXssChannel:
         """`--blind-oob[=<domains>]` takes its value attached. A separate `=host` argument would be
         parsed as a TARGET — measured against the 3.2.0 binary."""
         p = self._P(); p.blind_xss = True
-        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test")
+        cmd = self._cmd(monkeypatch, p, callback_server="oob.mine.test")
         assert "=oob.mine.test" not in cmd, cmd
         assert not any(c.startswith("=") for c in cmd)
 
@@ -858,7 +857,7 @@ class TestBlindXssChannel:
         self-hosted server) behind two flags, which mostly meant no blind XSS at all. Arming IS the
         consent."""
         p = self._P(); p.blind_xss = True
-        cmd = self._cmd(monkeypatch, p)                     # no interactsh_server configured
+        cmd = self._cmd(monkeypatch, p)                     # no callback_server configured
         assert "--blind-oob" in cmd and not any(c.startswith("--blind-oob=") for c in cmd)
         plan = params._blind_oob_plan(p)
         assert plan["armed"] and plan["backend"] == "public" and plan["channel"] == "native"
@@ -870,62 +869,36 @@ class TestBlindXssChannel:
         self._oob(monkeypatch)
         pub = params._blind_oob_plan(self._P_armed())["reason"]
         assert "ProjectDiscovery" in pub and "raw callbacks" in pub
-        self._oob(monkeypatch, interactsh_server="oob.mine.test")
+        self._oob(monkeypatch, callback_server="oob.mine.test")
         own = params._blind_oob_plan(self._P_armed())["reason"]
         assert "ProjectDiscovery" not in own and "oob.mine.test" in own
 
     def test_a_configured_server_moves_the_backend_without_another_flag(self, monkeypatch):
         p = self._P(); p.blind_xss = True
-        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test")
+        cmd = self._cmd(monkeypatch, p, callback_server="oob.mine.test")
         assert "--blind-oob=oob.mine.test" in cmd
 
     def test_the_token_is_optional_for_a_self_hosted_server(self, monkeypatch):
         """Plenty of interactsh instances run open."""
         p = self._P(); p.blind_xss = True
-        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test")   # no token
+        cmd = self._cmd(monkeypatch, p, callback_server="oob.mine.test")   # no token
         assert "--blind-oob=oob.mine.test" in cmd and "--config" not in cmd
         assert params._blind_oob_plan(p)["secret"] == ""
 
-    def test_b_is_NOT_paired_automatically(self, monkeypatch):
-        """dalfox fires BOTH channels when both are set — duplicate payloads, extra requests, two
-        callback lifecycles. `-b` stays an explicit operator choice."""
+    def test_there_is_exactly_ONE_channel(self, monkeypatch):
+        """Blind XSS is `--blind-oob` and nothing else: one channel means one callback lifecycle and
+        one correlation owner per finding. The `-b` assertions here are regression guards — a second
+        channel would double the blind payloads and the requests they cost."""
         p = self._P(); p.blind_xss = True
-        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test")
-        assert "-b" not in cmd, cmd
+        cmd = self._cmd(monkeypatch, p, callback_server="oob.mine.test")
+        plan = params._blind_oob_plan(p)
+        assert plan["channel"] == "native" and plan["armed"] and plan["backend"] == "self-hosted"
+        assert "--blind-oob=oob.mine.test" in cmd and "-b" not in cmd
 
-    def test_a_dormant_legacy_url_does_not_silently_double_the_channels(self, monkeypatch):
-        """review#17 (Lumpy): with BLIND_XSS armed AND a historical `blind_xss_url` present, the lane
-        emitted BOTH — duplicate payloads because a dormant setting existed, not because anyone chose
-        it. It refuses and names the knob instead."""
-        p = self._P(); p.blind_xss = True
-        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test",
-                        blind_xss_url="https://col.example")
+    def test_an_unarmed_profile_emits_no_channel_at_all(self, monkeypatch):
+        cmd = self._cmd(monkeypatch, self._P(), callback_server="oob.mine.test")
         assert not any(c.startswith("--blind-oob") for c in cmd) and "-b" not in cmd, cmd
-        plan = params._blind_oob_plan(p)
-        assert plan["channel"] == "conflict" and not plan["armed"]
-        assert "BLIND_XSS_DUAL" in plan["reason"] and "REFUSED" in plan["reason"]
-
-    def test_dual_mode_runs_BOTH_only_when_explicitly_permitted(self, monkeypatch):
-        p = self._P(); p.blind_xss = True; p.blind_xss_dual = True
-        cmd = self._cmd(monkeypatch, p, interactsh_server="oob.mine.test",
-                        blind_xss_url="https://col.example")
-        assert "--blind-oob=oob.mine.test" in cmd and cmd[cmd.index("-b") + 1] == "https://col.example"
-        plan = params._blind_oob_plan(p)
-        assert plan["channel"] == "dual" and "DOUBLES" in plan["reason"]
-
-    def test_a_legacy_channel_is_an_explicit_CHOICE_not_a_fallback(self, monkeypatch):
-        """A refused native channel must not fall back to the collector: the operator armed the native
-        one, and quietly using a different channel is not what they asked for."""
-        p = self._P(); p.blind_xss = True                    # no server, no public permission
-        cmd = self._cmd(monkeypatch, p, blind_xss_url="https://col.example")
-        plan = params._blind_oob_plan(p)
-        assert plan["channel"] == "conflict", plan["channel"]
-        assert "-b" not in cmd, "a refusal is not a fallback"
-
-    def test_b_still_works_as_an_opt_in_legacy_collector(self, monkeypatch):
-        cmd = self._cmd(monkeypatch, self._P(), blind_xss_url="https://col.example")
-        assert cmd[cmd.index("-b") + 1] == "https://col.example"
-        assert not any(c.startswith("--blind-oob") for c in cmd), "…and does not arm the OOB channel"
+        assert params._blind_oob_plan(self._P())["channel"] == "off"
 
     def test_the_arming_flags_do_not_fail_open_on_quoted_yaml(self):
         """An arming flag must never be enabled by a QUOTED string, and a quoted value must fail LOUD in
@@ -934,10 +907,10 @@ class TestBlindXssChannel:
         import pytest as _pt
         from quarry_recon.config import ProfileError, TargetProfile
         prof = TargetProfile.__new__(TargetProfile)
-        prof.modes = {"BLIND_XSS": "true", "BLIND_XSS_DUAL": "true"}
-        assert prof.blind_xss is False and prof.blind_xss_dual is False
+        prof.modes = {"BLIND_XSS": "true"}
+        assert prof.blind_xss is False
         # …and a quoted value fails LOUD through the real loader
-        for bad in ("BLIND_XSS", "BLIND_XSS_DUAL"):
+        for bad in ("BLIND_XSS",):
             f = pathlib.Path(_tf.mkdtemp()) / "target.yaml"
             f.write_text("target: acme.com\nscope:\n  in: [acme.com]\n"
                          f"MODES:\n  {bad}: \"true\"\n")
@@ -945,14 +918,14 @@ class TestBlindXssChannel:
                 TargetProfile.load(f)
 
     def test_every_arming_flag_defaults_to_OFF(self):
-        """An absent mode must never arm a lane: dual mode doubles blind payloads, and public OOB sends
-        callbacks to a third party. Neither may happen because a key was missing."""
+        """An absent mode must never arm a lane: public OOB sends callbacks to a third party, and that
+        must not happen because a key was missing."""
         from quarry_recon.config import TargetProfile
         prof = TargetProfile.__new__(TargetProfile)
         prof.modes = {}
         assert prof.blind_xss is False
-        assert prof.blind_xss_dual is False
         assert not hasattr(prof, "blind_xss_public"), "the second gate is gone, not renamed"
+        assert not hasattr(prof, "blind_xss_dual"), "dual mode is gone, not renamed"
 
     def test_an_OOB_finding_records_dalfox_as_the_OWNER(self):
         row = ('{"type":"V","param":"q","data":"http://h/p?q=1","method":"GET","location":"Query",'
@@ -1081,7 +1054,7 @@ class TestBlindXssChannel:
         c = TestARetryOwesOnlyWhatFailed._lane_in(TestARetryOwesOnlyWhatFailed(),
                                                   monkeypatch, tmp_path, "cred")
         monkeypatch.setattr(secrets, "oob",
-                            lambda: {"interactsh_server": "oob.mine.test", "interactsh_token": "T0K"})
+                            lambda: {"callback_server": "oob.mine.test", "auth_token": "T0K"})
         monkeypatch.setattr(params, "_make_oob_credential",
                             lambda s: (_ for _ in ()).throw(params.OobCredentialError("disk full")))
         monkeypatch.setattr(params, "exec_tool",
@@ -1113,9 +1086,10 @@ class TestBlindXssChannel:
 
 
 class TestTheOobPolicyIsPartOfTheWorkIdentity:
-    """review#19 (Lumpy): the work unit fingerprinted only the legacy collector, so arming native OOB
-    after a completed reflected scan reused the old chunks and injected NO blind payload — a lane that
-    looks done and never ran what was just enabled."""
+    """The OOB policy is part of the work's identity: arming blind XSS after a completed reflected scan
+    must NOT reuse the old chunks and inject no blind payload — that is a lane which looks done and
+    never ran what was just enabled. Switching backend (public <-> self-hosted, or one server to
+    another) has the same effect and must invalidate the same state."""
 
     @staticmethod
     def _wu(monkeypatch, tmp_path, tag, oob, **modes):
@@ -1127,24 +1101,24 @@ class TestTheOobPolicyIsPartOfTheWorkIdentity:
         monkeypatch.setattr(params, "exec_tool", _exec(META0, 0))
         events.reset(); events.configure(tmp_path / tag)
         c = _C(tmp_path / tag)
-        prof = type("P", (), {"http_rl": 0, "blind_xss": False, "blind_xss_dual": False, **modes})()
+        prof = type("P", (), {"http_rl": 0, "blind_xss": False, **modes})()
         params._dalfox_xss_fast(c, ["http://h/a?q="], prof)
         st = json.loads((c.run.raw_path("params", "dalfox", "chunks.state.json")).read_text())
         return st["work_unit"]
 
     def test_arming_native_OOB_invalidates_a_reflected_only_resume(self, monkeypatch, tmp_path):
         off = self._wu(monkeypatch, tmp_path, "a", {})
-        on = self._wu(monkeypatch, tmp_path, "b", {"interactsh_server": "s.test"}, blind_xss=True)
+        on = self._wu(monkeypatch, tmp_path, "b", {"callback_server": "s.test"}, blind_xss=True)
         assert off != on, "the old chunks would have been reused and no blind payload sent"
 
     def test_switching_BACKEND_invalidates_it_too(self, monkeypatch, tmp_path):
         pub = self._wu(monkeypatch, tmp_path, "c", {}, blind_xss=True)
-        own = self._wu(monkeypatch, tmp_path, "d", {"interactsh_server": "s.test"}, blind_xss=True)
+        own = self._wu(monkeypatch, tmp_path, "d", {"callback_server": "s.test"}, blind_xss=True)
         assert pub != own
 
     def test_switching_SERVER_invalidates_it_too(self, monkeypatch, tmp_path):
-        s1 = self._wu(monkeypatch, tmp_path, "e", {"interactsh_server": "s1.test"}, blind_xss=True)
-        s2 = self._wu(monkeypatch, tmp_path, "f", {"interactsh_server": "s2.test"}, blind_xss=True)
+        s1 = self._wu(monkeypatch, tmp_path, "e", {"callback_server": "s1.test"}, blind_xss=True)
+        s2 = self._wu(monkeypatch, tmp_path, "f", {"callback_server": "s2.test"}, blind_xss=True)
         assert s1 != s2
 
     def test_the_identity_carries_NO_secret_and_NO_server_name(self, monkeypatch, tmp_path):
@@ -1178,13 +1152,13 @@ class TestPolicyIsNotExecution:
 
     @staticmethod
     def _prof(**kw):
-        return type("P", (), {"http_rl": 0, "blind_xss": False, "blind_xss_dual": False, **kw})()
+        return type("P", (), {"http_rl": 0, "blind_xss": False, **kw})()
 
     def test_a_credential_refusal_does_NOT_also_claim_the_channel_was_tested(self, monkeypatch,
                                                                             tmp_path):
         c = self._lane(monkeypatch, tmp_path, "r")
         monkeypatch.setattr(secrets, "oob",
-                            lambda: {"interactsh_server": "oob.mine.test", "interactsh_token": "T0K"})
+                            lambda: {"callback_server": "oob.mine.test", "auth_token": "T0K"})
         monkeypatch.setattr(params, "_make_oob_credential",
                             lambda s: (_ for _ in ()).throw(params.OobCredentialError("disk full")))
         monkeypatch.setattr(params, "exec_tool",
@@ -1200,7 +1174,7 @@ class TestPolicyIsNotExecution:
 
     def test_a_launched_invocation_reports_the_channel_as_run(self, monkeypatch, tmp_path):
         c = self._lane(monkeypatch, tmp_path, "ok")
-        monkeypatch.setattr(secrets, "oob", lambda: {"interactsh_server": "oob.mine.test"})
+        monkeypatch.setattr(secrets, "oob", lambda: {"callback_server": "oob.mine.test"})
         monkeypatch.setattr(params, "exec_tool", _exec(META0, 0))
         params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
         chan = self._cov(tmp_path, "ok", "blind_xss_channel")
@@ -1210,7 +1184,7 @@ class TestPolicyIsNotExecution:
     def test_a_lifecycle_that_RAN_NOTHING_asserts_no_execution(self, monkeypatch, tmp_path):
         """Everything already complete: policy is still stated, execution claims nothing."""
         c = self._lane(monkeypatch, tmp_path, "a")
-        monkeypatch.setattr(secrets, "oob", lambda: {"interactsh_server": "oob.mine.test"})
+        monkeypatch.setattr(secrets, "oob", lambda: {"callback_server": "oob.mine.test"})
         monkeypatch.setattr(params, "exec_tool", _exec(META0, 0))
         params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
         c2 = self._lane(monkeypatch, tmp_path, "b")
@@ -1234,7 +1208,7 @@ class TestPolicyIsNotExecution:
         """review#21 (Lumpy): `launched` incremented before `exec_tool`, so a missing binary, a refused
         launch or a `Popen` that raised all counted as a process that ran with the armed channel."""
         c = self._lane(monkeypatch, tmp_path, "nolaunch")
-        monkeypatch.setattr(secrets, "oob", lambda: {"interactsh_server": "oob.mine.test"})
+        monkeypatch.setattr(secrets, "oob", lambda: {"callback_server": "oob.mine.test"})
         monkeypatch.setattr(params, "exec_tool", _exec(META0, 0, started=False))
         params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
         chan = self._cov(tmp_path, "nolaunch", "blind_xss_channel")
@@ -1289,7 +1263,7 @@ class TestPolicyIsNotExecution:
         """The policy is knowable before execution and the attempt is a fact — an exception must take
         neither with it, and must itself arrive unchanged."""
         c = self._lane(monkeypatch, tmp_path, "boom")
-        monkeypatch.setattr(secrets, "oob", lambda: {"interactsh_server": "oob.mine.test"})
+        monkeypatch.setattr(secrets, "oob", lambda: {"callback_server": "oob.mine.test"})
 
         def explode(*a, **k):
             raise RuntimeError("bookkeeping blew up mid-loop")
@@ -1302,7 +1276,7 @@ class TestPolicyIsNotExecution:
 
     def test_the_policy_record_precedes_the_first_chunk(self, monkeypatch, tmp_path):
         c = self._lane(monkeypatch, tmp_path, "order")
-        monkeypatch.setattr(secrets, "oob", lambda: {"interactsh_server": "oob.mine.test"})
+        monkeypatch.setattr(secrets, "oob", lambda: {"callback_server": "oob.mine.test"})
         monkeypatch.setattr(params, "exec_tool", _exec(META0, 0))
         params._dalfox_xss_fast(c, ["http://h/a?q="], self._prof(blind_xss=True))
         evs = [json.loads(x) for x in (tmp_path / "order" / "events.jsonl").read_text().splitlines()]
@@ -1365,16 +1339,16 @@ class TestDoctorHasONEOobSection:
 
     def test_a_configured_server_shows_its_ADDRESS(self, monkeypatch):
         """Not a secret, and seeing it is how an operator confirms the one they set is the one in use."""
-        _tool, srv = self._block(monkeypatch, {"interactsh_server": "oob.mine.test"})
+        _tool, srv = self._block(monkeypatch, {"callback_server": "oob.mine.test"})
         assert "callback server:" in srv and "oob.mine.test" in srv, srv
 
     def test_the_TOKEN_never_appears(self, monkeypatch):
-        out = self._doctor(monkeypatch, {"interactsh_server": "oob.mine.test",
-                                         "interactsh_token": "SUPERSECRETTOKEN"})
+        out = self._doctor(monkeypatch, {"callback_server": "oob.mine.test",
+                                         "auth_token": "SUPERSECRETTOKEN"})
         assert "SUPERSECRETTOKEN" not in out
 
     def test_no_per_TARGET_channel_and_no_how_to_prose(self, monkeypatch):
-        out = self._doctor(monkeypatch, {"blind_xss_url": "https://col.example"})
+        out = self._doctor(monkeypatch, {"callback_server": "oob.mine.test"})
         blk = out[out.index("[oob]"):]
         for noise in ("MODES.BLIND_XSS", "channel", "correlation owned by", "to use your own"):
             assert noise not in blk, (noise, blk[:400])
@@ -1393,7 +1367,6 @@ class TestThe320AdoptionIsMEASURED:
     class _P:
         http_rl = 0
         blind_xss = False
-        blind_xss_dual = False
 
     def _cmd(self, monkeypatch):
         monkeypatch.setattr(secrets, "oob", lambda: {})

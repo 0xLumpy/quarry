@@ -402,7 +402,7 @@ def doctor(phase):
     click.echo(_c("\n[oob]", "magenta"))
     for _l in oob_lines:
         click.echo(_l)
-    srv = str(ob.get("interactsh_server") or "").strip()
+    srv = str(ob.get("callback_server") or "").strip()
     if srv:
         click.echo(f"  {_c('✓', 'green')} {'callback server:':<20} {srv}")
     else:
@@ -1215,7 +1215,7 @@ def _echo_campaign(project, campaign_id: str) -> None:
 def oob():
     """Out-of-band (OOB) interaction — one Quarry-owned callback layer.
 
-    Quarry manages interactsh-client internally (default public backend, or override oob.interactsh_server).
+    Quarry manages interactsh-client internally (default public backend, or override oob.callback_server).
     poll   = resume a run's owned session and pull DELAYED callbacks, correlated to their source
              (params.oob_probe).
     import = compatibility only — ingest EXTERNAL callback logs (Burp/XSSHunter/manual), uncorrelated
@@ -1232,7 +1232,7 @@ def oob_import(src_file, profile_path, run_id):
     """Import EXTERNAL interactsh -json (JSONL) callback logs into a run as oob_interaction rows.
 
     Compatibility path only — for callbacks Quarry did NOT issue (Burp Collaborator, XSSHunter, a manual
-    interactsh-client, old dalfox -b logs). Recorded as evidence WITHOUT attribution; a row correlates
+    interactsh-client, any external collector). Recorded as evidence WITHOUT attribution; a row correlates
     only if it matches a Quarry-issued token. Quarry-owned probes are correlated live via the OOB layer
     (params.oob_probe / `quarry oob poll`). Raw import kept under raw/oob/.
     """
@@ -1282,7 +1282,7 @@ def oob_poll(profile_path, run_id, wait):
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
     # carry the configured token so a self-hosted/protected collector can resume (secrets, not persisted)
-    resumed = oobmod.resume_session(run_obj, token=secrets.oob().get("interactsh_token"))
+    resumed = oobmod.resume_session(run_obj, token=secrets.oob().get("auth_token"))
     if resumed is None:
         raise click.ClickException("no resumable OOB session for this run "
                                    "(session.json missing, interactsh-client absent, or domain mismatch)")

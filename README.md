@@ -279,9 +279,14 @@ finds, but several opt-in modes do act on the target — see the mode table abov
 ### Out-of-band callbacks
 
 With no server configured, Quarry uses the public interactsh service — ProjectDiscovery operates it
-and can see raw callbacks. Set `oob.interactsh_server` (and `oob.interactsh_token` if it needs auth)
-to point at one you host. Quarry's own probes, nuclei and dalfox keep separate sessions and
-correlation even on the same backend.
+and can see raw callbacks. Set `oob.callback_server` (and `oob.auth_token` if it needs auth) to
+point at one you host. Setting a server replaces the backend everywhere; it is not a second
+channel. Quarry's own probes, nuclei and dalfox keep separate sessions and correlation even on the
+same backend.
+
+`quarry oob import` exists for compatibility only: it ingests external callback logs (Burp
+Collaborator, XSSHunter, a manual interactsh session). Imported rows are evidence but stay
+uncorrelated unless they carry a Quarry-issued token.
 
 ## Documentation
 

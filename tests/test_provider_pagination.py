@@ -686,7 +686,7 @@ class TestShodanPivot:
 
     def test_failed_pivots_are_classified_not_swallowed(self, monkeypatch, tmp_path):
         from quarry_recon.phases import probe
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
 
         def auth_fail(req, timeout=20):
             raise urllib.error.HTTPError("u", 401, "unauthorized", {}, None)
@@ -708,7 +708,7 @@ class TestShodanPivot:
         # end-to-end: total failure -> run_provider FAILED terminal with the classified error (not EMPTY)
         from quarry_recon.phases import probe
         from quarry_recon import contract
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
         monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: (_ for _ in ()).throw(urllib.error.HTTPError("u", 429, "rate", {}, None))))
         ctx, _ = self._ctx(tmp_path)
         out = contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
@@ -720,7 +720,7 @@ class TestShodanPivot:
     def test_some_fail_is_partial_with_dominant_class(self, monkeypatch, tmp_path):
         # SOME pivots fail (with a successful one) -> PARTIAL ProviderResult carrying the dominant error class
         from quarry_recon.phases import probe
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
 
         def mixed(req, timeout=20):
             if "h_bad" in req.full_url:
@@ -733,7 +733,7 @@ class TestShodanPivot:
 
     def test_truncation_flagged_when_total_exceeds_paged(self, monkeypatch, tmp_path):
         from quarry_recon.phases import probe
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)   # 1 page only
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)   # 1 page only
 
         def big(req, timeout=20):
             # total 150 but page 1 only returns 100 -> truncated at 1 page (credit-bounded)
@@ -751,7 +751,7 @@ class TestShodanPivot:
         # review-r6#1: a host already in the store (Run.add -> False) must STILL appear in `found` — the
         # response HAD it. Gating found on the new-key return made a clean rerun a false EMPTY.
         from quarry_recon.phases import probe
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
         monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: _Resp(json.dumps({"total": 1, "matches": [{"hostnames": ["seen.acme.com"]}]}).encode())))
         ctx, added = self._ctx(tmp_path)
         monkeypatch.setattr(ctx.run, "add", lambda e, r: False)   # store already has it (dedup -> False)
@@ -762,7 +762,7 @@ class TestShodanPivot:
         # review-r7#2: the artifact holds the COMPLETE evidence as valid JSONL — never sliced/truncated, so an
         # ingested host's evidence is actually present in its raw_ref (no false provenance).
         from quarry_recon.phases import probe
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
         big = [{"hostnames": [f"h{i}.acme.com"], "pad": "x" * 4096} for i in range(1000)]   # > 2 MiB serialized
         monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: _Resp(json.dumps({"total": 1000, "matches": big}).encode())))
         ctx, _ = self._ctx(tmp_path)
@@ -796,7 +796,7 @@ class TestShodanPivot:
         # review-r2#3: a generic high-`total` pivot must NOT drop valid in-scope hosts. B1.5b: off-scope
         # candidates are no longer bounded either — nothing about cardinality removes membership.
         from quarry_recon.phases import probe
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
 
         def big(req, timeout=20):
             ms = [{"hostnames": ["real.acme.com"]}] + [{"hostnames": [f"junk{i}.example.org"]} for i in range(99)]
@@ -822,7 +822,7 @@ class TestShodanPivot:
             calls.append(str(req.full_url))
             return _Resp(json.dumps({"total": 0, "matches": []}).encode())
 
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
         monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(counted, credits=1000))
         ctx, _ = self._ctx(tmp_path)
         probe._shodan_pivot(ctx, "k", [f"h{i}" for i in range(30)], "http.favicon.hash",
@@ -1723,7 +1723,7 @@ class TestShodanPivot:
         # each malformed shape must be a CLASSIFIED parse failure (the only val -> all-fail -> RAISE), never a
         # crash and never a laundered clean empty.
         from quarry_recon.phases import probe
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
         monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: _Resp(json.dumps(body).encode())))
         ctx, added = self._ctx(tmp_path)
         with pytest.raises(ValueError):
@@ -1736,7 +1736,7 @@ class TestShodanPivot:
         # review-r4#1: page 2 fails -> _shodan_search returns page-1 matches + a page_error (not discarded);
         # _shodan_pivot ingests them and marks the pivot degraded.
         from quarry_recon.phases import probe
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 3)
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 3)
 
         def paged(req, timeout=20):
             page = int(req.full_url.split("page=")[1])
@@ -1770,7 +1770,7 @@ class TestShodanPivot:
         # terminal + fabricated pagination coverage.
         from quarry_recon.phases import probe
         from quarry_recon import contract
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 1)
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
 
         def mixed(req, timeout=20):
             if "h_bad" in req.full_url:

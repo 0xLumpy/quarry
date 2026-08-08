@@ -1822,7 +1822,9 @@ class TestLaterPagePositionAccounting:
         run = Run.create(tmp_path, "t")
         events.reset()
         events.configure(run.dir)
-        monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: max_pages)
+        # SHODAN_MAX_PAGES is read as a SPENDING control (settings.raw), not a worker count:
+        # `0` must reach the lane as 0 = unbounded, which `concurrency()` would floor to 1.
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: max_pages)
         routed = _with_balance(responder)
         monkeypatch.setattr(urllib.request, "urlopen", routed)
         monkeypatch.setattr(probe.urllib.request, "urlopen", routed)
@@ -2024,3 +2026,64 @@ class TestBalanceReasonMatchesTheGate:
         for cls in ("quota", "entitlement"):
             why = self._reason(cls)
             assert "free operations continue" in why, (cls, why)
+
+
+class TestThePageCeilingIsASpendingControl:
+    """`SHODAN_MAX_PAGES: 0` documents "no page ceiling — the credit balance is the bound", and it is
+    also the default. It was read through `settings.concurrency()`, whose `max(1, …)` floor is right
+    for a worker pool and wrong here: an operator who wrote the documented `0` got ONE page
+    (Lumpy, 2026-08-08). The direction matters — it silently bought less than asked on a paid pivot,
+    so nothing looked broken.
+    """
+
+    @pytest.mark.parametrize("raw,expect", [
+        (None, (0, True)), ("", (0, True)), ("   ", (0, True)),   # ABSENT is 0, and 0 is fine
+        (0, (0, True)), (3, (3, True)), (1, (1, True)),
+        (True, (0, False)), (False, (0, False)),   # bool is an int subclass; True is not one page
+        ("3", (0, False)), (2.0, (0, False)), (-1, (0, False)), ([], (0, False)), ("all", (0, False)),
+    ])
+    def test_only_an_exact_non_negative_int_is_a_ceiling(self, raw, expect):
+        from quarry_recon.phases.probe import _page_ceiling
+        assert _page_ceiling(raw) == expect
+
+    def test_an_unusable_ceiling_REFUSES_rather_than_removing_the_bound(self):
+        """The failure direction that matters: a malformed value must not read as "no ceiling" and let a
+        pivot page until the balance runs out. Same contract the credit reserve already had — a broken
+        cost guard is not the absence of a guard."""
+        from quarry_recon.phases import probe
+        pages, valid = probe._page_ceiling("all")
+        assert (pages, valid) == (0, False), "an unusable value must be flagged, not silently unbounded"
+
+    def test_the_balance_refuses_to_spend_on_an_unusable_ceiling(self, monkeypatch):
+        from quarry_recon.phases import probe
+        monkeypatch.setattr(probe.settings, "performance", lambda: {})
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: "all")
+        bal = probe.shodan_balance({"query_credits": 500})
+        assert bal.spendable == 0 and not bal.may_spend
+        assert bal.stop_kind == probe.SHODAN_PAGE_CEILING_INVALID
+        assert not bal.stop_is_limit, "our own broken knob is a GAP to fix, not an expected limit"
+
+    def test_a_usable_ceiling_still_spends(self, monkeypatch):
+        from quarry_recon.phases import probe
+        monkeypatch.setattr(probe.settings, "performance", lambda: {})
+        monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 3)
+        bal = probe.shodan_balance({"query_credits": 500})
+        assert bal.may_spend and bal.stop_kind != probe.SHODAN_PAGE_CEILING_INVALID
+
+    def test_the_knob_is_read_through_the_spending_reader(self):
+        """Structural, from the AST: `settings.concurrency` floors at 1 and swallows a malformed value
+        into a default — both wrong for a cost guard, which is why `settings.raw` exists. Asserted at
+        the CALL SITE so the defect cannot come back by editing one word."""
+        import ast
+        import pathlib
+
+        from quarry_recon.phases import probe
+
+        tree = ast.parse(pathlib.Path(probe.__file__).read_text())
+        readers = set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "SHODAN_MAX_PAGES"):
+                readers.add(getattr(node.func, "attr", None) or getattr(node.func, "id", None))
+        assert readers == {"raw"}, f"SHODAN_MAX_PAGES is read through {sorted(readers)}"

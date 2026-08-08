@@ -571,7 +571,7 @@ tools:
     doc: https://github.com/projectdiscovery/interactsh
     notes: >
       REQUIRED — backs the default-on params.oob_probe source (like dalfox/nuclei back theirs). Default
-      backend is interactsh-client's built-in public server; oob.interactsh_server overrides it.
+      backend is interactsh-client's built-in public server; oob.callback_server overrides it.
 
   # ── Phase 8: Continuous monitoring ──────────────────────────────────────
   - bin: gungnir

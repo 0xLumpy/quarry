@@ -59,7 +59,6 @@ MODES:
   # The options below add active or credential-using work. Arm them per engagement.
   SECRET_VERIFICATION: false  # sends discovered TARGET credentials to their providers
   BLIND_XSS: false            # stored payload; can fire later in someone else's browser
-  BLIND_XSS_DUAL: false       # also inject for a legacy -b collector (doubles blind payloads)
   DEEP_EVIDENCE: false        # downloads heapdumps and similar (the GET forces generation)
   JS_CHUNK_BRUTE: 0           # guessed chunk ids; each guess requests a path no bundle named
 

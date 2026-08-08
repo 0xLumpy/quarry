@@ -230,7 +230,7 @@ def open_session(run, server=None, token=None, wait: int = 12):
     # client after the immediate poll is fine — late interactions aren't lost.
     cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(sf)]
     # interactsh-client -server wants bare server domains (e.g. `oob.example.com`), NOT a URL — nuclei's
-    # -iserver takes the full URL, so the SAME oob.interactsh_server config is normalized PER CONSUMER here.
+    # -iserver takes the full URL, so the SAME oob.callback_server config is normalized PER CONSUMER here.
     srv = ",".join(_server_hosts(server)) if server else ""
     if srv:
         cmd += ["-server", srv]

@@ -405,6 +405,7 @@ SHODAN_UNKNOWN_WITH_RESERVE = "unknown_with_reserve"  # our own caution stopped 
 SHODAN_AUTH_REFUSED = "auth_refused"               # the credential does not work         -> GAP
 SHODAN_FORBIDDEN = "forbidden"                     # refused, reason unproven             -> GAP
 SHODAN_RESERVE_INVALID = "reserve_invalid"         # the knob is present but unusable     -> GAP
+SHODAN_PAGE_CEILING_INVALID = "page_ceiling_invalid"  # SHODAN_MAX_PAGES unusable         -> GAP
 
 #: stops that are EXPECTED boundaries rather than defects. Everything else is a gap: a bad key, an
 #: unexplained refusal and a broken cost guard are all things the operator must FIX, not accept.
@@ -415,6 +416,7 @@ _STOP_LIMITS = frozenset({SHODAN_PROVIDER_EXHAUSTED, SHODAN_ENTITLEMENT, SHODAN_
 #: `auth_refused` IS `auth` (the credential does not work); a broken cost guard, an unwritable ledger, a
 #: failed publish and a scheduler invariant are all OUR defect, which the taxonomy calls `error`.
 _TOKEN_CLASS = {SHODAN_AUTH_REFUSED: "auth", SHODAN_RESERVE_INVALID: PROVIDER_ERROR,
+                SHODAN_PAGE_CEILING_INVALID: PROVIDER_ERROR,
                 "ledger_unwritable": PROVIDER_ERROR, "publish_failed": PROVIDER_ERROR,
                 "scheduler_invariant": PROVIDER_ERROR}
 
@@ -555,6 +557,13 @@ def shodan_balance(doc, *, reserve: "int | None" = None) -> ShodanBalance:
                              "silently disabling the operator's cost guard",
                              allowance_unlimited=allowance_unlimited,
                              stop_kind=SHODAN_RESERVE_INVALID)
+    if not _page_ceiling(settings.raw("SHODAN_MAX_PAGES", None))[1]:
+        # the OTHER cost knob, same rule: a page ceiling we cannot read is not an absent ceiling.
+        return ShodanBalance(remaining, allowance, 0, 0, False,
+                             "SHODAN_MAX_PAGES is set but unusable — refusing to spend rather than "
+                             "removing the page ceiling the operator meant to set",
+                             allowance_unlimited=allowance_unlimited,
+                             stop_kind=SHODAN_PAGE_CEILING_INVALID)
     if remaining is None:
         if reserve:
             return ShodanBalance(None, allowance, reserve, 0, False,
@@ -713,6 +722,22 @@ _SHODAN_LANES = (
 )
 
 
+def _page_ceiling(v) -> "tuple[int, bool]":
+    """-> (pages, valid). `0` = no page ceiling; the credit balance is then the only bound, and that is
+    the default. ABSENT means 0 and is fine.
+
+    PRESENT-BUT-INVALID is not: a bool (an int subclass — `True` would read as one page), a float, a
+    string or a negative. Such a value does NOT become unbounded (Lumpy, 2026-08-08): a broken bound on
+    a paid lane must not read as "no bound", any more than a broken reserve reads as "no reserve". The
+    caller refuses paid acquisition instead — see `_shodan_reserve_setting` for the same contract on the
+    other cost knob."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return 0, True
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        return 0, False
+    return v, True
+
+
 def _shodan_work(ctx, key, lanes):
     """See `_shodan_work_locked`. The PROJECT lock wraps the whole page lifecycle: two runs of one
     project would otherwise both see a page as unowned and both pay for it."""
@@ -741,7 +766,13 @@ def _shodan_work_locked(ctx, key, lanes):
 
     Returns `(balance, WorkResult, {sid: found set})`. Each lane's TERMINAL is still produced inside its
     own `run_provider` bracket, so per-source telemetry and coverage generations are unchanged."""
-    max_pages = settings.concurrency("SHODAN_MAX_PAGES", 0)
+    # SHODAN_MAX_PAGES is a SPENDING control, not a worker count: `0` means "no page ceiling — the
+    # credit balance is the bound", which is also the default. It was read through `concurrency()`,
+    # whose `max(1, ...)` floor turned an explicitly configured `0` into ONE page (Lumpy, 2026-08-08) —
+    # a silent cap on a paid pivot, in the direction of buying less than asked. It is read exactly as
+    # written and parsed strictly, and an unusable value FAILS CLOSED: `shodan_balance` refuses to spend
+    # rather than removing the ceiling the operator meant to set. `max_pages` here is only the number.
+    max_pages, _pages_valid = _page_ceiling(settings.raw("SHODAN_MAX_PAGES", None))
     scope = ctx.scope
 
     def settled_balance():
@@ -1305,7 +1336,13 @@ def _shodan_pivots(ctx) -> None:
         # resume key. review-r4#4 + r5#5: the credential fingerprint scopes it to the ACCOUNT.
         wu = events.work_unit(spec.sid, inputs={"values": values},
                               config={"facet": spec.facet,
-                                      "max_pages": settings.concurrency("SHODAN_MAX_PAGES", 0),
+                                      # the SAME effective ceiling the lane will run under: reading it
+                                      # differently here would key the resume state to a bound that
+                                      # never applied (a configured `0` keyed as 1 page).
+                                      # the SAME effective ceiling the lane runs under, and whether the
+                                      # knob was usable: a run that refused to spend on a broken bound
+                                      # must not share a resume key with one that spent under a clean 0.
+                                      "max_pages": _page_ceiling(settings.raw("SHODAN_MAX_PAGES", None)),
                                       "oos_cap": 0,        # B1.5b: no cap; kept in the key so a
                                                            # resumed unit from a CAPPED generation is
                                                            # not mistaken for a complete one

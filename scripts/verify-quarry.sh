@@ -1099,19 +1099,18 @@ sys.exit(0 if ok else 1)
 PYEOF
 
 # ── Check 40: OOB config — self-host interactsh read + wired + secrets redacted — offline ──
-echo "[40] oob: config read; token+blind-xss redacted (server url not); nuclei gets -iserver/-itoken"
-PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "oob() reads; token+collector in values (server url not); redact masks token; params wires -iserver" || no "OOB config broken"
+echo "[40] oob: config read; auth_token redacted (server url not); nuclei gets -iserver/-itoken"
+PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "oob() reads; auth_token in values (server url not); redact masks token; params wires -iserver" || no "OOB config broken"
 import sys, pathlib
 from quarry_recon import secrets as sec
-sec.load = lambda: {"oob": {"interactsh_server": "https://oob.mine",
-                            "interactsh_token": "tok_secret_123456",
-                            "blind_xss_url": "https://xss.example/c/ABCDEF"}}
+sec.load = lambda: {"oob": {"callback_server": "https://oob.mine",
+                            "auth_token": "tok_secret_123456"}}
 o = sec.oob()
 vals = sec.values()
 red = sec.redact("nuclei -iserver https://oob.mine -itoken tok_secret_123456")
 src = pathlib.Path(__import__("quarry_recon.phases.params", fromlist=["x"]).__file__).read_text()
-ok = (o["interactsh_server"] == "https://oob.mine"
-      and "tok_secret_123456" in vals and "https://xss.example/c/ABCDEF" in vals
+ok = (o["callback_server"] == "https://oob.mine"
+      and "tok_secret_123456" in vals
       and "https://oob.mine" not in vals               # server URL is not a secret
       and "tok_secret_123456" not in red and "***" in red
       and '"-iserver"' in src and "secrets.oob()" in src and '"-itoken"' in src
@@ -2450,39 +2449,41 @@ wired = "--write-massdns" in src and 'ips.get(e["host"]' in src
 sys.exit(0 if (parse and wired) else 1)
 PYEOF
 
-echo "[84] blind XSS channel selection (v0.3.3 -b + 4.3.D native OOB): -b is the LEGACY collector, chosen only when MODES.BLIND_XSS is off; an armed native channel alongside a dormant blind_xss_url REFUSES rather than doubling payloads; the interactsh secret travels in a 0600 --config file and NEVER in argv; collector URL redacted from the manifest cmd"
-PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "-b only as the explicit legacy channel; armed native + dormant collector -> REFUSED (no doubled payloads); secret via 0600 --config, never argv; doctor line says 'dalfox -b'; collector URL redacted" || no "v0.3.3 blind XSS wiring broken"
+echo "[84] blind XSS is ONE channel: MODES.BLIND_XSS is the only gate, the payload is --blind-oob (dalfox owns correlation), the backend is the public pool unless oob.callback_server names your own, and auth_token travels in a 0600 --config file, NEVER in argv"
+PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "one channel: unarmed emits nothing, MODES.BLIND_XSS is the gate, self-hosted vs public backend selected by oob.callback_server, auth_token via 0600 --config and never argv, and no second channel survives in source" || no "blind XSS single-channel wiring broken"
 import sys, inspect
 import quarry_recon.phases.params as PA
-from quarry_recon import cli, secrets
-psrc=inspect.getsource(PA)
-# BEHAVIOURAL, not a source literal: 4.3.D made channel selection explicit, so assert what the lane
-# EMITS. `-b` is the legacy collector and is chosen only when the native OOB channel is not armed.
+from quarry_recon import secrets
 class _P:
-    http_rl = 0; blind_xss = False; blind_xss_dual = False
-_real_oob = secrets.oob          # restored below: `secrets.values()` reads oob() for the redaction guard
-secrets.oob = lambda: {"blind_xss_url": "https://col.example"}
-_cmd = PA._dalfox_cmd("i", "/tmp/_vq_dalfox.jsonl", _P(), 1)
-wired = _cmd[_cmd.index("-b") + 1] == "https://col.example"
-# …and a DORMANT collector must not silently double the channels once the native one is armed
+    http_rl = 0; blind_xss = False
+_real_oob = secrets.oob
+# 1. UNARMED: nothing is emitted, whatever is configured.
+secrets.oob = lambda: {}
+_off = PA._dalfox_cmd("i", "/tmp/_vq_dalfox.jsonl", _P(), 1)
+wired = "-b" not in _off and not any(c.startswith("--blind-oob") for c in _off)
+wired = wired and PA._blind_oob_plan(_P())["channel"] == "off"
+# 2. ARMED with a server of our own: the native channel runs against it.
 _P.blind_xss = True
-secrets.oob = lambda: {"blind_xss_url": "https://col.example", "interactsh_server": "oob.mine.test"}
-_dual = PA._dalfox_cmd("i", "/tmp/_vq_dalfox.jsonl", _P(), 1)
-wired = wired and "-b" not in _dual and not any(c.startswith("--blind-oob") for c in _dual)
-# …and the interactsh SECRET never reaches argv (/proc/<pid>/cmdline is world-readable to this user)
-secrets.oob = lambda: {"interactsh_server": "oob.mine.test", "interactsh_token": "T0KVALUE"}
+secrets.oob = lambda: {"callback_server": "oob.mine.test"}
+_armed = PA._dalfox_cmd("i", "/tmp/_vq_dalfox.jsonl", _P(), 1)
+wired = wired and "--blind-oob=oob.mine.test" in _armed and "-b" not in _armed
+# 3. The auth token never reaches argv (/proc/<pid>/cmdline is readable by this user).
+secrets.oob = lambda: {"callback_server": "oob.mine.test", "auth_token": "T0KVALUE"}
 _nat = PA._dalfox_cmd("i", "/tmp/_vq_dalfox.jsonl", _P(), 1)
 wired = (wired and "--blind-oob=oob.mine.test" in _nat
          and not any("T0KVALUE" in c for c in _nat) and "--blind-oob-secret" not in _nat)
-secrets.oob = _real_oob          # the redaction guard below needs the REAL reader
-doc = "dalfox -b" in inspect.getsource(cli)
-notreserved = "reserved" not in inspect.getsource(secrets.oob)
-# REDACTION guard: the -b collector URL is sensitive operational metadata (correlation) — it MUST be
-# masked in the manifest cmd, else it leaks into artifacts. Prove values() carries it + redact() masks.
-url="https://d97prkl.oast.me"
-secrets.load=lambda: {"oob":{"blind_xss_url":url}}; secrets._cache=None
-redacted = url in secrets.values() and url not in secrets.redact(f"dalfox scan -i file x -b {url} -o y")
-sys.exit(0 if (wired and doc and notreserved and redacted) else 1)
+# 4. No server configured -> the PUBLIC pool, stated as such (backend is the ownership answer).
+secrets.oob = lambda: {}
+_pub = PA._blind_oob_plan(_P())
+wired = wired and _pub["armed"] and _pub["backend"] == "public" and _pub["server"] == ""
+secrets.oob = _real_oob
+# 5. The removal is complete in the source: no dual/conflict/legacy channel survives anywhere.
+psrc = inspect.getsource(PA)
+gone = not any(t in psrc for t in ('"dual"', '"conflict"', '"legacy"', "blind_xss_url", "blind_xss_dual"))
+# 6. The auth token is still a REDACTED value (the redaction set must follow the rename).
+secrets.load = lambda: {"oob": {"auth_token": "tok_secret_123456"}}; secrets._cache = None
+red = "tok_secret_123456" in secrets.values()
+sys.exit(0 if (wired and gone and red) else 1)
 PYEOF
 
 echo "[85] v0.3.4 httpx matrix fix (reconftw-parity, keeps ALL ports): the bulk probe drops the two hidden multipliers -probe-all-ips (×ips) + -no-fallback (×schemes) that blew up the 567×94 matrix on filtered ports, and bounds -timeout so a firewall-dropped port fails fast; response-derived flags (favicon/cdn/asn) kept; probe AND enrich httpx match"
@@ -2914,7 +2915,7 @@ c_scheme = (_canonicalize_candidates(["http://h/p?x=","https://h/p?x=","https://
 sys.exit(0 if (c_dedup and c_nolost and c_top and c_ledger and c_wired and c_empty and c_blank and c_branch and c_scheme) else 1)
 PYEOF
 
-echo "[94] v0.3.8 dalfox v2->v3 (Rust) — wiring: params.dalfox_xss_fast drives dalfox v3 (scan -i file -f jsonl -S --skip-mining, 2D concurrency --workers/--max-concurrent-targets NOT v2 -w/--max-cpu, global --rate-limit, blind -b). FAIL-CLOSED tiered JSONL parse (V/R/A -> xss-verified/xss-candidate/dom-xss-static, all confirmed:false). Exit-code<->findings agreement (0+empty=EMPTY, 1+finds=SUCCESS, disagreement/hard/malformed=PARTIAL-retryable). Per-chunk OUTCOMES state (immutable wu_/attempt_ artifacts), engine-identity in the work unit, ledger tiers + matched. Registry entry v3-truthful. FULL parser/exit/retry/engine matrix is pytest-gated in tests/test_dalfox.py."
+echo "[94] v0.3.8 dalfox v2->v3 (Rust) — wiring: params.dalfox_xss_fast drives dalfox v3 (scan -i file -f jsonl -S --skip-mining, 2D concurrency --workers/--max-concurrent-targets NOT v2 -w/--max-cpu, global --rate-limit, blind --blind-oob). FAIL-CLOSED tiered JSONL parse (V/R/A -> xss-verified/xss-candidate/dom-xss-static, all confirmed:false). Exit-code<->findings agreement (0+empty=EMPTY, 1+finds=SUCCESS, disagreement/hard/malformed=PARTIAL-retryable). Per-chunk OUTCOMES state (immutable wu_/attempt_ artifacts), engine-identity in the work unit, ledger tiers + matched. Registry entry v3-truthful. FULL parser/exit/retry/engine matrix is pytest-gated in tests/test_dalfox.py."
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "dalfox v3 wiring: v3 flags, tiered fail-closed parse, exit<->findings agreement, completion+evidence state, engine-id in wu, registry truth (deep matrix in tests/test_dalfox.py)" || no "v0.3.8 dalfox v3 wiring broken"
 import sys, json, tempfile, inspect, pathlib
 from types import SimpleNamespace
@@ -2925,13 +2926,13 @@ from quarry_recon.runner import RunResult, Status
 c_reg = sources.get("params.dalfox_xss_fast") is not None
 settings.concurrency = lambda k, d=None: {"DALFOX_CHUNK":2,"DALFOX_TARGETS":4}.get(k, d)
 settings.workers = lambda t, d: d
-secrets.oob = lambda: {"blind_xss_url": "https://col.example"}
+secrets.oob = lambda: {}
 params._dalfox_engine_id = lambda: "v3.1.2"        # avoid a registry.health probe here
-prof = SimpleNamespace(http_rl=7)
+prof = SimpleNamespace(http_rl=7, blind_xss=True)   # armed: the ONE channel is --blind-oob
 cmd = _dalfox_cmd("i", "o", prof)
 c_flags = (cmd[:5]==["dalfox","scan","-i","file","i"] and cmd[cmd.index("-f")+1]=="jsonl"
            and "-S" in cmd and "--skip-mining" in cmd and "--workers" in cmd and "--max-concurrent-targets" in cmd
-           and cmd[cmd.index("-b")+1]=="https://col.example" and cmd[cmd.index("--rate-limit")+1]=="7"
+           and "--blind-oob" in cmd and "-b" not in cmd and cmd[cmd.index("--rate-limit")+1]=="7"
            and "-w" not in cmd and "--max-cpu" not in cmd and "--skip-headless" not in cmd and "--delay" not in cmd)
 def _p(txt):
     # review#13: the parser returns a STRUCTURED artifact, not one boolean. `.readable` is the
@@ -3221,9 +3222,9 @@ c_hotlist = ("## OOB interactions" in md and "2 uncorrelated" in md
 sys.exit(0 if (c_queue and c_item and c_hotlist) else 1)
 PYEOF
 
-echo "[100] OOB docs/doctor — doctor [oob] is READINESS-ONLY (terse: interactsh-client present/missing + which backend, NO model essay); the ONE-layer model (backend override / import compat / no '3 channels') lives in secrets.template + README, not doctor; blind_xss note operator-observed-until-import; params.oob_probe WIRED"
-PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "doctor [oob] readiness-only (interactsh-client + backend, no taxonomy prose); template carries one-layer model (no '3 channels'); blind_xss operator-observed-until-import; oob_probe wired" || no "OOB docs/doctor model broken"
-import sys
+echo "[100] OOB docs/doctor — doctor [oob] is READINESS-ONLY (terse: interactsh-client present/missing + which backend, NO model essay); the ONE-layer model (backend override / import compat / no '3 channels') lives in the README, not in doctor or the operator template; blind_xss note operator-observed-until-import; params.oob_probe WIRED"
+PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "doctor [oob] readiness-only (interactsh-client + backend, no taxonomy prose); README carries the one-layer model (override replaces the backend, import is compatibility-only, no '3 channels'); template stays terse; blind_xss operator-observed-until-import; oob_probe wired" || no "OOB docs/doctor model broken"
+import sys, pathlib
 from click.testing import CliRunner
 from quarry_recon import cli, sources as S
 from importlib import resources
@@ -3239,11 +3240,23 @@ c_doctor = (out.count("[oob]") == 1 and "interactsh-client" in oob and "callback
             and "MODES.BLIND_XSS" not in oob
             and all(k not in oob for k in ("owned probes", "import (compat)", "nuclei",   # essay lines removed
                                            "Quarry-owned OOB layer", "3 channels", "evidence substrate")))
+# The MODEL moved out of the secrets template into the README (2026-08-08 doc pass): the template is
+# an operator file and carries the two facts you need while editing it (public default = someone
+# else's server; set your own to replace it). The one-layer explanation — override is not a second
+# channel, import is compatibility-only and stays uncorrelated — lives in the README, and is asserted
+# THERE. The template is asserted to stay terse rather than to regrow the essay.
 tmpl = resources.files("quarry_recon.data").joinpath("secrets.template.yaml").read_text(encoding="utf-8")
-c_tmpl = ("quarry oob import" in tmpl and "3 channels" not in tmpl
-          and "compatibility only" in tmpl.lower() and "replaces the backend" in tmpl.lower())
+rdme = pathlib.Path("README.md").read_text(encoding="utf-8")
+c_tmpl = ("3 channels" not in tmpl and "callback_server" in tmpl
+          and "public interactsh" in tmpl.lower()
+          and "quarry oob import" in rdme and "3 channels" not in rdme
+          and "compatibility only" in rdme.lower() and "replaces the backend" in rdme.lower())
 bx = S.get("params.blind_xss")["notes"].lower()
-c_bx = "operator-observed until" in bx and "quarry oob import" in bx
+# the note describes the CURRENT contract only: one channel (--blind-oob), dalfox owning correlation,
+# and where a beacon becomes evidence. It does not carry the history of a channel that no longer exists.
+c_bx = ("operator-observed until" in bx and "quarry oob import" in bx
+        and "--blind-oob" in bx and "correlation is dalfox" in bx
+        and "legacy" not in bx and "removed" not in bx)
 c_wired = not S.get("params.oob_probe").get("pending")   # oob_probe wired (owned layer)
 sys.exit(0 if (c_doctor and c_tmpl and c_bx and c_wired) else 1)
 PYEOF
@@ -3466,7 +3479,7 @@ c_none = (oob.resume_session(Run(pathlib.Path(tempfile.mkdtemp()), "t")) is None
 sys.exit(0 if (c_ok and c_mismatch and c_none) else 1)
 PYEOF
 
-echo "[105] OOB Phase 2 / P2.4 (closer) — quarry oob poll + correlated digest tags: 'quarry oob poll' resumes the owned session with the CONFIGURED oob.interactsh_token (resume_session(run, token=secrets.oob()...)), sleeps --wait for delayed callbacks, polls, adds new oob_interaction rows (dedup on id), closes the client; a CORRELATED row gets SPECIFIC digest tags (payload_class + 'correlated' + source_tool) and a why naming source/param/target — NOT the Phase-1 unknown-oob/uncorrelated; an uncorrelated row KEEPS the Phase-1 tags; HOTLIST shows the correlated-vs-uncorrelated split"
+echo "[105] OOB Phase 2 / P2.4 (closer) — quarry oob poll + correlated digest tags: 'quarry oob poll' resumes the owned session with the CONFIGURED oob.auth_token (resume_session(run, token=secrets.oob()...)), sleeps --wait for delayed callbacks, polls, adds new oob_interaction rows (dedup on id), closes the client; a CORRELATED row gets SPECIFIC digest tags (payload_class + 'correlated' + source_tool) and a why naming source/param/target — NOT the Phase-1 unknown-oob/uncorrelated; an uncorrelated row KEEPS the Phase-1 tags; HOTLIST shows the correlated-vs-uncorrelated split"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "quarry oob poll registered + resumes with configured token + sleeps --wait + closes session; correlated row -> [payload_class,correlated,source_tool] tags + source-naming why; uncorrelated keeps unknown-oob/uncorrelated; HOTLIST correlated/uncorrelated split" || no "OOB P2.4 poll/tags broken"
 import sys, tempfile, pathlib, inspect
 from quarry_recon import triage, oob, cli as climod
@@ -3502,7 +3515,7 @@ md = triage.build(run, scope)
 c_hot = ("1 correlated, 1 uncorrelated" in md and "CORRELATED ssrf-callback <- params.oob_probe" in md)
 csrc = inspect.getsource(climod)
 c_cmd = (CliRunner().invoke(climod.cli, ["oob", "poll", "--help"]).exit_code == 0)
-c_wire = ('resume_session(run_obj, token=secrets.oob().get("interactsh_token"))' in csrc
+c_wire = ('resume_session(run_obj, token=secrets.oob().get("auth_token"))' in csrc
           and "close_session" in csrc and "--wait" in csrc)
 sys.exit(0 if (c_corr and c_unc and c_hot and c_cmd and c_wire and c_prov and c_wait) else 1)
 PYEOF

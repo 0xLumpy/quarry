@@ -115,11 +115,10 @@ def censys() -> dict:
 
 
 def oob() -> dict:
-    """Out-of-band config (optional) for Quarry's ONE owned OOB layer. `interactsh_server`
-    (+ optional `interactsh_token`) OVERRIDES the callback backend — used by Quarry's owned session
+    """Out-of-band config (optional) for Quarry's ONE owned OOB layer. `callback_server`
+    (+ optional `auth_token`) OVERRIDES the callback backend — used by Quarry's owned session
     (interactsh-client -server, normalized to a bare host) AND passed to nuclei (-iserver, full URL).
-    Empty => the built-in public interactsh backend (no setup needed). `blind_xss_url` is a legacy/compat
-    operator collector wired to dalfox -b (not the owned layer yet). All optional."""
+    Empty => the public interactsh backend (no setup needed). Both optional."""
     o = load().get("oob")
     return o if isinstance(o, dict) else {}
 
@@ -153,11 +152,9 @@ def values() -> list[str]:
         tg = nc.get("telegram")
         if isinstance(tg, dict) and tg.get("token"):
             vals.append(str(tg["token"]))
-    ob = load().get("oob")                          # interactsh token + blind-xss collector are secret
-    if isinstance(ob, dict):
-        for k in ("interactsh_token", "blind_xss_url"):
-            if isinstance(ob.get(k), str):
-                vals.append(ob[k])
+    ob = load().get("oob")                          # the callback server's auth token is secret
+    if isinstance(ob, dict) and isinstance(ob.get("auth_token"), str):
+        vals.append(ob["auth_token"])
     cy = load().get("censys")                        # censys Platform PAT is secret (org id is not)
     if isinstance(cy, dict) and isinstance(cy.get("token"), str):
         vals.append(cy["token"])

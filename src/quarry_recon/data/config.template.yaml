@@ -1,103 +1,63 @@
-# Quarry — non-secret runtime config (~/.config/quarry/config.yaml).
+# Quarry — machine settings (~/.config/quarry/config.yaml). Reference: README "Configuration".
+# Everything is optional; blank means the default. Engagement settings (scope, rate limits, modes)
+# belong in the project's target.yaml, not here.
 #
-# Machine-scoped knobs that are NOT credentials and NOT per-engagement. secrets.yaml stays
-# credentials-only; target.yaml stays the engagement (scope + RATELIMIT). Everything here is
-# optional — unset = safe defaults. Created once; `quarry install` never overwrites it.
+# Concurrency is how many local lanes a tool uses. Rate — how hard the target is hit — is an
+# engagement property and lives in target.yaml under RATELIMIT.
 
-# ── Performance / concurrency ────────────────────────────────────────────────────────────────
-# CONCURRENCY = how many LOCAL lanes a tool uses (a machine property). This is separate from RATE
-# (pressure on the TARGET) — RATE stays in target.yaml → RATELIMIT. Pushing concurrency must NOT
-# push past the target's rate budget; the two are tuned independently.
 PERFORMANCE:
-  PROFILE: auto        # auto (scale workers from CPU cores) | safe | balanced | aggressive
-  # auto/balanced/aggressive only ADD lanes on bigger boxes — they never drop below the tool's
-  # proven default, so a small VPS keeps the old behavior. Only `safe` throttles below defaults.
-  # optional explicit per-tool overrides (blank = profile / tool default):
+  PROFILE: auto              # auto | safe | balanced | aggressive. Only `safe` goes below a
+                             # tool's own default; the others add lanes on bigger hosts.
+
+  # Per-tool concurrency. Blank: scaled from CPU count under the profile.
   NUCLEI_CONCURRENCY:
   HTTPX_THREADS:
   FFUF_THREADS:
-  DALFOX_WORKERS:            # dalfox v3 --workers, per-target concurrency for the XSS fast path (default 30)
-  KATANA_CONCURRENCY:        # katana crawl -c (network-bound; was hard-coded 4 → now I/O-scaled)
-  KATANA_PARALLELISM:        # katana -p, parallel hosts (default 10; was 3)
-  ARJUN_THREADS:             # arjun -t (was hard-coded 5 → now I/O-scaled)
-  NUCLEI_BULK_SIZE:          # nuclei -bs, hosts per template batch (default 25) — raise for many-host scopes
-  NUCLEI_CHUNK_HOSTS:        # nuclei hosts per resumable batch (default 50; smaller = finer resume/progress, more template reloads)
-  NUCLEI_MAX_HOST_ERROR:     # nuclei -mhe, errors per host before it is SKIPPED. DEFAULT 0 = full depth (-nmhe, never drop an erroring host) — Quarry is coverage-first. A nonzero value is an explicitly bounded coverage policy (nuclei-native default would be 30) and costs coverage to save time. Changing it invalidates nuclei resume state
-  SUBFINDER_MAX_TIME:        # subfinder -max-time budget in MINUTES per apex (default 60). Reaching it = PARTIAL (capped, results kept); 0 = practically unbounded (24h) — run to completion
-  # Fetch-lane THROUGHPUT budgets in SECONDS. DEFAULT 0 = UNBOUNDED: process the whole eligible set. These
-  # replaced the old first-N input caps (JS 2000, sourcemaps 100), which silently dropped input and picked
-  # WHICH input by discovery order. Work is now host-round-robin ordered, and whatever a budget does not
-  # reach is a counted, RESUMABLE remainder — never a silent omission. Bound these only to time-box a run.
-  JS_FETCH_BUDGET_S:         # crawl JS download lane (was: cap 2000 of eligible JS URLs)
-  SOURCEMAP_BUDGET_S:        # crawl .map fetch lane (was: cap 100 of referenced sourcemaps)
-  CONTENT_FFUF_BUDGET_S:     # content discovery lane (was: cap 25 of eligible live services)
-  VHOST_BUDGET_S:            # vhost enumeration lane (was: cap 25 origins; membership is now base services)
-  ARJUN_BUDGET_S:            # arjun param discovery (was: cap 40 of eligible API endpoints). ONE TARGET PER
-                             # PROCESS: arjun crashes on a 400/413/418/429/503 target and a batched run loses
-                             # every target after it, so isolation is coverage
-  SHODAN_HOST_BUDGET_S:      # wall-clock budget for the FREE `/shodan/host/{ip}` lane (probe.shodan_host).
-                             # DEFAULT 0 = UNBOUNDED: the endpoint costs no query credit (measured at a zero
-                             # balance), so nothing but time bounds it, and what a bound does not reach is a
-                             # counted remainder — never a silent omission. RESUMABLE while the project-level
-                             # sweep progress persists (least-recently-asked first, so each bounded run
-                             # advances); when that progress cannot be written the remainder is reported as
-                             # RESTARTS instead, because the next run would re-ask the same prefix.
-                             # Membership is never capped: every OBSERVED in-scope address is eligible,
-                             # ordered fairly across /24 (v4) and /48 (v6) netblocks so one dense block
-                             # cannot monopolise a bound
-  SHODAN_PAGE_TTL_DAYS:      # how long a PURCHASED Shodan search page may stand in for a fresh one.
-                             # DEFAULT 7 — a POLICY choice, not a measurement: a search result is LIVE
-                             # intelligence (unlike a WHOIS record, which is why the whoxy page cache is
-                             # permanent). Pages are stored per PROJECT so a second run never re-buys
-                             # them; past the TTL a page is kept as HISTORICAL evidence, excluded from
-                             # current coverage, and NOT re-bought automatically — refreshing paid
-                             # evidence is an explicit operator decision, never a side effect of time
-                             # passing or of `--unbound` (which authorises no purchase at all).
-                             # 0 = never replay (always buy).
-  SHODAN_MAX_PAGES:          # pages bought per Shodan pivot. DEFAULT 0 = UNBOUNDED (page until the pivot
-                             # is exhausted) — the CREDIT BALANCE is what bounds the spend, not an
-                             # arbitrary page number. A nonzero value is a hard CAP on eligible input and
-                             # is reported as a gap, never as a soft sample
-  SHODAN_CREDIT_RESERVE:     # query credits this run will NOT spend, kept back for manual work (default 0
-                             # = spend everything available). Shodan meters query credits MONTHLY. Among
-                             # QUARRY'S CURRENT Shodan calls only /shodan/host/search consumes them —
-                             # /api-info, /shodan/host/count and /shodan/host/{ip} are free and keep
-                             # working at a zero balance (measured). Other Shodan endpoints DO charge
-                             # (e.g. /dns/domain/{domain}); re-check when a new call is added.
-                             # Exhaustion is an expected boundary, not an error: the run reports
-                             # complete_with_limits and persists the unqueried pivots as a resumable
-                             # remainder. NB if this is set but UNPARSEABLE, Quarry issues NO paid search
-                             # rather than silently spending — a broken cost guard must not read as none
-  WHOXY_CREDIT_RESERVE:      # reverse-whois credits this run will NOT spend, kept back for manual work
-                             # (default 0 = spend everything available). Whoxy charges ONE CREDIT PER
-                             # PAGE and a single anchor can run to hundreds of pages, so one anchor can
-                             # drain an account. `account=balance` is FREE and works at any balance
-                             # (measured), so the balance is read before any page is bought. Pages
-                             # already paid for are OWNED and replayed for free — changing this never
-                             # re-buys them. NB an UNPARSEABLE value issues NO paid request rather than
-                             # silently spending: a broken cost guard must not read as none
-  WHOXY_PAGE_BUDGET:         # pages this RUN may buy across all anchors (default 0 = unbounded; the
-                             # credit balance and the reserve are then the only bound). Distinct from
-                             # the reserve: the reserve protects credits for later, this limits THIS
-                             # invocation. Whatever a budget does not reach is a counted, RESUMABLE
-                             # remainder — the next run continues instead of starting over
-  ARJUN_TARGETS:             # concurrent arjun TARGET processes (default 5; at most one per host). RATE is
-                             # separate: RATELIMIT.HTTP is a GLOBAL lane cap partitioned across these workers
-                             # (never handed to each in full), and a rate below the pool size shrinks the POOL
-  DALFOX_TARGETS:            # dalfox v3 --max-concurrent-targets, target parallelism (default 4; conservative — raise via OTC)
-  DALFOX_CHUNK:              # dalfox xss candidate shapes per resumable batch (default 40)
-  # v0.3.5 web-port SYN prefilter: before the bulk httpx, naabu SYN-checks each host's PUBLIC IP(s) on
-  # the HTTP port set and httpx then probes ONLY open host:ports (bbot-style — never wastes httpx time
-  # on filtered ports). Fewer packets + fewer HTTP requests than direct httpx over all ports. Default on;
-  # falls back to direct httpx if naabu is missing/fails. NOT the infra portscan (MODES.PORTSCAN).
-  WEB_PORT_PREFILTER: true   # false = direct-httpx over ALL ports, no SYN prefilter (debugging).
-                             # the private/reserved-only-host SKIP still applies either way (safety rail).
+  KATANA_CONCURRENCY:
+  ARJUN_THREADS:
+  DALFOX_WORKERS:            # per target (default 30)
 
-# ── Advanced local tool paths (NOT credentials — paths, so they live here, not in secrets.yaml) ──
-# openintel-subs: extra PASSIVE subdomain source, silently unused unless BOTH paths are set AND
-# present. You provide the binary + local subs.db. See docs/design/OPENINTEL-OPTIONAL.md.
-# (Legacy: an `openintel:` block in secrets.yaml is still read for back-compat, but config.yaml is
-#  its proper home — this is a path pair, not a credential.)
+  # Batch and parallelism shapes.
+  KATANA_PARALLELISM:        # parallel hosts (default 10)
+  NUCLEI_BULK_SIZE:          # hosts per template batch (default 25)
+  NUCLEI_CHUNK_HOSTS:        # hosts per resumable batch (default 50)
+  ARJUN_TARGETS:             # concurrent target processes, max one per host (default 5)
+  DALFOX_TARGETS:            # concurrent targets (default 4)
+  DALFOX_CHUNK:              # candidates per resumable batch (default 40)
+
+  # Coverage policy. `quarry policy` prints the effective values.
+  NUCLEI_MAX_HOST_ERROR:     # errors before a host is dropped (default 0 = never drop).
+                             # Changing this invalidates nuclei resume state.
+  SUBFINDER_MAX_TIME:        # minutes per apex (default 60; 0 = the 1440-minute maximum).
+                             # Reaching it is reported as partial, not as success.
+  WILDCARD_ZONES_PER_RUN:    # wildcard zones differentiated per run (default 5)
+
+  # Throughput budgets in SECONDS. 0 = unbounded, and unbounded is the default: these bound how
+  # long a lane runs, never which input is eligible. Whatever a budget does not reach is counted
+  # and resumable. Set one only to time-box a run.
+  JS_FETCH_BUDGET_S:
+  SOURCEMAP_BUDGET_S:
+  CONTENT_FFUF_BUDGET_S:
+  VHOST_BUDGET_S:
+  ARJUN_BUDGET_S:
+  A1D_BUDGET_S:
+  WILDCARD_BUDGET_S:
+  SHODAN_HOST_BUDGET_S:      # the free per-IP lane; costs no credit, so only time bounds it
+
+  # Provider spending. Reserves are credits a run will NOT touch. An unparseable value here issues
+  # no paid request at all, rather than spending.
+  SHODAN_CREDIT_RESERVE:     # query credits held back (default 0 = spend what is available)
+  SHODAN_MAX_PAGES:          # pages per pivot (0 = until exhausted; the credit balance is the bound)
+  SHODAN_PAGE_TTL_DAYS:      # how long a purchased page substitutes for a fresh one (default 7).
+                             # Past it the page is kept as history and is never re-bought silently.
+  WHOXY_CREDIT_RESERVE:      # reverse-whois credits held back. Whoxy charges one credit per PAGE
+  WHOXY_PAGE_BUDGET:         # pages this run may buy (default 0 = unbounded)
+  PROVIDER_MAX_PAGES:        # cursor pages per free provider request (default 5)
+
+  WEB_PORT_PREFILTER: true   # SYN-check each host's public IPs before httpx, and probe only open
+                             # ports. false sends httpx at every port. Not the infra port scan.
+
+# openintel-subs: an extra passive subdomain source. Both paths must exist or it stays unused.
 # openintel:
 #   binary: /opt/openintel-subs/openintel-subs-linux
 #   db:     /opt/openintel-subs/subs.db

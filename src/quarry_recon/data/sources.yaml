@@ -281,13 +281,13 @@ sources:
   # split targets (declared now; wired in the conversion batch):
   params.dalfox_xss_fast:    {tool: dalfox, phase: params, tier: heavy, class: active, default: on, bounded: planned,
     input: xss_candidates(canonicalized), output: "finding(xss-verified|xss-candidate|dom-xss-static)", workers: "governor (--workers, --max-concurrent-targets)", rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: internal, log: delta,
-    notes: "WIRED 4.3.B; v3 (Rust) v0.3.8. flags scan -i file -f jsonl -S --skip-mining --workers --max-concurrent-targets --rate-limit; fail-closed JSONL parse, tiered V/R/A (all confirmed:false); chunk+resume; blind -b rides here until 4.3.D"}
+    notes: "WIRED 4.3.B; v3 (Rust) v0.3.8. flags scan -i file -f jsonl -S --skip-mining --workers --max-concurrent-targets --rate-limit; fail-closed JSONL parse, tiered V/R/A (all confirmed:false); chunk+resume; params.blind_xss rides here when MODES.BLIND_XSS arms it"}
   params.redirect_confirm:   {tool: internal, phase: params, tier: core, class: active, default: on,
     input: redirect_candidates, output: finding(open-redirect-candidate), workers: n/a, rate: http_rl, timeout: short, failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "WIRED 4.3.C. native single-request Location probe (inject canary into redirect param, read Location WITHOUT following); confirmed only when the Location host is the canary; NO dalfox"}
   params.oob_probe:          {tool: interactsh-client, phase: params, tier: core, class: active, default: on,
     input: ssrf_candidates, output: oob_interaction(correlated), workers: n/a, rate: http_rl, timeout: fixed, failure: partial-ok, fallback: skip, parser: internal, log: delta,
     notes: "WIRED P2.3: Quarry-owned interactsh session injects a per-(target,param) callback into SSRF-ish params; a callback correlates back to source/target/param. Skips if interactsh-client missing / passive / no candidates. Delayed callbacks: quarry oob poll (P2.4)"}
-  params.blind_xss:          {tool: dalfox, phase: params, tier: optional, class: deep, default: key, reason: "keyed (blind_xss_url collector)",
+  params.blind_xss:          {tool: dalfox, phase: params, tier: optional, class: deep, default: off, reason: "engagement gate (MODES.BLIND_XSS)",
     input: worthy_xss_candidates, output: "oob_interaction (operator-observed until imported)", workers: governor, rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: "OOB import", log: one-line,
-    notes: "LEGACY/operator-compat, NOT the owned OOB layer yet: dalfox -b rides params.dalfox_xss_fast when oob.blind_xss_url is set; beacons are OPERATOR-OBSERVED until `quarry oob import` records them. End-state (4.3.D): fold blind XSS into Quarry-issued owned tokens (correlated like oob_probe), gated to candidate classes worth blind testing — not every reflection"}
+    notes: "Rides params.dalfox_xss_fast when MODES.BLIND_XSS arms it (--blind-oob). CORRELATION is dalfox's: it mints the per-payload nonce, registers, polls and maps it back; beacons are OPERATOR-OBSERVED until `quarry oob import` records them. The BACKEND is the public interactsh pool unless oob.callback_server names one you host"}

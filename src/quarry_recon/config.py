@@ -231,7 +231,7 @@ class TargetProfile:
         default PUBLIC interactsh backend could be used. That was inconsistent — nuclei's OAST and
         Quarry's own SSRF probes already use public interactsh ungated — and it put the common case
         (no self-hosted server) behind two flags, which mostly means no blind XSS at all. Arming this IS
-        the consent; `oob.interactsh_server` (+ optional `interactsh_token`) moves the backend to your
+        the consent; `oob.callback_server` (+ optional `auth_token`) moves the backend to your
         own box when you have one.
 
         Ownership, precisely (review#12 + review#19, Lumpy). CORRELATION is dalfox's in every case: it
@@ -239,25 +239,15 @@ class TargetProfile:
         from this channel are recorded `oob_owner: dalfox`, never as Quarry-issued tokens. The SERVER is
         a separate question and depends on the backend:
 
-          * public backend (no `oob.interactsh_server`) — the server is ProjectDiscovery's public
+          * public backend (no `oob.callback_server`) — the server is ProjectDiscovery's public
             interactsh pool. Quarry owns NOTHING here: not the host, not the credentials, and the
             operator of that pool sees the raw callbacks, which is the same exposure nuclei's OAST and
             Quarry's own SSRF probes already accept.
           * self-hosted backend — you own the host, and Quarry owns the credential handling for it
-            (`interactsh_token` in an ephemeral 0600 `--config` file, never argv).
+            (`auth_token` in an ephemeral 0600 `--config` file, never argv).
 
         Strict `is True`, like every other arming flag: it must not fail open on quoted YAML."""
         return self.modes.get("BLIND_XSS", False) is True
-
-    @property
-    def blind_xss_dual(self) -> bool:
-        """MODES.BLIND_XSS_DUAL — permit the native OOB channel AND a legacy `-b` collector together.
-
-        Default OFF. dalfox injects a blind payload for EACH channel, so dual mode doubles the blind
-        payloads, adds requests and runs two callback lifecycles for one finding. With BLIND_XSS armed
-        and `oob.blind_xss_url` also set, the lane REFUSES until this says the duplication is intended
-        (review#17, Lumpy). Strict `is True`: an arming flag must not fail open."""
-        return self.modes.get("BLIND_XSS_DUAL", False) is True
 
     @property
     def headless(self) -> bool:
@@ -445,10 +435,9 @@ class TargetProfile:
         if "SECRET_VERIFICATION" in modes and not isinstance(modes["SECRET_VERIFICATION"], bool):
             raise ProfileError(f"MODES.SECRET_VERIFICATION must be a bare boolean true/false "
                                f"(got {modes['SECRET_VERIFICATION']!r})")
-        for _arm in ("BLIND_XSS", "BLIND_XSS_DUAL"):
-            if _arm in modes and not isinstance(modes[_arm], bool):
-                raise ProfileError(f"MODES.{_arm} must be a bare boolean true/false "
-                                   f"(got {modes[_arm]!r})")
+        if "BLIND_XSS" in modes and not isinstance(modes["BLIND_XSS"], bool):
+            raise ProfileError(f"MODES.BLIND_XSS must be a bare boolean true/false "
+                               f"(got {modes['BLIND_XSS']!r})")
         if "DEEP_EVIDENCE" in modes:
             dv = modes["DEEP_EVIDENCE"]
             if not (isinstance(dv, bool) or str(dv).strip().lower() in _TRUE_STRS | _FALSE_STRS | {"deep"}):
