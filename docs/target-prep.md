@@ -1,53 +1,61 @@
 # Target prep — manual OSINT to fill `target.yaml`
 
-The framework automates **vertical** discovery (subdomains, probing, crawling, JS) from the
+The framework automates the recon pipeline (subdomain discovery, probing, crawling, JS mining) from the
 seeds you give it. On bigger targets, the high-value work it can't fully automate is the
 **horizontal** seed-gathering: deciding *which apexes, IP ranges, and ASNs are in scope and
-owned by the target*. That's judgment + OSINT.
+authorized*. That's judgment + OSINT.
 
-This guide maps each `target.yaml` field to where the methodology says to find the data.
-Do as much or as little as the target warrants — a single
-in-scope domain needs none of this; a wide program with owned infrastructure rewards all of it.
+This guide covers the scope **anchors** (`APEX_DOMAINS` / `OOS` / `CIDR` / `ASN`, plus `ORG_NAMES`, which
+broadens OSINT, and `BRANDS`, which seeds active cloud-bucket discovery) and where to find them — not every profile field or
+mode (the `target.yaml` comments and `example.md` cover those). Do as much or as little as the target
+warrants — a single in-scope domain needs none of this; a wide program rewards all of it.
 
-> **Scope discipline first.** Only add an apex/CIDR/ASN you have **confirmed is owned by the
-> target and is in program scope**. `CIDR`/`ASN` entries enable *active* IP scanning
-> (tlsx, Caduceus, naabu→nmap). Out-of-scope = out.
+> **Scope discipline first.** Only add an apex/CIDR/ASN you have **confirmed is authorized and in
+> program scope** — authorization is the gate, and an authorized asset need not be target-owned. `CIDR`
+> enables *active* IP work (tlsx, Caduceus, and — with `MODES.PORTSCAN` — naabu→nmap); `ASN` is context
+> only, never a scan trigger. Out-of-scope = out.
 
 What the framework already does for you (so you don't have to do it by hand):
-`kaeferjaeger` SNI dumps, a native guarded CSP fetch, `subfinder` passive sources, and — if you provide
-`CIDR` — `tlsx`/`Caduceus`/reverse-DNS. The manual work below produces the **seeds** those
-phases build on.
+`kaeferjaeger` SNI dumps (local files), a native guarded CSP fetch, `subfinder` +
+`crt.sh`/`certspotter`/Censys CT sources, `puredns` brute + `alterx` permutation, DNS-record enrichment,
+Shodan favicon/cert pivots, and — if you provide `CIDR` — `tlsx`/`Caduceus`/reverse-DNS. The manual work
+below produces the **seeds** those phases build on.
 
 ---
 
 ## What the `quarry osint` pre-flight automates (and the keys it needs)
 
 Run **`quarry osint -t projects/<t>/target.yaml`** *before* `quarry run`. It automates the parts of this
-guide that *can* be scripted and writes a review report + `target.suggested.yaml` to the project's
-`osint/latest/`. **It never edits scope** — discovered apexes are candidates; you
-confirm and copy the good ones into `APEX_DOMAINS` yourself, then run recon.
+guide that *can* be scripted and writes `osint-report.md` + `target.suggested.yaml` (+ `candidates.jsonl`
+/ `intel.jsonl`) to the project's `osint/latest/`. **It never edits scope** — everything it finds is a
+candidate; you confirm and uncomment the good ones into `target.yaml` yourself, then run recon.
 
 | Source | What it finds | API key? | Key location |
 |--------|---------------|----------|--------------|
 | **azmap.dev** M365 tenant | related/sibling apex domains | no | — |
 | **whois** | registrant org/email (→ whoxy seed) | no | — |
 | **DMARC** (`dig _dmarc`) | related apexes via `rua`/`ruf` (3rd-party processors flagged) | no | — |
-| **whoxy** reverse-whois | sibling apexes by registrant email | **yes** | `secrets.yaml` → `whoxy:` |
-| **porch-pirate** | public Postman API endpoints/secrets | no | — |
-| (vertical) **github-subdomains** / **shosubgo** | github subdomains · shodan (shosubgo + probe favicon-hash + cert-fingerprint pivots) | **yes** | `secrets.yaml` → `github:` · `shodan:` |
-| (vertical) **subfinder** sources | passive subdomains | **yes (many)** | `~/.config/subfinder/provider-config.yaml` |
+| **whoxy** reverse-whois | sibling apexes by registrant email/org | **yes** | `secrets.yaml` → `whoxy:` |
+| **CAIDA ASRank** | candidate ASNs from `ORG_NAMES` (graph search) | no | — |
+| **RDAP** (rdap.org) | owning `CIDR` for each resolved apex IP | no | — |
+| **asnmap** | prefixes for any `ASN` you already set | no* | `secrets.yaml` → `projectdiscovery:` |
+| **porch-pirate** | public Postman endpoints/globals (intel, not scope) | no | — |
+| (vertical) **github-subdomains** / **shosubgo** | github subdomains · shodan subdomains | **yes** | `secrets.yaml` → `github:` · `shodan:` |
+| (vertical) **Censys** cert search | subdomains from `cert.names` | **yes** | `secrets.yaml` → `censys: {token, org}` |
 
-Add keys to `~/.config/quarry/secrets.yaml` and `quarry doctor` will show them as set. No key =
-normal sources are skipped and **recorded** (visible, not silent); advanced opt-ins (Censys,
-OpenINTEL) are **silent** when unset by design — no skip line, no doctor entry until configured.
+Add these keys to `~/.config/quarry/secrets.yaml` and `quarry doctor` will show them as set. No key = most
+sources are skipped and **recorded** (visible in the run). A few skip **silently** by design until
+configured: Censys (needs both `token` **and** `org`), OpenINTEL, and `shosubgo` (missing binary or unset
+`shodan:` key). *(asnmap uses the ProjectDiscovery/`chaos` key if present, but runs without it.)*
 
 **Still manual** (no good automation — judgment/login/paywall; do these by hand, then add to
-the profile): bgp.he.net ASN search, ARIN/RIPE full-text, Crunchbase/Tracxn/Pitchbook/OCCRP
-acquisitions, builtwith ad/analytics relationships. Everything below covers those.
+the profile): bgp.he.net free-form ASN search, ARIN/RIPE full-text, Crunchbase/Tracxn/Pitchbook/OCCRP
+acquisitions, builtwith ad/analytics relationships, merklemap CT search. Everything below covers those —
+ASRank/RDAP/asnmap give you a first pass, these go deeper.
 
 ---
 
-## `APEX_DOMAINS` — every apex the org owns
+## `APEX_DOMAINS` — every authorized in-scope apex
 
 The most important field. Each apex multiplies the whole pipeline. Sources, in rough priority:
 
@@ -129,10 +137,11 @@ Tip: prefer anchored, specific patterns. A loose pattern can silently drop in-sc
 
 ---
 
-## `CIDR` — in-scope owned IP ranges
+## `CIDR` — in-scope authorized IP ranges
 
-Only worth it when the target **owns IP space** (large orgs, not SaaS-hosted small targets).
-Setting `CIDR` turns on tlsx SAN harvest, Caduceus cert scan, reverse DNS, and naabu→nmap.
+Only worth it when the target **has its own IP space** (large orgs, not SaaS-hosted small targets).
+Setting `CIDR` turns on tlsx SAN harvest, Caduceus cert scan, and reverse DNS; the naabu→nmap infra
+portscan additionally needs `MODES.PORTSCAN: true` (both gates, so CIDR alone never sends a portscan).
 
 **Find the ranges:**
 - https://bgp.he.net — search the org name. Also try a **free-form description search** of
@@ -153,20 +162,21 @@ CIDR:
 ```
 
 > Empty `CIDR` is fine and common — horizontal IP steps just skip. Only fill it with ranges
-> you've verified are owned **and** in scope.
+> you've verified are **authorized and in scope**.
 
 ---
 
 ## `ASN` — manual ASN seeds
 
-Confirmed Autonomous System Numbers the target owns.
+Confirmed, authorized Autonomous System Numbers (ownership is a lead; authorization is the gate).
 
 - https://bgp.he.net — org name → ASN(s)
 - https://asrank.caida.org — related ASNs
 
-The framework treats `ASN` as seeds: `asnmap` records context, and active range scanning
-happens **only** for ASNs/CIDRs you explicitly list. Leave empty to have ASN candidates only
-suggested for review.
+The framework treats `ASN` as seeds: `quarry osint` expands them to `CIDR` candidates via `asnmap`, and
+the horizontal phase records ASN context. Active range scanning happens **only** for `CIDR` you
+explicitly list — an `ASN` alone never triggers a scan. Leave empty to have ASN candidates only
+suggested for review (ASRank finds them from `ORG_NAMES`).
 
 ```yaml
 ASN:
@@ -194,7 +204,7 @@ NOTES:
 ## Cloud ranges
 
 For cert-based apex/host discovery on cloud-hosted targets. Mostly feeds the **cert recon**
-step (§5) rather than a profile field directly — but a confirmed owned cloud block can go in
+step (§5) rather than a profile field directly — but an authorized in-scope cloud block can go in
 `CIDR`.
 
 - all major cloud provider ranges: `github.com/lord-alfred/ipranges` → `all/ipv4_merged.txt`
@@ -258,13 +268,14 @@ MODES:
   PASSIVE_ONLY: false
   SCREENSHOTS: true
   PORTSCAN: true       # opt-in for the infra CIDR→nmap scan (default false); needs CIDR set.
-                       # The web-port SYN prefilter is separate and always on.
+                       # The web-port SYN prefilter is a separate active-recon step (naabu-based; runs
+                       # when naabu + eligible IPs are present, else httpx probes directly).
   TAKEOVER: true
 
 NOTES:
   - boughtco.io via Crunchbase acquisition 2023
   - acmecloud.dev via kaeferjaeger cert grep
-  - AS64500 / 198.51.100.0/24 confirmed owned via RDAP
+  - AS64500 / 198.51.100.0/24 authorized + in scope (ownership confirmed via RDAP)
 ```
 
 Then:
@@ -274,7 +285,7 @@ quarry run -t projects/acme/target.yaml
 ```
 
 With `CIDR`/`ASN` set, the horizontal phase now also runs `mapcidr`, `tlsx` SAN harvest,
-reverse DNS, and `Caduceus` cert scan on the owned ranges — surfacing hosts no passive source
+reverse DNS, and `Caduceus` cert scan on the authorized in-scope ranges — surfacing hosts no passive source
 would find. See `example.md` for the full command-by-command trace of a run.
 
 ---
