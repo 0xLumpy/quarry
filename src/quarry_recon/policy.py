@@ -314,10 +314,10 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.phases.probe:SHODAN_READ_LIMIT": (
         "resource", "one provider response is read into memory. Hitting it RAISES (class `oversize`) and "
         "the page is reported as ours — it never drops rows from a page we keep"),
-    "quarry_recon.shodan_sched:REJECTED_BYTES_LIMIT": (
-        "provider", "how much of a REFUSED paid response is stored beside the run. It bounds a diagnostic "
-        "copy of something we did not accept as evidence — not evidence itself: an accepted page is "
-        "stored whole, and nothing here can shrink what a lane may discover"),
+    "quarry_recon.shodan_sched:REJECTED_INLINE_LIMIT": (
+        "not_a_bound", "the size at which a REFUSED paid response stops riding inside its rejection "
+        "document and gets its own artifact instead. A layout choice: the bytes are kept whole either "
+        "way, so nothing here bounds what is stored or what a lane may discover"),
     "quarry_recon.shodan_sched:MAX_REJECT_REASONS": (
         "not_a_bound", "how many objections a coverage REASON quotes. Prose in a telemetry line; the "
         "count is exact in `pages_rejected` and every refused response is kept on disk"),

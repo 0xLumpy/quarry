@@ -24,7 +24,8 @@ from .. import (budget, contract, events, netguard, normalize, pace, secrets, se
                 shodan_sched, store)
 from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PACE_BUSY, PROVIDER_PARSE,
                         PROVIDER_RATE_LIMIT,
-                        ProviderResult, ProviderSkip, ResponseTooLarge, capture_error_body,
+                        IncompleteAcquisition, ProviderResult, ProviderSkip, ResponseTooLarge,
+                        capture_error_body,
                         is_provider_limit, provider_error_class, read_bounded, run_contract,
                         run_provider, stream_to_file)
 from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir, have,
@@ -300,6 +301,11 @@ def _parse_owned_page(path):
         return None
 
 
+#: how much of a streamed error body is read back for CLASSIFICATION. The body itself is kept whole on
+#: disk; this only bounds what one classification holds in memory.
+_ERROR_CLASSIFY_BYTES = 64 * 1024
+
+
 def _shodan_page(key, facet, v, page, *, sink):
     """ONE page of a Shodan search, as the coordinator's `(matches, total, error)` triple. NEVER raises.
 
@@ -326,15 +332,48 @@ def _shodan_page(key, facet, v, page, *, sink):
                 f"response is KEPT and owned; its rows are not ingested by this process")
         page_rows, page_total = _parse_page_bytes(sink.read_bytes())
     except Exception as e:
-        # B1.1: read the error BODY here, while it is still readable, and stamp the refined class onto
-        # the exception. Shodan answers a spent balance with HTTP 401 + JSON and a bad key with HTTP
-        # 401 + HTML, so the status code alone would report every exhausted account as a broken
-        # credential. Capturing later is unreliable: an HTTPError wraps a live socket.
+        # A PAID ERROR RESPONSE IS STILL PAID. `urlopen` raises before returning on any 4xx/5xx, so the
+        # streaming above never ran for it — and `capture_error_body` reads a bounded head and closes
+        # the socket, which would leave that head as the only copy of a body we were charged for.
+        #
+        # It streams OUTSIDE the acquisition namespace (`.error`, never `<key>.json`): an ordinary 429
+        # or 500 is not a page we bought, and a file the ownership scan reads as an unowned paid
+        # response would refuse acquisition for that page on every later lifecycle.
+        err_sink = None
+        response = e                      # the ORIGINAL response, whatever `e` becomes below
+        if size == 0 and hasattr(e, "read"):
+            err_sink = sink.with_name(sink.name + ".error")
+            try:
+                size, digest = stream_to_file(e, err_sink)
+            except IncompleteAcquisition as inc:
+                # the partial bytes ARE ours. The incomplete acquisition becomes the carrier, so its
+                # class and its `.part` reach the coordinator instead of the status code's.
+                inc.__cause__ = e
+                e, size, digest = inc, inc.bytes_written, None
+                err_sink = inc.partial
+            except Exception:
+                size, digest, err_sink = 0, None, None
+            if size and err_sink is not None:
+                try:
+                    with Path(err_sink).open("rb") as fh:
+                        e.body_bytes = head = fh.read(_ERROR_CLASSIFY_BYTES)
+                    e.body_text = head.decode("utf-8", "replace")
+                except Exception:
+                    pass
+            # stamping `body_text` makes `capture_error_body` skip its own read — and its close with it.
+            # Closed on EVERY path, and on the original response: `e` may now be the carrier instead.
+            try:
+                response.close()
+            except Exception:
+                pass
+        # Shodan answers a spent balance with HTTP 401 + JSON and a bad key with HTTP 401 + HTML, so
+        # the status code alone would report every exhausted account as a broken credential. A body
+        # already stamped above is left alone.
         capture_error_body(e, provider="shodan")
         # the ARTIFACT travels with the failure. A paid response that we could not use is still a paid
         # response, and the coordinator publishes what it is handed.
-        for attr, val in (("raw_path", sink if size else getattr(e, "partial", None)),
-                          ("raw_digest", digest), ("raw_bytes", size)):
+        kept = err_sink if err_sink is not None else (sink if size else getattr(e, "partial", None))
+        for attr, val in (("raw_path", kept), ("raw_digest", digest), ("raw_bytes", size)):
             try:
                 setattr(e, attr, val)
             except Exception:

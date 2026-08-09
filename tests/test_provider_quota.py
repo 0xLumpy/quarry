@@ -6,6 +6,7 @@ read as an external LIMIT, never as a failure and never as a clean zero.
 The Whoxy payloads below are MEASURED against the live API (2026-07-27), not invented — including the
 detail that makes the whole class of bug possible: Whoxy reports a spent account inside an HTTP **200**.
 """
+import pathlib
 import json
 import urllib.error
 
@@ -2087,3 +2088,288 @@ class TestThePageCeilingIsASpendingControl:
                     and node.args[0].value == "SHODAN_MAX_PAGES"):
                 readers.add(getattr(node.func, "attr", None) or getattr(node.func, "id", None))
         assert readers == {"raw"}, f"SHODAN_MAX_PAGES is read through {sorted(readers)}"
+
+
+class TestAPaidResponseIsKeptWhole:
+    """Two truncations survived the acquisition rewrite. A refused paid response is still a paid
+    response: the credit is spent, so the bytes are evidence whatever our contract said about them.
+    """
+
+    def test_a_large_refused_body_is_stored_WHOLE_beside_its_document(self, tmp_path):
+        import json
+
+        from quarry_recon import shodan_sched as S
+
+        big = b"A" * (S.REJECTED_INLINE_LIMIT + 4096)
+        pivot = S.Pivot("probe.favicon", "http.favicon.hash", "12345")
+        art = S.publish_rejected(tmp_path, pivot, 1, reason="parse: nope", body=big)
+        assert art is not None
+        doc = json.loads(art.read_text())
+        assert doc["body_bytes"] == len(big)
+        assert "body_b64" not in doc, "a body too large to inline must not be inlined at all"
+        side = pathlib.Path(doc["raw_ref"])
+        assert side.read_bytes() == big, "the paid bytes are kept whole, not sliced"
+
+    def test_the_large_body_is_published_ATOMICALLY(self, tmp_path, monkeypatch):
+        """A crash mid-write must not leave a partial artifact at the name the document points at, so
+        the bytes go through the same content-verified primitive every other paid artifact uses."""
+        from quarry_recon import budget, shodan_sched as S
+
+        seen = {}
+
+        def _publish(dest, data, *, digest):
+            seen["dest"], seen["len"], seen["digest"] = dest, len(data), digest
+            return budget.publish_bytes(dest, data, digest=digest)
+
+        monkeypatch.setattr(S.budget, "publish_bytes", _publish)
+        big = b"B" * (S.REJECTED_INLINE_LIMIT + 1)
+        pivot = S.Pivot("probe.cert", "ssl.cert.fingerprint", "abc")
+        S.publish_rejected(tmp_path, pivot, 2, reason="parse", body=big)
+        assert seen.get("len") == len(big), "the side artifact must go through publish_bytes"
+
+    def test_a_body_the_store_refuses_is_reported_not_claimed(self, tmp_path, monkeypatch):
+        import json
+
+        from quarry_recon import shodan_sched as S
+
+        monkeypatch.setattr(S.budget, "publish_bytes", lambda *a, **k: False)
+        big = b"C" * (S.REJECTED_INLINE_LIMIT + 1)
+        art = S.publish_rejected(tmp_path, S.Pivot("probe.cert", "f", "v"), 3, reason="parse", body=big)
+        doc = json.loads(art.read_text())
+        assert doc.get("body_kept") is False and "raw_ref" not in doc
+
+    def test_a_small_refused_body_still_rides_inside_the_document(self, tmp_path):
+        import base64
+        import json
+
+        from quarry_recon import shodan_sched as S
+
+        small = b"{\"error\": \"nope\"}"
+        pivot = S.Pivot("probe.favicon", "http.favicon.hash", "12345")
+        doc = json.loads(S.publish_rejected(tmp_path, pivot, 1, reason="parse", body=small).read_text())
+        assert base64.b64decode(doc["body_b64"]) == small and doc["body_bytes"] == len(small)
+
+    @staticmethod
+    def _lane(tmp_path):
+        from quarry_recon import shodan_sched as S
+
+        class _Ledger:
+            def record(self, *a, **k):
+                return True
+
+            def add_evidence(self, *a, **k):
+                return True
+
+        pivot = S.Pivot("probe.favicon", "http.favicon.hash", "12345")
+        return S, _Ledger(), S.PivotState(pivot=pivot), S.LaneOutcome(lane="probe.favicon"), S.WorkResult()
+
+    def test_a_lost_receipt_on_a_READABLE_page_is_reported(self, tmp_path, monkeypatch):
+        """The page's own completion journals fine, so nothing else notices — but the receipt is the
+        proof we BOUGHT it, and without it the next run pays again."""
+        S, ledger, st, o, res = self._lane(tmp_path)
+        monkeypatch.setattr(S, "commit_acquisition", lambda *a, **k: False)
+        ok = S._commit_page(st, o, res, page=1, matches=[], total=0, ledger=ledger,
+                            attempt_dir=tmp_path, ingest=lambda *a, **k: 0)
+        assert ok is True, "the page is still ours"
+        assert res.records_journaled is False, "a lost receipt must reach the durability verdict"
+
+    def test_the_rejected_branch_commits_ONE_receipt_after_an_earlier_failure(self, tmp_path, monkeypatch):
+        """Driven, not inspected: `records_journaled` starts False, and the receipt must still be
+        committed exactly once — a skipped one leaves the page bought, unrecorded, and bought again."""
+        from quarry_recon import shodan_sched as S
+
+        pivot = S.Pivot("probe.favicon", "http.favicon.hash", "77")
+        attempt = tmp_path / "attempt"
+        (attempt / "raw").mkdir(parents=True)
+
+        def _search(pv, page):
+            # the bytes appear DURING the purchase, as the real lane streams them — writing them up
+            # front would make the ownership scan refuse acquisition before any of this ran.
+            (attempt / "raw" / f"{S.item_key(pv, page)}.json").write_bytes(b'{"total": 1}')
+            return "not a list", 1, None
+
+        calls = []
+        monkeypatch.setattr(S, "commit_acquisition",
+                            lambda *a, **k: (calls.append(k.get("state")), False)[1])
+
+        class _Ledger:
+            path = attempt / "ledger.json"
+
+            def has(self, *a, **k):
+                return False
+
+            def items(self):
+                return {}
+
+            def record(self, *a, **k):
+                return True
+
+            def save(self):
+                return True
+
+            def checkpoint(self):
+                return True
+
+        bal = type("B", (), {"may_spend": True, "spendable": 5, "stop_kind": "",
+                             "remaining": 5, "reserve": 0, "reason": ""})()
+        st = S.PivotState(pivot=pivot, total=1)
+        res = S.run_work(None, states=[st], balance=bal,
+                         search=_search,
+                         ingest=lambda *a, **k: 0, ledger=_Ledger(), attempt_dir=attempt,
+                         is_limit=lambda c: False, should_stop=lambda c: True)
+        assert calls == [S.ACQ_UNPARSED], f"one receipt for the rejected page, got {calls}"
+        assert res.records_journaled is False
+
+    def test_the_receipt_is_committed_even_after_an_EARLIER_failure(self):
+        """A rejected page's receipt is its only ownership record. Folding the call into
+        `records_journaled and commit_acquisition(...)` skips it entirely once an earlier record has
+        already set the flag False — so the page ends up bought, unrecorded, and bought again."""
+        import ast
+        import inspect
+
+        from quarry_recon import shodan_sched as S
+
+        tree = ast.parse(pathlib.Path(inspect.getfile(S)).read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.BoolOp) or not isinstance(node.op, ast.And):
+                continue
+            calls = [v for v in node.values
+                     if isinstance(v, ast.Call)
+                     and getattr(v.func, "id", getattr(v.func, "attr", None)) == "commit_acquisition"]
+            assert not calls, ("commit_acquisition must be called before its result is folded, "
+                               f"not inside an `and` (line {node.lineno})")
+
+    def test_a_kept_receipt_leaves_the_verdict_clean(self, tmp_path, monkeypatch):
+        S, ledger, st, o, res = self._lane(tmp_path)
+        monkeypatch.setattr(S, "commit_acquisition", lambda *a, **k: True)
+        S._commit_page(st, o, res, page=1, matches=[], total=0, ledger=ledger,
+                       attempt_dir=tmp_path, ingest=lambda *a, **k: 0)
+        assert res.records_journaled is True
+
+
+class TestAPaidErrorResponseIsKeptWhole:
+    """`urlopen` RAISES on any 4xx/5xx, so the streaming path never runs for an error — and the
+    classifier reads a bounded head and closes the socket. Without streaming the error body first, that
+    head is the only copy of a response we were charged for.
+    """
+
+    @staticmethod
+    def _raise_http_error(body: bytes):
+        import io
+        import urllib.error
+
+        def _open(req, timeout=20):
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, io.BytesIO(body))
+        return _open
+
+    def test_the_whole_error_body_reaches_disk(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import probe
+
+        body = b"X" * 716_800
+        monkeypatch.setattr(probe.urllib.request, "urlopen", self._raise_http_error(body))
+        sink = tmp_path / "page.json"
+        rows, total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=sink)
+        assert (rows, total) == ([], None) and err is not None
+        kept = pathlib.Path(err.raw_path)
+        assert kept.stat().st_size == len(body), f"kept {kept.stat().st_size} of {len(body)} paid bytes"
+        assert not sink.exists(), "an ordinary error is not a page we bought — it must not land in the"
+        assert kept.name.endswith(".error"), kept.name
+
+    def test_the_failure_still_carries_the_artifact(self, tmp_path, monkeypatch):
+        from quarry_recon.phases import probe
+
+        body = b'{"error": "Insufficient query credits"}'
+        monkeypatch.setattr(probe.urllib.request, "urlopen", self._raise_http_error(body))
+        sink = tmp_path / "page.json"
+        _rows, _total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=sink)
+        assert pathlib.Path(err.raw_path).read_bytes() == body
+        assert err.error_class in ("quota", "auth"), err.error_class
+
+
+class TestAnErrorResponseIsNotAnOrphan:
+    """An ordinary 429 or 500 is not a page we bought. If its body lands at the acquisition name, the
+    next lifecycle reads an unowned paid response and refuses acquisition for that page for ever — a
+    transient failure turned permanent.
+    """
+
+    def test_the_error_body_is_invisible_to_the_ownership_scan(self, tmp_path, monkeypatch):
+        import io
+        import urllib.error
+
+        from quarry_recon import shodan_sched as S
+        from quarry_recon.phases import probe
+
+        pivot = S.Pivot("probe.favicon", "http.favicon.hash", "999")
+        attempt = tmp_path / "attempt"
+        (attempt / "raw").mkdir(parents=True)
+        sink = attempt / "raw" / f"{S.item_key(pivot, 1)}.json"
+
+        def _open(req, timeout=20):
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many", {}, io.BytesIO(b"slow down"))
+
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _open)
+        probe._shodan_page("K", pivot.facet, pivot.value, 1, sink=sink)
+
+        class _Ledger:
+            def items(self):
+                return {}
+
+        view = S.ownership_view(attempt, _Ledger())
+        assert view.error == "", f"the scan itself failed: {view.error}"
+        assert view.orphans == {}, f"a transient error became an orphan: {view.orphans}"
+
+    def test_an_INTERRUPTED_error_stream_keeps_its_partial(self, tmp_path, monkeypatch):
+        """Driven through the REAL streamer, so the fields are the ones `stream_to_file` actually sets.
+        The partial bytes are ours and the class must say so — the status code's class would send an
+        operator looking at the provider instead of at a broken transfer."""
+        import urllib.error
+
+        from quarry_recon.contract import IncompleteAcquisition
+        from quarry_recon.phases import probe
+
+        closed = []
+
+        class _Truncated(urllib.error.HTTPError):
+            """Seven bytes, then the transport dies — what a real interrupted body looks like."""
+
+            def read(self, n=-1):
+                if not closed:                       # first chunk lands, second raises
+                    closed.append("read")
+                    return b"partial"
+                raise ConnectionResetError("transport broke mid-body")
+
+            def close(self):
+                closed.append("closed")
+
+        def _open(req, timeout=20):
+            return _Truncated(req.full_url, 500, "Server Error", {}, None)
+
+        monkeypatch.setattr(probe.urllib.request, "urlopen",
+                            lambda req, timeout=20: (_ for _ in ()).throw(_open(req)))
+        _rows, _total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1,
+                                                sink=tmp_path / "page.json")
+        assert isinstance(err, IncompleteAcquisition), type(err).__name__
+        assert err.raw_bytes == 7, f"reported {err.raw_bytes} of 7 partial bytes"
+        assert pathlib.Path(err.raw_path).read_bytes() == b"partial"
+        assert "closed" in closed, "the ORIGINAL response must be closed, not the carrier"
+
+    def test_a_streamed_error_response_is_closed(self, tmp_path, monkeypatch):
+        import io
+        import urllib.error
+
+        from quarry_recon.phases import probe
+
+        closed = []
+
+        class _Err(urllib.error.HTTPError):
+            def close(self):
+                closed.append(True)
+                super().close()
+
+        def _open(req, timeout=20):
+            raise _Err(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b"nope"))
+
+        monkeypatch.setattr(probe.urllib.request, "urlopen", _open)
+        probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=tmp_path / "page.json")
+        assert closed, ("the response must be closed by the lane: stamping `body_text` makes "
+                        "`capture_error_body` skip its own read, and its close with it")

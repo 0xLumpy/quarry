@@ -770,15 +770,21 @@ class TestTemplateDefectsRound2:
         data = b"body" * 10
         dig = _h.sha256(data).hexdigest()
         dest = tmp_path / f"{dig}.js"
-        real = pathlib_write = type(dest).write_bytes
+        import os as _os
 
-        def short_write(self, b):                              # simulate a partial write
-            return real(self, b[:3])
-        monkeypatch.setattr(type(dest), "write_bytes", short_write)
+        real_fdopen = _os.fdopen
+
+        def short_write(fd, mode="rb", *a, **k):               # simulate a partial write at the fd
+            fh = real_fdopen(fd, mode, *a, **k)
+            real_write = fh.write
+            fh.write = lambda b: real_write(b[:3])
+            return fh
+        monkeypatch.setattr(_os, "fdopen", short_write)
         assert budget.publish_bytes(dest, data, digest=dig) is False
-        monkeypatch.setattr(type(dest), "write_bytes", real)
+        monkeypatch.setattr(_os, "fdopen", real_fdopen)
         assert not dest.exists()                               # no half-file published
         assert list(tmp_path.glob("*.part-*")) == []           # and no temp left over
+        assert list(tmp_path.glob(".*.part-*")) == []
 
     def test_a_failed_publish_is_never_recorded(self, tmp_path, monkeypatch):
         ctx = _Ctx(tmp_path, _urls({"a.ex.com": 2}))

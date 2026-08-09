@@ -197,3 +197,330 @@ class TestNmap:
         p = tmp_path / "b.xml"
         p.write_text(bad)
         assert probe._nmap_services(p) == (None, False)
+
+
+class TestPublishBytesNeverDestroysWhatItCannotReplace:
+    """`publish_bytes` is the atomic primitive every paid and evidential artifact goes through. If it
+    can leave a destination empty on failure, "atomic" is a claim rather than a property.
+    """
+
+    def test_a_failed_write_leaves_the_ORIGINAL_in_place(self, tmp_path, monkeypatch):
+        import hashlib
+        import pathlib
+
+        from quarry_recon import budget
+
+        dest = tmp_path / "artifact.json"
+        dest.write_bytes(b"the evidence we already hold")
+        new = b"a replacement that never lands"
+
+        import os
+
+        def _fail(fd, *a, **k):
+            os.close(fd)
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(os, "fdopen", _fail)
+        ok = budget.publish_bytes(dest, new, digest=hashlib.sha256(new).hexdigest())
+        assert ok is False
+        assert dest.read_bytes() == b"the evidence we already hold", \
+            "a destination must never be unlinked before its replacement exists"
+
+    def test_wrong_bytes_at_the_name_are_SUPERSEDED(self, tmp_path):
+        import hashlib
+
+        from quarry_recon import budget
+
+        dest = tmp_path / "artifact.json"
+        dest.write_bytes(b"truncated")
+        new = b"the whole thing"
+        assert budget.publish_bytes(dest, new, digest=hashlib.sha256(new).hexdigest())
+        assert dest.read_bytes() == new
+
+
+class TestALedgerFailsClosedOnBytesItCannotDecode:
+    """`unreadable` exists so a store we cannot trust blocks work instead of reading as empty. A raised
+    UnicodeDecodeError bypasses that entirely and takes the lane down with it.
+    """
+
+    def test_an_undecodable_snapshot_is_UNREADABLE(self, tmp_path):
+        from quarry_recon import budget
+
+        state = tmp_path / "lane.json"
+        state.write_bytes(b'{"lane": "a1d", "done": \xff\xfe}')
+        led = budget.Ledger(state, lane="a1d")
+        assert led.unreadable, "invalid bytes must mark the store unreadable, not raise"
+        assert led.done == {}
+
+    def test_an_undecodable_journal_is_UNREADABLE(self, tmp_path):
+        from quarry_recon import budget
+
+        state = tmp_path / "lane.json"
+        state.write_text('{"lane": "a1d", "done": {}, "digests": {}}')
+        state.with_name(state.name + ".journal").write_bytes(b"\xff\xfe not text\n")
+        led = budget.Ledger(state, lane="a1d")
+        assert led.unreadable, "an undecodable journal must mark the store unreadable, not raise"
+
+    def test_ledger_writable_agrees_with_append(self, tmp_path):
+        """The shared predicate must refuse everything `_append` refuses, or it promises a write the
+        ledger will not perform."""
+        from quarry_recon import budget
+
+        state = tmp_path / "lane.json"
+        state.write_bytes(b'{"lane": "a1d", "done": \xff}')
+        led = budget.Ledger(state, lane="a1d")
+        assert led.unreadable
+        assert budget.ledger_writable(led) is False
+        assert led.checkpoint() is False
+
+
+class TestPublishBytesRefusesSymlinks:
+    """An artifact tree holds attacker-adjacent names, so a planted link must never let a publish
+    read, overwrite or certify a file outside it.
+    """
+
+    def test_staging_happens_inside_a_PRIVATE_directory(self, tmp_path, monkeypatch):
+        """Another user cannot create, swap or unlink a name inside a 0700 directory we made, so the
+        rename has nothing to race against."""
+        import hashlib
+        import os
+        import pathlib
+
+        from quarry_recon import budget
+
+        seen = {}
+        real_mkdir = os.mkdir
+
+        def _spy(path, mode=0o777, *a, **k):
+            seen["name"], seen["mode"] = str(path), mode
+            return real_mkdir(path, mode, *a, **k)
+
+        monkeypatch.setattr(os, "mkdir", _spy)
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        dest = art / "page.json"
+        data = b"published"
+        assert budget.publish_bytes(dest, data, digest=hashlib.sha256(data).hexdigest())
+        assert seen["mode"] == 0o700, f"staging directory created {seen['mode']:o}"
+        assert seen["name"].startswith(".quarry-stage-")
+        assert list(art.glob(".quarry-stage-*")) == [], "the staging directory must not be left behind"
+        assert dest.read_bytes() == data
+
+    def test_the_staging_directory_is_opened_by_DESCRIPTOR_not_by_name(self, tmp_path, monkeypatch):
+        """Reopening it by pathname would resolve through the parent again, which is the entry an
+        attacker controls — so the second open must be relative to the parent descriptor."""
+        import ast
+        import inspect
+
+        from quarry_recon import budget
+
+        tree = ast.parse(inspect.getsource(budget.publish_bytes))
+        opens = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call)
+                 and getattr(n.func, "attr", None) == "open"
+                 and any(k.arg == "dir_fd" for k in n.keywords)]
+        assert len(opens) == 2, "both the staging directory and the artifact open relative to an fd"
+
+    def test_a_planted_staging_directory_is_refused(self, tmp_path, monkeypatch):
+        """`mkdir` fails if the name exists, so a planted directory — or a link pretending to be one —
+        stops the publish instead of being written into."""
+        import hashlib
+
+        from quarry_recon import budget
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        monkeypatch.setattr(budget, "_token", lambda: "deadbeef")
+        (art / ".quarry-stage-deadbeef").symlink_to(outside)
+
+        dest = art / "page.json"
+        data = b"published"
+        assert budget.publish_bytes(dest, data, digest=hashlib.sha256(data).hexdigest()) is False
+        assert list(outside.iterdir()) == [], "nothing may be written through a planted name"
+        assert not dest.exists()
+
+    def test_replacing_the_staging_DIRECTORY_cannot_redirect_the_publish(self, tmp_path, monkeypatch):
+        """The staging directory's entry lives in a parent anyone with write access can rename. The
+        rename resolves through a held descriptor instead, so swapping that entry redirects nothing."""
+        import hashlib
+
+        from quarry_recon import budget
+
+        outside = tmp_path / "outside.txt"
+        outside.write_bytes(b"elsewhere")
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        dest = art / "page.json"
+        data = b"published"
+        monkeypatch.setattr(budget, "_token", lambda: "cafe1234")
+        stage = art / ".quarry-stage-cafe1234"
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        (evil / "artifact").symlink_to(outside)
+
+        real_digest = budget._fd_digest
+
+        def _swap(fd):                              # between the write and the rename
+            out = real_digest(fd)
+            if stage.is_dir():
+                stage.rename(tmp_path / "moved-away")
+                evil.rename(stage)                  # the NAME now points at the attacker's directory
+            return out
+
+        monkeypatch.setattr(budget, "_fd_digest", _swap)
+        assert budget.publish_bytes(dest, data, digest=hashlib.sha256(data).hexdigest()) is True
+        assert not dest.is_symlink(), "the publish followed a replaced directory entry"
+        assert dest.read_bytes() == data
+        assert outside.read_bytes() == b"elsewhere"
+
+    def test_a_planted_FIFO_at_the_destination_does_not_hang(self, tmp_path):
+        """`O_RDONLY` on a FIFO blocks until someone writes to it. The publisher must not be stoppable
+        by a name in its own artifact tree."""
+        import hashlib
+        import os
+        import signal
+
+        from quarry_recon import budget
+
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        dest = art / "page.json"
+        os.mkfifo(dest)
+        data = b"published"
+
+        class _Blocked(BaseException):
+            """NOT an OSError: `publish_bytes` catches those, and a swallowed alarm would let a
+            blocking open pass as an ordinary failure."""
+
+        def _die(*_a):
+            raise _Blocked("publish_bytes blocked on a FIFO")
+
+        signal.signal(signal.SIGALRM, _die)
+        signal.alarm(2)
+        try:
+            budget.publish_bytes(dest, data, digest=hashlib.sha256(data).hexdigest())
+        except _Blocked:
+            raise AssertionError("publish_bytes blocked on a planted FIFO")
+        finally:
+            signal.alarm(0)
+
+    def test_the_destination_is_never_digested_by_PATHNAME(self, tmp_path, monkeypatch):
+        """A name checked and then reopened can be swapped in between, so the already-published check
+        reads through the descriptor it opened and never hands the path to a digest helper."""
+        import hashlib
+
+        from quarry_recon import budget
+
+        data = b"already here"
+        dig = hashlib.sha256(data).hexdigest()
+        dest = tmp_path / "page.json"
+        dest.write_bytes(data)
+
+        by_path = []
+        monkeypatch.setattr(budget.events, "file_digest",
+                            lambda p, *a, **k: (by_path.append(p), dig)[1])
+        assert budget.publish_bytes(dest, data, digest=dig) is True
+        assert by_path == [], f"the destination was digested by pathname: {by_path}"
+
+    def test_a_planted_DESTINATION_link_is_never_certified(self, tmp_path):
+        """`lstat`, not `exists()`: digesting the link's TARGET would report someone else's file as
+        already published — and then the caller records ownership of a page it never wrote."""
+        import hashlib
+
+        from quarry_recon import budget
+
+        data = b"published"
+        dig = hashlib.sha256(data).hexdigest()
+        outside = tmp_path / "outside.json"
+        outside.write_bytes(data)                  # the target ALREADY holds the exact bytes
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        dest = art / "page.json"
+        dest.symlink_to(outside)
+
+        assert budget.publish_bytes(dest, data, digest=dig)
+        assert not dest.is_symlink(), "the link must be replaced, never published through"
+        assert dest.read_bytes() == data and outside.read_bytes() == data
+
+
+class TestStagingIsProvenOursBeforeItIsUsed:
+    """Between the `mkdir` and the open that pins it, the name still lives in a parent someone else
+    may be able to write. The directory we end up holding has to prove it is the one we made.
+    """
+
+    def test_a_directory_swapped_in_after_the_mkdir_is_refused(self, tmp_path, monkeypatch):
+        import hashlib
+        import os
+
+        from quarry_recon import budget
+
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        dest = art / "page.json"
+        monkeypatch.setattr(budget, "_token", lambda: "beefcafe")
+        stage = art / ".quarry-stage-beefcafe"
+        evil = tmp_path / "evil"
+        evil.mkdir(mode=0o777)
+
+        real_mkdir = os.mkdir
+
+        def _swap(path, mode=0o777, *a, **k):       # runs the swap the instant ours exists
+            real_mkdir(path, mode, *a, **k)
+            if stage.is_dir():
+                stage.rmdir()
+                evil.rename(stage)
+
+        monkeypatch.setattr(os, "mkdir", _swap)
+        data = b"published"
+        assert budget.publish_bytes(dest, data, digest=hashlib.sha256(data).hexdigest()) is False
+        assert not dest.exists(), "a swapped staging directory must not carry a publish"
+
+    def test_a_pre_existing_directory_is_never_removed(self, tmp_path, monkeypatch):
+        """`mkdir` fails on an existing name, and cleanup must not then delete whatever was there —
+        it belongs to someone else."""
+        import hashlib
+
+        from quarry_recon import budget
+
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        monkeypatch.setattr(budget, "_token", lambda: "0badc0de")
+        squatter = art / ".quarry-stage-0badc0de"
+        squatter.mkdir()
+
+        data = b"published"
+        assert budget.publish_bytes(art / "page.json", data,
+                                    digest=hashlib.sha256(data).hexdigest()) is False
+        assert squatter.is_dir(), "cleanup removed a directory this call did not create"
+
+    def test_cleanup_never_removes_a_REPLACEMENT_at_our_name(self, tmp_path, monkeypatch):
+        """`created` proves this call made a directory, not that the name still holds it. If ours is
+        renamed away and something else takes the name, the rmdir would be deleting a stranger's."""
+        import hashlib
+        import os
+
+        from quarry_recon import budget
+
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        dest = art / "page.json"
+        monkeypatch.setattr(budget, "_token", lambda: "feedface")
+        stage = art / ".quarry-stage-feedface"
+        replacement = tmp_path / "theirs"
+        replacement.mkdir()
+
+        real_replace = os.replace
+
+        def _swap(src, dst, **kw):                  # after the artifact lands, before cleanup
+            out = real_replace(src, dst, **kw)
+            if stage.is_dir():
+                stage.rename(tmp_path / "ours-moved")
+                replacement.rename(stage)
+            return out
+
+        monkeypatch.setattr(os, "replace", _swap)
+        data = b"published"
+        assert budget.publish_bytes(dest, data, digest=hashlib.sha256(data).hexdigest()) is True
+        assert stage.is_dir(), "cleanup removed a directory that had taken our name"

@@ -1,33 +1,18 @@
 """Bounded, FAIR, resumable processing of a lane's FULL eligible input.
 
-This replaces first-N input caps (`eligible[:2000]`). The OTC 20260725 audit showed why they had to go: a
-flat cap over a store-ordered list let a few JS-heavy hosts consume the whole budget, and WHICH hosts won
-depended on discovery order — so the scanned set ROTATED between runs. `influx1.eco.tsi-dev` went from
-433/439 JS files downloaded to 0/439 between two runs of the same target, taking the secrets it carried
-with it (24 -> 3). An input cap is the worst available bound: the omitted work is never processed, it was
-silent until the coverage counters landed, and it is not even deterministic.
-
-The model, borrowed from where each tool gets it right:
-  - reconftw bounds by MODE (all-or-skip on a declared limit), never by an arbitrary subset;
-  - bbot bounds THROUGHPUT (per-module queue depth), never set membership.
-So: keep the FULL eligible set, order it FAIRLY, bound the THROUGHPUT, and persist the REMAINDER.
-
-Consequences that make this strictly better than a cap:
-  - nothing is silently dropped — unprocessed input is a counted, resumable remainder;
-  - a bounded run's coverage is spread across hosts instead of concentrated in whichever host sorts first;
-  - default is UNBOUNDED (budget 0), so normal operation processes everything and the bound is an explicit
-    operator choice — runtime is workload, not a knob to trim.
-
-Per-ITEM size guards (a 15 MB ceiling on one JS file) are NOT caps in this sense and stay: they bound one
-item's cost, not which items get processed.
+A first-N cap lets a few heavy hosts eat the budget, and which hosts win depends on discovery order —
+so the scanned set rotates between runs. Instead: keep the full set, order it fairly, bound THROUGHPUT,
+persist the REMAINDER. Unbounded is the default.
 """
 from __future__ import annotations
 
 import contextlib
 import hashlib
+import secrets as _secrets
 import json
 import math
 import os
+import stat
 import time
 from pathlib import Path
 
@@ -64,13 +49,8 @@ class Budget:
 
 
 def order_fairly(items, key) -> list:
-    """Round-robin the items across their `key(item)` groups (the HOST, in practice), so every host gets
-    its 1st item before any host gets its 2nd. This is the whole fix for the cap lottery: with a flat
-    order, one host with 825 JS URLs ate a 2000-item budget and starved 40 other hosts.
-
-    Deterministic: groups are visited in sorted key order, and within a group the caller's INPUT order is
-    preserved (discovery order carries signal — the crawler found it first for a reason). Same input =>
-    same output, so a bounded run's coverage is reproducible instead of order-dependent."""
+    """Round-robin items across their `key(item)` groups: every host gets its 1st item before any host
+    gets its 2nd. Deterministic — same input, same output."""
     groups: dict = {}
     for it in items:
         groups.setdefault(key(it), []).append(it)
@@ -89,58 +69,106 @@ def order_fairly(items, key) -> list:
         i += 1
 
 
-def publish_bytes(dest: Path, data: bytes, *, digest: str) -> bool:
-    """ATOMICALLY publish `data` at a CONTENT-ADDRESSED `dest`, returning True only once dest provably holds
-    exactly these bytes.
+def _token() -> str:
+    return _secrets.token_hex(8)
 
-    review#2: `if not dest.exists(): dest.write_bytes(data)` is not safe at a content-addressed name. A kill
-    mid-write leaves a TRUNCATED file at the final name, and the next attempt sees it exists and reuses it —
-    so a lane recorded the digest of what it MEANT to write while the file on disk held something else, and
-    the miners read the truncated bytes. Write a same-directory temp, verify what actually landed, then
-    os.replace. A pre-existing destination is verified before reuse, never trusted for existing."""
-    tmp = None
+
+def _fd_digest(fd) -> str:
+    """sha256 of an OPEN descriptor, from offset 0. Takes no pathname: it hashes the inode we hold,
+    not whatever the name resolves to now."""
+    h = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, 1024 * 1024):
+        h.update(chunk)
+    return h.hexdigest()
+
+
+def publish_bytes(dest: Path, data: bytes, *, digest: str) -> bool:
+    """Atomically publish `data` at `dest`. True only once dest provably holds exactly these bytes.
+
+    Every step resolves through a DIRECTORY DESCRIPTOR we hold open, so renaming a directory entry in
+    the parent cannot redirect it. Same-uid interference is out of scope: a process running as us can
+    reach these descriptors directly.
+    """
+    dfd = sfd = None
+    name = None
+    created = False
     try:
-        if dest.exists():
-            if events.file_digest(dest) == digest:
-                return True                       # already published, content confirmed
-            dest.unlink()                         # wrong/truncated bytes at a content-addressed name
+        if _already_published(dest, digest):
+            return True
         dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_name(dest.name + f".part-{os.getpid()}")
-        tmp.write_bytes(data)
-        if events.file_digest(tmp) != digest:      # verify the WRITE, not the intent
-            tmp.unlink(missing_ok=True)
+        dfd = os.open(dest.parent, os.O_RDONLY | os.O_DIRECTORY)
+        name = f".quarry-stage-{_token()}"
+        os.mkdir(name, 0o700, dir_fd=dfd)          # fails if the name exists
+        created = True
+        # pin the staging directory by INODE: its entry lives in a parent anyone with write access can
+        # rename, so everything below resolves through this descriptor and never through that name.
+        sfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+        # ...and prove it is the one we just made. The name could have been swapped between the mkdir
+        # and this open, so a directory that is not ours, not private, or not empty is not staging.
+        st = os.fstat(sfd)
+        if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid()
+                or stat.S_IMODE(st.st_mode) != 0o700 or st.st_nlink != 2):
             return False
-        os.replace(tmp, dest)
-        return True
+        fd = os.open("artifact", os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=sfd)
+        try:
+            with os.fdopen(os.dup(fd), "wb") as fh:
+                fh.write(data)
+            if _fd_digest(fd) != digest:           # verify the WRITE, through the fd we hold
+                return False
+            os.replace("artifact", dest.name, src_dir_fd=sfd, dst_dir_fd=dfd)
+            return True
+        finally:
+            os.close(fd)
     except OSError:
-        # review-B1.3r8#2: the digest-mismatch path cleaned up and this one did not, so a failing
-        # os.replace (or a write that ran out of space) left `<name>.part-<pid>` in a tree whose
-        # contract is that every file in it is validated evidence. Measured with a failing replace:
-        # leftovers=['.quarry-write-probe.part-756343']. Cleanup belongs in the shared primitive, so
-        # every publisher gets it rather than each caller re-deriving the temp name.
-        if tmp is not None:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass                              # nothing further we can do; the caller still gets False
         return False
+    finally:
+        if sfd is not None:
+            try:
+                os.unlink("artifact", dir_fd=sfd)
+            except OSError:
+                pass
+            # remove the NAME only while it still resolves to the directory we are holding: renamed
+            # away and replaced, it belongs to someone else and deleting it would be our doing.
+            if created and dfd is not None and _same_inode(name, dfd, sfd):
+                try:
+                    os.rmdir(name, dir_fd=dfd)
+                except OSError:
+                    pass
+            os.close(sfd)
+        if dfd is not None:
+            os.close(dfd)
+
+
+def _same_inode(name: str, dir_fd: int, fd: int) -> bool:
+    """Whether `name` under `dir_fd` still resolves to the object `fd` refers to."""
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    own = os.fstat(fd)
+    return (st.st_dev, st.st_ino) == (own.st_dev, own.st_ino)
+
+
+def _already_published(dest: Path, digest: str) -> bool:
+    """Whether `dest` already holds exactly these bytes.
+
+    `O_NONBLOCK`, or a planted FIFO blocks the publisher; only a REGULAR file may answer this."""
+    try:
+        fd = os.open(dest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False                               # absent, a link, or not ours to read
+    try:
+        return stat.S_ISREG(os.fstat(fd).st_mode) and _fd_digest(fd) == digest
+    finally:
+        os.close(fd)
 
 
 def store_writable(attempt_dir) -> bool:
     """Whether a bought page could actually be PUBLISHED — proven by writing, not assumed.
 
-    review-B1.3r7#2: the ledger was probed before spending and the artifact store was not, so a
-    read-only attempt directory was discovered by paying for a page and then failing to store it
-    (`calls=[1]`, `stop_cause=publish_failed`) — and the next run bought it again. Both sinks are
-    required, so both are proven up front.
-
-    The probe exercises the same primitive the real page uses (temp + verify + replace) and then REMOVES
-    itself: an artifact directory must contain only real evidence, and a probe we cannot clean up is
-    itself a failure — it would be an orphan in a tree whose contract says every file is a validated
-    artifact.
-
-    B1.6: moved here from the Shodan coordinator, because the Whoxy paginator needs the identical probe
-    and the contract really is the same one. Two copies of a safety precondition would drift."""
+    The probe uses the same primitive a real page does, then removes itself: an artifact tree whose
+    contract is "every file is validated evidence" must not gain a probe."""
     probe = Path(attempt_dir) / ".quarry-write-probe"
     body = b'{"probe":1}'
     try:
@@ -153,15 +181,10 @@ def store_writable(attempt_dir) -> bool:
 
 
 def order_ranked_fair(items, *, rank, group) -> list:
-    """Order by RANK TIER first, then round-robin fairly WITHIN each tier.
+    """Order by RANK TIER first, then round-robin fairly within each tier.
 
-    Lumpy's rule, encoded: **ranking may determine the order work is done in, but never permanent
-    membership.** A lane that prefers origin (non-CDN) hosts, or https over http, keeps that preference as a
-    TIER ORDER — every item still appears in the output, so a budget that stops early has simply done the
-    most valuable work first rather than excluded anything.
-
-    Fairness applies inside a tier for the same reason it does anywhere: without it, one host's eight ports
-    drain the budget before another host's first port is touched."""
+    Ranking decides ORDER, never membership: a budget that stops early has done the most valuable
+    work first rather than excluded anything."""
     tiers: dict = {}
     for it in items:
         tiers.setdefault(rank(it), []).append(it)
@@ -174,39 +197,22 @@ def order_ranked_fair(items, *, rank, group) -> list:
 def ledger_writable(ledger) -> bool:
     """Whether completions can actually be JOURNALED — a precondition, not a postcondition.
 
-    review-shodan-r3#1: writability was checked only AFTER every purchase, so a foreign ledger let a run
-    buy 15 pages and then report `persisted=False`, and the next lifecycle bought all 15 again. For paid
-    work that difference is money; for free work it is a run that cannot resume.
-
-    B1.7: lives HERE because it is a question about a `Ledger` and nothing else. It existed identically in
-    `shodan_sched` and `whoxy_page`, and a third copy in the host lane is how three answers to one question
-    start to drift apart."""
-    return not getattr(ledger, "foreign", False) and not getattr(ledger, "_journal_unsafe", False)
+    Refuses everything `_append` refuses, or it promises a write the ledger will not perform."""
+    return (not getattr(ledger, "foreign", False)
+            and not getattr(ledger, "_journal_unsafe", False)
+            and not getattr(ledger, "unreadable", ""))
 
 
 class StateBusy(RuntimeError):
-    """Another lifecycle already holds this lane's state.
-
-    CONTENTION ONLY. A read-only filesystem, a bad descriptor or a filesystem without lock support raises
-    the underlying OSError instead — reporting those as "another run is active" sends an operator looking
-    for a process that does not exist (review-B1.6b2#2, learned on the Whoxy lock)."""
+    """Another lifecycle holds this lane's state. Not an error: the holder is advancing the rotation."""
 
 
 @contextlib.contextmanager
 def state_lock(path):
-    """An exclusive, ADVISORY, OS-RELEASED lock over one lane's PROJECT state — the lock a `Ledger` needs.
+    """An exclusive, advisory, OS-released lock over one lane's PROJECT state.
 
-    Every ledger-owning lane has the same problem: two runs of the same project load the same snapshot, do
-    the same work twice, then race while compacting and unlinking the journal that supersedes it — which is
-    how ownership gets lost outright. THIS is that lock, defined once next to `Ledger`, because three lanes
-    answering the same question separately is how the three answers drift apart.
-
-    `flock` and not lockfile EXISTENCE: a stale file from a killed run would block the project forever,
-    while the kernel drops an flock when the holder dies, however it dies. The file is never unlinked —
-    removing it lets a second process lock a path the first no longer shares.
-
-    Non-blocking: contention raises `StateBusy` immediately rather than parking a run behind another one
-    for an unbounded time. A caller decides what contention MEANS for it (a gap, a retry, a skip)."""
+    `flock`, not lockfile existence: the kernel drops it however the holder dies. Non-blocking, so
+    contention raises instead of queueing."""
     import errno
     import fcntl
     path = Path(path)
@@ -232,28 +238,15 @@ _SESSION = object()
 
 
 class SchedulerInvariant(RuntimeError):
-    """A scheduling fact moved under the holder of the lane lock — a BUG, never an expected disposition.
-
-    One sweeper owns a lane for the whole sweep, so nothing else can re-reserve a slot while it runs. A
-    generation that changes anyway means the state was written by something that ignored the lock, or the
-    driver reserved twice. Callers report it as MACHINERY and stop the lane; they never treat it as an
-    ordinary outcome (step-4 design v9#1)."""
+    """The rotation was asked for something its own records forbid. A defect, never an outcome."""
 
 
 @contextlib.contextmanager
 def rotation_session(state_dir, lane: str, *, schema: int, slot_grammar=None):
-    """`with rotation_session(dir, "a1d", schema=1) as progress:` — the ONLY way to reach lane progress.
+    """`with rotation_session(dir, lane, schema=1) as progress:` — the only way to reach lane progress.
 
-    Takes the lane's lock ONCE and yields a `RotationProgress` that knows the lock is HELD, so no `save()`
-    inside the session acquires it a second time. That is structural, not a caller convention: `state_lock`
-    is flock-based, so a nested acquisition in the SAME process raises `StateBusy` (proven) — a `save()`
-    that re-locked would report every write as contended (step-4 design v8#1 / v9#2).
-
-    Contention is an ACQUISITION fact: `StateBusy` escapes from entering this manager and means another
-    lifecycle owns the rotation. A `StateBusy` raised inside the body is the body's own machinery failure
-    and must not be reported as contention (v10#2) — so callers enter this manager under their own
-    `except`, and run the sweep outside it.
-    """
+    Contention escapes from ENTERING this manager; a `StateBusy` from inside the body is the body's
+    own machinery failure."""
     base = Path(state_dir)
     with state_lock(base / f"{lane}.lock"):
         yield RotationProgress(base / f"{lane}.json", lane=lane, schema=schema,
@@ -287,51 +280,36 @@ def _acquire_bounded(path: Path):
             time.sleep(_ROTATION_LOCK_POLL_S)
 
 
-#: how many lane GENERATIONS a refused target waits before it is asked again. A refusal must not become a
-#: membership cap: tier 3 alone is permanent exclusion, because clean work is eligible again every
-#: lifecycle and fills a finite allowance for ever (v80#1). Generations advance with every reservation, so
-#: a busy lane cools down quickly and a quiet one — where nothing else competes — never delays anything:
-#: `_rank` picks the lowest tier PRESENT, so an all-refused lane still runs.
+#: lane generations a refused target waits before it is asked again. Tier 3 alone would exclude it
+#: permanently, since clean work refills a finite allowance every lifecycle.
 ADMISSION_COOLDOWN_GENS = 16
 
 
 class RotationProgress:
-    """PROJECT-LEVEL rotation state for one lane: which slot was RESERVED when, and what it last RAN.
+    """Project-level rotation state for one lane: which slot was RESERVED when, and what it last RAN.
 
-    It ORDERS and nothing else. It never records an outcome, never claims completion, and losing it costs
-    ordering quality rather than coverage — evidence stays run-scoped (step-4 design).
-
-    Two independently ordered tuples per slot, never merged field-by-field:
-
-        res  = {"gen": int, "at": float}                     # the reservation: taken BEFORE the tool runs
-        done = {"gen": int, "at": float, "c": str, "n": int}  # written AFTER the invocation RETURNED
-
-    `c` is the digest of the members actually submitted, so a slot whose membership changed since it last
-    ran is DIRTY and outranks clean slots. Writing `c` at reservation time would have made a crash before
-    the launch look clean (v4#3).
-    """
+    It ORDERS and nothing else — losing it costs ordering quality, never coverage. `done` carries the
+    digest of the members actually submitted, so a slot whose membership changed is DIRTY; writing it
+    at reservation time would make a crash before launch look clean."""
 
     def __init__(self, path, *, lane: str, schema: int, slot_grammar=None, _session=None):
-        # the CONFIGURED schema is validated too (review v12#4): `int(True)` is 1 and `int("2")` is 2, and a
+        # the CONFIGURED schema is validated too : `int(True)` is 1 and `int("2")` is 2, and a
         # schema that coerces is a rotation that can be read under the wrong meaning.
         if isinstance(schema, bool) or not isinstance(schema, int) or schema < 0:
             raise ValueError(f"schema must be an exact non-negative int, got {schema!r}")
         self.path = Path(path) if path else None
         self.lane = lane
         self.schema = schema
-        #: the lane's slot-id grammar, or None for a lane that does not constrain ids. Rank inheritance
-        #: walks ids STRUCTURALLY (root + extension bits), so a document holding arbitrary dotted strings
-        #: could otherwise make unrelated slots each other's ancestors (v25).
+        #: the lane's slot-id grammar, or None. Rank inheritance walks ids structurally, so arbitrary
+        #: strings could make unrelated slots each other's ancestors.
         if slot_grammar is not None and not callable(slot_grammar):
             raise ValueError(f"slot_grammar must be callable, got {slot_grammar!r}")
         self.slot_grammar = slot_grammar
         self.held = _session is _SESSION       # ONLY `rotation_session` can hand over the token
         self.gen = 0
         self.targets: dict = {}
-        #: `missing` (no file yet) · `valid` (parsed clean) · `degraded` (parsed, but records were dropped
-        #: or repaired, so work may repeat) · `unusable` (present and not trustworthy at all). A driver must
-        #: be able to say which of those happened instead of reporting advancement over a prefix it
-        #: silently repeated.
+        #: `missing` · `valid` · `degraded` (records dropped or repaired, so work may repeat) · `unusable`.
+        #: A driver must say which, not report advancement over a prefix it silently repeated.
         self.state_status = "missing"
         self.state_reason = ""
         self._read()
@@ -364,9 +342,8 @@ class RotationProgress:
         if not isinstance(raw, dict):
             return None
         gen, at = cls._count(raw.get("gen")), cls._num(raw.get("at"))
-        # review v13b#1: generations START AT 1. `reserve()` refuses to allocate 0 and `complete()` refuses
-        # to accept it, so a PERSISTED 0 cannot have come from this map — and reading it as real made a
-        # never-run slot report CLEAN, which is the one direction a rotation must never fail in.
+        # generations START AT 1, so a persisted 0 cannot have come from this map. Reading it as real
+        # would make a never-run slot report CLEAN — the one direction a rotation must never fail in.
         if gen is None or gen < 1 or at is None:
             return None
         out = {"gen": gen, "at": at}
@@ -380,11 +357,10 @@ class RotationProgress:
 
     @classmethod
     def _parse(cls, text: str, *, lane: str, schema: int, slot_grammar=None) -> tuple:
-        """`(gen, targets)` from a state document, or a FRESH rotation when it cannot be trusted.
+        """Parse one persisted tuple, or None when it cannot be trusted.
 
-        A different lane or a different schema starts fresh rather than being reinterpreted: the schema
-        binds the bucket count, the hash and the record's meaning, so an old document is not the same
-        question asked earlier — it is a different question."""
+        NEVER raises, including on a caller-supplied grammar: unusable reads as "never happened", which
+        is the safe direction for a rotation."""
         try:
             doc = json.loads(text)
         except (ValueError, TypeError):
@@ -402,11 +378,11 @@ class RotationProgress:
         if gen is None or not isinstance(raw_targets, dict):
             return 0, {}, "unusable", "generation or targets malformed"
         targets: dict = {}
-        dropped = 0                                        # records we could not trust (review v12#5)
+        dropped = 0                                        # records we could not trust
         repaired = 0                                       # records we clamped back into consistency
         for name, raw_t in raw_targets.items():
-            # review v13b#2: the same identity rule the mutations enforce — an empty key is not a target,
-            # on the way in or the way out.
+            # the same identity rule the mutations enforce: an empty key is not a target, on the way
+            # in or the way out
             if not isinstance(name, str) or not name or not isinstance(raw_t, dict):
                 dropped += 1                               # a container we cannot read is not a target
                 continue
@@ -416,8 +392,8 @@ class RotationProgress:
                 dropped += 1
                 continue
             if seq > gen:
-                # review v12#3: a cursor AHEAD of the lane generation would keep this target at the back of
-                # the fairness order for as many lifecycles as the gap is wide. Clamp and say so.
+                # a cursor AHEAD of the lane generation keeps this target at the back of the fairness
+                # order for as many lifecycles as the gap is wide. Clamp, and say so.
                 seq, repaired = gen, repaired + 1
             slots: dict = {}
             for bucket, raw_s in raw_slots.items():
@@ -425,7 +401,7 @@ class RotationProgress:
                     dropped += 1
                     continue
                 if slot_grammar is not None:
-                    # `_parse` NEVER raises (review v11#1), and that promise now covers a caller-supplied
+                    # `_parse` NEVER raises, and that promise now covers a caller-supplied
                     # predicate: a grammar that blows up leaves the rotation unusable, not the read.
                     try:
                         usable = slot_grammar(bucket)
@@ -436,8 +412,8 @@ class RotationProgress:
                         continue
                 res = cls._tuple(raw_s.get("res"), with_content=False)
                 done = cls._tuple(raw_s.get("done"), with_content=True)
-                # a completion without its reservation, or one claiming to precede it, is not a record we
-                # can order — it reads as never-run, which is the SAFE direction for a rotation.
+                # a completion with no reservation, or one from a LATER generation than the reservation
+                # it claims, cannot be ordered — it reads as never-run, the safe direction.
                 if done is not None and (res is None or done["gen"] > res["gen"]):
                     done, dropped = None, dropped + 1
                 if res is not None and res["gen"] > gen:
@@ -449,15 +425,14 @@ class RotationProgress:
                     continue
                 slots[bucket] = {k: v for k, v in (("res", res), ("done", done)) if v is not None}
             highest = max([s["res"]["gen"] for s in slots.values() if "res" in s] or [0])
-            # v78: TARGET-level admission records — `adm` a refusal, `adm_ok` an admission that
-            # SUCCEEDED and supersedes it. They order (never claim execution) and are parsed fail-closed
-            # like everything else: unusable means "never happened", the safe direction.
+            # TARGET-level admission records: `adm` a refusal, `adm_ok` an admission that supersedes it. They
+            # order, never claim execution, and parse fail-closed.
             admission = {}
             for key in ("adm", "adm_ok"):
                 raw_adm = raw_t.get(key)
                 rec = cls._tuple(raw_adm, with_content=False)
                 if rec is None:
-                    # v79#2: a PRESENT but malformed record is a DROP, not an absence — the document is
+                    # a PRESENT but malformed record is a DROP, not an absence — the document is
                     # degraded and must say so.
                     if raw_adm is not None:
                         dropped += 1
@@ -466,7 +441,7 @@ class RotationProgress:
                     dropped += 1
                     continue
                 admission[key] = rec
-            # v79#2: the cursor covers every generation this target ORDERS by, admissions included.
+            # the cursor covers every generation this target ORDERS by, admissions included.
             highest = max([highest] + [r["gen"] for r in admission.values()])
             targets[name] = {"seq": max(seq, highest), "slots": slots, **admission}
         if dropped or repaired:
@@ -492,7 +467,7 @@ class RotationProgress:
         try:
             self.gen, self.targets, self.state_status, self.state_reason = self._parse(
                 text, lane=self.lane, schema=self.schema, slot_grammar=self.slot_grammar)
-        except Exception as e:                      # `_parse` must never raise (review v11#1)
+        except Exception as e:                      # `_parse` must never raise
             self.gen, self.targets = 0, {}
             self.state_status, self.state_reason = "unusable", f"unparseable ({type(e).__name__})"
 
@@ -502,7 +477,7 @@ class RotationProgress:
 
     def target_seq(self, target: str) -> int:
         """The reservation SEQUENCE this target was last selected at — the fairness cursor. A sequence, not
-        a clock: a backward jump in wall time must not reorder the rotation (v4#4)."""
+        a clock: a backward jump in wall time must not reorder the rotation."""
         return int(self.targets.get(target, {}).get("seq", 0))
 
     @staticmethod
@@ -514,7 +489,7 @@ class RotationProgress:
 
     @classmethod
     def _contains(cls, parent: str, child: str) -> bool:
-        """Containment is on the PARSED id, not on the string (v24#1). `177.0` contains `177.00`, whose id
+        """Containment is on the PARSED id, not on the string. `177.0` contains `177.00`, whose id
         does NOT begin with `177.0.` — the extension bits extend, they do not nest a second separator.
         Different roots are never related, so slot `70` is not a child of slot `7`."""
         proot, pbits = cls._parts(parent)
@@ -537,15 +512,8 @@ class RotationProgress:
     def _rank_record(self, target: str, bucket: str) -> tuple:
         """The record ORDER may be read from, and whether it is this slot's own.
 
-        A split replaces one slot with two children whose ids nothing has ever seen. Without this, every
-        split would send its subtree to the front of the rotation as never-run, ahead of slots that
-        genuinely never ran. So an absent id falls back to the nearest ANCESTOR (the slot that actually
-        covered these words), or — after a collapse, when only children exist — to the OLDEST descendant,
-        which is the conservative direction: it runs sooner, never later.
-
-        This is RANK ONLY (design v22#2). The returned record may supply `tier` and `slot_seq` and nothing
-        else: `reserve()` still allocates a generation for the exact id, and `complete()` still demands
-        that exact id's own reservation. An inherited record is never authority."""
+        An absent id inherits from the nearest ancestor, or after a collapse the oldest descendant.
+        RANK ONLY: `reserve()` and `complete()` still demand the exact id's own records."""
         own = self._slot(target, bucket)
         if own:
             return own, True
@@ -564,27 +532,19 @@ class RotationProgress:
         return int((rec.get("res") or {}).get("gen", 0))
 
     def tier(self, target: str, bucket: str, content: str) -> int:
-        """0 never ran (including reserved-then-crashed) · 1 DIRTY (membership changed since it ran) ·
-        2 clean · 3 REFUSED by the caller's admission check.
+        """0 never ran · 1 DIRTY (membership changed) · 2 clean · 3 REFUSED by admission.
 
-        v78: a refusal left the slot at tier 0, and tier dominates target fairness globally — so a
-        permanently refused target won every lifecycle and starved contactable dirty work for ever. The
-        refusal is a TARGET fact (nothing about the slot's membership changed), it ranks LAST, and it is
-        superseded the moment that slot really runs. A crash BEFORE admission stays never-run: only an
-        explicit refusal writes this."""
+        Tier dominates fairness globally, so a refusal must rank LAST — at tier 0 a permanently
+        refused target would win every lifecycle. A crash BEFORE admission stays never-run."""
         rec_t = self.targets.get(target, {}) or {}
         refused = rec_t.get("adm")
         if refused:
-            # v79#1: comparing only against THIS slot's completion left a stale refusal ranking a slot
-            # that did not exist when it happened. A later SUCCESSFUL admission is a target-level fact
-            # and supersedes it for every slot — and it is a generation-ordered tuple, so the merge
-            # cannot resurrect the older refusal.
+            # a later admission is a TARGET fact and supersedes a refusal for every slot, including ones that
+            # did not exist when it happened
             admitted = int((rec_t.get("adm_ok") or {}).get("gen", 0))
             done = (self._rank_record(target, bucket)[0] or {}).get("done") or {}
             if int(refused["gen"]) > max(admitted, int(done.get("gen", 0))):
-                # v80#1: a COOLDOWN, not an exclusion. While it holds the target ranks last; once the
-                # lane has moved on by `ADMISSION_COOLDOWN_GENS` it returns to its ordinary tier and is
-                # asked again — a transient refusal must not become a permanent membership cap.
+                # a COOLDOWN, not an exclusion: the target ranks last while it holds, then returns to its tier
                 if int(self.gen) - int(refused["gen"]) < ADMISSION_COOLDOWN_GENS:
                     return 3
         rec, own = self._rank_record(target, bucket)
@@ -592,10 +552,8 @@ class RotationProgress:
         if not done:
             return 0
         if not own:
-            # a CONSERVATIVE policy, not a proof: this record belongs to a containing or contained slot,
-            # and a one-sided split can legitimately hand a child exactly the parent's members and digest.
-            # Re-running a slot costs one invocation; certifying it clean on another slot's record would
-            # claim coverage nothing here ever produced.
+            # CONSERVATIVE: this record belongs to a containing or contained slot, so certifying clean on it
+            # would claim coverage nothing produced. Re-running costs one invocation.
             return 1
         return 1 if done.get("c") != content else 2
 
@@ -605,22 +563,20 @@ class RotationProgress:
         return self.gen
 
     def _key(self, target, bucket) -> tuple:
-        """Slot identity is EXACT (review v13#2). `reserve(7, True, …)` used to succeed and then come back
-        from JSON as target `"7"` and bucket `"true"` — the rotation history for a slot orphaned under a
-        key nothing will look up again."""
+        """Slot identity is EXACT: `reserve(7, True, …)` would come back from JSON as target `"7"` and
+        bucket `"true"`, orphaning that slot's history under a key nothing looks up again."""
         for name, value in (("target", target), ("bucket", bucket)):
             if isinstance(value, bool) or not isinstance(value, str) or not value:
                 raise ValueError(f"{name} must be a non-empty str, got {value!r}")
         if self.slot_grammar is not None and not self.slot_grammar(bucket):
-            # a MUTATION under a foreign id would persist a record the reader then drops (v25)
+            # a MUTATION under a foreign id would persist a record the reader then drops
             raise ValueError(f"slot id {bucket!r} does not belong to this lane's slot space")
         return target, bucket
 
     @classmethod
     def _checked(cls, *, at=None, members=None, content=None) -> tuple:
-        """Validate what a MUTATION is about to persist. review v12#2: these coerced instead of checking,
-        so a NaN timestamp, a negative one, `members=2.9` and `content=None` all reached the document —
-        and `json.dumps` then wrote a non-standard `NaN` token that nothing else can read back."""
+        """Validate what a MUTATION is about to persist. Checked, never coerced: a NaN timestamp reaches
+        the document as a token nothing can read back."""
         out = []
         if at is not None:
             v = cls._num(at)
@@ -639,11 +595,10 @@ class RotationProgress:
         return tuple(out)
 
     def reserve(self, target: str, bucket: str, *, at: float) -> int:
-        """Take the next generation and reserve this slot with it. Returns the generation.
+        """Take the next generation and reserve this slot with it -> the generation.
 
-        review v11#2: the caller used to PASS a generation, so a slot could hold gen 39 while the lane's own
-        counter was 0 — the monotonic authority behind ordering and merge, broken by one careless call.
-        Allocation belongs to the map."""
+        Allocation belongs to the map: a caller that passes one can leave a slot ahead of the lane's
+        own counter, breaking the ordering authority."""
         target, bucket = self._key(target, bucket)
         (when,) = self._checked(at=at)
         gen = self.next_gen()
@@ -653,11 +608,7 @@ class RotationProgress:
         return gen
 
     def refuse_target(self, target: str, *, at: float) -> int:
-        """Record that the caller's admission check REFUSED this target (v78).
-
-        It orders and nothing else: no slot is completed, nothing claims the tool ran, and the next
-        lifecycle still re-asks. What changes is the RANK — a refused target sits behind every target
-        with work that can actually be attempted, instead of holding the front of tier 0 for ever."""
+        """Record that admission REFUSED this target. Ordering only — it never claims execution."""
         if isinstance(target, bool) or not isinstance(target, str) or not target:
             raise ValueError(f"target must be a non-empty str, got {target!r}")
         (when,) = self._checked(at=at)
@@ -668,10 +619,7 @@ class RotationProgress:
         return gen
 
     def admit_target(self, target: str, *, at: float) -> int:
-        """Record that the caller's admission check ACCEPTED this target (v79#1).
-
-        The counterpart to `refuse_target`: a target-level fact that supersedes an older refusal for
-        every one of the target's slots, including ones that did not exist when it was refused."""
+        """Record that admission ACCEPTED this target, superseding any earlier refusal for every slot."""
         if isinstance(target, bool) or not isinstance(target, str) or not target:
             raise ValueError(f"target must be a non-empty str, got {target!r}")
         (when,) = self._checked(at=at)
@@ -687,7 +635,7 @@ class RotationProgress:
         when, n, digest = self._checked(at=at, members=members, content=content)
         if self._count(gen) is None or gen < 1:
             # generations start at 1, so 0 can only come from a caller that never reserved anything —
-            # and `held_gen` defaults to 0 too, which made the two match (review v13#1).
+            # and `held_gen` defaults to 0 too, which made the two match.
             raise ValueError(f"generation must be an exact positive int, got {gen!r}")
         slot = self._slot(target, bucket)
         if not slot.get("res"):
@@ -697,21 +645,15 @@ class RotationProgress:
             raise SchedulerInvariant(f"{self.lane}:{target}/{bucket}: reservation gen {held_gen} != {gen}")
         slot["done"] = {"gen": gen, "at": when, "c": digest, "n": n}
 
-    # ── BATCHED mutations: all-or-none, structurally (design v22#3). One invocation may cover several
-    #    slots, and a batch that half-applied would leave slots reserved against a run that never happened,
-    #    or completed against a reservation the rest of the batch never got. Every member is validated
-    #    BEFORE any generation is allocated, and every CAS is checked BEFORE any `done` tuple is written —
-    #    so an invariant discovered in the middle of a batch cannot leave half of it mutated. ──
+    # ── BATCHED mutations: all-or-none ────────────────────────────────────────────────────────────────
+    # Every member is validated before any generation is allocated, and every CAS is checked before any
+    # `done` is written, so an invariant found mid-batch cannot leave half of it applied.
     def reserve_batch(self, target: str, buckets, *, at: float) -> dict:
-        """Reserve several slots of ONE target under one clock reading. Returns {bucket: generation}.
+        """Reserve several slots of ONE target under one clock reading -> {bucket: generation}.
 
-        Raises before mutating anything if any id is unusable, repeated, or the timestamp is not a
-        timestamp. Generations are still per slot: batching is an execution fact, not a scheduling one.
-
-        The timestamp is a property of the BATCH, so it is validated once and even for an empty batch
-        (v29): a caller whose clock returned NaN has a broken clock whether or not there was work, and a
-        check that only fires when a member happens to exist is not a contract."""
-        (when,) = self._checked(at=at)     # the BATCH CLOCK first, in both primitives (v30)
+        Raises before mutating anything if an id is unusable or repeated, or the timestamp is not
+        one — validated even for an empty batch, since a broken clock is broken either way."""
+        (when,) = self._checked(at=at)     # the BATCH CLOCK first, in both primitives
         keys = []
         seen = set()
         for bucket in buckets:
@@ -730,12 +672,8 @@ class RotationProgress:
         return out
 
     def complete_batch(self, target: str, items, *, at: float) -> None:
-        """Record that several slots RAN, from `(bucket, gen, content, members)` items.
-
-        Every slot keeps its OWN reservation check and its own content digest — completion means the slot
-        was ATTEMPTED, and one result may attest several slots, but never one slot's record for another.
-
-        As in `reserve_batch`, the batch timestamp is validated once and even for an empty batch (v29)."""
+        """Complete several slots of one target. Every CAS is checked before any `done` is written, so an
+        invariant found mid-batch cannot leave half of it mutated."""
         (when,) = self._checked(at=at)
         checked = []
         seen = set()
@@ -760,7 +698,7 @@ class RotationProgress:
     @staticmethod
     def _merge_slot(mine: dict, theirs: dict) -> dict:
         """Newer GENERATION wins, per TUPLE, whole. Field-wise merging could assemble `at`, digest and
-        member count from three different runs (v5#3)."""
+        member count from three different runs."""
         out = dict(theirs)
         for key in ("res", "done"):
             m, o = mine.get(key), theirs.get(key)
@@ -778,16 +716,14 @@ class RotationProgress:
             return False
         fh = None
         if not self.held:
-            # Outside a session we serialise ourselves; inside one the lock is already held and a second
-            # acquisition would block against our own descriptor. The wait is BOUNDED and non-blocking at
-            # the syscall (the Shodan lesson: a `LOCK_EX` that blocks forever turns a best-effort write
-            # into a hang) — giving up answers False rather than writing unserialised.
+            # outside a session we serialise ourselves; inside one the lock is held. The wait is bounded and
+            # non-blocking: giving up answers False rather than hanging.
             fh = _acquire_bounded(self.path.parent / f"{self.lane}.lock")
             if fh is None:
                 return False
         try:
-            # review v12#1: ONLY absence means "there is nothing to merge with". A document we cannot read
-            # or parse must not be overwritten — that would silently destroy another lifecycle's rotation.
+            # ONLY absence means "nothing to merge with": a document we cannot read or parse must not
+            # be overwritten, or another lifecycle's rotation is destroyed silently
             try:
                 text = self.path.read_text(encoding="utf-8")
             except FileNotFoundError:
@@ -800,7 +736,7 @@ class RotationProgress:
                 try:
                     disk_gen, disk_targets, status, _why = self._parse(
                         text, lane=self.lane, schema=self.schema, slot_grammar=self.slot_grammar)
-                    # v26#1: without the grammar here, a foreign id dropped on LOAD came back through the
+                    # without the grammar here, a foreign id dropped on LOAD came back through the
                     # merge and was republished — to disk AND to `self.targets`, where it could rank.
                 except Exception:
                     return False                            # unparseable: leave the bytes alone
@@ -812,7 +748,7 @@ class RotationProgress:
             for name, mine in self.targets.items():
                 theirs = merged.setdefault(name, {"seq": 0, "slots": {}})
                 theirs["seq"] = max(int(theirs["seq"]), int(mine.get("seq", 0)))
-                for key in ("adm", "adm_ok"):       # newest admission record wins, whole (v78/v79#1)
+                for key in ("adm", "adm_ok"):       # newest admission record wins, whole
                     mine_adm, their_adm = mine.get(key), theirs.get(key)
                     if mine_adm and (not their_adm or int(mine_adm["gen"]) > int(their_adm["gen"])):
                         theirs[key] = mine_adm
@@ -841,12 +777,8 @@ class RotationProgress:
 def state_path(base, lane: str, config_fp: str):
     """The per-lane ledger path, namespaced by a COVERAGE-CONFIG fingerprint.
 
-    A per-item ledger cannot use the work_unit trick the chunked lanes use, and it must not skip an item
-    whose artifact was produced under a DIFFERENT coverage config (a changed wordlist, changed match codes):
-    that artifact still validates by digest and would be wrongly treated as done. Putting the config
-    fingerprint in the FILENAME means a config change starts a clean generation — no stale entries, and no
-    collision with the foreign-path guard (a same-path different-lane state is a different problem, and
-    `Ledger.foreign` must keep meaning exactly that)."""
+    An artifact produced under a different config still validates by digest, so the fingerprint in
+    the FILENAME starts a clean generation rather than letting it read as done."""
     return Path(base) / f"{lane.replace('.', '_')}.{config_fp[:12]}.state.json"
 
 
@@ -860,55 +792,29 @@ def prune_state(base, lane: str, keep_fp: str) -> None:
 
 
 class Ledger:
-    """A per-ITEM record of work already completed for a lane, so an interrupted or budget-bounded run
-    RESUMES instead of restarting — and so the remainder is a fact rather than a silent omission.
+    """A per-ITEM record of completed work, so an interrupted or bounded run RESUMES.
 
-    Deliberately NOT shaped like nuclei's chunk state, and the difference matters: nuclei keys its state on
-    a work_unit folding the whole host list, because its chunks are defined by that list. A fetch lane's
-    eligible set GROWS every run (more crawling => more JS URLs), so a work-unit-gated map would invalidate
-    on every growth and re-fetch everything. This ledger is keyed per ITEM, so a growing set simply leaves
-    the new items as remainder.
-
-    Only SUCCESSES are persisted. A failed fetch is NOT completed work: a transient 502 must be retried on
-    the next run, and since we cannot distinguish transient from permanent, retrying is the coverage-first
-    choice. Failures are still counted for THIS run's coverage.
-
-    Completed entries are CONTENT-BOUND (sha256): a recorded artifact that was truncated or edited on disk
-    is not trusted, the item is redone. Path validity is not content validity.
-
-    The ledger is the AUTHORITY on an item's artifact — callers must ask `artifact(item)` rather than
-    recomputing a path. review#4: when the caller derived its own destination and only checked that it
-    EXISTED, a state entry could bind item B to item A's (valid) artifact while B's own destination sat
-    stale or altered and got skipped with nothing verified. One lookup, one verification, one truth.
-
-    PERSISTENCE IS O(n) (review#5): each completion APPENDS one line to a journal; the compacted snapshot is
-    written once, atomically, at `save()`. Re-serializing the whole map every N records was quadratic —
-    151k items at a 25-record checkpoint would have serialized ~456M cumulative entries before the lane did
-    any real work. Load reads the snapshot then replays the journal, so a kill loses at most the partial last
-    line. Digest verification is CACHED PER ARTIFACT, not per item, so a body shared by 400 URLs is hashed
-    once instead of 400 times."""
+    Keyed per item, not per work unit: a fetch lane's eligible set grows every run, and a unit-gated
+    map would re-fetch everything. Only SUCCESSES persist — transient cannot be told from permanent."""
 
     def __init__(self, state_file: Path, *, lane: str):
         self.path = Path(state_file)
         self.journal = self.path.with_name(self.path.name + ".journal")
         self.lane = lane
         self.done: dict[str, str] = {}        # item -> COMPLETION artifact (relative to the state file's dir)
-        self.evid: dict[str, list] = {}       # item -> EVERY retained artifact, append-only (review#2 A1 r3)
+        self.evid: dict[str, list] = {}       # item -> EVERY retained artifact, append-only
         self.digests: dict[str, str] = {}     # relative artifact path -> sha256
         self._journal_unsafe = False          # set when the journal may not be APPENDED to
         self._journal_lost = False            # set when the journal can no longer be REPLAYED
         self.foreign = False                  # set when this PATH belongs to a DIFFERENT lane
-        #: items the snapshot RECORDED as done whose artifact no longer verifies (missing, altered, or
-        #: filed without a digest). They are correctly redone — the evidence really is gone — but for a
-        #: PAID lane "redo" means BUY AGAIN, and a repurchase that looks identical to a first purchase is
-        #: the accidental spend the ownership store exists to prevent. Kept as a fact so a caller can
-        #: report it; this class never decides what a lost item costs.
+        #: items recorded as done whose artifact no longer verifies. They are correctly redone — the
+        #: evidence really is gone — but for a PAID lane "redo" means BUY AGAIN, and a repurchase that
+        #: looks identical to a first purchase is the accidental spend the ownership store exists to
+        #: prevent. Kept as a fact for the caller; this class never decides what a lost item costs.
         self.lost: dict[str, str] = {}        # item -> the artifact path it was filed under ("" if none)
-        #: set when an ownership index EXISTS and cannot be trusted — unreadable, garbled, or shaped
-        #: wrong. ABSENT and UNUSABLE are different states and were previously the same empty dict: a
-        #: corrupt snapshot read as a clean store, so a PAID lane saw nothing owned and bought every page
-        #: again. That is the same laundering route as a lost artifact, one level up. The reason is kept
-        #: as prose because the caller has to be able to say WHY it refused.
+        #: set when an ownership index EXISTS and cannot be trusted. ABSENT and UNUSABLE are different
+        #: states: as one empty dict, a corrupt snapshot reads as a clean store and a PAID lane buys
+        #: every page again. The reason is prose because the caller has to say WHY it refused.
         self.unreadable: str = ""
         self._raw_evid: dict[str, list] = {}  # unvalidated evidence lists from the snapshot
         self._load()
@@ -934,10 +840,14 @@ class Ledger:
             raw = json.loads(self.path.read_text())
         except FileNotFoundError:
             return {}, {}                     # ABSENT: a first run must not be blocked
+        except UnicodeError as e:
+            # invalid bytes are UNUSABLE, not absent: raising here would take the lane down instead of
+            # refusing to trust a store it cannot read.
+            self.unreadable = f"state file is not valid text: {e}"
+            return {}, {}
         except OSError as e:
-            # a file we cannot READ is not a file that is not there. `Path.exists()` cannot make that
-            # call — it returns False for a path we lack permission to inspect, which would have cleared
-            # `unreadable` on exactly the permission failure it exists to catch (review#3).
+            # a file we cannot READ is not a file that is not there: `Path.exists()` returns False for a path we
+            # lack permission to inspect, which would clear `unreadable` on the very failure it exists to catch
             self.unreadable = f"state file unreadable: {e}"
             return {}, {}
         except json.JSONDecodeError as e:
@@ -947,8 +857,8 @@ class Ledger:
             self.unreadable = f"state root is {type(raw).__name__}, not an object"
             return {}, {}
         if raw.get("lane") != self.lane:
-            # review#3 (r5): a snapshot belonging to ANOTHER lane must not merely be ignored — save() would
-            # then overwrite it and destroy that lane's completions. Mark the path foreign and refuse to write.
+            # a snapshot belonging to ANOTHER lane is not merely ignored: save() would overwrite it and
+            # destroy that lane's completions, so the path is marked foreign and refuses writes
             self.foreign = True
             return {}, {}
         done, digests = raw.get("done"), raw.get("digests")
@@ -966,21 +876,17 @@ class Ledger:
     JOURNAL_SCHEMA = 1
 
     def _replay_journal(self, done: dict, digests: dict) -> None:
-        """Fold appended completions over the snapshot, then repair a damaged TAIL — but never mutate a
-        journal that is not ours.
+        """Fold appended completions over the snapshot, then repair a damaged TAIL of OUR OWN records.
 
-        review#4 (r3): every line carries its lane and schema, because the snapshot's lane guard was
-        bypassable through an uncompacted journal.
-
-        review#4 (r4): the repair itself was destructive. Foreign-lane lines were dropped from `kept` and the
-        journal was then rewritten without them — so lane B merely OPENING lane A's uncompacted journal
-        DELETED A's completions. A lane mismatch now means "this journal is not mine": no replay, no rewrite,
-        nothing touched. Only a torn/garbled tail of OUR OWN records is repaired, and if that repair fails we
-        refuse to append (an append onto a fragment corrupts the next record too)."""
+        A lane mismatch means "not mine": nothing is replayed and nothing is rewritten, or the other
+        lane's completions are deleted."""
         try:
             text = self.journal.read_text()
         except FileNotFoundError:
             return                                 # ABSENT: nothing was appended since the last compact
+        except UnicodeError as e:
+            self.unreadable = self.unreadable or f"journal is not valid text: {e}"
+            return
         except OSError as e:
             self.unreadable = self.unreadable or f"journal unreadable: {e}"
             return
@@ -1030,10 +936,7 @@ class Ledger:
             done[item] = rel
             digests[rel] = dig
         if damaged and self.unreadable:
-            # UNTRUSTED history is EVIDENCE. Rewriting it from `kept` deletes the very record that proved
-            # the store cannot be trusted, and a later run would then find a tidy journal and buy again
-            # (review#2). Nothing is appended either: the bytes stay exactly as they are until an operator
-            # decides what happened.
+            # UNTRUSTED history is EVIDENCE: rewriting it deletes the record that proved the store is broken
             self._journal_unsafe = True
         elif damaged:
             try:                                    # truncate to the intact prefix so the next append is clean
@@ -1067,19 +970,14 @@ class Ledger:
             if ok:
                 self.done[item] = rel
                 self.digests[rel] = want
-                # review#3 (A1 r4): a validated COMPLETION is always also evidence. Journal replay restores
-                # `done` but never touched `_raw_evid`, so a crash after journalling completion and before
-                # compaction resumed the item while replaying NOTHING — reproduced: has=True, evidence=[].
-                # Old snapshots written without an `evidence` field hit the same hole. Deriving it here fixes
-                # both, and every Ledger caller (vhost included) inherits the fix.
+                # a validated COMPLETION is also evidence: replay restores `done` but not the evidence map, so
+                # deriving it here covers a crash between journalling and compaction
                 self._raw_evid.setdefault(item, [])
                 if rel not in self._raw_evid[item]:
                     self._raw_evid[item].insert(0, rel)
             else:
                 self.lost[item] = rel          # recorded as done; the bytes do not match what we filed
-        # review#2 (A1 r3): retained EVIDENCE is digest-bound too. Replaying whatever matched a glob under
-        # attempt-*/ trusted mutable, unbound files — a tampered, planted or symlinked artifact could inject
-        # fabricated findings into normalized data. "Immutable" has to be VERIFIED, not assumed.
+        # retained EVIDENCE is digest-bound too, or a tampered artifact could inject fabricated findings
         for item, rels in self._raw_evid.items():
             keep = []
             for rel in rels:
@@ -1105,7 +1003,7 @@ class Ledger:
 
     def evidence(self, item: str) -> list:
         """Every VALIDATED retained artifact for this item, oldest first. Completion is separate: a historical
-        artifact contributes EVIDENCE only and can never decide whether the item is done (review#1 A1 r3)."""
+        artifact contributes EVIDENCE only and can never decide whether the item is done."""
         return [q for q in (self._safe_path(r) for r in self.evid.get(item, [])) if q is not None]
 
     def add_evidence(self, item: str, artifact: Path, *, digest: str | None = None) -> bool:
@@ -1146,14 +1044,9 @@ class Ledger:
     @property
     def durable(self) -> bool:
         """Whether completions recorded so far will SURVIVE this process — i.e. the journal is intact.
-        Independent of `save()`: a successful journal makes a run resumable even if compaction later
-        fails, because `_load` replays the journal.
 
-        review-B1.3r5#2: this read `_journal_unsafe`, which answers a DIFFERENT question — "may I append?"
-        `save()` sets that flag when the SNAPSHOT write fails, deliberately keeping the journal, so the
-        completions still replay on the next open. Measured: `save()=False`, journal present, completion
-        survives reopen — and durability nonetheless read False, producing a false persistence gap on
-        genuinely resumable work."""
+        Independent of `save()`: a journalled completion replays on the next open even if compaction
+        later fails."""
         return not self.foreign and not self._journal_lost
 
     def record(self, item: str, artifact: Path, *, digest: str | None = None) -> bool:
@@ -1168,20 +1061,19 @@ class Ledger:
         return self._append({"i": item, "r": rel, "d": dig})
 
     def checkpoint(self) -> bool:
-        """PROVE the journal is writable, without claiming anything. review-B1.3r5#3: `ledger_writable`
-        only reads flags, and the flags for an unwritable journal are only set BY a failed write — so a
-        paid caller had to spend one credit to discover it could not record the result. This appends a
-        no-op record that carries no state and is ignored on replay."""
+        """PROVE the journal is writable, without claiming anything.
+
+        The safety flags are only set BY a failed write, so a paid caller would spend a credit to
+        discover it cannot record the result."""
         return self._append({"k": "ckpt"})
 
     def _append(self, rec: dict) -> bool:
-        """True when the record is DURABLY journaled. review-B1.3r4: this swallowed OSError silently and
-        left both safety flags clear, so a caller could not tell an appended completion from one that
-        exists only in memory — and for PAID work that difference is money."""
+        """True when the record is DURABLY journaled. A swallowed error would leave a caller unable to
+        tell an appended completion from one that exists only in memory."""
         if self.foreign or self._journal_unsafe or self.unreadable:
-            # an UNTRUSTED store is read-only. Appending to it would build a healthy-looking history on
-            # top of one we already know is broken.
-            return False                       # never append onto a foreign or fragmented journal
+            # appending to a foreign, fragmented or untrusted journal builds a healthy-looking history
+            # on top of one we already know is broken
+            return False
         try:
             self.journal.parent.mkdir(parents=True, exist_ok=True)
             with self.journal.open("a", encoding="utf-8") as fh:
@@ -1189,9 +1081,8 @@ class Ledger:
             return True
         except OSError:
             self._journal_unsafe = True        # in-memory state is correct but NOT appendable
-            # APPENDABILITY and REPLAYABILITY differ here too: a torn tail is repaired to its intact
-            # prefix on load, so records that already returned True still replay. Only a journal we can
-            # no longer read is actually lost.
+            # APPENDABILITY and REPLAYABILITY differ here too: a torn tail is repaired to its intact prefix on
+            # load, so records that already returned True still replay. Only an unreadable journal is lost.
             try:
                 self._journal_lost = not self.journal.is_file()
             except OSError:
@@ -1199,22 +1090,14 @@ class Ledger:
             return False
 
     def save(self) -> bool:
-        """COMPACT: write the snapshot atomically (temp + os.replace), then drop the journal it supersedes.
-        A crash mid-write leaves the previous snapshot AND its journal intact, so nothing is lost.
+        """COMPACT: write the snapshot atomically, then drop the journal it supersedes.
 
-        Returns False without writing anything when the path is FOREIGN (review#3 r5) — overwriting another
-        lane's state would destroy its completions, and the caller reports the failure instead.
-
-        The same is true of an UNTRUSTED store, and for the same reason one level down: compaction would
-        write this run's empty maps over the corrupt snapshot, so the NEXT run would open a healthy,
-        empty ownership index and buy every page again — the original repurchase route, one lifecycle
-        later, with the evidence that should have blocked it destroyed on the way (review#1, Lumpy)."""
+        Refuses a FOREIGN path or an UNTRUSTED store: compaction would write empty maps over another
+        lane's completions, or over the only evidence that this store cannot be trusted."""
         if self.foreign or self.unreadable:
             return False
-        # review#3 (r7): the contract is "returns success, never raises". mkdir / write / os.replace can all
-        # fail on a full or read-only filesystem, and callers only handled a returned False — so a real IO
-        # failure bypassed the state_persisted gap entirely and could surface as an exception from the lane
-        # body instead, masking whatever the lane was actually doing.
+        # the contract is "returns success, never raises": mkdir, write and `os.replace` can all fail on a
+        # full or read-only filesystem, and a raised IO error would bypass the state_persisted gap entirely
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_name(self.path.name + ".tmp")
@@ -1224,8 +1107,8 @@ class Ledger:
         except OSError:
             self._journal_unsafe = True       # the snapshot is not authoritative; keep the journal
             return False
-        # review#3 (r5): append safety is restored ONLY if the damaged journal is actually gone. Clearing the
-        # flag on a journal we failed to remove sent the next record onto the fragment, where it vanished.
+        # append safety is restored ONLY if the damaged journal is actually gone: clearing the flag on
+        # one we failed to remove sends the next record onto the fragment, where it vanishes
         try:
             self.journal.unlink(missing_ok=True)
             self._journal_unsafe = self.journal.exists()
@@ -1235,13 +1118,12 @@ class Ledger:
 
 
 def _remainder_tail(omitted: int, durable: bool, unretriable: int) -> str:
-    """How to describe what was left. review v33: there were only two states — a RESUMABLE remainder or a
-    lane that RESTARTS — and neither is true of work no later run can reach at all (a slot no bound can
-    admit). Naming it resumable is a false promise in the opposite direction from the restart case."""
+    """How to describe what was left: a RESUMABLE remainder, a lane that RESTARTS, or work no later
+    run can reach at all. Calling the third resumable is a false promise."""
     if isinstance(unretriable, bool) or not isinstance(unretriable, int) or unretriable < 0:
         raise ValueError(f"unretriable must be an exact non-negative int, got {unretriable!r}")
     if unretriable > omitted:
-        # v34#2: clamping rewrote inconsistent accounting into a plausible sentence. More unretriable work
+        # clamping rewrote inconsistent accounting into a plausible sentence. More unretriable work
         # than there is remainder is a bug in the caller's arithmetic, and it must say so.
         raise ValueError(f"unretriable ({unretriable}) exceeds the remainder ({omitted})")
     resumable = omitted - unretriable
@@ -1253,8 +1135,7 @@ def _remainder_tail(omitted: int, durable: bool, unretriable: int) -> str:
              "policy change")
     if not resumable:
         return f"left {never}"
-    # v36: the mixed phrase was built by stripping "left " off the pure one, which turned the non-durable
-    # sentence into "3 over — completion state was NOT persisted". Both halves are written out instead.
+    # both halves are written out, never derived from each other
     carried = ("as a RESUMABLE remainder" if durable else
                "with NO persisted completion state (this lane RESTARTS from the beginning)")
     return f"left over: {resumable} {carried}, {unretriable} {never}"
@@ -1264,21 +1145,13 @@ def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, 
                      noun: str = "item", durable: bool = True, stop: str | None = None,
                      unit: str | None = None, cap_reason: str | None = None,
                      unretriable: int = 0, extra: str | None = None) -> None:
-    """SELECTION coverage: of everything eligible, how much did we get to at all?
-
-    Emitted EVERY run (omitted=0 when the whole set was processed) so a later unbounded rerun CLEARS a prior
-    gap. COVERAGE_CAP: a budget that stopped us short IS a hard ceiling that truncated eligible input, so it
-    must read as a gap whenever omitted > 0 — never as an operator-chosen SAMPLE, which would be a soft
-    limit and let the run still call itself complete."""
+    """Coverage for what a lane SELECTED to process, against its full eligible set."""
     omitted = max(0, eligible - attempted)
-    # `stop` names what ACTUALLY stopped us when it was not the budget — contention, a machinery failure, a
-    # missing dependency. Wording every omission as "budget exhausted" would misname those, and the KIND
-    # matters too: a budget is a CAP we chose, anything else is a TIMEOUT-class gap (step-4 design v4#3).
-    # v34#1: work nothing can schedule is a GAP whatever stopped us — an operator cap that also left
-    # unschedulable pairs behind is not a clean sample of the eligible set.
+    # `stop` names what ACTUALLY stopped us when it was not the budget: a budget is a CAP we chose,
+    # anything else is a TIMEOUT-class gap, and work nothing can schedule is a gap whatever stopped us
     kind = events.COVERAGE_TIMEOUT if (stop is not None or unretriable) else events.COVERAGE_CAP
     tail = _remainder_tail(omitted, durable, unretriable)
-    # v59#1: causes that ALSO applied but did not end the run — an operator cap alongside a clock that
+    # causes that ALSO applied but did not end the run — an operator cap alongside a clock that
     # fired, say. The head names what stopped us; these are named beside it rather than suppressed.
     also = f" (also: {extra})" if extra and omitted else ""
     if omitted and cap_reason is not None and stop is None:
@@ -1289,30 +1162,24 @@ def report_selection(lane: str, *, measure: str, eligible: int, attempted: int, 
         why = f"{stop}{also} — {attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
     elif omitted and unretriable == omitted:
         # nothing stopped us and the clock never ran out: the remainder is simply not schedulable, and
-        # blaming a budget that did not fire would misname it (v34#1).
+        # blaming a budget that did not fire would misname it.
         why = f"{attempted}/{eligible} {noun}(s) processed, {omitted} {tail}"
     elif omitted:
-        # review#4 (r7): only call the remainder RESUMABLE when the completion state was actually persisted.
-        # Otherwise the next run starts over, and "resumable" is a false promise.
+        # only RESUMABLE when the completion state actually persisted, or the next run starts over and
+        # "resumable" is a false promise
         why = (f"{noun} budget exhausted after {budget.elapsed()}s of {budget.seconds}s{also} — "
                f"{attempted}/{eligible} processed, {omitted} {tail}")
     else:
         why = f"{attempted}/{eligible} {noun}(s) processed (whole eligible set)"
-    # unit MUST be distinct per measure: reconciliation keeps the latest per (source_id, unit), so leaving
-    # it to default to the source_id would make the outcome report OVERWRITE the selection report and one of
-    # the two facts would silently vanish from the rollup.
+    # the unit MUST be distinct per measure: reconciliation keeps the latest per (source_id, unit), so a
+    # shared one would have the outcome report overwrite the selection report and lose a fact.
     events.coverage_partial(lane, kind=kind, measure=measure, unit=unit or measure,
                             eligible=eligible, tested=attempted, omitted=omitted, reason=why)
 
 
 def report_outcome(lane: str, *, measure: str, attempted: int, obtained: int, classes: dict | None = None,
                    noun: str = "item") -> None:
-    """OUTCOME coverage: of what we DID attempt, how much actually came back?
-
-    Separate from selection because the causes differ and so do the fixes: selection loss is ours (a budget),
-    outcome loss is the target's (a 403, a timeout, a body over the size guard). COVERAGE_TIMEOUT is the
-    lost-in-flight bucket. This measure was entirely invisible before — the OTC runs attempted 2000 JS URLs
-    and obtained 628 and then 1321, a 69%/34% failure rate nobody could see."""
+    """Coverage for what a lane OBTAINED from what it attempted — the target's losses, not ours."""
     lost = max(0, attempted - obtained)
     detail = f" {dict(sorted(classes.items()))}" if classes else ""
     why = (f"{obtained}/{attempted} attempted {noun}(s) obtained; {lost} failed in flight{detail}"

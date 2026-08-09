@@ -2860,7 +2860,7 @@ class TestTheProgressWriteIsSerialisedAndPrivate:
                             lambda path, **kw: (order.append("lock"), real_open(path, **kw))[1])
         monkeypatch.setattr(sh, "_release", lambda fh: (order.append("unlock"), real_release(fh))[1])
         monkeypatch.setattr(sh.os, "replace",
-                            lambda src, dst: (order.append("replace"), real_replace(src, dst))[1]
+                            lambda src, dst, **kw: (order.append("replace"), real_replace(src, dst, **kw))[1]
                             if str(dst).endswith("sweep.json") else real_replace(src, dst))
         p = sh.SweepProgress(sh.progress_path(tmp_path / "project"))
         p.note("1.1.1.1", 100.0)
@@ -2872,7 +2872,7 @@ class TestTheProgressWriteIsSerialisedAndPrivate:
         srcs = []
         real_replace = sh.os.replace
         monkeypatch.setattr(sh.os, "replace",
-                            lambda src, dst: (srcs.append(str(src)), real_replace(src, dst))[1])
+                            lambda src, dst, **kw: (srcs.append(str(src)), real_replace(src, dst, **kw))[1])
         path = sh.progress_path(tmp_path / "project")
         for when in (100.0, 200.0):
             p = sh.SweepProgress(path)
@@ -2932,8 +2932,8 @@ class TestTheLockHelperNeverSwallowsTheBody:
     def test_a_failing_REPLACE_is_a_False_save_not_an_exception(self, tmp_path, monkeypatch):
         real = sh.os.replace
         monkeypatch.setattr(sh.os, "replace",
-                            lambda src, dst: ((_ for _ in ()).throw(OSError("read-only filesystem"))
-                                              if str(dst).endswith("sweep.json") else real(src, dst)))
+                            lambda src, dst, **kw: ((_ for _ in ()).throw(OSError("read-only filesystem"))
+                                              if str(dst).endswith("sweep.json") else real(src, dst, **kw)))
         p = sh.SweepProgress(sh.progress_path(tmp_path / "project"))
         p.note("1.1.1.1", 100.0)
         assert p.save() is False
@@ -2956,8 +2956,8 @@ class TestTheLockHelperNeverSwallowsTheBody:
         # progress write, which is what this test is about.
         real = sh.os.replace
         monkeypatch.setattr(sh.os, "replace",
-                            lambda src, dst: ((_ for _ in ()).throw(OSError("read-only filesystem"))
-                                              if str(dst).endswith("sweep.json") else real(src, dst)))
+                            lambda src, dst, **kw: ((_ for _ in ()).throw(OSError("read-only filesystem"))
+                                              if str(dst).endswith("sweep.json") else real(src, dst, **kw)))
         prov = _Provider(records={"1.1.1.1": _body("1.1.1.1")})
         o = _run(tmp_path, [sh.IpTarget("1.1.1.1")], prov,
                  progress=sh.SweepProgress(sh.progress_path(tmp_path / "project")))
