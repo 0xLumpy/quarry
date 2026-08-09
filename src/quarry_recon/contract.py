@@ -195,7 +195,7 @@ def stream_to_file(r, dest, *, chunk: int = 1024 * 1024, deadline_s: float = 300
         raise
     except Exception as e:
         # the partial file stays: a request that half-arrived is evidence of what we got
-        raise IncompleteAcquisition(f"paid response incomplete after {written} byte(s): {e}",
+        raise IncompleteAcquisition(f"response incomplete after {written} byte(s): {e}",
                                     bytes_written=written, partial=part) from e
     _os.replace(part, dest)
     return written, digest.hexdigest()

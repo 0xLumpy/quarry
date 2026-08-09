@@ -852,7 +852,7 @@ class TestAcquisitionIsCommittedBeforeInterpretation:
     def test_an_INCOMPLETE_paid_response_refuses_an_automatic_retry(self, tmp_path):
         partial = b'{"total": 3, "matches": [{"hostna'
         first = self._lane(tmp_path, response=partial,
-                           err=("incomplete", "paid response incomplete after 33 byte(s)"))
+                           err=("incomplete", "response incomplete after 33 byte(s)"))
         assert first["issued"] == [1] and first["outcome"].pages_incomplete == 1
 
         acq = S.read_acquisition(self._fresh_ledger(first), first["pivot"], 1)

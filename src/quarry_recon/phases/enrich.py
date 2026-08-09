@@ -114,6 +114,7 @@ def _a1d_sweep(ctx, prof, kept, origins, execute, *, dependency_ok):
 
 
 def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
+    """Fold the sweep into the lane's reported facts. Fallible on purpose — the caller contains it."""
     # what the apex brute still OWES, for a supervisor (settle prerequisite B). Best effort: a report is
     # never a stop.
     try:
@@ -123,7 +124,6 @@ def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
             remainder.unknown("enrich.a1d_brute", why="the eligible set was never established")
     except Exception:                                        # noqa: BLE001
         pass
-    """Fold the sweep into the lane's reported facts. Fallible on purpose — the caller contains it."""
     # machinery is folded unchanged: unschedulable slots are their own structured fact, rendered once
     # from the counters below.
     if swept.machinery:
