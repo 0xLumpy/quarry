@@ -1,8 +1,8 @@
-"""Optional multi-channel run notifications — OPT-IN, OFF by default.
+"""Optional multi-channel run notifications — opt-in, off by default.
 
-Config lives in the 0600 `secrets.yaml` under `notify:` — a list of enabled events + per-channel
-targets. Nothing is sent unless the user configures both an event and a channel. Best-effort: a
-failed notification NEVER breaks a run. Messages are `secrets.redact()`'d before send.
+Config lives in the 0600 `secrets.yaml` under `notify:`. Nothing is sent unless both an event and a
+channel are configured. Best-effort: a failed notification never breaks a run, and messages are
+`secrets.redact()`'d before send.
 
     notify:
       events: [complete, error]          # opt in per event (default: none = off)
@@ -20,14 +20,11 @@ from . import secrets
 
 EVENTS = ("complete", "error", "lead")     # run finished · phase/tool error · promising lead
 
-#: how a run VERDICT is said to a human. `complete_with_gaps` is Quarry's internal vocabulary — it tells an
-#: operator nothing about what to do, and shipping internal tokens outward is how a tool teaches its user
-#: its own jargon instead of its state.
+#: how a run verdict is said to a human, so no internal token ships outward.
 VERDICT_WORDS = {"complete": "run completed",
                  "complete_with_limits": "run completed, with expected limits",
                  "complete_with_gaps": "run completed; coverage needs attention"}
-#: at most this many bullets per section, then a pointer at the manifest — a notification is a summons to
-#: the evidence, not the evidence.
+#: at most this many bullets per section, then a pointer at the manifest.
 _MAX_BULLETS = 5
 CHANNELS = ("slack", "discord", "telegram", "webhook")
 
@@ -50,7 +47,7 @@ def channels() -> dict:
 
 
 def configured() -> bool:
-    """True when at least one event AND one channel are set — otherwise notify is a no-op."""
+    """True when at least one event and one channel are set — otherwise notify is a no-op."""
     return bool(enabled_events() and channels())
 
 
@@ -77,8 +74,8 @@ def _send_channel(name: str, target, title: str, body: str) -> None:
 
 
 def send(event: str, title: str, body: str = "") -> int:
-    """Send `event` to every configured channel IF the user enabled that event. Returns the count of
-    channels notified. Best-effort — never raises. Secrets are redacted from the message first."""
+    """Send `event` to every configured channel that enabled it, redacted. Returns the count of channels
+    notified. Best-effort — never raises."""
     if event not in enabled_events():
         return 0
     title = secrets.redact(title) or ""
@@ -94,13 +91,10 @@ def send(event: str, title: str, body: str = "") -> int:
 
 
 def _bullets(summary: dict) -> tuple[list, list]:
-    """(needs_attention, expected_limits), from the manifest's OWN structured fields.
+    """(needs_attention, expected_limits), from the manifest's own structured fields.
 
-    Two categories, never merged: a failure or a coverage gap is something WRONG, while a provider's quota
-    or an operator's own budget is an expected boundary that nothing can retry. Conflating them is the
-    blame-shift the limit/gap taxonomy exists to prevent — and it is also what makes an operator ignore
-    the message, because everything looks equally alarming.
-    """
+    Two categories, never merged: a failure or coverage gap is something wrong, while a provider quota or
+    our own budget is an expected boundary nothing can retry."""
     fails, gaps = summary.get("failures") or [], summary.get("gaps") or []
     pexc = summary.get("phase_exceptions") or []
     attention: list = []
@@ -123,12 +117,7 @@ def _bullets(summary: dict) -> tuple[list, list]:
 
 def completion_message(*, target: str, run_id: str, summary: dict, totals: str = "",
                        leads: int = 0) -> tuple[str, str]:
-    """The ONE rendering of a finished run, shared by every outbound channel.
-
-    `notify` used to build its own sentence and send it TWICE — once as `complete`, once as `lead`, with an
-    identical body — which reads as a loop and says nothing the other message did not. One message, and
-    every future transport (messenger adapters) renders from here rather than inventing its own wording.
-    """
+    """(title, body) for a finished run — the one rendering every outbound transport shares."""
     verdict = summary.get("verdict", "")
     title = f"Quarry {target}: {VERDICT_WORDS.get(verdict, 'run finished')}"
     if leads:
@@ -147,11 +136,10 @@ def completion_message(*, target: str, run_id: str, summary: dict, totals: str =
 
 
 def send_completion(*, target: str, run_id: str, summary: dict, totals: str = "", leads: int = 0) -> int:
-    """Send ONE consolidated run-completion message, whichever of `complete`/`lead` is enabled.
+    """Send one consolidated run-completion message, whichever of `complete`/`lead` is enabled.
 
-    Both enabled -> one message carrying the lead headline. Only `lead` enabled -> the same message, sent
-    only when there ARE leads (that is what subscribing to leads alone means). Only `complete` -> always.
-    """
+    `complete` sends always and carries any lead headline; `lead` alone sends only when there are leads.
+    Returns the count of channels notified."""
     events = enabled_events()
     if "complete" in events:
         event = "complete"
@@ -165,8 +153,7 @@ def send_completion(*, target: str, run_id: str, summary: dict, totals: str = ""
 
 
 def send_test() -> int:
-    """Send a test message to every configured channel, bypassing event-gating (for `notify --test`
-    / doctor validation). Returns channels reached."""
+    """Send a test message to every configured channel, bypassing event-gating. Returns channels reached."""
     sent = 0
     for name, target in channels().items():
         try:

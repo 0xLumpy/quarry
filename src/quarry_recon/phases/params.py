@@ -1,9 +1,10 @@
-"""Phase 7: Params + lightweight scanning (deepened).
+"""Phase 7: params + lightweight scanning.
 
 gf vuln-class buckets over the URL corpus -> ranked candidate queues; arjun param
-discovery; non-intrusive nuclei with built-in interactsh OOB; dalfox XSS/open-redirect
-on reflected/redirect candidates. Scanner output is NEVER a finding without manual
-confirmation (design §7) — entities carry confirmed:false.
+discovery; non-intrusive nuclei with built-in interactsh OOB; dalfox reflected-XSS on
+reflected candidates and a native Location probe for open-redirect candidates (dalfox
+does not do redirect). Scanner output is stored as candidates (confirmed:false), never
+as confirmed findings.
 """
 from __future__ import annotations
 
@@ -29,15 +30,10 @@ GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", 
 
 
 def active_review_values(ctx, klass: str) -> list:
-    """Review rows an ACTIVE lane may act on: the expected `klass` AND `scope.active_allowed`.
+    """Review rows an active lane may act on: expected `klass` AND `scope.active_allowed`.
 
-    review-B1.5br1#2: every active consumer of `review` filtered on its own klass, and most also asked
-    `active_allowed` — but each did it inline, so the RoE guarantee was a convention repeated four times
-    rather than a rule. Off-scope evidence (`related-host`) is RETAINED IN FULL and must never reach a
-    lane that CONTACTS anything; that is what makes full retention passive. One helper, so a new active
-    lane cannot select rows generically and quietly widen the boundary.
-
-    Values are returned in store order; the caller still canonicalizes and guards its own targets."""
+    Off-scope evidence (`related-host`) is retained in full but must never reach a lane that contacts
+    anything. Values are returned in store order; the caller canonicalizes and guards its own targets."""
     out = []
     for r in ctx.run.read("review"):
         if r.get("klass") != klass:
@@ -49,11 +45,7 @@ def active_review_values(ctx, klass: str) -> list:
 
 
 def _arjun_base(url: str) -> "str | None":
-    """The scheme://host[:port]/path identity of an absolute HTTP(S) URL, or None if it is not one.
-
-    review#2 (A2): `"?" in line` is not a URL contract — `garbage?x=1` passed it and was ingested as a
-    discovered parameter. A row must be an absolute http(s) URL with a real host before anything downstream
-    treats it as one."""
+    """The scheme://host[:port]/path identity of an absolute HTTP(S) URL, or None if it is not one."""
     try:
         s = urlsplit(url.strip())
     except ValueError:
@@ -71,16 +63,11 @@ def _arjun_base(url: str) -> "str | None":
 
 
 def _arjun_rows(path, target: str) -> tuple:
-    """Parse an -oT artifact BOUND TO ITS TARGET -> (rows, malformed). `rows` is None when there is no file.
+    """Parse an -oT artifact bound to its target -> (rows, malformed). `rows` is None when there is no file.
 
-    Every row must be an absolute http(s) URL, carry a query, and resolve to the SAME base URL we asked
-    arjun to scan. review#2 (A2): without the target binding, an artifact naming a different host was
-    accepted verbatim and its 'parameters' were ingested against a target we never requested — evidence
-    laundering, and a scope escape if that host is out of scope.
-
-    A malformed non-blank row makes the artifact NON-COMPLETABLE (the caller must not journal the target
-    as done) while the rows that DO validate are still retained: partial corruption must not discard
-    trustworthy siblings."""
+    Every row must be an absolute http(s) URL, carry a query, and resolve to the same base URL arjun was
+    asked to scan. A malformed non-blank row makes the artifact non-completable (the caller must not
+    journal the target as done) while validated rows are still retained."""
     if path is None or not Path(path).exists():
         return None, 0
     try:
@@ -102,22 +89,15 @@ def _arjun_rows(path, target: str) -> tuple:
     return rows, malformed
 
 
-# ── arjun completion contract (probed against arjun 2.2.7, 2026-07-27) ────────────────────────────────
-# Measured, not inferred. `main()` returns None on every ordinary path, so the EXIT CODE is not an
-# execution oracle: a run whose every target was skipped still exits 0. Only arjun's own crash exits
-# nonzero — and it crashes on any target answering 400/413/418/429/503 (`initialize()` calls
-# `.status_code` on a dict) or on a transport error (`requester` returns `str(e)`, and the `type(...)
-# == str` guard sits two lines AFTER the attribute access). That traceback is unhandled, so in a BATCHED
-# invocation every remaining target is never scanned: measured 3 targets with a 429 second -> exit 1,
-# `Scanning 1/3` last, target 3 silently lost. Hence one target per process (below).
+# arjun's exit code is not an execution oracle: a run whose every target was skipped still exits 0, and
+# a batched run aborts every remaining target on the first crash. One target per process (see _arjun_lane).
 _ARJUN_SCHEMA = 1                      # parser+contract version; folded into the resume identity
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _AJ_SCAN_RE = re.compile(r"^\[\*\]\s+Scanning\s+\d+/\d+:\s+(\S+)")
 _AJ_SKIP_RE = re.compile(r"^\[-\]\s+Skipped\s+(\S+)\s+due to errors")
 _AJ_FOUND = "Parameters found:"
 _AJ_NONE = "No parameters were discovered."
-# arjun prints this, then `return []` — which main() reports with the ORDINARY no-parameters line. The
-# terminal line therefore LIES about a target it actually abandoned; treat it as a skip, never a clean zero.
+# arjun prints this then reports the ordinary no-parameters line; treat it as a skip, never a clean zero.
 _AJ_UNSTABLE = "Webpage is returning different content on each request. Skipping."
 
 
@@ -129,34 +109,27 @@ def _arjun_signals(text: str) -> dict:
             "found": [ln for ln in lines if _AJ_FOUND in ln],
             "none": [ln for ln in lines if _AJ_NONE in ln],
             "skipped": [ln for ln in lines if _AJ_SKIP_RE.match(ln)],
-            # the URL the skip line names, EXTRACTED — the caller binds it to the requested target, and
-            # passing the whole line to a URL parser silently yields "not a URL" for every skip.
-            "skipped_url": [m.group(1) for ln in lines if (m := _AJ_SKIP_RE.match(ln))],
+            "skipped_url": [m.group(1) for ln in lines if (m := _AJ_SKIP_RE.match(ln))],   # URL only
             "unstable": [ln for ln in lines if _AJ_UNSTABLE in ln]}
 
 
 def _arjun_verdict(exit_ok: bool, sig: dict, urls, *, target: str, malformed: int = 0) -> tuple:
-    """FAIL-CLOSED per-target classification -> (verdict, detail). `urls` is `_arjun_rows()[0]`: the
+    """Fail-closed per-target classification -> (verdict, detail). `urls` is `_arjun_rows()[0]`: the
     validated rows, or None when no -oT file exists.
 
-    Completion is claimed ONLY when the exit code, the stdout terminal line and the artifact state all
-    agree — AND all three are about the target we actually asked for. `Scanning i/N` proves a target was
-    ATTEMPTED, never that it completed, so it is a precondition here and not evidence of success.
-    Verdicts:
+    Completion is claimed only when the exit code, the stdout terminal line and the artifact state all
+    agree, and all three are about the requested target. Verdicts:
       success  -> complete, params found        · empty    -> complete, target genuinely has none
       skipped  -> degraded, retained, retryable · failed   -> nonzero exit; keep partial findings
-      unknown  -> missing / duplicate / contradictory / OFF-TARGET signals; never a clean zero"""
+      unknown  -> missing / duplicate / contradictory / off-target signals; never a clean zero"""
     n_scan = len(sig["scanned"])
     terminal = len(sig["found"]) + len(sig["none"]) + len(sig["skipped"])
     if not exit_ok:
-        # the traceback is the evidence; any -oT rows already exported stay valid (text_export appends
-        # per target as params are confirmed), so findings survive but the target is NEVER complete.
+        # any -oT rows already exported stay valid, so findings survive but the target is never complete
         return "failed", "arjun exited nonzero (crash) — findings retained, target not complete"
     if n_scan != 1:
         return "unknown", f"expected exactly 1 target attempt on stdout, saw {n_scan}"
-    # review#2 (A2): the stdout must be ABOUT the requested target. arjun prints the URL it was given
-    # (main() captures `url` before initialize() rewrites request['url']), so a mismatch means this
-    # output does not belong to this target and nothing in it may be attributed to it.
+    # the stdout must name the requested target, else nothing in it may be attributed to it
     want = _arjun_base(target)
     if want is None or _arjun_base(sig["scanned"][0]) != want:
         return "unknown", f"stdout reports scanning {sig['scanned'][0]!r}, not the requested target"
@@ -167,8 +140,7 @@ def _arjun_verdict(exit_ok: bool, sig: dict, urls, *, target: str, malformed: in
             return "unknown", "the skip line names a different target than the one requested"
         return "skipped", "arjun skipped the target due to errors"
     if malformed:
-        # partial corruption: the valid rows are still ingested by the caller, but an artifact we cannot
-        # fully account for must never be journaled as this target's finished work.
+        # valid rows are still ingested by the caller, but the target is not journaled as finished
         return "unknown", f"{malformed} malformed/off-target row(s) in the -oT artifact"
     if sig["none"]:
         if sig["unstable"]:
@@ -182,13 +154,11 @@ def _arjun_verdict(exit_ok: bool, sig: dict, urls, *, target: str, malformed: in
 
 
 def _arjun_manifest(dest: Path, url: str, verdict: str, channels: dict) -> tuple:
-    """Publish the completion MANIFEST binding every evidence channel of one attempt, -> (path, digest)
+    """Publish the completion manifest binding every evidence channel of one attempt -> (path, digest)
     or (None, None).
 
-    The manifest — not the -oT file — is the ledger's completion artifact, because an attempt has THREE
-    evidence channels (stdout, stderr/traceback, optional -oT) and completion must cover all of them.
-    Recording one channel while merely retaining the others would let a resume trust a verdict whose
-    proof had since been truncated or replaced."""
+    The manifest, not the -oT file, is the ledger's completion artifact: an attempt has three evidence
+    channels (stdout, stderr/traceback, optional -oT) and completion must cover all of them."""
     body = json.dumps({"schema": _ARJUN_SCHEMA, "url": url, "verdict": verdict,
                        "channels": dict(sorted(channels.items()))}, sort_keys=True).encode()
     dig = hashlib.sha256(body).hexdigest()
@@ -196,12 +166,11 @@ def _arjun_manifest(dest: Path, url: str, verdict: str, channels: dict) -> tuple
 
 
 def _arjun_channels(ledger, url: str) -> "dict | None":
-    """The validated channel paths for a COMPLETED target, or None when the attempt can no longer be
+    """The validated channel paths for a completed target, or None when the attempt can no longer be
     trusted and must be redone.
 
-    `Ledger.evidence()` returns only artifacts whose digest still matches, so requiring every channel the
-    manifest names to appear there is what stops a half-remembered attempt from being resumed: alter or
-    truncate any one channel and the whole completion is withdrawn, not silently narrowed."""
+    `Ledger.evidence()` returns only artifacts whose digest still matches; requiring every channel the
+    manifest names to appear there withdraws the whole completion if any one channel was altered."""
     man = ledger.artifact(url)
     if man is None:
         return None
@@ -230,19 +199,13 @@ def _arjun_channels(ledger, url: str) -> "dict | None":
 
 
 def _arjun_ingest(ctx, rows, params_path) -> int:
-    """Feed a target's VALIDATED -oT rows forward — provenance AND the param-bearing URL handed to dalfox
-    so a hidden reflected param actually gets XSS-tested (without this it was written to a file + dropped).
-
-    review#5 (A2): every entity carries `raw_ref` to the artifact the evidence actually came from, per
-    Quarry's traceability contract — a finding whose proof cannot be located is not reviewable."""
+    """Feed a target's validated -oT rows forward: provenance and the param-bearing URL handed to dalfox
+    so a hidden reflected param gets XSS-tested. Every entity carries `raw_ref` to its source artifact."""
     ref = str(params_path) if params_path is not None else None
     n = 0
     for u in rows or []:
         base, qs = u.split("?", 1)
-        # review#4 (A2): a truncated identity COLLIDES. Two long URLs sharing a 100-char prefix collapsed
-        # into one review, silently discarding a distinct finding. Bind the id to the whole URL — the FULL
-        # digest, so the identity matches what the comment claims (a 32-hex slice is 128-bit, not sha256).
-        uid = hashlib.sha256(u.encode()).hexdigest()
+        uid = hashlib.sha256(u.encode()).hexdigest()   # full digest: the id must not collide on a prefix
         ctx.run.add("url", {"url": u, "sources": ["arjun"], "raw_ref": ref})
         for pair in qs.split("&"):
             pname = pair.split("=", 1)[0]
@@ -256,13 +219,8 @@ def _arjun_ingest(ctx, rows, params_path) -> int:
 
 
 def _arjun_engine() -> str:
-    """The VERIFIED identity of the arjun binary that will ACTUALLY run (registry health), folded into the
-    resume work unit.
-
-    review#3 (A2): returning a stable "" when identity could not be established let a shadowed, drifted or
-    unidentifiable arjun resume another binary's completions — the exact hole `_dalfox_engine_id` already
-    closes. An unverified engine now yields a per-run NONCE, so that run is NON-resumable: re-scanning is a
-    safe superset, silently skipping targets we cannot prove ran on this binary is not."""
+    """The verified identity of the arjun binary that will actually run (registry health), folded into the
+    resume work unit. An unverified engine yields a per-run nonce, making that run non-resumable."""
     try:
         from ..registry import health, load_tools
         t = next((x for x in load_tools() if x.bin == "arjun"), None)
@@ -280,17 +238,12 @@ _AJ_STATUS = {"success": Status.SUCCESS, "empty": Status.EMPTY,
 
 
 def _arjun_rate_shares(rl: int, procs: int) -> list:
-    """Partition a GLOBAL lane rate `rl` (req/s) across `procs` concurrent arjun processes.
+    """Partition a global lane rate `rl` (req/s) across `procs` concurrent arjun processes.
 
-    review#1 (A2): `--rate-limit` is PER PROCESS. Handing every worker the full `rl` would multiply the
-    real rate at the target by the worker count — an RoE breach dressed as a rate cap. The shares are
-    integers summing to EXACTLY `rl`, and no process may be given 0 (arjun treats that as unlimited), so
-    a rate below the pool size reduces the POOL instead: concurrency yields to the rate, never the
-    reverse. `rl` falsy = no operator cap = no flag at all and the pool runs unthrottled.
-
-    review#1 (A2 r2): shares are returned LARGEST FIRST and slots are consumed in order, so a run that
-    never fills the pool still uses the biggest share available. `procs` must already be the EFFECTIVE
-    pool (see `_arjun_pool`) — partitioning across slots that cannot run strands the operator's rate."""
+    arjun's `--rate-limit` is per process. Shares are integers summing to exactly `rl` with no process
+    given 0 (arjun treats that as unlimited), so a rate below the pool size shrinks the pool instead.
+    `rl` falsy means no flag and the pool runs unthrottled. Shares are returned largest first and slots
+    consumed in order; `procs` must already be the effective pool (see `_arjun_pool`)."""
     if not rl:
         return [0] * max(1, procs)
     procs = max(1, min(procs, rl))
@@ -299,33 +252,29 @@ def _arjun_rate_shares(rl: int, procs: int) -> list:
 
 
 def _arjun_pool(configured: int, hosts: int, rl: int) -> int:
-    """The EFFECTIVE number of concurrent arjun processes.
-
-    review#1 (A2 r2): the pool was sized from config alone and the rate partitioned across it BEFORE
-    knowing how many slots could ever run. One eligible host with rate 7 and pool 5 produced shares
-    [2,2,1,1,1], ran strictly one at a time (one active target per host), and — taking the last slot
-    first — used 1 req/s of the 7 the operator permitted. Bound the pool by the work that actually
-    exists: at most one target per host means more slots than hosts are unusable by construction."""
+    """The effective number of concurrent arjun processes, bounded by the work that exists: at most one
+    active target per host means more slots than hosts are unusable, and a rate below the pool shrinks
+    it (see `_arjun_rate_shares`)."""
     n = max(1, min(configured, max(1, hosts)))
     return max(1, min(n, rl)) if rl else n
 
 
 def _arjun_exec(url: str, rate: int, threads: int, paths: tuple, timeout: int) -> dict:
-    """Run ONE arjun process for ONE target and return everything the parent needs to classify it.
+    """Run one arjun process for one target and return everything the parent needs to classify it.
 
-    Deliberately does NO ledger / event / store writes: those stay single-threaded in the parent, so the
-    append-only journal, the coverage generation and the entity store keep exactly the ordering guarantees
-    they were hardened for. A worker only produces facts."""
+    Does no ledger/event/store writes: those stay single-threaded in the parent so the append-only
+    journal, coverage generation and entity store keep their ordering guarantees. A worker only
+    produces facts."""
     out_f, std_f, err_f = paths
-    out_f.unlink(missing_ok=True)          # our OWN fresh attempt file; a stale -oT must not fake output
+    out_f.unlink(missing_ok=True)          # fresh attempt file; a stale -oT must not fake output
     cmd = ["arjun", "-u", url, "-oT", str(out_f), "-t", str(threads)]
     if rate:
-        cmd += ["--rate-limit", str(rate)]              # this process's SHARE of the global lane rate
+        cmd += ["--rate-limit", str(rate)]              # this process's share of the global lane rate
     r = exec_tool("arjun", cmd, raw_path=std_f, stderr_path=err_f, timeout=timeout)
     try:
         text = std_f.read_text(encoding="utf-8", errors="replace") if std_f.exists() else ""
     except OSError:
-        text = ""                          # unreadable stdout -> no signals -> unknown (fails CLOSED)
+        text = ""                          # unreadable stdout -> no signals -> unknown (fails closed)
     rows, malformed = _arjun_rows(out_f, url)
     verdict, detail = _arjun_verdict(r.exit_code == 0, _arjun_signals(text), rows,
                                      target=url, malformed=malformed)
@@ -334,11 +283,8 @@ def _arjun_exec(url: str, rate: int, threads: int, paths: tuple, timeout: int) -
 
 
 def _arjun_zero_lifecycle(ctx, why: str) -> None:
-    """Emit a COMPLETE zero-valued lifecycle, then record the skip.
-
-    review#6 (A2): the no-input exit simply returned, so on a resumed lifecycle a PRIOR run's arjun
-    coverage units stayed visible as current — the same defect the content/vhost lanes fixed by routing
-    EVERY exit through an explicit generation."""
+    """Emit a complete zero-valued lifecycle, then record the skip, so a resumed lifecycle does not leave
+    a prior run's arjun coverage units visible as current."""
     for m in ("api_endpoints", "endpoints_tested", "state_persisted"):
         events.coverage_partial("params.arjun", measure=m, unit=m, eligible=0, tested=0, omitted=0,
                                 reason=why)
@@ -346,19 +292,13 @@ def _arjun_zero_lifecycle(ctx, why: str) -> None:
 
 
 def _arjun_lane(ctx, prof, corpus) -> None:
-    """arjun param discovery, ONE TARGET PER PROCESS.
+    """arjun param discovery, one target per process.
 
-    A batched `-i` invocation cannot attribute completion per target, and arjun's unhandled `.status_code`
-    crash on a 400/413/418/429/503 (or any transport error) aborts every REMAINING target in the file —
-    measured: 3 targets, a 429 second, target 3 never scanned. Per-target isolation contains that to its
-    own target, makes each URL independently classifiable, and makes the remainder resumable. Overhead is
-    0.08 s interpreter start against a network-bound scan.
-
-    Targets run CONCURRENTLY in a bounded pool (`ARJUN_TARGETS`, default 5), one process per target and at
-    most one active target per HOST. review#1 (A2): isolation is about one process per target — forcing
-    those processes to run one at a time was false conservatism that bought nothing when no rate is
-    configured, and it contradicts Quarry's own rate-is-not-concurrency rule. When the operator DOES set
-    RATELIMIT.HTTP it is a GLOBAL lane limit, partitioned across the workers by `_arjun_rate_shares`."""
+    A batched `-i` invocation cannot attribute completion per target, and an arjun crash aborts every
+    remaining target in the file; per-target isolation contains that, makes each URL independently
+    classifiable, and makes the remainder resumable. Targets run concurrently in a bounded pool
+    (`ARJUN_TARGETS`, default 5), one process per target and at most one active target per host. A set
+    RATELIMIT.HTTP is a global lane limit, partitioned across the workers by `_arjun_rate_shares`."""
     api_all = sorted({u.split("?")[0] for u in corpus
                       if "?" not in u and any(s in u.lower() for s in
                       ("/api", "/rest", "/account", "/profile", "/search", "/user", "/order"))})
@@ -368,8 +308,7 @@ def _arjun_lane(ctx, prof, corpus) -> None:
         _arjun_zero_lifecycle(ctx, "no param-less API endpoints found")
         return
     if not have("arjun"):
-        # A1 invariant: an unavailable TOOL is COVERAGE_UNKNOWN, never a clean zero — we could not look,
-        # so 0/0 would assert these endpoints have no hidden parameters.
+        # an unavailable tool is COVERAGE_UNKNOWN, never a clean zero — we could not look
         ctx.run.record("params", skipped("arjun", "arjun not on PATH"))
         events.coverage_partial("params.arjun", kind=events.COVERAGE_UNKNOWN, measure="api_endpoints",
                                 unit="api_endpoints", eligible=len(api_all), tested=0, omitted=len(api_all),
@@ -387,9 +326,8 @@ def _arjun_lane(ctx, prof, corpus) -> None:
     attempt_dir = fresh_artifact_dir(state_base / "arjun" / cfg_fp[:16])
 
     def _rank(u):
-        """NEVER-ATTEMPTED work runs first. A target arjun skipped (or crashed on) is retried only after
-        every untouched endpoint, so a permanent 'not a webpage' skip cannot consume a finite budget on
-        every rerun and hide the remainder that was never looked at once."""
+        """Never-attempted work runs first; a target arjun skipped or crashed on is retried only after
+        every untouched endpoint, so a permanent skip cannot consume the budget and hide the remainder."""
         return 0 if (ledger.has(u) or not ledger.evidence(u)) else 1
 
     ordered = budget.order_ranked_fair(api_all, rank=_rank, group=normalize.host_of_url)
@@ -412,12 +350,13 @@ def _arjun_lane(ctx, prof, corpus) -> None:
         pending.append(u)
 
     # ── bounded concurrent pool over the remainder ──
-    # size the pool from the work that can ACTUALLY run concurrently (one target per host) BEFORE
-    # partitioning the rate, or the operator's budget is split across slots that will never open.
+
+    # size the pool from concurrent work (one target per host) before partitioning the rate, or the
+    # operator's budget is split across slots that never open
     n_hosts = len({normalize.host_of_url(u) for u in pending})
     procs = _arjun_pool(max(1, settings.concurrency("ARJUN_TARGETS", 5)), n_hosts, prof.http_rl)
     shares = _arjun_rate_shares(prof.http_rl, procs)
-    procs = len(shares)                      # a rate below the pool size SHRINKS the pool (never the rate)
+    procs = len(shares)                      # a rate below the pool size shrinks the pool, not the rate
     ctx.echo(f"  arjun: {len(api_all)} param-less API endpoint(s)"
              + (f", {resumed} resumed" if resumed else "")
              + f" · {procs} concurrent target(s)"
@@ -425,18 +364,14 @@ def _arjun_lane(ctx, prof, corpus) -> None:
              + (f" · budget {aj_budget.seconds}s" if not aj_budget.unbounded else ""))
 
     def _finish(res: dict) -> None:
-        """Parent-side, SINGLE-THREADED: ledger, events and store writes for one completed target."""
+        """Parent-side, single-threaded: ledger, events and store writes for one completed target."""
         nonlocal nfound
         u, r, verdict = res["url"], res["result"], res["verdict"]
         uid = hashlib.sha256(u.encode()).hexdigest()
         out_f, std_f, err_f = res["paths"]
         counts[verdict] += 1
-        # EVERY channel is bound as evidence BEFORE any completion claim, so a retained attempt can
-        # never be remembered by one channel while another goes unverified.
-        # review#2 (A2 r3): the digest is computed and CHECKED here rather than inside add_evidence.
-        # `events.file_digest` returns "" for an unreadable file instead of raising, so the channel was
-        # bound with an empty digest, the manifest still named it, `state_persisted` still read 1/1 — and
-        # the next load rejected the unhashed channel and silently redid the target.
+        # every channel is bound as evidence before any completion claim, and the digest is checked here:
+        # an unhashable channel must not be named by the manifest and then rejected on the next load.
         channels, channels_ok = {}, True
         for name, p in (("stdout", std_f), ("stderr", err_f), ("params", out_f)):
             if not p.exists():
@@ -450,10 +385,8 @@ def _arjun_lane(ctx, prof, corpus) -> None:
         if verdict != "failed":
             r.status = _AJ_STATUS[verdict]
         elif r.status in (Status.SUCCESS, Status.EMPTY, Status.PARTIAL):
-            # a NONZERO exit is never a clean or merely-degraded status. The generic classifier reads
-            # arjun's traceback as a transport hiccup and returns PARTIAL, which understates a crash
-            # that ended the process. Only a MORE specific hard status (TIMED_OUT / BLOCKED / SKIPPED)
-            # survives — hardening the verdict, never laundering it.
+            # a nonzero exit is never clean or merely-degraded; only a more specific hard status
+            # (TIMED_OUT / BLOCKED / SKIPPED) survives, so a crash is not understated as PARTIAL
             r.status = Status.FAILED
         r.note = f"arjun[{verdict}] {normalize.host_of_url(u)}: {res['detail']}"
         ctx.run.record("params", r)
@@ -469,13 +402,11 @@ def _arjun_lane(ctx, prof, corpus) -> None:
             if man is not None:
                 ledger.record(u, man, digest=dig)
             else:
-                # review#4 (A2 r2): the manifest (or a channel digest) could not be published, so this
-                # TRUSTED completion is not durable — the target will be redone. ledger.save() knows
-                # nothing about that, so without this counter `state_persisted` still reported 1/1 and
-                # the operator read a resumable lane that will silently repeat work.
+                # the manifest or a channel digest could not be published, so this completion is not
+                # durable and the target will be redone; ledger.save() cannot see that on its own
                 unpublished.append(u)
-        # rows that VALIDATED are ingested even from a non-completable attempt: partial corruption must
-        # not discard trustworthy siblings, and a crashed target's exported params are real evidence.
+        # validated rows are ingested even from a non-completable attempt: a crashed target's exported
+        # params are real evidence, and partial corruption must not discard trustworthy siblings
         nfound += _arjun_ingest(ctx, res["rows"], out_f if out_f.exists() else None)
 
     def _paths(u: str) -> tuple:
@@ -487,28 +418,24 @@ def _arjun_lane(ctx, prof, corpus) -> None:
     busy_hosts: set = set()
     free = list(range(procs))
     runner_reset_cancel()                    # a previous lane's latch must not cancel this one
-    # review#2 (A2 r2): KeyboardInterrupt is delivered to the MAIN thread only. A tool running inside a
-    # worker never reaches runner.run()'s interrupt branch, so its process keeps going and the pool's
-    # __exit__ waits for it — unbounded under `timeout 0`. On Ctrl-C we stop submitting, reach into the
-    # workers via the runner's live-process registry to tear every group down, let the futures unwind,
-    # then RE-RAISE. future.cancel() alone cannot stop an already-running subprocess.
+    # KeyboardInterrupt reaches only the main thread, so a tool inside a worker keeps running: on Ctrl-C
+    # stop submitting, tear the groups down via the runner's registry, then re-raise
     interrupted = False
-    # review#1 (A2 r3): NOT a `with` block. ThreadPoolExecutor.__exit__ is shutdown(wait=True), so leaving
-    # the block after a cancellation re-blocks on any worker that did not unwind — the exact unbounded wait
-    # the handler exists to avoid. Shutdown is explicit on each path instead.
+    # not a `with` block: ThreadPoolExecutor.__exit__ is shutdown(wait=True), which would re-block on any
+    # worker that did not unwind after a cancellation. Shutdown is explicit on each path instead.
     pool = ThreadPoolExecutor(max_workers=procs)
     try:
         while True:
-            # SUBMIT: fill free slots with the first queued target whose host is not already active, so a
-            # host with many endpoints never gets several concurrent processes pointed at it.
+            # fill free slots with the first queued target whose host is not already active, so a host
+            # with many endpoints never gets several concurrent processes pointed at it
             while free and not aj_budget.exhausted():
                 pick = next((i for i, u in enumerate(queue)
                              if normalize.host_of_url(u) not in busy_hosts), None)
                 if pick is None:
                     break                    # every remaining target belongs to a currently-active host
                 u = queue.pop(pick)
-                # take the LOWEST free slot: shares are largest-first, so a partly-filled pool still runs
-                # at the biggest rate available instead of stranding it on an unused slot.
+                # lowest free slot first: shares are largest-first, so a partly-filled pool runs at the
+                # biggest rate available instead of stranding it on an unused slot
                 host, slot = normalize.host_of_url(u), free.pop(0)
                 busy_hosts.add(host)
                 attempted += 1
@@ -516,7 +443,7 @@ def _arjun_lane(ctx, prof, corpus) -> None:
                                    ctx.http_timeout)] = (u, host, slot)
             if not active:
                 break                        # nothing running and nothing submittable -> done
-            # the budget stops LAUNCHING new work; targets already in flight always finish.
+            # the budget stops launching new work; targets already in flight always finish
             done, _ = wait(list(active), return_when=FIRST_COMPLETED)
             for fut in done:
                 u, host, slot = active.pop(fut)
@@ -524,7 +451,7 @@ def _arjun_lane(ctx, prof, corpus) -> None:
                 insort(free, slot)               # keep slots ordered so the largest share is reused first
                 try:
                     _finish(fut.result())
-                except Exception as exc:     # a worker crash is OUR failure, not a target verdict
+                except Exception as exc:     # a worker crash is our failure, not a target verdict
                     counts["unknown"] += 1
                     events.coverage_partial("params.arjun", kind=events.COVERAGE_UNKNOWN,
                                             measure="target",
@@ -533,10 +460,8 @@ def _arjun_lane(ctx, prof, corpus) -> None:
                                             reason=f"{u}: worker failed — {type(exc).__name__}: {exc}")
     except KeyboardInterrupt:
         interrupted = True
-        # 1) HARVEST FIRST. A target that finished just before the interrupt has EARNED its completion;
-        #    killing without harvesting threw it away and the resume repeated that whole scan. Only
-        #    futures already done at THIS instant are harvested — anything completing later raced the
-        #    kill and is reported as cancelled, never as a measured verdict.
+        # 1) harvest first: a target that finished just before the interrupt keeps its completion. Only
+        #    futures already done at this instant qualify; anything later is reported as cancelled.
         for fut in [f for f in list(active) if f.done()]:
             u, _host, _slot = active.pop(fut)
             try:
@@ -547,15 +472,13 @@ def _arjun_lane(ctx, prof, corpus) -> None:
                                         unit=f"target:{hashlib.sha256(u.encode()).hexdigest()[:16]}",
                                         eligible=1, tested=0, omitted=1,
                                         reason=f"{u}: worker failed — {type(exc).__name__}: {exc}")
-        # 2) then tear down what is still running (ONE shared grace deadline across every group).
+        # 2) tear down what is still running (one shared grace deadline across every group)
         killed = runner_cancel_all()
         for fut in list(active):
-            fut.cancel()                     # only drops NOT-YET-STARTED work; the kill handles the rest
+            fut.cancel()                     # only drops not-yet-started work; the kill handles the rest
         wait(list(active), timeout=30)       # bounded: the groups are already dead
-        # 3) HARVEST AGAIN. review#2 (A2 r4): a target that finished naturally BETWEEN the snapshot in (1)
-        #    and process termination was previously declared unmeasured, throwing away a verdict — and its
-        #    evidence — that had actually been reached. Harvesting is safe for killed runs too: completion
-        #    demands the exit code, terminal line and artifact to AGREE, which a truncated kill cannot fake.
+        # 3) harvest again: a target that finished naturally between (1) and process termination still
+        #    has a real verdict. Safe for killed runs — completion demands three signals a kill can't fake.
         for fut in [f for f in list(active) if f.done() and not f.cancelled()]:
             u, _host, _slot = active.pop(fut)
             try:
@@ -566,8 +489,8 @@ def _arjun_lane(ctx, prof, corpus) -> None:
                                         unit=f"target:{hashlib.sha256(u.encode()).hexdigest()[:16]}",
                                         eligible=1, tested=0, omitted=1,
                                         reason=f"{u}: worker failed — {type(exc).__name__}: {exc}")
-        # 4) only what is still UNRESOLVED (or was cancelled before it ran) is unmeasured — looked at but
-        #    never judged. An honest gap, not a clean zero, and absent from the ledger so a resume retries.
+        # 4) only what is still unresolved (or cancelled before it ran) is unmeasured: an honest gap,
+        #    absent from the ledger so a resume retries it
         for _fut, (u, _h, _s) in list(active.items()):
             counts["unknown"] += 1
             events.coverage_partial("params.arjun", kind=events.COVERAGE_UNKNOWN, measure="target",
@@ -577,11 +500,11 @@ def _arjun_lane(ctx, prof, corpus) -> None:
         ctx.echo(f"    params.arjun: cancelled — terminated {killed} running arjun process(es), "
                  f"{len(active)} target(s) left unmeasured")
     finally:
-        # NEVER wait on workers here: on the interrupt path their processes are already dead, and on every
-        # other path the loop only exits once `active` is empty.
+        # never wait on workers here: on the interrupt path their processes are already dead, and on
+        # every other path the loop only exits once `active` is empty
         pool.shutdown(wait=False, cancel_futures=True)
-    # DURABILITY is the conjunction: the state file was written AND every trusted completion actually
-    # published its evidence. Either failure means a resume redoes work, so both must reach the verdict.
+    # durability is the conjunction: the state file was written and every trusted completion published
+    # its evidence. Either failure means a resume redoes work, so both must reach the verdict.
     saved = ledger.save()
     persisted = saved and not unpublished
     if not persisted:
@@ -595,10 +518,10 @@ def _arjun_lane(ctx, prof, corpus) -> None:
                                     (f"{len(unpublished)} completed target(s) could not publish their "
                                      "evidence manifest; those targets WILL be redone" if unpublished else
                                      "completion state could not be persisted; a resume will redo this lane")))
-    # SELECTION: of every eligible endpoint, how many did we get to at all? (the old ARJUN_CAP lived here)
+    # selection: of every eligible endpoint, how many did we get to at all?
     budget.report_selection("params.arjun", measure="api_endpoints", eligible=len(api_all),
                             attempted=attempted, budget=aj_budget, noun="endpoint", durable=persisted)
-    # OUTCOME: of those attempted, how many reached a TRUSTED terminal state?
+    # outcome: of those attempted, how many reached a trusted terminal state?
     budget.report_outcome("params.arjun", measure="endpoints_tested", attempted=attempted,
                           obtained=counts["success"] + counts["empty"] + resumed,
                           classes={k: v for k, v in (("skipped", counts["skipped"]),
@@ -612,16 +535,15 @@ def _arjun_lane(ctx, prof, corpus) -> None:
              + (f" · {left} left by budget — {'resumable' if persisted else 'NOT saved, will restart'}"
                 if left else ""))
     if interrupted:
-        # coverage and completion state for the work that DID finish are now recorded; only then does the
-        # cancellation propagate, so a Ctrl-C costs the operator nothing already earned.
+        # coverage and completion state for the finished work are recorded before the cancellation
+        # propagates, so a Ctrl-C costs the operator nothing already earned
         raise KeyboardInterrupt
 
 
 def _apply_nuclei_oob(cmd: list[str]) -> list[str]:
-    """Append self-hosted interactsh flags to a nuclei command (else nuclei's built-in public
-    server). Shared by EVERY nuclei invocation so they all use the same OOB endpoint — no drift
-    where one nuclei call silently uses the public server. `secrets.oob()` is the single source of
-    truth for OOB config (future OOB consumers read it too)."""
+    """Append self-hosted interactsh flags to a nuclei command (else nuclei's built-in public server).
+    Shared by every nuclei invocation so they all use the same OOB endpoint. `secrets.oob()` is the
+    single source of truth for OOB config."""
     oob = secrets.oob()
     if oob.get("callback_server"):
         cmd += ["-iserver", str(oob["callback_server"])]
@@ -631,10 +553,9 @@ def _apply_nuclei_oob(cmd: list[str]) -> list[str]:
 
 
 def _chunk_terminal(sid, chunk_wu, res, cf, *, status) -> None:
-    """review#1: emit a chunk's TERMINAL event from a finally so a chunk NEVER stays 'started'. `status` is the
-    chunk OUTCOME the caller promotes to the tool's status ONLY after ALL per-chunk bookkeeping (logging, state
-    save, artifact parse, run.add) succeeded — it stays FAILED when execution OR any post-execution step raised,
-    so a chunk whose processing was incomplete is never recorded SUCCESS."""
+    """Emit a chunk's terminal event from a finally so a chunk never stays 'started'. `status` is the
+    chunk outcome, which the caller promotes only after all per-chunk bookkeeping succeeded; it stays
+    FAILED when execution or any post-execution step raised."""
     reason = None
     if status == Status.FAILED.value:
         reason = (res.note if (res and res.note) else "chunk raised before completing bookkeeping")
@@ -646,13 +567,11 @@ def _chunk_terminal(sid, chunk_wu, res, cf, *, status) -> None:
 
 
 def _nuclei_templates_fp() -> str | None:
-    """review#6/#10: a coverage-affecting fingerprint of the INSTALLED nuclei template set, so a templates
-    update (new/changed detections) invalidates the resume work_unit — else C10b would skip a chunk that a
-    fresh template set would now flag differently. nuclei records its templates state in its config dir; read
-    it (honoring NUCLEI_CONFIG / XDG / ~/.config) and fold the COMPLETE effective state — version AND the
-    ignore-hash (a changed .nuclei-ignore alters which templates run even at the same version). Returns a
-    stable JSON string of every present field, or None when the state cannot be read (the caller then makes
-    the unit NON-RESUMABLE — an unknown template set must never be treated as unchanged)."""
+    """A coverage-affecting fingerprint of the installed nuclei template set, so a templates update
+    invalidates the resume work_unit. Reads nuclei's config dir (honoring NUCLEI_CONFIG / XDG / ~/.config)
+    and folds version and the ignore-hash (a changed .nuclei-ignore alters which templates run at the same
+    version). Returns a stable JSON string, or None when the state cannot be read (caller makes the unit
+    non-resumable — an unknown template set must not be treated as unchanged)."""
     base = (os.environ.get("NUCLEI_CONFIG")
             or os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "nuclei"))
     cfg = Path(base) / ".templates-config.json"
@@ -666,46 +585,34 @@ def _nuclei_templates_fp() -> str | None:
     return json.dumps(parts, sort_keys=True) if parts else None
 
 
-_NUCLEI_MHE_DEFAULT = 0        # FULL DEPTH (-nmhe). nuclei's own default is 30, which SILENTLY drops a host
-_NUCLEI_MHE_MAX = 100_000      # after 30 request errors — on the OTC run that cost 459,930 unsent requests.
+_NUCLEI_MHE_DEFAULT = 0        # full depth (-nmhe); nuclei's own default of 30 drops a host after 30
+_NUCLEI_MHE_MAX = 100_000      # request errors
 _ANSI_RX = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def _nuclei_mhe() -> int:
-    """`PERFORMANCE.NUCLEI_MAX_HOST_ERROR` — errors tolerated per host before nuclei SKIPS it (`-mhe`).
-    Quarry's 0 means FULL DEPTH: no host is ever dropped for erroring (`-nmhe`), and that is the DEFAULT.
-    Quarry is coverage-first — a host that errors is exactly the kind of host worth finishing, and nuclei's
-    own default of 30 quietly turns a flaky target into an unscanned one. A nonzero value is an EXPLICITLY
-    bounded coverage policy the operator opted into, never Quarry's normal behaviour.
+    """`PERFORMANCE.NUCLEI_MAX_HOST_ERROR`: errors tolerated per host before nuclei skips it (`-mhe`).
+    0 is the default and means full depth (`-nmhe`) — no host is dropped for erroring. A nonzero value
+    is a bounded coverage policy the operator opted into.
 
-    This is a COVERAGE policy, not a runtime knob — it decides which hosts get scanned at all, so it is
-    folded into the resume fingerprint and a change re-scans rather than silently resuming a shallower
-    generation. (It does cost wall-clock: the requests `-mhe` was suppressing now actually go out.)
-
-    STRICT parse via the shared coverage-knob parser (settings.strict_int): an exact int (never a bool) or
-    a clean int-string in 0.._NUCLEI_MHE_MAX; anything else — bool, float, negative, oversized, garbage —
-    falls back to the default rather than inventing a policy from a typo."""
+    This is a coverage policy, not a runtime knob: it is folded into the resume fingerprint so a change
+    re-scans rather than resuming a shallower generation. Strict parse via settings.strict_int (an exact
+    int in 0.._NUCLEI_MHE_MAX, never a bool); anything else falls back to the default."""
     return settings.strict_int("NUCLEI_MAX_HOST_ERROR",
                                default=_NUCLEI_MHE_DEFAULT, maximum=_NUCLEI_MHE_MAX)
 
 
 def _nuclei_progress(text: str) -> dict:
-    """Read nuclei's OWN stderr for what only nuclei can tell us (the OTC 20260725 lesson: a generic stderr
-    signature conflates execution with coverage and gets BOTH wrong).
+    """Read nuclei's own stderr for what only nuclei can tell us.
 
-      1. `planned` / `requests` / `errors` — how much of the planned request budget it actually COVERED, from
-         the LAST `-stats` line. This is the ONLY coverage oracle; absent, coverage is UNKNOWN. nuclei skips a
-         host after `-mhe` errors, so a finished scan can still leave requests unsent — a COVERAGE gap, never
-         an execution one.
-      2. `completed` — whether nuclei's own terminal line `Scan completed in <dur>.` (with either
-         `N matches found.` or `No results found.`) was recognized. review#P1.4: this is CORROBORATING
-         TELEMETRY ONLY. It must never gate resumability — execution completion is `exit_code == 0`, full stop.
-         Requiring this sentence meant a nuclei release that reworded only its terminal (while keeping the stats
-         JSON) would mark every chunk retryable forever.
+      1. `planned` / `requests` / `errors` — the planned request budget actually covered, from the last
+         `-stats` line. This is the only coverage oracle; absent, coverage is unknown. A finished scan can
+         still leave requests unsent (host skipped after `-mhe` errors) — a coverage gap, not an execution one.
+      2. `completed` — whether nuclei's terminal line `Scan completed in <dur>.` was recognized. This is
+         corroborating telemetry only; it must never gate resumability (execution completion is exit_code == 0).
 
-    stderr is ANSI-coloured, so strip escapes before matching. Counters are returned RAW (not clamped): an
-    impossible triple must reach events.coverage_partial's validator and surface as coverage UNKNOWN rather
-    than be quietly repaired into a plausible-looking lie."""
+    stderr is ANSI-coloured, so strip escapes before matching. Counters are returned raw (not clamped): an
+    impossible triple must reach events.coverage_partial's validator and surface as coverage unknown."""
     completed, planned, requests, errors = False, None, None, None
     for line in (text or "").splitlines():
         s = _ANSI_RX.sub("", line).strip()
@@ -722,7 +629,7 @@ def _nuclei_progress(text: str) -> dict:
             continue
         if not (isinstance(d, dict) and "requests" in d and "total" in d):
             continue
-        try:                                       # nuclei emits these as STRINGS; last valid line wins
+        try:                                       # nuclei emits these as strings; last valid line wins
             planned, requests = int(d["total"]), int(d["requests"])
             errors = int(d["errors"]) if str(d.get("errors", "")).lstrip("-").isdigit() else None
         except (TypeError, ValueError):
@@ -731,13 +638,13 @@ def _nuclei_progress(text: str) -> dict:
 
 
 def _nuclei_cmd(targets_file, out_file, prof, mhe: int) -> list[str]:
-    """The nuclei main-scan command for one target file — identical flags for every chunk, only -l/-o
+    """The nuclei main-scan command for one target file; identical flags for every chunk, only -l/-o
     differ (non-intrusive, severity-scoped, governor-scaled -c/-bs, explicit host-error policy, shared
     OOB endpoint)."""
     cmd = ["nuclei", "-l", str(targets_file), "-jsonl", "-o", str(out_file),
            "-etags", "intrusive,fuzz,dos,brute-force",
            "-s", "critical,high,medium", "-stats", "-si", "30",
-           "-c", str(settings.workers("nuclei", 25)),      # H2: core-scaled concurrency (rate stays separate)
+           "-c", str(settings.workers("nuclei", 25)),      # core-scaled concurrency (rate stays separate)
            "-bs", str(settings.concurrency("NUCLEI_BULK_SIZE", 25))]   # hosts/template batch
     cmd += ["-nmhe"] if mhe == 0 else ["-mhe", str(mhe)]   # 0 = full depth: never drop an erroring host
     if prof.http_rl:
@@ -747,78 +654,54 @@ def _nuclei_cmd(targets_file, out_file, prof, mhe: int) -> list[str]:
 
 
 def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
-    """Chunked nuclei main scan (step 4.2 Commit B). Split live hosts into NUCLEI_CHUNK_HOSTS-sized
-    batches and scan SEQUENTIALLY — rate is target-wide (RoE), so parallel batches would blow the
-    budget; chunking buys resume + progress + per-batch isolation, NOT speed (work is rate-bound and
-    fixed: OTC = 448 hosts / 5.08M req / 7h41 @ 183rps, died at 93%). Each batch gets its own
-    nuclei_timeout, so one slow batch -> coverage_partial instead of a whole-run kill.
+    """Chunked nuclei main scan: split live hosts into NUCLEI_CHUNK_HOSTS batches and scan sequentially (rate
+    is target-wide, so parallel batches would blow the budget). Chunking buys resume, progress and per-batch
+    isolation, not speed.
 
-    RESUME is keyed on EXECUTION COMPLETION, not on a clean status — the two are independent facts. A chunk is
-    done when the process EXITED 0 (it reached its own end; a kill leaves exit_code None, a crash nonzero).
-    Degraded COVERAGE (host-error skips, WAF-blocked requests) is reported separately as structured request
-    counters and does NOT make the chunk retryable; unmeasurable coverage is reported as coverage:unknown, never
-    as complete. nuclei's `Scan completed in …` line is corroborating telemetry only — gating on it would let a
-    reworded terminal lock resumability forever. The OTC 20260725 run proved why: at ~610k requests/chunk a generic stderr
-    signature ALWAYS matched (one `i/o timeout` line is inevitable), so every chunk read PARTIAL, no chunk
-    was ever recorded done, and `chunks` stayed `{}` — a resume would have repeated all 8.5 hours while the
-    real gap (92.44% of planned requests sent, 459,930 skipped by `-mhe`) went unmeasured. A chunk that did
-    NOT complete stays retryable. Its OUTPUT is still KEPT — the aggregate is rebuilt
-    idempotently from every per-chunk artifact (findings_<ci>.jsonl), so a WAF/timeout-degraded chunk's
-    real findings are never discarded and a re-scan can't duplicate. The state is tied to the
-    INPUT (hash of the ordered live list + chunk size) so a changed host set / chunk size invalidates it
-    instead of skipping the wrong hosts. Emits source-level tool_start / tool_progress / tool_finish;
-    returns a RunResult for the manifest."""
+    Resume is keyed on execution completion, not a clean status: a chunk is done when the process exited 0.
+    Degraded coverage rides structured request counters and does not make the chunk retryable; unmeasurable
+    coverage is coverage:unknown. The aggregate is rebuilt idempotently from every per-chunk artifact, so a
+    degraded chunk's findings are never discarded and a re-scan cannot duplicate.
+    """
     sid = "params.nuclei_scan"
     chunk_n = max(1, settings.concurrency("NUCLEI_CHUNK_HOSTS", 50))
     batches = [live[i:i + chunk_n] for i in range(0, len(live), chunk_n)]
     state_f = ctx.run.raw_path("params", "nuclei", "chunks.state.json")
-    # C07 inc4: resume validity is a WORK_UNIT that folds the coverage-affecting CONFIG (severity + excluded
-    # tags + chunk size), not just the host list. The old input_hash keyed on hosts+chunk_size ALONE, so a
-    # template-scope change (a different severity/etags) would wrongly RESUME done chunks — the same
-    # skip-after-settings-change bug fixed for ffuf. Any coverage-affecting change now invalidates the state.
-    _tpl = _nuclei_templates_fp()                           # review#10: template SET is coverage-affecting
-    mhe = _nuclei_mhe()                                     # host-error policy = WHICH hosts get scanned at all
+    # resume validity is a work_unit that folds the coverage-affecting config (severity + excluded tags +
+    # chunk size), not just the host list, so any coverage-affecting change invalidates the state
+    _tpl = _nuclei_templates_fp()                           # template set is coverage-affecting
+    mhe = _nuclei_mhe()                                     # host-error policy = which hosts get scanned
     _cfg = {"severity": "critical,high,medium", "etags": "intrusive,fuzz,dos,brute-force", "chunk": chunk_n,
             "templates": _tpl if _tpl is not None else "unknown", "mhe": mhe}
     if _tpl is None:
-        # review#6: template state UNKNOWN -> non-resumable. A per-run nonce makes scan_wu/chunk_wu differ every
-        # run, so resume NEVER skips a chunk we cannot prove ran against the same templates (re-scan is a safe
-        # superset; silently skipping on an unverifiable set is not).
+        # template state unknown -> non-resumable: a per-run nonce makes resume never skip a chunk we
+        # cannot prove ran against the same templates
         _cfg["_nonce"] = os.urandom(8).hex()
     scan_wu = events.work_unit(sid, inputs={"hosts": live}, config=_cfg)
-    # review#4: a work_unit is NOT an execution attempt. Layout is wu_<scan_wu>/attempt_<attempt_id>/, and the
-    # state maps each DONE chunk to the ARTIFACT PATH that produced it. A same-work-unit RETRY writes to a FRESH
-    # attempt dir, so it can NEVER overwrite a prior attempt's chunk evidence; done chunks are read back from
-    # their recorded paths. Raw attempt dirs are RETAINED (pruning is a separate explicit GC, never part of
-    # publishing an aggregate — a publish must not delete raw evidence).
+    # a work_unit is not an attempt (wu_<scan_wu>/attempt_<attempt_id>/); a same-work-unit retry writes a
+    # fresh attempt dir and reads done chunks back from recorded paths.
     wu_dir = state_f.parent / f"wu_{scan_wu}"
     wu_root = wu_dir.resolve()
-    attempt_id = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(4).hex()   # UNIQUE per execution attempt
+    attempt_id = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(4).hex()   # unique per execution attempt
     attempt_dir = wu_dir / f"attempt_{attempt_id}"        # created lazily, only if a chunk actually runs
 
     def _valid_entry(ci_str, rel, digests=None) -> bool:
-        """review#1/#2: a loaded state entry is trusted to skip/aggregate a chunk ONLY if it is fully valid — a
-        non-negative in-range index, and a RELATIVE path with no absolute/`..` escape that resolves INSIDE THIS
-        work_unit's dir (review#2: not merely the nuclei dir — a corrupt path must not borrow ANOTHER work unit's
-        artifact) AND whose filename is exactly this chunk's `findings_<ci>.jsonl`, pointing at a readable file.
-        Anything else is dropped so the chunk RE-RUNS (an invalid/foreign artifact is never a silent skip).
-
-        review#P3: path validity is not CONTENT validity. An artifact recorded as done, then truncated/edited/
-        replaced on disk, satisfied every path check and was still trusted — so a resume skipped the chunk and
-        aggregated whatever the file now says. Each recorded artifact therefore carries its sha256 and must
-        still match. A state file with no digest for an entry (written by an older Quarry) fails CLOSED: the
-        chunk re-runs. Re-running costs time; trusting an unverifiable artifact costs silent surface."""
+        """A loaded state entry is trusted to skip/aggregate a chunk only if it is fully valid: a
+        non-negative in-range index; a relative path with no absolute/`..` escape resolving inside this
+        work_unit's dir, whose filename is exactly this chunk's `findings_<ci>.jsonl`, pointing at a
+        readable file; and whose recorded sha256 still matches its content. Anything else — including a
+        missing digest (older state) — is dropped so the chunk re-runs, never a silent skip."""
         if not (isinstance(ci_str, str) and ci_str.isdigit() and 0 <= int(ci_str) < len(batches)):
             return False
         if not isinstance(rel, str) or not rel or os.path.isabs(rel) or ".." in Path(rel).parts:
             return False
-        if Path(rel).name != f"findings_{int(ci_str)}.jsonl":   # must be THIS chunk's artifact, not another's
+        if Path(rel).name != f"findings_{int(ci_str)}.jsonl":   # must be this chunk's artifact
             return False
         p = state_f.parent / rel
         try:
-            if not p.resolve().is_relative_to(wu_root):      # containment: under the CURRENT work-unit dir only
+            if not p.resolve().is_relative_to(wu_root):      # containment: this work-unit's dir only
                 return False
-            if not p.is_file():                              # missing artifact -> NOT done (re-run)
+            if not p.is_file():                              # missing artifact -> not done (re-run)
                 return False
             with open(p, "rb"):                              # readability
                 pass
@@ -841,11 +724,11 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             prev = json.loads(state_f.read_text())
         except (OSError, json.JSONDecodeError):
             return None
-        if not isinstance(prev, dict):                       # review#7: [], null, or a scalar -> reject (rerun all)
+        if not isinstance(prev, dict):                       # [], null, or a scalar -> reject (rerun all)
             return None
         return prev if prev.get("work_unit") == scan_wu else None   # config-inclusive key: mismatch → fresh
 
-    def _load_digests(prev) -> dict:                          # {rel: sha256} — content binding for every artifact
+    def _load_digests(prev) -> dict:                          # {rel: sha256} — content binding per artifact
         m = (prev or {}).get("digests")
         if not isinstance(m, dict):
             return {}
@@ -857,7 +740,7 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             return {}
         return {str(k): str(v) for k, v in m.items() if _valid_entry(str(k), v, digests)}
 
-    def _load_evidence(prev, digests) -> dict:               # review#1: {ci: [rel, ...]} — a LIST, each validated
+    def _load_evidence(prev, digests) -> dict:               # {ci: [rel, ...]} — a list, each validated
         m = (prev or {}).get("evidence")
         out: dict[str, list[str]] = {}
         if isinstance(m, dict):
@@ -869,10 +752,9 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
         return out
 
     def _load_coverage(prev, done: dict) -> dict:
-        """{ci: {"planned": int, "requests": int}} — the request coverage a DONE chunk reported, persisted so a
-        RESUME can re-emit it. Without this a resumed run re-emits counters only for the chunks it actually ran
-        and the skipped ones read as zero-eligible, understating the run's real gap. Validated: an in-range
-        index and two non-negative ints (an impossible pair is dropped, not repaired)."""
+        """{ci: {"planned": int, "requests": int}} — the request coverage a done chunk reported, persisted
+        so a resume can re-emit it (else skipped chunks read as zero-eligible and understate the gap).
+        Validated: an in-range index and two non-negative ints (an impossible pair is dropped)."""
         m = (prev or {}).get("coverage")
         out: dict[str, dict] = {}
         if not isinstance(m, dict):
@@ -885,15 +767,12 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             p, r = v.get("planned"), v.get("requests")
             if all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in (p, r)):
                 out[k] = {"planned": p, "requests": r}
-        # A coverage record is only meaningful for a chunk that COMPLETED — an entry for a chunk we are about
-        # to RE-RUN is stale by definition, and keeping it would let last attempt's numbers stand in for this
-        # one if the re-run finishes without a parseable stats line.
+        # a coverage record is only meaningful for a completed chunk: an entry for a chunk about to re-run is
+        # stale, and keeping it would let the last attempt's numbers stand in for this one
         return {k: v for k, v in out.items() if k in done}
 
-    # done_map: chunks whose EXECUTION COMPLETED -> artifact (controls SKIP). evidence_map: for EVERY chunk that
-    # produced output (complete OR not), the LIST of every preserved artifact across attempts (controls
-    # AGGREGATION). review#1: a list, not a single pointer — PARTIAL(A) then PARTIAL(B) must keep BOTH, aggregate
-    # + dedup all evidence. cov_map: per-chunk request coverage, so resume re-reports the gap it did not re-run.
+    # done_map: completed chunks -> artifact. evidence_map: every preserved artifact per chunk across
+    # attempts (a list, so two partial attempts both survive). cov_map: per-chunk request coverage.
     _p = _prev()
     digest_map: dict[str, str] = _load_digests(_p)            # {rel: sha256} — binds every recorded artifact
     done_map: dict[str, str] = _load_map(_p, digest_map)
@@ -925,20 +804,15 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
              "evidence": evidence_map, "coverage": cov_map, "digests": digest_map}))
 
     def _emit_coverage(ci: int, planned, requests, *, why: str) -> None:
-        """Per-chunk REQUEST coverage as structured counters, one stable unit per chunk so the store's
+        """Per-chunk request coverage as structured counters, one stable unit per chunk so the store's
         latest-per-unit reconciliation sums them into a single (source, "requests") rollup for the run.
 
-        COVERAGE_TIMEOUT, not CAP: nothing here is OUR ceiling or the operator's chosen subset — the requests
-        were lost in flight (target/network errors, or nuclei dropping a host once `-mhe` is exceeded, which is
-        off by default). That is exactly the TIMEOUT bucket's policy contract: always feeds the verdict. The
-        constant's name is narrower than its bucket; see the note on events.COVERAGE_TIMEOUT.
-
-        Counters go through RAW — the validator flags an impossible triple as coverage UNKNOWN instead of us
-        inventing a consistent-looking one."""
+        COVERAGE_TIMEOUT, not CAP: the requests were lost in flight (target/network errors, or nuclei
+        dropping a host once `-mhe` is exceeded), which is the TIMEOUT bucket's always-feeds-the-verdict
+        contract. Counters go through raw so the validator can flag an impossible triple as unknown."""
         if planned is None or requests is None:
-            # review#P1.1: COVERAGE_UNKNOWN, not a reason-only event. A reason-only partial neither opens a
-            # generation nor reaches the rollup, so an unmeasurable chunk read as fully covered and a PRIOR
-            # run's counters kept standing in for it. Unknown must reach the verdict as a gap.
+            # COVERAGE_UNKNOWN, not a reason-only event: a reason-only partial neither opens a generation
+            # nor reaches the rollup, so an unmeasurable chunk must reach the verdict as a gap
             events.coverage_partial(sid, kind=events.COVERAGE_UNKNOWN, unit=f"chunk_{ci}", measure="requests",
                                     reason=f"chunk {ci + 1}/{len(batches)}: {why} (request counters unavailable "
                                            f"— coverage UNMEASURED, not assumed complete)")
@@ -950,71 +824,57 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
 
     events.tool_start(sid, cmd=["nuclei", "-l", "<chunk>", "-jsonl"], input_total=len(live), work_unit=scan_wu)
     t0 = time.monotonic()
-    incomplete = 0                                        # chunks whose EXECUTION did not complete (retryable)
+    incomplete = 0                                        # chunks whose execution did not complete (retryable)
 
-    def _completed_hosts():                               # UX #4: hosts in EXECUTION-COMPLETE chunks (NOT attempted)
+    def _completed_hosts():                               # hosts in execution-complete chunks (not attempted)
         return sum(len(batches[j]) for j in (int(k) for k in done_map) if j < len(batches))
 
-    # C07 inc4: a source terminal ALWAYS fires (try/finally) even if the loop raises. status starts FAILED
-    # (an exception mid-loop must NOT emit a scan-level success) and is set to SUCCESS/PARTIAL only after the
-    # loop + aggregate complete. Each executed chunk gets its OWN start+terminal (keyed on chunk_wu), and the
-    # resume record is chunks.state.json (keyed on scan_wu). The source lifecycle is scan_wu; no duplicates.
+    # the source terminal always fires (try/finally). status starts FAILED so an exception mid-loop cannot
+    # emit a scan-level success, and is set to SUCCESS/PARTIAL only after the loop + aggregate complete.
     status = Status.FAILED
     try:
         for ci, batch in enumerate(batches):
             chunk_wu = events.work_unit(sid, inputs={"hosts": batch}, config=_cfg)
-            # UX #2: progress BEFORE the chunk — status shows STARTING chunk ci+1, with CLEANLY-completed
-            # host count; the per-chunk work_unit is the stable unit id (resume/audit key).
+            # progress before the chunk, counting cleanly-completed hosts; the per-chunk work_unit is the
+            # stable unit id (resume/audit key)
             events.tool_progress(sid, chunk_index=ci + 1, chunk_total=len(batches),
                                  current_index=_completed_hosts(), work_unit=chunk_wu)
-            if str(ci) in done_map:                       # resume: EXECUTION already completed in a prior attempt
+            if str(ci) in done_map:                       # resume: execution already completed in a prior attempt
                 _prior = cov_map.get(str(ci)) or {}        # (artifact recorded + preserved; do not re-run)
                 _emit_coverage(ci, _prior.get("planned"), _prior.get("requests"),
                                why="resumed — coverage as first recorded")
                 continue
             attempt_dir.mkdir(parents=True, exist_ok=True)   # lazy: only create the attempt dir if a chunk runs
             bf = ctx.write_list(f"nuclei_targets_{ci}.txt", batch)
-            cf = attempt_dir / f"findings_{ci}.jsonl"        # review#4: THIS attempt's artifact (never overwrites a prior)
-            ef = attempt_dir / f"stderr_{ci}.log"            # per-chunk FULL stderr: the completion/coverage oracle
-            rel = f"wu_{scan_wu}/attempt_{attempt_id}/findings_{ci}.jsonl"   # recorded in state, relative to the state dir
+            cf = attempt_dir / f"findings_{ci}.jsonl"        # this attempt's artifact (never overwrites a prior)
+            ef = attempt_dir / f"stderr_{ci}.log"            # per-chunk full stderr: completion/coverage oracle
+            rel = f"wu_{scan_wu}/attempt_{attempt_id}/findings_{ci}.jsonl"   # recorded in state, relative to state dir
             events.tool_start(sid, work_unit=chunk_wu, input_total=len(batch))   # this chunk's own lifecycle
             res = None
-            chunk_status = Status.FAILED.value               # review#1: promoted ONLY after ALL bookkeeping below
-            try:                                             # review#1: chunk terminal ALWAYS fires (finally)
+            chunk_status = Status.FAILED.value               # promoted only after all bookkeeping below
+            try:                                             # chunk terminal always fires (finally)
                 res = exec_tool("nuclei", _nuclei_cmd(bf, cf, prof, mhe),
                                 timeout=nuclei_timeout(len(batch), ctx.http_timeout), stderr_path=ef)
                 if res.stderr_tail:
                     with log.open("a", encoding="utf-8") as lf:
                         lf.write(res.stderr_tail + "\n")
-                # Ask NUCLEI whether it finished, from its OWN terminal line in the FULL stderr (the 8-line tail
-                # can be evicted by a trailing [INF] burst, so prefer the file and fall back only if it is absent).
+                # ask nuclei whether it finished, from its terminal line in the full stderr (the 8-line tail
+                # can be evicted by a trailing [INF] burst, so prefer the file and fall back only if absent)
                 try:
                     _err = ef.read_text(encoding="utf-8", errors="replace") if ef.is_file() else res.stderr_tail
                 except OSError:
                     _err = res.stderr_tail
                 prog = _nuclei_progress(_err)
-                # ── the split, in one line each ────────────────────────────────────────────────────────────
-                # EXECUTION COMPLETE  <- res.exit_code == 0. NOTHING else. The process reached its own end; a
-                #                        kill leaves exit_code None (TIMED_OUT) and a crash leaves it nonzero.
-                # COVERAGE            <- the -stats counters. Absent -> coverage:unknown, never "complete".
-                # `Scan completed in …` is CORROBORATING TELEMETRY only (it rides the reason string) — it must
-                #                        NOT gate resumability.
-                #
-                # review#P1.4: requiring that sentence whenever ANY stats line was recognized left a second way
-                # to lock resumability forever — a nuclei release that keeps the stats JSON but reworded only its
-                # terminal would give completed=False, exit 0, and a chunk retryable on every future run: the
-                # 8.5-hour bug again, through a PARTIAL format change. (review#P1.2 closed the same hole for the
-                # status fallback; this is its twin.) Consequence worth naming: "we sent fewer requests than
-                # planned" is now ALWAYS a coverage fact, never a resumability one — which is correct, because a
-                # process that ran to its own end has no work left to resume.
+                # execution-complete is `exit_code == 0` only; coverage is the -stats counters (absent ->
+                # unknown). `Scan completed in …` is corroborating telemetry and must not gate resumability.
                 complete = res.exit_code == 0
                 terminal_seen = bool(prog["completed"])      # telemetry: did we recognize nuclei's own terminal?
                 planned, requests = prog["planned"], prog["requests"]
-                # KEEP a chunk's findings regardless of outcome — real even if WAF/timeout-degraded.
+                # keep a chunk's findings regardless of outcome — real even if WAF/timeout-degraded
                 if complete:
                     if not cf.exists():
-                        cf.touch()                           # review#1: explicit zero-byte artifact for a clean-EMPTY
-                    done_map[str(ci)] = rel                  # execution complete -> controls SKIP
+                        cf.touch()                           # explicit zero-byte artifact for a clean-empty
+                    done_map[str(ci)] = rel                  # execution complete -> controls skip
                     _add_evidence(str(ci), rel)              # ...and joins this chunk's evidence history
                     _bind(rel, cf)                           # content binding: a later edit invalidates the skip
                     if planned is not None and requests is not None:
@@ -1023,16 +883,16 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                     _emit_coverage(ci, planned, requests,
                                    why=("exit 0" + ("" if terminal_seen else ", nuclei terminal not recognized")
                                         + (f", {prog['errors']} error(s)" if prog["errors"] is not None else "")))
-                    # status now reflects EXECUTION, not a stderr signature: findings -> SUCCESS, none -> EMPTY.
+                    # status now reflects EXECUTION, not a stderr signature: findings -> SUCCESS, none ->
+                    # EMPTY.
                     chunk_status = (Status.SUCCESS if cf.stat().st_size > 0 else Status.EMPTY).value
                 else:
                     incomplete += 1
                     _emit_coverage(ci, planned, requests,
                                    why=f"execution INCOMPLETE (exit {res.exit_code}, {res.status.value}) "
                                        f"— chunk stays retryable")
-                    # review#1: a chunk that produced real output APPENDS to this chunk's evidence list
-                    # (PARTIAL(A) then PARTIAL(B) keeps BOTH). A degraded/failed retry with NO output appends
-                    # nothing, so an earlier attempt's findings are never erased.
+                    # a chunk that produced output appends to its evidence list; a degraded retry with no
+                    # output appends nothing, so an earlier attempt's findings are never erased
                     if cf.exists() and cf.stat().st_size > 0:
                         _add_evidence(str(ci), rel)
                         _bind(rel, cf)
@@ -1041,19 +901,15 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                     chunk_status = (res.status if res.status not in (Status.SUCCESS, Status.EMPTY)
                                     else Status.PARTIAL).value
             finally:
-                _chunk_terminal(sid, chunk_wu, res, cf, status=chunk_status)   # FAILED if exec OR bookkeeping raised
-        # review#1/#2/#4: rebuild the aggregate into a TEMP file, then swap ATOMICALLY — the prior findings.jsonl
-        # is only replaced once the new one is fully written, so a crash mid-rebuild leaves the old aggregate
-        # intact. For each chunk, read EVERY preserved evidence artifact (all attempts, clean OR degraded — so a
-        # later degraded/failed retry can't drop an earlier attempt's findings) and DEDUPLICATE lines. Falls back
-        # to THIS attempt's file for a chunk just run but not yet recorded. Prior attempt dirs are RETAINED — NO
-        # pruning here (a publish must never delete raw evidence; attempt-dir GC is a separate operation).
+                _chunk_terminal(sid, chunk_wu, res, cf, status=chunk_status)   # FAILED if exec or bookkeeping raised
+        # rebuild the aggregate into a temp file, then swap atomically, so a crash mid-rebuild leaves the old
+        # findings.jsonl intact; read every preserved evidence artifact per chunk and deduplicate lines
         tmp = findings.with_name(findings.name + ".tmp")
         with tmp.open("w", encoding="utf-8") as fh:
             for ci in range(len(batches)):
                 rels = list(evidence_map.get(str(ci)) or [])
                 paths = [state_f.parent / r for r in rels] or [attempt_dir / f"findings_{ci}.jsonl"]
-                seen_lines: set[str] = set()                  # dedup PER CHUNK (across its attempts) — never across
+                seen_lines: set[str] = set()                  # dedup per chunk (across its attempts) — never across
                 for p in paths:                               # chunks, whose identical-looking lines are distinct hosts
                     if not (p.exists() and p.stat().st_size > 0):
                         continue
@@ -1062,15 +918,13 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                             seen_lines.add(line)
                             fh.write(line + "\n")
         os.replace(tmp, findings)
-        # Scan STATUS tracks EXECUTION only. Degraded request coverage does NOT go here — it rides the
-        # structured counters and reaches the operator through the run verdict (complete_with_gaps), so the
-        # status stays a signal that can actually discriminate "a chunk needs re-running" from "the target
-        # dropped some requests". Before this split every real-target run read PARTIAL and told us nothing.
+                # scan status tracks execution only; degraded request coverage rides the structured counters
+                # and reaches the operator through the run verdict
         status = Status.PARTIAL if incomplete else Status.SUCCESS
     finally:
         events.tool_progress(sid, chunk_index=len(batches), chunk_total=len(batches),
                              current_index=_completed_hosts(), work_unit=scan_wu)   # final: execution-complete
-        try:                                                 # review#1: a stat() raise must NOT defeat the scan terminal
+        try:                                                 # a stat() raise must not defeat the scan terminal
             size = findings.stat().st_size
         except OSError:
             size = None
@@ -1083,8 +937,8 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     _planned = sum(v["planned"] for v in cov_map.values())
     _sent = sum(v["requests"] for v in cov_map.values())
     if _planned:
-        # Say WHICH chunks the percentage covers — nuclei may not report counters for every chunk, and an
-        # unqualified "92.44%" over a subset would read as a whole-scan figure.
+        # say which chunks the percentage covers — nuclei may not report counters for every chunk, and an
+        # unqualified percentage over a subset would read as a whole-scan figure
         _scope = ("" if len(cov_map) == len(batches)
                   else f" over {len(cov_map)}/{len(batches)} measured chunk(s)")
         ctx.echo(f"  nuclei coverage: {_sent}/{_planned} planned request(s) sent "
@@ -1138,11 +992,10 @@ def _graphql_urls(ctx, scope) -> list[str]:
 
 
 def _actuator_bases(ctx, scope) -> list[str]:
-    """In-scope Spring Boot actuator base URLs to interrogate. Two candidate sources:
+    """In-scope Spring Boot actuator base URLs to interrogate, from two candidate sources:
     (a) any observed URL containing `/actuator`, collapsed to its base; and
-    (b) live hosts httpx fingerprints as Spring/Spring-Boot — `/actuator` is almost never linked, so
-        the tech fingerprint IS the candidate signal (Test-6: mgmt was Spring but had no /actuator
-        URL, so the probe never ran). Still candidate-driven — never blind onto every host."""
+    (b) live hosts fingerprinted as Spring/Spring-Boot — `/actuator` is almost never linked, so the
+        tech fingerprint is the candidate signal. Candidate-driven, never blind onto every host."""
     seen: set[str] = set()
     out: list[str] = []
     def add_base(base: str):
@@ -1199,7 +1052,7 @@ def _framework_endpoint_candidates(ctx, scope) -> list[dict]:
     """Candidate-driven framework recon endpoints: for each live host, match its httpx tech against
     framework-endpoints.yaml and build the origin+path URLs to GET-probe. Only frameworks actually
     fingerprinted contribute (never blind onto every host), de-duped, active-allowed, bounded.
-    Mirrors _actuator_bases — the tech fingerprint IS the candidate signal."""
+    Mirrors _actuator_bases — the tech fingerprint is the candidate signal."""
     fw = evidence._framework_endpoints()
     seen: set[str] = set()
     out: list[dict] = []
@@ -1245,8 +1098,8 @@ def _ssti_targets(ctx, scope) -> list[str]:
 
 def _dalfox_signature(u: str) -> tuple:
     """The identity dalfox deduplicates on under `--dedup-urls signature`: method+host+path+parameter
-    NAMES. Every target we submit is a GET, so method is constant here — and this is deliberately the
-    same key `_canonicalize_candidates` uses, because that is what makes the two agree."""
+    names. Every target is a GET, and this is the same key `_canonicalize_candidates` uses, so the two
+    agree."""
     from urllib.parse import urlsplit, parse_qsl
     sp = urlsplit(u)
     names = tuple(sorted({k for k, _ in parse_qsl(sp.query, keep_blank_values=True)}))
@@ -1254,33 +1107,23 @@ def _dalfox_signature(u: str) -> tuple:
 
 
 def _dalfox_identity_fn(mode: str):
-    """The identity dalfox is deduplicating on, PER MODE — and whether multiplicity matters.
-
-    review#39 (Lumpy): the reconciliation applied signature semantics unconditionally, so a fully
-    covered `exact` scan of `a?q=1` and `a?q=2` read as one signature reported twice and returned
-    PARTIAL on every lifecycle — with no remainder, so it re-sent the whole batch for ever. `off` scans
-    every input line, so multiplicity IS the identity there."""
+    """The identity dalfox deduplicates on, per mode -> (keyfn, multiplicity_matters). `off` scans every
+    input line, so multiplicity is the identity there."""
     if mode in ("exact", "off"):
         return (lambda u: u), (mode == "off")                  # exact: the URL; off: URL x multiplicity
-    # `signature`, and an UNKNOWN mode: the least demanding identity, so "never mentioned" means
-    # never mentioned under ANY policy. What that identity cannot settle is handled separately as
-    # UNDECIDABLE membership rather than being asserted either way (review#40, Lumpy).
+    # `signature` and an unknown mode use the least demanding identity, so "never mentioned" means never
+    # mentioned under any policy; what it cannot settle is handled separately as undecidable membership
     return _dalfox_signature, False
 
 
 def _dedupe_owed(named, mode) -> list:
-    """Collapse the targets dalfox NAMED as failed, under the identity THAT MODE scans by.
+    """Collapse the targets dalfox named as failed, under the identity that mode scans by:
 
-    review#44 (Lumpy): this used `dict.fromkeys`, i.e. the exact URL, while claiming "one signature
-    identity owes one retry" — so `/a?q=1` and `/a?q=2`, one signature and both `SESSION_LOST`, were
-    owed twice under `dedup_mode=signature`. The previous test only repeated an identical URL, which
-    exact-URL dedup passes.
-
-      off      every occurrence is its own scan          -> collapse nothing
-      signature  method+host+path+param names            -> one retry per signature
-      exact      the URL                                 -> one retry per URL
-      unknown    no identity we can trust                -> collapse nothing (re-scanning is the safe
-                                                            error; dropping an owed scan is not)"""
+      off       every occurrence is its own scan   -> collapse nothing
+      signature method+host+path+param names       -> one retry per signature
+      exact     the URL                            -> one retry per URL
+      unknown   no identity we can trust           -> collapse nothing (re-scanning is safe; dropping
+                                                      an owed scan is not)"""
     if mode == "off" or mode not in _DALFOX_DEDUP_MODES:
         return list(named)
     key = _dalfox_signature if mode == "signature" else (lambda u: u)
@@ -1294,24 +1137,18 @@ def _dedupe_owed(named, mode) -> list:
 
 
 def _dalfox_accounting(batch, art) -> "tuple[list, dict]":
-    """Reconcile dalfox's `target_summary` against the batch we submitted — by MEMBERSHIP, under the
-    mode dalfox SAYS it used. Returns `(owed_urls, info)` where `info` carries:
+    """Reconcile dalfox's `target_summary` against the submitted batch by membership, under the mode
+    dalfox says it used. Returns `(owed_urls, info)` where `info` carries:
 
-        retryable   membership failures a RETRY could cover — the chunk stays owed
-        terminal    membership we cannot DECIDE — retrying changes nothing, and it is a coverage gap
+        retryable   membership failures a retry could cover — the chunk stays owed
+        terminal    membership we cannot decide — retrying changes nothing, and it is a coverage gap
         mode        the mode the reconciliation was performed under
+        ambiguous   targets covered under `signature` but short under `exact`/`off`
 
-    review#38 (Lumpy): comparing counts let `[a,b]` be answered by `[a,a]`, by `[a,c]`, or by nothing at
-    all with `deduplicated=99`. So `expected` is the multiset of identities in the batch UNDER THE
-    REPORTED MODE — exactly what dalfox scans — and the dedup count is DERIVED rather than believed.
-
-    review#40 (Lumpy): an UNKNOWN mode has no identity to reconcile under, and signature is the LEAST
-    demanding one — using it certified coverage that `exact`/`off` would have denied ("only a?q=1 was
-    reported" is complete under signature and short under exact). Two facts are separated instead:
-    anything missing even by SIGNATURE was never mentioned under any policy and is genuinely owed;
-    anything present by signature but not as the exact URL is UNDECIDABLE — recorded as coverage-unknown
-    and left terminal, because a retry under the same unknown policy produces the same ambiguity. An
-    unreadable POLICY must not become either a clean claim or an endless retry."""
+    `expected` is the multiset of identities in the batch under the reported mode, so the dedup count is
+    derived rather than believed. An unknown mode has no identity to reconcile under: anything missing
+    even by signature is genuinely owed, while anything present by signature but not as the exact URL is
+    undecidable (recorded coverage-unknown and left terminal, since a retry would repeat the ambiguity)."""
     from collections import Counter
     mode = art.dedup_mode
     keyfn, multiplicity = _dalfox_identity_fn(mode)
@@ -1325,8 +1162,8 @@ def _dalfox_accounting(batch, art) -> "tuple[list, dict]":
 
     retryable, terminal, owed, ambiguous = [], [], [], []
     if multiplicity:
-        # `off` scans every input LINE: two identical lines owe two reports, and one report leaves one
-        # occurrence unaccounted (review#40 — the set intersection could not see that).
+        # `off` scans every input line: two identical lines owe two reports, and one report leaves one
+        # occurrence unaccounted
         short = {k: len(v) - rep_count.get(k, 0) for k, v in expected.items()
                  if rep_count.get(k, 0) < len(v)}
         if short:
@@ -1343,8 +1180,8 @@ def _dalfox_accounting(batch, art) -> "tuple[list, dict]":
                              + (f" (+{len(names) - 20} more)" if len(names) > 20 else ""))
             owed = [u for k in unlisted for u in expected[k]]
     if not known:
-        # present by signature, but NOT as the exact URL dalfox would have had to scan under `exact`
-        # or `off`. Whether those were covered is not knowable from this artifact.
+        # present by signature, but not as the exact URL dalfox would have scanned under `exact`/`off`;
+        # whether those were covered is not knowable from this artifact
         rep_urls = set(art.summary_targets)
         ambiguous = [u for u in batch if u not in rep_urls and _dalfox_signature(u) in rep_count]
         if ambiguous:
@@ -1367,25 +1204,23 @@ def _dalfox_accounting(batch, art) -> "tuple[list, dict]":
             retryable.append(f"dalfox claims {claimed} target(s) collapsed; under dedup_mode={mode} "
                              f"this batch has {derived} duplicate(s)")
     return owed, {"retryable": retryable, "terminal": terminal, "mode": mode,
-                  # the ambiguous TARGETS, not the sentence about them: a doubt is cleared per identity
-                  # by an attempt that actually scanned it (review#42, Lumpy).
+                  # the ambiguous targets, not the sentence about them: a doubt is cleared per identity
+                  # by an attempt that actually scanned it
                   "ambiguous": ambiguous}
 
 
 def _canonicalize_candidates(urls: list[str]) -> tuple[list[str], dict]:
-    """Collapse XSS/redirect candidate URLs to unique (host, path, sorted param-NAMES) shapes, keeping
-    ONE representative URL per shape. dalfox's reflected-XSS selection depends on the param SHAPE, not
-    the specific values, so scanning one URL per shape covers the same surface at a fraction of the cost.
-    The real problem was never 'dalfox is slow' — it was feeding it the same shape ~10x (measured on OTC:
-    993 raw -> 106 shapes, 89.3% collapsed). Returns (representatives, stats) where stats =
+    """Collapse XSS/redirect candidate URLs to unique (scheme, host, path, sorted param-names) shapes,
+    keeping one representative URL per shape. dalfox's reflected-XSS selection depends on the param shape,
+    not the values, so scanning one URL per shape covers the same surface at a fraction of the cost.
+    Returns (representatives, stats) where stats =
     {raw_candidates, canonical_candidates, reduction_percent, top_collapsed}."""
     from urllib.parse import urlsplit, parse_qsl
     shapes: dict = {}
     for u in urls:
         s = urlsplit(u)
-        # ORIGIN-aware key: scheme is part of the identity — http://h/p?x= and https://h/p?x= can be
-        # different services / redirect chains, so they must NOT collapse. keep_blank_values: a blank
-        # redirect/XSS param (?next= / ?url=) is a REAL distinct sink parse_qs() would silently drop.
+        # origin-aware key: scheme is part of the identity (http and https can be different services), and
+        # keep_blank_values keeps a blank redirect/XSS param (?next= / ?url=) that parse_qs() would drop
         names = tuple(sorted({k for k, _ in parse_qsl(s.query, keep_blank_values=True)}))
         key = (s.scheme.lower(), s.netloc.lower(), s.path, names)
         shapes.setdefault(key, {"url": u, "count": 0})["count"] += 1
@@ -1409,12 +1244,9 @@ _OOB_CRED_SUFFIX = ".cred.json"
 
 
 def sweep_stale_oob_creds(max_age_s: float = 3600.0) -> int:
-    """Remove credential-transport files a KILLED Quarry could not clean up. Returns how many went.
-
-    A SIGKILL skips every `finally`, so the file outlives the process that needed it (review#18, Lumpy).
-    Only files this module creates are touched — matched by prefix AND suffix inside the private 0700
-    directory pattern, never a glob over somebody else's temp files — and only ones old enough that no
-    live scan can still be using them."""
+    """Remove credential-transport files a killed Quarry could not clean up; returns how many. Matched by
+    prefix and suffix inside the private 0700 directory, and only ones too old for a live scan to be using.
+    """
     import tempfile
     removed = 0
     root = Path(tempfile.gettempdir())
@@ -1426,8 +1258,8 @@ def sweep_stale_oob_creds(max_age_s: float = 3600.0) -> int:
                 if time.time() - d.stat().st_mtime < max_age_s:
                     continue                       # a live scan may still hold it
                 for f in d.glob("*" + _OOB_CRED_SUFFIX):
-                    # a SYMLINK (dangling or not) is unlinked as the link it is: `is_file()` alone
-                    # follows it and answers False for a dangling one, which left the litter for ever.
+                    # unlink a symlink as the link it is: `is_file()` alone follows it and answers False
+                    # for a dangling one
                     if f.is_symlink() or f.is_file():
                         f.unlink()
                         removed += 1
@@ -1442,38 +1274,31 @@ def sweep_stale_oob_creds(max_age_s: float = 3600.0) -> int:
 
 
 class OobCredentialError(RuntimeError):
-    """The armed OOB channel's credential could not be transported. The scan does NOT run unauthenticated.
-
-    review#19 (Lumpy): yielding None on failure meant `_dalfox_cmd` still emitted `--blind-oob=<server>`
-    while dropping `--config` — so an operator who configured an AUTHENTICATED backend silently got a
-    different configuration, which finishes cleanly with no callbacks and looks valid."""
+    """The armed OOB channel's credential could not be transported. The scan does not run unauthenticated
+    (that would be a different configuration that finishes cleanly with no callbacks and looks valid)."""
 
 
 def _make_oob_credential(secret: str):
     """Create the 0600 credential file and return (dir, path), or raise `OobCredentialError`.
 
-    ACQUISITION ONLY. It is deliberately not a context manager: `shodan_host._open_lock` records what
-    happens when one `try` covers both acquisition and the protected body — an exception thrown by the
-    BODY is caught here, the generator yields a second time, and `contextlib` replaces the real failure
-    with `RuntimeError: generator didn't stop after throw()`. The body's exceptions are none of this
-    function's business (review#19, Lumpy)."""
+    Acquisition only, deliberately not a context manager: the body's exceptions are not this function's
+    business, and folding both into one `try` would let contextlib mask the real failure."""
     import tempfile
     d = path = None
     try:
         # 0700 and ours alone: `mkdtemp` refuses to reuse, so no other user can pre-create it
         d = Path(tempfile.mkdtemp(prefix=_OOB_CRED_PREFIX))
         path = d / ("cfg" + _OOB_CRED_SUFFIX)
-        # O_EXCL|O_NOFOLLOW: an existing path — or a symlink planted at it — is REFUSED, never followed
+        # O_EXCL|O_NOFOLLOW: an existing path — or a symlink planted at it — is refused, never followed
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as fh:
-            # dalfox reads TOML **or JSON**, so a SERIALIZER escapes the value rather than interpolation
+            # dalfox reads TOML or JSON, so a serializer escapes the value rather than interpolation
             json.dump({"scan": {"blind_oob_secret": secret}}, fh)
         return d, path
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
-        # `path` is passed so a REFUSED symlink is unlinked too — otherwise it and its directory
-        # survive for ever, and the sweep cannot see through a dangling link either.
+        # `path` is passed so a refused symlink is unlinked too, else it and its directory survive forever
         _drop_oob_credential(d, path)
         raise OobCredentialError(f"the OOB credential could not be written: {e}") from e
 
@@ -1481,9 +1306,8 @@ def _make_oob_credential(secret: str):
 def _drop_oob_credential(d, path) -> None:
     """Destroy exactly what one invocation created. Never raises."""
     try:
-        # `unlink` on a SYMLINK removes the link, never its target — so a path we REFUSED to write
-        # through is still cleaned up. Leaving it behind kept the planted link and its directory around
-        # for ever, since the sweep cannot see through a dangling one either.
+                                # `unlink` on a symlink removes the link, not its target, so a refused path is
+                                # still cleaned up
         if path is not None and (Path(path).is_symlink() or Path(path).is_file()):
             Path(path).unlink()
     except OSError:
@@ -1497,16 +1321,10 @@ def _drop_oob_credential(d, path) -> None:
 
 @contextlib.contextmanager
 def blind_oob_credential(secret: str):
-    """Yield a path to dalfox's `--config` carrying ONLY the OOB secret, then destroy it.
-
-    review#18 (Lumpy): a 0600 file is right DURING execution and wrong afterwards. This one lived in the
-    run's raw artifact tree, where it would have reached publication, manifests, exports, digests and
-    resume artifacts — the credential becoming permanent local evidence. It lives OUTSIDE the run, and
-    the `finally` covers success, timeout, a parse failure and any runner exception.
-
-    Yields None only when there is NO secret to carry. A secret that cannot be written raises
-    `OobCredentialError`: running the armed channel unauthenticated is a different scan than the one the
-    operator configured."""
+    """Yield a path to dalfox's `--config` carrying only the OOB secret, then destroy it. It lives outside the
+    run tree (so it never reaches publication), and the `finally` covers every exit. None when there is no
+    secret; OobCredentialError when it cannot be written.
+    """
     if not secret:
         yield None
         return
@@ -1520,24 +1338,9 @@ def blind_oob_credential(secret: str):
 def _blind_oob_plan(prof) -> dict:
     """Decide the blind/stored-XSS OOB channel: {armed, channel, backend, server, secret, reason}.
 
-    The contract (review#12, Lumpy), in order:
-
-      * OFF unless `MODES.BLIND_XSS` explicitly arms it. A blind payload persists on the target and
-        fires later in someone else's browser — a heavier engagement decision than a reflected probe.
-      * A self-hosted `oob.callback_server` is used when present, with `auth_token` carried in an
-        ephemeral 0600 `--config` file. The token is OPTIONAL: plenty of instances run open.
-      * With no server configured the backend is the public interactsh pool — dalfox's own default, and
-        the same posture as nuclei's OAST and Quarry's SSRF probes. ONE arming flag is the consent
-        (Lumpy, 2026-08-06); a second gate for the common case just meant no blind XSS at all.
-
-    CORRELATION is dalfox's either way: it mints the per-payload nonce, registers, polls, waits and maps
-    the callback back to target/param/location/method/payload. Quarry imports it. The SERVER is a
-    separate ownership question — ProjectDiscovery's pool on the public backend (its operator sees the
-    raw callbacks), yours when `oob.callback_server` is set. `backend` in the returned plan is the
-    field that answers it; do not read `armed` as "we own the channel" (review#19, Lumpy).
-
-    There is exactly ONE channel — `--blind-oob`. No configuration adds a second one, so a finding has
-    one callback lifecycle and one correlation owner.
+    Off unless `MODES.BLIND_XSS` arms it; a self-hosted `oob.callback_server` is used when present, else
+    the public interactsh pool. Correlation is dalfox's either way; `backend` says who owns the server, so
+    `armed` is not "we own the channel". See docs/design/DALFOX-XSS-DESIGN.md.
     """
     o = secrets.oob() or {}
     if not getattr(prof, "blind_xss", False):
@@ -1549,9 +1352,8 @@ def _blind_oob_plan(prof) -> dict:
                 "secret": str(o.get("auth_token") or "").strip(),
                 "reason": f"blind XSS armed on the configured callback server ({server}); "
                           f"correlation is owned by DALFOX and imported"}
-    # No self-hosted server: dalfox's own default, the public interactsh pool. Stated, not warned about
-    # — it is what nuclei's OAST and Quarry's own SSRF probes already do, and what an operator reaching
-    # for Burp Collaborator does without ceremony (Lumpy, 2026-08-06).
+    # no self-hosted server: dalfox's own default, the public interactsh pool — the same channel nuclei's
+    # OAST and Quarry's SSRF probes already use
     return {"armed": True, "channel": "native", "backend": "public", "server": "", "secret": "",
             "reason": "blind XSS armed on ProjectDiscovery's PUBLIC interactsh pool (set "
                       "`oob.callback_server` to use your own) — its operator sees the raw callbacks; "
@@ -1559,70 +1361,44 @@ def _blind_oob_plan(prof) -> dict:
 
 
 def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0, cred_path=None) -> list[str]:
-    """dalfox v3 (Rust) reflected-XSS scan (v0.3.8). v3 replaced the headless browser with static AST DOM
-    analysis, so v2's --skip-headless timekiller is GONE; params are pre-discovered (arjun/gf), so --skip-mining
-    stays. Output is structured JSONL to the -o file; -S keeps captured output minimal (status is read from the
-    EXIT CODE, not stdout — see the scan loop). Concurrency is 2-DIMENSIONAL in v3: --workers is PER TARGET,
-    --max-concurrent-targets is target parallelism — carrying v2's -w 100 forward would explode a 40-target
-    chunk's fan-out, so BOTH are governed with CONSERVATIVE defaults (roughly v2's per-host blast radius, more
-    hosts sequential) pending OTC measurement, and the global --rate-limit caps the aggregate rps when RoE is set."""
-    # dalfox has its OWN membership cap: `--max-targets-per-host`, default 100. Targets past it are
-    # dropped from the scan — reported honestly by dalfox (status `skipped`, error_code
-    # TRUNCATED_PER_HOST_CAP) and, until review#13, thrown away by us. PREVENTATIVE (Lumpy): pass a
-    # value that cannot truncate the chunk we submitted, so the cap can never decide our membership
-    # whatever `DALFOX_CHUNK` is set to. The meta row is still parsed — dalfox may gain other states.
+    """dalfox v3 (Rust) reflected-XSS scan: static AST DOM analysis, no headless browser, `--skip-mining`
+    (params are pre-discovered), JSONL to -o, status from the exit code. Concurrency is `--workers` per
+    target and `--max-concurrent-targets` across targets; `--rate-limit` caps aggregate rps when RoE is set."""
+    # dalfox's own membership cap `--max-targets-per-host` drops targets past it; the lane passes a value
+    # that cannot truncate the submitted chunk.
     per_host = max(1, int(batch_len or settings.concurrency("DALFOX_CHUNK", 40)))
     cmd = ["dalfox", "scan", "-i", "file", str(batch_file), "-o", str(out_file),
            "-f", "jsonl", "-S", "--skip-mining",
-           # 3.2.0 adoption (MEASURED against the real binary, 2026-08-07):
-           #
-           # `--dedup-urls signature` keys on method+host+path+parameter NAMES and is COUNTED in
-           # meta.targets_deduplicated, so it can never hide what it collapsed. It is the same identity
-           # `_canonicalize_candidates` already computes — verified, including that it does NOT collapse
-           # across SCHEME (http and https stay two targets, as ours does). So on this lane it should
-           # find almost nothing left to collapse; it is here as a second net for any caller that feeds
-           # raw URLs, and `targets_deduplicated` is reported so the residual is measurable rather than
-           # assumed.
+           # `--dedup-urls signature`, counted in `targets_deduplicated` so it cannot hide what it collapsed —
+           # the same identity `_canonicalize_candidates` computes.
            "--dedup-urls", "signature",
-           # the finding IS the product: carry the exact request that produced it and the response that
-           # proved it, so a candidate is auditable without re-running anything. Measured field names:
-           # `request` / `response`, both plain strings on the finding row.
+           # the finding is the product: carry the exact request that produced it and the response that proved
+           # it (fields `request`/`response`), so a candidate is auditable without re-running anything
            "--include-request", "--include-response",
-           #
-           # `--scan-timeout` is DELIBERATELY NOT PASSED (measured): a target whose injection stage it
-           # cuts is reported `status: "clean", incomplete: false` — byte-identical to a target that was
-           # genuinely scanned and found nothing. Quarry cannot report coverage it cannot observe, and a
-           # silent false negative is exactly the failure `quarry-subfinder-ceiling-honesty` is about.
-           # Revisit if dalfox surfaces the cut in the artifact.
+           # `--scan-timeout` is deliberately not passed: a cut injection reports `clean, incomplete:false`,
+           # coverage we cannot observe.
            "--max-targets-per-host", str(per_host),
-           "--workers", str(max(1, settings.workers("dalfox", 30))),          # per-target; v2 -w 100 NOT carried
-           "--max-concurrent-targets", str(max(1, settings.concurrency("DALFOX_TARGETS", 4)))]  # OTC-tunable
-    # BLIND / STORED XSS. `--blind-oob` is the channel: dalfox mints a fresh callback per PAYLOAD and
-    # correlates each interaction back to target/param/location/method/payload, so a beacon names the
-    # injection that produced it.
+           "--workers", str(max(1, settings.workers("dalfox", 30))),          # per-target
+           "--max-concurrent-targets", str(max(1, settings.concurrency("DALFOX_TARGETS", 4)))]  # tunable
+    # blind / stored XSS: `--blind-oob` mints a fresh callback per payload and correlates each interaction
+    # back to target/param/location/method/payload, so a beacon names the injection that produced it
     plan = _blind_oob_plan(prof)
     if plan["armed"]:
         # ONE argv token when a server is given: the flag is `--blind-oob[=<domains>]`, so a separate
         # `=host` argument would be parsed as a TARGET, not as the backend.
         cmd += [f"--blind-oob={plan['server']}" if plan["server"] else "--blind-oob"]
         if plan["secret"] and cred_path is not None:
-            # NEVER `--blind-oob-secret <token>`: argv is world-readable through /proc/<pid>/cmdline and
-            # every process listing, and a display-level redaction does not fix that (review#17, Lumpy).
-            # dalfox reads `scan.blind_oob_secret` from a `--config` file, so the credential reaches it
-            # through an EPHEMERAL 0600 one whose lifetime the CALLER owns (review#18): the command
-            # builder must not create a file it cannot destroy.
+            # never `--blind-oob-secret <token>` (argv is world-readable): dalfox reads it from a `--config`
+            # file, an ephemeral 0600 file the caller owns.
             cmd += ["--config", str(cred_path)]
     if prof.http_rl:
-        # v3 has a REAL global rate cap (req/s, shared across workers AND targets) — supersedes v2's per-host
-        # --delay math and its per-target-limiter caveat. Bound the aggregate stream directly to the RoE rate.
+        # v3's global rate cap (req/s, shared across workers and targets); bound to the RoE rate.
         cmd += ["--rate-limit", str(prof.http_rl)]
     return cmd
 
 
-# dalfox v3 finding TYPE -> (store klass, confidence tier, display name). Kept DISTINCT (Lumpy): a Dalfox-verified
-# hit (V) is higher-confidence than a reflection (R), and an AST-DOM static finding (A) is its own static-analysis
-# evidence — none collapses into another. `confirmed` stays False for all (Quarry-owned impact validation only);
-# "Dalfox-verified" (not "DOM-verified") — V is dalfox's own verdict, which doesn't always establish DOM execution.
+# dalfox finding type -> (store klass, confidence tier, display name), kept distinct; `confirmed`
+# stays False (Quarry owns impact validation).
 _DALFOX_TIER = {
     "V": ("xss-verified", "verified", "XSS — Dalfox-verified (Quarry impact validation pending)"),
     "R": ("xss-candidate", "candidate", "reflected parameter — XSS candidate (manual validation required)"),
@@ -1633,10 +1409,10 @@ _DALFOX_LINECOL = re.compile(r":(\d+):(\d+)\s*-\s")
 
 
 def _dalfox_engine_id() -> str:
-    """The VERIFIED identity of the dalfox binary that will ACTUALLY run (registry health) — folded into the
-    resume work unit so a drifted / shadowed / manually-upgraded binary can't reuse another engine's chunks
-    (review-r9#4). An unverified/unknown engine returns a per-run NONCE -> that run is NON-resumable (a re-scan
-    is a safe superset; silently skipping chunks we can't prove ran on the same binary is not)."""
+    """The verified identity of the dalfox binary that will actually run, folded into the resume work unit so a
+    drifted or shadowed binary cannot reuse another engine's chunks. An unverified engine returns a per-run
+    nonce, making that run non-resumable.
+    """
     try:
         from ..registry import load_tools, health
         t = next((x for x in load_tools() if x.bin == "dalfox"), None)
@@ -1650,17 +1426,15 @@ def _dalfox_engine_id() -> str:
 
 
 def _dstr(v) -> str:
-    """A JSON field coerced to a stripped string ONLY if it is a scalar string — a list/dict/number returns ''
-    (never str([...])). review-r9#3: essential fields are scalar-string validated, not blindly str()'d."""
+    """A JSON field coerced to a stripped string only if it is a scalar string; a list/dict/number returns ''."""
     return v.strip() if isinstance(v, str) else ""
 
 
 def _dalfox_identity(ftype: str, obj: dict) -> "str | None":
-    """A canonical identity per finding so DISTINCT routes never collapse (review-r8#2). V/R key on
-    scheme://host:port/path + location:param + method — /search?q and /admin?q are DISTINCT. A (AST-DOM) has no
-    real param (dalfox writes param '-'), so it keys on its SOURCE/SINK + line:col (two sinks on one URL are
-    distinct). Returns None (row rejected, never raises — review-r9#3) when a needed field is missing/non-scalar
-    or the PoC URL is unparseable (incl. a bad :port that only raises on attribute access)."""
+    """A canonical identity per finding so distinct routes never collapse. V/R key on
+    scheme://host:port/path + location:param + method; A (AST-DOM) keys on source/sink + line:col. Returns
+    None (never raises) when a needed field is missing/non-scalar or the PoC URL is unparseable.
+    """
     poc = _dstr(obj.get("data"))
     if not poc:
         return None
@@ -1672,7 +1446,7 @@ def _dalfox_identity(ftype: str, obj: dict) -> "str | None":
         return None
     if not host:
         return None
-    h = f"[{host}]" if ":" in host else host                   # review-r10#2: bracket IPv6 so [::1]:80 != [::1:80]
+    h = f"[{host}]" if ":" in host else host                   # bracket IPv6 so [::1]:80 != [::1:80]
     base = f"{(u.scheme or 'http').lower()}://{h}{f':{port}' if port else ''}{u.path or '/'}"
     method = (_dstr(obj.get("method")) or "GET").upper()
     if ftype == "A":
@@ -1714,36 +1488,26 @@ def _dalfox_finding(obj) -> "dict | None":
             "location": _dstr(obj.get("location")) or _dstr(obj.get("inject_type")) or None,
             "evidence": _dstr(obj.get("evidence")) or None, "poc": poc,
             "cwe": _dstr(obj.get("cwe")) or None,
-            # 3.2.0 splits confidence / detection-method / impact into their own axes; carry them rather
-            # than flattening to our single tier. `detection_method: "oob"` is a BLIND callback that
-            # actually arrived — the one observable proof that channel worked.
+            # 3.2.0 splits confidence and detection-method into their own axes; carry both (impact is not
+            # stored). `detection_method: "oob"` is a blind callback that arrived — proof the channel worked.
             "detection_method": _dstr(obj.get("detection_method")) or None,
             "confidence_reason": _dstr(obj.get("confidence_reason")) or None,
             "inject_type": _dstr(obj.get("inject_type")) or None,
-            # `--include-request/--include-response`: the exact request that produced the finding and the
-            # response that proved it. Stored WHOLE — this is the evidence, not a preview of it — and
-            # only when dalfox actually emitted a string (a missing one must not become "None").
+            # `--include-request/--include-response`: the exact request and the response that proved the
+            # finding, stored whole (the evidence, not a preview), only when dalfox emitted a string
             "request": obj.get("request") if isinstance(obj.get("request"), str) else None,
             "response": obj.get("response") if isinstance(obj.get("response"), str) else None,
-            # correlation for an OOB hit is dalfox's: it minted the nonce, registered, polled and mapped
-            # it back. Quarry imports that — it did not issue the token (review#12, Lumpy).
+                        # correlation for an OOB hit is dalfox's: it minted the nonce, registered, polled and
+                        # mapped it back; Quarry imports that and did not issue the token
             **({"oob_owner": "dalfox"} if _dstr(obj.get("detection_method")) == "oob" else {})}
 
 
-#: dalfox's own per-target error codes, split by WHAT A RETRY WOULD DO. review#13 (Lumpy): "retriable
-#: remainder versus deterministic terminal omission" — collapsing both into one boolean is how a chunk
-#: either retries for ever or is marked done over evidence nobody collected.
-#:
-#: RETRIABLE — the environment failed and a later attempt may succeed. The chunk is NOT done.
+#: retriable per-target error codes (the environment failed, the chunk is not done).
+#: See docs/design/DALFOX-XSS-DESIGN.md.
 _DALFOX_RETRIABLE = frozenset({"CONNECTION_FAILED", "DNS_RESOLUTION_FAILED", "TLS_HANDSHAKE_FAILED",
                                "REQUEST_TIMEOUT", "SESSION_LOST"})
-#: DETERMINISTIC — the same input under the same config omits the same targets, for ever. The chunk IS
-#: execution-complete (retrying changes nothing); the omission is COVERAGE and is reported as such.
-#:
-#: Each maps to the coverage KIND that actually describes it, because the manifest is operator evidence
-#: and `timeout` was misleading for both (review#16, Lumpy):
-#:   TRUNCATED_PER_HOST_CAP  a hard ceiling truncated eligible input      -> COVERAGE_CAP
-#:   CONTENT_TYPE_MISMATCH   the tool declined it as unscannable content  -> COVERAGE_TOOL_OMISSION
+#: deterministic per-target error codes (same omission for ever; the chunk is done, the omission is
+#: coverage). See docs/design/DALFOX-XSS-DESIGN.md.
 _DALFOX_TERMINAL_KIND = {"TRUNCATED_PER_HOST_CAP": events.COVERAGE_CAP,
                          "CONTENT_TYPE_MISMATCH": events.COVERAGE_TOOL_OMISSION}
 _DALFOX_DETERMINISTIC = frozenset(_DALFOX_TERMINAL_KIND)
@@ -1751,19 +1515,8 @@ _DALFOX_DETERMINISTIC = frozenset(_DALFOX_TERMINAL_KIND)
 
 @dataclass(frozen=True)
 class DalfoxArtifact:
-    """What ONE dalfox JSONL artifact says about itself — as separate facts.
-
-    review#13 (Lumpy): "don't reduce all metadata problems to one `artifact_ok=False`", because
-    "valid artifact" and "complete scan" then become the same boolean again. They are different
-    questions and the answers drive different machinery:
-
-      readable    the artifact PARSES to our contract (one meta row first, counts agree, every row
-                  valid). Drives resume validation: an unreadable artifact proves nothing.
-      complete    dalfox says it finished the batch — `meta.incomplete` false and no target skipped.
-      skipped     every target NOT scanned or not trusted, with dalfox's own reason.
-      retriable   a later attempt could still cover those targets  -> the chunk is not done.
-      deterministic  the same input+config omits them for ever      -> the chunk IS done, and the
-                  omission is reported as coverage rather than retried into eternity.
+    """What one dalfox JSONL artifact says about itself, as separate facts: readable (parses to our
+    contract), complete, skipped, retriable, deterministic. See docs/design/DALFOX-XSS-DESIGN.md.
     """
 
     readable: bool
@@ -1771,13 +1524,8 @@ class DalfoxArtifact:
     skipped: tuple = ()          # ((target, status, error_code), ...)
     total_requests: "int | None" = None
     deduplicated: "int | None" = None
-    #: what dalfox says it ACTUALLY did about duplicates. We ask for `signature`; a build that ignored
-    #: the flag, or a future default change, would silently scan a different target set than the one we
-    #: think we asked for — so the artifact's own word is read rather than assumed (2026-08-07).
-    #: every target dalfox ACCOUNTED FOR, whatever its disposition. review#37 (Lumpy): `complete` meant
-    #: "no listed target was skipped", which is silent about targets that were never listed — an empty
-    #: summary certified a whole batch. Membership is reconciled against the submitted batch by the lane,
-    #: which is the only place that knows what was submitted.
+    #: what dalfox says it did about duplicates, read from the artifact, not assumed. `complete` is silent
+    # about targets never listed, so membership is reconciled against the submitted batch by the lane
     summary_targets: tuple = ()
     #: one of `_DALFOX_DEDUP_MODES`, or "unknown" when the artifact does not establish it.
     dedup_mode: str = "unknown"
@@ -1785,11 +1533,9 @@ class DalfoxArtifact:
 
     @property
     def complete(self) -> bool:
-        """dalfox covered every target it was given — and SAID SO in a form we could read.
-
-        review#36 (Lumpy): coverage was derived from two fields while the row carrying them might be
-        malformed, so `{"incomplete": "true"}` produced `complete=True` on an artifact whose own meta
-        could not be trusted. An unreadable claim is not a claim of coverage."""
+        """dalfox covered every target it was given, and said so in a readable form: an unreadable meta row is
+        not a claim of coverage.
+        """
         return self.readable and not self.incomplete_flag and not self.skipped
 
     @property
@@ -1827,10 +1573,8 @@ class DalfoxArtifact:
         return "; ".join(bits) or "every target covered"
 
 
-#: what dalfox can legitimately say it did about duplicates. review#35 (Lumpy): `str(x or "")` turned a
-#: dict into `"{'mode': 'signature'}"` and an absent field into `""` — one is malformed input dressed as
-#: a policy, the other is no claim at all. Anything not in this set is `unknown`: the findings are still
-#: evidence, but WHICH TARGET SET produced them is not established, and the lane says so.
+#: what dalfox can legitimately say it did about duplicates; anything else is `unknown` — the findings
+#: are still evidence, but which target set produced them is not established
 _DALFOX_DEDUP_MODES = frozenset({"signature", "exact", "off"})
 
 
@@ -1841,23 +1585,14 @@ def _dedup_mode(v) -> str:
 def _dalfox_meta(m: dict) -> "tuple[int | None, DalfoxArtifact | None]":
     """Read the meta row -> (findings_count, partially-built artifact). `None` count = unusable."""
     def _nonneg(v):
-        # review#35 (Lumpy): these numbers become OPERATOR-FACING MEASUREMENT — "37 requests, 4 targets
-        # collapsed" — so `-7` and `-3` were being summed and shown. A count that cannot be true is not
-        # a count; it is an unreadable field, and `None` says exactly that.
+        # these numbers are operator-facing measurement ("37 requests, 4 targets collapsed"), so a count that
+        # cannot be true is not a count: `None` says exactly that rather than showing a negative
         return v if type(v) is int and v >= 0 else None
 
     c = m.get("findings_count")
     count = _nonneg(c)                                        # STRICT int (not bool), non-negative
-    # review#36 (Lumpy): these fields DRIVE THE VERDICT — `incomplete` decides whether the chunk may be
-    # marked resumably complete, and `target_summary` is where a SKIPPED target is named. Both were
-    # permissive: `"incomplete": "true"` is not `True`, so it read as "not incomplete", and a
-    # dict-valued `target_summary` failed the `isinstance(list)` check and became "no targets skipped".
-    # Malformed input must not be able to say a scan finished cleanly, so it invalidates the meta row
-    # (count None -> artifact not readable -> chunk PARTIAL/retryable) rather than defaulting to clean.
-    # review#37 (Lumpy): the checks only rejected these when PRESENT, so `{"findings_count": 0}` — no
-    # `incomplete`, no `target_summary` — still certified a clean, resumably complete chunk. 3.2.0
-    # always emits both (measured), so their ABSENCE is not "nothing to report", it is an artifact that
-    # does not implement the contract this lane resumes on.
+    # these fields drive the verdict (`incomplete`, `target_summary`), so both are validated strictly and
+    # fail closed: a bad or absent field makes the chunk PARTIAL.
     malformed = False
     skipped, summary_targets = [], []
     ts = m.get("target_summary")
@@ -1894,30 +1629,12 @@ def _dalfox_meta(m: dict) -> "tuple[int | None, DalfoxArtifact | None]":
 
 
 def scan_dalfox_jsonl(cf, sink=None) -> "tuple[int, DalfoxArtifact]":
-    """FAIL-CLOSED, STREAMING parse of a dalfox v3 JSONL artifact -> (valid_finding_count, DalfoxArtifact).
+    """Fail-closed, streaming parse of a dalfox v3 JSONL artifact -> (valid_finding_count, DalfoxArtifact).
 
-    Every valid finding is handed to `sink` AS IT IS READ and never retained here. review#35 (Lumpy):
-    with `--include-response` a finding carries a whole HTTP response, and the old shape read the entire
-    file into a str, copied it again through `splitlines()`, and held every finding at once — so the
-    artifact dalfox had already written successfully could OOM the process that came to read it, and do
-    it again on resume. The bytes are preserved in full; what is bounded is how many of them we hold at
-    the same time. That is the same split the acquisition side settled on: keep everything, hold one
-    piece at a time.
-
-    `artifact_ok` is False on ANY inconsistency: missing/unreadable file, a decode error, a meta row NOT
-    in first position or MORE than one, a non-int/negative/bool findings_count (review-r10#3: bool
-    subclasses int, so `type(x) is int`), finding-count != meta count, a torn/non-object line, an unknown
-    type, or a row missing its identity fields. The caller ingests the valid findings but marks a not-ok
-    chunk PARTIAL/retryable (never 'done'), so incomplete work can't be permanently skipped on resume.
-
-    A DECODE ERROR is now per LINE rather than per file: the artifact is opened in binary and each line
-    is decoded strictly, so one bad byte costs that row (and the artifact's `readable` verdict, exactly
-    as before) instead of discarding every finding beside it.
-
-    review#13 (Lumpy): the meta row is READ, not just counted. dalfox reports `incomplete` and a
-    per-target `status`/`error_code`, so a batch where a target was SKIPPED used to parse as clean and
-    become resumably complete. Those facts ride on the returned `DalfoxArtifact`: `readable` is the
-    structural verdict this function always gave, and completeness is a separate question."""
+    Every valid finding is handed to `sink` as it is read and never retained (a finding can carry a whole
+    response). `artifact_ok` is False on any inconsistency, and the caller marks a not-ok chunk
+    PARTIAL/retryable. See docs/design/DALFOX-XSS-DESIGN.md.
+    """
     if not cf.exists():
         return 0, DalfoxArtifact(readable=False)
     kept, ok, meta_rows, meta_count, row_idx = 0, True, 0, None, 0
@@ -1940,7 +1657,7 @@ def scan_dalfox_jsonl(cf, sink=None) -> "tuple[int, DalfoxArtifact]":
                     ok = False; row_idx += 1; continue
                 if "meta" in obj:
                     meta_rows += 1
-                    if row_idx != 0:                          # review-r10#3: meta must be the FIRST row
+                    if row_idx != 0:                          # meta must be the first row
                         ok = False
                     m = obj.get("meta")
                     if isinstance(m, dict):
@@ -1958,10 +1675,8 @@ def scan_dalfox_jsonl(cf, sink=None) -> "tuple[int, DalfoxArtifact]":
                 else:
                     kept += 1
                     if sink is not None:
-                        # review#36 (Lumpy): the sink STORES the finding, and an OSError from that is a
-                        # STORAGE failure, not an unreadable artifact — swallowing it returned
-                        # `(0, readable=False)` while earlier rows had already landed, and the real
-                        # failure disappeared. It is re-raised through the artifact-I/O boundary below.
+                        # the sink stores the finding; an OSError from that is a storage failure, not an
+                        # unreadable artifact, so it is re-raised through the I/O boundary below
                         in_sink = True
                         sink(rec)
                         in_sink = False
@@ -1971,7 +1686,7 @@ def scan_dalfox_jsonl(cf, sink=None) -> "tuple[int, DalfoxArtifact]":
         if in_sink:
             raise                                             # the caller's failure, reported as its own
         return 0, DalfoxArtifact(readable=False)
-    if meta_rows != 1:                                        # review-r10#3: EXACTLY one meta summary row
+    if meta_rows != 1:                                        # exactly one meta summary row
         ok = False
     if meta_count is not None and meta_count != kept:
         ok = False                                            # count mismatch -> torn/partial artifact
@@ -1981,8 +1696,9 @@ def scan_dalfox_jsonl(cf, sink=None) -> "tuple[int, DalfoxArtifact]":
 
 
 def _sha256_file(p) -> str:
-    """sha256 of a file, streamed. Used to prove a recorded completion artifact is UNCHANGED before a resume
-    trusts it to SKIP its chunk (review-r11#1)."""
+    """sha256 of a file, streamed. Proves a recorded completion artifact is unchanged before a resume trusts
+    it to skip its chunk.
+    """
     h = hashlib.sha256()
     with open(p, "rb") as f:
         for b in iter(lambda: f.read(65536), b""):
@@ -1991,43 +1707,31 @@ def _sha256_file(p) -> str:
 
 
 def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
-    """params.dalfox_xss_fast (step 4.3.B): reflected-XSS scan over the CANONICALIZED xss candidates with
+    """params.dalfox_xss_fast: reflected-XSS scan over the CANONICALIZED xss candidates with
     the fast flags, in resumable chunks. Mirrors _nuclei_scan: input-hashed chunk state, mark done ONLY
     on clean completion (failed batch stays retryable), source-level tool_start/tool_progress/tool_finish
     + ledger. dalfox v3 emits structured JSONL (parsed below): findings are tiered by dalfox's own verdict
     (V verified / R reflected / A AST-DOM) into confidence, but stay confirmed:false — the map-don't-exploit
     boundary holds (Quarry-owned impact validation is separate). Findings go straight to the store (deduped by id)."""
     sid = "params.dalfox_xss_fast"
-    # a SIGKILLed run skips every `finally`, so a credential-transport file can outlive the process that
-    # needed it. Sweep before we make another one (review#18, Lumpy).
+    # a SIGKILLed run skips every `finally`, so a credential-transport file can outlive the process;
+    # sweep before we make another.
     sweep_stale_oob_creds()
     _plan_for_run = _blind_oob_plan(prof)     # resolved ONCE: the command, the identity and the report
-    # EXECUTION facts about the OOB channel, distinct from the policy above: how many invocations this
-    # lifecycle tried to launch with it, and how many actually did (review#20, Lumpy).
+    # execution facts about the OOB channel, distinct from the policy above: how many invocations this
+    # lifecycle tried to launch the armed channel, and how many actually did.
     _oob = {"attempted": 0, "launched": 0, "why": ""}
     chunk_n = max(1, settings.concurrency("DALFOX_CHUNK", 40))
     batches = [cands[i:i + chunk_n] for i in range(0, len(cands), chunk_n)]
     state_f = ctx.run.raw_path("params", "dalfox", "chunks.state.json")
-    # C07 inc4 + review-r8#4/r9#4: resume validity folds EVERY coverage-affecting knob — the effective v3
-    # contract: the VERIFIED EXECUTED engine identity (not just the configured pin — a drifted/shadowed binary
-    # must not reuse old chunks; an unverified engine carries a nonce -> non-resumable), workers + target
-    # concurrency + rate-limit (fan-out/pacing), a FINGERPRINT of the blind collector (never the raw URL), and
-    # chunk size. `mode` v3-fast invalidates any in-progress v2 state.
-    # `mode` carries the SCAN CONTRACT, not just the engine generation (review#36, Lumpy): the 3.2.0
-    # adoption changed WHAT AN ARTIFACT CONTAINS (full request/response evidence) and WHICH TARGET SET
-    # was scanned (signature dedup). A chunk completed before it is structurally valid and would be
-    # accepted on resume — skipping work whose evidence we just decided we need. Changing this string
-    # invalidates that state, which is exactly what should happen.
+    # resume validity folds every coverage-affecting knob (engine identity, workers, concurrency, rate,
+    # blind-collector fingerprint, chunk size, `mode`).
     _cfg = {"mode": "v3-fast-reflected+evidence+sigdedup", "engine": _dalfox_engine_id(),
             "workers": settings.workers("dalfox", 30),
             "targets": settings.concurrency("DALFOX_TARGETS", 4),
             "rate_limit": prof.http_rl,
-            # THE OOB POLICY IS PART OF THE WORK'S IDENTITY (review#19, Lumpy): arming blind XSS after a
-            # completed reflected scan must not reuse the old chunks and inject NO blind payload at all —
-            # a lane that looks done and never ran what was just enabled. Switching backend
-            # (public <-> self-hosted, or one server to another) has the same effect. The SERVER is
-            # fingerprinted, never named: a work unit is reported and must not carry infrastructure, and
-            # the token is not in here at all.
+            # the OOB policy is part of the work's identity, so arming blind XSS or switching backend must not
+            # reuse old chunks; the server is fingerprinted, never named, and never the token
             "oob_channel": _plan_for_run["channel"],
             "oob_backend": _plan_for_run["backend"],
             "oob_server": (secrets.fingerprint(_plan_for_run["server"])
@@ -2035,13 +1739,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             "oob_authenticated": bool(_plan_for_run["secret"]),
             "chunk": chunk_n}
     scan_wu = events.work_unit(sid, inputs={"cands": cands}, config=_cfg)
-    # review-r9#1/r10#1: nuclei's proven resume contract (not just its dir layout). Immutable per-attempt
-    # artifacts wu_<scan_wu>/attempt_<id>/findings_<ci>.jsonl; a COMPLETION map (clean chunk -> validated
-    # artifact path, controls SKIP) is kept separate from an append-only EVIDENCE map (every attempt's artifact
-    # that produced output, controls AGGREGATION). A chunk is skipped ONLY if its recorded artifact still
-    # validates (index in range · relative · no `..` · exact filename · resolves INSIDE this work_unit · readable
-    # · re-parses); the source verdict + `matched` are derived from the RETAINED EVIDENCE (all attempts, deduped
-    # by finding id), so a finding kept in a degraded attempt is never lost when a later retry comes back empty.
+    # nuclei's proven resume contract: a completion map (controls skip) kept separate from an append-only
+    # evidence map (controls aggregation), so a finding in a degraded attempt survives a later empty retry
     wu_dir = state_f.parent / f"wu_{scan_wu}"
     wu_root = wu_dir.resolve()
     attempt_id = time.strftime('%Y%m%d-%H%M%S') + "-" + os.urandom(4).hex()
@@ -2078,10 +1777,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         return prev if prev.get("work_unit") == scan_wu else None   # config-inclusive key: mismatch → fresh
 
     def _valid_completion(ci_str, entry) -> bool:
-        # review-r11#1: a completion is trusted to SKIP a chunk only if its artifact is structurally valid AND
-        # UNCHANGED (sha256 matches what we recorded) AND still PARSES CLEAN AND still AGREES with the recorded
-        # outcome (EMPTY = no findings, SUCCESS = >=1). A completed artifact that later went missing/malformed/
-        # tampered is dropped -> the chunk RE-RUNS (never a silent skip on stale evidence).
+        # a completion skips a chunk only if its artifact is valid, unchanged (sha256), still parses, and
+        # agrees with the recorded outcome; otherwise the chunk re-runs
         if not isinstance(entry, dict):
             return False
         rel, outcome, sha = entry.get("rel"), entry.get("outcome"), entry.get("sha256")
@@ -2093,10 +1790,9 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 return False
         except OSError:
             return False
-        n_f, art = scan_dalfox_jsonl(p)                      # re-scans (as the comment promises); the
-                                                             # findings themselves are not needed here
-        # a recorded completion is only trusted when the artifact is still STRUCTURALLY sound and dalfox
-        # itself had nothing left to retry on it
+        n_f, art = scan_dalfox_jsonl(p)                      # re-scans as the docstring promises
+                                                                                     # a completion is trusted only when the artifact is still sound and dalfox had nothing left
+                                                                                     # to retry (see the docstring)
         return art.execution_done and ((outcome == "EMPTY" and not n_f)
                                        or (outcome == "SUCCESS" and n_f > 0))
 
@@ -2109,10 +1805,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         return out
 
     def _valid_evidence(ci_str, entry) -> bool:
-        # review-r12: an evidence artifact is aggregated only if structurally valid AND UNCHANGED (its recorded
-        # sha256 still matches). A rejected/tampered artifact whose completion failed the digest must not sneak
-        # its rows in through the evidence map. Valid rows from an ORIGINALLY malformed/degraded artifact are
-        # still retained — as long as its bytes have not changed since we recorded it.
+        # an evidence artifact is aggregated only if structurally valid and unchanged (sha256); valid rows
+        # from an originally-degraded artifact are still retained, as long as its bytes have not changed
         if not isinstance(entry, dict):
             return False
         rel, sha = entry.get("rel"), entry.get("sha256")
@@ -2135,11 +1829,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         return out
 
     def _load_membership(prev) -> dict:
-        """{ci: [reason, …]} — membership this lane could not DECIDE (an unreadable dedup policy).
-
-        review#41 (Lumpy): it was emitted once and the chunk was recorded complete, so the next
-        lifecycle skipped the chunk, re-derived nothing, and the fresh coverage generation retired the
-        record — an unresolved doubt that quietly became a clean run."""
+        """{ci: [reason, …]} — membership this lane could not decide (an unreadable dedup policy)."""
         m = (prev or {}).get("membership")
         out: dict[str, list] = {}
         if isinstance(m, dict):
@@ -2150,12 +1840,9 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         return out
 
     def _load_remainder(prev) -> dict:
-        """{ci: [url, …]} — the targets a prior attempt still owes, and ONLY those.
-
-        review#14 (Lumpy): a chunk that failed on one `SESSION_LOST` target used to re-run its whole
-        input file, re-requesting every target that had already succeeded — someone else's site, hit
-        again for nothing. dalfox names the affected URLs in `target_summary`, so the remainder can be
-        exactly those."""
+        """{ci: [url, …]} — the targets a prior attempt still owes, and only those (dalfox names them in
+        `target_summary`).
+        """
         m = (prev or {}).get("remainder")
         out: dict[str, list] = {}
         if isinstance(m, dict):
@@ -2166,12 +1853,9 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         return out
 
     def _load_terminal(prev) -> dict:
-        """{ci: [{url, code}, …]} — omissions NO retry can close, accumulated across attempts.
-
-        review#15 (Lumpy): a clean retry used to erase them. Attempt 1 truncates `b` and loses `c` to a
-        dead session; attempt 2 re-runs `c` alone, succeeds, emits no omission — and `b`'s truncation
-        vanished from the run entirely. A terminal gap is a FACT ABOUT THE TARGET SET, not about the
-        attempt that happened to observe it, so it is persisted and re-reported every run."""
+        """{ci: [{url, code}, …]} — omissions no retry can close, accumulated across attempts. A terminal gap is
+        a fact about the target set, so it is persisted and re-reported every run.
+        """
         m = (prev or {}).get("terminal")
         out: dict[str, list] = {}
         if isinstance(m, dict):
@@ -2202,9 +1886,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": completion, "evidence": evidence_map,
              "remainder": remainder, "terminal": terminal, "membership": membership}))
 
-    # THE DECISION, recorded BEFORE execution — which is what it is: knowable up front, and it must
-    # survive a run that raises anywhere in the loop (review#21, Lumpy). `omitted=0` keeps it inert in
-    # the verdict: telemetry about a choice, never a coverage claim.
+    # the decision, recorded before execution (knowable up front) and surviving a run that raises anywhere.
+    # `omitted=0` keeps it inert in the verdict: telemetry about a choice, never a coverage claim.
     events.coverage_partial(
         sid, kind=events.COVERAGE_SAMPLE, measure="blind_xss_policy", unit=f"{sid}.blind_oob.policy",
         eligible=1, tested=1, omitted=0,
@@ -2229,13 +1912,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                              work_unit=chunk_wu)
         if str(ci) in completion:                         # resume: CLEAN in a prior attempt (revalidated on load)
             continue
-        # RESUME ONLY WHAT IS OWED. A prior attempt that named its retriable targets re-runs those and
-        # nothing else, so a chunk's successful targets are never re-requested (review#14, Lumpy). The
-        # remainder is intersected with this run's batch: a candidate set that changed cannot smuggle a
-        # URL back in, and a stale entry naming nothing simply falls back to the full chunk.
-        # COUNTED, not set-membership (review#41, Lumpy): the state correctly stored two owed
-        # occurrences of one URL under `dedup_mode=off`, and `set()` then selected all three originals —
-        # so a retry re-requested a target that had already answered. The remainder is consumed.
+        # resume only what is owed: a prior attempt's retriable targets re-run, intersected with this run's
+        # batch. Counted, not set-membership, so two owed occurrences of one URL are both owed.
         from collections import Counter as _Counter
         _owed_count = _Counter(remainder.get(str(ci), []))
         owed = []
@@ -2256,10 +1934,10 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         rel = f"wu_{scan_wu}/attempt_{attempt_id}/findings_{ci}.jsonl"
         events.tool_start(sid, work_unit=chunk_wu, input_total=len(batch))   # this chunk's own lifecycle
         res = None
-        chunk_status = Status.FAILED.value                   # review#1: promoted ONLY after ALL bookkeeping below
-        try:                                                 # review#1: chunk terminal ALWAYS fires (finally)
+        chunk_status = Status.FAILED.value                   # promoted only after all bookkeeping below
+        try:                                                 # chunk terminal always fires (finally)
             # the credential exists ONLY around the exec: created here, destroyed in the context
-            # manager's `finally` whether the run succeeds, times out, or raises (review#18, Lumpy).
+                        # the manager's `finally`, whether the run succeeds, times out, or raises
             if _plan_for_run["armed"]:
                 _oob["attempted"] += 1
             try:
@@ -2267,17 +1945,15 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                     res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof, len(batch), _cred),
                                     ok_codes=(0, 1),
                                     timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
-                    # PROVEN by the runner, never inferred: "the credential is in hand" is readiness,
-                    # and a missing binary, a cancelled launch or a Popen that raised must not read as a
-                    # process that ran with the armed channel (review#21, Lumpy).
+                    # proven by the runner, never inferred: a missing binary, a cancelled launch or a Popen
+                    # that raised must not read as a process that ran with the armed channel
                     if _plan_for_run["armed"] and getattr(res, "started", False):
                         _oob["launched"] += 1
                     elif _plan_for_run["armed"]:
                         _oob["why"] = _oob["why"] or f"dalfox did not start ({res.note or res.status})"
             except OobCredentialError as e:
-                # REFUSE, never fall back. Running the armed channel unauthenticated is a DIFFERENT scan
-                # from the one the operator configured, and it finishes cleanly with no callbacks —
-                # looking valid while proving nothing (review#19, Lumpy).
+                # refuse, never fall back: running the armed channel unauthenticated is a different scan that
+                # finishes cleanly with no callbacks — looking valid while proving nothing
                 degraded += 1
                 _oob["why"] = _oob["why"] or f"credential transport failed ({e})"
                 events.coverage_partial(
@@ -2289,26 +1965,12 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                             f"unauthenticated"))
                 chunk_status = Status.PARTIAL.value
                 continue
-            # dalfox v3 EXIT CONTRACT (measured): 0 = clean/no-findings, 1 = clean/WITH-findings, >=2 = error.
-            # review-r9#2: exit code and parsed artifact must AGREE — CLEAN only for (0 + valid empty) or
-            # (1 + valid findings). Any disagreement / hard exit / malformed artifact -> PARTIAL, retryable.
-            # the findings are INGESTED below from the retained artifacts; here only the count and the
-            # artifact's own verdict are needed, so nothing is held.
+            # dalfox v3 exit contract: 0 = clean/no-findings, 1 = clean/with-findings, >=2 = error. Exit code
+            # and parsed artifact must agree, or the chunk is PARTIAL/retryable; findings are ingested below.
             n_findings, art = scan_dalfox_jsonl(cf)
             rc = res.exit_code
-            # EXECUTION completion decides resume; COVERAGE is reported separately below. A chunk whose
-            # only omissions are DETERMINISTIC is done — retrying it would omit exactly the same targets
-            # for ever — and its gap is a counter, not a retry (review#13, Lumpy).
-            # MEMBERSHIP RECONCILIATION (review#37, Lumpy). `execution_done` only says nothing dalfox
-            # LISTED still needs retrying; it is silent about targets it never listed. With signature
-            # dedup the expected accounting is (submitted - collapsed), so a shortfall means dalfox
-            # never told us what happened to those URLs — and a chunk marked done over them would drop
-            # them for ever. Unaccounted targets keep the chunk retryable.
-            # review#38 (Lumpy): counting is not reconciling. `[a,b]` answered by `[a,a]`, by `[a,c]`,
-            # or by an empty summary with `deduplicated=99` all balanced arithmetically and were marked
-            # done. Membership is computed from the batch's OWN signatures — the identity dalfox
-            # deduplicates on, which is the identity `_canonicalize_candidates` already uses — and every
-            # disagreement is named.
+                        # execution completion decides resume, coverage is reported separately: membership is
+                        # reconciled from the batch's own signatures.
             _owed_unlisted, _acct = _dalfox_accounting(batch, art)
 
             if _acct["retryable"]:
@@ -2318,16 +1980,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                     reason=(f"chunk {ci + 1}/{len(batches)}: dalfox's target accounting does not "
                             f"reconcile with the batch submitted — " + "; ".join(_acct["retryable"])
                             + "; the chunk stays RETRYABLE rather than done over it"))
-            # UNDECIDABLE, not unfinished (review#40, Lumpy): a retry under the same unknown policy
-            # produces the same ambiguity, so the chunk is execution-complete and the doubt is carried
-            # as coverage. ACCUMULATED rather than emitted here (review#41): the chunk is recorded
-            # COMPLETE, so a fresh lifecycle skips it and never re-derives the doubt, and the new
-            # coverage generation would retire the old record.
-            #
-            # CLEARED PER IDENTITY (review#42, Lumpy): `pop()` cleared doubt about targets this attempt
-            # never touched — a retry narrowed to the remainder, or an artifact we could not even read,
-            # both wiped an unresolved question about the rest of the original batch. Only a target this
-            # attempt actually SCANNED, and reconciled unambiguously, resolves.
+                                                # undecidable, not unfinished: a retry under the same unknown policy repeats
+                                                # the ambiguity, so the chunk is complete.
             _prior = set(membership.get(str(ci), []))
             if art.readable:
                 _prior -= {u for u in batch if u not in set(_acct["ambiguous"])}
@@ -2339,23 +1993,18 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             clean = (art.execution_done and not _acct["retryable"]
                      and ((rc == 0 and not n_findings) or (rc == 1 and n_findings > 0)))
             cf_sha = _sha256_file(cf) if cf.exists() else None
-            # what the scan COST and what it COLLAPSED — parsed since 4.3 and never surfaced, which made
-            # the meta row half-read. Accumulated here and reported on the lane's result, so the residual
-            # duplicate rate over our own canonicalizer is a MEASURED number at the next OTC run rather
-            # than an assumption (2026-08-07).
+            # what the scan cost and what it collapsed, accumulated and reported on the lane's result, so the
+            # residual duplicate rate over our own canonicalizer is a measured number, not an assumption
             if type(art.total_requests) is int:
                 cost["requests"] += art.total_requests
             if type(art.deduplicated) is int:
                 cost["deduplicated"] += art.deduplicated
             if art.dedup_mode != "signature":
-                # we asked for `signature`; the artifact says otherwise. Not a failure of THIS chunk —
-                # the scan is what it is — but the target set is not the one we asked for, and an
-                # operator reading "N targets scanned" deserves to know which policy produced it.
+                                # we asked for `signature` and the artifact says otherwise: not this chunk's failure,
+                                # but the target set is not the one we asked for, and an operator deserves to know
                 cost["dedup_disagreement"].add(art.dedup_mode)
-            # ACCUMULATE the gaps no retry can close, unioned by URL. A repeat observation does not
-            # double-count and a CLEAN RETRY CANNOT ERASE an earlier one (review#15, Lumpy). The
-            # coverage record is emitted once per chunk AFTER the loop, from this union — one record
-            # per (source_id, unit) is what reconciliation keeps, and it must outlive the attempt.
+                        # accumulate the gaps no retry can close, unioned by URL; emitted once per chunk after the
+                        # loop, and outlives the attempt
             if art.deterministic:
                 rows = terminal.setdefault(str(ci), [])
                 have = {r["url"] for r in rows}
@@ -2369,22 +2018,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                     unit=f"{sid}.chunk{ci}.pending", eligible=len(batch),
                     tested=max(0, len(batch) - still), omitted=still,
                     reason=f"chunk {ci + 1}/{len(batches)}: {art.coverage_reason()}")
-            # WHAT THIS ATTEMPT STILL OWES: the targets dalfox named as retriable or unexplained, and
-            # only those. Deterministic omissions are NEVER rescheduled — retrying omits exactly the same
-            # targets for ever — and covered targets are not re-requested (review#14, Lumpy).
-            # review#38 (Lumpy): a target dalfox never mentioned is owed too. Without it the remainder
-            # held only the rows dalfox NAMED, so an unlisted target cleared the remainder and the next
-            # lifecycle re-sent the whole batch — someone else's site, hit again for targets that had
-            # already answered.
-            # WHAT THE RETRY OWES, in the arithmetic of the mode dalfox reported.
-            #
-            # Under `off` each target_summary row IS an occurrence: three identical inputs where one
-            # comes back SESSION_LOST owe 1 named failure + 2 never-reported = 3 scans, and any
-            # set-dedup of either half collapses that to 1 (review#43, Lumpy). The two halves are
-            # disjoint by construction — a NAMED row was reported, so it is not part of the unlisted
-            # shortfall, which is computed from (expected - reported) counts.
-            #
-            # Under `signature`/`exact` one identity is one scan, so deduping is right there.
+                                                # what this attempt owes: targets dalfox named retriable, plus ones it never
+                                                # mentioned.
             _named_owed = _dedupe_owed([t[0] for t in (art.retriable + art.unclassified) if t[0]],
                                        art.dedup_mode)
             _key = _dalfox_identity_fn(art.dedup_mode)[0]
@@ -2404,9 +2039,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                        art.coverage_reason() if not art.execution_done else
                        f"exit {rc} disagrees with {n_findings} finding(s)")
                 events.coverage_partial(sid, reason=f"chunk {ci + 1}/{len(batches)}: {why}")
-                # A named remainder only when dalfox told us WHICH targets: an artifact we could not
-                # read, or an exit-code disagreement, says nothing about individual targets, so the whole
-                # chunk stays owed. Naming a subset there would silently drop the rest.
+                # a named remainder only when dalfox told us which targets: an unreadable artifact or an exit-
+                # code disagreement says nothing about individual targets, so the whole chunk stays owed
                 if art.readable and owed_next:
                     remainder[str(ci)] = owed_next
                 else:
@@ -2418,32 +2052,17 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                             else Status.EMPTY if clean else Status.PARTIAL).value
         finally:
             _chunk_terminal(sid, chunk_wu, res, cf, status=chunk_status)   # FAILED if exec OR bookkeeping raised
-      # review-r10#1/r11#2: DERIVE the verdict + telemetry from the RETAINED EVIDENCE (all attempts), not the
-      # last per-chunk label. EVERY observation goes through Run.add() so C09 merges raw_refs / reconciles
-      # conflicts across attempts (a later clean attempt's provenance must reach the store, not be dropped by a
-      # pre-add dedup). A separate GLOBAL id set drives only the `matched` (distinct findings) counter; `produced`
-      # counts NEW entities (Run.add True). Falls back to THIS attempt's file for a chunk just run but not yet
-      # recorded. Verdict: any degraded this run -> PARTIAL; else any distinct finding -> SUCCESS; else EMPTY.
-      # THE BLIND-XSS DECISION, every run, whichever way it went — armed or refused. Lumpy required the
-      # backend to be recorded BEFORE execution; this is that record, and it is Quarry's own decision, so
-      # it is fully knowable.
-      #
-      # What is NOT claimed: dalfox's session lifecycle. Registration, poll completion and the final wait
-      # are written to its STDERR (`ceprintln!`), not to the JSONL artifact, and Quarry runs it under
-      # `-S`. Asserting "registered" or "polled" from a stderr substring is exactly the oracle this
-      # codebase stopped trusting. A callback that ARRIVES is observable — it lands as a `V` finding with
-      # `detection_method: oob` — so findings prove the channel worked; their absence proves nothing.
-      # TERMINAL COVERAGE, re-reported EVERY run from the persisted union — not from this attempt.
-      # A gap no retry can close is a fact about the TARGET SET, so it must outlive the attempt that
-      # observed it and reach a fresh process's manifest and verdict (review#15, Lumpy). `_save()` has
-      # already persisted it, so the record survives even if this run adds nothing.
+            # derive the verdict from the retained evidence across all attempts, not the last label:
+            # any degraded -> PARTIAL, else any finding -> SUCCESS, else EMPTY.
+
+                        # dalfox's session lifecycle is not claimed from its stderr; a callback that arrives is a
+                        # `V` finding, so findings prove the channel and their absence nothing
       _save()
       for _ci, _rows in sorted(membership.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
           if not _rows:
               continue
-          # UNDECIDABLE membership is a fact about the TARGET SET under a policy we could not read, so
-          # like a deterministic omission it must outlive the attempt that saw it and reach a fresh
-          # process's verdict — the chunk itself is complete and will be skipped (review#41, Lumpy).
+          # undecidable membership is a fact about the target set under a policy we could not read, so like a
+          # deterministic omission it outlives the attempt and reaches a fresh verdict; the chunk is complete
           _n = len(batches[int(_ci)]) if _ci.isdigit() and int(_ci) < len(batches) else len(_rows)
           events.coverage_partial(
               sid, kind=events.COVERAGE_UNKNOWN, measure="dalfox_membership",
@@ -2459,9 +2078,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
           if not _rows:
               continue
           _n = len(batches[int(_ci)]) if _ci.isdigit() and int(_ci) < len(batches) else len(_rows)
-          # ONE record per KIND, each on its own unit: a truncating ceiling and an unscannable
-          # content-type are different dispositions, and reconciliation keeps the latest record per
-          # (source_id, unit) — sharing a unit would drop one of them (review#16, Lumpy).
+          # one record per kind, each on its own unit: a truncating ceiling and an unscannable content-type
+          # are different dispositions, and reconciliation keeps the latest per (source_id, unit)
           _by_kind: dict = {}
           for _r in _rows:
               _by_kind.setdefault(
@@ -2480,14 +2098,14 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
       seen_ids: set[str] = set()                            # GLOBAL — for the matched counter ONLY (not dedup)
       for ci in range(len(batches)):
         entries = list(evidence_map.get(str(ci)) or [])       # each already digest-validated on load
-        # fall back to THIS run's just-written attempt file (trusted — we wrote it) for a chunk run but not recorded
+        # fall back to THIS run's just-written attempt file (trusted — we wrote it) for a chunk run but not
+        # recorded
         paths = [state_f.parent / e["rel"] for e in entries] or [attempt_dir / f"findings_{ci}.jsonl"]
         for p in paths:
             if not (p.exists() and p.stat().st_size > 0):
                 continue
-            # STREAMED into the store: one finding is held at a time, whatever the artifact weighs
-            # (review#35, Lumpy). The counters below are closed over deliberately — the alternative is
-            # a list of every finding with its full request and response in it.
+            # streamed into the store, one finding held at a time whatever the artifact weighs; the
+            # alternative is a list of every finding with its full request and response
             def _ingest(rec, _p=p):
                 nonlocal matched, produced
                 rec["raw_ref"] = str(_p)
@@ -2499,9 +2117,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             scan_dalfox_jsonl(p, _ingest)
       status = Status.PARTIAL if degraded else (Status.SUCCESS if matched else Status.EMPTY)
     finally:
-        # EXECUTION ACCOUNTING for the OOB channel, from a `finally` so an exception anywhere in the loop
-        # still leaves what was ATTEMPTED on the record (review#21, Lumpy). It never masks that
-        # exception: its own failure is swallowed, and the original propagates untouched.
+        # execution accounting for the OOB channel, from a `finally` so an exception still leaves what was
+        # attempted on the record; its own failure is swallowed and the original propagates untouched
         try:
             if _plan_for_run["armed"] and _oob["attempted"]:
                 _missed = _oob["attempted"] - _oob["launched"]
@@ -2521,11 +2138,11 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             raise
         except Exception:
             pass                       # accounting must never replace the failure it is describing
-        # C07 inc4: source terminal ALWAYS fires (even if the loop raised) — one source lifecycle, no dup.
+        # source terminal always fires (even if the loop raised) — one source lifecycle, no dup
         events.tool_finish(sid, status=status.value, work_unit=scan_wu,
                            reason=(f"{degraded}/{len(batches)} chunk(s) degraded" if degraded else None),
                            duration=round(time.monotonic() - t0, 2), discovery_context="params")
-        # ledger: NEW entities by tier (verified/candidate/dom-static kept distinct, review-r8#5) + matched
+        # ledger: NEW entities by tier (verified/candidate/dom-static kept distinct) + matched
         # (all valid findings across retained evidence) tracked separately from produced (newly added).
         events.ledger(sid, produced={"xss_verified": tiers["xss-verified"],
                                      "xss_candidate": tiers["xss-candidate"],
@@ -2551,7 +2168,7 @@ _REDIR_CANARY = "quarry-redirect-canary.example"   # reserved TLD; never followe
 
 
 def _redirect_confirm(ctx, cands, prof) -> RunResult:
-    """params.redirect_confirm (step 4.3.C): native open-redirect probe — NO dalfox, NO chromium. For
+    """params.redirect_confirm: native open-redirect probe — NO dalfox, NO chromium. For
     each canonical candidate, inject a canary host into the redirect-ish param(s) and read the Location
     header WITHOUT following it (one scoped, rate-paced, non-mutating request each via
     fetch.redirect_location). If the app would send us to the canary HOST, it's an open-redirect
@@ -2580,10 +2197,8 @@ def _redirect_confirm(ctx, cands, prof) -> RunResult:
         except Exception:
             degraded += 1
             continue
-        # A Location header only redirects on a 3xx — a 200/201 that happens to echo one is NOT an open
-        # redirect. urljoin resolves relative/protocol-relative Locations against the origin, so a
-        # same-host redirect stays on-host (not a finding); only a 3xx whose Location HOST is our canary
-        # confirms.
+        # a Location header only redirects on a 3xx; urljoin resolves it against the origin, so a same-host
+        # redirect stays on-host (not a finding). Only a 3xx whose Location host is our canary confirms.
         if loc and 300 <= int(status_code or 0) < 400 \
                 and normalize.host_of_url(urljoin(probe, loc)) == _REDIR_CANARY:
             confirmed += 1
@@ -2654,9 +2269,8 @@ def _oob_probe(ctx, scope, prof):
                                     urlencode([(kk, cb if kk == k else vv) for kk, vv in pairs]), ""))
             issued += 1
             try:
-                # NO-FOLLOW + header-only: if the target 302s to Location: <our-callback>, we must NOT
-                # follow it — Quarry would fetch its OWN collector and fake an SSRF hit. The server-side
-                # SSRF (if any) still fires from the request itself; we just don't self-trigger.
+                                # no-follow + header-only: if the target 302s to Location: <our-callback> we must not
+                                # follow it, or Quarry fetches its own collector; the server-side SSRF still fires
                 fetch.redirect_location(ctx, probe_url, normalize.host_of_url(probe_url), timeout=10)
             except Exception:
                 pass                               # a target that doesn't SSRF-fetch is the common case
@@ -2720,9 +2334,8 @@ def run(ctx) -> None:
         # have no A record and live only in `subdomain` — they must still be checked.
         subs = scope.filter_hosts(sorted(set(ctx.run.values("resolved"))
                                          | set(ctx.run.values("subdomain"))))
-        # netguard fresh-resolves these subs: RECORDS private/self leads, WITHHOLDS only scan-box/metadata
-        # self-hits (private is scanned), and KEEPS authoritative-NXDOMAIN dangling hosts (allow_dangling) —
-        # exactly the takeover signal — while a transient-indeterminate host still passes through.
+        # netguard fresh-resolves these: records private/self leads, withholds only scan-box/metadata self-
+        # hits, and keeps authoritative-NXDOMAIN dangling hosts (the takeover signal)
         subs = netguard.guard_hosts(ctx, subs, phase="params.takeover", allow_dangling=True)
         if subs:
             tk_in = ctx.write_list("takeover_targets.txt", subs)
@@ -2749,17 +2362,16 @@ def run(ctx) -> None:
                                             "sources": ["nuclei-takeover"], "confirmed": False})
 
     live = [u for u in ctx.run.values("live") if scope.active_allowed(normalize.host_of_url(u))]
-    # FRESH self-attack guard right before the scan: `live` was resolved back in the probe phase (possibly
-    # hours + a crawl/content phase ago), so re-check current resolution — a host that now points to the scan
-    # box / metadata never reaches a nuclei chunk. Private targets stay allowed (recorded as leads).
+    # fresh self-attack guard right before the scan: `live` was resolved hours ago, so re-check current
+    # resolution — a host now pointing at the scan box / metadata never reaches a nuclei chunk
     live = netguard.guard_urls(ctx, live, phase="params.nuclei_scan")
     if not live:
         ctx.run.record("params", skipped("nuclei", "no active-allowed live hosts"))
         return
-    # ── nuclei (non-intrusive, OOB interactsh, severity-scoped) — chunked + resumable (step 4.2 B) ──
-    # The long-pole: OTC = 448 hosts / 5.08M req / 7h41 @ 183rps, died at 93%. Work is rate-bound, so we
-    # do NOT gate templates or parallelize batches (would blow the RoE) — we chunk hosts for resume,
-    # progress and per-batch isolation. See _nuclei_scan.
+    # ── nuclei (non-intrusive, OOB interactsh, severity-scoped) — chunked + resumable ──
+
+    # the long-pole. Work is rate-bound, so templates are not gated and batches are not parallelized (that
+    # would blow the RoE); hosts are chunked for resume, progress and per-batch isolation. See _nuclei_scan.
     findings = ctx.run.raw_path("params", "nuclei", "findings.jsonl")
     log = ctx.run.raw_path("params", "nuclei", "nuclei.run.log")
     ck = max(1, settings.concurrency("NUCLEI_CHUNK_HOSTS", 50))
@@ -2808,8 +2420,9 @@ def run(ctx) -> None:
                       produced={"finding": n, **sev}, consumed={"target": len(live)})
 
     # ── exposed-resource fetch + secret extraction (recon evidence: unauth, in-scope, GET-only) ──
-    # Map-don't-exploit line = "don't accidentally perform impact": an exposed .env/.git/config is
-    # fetched and its secret read (redacted). No payloads, no creds used, no state change.
+
+    # map-don't-exploit: an exposed .env/.git/config is fetched and its secret read; no payloads, no creds
+    # used, no state change
     exp_urls = _exposed_urls(ctx, scope)
     if exp_urls:
         ne = evidence.fetch_exposed(ctx, exp_urls)
@@ -2833,23 +2446,22 @@ def run(ctx) -> None:
         nf = evidence.probe_framework_endpoints(ctx, fw_cands)
         ctx.echo(f"  framework-endpoints: {len(fw_cands)} candidate(s) probed, {nf} exposed (200)")
 
-    # ── arjun param discovery on param-less API endpoints — per-target, bounded, resumable (A2) ──
-    # The ARJUN_CAP 40 membership cap is GONE: the full guarded endpoint set is processed in host-fair
-    # order under ARJUN_BUDGET_S (0 = unbounded = default), and whatever a bounded run does not reach is
-    # a counted, resumable remainder. See _arjun_lane for the measured completion contract.
+    # ── arjun param discovery on param-less API endpoints — per-target, bounded, resumable ──
+
+    # the full guarded endpoint set is processed host-fair under ARJUN_BUDGET_S (0 = unbounded default);
+    # whatever a bounded run does not reach is a counted, resumable remainder. See _arjun_lane.
     _arjun_lane(ctx, prof, corpus)
 
-    # ── vuln-primitive probes over the 4.3.A CANONICALIZED shapes, SPLIT by primitive ──
-    # XSS reflection -> params.dalfox_xss_fast (dalfox, 4.3.B). Open-redirect -> params.redirect_confirm
-    # (native Location probe, NO dalfox, 4.3.C). dalfox is no longer responsible for redirect at all.
-    # review-B1.5br1#2: these two selected on klass ALONE, so the RoE gate was left entirely to
-    # netguard downstream. Scope policy and network policy are different questions; ask both.
+    # ── vuln-primitive probes over the canonicalized shapes, split by primitive ──
+
+    # XSS reflection -> params.dalfox_xss_fast; open-redirect -> params.redirect_confirm (native —
+    # dalfox is no longer responsible for redirect). These select on scope and network policy both.
     xss_raw = active_review_values(ctx, "xss")
     redir_raw = active_review_values(ctx, "redirect")
     xss_cands, xss_canon = _canonicalize_candidates(xss_raw)
     redir_cands, redir_canon = _canonicalize_candidates(redir_raw)
-    # audit #1: dalfox is an external tool that CONTACTS these URLs — drop any whose host resolves internal /
-    # can't be resolved. (redir_cands go through fetch.redirect_location, which resolve-guards each origin.)
+    # dalfox contacts these URLs, so drop any whose host resolves internal or cannot be resolved
+    # (redir_cands go through fetch.redirect_location, which resolve-guards each origin)
     xss_cands = netguard.guard_urls(ctx, xss_cands, phase="params.dalfox")
     if not xss_cands and not redir_cands:
         ctx.run.record("params", skipped("dalfox", "no xss/redirect candidates"))
@@ -2862,7 +2474,7 @@ def run(ctx) -> None:
             ctx.run.record("params", _dalfox_xss_fast(ctx, xss_cands, prof))
         else:
             ctx.run.record("params", skipped("dalfox", "dalfox not installed"))
-    # open-redirect — native single-request Location probe (4.3.C), no dalfox
+    # open-redirect — native single-request Location probe, no dalfox
     if redir_cands:
         r = _redirect_confirm(ctx, redir_cands, prof)
         ctx.echo(f"  redirect_confirm: {redir_canon['raw_candidates']} raw -> "
@@ -2876,8 +2488,9 @@ def run(ctx) -> None:
                       reduction_percent=redir_canon["reduction_percent"])
 
     # ── SSTI primitive-confirm probe (benign {{math}} eval; candidate output) ──
-    # gf only name-matches ssti params; nothing else probes them. Confirm the PRIMITIVE with a
-    # non-mutating math eval. (reflection/open-redirect primitives are already covered by dalfox.)
+
+    # gf only name-matches ssti params; confirm the primitive with a non-mutating math eval (reflection
+    # and open-redirect are covered by dalfox)
     ssti_urls = _ssti_targets(ctx, scope)
     if ssti_urls:
         ns = evidence.probe_ssti(ctx, ssti_urls)

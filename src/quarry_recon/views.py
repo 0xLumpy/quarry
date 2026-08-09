@@ -1,13 +1,10 @@
-"""Reader/rendering views for the control plane (v0.3 stabilization, step 3).
+"""Read-only rendering views for the control plane — two renderers, no execution and no scheduling.
 
-READ-ONLY. Two renderers, no execution and no scheduling:
-- ``plan_lines()`` — a STATIC dry-run: folds the registry (`sources`) + machine settings into a
-  per-phase explanation of what WOULD run. It never calls the runner.
+- ``plan_lines()`` — a static dry-run: folds the registry (`sources`) plus machine settings into a
+  per-phase account of what would run. It never calls the runner.
 - ``status_lines()`` — folds ``events.jsonl`` into current/last-known per-source state.
 
-Deliberately NOT here (step 4+ territory): tool conversion, scheduling logic, or BBOT-style
-per-interval module chatter. One line per source, Quarry-style. This module imports neither ``runner``
-nor ``contract`` — it only reads.
+One line per source. Imports neither ``runner`` nor ``contract``.
 """
 from __future__ import annotations
 
@@ -26,7 +23,7 @@ def _phase_rank(p: str) -> int:
 
 
 def plan_lines() -> list[str]:
-    """Static dry-run: what WOULD run, derived from the registry + machine settings. No execution.
+    """Static dry-run: what would run, derived from the registry plus machine settings. No execution.
     ``workers`` prefers the source's contract value, else the machine-scaled ``settings.workers``;
     ``rate`` (per-target RoE) and ``timeout`` come from the contract when declared."""
     srcs = sources.all_sources()
@@ -45,19 +42,19 @@ def plan_lines() -> list[str]:
             pending = s.get("pending")
             retired = s.get("retired")
             if retired:
-                ret += 1; mark = "⊘"      # ⊘ retired — split/replaced; no code routes through it
+                ret += 1; mark = "⊘"      # retired: no code routes through it
                 note = f"  (retired: {retired})"
             elif pending:
-                pend += 1; mark = "◔"     # ◔ planned but NOT wired yet — plan must not claim it runs
+                pend += 1; mark = "◔"     # declared but not wired yet
                 note = f"  (pending: {pending})"
             elif d == "on":
-                run += 1; mark = "▶"      # ▶ will run
+                run += 1; mark = "▶"      # will run
                 note = ""
             elif d == "key":
-                key += 1; mark = "◆"      # ◆ needs key
+                key += 1; mark = "◆"      # needs key
                 note = f"  ({s['reason']})" if s.get("reason") else ""
             else:
-                off += 1; mark = "·"      # · off
+                off += 1; mark = "·"      # off
                 note = f"  ({s['reason']})" if s.get("reason") else ""
             tool = s.get("tool", "?")
             w = s.get("workers") or settings.workers(tool, 0) or "-"
@@ -67,7 +64,7 @@ def plan_lines() -> list[str]:
             debt = s.get("debt")
             if debt:
                 dbt += 1
-                note = f"{note}  ⚠debt: {debt}"     # control-debt on a running source — surface it, don't bury
+                note = f"{note}  ⚠debt: {debt}"
             name = sid.split(".", 1)[-1]
             lines.append(f"  {mark} {name:<22} {s.get('tier','?'):<12} {s.get('class','?'):<8} "
                          f"w={str(w):<4} rate={str(rate):<5} to={str(to):<6}{longpole}{note}")
@@ -78,20 +75,17 @@ def plan_lines() -> list[str]:
     return lines
 
 
-# event-only states (no terminal status carried) → a human state for the status surface.
-# NB: coverage_partial / coverage_reset are NOT here — coverage is telemetry, not lifecycle, so it must
-# never set a source's status (a fully-covered omitted=0 observation would else read as "partial"). The
-# coverage TRUTH lives in the manifest summary.coverage / verdict, not the status surface.
+# event-only states (no terminal status carried) → a human state for the status surface. Coverage events
+# are absent by design: coverage is telemetry, and its truth is the manifest's summary.coverage/verdict.
 _HUMAN = {"tool_start": "running", "tool_progress": "running",
           "tool_blocked": "blocked", "artifact_written": "running", "tool_finish": "done"}
 
 
 def _fold_events(path: Path) -> dict:
     """Collapse the append-only event log to the latest known state per source_id. Later events win;
-    terminal status, ledger produced/consumed, blocked/partial reasons and progress are carried
-    forward."""
+    terminal status, ledger produced/consumed, blocked/partial reasons and progress carry forward."""
     state: dict[str, dict] = {}
-    # explicit utf-8: events.jsonl carries UTF-8 payloads; Windows would else default to the codepage.
+    # explicit utf-8: Windows would else read UTF-8 payloads in the codepage.
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -104,13 +98,13 @@ def _fold_events(path: Path) -> dict:
         if not sid:
             continue
         if e.get("event") in ("coverage_partial", "coverage_reset"):
-            continue                       # coverage is telemetry, not lifecycle — never overrides tool status
+            continue                       # telemetry, never a lifecycle status
         st = state.setdefault(sid, {})
-        if e.get("event") == "ledger":     # LEDGER carries produced/consumed but is NOT the lifecycle terminal
+        if e.get("event") == "ledger":     # carries produced/consumed, but is not a lifecycle terminal
             for k in ("produced", "consumed"):
                 if e.get(k) is not None:
                     st[k] = e[k]
-            continue                       # do NOT set last_event -> the real tool_finish stays the terminal
+            continue                       # last_event unset, so tool_finish stays the terminal
         st["last_event"] = e.get("event", st.get("last_event"))
         if e.get("ts") is not None:
             st["ts"] = e["ts"]
@@ -135,12 +129,9 @@ def status_lines(events_path) -> list[str]:
     lines = [f"quarry status — {p}", ""]
     for sid in sorted(state):
         st = state[sid]
-        # a terminal status (from tool_finish) wins; otherwise map the raw event name to a human state
-        # so the surface never leaks internals like 'tool_progress'/'tool_blocked'.
+        # a terminal status wins; otherwise the raw event name maps to a human state.
         status = st.get("status") or _HUMAN.get(st.get("last_event"), st.get("last_event") or "?")
-        # progress: counted inputs (dalfox 12/765) or chunks, when the source reported them
-        # a chunked source (nuclei/dalfox) reports BOTH chunk_index/total + input_total/current_index —
-        # show the chunk AND the completed-host count (`chunk 4/10 · 150/491 complete`), not just one.
+        # a chunked source reports both chunk and input counts: show both (`chunk 4/10 · 150/491 complete`).
         prog = ""
         if st.get("chunk_total") is not None:
             prog = f"chunk {st.get('chunk_index', '?')}/{st['chunk_total']}"

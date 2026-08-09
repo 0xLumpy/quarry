@@ -1,20 +1,14 @@
-"""Phase: Origin-IP correlation (A2) — de-fronting candidates for CDN/WAF-fronted hosts.
+"""Origin-IP correlation (A2): propose candidate origin IPs for CDN/WAF-fronted hosts. Sends no
+packets — correlates already-collected evidence (httpx `-cdn`/`-favicon`, tlsx certs) into `review`
+items tagged verify-ownership. Map-only: candidates are never added to scope or any scan target.
 
-A CDN/WAF in front of a host hides its true origin IP. The origin (if reachable directly) is where
-the app actually runs — no WAF in the way — so it is the real attack surface for the later attack
-layer. This phase does NOT bypass anything and sends NO packets: it CORRELATES evidence already
-collected (httpx `-cdn`/`-favicon`, tlsx certs) to PROPOSE candidate origin IPs, emitted as `review`
-items tagged verify-ownership. Two channels:
+Two channels:
+  - favicon twin: a non-CDN live host serving the same favicon hash as a CDN-fronted host.
+  - cert twin / SAN: a non-CDN host presenting the same TLS cert (sha1) as the CDN host, or a host
+    named in the CDN host's cert SANs that we already see direct.
 
-  - favicon-hash twin: a non-CDN live host serving the SAME favicon hash as a CDN-fronted host is very
-    likely the same application on its origin IP — the CDN just fronts it. (Range-validatable.)
-  - cert twin / SAN: a non-CDN host presenting the SAME TLS cert (sha1) as the CDN host, or a host
-    named in the CDN host's cert SANs that we already see direct, is a candidate origin. (Real-world;
-    a CDN usually terminates TLS with its OWN cert, so the sha1 twin mostly fires off-CDN.)
-
-Map-only (design §3): candidates are review items — NEVER added to scope or any scan target. A CDN
-anycast IP must never be port-scanned, and an unconfirmed origin is a lead, not a target. Naabu stays
-CIDR-gated to human scope; this phase feeds nothing into it.
+A CDN usually terminates TLS with its own cert, so the cert-sha1 twin mostly fires off-CDN; the
+favicon-hash twin is the range-validatable channel.
 """
 from __future__ import annotations
 
@@ -22,8 +16,7 @@ from ..runner import skipped
 
 
 def _emit(ctx, cdn_host: str, ip: str, channel: str, matched_host: str, sources) -> bool:
-    # matched_host = the non-CDN host that produced this IP (the grey twin / SAN host) — the
-    # evidence trail a human needs to verify the lead by hand. Map-only: still just a review item.
+    # matched_host = the non-CDN host that produced this IP — the evidence trail for manual verification.
     return ctx.run.add("review", {
         "id": f"origin-ip:{cdn_host}->{ip}:{channel}",
         "klass": "origin-ip", "value": f"{cdn_host} -> {ip} (matches {matched_host})",

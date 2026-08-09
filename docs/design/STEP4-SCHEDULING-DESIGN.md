@@ -1,10 +1,11 @@
-# Step 4 — stable scheduling progress, separate from evidence (DESIGN v10, not built)
+# Step 4 — stable scheduling progress, separate from evidence (as-built; DESIGN v10 baseline)
 
 > **Verified state 2026-08-03 (`2bcd00a`): BUILT** — `sweep.py` (SCHEMA 2, adaptive prefix subslots, batched invocation) + `budget.py` (the bounded-lane template).
 
 
-Item 4 of the approved order, amended nine times under review. Nothing here is implemented; 4.2
-(`puredns`) and 4.3 (wildcard HTTP) build against it, with defaults from a controlled timing pass.
+Item 4 of the approved order. This is the design baseline that was
+built (`2bcd00a`): `sweep.py` (SCHEMA 2) and `budget.py`. It records the reasoning; where the shipped
+code diverged — adaptive prefix subslots and batched invocation — the as-built notes below say so.
 
 ## What this must fix
 
@@ -25,30 +26,34 @@ Item 4 of the approved order, amended nine times under review. Nothing here is i
 ## The scheduling unit
 
     slot   = (lane, target, bucket)                       # target = apex (4.2) or zone (4.3)
-    bucket = int(sha256(word).hexdigest()[:4], 16) % BUCKETS
+    bucket = hash-prefix of the word, mod BUCKETS         # adding a word never moves another word's bucket
 
 Source is not part of the slot: with it, 49,634 words over 3 sources and 256 buckets is ~65 words per
-invocation and up to 768 invocations per apex instead of ~195 and 256. One slot = one tool invocation,
-which is what makes a wall-clock budget meaningful — it is checked BETWEEN invocations. `BUCKETS` is
-schema-bound and set by the timing pass.
+invocation and up to 768 invocations per apex instead of ~195 and 256. `BUCKETS` is schema-bound and set
+by the timing pass.
 
-## Generations: the reservation is the authority (review v4#1)
+A slot is not one invocation. The allocator batches several buckets of a target into one runner call
+(`reserve_batch`, `chosen: [(bucket, words)]`), and a slot too large for the batch cap splits into
+hash-prefix subslots. The wall-clock budget is checked between invocations, so `invocations` is its own
+measure — runner calls that ran, not a slot count.
+
+## Generations: the reservation is the authority
 
 A monotonic `gen` per lane, incremented under the lane lock. Every reservation takes the next one; a
 completion may only publish if its generation is still the newest for that slot.
 
-    # THE WHOLE SWEEP RUNS UNDER THE LANE LOCK (review v7#1). `picked` is run-local, so it cannot keep a
+    # THE WHOLE SWEEP RUNS UNDER THE LANE LOCK. `picked` is run-local, so it cannot keep a
     # SECOND lifecycle out of a slot this one already ran: two concurrent runs would each exclude only
     # their own picks and could execute every slot twice — duplicate traffic at the target, which no CAS
     # can prevent (CAS protects STATE from a stale completion, it is not an execution claim).
-    # BEFORE the lock (review v8#2): the workload is a pure function of the corpus and the eligible
+    # BEFORE the lock: the workload is a pure function of the corpus and the eligible
     # targets, so a CONTENDER can still report exact coverage — tested=0, omitted=eligible — instead of a
     # gap with no denominator.
-    preflight_dependency()                          # v7#2: no reservations at all if the tool is absent
-    eligible = snapshot_slot_keys()                 # taken ONCE at lane start (v6#1)
+    preflight_dependency()                          # no reservations at all if the tool is absent
+    eligible = snapshot_slot_keys()                 # taken ONCE at lane start
     pairs    = sum(len(members(s)) for s in eligible)
 
-    # ACQUISITION-ONLY contention handling (review v10#2). Wrapping the whole `with` in `except StateBusy`
+    # ACQUISITION-ONLY contention handling. Wrapping the whole `with` in `except StateBusy`
     # would report a StateBusy raised by the SWEEP BODY as "another lifecycle owns this" — the same boundary
     # already corrected in Whoxy. Only the acquisition is inside the except.
     with contextlib.ExitStack() as stack:
@@ -69,7 +74,7 @@ completion may only publish if its generation is still the newest for that slot.
             picked.add(slot.key)
             reservations_persisted += 1 if reservation_saved else 0   # the ROTATION advanced by this many
 
-            if not reservation_saved:               # FAIL CLOSED (v6#2)
+            if not reservation_saved:               # FAIL CLOSED
                 stop = "machinery: reservation state could not be saved"
                 break                               # no request is issued for an unowned slot
 
@@ -77,31 +82,31 @@ completion may only publish if its generation is still the newest for that slot.
                 result = exec_tool(...)             # the lock is HELD across this: one sweeper per lane
             except (KeyboardInterrupt, SystemExit):
                 raise                               # cancellation ends the run, never a slot outcome
-            except Exception as e:                  # review v10#1: `runner.run` can raise around Popen
+            except Exception as e:                  #: `runner.run` can raise around Popen
                 machinery.append(f"{slot.key}: {type(e).__name__}: {e}")
                 stop = "machinery: the invocation raised"
                 break                               # reservation stays persisted; NO completion, and this
                                                     # slot never enters the attempted denominator
             outcome.record(result)                  # slot_outcomes: obtained / classed loss
-            match publish_held(state, slot, gen, result):        # HELD: never re-acquires (v8#1)
+            match publish_held(state, slot, gen, result):        # HELD: never re-acquires
                 case "published":
                     completions_published += 1
                 case "failed":
                     completion_unpersisted += 1     # ran, evidence kept, may be selected again
-                case "not_run":                     # v7#2 — the tool vanished mid-sweep
+                case "not_run":                     # the tool vanished mid-sweep
                     stop = "dependency: the tool did not run"
                     break
-                case "invariant":                   # v9#1 — a bug, not a disposition
+                case "invariant":                   # a bug, not a disposition
                     machinery.append(f"scheduler_invariant: {slot.key}")
                     stop = "machinery: scheduler invariant"
                     break
 
-### One sweeper per lane (review v7#1)
+### One sweeper per lane
 
 The lane lock is held for the WHOLE sweep, exactly as `whoxy_page.lifecycle_lock` does: acquisition is
 non-blocking, so a second run records a zero-evidence gap ("another lifecycle owns this rotation") and
 submits nothing rather than duplicating traffic. The runner is synchronous, so a crashed lifecycle cannot
-return later and publish: within a sweep the generation check is an INVARIANT (v9#3), and generations keep
+return later and publish: within a sweep the generation check is an INVARIANT, and generations keep
 their real job in the MERGE rule, where two snapshots of the same lane must be ordered.
 
 The trade-off is explicit: under `budget = 0` (unbounded) the sweep can hold the lane for a long time, and
@@ -109,7 +114,7 @@ a concurrent run gets a gap rather than partial work. That is the same bargain e
 Quarry already makes, and the alternative — per-slot in-flight ownership with crash-safe release — is a
 lease protocol this lane has no reason to invent.
 
-### Each slot runs at most once per lifecycle (review v6#1)
+### Each slot runs at most once per lifecycle
 
 `eligible` is snapshotted at lane start and `picked` is run-local. Without it, ranking would happily
 re-select the oldest CLEAN slot once every slot is clean: a long bounded run would cycle over completed
@@ -117,7 +122,7 @@ work, and an unbounded budget (`0`, the template default) would never terminate.
 budget is exhausted OR every eligible slot has been picked once — so an unbounded lifecycle performs
 exactly one full sweep and stops.
 
-### The reservation-save failure has ONE rule: fail closed (review v6#2)
+### The reservation-save failure has ONE rule: fail closed
 
 If the reservation cannot be persisted, the lane issues **no request** for that slot and stops with a
 machinery gap. These lanes CONTACT the target; running work whose reservation nobody owns — while the
@@ -125,27 +130,27 @@ rotation has not advanced — is the wrong side to err on. (The run-local `picke
 would not be offered again in this lifecycle either way; the stop is about not spending on an unowned slot,
 not about avoiding a loop.)
 
-### Publishing a completion: four dispositions (review v6#3, v9#1)
+### Publishing a completion: four dispositions
 
     def publish_held(state, slot, gen, result) -> "published | failed | not_run | invariant":
-        """Called WITH the lane lock already held — it must never acquire it again (review v8#1).
+        """Called WITH the lane lock already held — it must never acquire it again.
         `budget.state_lock` is flock-based: non-reentrant and non-blocking, so a nested acquisition in the
         SAME process raises `StateBusy` (proven by the Whoxy nested-lock regression). A publish that
         re-locked would exhaust its retries and report every completion as failed."""
-        if result.status is SKIPPED:              # no process ran (review v7#2)
+        if result.status is SKIPPED:              # no process ran
             return "not_run"
         try:
             if state.slot.reservation.gen != gen:
                 # UNREACHABLE while one sweeper owns the lane: nobody else can re-reserve. Kept as an
                 # INVARIANT check, and a mismatch is machinery — `scheduler_invariant` — not a normal
-                # disposition (review v8#3).
+                # disposition.
                 raise SchedulerInvariant(f"{slot.key}: reservation gen moved under the holder")
             state.slot.done = {"gen": gen, "ran_at": now, "content": digest, "members": n}
             return "published" if state.save() else "failed"
         except (KeyboardInterrupt, SystemExit):
             raise                                 # cancellation is never contained
         except SchedulerInvariant:
-            return "invariant"                    # v9#1: NOT an ordinary publication failure
+            return "invariant"                    # NOT an ordinary publication failure
         except Exception:                         # a broken save, a raising serializer …
             return "failed"
 
@@ -153,7 +158,7 @@ Every ordinary failure after the evidence exists is contained here; only cancell
 no contention branch any more: the caller already holds the lock, so the only ways to fail are a broken
 `save()` or a broken state, and both are contained with the evidence intact.
 
-**`SKIPPED` is a dependency answer, not a scheduling one (review v7#2).** The tool's absence is checked
+**`SKIPPED` is a dependency answer, not a scheduling one.** The tool's absence is checked
 ONCE, before the first reservation, and the lane records a dependency gap and reserves nothing. The
 post-call branch remains for the race (a binary removed mid-sweep): the disposition is `not_run`, it
 records the dependency gap, it STOPS the lane — reserving every remaining slot against a tool that is not
@@ -168,7 +173,7 @@ there would burn the whole rotation — and it never enters the attempted denomi
 - **A failed reservation save is not authoritative**, and nothing runs on it: see the fail-closed rule
   above.
 
-### The completion boundary is its own fact (review v5#2)
+### The completion boundary is its own fact
 
 `reservation_saved` and `completion_saved` are tracked independently, because they mean different things:
 
@@ -180,7 +185,7 @@ there would burn the whole rotation — and it never enters the attempted denomi
 A completion failure must never escape and abort the phase: it is contained, the evidence and the outcome
 counters stand, and the affected slots are named.
 
-**Three separate durability facts (review v6#4)** — one lane-wide `durable=False` would claim the whole
+**Three separate durability facts** — one lane-wide `durable=False` would claim the whole
 remainder "restarts from the beginning", which is false when a single completion write failed:
 
 | count | meaning | wording |
@@ -191,12 +196,12 @@ remainder "restarts from the beginning", which is false when a single completion
 | `completion_unpersisted` | returned slots whose completion could not be published | "N slot(s) ran but may be selected again" |
 | `scheduler_invariant` | a reservation generation moved while THIS lifecycle held the lane | a bug, reported as machinery — not an expected disposition |
 
-`rotation_advanced` as a lane-wide Boolean is wrong (review v7#3): ten persisted reservations followed by
+`rotation_advanced` as a lane-wide Boolean is wrong: ten persisted reservations followed by
 one failure neither fully advanced nor restarted. The selection record names the COUNTS; the all-or-nothing
 "restarts from the beginning" wording is reserved for the case where NO reservation persisted, or the state
 became unusable altogether.
 
-## The one launch fact we can observe (review v4#2)
+## The one launch fact we can observe
 
 `runner.run()` returns only after the process completes, and it has no start hook. Measured shapes: a
 missing binary returns `SKIPPED` with no process; a timeout returns `TIMED_OUT` after the process ran and
@@ -206,7 +211,7 @@ So the unit is **runner invocations that RETURNED a process result** — i.e. `e
 status is not `SKIPPED`. `ran_at` is written for exactly that state, and the word "launched" is dropped
 from the design: it names something the caller cannot see.
 
-## Ranking: exact, sequence-driven (review v4#4)
+## Ranking: exact, sequence-driven
 
     tier(slot) = 0 if slot.done is None            # never RAN (incl. reserved-then-crashed)
                  1 if slot.done.content != today   # DIRTY: membership changed since the slot last ran
@@ -217,7 +222,7 @@ from the design: it names something the caller cannot see.
     target  = min(targets, key=(target.last_selected_seq or 0, target_name))   # fairness INSIDE the tier
     slot    = min(target's slots at t*, key=(slot.reservation.gen or 0, bucket))
 
-Tier dominates target fairness (review v5#1): a target holding only clean work must not run while another
+Tier dominates target fairness: a target holding only clean work must not run while another
 target still has never-run or dirty work. Pinned case — target A clean and long-unselected, target B dirty
 and recently selected: **B wins**.
 
@@ -228,7 +233,7 @@ SAME TIER alternate A,B,A,B because the cursor advances on every pick.
 "Dirty" means **membership changed since the slot last ran** — the reservation ordering cannot promise
 "holds words never submitted".
 
-## Ownership of shared words — accounting attribution only (review v4#5)
+## Ownership of shared words — accounting attribution only
 
     owner(word) = argmax over sources_that_produced(word) of sha256(word + "|" + source_id)
 
@@ -244,14 +249,14 @@ Source proportionality is an EXPECTATION, not a guarantee: uniform hashing sprea
 corpus, but the first k scheduled buckets need not preserve those proportions. The timing pass measures the
 post-attribution distribution of scheduled PREFIXES.
 
-## Coverage — two records, and the stop cause lives in the terminal (review v4#3)
+## Coverage — three measures, and the stop cause lives in the terminal
 
-**A raising invocation keeps everything already earned (review v10#1).** The slot's reservation stays on
+**A raising invocation keeps everything already earned.** The slot's reservation stays on
 disk (the rotation advanced), the failure is machinery, the lane stops, and every earlier slot's evidence
 and outcome counters survive. The terminal is PARTIAL when this sweep produced evidence and FAILED when it
 produced none — the same rule every other lane here uses.
 
-**Contention is an ACQUISITION fact, not a body fact (review v10#2).** A `StateBusy` (or `OSError`) raised
+**Contention is an ACQUISITION fact, not a body fact.** A `StateBusy` (or `OSError`) raised
 INSIDE the sweep is machinery and is reported as such; only a failure to ENTER the lane lock is contention.
 Both directions are pinned.
 
@@ -268,7 +273,7 @@ contract the other run-scoped lanes use.
    parameter (default = today's budget wording, so no existing caller changes).
 2. **outcome over SLOTS** — `measure="slot_outcomes"`, attempted = invocations that returned, obtained =
    those whose tool completed cleanly, `classes` = error classes of the rest. "Cleanly" is a pinned status
-   mapping, not prose (review v5#4):
+   mapping, not prose:
 
    | status | counts as |
    |---|---|
@@ -276,8 +281,10 @@ contract the other run-scoped lanes use.
    | `PARTIAL`, `FAILED`, `TIMED_OUT`, `BLOCKED` | attempted-but-lost, each its own class |
    | `SKIPPED` | never enters the attempted denominator (no process ran) |
 
-There is no third coverage record: the stop CAUSE is carried by the lane's terminal (and by the selection
-record's wording), not by a third denominator that would re-count the same remainder.
+Coverage is recorded in three measures: `candidate_pairs` (the selection denominator), `slot_outcomes`
+(the per-slot classes above), and `tool_invocations` (runner calls — one call may carry several slots).
+The stop CAUSE is not a further denominator: it is carried by the lane's terminal and the selection
+record's wording, not by re-counting the same remainder.
 
 ## Storage
 
@@ -293,7 +300,7 @@ record's wording), not by a third denominator that would re-count the same remai
 `SCHEMA` binds `BUCKETS`, the hash algorithm and the record's meaning — changing any of them starts a fresh
 rotation instead of misreading old records. Atomic save (temp + `os.replace`).
 
-**Merge (review v5#3): a slot holds TWO independently ordered tuples.** Reservation gen 41 can sit beside
+**Merge: a slot holds TWO independently ordered tuples.** Reservation gen 41 can sit beside
 completion gen 39, so "newest generation wins per slot" is ambiguous and could erase a newer completion:
 
 - `reservation` is replaced when the incoming `reservation.gen` is greater;
@@ -306,7 +313,7 @@ No `done` flag in the completion sense: scheduling knows recency and membership,
 ## Shared primitive
 
 Extract a GENERIC `budget.RotationProgress`, and make "the lock is already held" STRUCTURAL rather than a
-caller convention (review v9#2) — otherwise a `save()` that takes its own lock reintroduces exactly the
+caller convention — otherwise a `save()` that takes its own lock reintroduces exactly the
 self-contention v8 fixed:
 
     with budget.rotation_session(state_dir, lane) as progress:   # takes the lane lock ONCE
@@ -328,3 +335,56 @@ Shodan adapter; only the mechanism is shared, and Shodan adopts it in its own co
 - post-attribution source distribution of the first k scheduled buckets;
 - whether the wildcard baseline pair is re-probed per bucket (correctness) or once per zone per run (cost);
 - whether invocation overhead is small enough to reconsider equal-share source fairness.
+
+---
+
+## Ledger ownership states
+
+`Ledger.lost` holds items the snapshot recorded as done whose artifact no longer verifies: missing,
+altered, or filed without a digest. Redoing them is correct, because the evidence really is gone. For
+a paid lane "redo" means buy again, and a repurchase that looks identical to a first purchase is the
+accidental spend the ownership store exists to prevent. The ledger keeps the loss as a fact and never
+decides what it costs — the lane that knows whether an item is paid for decides that.
+
+`Ledger.unreadable` holds the reason an ownership index that exists cannot be trusted: garbled,
+truncated, or shaped wrong. Absent and unusable never collapse into the same empty dict. If they did,
+a corrupt snapshot would read as a clean store, a paid lane would see nothing owned, and it would buy
+every page again. The field is prose rather than a flag because the caller has to report why it
+refused.
+
+The same distinction appears one level down in the artifact store (`shodan_sched.ownership_view`) and
+one level up in the run verdict: a failure to inspect ownership blocks spending, and never erases
+ownership from the decision.
+
+---
+
+## Sweep dispositions
+
+### The `run_sweep` bounds
+
+`max_pairs_per_target` is a spend bound: a slot that would take a target past it is not submitted, so
+the bound is never exceeded. `max_targets_per_run` bounds throughput, never membership — the rotation
+decides which targets, so a later run continues instead of contacting the same first N for ever. Both
+are 0 for unbounded.
+
+`admit(target)` is an optional per-target admission check for work that is itself active. It runs after
+the target's first batch is reserved and persisted, once per target per lifecycle. A refusal consumes
+the allowance and excludes that target's remaining slots — no backfill, or many refusals would recreate
+the traffic the allowance bounds. The reservation has already advanced the cursor, so a refused target
+moves to the back of its tier, and the refusal is recorded on its own: never an invocation, never
+attempted pairs.
+
+### Classifying a run that ended before the rotation could be read
+
+Every early exit reaches `_partition_unrun`. Nothing completed, so the eligible targets are what is
+owed, and the only question is who holds them. A lane that returns without a partition publishes zeroes,
+which a supervisor reads as a fixed point.
+
+| what stopped it | class | why |
+|---|---|---|
+| dependency / machinery | terminal | repetition does not install a tool or unbreak a run |
+| contention | retriable | another lifecycle is advancing this rotation |
+| nothing schedulable | terminal, as `unschedulable` | only when a corpus exists at all |
+| anything else | retriable | |
+
+An eligible set that was never established stays unknown, which is not zero.

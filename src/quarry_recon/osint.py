@@ -1,15 +1,8 @@
-"""OSINT pre-flight module (standalone `quarry osint`).
+"""OSINT pre-flight (`quarry osint`): discover scope candidates and attack-surface intel from a target
+profile's anchors, score them, and write a review-only workspace under <project>/osint/<ts>/.
 
-Discovers scope CANDIDATES (apex/asn/cidr/org) + attack-surface INTEL (endpoints/secrets/
-emails) from the anchors in a target profile, scores them (confidence + scope_hint), and
-writes a review-oriented OSINT workspace.
-
-It NEVER edits scope. Candidates are review-only; the human confirms and copies approved ones
-into target.yaml (see target.suggested.yaml + docs/target-prep.md). Automated parts of the
-horizontal-OSINT methodology; manual-only sources are surfaced as a "manual to-do" list.
-
-Output:  <project>/osint/<ts>/{raw/, candidates.jsonl, intel.jsonl, osint-report.md,
-                              target.suggested.yaml, manifest.json}   + <project>/osint/latest
+Never edits scope — candidates are review-only. Coverage verdict and provider taxonomy:
+docs/design/PROVIDER-QUOTA-DESIGN.md.
 """
 from __future__ import annotations
 
@@ -32,20 +25,16 @@ from .contract import (PROVIDER_PARSE, PROVIDER_TRANSPORT, ProviderBodyError, ca
                        provider_error_class, whoxy_envelope)
 from .runner import RunResult, Status, fresh_artifact_dir, have, run as exec_tool, skipped
 
-#: how many ORGANIZATIONS one ASRank name search materialises. A THROUGHPUT bound over the matches the
-#: provider reports, never a membership cut of what we asked for: 0 = every match (paginated), and the
-#: withheld remainder is reported. Registered in `policy.BOUNDS`, so `--unbound` lifts it.
+#: organizations one ASRank name search materialises — a throughput bound (0 = every match), in
+#: `policy.BOUNDS`. See docs/design/PROVIDER-QUOTA-DESIGN.md.
 ASRANK_ORGS = 10
-#: CAIDA ASRank — free, keyless, public. GraphQL only: the RESTful endpoint ignores an `asn=` filter and
-#: returns the global list (MEASURED 2026-08-03).
+#: CAIDA ASRank — free, keyless, public. GraphQL only.
 _ASRANK_URL = "https://api.asrank.caida.org/v2/graphql"
-#: how many member ASNs one org query REQUESTS. Not a coverage bound: `numberAsns` says how many exist, and
-#: an org holding more than this is re-queried for exactly its own count, so membership is never truncated.
+#: member ASNs one org query requests; an org holding more is re-queried for its own count.
 _ASRANK_ASN_PAGE = 200
 
-#: how many RESOLVED ADDRESSES the RDAP lane looks up in one session. A THROUGHPUT bound over the full
-#: eligible set (host-fair order), never a membership cut: 0 = every eligible address, and the withheld
-#: remainder is reported as an operator limit. Registered in `policy.BOUNDS`, so `--unbound` lifts it.
+#: resolved addresses the RDAP lane looks up per session — a throughput bound (0 = all), in
+#: `policy.BOUNDS`. See docs/design/PROVIDER-QUOTA-DESIGN.md.
 RDAP_LOOKUPS = 20
 
 # Full email (no inner capture group) — findall returns the whole address.
@@ -85,9 +74,6 @@ def _http(url: str, timeout: int = 25) -> str:
 
 
 def _http_post_json(url: str, payload: dict, timeout: int = 25) -> dict:
-    """POST JSON, return the parsed object. GraphQL errors are RAISED, never returned as an empty result:
-    a query the server rejected is a lane failure, and reading it as "no matches" would report a clean
-    zero over something nobody asked."""
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"User-Agent": "quarry-osint",
@@ -128,14 +114,11 @@ class OsintSession:
         entry = {"tool": result.tool, "status": str(result.status.value),
                  "note": secrets.redact(result.note),
                  "cmd": secrets.redact(" ".join(result.cmd))}
-        # review-B0#3: carry the STRUCTURED outcome into the manifest. A provider limit recorded only as
-        # prose in `note` cannot be acted on — a consumer would have to grep English to tell "the account
-        # is out of credits" from "the tool broke", which is precisely the distinction B0 exists to make.
+        # carry the structured outcome into the manifest: a limit recorded only as prose cannot be
+        # acted on
         meta = getattr(result, "meta", None)
         if isinstance(meta, dict) and meta:
-            # review-B1.6b24#1: `note` and `cmd` were redacted here and the structured outcome was not,
-            # so a machinery reason carrying an exception string — which can carry a configured key —
-            # reached the manifest verbatim beside a redacted `note: ***`.
+            # redacted too: a machinery reason can carry an exception string carrying a key
             entry["outcome"] = secrets.redact_deep(dict(meta))
         self._tool_runs.append(entry)
 
@@ -162,8 +145,7 @@ class OsintSession:
                                 "manual_followup": manual_followup}
 
     def intel(self, kind: str, value: str, source: str, **provenance) -> None:
-        """One intel row. `provenance` carries whatever the lane knows about WHERE the value came from —
-        a value whose origin was parsed and then dropped is evidence nobody can return to."""
+        """One intel row; `provenance` records where the value came from."""
         self._intel.append({"kind": kind, "value": value, "sources": [source],
                             **{k: v for k, v in provenance.items() if v not in (None, "")}})
 
@@ -183,28 +165,19 @@ class OsintSession:
         return out
 
     def note_failure(self, tool: str, why: str) -> None:
-        """Record a native-lane failure. review-B0r3#3: `_azmap` / `whois` / `dmarc` / `rdap` only ECHOED
-        their exceptions, so a session where half of them blew up still produced a clean verdict."""
+        """Record a native-lane failure so a session where half the lanes broke does not report clean."""
         self._lane_failures.append({"tool": tool, "why": secrets.redact(str(why))})
 
     def outcome(self) -> dict:
-        """The session's own coverage verdict — the OSINT path has no events pipeline, so without this a
-        provider LIMIT lived only in a per-tool `outcome` block nothing ever read (review-B0r2#5), and the
-        CLI printed an unconditional green `osint done` over a run that never queried half its anchors."""
+        """The session's own coverage verdict — limits and gaps recorded independently, gaps dominating. See
+        docs/design/PROVIDER-QUOTA-DESIGN.md.
+        """
         limits, operator_limits, gaps = [], [], list(self._lane_failures)
         for tr in self._tool_runs:
             out = tr.get("outcome") or {}
             entry = {"tool": tr["tool"], "why": tr.get("note", ""), **out}
-            # review-B0r3#2: a limit and a gap are INDEPENDENT facts and one tool result can carry BOTH —
-            # query 1 fails or is page-limited, query 2 exhausts the credits. The old if/elif recorded only
-            # the limit, so a genuine gap vanished behind an expected boundary. Never `elif` these.
-            # review-B1.6b14#4: an OPERATOR boundary (a credit reserve, a page budget) is a limit the
-            # session must state too — it was invisible here, so a deliberately withheld remainder folded
-            # as `complete`. `limit_origin` carries which, so a reader is never told the provider
-            # refused us when our own policy did.
-            # review-B1.6b15#1: both kinds were appended to ONE list and returned as
-            # `provider_limits`, so an operator's own reserve was reported to them as the provider
-            # refusing us — the blame-shift this taxonomy exists to prevent, at the last step.
+            # a limit and a gap are independent facts and one result can carry both; provider and
+            # operator limits stay on separate lists. Never `elif` these.
             if out.get("provider_limit"):
                 limits.append(entry)
             if out.get("operator_limit"):
@@ -212,7 +185,7 @@ class OsintSession:
             if (out.get("failed") or out.get("truncated_pages")
                     or tr.get("status") in ("failed", "partial", "timed_out", "blocked")):
                 gaps.append(entry)
-        # gaps DOMINATE: a limit may only lift an otherwise-clean session.
+        # gaps dominate: a limit may only lift an otherwise-clean session
         verdict = ("complete_with_gaps" if gaps
                    else "complete_with_limits" if (limits or operator_limits) else "complete")
         return {"verdict": verdict, "provider_limits": limits,
@@ -256,17 +229,10 @@ def _azmap(s: OsintSession, apex: str, echo, timeout: int) -> None:
         raw = s.raw_path("azmap", f"{apex}.json")
         raw.write_text(data)
         obj = json.loads(data)
-        # UNION, never `or`: `related_domains or email_domains` short-circuited, so every tenant that
-        # returned related domains silently DROPPED its e-mail domains. TBHM treats them as ADDITIONAL
-        # evidence, not as a fallback — and the two carry different reasons, so a reviewer can tell which
-        # kind of tenant link they are looking at.
+        # union, not `or`: related and e-mail domains are both evidence, with different reasons
         related = [d for d in (obj.get("related_domains") or []) if d != apex]
         by_email = [d for d in (obj.get("email_domains") or []) if d != apex]
-        # DISTINCT source ids, not one: `candidate()` merges by (type, value) and keeps only the first
-        # reason at equal rank, so a domain listed in BOTH lists recorded only the related-domain link and
-        # the e-mail relationship vanished. Two ids means the merged candidate carries both in `sources`,
-        # and a reader can see it was reached two independent ways — which is stronger evidence, not
-        # duplicate noise.
+        # distinct source ids: a domain in both lists then carries both in `sources`, reached two ways
         for d in related:
             s.candidate(d, "apex", "azmap-tenant", "related",
                         f"M365 tenant of {apex}", raw_ref=str(raw))
@@ -283,15 +249,14 @@ def _azmap(s: OsintSession, apex: str, echo, timeout: int) -> None:
 
 
 def _whois(s: OsintSession, apex: str, echo, timeout: int) -> set[str]:
-    """Returns full registrant EMAILS (for whoxy reverse-whois)."""
+    """Returns registrant emails for whoxy reverse-whois."""
     emails: set[str] = set()
     try:
         p = subprocess.run(["whois", apex], capture_output=True, text=True,
                            timeout=min(timeout, 30), stdin=subprocess.DEVNULL)
         raw = s.raw_path("whois", f"{apex}.txt")
         raw.write_text(p.stdout)
-        # review-B0r4#2: `whois` can exit NONZERO without raising, so the lane parsed an empty/partial
-        # body and reported clean completion. An outcome check is not the same as an exception handler.
+        # `whois` can exit nonzero without raising, so the exit code is checked separately
         if p.returncode != 0:
             s.note_failure("whois", f"{apex}: exit {p.returncode} "
                                     f"{(p.stderr or '').strip().splitlines()[:1]}")
@@ -319,10 +284,10 @@ def _dmarc(s: OsintSession, apex: str, echo, timeout: int) -> None:
                            stdin=subprocess.DEVNULL)
         raw = s.raw_path("dmarc", f"{apex}.txt")
         raw.write_text(p.stdout)
-        if p.returncode != 0:                          # review-B0r4#2: dig exits nonzero without raising
+        if p.returncode != 0:                          # dig exits nonzero without raising
             s.note_failure("dmarc", f"{apex}: dig exit {p.returncode}")
         for email in _EMAIL_RE.findall(p.stdout):       # rua/ruf mailto addresses
-            dom = _email_domain(email)                  # the reporting DOMAIN is the candidate
+            dom = _email_domain(email)                  # the reporting domain is the candidate
             if not dom or dom == apex:
                 continue
             third = any(proc in dom for proc in _DMARC_PROCESSORS)
@@ -336,21 +301,16 @@ def _dmarc(s: OsintSession, apex: str, echo, timeout: int) -> None:
 
 
 def _whoxy_get(url: str, timeout: int):
-    """One Whoxy request -> `(raw_bytes, error)`. NEVER raises: the paginator classifies, it does not
-    catch. Returns the EXACT response bytes, which are what gets stored as evidence."""
     raw = b""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "quarry-osint"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
     except Exception as e:
-        # review-B1.6b13#7: `capture_error_body` reads an HTTPError's body and stamps it onto the
-        # exception — but `raw` was still empty, so the EXACT failure bytes could never be persisted.
-        # Whoxy answers failure inside a 200 more often than not, and when it does not, this is the
-        # evidence.
+        # capture the failure bytes: Whoxy usually answers failure inside a 200, but when it does
+        # not, these are the evidence
         capture_error_body(e, provider="whoxy")
-        # the EXACT bytes captured at the raise site — `body_text` is a lossy decode and re-encoding it
-        # would not give back what the provider sent (review-B1.6b14#5).
+        # the exact bytes: `body_text` is a lossy decode
         body = getattr(e, "body_bytes", None)
         if body:
             raw = body
@@ -363,25 +323,9 @@ def _whoxy_get(url: str, timeout: int):
 
 
 def _balance_from_error(err) -> "whoxy_page.BalanceRead":
-    """A failed balance REQUEST as a balance outcome.
-
-    review-B1.6b15#2: this said `refused=False` unconditionally, so a class the type requires to be
-    refused — a proven quota or entitlement — built an INVALID `BalanceRead` and raised `ValueError` out
-    of the lane.
-
-    review-B1.6b16#1: the fix then derived refusal from the CLASS alone, which infers a provider response
-    from something that may never have reached the provider. `PROVIDER_ERROR` is what an unclassified
-    LOCAL exception maps to, and calling that "the provider refused us" is a claim about a conversation
-    that did not happen. ORIGIN and class together:
-
-      · a PROVEN limit is a refusal by definition, whatever carried it;
-      · an HTTPError or a provider ENVELOPE failure is the provider having answered — except `parse`,
-        which is our inability to read what it said;
-      · anything else (a timeout, a URLError, a local bug) is a failure to READ, not a refusal.
-
-    Whoxy reports quota inside an HTTP 200 today, so the transport path is unlikely to produce a limit
-    class — but "unlikely" is not a contract, and getting it wrong crashes the lane rather than
-    degrading it."""
+    """A failed balance request as a balance outcome — refused only when the provider answered or a limit
+    was proven. See docs/design/PROVIDER-QUOTA-DESIGN.md.
+    """
     cls = provider_error_class(err) or PROVIDER_TRANSPORT
     from .contract import PROVIDER_LIMITS
     answered = isinstance(err, (urllib.error.HTTPError, ProviderBodyError))
@@ -391,17 +335,11 @@ def _balance_from_error(err) -> "whoxy_page.BalanceRead":
 
 
 def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeout: int) -> None:
-    """Reverse-whois by registrant EMAIL (from whois) and by ORG_NAMES (profile anchor).
-
-    B1.6b: paginated, budgeted and RESUMABLE. Whoxy charges ONE CREDIT PER PAGE and a single anchor can
-    run to hundreds of pages, so a page bought in an earlier run is OWNED and replayed for free, ordering
-    is page-tier-first across anchors, and whatever a budget does not reach is a counted remainder rather
-    than a silent truncation. Page state lives beside the timestamped sessions so it survives them.
-
-    review-B0#4: there is no first-N cap on anchors. Ordering decides what is asked FIRST; the balance
-    and the operator's reserve decide how much is asked at all."""
-    # the THIRD door into a provider: this path runs plain HTTP, outside `run_contract`/`run_provider`.
-    # A campaign that closed acquisition must not be able to buy pages through it (settle: closure).
+    """Reverse-whois by registrant email and by org name: paginated, budgeted and resumable, one credit per
+    page. There is no first-N cap on anchors — ordering decides what is asked first, the balance and reserve
+    decide how much.
+    """
+    # a third door into a provider, outside `run_contract`: a closed campaign must not buy through it
     from . import campaign as _campaign
     _allowed, _why = _campaign.acquisition_allowed("osint.whoxy")
     if not _allowed:
@@ -412,16 +350,14 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
     if not key:
         s.record(skipped("whoxy", "no Whoxy key in secrets.yaml"))
         return
-    # ORDER (not membership): registrant emails are the stronger ownership signal, so they go first.
+    # order, not membership: registrant emails are the stronger ownership signal, so they go first
     anchors = [whoxy_page.Anchor("email", e) for e in sorted(emails)]
     anchors += [whoxy_page.Anchor("company", o) for o in sorted(org_names or [])]
     if not anchors:
         s.record(skipped("whoxy", "no registrant email / org-name anchors to pivot on"))
         return
 
-    # RAW, not `concurrency()`: that clamps to `max(1, ...)` and falls back silently, which would turn
-    # an explicit 0 into 1, a negative typo into 1, and a malformed value into "unbounded". A spending
-    # control's own parser must see what the operator actually wrote (review-B1.6b13#1).
+    # raw, not `concurrency()`: a spending control must see what the operator wrote, not a clamped 1
     reserve = settings.raw("WHOXY_CREDIT_RESERVE", 0)
     run_budget = settings.raw("WHOXY_PAGE_BUDGET", 0)
     states = [whoxy_page.AnchorState(a) for a in anchors]
@@ -430,12 +366,9 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
     seen: dict = {"policy": None, "balance": None}
 
     def fetch(anchor, page):
-        """One page, as the paginator's `(raw_bytes, error)` — the EXACT bytes either way.
-
-        Whoxy reports failure INSIDE an HTTP 200 (`{"status": 0, "status_reason": "Zero Account
-        Balance"}`), so a transport-only check sees no error at all and the paginator would treat a
-        spent account as an unreadable page — the false-empty B0 exists to prevent, one layer up. The
-        STATUS ENVELOPE is what classifies here; the row contract stays with `read_page`."""
+        """One page as the paginator's `(raw_bytes, error)`. Whoxy reports failure inside an HTTP 200, so the
+        status envelope classifies here.
+        """
         q = urllib.parse.quote(anchor.value)
         raw, err = _whoxy_get(f"https://api.whoxy.com/?key={key}&reverse=whois&{anchor.param}={q}"
                               f"&page={page}", min(timeout, 60))
@@ -458,8 +391,9 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
 
     @contextlib.contextmanager
     def paid():
-        """The account-wide spend lock, the FREE balance read, and the settled allowance — in that order,
-        entered only when pending work remains (see `whoxy_page.spend_lock`)."""
+        """The account-wide spend lock, the free balance read, and the settled allowance in that order,
+        entered only when pending work remains.
+        """
         with whoxy_page.spend_lock():
             raw, err = _whoxy_get(f"https://api.whoxy.com/?key={key}&account=balance", min(timeout, 30))
             if err is None:
@@ -480,8 +414,7 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
     except (KeyboardInterrupt, SystemExit):
         raise                                    # cancellation ends the run; it is not a lane outcome
     except whoxy_page.LockBusy as e:
-        # ANOTHER RUN holds this project's page state. Nothing was read and nothing spent — and it is a
-        # gap, not a skip: the coverage this lane would have produced is simply absent.
+        # another run holds the page state: a gap, not a skip — nothing read, nothing spent
         echo(f"  whoxy: {e}")
         s.record(RunResult("whoxy", ["whoxy", "reverse=whois"], Status.BLOCKED, None, 0.0, None, 0,
                            note=f"another run holds this project's whoxy page state — {e}",
@@ -489,10 +422,7 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
                                  "coverage_incomplete": True}))
         return
     except Exception as e:
-        # review-B1.6b21: only LockBusy was caught, so a machinery failure the lock deliberately
-        # PROPAGATES — a read-only filesystem, a filesystem without lock support — aborted the whole
-        # OSINT run with no Whoxy terminal at all. `outcome()` never saw the gap, and best-effort is the
-        # provider contract: one lane failing must not take the session with it.
+        # best-effort: a page-state machinery failure is this lane's gap, not the session's
         echo(secrets.redact(f"  whoxy: {e}"))
         s.record(RunResult("whoxy", ["whoxy", "reverse=whois"], Status.FAILED, None, 0.0, None, 0,
                            note=f"whoxy page state is unusable: {e}",
@@ -506,78 +436,53 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
 
 
 def _whoxy_record(s: OsintSession, out, pol, anchors, echo) -> None:
-    """Turn one paginator Outcome into this lane's terminal.
-
-    review-B1.6b13#3: this was an `if/elif` chain, so whichever branch matched first ERASED the others —
-    an invalid knob hid a simultaneous provider refusal, a failure hid a simultaneous limit, and
-    `account_busy` reported as LIMITED though it is a gap by contract. Every fact is now recorded
-    INDEPENDENTLY and the status is chosen afterwards, with gaps dominating limits."""
-    # review-B1.6b13#5: a rejected page-one request was ATTEMPTED and never touched, so counting touched
-    # anchors reported `attempted=0` for a run that spent a credit on every anchor.
-    # review-B1.6b14#6: anchors we actually SENT a request for. `anchors - unopened` reported a
-    # replay-only lifecycle as having attempted every anchor while issuing zero requests.
+    """Turn one paginator Outcome into this lane's terminal. Every fact is recorded independently and the
+    status chosen afterward, gaps dominating limits.
+    """
+    # anchors we actually sent a request for
     attempted = len(out.requested)
-    # review-B1.6b13#8: pages and anchors are different units. A known page remainder is pages; an
-    # unopened anchor has no knowable page count at all, and adding them invents a denominator.
+    # pages and anchors are different units; an unopened anchor has no knowable page count
     pages_left, unopened = out.pages_left_known, len(out.unopened)
-    # review-B1.6b13 (closing note): an unusable page increments `fail_classes["parse"]` AND
-    # `evidence_invalid`, so adding both counted one malformed response twice.
-    # review-B1.6b23#1: an unconsumed page is a failure of THIS lane to deliver coverage it holds, and
-    # `failed` is what `OsintSession.outcome()` folds into the verdict.
+    # `failed` is what the session verdict folds in: parse failures, publish failures, unconsumed pages
     failed = sum(out.fail_classes.values()) + out.publish_failed + out.pages_unconsumed
     pol = pol or whoxy_page.SpendPolicy()
 
     limits = dict(out.limit_classes)
     limit_why = out.limit_reason or pol.limit
     gap_why = out.fail_reason or pol.gap
-    # review-B1.6b14#2: status was chosen from `gap_why` alone, so a lane could publish nothing, journal
-    # nothing, or reject every page and still report SUCCESS. Every real failure gets a reason.
+    # every real failure gets a reason, or the status could read success over it
     if out.publish_failed and not gap_why:
         gap_why = f"{out.publish_failed} page(s) could not be stored"
     if out.evidence_invalid and not gap_why:
         gap_why = f"{out.evidence_invalid} page(s) were unusable and were not owned"
-    # review-B1.6b22: the paginator now KEEPS the outcome when its own machinery fails, so the terminal
-    # must be able to explain a run that holds real pages and still did not finish.
-    # review-B1.6b23#3: `gap_why or ...` hid EVERY machinery failure behind an earlier provider one — a
-    # transport error followed by our accounting blowing up reported only the transport error. The first
-    # cause still leads the sentence; the rest are appended, because both happened.
-    # review-B1.6b26: the check was on the COMBINED string, which never matched once there were two
-    # failures — so the first reason, already carried by `fail_reason`, was rendered a second time
-    # inside the appendix. Each entry decides for itself whether it has been said.
+    # a machinery failure is appended, not hidden behind an earlier provider one; each entry checks
+    # whether it has already been said
     machinery_why = "; ".join(m for m in out.machinery if m not in gap_why)
     if machinery_why:
         gap_why = (f"{gap_why} · page state machinery also failed ({machinery_why})" if gap_why
                    else f"page state machinery failed ({machinery_why})")
-    # review-B1.6b23#1: a page whose ingestion failed is owned and out of the page remainder, so nothing
-    # else in this terminal can say its rows are missing.
+    # an unconsumed page is owned and out of the page remainder, so it is stated here
     if out.pages_unconsumed:
         why = f"{out.pages_unconsumed} page(s) were read but not ingested"
         gap_why = f"{gap_why} · {why}" if gap_why else why
     if out.stop_cause in ("ledger_unwritable", "publish_failed", "scheduler_invariant"):
         gap_why = gap_why or f"page state machinery failed ({out.stop_cause})"
     if out.stop_cause == "account_busy":
-        # agreed contract: another project holding the account is a GAP, not a soft limit — the pages we
-        # could not buy are simply missing, and nothing about this account refused us.
+        # another project holding the account is a gap, not a soft limit: nothing refused us
         gap_why = gap_why or "another project is spending this account; the remainder was not bought"
     if out.stop_cause.startswith("provider_stop:"):
         gap_why = gap_why or out.stop_cause
     if not out.persisted:
         gap_why = gap_why or "page state was NOT persisted — paid pages will be bought again"
-    # review-B1.6b14#1: only a KNOWN page remainder activated the boundary, so two anchors we never
-    # opened at all — the larger loss — reported SUCCESS. Units stay separate in the reporting.
+    # a remainder is known pages or unopened anchors, kept as separate units
     has_remainder = bool(pages_left or unopened)
     left_desc = " and ".join(x for x in ((f"{pages_left} page(s)" if pages_left else ""),
                                          (f"{unopened} anchor(s)" if unopened else "")) if x)
-    # review-B1.6b19: `limit_origin` was a single value and provider won first, so a quota AND a reserve
-    # together reported `operator_limit=False` beside `spend_stop_kind="operator_reserve"` — metadata
-    # contradicting itself, with the operator's own boundary dropped. They are independent facts and one
-    # run can hit both: the provider refused what was left, and we had withheld some of it anyway.
+    # provider and operator limits are independent; one run can hit both
     provider_why = out.limit_reason or pol.limit or ""
     operator_why = ""
-    # review-B1.6b20: a remainder ALONE activated the policy's boundary, so a run our own machinery
-    # stopped — a failed publish, an unwritable ledger — reported a provider or operator limit it never
-    # reached. The policy explains a remainder only when its allowance was actually spent; the scheduler
-    # counts that, and nothing else can know it. Page-proven limits stay independent of this.
+    # a policy explains a remainder only when its allowance was actually spent, which the scheduler
+    # counts
     bounded = has_remainder and out.allowance_exhausted
     if bounded and pol.stop_kind in ("operator_reserve", "run_budget"):
         operator_why = f"{left_desc} withheld by the operator ({pol.stop_kind})"
@@ -587,8 +492,7 @@ def _whoxy_record(s: OsintSession, out, pol, anchors, echo) -> None:
     operator_limit = bool(operator_why)
     limit_why = limit_why or provider_why or operator_why
 
-    # what this child actually BOUGHT from a Quarry-owned provider path, in the unit Whoxy charges in.
-    # Replayed pages cost nothing, and requests issued are not the bill — the page is (settle D).
+    # what was bought, in Whoxy's unit: replayed pages cost nothing, and requests are not the bill
     events.spend("osint.whoxy", provider="whoxy", measure="pages", amount=int(out.pages_bought))
 
     counts = (f"{attempted}/{out.anchors} anchor(s) attempted · {out.pages_bought} page(s) bought"
@@ -598,14 +502,11 @@ def _whoxy_record(s: OsintSession, out, pol, anchors, echo) -> None:
               + (f" · {unopened} anchor(s) never opened" if unopened else "")
               + (f" · {out.pages_unconsumed} page(s) not ingested" if out.pages_unconsumed else "")
               + (f" · {out.error_bodies} error body(ies) kept" if out.error_bodies else ""))
-    # the balance outcome's class counts too: a lane stopped before its first page has no page-level
-    # class, and reporting a gap with no class tells an operator only that something went wrong.
+    # the balance outcome's class counts too: a lane stopped before its first page has no page class
     cls = next(iter(out.fail_classes), None) or next(iter(limits), None) or (pol.error_class or None)
     meta = {"eligible": out.anchors, "attempted": attempted, "completed": out.anchors_touched,
-            # `failed` and `truncated_pages` are what `OsintSession.outcome()` folds into the verdict.
-            # review-B1.6b13#2: EVERY remainder went into `truncated_pages`, and any value there is a
-            # gap — so a quota, which is a soft limit by contract, produced complete_with_gaps. Only a
-            # remainder nothing else explains belongs there.
+            # `truncated_pages` is a gap in the verdict, so only a remainder nothing else explains
+            # belongs there — a quota is a soft limit, not a gap
             "failed": failed, "not_sent": unopened,
             "truncated_pages": pages_left if (gap_why and not limit_why) else 0,
             "pages_left": pages_left, "unopened_anchors": unopened,
@@ -616,11 +517,8 @@ def _whoxy_record(s: OsintSession, out, pol, anchors, echo) -> None:
             "pages_unconsumed": out.pages_unconsumed, "machinery": list(out.machinery),
             "limit_reason": limit_why or None, "gap_reason": gap_why or None,
             "config_invalid": pol.invalid or None, "balance_invalid": pol.balance_invalid or None,
-            # review-B1.6b14#3: `provider_limit` was set only inside the limit-ONLY status branch, so a
-            # transport failure plus a quota reported the gap and lost the limit entirely. A limit and a
-            # gap are independent facts; both are recorded before any status is chosen.
-            # review-B1.6b14#4: an OPERATOR boundary is a limit too, and the session verdict could not
-            # see it — a withheld remainder folded as `complete`.
+            # limit and gap recorded independently before any status is chosen; an operator boundary
+            # is a limit the verdict must see
             "provider_limit": provider_limit, "operator_limit": operator_limit,
             "provider_limit_reason": provider_why or None,
             "operator_limit_reason": operator_why or None,
@@ -628,8 +526,7 @@ def _whoxy_record(s: OsintSession, out, pol, anchors, echo) -> None:
             "limit_origin": ("+".join(k for k, on in (("provider", provider_limit),
                                                       ("operator", operator_limit)) if on) or None)}
 
-    # GAPS DOMINATE: a limit may only lift an otherwise-clean lane. An unusable control is our own
-    # defect and outranks both.
+    # gaps dominate: a limit only lifts an otherwise-clean lane. An unusable control outranks both.
     if pol.invalid:
         status, note = Status.FAILED, f"unusable spending control ({pol.invalid}) — no paid request issued"
         meta["coverage_incomplete"] = True
@@ -665,20 +562,15 @@ _ASRANK_MEMBERS_Q = """
 """
 
 
-#: the widest ASN a 32-bit AS number can be. AS0 is reserved, so a valid ASN is 1..4294967295.
+#: the widest 32-bit AS number; AS0 is reserved, so a valid ASN is 1..4294967295
 _ASN_MAX = 2 ** 32 - 1
 
 
 def _exact_count(value) -> int | None:
-    """A provider count we can do arithmetic with, or None. `int(x)` accepted `True`, `3.9` and `"7"` —
-    and a count nobody validated is what turns a provider shortfall into a confident subtraction."""
     return value if type(value) is int and value >= 0 else None
 
 
 def _asn_number(value) -> str | None:
-    """The CANONICAL ASN string, or None. `str(x).isdigit()` accepted `"٤٢"` (Arabic-Indic digits, which
-    `int()` then happily parses), `"0"` (reserved), `"007"` (non-canonical, so two spellings of one ASN
-    would become two candidates) and values far outside the 32-bit range."""
     if not isinstance(value, str):
         return None
     v = value.strip()
@@ -689,38 +581,21 @@ def _asn_number(value) -> str | None:
 
 
 def _obj(value) -> dict:
-    """A nested provider object, or an empty one. `x or {}` returns the LIST when the provider sent a
-    list, and the `.get()` after it raises — outside the query guard, so the lane never emitted its
-    terminal and a malformed row took the whole preflight's account of itself with it."""
     return value if isinstance(value, dict) else {}
 
 
 def _text(value) -> str:
-    """A provider string, or empty. `.strip()` on a number raises for the same reason."""
     return value.strip() if isinstance(value, str) else ""
 
 
 def _readable(value, want) -> bool:
-    """Whether a provider field is USABLE — absent counts as readable, wrong-typed does not.
-
-    The distinction is the whole point: a field the provider did not send is an answer, while a field it
-    sent in a shape we cannot read is evidence we DISCARDED, and the second must never pass silently just
-    because the typed accessor kept it from raising."""
     return value is None or isinstance(value, want)
 
 
 def _asrank_orgs(name: str, limit: int, timeout: int, save) -> tuple[list, int | None, int | None]:
-    """`(organizations, total_matches, provider_short)` for one org-name search — `total` and `short` are
-    None when the provider's own count could not be read.
-
-    Pages until it HAS what the bound allows — `min(limit, total)`, or everything when `limit <= 0`. The
-    first version stopped after one response in bounded mode, so a provider that returned three of ten
-    admitted results was reported as ten obtained and the rest withheld by OUR cap: our bound got the
-    blame for work the provider never sent. What the provider owed and did not send is returned
-    separately, as its own shortfall.
-
-    Every response is saved as its own immutable artifact and each node carries the path of the page it
-    came from, so a candidate always cites the file that actually contains it.
+    """`(organizations, total_matches, provider_short)` for one org-name search; `total` and `short` are None
+    when the provider count could not be read. Pages until it has what the bound allows, saving each
+    response as its own artifact.
     """
     page = max(1, min(limit, 50)) if limit > 0 else 50
     nodes: list = []
@@ -743,21 +618,15 @@ def _asrank_orgs(name: str, limit: int, timeout: int, save) -> tuple[list, int |
         if not got or len(nodes) >= want or guard >= 40:
             break
     if total is None:
-        # an unreadable denominator is UNKNOWN, never `len(nodes)`. Substituting what we happened to
-        # receive turns malformed provider data into a certificate of complete coverage: the shortfall
-        # computes to zero precisely because nobody knows what the total was.
+        # an unreadable denominator is unknown, never `len(nodes)`: that would compute a zero shortfall
         return (nodes if limit <= 0 else nodes[:limit]), None, None
     allowed = total if limit <= 0 else min(limit, total)
     return nodes[:allowed], total, max(0, allowed - len(nodes))
 
 
 def _asrank_asns(node: dict, timeout: int, save) -> tuple[list, str, str]:
-    """`(member ASNs, shortfall reason, artifact)` for one organisation.
-
-    `numberAsns` is the org's OWN count, so a page that returned fewer is a request-size shortfall we can
-    fix by asking for exactly that many — never a membership decision, and never silently accepted. The
-    follow-up response is saved as its OWN artifact and returned, because the ASNs only that query
-    produced cannot cite a page written before it ran.
+    """`(member ASNs, shortfall reason, artifact)` for one organisation. A page returning fewer than
+    `numberAsns` is re-requested for exactly that count.
     """
     members = _obj(node.get("members"))
     edges = (_obj(members.get("asns")).get("edges") or [])
@@ -782,14 +651,8 @@ def _asrank_asns(node: dict, timeout: int, save) -> tuple[list, str, str]:
 
 
 def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
-    """ORG NAME -> CAIDA ASRank -> ASN + related-organisation CANDIDATES (review-only).
-
-    This is the ASN DISCOVERY the preflight claimed and never did: `_asn_expand` only expands ASNs the
-    operator already listed, so a target whose ASNs nobody knew stayed invisible. ASRank is free, keyless
-    and public, and its org search is FUZZY — which is exactly why every result is `verify-ownership` and
-    nothing here ever reaches an active lane. Discovering an ASN is a claim about naming, not ownership.
-
-    ORG_NAMES only: brands are marketing terms and would match half the internet.
+    """Org name -> CAIDA ASRank -> ASN and related-org candidates (review-only). ASRank's org search is
+    fuzzy, so every result is `verify-ownership`. ORG_NAMES only; brands would match half the internet.
     """
     from . import policy
     if not profile.org_names:
@@ -799,19 +662,14 @@ def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
     n_orgs = n_asns = withheld = provider_short = bad_asns = bad_orgs = bad_fields = 0
     short: list = []
     failed = unknown_total = 0
-    seq = {"n": 0}                 # RUN-WIDE, so no two responses in this lane can share a filename
+    seq = {"n": 0}                 # run-wide, so no two responses in this lane share a filename
     for name in profile.org_names:
-        # the slug is for HUMANS; the digest is what makes the name unique. Sanitising and truncating maps
-        # `a/b`, `a?b` and any two long names with a common prefix onto one slug, and a per-name counter
-        # then had the second anchor overwrite artifacts the first anchor's candidates already cite.
+        # the slug is for humans; the digest makes it unique, or two names collide onto one artifact
         slug = (re.sub(r"[^A-Za-z0-9._-]", "_", name)[:40] + "-"
                 + hashlib.sha256(name.encode("utf-8")).hexdigest()[:8])
 
         def save(kind: str, doc: dict, _slug=slug) -> str:
-            """One IMMUTABLE artifact per response. A candidate must cite the file that actually contains
-            it — a single per-name artifact written before the follow-up query left every ASN that only
-            the follow-up returned pointing at a file it is not in, and those are exactly the biggest
-            organisations."""
+            """One immutable artifact per response, so a candidate always cites the file that contains it."""
             seq["n"] += 1
             raw = s.raw_path("asrank", f"{_slug}.{seq['n']:03d}-{kind}.json")
             raw.write_text(json.dumps(doc, indent=2, ensure_ascii=False))
@@ -824,9 +682,8 @@ def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
             echo(f"    asrank[{name}]: {e}")
             s.note_failure("asrank", f"{name}: {e}")
             continue
-        # OUR bound and THEIR shortfall are different facts. Blaming our cap for results the provider
-        # never sent is the same blame-shift the limit/gap taxonomy exists to prevent, pointed the other
-        # way: it tells an operator that raising the bound would recover work that is simply not there.
+        # our bound and their shortfall are different facts; blaming our cap for what the provider
+        # never sent is the same blame-shift, reversed
         if total is None:
             unknown_total += 1
             s.note_failure("asrank", f"{name}: the provider's match count was unreadable — coverage of "
@@ -840,18 +697,15 @@ def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
         for node in orgs:
             try:
                 raw_name, raw_country = node.get("orgName"), node.get("country")
-                # the LEAF is what carries the evidence: checking that `country` is a dict says nothing
-                # about `country.iso`, and `{"iso": 7}` passed the container check while the typed read
-                # discarded the value. When the container itself is unreadable the leaf is UNREACHABLE
-                # rather than discarded, so it is reported as absent and counted once, not twice.
+                # the leaf carries the evidence: an unreadable container makes the leaf unreachable
+                # (absent), not discarded, so it is counted once
                 raw_iso = _obj(raw_country).get("iso") if isinstance(raw_country, dict) else None
                 for field, value, want in (("orgName", raw_name, str),
                                            ("country", raw_country, dict),
                                            ("country.iso", raw_iso, str)):
                     if not _readable(value, want):
-                        # NOT a crash any more, and not silence either: the typed read saved the row, and
-                        # this says what the row cost. A lane that discards provider evidence may not
-                        # report SUCCESS over it.
+                        # a discarded field is counted: a lane may not report success over evidence
+                        # it could not read
                         bad_fields += 1
                         s.note_failure("asrank", f"{name}: unreadable {field} on organisation "
                                                  f"{_text(raw_name) or node.get('orgId') or '?'} "
@@ -860,9 +714,7 @@ def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
                 iso = _text(raw_iso)
                 asns, shortfall, asn_ref = _asrank_asns(node, timeout=min(timeout, 30), save=save)
             except Exception as e:                               # noqa: BLE001
-                # ONE unreadable row may not cost the lane its terminal: without this, a numeric orgName
-                # or a list-valued `country` raised past the query guard and the whole preflight lost its
-                # account of what it did.
+                # one unreadable row may not cost the lane its terminal
                 bad_orgs += 1
                 s.note_failure("asrank", f"{name}: unreadable organisation row ({type(e).__name__})")
                 continue
@@ -879,8 +731,8 @@ def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
             for a in asns:
                 num = _asn_number(a.get("asn"))
                 if num is None:
-                    # never published — and never silent either: a discarded row is provider evidence we
-                    # could not use, so a response that was partly unreadable may not finish as SUCCESS.
+                    # a discarded ASN row is counted: a partly-unreadable response may not finish
+                    # success
                     bad_asns += 1
                     continue
                 n_asns += 1
@@ -926,7 +778,6 @@ def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
 
 
 def _asn_expand(s: OsintSession, profile, echo, timeout: int) -> None:
-    """Profile ASN seeds → CIDR candidates (verify-ownership; high-risk = active scanning)."""
     if not profile.asn or not have("asnmap"):
         return
     raw = s.raw_path("asnmap", "ranges.txt")
@@ -943,18 +794,14 @@ def _asn_expand(s: OsintSession, profile, echo, timeout: int) -> None:
                             manual_followup="verify ownership on bgp.he.net / RDAP before adding")
 
 
-#: strips the tool's ANSI colouring so its output can be parsed as text. porch-pirate always colours, has
-#: no `--no-color`, and its `--raw` flag does not apply to the globals path (MEASURED against v1.x: the
-#: globals view prints `- Author: / - Key: / - Value:` triples, coloured, never JSON).
+#: strips porch-pirate's ANSI colouring; the globals view has no plain-text or JSON mode.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _porch_globals(text: str) -> list[dict]:
-    """`{author, key, value}` per workspace global variable, from the tool's own coloured output.
-
-    The VALUE is preserved EXACTLY as the tool printed it — a Postman global is where a public workspace
-    leaks its API keys, and a truncated or masked secret is not evidence. Only Quarry's OWN configured
-    credentials are ever redacted, and that happens at the manifest sink, not here."""
+    """`{author, key, value}` per workspace global, from the tool's coloured output. The value is preserved
+    exactly — a Postman global is where a workspace leaks its API keys.
+    """
     out: list = []
     author = ""
     pending_key = None
@@ -972,12 +819,9 @@ def _porch_globals(text: str) -> list[dict]:
 
 
 def _porch_pirate(s: OsintSession, apex: str, echo, timeout: int) -> None:
-    """Public Postman leaks → INTEL. TWO views, because the tool exposes two different things and the
-    documented one (secrets) was never collected: `--urls` gives endpoints, `--globals` gives workspace
-    GLOBAL VARIABLES — which is where a public workspace leaks its API keys and tokens.
-
-    Both are intel, never scope. A global with an empty value is still recorded: "this workspace defines
-    `apiKey`" is a finding about the workspace even when the value is withheld."""
+    """Public Postman leaks -> intel. Two views: `--urls` gives endpoints, `--globals` gives workspace global
+    variables. Both are intel, never scope; a global with an empty value is still recorded.
+    """
     pp = s.raw_path("porch-pirate", f"{apex}.txt")
     r = exec_tool("porch-pirate", ["porch-pirate", "-s", apex, "--urls"],
                   raw_path=pp, timeout=timeout)
@@ -995,10 +839,8 @@ def _porch_pirate(s: OsintSession, apex: str, echo, timeout: int) -> None:
     n_globals = 0
     if rg.raw_path:
         for g in _porch_globals(rg.raw_path.read_text()):
-            # VERBATIM, and WITH the workspace it came from: several public workspaces define the same
-            # key names, so `apiKey=…` without its author is evidence nobody can go back to. The author
-            # rides as its own field rather than being glued into the value, which stays exactly what the
-            # tool printed.
+            # verbatim, with the workspace author as its own field: `apiKey=…` without it is evidence
+            # nobody can return to
             s.intel("postman-global", f"{g['key']}={g['value']}", "porch-pirate",
                     workspace_author=g["author"] or "unknown", key=g["key"])
             n_globals += 1
@@ -1007,7 +849,6 @@ def _porch_pirate(s: OsintSession, apex: str, echo, timeout: int) -> None:
 
 
 def _rdap_org(obj: dict) -> str:
-    """Pull an org/name from an RDAP object's entities (vcard fn/org)."""
     for ent in obj.get("entities") or []:
         vcard = ent.get("vcardArray")
         if vcard and len(vcard) > 1:
@@ -1020,11 +861,6 @@ def _rdap_org(obj: dict) -> str:
 
 
 def _rdap_addresses(profile, s: OsintSession) -> dict:
-    """Every address each apex resolves to — v4 AND v6.
-
-    `gethostbyname_ex` is IPv4-ONLY, so a v6-only apex resolved to nothing and its netblock was invisible;
-    `getaddrinfo` asks for both families. Returns `{apex: [ip, ...]}` so the lane can order host-FAIRLY
-    rather than letting one apex's address set crowd out every other apex."""
     import socket
     per_apex: dict = {}
     for apex in profile.apex_domains:
@@ -1034,25 +870,19 @@ def _rdap_addresses(profile, s: OsintSession) -> dict:
                 for info in socket.getaddrinfo(apex, None, family, socket.SOCK_STREAM):
                     found.add(info[4][0])
             except OSError:
-                continue          # one family missing is normal; only a COMPLETE failure is a gap
+                continue          # one family missing is normal; only a complete failure is a gap
         per_apex[apex] = sorted(found)
         if not found:
-            # review-B0r4#2: an apex we could not resolve must contribute to the verdict, never a silent
-            # `continue` under a clean completion.
+            # an apex that resolved to nothing is a gap in the verdict, not a silent continue
             s.note_failure("rdap", f"{apex}: resolved to no address (v4 or v6)")
     return per_apex
 
 
 def _rdap(s: OsintSession, profile, echo, timeout: int) -> None:
-    """Resolved apex IPs -> RDAP netblock/org -> CIDR/org CANDIDATES (suggest-only). Never adds
-    scope or scans; a resolved IP may be a CDN/shared host, so everything is verify-ownership.
-
-    The lookup count is a THROUGHPUT bound, never a membership cut. `sorted(ips)[:20]` silently deleted
-    every address after the twentieth — sorted, so biased toward low first octets — and reported nothing
-    about what it dropped. Now the full eligible set is established, ordered host-FAIRLY (one address per
-    apex per round, so a big apex cannot crowd out a small one), bounded by `RDAP_LOOKUPS` (0 = every
-    eligible address, which is exactly what `--unbound` sets), and whatever the bound withholds is
-    reported as OUR OWN operator limit, with its remainder."""
+    """Resolved apex IPs -> RDAP netblock/org -> CIDR/org candidates (suggest-only, verify-ownership). The
+    lookup count is a throughput bound over the host-fair eligible set, never a membership cut; the withheld
+    remainder is reported as our own operator limit.
+    """
     from . import policy
     per_apex = _rdap_addresses(profile, s)
     owner = {ip: apex for apex, ips in per_apex.items() for ip in ips}
@@ -1083,8 +913,7 @@ def _rdap(s: OsintSession, profile, echo, timeout: int) -> None:
             s.candidate(org, "org", "rdap", "verify-ownership",
                         f"RDAP org for resolved IP {ip}", raw_ref=str(raw))
         echo(f"  rdap[{ip}]: {netname or org or 'no netblock'}")
-    # OUR bound, so OUR limit — never a provider limit, and never silence: a withheld remainder nobody
-    # reports is indistinguishable from an address that does not exist.
+    # our bound, so our limit: a withheld remainder is reported, never silent
     note = f"{len(chosen)}/{len(eligible)} resolved address(es) looked up"
     meta = {"eligible": len(eligible), "tested": len(chosen), "withheld": withheld,
             "measure": "addresses", "bound": cap}
@@ -1098,8 +927,7 @@ def _rdap(s: OsintSession, profile, echo, timeout: int) -> None:
 
 
 def _key_health(s: OsintSession, echo) -> None:
-    """Surface which keys THIS OSINT run uses (set vs missing) so thin OSINT is explained, not
-    silent. Only keys quarry osint actually consumes — not the run-phase keys (shodan/github)."""
+    """Surface which keys this OSINT run uses (set vs missing), so thin OSINT is explained."""
     status = {"whoxy (reverse-whois)": bool(secrets.whoxy()),
               "projectdiscovery/chaos (asnmap)": bool(secrets.chaos())}
     have_ = [k for k, v in status.items() if v]
@@ -1111,10 +939,8 @@ def _key_health(s: OsintSession, echo) -> None:
 
 
 def run(profile, scope, project_dir: Path, echo=print, timeout: int = 1800) -> Path:
-    """Run the OSINT pre-flight. Returns the report path. Never edits scope.
-
-    Output lands under <project_dir>/osint/. `timeout` is the per-tool ceiling; fast lookups
-    (whois/dig/HTTP) use shorter caps.
+    """Run the OSINT pre-flight and return the report path. Never edits scope. `timeout` is the per-tool
+    ceiling; fast lookups use shorter caps.
     """
     sess = OsintSession(project_dir, profile.target)
     from .runner import set_tool_cwd
@@ -1125,7 +951,7 @@ def run(profile, scope, project_dir: Path, echo=print, timeout: int = 1800) -> P
         emails |= _whois(sess, apex, echo, timeout)
         _dmarc(sess, apex, echo, timeout)
     _whoxy(sess, emails, profile.org_names, echo, timeout)
-    _asrank(sess, profile, echo, timeout)      # ORG NAME -> ASN candidates (the discovery step)
+    _asrank(sess, profile, echo, timeout)      # org name -> ASN candidates (the discovery step)
     _asn_expand(sess, profile, echo, timeout)  # ...and profile ASN seeds -> CIDR context
     _rdap(sess, profile, echo, timeout)
     _key_health(sess, echo)

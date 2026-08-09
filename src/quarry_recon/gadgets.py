@@ -1,26 +1,18 @@
-"""GADGET CANDIDATES — chain material, kept apart from findings.
+"""Gadget candidates — chain material, kept apart from findings.
 
-    HOTLIST   things to VERIFY as findings
-    GADGETS   weird primitives to REMEMBER, because step two of a chain is rarely a finding on its own
+A gadget is a primitive, not a vulnerability and not noise: a malformed redirect, a parser quirk, a
+reflected-but-unexploitable parameter, an odd auth-flow parameter — step two of a chain, rarely a finding
+on its own. This module holds the `gadget_candidate` entity, the `gadgets` digest queue, and deterministic
+classifiers over evidence Quarry already holds. It contacts nothing.
 
-A gadget is not a vulnerability and not noise. It is a primitive: a malformed redirect, a parser quirk, a
-reflected-but-unexploitable parameter, an odd auth-flow parameter. Most recon tools throw these away
-because nothing can be reported from them alone — and then the chain that needed them is never built.
-This is the layer-1 substrate: a `gadget_candidate` entity, a `gadgets` digest queue, and DETERMINISTIC
-classifiers over evidence Quarry ALREADY holds. Nothing here contacts anything.
+Three rules the classifiers obey:
 
-Three rules the classifiers obey, because a queue nobody trusts is a queue nobody reads:
+  impact is never claimed     every record is `impact_state: none_proven`;
+  suppression is explicit     suppression rules are named and testable, not a similarity score;
+  the evidence is cited       every record carries the source entity and its raw_ref.
 
-  IMPACT IS NEVER CLAIMED     every record is `impact_state: none_proven`. A gadget says "this is odd and
-                              might matter later", never "this is exploitable".
-  SUPPRESSION IS EXPLICIT     a generic login redirect on every path is not a gadget; it is what the site
-                              does. Suppression rules are named and testable, not a similarity score.
-  THE EVIDENCE IS CITED       every record carries the entity it came from and that entity's raw_ref, so a
-                              reviewer lands on the response, not on our summary of it.
-
-Ranking, clustering and chain SUGGESTIONS are deliberately not here: they belong to the v0.4 relationship
-layer, which will link `gadget -> host/url/param/finding/oob` and can then rank with context this layer
-does not have.
+Ranking, clustering and chain suggestions belong to the future relationship layer, which links
+`gadget -> host/url/param/finding/oob` with context this layer does not have.
 """
 from __future__ import annotations
 
@@ -29,11 +21,10 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import normalize
 
-#: what KIND of primitive a gadget is. A class is the question "what could this become", not a severity.
+#: what kind of primitive a gadget is — the question "what could this become", not a severity.
 CLASSES = ("redirect-parser", "auth-flow", "redirect-chain")
 
-#: chains a class can plausibly feed. Declared per record so a reviewer (and later the relationship layer)
-#: can ask "what would I even do with this" without re-deriving it.
+#: chains a class can plausibly feed, declared per record so a reviewer need not re-derive it.
 CHAINS = ("oauth", "saml", "cache-poisoning", "redirect-chain", "waf-bypass", "request-smuggling", "ato",
           "parser-differential")
 
@@ -42,22 +33,17 @@ REDIRECT_PARAMS = ("redirect_uri", "redirect_url", "redirecturl", "redirect", "r
                    "returnurl", "return_to", "returnto", "callback", "continue", "dest", "destination",
                    "goto", "target", "url", "rurl", "back", "backurl", "state")
 
-#: path markers that put a parameter inside an AUTHENTICATION flow. Matched as complete path SEGMENTS
-#: (see `_auth_context`), never as substrings: `/authorization-help` is not an auth route, and giving it
-#: OAuth/SAML/ATO chain potential is how a queue fills with paths nobody will ever chain. — where a redirect primitive stops
-#: being cosmetic. `mellon` and `saml2` are here because the OTC case that motivated this lane was a
-#: Mellon SAML flow emitting a malformed Location.
+#: path markers that put a parameter inside an authentication flow. Matched as complete path segments
+#: (see `_auth_context`), never as substrings, so `/authorization-help` is not an `/auth` route.
 AUTH_MARKERS = ("/oauth", "/oauth2", "/openid", "/oidc", "/saml", "/saml2", "/sso", "/login", "/signin",
                 "/sign-in", "/auth", "/adfs", "/mellon", "/cas/", "/idp", "/callback", "/session",
                 ".well-known/openid-configuration")
 
-#: statuses that actually REDIRECT a client. Not the whole 3xx class: `304 Not Modified` carries cache
-#: validators (and sometimes a Location) while sending nobody anywhere, `300` offers choices without
-#: taking one, and `305` is a proxy instruction — treating those as redirects publishes gadgets from
-#: responses that redirect nothing, and lets them count toward the suppression population.
+#: statuses that actually redirect a client — not the whole 3xx class. 304, 300 and 305 carry a Location
+#: (or cache validators) without sending a client anywhere.
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
-#: a Location that a client and a server can read DIFFERENTLY. Each is a parser differential in waiting.
+#: a Location that a client and a server can read differently — a parser differential in waiting.
 _MALFORMED_LOCATION = (
     (re.compile(r"^https?:/(?!/)", re.I), "scheme followed by ONE slash"),
     (re.compile(r"^https?:\\\\", re.I), "scheme followed by backslashes"),
@@ -73,12 +59,11 @@ _AUTH_SEGMENTS = tuple(tuple(s for s in m.lower().split("/") if s) for m in AUTH
 
 
 def _auth_context(*urls) -> bool:
-    """Whether any of these URLs is INSIDE an authentication flow — judged on the PATH, by SEGMENT.
+    """Whether any of these URLs is inside an authentication flow — judged on the path, by segment.
 
-    Two ways this went wrong before. Searching the whole URL let a value create the context it was
-    supposed to be judged in (`/search?next=/oauth/callback` read as an auth flow while its path is
-    `/search`) — and that value is exactly what an attacker controls. Then substring matching on the path
-    made `/authorization-help` an `/auth` route and `/login-assets` a `/login` one.
+    Only the path is examined, so an attacker-controlled query value (`/search?next=/oauth/callback`)
+    cannot create the context it is judged in; segments must match whole, so `/authorization-help` is not
+    an `/auth` route.
     """
     for url in urls:
         if not isinstance(url, str) or not url:
@@ -95,24 +80,19 @@ def _auth_context(*urls) -> bool:
 
 
 def _is_redirect(live: dict) -> bool:
-    """A REDIRECT, not merely a response carrying a `Location`.
-
-    A `Location` on a 200 is a curiosity, not a redirect: calling it one published false gadgets and let
-    five such responses satisfy the suppression population that protects real ones."""
+    """A redirect, not merely a response carrying a `Location` (a `Location` on a 200 is neither)."""
     status, loc = live.get("status_code"), live.get("location")
     return (type(status) is int and status in REDIRECT_STATUSES
             and isinstance(loc, str) and bool(loc))
 
 
 def _ours(host: str, scope) -> bool:
-    """Whether a host is IN SCOPE. Observed out-of-scope behaviour stays evidence — it is simply not a
-    primitive we would ever chain, and publishing it as ours invites exactly the action the RoE forbids."""
+    """Whether a host is in scope. Out-of-scope behaviour stays evidence but is not a primitive we chain."""
     return bool(host) and scope.in_scope(host)
 
 
 def _provenance(row: dict) -> tuple[list, str]:
-    """The entity's OWN sources and raw evidence. Substituting a lane name and an empty ref would land a
-    reviewer on our summary instead of the response — the one thing this queue promises not to do."""
+    """The entity's own sources and raw evidence, so a reviewer lands on the response, not our summary."""
     sources = [s for s in (row.get("sources") or []) if isinstance(s, str)] or ["url-corpus"]
     ref = row.get("raw_ref") or ""
     if not ref:
@@ -137,11 +117,9 @@ def _record(klass: str, subtype: str, *, host: str, value: str, observed: str, w
             "observed_behavior": observed, "why": why,
             "chain_potential": [c for c in chains if c in CHAINS],
             "confidence": confidence,
-            # a gadget NEVER claims impact. The whole point is that it is interesting without being a
-            # finding, and a queue that quietly promotes itself is a queue an operator stops believing.
+            # a gadget never claims impact
             "impact_state": "none_proven",
-            # EVERY source, not the first: an endpoint reached through katana AND gau is corroborated,
-            # and dropping one is dropping the corroboration.
+            # every source, not the first: an endpoint reached through katana and gau is corroborated
             "sources": [s for s in (sources if isinstance(sources, list) else [sources]) if s],
             "raw_ref": raw_ref}
 
@@ -168,8 +146,8 @@ def _malformed_location(live: dict) -> dict | None:
 
 
 def _auth_redirect_param(row: dict, scope) -> dict | None:
-    """A redirect-bearing parameter INSIDE an auth flow. Outside one it is an open-redirect candidate the
-    redirect queue already owns; inside one it is where tokens get stolen."""
+    """A redirect-bearing parameter inside an auth flow. Outside one it is an open-redirect candidate the
+    redirect queue already owns."""
     url = row.get("url") or row.get("value") or ""
     if not isinstance(url, str) or not _auth_context(url):
         return None
@@ -192,7 +170,7 @@ def _auth_redirect_param(row: dict, scope) -> dict | None:
 
 
 def _cross_host_redirect(live: dict, scope) -> dict | None:
-    """A 3xx pointing at ANOTHER host. Observed only — Quarry never follows it to decide."""
+    """A 3xx pointing at another host. Observed only — Quarry never follows it to decide."""
     loc, url = live.get("location"), live.get("url") or ""
     status = live.get("status_code")
     if not _is_redirect(live) or not loc.lower().startswith(("http://", "https://")):
@@ -202,8 +180,7 @@ def _cross_host_redirect(live: dict, scope) -> dict | None:
         return None
     in_auth = _auth_context(url, loc)
     if not in_auth and scope.in_scope(dst_host):
-        # an in-scope host redirecting to another in-scope host, outside any auth flow, is ordinary site
-        # structure. Recording it would bury the queue in what the site simply DOES.
+        # in-scope -> in-scope outside any auth flow is ordinary site structure
         return None
     return _record(
         "redirect-chain", "cross-host",
@@ -216,32 +193,24 @@ def _cross_host_redirect(live: dict, scope) -> dict | None:
 
 
 def _generic_login_redirect(lives: list) -> set:
-    """Hosts whose 3xx ALWAYS lands on the same login destination.
-
-    Explicit suppression, and the only one this layer has: a site that redirects every path to its SSO
-    entry point is not offering a primitive, it is describing itself. Without this rule the queue fills
-    with one row per URL on exactly the estates worth reading.
+    """Hosts whose 3xx always lands on the same login destination — a site that redirects every path to
+    its SSO entry point is describing itself, not offering a primitive. The only suppression rule here.
     """
     seen: dict = {}
     for live in lives:
         host = live.get("host")
         if _is_redirect(live) and isinstance(host, str):
             seen.setdefault(host, []).append(live["location"])
-    # the population is REDIRECTS, not pages: counting every live row let one redirect beside four
-    # ordinary responses pass as a five-sample "pattern", and that one redirect is exactly the primitive
-    # this rule exists to keep.
+    # the population is redirects, not pages
     return {host for host, locs in seen.items() if len(set(locs)) == 1 and len(locs) >= 5}
 
 
 def classify(run, scope) -> int:
-    """Read what the run already holds, write `gadget_candidate` rows. Returns how many are NEW.
+    """Read what the run already holds, write `gadget_candidate` rows, returning how many are new.
 
-    Contacts nothing and probes nothing: every input is an entity another lane already produced, so this
-    can never change what a run does to a target — only what the run remembers about it.
+    Contacts nothing and probes nothing: every input is an entity another lane already produced.
     """
-    # ONE scope gate, before any classifier: the ORIGIN host decides whether a primitive is ours to
-    # chain. Gating inside a single classifier left the other two publishing gadgets from out-of-scope
-    # origins — observed behaviour is evidence, but it is not a primitive we would ever act on.
+    # one scope gate before any classifier: the origin host decides whether a primitive is ours to chain
     lives = [live for live in run.read("live")
              if isinstance(live, dict) and _ours(live.get("host") or _host(live.get("url") or ""), scope)]
     uniform = _generic_login_redirect(lives)

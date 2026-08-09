@@ -1,19 +1,9 @@
-"""DNS-record enrichment phase (after vertical, before probe).
+"""DNS-record enrichment: one dnsx pass over the in-scope resolved set → `dns_record` entities
+(A/AAAA/CNAME/MX/NS/TXT/SOA/CAA + per-host ASN/CDN) with provenance. Does not re-discover hosts.
 
-puredns stays the brute/validation path; this phase does NOT re-discover hosts. It runs ONE dnsx
-pass over the known in-scope resolved set to pull the full useful record layer — A/AAAA/CNAME/MX/
-NS/TXT/SOA/CAA + per-host ASN/CDN — as first-class `dns_record` entities with provenance. Placed
-early so the DNS context (IPv6, org/DNS-provider, per-host ASN) feeds review/digest + human
-decisions from probe onward, instead of being buried at the end of the run.
-
-Overlap is justified as CONTEXT, not duplication: puredns = does-it-resolve; dnsx-enrich = what
-records it has. asnmap (horizontal) expands a profile ASN/CIDR into scope; dnsx `-asn` tags each
-resolved host with the ASN it sits in — complementary.
-
-`enrich_hosts()` is the reusable core: the `dns` phase runs it over the full resolved set; `enrich`
-runs it over late-discovered (crawl/CSP) hosts as a catch-up, so late hosts also get DNS metadata.
-Wildcard-inherited records (A/AAAA/CNAME/TXT spread by a `*.apex` record) are filtered against a
-per-apex baseline so they don't pollute every host.
+`enrich_hosts()` is the reusable core: the `dns` phase runs it over the full resolved set, `enrich`
+over late-discovered hosts. Wildcard-inherited records (A/AAAA/CNAME/TXT spread by a `*.apex` record)
+are filtered against a per-apex baseline.
 """
 from __future__ import annotations
 
@@ -23,16 +13,15 @@ from .. import normalize
 from ..runner import have, run as exec_tool, skipped
 
 _RECORD_FLAGS = ["-a", "-aaaa", "-cname", "-mx", "-ns", "-txt", "-soa", "-caa", "-asn", "-cdn"]
-# only these types are spuriously spread by a `*.apex` wildcard → filter them against the baseline.
-# mx/ns/soa/caa/asn/cdn are zone-level / meaningful context — never wildcard-filtered.
+# types a `*.apex` wildcard spuriously spreads → filtered against the baseline; zone-level types
+# (mx/ns/soa/caa/asn/cdn) are meaningful context, never filtered.
 _WILDCARD_TYPES = frozenset({"a", "aaaa", "cname", "txt"})
 _WILDCARD_PROBE_FLAGS = ["-a", "-aaaa", "-cname", "-txt"]   # baseline only needs the filtered types
 
 
 def _apex_of(host: str, apexes) -> str:
-    # LONGEST matching apex, not the first — with both example.com and dev.example.com in scope,
-    # x.dev.example.com must attribute to dev.example.com (order-independent), else its wildcard baseline
-    # is computed against the wrong root.
+    # longest matching apex, not the first (order-independent): x.dev.example.com → dev.example.com,
+    # so the wildcard baseline is computed against the right root.
     h = host.lower().rstrip(".")
     best = None
     for a in apexes:
@@ -49,9 +38,8 @@ def _dnsx_cmd(ctx, list_file, flags=None):
 
 
 def _wildcard_baseline(ctx, apexes: set, phase: str) -> dict:
-    """Per-apex wildcard record set: resolve a random non-existent label and collect its records.
-    Anything a real host shares with this baseline (for a wildcard-spread type) is inherited, not
-    host-specific → filtered."""
+    """Per-apex wildcard record set: resolve a random non-existent label per apex and collect its
+    records. A real host's record matching this baseline is wildcard-inherited → filtered."""
     apexes = sorted(a for a in apexes if a)
     if not apexes:
         return {}
@@ -69,7 +57,7 @@ def _wildcard_baseline(ctx, apexes: set, phase: str) -> dict:
 
 def enrich_hosts(ctx, hosts, phase: str) -> int:
     """dnsx record enrichment over `hosts` → dns_record entities, wildcard-filtered. Returns the
-    number of NEW records stored. Shared by the dns phase + enrich late-host catch-up."""
+    number of new records stored. Shared by the dns phase and the enrich late-host catch-up."""
     scope = ctx.scope
     apexes = ctx.profile.apex_domains
     hosts = sorted(h for h in set(hosts)
@@ -98,9 +86,8 @@ def run(ctx) -> None:
     if not have("dnsx"):
         ctx.run.record("dns", skipped("dnsx", "dnsx not installed"))
         return
-    # RESOLVED hosts only. A no-A / dangling-CNAME host (known as `subdomain` but never resolved)
-    # is intentionally NOT enriched here — dns_record is a resolved-asset metadata layer; the
-    # CNAME/takeover signal for no-A hosts stays in vertical + enrich.
+    # resolved hosts only: dns_record is a resolved-asset metadata layer. No-A / dangling-CNAME hosts
+    # keep their CNAME/takeover signal in vertical + enrich.
     in_scope = sorted(h for h in set(ctx.run.values("resolved"))
                       if h and ctx.scope.in_scope(h) and not ctx.scope.is_oos(h))
     if not in_scope:

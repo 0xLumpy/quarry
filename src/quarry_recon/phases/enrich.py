@@ -1,11 +1,8 @@
-"""Enrich phase — catch-up over hosts discovered AFTER vertical + probe.
+"""Enrich phase — catch-up over hosts discovered after vertical and probe.
 
-CSP siblings (found in probe via httpx -irh) and link-only needles (found in crawl) become
-known *after* the vertical resolve/CNAME pass and the probe pass have already run. Without a
-catch-up they stay un-resolved, un-probed, and — critically — never get subdomain-takeover
-analysis (a dangling-CNAME host first seen via a crawl link would otherwise be invisible to
-the takeover check). This phase resolves them, runs the CNAME/takeover signal, and probes the
-ones that resolve, so late-discovered hosts get the same treatment as vertical-discovered ones.
+CSP siblings (probe, httpx -irh) and crawl link-only needles surface after the vertical resolve/CNAME
+and probe passes, so without this they never get takeover analysis. This phase resolves them, runs the
+CNAME/takeover signal, and probes those that resolve — the same treatment vertical-discovered hosts get.
 """
 from __future__ import annotations
 
@@ -21,27 +18,18 @@ from .. import budget, events, remainder, sweep
 from ..contract import registered
 
 
-#: how many mined labels A1d may actually brute-force per apex (puredns, DNS). A SPEND bound, unchanged
-#: since before step 4 — what a measured, chunked, resumable selection should look like is 4.2's question.
+#: mined labels A1d may brute-force per apex (puredns, DNS) — a spend bound.
 A1D_WORD_CAP = 2000
 
-#: how many mined labels A1d may hand to the WILDCARD HTTP differentiator, per zone. review-step4-remeasure
-#: #3: this used to be the very same list `puredns` got, so widening the DNS selection in 4.2 would have
-#: silently widened HTTP work in a lane 4.3 had not scheduled yet. Two lanes, two bounds — the value is
-#: today's effective behaviour, so nothing widens now.
+#: mined labels A1d may hand the wildcard HTTP differentiator, per zone. A separate bound from the DNS
+#: one, so widening one lane's selection cannot widen the other's.
 A1D_WILDCARD_WORD_CAP = 2000
 
 
 def _a1d_subtract_base(ctx, words: list, wordlist_fn, loss: dict) -> list:
-    """Drop mined words the BASE dictionary already covers, by STREAMING the base file.
-
-    review-step4-measure#3: this used to build a `set()` of the whole base list — MEASURED at 9,544,235
-    words, 1.5 GB RSS and 3.9 s on this box — purely to subtract a few thousand mined labels from. The
-    membership test only needs OUR side in memory: stream the base file and drop the mined words it hits.
-
-    review-B-audit-12#2: the read stays inside A1d's loss boundary. The base list exists only to avoid
-    re-brute-forcing dictionary words, so failing to read it does not stop A1d; it means the mined words
-    were NOT deduped against it, which is a loss worth reporting."""
+    """Drop mined words the base dictionary already covers, streaming the base file so only our side is
+    held in memory. A base file that cannot be read is a reported loss, not a stop — the mined words are
+    simply not deduped against it."""
     try:
         base_wl = wordlist_fn(ctx)
     except Exception as ex:
@@ -72,11 +60,8 @@ def _a1d_subtract_base(ctx, words: list, wordlist_fn, loss: dict) -> list:
 
 
 def _a1d_loss_why(loss: dict, produced: int) -> str:
-    """One accurate sentence for everything A1d lost, or "" when nothing was lost.
-
-    review-B-audit-12#1: "every mined wordlist artifact was unreadable" was asserted whenever ANY file was
-    unreadable, so one unreadable file beside a readable-but-empty one produced a false claim. What the
-    readable files yielded is stated, not assumed."""
+    """One accurate sentence for everything A1d lost, or "" when nothing was lost. States what the
+    readable files yielded rather than asserting a blanket failure."""
     files, unreadable = loss.get("files", 0), loss.get("unreadable_files", 0)
     parts = []
     if unreadable:
@@ -89,12 +74,8 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
         parts.append(f"{loss['base_error']} — mined words were NOT deduped against it")
     if loss.get("base_dropped_lines"):
         parts.append(f"{loss['base_dropped_lines']} base wordlist line(s) not valid UTF-8")
-    # v63#1: the differ RETAINS the whole corpus; what a run withholds is candidate-target PAIRS, in the
-    # scheduler's own unit. v64#1: each disposition names the bound that ACTUALLY withheld it — the total
-    # remainder also holds guard refusals, unschedulable work and whatever a stop left behind, and calling
-    # all of it "the spend bound" promised a rotation those pairs will never get. What a whole ZONE
-    # withheld — a deferral, a guard refusal — is already stated in the ZONE unit beside its own cause, so
-    # only the dispositions the zone count CANNOT express are rendered here.
+    # a run withholds candidate-target pairs in the scheduler's unit, each named by the bound that
+    # withheld it; only dispositions the per-zone count cannot express are rendered here.
     _pairs = loss.get("wildcard_pairs", 0)
     for _key, _sentence in (
             ("bound", f"withheld by the {A1D_WILDCARD_WORD_CAP}-per-zone spend bound — they rotate in on "
@@ -112,22 +93,19 @@ def _a1d_loss_why(loss: dict, produced: int) -> str:
     if loss.get("sweep_machinery"):
         parts.append(loss["sweep_machinery"])
     if loss.get("withheld_by_word_cap"):
-        # the SPEND bound is a fact, like every other cap. Counted in candidate-TARGET PAIRS, exactly as
-        # the scheduler measures them, and taken from what it ACTUALLY submitted — whole buckets can
-        # underfill the bound, so the arithmetic `corpus - cap` was wrong (review v17#4).
+        # counted in candidate-target pairs as the scheduler measures them, from what it actually
+        # submitted — whole buckets can underfill the bound, so `corpus - cap` would be wrong.
         parts.append(f"{loss['withheld_by_word_cap']}/{loss.get('sweep_eligible_pairs', 0)} candidate(s) "
                      f"withheld by the {A1D_WORD_CAP}-per-apex A1d spend bound")
     return "; ".join(parts)
 
 
 def _a1d_sweep(ctx, prof, kept, origins, execute, *, dependency_ok):
-    """The scheduled apex brute. Isolated so its caller can bracket it in ONE source lifecycle."""
+    """The scheduled apex brute, isolated so its caller can bracket it in one source lifecycle."""
     return sweep.run_sweep(
         lane="a1d_brute",
-        # the SCHEMA is part of the path: changing `BUCKETS` bumps it, and a bumped schema must start a
-        # fresh rotation rather than meeting a document `RotationProgress` will (correctly) refuse to
-        # overwrite — which would leave the lane unable to reserve anything until an operator intervened
-        # (review v17#2).
+        # the schema is part of the path: a `BUCKETS` change bumps it and starts a fresh rotation, rather
+        # than meeting a document `RotationProgress` refuses to overwrite.
         state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}",
         targets=list(prof.apex_domains), vocabulary=lambda _apex: list(kept), execute=execute,
         budget_s=budget.budget_seconds("A1D_BUDGET_S"), coverage_lane="enrich.a1d_brute",
@@ -146,22 +124,19 @@ def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
     except Exception:                                        # noqa: BLE001
         pass
     """Fold the sweep into the lane's reported facts. Fallible on purpose — the caller contains it."""
-    # machinery is folded UNCHANGED: unschedulable slots are their own structured fact on the result and
-    # are rendered once from the counters below, so there is nothing to filter out by wording (v38).
+    # machinery is folded unchanged: unschedulable slots are their own structured fact, rendered once
+    # from the counters below.
     if swept.machinery:
         wl_loss["sweep_machinery"] = "; ".join(swept.machinery)
     if swept.stop_kind not in (None, "bound"):
         wl_loss["sweep_stop"] = swept.stop
     if swept.stop_kind == "dependency" and not swept.slots_attempted:
-        # review-B-audit-13#1: an eligible brute that never ran must SAY so — a missing REQUIRED tool is
-        # already a manifest gap, and the note carries how much work went unsubmitted. The gate itself is
-        # the sweep's (one authority), so this is the reporting half. A tool that vanished MID-sweep is a
-        # different fact and is carried by the terminal, not by a second dependency record (v17#3).
+        # an eligible brute that never ran must say so: the note carries how much work went unsubmitted.
+        # A tool that vanished mid-sweep is a different fact, carried by the terminal.
         ctx.run.record("enrich", skipped("puredns", f"not installed — {len(prof.apex_domains)} A1d "
                                                     f"apex brute(s) unsubmitted"))
-    # review v19#2: the SELECTION remainder is not automatically cap withholding — contention, a
-    # dependency stop, machinery and the clock all leave `eligible - attempted` behind, and each already
-    # has its own fact. Only a `bound` stop is the spend bound withholding work.
+    # only a `bound` stop is the spend bound withholding work: contention, a dependency stop, machinery
+    # and the clock each leave `eligible - attempted` behind with their own fact.
     if swept.stop_kind == "bound":
         wl_loss["withheld_by_word_cap"] = max(0, swept.eligible_pairs - swept.attempted_pairs)
         wl_loss["sweep_eligible_pairs"] = swept.eligible_pairs
@@ -173,29 +148,25 @@ def _a1d_fold_sweep(ctx, prof, swept, wl_loss) -> None:
 
 
 def _a1d_terminal(swept, produced: int):
-    """ONE terminal for the source, over the WHOLE multi-bucket sweep (v17#1).
-
-    review v18#3: derived from what was PRODUCED and from the slot CLASSES, not from "the runner
-    returned" — `slots_obtained` counts SUCCESS *and* EMPTY, so an all-empty sweep read SUCCESS and a
-    failed one read EMPTY, while failed/timed-out/blocked slots never showed at all."""
-    # every degrading fact is ORTHOGONAL and they ACCUMULATE (v39#1 / v40): a run can lose slots to a
-    # machinery failure, get failures back from the ones it did submit, AND hold candidates no bound can
-    # admit. The REASON is built once, for every path — contention and a missing dependency used to return
-    # early and drop the structured facts they coexisted with — while the STATUS keeps its precedence.
+    """One terminal for the source over the whole multi-bucket sweep, derived from what was produced and
+    from the slot classes (not from "the runner returned": `slots_obtained` counts SUCCESS and EMPTY
+    alike)."""
+    # degrading facts are orthogonal and accumulate (lost slots, submitted-slot failures, unadmittable
+    # candidates). The reason is built once for every path; the status keeps its precedence.
     facts = []
     if swept.machinery:
         facts.append("; ".join(swept.machinery))
     if swept.classes:
-        # both currencies: with batching, 10 failed slots may be one failed call or ten of them, and the
-        # slot-weighted map alone cannot say which (step 4.2, invocation classes).
+        # both currencies: with batching, 10 failed slots may be one failed call or ten, and the
+        # slot-weighted map alone cannot say which.
         facts.append(f"slot outcomes {dict(sorted(swept.classes.items()))} in "
                      f"{swept.invocations} invocation(s) "
                      f"{dict(sorted(swept.invocation_classes.items()))}")
     if swept.unselectable_pairs:
         facts.append(f"{swept.unselectable_pairs} candidate(s) in {swept.unselectable_slots} slot(s) "
                      f"cannot be scheduled under the current bounds")
-    # `or None`: a clean sweep has nothing to say, and an EMPTY string is a reason FIELD carrying no
-    # reason. `events.emit` omits None, which is what a clean terminal looked like before (v41).
+    # `or None`: a clean sweep has nothing to say, and an empty string is a reason field carrying no
+    # reason. `events.emit` omits None.
     _why = "; ".join(p for p in ([swept.stop] if swept.stop else []) + facts) or None
 
     if swept.contended:
@@ -203,8 +174,8 @@ def _a1d_terminal(swept, produced: int):
     elif swept.stop_kind == "dependency" and not swept.slots_attempted:
         _st = Status.SKIPPED                            # nothing ran at all
     elif facts or swept.stop_kind == "dependency":
-        # PARTIAL asserts something was PRODUCED — a slot answering "nothing here" is not production (the
-        # audit-7#2 rule). A tool that vanished mid-sweep degrades the same way.
+        # PARTIAL asserts something was produced — a slot answering "nothing here" is not production. A
+        # tool that vanished mid-sweep degrades the same way.
         _st = Status.PARTIAL if produced else Status.FAILED
     else:
         _st = Status.SUCCESS if produced else Status.EMPTY
@@ -212,48 +183,34 @@ def _a1d_terminal(swept, produced: int):
 
 
 def _a1d_recursive_brute(ctx) -> set[str]:
-    """A1d — recursion: feed the target-specific wordlist mined during the crawl back into the brute.
+    """A1d — recursion: re-brute with the target's own naming vocabulary mined during the crawl.
 
-    "Teach Quarry how the target functions." The crawl phase (which runs AFTER vertical) mines the
-    target's own naming vocabulary via xnLinkFinder over waymore/JS. Here — the first phase after
-    crawl — we harvest that vocabulary and re-brute with it: apexes (puredns) + any wildcard zones
-    vertical discovered (the A1 HTTP-differentiator, with the target words folded in). Bounded: the
-    target wordlist is capped and deduped against the base dictionary, so this can't explode the
-    brute. Returns the set of hosts discovered so run() can force them into the enrich catch-up set."""
+    The crawl (after vertical) mines the vocabulary via xnLinkFinder over waymore/JS; here we re-brute
+    apexes (puredns) and any wildcard zones with it. Bounded: the wordlist is capped and deduped against
+    the base dictionary. Returns the hosts discovered, for run() to force into the catch-up set."""
     prof, scope = ctx.profile, ctx.scope
     if scope.passive_only:
         return set()
     from .vertical import _target_wordlist, _wildcard_differentiate, _resolvers, _wordlist
     wl_loss: dict = {}
-    # RETENTION: everything the crawl mined, in encounter order. SUBTRACTION: streamed against the base
-    # dictionary. SELECTION: the spend bound, applied last and unchanged by step 4.1 — the set A1d
-    # brute-forces is the same size it has always been.
+    # retention (crawl-mined, in encounter order), subtraction (streamed against the base dictionary),
+    # then selection (the spend bound, applied last).
     mined = _target_wordlist(ctx, loss=wl_loss)
     kept = _a1d_subtract_base(ctx, mined, _wordlist, wl_loss)
     wl_loss["mined_words"] = len(mined)
     wl_loss["after_base"] = len(kept)
-    # `kept` is RETENTION: the whole mined corpus minus what the base dictionary already covers. Each
-    # ACTIVE lane then selects from it under its OWN bound, so a change to one cannot widen the other.
-    # SELECTION 1 -> puredns (DNS): the SWEEP picks which `A1D_WORD_CAP` candidates per apex, from the
-    # whole retained corpus, in rotation. `twords` stays only as the "is there vocabulary at all" answer.
+    # `kept` = mined corpus minus base-dictionary coverage. Each active lane selects under its own bound,
+    # so widening one cannot widen the other; `twords` is only the "any vocabulary at all" answer.
     twords = kept
-    # v63#1: the COMPLETE retained corpus goes to the differ; `A1D_WILDCARD_WORD_CAP` travels with it as
-    # the per-zone SPEND the scheduler applies, so the tail rotates in on later runs instead of being cut
-    # off for ever.
+    # the whole retained corpus goes to the differ; `A1D_WILDCARD_WORD_CAP` is the per-zone spend the
+    # scheduler applies, so the tail rotates in on later runs instead of being cut off.
     wc_words = sorted(kept)                                    # -> the wildcard differ (HTTP), per zone
-    # the DNS withholding is the SWEEP's fact — it knows what it submitted and why it stopped (v19#2).
-    # review-step4-remeasure2#1: the wildcard withholding is NOT a fact yet. Words are only withheld from
-    # work that EXISTS, and whether any wildcard zone is eligible is something only the pass can say — a
-    # puredns-only run with no in-scope zone was degrading itself over vocabulary nothing wanted.
-    # review-B-audit-12#1: ONE attempt, ONE outcome. Two independent branches used to record a PARTIAL and
-    # then a FAILED/SKIPPED for the same attempt, and the FAILED claimed "every artifact was unreadable"
-    # even when a readable one had simply yielded nothing. The verdict is chosen once, from what was
-    # PRODUCED and what was LOST.
+    # the DNS withholding is the sweep's own fact; the wildcard withholding is not a fact until the pass
+    # runs. One outcome, chosen once from what was produced and what was lost.
     lost = _a1d_loss_why(wl_loss, len(twords))
     if not twords:
-        # review-B-audit-13#2: the base list exists only to DEDUP mined words against. With nothing mined,
-        # dedup had no work to do, so a base-only failure is not A1d damage — a genuine no-input SKIP must
-        # survive it. Damage to the MINED input is a different fact and still fails.
+        # the base list only dedups mined words, so a base-only failure with nothing mined is not A1d
+        # damage — a genuine no-input skip survives it. Damage to the mined input still fails.
         mined_damage = _a1d_loss_why({k: v for k, v in wl_loss.items() if not k.startswith("base_")}, 0)
         if mined_damage:
             why = (f"A1d has NO vocabulary and the mined input was DAMAGED ({mined_damage}) — not proof "
@@ -267,29 +224,21 @@ def _a1d_recursive_brute(ctx) -> set[str]:
              f"({A1D_WORD_CAP}/apex)")
     discovered: set[str] = set()
 
-    # ── the apex brute is SCHEDULED (step 4.2): stable buckets, one sweeper per lane, a resumable
-    #    rotation. The SPEND is unchanged — `A1D_WORD_CAP` candidates per apex, exactly as before — but
-    #    WHICH candidates is no longer the lexicographic first N forever: a bounded run advances the
-    #    rotation and the next one continues where it stopped. ──
+    # the apex brute is scheduled: stable buckets, resumable rotation, `A1D_WORD_CAP` candidates per apex.
+    # Which candidates is not a fixed first-N — a bounded run advances the rotation for the next to continue.
     submitted_apexes = 0
     swept = None
     origins = wl_loss.get("origins") or {}
     apexes_run: set = set()
     resolvers = trusted = None
-    # review v20#1: dependency detection and resolver preparation happen INSIDE the guarded interval
-    # below — they used to run before the registry gate and before `tool_start`, so a raising
-    # `_resolvers()` aborted the whole enrich phase with no A1d lifecycle at all (and silenced the
-    # wildcard lane), and `have()` was observed TWICE: False here and True in the scheduler's gate ran
-    # puredns with `--resolvers-trusted None`.
+    # dependency detection and resolver prep happen inside the guarded interval below, so a raising
+    # `_resolvers()` cannot abort the phase before the A1d lifecycle opens, and `have()` is observed once.
     sid = "enrich.a1d_brute"
-    # the resume key covers everything that shapes the PARTITION, not just the spend: the root count, the
-    # invocation maximum (slots are split against the smaller of it and the spend bound) and the slot-space
-    # schema. A run under a different partition is a different question, and must not read as the same one.
+    # the resume key covers everything that shapes the partition, not just the spend: root count,
+    # invocation maximum and slot-space schema. A different partition is a different question.
     fp = events.work_unit(sid,
-                          # the INPUT is the retained vocabulary, not only which apexes it is aimed at
-                          # (v37#1): two entirely different corpora over the same apexes are not the same
-                          # work, and they were emitting the same key. Per-INVOCATION identity is not
-                          # needed here — the unit names the artifacts and the rotation owns the slots.
+                          # input is the retained vocabulary, not only the apexes (two corpora over the
+                          # same apexes are different work); the rotation owns per-slot identity.
                           inputs={"apexes": sorted(prof.apex_domains),
                                   "vocabulary": sweep.content_digest(sorted(kept))},
                           config={"per_apex": A1D_WORD_CAP, "buckets": sweep.BUCKETS,
@@ -297,8 +246,8 @@ def _a1d_recursive_brute(ctx) -> set[str]:
                           schema_version=sweep.SCHEMA)
 
     def _brute(apex: str, unit: str, words):
-        """ONE puredns invocation. `unit` names it — a lone slot keeps its own id, a batched one reads
-        `<first>+<n>` — and `words` is the union of every slot it carries (step 4.2 batching)."""
+        """One puredns invocation. `unit` names it — a lone slot keeps its own id, a batched one reads
+        `<first>+<n>` — and `words` is the union of every slot it carries."""
         nonlocal submitted_apexes
         wl_file = ctx.write_list(f"a1d_words_{apex.replace('.', '_')}_{unit}.txt", sorted(words))
         cmd = ["puredns", "bruteforce", str(wl_file), apex, "--resolvers-trusted", str(trusted), "-q"]
@@ -310,7 +259,7 @@ def _a1d_recursive_brute(ctx) -> set[str]:
         r = exec_tool("puredns", cmd, raw_path=br, timeout=ctx.http_timeout)
         ctx.run.record("enrich", r)
         if r.status is not Status.SKIPPED and apex not in apexes_run:
-            # an invocation that never spawned is not an apex we brute-forced (review v17#3)
+            # an invocation that never spawned is not an apex we brute-forced
             apexes_run.add(apex)
             submitted_apexes = len(apexes_run)
         if r.raw_path and r.raw_path.exists():
@@ -320,18 +269,16 @@ def _a1d_recursive_brute(ctx) -> set[str]:
                     discovered.add(row["host"])
         return r
 
-    # review v18#1: the registry gate is for THIS source only. `enrich.wildcard_a1d` is a separate lane
-    # with its own entry, and a disabled or unavailable puredns lane must not suppress eligible wildcard
-    # differentiation — so the gate skips the sweep and the function continues.
+    # the registry gate is for this source only: `enrich.wildcard_a1d` is a separate lane, so a disabled
+    # or unavailable puredns lane skips the sweep but the function continues.
     if registered(sid):
         events.tool_start(sid, cmd=["puredns", "bruteforce", "(scheduled)"],
                           input_total=len(prof.apex_domains), work_unit=fp)
-        # review v18#2 / v19#1: the WHOLE start-to-terminal interval is protected, and the terminal is
-        # emitted in `finally` — exactly once, whatever happened. Reporting is fallible too (`record()`
-        # can raise), and a `tool_start` with no `tool_finish` is a source that never answered.
+        # the whole start-to-terminal interval is protected and the terminal is emitted in `finally`,
+        # exactly once: a `tool_start` with no `tool_finish` is a source that never answered.
         outcome = (Status.FAILED, "the scheduled brute did not report an outcome")
         try:
-            tool_ok = have("puredns")               # ONE observation, used for setup AND the gate
+            tool_ok = have("puredns")               # one observation, used for setup and the gate
             if tool_ok:
                 resolvers, trusted = _resolvers(ctx)
             swept = _a1d_sweep(ctx, prof, kept, origins, _brute, dependency_ok=lambda: tool_ok)
@@ -351,9 +298,8 @@ def _a1d_recursive_brute(ctx) -> set[str]:
             events.tool_finish(sid, status=outcome[0].value, reason=outcome[1], work_unit=fp,
                                produced={"subdomains": len(discovered)})
 
-    # ── the wildcard differ is its own lane and runs regardless of the brute above. It owns its full
-    #    lifecycle now (step 4.3): `_wildcard_differentiate` gates on the registry and emits its own
-    #    start and terminal under `enrich.wildcard_a1d`. Putting its SELECTION on the sweep is next. ──
+    # the wildcard differ is its own lane and runs regardless of the brute above: `_wildcard_differentiate`
+    # gates on the registry and emits its own start/terminal under `enrich.wildcard_a1d`.
 
     # wildcard-zone differ with the target words folded in (zones persisted by vertical)
     zones = set(ctx.run.values("wildcard_zone"))
@@ -363,38 +309,34 @@ def _a1d_recursive_brute(ctx) -> set[str]:
                                                   label="wildcard-a1d", source="wildcard-http-a1d",
                                                   source_id="enrich.wildcard_a1d", stats=wc,
                                                   word_spend=policy.limit('A1D_WILDCARD_WORD_CAP')))
-    # ── ONE A1d outcome, chosen AFTER the work (review-B-audit-13#1): the earlier note claimed "the
-    #    brute ran with less vocabulary" before anything had run — including when it never ran at all.
+    # one A1d outcome, chosen after the work.
     if wc.get("eligible_zones", 0) > 0:
         wl_loss["wildcard_withheld"] = wc.get("candidate_pairs_withheld", 0)
         wl_loss["wildcard_pairs"] = wc.get("candidate_pairs_eligible", 0)
         wl_loss["wildcard_by_cause"] = wc.get("candidate_pairs_by_cause") or {}
         wl_loss["wildcard_stop"] = wc.get("sweep_stop") or wc.get("blocked_reason") or ""
-    # review v19#3: `after_base` is the RETAINED WORD count and other wording (wildcard withholding, the
-    # unreadable-input sentence) reads it as such — the scheduler's candidate-target PAIRS are a different
-    # unit and live in their own fields.
+    # `after_base` is the retained-word count; the scheduler's candidate-target pairs are a different unit
+    # in their own fields.
     unsubmitted = max(0, len(prof.apex_domains) - submitted_apexes)
     unsubmitted_why = (swept.stop if swept is not None and swept.stop
                        else wl_loss.get("sweep_error")
                        or ("the source is not registered" if swept is None else None)
-                       # nothing STOPPED the run: every candidate sat in a slot no bound can admit, which
-                       # is exactly why no apex was brute-forced (v37#2). Without this the note said
-                       # "no reason recorded" beside the reason.
+                       # nothing stopped the run: every candidate sat in a slot no bound can admit, which
+                       # is why no apex was brute-forced.
                        or ("no candidate is schedulable under the current bounds"
                            if wl_loss.get("unschedulable_pairs") else "no reason recorded"))
-    # review-B-audit-14: "there were wildcard zones" is not "the wildcard pass ran" — passive mode, a
-    # missing httpx, no wordlist, the self-contact guard and the zone cap all leave zones UNSUBMITTED.
-    # The differentiator now says what it actually probed, and both facts are reported.
+    # "there were wildcard zones" is not "the wildcard pass ran": passive mode, a missing httpx, no
+    # wordlist, the self-contact guard and the zone cap all leave zones unsubmitted. Both facts are reported.
     wc_eligible, wc_probed = wc.get("eligible_zones", 0), wc.get("probed_zones", 0)
     wc_unsubmitted = max(0, wc_eligible - wc_probed)
-    lost = _a1d_loss_why(wl_loss, len(kept))        # `produced` here is USABLE WORDS, not pairs (v19#3)
+    lost = _a1d_loss_why(wl_loss, len(kept))        # `produced` here is usable words, not pairs
     parts = ([lost] if lost else []) + ([f"{unsubmitted} apex brute(s) unsubmitted "
                                          f"({unsubmitted_why})"] if unsubmitted else [])
     if wc_unsubmitted:
         parts.append(f"{wc_unsubmitted}/{wc_eligible} wildcard zone(s) not differentiated"
                      + (f" ({wc['blocked_reason']})" if wc.get("blocked_reason") else ""))
-    # review-B-audit-16#2: vocabulary the wildcard pass could not use is A1d's loss too, and it was only
-    # ever looked at when zones went unsubmitted — so a probed run with a damaged wordlist read clean.
+    # vocabulary the wildcard pass could not use is A1d's loss too, even on a probed run with a damaged
+    # wordlist (which was only looked at when zones went unsubmitted before).
     _v = wc.get("vocabulary") or {}
     _vlost = _v.get("undecodable", 0) + _v.get("rejected", 0)
     if _v.get("unreadable"):
@@ -419,10 +361,8 @@ def run(ctx) -> None:
     # A1d recursion FIRST — its discoveries then flow through the resolve/probe/takeover pass below.
     a1d_hosts = _a1d_recursive_brute(ctx)
     resolved = set(ctx.run.values("resolved"))
-    # hosts known (subdomain) but never resolved → the crawl/CSP-discovered ones.
-    # A1d's wildcard-differentiator adds its hits to `resolved` too (it needs its own httpx pass),
-    # which would exclude them from this catch-up — force them back in so they still get the full
-    # enrich treatment (dns-record, CNAME/takeover, rich httpx fingerprint, screenshots/WAF/smap).
+    # hosts known but never resolved (crawl/CSP-discovered). A1d's wildcard differentiator marks its hits
+    # `resolved`, so force those back in for the full enrich treatment (takeover, httpx, screenshots).
     new = sorted({h for h in set(ctx.run.values("subdomain"))
                   if h and h not in resolved and scope.in_scope(h) and not scope.is_oos(h)}
                  | {h for h in a1d_hosts if scope.in_scope(h) and not scope.is_oos(h)})
@@ -486,8 +426,8 @@ def run(ctx) -> None:
             ctx.echo(f"  dns-enrich (late): +{nd} record(s) over {len(new_resolved)} host(s)")
 
     if not scope.passive_only and have("httpx") and new_resolved:
-        # v0.3.5: share probe's fingerprint path — SYN web-port prefilter → httpx on open ports only,
-        # same fallback discipline. Late A1d/crawl/CSP hosts don't fall back to the slow direct behavior.
+        # share probe's fingerprint path — SYN web-port prefilter, then httpx on open ports only, so
+        # late A1d/crawl/CSP hosts get the same fast treatment, not the slow direct behaviour.
         from .probe import fingerprint_hosts
         new_live: list[str] = []
         for raw_ref, glines in fingerprint_hosts(ctx, new_resolved, "enrich"):   # per-group raw provenance
@@ -524,14 +464,14 @@ def run(ctx) -> None:
 
             if prof.screenshots and have("gowitness"):  # screenshots
                 lf = ctx.write_list("enrich_live.txt", new_live)
-                shot_dir = fresh_artifact_dir(ctx.run.dir / "raw" / "enrich" / "gowitness")   # FRESH per invocation
+                shot_dir = fresh_artifact_dir(ctx.run.dir / "raw" / "enrich" / "gowitness")
                 gr = exec_tool("gowitness",
                     ["gowitness", "scan", "file", "-f", str(lf),
                      "--screenshot-path", str(shot_dir), "--write-jsonl",
                      "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
                     timeout=ctx.http_timeout)
-                # same file-output reclassification as probe — count THIS attempt's dir only (a reused/
-                # pre-populated dir must not inflate the count; T1.6 core precondition: fresh artifact)
+                # same reclassification as probe; count this attempt's dir only, so a reused/
+                # pre-populated dir cannot inflate the count (the dir is fresh per invocation)
                 shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
                 reclassify_from_files(gr, shots, "screenshot")
                 ctx.run.record("enrich", gr)
@@ -539,13 +479,13 @@ def run(ctx) -> None:
                     for img in shot_dir.glob(ext):
                         ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
 
-            if have("smap"):                            # passive (Shodan) ports — parse like probe (C12)
+            if have("smap"):                            # passive (Shodan) ports — parse like probe
                 sm_targets = [normalize.host_of_url(u) for u in new_live]
                 si = ctx.write_list("enrich_smap.txt", sm_targets)
                 sm = ctx.run.raw_path("enrich", "smap", "smap.json")
                 sm.unlink(missing_ok=True)              # -o file: clear stale before the run
                 sr = exec_tool("smap", ["smap", "-iL", str(si), "-oJ", str(sm)], timeout=600)
-                # was recorded raw-only — enrich's passive port yield was lost (C12). Parse + reclassify +
-                # ingest via the SAME shared helper probe uses (-oJ structured; status reflects yield).
+                # parse + reclassify + ingest via the same shared helper probe uses (-oJ structured;
+                # status reflects yield), so enrich's passive port yield is not lost as raw-only.
                 from .probe import _smap_ingest
                 _smap_ingest(ctx, sr, sm, "enrich", sm_targets)

@@ -1,24 +1,16 @@
 """Normalising an ast-analyzer artifact into `path_observation` evidence.
 
-COLLECT ONCE, INTERPRET LATER (notes/current/AST-ANALYZER-LANE-DESIGN.md). An observation is a
-path-like string the analyzer found, with everything needed to judge it later: where it came from, what
-the surrounding source said, how often it appeared, whether a tool Quarry already runs corroborates it,
-and deterministic TAGS describing its shape.
-
-The tags are descriptive, never promotion. `api-shaped` says a path looks like an application route on
-this corpus; it does not say the route exists. Two rows from the POAB sample are the standing reminder
-that no string rule can finish this job: `/masterdata/uas/brands` is a React-Query cache key whose real
-request hides behind `A.listBrands()`, and `/admin/companies` is a fragment of
-`` `/api/${t?"admin/companies":"operator"}/${id}/logo` ``. Following either needs code analysis, which is
-the v0.4 skill layer's work — this module's job is to preserve them faithfully until then.
+An observation is a path-like string the analyzer found plus what is needed to judge it later: where it
+came from, what the surrounding source said, how often it appeared, whether a tool Quarry already runs
+corroborates it, and deterministic tags describing its shape. The tags are descriptive: `api-shaped`
+says a path looks like an application route, never that the route exists.
 """
 from __future__ import annotations
 
 import re
 from urllib.parse import urlsplit
 
-#: analyzers whose matches are path-like. The rest (DOM sources and sinks) are a separate observation
-#: type — step 6 — and are not silently folded in here.
+#: analyzers whose matches are path-like; DOM sources and sinks are a separate observation type below
 PATH_ANALYZERS = frozenset(("robust-paths", "fetch", "fetch-options", "graphql", "http-methods"))
 
 _TRAILING = re.compile(r"[)\]\}>,;'\"]+$")
@@ -27,8 +19,7 @@ _META = frozenset("*?[]()|\\{}^$+<>")
 
 ASSET_SUFFIXES = (".js", ".mjs", ".cjs", ".css", ".map", ".png", ".jpg", ".jpeg", ".svg", ".gif",
                   ".woff", ".woff2", ".ttf", ".ico", ".webp", ".mp4", ".json", ".wasm", ".avif")
-#: segments that read like an application route on the corpora measured so far. DESCRIPTIVE — this is
-#: the bucketing from the labelled sample, and it is a prioritisation signal, not a promotion rule.
+#: segments that read like an application route — a prioritisation signal, not a promotion rule
 API_WORDS = frozenset(("api", "v1", "v2", "v3", "graphql", "gql", "rest", "auth", "oauth", "login",
                        "admin", "user", "users", "account", "accounts", "token", "session", "upload",
                        "download", "search", "config", "callback", "webhook", "internal"))
@@ -41,13 +32,11 @@ _MIME_TYPES = frozenset(("application", "audio", "font", "image", "message", "mo
 
 
 def path_key(value: str, *, host_prefixed: bool = False) -> str | None:
-    """Compare and store endpoints by PATH — SOURCE-AWARE, and case-preserving.
+    """Compare and store endpoints by path — source-aware, case-preserving, None when unusable.
 
-    A relative path written in source (`api/users`) keeps every segment: treating any value containing a
-    slash as `host/path` amputated the first one, which manufactured agreement between tools and destroyed
-    the api-shaped signal. Only a producer that emits `host/path` may drop a leading host. The path keeps
-    its CASE, because `/API` and `/api` are different resources to a server and Quarry's own
-    canonicalisation preserves path case deliberately.
+    A relative path written in source (`api/users`) keeps every segment; only a producer that emits
+    `host/path` (`host_prefixed`) may drop a leading host. Case is preserved, as `/API` and `/api` are
+    different resources to a server.
     """
     if not isinstance(value, str):
         return None
@@ -76,9 +65,8 @@ def path_key(value: str, *, host_prefixed: bool = False) -> str | None:
 
 
 def plausible(key: str) -> bool:
-    """Whether the string is a PATH at all, as opposed to a regex fragment, a placeholder template or a
-    single character. Measured on the labelled sample: of 21 implausible rows, 0 were endpoints — so this
-    costs no recall, and everything it drops is still in the raw artifact."""
+    """Whether the string is a path at all, rather than a regex fragment, a placeholder template or a
+    single character. Nothing is dropped by this: it only tags, and the raw artifact keeps everything."""
     if not key or any(c in _META for c in key):
         return False
     segs = [s for s in key.strip("/").split("/") if s]
@@ -94,12 +82,8 @@ _DEFAULT_PORT = {"http": 80, "https": 443, "ws": 80, "wss": 443}
 
 
 def origin_of(url: str, *, default_scheme: str = "https") -> tuple | None:
-    """`(scheme, host, effective port)` — the ORIGIN, not the hostname.
-
-    A host comparison alone called `http://acme.com:9000/api` same-origin with a bundle from
-    `https://acme.com:8443`, which is a different service. A protocol-relative value inherits the
-    bundle's scheme, which is what a browser does with it.
-    """
+    """`(scheme, host, effective port)` — the origin, not the hostname; None when there is no host.
+    A protocol-relative value inherits `default_scheme`, which is what a browser does with it."""
     if not isinstance(url, str) or not url.strip():
         return None
     u = url.strip()
@@ -118,11 +102,8 @@ def origin_of(url: str, *, default_scheme: str = "https") -> tuple | None:
 
 
 def position(start) -> tuple:
-    """`(line, column)` from an analyzer match — REAL integers or nothing.
-
-    `bool` is an `int` in Python, and a dict or a string reaches slice arithmetic, so a broken artifact
-    could both crash a reader and be persisted as evidence. Validated once, here, for every consumer.
-    """
+    """`(line, column)` from an analyzer match — a real int each, or None. Bools and out-of-range
+    values are rejected, so a broken artifact is never persisted as a position."""
     if not isinstance(start, dict):
         return None, None
     ln, col = start.get("line"), start.get("column")
@@ -134,12 +115,8 @@ def position(start) -> tuple:
 
 
 def classify(key: str, raw_value: str, origin=None) -> list:
-    """Deterministic SHAPE tags. Descriptive, ordered, and never a verdict.
-
-    What these are for is prioritisation and, later, exclusion from an endpoint queue: a static asset, an
-    external service, a localhost dev call, a MIME value, a package specifier and a protobuf type are all
-    real strings a bundle contains, and none of them is an application route on the target.
-    """
+    """Deterministic shape tags — descriptive, ordered, never a verdict: implausible, asset, external,
+    localhost, mime, module, tz-database, api-shaped."""
     tags: list = []
     segs = [s for s in key.strip("/").split("/") if s]
     val = raw_value if isinstance(raw_value, str) else ""
@@ -151,9 +128,7 @@ def classify(key: str, raw_value: str, origin=None) -> list:
     if "://" in bare or bare.startswith("//"):
         here = origin if isinstance(origin, tuple) else origin_of(origin or "")
         there = origin_of(bare, default_scheme=(here[0] if here else "https"))
-        # EXTERNAL means a different ORIGIN — scheme, host and effective port — not merely an absolute
-        # URL. `https://app.acme/api/users` in a bundle served from app.acme is the target's own route,
-        # and tagging it external would exclude it from exactly the view it belongs in.
+        # external = a different origin (scheme, host, effective port), not merely an absolute URL
         if there and (here is None or there != here):
             tags.append("external")
         host = there[1] if there else ""
@@ -174,9 +149,7 @@ def observations(doc, *, bundle: str, bundle_digest: str, bundle_url: str, artif
                  corroborated=None, context=None) -> list:
     """Every path-like match in one artifact, as `path_observation` records.
 
-    EVERY readable one: the expensive work — the analysis — is already paid and its artifact published, so
-    stopping short here would produce a partial view of work that succeeded. Records are keyed by the
-    path, and repeated sightings union their provenance rather than creating duplicates.
+    Records are keyed by the path; repeated sightings union their provenance instead of duplicating.
     """
     out: dict = {}
     corroborated = corroborated or {}
@@ -195,21 +168,18 @@ def observations(doc, *, bundle: str, bundle_digest: str, bundle_url: str, artif
                 "tags": classify(key, m.get("value", ""), origin),
                 "analyzers": [], "bundles": [bundle], "bundle_digests": [bundle_digest],
                 "raw_ref": artifact, "discovered_from": bundle_url,
-                # PER BUNDLE, because the store unions lists and treats differing scalars as ALTERNATES:
-                # a scalar `occurrences` merged 3 and 2 into "3, alt 2" rather than 5. A consumer sums
-                # these; nothing has to guess what a single number meant.
+                # per bundle, and summed by the consumer: the store unions lists but keeps differing
+                # scalars as alternates, so one `occurrences` number would merge as "3, alt 2"
                 "sightings": [{"bundle": bundle, "digest": bundle_digest, "n": 0}],
                 "sites": [],
-                # WHO corroborates THIS path — not the whole corroborated set, which put thousands of
-                # unrelated paths in one row and still named nobody.
-                "corroborated_by": list(corroborated.get(key, ())),
+                "corroborated_by": list(corroborated.get(key, ())),   # who corroborates this path
             }
         rec["sightings"][0]["n"] += 1
         name = m.get("analyzerName")
         if name and name not in rec["analyzers"]:
             rec["analyzers"].append(name)
         if len(rec["sites"]) < 3:                 # a few representative sites, not the whole file
-            line, col = position(m.get("start"))   # VALIDATED: a broken position is not persisted
+            line, col = position(m.get("start"))
             rec["sites"].append({"bundle": bundle, "line": line,
                                  "column": col, "analyzer": name,
                                  "value": str(m.get("value", ""))[:200],
@@ -217,30 +187,17 @@ def observations(doc, *, bundle: str, bundle_digest: str, bundle_url: str, artif
     return list(out.values())
 
 
-# ── the high-priority VIEW ───────────────────────────────────────────────────────────────────────────
-#: shape tags that keep an observation OUT of the endpoint queue. From the architecture decision, not
-#: from a measurement: a static asset, another origin's service, a dev-server call, a MIME value, a
-#: package specifier and a tz entry are all real strings a bundle contains, and none is an application
-#: route on the target. They stay in the evidence; they are simply not prioritised.
+# ── the high-priority view ──────────────────────────────────────────────────────────────
+#: shape tags that keep an observation out of the endpoint queue; kept in the evidence, not prioritised
 EXCLUDED_TAGS = frozenset(("asset", "external", "localhost", "mime", "module", "tz-database"))
 
 
 def high_priority(record) -> bool:
-    """Whether a `path_observation` belongs in the prioritised view.
+    """Whether a `path_observation` belongs in the prioritised view: `api-shaped`, not `implausible`,
+    and carrying no excluded tag.
 
-    `plausible AND api-shaped` is the part that was MEASURED — on an unseen corpus, with the rule frozen
-    before the labels, it scored precision 0.90 / recall 0.90 over net-new paths (the labels were the
-    model's, corrected by the operator; see notes/current/AST-ANALYZER-LANE-DESIGN.md). The tag alone is
-    not the rule: on one POAB bundle 214 of 254 api-shaped rows were also `implausible`
-    (`/this.http.get("/portalapi/...`), so the conjunction is what carries the precision.
-
-    The EXCLUDED_TAGS subtraction on top is a design decision rather than a measured one, and it is
-    deliberately conservative in the direction that keeps evidence: an excluded row is still stored, still
-    queryable, and still in the raw artifact.
-
-    This is PRIORITISATION, not promotion. Nothing here says the route exists, nothing is requested
-    because it matched, and no entity is created — following `A.listBrands()` or reconstructing
-    `/api/${...}/${id}/logo` is the v0.4 skill layer's work.
+    Prioritisation, not promotion — nothing here says the route exists, nothing is requested because it
+    matched, and no entity is created. Rows left out stay stored, queryable and in the raw artifact.
     """
     if not isinstance(record, dict):
         return False
@@ -251,13 +208,8 @@ def high_priority(record) -> bool:
 
 
 def corroborators(record, fresh=None) -> list:
-    """Who corroborates this path — the record's snapshot UNIONED with a fresher map when one is given.
-
-    The stored field is a snapshot taken when the artifact was normalised; corroboration is a run-wide
-    relation that keeps changing until the run ends (params, content and enrich all publish later). A
-    union rather than a replacement, because a RESUMED observation can carry a snapshot from a run whose
-    urls this store never held — dropping it would lose evidence, and corroboration only ever accumulates.
-    """
+    """Who corroborates this path — the record's stored snapshot unioned with a fresher map when given.
+    A union, never a replacement: a resumed observation's snapshot names runs this store never held."""
     names = list(record.get("corroborated_by") or [])
     if isinstance(fresh, dict):
         for s in fresh.get(str(record.get("id", "")), ()) or ():
@@ -268,11 +220,7 @@ def corroborators(record, fresh=None) -> list:
 
 def priority_view(records, fresh=None) -> list:
     """The prioritised rows, most-corroborated first, then most-sighted, then stable by path.
-
-    Corroboration ORDERS but never gates: a path only this analyzer found is exactly the interesting
-    case, so it must not sort itself out of sight — and it is never counted as something an incumbent
-    contributed.
-    """
+    Corroboration orders but never gates: a path only this analyzer found still appears."""
     rows = [r for r in records if high_priority(r)]
     return sorted(rows, key=lambda r: (-len(corroborators(r, fresh)),
                                        -sum(s.get("n", 0) for s in (r.get("sightings") or [])
@@ -280,27 +228,20 @@ def priority_view(records, fresh=None) -> list:
                                        str(r.get("id", ""))))
 
 
-# ── DOM sources and sinks ────────────────────────────────────────────────────────────────────────────
-#: analyzer -> role. MEASURED against real artifacts: the names are the analyzer's own
-#: (`dangerouslySetInnerHTML`, `regex`), not the file names they live in, and getting that wrong would
-#: silently classify nothing.
-#:
-#: The roles are deliberately coarse. This layer knows WHERE a source or a sink is, never that one
-#: reaches the other — proving a flow means following assignments across a minified bundle, which is the
-#: v0.4 skill layer's work. `storage` is its own role because localStorage/sessionStorage/cookie are both
-#: an input and an output depending on direction, and the analyzer's own tags (`property-getItem` vs
-#: `property-setItem`, `cookie-read` vs `cookie-assignment`) are what say which — so they ride along.
+# ── DOM sources and sinks ───────────────────────────────────────────────────────────────
+#: analyzer -> role, by the analyzer's own name. Coarse: where a source or sink is, not that they connect
 SINK_ROLES = {
     "inner-html": "sink", "dangerouslySetInnerHTML": "sink", "eval": "sink",
     "window-open": "sink", "document-domain": "sink", "postmessage": "sink",
     "location": "source", "url-search-params": "source", "window-name": "source",
     "onhashchange": "source", "onmessage": "source",
+    # storage is both input and output; the analyzer's own tags (`property-getItem` etc.) say which
     "local-storage": "storage", "session-storage": "storage", "cookie": "storage",
     "add-event-listener": "channel",
     "regex": "informational", "regex-match": "informational", "hostname": "informational",
 }
-#: what a hunter would call DOM data-flow surface — everything except the informational families, which
-#: are useful context and dominate the raw count (7075 regex patterns against 42 innerHTML in one bundle)
+#: the DOM data-flow surface — everything but the informational families, which are context and
+#: dominate the raw count
 FLOW_ROLES = frozenset(("sink", "source", "storage", "channel"))
 
 
@@ -308,14 +249,9 @@ def sink_observations(doc, *, bundle: str, bundle_digest: str, bundle_url: str, 
                       context=None) -> list:
     """Every DOM source/sink match in one artifact, as `sink_observation` records.
 
-    Keyed by (analyzer, matched text) so the same construct in two bundles is ONE observation with two
-    sightings — the same aggregation the path layer uses, for the same reason: a vendor bundle shipped
-    twice is not two findings.
-
-    Only the DATA-FLOW roles are normalised. `regex` and `hostname` are 13,953 of the 14,000-odd matches
-    in two POAB bundles — at corpus scale that is a million rows of context nobody queries as an entity,
-    and the architecture already says the raw artifact is the complete record (it holds every one of
-    them, digest-bound, for anything that wants them). Storing them twice buys nothing.
+    Keyed by (analyzer, matched text), so the same construct in two bundles is one observation with two
+    sightings. Only the data-flow roles are normalised; the informational ones stay in the raw artifact,
+    which is digest-bound and remains the complete record.
     """
     import hashlib
     out: dict = {}
@@ -326,14 +262,11 @@ def sink_observations(doc, *, bundle: str, bundle_digest: str, bundle_url: str, 
         role = SINK_ROLES.get(name)
         if role not in FLOW_ROLES:
             continue
-        # ONE line: a match can span a formatted block, and a record that breaks a report's markdown is
-        # a record nobody reads.
-        full = " ".join(str(m.get("value", "")).split())
+        full = " ".join(str(m.get("value", "")).split())   # one line: a match can span a formatted block
         if not full:
             continue
-        # the IDENTITY is the complete value; only the stored preview is capped. Hashing the truncation
-        # collapsed two distinct expressions that happened to share their first 400 characters — which is
-        # exactly what minified code looks like.
+        # the identity is the complete value; only the stored preview is capped, so two minified
+        # expressions sharing their first 400 characters stay distinct
         key = hashlib.sha256(f"{name}\x00{full}".encode()).hexdigest()[:16]
         value = full[:400]
         rec = out.get(key)
@@ -359,12 +292,8 @@ def sink_observations(doc, *, bundle: str, bundle_digest: str, bundle_url: str, 
 
 
 def flow_view(records) -> list:
-    """The DOM data-flow rows, most-sighted first, then stable.
-
-    A no-op filter today, because only flow roles are normalised — it stays because the role field is
-    what a consumer keys on, and an informational row arriving from an older run must not silently rank
-    beside a sink.
-    """
+    """The DOM data-flow rows, most-sighted first, then stable. The role filter is what keeps an
+    informational row from an older run out of the ranking."""
     rows = [r for r in records
             if isinstance(r, dict) and r.get("role") in FLOW_ROLES]
     return sorted(rows, key=lambda r: (-sum(s.get("n", 0) for s in (r.get("sightings") or [])

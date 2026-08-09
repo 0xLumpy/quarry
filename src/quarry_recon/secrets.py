@@ -1,9 +1,10 @@
 """Framework-managed secrets — single store at ~/.config/quarry/secrets.yaml (chmod 600).
 
-Holds only the keys the framework passes to tools itself (github / shodan / whoxy / chaos).
+Holds only the keys the framework passes to tools itself (github, shodan, whoxy, projectdiscovery/chaos,
+certspotter, openintel, censys) plus the notify and OOB-callback secrets.
 Tool-native configs (subfinder provider-config.yaml, waymore config.yml) keep their own files —
-this never touches them. Secret VALUES are stripped from manifests/logs via redact(). Secrets
-are never written to target.yaml, run manifests, reports, or AI prompts.
+this never touches them. Secret values are stripped from manifests and logs via redact(), and are
+never written to target.yaml, run manifests, reports, or AI prompts.
 
 Missing/unset keys are not an error: the consuming step is skipped gracefully.
 """
@@ -46,25 +47,20 @@ def _scalar(v) -> str | None:
     return items[0] if items else None
 
 
-#: LOCAL shape checks — never a network call (Lumpy, 2026-08-07: "not by pinging, and accidentally
-#: create costs"). A pattern is declared ONLY where the provider's format is actually known; everywhere
-#: else the answer is "set", with no claim about validity, because inventing a shape would reject a
-#: perfectly good key. `doctor` reports the shape; nothing here ever gates a lane — a key we cannot
-#: parse is still the operator's key, and the provider is the authority on whether it works.
+#: local shape checks, never a network call — a pattern is declared only where the provider's format is
+#: known. `doctor` reports the shape; nothing here gates a lane, since the provider is the authority.
 _KEY_SHAPES = {
     # classic PAT `ghp_` + 36, fine-grained `github_pat_` + 82, and the pre-2021 40-hex tokens
     "github": re.compile(r"\A(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|[a-f0-9]{40})\Z"),
     "shodan": re.compile(r"\A[A-Za-z0-9]{32}\Z"),
 }
-#: what a key is NEVER: an unedited template placeholder, or a value with whitespace/quotes in it.
+#: what a key is never: an unedited template placeholder, or a value with whitespace/quotes in it.
 _PLACEHOLDER = re.compile(r"(?i)\A(<.*>|your[-_ ]?|changeme|xxx+|todo|none|null|example)")
 
 
 def key_shape(kind: str, value: str) -> str:
-    """"ok" | "malformed" | "unknown" — a LOCAL verdict on one key's shape.
-
-    "unknown" is the honest default: it means we hold no documented format for that provider, so the
-    key is reported as set and nothing is claimed about it."""
+    """"ok" | "malformed" | "unknown" — a local verdict on one key's shape. "unknown" means no documented
+    format is held for that provider, so the key is reported as set with nothing claimed about it."""
     v = (value or "").strip()
     if not v:
         return "unknown"
@@ -99,26 +95,25 @@ def certspotter() -> str | None:
 
 
 def openintel() -> dict:
-    """ADVANCED optional passive source (openintel-subs binary + local subs.db). Returns {} unless
-    the user set an `openintel:` block. Deliberately NOT a registered tool — install/update/doctor
-    ignore it entirely, and it's SILENTLY unused unless BOTH `binary` and `db` are configured."""
+    """Optional passive source (openintel-subs binary + local subs.db), {} unless an `openintel:` block
+    is set. Not a registered tool: install/update/doctor ignore it, and it is silently unused unless
+    both `binary` and `db` are configured."""
     o = load().get("openintel")
     return o if isinstance(o, dict) else {}
 
 
 def censys() -> dict:
-    """OPTIONAL Censys Platform API creds — `{token: <PAT>, org: <organization-id>}`. Returns {} unless
-    a `censys:` block is set. Silent opt-in (like openintel): install/update/doctor ignore it and the
-    vertical Censys source is skipped without noise unless BOTH `token` and `org` are configured."""
+    """Optional Censys Platform creds `{token: <PAT>, org: <organization-id>}`, {} unless a `censys:`
+    block is set. Silent opt-in: install/update/doctor ignore it and the vertical Censys source is
+    skipped without noise unless both `token` and `org` are configured."""
     c = load().get("censys")
     return c if isinstance(c, dict) else {}
 
 
 def oob() -> dict:
-    """Out-of-band config (optional) for Quarry's ONE owned OOB layer. `callback_server`
-    (+ optional `auth_token`) OVERRIDES the callback backend — used by Quarry's owned session
-    (interactsh-client -server, normalized to a bare host) AND passed to nuclei (-iserver, full URL).
-    Empty => the public interactsh backend (no setup needed). Both optional."""
+    """Optional out-of-band config for Quarry's one owned OOB layer. `callback_server` (plus optional
+    `auth_token`) overrides the callback backend, for both Quarry's own interactsh-client session
+    (-server, a bare host) and nuclei (-iserver, the full URL). Empty means the public backend."""
     o = load().get("oob")
     return o if isinstance(o, dict) else {}
 
@@ -171,15 +166,10 @@ def redact(text: str | None) -> str | None:
 
 
 def redact_deep(value):
-    """`redact` over a whole STRUCTURE — every string leaf, at any depth.
+    """`redact` over a whole structure — every string leaf, at any depth.
 
-    review-B1.6b24#1: structured outcome metadata was copied into the manifest verbatim while its prose
-    siblings went through `redact`. Anything that carries an exception string — and machinery reasons
-    now do — can carry a configured credential with it, and one unredacted sink is the whole leak.
-
-    Containers are rebuilt rather than mutated: the caller's own object is evidence and is not ours to
-    edit. Only CONFIGURED credentials are replaced; discovered secrets and verbatim provider evidence
-    are untouched by this — they live in raw/ and are the point of the run."""
+    Containers are rebuilt, never mutated: the caller's object is evidence. Only configured credentials
+    are replaced; discovered secrets and verbatim provider evidence are untouched."""
     if isinstance(value, str):
         return redact(value)
     if isinstance(value, dict):
@@ -198,9 +188,9 @@ def _coerce(value) -> str:
 
 
 def mask(value) -> str:
-    """Short, non-usable preview of a DISCOVERED secret (a scanner finding, not our own
-    key) — enough to recognize in a report, not enough to use. Raw evidence stays in the
-    controlled raw/ files only."""
+    """Short, non-usable preview of a discovered secret (a scanner finding, not our own key) — enough to
+    recognize, not enough to use. The complete value is retained whole on its entity and shown by local
+    artifacts (HOTLIST, digest, exports); this preview only sits beside it."""
     s = _coerce(value).strip()
     if not s:
         return ""

@@ -33,10 +33,8 @@ from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir
                       reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
                       skipped)
 
-# Serialized-object / token markers that surface in Set-Cookie + response headers. Spotting the
-# FORMAT is PASSIVE recon evidence (a hand-off to the attack layer), never exploitation. Only
-# distinctive markers are used — pickle (`gAR`) / Ruby-Marshal (`BAg`) base64 prefixes are too
-# collision-prone from a raw header string to include without noise. Source: TBHM cheatsheet §9.
+# Serialized-object / token markers in Set-Cookie + response headers; passive format evidence only.
+# Distinctive markers only — pickle (`gAR`) / Ruby-Marshal (`BAg`) prefixes collide too easily.
 _DESER_MARKERS = (
     ("java-serialized", "rO0AB"),            # ObjectOutputStream AC ED 00 05 → base64
     ("dotnet-binaryformatter", "AAEAAAD"),   # 00 01 00 00 00 FF FF FF FF → base64 AAEAAAD/////
@@ -46,15 +44,14 @@ _PHP_OBJ_RX = _re.compile(r'O:\d+:"[A-Za-z0-9_\\]+":')          # PHP serialize(
 _JWT_RX = _re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")
 
 
-_SHODAN_PAGE = 100                                          # Shodan host/search returns up to 100 matches/page
+_SHODAN_PAGE = 100                              # Shodan host/search returns up to 100 matches/page
 
 
 class ShodanPageError(Exception):
-    """Carries a page failure's STRUCTURED class when the original exception cannot hold one.
+    """Carries a page failure's `error_class` when the original exception cannot hold one.
 
-    B1.4: the coordinator reads `err.error_class` and asks `is_provider_limit` about it — that is the
-    whole interface between the lane and the scheduler. An exception that reaches it unclassified would
-    be counted as a generic `error`, which is the difference between a provider LIMIT and a defect."""
+    The coordinator reads that attribute and asks `is_provider_limit` about it; an unclassified
+    exception counts as a generic `error`."""
 
     def __init__(self, error_class: str, cause: BaseException):
         super().__init__(str(cause) or error_class)
@@ -63,7 +60,6 @@ class ShodanPageError(Exception):
 
 
 def _classified(e: BaseException) -> BaseException:
-    """Every Shodan exception leaves the adapter carrying a class the coordinator can act on."""
     cls = provider_error_class(e)
     try:
         e.error_class = cls                                   # type: ignore[attr-defined]
@@ -72,20 +68,15 @@ def _classified(e: BaseException) -> BaseException:
         return ShodanPageError(cls, e)
 
 
-#: characters a DNS owner name may use beyond a hostname's. `_` appears in real records (`_dmarc`,
-#: `_acme-challenge`); `*` is a wildcard owner. Neither is a valid HOSTNAME, and neither is junk.
+#: characters a DNS owner name may use beyond a hostname's: `_` (`_dmarc`) and `*` (wildcard owner).
 _DNS_OWNER_EXTRA = "_*"
 
 
 def _dns_owner_name(h: str):
-    """A syntactically valid DNS OWNER NAME that is not a valid hostname, or None.
+    """A syntactically valid DNS owner name that is not a valid hostname, or None.
 
-    review-B1.5br2#1: `_dmarc.acme.com` was kept on the strength of containing a dot — and so were
-    `../admin.acme.com`, `a/b.acme.com` and `bad name.acme.com`. The first is real evidence; the rest are
-    malformed. Separating them is what lets the real one be retained without letting the others through.
-
-    This is deliberately NOT a hostname check (`normalize.canon_host_strict` is that, and it is the one
-    a caller about to CONTACT a name must use)."""
+    Not a hostname check — `normalize.canon_host_strict` is that, and a caller about to CONTACT a name
+    must use it instead."""
     s = str(h).strip().lower().rstrip(".")
     if not s or "." not in s or ".." in s or "/" in s or any(c.isspace() for c in s):
         return None
@@ -100,18 +91,12 @@ def _dns_owner_name(h: str):
     return s
 
 
-#: cooldown applied when Shodan answers 429 without a usable `Retry-After`. A provider-driven backoff,
-#: NOT an operator knob and NOT the target rate limit (`RATELIMIT.HTTP` is pressure on the target; using
-#: it for a third-party API would be a category error).
+#: cooldown applied when Shodan answers 429 without a usable `Retry-After`. Provider-driven, not an
+#: operator knob and not the target rate limit.
 _SHODAN_BACKOFF_S = 5.0
-#: the minimum gap between two Shodan requests. Shodan documents ~1 request/second and answers a burst
-#: with 429 + a `Retry-After` we honour up to 300 s — so with no pacing at all we generated the very
-#: penalty we then waited out (MEASURED 2026-08-05: four requests in ~3 s, then a 301 s sleep). Pacing is
-#: the CONTROL; a shorter backoff would only argue with the provider about its own rule.
+#: the minimum gap between two Shodan requests; Shodan documents ~1 request/second.
 _SHODAN_MIN_INTERVAL_S = 1.05
-#: the longest slowdown we will honor from a header. Beyond this the value is not usable as pacing — a
-#: run must not silently stall for an hour on one — so the fallback applies and the class still stops
-#: work by its own rules.
+#: the longest slowdown honored from a `Retry-After` header; beyond it the fallback applies.
 _SHODAN_BACKOFF_MAX_S = 300.0
 
 
@@ -119,21 +104,16 @@ _SHODAN_BACKOFF_MAX_S = 300.0
 class _ProviderCooldown:
     """This ACCOUNT's rate boundary — honored by every Shodan request, from any lane or process.
 
-    review-B1.5r1#2: issuing counts serially is not pacing, and stopping sizing on a 429 while entering
-    paid search immediately means the provider's "slow down" was heard and ignored. One cooldown, shared
-    by sizing and purchasing, so honoring it is not something a caller can forget."""
+    One cooldown shared by sizing and purchasing."""
 
     def __init__(self, key=None):
         self.until = 0.0
         self.hits = 0
-        self.last = 0.0                 # when THIS object last issued a request (monotonic, fallback)
-        # review (Lumpy): pacing belongs to the provider ACCOUNT, not to a lifecycle. Every
-        # `_ProviderCooldown()` started at `last = 0`, so the first request of each lane was unpaced
-        # against whatever ran a moment before it, and two processes had independent clocks. The shared
-        # boundary is keyed by a FINGERPRINT of the credential — never the credential itself.
+        self.last = 0.0                 # when this object last issued a request (monotonic, fallback)
+        # keyed by a fingerprint of the credential, never the credential itself
         self.account = pace.account("shodan", key)
-        #: set when a provider penalty could NOT be shared with the account. Nothing else enforces it,
-        #: so this lifecycle stops contacting the provider rather than pretending it is coordinated.
+        #: set when a provider penalty could NOT be shared with the account; this lifecycle then stops
+        #: contacting the provider rather than pretending it is coordinated.
         self.unshared_penalty = ""
 
     def note(self, err) -> None:
@@ -143,17 +123,14 @@ class _ProviderCooldown:
         raw = hdrs.get("Retry-After") if hdrs is not None else None
         try:
             if raw is not None:
-                # review-B1.5r3#3: `float()` accepts `inf` and `1e309`, and `sleep(inf)` raises
-                # OverflowError while a huge finite value stalls the run outright. Only a FINITE,
-                # non-negative, usable value is honored; anything else falls back.
+                # only a finite, non-negative, in-range value is honored; anything else falls back
                 got = float(str(raw).strip())
                 if _math.isfinite(got) and 0.0 <= got <= _SHODAN_BACKOFF_MAX_S:
                     wait = got
         except (TypeError, ValueError):
             pass
         self.until = max(self.until, _time.monotonic() + wait)
-        # a 429 is a statement about the CREDENTIAL, not about the process that happened to receive it:
-        # persist it so the next run — and any concurrent one — honours what this one earned.
+        # a 429 is about the CREDENTIAL: persisted so concurrent and later runs honour it too
         if not pace.note_penalty(self.account, _time.time() + wait):
             self.unshared_penalty = (f"a {wait:g}s provider slowdown could not be shared with this "
                                      f"account — other runs would not honour it")
@@ -161,15 +138,11 @@ class _ProviderCooldown:
     def wait(self) -> None:
         """Honour this ACCOUNT's slowdown and minimum interval, then mark the request.
 
-        Called immediately before PROVIDER CONTACT and nowhere else: replaying owned evidence touches no
-        provider, so it never waits here (Lumpy, 2026-08-05).
-
-        The account boundary is authoritative and shared installation-wide; the in-process interval below
-        remains as a fallback for the case where that state cannot be read or written at all."""
+        Called immediately before PROVIDER CONTACT and nowhere else — replaying owned evidence never
+        waits here. The account boundary is authoritative and shared installation-wide; the in-process
+        interval is the fallback for when that state cannot be read or written."""
         if self.unshared_penalty:
-            # we know the provider asked us to slow down and we could not tell the account. Continuing
-            # would be this process honouring a penalty it cannot coordinate — exactly the burst the
-            # boundary exists to prevent.
+            # a penalty we cannot coordinate: refuse rather than burst
             raise pace.PaceBusy(self.unshared_penalty)
         penalty = self.until - _time.monotonic()
         pace.wait(self.account, _SHODAN_MIN_INTERVAL_S,
@@ -181,23 +154,12 @@ class _ProviderCooldown:
         self.last = _time.monotonic()
 
 
-#: MEASURED 2026-08-05: `Mozilla/5.0` on `/shodan/host/search` is answered by Cloudflare's "Just a
-#: moment..." interstitial (HTTP 403) while the same key, query and encoding succeed with an ordinary
-#: client identifier — a browser User-Agent without a browser's TLS and headers is exactly what a bot
-#: filter looks for. `/shodan/host/count` was not challenged, so the lane sized its pivots correctly and
-#: then could not buy a single page. The free `shodan_host` lane below already sent `quarry-recon`; the
-#: paid path is now the same client. This is an API we identify ourselves to, not a target we blend into.
+#: the client identifier every Shodan request sends. A browser User-Agent is answered on
+#: `/shodan/host/search` by Cloudflare's interstitial (403); this is an API we identify ourselves to.
 SHODAN_UA = "quarry-recon"
 
-#: A PAID response has NO byte ceiling. It is streamed to disk in chunks and kept whole (Lumpy,
-#: 2026-08-05: "if we are already paying, I want to get EVERYTHING I pay for"). First a 4 MiB cap
-#: truncated two pages mid-string and reported the fragment as the provider's malformed JSON; then I
-#: replaced it with 64 MiB, which is the same mistake with a bigger number. A cap on something already
-#: bought converts money into incomplete evidence and invites a second purchase.
-#:
-#: What IS bounded is memory: this is how large an artifact we will PARSE in one process. Beyond it the
-#: bytes are still acquired, owned and published — only the ingest of that page waits for a bigger box,
-#: and the run says so. It bounds what we hold in RAM, never what we keep.
+#: how large an artifact this process will parse in memory. A paid response has no byte ceiling; over
+#: this bound the page is still acquired and owned, only its ingest is deferred
 SHODAN_PARSE_LIMIT = 256 * 1024 * 1024
 #: how much of a FREE endpoint's response we hold in memory (nothing is bought, so a re-read is free)
 SHODAN_READ_LIMIT = 64 * 1024 * 1024
@@ -215,26 +177,18 @@ class ShodanPageTooLargeToParse(ValueError):
 
 
 def _read_bounded(r, limit: "int | None" = None) -> bytes:
-    """`contract.read_bounded` with this lane's bound, read AT CALL TIME.
-
-    Not captured as a default argument: a module constant frozen into a signature at import cannot be
-    changed by anything — not the policy report, not a test, not a future setting — while still looking
-    like a knob."""
+    """`contract.read_bounded` with this lane's bound, read at CALL TIME rather than frozen into the
+    signature as a default."""
     return read_bounded(r, SHODAN_READ_LIMIT if limit is None else limit, provider="shodan",
                         bound="SHODAN_READ_LIMIT")
 
 
 def _shodan_count(key, facet, v):
-    """ONE free `/shodan/host/count` -> `(total, error)`. NEVER raises.
+    """ONE free `/shodan/host/count` -> `(total, raw_bytes, error)`. NEVER raises.
 
-    B1.5 sizing. Count is FREE: query credits gate `/shodan/host/search` only, and `/host/count` keeps
-    working at a zero balance (measured), which is why sizing continues when paid credits are exhausted
-    or reserved. `total` is validated strictly — an exact non-negative int, `bool` excluded — and
-    anything else is UNKNOWN. Never zero: a count we could not read says nothing about the pivot.
-
-    Returns `(total, raw_bytes, error)`. review-B1.5r1#3: the response bytes were parsed and DISCARDED,
-    and a fresh document was synthesized to stand in for them — so the "raw evidence" was Quarry's
-    account of the answer rather than the answer. The exact bytes come back and are what gets stored."""
+    Count is free and keeps working at a zero balance, so sizing continues when paid credits are
+    exhausted or reserved. `total` is an exact non-negative int (`bool` excluded) or None for UNKNOWN,
+    never zero. `raw_bytes` are the provider's exact bytes, which is what gets stored."""
     url = (f"https://api.shodan.io/shodan/host/count?key={key}"
            f"&query={urllib.parse.quote(f'{facet}:{v}')}")
     raw = b""
@@ -257,9 +211,8 @@ def _shodan_count(key, facet, v):
 def _parse_page_bytes(raw: bytes):
     """Validate one page's BYTES into `(rows, total)`. Raises on anything we will not call a page.
 
-    Split out so a response we already own can be interpreted later without contacting Shodan: a page
-    bought on a small box and deferred (`complete_unparsed`) is parsed from its artifact on the next run,
-    for no credit (review#1, Lumpy)."""
+    Separate from acquisition so a response we already own can be interpreted later, from its artifact
+    and for no credit, without contacting Shodan."""
     data = _json.loads(raw.decode("utf-8", "replace"))
     if not isinstance(data, dict):
         raise ValueError("shodan: non-object response — not a valid empty result")
@@ -276,8 +229,7 @@ def _parse_page_bytes(raw: bytes):
         hns = m.get("hostnames")
         if hns is not None and not isinstance(hns, list):
             raise ValueError(f"shodan: non-list hostnames {type(hns).__name__}")
-        # review-B1.5br1#1: the LIST was validated and its MEMBERS were not, so the ingest side
-        # stringified whatever arrived. A non-string member is corruption, exactly like a non-dict row.
+        # a non-string member is corruption, exactly like a non-dict row
         for _h in (hns or []):
             if not isinstance(_h, str):
                 raise ValueError(f"shodan: non-string hostname {type(_h).__name__}")
@@ -288,8 +240,8 @@ def _parse_page_bytes(raw: bytes):
 def _parse_owned_page(path):
     """`(rows, total)` from bytes we already paid for, or None when they still cannot be read.
 
-    Never raises and never contacts the provider: this is the deferred-interpretation path, and a page
-    that still will not parse simply stays owned and unparsed."""
+    Never raises and never contacts the provider; a page that still will not parse stays owned and
+    unparsed."""
     try:
         p = Path(path)
         if p.stat().st_size > SHODAN_PARSE_LIMIT:
@@ -309,14 +261,13 @@ _ERROR_CLASSIFY_BYTES = 64 * 1024
 def _shodan_page(key, facet, v, page, *, sink):
     """ONE page of a Shodan search, as the coordinator's `(matches, total, error)` triple. NEVER raises.
 
-    The response is STREAMED to `sink` and kept WHOLE — a paid page has no byte ceiling (see
-    `SHODAN_PARSE_LIMIT`). Parsing then reads that file, so the artifact is the evidence of record and
-    our contract checks are applied to something we still hold. Every error carries the artifact it was
-    raised over, so the coordinator can publish the bytes whatever the outcome.
+    The response is streamed to `sink` and kept whole — a paid page has no byte ceiling (see
+    `SHODAN_PARSE_LIMIT`). Parsing reads that file, so the artifact is the evidence of record, and every
+    error carries the artifact it was raised over so the coordinator can publish the bytes whatever the
+    outcome.
 
-    FULLY FAIL-CLOSED, unchanged: a non-object body, a non-int/negative `total`, a non-list `matches`, a
-    NON-DICT row, or a NON-LIST `hostnames` is an ERROR, never laundered into a clean empty.
-    `{"total":1,"matches":[null]}` therefore fails — and its bytes are still on disk."""
+    Fail-closed: a non-object body, a non-int/negative `total`, a non-list `matches`, a non-dict row or a
+    non-list `hostnames` is an error, never laundered into a clean empty."""
     url = (f"https://api.shodan.io/shodan/host/search?key={key}"
            f"&query={urllib.parse.quote(f'{facet}:{v}')}&page={page}")
     sink = Path(sink)
@@ -332,13 +283,8 @@ def _shodan_page(key, facet, v, page, *, sink):
                 f"response is KEPT and owned; its rows are not ingested by this process")
         page_rows, page_total = _parse_page_bytes(sink.read_bytes())
     except Exception as e:
-        # A PAID ERROR RESPONSE IS STILL PAID. `urlopen` raises before returning on any 4xx/5xx, so the
-        # streaming above never ran for it — and `capture_error_body` reads a bounded head and closes
-        # the socket, which would leave that head as the only copy of a body we were charged for.
-        #
-        # It streams OUTSIDE the acquisition namespace (`.error`, never `<key>.json`): an ordinary 429
-        # or 500 is not a page we bought, and a file the ownership scan reads as an unowned paid
-        # response would refuse acquisition for that page on every later lifecycle.
+        # a paid error response is still paid: streamed to `.error` (outside the acquisition namespace, or
+        # the ownership scan reads it as an unowned paid response)
         err_sink = None
         response = e                      # the ORIGINAL response, whatever `e` becomes below
         if size == 0 and hasattr(e, "read"):
@@ -346,8 +292,8 @@ def _shodan_page(key, facet, v, page, *, sink):
             try:
                 size, digest = stream_to_file(e, err_sink)
             except IncompleteAcquisition as inc:
-                # the partial bytes ARE ours. The incomplete acquisition becomes the carrier, so its
-                # class and its `.part` reach the coordinator instead of the status code's.
+                # the partial bytes are ours: the incomplete acquisition carries its own class and
+                # `.part` to the coordinator instead of the status code's
                 inc.__cause__ = e
                 e, size, digest = inc, inc.bytes_written, None
                 err_sink = inc.partial
@@ -360,18 +306,16 @@ def _shodan_page(key, facet, v, page, *, sink):
                     e.body_text = head.decode("utf-8", "replace")
                 except Exception:
                     pass
-            # stamping `body_text` makes `capture_error_body` skip its own read — and its close with it.
-            # Closed on EVERY path, and on the original response: `e` may now be the carrier instead.
+            # a stamped `body_text` makes `capture_error_body` skip its own read, and its close with it:
+            # closed here on every path, and on the ORIGINAL response — `e` may now be the carrier.
             try:
                 response.close()
             except Exception:
                 pass
-        # Shodan answers a spent balance with HTTP 401 + JSON and a bad key with HTTP 401 + HTML, so
-        # the status code alone would report every exhausted account as a broken credential. A body
-        # already stamped above is left alone.
+        # Shodan answers a spent balance with 401 + JSON and a bad key with 401 + HTML, so the class is
+        # refined by body. A body already stamped above is left alone.
         capture_error_body(e, provider="shodan")
-        # the ARTIFACT travels with the failure. A paid response that we could not use is still a paid
-        # response, and the coordinator publishes what it is handed.
+        # the artifact travels with the failure; the coordinator publishes what it is handed
         kept = err_sink if err_sink is not None else (sink if size else getattr(e, "partial", None))
         for attr, val in (("raw_path", kept), ("raw_digest", digest), ("raw_bytes", size)):
             try:
@@ -382,34 +326,30 @@ def _shodan_page(key, facet, v, page, *, sink):
     return page_rows, page_total, None
 
 
-# ── B1.2: the Shodan CREDIT BALANCE contract ─────────────────────────────────────────────────────────
-# `/api-info` is FREE and works at a ZERO balance (measured 2026-07-28), so the remaining credits are a
-# fact we can always read rather than a number we have to guess or track locally across runs. A MONTHLY
-# quota cannot be protected by per-run bookkeeping anyway — another client may spend concurrently — so the
-# provider's own answer is the planning input and its 401-quota body stays the authority.
+# ── the Shodan credit-balance contract ──
+
+# `/api-info` is free at a zero balance, so the provider's answer is the planning input, and its
+# 401-quota body stays the authority
 _SHODAN_RESERVE_MAX = 1_000_000
 
 
 @_dataclass(frozen=True)
 class ShodanBalance:
-    """The settled credit contract. Facts stay DISTINCT — collapsing any two of them loses the only
-    information the number carries:
+    """The settled credit contract. Each field is a distinct fact:
 
-      remaining   finite credits the provider reports   (None = UNKNOWN — never "unlimited": the
-                                                         top-level field has no documented -1 sentinel,
-                                                         and assuming one fails OPEN on a cost guard)
+      remaining   finite credits the provider reports   (None = UNKNOWN, never "unlimited")
       allowance   the plan's monthly limit              (context; None when unreadable or unlimited)
       reserve     credits the OPERATOR withholds        (our own config, always known)
       spendable   what this run may use                 (None = UNKNOWN, i.e. no computable bound —
                                                          permitted only when no reserve is set)
       allowance_unlimited  the PLAN has no monthly ceiling (usage_limits.query_credits == -1)
-      stop_kind   WHY we may not spend, as a token      (never inferred from prose; NOT all stops are
-                                                         soft limits — see `stop_is_limit`)
-      read_error  how the /api-info read FAILED         (None on success — kept even when the balance
-                                                         itself is unusable, so a bad key stays visible)
-      count_refused  how a /host/count refused the KEY   (None unless a free count proved the credential
-                                                         is refused AFTER /api-info had succeeded — a
-                                                         separate fact from the balance read's own)"""
+      stop_kind   WHY we may not spend, as a token      (not all stops are soft limits — see
+                                                         `stop_is_limit`)
+      read_error  how the /api-info read FAILED         (None on success; kept even when the balance
+                                                         itself is unusable)
+      count_refused  how a /host/count refused the KEY   (set only when a free count proved the
+                                                         credential is refused after /api-info
+                                                         succeeded)"""
 
     remaining: "int | None"
     allowance: "int | None"
@@ -428,10 +368,7 @@ class ShodanBalance:
 
     @property
     def stop_is_limit(self) -> bool:
-        """Whether a stop is an EXPECTED soft limit (-> complete_with_limits) or a real gap.
-
-        review-B1.2r3#2: one `read_refused` token held auth, generic forbidden AND entitlement, so a BAD
-        KEY would have softened into complete_with_limits alongside a genuinely exhausted account. A
+        """Whether a stop is an expected soft limit (-> complete_with_limits) or a real gap. A
         credential that does not work is a defect in our setup; an account that ran out is not."""
         return self.stop_kind in _STOP_LIMITS
 
@@ -446,23 +383,19 @@ SHODAN_FORBIDDEN = "forbidden"                     # refused, reason unproven   
 SHODAN_RESERVE_INVALID = "reserve_invalid"         # the knob is present but unusable     -> GAP
 SHODAN_PAGE_CEILING_INVALID = "page_ceiling_invalid"  # SHODAN_MAX_PAGES unusable         -> GAP
 
-#: stops that are EXPECTED boundaries rather than defects. Everything else is a gap: a bad key, an
-#: unexplained refusal and a broken cost guard are all things the operator must FIX, not accept.
+#: stops that are expected boundaries rather than defects. Everything else is a gap the operator fixes.
 _STOP_LIMITS = frozenset({SHODAN_PROVIDER_EXHAUSTED, SHODAN_ENTITLEMENT, SHODAN_OPERATOR_RESERVE,
                           SHODAN_UNKNOWN_WITH_RESERVE})
 
-#: review-B1.7a#4: every stop token that is NOT already a taxonomy class, mapped to the one it means.
-#: `auth_refused` IS `auth` (the credential does not work); a broken cost guard, an unwritable ledger, a
-#: failed publish and a scheduler invariant are all OUR defect, which the taxonomy calls `error`.
+#: every stop token that is not already a taxonomy class, mapped to the one it means. A broken cost
+#: guard, an unwritable ledger, a failed publish and a scheduler invariant are all `error`.
 _TOKEN_CLASS = {SHODAN_AUTH_REFUSED: "auth", SHODAN_RESERVE_INVALID: PROVIDER_ERROR,
                 SHODAN_PAGE_CEILING_INVALID: PROVIDER_ERROR,
                 "ledger_unwritable": PROVIDER_ERROR, "publish_failed": PROVIDER_ERROR,
                 "scheduler_invariant": PROVIDER_ERROR}
 
 
-#: stop causes that are OUR OWN machinery, not the provider's. review-B1.7a#4: these were only ever
-#: consulted when a page REMAINDER was left, so a run that bought every page it wanted and then could not
-#: journal one returned a clean terminal — the defect visible in `stop_cause` and nowhere else.
+#: stop causes that are OUR OWN machinery, not the provider's.
 _INTERNAL_STOPS = frozenset({"ledger_unwritable", "publish_failed", "scheduler_invariant"})
 
 
@@ -471,44 +404,35 @@ def _internal_stop(stop: str) -> bool:
 
 
 def _canonical_class(token) -> str:
-    """A CANONICAL taxonomy class for an internal stop token.
-
-    review-B1.7a#4: the lane emitted its own scheduler vocabulary as `error_class` — `publish_failed`,
-    `machinery:OSError`, `auth_refused` — and a consumer validating against `PROVIDER_CLASSES` sees a
-    value the taxonomy does not define. The token itself stays in the REASON, where prose belongs."""
+    """A canonical `PROVIDER_CLASSES` value for an internal stop token; the token itself stays in the
+    reason."""
     if token in PROVIDER_CLASSES:
         return token
     return _TOKEN_CLASS.get(token, PROVIDER_ERROR)
 
 
-#: a stop that the PROVIDER proved, as the error class the terminal speaks. Only these two are the
-#: provider's own boundary; an operator reserve or an unreadable balance is OUR policy or OUR problem and
-#: must not be dressed up as the provider refusing us (B1.4).
+#: a stop the PROVIDER proved, as the error class the terminal speaks. An operator reserve or an
+#: unreadable balance is our own policy or problem and is not dressed up as the provider refusing us.
 _STOP_CLASS = {SHODAN_PROVIDER_EXHAUSTED: "quota", SHODAN_ENTITLEMENT: "entitlement"}
-#: count-endpoint outcomes that stop SIZING, mapped to whether they also prove the CREDENTIAL is
-#: refused. `auth` is global — the key does not work anywhere, so paid work must stop too and read as a
-#: gap. `forbidden` and `entitlement` are proven only for the endpoint that returned them, so they end
-#: sizing and leave the paid lane to discover its own answer (review-B1.5r3#2).
+#: count-endpoint outcomes that stop sizing, and whether they also prove the credential refused.
+#: `auth` is global; `forbidden`/`entitlement` are proven only for their own endpoint.
 _COUNT_STOPS = {"auth": True, "forbidden": False, "entitlement": False}
 
-#: balance-read outcomes that mean Shodan is NOT accepting this key, so even FREE calls must stop. Quota,
-#: entitlement and an operator reserve are all "the key works, the spend does not" — sizing continues
-#: through those, because /host/count costs nothing (review-B1.5r2#1).
+#: balance-read outcomes that mean the key is not accepted, so even free calls stop. Quota,
+#: entitlement and a reserve are "key works, spend does not", so sizing continues through those.
 _SIZING_REFUSED = {SHODAN_AUTH_REFUSED: "auth_refused", SHODAN_FORBIDDEN: "forbidden"}
 
 
-#: stops that are OURS: the outcome is LIMITED (deliberately bounded), never a provider class and never
-#: a degraded execution.
+#: stops that are OURS: the outcome is LIMITED, never a provider class and never a degraded execution.
 _OPERATOR_STOPS = frozenset({SHODAN_OPERATOR_RESERVE, SHODAN_UNKNOWN_WITH_RESERVE})
 
-#: read outcomes that PROVE paid work is pointless. transport/parse/server say nothing about the account,
-#: so they keep the ordinary unknown fallback; these four are the provider telling us plainly.
+#: read outcomes that prove paid work is pointless. transport/parse/server say nothing about the
+#: account, so they keep the ordinary unknown fallback.
 _BLOCKING_READ = frozenset({"auth", "quota", "entitlement", "forbidden"})
 
 
 def _exact_int(v, *, minimum: int = 0):
-    """An exact int >= minimum, or None. `True` is an int in Python, and a float or numeric string is a
-    different kind of claim — none of them may pass for a credit count."""
+    """An exact int >= minimum, or None. `bool`, floats and numeric strings never pass."""
     if isinstance(v, bool) or not isinstance(v, int) or v < minimum:
         return None
     return v
@@ -525,20 +449,14 @@ def _allowance_field(v):
 
 
 def _remaining_field(v):
-    """-> value or None. An EXACT non-negative int, with NO -1 sentinel.
-
-    review-B1.2r3#1: I had the top-level `query_credits` share the allowance parser, so `-1` there meant
-    "unlimited" and disabled the reserve entirely. Nothing establishes that sentinel for this field —
-    Shodan's own documented example pairs a FINITE `query_credits` with `usage_limits.query_credits: -1`,
-    and the test asserting it was a shape I invented rather than measured. Guessing here fails OPEN on a
-    spending control, so an unproven `-1` is schema drift until a real payload says otherwise."""
+    """-> value or None. An exact non-negative int, with NO -1 sentinel: the top-level `query_credits`
+    has no documented unlimited value, so `-1` here is schema drift."""
     return _exact_int(v)
 
 
 def _shodan_reserve_setting():
-    """-> (reserve, valid). ABSENT means 0 and is fine. PRESENT-BUT-INVALID is NOT: a typo, a bool, a
-    float or an oversized value would otherwise fall back to 0 and silently DISABLE the operator's cost
-    guard — failing open on a control whose whole purpose is to withhold spending."""
+    """-> (reserve, valid). Absent means 0 and is fine; present-but-invalid (a typo, a bool, a float, an
+    oversized value) is not valid and must not fall back to 0, which would disable the cost guard."""
     raw = settings.performance().get("SHODAN_CREDIT_RESERVE")
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return 0, True
@@ -555,8 +473,8 @@ def _shodan_reserve_setting():
 def shodan_balance(doc, *, reserve: "int | None" = None) -> ShodanBalance:
     """Turn an `/api-info` body (or None, when the read failed) into the settled contract.
 
-    The cases that matter, each with a distinct `stop_kind` (and see `stop_is_limit` — not every stop is
-    an expected boundary):
+    Each case has a distinct `stop_kind` (and see `stop_is_limit` — not every stop is an expected
+    boundary):
 
       remaining 0, reserve 0   -> PROVIDER EXHAUSTED. The account really is empty.            LIMIT
       remaining <= reserve     -> OPERATOR RESERVE. Credits exist; Shodan would still serve   LIMIT
@@ -574,7 +492,7 @@ def shodan_balance(doc, *, reserve: "int | None" = None) -> ShodanBalance:
         reserve, reserve_valid = _shodan_reserve_setting()
     else:
         strict = _exact_int(reserve)
-        if strict is None:                       # a caller passing True/12.9/"abc" is a bug, not a policy
+        if strict is None:                       # True/12.9/"abc" from a caller is a bug, not a policy
             reserve, reserve_valid = 0, False
         else:
             reserve = strict
@@ -586,10 +504,8 @@ def shodan_balance(doc, *, reserve: "int | None" = None) -> ShodanBalance:
         limits = doc.get("usage_limits")
         if isinstance(limits, dict):
             allowance, allowance_unlimited = _allowance_field(limits.get("query_credits"))
-    # review-B1.2r2#1: the ALLOWANCE and the REMAINING balance are separate facts. Shodan's own /api-info
-    # example returns a finite `query_credits: 100000` alongside `usage_limits.query_credits: -1` — an
-    # unlimited PLAN with a finite balance right now. Letting the allowance flip the account to unlimited
-    # discarded the real number and would have spent against a ceiling that does not describe this month.
+    # the plan ALLOWANCE and the REMAINING balance are separate facts: an unlimited plan can still
+    # report a finite balance for this month, and that number is the one we spend against.
     if not reserve_valid:
         return ShodanBalance(remaining, allowance, 0, 0, False,
                              "SHODAN_CREDIT_RESERVE is set but unusable — refusing to spend rather than "
@@ -636,12 +552,8 @@ def shodan_balance(doc, *, reserve: "int | None" = None) -> ShodanBalance:
 
 
 def _blocked_read(bal: ShodanBalance, cls: str) -> ShodanBalance:
-    """A read outcome that PROVES paid work is pointless must also STOP it.
-
-    review-B1.2r2#2: the failure paths were `replace(shodan_balance(None), read_error=...)`, and with
-    reserve 0 that unknown contract says `may_spend=True`. So `/api-info` could prove a bad key or an
-    exhausted account and the coordinator would still have gone and spent credits against it. The read
-    error was recorded and then ignored by the only field anyone acts on."""
+    """A read outcome that PROVES paid work is pointless must also STOP it — `read_error` alone is
+    recorded and not acted on."""
     if cls not in _BLOCKING_READ:
         return dataclasses.replace(bal, read_error=cls)      # transport/parse/server: says nothing
     kind = {"quota": SHODAN_PROVIDER_EXHAUSTED, "entitlement": SHODAN_ENTITLEMENT,
@@ -650,10 +562,7 @@ def _blocked_read(bal: ShodanBalance, cls: str) -> ShodanBalance:
            "entitlement": "the PLAN cannot reach this endpoint",
            "auth": "the credential was REJECTED — a setup defect, not an expected boundary",
            }.get(cls, f"the provider REFUSED the balance read ({cls})")
-    # review-B1.5r3#4: this told every operator that "free operations continue", which stopped being
-    # true when a REFUSED CREDENTIAL began blocking free sizing too. What continues depends on WHY we
-    # stopped: a spend the provider will not honor still leaves free endpoints usable; a key it will not
-    # accept leaves nothing usable at all.
+    # a spend the provider will not honor leaves free endpoints usable; a key it will not accept does not
     free = "free operations continue" if kind not in _SIZING_REFUSED else \
         "no free operation is issued either — the key itself was refused"
     return dataclasses.replace(bal, read_error=cls, may_spend=False, spendable=0, stop_kind=kind,
@@ -663,28 +572,21 @@ def _blocked_read(bal: ShodanBalance, cls: str) -> ShodanBalance:
 def _read_shodan_balance(key, timeout: int = 15, cooldown=None) -> ShodanBalance:
     """Read `/api-info` (FREE, and it works at a ZERO balance) and settle the contract.
 
-    review-B1.2#3: the READ OUTCOME is preserved separately from the balance facts. Collapsing every
-    failure into an undifferentiated "unknown" hid a real problem: with a reserve configured no paid
-    request follows, so a BAD KEY produced no other signal and stayed invisible behind "balance unknown;
-    reserve protected". `read_error` keeps auth/quota/transport/parse distinguishable — and, for the
-    classes that PROVE refusal, also blocks spending.
-
-    A failure yields UNKNOWN, never zero: "we could not look" and "there is nothing left" are different
-    facts with different consequences."""
+    The READ OUTCOME is kept separately from the balance facts: `read_error` keeps auth/quota/transport/
+    parse distinguishable, and for the classes that prove refusal it also blocks spending. A failure
+    yields UNKNOWN, never zero."""
     try:
         url = f"https://api.shodan.io/api-info?key={urllib.parse.quote(str(key))}"
         req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read(64 * 1024).decode("utf-8", "replace")
     except Exception as e:
-        # B1.1 helper: reads the body AT THE RAISE SITE, closes the stream, and refines 401 by body —
-        # so an exhausted account reads `quota` here and a bad key reads `auth`, not one blurred class.
+        # reads the body at the raise site, closes the stream, and refines 401 by body: an exhausted
+        # account reads `quota` and a bad key reads `auth`
         capture_error_body(e, provider="shodan")
         cls = provider_error_class(e)
         if cooldown is not None and cls == PROVIDER_RATE_LIMIT:
-            # review-B1.5r2#1: the balance read sat OUTSIDE the shared cooldown, so a 429 here was
-            # followed straight away by a count for every pivot. Noted at the raise site, where the
-            # response (and any Retry-After) is still readable.
+            # noted at the raise site, where the response (and any Retry-After) is still readable
             cooldown.note(e)
         return _blocked_read(shodan_balance(None), cls)
     try:
@@ -692,10 +594,8 @@ def _read_shodan_balance(key, timeout: int = 15, cooldown=None) -> ShodanBalance
     except Exception:
         return _blocked_read(shodan_balance(None), "parse")
     bal = shodan_balance(doc)
-    # review-B1.2r2#3: decoding is not validating. A well-formed JSON body carrying `"85"`, `-2` or no
-    # `query_credits` at all is SCHEMA drift at the read boundary, and reporting it as a successful read
-    # of an unknown balance let a broken response look like a healthy one. (A malformed `usage_limits`
-    # stays non-fatal — it is context, not the balance.)
+    # a well-formed body carrying `"85"`, `-2` or no `query_credits` is schema drift, not an unknown
+    # balance. A malformed `usage_limits` stays non-fatal: it is context, not the balance.
     if not bal.known:
         return _blocked_read(bal, "parse")
     return bal
@@ -704,13 +604,8 @@ def _read_shodan_balance(key, timeout: int = 15, cooldown=None) -> ShodanBalance
 def _emit_shodan_balance(sid: str, bal: ShodanBalance) -> None:
     """Publish the balance as its OWN ledger event, every lifecycle.
 
-    Emitted unconditionally, INCLUDING the unknown case — a run that could not read the balance must
-    still say so, or the previous run's numbers stay on display as if current. `remaining`/`allowance`
-    are null when unknown and never defaulted to 0, which would read as a spent account.
-
-    SCOPE (review-B1.2#4): nothing CONSUMES this yet — `views._fold_events` keeps only produced/consumed
-    from a ledger event. B1.3 adds the reconciling consumer; until then this is an honest record, not a
-    reconciled fact, and no code should claim the latest one supersedes the rest."""
+    Emitted unconditionally, including the unknown case, so a previous run's numbers never stay on
+    display as current. `remaining`/`allowance` are null when unknown, never 0."""
     events.ledger(sid, produced=None, consumed=None, balance={
         "provider": "shodan", "remaining": bal.remaining, "allowance": bal.allowance,
         "reserve": bal.reserve, "spendable": bal.spendable, "known": bal.known,
@@ -719,16 +614,13 @@ def _emit_shodan_balance(sid: str, bal: ShodanBalance) -> None:
         "read_error": bal.read_error, "count_refused": bal.count_refused, "reason": bal.reason})
 
 
-#: B1.5b: there is no OOS cap. RoE boundary — OBSERVE and mine OOS evidence, never actively expand
-#: against it. A first-N slice bounded MEMBERSHIP by page order, so which related hosts an operator ever
-#: saw depended on which page they happened to appear on; the last hidden membership cap in the lane.
-#: Bound a DISPLAY if a report is long. Never the stored evidence.
+#: There is no OOS cap: the RoE boundary is OBSERVE and mine OOS evidence, never actively expand
+#: against it. Bound a DISPLAY if a report is long; never the stored evidence.
 
 
 @_dataclass
 class _SharedWork:
-    """What ONE coordinator run produced for ALL lanes. Each field is per-source_id; nothing here is a
-    lane-agnostic aggregate, because every one of these facts belongs to exactly one lane."""
+    """What ONE coordinator run produced for ALL lanes. Every field is per-source_id."""
 
     balance: "ShodanBalance"
     result: "shodan_sched.WorkResult"
@@ -752,7 +644,7 @@ class _LaneSpec:
     note: str                      # review note template for an off-scope related host
 
 
-#: every Shodan search lane, collected TOGETHER so one coordinator can order them fairly.
+#: every Shodan search lane, collected together so one coordinator can order them fairly
 _SHODAN_LANES = (
     _LaneSpec("probe.favicon", "http.favicon.hash", "favicon-shodan", "live", "favicon",
               "same favicon (hash {}) as an in-scope host — VERIFY OWNERSHIP"),
@@ -762,14 +654,12 @@ _SHODAN_LANES = (
 
 
 def _page_ceiling(v) -> "tuple[int, bool]":
-    """-> (pages, valid). `0` = no page ceiling; the credit balance is then the only bound, and that is
-    the default. ABSENT means 0 and is fine.
+    """-> (pages, valid). `0` = no page ceiling, the default; the credit balance is then the only bound.
+    Absent means 0 and is valid.
 
-    PRESENT-BUT-INVALID is not: a bool (an int subclass — `True` would read as one page), a float, a
-    string or a negative. Such a value does NOT become unbounded (Lumpy, 2026-08-08): a broken bound on
-    a paid lane must not read as "no bound", any more than a broken reserve reads as "no reserve". The
-    caller refuses paid acquisition instead — see `_shodan_reserve_setting` for the same contract on the
-    other cost knob."""
+    A bool, float, string or negative is present-but-invalid and does NOT become unbounded — the caller
+    refuses paid acquisition instead, the same contract `_shodan_reserve_setting` holds for the other
+    cost knob."""
     if v is None or (isinstance(v, str) and not v.strip()):
         return 0, True
     if isinstance(v, bool) or not isinstance(v, int) or v < 0:
@@ -784,9 +674,8 @@ def _shodan_work(ctx, key, lanes):
         with shodan_sched.lifecycle_lock(ctx.run.project_dir):
             return _shodan_work_locked(ctx, key, lanes)
     except shodan_sched.StoreBusy as e:
-        # REFUSE, never wait: waiting for a lock is not a spending policy, and this run issues zero paid
-        # requests. It is a GAP local to this run — the holder's evidence is not ours, its eligible set
-        # may differ, and it may fail before covering anything.
+        # refuse rather than wait: this run issues zero paid requests, and the holder's evidence is not
+        # ours — a gap local to this run
         for spec, _vals in lanes:
             events.coverage_partial(
                 spec.sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_pages", unit=f"{spec.sid}.pages",
@@ -796,34 +685,23 @@ def _shodan_work(ctx, key, lanes):
 
 
 def _shodan_work_locked(ctx, key, lanes):
-    """Spend ONE credit budget across ALL Shodan pivot lanes, under ONE coordinator.
+    """Spend ONE credit budget across ALL Shodan pivot lanes, under ONE coordinator: collect every
+    lane's values first, spend once, so credits are ordered fairly across them.
 
-    review-B1.4r2#1: each lane used to build its own balance, ledger and coordinator run, and they were
-    then called in sequence — so favicon could consume every spendable credit before certificate work
-    was even collected. The coordinator's cross-lane fairness was real in isolation and absent in
-    production. Collecting first and spending once is the whole point of it.
-
-    Returns `(balance, WorkResult, {sid: found set})`. Each lane's TERMINAL is still produced inside its
-    own `run_provider` bracket, so per-source telemetry and coverage generations are unchanged."""
-    # SHODAN_MAX_PAGES is a SPENDING control, not a worker count: `0` means "no page ceiling — the
-    # credit balance is the bound", which is also the default. It was read through `concurrency()`,
-    # whose `max(1, ...)` floor turned an explicitly configured `0` into ONE page (Lumpy, 2026-08-08) —
-    # a silent cap on a paid pivot, in the direction of buying less than asked. It is read exactly as
-    # written and parsed strictly, and an unusable value FAILS CLOSED: `shodan_balance` refuses to spend
-    # rather than removing the ceiling the operator meant to set. `max_pages` here is only the number.
+    Returns a `_SharedWork`. Each lane's TERMINAL is still produced inside its own `run_provider`
+    bracket, so per-source telemetry and coverage generations are unchanged."""
+    # SHODAN_MAX_PAGES is a spending control, read raw and strict, not through `concurrency()` whose
+    # `max(1, ...)` floor would turn a configured 0 (no ceiling) into one page
     max_pages, _pages_valid = _page_ceiling(settings.raw("SHODAN_MAX_PAGES", None))
     scope = ctx.scope
 
     def settled_balance():
-        """The balance as it FINALLY stood — or an explicit "not consulted" when the run never needed
-        to ask. Saying "unknown" there would be wrong in the other direction: nothing was refused and
-        nothing was withheld."""
+        """The balance as it FINALLY stood, or an explicit "not consulted" when the run never asked."""
         if paid["bal"] is not None:
             return paid["bal"]
         if paid["pace_busy"]:
-            # NOT a reserve and NOT a provider limit: our own rate boundary declined to let a request
-            # out. `stop_kind` stays empty so nothing reads this as an operator withholding credits or
-            # as the account being exhausted; the lane's `pace_busy` stop cause carries the meaning.
+            # our own rate boundary declined to let a request out. `stop_kind` stays empty so nothing
+            # reads this as a reserve or as exhaustion; the lane's `pace_busy` stop cause carries it.
             return ShodanBalance(
                 remaining=None, allowance=None, reserve=_shodan_reserve_setting(), spendable=0,
                 may_spend=False,
@@ -834,30 +712,24 @@ def _shodan_work_locked(ctx, key, lanes):
             reason="balance not consulted — the run ended before any provider contact was needed")
 
     cooldown = _ProviderCooldown(key)
-    # THE BALANCE IS PROVIDER CONTACT and is therefore read lazily, after replay, and only if pages
-    # remain to buy (Lumpy, 2026-08-05). A run whose project already owns everything it needs now issues
-    # NO request at all — not a balance read, not a free count.
+    # the balance IS provider contact: read lazily, after replay, and only if pages remain to buy, so a
+    # project that already owns everything it needs issues no request at all.
     paid: dict = {"bal": None, "sizing": None, "consulted": False, "pace_busy": ""}
     try:
         found: dict = {spec.sid: set() for spec, _vals in lanes}
         oos: dict = {spec.sid: {"seen": 0, "invalid": 0, "kept": set()} for spec, _vals in lanes}
         hostnames: dict = {spec.sid: {"seen": 0, "unusable": 0, "noncanonical": 0} for spec, _vals in lanes}
 
-        # ONE ledger for the coordinator's own lane. Pages never collide inside it: `item_key` is namespaced
-        # by the pivot's lane, so a favicon page and a cert page are distinct identities by construction.
+        # ONE ledger for the coordinator's own lane; `item_key` is namespaced by the pivot's lane, so a
+        # favicon page and a cert page are distinct identities.
         cfg_fp = events.work_unit("probe.shodan", inputs={}, config={"facets": [s.facet for s, _v in lanes]},
                                   schema_version=shodan_sched.SHODAN_WORK_SCHEMA)
-        # PROJECT-scoped, not run-scoped: purchased pages are the one kind of evidence a new run must not
-        # pay for twice. `state_dir` explains the generation rule; the TTL below is what keeps it from
-        # becoming the eternal cache the free `shodan_host` lane warns about.
+        # PROJECT-scoped, not run-scoped: purchased pages must not be paid for twice. The TTL below is
+        # what keeps this from becoming an eternal cache.
         sbase = shodan_sched.state_dir(ctx.run.project_dir)
         sbase.mkdir(parents=True, exist_ok=True)
-        # the durable ledger's identity is the SCHEMA, never the enabled pivot set. `cfg_fp` folds in the
-        # current facet list, so running favicon alone and then favicon+cert changed the filename — and
-        # `prune_state` then DELETED the only ownership index for pages already paid for, leaving their
-        # artifacts unreplayable and buyable again. Per-page keys already separate lane/facet/value, so
-        # one ledger per generation is the correct grain; nothing is pruned here, because pruning a
-        # durable purchase record is exactly the loss this store exists to prevent.
+        # the ledger's identity is the schema, not the enabled pivot set. Nothing is pruned, or paid-for
+        # artifacts become unreplayable and buyable again.
         ledger = budget.Ledger(
             budget.state_path(sbase, "probe.shodan", f"v{shodan_sched.SHODAN_WORK_SCHEMA}"),
             lane="probe.shodan")
@@ -865,24 +737,16 @@ def _shodan_work_locked(ctx, key, lanes):
         attempt_dir = fresh_artifact_dir(sbase / "pages" / cfg_fp[:16])
         page_ttl = _shodan_page_ttl()
         by_sid = {spec.sid: spec for spec, _vals in lanes}
-        # review-B1.4r3#2: ONE global last-error let a failure in one lane decide another lane's terminal —
-        # cert taking a 500 and favicon a quota reported BOTH as FAILED/server. Error evidence is per SOURCE,
-        # exactly like every other per-lane fact.
+        # error evidence is per SOURCE: one global last-error would let a failure in one lane decide
+        # another lane's terminal
         errs: dict = {spec.sid: {"last": None, "last_fail": None} for spec, _vals in lanes}
 
         def search(pivot, page):
-            # `cooldown.wait()` may REFUSE (PaceBusy) when this account's boundary cannot be honoured.
-            # It PROPAGATES: the coordinator has to see it BEFORE it crosses its own "a request was
-            # ISSUED" line, or it charges a credit for a socket that never opened. review#5 (Lumpy):
-            # this wrapper used to catch it and hand back an error tuple, which left the phantom-credit
-            # defect in production while the scheduler's own fix looked complete — the same
-            # adapter-masks-the-signal seam as the deferred-parse wiring.
-            # review-B1.5r3#1: only ONE wait ran, before the whole paid loop, so a 429 mid-purchase was
-            # neither recorded nor honored and the scheduler went straight to the next pivot. Every paid
-            # request now passes through the same cooldown that sizing uses.
+            # `cooldown.wait()` may refuse (PaceBusy) and that propagates: the coordinator must see it before
+            # it crosses "a request was issued", or it charges a credit for a socket that never opened
             cooldown.wait()
-            # the RAW response is streamed here, under the ledger's own directory, so a page we paid for
-            # exists on disk before anything decides whether we can use it.
+            # streamed under the ledger's own directory, so a page we paid for exists on disk before
+            # anything decides whether we can use it
             sink = attempt_dir / "raw" / f"{shodan_sched.item_key(pivot, page)}.json"
             matches, total, err = _shodan_page(key, pivot.facet, pivot.value, page, sink=sink)
             if err is not None and provider_error_class(err) == PROVIDER_RATE_LIMIT:
@@ -895,8 +759,8 @@ def _shodan_work_locked(ctx, key, lanes):
             return matches, total, err
 
         def ingest(pivot, page, matches, raw_path):
-            """Turn one page's rows into entities. `raw_path` IS the page artifact the coordinator published,
-            so every ingested host's `raw_ref` points at a file that provably contains its evidence."""
+            """Turn one page's rows into entities. `raw_path` is the page artifact the coordinator
+            published, so every ingested host's `raw_ref` points at the file containing its evidence."""
             spec = by_sid[pivot.lane]
             label = spec.sid.split(".", 1)[-1]
             v = pivot.value
@@ -906,15 +770,11 @@ def _shodan_work_locked(ctx, key, lanes):
                     names["seen"] += 1
                     hn = raw_hn.strip().lower().rstrip(".")
                     # ONE canonical form decides identity AND scope, so a Unicode name and its punycode
-                    # spelling are the same host to both. `canon_host_strict` is Quarry's single IDNA policy.
+                    # spelling are the same host to both. `canon_host_strict` is Quarry's IDNA policy.
                     canon = normalize.canon_host_strict(hn)
                     if canon is None:
-                        # review-B1.5br2#1: a name that is not a valid HOSTNAME must never become a
-                        # `subdomain`. That entity is consumed by ACTIVE lanes elsewhere — resolution,
-                        # alterx, takeover checks, httpx — so "this lane never contacts it" was true of this
-                        # lane and false of Quarry. A valid DNS OWNER NAME (`_dmarc`, `_acme-challenge`, a
-                        # wildcard) is real evidence and is retained as PASSIVE review evidence; anything
-                        # else is malformed and counted as unusable.
+                        # a name that is not a valid hostname never becomes a `subdomain` (consumed by active
+                        # lanes); a valid DNS owner name is retained as passive review evidence
                         owner = _dns_owner_name(hn)
                         if owner is None:
                             names["unusable"] += 1      # counted, never silently skipped
@@ -935,24 +795,14 @@ def _shodan_work_locked(ctx, key, lanes):
                         names["unusable"] += 1
                         continue
                     if scope.in_scope(hn) and not scope.is_oos(hn):
-                        # review-r6#1: the response HAD this in-scope host — it belongs in `found` REGARDLESS
-                        # of whether the store already had it (dedup is a storage concern, NOT presence).
-                        # review-B1.7a#1: but the STORE COMES FIRST. `found` drives the lane terminal and the
-                        # announcement, so adding before the write meant a storage failure — now correctly
-                        # counted as an unconsumed page — still reported the hostname as produced. A `False`
-                        # return is dedup and still counts; an exception means the host is not there.
+                        # the store comes first: `found` drives the terminal, so a storage failure must not
+                        # report the host as produced. A `False` return is dedup and still counts.
                         ctx.run.add("subdomain", {"host": hn, "sources": [spec.source],
                                                   "raw_ref": str(raw_path)})
                         found[spec.sid].add(hn)
                     else:
-                        # OFF-SCOPE. The RoE boundary is OBSERVE, never expand: a host returned by a page we
-                        # already BOUGHT is evidence we hold, and mining it is passive. It reaches a REVIEW
-                        # queue — `related-host` is consumed by nothing active (every active lane filters on
-                        # its own klass AND `scope.active_allowed`), so retention adds no traffic.
-                        #
-                        # B1.5b: retained in FULL. The old first-N slice per pivot dropped candidates by page
-                        # order, so which related hosts an operator ever saw depended on where they appeared.
-                        # Deduplicate by identity; never truncate.
+                        # off-scope: mining a page we already bought is passive, and `related-host` feeds
+                        # nothing active. Kept in full, deduplicated, never truncated.
                         rec = {"id": f"{label}:{v}:{hn}", "klass": "related-host", "value": hn,
                                "note": spec.note.format(v), "sources": [spec.source],
                                "raw_ref": str(raw_path)}
@@ -977,26 +827,20 @@ def _shodan_work_locked(ctx, key, lanes):
             try:
                 cooldown.wait()          # the balance read is provider contact like any other
             except pace.PaceBusy as e:
-                # no contact at all this lifecycle. Replay has already happened and is unaffected; the
-                # unbought remainder is reported and a later run closes it for free. RAISED, not
-                # returned as None: the coordinator records `pace_busy` as the stop cause, so this reads
-                # as OUR gap rather than a quiet skip (review#2, Lumpy).
+                # no contact at all this lifecycle. Raised, not returned: the coordinator records
+                # `pace_busy` as the stop cause, so this reads as our gap rather than a quiet skip.
                 paid["pace_busy"] = str(e)
                 raise
             bal = _read_shodan_balance(key, cooldown=cooldown)
-            # held IMMEDIATELY: review-B1.5r5#3 — a failure in sizing (or anywhere after) must still
-            # leave exactly one balance record per lane, which is the missing-lifecycle hole this
-            # telemetry exists to close. Reading it lazily must not reopen that.
+            # held immediately, so a failure in sizing or later still leaves one balance record per lane
             paid["bal"] = bal
             sizing, refused = _size_pivots(key, states, ledger=ledger, attempt_dir=attempt_dir,
                                            cooldown=cooldown,
                                            refused=_SIZING_REFUSED.get(bal.stop_kind))
             paid["sizing"] = sizing
             if refused:
-                # a count PROVED the credential is refused. /api-info may well have SUCCEEDED — a key can
-                # be revoked between the two — so spending stops while the measured balance and
-                # `read_error` are left exactly as /api-info reported them. review-B1.5r4#3: overwriting
-                # `read_error` made reconciliation announce "balance read failed" about a working read.
+                # a count PROVED the credential is refused, and /api-info may still have succeeded (a
+                # key can be revoked between the two), so its balance and `read_error` stay as reported
                 bal = dataclasses.replace(bal, may_spend=False, spendable=0, count_refused=refused,
                                           stop_kind=SHODAN_AUTH_REFUSED,
                                           reason=f"shodan refused the credential on /host/count "
@@ -1005,8 +849,8 @@ def _shodan_work_locked(ctx, key, lanes):
             return bal
 
         def should_stop(cls):
-            """Failures further requests cannot get past. NOT a reclassification (review-B1.5r4#1): these
-            stay exactly what they are — gaps — and only stop us ASKING.
+            """Failures further requests cannot get past. Not a reclassification: these stay gaps and
+            only stop us ASKING.
 
               auth        the credential is refused; every remaining pivot would be refused identically
               forbidden   the shared search endpoint said no; the next pivot uses the same endpoint
@@ -1022,22 +866,15 @@ def _shodan_work_locked(ctx, key, lanes):
         return _SharedWork(balance=settled_balance(), result=res, found=found, errs=errs, oos=oos, names=hostnames,
                            sizing=paid["sizing"] or {}, max_pages=max_pages)
     finally:
-        # review-B1.5r5#3: emitting after sizing made the record reflect what the run ACTED on, but
-        # also meant a failure in state setup, the cooldown or sizing itself left NO balance event —
-        # reopening the missing-lifecycle hole this telemetry exists to close. Exactly one record per
-        # lane, on every path, carrying the final state of `bal`.
+        # exactly one balance record per lane, on every path, carrying the final state of `bal`
         settled = settled_balance()
         for spec, _vals in lanes:
             _emit_shodan_balance(spec.sid, settled)
 
 
 def _hostname_facts(nm: dict) -> list:
-    """Every hostname fact, stated INDEPENDENTLY.
-
-    review-B1.5br4#2: this was one if/else, so any unusable name suppressed the noncanonical count — a
-    page carrying `_dmarc.acme.com` alongside one malformed value stopped reporting that passive DNS
-    owner evidence had been retained at all. Two different facts about two different names cannot share
-    a branch."""
+    """Every hostname fact, stated independently — two facts about two different names never share a
+    branch."""
     facts = [f"{nm['seen']} hostname(s) read"]
     if nm["unusable"]:
         facts.append(f"{nm['unusable']} not usable as a host name")
@@ -1048,34 +885,24 @@ def _hostname_facts(nm: dict) -> list:
 
 
 def _shodan_page_ttl() -> float:
-    """How long a purchased page may stand in for a fresh one, as CONFIGURED.
-
-    Its own seam so the reading can be tested at the consumer rather than only at the reader: a DURATION
-    is not a lane count, and reading it through `settings.concurrency()` (which clamps to >= 1) made the
-    documented `0 = never replay` unreachable while every direct test of the parser still passed.
-    """
+    """How long a purchased page may stand in for a fresh one, as configured. A DURATION, not a lane
+    count: `settings.concurrency()` would clamp to >= 1 and make the documented `0 = never replay`
+    unreachable."""
     return settings.policy_days("SHODAN_PAGE_TTL_DAYS", shodan_sched.PAGE_TTL_DAYS_DEFAULT)
 
 
 def _size_pivots(key, states, *, ledger, attempt_dir, cooldown, refused=None) -> tuple:
-    """Size EVERY eligible pivot with a free `/host/count`, every lifecycle. Returns per-lane stats.
-
-    Including pivots whose pages are all already owned: that is how Quarry finds results that appeared
-    since the pagination completed, instead of treating an old completion as permanent.
-
-    Order is CROSS-LANE FAIR (review-B1.5r1#2): sizing in lane order meant an early stop sized every
-    favicon pivot and no certificate one, so a provider slowdown decided which lane got ordered at all.
+    """Size EVERY eligible pivot with a free `/host/count`, every lifecycle — including pivots whose
+    pages are all already owned, so results that appeared since pagination completed are found.
 
     Returns `(stats, refused_credential)`; the second is set when a count proved the KEY is refused,
     which must stop paid work too.
 
-    PROVIDER-SAFE without a new knob. Requests are serial, carry the same per-request timeout as a paid
-    search, and go through a shared cooldown — so a 429 is honored by everything that follows, including
-    the paid run. A first 429 backs off and continues; a REPEATED one stops sizing for this lifecycle.
-    Unsized pivots keep unknown cardinality, which is a position and not an exclusion.
-
-    A count is used for ORDERING only once its evidence is durably bound (review-B1.5r1#3): ranking
-    scarce paid credits by something we did not keep would make the ordering unauditable."""
+    Order is cross-lane fair, so a provider slowdown does not decide which lane got sized at all.
+    Requests are serial, carry the same per-request timeout as a paid search, and share the paid run's
+    cooldown; a first 429 backs off and continues, a repeated one stops sizing for this lifecycle.
+    Unsized pivots keep unknown cardinality, which is a position and not an exclusion. A count orders
+    paid work only once its evidence is durably bound."""
     stats: dict = {}
     refused_credential = [None]                      # set when a count PROVES the key itself is refused
 
@@ -1084,9 +911,7 @@ def _size_pivots(key, states, *, ledger, attempt_dir, cooldown, refused=None) ->
                                       "failed_by_class": {}, "evidence_failed": 0, "stop_reason": ""})
 
     ordered = budget.order_fairly(list(states), lambda st: st.pivot.lane)
-    # a PROVEN refusal of the credential means not one request: free or not, hammering every pivot with a
-    # key Shodan has already rejected is exactly what the contract's "while Shodan still accepts the key"
-    # excludes (review-B1.5r2#1).
+    # a proven refusal of the credential means not one request, free or not
     stopped = refused or ""
     for st in ordered:
         sid = st.pivot.lane
@@ -1096,8 +921,8 @@ def _size_pivots(key, states, *, ledger, attempt_dir, cooldown, refused=None) ->
         try:
             cooldown.wait()                          # honor any slowdown already in force
         except pace.PaceBusy as e:
-            # the account boundary refused: this pivot is NOT attempted, and neither is any that follows
-            # — the next one would be refused identically. Counted, never disguised as a zero count.
+            # the account boundary refused: this pivot and every one after it go unattempted, counted
+            # rather than disguised as a zero count
             stat(sid)["not_attempted"] += 1
             stat(sid)["stop_reason"] = PROVIDER_PACE_BUSY
             stopped = True
@@ -1114,15 +939,13 @@ def _size_pivots(key, states, *, ledger, attempt_dir, cooldown, refused=None) ->
                 if cooldown.hits > 1:
                     stopped = "rate_limit"
             elif cls in _COUNT_STOPS:
-                # a refusal does not become acceptable by repetition: asking every remaining pivot the
-                # same rejected question is exactly the fan-out this stops (review-B1.5r3#2).
+                # asking every remaining pivot the same rejected question is the fan-out this stops
                 stopped = cls
                 if _COUNT_STOPS[cls]:
                     refused_credential[0] = cls
             continue                                 # unknown cardinality; the pivot stays eligible
-        # the EXACT response bytes, named by an identity that binds them to the request that produced
-        # them (`count_key` = schema|lane|facet|value|count). Evidence, never a completion: sizing is
-        # redone every lifecycle and must never let a later run skip a count.
+        # the EXACT response bytes, under an identity binding them to the request that produced them.
+        # Evidence, never a completion: sizing is redone every lifecycle.
         ckey = shodan_sched.count_key(st.pivot)
         dig = hashlib.sha256(raw).hexdigest()
         art = attempt_dir / f"{ckey}.json"
@@ -1137,8 +960,7 @@ def _size_pivots(key, states, *, ledger, attempt_dir, cooldown, refused=None) ->
     for st in states:
         stat(st.pivot.lane)
     if stopped:
-        # review-B1.5r2#3: the reason was written only while walking LATER unattempted pivots, so a stop
-        # on the final one left every lane reporting None. Stamp it on each participating lane.
+        # stamped on every participating lane, including one stopped on its final pivot
         for s in stats.values():
             s["stop_reason"] = stopped
     return stats, refused_credential[0]
@@ -1147,21 +969,20 @@ def _size_pivots(key, states, *, ledger, attempt_dir, cooldown, refused=None) ->
 def _shodan_result(spec, values, work):
     """One lane's COVERAGE and TERMINAL, derived from the shared coordinator run.
 
-    Runs inside that lane's own `run_provider` bracket, because `coverage_reset` opens the generation
-    there — coverage emitted before the bracket would be wiped by it.
+    Runs inside that lane's own `run_provider` bracket: `coverage_reset` opens the generation there, so
+    coverage emitted before the bracket would be wiped by it.
 
-    review-r3#4 terminal truth: a plain set (SUCCESS/EMPTY) when nothing failed; a PARTIAL
-    ProviderResult (with the dominant class) when evidence exists alongside errors; and a RAISE when the
-    lane yielded nothing and something either broke or refused us."""
+    Returns a plain set (SUCCESS/EMPTY) when nothing failed, a PARTIAL `ProviderResult` carrying the
+    dominant class when evidence exists alongside errors, and RAISES when the lane yielded nothing and
+    something either broke or refused us."""
     bal, res, max_pages = work.balance, work.result, work.max_pages
     o = res.lanes.get(spec.sid) or shodan_sched.LaneOutcome(lane=spec.sid)
     shodan_sched.report(spec.sid, o, balance=bal, persisted=res.persisted, max_pages=max_pages,
                         stop_cause=res.stop_cause)
     hits = work.found.get(spec.sid) or set()
     lane_errs = work.errs.get(spec.sid) or {"last": None, "last_fail": None}
-    # B1.5b: OOS RETENTION is its own fact. Deduplication is not omission, so only candidates we could
-    # not IDENTIFY (and therefore could not store) count as omitted — a real evidence loss, reported as
-    # a gap rather than absorbed silently. Emitted every run so a later clean run clears it.
+    # OOS retention is its own fact: deduplication is not omission, so only candidates we could not
+    # IDENTIFY count as omitted. Emitted every run so a later clean run clears it.
     st = work.oos.get(spec.sid) or {"seen": 0, "invalid": 0, "kept": set()}
     events.coverage_partial(spec.sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_oos_retained",
                             unit=f"{spec.sid}.oos", eligible=st["seen"],
@@ -1170,11 +991,8 @@ def _shodan_result(spec, values, work):
                                     f"and were NOT stored" if st["invalid"] else
                                     f"{len(st['kept'])} distinct off-scope related host(s) retained "
                                     f"from {st['seen']} observation(s) — no cap"))
-    # SIZING is DIAGNOSTIC, and says what actually happened rather than what was hoped. It is a ledger
-    # event, not a coverage counter: review-B1.5r1#4 — forced into coverage it had to report every pivot
-    # as `tested` even when a first-call 429 meant none were attempted, could not carry the attempt count
-    # or the stop reason, and claimed agreement where no baseline had existed. Coverage is decided by
-    # PAID SEARCH; a failed count changes nothing about it.
+    # SIZING is DIAGNOSTIC — a ledger event, not a coverage counter. Coverage is decided by PAID SEARCH;
+    # a failed count changes nothing about it.
     sz = work.sizing.get(spec.sid) or {}
     events.ledger(spec.sid, produced=None, consumed=None, shodan_sizing={
         "pivots": len(values), "attempted": sz.get("attempted", 0),
@@ -1183,8 +1001,8 @@ def _shodan_result(spec, values, work):
         "evidence_failed": sz.get("evidence_failed", 0),
         "stop_reason": sz.get("stop_reason") or None,
         "compared": o.count_compared, "drift": o.count_drift})
-    # hostname MEMBERS are their own contract: a name we cannot use at all is a lost observation, and a
-    # name that is not canonical is usable but deduplicates on the weaker form. Both are stated.
+    # hostname members: a name we cannot use at all is a lost observation, a non-canonical one is usable
+    # but deduplicates on the weaker form. Both are stated.
     nm = work.names.get(spec.sid) or {"seen": 0, "unusable": 0, "noncanonical": 0}
     events.coverage_partial(spec.sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_hostnames",
                             unit=f"{spec.sid}.hostnames", eligible=nm["seen"],
@@ -1193,18 +1011,16 @@ def _shodan_result(spec, values, work):
     fail_classes, limit_classes = dict(o.fail_classes), dict(o.limit_classes)
     errored = sum(fail_classes.values()) + sum(limit_classes.values())
     evidence = o.pages_bought + o.pages_replayed
-    # what this lane actually BOUGHT, in the unit it is charged in — a campaign that repeats runs has to
-    # see spend per child, and replayed pages cost nothing (settle prerequisite D)
+    # what this lane BOUGHT, in the unit it is charged in; replayed pages cost nothing
     events.spend(spec.sid, provider="shodan", measure="pages", amount=int(o.pages_bought))
-    # the four page dispositions, named so a reader can tell CURRENT evidence from history and from a
-    # purchase this run declined to make. `replayed_fresh` carries its age because "current" without an
-    # age is exactly the eternal-cache claim this policy exists to prevent.
+    # the four page dispositions, so a reader can tell CURRENT evidence from history and from a purchase
+    # this run declined to make. `replayed_fresh` carries its age: "current" without one is a cache claim.
     if (o.pages_bought or o.pages_replayed or o.pages_aged or o.refresh_refused
             or o.pages_lost):
         events.coverage_partial(
             spec.sid, kind=events.COVERAGE_TIMEOUT, measure="shodan_pages", unit=f"{spec.sid}.pages",
-            # a LOST page is eligible evidence this project paid for and cannot show, so it belongs in
-            # the denominator and in `omitted` beside the aged ones — not quietly outside both.
+            # a LOST page is evidence this project paid for and cannot show: it belongs in the
+            # denominator and in `omitted`, beside the aged ones
             eligible=o.pages_bought + o.pages_replayed + o.pages_aged + o.pages_lost,
             tested=o.pages_bought + o.pages_replayed, omitted=o.pages_aged + o.pages_lost,
             reason=(f"bought={o.pages_bought}"
@@ -1219,66 +1035,42 @@ def _shodan_result(spec, values, work):
     if values and not evidence and not errored:
         stop_cls = _STOP_CLASS.get(bal.stop_kind)          # already canonical: quota / entitlement
         if stop_cls:
-            # the balance PROVED further work is pointless, so no request was issued. There is no
-            # exception to raise (nothing failed), and a bare empty set would read as a clean EMPTY —
-            # the lane silently doing nothing on a depleted account.
+            # the balance PROVED further work is pointless, so no request was issued. Nothing failed, so
+            # there is no exception to raise, and a bare empty set would read as a clean EMPTY.
             return ProviderResult(hits, partial=True, partial_kind="degraded", error_class=stop_cls,
                                   partial_reason=f"no page queried — {bal.reason}")
         if bal.stop_kind and not bal.stop_is_limit:
-            # review-B1.4r2#3: a stop that is NOT a soft limit — a credential that does not work, an
-            # unexplained refusal, a broken cost guard — is a DEFECT in our setup. It used to fall
-            # through to `return found`, producing a ghost EMPTY terminal with no class while the
-            # coverage said "gap": the verdict was right and `failed_tools` was a lie.
-            # the CANONICAL class, not the internal stop token: `count_refused` is set when a free
-            # count proved the key is refused, and it is what a consumer can act on (review-B1.5r5#2).
+            # a stop that is not a soft limit (a broken credential, a refusal, a broken cost guard)
+            # is a defect, raised with the canonical class, not the internal stop token
             token = bal.count_refused or bal.read_error or bal.stop_kind
             raise ShodanPageError(_canonical_class(token),
                                   RuntimeError(f"shodan: {bal.reason} ({token})"))
     if values and errored and not hits and not evidence:
-        # everything we attempted yielded NOTHING. A REAL failure outranks a limit: if something actually
-        # broke, the run must not read as "merely limited" (review#2 — the outcome used to depend on
-        # which pivot happened to be last).
+        # everything we attempted yielded NOTHING, and a REAL failure outranks a limit
         raise (lane_errs["last_fail"] if lane_errs["last_fail"] is not None else lane_errs["last"])
-    # review-B1.4r3#3 / r4#2: work this lane did not reach. `unqueried` alone was not the remainder —
-    # a pivot with one bought page and four provider-bounded pages left is just as incomplete, and it
-    # reported EMPTY (or SUCCESS, with a non-empty first page) while its own coverage said omitted=4.
-    # The scheduler already models the whole remainder; the terminal must read ALL of it.
-    # review-B1.7a: OUR OWN machinery failing is a defect and must read as one — and it is independent of
-    # whether a remainder is left. A run that bought every page and then could not write its state has
-    # nothing "unqueried" at all, and used to return a clean terminal with the failure discarded. A page
-    # we own but could not ingest is the same class of loss: the evidence is bought and unusable.
-    # review-B1.7a#2: THIS lane's machinery, plus failures that genuinely belong to every lane (the
-    # ledger save, remainder accounting). Another lane's ingest defect is not this lane's outcome.
+    # THIS lane's machinery, plus failures that belong to every lane (the ledger save, remainder
+    # accounting). Another lane's ingest defect is not this lane's outcome.
     machinery = list(o.machinery) + list(res.machinery)
+    # the whole remainder, not just `unqueried`: a pivot with one bought page and four provider-bounded
+    # pages left is just as incomplete
     left = len(o.unqueried) + o.pages_left_known
-    # a GLOBAL internal stop reaches this lane only if it actually COST it something: work left, or state
-    # that did not persist. A lane that bought everything it wanted and journaled it owes nothing to
-    # another lane's ingest defect — the stop ended purchasing this lane had no need of (review-B1.7a#5).
-    # review-B1.7a#7: this also consulted `records_journaled`, and that was WRONG — `Ledger.record`
-    # updates the ownership map before appending and a successful `save()` snapshots that map, so a
-    # rescued append failure still leaves the pages owned. `persisted` IS the durability handshake
-    # ("snapshot written OR journal intact"); reproduced: snapshot holding both completions, both lanes
-    # nonetheless reporting a defect. A stop we recovered from cost this lane nothing.
+    # a global internal stop reaches this lane only if it cost it something: work left, or state that
+    # did not persist. `persisted` is the durability handshake (snapshot written or journal intact).
     if machinery or o.pages_unconsumed or (_internal_stop(res.stop_cause)
                                           and (left or not res.persisted)):
-        # review-B1.7a#7: an internal stop with no lane-local fact produced "failed —  (token)" — a
-        # dangling dash and an empty clause. Every part is added only when it says something.
+        # every part is added only when it says something, so no dangling dash or empty clause
         parts = [x for x in ("; ".join(machinery),
                              (f"{o.pages_unconsumed} owned page(s) could not be ingested"
                               if o.pages_unconsumed else ""),
                              ("page state was NOT persisted — bought pages will be bought again"
                               if not res.persisted else "")) if x]
-        # review-B1.7a#3: `res.stop_cause` is a SCHEDULER TOKEN, not a provider class, and emitting
-        # `machinery:OSError` as `error_class` put a value outside `contract.PROVIDER_CLASSES` into
-        # provider telemetry. Our own defect IS the canonical `error`; the token stays in the reason.
+        # `res.stop_cause` is a SCHEDULER TOKEN, not a provider class: our own defect is the canonical
+        # `error` and the token stays in the reason.
         if res.stop_cause:
             parts.append(f"stopped: {res.stop_cause}")
         why = "; ".join(parts)
-        # A GAP DOMINATES a limit — and the limit is not destroyed by that: it keeps its own coverage
-        # measures (`shodan_pivots_limited` / `shodan_results_limited`, already emitted by `report()`
-        # above) and is named here too. Passing `limited=True` beside a non-limit class would be a claim
-        # nothing can observe: both `_partial_status` and `_partial_coverage_kind` let the gap win, so
-        # the flag would change no status, no kind and no verdict.
+        # a gap dominates a limit; the limit survives in its own coverage measures and is named here.
+        # `limited=True` beside a non-limit class changes no status, kind or verdict.
         if limit_classes:
             why += f"; {sum(limit_classes.values())} page(s) provider-limited {dict(limit_classes)}"
         if not hits and not evidence:
@@ -1286,35 +1078,32 @@ def _shodan_result(spec, values, work):
                                   RuntimeError(f"shodan: page state machinery failed — {why}"))
         return ProviderResult(hits, partial=True, partial_kind="degraded", error_class=PROVIDER_ERROR,
                               partial_reason=f"evidence KEPT; page state machinery failed — {why}")
-    # The scheduler already models the whole remainder; the terminal must read ALL of it (`left` above).
     if left and not errored:
         stop = res.stop_cause or ""
-        # OUR OWN machinery is handled ABOVE, whether or not a remainder is left (`_internal_stop`).
+        # OUR OWN machinery is handled above, whether or not a remainder is left (`_internal_stop`)
         cls = stop.split(":", 1)[1] if stop.startswith("provider_limit:") else None
         if stop.startswith("provider_stop:"):
-            # review-B1.5r5#1: another lane's FAILURE ended purchasing. This lane is incomplete for a
-            # real reason, and that reason is a gap — reporting it as a bare PARTIAL with no class said
-            # "something is missing" while withholding the one fact that explains it.
+            # another lane's FAILURE ended purchasing: this lane is incomplete for a real reason, and
+            # that reason is a gap that must be named rather than left as a classless PARTIAL
             return ProviderResult(hits, partial=True, partial_kind="degraded",
                                   error_class=stop.split(":", 1)[1],
                                   partial_reason=f"{len(o.unqueried)} pivot(s) never queried, "
                                                  f"{o.pages_left_known} page(s) unbought — {stop}")
         if stop == "budget_provider" and not cls:
             cls = _STOP_CLASS.get(SHODAN_PROVIDER_EXHAUSTED)
-        # review-B1.4r4#3: an OPERATOR boundary is a LIMIT, not a degraded execution and not the
-        # provider's fault. It carries no provider class, so it says `limited` in its own right.
+        # an OPERATOR boundary is a LIMIT, not a degraded execution and not the provider's fault: it
+        # carries no provider class, so it says `limited` in its own right
         operator = stop == "budget_reserve" or (not stop and bal.stop_kind in _OPERATOR_STOPS)
         why = (f"{len(o.unqueried)} pivot(s) never queried, {o.pages_left_known} page(s) unbought — "
                f"{stop or bal.reason or 'credit budget exhausted'}")
         if bal.read_error:
-            # the balance read ALSO failed: keep both facts (an `unknown_with_reserve` stop is our
-            # caution, and the read error is still a gap in its own coverage measure).
+            # the balance read ALSO failed; both facts are kept
             why += f"; balance read failed ({bal.read_error})"
         return ProviderResult(hits, partial=True, partial_kind="degraded", error_class=cls,
                               limited=operator, partial_reason=why)
     if errored:
-        # review#2: pick the dominant class from REAL failures when there are any, so a single transport
-        # error is never relabelled as a provider limit (nor the reverse).
+        # the dominant class comes from REAL failures when there are any, so a single transport error is
+        # never relabelled as a provider limit (nor the reverse)
         pool = fail_classes or limit_classes
         dominant = max(pool.items(), key=lambda kv: (kv[1], kv[0]))[0]
         limited = sum(limit_classes.values())
@@ -1329,9 +1118,8 @@ def _shodan_result(spec, values, work):
 def _shodan_pivot(ctx, key, values, facet, source, sid, note):
     """ONE lane through the shared path: collect, spend, produce that lane's result.
 
-    Production calls `_shodan_pivots`, which hands the coordinator EVERY lane at once so credits are
-    ordered fairly across them. This is the same two functions with a single lane — a seam for driving
-    one lane directly, not a second implementation."""
+    A seam for driving a single lane directly, not a second implementation — production calls
+    `_shodan_pivots`, which hands the coordinator every lane at once."""
     spec = _LaneSpec(sid, facet, source, "", "", note)
     vals = sorted({str(v) for v in values if v})
     return _shodan_result(spec, vals, _shodan_work(ctx, key, [(spec, vals)]))
@@ -1340,14 +1128,9 @@ def _shodan_pivot(ctx, key, values, facet, source, sid, note):
 def _shodan_pivots(ctx) -> None:
     """Every Shodan search pivot: collect ALL lanes' values first, then spend one budget across them.
 
-    review-B1.4r2#2: pivot values are NEVER sliced. A first-N cap picked WHICH pivots to query by store
-    order — silent, non-deterministic breadth loss — and reporting it as a gap made it honest without
-    making it right. Throughput is bounded by the credit balance and the page policy; MEMBERSHIP is not
-    bounded at all.
-
-    review-B1.4r3#1/#4: every lane is STARTED before a single credit is spent, and every lane gets a
-    terminal even when it cannot run. A silent early return left the previous run's terminal and coverage
-    generation standing as though they were current."""
+    Pivot values are never sliced — throughput is bounded by the credit balance and the page policy;
+    MEMBERSHIP is not bounded at all. Every lane is started before a single credit is spent and gets a
+    terminal even when it cannot run, so no previous run's coverage generation stands as current."""
     key = secrets.shodan()
     lanes = [(spec, sorted({str(r.get(spec.field)) for r in ctx.run.read(spec.entity)
                             if r.get(spec.field)}))
@@ -1371,20 +1154,16 @@ def _shodan_pivots(ctx) -> None:
 
     entries = []
     for spec, values in lanes:
-        # review-r3#5: a stable work_unit from the bounded inputs + effective config — the C07/C10
-        # resume key. review-r4#4 + r5#5: the credential fingerprint scopes it to the ACCOUNT.
+        # the resume key: bounded inputs + effective config, scoped to the ACCOUNT by credential
+        # fingerprint
         wu = events.work_unit(spec.sid, inputs={"values": values},
                               config={"facet": spec.facet,
-                                      # the SAME effective ceiling the lane will run under: reading it
-                                      # differently here would key the resume state to a bound that
-                                      # never applied (a configured `0` keyed as 1 page).
-                                      # the SAME effective ceiling the lane runs under, and whether the
-                                      # knob was usable: a run that refused to spend on a broken bound
-                                      # must not share a resume key with one that spent under a clean 0.
+                                      # the effective ceiling the lane ran under, plus whether the knob was
+                                      # usable: a broken-bound refusal must not share a clean-0 spend's key
                                       "max_pages": _page_ceiling(settings.raw("SHODAN_MAX_PAGES", None)),
-                                      "oos_cap": 0,        # B1.5b: no cap; kept in the key so a
-                                                           # resumed unit from a CAPPED generation is
-                                                           # not mistaken for a complete one
+                                      "oos_cap": 0,        # no cap; kept in the key so a unit resumed
+                                                           # from a CAPPED generation is not mistaken
+                                                           # for a complete one
                                       "cred_fp": secrets.fingerprint(key) if key else None})
         entries.append((spec.sid, wu, lambda s=spec, v=values: finalize(s, v)))
     results = contract.run_providers(entries, collect)
@@ -1396,9 +1175,8 @@ def _shodan_pivots(ctx) -> None:
 
 
 def _vhost_wordlist():
-    """Locate a DEDICATED vhost wordlist (small, label-per-line). We deliberately do NOT fall back to
-    the big DNS brute list — vhost fuzzing is IPs×apexes×words, so an unbounded list is a footgun.
-    None → the step records a skip (opt-in by dropping a list at one of these paths)."""
+    """Locate a DEDICATED vhost wordlist (small, label-per-line), or None → the step records a skip.
+    There is no fallback to the big DNS brute list: vhost fuzzing is IPs x apexes x words."""
     from pathlib import Path
     home = Path.home()
     for p in (home / ".config/quarry/wordlists/vhost.txt",     # canonical (clean layout)
@@ -1415,11 +1193,9 @@ _VHOST_SCHEMA = 2        # v2: typed status + canonical-host + wordlist-membersh
 def _vhost_unknown_lifecycle(ctx, why) -> None:
     """Emit an UNKNOWN-coverage generation for the vhost lane, then record the skip.
 
-    review#1 (vhost r5): distinct from _vhost_zero_lifecycle. A missing ffuf binary or a missing wordlist is
-    not "zero eligible input" — we could not LOOK at the input at all, so a clean 0/0 would assert there was
-    nothing to find. COVERAGE_UNKNOWN carries no counters, forces coverage_valid=False and reaches the verdict
-    as a gap. Both exits previously returned without opening any generation, so a PRIOR run's vhost counters
-    stayed current after the tool or wordlist went away."""
+    For the case where we could not LOOK at the input at all (no ffuf, no wordlist), as distinct from
+    `_vhost_zero_lifecycle`'s zero eligible input. COVERAGE_UNKNOWN carries no counters, forces
+    coverage_valid=False and reaches the verdict as a gap."""
     for m in ("base_services", "base_services_scanned", "state_persisted"):
         events.coverage_partial("probe.ffuf_vhost", kind=events.COVERAGE_UNKNOWN, measure=m, unit=m,
                                 reason=why)
@@ -1429,10 +1205,8 @@ def _vhost_unknown_lifecycle(ctx, why) -> None:
 def _vhost_zero_lifecycle(ctx, why, *, excluded=0, invalid=0) -> None:
     """Emit a COMPLETE zero-valued lifecycle for the vhost lane, then record the skip.
 
-    review#1 (vhost r4): both early returns used to leave a PRIOR run's `base_services`,
-    `base_services_scanned`, `result_rows` and persistence state standing as current — so after a scope or
-    live-service change that leaves nothing eligible, the operator still saw the old numbers. Every exit path
-    now goes through here, which is the same emit-every-lifecycle rule the sourcemap ledger taught us."""
+    Every early exit goes through here, so a scope or live-service change that leaves nothing eligible
+    cannot leave a prior run's counters standing as current."""
     events.ledger("probe.ffuf_vhost",
                   consumed={"wordlist_submitted": 0, "wordlist_oos_excluded": excluded,
                             "wordlist_invalid": invalid})
@@ -1445,26 +1219,20 @@ def _vhost_zero_lifecycle(ctx, why, *, excluded=0, invalid=0) -> None:
 def _vhost_effective_wordlist(ctx, wl, apex, scope):
     """Build the per-apex wordlist containing ONLY candidates we are allowed to CONTACT.
 
-    review#1 (vhost r1): ffuf sends every word as `Host: FUZZ.<apex>`, so an OOS name was ACTIVELY PROBED and
-    only filtered after the response came back. Post-filtering cannot un-send a request to an explicitly
-    excluded host. The boundary Lumpy set is: observe and mine OOS evidence, never actively expand against
-    OOS — so the exclusion has to happen BEFORE the request, in the wordlist itself.
+    ffuf sends every word as `Host: FUZZ.<apex>`, so the OOS exclusion happens here, in the wordlist,
+    before the request — post-filtering cannot un-send it.
 
-    Returns (path, digest, submitted_set, eligible_n, excluded_n, invalid_n). The digest binds this EFFECTIVE
-    file into the work unit and ledger generation, so a scope change re-scans instead of resuming a narrower
-    sweep."""
+    Returns (path, digest, submitted_set, eligible_n, excluded_n, invalid_n). The digest binds this
+    effective file into the work unit and ledger generation, so a scope change re-scans instead of
+    resuming a narrower sweep."""
     words, excluded, invalid = [], 0, 0
     seen = set()
     for raw in wl.read_text(errors="replace").splitlines():
         w = raw.strip().lower().strip(".")
         if not w or w.startswith("#"):
             continue
-        # review#1 (vhost r2): CANONICALIZE AND VALIDATE HERE. Validating after the response meant `../admin`,
-        # `a/b`, bad labels and Unicode had already been sent in a Host header. The submitted file must
-        # contain only names we are willing to contact.
-        # review#2 (vhost r3): via the SHARED canonicalizer, so this lane uses the same IDNA2008/UTS-46
-        # non-transitional policy as scope canonicalization. The builtin codec maps `faß` -> `fass`, a
-        # DIFFERENT domain, which would mean actively contacting a name the operator never scoped.
+        # canonicalized and validated here through the shared canonicalizer, so the submitted file holds
+        # only names we will contact under the same IDNA2008/UTS-46 policy as scope
         host = normalize.canon_host_strict(f"{w}.{apex}")
         if host is None or not host.endswith("." + apex):
             invalid += 1                                 # never contactable: malformed / not under this apex
@@ -1483,11 +1251,10 @@ def _vhost_effective_wordlist(ctx, wl, apex, scope):
 
 
 def _vhost_row(row, submitted, apex, scope) -> bool:
-    """A usable vhost row — validated, not merely present (review#3 vhost r1).
+    """A usable vhost row — validated, not merely present.
 
-    Requires a real integer HTTP status (bool excluded: it is an int subclass), a FUZZ value that BELONGS to
-    the wordlist we actually submitted (so a fabricated or mangled row cannot invent a candidate), and a
-    canonical in-scope final hostname (`../admin` and friends never become a host)."""
+    Requires a real integer HTTP status (`bool` excluded), a FUZZ value belonging to the wordlist we
+    submitted, and a canonical in-scope final hostname."""
     st = row.get("status")
     if not isinstance(st, int) or isinstance(st, bool) or not (100 <= st <= 599):
         return False
@@ -1519,11 +1286,12 @@ def _vhost_status(out, submitted, apex, scope) -> tuple:
 
 def _vhost_ingest(ctx, scope, known, base, addrs, apex, unit_id, artifacts, current, seen_hosts,
                   launched, submitted) -> int:
-    """Ingest EVERY retained artifact for one BASE SERVICE x apex, then report coverage for the CURRENT one.
+    """Ingest EVERY retained artifact for one BASE SERVICE x apex, then report coverage for the CURRENT
+    one.
 
-    Mirrors the cleared content lane: history is PROVENANCE only (so a dirty old artifact cannot keep the
-    coverage gap open forever), coverage is emitted AFTER consumption, and candidate identities are counted
-    UNIQUELY per lifecycle so replay cannot inflate them."""
+    History is PROVENANCE only, so a dirty old artifact cannot keep the coverage gap open forever;
+    coverage is emitted after consumption, and candidate identities are counted uniquely per lifecycle
+    so replay cannot inflate them."""
     added = 0
     try:
         for out in artifacts:
@@ -1537,10 +1305,8 @@ def _vhost_ingest(ctx, scope, known, base, addrs, apex, unit_id, artifacts, curr
                 # a vhost that's ALREADY a known subdomain isn't the signal — the value is DNS-INVISIBLE names
                 if host in known:
                     continue
-                # review#2 (vhost r2): the identity is the BASE SERVICE that served it. Keying on a
-                # hostname-as-"origin" wrote a host into the `ip` field, collapsed http://h:80 and
-                # https://h:443 into one identity (so two distinct observations merged and could conflict on
-                # status), and the note claimed an "origin" served it. `addrs` stays as CONTEXT only.
+                # the identity is the BASE SERVICE that served it — it carries scheme and port, so
+                # http://h:80 and https://h:443 stay distinct observations. `addrs` is CONTEXT only.
                 if ctx.run.add("review", {"id": f"vhost:{base}:{host}", "klass": "vhost",
                                           "value": host, "host": host, "base": base,
                                           "a": list(addrs) or None,
@@ -1584,18 +1350,9 @@ def _vhost_ingest(ctx, scope, known, base, addrs, apex, unit_id, artifacts, curr
 
 
 def _vhost_scan(ctx, base, apex, out, wl, wl_digest, mc, ffuf_to, prof):
-    """One ffuf vhost sweep for one BASE SERVICE x apex, under the contract. Extracted FIRST, as a
-    standalone no-behaviour-change step, because the enclosing function is a 120-line doubly-nested
-    loop and patching it in place is what broke it twice."""
-    # -mc = "served/exists" (2xx/3xx/401/403), NOT `all`: a 404/5xx means the server does NOT
-    # serve that Host, so it isn't a vhost. -ac drops the catch-all baseline. NO -r: a redirecting
-    # vhost is matched on its 3xx (in -mc) and -ac folds a uniform catch-all by size regardless —
-    # so we never follow a Location to another (possibly off-scope) host.
-    # -maxtime: ffuf GRACEFULLY stops the run at the ceiling (writing its partial -o), so a
-    # slow/calibration-stuck service yields real partial results instead of a hard SIGKILL that
-    # loses the buffered artifact. exec_tool's timeout is now the hard BACKSTOP (ceiling + margin).
-    # -noninteractive: no interactive keybinding console (batch hygiene). -ach not needed — one
-    # base service per ffuf call, so -ac already calibrates per-service. (T2.2)
+    """One ffuf vhost sweep for one BASE SERVICE x apex, under the contract."""
+    # -mc = "served/exists" (2xx/3xx/401/403), not `all`; -ac drops the catch-all; no -r, so a redirecting
+    # vhost matches on its 3xx. -maxtime: ffuf stops gracefully, exec_tool's timeout is the backstop.
     cmd = ["ffuf", "-w", f"{wl}:FUZZ", "-H", f"Host: FUZZ.{apex}",
            "-u", f"{base}/", "-ac", "-timeout", "7", "-noninteractive",
            "-t", str(settings.workers("ffuf", 40)), "-s",
@@ -1605,11 +1362,9 @@ def _vhost_scan(ctx, base, apex, out, wl, wl_digest, mc, ffuf_to, prof):
         cmd += ["-maxtime", str(ffuf_to)]
     if prof.http_rl:
         cmd += ["-rate", str(prof.http_rl)]
-    hard = ffuf_to + 60 if ffuf_to else 0        # backstop when bounded; stays UNBOUNDED (0) when ffuf_to==0
-    # C07 inc3: per-base×apex work_unit binds the semantic inputs + coverage-affecting config (match codes,
-    # effective wordlist) + that wordlist's digest, so a completed unit is re-run on any change.
-    # the unit is BASE SERVICE x apex. The base is what the scan actually CONNECTS through — scheme, host and
-    # port — so it IS the identity; a different representative for the same address set is a different unit.
+    hard = ffuf_to + 60 if ffuf_to else 0        # backstop when bounded; stays unbounded when ffuf_to==0
+    # the unit is base-service x apex — the base is what the scan connects through, so it is the
+    # identity; match codes and the effective-wordlist digest ride along to force a re-run on change
     wu = events.work_unit("probe.ffuf_vhost", inputs={"base": base, "apex": apex},
                           config={"mc": mc, "wordlist": wl.name},
                           file_digests={"wordlist": wl_digest}, schema_version=_VHOST_SCHEMA)
@@ -1620,24 +1375,17 @@ def _vhost_scan(ctx, base, apex, out, wl, wl_digest, mc, ffuf_to, prof):
 
 
 def _vhost_enum(ctx) -> None:
-    """Virtual-host enumeration (ffuf `-H 'Host: FUZZ.<apex>'`): a web server frequently serves name-based
-    vhosts that DON'T resolve in public DNS (staging/internal/legacy/pre-prod). We fuzz the Host header
-    against every non-CDN active-allowed live BASE SERVICE — NOT `http://<ip>/`. A bare-IP request
-    fails on HTTPS/redirecting origins: Caddy/CDN answers port 80 with a uniform redirect that `-ac`
-    folds to nothing, and a bare-IP TLS handshake fails SNI. Connecting via a real live host (valid
-    scheme + SNI + cert) still reaches the same server, and the overridden Host header surfaces the
-    DNS-invisible vhosts. `-ac` drops the catch-all so a distinct response stands out. Hits are `vhost`
-    review candidates (a 200 isn't proof the name resolves/is owned — human verifies). Active; needs
-    ffuf + a vhost wordlist. Membership is base services (that is what ffuf connects through); the address
-    set only RANKS them, so one co-hosted representative is fuzzed first and the rest follow — never dropped.
+    """Virtual-host enumeration (ffuf `-H 'Host: FUZZ.<apex>'`) over every non-CDN active-allowed live
+    BASE SERVICE. Active; needs ffuf + a vhost wordlist.
 
-    Only DNS-INVISIBLE hits are surfaced — a vhost that's already a known subdomain is dropped (the
-    signal is names that DON'T resolve). Base URL is chosen HTTPS-first + subdomain-first (the apex is
-    often a separate static site). Matching is the "served/exists" set (2xx/3xx/401/403) + `-ac` (drops
-    the catch-all baseline) — broader than a bare 200/301, but a 404/5xx means the Host isn't served so
-    it's excluded. Redirects are NOT followed (no `-r`): a vhost that 30x's is already a hit via `-mc`
-    (3xx matched) and `-ac` folds a uniform catch-all by response SIZE whether or not we follow — so we
-    classify on the 3xx itself and never chase a Location cross-host / off-scope."""
+    The Host header is fuzzed against a real live host, not `http://<ip>/`: a bare-IP request fails SNI
+    on HTTPS origins and folds to nothing against a uniform port-80 redirect. Membership is base
+    services (what ffuf connects through); the address set only RANKS them, so one co-hosted
+    representative is fuzzed first and the rest follow, never dropped. Base URL is chosen HTTPS-first +
+    subdomain-first, the apex often being a separate static site.
+
+    Hits are `vhost` review candidates — a 200 is not proof the name resolves or is owned. Only
+    DNS-invisible hits are surfaced; a vhost that is already a known subdomain is dropped."""
     if not have("ffuf"):
         _vhost_unknown_lifecycle(ctx, "ffuf not installed — vhost coverage UNMEASURED")
         return
@@ -1647,19 +1395,11 @@ def _vhost_enum(ctx) -> None:
                                       "— vhost coverage UNMEASURED")
         return
     scope, prof = ctx.scope, ctx.profile
-    # EVERY non-CDN active-allowed base service is a unit; the score only RANKS them. Prefer HTTPS (valid
-    # SNI, no port-80 redirect dance) and a SUBDOMAIN host — the bare apex is often a SEPARATE static site,
-    # not the vhost-routing app, so fuzzing it first would miss the app's vhosts. score = https(2) + sub(1).
+    # every non-CDN active-allowed base service is a unit; the score only ranks them, preferring HTTPS
+    # and a subdomain host (the bare apex is often a separate static site, not the vhost-routing app)
     apexset = {a.lower() for a in prof.apex_domains}
-    # review#2 (vhost r1): "origin coverage" was FICTIONAL. Keeping only `a[0]` collapsed 74 distinct A-record
-    # origins to 47 keys on the OTC data, silently dropping 27 before any budget — and ffuf connects to
-    # `base`, a HOSTNAME, so it never routed through the origin key at all; DNS decided which address
-    # answered. ffuf 2.1.0-dev offers `-sni` (static) but NO address-pinning flag, so honestly scanning a
-    # chosen A record is not achievable with this tool. So membership is what we ACTUALLY scan: BASE SERVICES.
-    #
-    # The ADDRESS SET survives as a RANK ONLY: one representative per co-hosted set is fuzzed first, then
-    # the rest. A bounded run therefore gets full origin spread before it spends time on likely-redundant
-    # co-hosted names — and nothing is excluded.
+    # membership is what we actually scan: base services (ffuf connects to a hostname and has no
+    # address-pinning flag). The address set survives as a rank only, so nothing is excluded.
     bases: list = []
     for l in ctx.run.read("live"):
         if l.get("cdn"):
@@ -1689,18 +1429,16 @@ def _vhost_enum(ctx) -> None:
     known = set(ctx.run.values("subdomain")) | set(ctx.run.values("resolved"))
     apexes = [a for a in prof.apex_domains if scope.in_scope(a)]
     found = 0
-    # per-call ceiling scaled by wordlist size (each ffuf fuzzes one base-service x apex over the list);
-    # the flat 1800s cut a big-wordlist run. Higher -t (I/O-bound concurrency) makes each call faster.
-    # review#1 (vhost r1): one EFFECTIVE wordlist per apex, containing only names we may CONTACT. Built here
-    # so the exclusion happens before any request, and digested into the resume identity.
+    # per-call ceiling scaled by wordlist size, since a flat 1800s cut a big-wordlist run. One effective
+    # wordlist per apex, holding only names we may contact, digested into the resume identity.
     eff: dict = {}
     excluded_total = invalid_total = 0
     for apex in apexes:
         path, digest, submitted, n_ok, n_ex, n_bad = _vhost_effective_wordlist(ctx, wl, apex, scope)
         excluded_total += n_ex
         invalid_total += n_bad
-        # review#5 (vhost r2): an apex whose every candidate is OOS or malformed has NOTHING contactable.
-        # Building units for it produced repeated ffuf failures against an empty file; skip it cleanly.
+                # an apex whose every candidate is OOS or malformed has nothing contactable;
+                # building units for it just fails ffuf against an empty file, so skip it cleanly
         if n_ok == 0:
             ctx.run.record("probe", skipped("ffuf-vhost", f"{apex}: no contactable vhost candidate "
                                                           f"({n_ex} out of scope, {n_bad} malformed)"))
@@ -1714,9 +1452,8 @@ def _vhost_enum(ctx) -> None:
         _vhost_zero_lifecycle(ctx, "no contactable vhost candidate for any apex (scope policy)",
                               excluded=excluded_total, invalid=invalid_total)
         return
-    # review#4 (vhost r2): NOT a coverage measure. COVERAGE_SAMPLE means an operator-chosen subset of
-    # otherwise-eligible input and yields complete_with_limits — but an OOS or malformed candidate was never
-    # eligible ACTIVE input at all, so calling it "omitted" would invent a shortfall. It is policy context.
+    # not a coverage measure: COVERAGE_SAMPLE is an operator-chosen subset of eligible input, but an OOS
+    # or malformed candidate was never eligible active input, so calling it "omitted" invents a shortfall
     events.ledger("probe.ffuf_vhost",
                   consumed={"wordlist_submitted": sum(e["n"] for e in eff.values()),
                             "wordlist_oos_excluded": excluded_total,
@@ -1724,7 +1461,7 @@ def _vhost_enum(ctx) -> None:
     wl_n = max([e["n"] for e in eff.values()] or [0])
     ffuf_to = scaled_timeout(wl_n, ctx.http_timeout, per_unit=0.4)
     wl_digest = events.file_digest(wl)                       # provenance: the SOURCE list this run derived from
-    # EXECUTION completion and ARTIFACT usability are separate counters (content review#4).
+        # execution completion and artifact usability are separate counters
     ffuf_clean = ffuf_partial = ffuf_blocked = ffuf_errors = ffuf_total = 0
     ffuf_resumed = ffuf_unusable = 0
     _mc = "200-299,301,302,303,307,308,401,403"
@@ -1741,9 +1478,8 @@ def _vhost_enum(ctx) -> None:
     vh_budget = budget.Budget(budget.budget_seconds("VHOST_BUDGET_S"))
     cfg_dir = sbase / "ffuf-vhost" / cfg_fp[:16]
     attempt_dir = fresh_artifact_dir(cfg_dir)
-    # One unit = BASE SERVICE x apex. The base carries scheme + host + port, which is exactly what ffuf
-    # connects through, so it IS the identity. The ADDRESS SET only ranks the order (co-hosted
-    # representative first), never membership.
+    # one unit = base-service x apex — the base carries scheme + host + port, exactly what ffuf connects
+    # through, so it is the identity; the address set only ranks the order, never membership
     units = [(b, a) for b in bases for a in apexes]
     # rank: co-hosted representatives first (tier 0), then by descending service score. ORDER only.
     ordered = budget.order_ranked_fair(units, rank=lambda u: (u[0]["tier"], -u[0]["score"]),
@@ -1813,7 +1549,7 @@ def _vhost_enum(ctx) -> None:
                             omitted=0 if persisted else 1,
                             reason=("completion state persisted" if persisted else
                                     "completion state could not be persisted; a resume will redo this lane"))
-    # measure = BASE SERVICES, not "origins": that is what we actually scan (review#2 vhost r1).
+        # measure = base services, not "origins": that is what we actually scan
     budget.report_selection("probe.ffuf_vhost", measure="base_services", eligible=len(units),
                             attempted=attempted, budget=vh_budget, noun="service x apex", durable=persisted)
     budget.report_outcome("probe.ffuf_vhost", measure="base_services_scanned", attempted=attempted,
@@ -1832,16 +1568,16 @@ def _vhost_enum(ctx) -> None:
 
 
 def _httpx_probe_cmd(hosts_file, ports, http_rl) -> list[str]:
-    """The shared httpx fingerprint command (v0.3.4 discipline: NO -probe-all-ips / -no-fallback
-    multipliers, bounded -timeout/-retries; rich response-derived flags kept — they cost only on hosts
-    that answer). Used by the bulk probe, every prefilter port-group, the direct fallback, and enrich."""
+    """The shared httpx fingerprint command: no -probe-all-ips / -no-fallback multipliers, bounded
+    -timeout/-retries, rich response-derived flags kept. Used by the bulk probe, every prefilter port-group,
+    the direct fallback, and enrich.
+    """
     cmd = ["httpx", "-l", str(hosts_file), "-json", "-silent",
            "-ports", ",".join(str(p) for p in ports),
            "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
            "-asn", "-location", "-ip", "-cname", "-irh",
-           # -follow-host-redirects (NOT -follow-redirects): follow only SAME-HOST 30x (http->https on the
-           # same host), never cross-host/off-scope — an in-scope host that 30x's off-scope is not fetched.
-           # `-location` still records the Location for cross-host redirects (intel without following).
+           # -follow-host-redirects, not -follow-redirects: follow only same-host 30x. `-location`
+           # still records the Location for cross-host redirects (intel without following).
            "-follow-host-redirects", "-random-agent", "-timeout", "7", "-retries", "0",
            # never connect to the SCAN BOX itself / cloud metadata (small deny; private targets are contacted)
            "-deny", netguard.self_deny_list(),
@@ -1859,10 +1595,8 @@ def _run_httpx(ctx, hosts, ports, phase, tag):
     hx = ctx.run.raw_path(phase, "httpx", f"{tag}.jsonl")
     cmd = _httpx_probe_cmd(hf, ports, ctx.profile.http_rl)
     to = scaled_timeout(len(hosts), ctx.http_timeout, per_unit=max(6, len(ports) // 12))
-    # C07 inc3: this httpx GROUP's work_unit = its exact host set + port set (a resumable unit); a changed
-    # group (different hosts/ports) is a different unit. source_id is phase-scoped (probe/enrich .httpx).
-    # review#10: fold the EFFECTIVE probe config (rate + a flag-profile marker) so a probe-flag/rate change
-    # invalidates the unit — not just the host/port set. Bump "flags" when _httpx_probe_cmd's flags change.
+    # this httpx group's work_unit = its exact host set + port set. The effective probe config folds in,
+    # so a flag/rate change invalidates the unit, not just the host/port set.
     wu = events.work_unit(f"{phase}.httpx", inputs={"hosts": sorted(set(hosts)), "ports": sorted(ports)},
                           config={"flags": "v0.3.4-probe", "rl": ctx.profile.http_rl})
     r = run_contract(f"{phase}.httpx", cmd, work_unit=wu, raw_path=hx, timeout=to)
@@ -1988,22 +1722,10 @@ def _nmap_services(path):
     return out, complete
 
 
-# ── B1.7: probe.shodan_host — the FREE per-IP passive record lane ─────────────────────────────────────
-# `/shodan/host/{ip}` costs no query credit (MEASURED 2026-07-30 at a zero balance, delta 0), so this lane
-# is deliberately OUTSIDE the favicon/cert credit coordinator: an exhausted account, an operator reserve
-# and a withheld page budget are all facts about spending, and none of them may stop work no credit pays
-# for. What it shares with the paid lanes is everything that is not about money — ledger ownership, the
-# digest-bound artifact handshake, the provider taxonomy, and the machinery boundary from B1.7a.
-#
-# ENTITY CHOICES ARE ROE DECISIONS, not conveniences (agreed for B1.7):
-#   ports     -> `port`, with PASSIVE provenance in list-valued fields. Never "confirmed open": this is
-#                Shodan's memory of a scan IT ran, at a time IT chose, and a later naabu/nmap observation
-#                must be able to coexist with it rather than fight a first-write scalar.
-#   hostnames -> `review`. NOT `resolved`/`subdomain`: those are consumed by active lanes
-#                (`filter_hosts(active=True)` feeds httpx and everything downstream), and a name in a
-#                Shodan record is not proof that DNS resolves it today.
-#   vulns     -> `review`, class `shodan-vuln`, explicitly UNVERIFIED. `finding` drives the confirmed
-#                counters and the notify summary; banner-inferred CVEs are version guesses, not findings.
+# ── probe.shodan_host — the free per-IP passive record lane ──
+
+# `/shodan/host/{ip}` costs no query credit, so this lane sits outside the credit coordinator. Entity
+# choices are rules of engagement: docs/design/SHODAN-HOST-DESIGN.md.
 _SHODAN_HOST_SID = "probe.shodan_host"
 
 
@@ -2016,19 +1738,13 @@ def _shodan_host_get(url: str, timeout: int):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            # review-B1.7r9#1: the STATUS travels with the body. The no-data contract is `404 + wording` and
-            # the record contract is `200 + shape`; assuming 200 for anything that did not raise would have
-            # let a 201 be stored as the measured answer.
+            # the status travels with the body: the no-data contract is `404 + wording` and the
+            # record contract `200 + shape`, so assuming 200 would store a 201 as the answer
             return r.read(), int(getattr(r, "status", 0) or getattr(r, "code", 0) or 0), None
     except Exception as e:                                   # noqa: BLE001 - classified, never swallowed
         capture_error_body(e, provider="shodan")             # keeps `body_bytes` for the 404 contract
-        # review-B1.7r7#2: assigning `error_class` ONTO the exception can raise — a `__slots__` class or an
-        # overridden `__setattr__` — from a function whose contract is "never raises". The carrier holds the
-        # class instead, and forwards everything a consumer of this error reads:
-        #   code + body_bytes  the measured 404 no-data contract
-        #   headers            review-B1.7r8#4: `_ProviderCooldown.note()` reads `err.headers` for
-        #                      `Retry-After`. Dropping it made every real 429 fall back to a flat 5s and
-        #                      silently discard the pacing the provider actually asked for.
+        # the carrier holds `error_class` instead of assigning it onto the exception (which can raise), and
+        # forwards everything a consumer reads — code, body_bytes, and headers (`Retry-After` for pacing)
         err = ShodanPageError(getattr(e, "error_class", None) or provider_error_class(e), e)
         err.code = getattr(e, "code", 0) or 0
         err.body_bytes = getattr(e, "body_bytes", b"") or b""
@@ -2037,12 +1753,10 @@ def _shodan_host_get(url: str, timeout: int):
 
 
 def _shodan_host_ingest(ctx, target, rec, art, wrote) -> None:
-    """Write one address's passive record, reporting each entity as it is stored.
-
-    review-B1.7r7#4: the store keys a `port` on `ip:port`, so 53/tcp and 53/udp are ONE row — and writing
-    them as two adds meant the second was dropped and its `tls`/`observed_at` lost, leaving the row saying
-    `tls=False` about a service that had TLS. The observations for one port are merged into a single row
-    that keeps ALL of them, so nothing depends on which banner arrived first."""
+    """Write one address's passive record, reporting each entity as it is stored. The store keys a `port` on
+    `ip:port`, so 53/tcp and 53/udp are one row: the observations for one port are merged, keeping all of
+    them, so nothing depends on which banner arrived first.
+    """
     ref = str(art)
     hosts = list(target.hosts)
     by_port: dict = {}
@@ -2062,9 +1776,8 @@ def _shodan_host_ingest(ctx, target, rec, art, wrote) -> None:
                              "passive": True,
                              "observed_at": max((g.seen for g in group if g.seen), default=None),
                              "hosts": hosts, "sources": ["shodan-host"], "raw_ref": ref})
-        # review-B1.7r8#2: ONE row, but `len(group)` observations — `_fold` counts what the record SAW
-        # (per (port, transport)), so counting one write per row fabricated an omission on every host with
-        # both 53/tcp and 53/udp.
+        # one row, but `len(group)` observations: `_fold` counts per (port, transport), so one write per row
+        # would fabricate an omission on every host with both 53/tcp and 53/udp
         wrote(shodan_host.WROTE_PORT, len(group))
         wrote(shodan_host.WROTE_PORT_ROW)      # one ROW, however many observations it carries
     for name in rec.hostnames:
@@ -2087,12 +1800,10 @@ def _shodan_host_ingest(ctx, target, rec, art, wrote) -> None:
 
 
 def _shodan_host_class(o):
-    """`(error_class, reason)` for a lane with failures — one PAIR, never a class from one event beside a
-    sentence from another.
-
-    GAPS DOMINATE LIMITS (B1.4r4#3 precedence): a real failure alongside a quota must not report the soft
-    limit, however many times the quota happened. Among classes of the same kind the most frequent wins,
-    ties broken by name so the answer is deterministic."""
+    """`(error_class, reason)` for a lane with failures — one pair, never a class from one event beside a
+    sentence from another. Gaps dominate limits, so a real failure alongside a quota reports the failure;
+    among classes of one kind the most frequent wins, ties broken by name.
+    """
     if not o.fail_classes:
         return None, ""
     real = {c: n for c, n in o.fail_classes.items() if not is_provider_limit(c)}
@@ -2105,9 +1816,8 @@ def _shodan_host_terminal(ctx, o, bound) -> "ProviderResult | set":
     """The lane's terminal, from the outcome's own facts."""
     left = len(o.not_attempted)
     machinery = list(o.machinery)
-    # review-B1.7r8#3: the class the terminal speaks and the sentence it quotes must be about the SAME
-    # event, and GAPS DOMINATE LIMITS — picking the most frequent class let two quota failures outrank one
-    # transport failure and report a soft limit over a real one.
+    # the class the terminal speaks and the sentence it quotes must be one event, and gaps dominate
+    # limits: picking the most frequent class would let two quota failures outrank one transport failure
     cls, gap = _shodan_host_class(o)
     if machinery:
         cls, gap = PROVIDER_ERROR, ""          # our own defect: no provider class describes it
@@ -2117,15 +1827,14 @@ def _shodan_host_terminal(ctx, o, bound) -> "ProviderResult | set":
                           else ""),
                          ("host state was NOT persisted — records will be fetched again"
                           if not o.persisted else "")) if x]
-    # review-B1.7r8#1: a BUDGET stop is an operator bound, not a defect of ours — it belongs to the
-    # selection report below and must not turn the terminal into a machinery gap.
+        # a budget stop is an operator bound, not a defect: it belongs to the selection report below and
+        # must not turn the terminal into a machinery gap
     if o.stop_cause and o.stop_cause != "budget_time":
         parts.append(f"stopped: {o.stop_cause}")
-    # review-B1.7r9#4: a record with parts we could not read was OWNED and reported clean — `incomplete`
-    # and `unusable_parts` lived only in metadata nothing emitted. Malformed evidence is a PARSE gap.
+        # a record with parts we could not read is owned but a parse gap; `incomplete`/`unusable_parts`
+        # are the fact
     if o.publish_failed or not o.records_journaled:
-        # OUR OWN evidence loss. review-B1.7r10#2: a body we could not keep must not finish behind the
-        # provider's boundary — a gap outranks a limit, and this one is ours.
+                # our own evidence loss: a body we could not keep is a gap that outranks a limit
         parts.append("evidence could not be retained")
         if cls is None or is_provider_limit(cls):
             cls, gap = PROVIDER_ERROR, ""
@@ -2153,25 +1862,18 @@ def _shodan_host_terminal(ctx, o, bound) -> "ProviderResult | set":
             "stop_cause": o.stop_cause or None, "requests": o.requests,
             "answered": o.answered, "owned": o.owned, "port_rows": o.port_rows,
             "port_observations": o.ports, "gap_classes": gap_classes,
-            # review-B1.7r10#3: `provider_limit` was hard-coded False, so in a transport-then-quota run the
-            # limit survived only in prose. A FREE lane still has no OPERATOR spend to withhold — that part
-            # is true by construction — but the PROVIDER can absolutely refuse us, and it must be structured.
+            # `provider_limit` is structured, not hard-coded False: a free lane withholds no spend,
+            # but the provider can refuse us, and a transport-then-quota run must keep the limit
             "limit_classes": limit_classes,
             "provider_limit": bool(limit_classes), "operator_limit": False}
-    # review-B1.7r7#5: SELECTION and OUTCOME are different facts with different fixes, and the shared
-    # reporters already encode that — selection loss to a budget is a hard COVERAGE_CAP (never a soft
-    # sample), outcome loss is the lost-in-flight bucket with the provider's own classes. Rolling both into
-    # one COVERAGE_TIMEOUT measure also let a run where EVERY request failed report "all addresses
-    # answered", because nothing was left unreached.
-    # review-B1.7r8#1: `report_selection` says COVERAGE_CAP, which is TRUE for a budget and a lie for
-    # anything else — a five-address run stopped by the first 401 reported that a `0s` budget was
-    # exhausted. Only `budget_time` is a cap; every other stop is a gap that names itself.
+        # selection and outcome are different facts: selection loss to a budget is a hard COVERAGE_CAP,
+        # outcome loss the lost-in-flight bucket. One measure would let an all-failed run read "all answered".
     reached = o.eligible - left
     limit_stop = (o.stop_cause.startswith("provider_stop:")
                   and is_provider_limit(o.stop_cause.split(":", 1)[1]))
     if left and limit_stop:
-        # review-B1.7r9#5: a proven limit is a PROVIDER boundary, not something the target or our own
-        # machinery cost us. Filing it as a timeout made a `complete_with_limits` run read as a gap.
+                # a proven limit is a provider boundary, not the target or our machinery: filing it as a
+                # timeout made a `complete_with_limits` run read as a gap
         events.coverage_partial(
             _SHODAN_HOST_SID, kind=events.COVERAGE_PROVIDER, measure="shodan_host_addresses",
             unit="shodan_host_addresses", eligible=o.eligible, tested=reached, omitted=left,
@@ -2185,22 +1887,17 @@ def _shodan_host_terminal(ctx, o, bound) -> "ProviderResult | set":
                     f"{o.stop_cause or 'unknown stop'}"
                     + ("" if o.persisted else " (state was NOT persisted, so this lane RESTARTS)")))
     else:
-        # review-B1.7r10#1: `durable` is about whether the remainder can actually be PICKED UP. For this
-        # lane that needs BOTH facts: evidence persisted, and the scheduling rotation recorded — a bounded
-        # run that lost its progress restarts from the same prefix, so calling it RESUMABLE is the false
-        # promise this flag exists to prevent.
+        # `durable` is whether the remainder can be picked up: this lane needs both evidence persisted and the
+        # rotation recorded, or a bounded run restarts from the same prefix and "resumable" is a false promise
         budget.report_selection(_SHODAN_HOST_SID, measure="shodan_host_addresses", eligible=o.eligible,
                                 attempted=reached, budget=bound, noun="address",
                                 durable=o.persisted and o.progress_saved)
-    # review-B1.7r10#3: one measure could only carry ONE kind, so a run with both a real failure and a
-    # proven limit had to pick — and the limit vanished into prose. Two measures, two units, two kinds: the
-    # reconciler keeps the latest per (source_id, unit), so distinct units is what makes both survive.
+    # two measures, two units, two kinds: one measure could carry only one kind, so a run with both a
+    # failure and a proven limit lost the limit. The reconciler keeps the latest per (source_id, unit).
     lost_gap = sum(gap_classes.values())
     lost_limit = sum(limit_classes.values())
-    # review-B1.7r11#3: `obtained = attempted - lost_gap` DERIVED an answer count, so a quota-only run
-    # reported "all 1 attempted address obtained" while `answered` was 0 — the request was refused before
-    # any answer existed. A refused request is not an answer OPPORTUNITY either, so it leaves the
-    # denominator as well; `answered` is the only thing that knows what came back.
+    # `answered` is the only count of what came back: `attempted - lost_gap` would report a quota-only run
+    # as "all attempted obtained" though the request was refused before any answer existed
     answer_attempted = max(0, o.attempted - lost_limit)
     budget.report_outcome(_SHODAN_HOST_SID, measure="shodan_host_answers",
                           attempted=answer_attempted, obtained=o.answered,
@@ -2213,17 +1910,14 @@ def _shodan_host_terminal(ctx, o, bound) -> "ProviderResult | set":
                 f"nothing to retry this run" if lost_limit else "no request was refused"))
     budget.report_outcome(_SHODAN_HOST_SID, measure="shodan_host_consumed",
                           attempted=o.ports_seen, obtained=o.ports, noun="observed port")
-    # review-B1.7r9#3: `meta` was built and never emitted. `events.ledger` is the honest home for real
-    # counts (contract.py's own rule), and it carries the facts a consumer would otherwise have to parse
-    # out of prose.
+    # `meta` is emitted via `events.ledger`, the honest home for record counts, carrying facts a consumer
+    # would otherwise parse out of prose
     events.ledger(_SHODAN_HOST_SID, produced={"port": o.port_rows, "review": o.hostnames + o.vulns},
-                  # CONSUMED is what we actually got an answer for and kept — a refused request consumed
-                  # nothing, and an answer whose persistence failed is not ours (review-B1.7r10#5).
+                  # consumed = what we got an answer for and kept; a refused request and an
+                  # unpersisted answer are neither
                   consumed={"address": o.owned + o.replayed}, shodan_host=meta)
-    # review-B1.7r9#4: the parts we could not read are a coverage fact, emitted every run so a later clean
-    # sweep clears it.
-    # review-B1.7r10#6: records and PARTS cannot share a denominator. The unit is RECORDS — how many came
-    # back whole — and the part count belongs in the reason, where it explains rather than counts.
+    # the parts we could not read are a coverage fact, emitted every run so a later sweep clears it.
+    # Records and parts cannot share a denominator: the unit is records, and the part count is in the reason.
     events.coverage_partial(_SHODAN_HOST_SID, kind=events.COVERAGE_TIMEOUT,
                             measure="shodan_host_record_parts", unit="shodan_host_record_parts",
                             eligible=o.records, tested=o.records - o.incomplete, omitted=o.incomplete,
@@ -2241,14 +1935,13 @@ def _shodan_host_terminal(ctx, o, bound) -> "ProviderResult | set":
         return ProviderResult(set(), partial=True, partial_kind="degraded", error_class=cls,
                               produced=produced, partial_reason=f"evidence KEPT; {gap_why}")
     if left:
-        # NB a PROVEN limit never reaches here: `provider_stop:<cls>` is only set after `_count_fail`, so
-        # `gap_why` is always non-empty and the branch above returns first — with the limit's own class,
-        # which `_partial_status` turns into LIMITED. A second limit branch here would be unreachable.
+        # a proven limit never reaches here: `provider_stop:<cls>` is set only after `_count_fail`,
+        # so `gap_why` is non-empty and the branch above returns first. This branch is unreachable.
         return ProviderResult(set(), partial=True, partial_kind="degraded",
                               error_class=None, produced=produced,
                               partial_reason=f"{left} address(es) not reached — {o.stop_cause}")
-    # review-B1.7r9#3: a lane that stored ports and review rows is not EMPTY. `produced` is what it wrote,
-    # and `run_provider` reads status from THAT rather than from a hostname set this lane never fills.
+        # a lane that stored ports and review rows is not empty: `produced` is what it wrote, and
+        # `run_provider` reads status from that, not a hostname set this lane never fills
     return ProviderResult(set(), produced=produced)
 
 
@@ -2266,9 +1959,8 @@ def shodan_host_lane(ctx) -> None:
         cfg_fp = events.work_unit(_SHODAN_HOST_SID, inputs={}, config={},
                                   schema_version=shodan_host.SHODAN_HOST_SCHEMA)
         budget.prune_state(sbase, _SHODAN_HOST_SID, cfg_fp)
-        # RUN-SCOPED by construction: `ctx.run.dir` is this run's own tree. The endpoint is free and its
-        # records are live, so a project-global ledger would replay a stale snapshot of a host forever
-        # rather than asking again for nothing (agreed for B1.7).
+        # run-scoped by construction: the endpoint is free and its records live, so a project-global
+        # ledger would replay a stale snapshot forever rather than asking again for nothing
         ledger = budget.Ledger(budget.state_path(sbase, _SHODAN_HOST_SID, cfg_fp), lane=_SHODAN_HOST_SID)
         attempt_dir = fresh_artifact_dir(sbase / "shodan-host" / cfg_fp[:16])
         cooldown = _ProviderCooldown(key)      # the SAME account boundary as the paid pivot lanes
@@ -2283,14 +1975,11 @@ def shodan_host_lane(ctx) -> None:
                 cooldown.note(err)             # the provider said slow down; every later request honors it
             return raw, code, err
 
-        # review-B1.7r7#1: `settings.concurrency` clamps 0 to 1 — right for a worker pool, catastrophic for
-        # a wall-clock budget, where 0 MEANS unbounded and would have become a one-second run.
-        # `budget.budget_seconds` is the strict coverage-knob parser every other bounded lane uses.
+        # `budget.budget_seconds`, not `settings.concurrency`: the latter clamps 0 to 1, right for a worker
+        # pool but catastrophic for a wall-clock budget where 0 means unbounded
         bound = budget.Budget(budget.budget_seconds("SHODAN_HOST_BUDGET_S"))
-        # review-B1.7r9#2 / r11#2: EVIDENCE is run-scoped (free endpoint, live records); SCHEDULING PROGRESS
-        # is project-level, because `ctx.run.dir` is a fresh directory every run. The session holds the
-        # progress lock across LOAD, SCHEDULE, NOTE and SAVE — locking only the save preserved both runs'
-        # records and still let both pick the same address, because each loaded before either wrote.
+        # evidence is run-scoped, scheduling progress project-level (a fresh run dir every run). The session
+        # holds the progress lock across load/schedule/note/save, or both runs pick the same address.
         try:
             with shodan_host.sweep_session(shodan_host.progress_path(ctx.run.project_dir)) as progress:
                 o = shodan_host.run_hosts(
@@ -2298,17 +1987,13 @@ def shodan_host_lane(ctx) -> None:
                     fetch=fetch,
                     ingest=lambda t, rec, art, wrote: _shodan_host_ingest(ctx, t, rec, art, wrote),
                     ledger=ledger, attempt_dir=attempt_dir, bound=bound, progress=progress,
-                    # review-B1.7r9#5: a PROVEN limit (quota/entitlement, from the provider's own body) means
-                    # every remaining address would be refused identically — asking anyway fans out a known
-                    # answer.
+                    # a proven limit refuses every remaining address identically, so
+                    # asking anyway fans out a known answer
                     should_stop=lambda cls: (cls in ("auth", "forbidden") or is_provider_limit(cls)
                                              or (cls == PROVIDER_RATE_LIMIT and cooldown.hits > 1)))
         except shodan_host.SweepBusy as e:
-            # another run on this project holds the sweep. review-B1.7r12#1: this was a SKIP, which reads as
-            # "did not run and lost nothing" — but EVIDENCE is run-scoped, so this run receives none of the
-            # holder's records; the two runs' eligible sets can differ; and the holder may fail before
-            # covering anything. Whoxy's `LockBusy` precedent applies: it is a GAP, local to this run, with
-            # every eligible address unattempted and no request issued.
+            # another run holds the sweep: a gap local to this run, not a skip — evidence is run-scoped,
+            # so this run gets none of the holder's records and every eligible address is unattempted
             events.coverage_partial(
                 _SHODAN_HOST_SID, kind=events.COVERAGE_TIMEOUT, measure="shodan_host_addresses",
                 unit="shodan_host_addresses", eligible=len(targets), tested=0, omitted=len(targets),
@@ -2316,10 +2001,8 @@ def shodan_host_lane(ctx) -> None:
                         f"sweep ({e}); its evidence belongs to that run, not this one"))
             ctx.echo(f"  shodan-host: contended — {len(targets)} address(es) left to the run holding "
                      f"the sweep")
-            # review-B1.7r13#1: PARTIAL asserts evidence was produced BEFORE degradation. This run produced
-            # nothing and inherited nothing — the holder's records are in the holder's run directory. Whoxy's
-            # `LockBusy` precedent is exact: a FAILED terminal whose coverage gap folds to
-            # `complete_with_gaps`, not a partial that implies we got some of it.
+                        # a FAILED terminal folding to `complete_with_gaps`, not PARTIAL:
+                        # this run produced and inherited nothing
             raise ShodanPageError(PROVIDER_ERROR,
                                   RuntimeError(f"shodan-host: {len(targets)} address(es) not queried — "
                                                f"another run holds this project's sweep ({e})"))
@@ -2380,14 +2063,12 @@ def _smap_records(path):
 
 
 def _smap_ingest(ctx, r, sm, phase, targets):
-    """Shared smap file-output handling for BOTH probe and enrich (enrich previously ran smap but never
-    parsed it — its passive port yield was lost, C12). Parse -oJ, reclassify the run status from the port
-    YIELD via the shared adapter (clean+ports -> SUCCESS, clean+0 -> EMPTY, degraded stays degraded,
-    unreadable/malformed-root -> hard/PARTIAL); a partially-malformed artifact -> PARTIAL while KEEPING the
-    valid records. Attribute each record's ports to the exact submitted `user_hostname` (priority), else our
-    stored resolved ip->host map, else Shodan's hostnames. smap is passive (Shodan-backed, no packets) and
-    CANNOT prove per-target completion (omits a no-data IP the same as a swallowed failure), so
-    returned/eligible is a VISIBILITY note, never forced to PARTIAL. Returns the in-scope port count."""
+    """Shared smap file-output handling for probe and enrich. Parse -oJ, reclassify the run status from the
+    port yield (clean+ports -> SUCCESS, clean+0 -> EMPTY, degraded stays degraded, unreadable -> hard/PARTIAL),
+    attributing each record's ports to the submitted host, else the resolved ip->host map, else Shodan's
+    hostnames. smap is passive and cannot prove per-target completion, so returned/eligible is a visibility
+    note, never forced to PARTIAL. Returns the in-scope port count.
+    """
     records, complete = _smap_records(sm)
     reclassify_from_artifact(r, None if records is None else sum(len(rp) for *_, rp in records), label="smap")
     if records is not None and not complete and r.status in (Status.SUCCESS, Status.EMPTY):
@@ -2428,18 +2109,15 @@ def _smap_ingest(ctx, r, sm, phase, targets):
 
 
 def _web_port_prefilter(ctx, hosts, phase, pubmap):
-    """v0.3.5 SYN web-port prefilter (bbot-style, NOT the infra portscan). `hosts` carry a CONTACTABLE IP
-    (scan-box/metadata self-hits already withheld by netguard; private IS scanned by default). naabu SYN
-    over their contactable IPs × prof.ports (never top-1000/CIDR/nmap) → open ip:ports → mapped back to
-    hosts → {host:[open ports]}. TRI-STATE (T1.1), for honest coverage:
-      - dict of open host:ports  → usable_with_ports (httpx on the open ports)
-      - {} (empty dict)          → usable_empty: CLEAN scan, nothing open. The caller STILL direct-probes
-                                   these hosts (a clean SYN 0-open is never trusted to DROP a host — SYN
-                                   false-negatives from filtering/rate-limit/loss); it is only a recorded
-                                   coverage state, not a reason to skip.
-      - None                     → unusable: truncated/timeout/block/error → full direct fallback, so a
-                                   few ports found mid-failure can't silently thin coverage.
-    Only a CLEAN completion is trusted. Stores web_port evidence + records the coverage state."""
+    """SYN web-port prefilter (bbot-style, not the infra portscan). naabu SYN over each host's contactable IPs x
+    prof.ports (never top-1000/CIDR/nmap) -> open ip:ports mapped back to hosts. Tri-state, for honest
+    coverage:
+    - dict of open host:ports  -> usable_with_ports (httpx on the open ports)
+    - {} empty                 -> usable_empty: a clean scan with nothing open. The caller still
+    direct-probes these (a clean SYN 0-open never drops a host).
+    - None                     -> unusable: truncated/timeout/block/error -> full direct fallback.
+    Only a clean completion is trusted. Stores web_port evidence and records the coverage state.
+    """
     if not have("naabu"):
         return None
     prof = ctx.profile
@@ -2460,10 +2138,8 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
     to = scaled_timeout(len(unique_ips) * len(prof.ports), ctx.http_timeout, per_unit=0.02)
     res = exec_tool("naabu", cmd, timeout=to)
     raw_status = res.status
-    # naabu writes findings to the -o FILE (empty stdout, -json). Parse it FAIL-CLOSED: any malformed row,
-    # non-object, unparseable port, unexpected IP (not one we scanned), or out-of-profile port makes the
-    # WHOLE scan UNUSABLE (full fallback) — narrowing httpx to a subset off a stale/garbled artifact would
-    # silently drop coverage. A missing/empty file is NOT malformed (just no open ports).
+    # naabu writes findings to the -o file. Parse fail-closed: any malformed row or out-of-profile
+    # port makes the whole scan unusable (full fallback). A missing/empty file is not malformed.
     want_ips = set(unique_ips)
     want_ports = set(prof.ports)
     open_by_ip: dict[str, set] = {}
@@ -2495,10 +2171,8 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
                 parse_ok = False; break
             open_by_ip.setdefault(ip, set()).add(port)
     n_open = sum(len(v) for v in open_by_ip.values())
-    # TRI-STATE (T1.1): the state is recorded in RunResult.note (per-source truth). NON-hit outcomes behave
-    # IDENTICALLY for routing — both send their hosts to direct httpx via the caller (a clean SYN 0-open is
-    # NEVER trusted to DROP a host). usable_empty is a normal clean result (note only, no coverage event);
-    # unusable is a degraded execution (truncated/error/garbled → full fallback) and DOES flag an event.
+    # tri-state in RunResult.note: a non-hit routes hosts to direct httpx (a clean SYN 0-open never drops
+    # a host); usable_empty is a clean note-only result; unusable is a degraded execution that flags an event
     clean = raw_status in (Status.SUCCESS, Status.EMPTY) and parse_ok
     if not clean:
         state = "unusable"
@@ -2535,26 +2209,22 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
 
 
 def fingerprint_hosts(ctx, hosts, phase):
-    """Fingerprint `hosts` → list of (raw_ref, json_lines) per httpx call (callers parse each with its
-    REAL raw file for per-entity provenance). v0.3.5: SYN-prefilter → httpx only on OPEN host:ports
-    (grouped by open-port set); hosts with NO known IP → direct-httpx by hostname. SAFETY RAILS:
-    - hosts whose CURRENT answer is a scan-box/metadata self-hit are withheld by netguard; private IS scanned.
-    - FALLBACK-SAFE: prefilter off / naabu missing / truncated / zero-open → v0.3.4 direct-httpx over the
-      contactable + unknown-IP hosts (private included by default; never a thin run). Shared by probe + enrich."""
+    """Fingerprint `hosts` -> list of (raw_ref, json_lines) per httpx call. SYN-prefilter -> httpx only on open
+    host:ports (grouped by open-port set); hosts with no known IP go direct by hostname. Safety rails: a host
+    whose current answer is a scan-box/metadata self-hit is withheld by netguard (private is scanned); on
+    prefilter-off / naabu-missing / truncated / zero-open it falls back to direct httpx (never a thin run).
+    Shared by probe and enrich.
+    """
     prof = ctx.profile
-    # self-attack guard (contact-by-default): RECORD every private/self-resolving host as internal-resolution
-    # intel, WITHHOLD only the scan-box/metadata self-hits (private space is scanned — it's a lead). Every
-    # downstream active tool derives from what this produces, so the gate lives here.
+    # self-attack guard: record every private/self-resolving host as internal-resolution intel, withhold
+    # only the scan-box/metadata self-hits. The gate lives here, before any downstream active tool.
     hosts = netguard.guard_hosts(ctx, hosts, phase=phase)
     if not hosts:
         return []
     pubmap, a_known = _host_public_ip_map(ctx, hosts)                     # {host: contactable A IPs} (private incl. by default)
     prefilter_on = settings.web_port_prefilter()
-    # CDN-aware SYN gate (T0.3): raw SYN must not hit SHARED third-party edge (CDN/WAF) — multi-tenant infra
-    # that isn't the origin anyway. Classify offline (cdncheck, no target contact) and drop CDN/WAF IPs from
-    # the SYN target set only; CLOUD + unclassified IPs are still scanned (unclassified is NOT proof of a
-    # dedicated origin, but it isn't shared edge either). A host left with no SYN-eligible IP is NOT dropped
-    # — it falls to direct httpx-by-name (zero coverage loss).
+    # CDN-aware SYN gate: raw SYN must not hit shared third-party edge, so classify offline (cdncheck) and
+    # drop CDN/WAF IPs from the SYN set only. A host left with no SYN-eligible IP falls to httpx-by-name.
     shared: set = set()
     if prefilter_on:
         all_ips = sorted({ip for ips in pubmap.values() for ip in ips})
@@ -2565,9 +2235,8 @@ def fingerprint_hosts(ctx, hosts, phase):
         if cls:
             ctx.run.notes.append(f"{phase} cdn-aware SYN gate: {len(cls)}/{len(all_ips)} contactable IPs are "
                                  f"CDN/WAF edge — excluded from SYN, hosts probed by name")
-    # A host is SYN-eligible only when ALL its contactable IPs are non-shared. If ANY answer is CDN/WAF, the
-    # whole hostname goes direct: httpx probes BY NAME, whose DNS answer may be the CDN IP, so ports found on
-    # a non-CDN sibling IP wouldn't match what httpx-by-name actually hits (partial-prefilter mismatch).
+    # a host is SYN-eligible only when all its contactable IPs are non-shared: httpx probes by name, so
+    # ports found on a non-CDN sibling IP would not match what httpx-by-name hits
     syn_map = {h: ([] if any(ip in shared for ip in ips) else ips) for h, ips in pubmap.items()}
     public_hosts = [h for h in hosts if syn_map[h]]                      # ALL contactable IPs non-shared -> SYN-eligible
     no_ip = [h for h in hosts if not syn_map[h]]                         # any shared IP / no IP -> httpx by name
@@ -2576,7 +2245,7 @@ def fingerprint_hosts(ctx, hosts, phase):
         return [_run_httpx(ctx, targets, prof.ports, phase, "httpx")] if targets else []
 
     if not prefilter_on:
-        return _direct(public_hosts + no_ip)                             # v0.3.4 direct (contactable incl. private)
+        return _direct(public_hosts + no_ip)                             # direct (contactable incl. private)
     host_ports = _web_port_prefilter(ctx, public_hosts, phase, syn_map) if public_hosts else None
     if host_ports is None:
         return _direct(public_hosts + no_ip)                             # fallback: full direct over every guarded host
@@ -2586,9 +2255,8 @@ def fingerprint_hosts(ctx, hosts, phase):
         groups.setdefault(tuple(ps), []).append(h)
     for i, (ps, hs) in enumerate(sorted(groups.items())):
         results.append(_run_httpx(ctx, hs, list(ps), phase, f"httpx-g{i}"))   # httpx on OPEN ports only
-    # A SYN-eligible host that came back with ZERO open ports is NOT dropped: SYN can false-negative
-    # (filtered/rate-limited/packet loss), so probe it directly over the full port set. A host's outcome
-    # must never depend on another host's scan — only on its own evidence. Union with the by-name hosts.
+    # a SYN-eligible host with zero open ports is not dropped: SYN can false-negative, so probe it directly.
+    # A host's outcome must depend only on its own evidence.
     covered = set(host_ports)
     direct_targets = no_ip + [h for h in public_hosts if h not in covered]
     if direct_targets:
@@ -2598,10 +2266,8 @@ def fingerprint_hosts(ctx, hosts, phase):
 
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
-    # review-B1.7r5 (wiring): the free Shodan host lane sends NO packet to the target, so both early
-    # returns below have to stop being the end of this phase. It runs on WHATEVER addresses the run has
-    # observed — which in passive-only mode, or with no probeable host, is the resolved set — and on the
-    # active path it runs LAST, once naabu/smap have written the port rows it also feeds on.
+    # the free Shodan host lane sends no packet to the target, so the early returns below cannot end the
+    # phase: it runs on whatever addresses the run observed, last on the active path
     if scope.passive_only:
         ctx.run.record("probe", skipped("httpx", "passive-only mode"))
         shodan_host_lane(ctx)                   # passive by construction: no packets to the target
@@ -2615,7 +2281,7 @@ def run(ctx) -> None:
         shodan_host_lane(ctx)                   # resolved addresses may exist even with nothing probeable
         return
 
-    # ── httpx full fingerprint -> live services (v0.3.5: SYN-prefilter → httpx on open ports only) ──
+    # ── httpx full fingerprint -> live services (SYN-prefilter -> httpx on open ports only) ──
     groups = fingerprint_hosts(ctx, hosts, "probe")     # [(raw_ref, json_lines)] per httpx call
     lines = [ln for _ref, gl in groups for ln in gl]    # combined, for the CSP/deser pass below
     if groups:
@@ -2631,10 +2297,9 @@ def run(ctx) -> None:
         ctx.echo(f"  httpx: {n} live services")
 
         # ── CSP-advertised siblings (horizontal discovery from live response headers) ──
-        # httpx -irh carries the Content-Security-Policy; in-scope hosts named there (e.g. an
-        # internal/staging host in script-src) are a real discovery channel. Parsed here over
-        # live hosts because the CSP lives on a probed host (www), not the bare apex — which is
-        # why csprecon over apex roots in horizontal found nothing.
+
+        # httpx -irh carries the CSP; in-scope hosts named there are a discovery channel. Parsed over live
+        # hosts because the CSP lives on a probed host (www), not the bare apex.
         _CSP_HOST = _re.compile(r"\b(?:https?://)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})\b", _re.I)
         csp_added = deser_n = 0
         for line in lines:
@@ -2675,10 +2340,10 @@ def run(ctx) -> None:
         if deser_n:
             ctx.echo(f"  deser: {deser_n} serialization/token fingerprint(s) in headers/cookies")
 
-    # ── tlsx over in-scope hosts — cert SAN harvest (new sibling hostnames) + cert context ──
-    # tlsx is used in horizontal over IP RANGES; here it runs over the resolved HOST set: cert SANs
-    # reveal sibling hostnames we'd otherwise miss (coverage → enrich resolves/probes them), and the
-    # cert (cn/issuer/expiry/wildcard) is stored as first-class context (the `certificate` entity).
+    # ── tlsx over in-scope hosts — cert SAN harvest + cert context ──
+
+    # runs over the resolved host set: cert SANs reveal sibling hostnames, and the cert is stored as
+    # first-class context (the `certificate` entity)
     if have("tlsx"):
         thosts = sorted(h for h in set(ctx.run.values("resolved"))
                         if h and scope.in_scope(h) and not scope.is_oos(h))
@@ -2711,14 +2376,14 @@ def run(ctx) -> None:
                 ctx.echo(f"  tlsx: +{san_new} sibling host(s) from cert SANs")
 
     # ── Shodan pivots (key-gated, silent): same favicon + same TLS cert fingerprint → related hosts ──
-    _shodan_pivots(ctx)          # B1.4: ALL Shodan lanes, one collection, one credit budget
+    _shodan_pivots(ctx)          # all Shodan lanes, one collection, one credit budget
 
     # ── virtual-host enumeration (ffuf Host-header fuzz over base services; needs a vhost wordlist) ──
     _vhost_enum(ctx)
 
     # ── WAF fingerprint (nuclei waf-detect templates over live hosts) ──
-    # Recon-side only: identify WHICH WAF fronts each host (Cloudflare/Akamai/F5…).
-    # Bypass tooling (nomore403/nowafpls/NewTowner) stays human/Burp work.
+
+    # recon-side only: identify which WAF fronts each host. Bypass tooling stays human/Burp work.
     if have("nuclei") and ctx.run.count("live"):
         waf_in = ctx.write_list("waf_targets.txt", ctx.run.values("live"))
         waf_out = ctx.run.raw_path("probe", "nuclei", "waf.jsonl")
@@ -2747,9 +2412,8 @@ def run(ctx) -> None:
     if prof.screenshots and ctx.run.count("live"):
         live_file = ctx.write_list("live.txt", ctx.run.values("live"))
         shot_dir = fresh_artifact_dir(ctx.run.dir / "raw" / "probe" / "gowitness")   # FRESH per invocation
-        # gowitness writes to FILES, not stdout → the runner mislabels it BLOCKED on a stderr WAF line even
-        # when it screenshotted most hosts. Reclassify from shots in THIS attempt's fresh dir (a reused dir
-        # must not inflate the count). Done inside the contract so the terminal event has the FINAL status.
+        # gowitness writes to files, so the runner mislabels it BLOCKED on a stderr WAF line; reclassify from
+        # shots in this attempt's fresh dir, inside the contract so the terminal event has the final status
         def _gw_reclassify(res):
             shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
             return reclassify_from_files(res, shots, "screenshot")
@@ -2785,11 +2449,8 @@ def run(ctx) -> None:
                 if ":" in line:
                     ip, _, port = line.rpartition(":")
                     open_ports.setdefault(ip, set()).add(port)
-        # nmap -sV only on the ports naabu found open (methodology: don't full-scan). Group IPs by their
-        # EXACT open-port set → one nmap call per group on JUST those ports, not the Cartesian union of every
-        # port over every IP (which probed host:port pairs naabu never found — C12). -oX structured so the
-        # service yield is parsed (was previously recorded raw, never ingested). nmap ingests BEFORE the
-        # naabu-bare fill below, so its richer service entity wins the shared {ip}:{port} id.
+                # nmap -sV only on the ports naabu found open, grouped by exact open-port set (one call per
+                # group). -oX so the service yield is parsed; nmap ingests first, so its richer entity wins.
         if open_ports and have("nmap"):
             groups: dict[tuple, list] = {}
             for ip, ports in open_ports.items():
@@ -2798,7 +2459,7 @@ def run(ctx) -> None:
                 g_ips = ctx.write_list(f"nmap_ips_{gi}.txt", sorted(ips))
                 nm = ctx.run.raw_path("probe", "nmap", f"service_{gi}.xml")
                 nm.unlink(missing_ok=True)                   # -oX file: clear stale before the run
-                # C07 inc3: reclassify (status-only) inside the contract so the terminal event has the final
+                # reclassify (status-only) inside the contract so the terminal event has the final
                 # nmap status; re-read below for ingest. work_unit = this port-group's ports + its IP set.
                 def _nmap_reclassify(res, xml=nm):
                     svcs, complete = _nmap_services(xml)
@@ -2806,7 +2467,7 @@ def run(ctx) -> None:
                     if svcs is not None and not complete and res.status in (Status.SUCCESS, Status.EMPTY):
                         res.status = Status.PARTIAL          # malformed rows / no clean finish -> uncertain (valid kept)
                     return res
-                # review#10: fold the nmap scan config (flags decide coverage) so a flag change flips the unit.
+                                # fold the nmap scan config, so a flag change flips the unit
                 wu = events.work_unit("probe.nmap_service", inputs={"ports": list(ptup), "ips": sorted(ips)},
                                       config={"flags": "sV-Pn-T4"})
                 nr = run_contract("probe.nmap_service",
@@ -2821,11 +2482,8 @@ def run(ctx) -> None:
                     ctx.run.add("port", {"id": f"{sip}:{sport}", "ip": sip, "port": sport, "proto": proto,
                                          "service": service, "product": product, "version": version,
                                          "sources": ["naabu", "nmap"], "raw_ref": str(nm)})
-        # naabu bare ports — fills any ip:port nmap didn't enrich (dedup: skipped where nmap already added)
-        # review-B1.7r5#2: these rows carried ONLY `id`, so every consumer had to re-parse `"ip:port"` to
-        # learn what they were about — and the B1.7 host lane, which reads `ip`, could not see them at all.
-        # The fields are structured here; `shodan_host.eligible_ips` keeps an `id` fallback for rows an
-        # earlier run already wrote.
+        # naabu bare ports — fills any ip:port nmap did not enrich. The rows are structured here (ip, port),
+        # not just an `"ip:port"` id; `shodan_host.eligible_ips` keeps an id fallback for older rows.
         for ip, ports in open_ports.items():
             for port in ports:
                 ctx.run.add("port", {"id": f"{ip}:{port}", "ip": ip, "port": port,
@@ -2840,14 +2498,14 @@ def run(ctx) -> None:
         sm = ctx.run.raw_path("probe", "smap", "smap.json")
         sm.unlink(missing_ok=True)                          # -o file: clear stale before the run
         # -oJ structured output (verified schema) instead of scraping nmap-text; parse + reclassify + ingest
-        # via the shared helper (it was recorded raw ONLY: 505 lines, 0 entities on the OTC run).
+        # via the shared helper (raw-only recording dropped the passive port yield)
         r = exec_tool("smap", ["smap", "-iL", str(sm_in), "-oJ", str(sm)], timeout=600)
         smn = _smap_ingest(ctx, r, sm, "probe", sm_targets)
         if smn:
             ctx.echo(f"  smap: +{smn} passive port(s) (Shodan-backed, no packets to target)")
 
-    # ── B1.7: the FREE per-IP Shodan record lane — LAST, so it sees every address this phase observed ──
-    # Placed here rather than beside the other Shodan lanes on purpose: it consumes `port`/`web_port` rows
-    # that naabu and smap write above, and running it earlier would give it only the resolved set on the
-    # first lifecycle while reporting full coverage of a smaller eligible set.
+    # ── the free per-IP Shodan record lane — last, so it sees every address this phase observed ──
+
+    # placed here, not beside the other Shodan lanes: it consumes the `port`/`web_port` rows naabu and
+    # smap write above, and running earlier would give it only the resolved set on the first lifecycle
     shodan_host_lane(ctx)

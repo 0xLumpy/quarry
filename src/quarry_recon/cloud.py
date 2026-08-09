@@ -1,10 +1,8 @@
 """Cloud-asset discovery — candidate bucket enumeration (S3 + GCS) from the target's apex/org.
 
-Map-don't-exploit + verify-ownership: DETECT bucket existence + public/private (unauth, non-mutating
-GET, **status only — no content is read, downloaded, or modified**), emit candidates for human
-confirmation. A guessed name is NOT proof of ownership — items are review candidates tagged
-"VERIFY OWNERSHIP", same model as the OSINT RDAP/azmap candidates. Azure *tenancy* is handled
-separately (azmap in osint); this is object storage only.
+Detects bucket existence and public/private via an unauth, non-mutating GET (status only — no content
+is read, downloaded, or modified) and emits candidates tagged "VERIFY OWNERSHIP" for human review; a
+guessed name is not proof of ownership. Object storage only — Azure tenancy is handled by azmap.
 """
 from __future__ import annotations
 
@@ -48,11 +46,9 @@ def _all_candidates(profile) -> list:
 
 
 def _check(url: str, timeout: int = 8):
-    """Return (exists, access): GET status ONLY — the body is never read (non-mutating; no content is
-    touched). C06 tri-state: exists is True (200=public / 403=private), False (404 = definitively absent),
-    or None when INDETERMINATE — a transport error or non-definitive HTTP code. An indeterminate probe must
-    NOT be recorded as a confirmed absence (the old `except → not found` was a false negative: a bucket that
-    EXISTS but whose probe timed out / DNS-failed was dropped)."""
+    """Return (exists, access) from a status-only GET (body never read): exists True (200 public /
+    403 private), False (404 absent), or None when indeterminate (transport error or non-definitive
+    HTTP code). An indeterminate probe is never recorded as a confirmed absence."""
     try:
         req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -64,33 +60,30 @@ def _check(url: str, timeout: int = 8):
             return False, None                              # NoSuchBucket — definitively absent
         return None, None                                   # other 4xx/5xx — indeterminate, not "absent"
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError):
-        return None, None                                   # transport error — INDETERMINATE (never a false negative)
+        return None, None                                   # transport error — indeterminate, not absent
 
 
 def discover(ctx) -> int:
-    """Enumerate S3/GCS bucket candidates from the target's apex/org and record the ones that exist as `cloud`
-    review candidates (verify-ownership). Returns the count found. Skipped in passive. review-r2#2: the whole
-    enumeration runs UNDER the provider contract (registered source_id `horizontal.cloud_buckets`) so it gets a
-    tool_start/tool_finish lifecycle like every other source — not an unbracketed side channel."""
+    """Enumerate S3/GCS bucket candidates and record existing ones as `cloud` review candidates
+    (verify-ownership); returns the count found. Skipped in passive. Runs under the provider contract
+    (source_id `horizontal.cloud_buckets`) for a tool_start/tool_finish lifecycle."""
     if ctx.profile.passive_only:
         return 0
     from .contract import run_provider
-    # review-r3#5: stable work_unit from the bounded inputs (candidate seeds) + effective config (providers,
-    # name cap) — the C07/C10 resume key.
+    # stable work_unit from the bounded inputs (seeds) + effective config — the resume key
     wu = events.work_unit("horizontal.cloud_buckets",
                           inputs={"seeds": sorted(_seeds(ctx.profile))},
                           config={"providers": [p for p, _ in _PROVIDERS],
                                   "name_cap": policy.limit("CLOUD_NAME_CAP"),
-                                  "suffixes": _SUFFIXES})     # review-r4#4: suffix set is coverage-affecting
+                                  "suffixes": _SUFFIXES})     # suffix set is coverage-affecting
     r = run_provider("horizontal.cloud_buckets", lambda: _enumerate(ctx), work_unit=wu)
     return len(r) if r else 0
 
 
 def _enumerate(ctx) -> set:
-    """C06: the bucket-enum body (run under run_provider). Records existing buckets as review candidates and
-    returns the set of existing-bucket URLs. Candidates over the `_MAX_NAMES` cap AND probes that were
-    INDETERMINATE (transport/other errors — not confirmed absences) are surfaced as STRUCTURED coverage, so a
-    capped or partly-unreachable enum is an honest gap the verdict sees, not silent."""
+    """Probe the candidate buckets (under run_provider), record existing ones as review candidates,
+    and return the set of existing-bucket URLs. Names over the cap and indeterminate probes are
+    emitted as structured coverage so a capped or partly-unreachable enum is a visible gap."""
     sid = "horizontal.cloud_buckets"
     all_names = _all_candidates(ctx.profile)
     cap = policy.limit("CLOUD_NAME_CAP")        # 0 = every candidate name (`--unbound`)
@@ -112,9 +105,7 @@ def _enumerate(ctx) -> set:
                     "note": f"{prov} bucket exists ({access}) — VERIFY OWNERSHIP",
                     "sources": ["cloud-enum"]})
                 found_urls.add(url)
-    # review#4: STRUCTURED coverage (eligible/tested/omitted + stable unit) so the VERDICT actually sees it —
-    # an unstructured reason-only event is dropped by _read_coverage. Emit BOTH units EVERY run (omitted=0 when
-    # clean) so a later clean rerun CLEARS a prior gap (latest-per-unit reconciliation).
+    # emit both units every run (omitted=0 when clean) so a later clean rerun clears a prior gap
     events.coverage_partial(sid, kind=events.COVERAGE_CAP, measure="bucket_names", unit="cloud.bucket_names",
                             eligible=len(all_names), tested=len(names), omitted=len(all_names) - len(names),
                             reason=f"bucket-name candidates {len(names)}/{len(all_names)} probed (cap {_MAX_NAMES})")

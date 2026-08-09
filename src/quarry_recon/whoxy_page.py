@@ -1,19 +1,8 @@
-"""The Whoxy reverse-whois paginator.
+"""The Whoxy reverse-whois paginator: one credit per page, `total_pages` authoritative.
 
-Whoxy-local by design: it reuses Quarry's provider vocabulary (the outcome taxonomy, host-fair
-ordering, `budget.Ledger`) but not the Shodan coordinator's machinery.
-
-Three facts drive the design:
-
-  · ONE CREDIT PER PAGE, and a single anchor can run to hundreds. Pages are ordered PAGE TIER FIRST —
-    page 1 of every anchor before page 2 of any — and what a budget does not reach is a counted,
-    resumable remainder. Ranking decides order, never membership.
-  · CARDINALITY IS FREE: `total_pages` arrives with page 1, so ordering rare anchors first costs
-    nothing and there is no sizing pass to build.
-  · `total_pages` IS AUTHORITATIVE. Asking past the end is free but answers `status: 0`, so a
-    paginator that probed for the end would turn a clean completion into a provider failure.
-
-Measured response shapes: docs/design/PROVIDER-QUOTA-DESIGN.md.
+Pages are ordered page tier first — page 1 of every anchor before page 2 of any — and what a budget
+does not reach is a counted, resumable remainder. Measured response shapes and the spending contract:
+docs/design/PROVIDER-QUOTA-DESIGN.md.
 """
 
 from __future__ import annotations
@@ -26,9 +15,8 @@ from pathlib import Path
 
 from . import budget
 
-#: bump when a stored page's MEANING changes — it is part of every page's identity, so a bump
-#: deliberately re-buys every page. Row shape varies between query forms; that is the provider's
-#: own variation within one schema.
+#: bump when a stored page's meaning changes: it is part of every page's identity, so a bump re-buys
+#: every page. Row shape varies between query forms, which is variation within one schema.
 WHOXY_WORK_SCHEMA = 1
 WHOXY_PAGE_SIZE = 100          # measured: 100 rows/page on both query forms
 
@@ -42,33 +30,24 @@ class Anchor:
 
 
 def provider_dir(project_dir) -> "Path":
-    """`<project>/osint/state/whoxy` — the PROVIDER level, above the schema generation.
-
-    Concurrency is a property of the provider and the project, so the lock must not live inside a
-    schema directory where two builds would take different locks against one account."""
+    """`<project>/osint/state/whoxy` — above the schema generation: the account lock is provider-wide."""
     return Path(project_dir) / "osint" / "state" / "whoxy"
 
 
 def state_dir(project_dir) -> "Path":
-    """The durable home for Whoxy page ownership: `<project>/osint/state/whoxy/v<schema>/`.
-
-    Outside the timestamped session directory, or every run re-buys page 1. The generation is the WORK
-    SCHEMA only: folding in a key, an anchor or a spending control would re-buy paid pages."""
+    """The durable home for Whoxy page ownership. Outside the timestamped session directory, or a resumed
+    run would re-buy every page."""
     return provider_dir(project_dir) / f"v{WHOXY_WORK_SCHEMA}"
 
 
 def error_key(anchor: Anchor, page: int) -> str:
-    """Identity of a FAILED page's response body. A distinct namespace from `item_key`, so a retained
-    explanation can never be mistaken for a page we own."""
     raw = f"{WHOXY_WORK_SCHEMA}|{anchor.param}|{anchor.value}|p{page}|error"
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def item_key(anchor: Anchor, page: int) -> str:
-    """The per-page completion identity: (schema, param, value, page).
-
-    The budget and reserve are deliberately absent: they govern what we may spend, not what a page
-    contains."""
+    """The per-page completion identity: (schema, param, value, page). Budget and reserve are absent — they
+    govern what we may buy, never what a bought page is."""
     raw = f"{WHOXY_WORK_SCHEMA}|{anchor.param}|{anchor.value}|p{page}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -83,16 +62,13 @@ class AnchorState:
     pages_done: set = field(default_factory=set)
     attempted: bool = False
     stopped: str = ""                    # the error class that ended this anchor, if any
-    # whether any page of this anchor was INGESTED. `not pages_done` answers a different question,
-    # and would never count an anchor whose page 1 failed to ingest and whose page 2 succeeded.
+    # ingested, not owned: `not pages_done` would miss an anchor whose page 1 failed to ingest
     delivered: bool = False
     _cursor: int = 1
 
     def next_page(self) -> "int | None":
-        """The lowest page still owed, or None.
-
-        Exactly one page is offered for an unopened anchor: until page 1 answers there is no count.
-        `total_pages` then bounds the walk — asking past it is free but classifies as a failure."""
+        """The lowest page still owed, or None. One page is offered for an unopened anchor: until page 1
+        answers, there is no count."""
         if self.stopped:
             return None
         while self._cursor in self.pages_done:
@@ -102,20 +78,15 @@ class AnchorState:
         return self._cursor if self._cursor <= self.total_pages else None
 
     def pages_left(self) -> int:
-        """Pages this anchor is known to hold and we do not own. 0 while the count is unknown — an
-        unopened anchor has no knowable page count, and inventing one is the same class of lie as an
-        unmeasured zero."""
+        """Pages this anchor is known to hold and we do not own. 0 while the count is unknown."""
         if self.total_pages is None:
             return 0
         return max(0, self.total_pages - sum(1 for p in self.pages_done if p <= self.total_pages))
 
 
 def usable_page_count(total_pages, total_results) -> "int | None":
-    """`total_pages`, accepted only when the provider's own two fields agree.
-
-    `total_pages == ceil(total_results / 100)` is measured on both query forms. It is the only thing
-    that terminates the walk, so an uncorroborated value would have us paginate — and pay — for as long
-    as it says to. Disagreement is drift: the page stays owed."""
+    """`total_pages`, accepted only when the provider's own two fields agree — a disagreement is a count we
+    cannot spend against."""
     if isinstance(total_pages, bool) or not isinstance(total_pages, int) or total_pages < 1:
         return None
     if not isinstance(total_results, int) or isinstance(total_results, bool) or total_results < 0:
@@ -126,18 +97,13 @@ def usable_page_count(total_pages, total_results) -> "int | None":
 
 #: how a validated success body describes its own place in a walk.
 PAGE_PAGED = "paged"           # carries corroborated pagination -> the walk continues to `pages`
-PAGE_TERMINAL = "terminal"     # the MEASURED compact ZERO-result answer -> exactly one page
+PAGE_TERMINAL = "terminal"     # the compact zero-result answer -> exactly one page
 PAGE_CONTRADICTORY = "bad"     # pagination fields that do not corroborate -> not a page we can own
 
 
 def classify_page(doc) -> tuple:
-    """`(kind, pages)` for a success body.
-
-    A contradictory count keeps the bytes as evidence and leaves the page OWED, so a transient
-    contradiction cannot become permanent ownership of a page we could not size.
-
-    Terminal means the measured compact zero shape and nothing else: "no pagination fields" would let a
-    body claiming 250 results and returning 100 rows own a one-page completion with no remainder."""
+    """`(kind, pages)` for a success body. A contradictory count keeps the bytes as evidence and leaves
+    the page owed (the credit is already spent, but the coverage is retryable, not lost)."""
     if not isinstance(doc, dict):
         return PAGE_CONTRADICTORY, None
     if "total_pages" not in doc and "current_page" not in doc:
@@ -150,8 +116,7 @@ def classify_page(doc) -> tuple:
     pages = usable_page_count(doc.get("total_pages"), total)
     if pages is None:
         return PAGE_CONTRADICTORY, None
-    # both numbers are checked: 100 rows a page, and `total_pages == ceil(total / 100)`. A page
-    # claiming 50 results and returning one row contradicts itself and must not be owned.
+    # a page claiming 50 results and returning one row contradicts itself and must not be owned
     page = doc.get("current_page")
     if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= pages:
         return PAGE_CONTRADICTORY, None
@@ -165,11 +130,8 @@ def classify_page(doc) -> tuple:
 
 
 def read_page(artifact):
-    """A stored page, strictly validated -> {"anchor", "page", "doc"} | None.
-
-    Validation is `contract`'s, not a second parser: the identity is read from the body and handed back
-    to that validator, so the body must agree with itself. Tests use this reader too — a laxer stand-in
-    hides the defects they exist to find."""
+    """A stored page, strictly validated -> {"anchor", "page", "doc"} | None. Validation is `contract`'s, so
+    the identity a replayed page proves is the one a fresh page had to prove."""
     from .contract import ProviderBodyError, whoxy_envelope, whoxy_reverse_page
     try:
         body = json.loads(artifact.read_text())
@@ -177,16 +139,14 @@ def read_page(artifact):
         return None
     if not isinstance(body, dict):
         return None
-    # identity DISCOVERY, not enforcement: the body is asked who it answers, and the parser is then
-    # asked to agree. One rule, one authority.
+    # identity discovery, not enforcement: the body is asked who it answers, then the parser agrees
     ident = body.get("search_identifier")
     if not isinstance(ident, dict) or len(ident) != 1:
         return None
     (param, value), = ident.items()
     if param not in ("company", "email") or not isinstance(value, str) or not value.strip():
         return None
-    # the compact answer carries no position of its own and is only ever coherent as page 1;
-    # everything else must name its own page.
+    # the compact answer carries no position of its own and is only coherent as page 1
     if "current_page" not in body and "total_pages" not in body:
         page = 1
     else:
@@ -205,8 +165,6 @@ def read_page(artifact):
 
 
 def dedupe(states: "list[AnchorState]") -> "list[AnchorState]":
-    """One state per (param, value). Two states for the same anchor would both buy page 1: a round is
-    computed before either records completion, so the duplicate is invisible to any in-flight guard."""
     seen: set = set()
     out = []
     for st in states:
@@ -219,21 +177,12 @@ def dedupe(states: "list[AnchorState]") -> "list[AnchorState]":
 
 
 def _rank(st: AnchorState):
-    """Ordering position for an anchor's cardinality: fewest pages first, unknown last.
-
-    A rare anchor answers completely for fewer credits. An unopened anchor sorts last within its tier at
-    no cost, since page 1 of every anchor is tier 1."""
     return (0, st.total_pages) if st.total_pages is not None else (1, 0)
 
 
 def schedule(states: "list[AnchorState]") -> list:
-    """The next round: at most one page per anchor, PAGE TIER first, fair across anchors.
-
-    Rank must be the PAGE alone — cardinality in the rank gives almost every anchor its own tier and
-    collapses fairness into a global cardinality sort. Rare anchors are ordered by pre-sorting instead.
-
-    The group is the anchor TYPE, so fifty company anchors cannot starve the email ones. Grouping by
-    anchor would re-sort alphabetically and discard the pre-sort."""
+    """The next round: at most one page per anchor, page tier first, fair across anchors. Rank is the page
+    alone; cardinality breaks ties within a tier."""
     pending = [(st, st.next_page()) for st in states]
     pending = [(st, pg) for st, pg in pending if pg is not None]
     pending.sort(key=lambda it: (it[1], _rank(it[0]), it[0].anchor.param, it[0].anchor.value))
@@ -243,46 +192,37 @@ def schedule(states: "list[AnchorState]") -> list:
 
 @dataclass(frozen=True)
 class SpendPolicy:
-    """How many pages this run may buy, and whether the controls themselves were usable.
-
-    A cost guard that fails open is worse than none: `run_budget=-1` must not coerce to 0, which means
-    "no ceiling". Invalid controls stop paid work and are reported as the configuration defect."""
+    """How many pages this run may buy, and whether the controls themselves were usable. A cost guard that
+    fails open is worse than none."""
 
     pages: "int | None" = None       # None = no computable bound
-    invalid: str = ""                # which OPERATOR control is unusable, if any
-    balance_invalid: str = ""        # the PROVIDER's balance was unreadable as a number
-    limit: str = ""                  # the provider PROVED paid work is pointless — a soft limit
-    gap: str = ""                    # something FAILED; coverage is incomplete and must say so
-    # which boundary produced the allowance, so exhaustion can be told from an operator ceiling.
-    # Applies only if work remains: a run that finished inside its allowance hit no boundary.
+    invalid: str = ""                # an operator control we cannot read
+    balance_invalid: str = ""        # a provider balance we cannot read
+    limit: str = ""                  # the provider proved paid work is pointless — a soft limit
+    gap: str = ""                    # something failed; coverage is incomplete
     stop_kind: str = ""              # "provider_balance" | "operator_reserve" | "run_budget" | ""
-    # the balance outcome's class, so a 401 or 500 on the balance endpoint is more than "failed"
-    error_class: str = ""
+                                     # named only when work remains
+    error_class: str = ""           # the balance outcome's class, so a 401 is more than "failed"
 
 
 def _exact_count(v) -> "int | None":
-    """An exact non-negative int. `bool` is excluded — it is an int subclass, and `True` is not a count."""
     if isinstance(v, bool) or not isinstance(v, int) or v < 0:
         return None
     return v
 
 
 def spend_policy(balance, reserve, run_budget) -> SpendPolicy:
-    """The settled spending contract. Every path fails closed, and WHY decides how it reads:
-
-      · a provider limit (quota, entitlement)               -> no paid work, a SOFT limit
-      · any other refusal (auth, forbidden, unclassifiable) -> no paid work, a GAP
-      · a balance we asked for and could not read           -> no paid work, a GAP"""
+    """The settled spending contract. Every path fails closed, and why it failed decides how the run reads:
+    a provider limit is not a Quarry error, an unreadable control is."""
     from .contract import is_provider_limit
     if not isinstance(balance, BalanceRead):
-        # reading the balance is not optional: a caller that skipped it would otherwise get the most
-        # permissive answer available. Forgetting it is a defect in the CALL, not a spending decision.
+        # skipping the balance read is a defect in the call, not a spending decision
         raise TypeError(f"spend_policy needs a BalanceRead from read_balance(), got {type(balance).__name__}")
     res, run = _exact_count(reserve), _exact_count(run_budget)
     invalid = ", ".join(n for n, v in (("WHOXY_CREDIT_RESERVE", res), ("WHOXY_PAGE_BUDGET", run))
                         if v is None)
-    # both facts are kept: pages are zero either way, and an operator who fixes the knob should not
-    # then discover the account was refused.
+    # both facts are kept: an operator who fixes the knob must not then discover the account was
+    # refused
     if balance.refused:
         # the provider spoke. Not an unknown, and never a licence to spend.
         if is_provider_limit(balance.error_class):
@@ -291,8 +231,7 @@ def spend_policy(balance, reserve, run_budget) -> SpendPolicy:
         return SpendPolicy(pages=0, invalid=invalid, error_class=balance.error_class,
                            gap=f"{balance.error_class}: {balance.reason}")
     if balance.error_class:
-        # we asked and could not read the answer: no paid work. A cost guard that does not understand
-        # the body must not spend against it. Reported as provider drift, not as a broken knob.
+        # a cost guard that cannot read the body must not spend against it — provider drift, not a knob
         return SpendPolicy(pages=0, invalid=invalid, error_class=balance.error_class,
                            balance_invalid=f"{balance.error_class}: {balance.reason}",
                            gap=f"balance unreadable ({balance.error_class}): {balance.reason}")
@@ -310,11 +249,8 @@ def spend_policy(balance, reserve, run_budget) -> SpendPolicy:
 
 
 def spendable(balance: "int | None", reserve: int, run_budget: int) -> "int | None":
-    """How many pages this run may buy. None = no computable bound (the balance is unknown).
-
-    The reserve protects credits for later, the run budget limits this invocation, and `0` means "no
-    ceiling" for each. An unknown balance is not zero — but an unknown balance WITH a reserve is
-    contradictory, and stops us as an operator limit rather than a provider refusal."""
+    """How many pages this run may buy, or None when the balance is unknown. The reserve protects credits
+    for later work."""
     res = max(0, int(reserve or 0))
     run = max(0, int(run_budget or 0))
     if balance is None:
@@ -327,7 +263,7 @@ def spendable(balance: "int | None", reserve: int, run_budget: int) -> "int | No
 
 @dataclass
 class Outcome:
-    """What a lifecycle did. Every field is a FACT the caller reports; none is a threshold."""
+    """What a lifecycle did. Every field is a fact the caller reports; none is a threshold."""
 
     anchors: int = 0
     anchors_touched: int = 0            # at least one page bought or replayed
@@ -336,32 +272,24 @@ class Outcome:
     domains: int = 0
     fail_classes: dict = field(default_factory=dict)
     limit_classes: dict = field(default_factory=dict)
-    # the provider's own words, verbatim: an operator needs "Zero Account Balance", not `{"quota": 1}`
-    limit_reason: str = ""              # ...paired with the class it came from, so several failures
-    fail_reason: str = ""               #    cannot cross-associate class and wording
-    unopened: list = field(default_factory=list)     # EXACT anchors, never a count alone
-    # anchors we actually sent a request for; `anchors - unopened` counts a replay-only run as having
-    # attempted every one of them
-    requested: set = field(default_factory=set)
+    limit_reason: str = ""              # the provider's own words, paired with the class they came
+    fail_reason: str = ""               # from, so two failures cannot cross-associate
+    unopened: list = field(default_factory=list)     # exact anchors, never a count alone
+    requested: set = field(default_factory=set)      # sent a request for; `anchors - unopened` would
+                                                     # count a replay-only run as attempting every one
     pages_left_known: int = 0
     pages_left_unknown_anchors: int = 0
-    evidence_invalid: int = 0           # a recorded page whose artifact no longer validates
-    # ownership is not consumption: a page whose `ingest` raised stays owned (or the scheduler sells
-    # it to us again) but its rows never reached the report
-    pages_unconsumed: int = 0
-    # every machinery failure in order: the first cause governs, but a later one is still a fact
-    machinery: list = field(default_factory=list)
+    evidence_invalid: int = 0
+    pages_unconsumed: int = 0           # owned, its rows unreported: ownership is not consumption
+    machinery: list = field(default_factory=list)    # every failure in order; the first cause governs
     publish_failed: int = 0
     total_drift: int = 0                # pages whose total disagreed with another page of the anchor
-    requests_issued: int = 0            # requests SENT, not credits: a past-end refusal costs nothing,
-                                        # and only the next balance read says what was charged
-    error_bodies: int = 0               # non-empty failure bodies retained as evidence
-    # the allowance was actually used up. A policy's `stop_kind` says what it WOULD bound; if our own
-    # machinery stopped first, no boundary was reached and reporting one invents a limit.
-    allowance_exhausted: bool = False
-    records_journaled: bool = True      # every LEDGER WRITE this run reported success — completions and
-                                        # evidence binds alike, since both must survive for the run to
-                                        # be resumable and for its evidence to be findable
+    requests_issued: int = 0            # requests, not credits: only the next balance read says what
+                                        # was charged
+    error_bodies: int = 0
+    allowance_exhausted: bool = False   # actually used up, as opposed to what `stop_kind` would bound
+    records_journaled: bool = True      # every ledger write reported success, completions and evidence
+                                        # alike
     config_invalid: str = ""            # OPERATOR spending controls that could not be used
     balance_invalid: str = ""           # the PROVIDER's balance was not a readable count
     stop_cause: str = ""
@@ -369,12 +297,8 @@ class Outcome:
 
 
 def owned_index(ledger, read) -> dict:
-    """Pages the ledger demonstrably owns: {(param, value): [(page, artifact, doc)]}.
-
-    One pass over every digest-validated completion, so a hole of any width is recovered — probing
-    upward from page 1 would lose paid evidence above a damaged page. The identity is recomputed from
-    the document and must match the key it was filed under, so a transplanted artifact cannot donate
-    ownership."""
+    """Pages the ledger demonstrably owns: {(param, value): [(page, artifact, doc)]}. One pass over every
+    digest-validated completion."""
     out: dict = {}
     for item, art in ledger.items():
         ident = read(art)
@@ -383,8 +307,8 @@ def owned_index(ledger, read) -> dict:
         anchor, page = ident["anchor"], ident["page"]
         if item_key(anchor, page) != item:
             continue
-        # replayed evidence owes the same contract as fresh output: a digest-valid but contradictory
-        # completion would otherwise replay for free and stay permanently unsized
+        # replayed evidence owes the same contract as fresh output, or a contradictory completion replays
+        # free and stays permanently unsized
         if classify_page(ident["doc"])[0] == PAGE_CONTRADICTORY:
             continue
         out.setdefault((anchor.param, anchor.value), []).append((page, art, ident["doc"]))
@@ -394,27 +318,22 @@ def owned_index(ledger, read) -> dict:
 
 
 class LockBusy(Exception):
-    """A Whoxy lock is held by another lifecycle.
-
-    Either the PROJECT lock (nothing can proceed) or the ACCOUNT lock (replayed evidence is still valid;
-    only the unpaid remainder is blocked)."""
+    """A Whoxy lock is held by another lifecycle — the project lock, or the account lock that guards
+    spending."""
 
 
 @dataclass(frozen=True)
 class BalanceRead:
-    """What `account=balance` told us, with the facts kept apart.
-
-    A proven refusal must not read as "we could not tell" — with no reserve that would mean unbounded
-    spending — and the reason must survive for the verdict."""
+    """What `account=balance` told us, with the facts kept apart: a proven refusal must not read as "we
+    could not tell"."""
 
     remaining: "int | None" = None
     error_class: str = ""        # the provider-outcome class, when it refused or could not be read
     reason: str = ""             # verbatim, as the provider said it
-    refused: bool = False        # the provider EXPLICITLY refused, as opposed to us failing to read
+    refused: bool = False        # the provider refused, as opposed to us failing to read
 
     def __post_init__(self):
-        """Only valid outcomes exist: a bad state is unconstructable rather than checked downstream,
-        because `BalanceRead()` alone would mean unbounded spending."""
+        """Only valid outcomes exist: a bad state is unconstructable rather than checked downstream."""
         from .contract import PROVIDER_CLASSES, PROVIDER_LIMITS, PROVIDER_PARSE
         if not isinstance(self.refused, bool):
             raise ValueError(f"refused must be a bool, got {type(self.refused).__name__}")
@@ -438,12 +357,8 @@ class BalanceRead:
 
 
 def read_balance(raw) -> BalanceRead:
-    """Whoxy's `account=balance` reply, as a structured outcome.
-
-    The call is free, and only the reverse-whois figure funds this lane. The envelope is
-    `contract.whoxy_envelope`, so a refusal arrives classified from the provider's own words.
-
-    A missing or malformed figure is UNKNOWN, never zero, and carries its reason."""
+    """Whoxy's `account=balance` reply as a structured outcome. The call is free, and only the reverse-whois
+    figure funds this lane."""
     from .contract import ProviderBodyError, whoxy_envelope
     try:
         doc = json.loads(raw)
@@ -456,8 +371,7 @@ def read_balance(raw) -> BalanceRead:
     try:
         env = whoxy_envelope(doc)
     except ProviderBodyError as e:
-        # a body we cannot parse is our inability to read it, not the provider saying no — the two send
-        # an operator to completely different places
+        # a body we cannot parse is our failure to read it, not the provider saying no
         return BalanceRead(error_class=e.error_class, reason=e.reason,
                            refused=e.error_class != PROVIDER_PARSE)
     n = _exact_count(env.get("reverse_whois_balance"))
@@ -474,9 +388,6 @@ SPEND_LOCK = Path.home() / ".config" / "quarry" / "whoxy-spend.lock"
 
 @contextlib.contextmanager
 def _flock(path):
-    """An exclusive, advisory, OS-released lock on `path`. Raises `LockBusy` on contention only.
-
-    The mechanism is `budget.state_lock`; this wrapper only preserves Whoxy's own contention type."""
     with contextlib.ExitStack() as stack:
         try:
             p = stack.enter_context(budget.state_lock(path))
@@ -488,26 +399,16 @@ def _flock(path):
 
 @contextlib.contextmanager
 def spend_lock(path=None):
-    """The installation-wide Whoxy SPENDING lock — the inner of the two, taken last and briefly.
-
-    Credits are account-wide, so two projects would otherwise each spend down to the reserve. Taken only
-    once paid work remains, so owning everything never waits on another project's purchasing.
-
-    Order is fixed — project lock first, always. These acquisitions are non-blocking, so a call site
-    that disagrees live-locks rather than deadlocks. Full order: docs/design/PROVIDER-QUOTA-DESIGN.md."""
+    """The installation-wide Whoxy spending lock — the inner of the two, taken last and briefly. Credits are
+    account-wide, so two projects share one balance."""
     with _flock(Path(path) if path is not None else SPEND_LOCK) as p:
         yield p
 
 
 @contextlib.contextmanager
 def lifecycle_lock(project_dir):
-    """Exclusive, advisory, OS-released lock over a project's Whoxy page state.
-
-    `flock`, not lockfile existence: the kernel releases it however the holder dies, and the file is
-    never unlinked, or a second process would lock a path the first no longer shares.
-
-    Held across the whole lifecycle, and contention raises before any of it, so a blocked run issues
-    zero paid requests. Protects one project's LEDGER; credits need `spend_lock` as well."""
+    """Exclusive, advisory, OS-released lock over a project's Whoxy page state. Non-blocking: contention
+    raises `LockBusy` rather than queueing behind a run that may take hours."""
     base = provider_dir(project_dir)
     with _flock(base / ".lock"):
         yield base
@@ -515,13 +416,8 @@ def lifecycle_lock(project_dir):
 
 @contextlib.contextmanager
 def open_state(project_dir):
-    """`with open_state(project) as (ledger, pages):` — the only way to reach Whoxy page state.
-
-    Takes the PROJECT lock only. The account lock is acquired lazily by `run_pages`, once replay has
-    finished and paid work remains, so free operations never wait on another project's spending.
-
-    Locking and state-opening are one step by design: the safe order cannot be got wrong by a caller
-    that constructs the ledger itself."""
+    """`with open_state(project) as (ledger, pages):` — the only way to reach Whoxy page state. Takes the
+    project lock only; the account lock is taken separately, around spending."""
     with lifecycle_lock(project_dir):
         base = state_dir(project_dir)
         pages = base / "pages"
@@ -531,18 +427,14 @@ def open_state(project_dir):
 
 @contextlib.contextmanager
 def fixed_allowance(pages):
-    """A paid phase with a KNOWN allowance and no lock — for callers that already settled both."""
     yield pages
 
 
 def run_pages(states, *, paid, fetch, ingest, read, ledger, attempt_dir, is_limit=None) -> Outcome:
     """Buy pages under the budget, replaying anything already owned.
 
-    `fetch(anchor, page) -> (raw_bytes, error)` never raises; `read(artifact)` validates a stored page;
-    `ingest(...) -> int` returns domains yielded.
-
-    `paid` yields the page allowance and is entered only once replay has finished and work remains —
-    where the caller takes the spend lock. On `LockBusy` replayed evidence is kept."""
+    `fetch(anchor, page) -> (raw_bytes, error)` never raises. A budget bounds throughput, never
+    membership: what it does not reach is a counted, resumable remainder."""
     from .contract import is_provider_limit as _default_is_limit
     is_limit = is_limit or _default_is_limit
     states = dedupe(states)
@@ -550,8 +442,7 @@ def run_pages(states, *, paid, fetch, ingest, read, ledger, attempt_dir, is_limi
     try:
         try:
             _replay(states, o, ledger=ledger, ingest=ingest, read=read)
-            # an index that exists and cannot be trusted must never read as empty: that is permission to
-            # re-buy every page of a permanent cache
+            # an untrusted index must never read as empty: that is permission to re-buy the whole cache
             unreadable = getattr(ledger, "unreadable", "")
             if unreadable and schedule(states):
                 o.stop_cause = o.stop_cause or f"ownership_unreadable:{unreadable}"
@@ -565,8 +456,7 @@ def run_pages(states, *, paid, fetch, ingest, read, ledger, attempt_dir, is_limi
                     # another project is spending: what we replayed stays, only the unbought part is blocked
                     o.stop_cause = "account_busy"
                 except Exception as e:
-                    # caught here rather than at the lifecycle boundary, so `_remainder` still runs and the run
-                    # reports what is left as well as what it got
+                    # caught here, not at the lifecycle boundary, so `_remainder` still runs
                     _machinery(o, e)
         except (KeyboardInterrupt, SystemExit):
             raise                                  # cancellation ends the run; it is not an outcome
@@ -574,17 +464,16 @@ def run_pages(states, *, paid, fetch, ingest, read, ledger, attempt_dir, is_limi
             # replay is machinery too: every page it accepted before a failure is a fact
             _machinery(o, e)
     finally:
-        # runs in `finally`, and over a SNAPSHOT of the states, so a machinery failure still reports its
-        # remainder and a second pass cannot double-count
+        # in `finally`, over a snapshot: a machinery failure still reports its remainder, and a second
+        # pass cannot double-count
         try:
             _remainder(states, o)
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as e:
             _machinery(o, e)
-        # a ledger we could not write leaves every page bought this run to be bought again, so the
-        # result is a fact the caller must be able to report. Inside the machinery boundary: a save
-        # that raises did not save, and a journaled checkpoint does not prove THIS page's append landed.
+        # a ledger we could not write leaves every page bought this run to be bought again. Inside the
+        # boundary: a save that raises did not save.
         try:
             saved = bool(ledger.save())
         except (KeyboardInterrupt, SystemExit):
@@ -609,11 +498,9 @@ def run_pages(states, *, paid, fetch, ingest, read, ledger, attempt_dir, is_limi
 
 
 def _take(st, o, *, page, art, doc, ingest, replayed: bool) -> None:
-    """Fold one validated page into the state and the outcome, however it was obtained."""
     st.pages_done.add(page)
     st.attempted = True
-    # every page is reconciled MAX-WINS, so the remainder is never understated and a disagreement
-    # between pages stays a fact about the provider's index
+    # max wins, so the remainder is never understated and a disagreement stays a fact
     seen_total = doc.get("total_results_int")
     _kind, seen_pages = classify_page(doc)
     if isinstance(seen_total, int) and not isinstance(seen_total, bool):
@@ -635,15 +522,14 @@ def _take(st, o, *, page, art, doc, ingest, replayed: bool) -> None:
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:
-        # a page that failed to ingest stays owned — dropping it would have the scheduler sell it again —
-        # and the shortfall is counted in its own unit
+        # a page that failed to ingest stays owned, or the scheduler sells it again
         o.pages_unconsumed += 1
         raise
 
 
 def _replay(states, o, *, ledger, ingest, read) -> None:
-    """Replay every owned page BEFORE any scheduling, so a resumed run spends nothing on what it holds
-    and still ingests it — the candidates belong to THIS run's report as much as the run that paid."""
+    """Replay every owned page before any scheduling, so a resumed run spends nothing on what it holds and
+    still ingests it."""
     index = owned_index(ledger, read)
     for st in states:
         for page, art, doc in index.get((st.anchor.param, st.anchor.value), ()):
@@ -653,10 +539,7 @@ def _replay(states, o, *, ledger, ingest, read) -> None:
 
 
 def _keep_evidence(o, ledger, attempt_dir, key, raw) -> str:
-    """Retain bytes as EVIDENCE, never a completion, under a page's durability handshake.
-
-    Returns "" on success, else which sink failed. If this write did not land neither will the next, and
-    paying for pages we cannot bind is the same defect as running without a journal."""
+    """Retain bytes as evidence, never a completion. Returns "" on success, else which sink failed."""
     art = attempt_dir / f"{key}.json"
     dig = hashlib.sha256(raw).hexdigest()
     if not budget.publish_bytes(art, raw, digest=dig):
@@ -674,11 +557,8 @@ def _buy(states, o, *, spend, fetch, ingest, read, ledger, attempt_dir, is_limit
     probed: list = []
 
     def sinks_ok() -> bool:
-        """Prove BOTH sinks once, immediately before the first purchase.
-
-        Buying what we cannot record means paying twice. The flags alone are not a precondition —
-        nothing sets them until a write has already failed — so this performs a real replay-safe write
-        and a publish/remove probe. Lazy and memoized: a run that buys nothing probes neither."""
+        """Prove both sinks once, immediately before the first purchase: buying what we cannot record means
+        paying twice."""
         if not probed:
             if not (ledger_writable(ledger) and ledger.checkpoint()):
                 o.stop_cause = "ledger_unwritable"
@@ -715,8 +595,8 @@ def _buy(states, o, *, spend, fetch, ingest, read, ledger, attempt_dir, is_limit
             if err is not None:
                 cls = getattr(err, "error_class", None) or "error"
                 st.stopped = cls
-                # Whoxy reports failure inside an HTTP 200, so the bytes are where the explanation lives.
-                # Kept as evidence, never a completion: the page is still owed.
+                # Whoxy reports failure inside an HTTP 200, so the bytes hold the explanation.
+                # Evidence, never a completion: the page is still owed.
                 if raw:
                     why = _keep_evidence(o, ledger, attempt_dir, error_key(st.anchor, page), raw)
                     if why:
@@ -727,16 +607,14 @@ def _buy(states, o, *, spend, fetch, ingest, read, ledger, attempt_dir, is_limit
                 limited = is_limit(cls)
                 bucket = o.limit_classes if limited else o.fail_classes
                 bucket[cls] = bucket.get(cls, 0) + 1
-                # FIRST of each kind wins, stored WITH its own class, so two failures cannot cross-associate
-                # one's class with the other's wording
+                # first of each kind wins, stored with its own class, so two failures cannot cross-associate
                 why = f"{cls}: {(getattr(err, 'reason', '') or str(err) or cls).strip()}"
                 if limited and not o.limit_reason:
                     o.limit_reason = why
                 elif not limited and not o.fail_reason:
                     o.fail_reason = why
                 if is_limit(cls) and not o.stop_cause:
-                    # degrade, don't disable: stop buying, keep what is earned, count the rest. A storage failure
-                    # is ours and outranks the provider's boundary.
+                    # degrade, don't disable: stop buying, keep what is earned, count the rest
                     o.stop_cause = f"provider_limit:{cls}"
                 continue
             dig = hashlib.sha256(raw).hexdigest()
@@ -752,8 +630,8 @@ def _buy(states, o, *, spend, fetch, ingest, read, ledger, attempt_dir, is_limit
                                    and ident["page"] == page) else None
             kind = classify_page(doc)[0] if doc is not None else PAGE_CONTRADICTORY
             if doc is None or kind == PAGE_CONTRADICTORY:
-                # stored but NOT owned — unreadable, wrong page, or self-contradictory. Recording it would stop
-                # it ever being re-bought, so it could never repair itself. Bound under the ERROR namespace.
+                # stored but not owned: recording it would stop it ever being re-bought, so it could never
+                # repair itself
                 o.evidence_invalid += 1
                 st.stopped = "parse"
                 o.fail_classes["parse"] = o.fail_classes.get("parse", 0) + 1
@@ -781,10 +659,8 @@ ledger_writable = budget.ledger_writable
 
 
 def _machinery(o, e: BaseException) -> None:
-    """Record OUR OWN failure without discarding what the lifecycle already established.
-
-    The first failure names the stop: a later one is a consequence, and overwriting would report the
-    symptom instead of the cause."""
+    """Record our own failure without discarding what the lifecycle established. The first failure names the
+    stop."""
     o.machinery.append(f"{type(e).__name__}: {e}")
     o.stop_cause = o.stop_cause or f"machinery:{type(e).__name__}"
     # the reason must say it was OUR machinery: a bare exception string reads as a provider failure

@@ -1,9 +1,4 @@
-"""Triage engine — analyst-facing prioritization with stated rationale (design §8).
-
-Turns the structured store into ranked review queues. The vuln-class param lists and
-interest buckets follow the day-2 heat-mapping methodology so the automation mirrors
-the manual workflow.
-"""
+"""Triage engine: turn the structured store into ranked review queues with stated provenance."""
 from __future__ import annotations
 
 import hashlib
@@ -17,12 +12,8 @@ DIGEST_SCHEMA = "1.0"
 
 
 def _corroboration_now(run) -> dict:
-    """`{path: [sources]}` as the store stands NOW.
-
-    An observation's own `corroborated_by` is a snapshot from the moment its artifact was normalised, and
-    later lanes keep publishing. Recomputing here means the report ranks on what the run actually knows,
-    without rewriting evidence that was true when it was written.
-    """
+    """`{path: [sources]}` recomputed against the store as it stands now, so ranking reflects every
+    lane that has since published without rewriting the observations' own snapshots."""
     from . import ast_obs, store
     out: dict = {}
     for entity in ("url", "js_url", "endpoint"):
@@ -37,38 +28,24 @@ def _corroboration_now(run) -> dict:
                 if isinstance(s, str) and s not in names:
                     names.append(s)
     return {k: sorted(v) for k, v in out.items()}
-# Canonical queue keys — ALWAYS present in the contract (empty list if nothing landed) so
-# consumers can rely on a stable shape.
+# Queue keys always present in the contract (empty list if nothing landed) for a stable shape.
 CANONICAL_QUEUES = ["origin", "auth", "api", "admin", "files", "xss", "idor", "ssrf", "sqli",
                     "redirect", "lfi", "rce", "ssti", "sourcemap", "takeover", "secrets", "scanner",
-                    # evidence-probe surfaces (additive, same as the placeholder pattern):
-                    "graphql", "actuator", "websocket", "api-base",
-                    # out-of-band callbacks imported from interactsh (OOB.3; uncorrelated in Phase 1):
-                    "oob",
-                    # path-like strings an AST pass read out of JS bundles: EVIDENCE with a ranking,
-                    # never a queue of things to fetch (`ast_obs.priority_view`):
-                    "path_observations",
-                    # DOM sources and sinks read out of the same bundles — a surface Quarry did not have
-                    # before, and still evidence: where data ENTERS or LANDS, never a proven flow:
-                    "sink_observations",
-                    # chain MATERIAL, deliberately separate from every queue above: those rank things to
-                    # VERIFY, this remembers primitives that are not findings on their own (`gadgets.py`):
-                    "gadgets",
-                    # DNS-record context (notable records only — a/cname excluded as noise):
-                    "dns",
-                    # name-based virtual hosts served by an origin IP (may not resolve in DNS):
-                    "vhost",
-                    # framework debug/admin endpoints reachable (tech-conditional probe):
-                    "debug",
-                    # serialized-object / token format fingerprints (deser attack surface):
-                    "deser",
-                    # framework CVE/primitive reference for fingerprinted tech (attack-layer handoff):
-                    "tech-intel"]
+                    "graphql", "actuator", "websocket", "api-base",   # evidence-probe surfaces
+                    "oob",                     # out-of-band callbacks imported from interactsh
+                    "path_observations",       # path-like strings read from JS: evidence, not a fetch queue
+                    "sink_observations",       # DOM sources/sinks read from JS: where data enters/lands
+                    "gadgets",                 # chain material, not findings on their own
+                    "dns",                     # notable DNS records only (a/cname excluded)
+                    "vhost",                   # name-based vhosts on an origin IP (may not resolve)
+                    "debug",                   # framework debug/admin endpoints (tech-conditional probe)
+                    "deser",                   # serialized-object / token format fingerprints
+                    "tech-intel"]              # framework CVE/primitive reference for fingerprinted tech
 
 _FW_CVE: dict | None = None
 
 
-#: what each review class actually IS, so the report never implies we probed something we observed.
+#: what each review class is, so the report never implies we probed something we only observed.
 _REVIEW_LABELS = {
     "sourcemap": "fetch .map -> unminified source",
     "related-host": "PASSIVE off-scope evidence — observed, never actively expanded",
@@ -80,9 +57,8 @@ _REVIEW_LABELS = {
 
 
 def _framework_cve() -> dict:
-    """Load + cache the framework → CVE/primitive REFERENCE map (data/framework-cve.yaml). Best-effort:
-    missing/malformed yields {} (no tech-intel annotations). Recon fires nothing from this — it is
-    pure context for the attack/AI layer."""
+    """Load + cache the framework → CVE/primitive reference map (data/framework-cve.yaml);
+    missing/malformed yields {}. Reference context only — recon fires nothing from it."""
     global _FW_CVE
     if _FW_CVE is None:
         import yaml
@@ -94,13 +70,11 @@ def _framework_cve() -> dict:
             _FW_CVE = {}
     return _FW_CVE
 
-# Notable DNS record types to surface (mail/provider/cert/network context); plain a/aaaa/cname/soa
-# are excluded — a/cname already live in resolved/review, aaaa/soa are low signal for a queue.
+# Notable DNS record types to surface (mail/provider/cert/network context); a/aaaa/cname/soa excluded.
 NOTABLE_DNS_TYPES = ("mx", "ns", "txt", "caa", "asn", "cdn")
 
 
-# TXT intelligence — map a needle in the TXT value to the org's provider/vendor (SPF includes +
-# domain-verification tokens). OSINT pivots: which SaaS/mail/cloud a target actually uses.
+# Map a needle in a TXT value to the org's provider/vendor (SPF includes + verification tokens).
 _TXT_PROVIDERS = [
     ("_spf.google.com", "google-workspace"), ("google-site-verification", "google"),
     ("spf.protection.outlook.com", "microsoft-365"), ("ms=", "microsoft"),
@@ -126,8 +100,7 @@ def _txt_intel(value: str) -> list[str]:
         m = re.search(r"\bp=(none|quarantine|reject)\b", v)
         if m:
             tags.append(f"dmarc-policy:{m.group(1)}")
-        # rua/ruf report-address domains = org/vendor pivots (a shared rua across domains implies
-        # the same org — a lightweight slice of reverse-DMARC; the full reverse index is deferred).
+        # rua/ruf report-address domains are org/vendor pivots.
         for rm in re.finditer(r"(?:rua|ruf)=([^;]+)", v):
             for addr in rm.group(1).split(","):
                 dom = addr.strip().replace("mailto:", "").split("@")[-1].strip().rstrip(".")
@@ -141,8 +114,7 @@ def _txt_intel(value: str) -> list[str]:
         if needle in v:
             tags.append(f"provider:{prov}")
     return list(dict.fromkeys(tags))               # dedup, keep order
-# Reserved keys — present from M2.1 so the schema is stable, filled by tag-only classifiers
-# in M2.2 (api-doc/oauth-jwt/cloud/mobile).
+# Reserved queue keys filled by the tag-only classifiers below.
 PLACEHOLDER_QUEUES = ["api-doc", "oauth-jwt", "cloud", "mobile"]
 
 # Common vuln-class param lists (XSS/IDOR/SSRF/SQLi).
@@ -169,8 +141,7 @@ INTEREST = {
     "files": re.compile(r"/(upload|file|export|download|import|attachment|document|backup)(/|\?|$)", re.I),
 }
 
-# M2.2 tag-only classifiers — simple regex over the existing URL corpus. TAG only: no parsing,
-# no fetching, no enumeration, no analysis (those are later, separate items).
+# Tag-only classifiers over the URL corpus: tag, never parse/fetch/enumerate.
 API_DOC_RX = re.compile(r"(/swagger|/openapi|/api-docs|/graphql\b|/gql\b|swagger\.json|"
                         r"openapi\.(?:json|ya?ml)|\.well-known/openapi)", re.I)
 OAUTH_RX = re.compile(r"(/oauth2?\b|/authorize\b|/token\b|/connect/token\b|"
@@ -178,8 +149,7 @@ OAUTH_RX = re.compile(r"(/oauth2?\b|/authorize\b|/token\b|/connect/token\b|"
 OAUTH_PARAMS = {"code", "state", "id_token", "access_token", "redirect_uri",
                 "response_type", "client_id", "scope", "nonce"}
 
-# Query-param names whose VALUES are sensitive — the digest keeps the param name + URL
-# structure but masks the value (full evidence stays in normalized/url.jsonl via raw_ref).
+# Query-param names whose values are masked in the digest (full value stays in normalized/url.jsonl).
 SENSITIVE_PARAMS = {"access_token", "id_token", "code", "state", "redirect_uri",
                     "client_secret", "token", "jwt", "assertion", "refresh_token"}
 
@@ -214,9 +184,7 @@ def _params_of(url: str) -> list[str]:
 
 
 def _more(add, shown: int, total: int, where: str = "normalized/ + digest.json") -> None:
-    """Say what a DISPLAY cap is holding back. A section that simply stops looks COMPLETE, which is how
-    a cap hides in plain sight. Secrets are not capped at all; these are context lists, and even those
-    must state what they are not showing (Lumpy, 2026-08-05)."""
+    """Say what a display cap is holding back, so a truncated section is never read as complete."""
     if total > shown:
         add(f"- … and {total - shown} more not shown here — all of them in `{where}`")
 
@@ -228,11 +196,8 @@ def build(run, scope) -> str:
     resolved = run.count("resolved")
     secrets = run.read("secret")
 
-    # origin (non-CDN) hosts = juicier (no WAF)
-    origins = [l for l in live if not l.get("cdn")]
-    # interest buckets over url corpus
+    origins = [l for l in live if not l.get("cdn")]   # non-CDN hosts: no WAF
     buckets = {k: sorted({u for u in urls if rx.search(u)}) for k, rx in INTEREST.items()}
-    # vuln-class param classification
     vuln_urls = {k: [] for k in VULN_PARAMS}
     for u in urls:
         ps = _params_of(u)
@@ -296,16 +261,11 @@ def build(run, scope) -> str:
 
     if secrets:
         A(f"## Secret candidates ({len(secrets)}) — review before any validation")
-        # NO CAP. A finding the report does not print is a finding an operator has to go looking for,
-        # and secrets are the reason the run happened (Lumpy, 2026-08-05).
-        for s in secrets:
+        for s in secrets:                          # no cap: secrets are the point of the run
             verified = " VERIFIED" if s.get("verified") else ""
             loc = f"  @ {s.get('file')}" if s.get("file") else ""
             where = f":{s.get('line')}" if s.get("line") else ""
-            # THE VALUE, READABLE. This report is LOCAL evidence for the operator doing the hunting: a
-            # masked finding means opening the raw artifact before you can even tell a false positive
-            # from a live credential (Lumpy, 2026-08-05). `preview` exists for channels that leave the
-            # box; it is the fallback here only when a producer stored no value at all.
+            # the readable value: local evidence for the operator; `preview` only if no value stored.
             shown = s.get("value") or s.get("data") or s.get("preview", "")
             A(f"- [{s.get('kind')}{verified}] {shown}{loc}{where}  "
               f"(src: {','.join(s.get('sources', []))})")
@@ -345,22 +305,14 @@ def build(run, scope) -> str:
                 _more(A, 12, len(items))
                 A("")
 
-    # gf / sourcemap candidates (review entities)
-    reviews = run.read("review")
-    # OWNERSHIP LIFECYCLE rows are an append-only transition log (`state_key`/`state_seq`), because an
-    # ownership problem can open, be resolved, and open AGAIN — a mutable flag on a merged entity cannot
-    # say that, and once set it never cleared (review#29, Lumpy). Only the LATEST transition per path is
-    # the current state; the earlier ones stay in the log as history.
-    # ONE resolver, shared with the lane (review#32, Lumpy): picking the current transition here
-    # through the trust-blind read gave two answers to one question — a log the lane refuses to act on
-    # was still rendered as fact.
+    reviews = run.read("review")                 # gf / sourcemap candidates
+    # Current per-path ownership state from the append-only transition log, via the one resolver the
+    # lane also uses (a log the lane refuses to act on must not be rendered here as fact).
     from .evidence import current_ownership_rows
     _own_rows, _own_ok = current_ownership_rows(run)
-    reviews = list(reviews) + _own_rows          # transitions live in their OWN entity now
+    reviews = list(reviews) + _own_rows
     if not _own_ok:
-        # review#33 (Lumpy): a log that is wholly lost leaves NO surviving row to hang a per-path
-        # warning on, so the report said nothing at all — while the lane was refusing to write new
-        # refusals into it. The warning is section-level for exactly that case.
+        # a wholly-lost log has no surviving row to carry a per-path warning, so warn at section level.
         A("## ⚠ Acquisition-ownership log NOT AUTHORITATIVE")
         A("> Its transitions could not be read as a trustworthy history, so **no path's current "
           "acquisition state is known** and new ownership transitions are NOT being recorded. This log "
@@ -370,8 +322,7 @@ def build(run, scope) -> str:
         A("")
 
     by_klass: dict[str, list[str]] = {}
-    # `unclassified` is ordered SHAPE-INTERESTING FIRST so the 15 shown are the ones worth a look. The
-    # order is presentation; every row is in the queue either way (review#21, Lumpy).
+    # `unclassified` ordered shape-interesting first; order is presentation, every row stays in the queue.
     for r in sorted(reviews, key=lambda x: (x.get("interest") != "high", str(x.get("value", "")))):
         v = r.get("value", "")
         if r.get("undecidable"):
@@ -383,24 +334,16 @@ def build(run, scope) -> str:
             v = f"{r['key']} = {v}   [{r.get('interest', 'low')}: {r.get('reason', '')}]"
         by_klass.setdefault(r.get("klass", "other"), []).append(v)
     if reviews:
-        # review-B1.5br4#3: the class headings became truthful while this one still said every queue was
-        # a gf bucket or a source map. Some of them are evidence Quarry OBSERVED and will not act on.
         A(f"## Review queues ({len(reviews)}) — candidates and passive evidence")
         for klass in sorted(by_klass):
-            # dict.fromkeys keeps FIRST-SEEN order (so `unclassified` stays interest-ordered) while
-            # still de-duplicating; `sorted(set(...))` threw that ordering away.
+            # dict.fromkeys keeps first-seen order (unclassified stays interest-ordered) while deduping.
             items = list(dict.fromkeys(by_klass[klass])) if klass == "unclassified" \
                 else sorted(set(by_klass[klass]))
-            # every non-sourcemap class was labelled "gf match", which is wrong for anything that did
-            # not come from a gf bucket — and actively misleading for PASSIVE evidence, which an operator
-            # must not read as something Quarry probed.
             label = _REVIEW_LABELS.get(klass, "gf match")
             A(f"### {klass.upper()}  ({len(items)}) — {label}")
             for v in items[:15]:
                 A(f"- {v}")
-            if len(items) > 15:
-                # B1.5b: a DISPLAY may be bounded; the stored evidence never is. Say so, or a reader
-                # takes the preview for the whole queue — which is how a cap hides in plain sight.
+            if len(items) > 15:                    # display bounded; stored evidence is not
                 A(f"- … {len(items) - 15} more — full list in normalized/review.jsonl")
             A("")
 
@@ -437,8 +380,7 @@ def build(run, scope) -> str:
             seen = sum(s.get("n", 0) for s in (o.get("sightings") or []) if isinstance(s, dict))
             who = ", ".join(ast_obs.corroborators(o, fresh)) or "ast only"
             A(f"- {o.get('id')}  ·  x{seen}  ·  {who}")
-        if len(top) > 15:
-            # a DISPLAY may be bounded; the stored evidence never is
+        if len(top) > 15:                          # display bounded; stored evidence is not
             A(f"- … {len(top) - 15} more prioritised — full list in normalized/path_observation.jsonl")
         if len(obs) > len(top):
             A(f"- ({len(obs) - len(top)} further observation(s) kept as evidence, not prioritised)")
@@ -480,27 +422,22 @@ def build(run, scope) -> str:
     return "\n".join(out) + "\n"
 
 
-# ── M2.1: structured digest contract (digest.json schema 1.0) ───────────────────────────
-# Built from the SAME existing data as the markdown HOTLIST. Every queue item carries
-# provenance (sources + raw_ref + why + confidence); values are redacted (secret previews
-# only, plus a defensive redact() of our own configured keys). The new queue types are
-# present as empty placeholder keys (filled by tag-only classifiers in M2.2).
+# Structured digest contract (digest.json schema 1.0): every queue item carries provenance
+# (sources + raw_ref + why + confidence). Discovered values are shown whole with a short preview
+# alongside; only Quarry's own configured keys are redacted.
 
 def _item(type_: str, value, why: str, confidence: str, sources, raw_ref: str, tags,
           location: str | None = None, identity: str | None = None) -> dict:
     val = _sanitize_url(secrets.redact(value)) if isinstance(value, str) else value
-    # hash the SANITIZED value: keeps raw tokens out of the id AND dedups the same endpoint
-    # that differs only by a one-time code/state.
-    #
-    # `identity` overrides it for a type whose DISPLAY is bounded: hashing a truncated string collapses
-    # two distinct records that happen to share a prefix, and dedup below is by item id.
+    # id hashes the sanitized value (raw tokens out of the id, dedups one-time code/state variants);
+    # `identity` overrides it when the display is truncated, since a prefix hash would collide.
     iid = (f"{type_}:{identity}" if identity else
            f"{type_}:{hashlib.sha1(str(val).encode('utf-8', 'replace')).hexdigest()[:10]}")
     item = {"id": iid, "type": type_, "value": val, "why": why,
             "confidence": confidence, "sources": list(sources or []),
             "raw_ref": raw_ref, "tags": [t for t in (tags or []) if t]}
-    if location:                          # evidence hint (e.g. the JS file a secret was in) —
-        item["location"] = location       # distinct from raw_ref (the immutable normalized store)
+    if location:                          # evidence hint (e.g. the JS file), distinct from raw_ref
+        item["location"] = location
     return item
 
 
@@ -521,7 +458,7 @@ def collect(run, scope) -> dict:
             tags = ["origin", "no-waf"] + ([str(l["status_code"])] if l.get("status_code") else [])
             add("origin", _item("origin", l["url"], "origin host (no CDN → likely no WAF)",
                                 "high", l.get("sources"), "normalized/live.jsonl", tags))
-        else:                                        # CDN/WAF-fronted host — tag it as such (A2)
+        else:                                        # CDN/WAF-fronted host — tag it as such
             cn = l.get("cdn_name") or "cdn"
             add("origin", _item("origin", l["url"], f"CDN/WAF-fronted host ({cn}) — origin hidden",
                                 "low", l.get("sources"), "normalized/live.jsonl",
@@ -542,7 +479,7 @@ def collect(run, scope) -> dict:
                 if any(p in names for p in ps):
                     add(cls, _item(cls, u, f"{cls} candidate param present", "low",
                                    src, "normalized/url.jsonl", [cls, "param"]))
-        # M2.2 tag-only classifiers (no parse/fetch/enum)
+        # tag-only classifiers (no parse/fetch/enum)
         if API_DOC_RX.search(u):
             add("api-doc", _item("api-doc", u, "API spec/doc endpoint (tag only — not parsed)",
                                  "medium", src, "normalized/url.jsonl", ["api-doc"]))
@@ -557,8 +494,7 @@ def collect(run, scope) -> dict:
             add("mobile", _item("mobile", u, "mobile app reference (tag only)", "low",
                                 src, "normalized/url.jsonl", ["mobile"]))
 
-    # deep-mine kinds FIRST → a richer review (e.g. graphql introspection-ENABLED) for the same URL
-    # then wins on the id-dedup below (dedup keeps the last-added item).
+    # deep-mine kinds first so a richer review for the same URL wins on the id-dedup below (keeps last).
     for ep in run.read("endpoint"):
         kind = ep.get("kind")
         if kind in ("graphql", "websocket", "api-base"):
@@ -611,8 +547,7 @@ def collect(run, scope) -> dict:
                 "medium", r.get("sources"), "normalized/review.jsonl",
                 [t for t in ("origin-ip", r.get("channel"), "verify-ownership") if t]))
 
-    # framework CVE/primitive REFERENCE annotation — recon fires NOTHING from this; it hands the
-    # attack/AI layer "this tech is present → here's what's known to try" (provenance = the interface).
+    # framework CVE/primitive reference for the attack layer; recon fires nothing from it.
     techblob = " ".join(str(t.get("tech", "")).lower() for t in run.read("tech"))
     if techblob:
         for name, spec in _framework_cve().items():
@@ -630,17 +565,14 @@ def collect(run, scope) -> dict:
         if t not in NOTABLE_DNS_TYPES:
             continue
         val = str(d.get("value", ""))
-        tags = ["dns", t] + (_txt_intel(val) if t == "txt" else [])   # tag from the FULL value
-        # the FULL record: a DKIM/verification blob is long, and truncating it in the one place an
-        # operator reads is how a leaked key hides in plain sight.
+        tags = ["dns", t] + (_txt_intel(val) if t == "txt" else [])   # tag from the full value
+        # the full record: truncating a long DKIM/verification blob would hide a leaked key.
         add("dns", _item("dns", f"{d.get('host')} · {t}={val}", f"{t} record (DNS context)",
             "low", d.get("sources"), "normalized/dns_record.jsonl", tags))
 
     for s in secrets_e:
-        # THE VALUE. `digest.json` is LOCAL — it is the recon->attack contract, and an attack layer (or
-        # an operator triaging a false positive) cannot work from `AKIA…MPLE (20 chars)`. Quarry's OWN
-        # configured credentials are still redacted inside `_item`; a DISCOVERED secret is the finding
-        # (Lumpy, 2026-08-05). `preview` remains for channels that leave the box.
+        # the readable value: digest.json is the local recon→attack contract. Our own configured
+        # credentials are still redacted inside `_item`; `preview` only if no value stored.
         shown = s.get("value") or s.get("data") or s.get("preview") or ""
         add("secrets", _item("secret", shown,
             f"{s.get('kind')} secret candidate", "high" if s.get("verified") else "medium",
@@ -648,31 +580,29 @@ def collect(run, scope) -> dict:
             ["secret", s.get("kind", "")], location=s.get("file")))
 
     sev_conf = {"critical": "high", "high": "high", "medium": "medium", "low": "low", "info": "low"}
-    for f in findings:                              # scanner candidates (UNCONFIRMED)
+    for f in findings:                              # scanner candidates (unconfirmed)
         sev = f.get("severity", "unknown")
         add("scanner", _item("finding", f.get("matched") or f.get("id"),
             f"{f.get('template')} [{sev}] — UNCONFIRMED", sev_conf.get(sev, "low"),
             f.get("sources"), "normalized/finding.jsonl", ["scanner", sev]))
 
-    for o in run.read("oob_interaction"):           # OOB callbacks — CORRELATED (P2) or UNCORRELATED (P1)
+    for o in run.read("oob_interaction"):           # OOB callbacks — correlated or uncorrelated
         proto = o.get("protocol", "?")
         dom = o.get("interaction_domain") or o.get("correlation_id") or o.get("id")
-        if o.get("correlation") == "correlated":    # Quarry-issued token named the source -> specific tags
+        if o.get("correlation") == "correlated":    # Quarry-issued token named the source
             pc = o.get("payload_class") or "oob"
             why = (f"out-of-band interaction — CORRELATED to {o.get('source_tool')} "
                    f"(param {o.get('param') or '?'} on {o.get('target_url') or '?'})")
             tags = [t for t in ["oob", proto, pc, "correlated", o.get("source_tool")] if t]
-        else:                                       # Phase-1 import / stray callback — no attribution
+        else:                                       # imported / stray callback — no attribution
             why = "out-of-band interaction — UNCORRELATED (no source attribution until a Quarry-issued token matches)"
             tags = ["oob", proto, "unknown-oob", "external-service-interaction", "uncorrelated"]
         add("oob", _item("oob_interaction", f"{proto} · {dom} · from {o.get('remote_address', '?')}",
             why, "candidate", o.get("sources"), "normalized/oob_interaction.jsonl", tags,
             location=o.get("raw_ref")))
 
-    # ── GADGETS: chain material, never a finding ────────────────────────────────────────────────
-    # Deliberately its own queue. Every queue above ranks things to VERIFY; this one remembers primitives
-    # that are worthless alone and decisive as step two — and mixing them would teach a reviewer to skim
-    # both. `impact_state` rides along so a consumer can never mistake one for a claim.
+    # gadgets: its own queue of chain material, never a finding. `impact_state` rides along so no
+    # consumer mistakes one for a claim.
     for g in run.read("gadget_candidate"):
         if not isinstance(g, dict):
             continue
@@ -685,10 +615,8 @@ def collect(run, scope) -> dict:
             + [f"chain:{c}" for c in chains],
             location=g.get("raw_ref") or None))
 
-    # ── PATH OBSERVATIONS: prioritised EVIDENCE, never a queue of things to fetch ────────────────
-    # Its own queue for the same reason gadgets have one: everything above ranks things to VERIFY, and
-    # these are strings a parser read out of a bundle. `impact_state` and the "observation" tag ride
-    # along so no consumer — including a v0.4 skill — can mistake one for a claim that the route exists.
+    # path observations: prioritised evidence (strings read from a bundle), never a fetch queue.
+    # The "observation" tag + `impact_state` ride along so no consumer reads one as a proven route.
     from . import ast_obs as _ast_obs
     _obs = [o for o in run.read("path_observation") if isinstance(o, dict)]
     _fresh = _corroboration_now(run)
@@ -713,8 +641,7 @@ def collect(run, scope) -> dict:
             "candidate", s.get("sources"), "normalized/sink_observation.jsonl",
             ["observation", "dom", "impact:none_proven"] + sorted(s.get("tags") or []),
             location=s.get("raw_ref") or None,
-            # the ENTITY's id: the display is truncated, the identity must not be
-            identity=str(s.get("id") or "")))
+            identity=str(s.get("id") or "")))       # the entity id: display is truncated, identity is not
 
     for q in queues:                                # dedup by item id (keys already canonical)
         queues[q] = list({it["id"]: it for it in queues[q]}.values())
@@ -727,8 +654,8 @@ def collect(run, scope) -> dict:
     clusters = [{"key": apex, "type": "apex", "members": sorted(m), "signal_strength": "medium"}
                 for apex, m in sorted(by_apex.items())]
 
-    # findings are scanner output: split confirmed vs candidate so a bare "findings" number never presents
-    # UNCONFIRMED scanner candidates (all confirmed:false today) as if they were confirmed findings.
+    # split confirmed vs candidate so a bare "findings" number never presents unconfirmed candidates
+    # as confirmed findings.
     _confirmed = sum(1 for f in findings if f.get("confirmed"))
     inventory = {"subdomains": run.count("subdomain"), "resolved": run.count("resolved"),
                  "live": len(live), "urls": len(url_rows), "secrets": len(secrets_e),

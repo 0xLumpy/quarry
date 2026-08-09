@@ -28,9 +28,8 @@ class PhaseContext:
         return p
 
 
-# phase name -> (callable, human label, requires_active)
-# OSINT is NOT here — it's a separate pre-flight command (`quarry osint`). The recon run acts
-# only on the human-confirmed scope in target.yaml.
+# OSINT is a separate pre-flight command (`quarry osint`), not a phase — the run acts only on the
+# human-confirmed scope in target.yaml.
 from . import horizontal, vertical, dns, probe, crawl, enrich, origin, content, params  # noqa: E402
 
 # needs_active=True => whole phase skipped in passive mode. Phases with passive value

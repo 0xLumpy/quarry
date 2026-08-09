@@ -1,15 +1,9 @@
 """Machine-scoped runtime settings — the non-secret counterpart to secrets.yaml.
 
-Store: `~/.config/quarry/config.yaml`. Holds knobs that are NOT credentials and NOT per-engagement —
-local performance / concurrency and advanced local tool paths. Two stores, two axes:
-
-  secrets.yaml  = credentials (tokens / keys / webhooks).
-  target.yaml   = the ENGAGEMENT (scope, RATELIMIT = "pressure on the TARGET").
-  config.yaml   = the MACHINE ("how many local lanes does a tool use?" = CONCURRENCY) + local paths.
-
-(This module is `settings` to avoid colliding with `config.py`, which parses the target profile.)
-Everything is optional: a missing file or unset key falls back to a safe default. `config.yaml` is
-created once by bootstrap and never overwritten (same rule as secrets.yaml).
+Store: `~/.config/quarry/config.yaml`. Non-credential, non-per-engagement knobs — local
+performance / concurrency and advanced local tool paths (secrets.yaml = credentials;
+target.yaml = the engagement). Every key is optional: a missing file or unset key falls back to a
+safe default. Created once by bootstrap and never overwritten.
 """
 from __future__ import annotations
 
@@ -21,9 +15,8 @@ import yaml
 
 PATH = Path.home() / ".config" / "quarry" / "config.yaml"
 _cache: dict | None = None
-#: RUN-scoped knob overrides set by an explicit operator FLAG. Config is machine policy; a flag is this
-#: run's instruction, and it wins over the file for this process only. Values go through the same strict
-#: readers, so a flag can never introduce a value the file could not hold (step 4.3, `--unbound`).
+#: run-scoped knob overrides from an explicit operator flag; win over the file for this process only,
+#: through the same strict readers (a flag can never introduce a value the file could not hold).
 _overrides: dict = {}
 
 PROFILES = ("safe", "balanced", "aggressive", "auto")
@@ -40,23 +33,16 @@ def load() -> dict:
 
 
 def override(key: str, value) -> None:
-    """Set a run-scoped override for one knob. Explicit, per flag, never inferred."""
     _overrides[key] = value
 
 
 def clear_overrides() -> None:
-    """Drop every run-scoped override (a fresh process, or a test)."""
     _overrides.clear()
 
 
 @contextlib.contextmanager
 def overrides(values: dict):
-    """Apply flag overrides for ONE run, and restore whatever was there before.
-
-    `override()` alone is process-global and never restored, which is wrong the moment two runs share an
-    interpreter — a `--settle` supervisor drives child runs in one process, and an unbound child would
-    leave its bounds lifted for the next one. Snapshot in, restore in `finally`, so a run's instruction
-    cannot outlive the run (flag-axis step 2)."""
+    """Apply flag overrides for one run, restoring the previous set on exit."""
     before = dict(_overrides)
     _overrides.update(values)
     try:
@@ -67,10 +53,10 @@ def overrides(values: dict):
 
 
 def source_of(key: str) -> str:
-    """Where a value for `key` was WRITTEN: a run `flag`, the machine `config`, else `default`.
+    """Where a value for `key` came from: a run `flag`, the machine `config`, else `default`.
 
-    Presence is not acceptance — a value the strict parser rejects still leaves the key present here. Ask
-    `strict_int_with_source()` for the ATTRIBUTION of an effective value."""
+    Presence is not acceptance — a value the strict parser rejects still leaves the key present here;
+    `strict_int_with_source()` gives the attribution of an effective value."""
     if key in _overrides:
         return "flag"
     return "config" if key in performance() else "default"
@@ -82,17 +68,16 @@ def performance() -> dict:
 
 
 def profile() -> str:
-    """The concurrency PROFILE: safe | balanced | aggressive | auto (default). `auto` = derive worker
-    counts from CPU cores at run time (H2); the others are fixed tiers. Unknown value → `auto`."""
+    """The concurrency profile: safe | balanced | aggressive | auto (default). `auto` derives worker
+    counts from cpu cores at run time; the others are fixed tiers. Unknown value → `auto`."""
     prof = str(performance().get("PROFILE") or "auto").strip().lower()
     return prof if prof in PROFILES else "auto"
 
 
 def web_port_prefilter() -> bool:
-    """v0.3.5: SYN web-port prefilter before the bulk httpx (naabu over host IPs × the HTTP port set →
-    httpx only on OPEN host:ports, bbot-style). Default ON. `false` restores direct-httpx over ALL
-    configured ports (no SYN prefilter) — but the private/reserved-only-host SKIP still applies (that's a
-    safety rail, not part of the prefilter). Separate from MODES.PORTSCAN (infra scan)."""
+    """SYN web-port prefilter before the bulk httpx (naabu over host IPs × the HTTP port set → httpx
+    only on open host:ports). Default on. `false` restores direct httpx over all configured ports; the
+    private/reserved-only-host skip still applies. Separate from MODES.PORTSCAN (infra scan)."""
     v = performance().get("WEB_PORT_PREFILTER")
     if v is None:
         return True
@@ -100,27 +85,21 @@ def web_port_prefilter() -> bool:
 
 
 def strict_int(key: str, *, default: int, maximum: int) -> int:
-    """A COVERAGE/BUDGET knob from PERFORMANCE, parsed strictly: an exact int (never a bool) or a clean
-    int-string in 0..maximum. Anything else — bool, float, negative, oversized, whitespace, garbage —
-    falls back to `default` rather than inventing a policy from a typo.
+    """A coverage/budget knob from PERFORMANCE, parsed strictly: an exact int (never a bool) or a clean
+    int-string in 0..maximum. Anything else falls back to `default` rather than inventing a policy from
+    a typo.
 
-    `0` is a MEANINGFUL value for these knobs (the caller decides what it means: unbounded budget, full
-    depth, …), which is why this is separate from `concurrency()` — that one clamps to >= 1 and would turn
-    an intentional 0 into 1. Shared because the same parser is needed by every knob that decides how much
-    of the eligible input gets processed (SUBFINDER_MAX_TIME, NUCLEI_MAX_HOST_ERROR, the fetch budgets),
-    and three hand-rolled copies would drift."""
+    `0` is a meaningful value here (unbounded budget, full depth, …), which is why this is separate from
+    `concurrency()` — that one clamps to >= 1 and would turn an intentional 0 into 1."""
     return strict_int_with_source(key, default=default, maximum=maximum)[0]
 
 
 def _diagnostic(raw, *, maximum: int | None = None) -> str:
-    """A BOUNDED, non-disclosing description of a value the parser refused.
+    """A bounded, non-disclosing description of a value the parser refused.
 
-    A rejected value is diagnostic text that reaches the console and `manifest.json`, so it may not be an
-    unrestricted echo of whatever the config held. Numbers are not exempt: a credential of digits echoes
-    as an int, and truncating a numeric STRING before redacting it defeats the redactor, which matches the
-    whole secret. So the complete representation is redacted FIRST, and a number is only shown when it is
-    short enough to be a bound rather than a secret — otherwise it is described by DIGIT COUNT and how it
-    missed the range, which is what an operator actually needs to find the typo."""
+    The text reaches the console and `manifest.json`, so it is not an unrestricted echo: the whole
+    representation is redacted first, and a number is shown only when short enough to be a bound rather
+    than a secret — otherwise it is described by digit count and how it missed the range."""
     from . import secrets
     if isinstance(raw, bool):
         return repr(raw)
@@ -128,7 +107,7 @@ def _diagnostic(raw, *, maximum: int | None = None) -> str:
     limit = _int_str_limit()
     if isinstance(raw, (int, float)):
         if isinstance(raw, int) and _digit_count(raw) > limit:
-            # too long even to RENDER: describe it from its bit length, and never build the string
+            # too long to render: describe it from its bit length, never build the string
             return f"int({_digit_count(raw)} digits; {_range_note(raw, maximum)})"
         text, quoted = repr(raw), False
         numeric = raw
@@ -137,13 +116,13 @@ def _diagnostic(raw, *, maximum: int | None = None) -> str:
         body = stripped[1:] if stripped[:1] == "-" else stripped
         if body.isdigit():
             if len(_significant(body)) > limit:
-                # this many SIGNIFICANT digits cannot be converted — and is genuinely above any maximum
+                # this many significant digits cannot be converted, and is above any maximum
                 return (f"str({len(body)} digits; "
                         f"{'below zero' if stripped[:1] == '-' else _range_note(None, maximum)})")
             text, quoted = stripped, True
             numeric = int(_significant(body) or "0") * (-1 if stripped[:1] == "-" else 1)
         else:
-            return f"str({len(raw)} chars)"             # never the CONTENT of an opaque value
+            return f"str({len(raw)} chars)"             # never the content of an opaque value
     elif isinstance(raw, (list, tuple, set)):
         return f"{type(raw).__name__}({len(raw)} item(s))"
     elif isinstance(raw, dict):
@@ -152,58 +131,56 @@ def _diagnostic(raw, *, maximum: int | None = None) -> str:
         return type(raw).__name__
     digits = sum(c.isdigit() for c in text)
     kind = "str" if quoted else type(raw).__name__
-    # the WHOLE representation goes through the redactor before anything is shortened
+    # redact the whole representation before shortening anything
     if (secrets.redact(text) or text) != text or digits > _DIAGNOSTIC_DIGITS:
         return f"{kind}({digits} digits; {_range_note(numeric, maximum)})"
     return f"'{text}'" if quoted else text
 
 
-#: how many digits a rejected number may show before it is described instead. A bound an operator typed
-#: wrong is short (1440, 5000, 100000); a credential is not.
+#: how many digits a rejected number may show before it is described instead — a mistyped bound is
+#: short (1440, 5000, 100000), a credential is not.
 _DIAGNOSTIC_DIGITS = 6
 
 
 def _int_str_limit() -> int:
     """CPython's int<->str conversion limit (4300 by default, 3.11+). Above it, `int("9" * 5000)` and even
-    `repr(10 ** 5000)` RAISE — so a knob holding such a value could abort a run from inside the parser that
-    exists to refuse it, and now does so on every run, since the policy snapshot reads every bound."""
+    `repr(10 ** 5000)` raise, so a knob holding such a value could abort a run from inside the parser
+    meant to refuse it."""
     import sys
     getter = getattr(sys, "get_int_max_str_digits", None)
     limit = getter() if getter else 0
-    # 0 means the interpreter DISABLED the limit (3.11+), not "zero digits allowed". Reading it literally
-    # refused every numeric setting — a configured "10" became the default.
+    # 0 means the interpreter disabled the limit (3.11+), not "zero digits allowed" — read literally it
+    # would refuse every numeric setting.
     return limit if limit > 0 else 4300
 
 
 def _significant(digits: str) -> str:
-    """The digits that decide the VALUE — leading zeroes are representation, not magnitude. `"0" * 5000` is
-    zero, and calling it "above maximum" claims a comparison nobody performed."""
+    """The digits that decide the value — leading zeroes are representation, not magnitude."""
     return digits.lstrip("0")
 
 
 def _digit_count(raw: int) -> int:
-    """How many decimal digits an int has, WITHOUT converting it to a string (which is what fails)."""
+    """How many decimal digits an int has, without converting it to a string."""
     n = abs(raw)
     return n.bit_length() * 30103 // 100000 + 1
 
 
 def _range_note(value, maximum: int | None) -> str:
-    """How a refused number missed the accepted range — the fact, never the value."""
+    """How a refused number missed the accepted range."""
     if value is not None and value < 0:
         return "below zero"
     if maximum is not None and value is not None and value > maximum:
         return f"above maximum {maximum}"
     if maximum is not None and value is None:
-        return f"above maximum {maximum}"      # too long to convert IS above any maximum
+        return f"above maximum {maximum}"      # too long to convert is above any maximum
     return "outside the accepted range"
 
 
 def flag_int(key: str, *, default: int, maximum: int) -> tuple[int, str, str | None, str | None]:
-    """Like `strict_int_with_source`, but reading ONLY run-scoped flag overrides — never `config.yaml`.
+    """Like `strict_int_with_source`, but reading only run-scoped flag overrides — never `config.yaml`.
 
-    A module constant is not a PERFORMANCE knob: config has no say over it, and letting the same reader
-    serve both made an ordinary config key change a module bound (and made the policy report claim a HELD
-    cap had moved while the lane went on using its constant)."""
+    A module constant is not a PERFORMANCE knob: config has no say over it, so the same reader may not
+    serve both."""
     if key not in _overrides:
         return default, "default", None, None
     saved = dict(_overrides)
@@ -217,13 +194,11 @@ def flag_int(key: str, *, default: int, maximum: int) -> tuple[int, str, str | N
 
 def strict_int_with_source(key: str, *, default: int,
                            maximum: int) -> tuple[int, str, str | None, str | None]:
-    """`(value, source, rejected, rejected_source)` — the value, WHO it came from, what was thrown away
-    getting there, and who had written THAT.
+    """`(value, source, rejected, rejected_source)` — the value, where it came from, what was thrown away
+    getting there, and who had written that.
 
-    Attribution has to come out of the SAME parse as the value. Asking "is the key present?" separately
-    reported `source: config` for a run whose configured value the parser had refused, so the policy
-    evidence named an author for a number it did not choose (flag-axis step 3 review). A rejected value is
-    attributed to the DEFAULT and the offending input is kept, so the report can say what was ignored."""
+    Attribution comes out of the same parse as the value: a value the parser refused is attributed to the
+    default and the offending input is kept, so the report can say what was ignored."""
     written = source_of(key)
     if written == "default":
         return default, "default", None, None
@@ -235,43 +210,34 @@ def strict_int_with_source(key: str, *, default: int,
         value = raw if 0 <= raw <= maximum else None  # a comparison never converts, however long it is
     elif (isinstance(raw, str) and raw.strip().isdigit()
             and len(_significant(raw.strip())) <= _int_str_limit()):
-        # the LENGTH gate comes first: `int("9" * 5000)` raises, and a parser that exists to refuse a
-        # value may not abort the run with it — every run reads every bound for the policy report. Leading
-        # zeroes are representation: `"0" * 5000` is zero, and zero is a value this parser accepts.
-        # ...and the SIGNIFICANT part is what gets converted: CPython's limit counts the STRING's length,
-        # so `int("0" * 5000)` raises even though the value is zero.
+        # length gate first: `int("9" * 5000)` raises, and this parser may not abort the run with it.
+        # Only the significant digits convert — `int("0" * 5000)` raises though the value is zero.
         v = int(_significant(raw.strip()) or "0")
         value = v if 0 <= v <= maximum else None
     if value is None:
-        return default, "default", _diagnostic(raw, maximum=maximum), written   # refused, and SAID so
+        return default, "default", _diagnostic(raw, maximum=maximum), written   # refused, and says so
     return value, written, None, None
 
 
 def raw(key: str, default=None):
-    """The configured value EXACTLY as written, or `default` when unset.
+    """The configured value exactly as written, or `default` when unset.
 
-    review-B1.6b13#1: `concurrency()` exists for worker counts, where `max(1, ...)` and a silent fallback
-    are right — a zero worker pool is meaningless. They are wrong for a SPENDING control, where `0` means
-    "no ceiling", a negative is a typo, and a malformed value must not become a permissive default. A
-    cost guard needs the value as the operator wrote it so its own parser can refuse it."""
+    For a spending control `0` means "no ceiling" and a malformed value must not become a permissive
+    default — so this returns the value as the operator wrote it, for the caller's own parser to refuse.
+    `concurrency()` cannot serve it (its `max(1, …)` and silent fallback are for worker counts)."""
     v = performance().get(key)
     return default if v in (None, "") else v
 
 
 def policy_days(key: str, default: float) -> float:
-    """A non-negative DURATION in days from PERFORMANCE, exactly as written: an int or a float, and `0`
-    is a real value. A string, a boolean, a negative or a non-finite value falls back to the default.
+    """A non-negative duration in days from PERFORMANCE, exactly as written: an int or a float, `0` is a
+    real value. A string, bool, negative or non-finite value falls back to the default.
 
-    `concurrency()` cannot serve this: it clamps to at least 1, because a tool with zero lanes does
-    nothing — and a freshness policy of zero means something entirely different ("never replay"). Reading
-    a duration through the concurrency reader silently made `0` into `1`, so the documented policy could
-    not be configured at all. A malformed or negative value falls back to the default rather than
-    becoming a permissive one.
-    """
+    `concurrency()` cannot serve this — it clamps to at least 1, and a freshness policy of zero means
+    "never replay"."""
     v = performance().get(key)
-    # EXACT: an int or a float, never a bool (an int subclass), never a string. `float("7")` succeeded, so
-    # the contract said "as written" while quietly coercing — and a policy that accepts `"7"` today has to
-    # decide what `"7 days"` means tomorrow. YAML already gives a number for a number.
+    # an int or a float, never a bool (an int subclass), never a string: `float("7")` would coerce, and
+    # YAML already gives a number for a number.
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return float(default)
     f = float(v)
@@ -282,8 +248,8 @@ def policy_days(key: str, default: float) -> float:
 
 def concurrency(key: str, default: int) -> int:
     """An explicit per-tool concurrency override from PERFORMANCE (e.g. `NUCLEI_CONCURRENCY`,
-    `HTTPX_THREADS`), else `default`. This is the explicit-override floor; the auto/core-scaling
-    layer (H2) sits on top. A blank/invalid value falls back to `default`."""
+    `HTTPX_THREADS`), else `default`. The explicit-override floor; the auto/core-scaling layer sits on
+    top. A blank/invalid value falls back to `default`."""
     v = performance().get(key)
     if v in (None, ""):
         return default
@@ -293,36 +259,25 @@ def concurrency(key: str, default: int) -> int:
         return default
 
 
-# ── H2: concurrency scaled by CPU cores × profile ────────────────────────────────────────────
-# Workers = CPU cores × a per-tool factor × the profile multiplier, clamped. This is CONCURRENCY
-# only (local lanes); it never touches RATE (target.yaml RATELIMIT), which is applied separately —
-# pushing workers must stay within the rate budget. reconftw scales threads by cores the same way;
-# we cap + profile-gate it. Tools with no factor (dalfox — rate-sensitive) are override-only.
+# ── H2: concurrency scaled by cpu cores × profile ─────────────────────────────────────────────
+# workers = cpu cores × per-tool factor × profile multiplier, clamped; local lanes only, never rate.
 _OVERRIDE_KEY = {"nuclei": "NUCLEI_CONCURRENCY", "httpx": "HTTPX_THREADS",
                  "ffuf": "FFUF_THREADS", "dalfox": "DALFOX_WORKERS",
                  "katana": "KATANA_CONCURRENCY", "arjun": "ARJUN_THREADS"}
-_CORE_FACTOR = {"nuclei": 10, "httpx": 12, "ffuf": 12, "katana": 6, "arjun": 6}   # workers per core;
-#   interim bump from 6/8/10 — eyeballed per-tool RAM is modest (all <1.5 GB), so there's headroom.
-#   PRECISE factors wait on per-tool CPU/RAM telemetry + a bigger-target run (the range under-stresses
-#   cores). Higher nuclei -c also finishes faster → eases the timeout on multi-core boxes.
+_CORE_FACTOR = {"nuclei": 10, "httpx": 12, "ffuf": 12, "katana": 6, "arjun": 6}   # workers per core
 _PROFILE_MULT = {"safe": 0.5, "balanced": 1.0, "auto": 1.0, "aggressive": 1.75}
 _CAP = {"nuclei": 100, "httpx": 300, "ffuf": 300, "katana": 50, "arjun": 40}
 _FLOOR = 4
-# Network-I/O-bound tools: their concurrency tracks network round-trips, not CPU cores. Core-scaling
-# ALONE starves them on small-core boxes — a 4-core VPS got httpx -t 48, and a 567-host × 94-port probe
-# timed out at 1800s. Give these a core-INDEPENDENT base (profile-scaled), and take the max with the
-# core-scaled value so a big box can still go higher. Initial estimates (well within each tool's async
-# limits, conservative); the next big-target run's per-tool telemetry (H3, now flushed per-phase) refines.
-_IO_BASE = {"httpx": 150, "ffuf": 120, "katana": 25, "arjun": 20}   # katana/arjun are network-bound too;
-# the hard-coded lows (katana -c 4, arjun -t 5) left a multi-core VPS idle. I/O-scaled now, config-tunable.
+# network-I/O-bound tools track round-trips, not cores: give them a core-independent base
+# (profile-scaled) and take the max with the core-scaled value, so a small box is not starved.
+_IO_BASE = {"httpx": 150, "ffuf": 120, "katana": 25, "arjun": 20}   # katana/arjun are network-bound too
 
 
 def workers(tool: str, default: int) -> int:
     """Resolve a tool's local concurrency, in priority order:
-      1. explicit PERFORMANCE override (e.g. `NUCLEI_CONCURRENCY`) — always wins.
+      1. explicit PERFORMANCE override (e.g. `NUCLEI_CONCURRENCY`).
       2. auto/core-scaled: `cpu_cores × per-tool factor × profile multiplier`, clamped [floor, cap].
-      3. the tool's base `default` — for a tool with no scaling factor (dalfox is override-only,
-         since its worker count interacts with the rate budget)."""
+      3. the tool's base `default`, for a tool with no scaling factor (dalfox is override-only)."""
     key = _OVERRIDE_KEY.get(tool)
     if key:
         ov = performance().get(key)
@@ -342,16 +297,14 @@ def workers(tool: str, default: int) -> int:
     if io is not None:                      # I/O-bound: a low core count must not cap network concurrency
         scaled = max(scaled, round(io * mult))
     scaled = min(scaled, _CAP.get(tool, 200))
-    # `safe` = the user opted to throttle → may drop below the tool's baseline (floored at _FLOOR).
-    # auto/balanced/aggressive NEVER go below the proven `default` — scaling only ADDS lanes on bigger
-    # boxes, so a small VPS keeps the old behavior and `auto` never surprise-slows an existing setup.
+    # `safe` may drop below the tool's baseline (floored at _FLOOR); the other profiles never go below
+    # the tool's `default` — scaling only adds lanes on bigger boxes.
     return int(max(_FLOOR, scaled) if prof == "safe" else max(default, scaled))
 
 
 def openintel() -> dict:
-    """Advanced local openintel-subs paths (`{binary, db}`) — a PATH pair, not a credential, so its
-    home is config.yaml. Back-compat: if config.yaml doesn't carry it, fall back to the legacy
-    `openintel:` block in secrets.yaml (its temporary parking spot). Returns {} unless configured."""
+    """Advanced local openintel-subs paths (`{binary, db}`) — a path pair, not a credential. Back-compat:
+    falls back to the legacy `openintel:` block in secrets.yaml. Returns {} unless configured."""
     o = load().get("openintel")
     if isinstance(o, dict) and (o.get("binary") or o.get("db")):
         return o

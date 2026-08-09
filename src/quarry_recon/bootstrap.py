@@ -1,9 +1,6 @@
-"""Blank-VPS provisioning: system packages, Golang, framework data files, extras.
+"""Blank-VPS provisioning: system packages, Go toolchain, framework data files, extras.
 
-This is what makes `quarry install` a complete installer (design principle 12) rather than
-just a per-tool runner: on a fresh VPS it installs the OS deps, Go toolchain, wordlists,
-resolvers, gf patterns and nuclei templates the methodology needs. Anything it cannot
-automate (no sudo, unsupported OS) is reported, never silently skipped.
+Anything that cannot be automated (no sudo, unsupported OS) is reported, never silently skipped.
 """
 from __future__ import annotations
 
@@ -55,9 +52,7 @@ def _sh(cmd: str, dry: bool, timeout: int = 1800) -> tuple[int, str]:
 
 
 def _curl_to(url: str, dest: Path, dry: bool, timeout: int = 300) -> tuple[int, str]:
-    """Download `url` → `dest` via argv (NO shell). `quarry set --url <src>` is user input, so a
-    shell-string `curl '...'` is injectable (a single quote in the URL breaks out). subprocess.run
-    with a list passes the URL as one opaque argv element — nothing to escape, nothing to inject."""
+    """Download `url` → `dest` via argv, never a shell string — the url is user input."""
     if dry:
         return 0, "(dry-run)"
     try:
@@ -70,8 +65,7 @@ def _curl_to(url: str, dest: Path, dry: bool, timeout: int = 300) -> tuple[int, 
 
 
 def _tool_deps(mgr: str) -> list[str]:
-    """Union of per-tool `deps:` from tools.yaml (apt names). Other managers: best-effort
-    name-map for the few that differ."""
+    """Union of per-tool `deps:` from tools.yaml (apt names), name-mapped for dnf/pacman."""
     from .registry import load_tools
     apt_to = {
         "pacman": {"libpcap-dev": "libpcap", "libxml2-dev": "libxml2",
@@ -97,11 +91,8 @@ def _chromium_bin() -> "str | None":
 
 
 def _chromium_state(dry: bool, cc: int, lc: int, tail: str) -> str:
-    """What the screenshot lane will actually get — measured, then said in one line.
-
-    Three outcomes and no fourth: it runs, it is missing, or it is installed and cannot start. The last
-    one names the reason chromium itself gave (a missing .so lands here verbatim), because that is the
-    only thing an operator can act on."""
+    """One line for what the screenshot lane gets: it runs, it is missing, or it will not start
+    (naming chromium's own reason)."""
     if dry:
         return "(dry-run)"
     exe = _chromium_bin()
@@ -153,13 +144,9 @@ def install_system_packages(echo, dry: bool) -> bool:
         if libs:
             lc, tail = _sh(f"{_sudo()}{prefix} {' '.join(libs + cg.get('libs_primary_extra', []))}", dry, 900)
             if lc != 0 and cg.get("libs_fallback"):
-                # the renamed-package fallback (24.04 libasound2 -> libasound2t64). The FIRST attempt
-                # failing is the NORMAL path on a modern release, not a problem to report.
+                # renamed-package fallback (libasound2 -> libasound2t64); a first-attempt failure is normal
                 lc, tail = _sh(f"{_sudo()}{prefix} {' '.join(libs + cg['libs_fallback'])}", dry, 900)
-            # ASK CHROMIUM, don't infer from apt (Lumpy, 2026-08-07). "check log (some libs optional)"
-            # told the operator neither what failed nor which log, and it appeared on a box where the
-            # only thing that happened was the expected rename fallback. Exit codes describe the package
-            # manager; a headless launch describes what the SCREENSHOT LANE will actually get.
+            # the state comes from launching chromium, not from apt's exit codes
             echo(f"  chromium + headless libs: {_chromium_state(dry, cc, lc, tail)}")
         else:
             echo(f"  chromium: {'ok' if cc == 0 else 'manual install needed'}")
@@ -183,13 +170,11 @@ def ensure_golang(echo, dry: bool) -> bool:
             pass
     arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64",
             "arm64": "arm64"}.get(platform.machine().lower())
-    if arch is None:                                        # review-C08.2r4#7: an unknown arch must FAIL LOUD, not
+    if arch is None:
         echo(f"  unsupported CPU architecture {platform.machine()!r} — cannot install a verified Go toolchain")
-        return False                                       # silently installing an amd64 archive would be unusable
+        return False
     osname = "darwin" if platform.system() == "Darwin" else "linux"
-    # review-C08.2r3#3 (Go toolchain policy): the Go compiler is a BUILD TOOLCHAIN — policy is min_version (keep
-    # an adequate existing/distro Go, kept as-is above). When absent/too old we install the DECLARED `version`
-    # (not floating latest) AND VERIFY the archive sha256 before replacing /usr/local/go (C08 supply-chain).
+    # policy: an existing Go passes on min_version; an install takes the declared `version`, sha256-verified
     target = bs["version"]
     plat = f"{osname}/{arch}"
     sha = (bs.get("sha256") or {}).get(plat)
@@ -197,9 +182,6 @@ def ensure_golang(echo, dry: bool) -> bool:
         echo(f"  Go archive sha256 not pinned for {plat} — refusing an UNVERIFIED /usr/local/go replacement (C08)")
         return False
     url = bs["url"].format(version=f"go{target}", os=osname, arch=arch)
-    # the LINE says what is happening; the guarantees are the code above it (Lumpy, 2026-08-07). The
-    # pin and the sha256 check are unconditional — announcing them on every install is noise, and the
-    # one case an operator needs to see is the refusal, which prints its own line and returns.
     echo(f"  installing Go {target} {osname}/{arch}")
     cmd = (f"wget -q {url} -O /tmp/go.tgz && echo '{sha}  /tmp/go.tgz' | sha256sum -c - && "
            f"{_sudo()}rm -rf /usr/local/go && "
@@ -225,7 +207,7 @@ def install_data_files(echo, dry: bool, update: bool = False) -> None:
             code = 0
         echo(f"  {df['name']}: {'ok' if code == 0 else 'FAILED'}")
 
-    # framework secrets store — created once, chmod 600, NEVER overwritten
+    # framework secrets store — created once, chmod 600, never overwritten
     sp = Path.home() / ".config" / "quarry" / "secrets.yaml"
     if sp.exists():
         echo("  secrets.yaml: present")
@@ -237,7 +219,7 @@ def install_data_files(echo, dry: bool, update: bool = False) -> None:
             sp.chmod(0o600)
         echo("  secrets.yaml: created")
 
-    # non-secret runtime config (PERFORMANCE / local paths) — created once, NEVER overwritten
+    # non-secret runtime config (performance / local paths) — created once, never overwritten
     cp = Path.home() / ".config" / "quarry" / "config.yaml"
     if cp.exists():
         echo("  config.yaml: present")
@@ -250,12 +232,11 @@ def install_data_files(echo, dry: bool, update: bool = False) -> None:
 
 
 def set_data_file(name: str, url: str | None, echo, dry: bool = False) -> bool:
-    """Fetch/refresh ONE data file by name — the granular alternative to a full `quarry install`.
+    """Fetch/refresh one data file by name, overwriting unconditionally.
 
-    The NAME (from bootstrap.yaml `data_files`) always determines the destination; `url` only
-    overrides the SOURCE (e.g. point resolvers at a fresher list). Overwrites unconditionally — the
-    whole point is to refresh a single file. Robust on failure: falls back to the bundled default when
-    one exists (and no custom url was given), else reports the failure and returns False."""
+    The name (from bootstrap.yaml `data_files`) fixes the destination; `url` only overrides the source.
+    On failure writes the bundled fallback when one exists and no custom url was given, else returns False.
+    """
     bs = load_bootstrap()
     df = next((d for d in bs.get("data_files", []) if d["name"] == name), None)
     if df is None:
@@ -293,11 +274,9 @@ def run_extras(echo, dry: bool) -> None:
 
 
 def cleanup(echo, dry: bool) -> None:
-    """Reclaim disk after a bulk install (Go module/build caches are GBs after building ~25
-    Go tools; package-manager download caches add more). Tools keep working — only caches go."""
+    """Reclaim disk after a bulk install: caches only (Go build/module, pip, package manager)."""
     steps = []
     if shutil.which("go"):
-        # build cache + downloaded module sources + test cache (the big ones)
         steps.append(("go caches", "go clean -cache -modcache -testcache"))
     steps.append(("pip cache", "rm -rf ~/.cache/pip"))
     mgr, _ = detect_pkg_manager()
@@ -312,22 +291,15 @@ def cleanup(echo, dry: bool) -> None:
         echo(f"  {label}: {'cleared' if code == 0 else 'skip'}")
 
 
-# Tiered baseline (long DNS/HTTP scans are CPU/RAM hungry; crawl/screenshots/JSONL eat disk).
-# Recommended = silent ok · Minimum..Recommended = warn + proceed · below Minimum = abort.
+# Tiered baseline: recommended = silent ok · minimum..recommended = warn + proceed · below minimum = abort.
 REC_CPU, REC_RAM_GB = 4, 8          # recommended (documented + displayed)
 MIN_CPU, MIN_RAM_GB = 2, 4          # hard floor — below this, abort
-RAM_DRIFT = 0.88                    # MemTotal sits under physical (kernel/hypervisor reserve):
-                                    # an 8 GB VPS reports ~7.4–7.8 → gate at 8*0.88=7.04 clears it,
-                                    # while a true sub-8 box (~6.7) still warns. Same for the 4 GB floor.
-# Disk-free floors differ by context: install needs transient build space (Go modcache balloons
-# mid-build, freed in the cleanup stage) PLUS run headroom; after install only run space matters.
-# Install floors loosened 2026-07-04: a clean VPS git-clone + full install measured ~3.6 GB used
-# (go build/module caches balloon transiently, then bootstrap.cleanup reclaims them). The old
-# 20/30 GB install floors were far too conservative. RUN floors stay — run-time output growth on
-# big targets (crawl/screenshots/JSONL) is the real disk driver.
+RAM_DRIFT = 0.88                    # MemTotal sits under physical: an 8 GB VPS reports ~7.4–7.8
+# install floors cover transient build space (Go modcache, freed by cleanup) plus run headroom;
+# run floors cover output growth alone (crawl/screenshots/JSONL)
 DISK_MIN = {"install": 5, "run": 10}     # below -> abort
 DISK_WARN = {"install": 10, "run": 20}   # below -> warn
-REC_DISK_GB = 40                         # recommended free for comfortable runs (80+ for large targets)
+REC_DISK_GB = 40                         # recommended free (80+ for large targets)
 
 _RANK = {"ok": 0, "warn": 1, "abort": 2}
 
@@ -359,10 +331,9 @@ def disk_free_gb(path: Path | None = None) -> float:
 
 
 def system_report(context: str = "install") -> dict:
-    """Assess cpu/ram + disk against the tiers. Unknown (0) values never fail.
+    """Assess cpu/ram + disk against the tiers; unknown (0) values never fail.
 
-    `context` ('install' | 'run') only changes the disk floors — install needs transient build
-    space + run headroom; 'run' (doctor) needs only run space. Returns
+    `context` ('install' | 'run') selects the disk floors. Returns
     {'level': 'ok'|'warn'|'abort', 'checks': [(text, level), ...]}.
     """
     cpu, ram = system_info()
@@ -370,7 +341,6 @@ def system_report(context: str = "install") -> dict:
 
     cpu_s = f"{cpu} vCPU" if cpu else "unknown vCPU"
     ram_s = f"{ram:.1f} GB" if ram else "unknown"
-    # drift tolerance on RAM both tiers — a 4 GB box reports ~3.8, an 8 GB box ~7.8 (kernel reserve)
     if (cpu and cpu < MIN_CPU) or (ram and ram < MIN_RAM_GB * RAM_DRIFT):
         cr = "abort"
     elif (cpu and cpu < REC_CPU) or (ram and ram < REC_RAM_GB * RAM_DRIFT):

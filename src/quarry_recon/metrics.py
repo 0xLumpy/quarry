@@ -1,9 +1,7 @@
 """Lightweight runtime telemetry → `<run_id>/metrics/summary.json`.
 
-Data beats vibes: per-phase wall + child-CPU + inventory-at-phase (target size at that moment),
-per-tool wall/status (from the manifest's tool records), and the run's long poles. No new deps —
-`time.perf_counter` + `resource.getrusage(RUSAGE_CHILDREN)`. Groundwork for later concurrency
-tuning (which tool is the bottleneck at what target size).
+Per-phase wall + child-CPU + inventory-at-phase, per-tool wall/status (from the manifest's tool
+records), and the run's long poles, via `time.perf_counter` + `resource.getrusage(RUSAGE_CHILDREN)`.
 """
 from __future__ import annotations
 
@@ -14,10 +12,8 @@ try:
     import resource
 
     def rusage() -> tuple[float, int]:
-        """(cumulative child CPU seconds, peak child RSS). Deltas give per-phase CPU; RSS is a
-        monotonic high-water mark, so only the final value is meaningful (run-level peak).
-        NOTE: `ru_maxrss` unit is platform-specific — KB on Linux (Quarry's target), bytes on macOS;
-        the caller's `/1024` assumes Linux."""
+        """(cumulative child CPU seconds, peak child RSS). RSS is a monotonic high-water mark, so
+        only the final value is meaningful. `ru_maxrss` is KB on Linux (assumed) / bytes on macOS."""
         ru = resource.getrusage(resource.RUSAGE_CHILDREN)
         return ru.ru_utime + ru.ru_stime, ru.ru_maxrss
 except ImportError:                                # non-unix — telemetry degrades, never breaks
@@ -28,14 +24,13 @@ except ImportError:                                # non-unix — telemetry degr
 def build(run, phases: list[dict], run_wall: float, run_cpu: float, peak_rss_mb: float) -> dict:
     tools = [{"phase": r.phase, "tool": r.tool, "status": r.status,
               "wall_s": round(r.duration, 2), "out_lines": r.stdout_lines,
-              # -1.0 = UNMEASURED (the tool ran concurrently with another, so the process-global
-              # getrusage delta cannot be attributed to it). Render null, never a 0 that reads as "free".
+              # -1.0 means unmeasured (ran concurrently — getrusage delta unattributable); render null, not 0
               "cpu_s": (None if getattr(r, "cpu_s", 0.0) < 0 else getattr(r, "cpu_s", 0.0)),
               "peak_rss_mb": getattr(r, "peak_rss_mb", 0.0)}
              for r in run.tool_runs()]
     long_tools = sorted(tools, key=lambda t: t["wall_s"], reverse=True)[:5]
     long_phases = sorted(phases, key=lambda p: p.get("wall_s", 0), reverse=True)[:3]
-    # per-tool RAM ranking — the H3 data for concurrency budgeting (tool_RAM × workers ≤ box RAM)
+    # per-tool RAM ranking — concurrency-budgeting data (tool_RAM × workers ≤ box RAM)
     heavy_rss = sorted((t for t in tools if t["peak_rss_mb"]),
                        key=lambda t: t["peak_rss_mb"], reverse=True)[:5]
     return {

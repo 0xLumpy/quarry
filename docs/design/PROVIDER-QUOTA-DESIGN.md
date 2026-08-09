@@ -3,9 +3,11 @@
 > **Verified state 2026-08-03 (`2bcd00a`): B0 + B1 BUILT** (Shodan credit budget across all pivot lanes, Whoxy paginator). B2 (Censys) is BLOCKED BY ENTITLEMENT, not by code — the Platform search API is org-gated. The quota SEMANTICS below still govern every provider lane.
 
 
-Pre-Batch-B clarification. **B0 SHIPPED `883120e` + no-match follow-up `ca6d479` (both unpushed); B1/B2 not started.** Everything below marked VERIFIED was read in the tree or
-measured; everything marked MEASURE is an assumption that must be confirmed against the live API before
-it is built on.
+Originally a pre-Batch-B research note (2026-07-27). **As built (`2bcd00a`): B0 + B1 shipped** — Shodan
+credit budget across the pivot lanes and the Whoxy paginator; B2 (Censys) is blocked by entitlement, not
+code. The semantics below govern every provider lane and are what the code cites; the defect list and
+"proposed shape" are kept as the reasoning that produced the build, past tense. Items still marked MEASURE
+were assumptions to confirm against the live API.
 
 ## The principle (Lumpy's, adopted)
 
@@ -20,7 +22,7 @@ It must be visible as an *external provider limit*, never as a tool failure and 
 Distinct classes, never collapsed (Lumpy r1):
   - `401` -> authentication
   - `403` -> forbidden/entitlement, pending provider-BODY classification
-  - `429` -> **rate limit** (NOT quota — `contract.py:56` currently calls it `quota`, which is wrong)
+  - `429` -> **rate limit** (`classify_provider_error` returns `PROVIDER_RATE_LIMIT`, resolved)
   - quota exhaustion -> **proven from the provider's response body or balance endpoint, NEVER inferred
     from an HTTP status alone**
   - `transport` · `5xx server` unchanged
@@ -31,31 +33,34 @@ provider that IS configured but cannot run because the account lacks entitlement
 and DOES contribute to `complete_with_limits`. (Supersedes my earlier "silence -> UNKNOWN" framing for
 the Censys gate: the fix there is an explicit SKIPPED, not a gap.)
 
-## VERIFIED defects in the current tree
+## Defects this addressed (all resolved in `2bcd00a`)
 
-**1. `401` and `403` are the same class.** `contract.classify_provider_error` maps both to `"auth"`
-(`contract.py:52-53`). Entitlement ("your plan cannot call this endpoint") is a *permanent capability*
+The four below were the state that motivated the build. Each is fixed; the shipped location is noted so a
+reader arriving from a code citation does not read a resolved defect as current.
+
+**1. `401` and `403` were the same class.** *Resolved:* `classify_provider_error` now splits 401->`auth`,
+403->`forbidden`. Entitlement ("your plan cannot call this endpoint") is a *permanent capability*
 fact; a bad key is an *operator* fact; neither is quota. Three different operator actions, one label.
 
-**2. Censys never ran — confirmed.** `vertical.py:597` gates the whole lane on `token AND org`:
+**2. Censys ran silently skipped.** *Resolved:* `vertical.censys_entitlement_skip` records an explicit
+provider skip when a token is configured without an org id. The lane still gates on `token AND org`:
 
     if cen.get("token") and cen.get("org"):
 
-A Censys **Free** account has no organization ID, so the lane is skipped **silently** — no source event,
-no skip record, nothing in the digest. That matches Lumpy's observation that 100 Censys credits have
-never been touched. Two separate problems:
-  - the silence itself ("we could not look" must not read as "nothing was there" — the same rule the
-    A1/A2 lanes now follow with COVERAGE_UNKNOWN);
-  - the endpoint used is Platform v3 **global search** (`/v3/global/search/query`), which is a paid tier.
-    A Free PAT would get a pre-charge `403` even if the org gate were removed. MEASURE: what a Free PAT
-    actually returns, and whether any Free-reachable endpoint yields cert names.
+A Censys **Free** account has no organization ID, so the `token AND org` gate is not met. Previously the
+lane was skipped silently — no source event, no skip record — which is why 100 Censys credits went
+untouched unseen; it now emits an explicit provider skip, so the gap is visible. The remaining limit is
+entitlement: the endpoint is Platform v3 **global search** (`/v3/global/search/query`), a paid tier, so a
+Free PAT would get a pre-charge `403` even with an org id. MEASURE: what a Free PAT returns, and whether
+any Free-reachable endpoint yields cert names.
 
-**3. Whoxy reports credit exhaustion as a clean empty result — SIGNAL NOW MEASURED.** `osint.py:240-251` parses
+**3. Whoxy reported credit exhaustion as a clean empty result.** *Resolved:* the `status:0` envelope in a
+200 now maps to `complete_with_limits`, not a false empty. `osint.py` parses
 `domainsList` / `search_result` straight out of the body. Whoxy answers **HTTP 200** with a
-`{"status": 0, "status_reason": "..."}` envelope on failure (including out-of-credits), so both keys are
-absent, `doms` becomes `[]`, and the lane echoes `whoxy[label]: 0 domains` — a **false empty**, not even
-a failure. The `except` branch only catches transport/JSON errors and echoes without recording a source
-event. Whoxy is credit-based like Shodan, so this is the same class of bug.
+`{"status": 0, "status_reason": "..."}` envelope on failure (including out-of-credits). Previously both
+keys were absent, `doms` became `[]`, and the lane echoed `whoxy[label]: 0 domains` — a **false empty**;
+the envelope now maps to `complete_with_limits`. Whoxy is credit-based like Shodan, the same class as
+the bug above.
 
 Measured 2026-07-27 (HTTP 200 both times):
 
@@ -68,12 +73,12 @@ credit-exhaustion case is a **string in the body of a 200**. This is ground trut
 assumed HTTP code anywhere. `account=balance` is free and reports THREE separate balances
 (live_whois / whois_history / reverse_whois), i.e. Whoxy meters each service independently.
 
-**4. No provider anywhere reads its remaining credits.** No `/api-info`, no `account=balance`, no
-pre-flight. Budgeting is blind.
+**4. No provider read its remaining credits.** *Resolved for Shodan:* the budget now reads `/api-info`
+(free) as its balance authority. Whoxy's free `account=balance` and other providers remain candidates.
 
 ## Shodan specifics
 
-Endpoint in use: `/shodan/host/search` (`vertical.py:51`) — the query-credit endpoint.
+Endpoint in use: `/shodan/host/search` (`probe.py`) — the query-credit endpoint.
 
 | credit type | what it buys | Quarry relevance |
 |---|---|---|
@@ -121,7 +126,7 @@ command (`quarry shodan scan <ip>`), gated on a target-profile flag, with the pu
 stated in the prompt. Monitored IPs / alerts are a better fit for the future continuous layer than for a
 run, and cost no query credits.
 
-## Proposed shape for Batch B (for approval, not built)
+## Batch B — the shape that was built
 
 1. `provider_quota` as a first-class coverage kind — soft limit -> `complete_with_limits`, carrying
    `eligible / queried / remaining_pivots` and the provider's own reported balance.
@@ -284,15 +289,15 @@ be the same "bound the wrong axis" mistake as the input-set caps, one level up.
 CAVEAT: measured on a `dev` plan. Another plan tier may meter these differently; re-measure before
 assuming it holds elsewhere.
 
-The exhaustion phrase is recorded here but deliberately NOT yet added to `_QUOTA_REASONS`: there is no
-Shodan body-classifier call site until B1, and shipping the data without the wiring is exactly the
-"declaration with no consumer" defect this batch hit five times.
+The Shodan and Whoxy exhaustion phrases are now in `contract._QUOTA_REASONS`, matched exactly by
+`classify_provider_reason` — the wiring shipped with B1, so the data is no longer a "declaration with no
+consumer".
 
-## STILL UNMEASURED
+## Measured signals (once open, now closed)
 
-Shodan's exact exhaustion signal (HTTP code + body), and the error-envelope shape of the endpoint B0/B1
-actually use (`/shodan/host/search`) as opposed to `/api-info`. Do not build a classifier on either
-until measured — an unrecognised body stays a visible generic error, never PROVIDER_QUOTA.
+Shodan's exhaustion string ("insufficient query credits …") is measured and in `_QUOTA_REASONS`; an
+unrecognised body still stays a visible generic error, never PROVIDER_QUOTA. Any new provider's signal
+must be measured before it is added to the allow-list.
 
 ## PAGINATION (B1, credit-bound)
 
@@ -310,3 +315,178 @@ deliberate query at a near-zero balance, not a hundred.
 Providers to cover: **shodan, censys, whoxy** (Lumpy loading credits), plus **certspotter**
 (`api.certspotter.com`, free tier is rate-limited -> 429). No-quota providers already in the tree:
 kaeferjaeger (GCS), rdap.org.
+
+---
+
+## Reference: the outcome classes (moved out of `contract.py`, 2026-08-08)
+
+One taxonomy for every external provider, whether it runs in the events pipeline or in the standalone
+OSINT session. Each class implies a **different operator action**, so collapsing any two of them
+destroys the only information the label carries.
+
+| class | means | the operator's next move |
+|---|---|---|
+| `auth` | the credential is bad or missing | fix a key |
+| `forbidden` | refused, reason unknown | treat as a failure until something proves otherwise |
+| `entitlement` | the PLAN cannot, on provider evidence | an external limit |
+| `rate_limit` | too fast right now | back off; the quota is untouched |
+| `quota` | the account's credits are spent | an external limit; nothing to retry |
+| `oversize` | OUR read ceiling stopped us | raise our own constant |
+| `pace_busy` | OUR pacing refused to issue the request | retry later, free |
+| `http` | an unclassified 4xx | investigate |
+| `transport` / `server` / `parse` / `error` | ordinary failures | investigate |
+
+Two rules the code enforces rather than assumes:
+
+- **403 is `forbidden`, never `entitlement`.** A WAF, an IP allow-list, a permission error and a
+  malformed request all answer 403. Calling any of them an expected limit lets a real defect pass the
+  run as "the plan is just too small".
+- **Quota and entitlement are never inferred from a status code.** They are proven from the provider's
+  own response body or its balance endpoint.
+
+### Measured provider shapes
+
+These are why the envelope validation exists at all.
+
+- **Whoxy** reports an exhausted account as `{"status":0,"status_reason":"Zero Account Balance"}`
+  inside an **HTTP 200** (measured 2026-07-27). No status code could have revealed it. A genuine
+  no-match is `{"status":1,"api_query":"reverse_whois","search_identifier":{...},"total_results":0}`
+  — no `search_result`, no `current_page`, no `total_pages`.
+- **Whoxy `total_results` varies by value**: a no-match answers the integer `0`, a non-empty
+  reverse-whois answers the string `"39766"` (measured 2026-07-29).
+- **Shodan** answers a spent balance with **HTTP 401** and a JSON body, the same status it returns for
+  a bad key with an HTML body (measured 2026-07-28, by depleting a real account). The status alone
+  cannot tell auth from quota.
+- **Shodan `/shodan/host/{ip}`** answers an unseen IP with **404** and `{"error": "No information
+  available for that IP."}`, at a zero query-credit balance (measured 2026-07-30). Without a rule for
+  it, "not in Shodan" — the ordinary case for most eligible addresses — reports as a lane failure.
+- **A 4 MiB read cap** truncated two paid Shodan pages mid-string and the run reported
+  `JSONDecodeError` twice: our own ceiling, billed to the provider's reputation and to two credits.
+  That is the distinction `oversize` exists to keep.
+
+### Whoxy reverse-whois pagination (measured 2026-07-29, both query forms)
+
+```
+page 1 of a 39,766-result anchor:  {"status": 1, "api_query": "reverse_whois",
+                                    "search_identifier": {"company": "<verbatim>"},
+                                    "total_results": "39766",     <- a STRING when non-empty
+                                    "total_pages": 398, "current_page": 1,
+                                    "search_result": [ ...100 rows... ]}
+one page past the end:             {"status": 0, "status_reason": "Invalid Page Number"}   COST 0
+account=balance:                    FREE (two consecutive reads, no change)
+```
+
+`total_pages == ceil(total_results / 100)` on both forms (39766 -> 398, 355 -> 4). The row shape
+differs between forms — the email form carries registrant and administrative contacts, the company form
+carries `create_date`/`domain_status` — which is provider variation within one schema, not a schema
+change. Both forms echo `search_identifier` verbatim on every page, which is what lets a stored page
+identify itself during ownership enumeration.
+
+**Lock order** (`whoxy_page.py`), fixed, because credits are account-wide while page state is per
+project:
+
+```
+project lock (open_state)
+  -> replay owned pages                 free, never waits on the account
+  -> if paid work remains: spend lock   account-wide
+       -> balance read
+       -> purchases, journaled as they land
+  -> final ledger compaction            project lock only
+```
+
+---
+
+## Shodan coordinator: acquisition states, coverage kinds, and the position × cause matrix
+
+Reference for `src/quarry_recon/shodan_sched.py`.
+
+### Acquisition is committed separately from interpretation
+
+Bytes landing on disk is not ownership. A response we paid for and could not parse, published only as a
+rejection, is bought again by the next run — the double spend the store exists to prevent. So a receipt
+records the purchase itself:
+
+| state | meaning |
+|---|---|
+| `complete_parsed` | the page is ours and readable |
+| `complete_unparsed` | the whole response is ours; this build would not parse it. Eligible for later processing from the artifact, never re-bought. |
+| `incomplete_paid` | the transport or disk broke mid-body. The partial bytes are ours, and an automatic retry is refused — an operator decides whether to pay again. |
+
+Every valid receipt blocks acquisition. A receipt without a usable page is evidence loss plus a refused
+repair, never permission to buy. A page already paid for whose artifact no longer verifies is refused on
+exactly the terms an aged page is: "gone" is not an authorisation, because buying it again is a fresh
+charge.
+
+### Who stopped us decides the coverage kind
+
+| stop | kind | verdict |
+|---|---|---|
+| a proven provider boundary (quota, entitlement) | `provider` | soft limit |
+| the operator's credit reserve | `sample` | soft limit |
+| the operator's `max_pages` page ceiling | `cap` | gap — a ceiling that withheld pages is not "complete" |
+| something failed (transport, auth, server, parse) | `timeout` | gap |
+
+Collapsing any of them lets a broken run report `complete_with_limits`. `provider_stop:*` is a failure we
+stopped requesting through — a gap, never a soft limit. `publish_failed`, `ledger_unwritable`,
+`scheduler_invariant`, `ownership_unreadable` and `pace_busy` are ours; of those only `pace_busy` is not
+a defect, since a boundary declining to burst is working as intended.
+
+### Position × cause
+
+Four measures, each naming only its own position's classes. A mid-flight quota is not a pivot the
+provider refused outright, and a later-page transport failure is not our page budget. Without the split,
+a run stopped dead by quota folds as `complete`: an attempted pivot is not "unqueried", and a pivot with
+no total has no page remainder.
+
+| position | cause | kind | verdict |
+|---|---|---|---|
+| first | broke | `COVERAGE_TIMEOUT` | gap (the target or network cost us the pivot) |
+| first | refused | `COVERAGE_PROVIDER` | soft limit (nothing to retry this run) |
+| later | broke | `COVERAGE_TIMEOUT` | gap |
+| later | refused | `COVERAGE_PROVIDER` | soft limit |
+
+A paid response we refused gets its own measure: the position measures answer "which pivots failed, first
+or later, broken or refused", and an objection about a page's shape is neither. The credit is spent either
+way, so it is emitted every lifecycle and says where the bytes went.
+
+Total drift is telemetry, not a boundary: the index is live, so two pages of one pivot can report
+different totals. The maximum is kept, `omitted` stays 0, and the count rides in the reason.
+
+---
+
+## OSINT pre-flight coverage (`osint.py`)
+
+The `quarry osint` path has no events pipeline, so `OsintSession.outcome()` is its own coverage verdict.
+Without it a provider limit lived only in a per-tool block nothing read, and the CLI printed a green
+`osint done` over a run that never queried half its anchors.
+
+**A limit and a gap are independent facts, and one tool result can carry both** — query 1 is
+page-limited, query 2 exhausts the credits. They are recorded on independent lists, never `elif`, and
+the status is chosen afterward. **Gaps dominate:** a limit may only lift an otherwise-clean session
+(`complete_with_gaps` > `complete_with_limits` > `complete`). An unusable spending control is our own
+defect and outranks both.
+
+**Provider limit vs operator limit stay separate.** A credit reserve or a page budget is a limit the
+session must state, but it is *ours* — folding it in with a provider refusal tells the operator the
+provider refused us when our own policy did. `limit_origin` can name both, because one run can hit both:
+the provider refused what was left, and we had withheld some of it anyway. A policy boundary explains a
+remainder only when its allowance was actually spent (the scheduler counts that); a remainder our own
+machinery stopped is not a limit anyone reached.
+
+**Our bound is not their shortfall** (ASRank orgs, RDAP lookups, Whoxy pages). A throughput bound over
+the matches the provider *reports* is an operator limit with a counted remainder; results the provider
+*admitted to and did not send* are its shortfall, reported separately. Blaming our cap for work the
+provider never sent tells an operator that raising the bound would recover results that are not there.
+An unreadable provider count is **unknown coverage**, never `len(received)` — substituting what we
+happened to receive turns malformed data into a certificate of complete coverage, because the shortfall
+then computes to zero.
+
+**A discarded provider field is not an absent one.** A field the provider did not send is an answer; a
+field it sent in a shape we cannot read is evidence we discarded, and a lane that discards provider
+evidence may not report success over it. The typed accessors (`_obj`, `_text`, `_asn_number`,
+`_readable`) keep a malformed row from crashing the lane, and each discard is counted.
+
+**A failed balance request as a balance outcome** (`_balance_from_error`): a proven limit is a refusal
+whatever carried it; an HTTPError or an envelope failure is the provider having answered (except
+`parse`, our inability to read it); anything else is a failure to read, not a refusal. Deriving refusal
+from the error class alone would infer a provider response from a local exception that never reached it.

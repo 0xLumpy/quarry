@@ -1,7 +1,7 @@
 """Renderers for the OSINT pre-flight: human review report + suggested profile.
 
 The report is the product a human reviews. `target.suggested.yaml` is the live profile copied
-verbatim with COMMENTED candidate blocks appended — the human uncomments approved entries into
+verbatim with commented-out candidate blocks appended — the human uncomments approved entries into
 their real target.yaml. Scope is never auto-edited.
 """
 from __future__ import annotations

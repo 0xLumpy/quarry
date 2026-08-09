@@ -22,16 +22,14 @@ from datetime import datetime, timezone
 
 from pathlib import Path
 
-# PRIORITY thresholds (NOT a gate): any cap/timeout with omitted>0 is already a gap — truth is not a
-# fraction. These only label a gap `major` vs `minor` for operator triage: omitted >= 10% OR >= 100 absolute
-# is `major` (a big-fraction small set AND a small-fraction huge set both count). Boundaries are inclusive.
+# priority thresholds, never a gate: any cap/timeout with omitted>0 is already a gap. These only label it
+# `major` (omitted >= 10% or >= 100 absolute, boundaries inclusive) vs `minor`, for operator triage.
 COVERAGE_GAP_FRACTION = 0.10
 COVERAGE_GAP_ABSOLUTE = 100
 
 
 def _coverage_gates(frac: float, omitted: int) -> bool:
-    """Priority label: True == `major` (material under-coverage), False == `minor`. Does NOT decide gating —
-    a cap/timeout with omitted>0 is always a gap regardless of this."""
+    """Priority label for a coverage gap: True == `major`, False == `minor`. Never decides gating."""
     return frac >= COVERAGE_GAP_FRACTION or omitted >= COVERAGE_GAP_ABSOLUTE
 
 
@@ -52,61 +50,50 @@ ENTITY_KEYS = {
     "screenshot": "url",
     "tech": "id",
     "review": "id",
-    # review#34 (Lumpy): acquisition-ownership TRANSITIONS get their own log. They shared `review` with
-    # unclassified matches, source maps, debug endpoints and API documents — so one unreadable line
-    # anywhere in that file froze ownership globally, and the report could not honestly say which kind
-    # of row had been lost. A separate entity makes the blast radius the thing that was actually damaged.
+    # acquisition-ownership transitions, in their own log so a bad row damages only these
     "ownership_transition": "id",
-    "wildcard_zone": "value",   # A1: cert-derived *.X.apex brute-zones (persisted vertical→enrich for A1d)
-    "web_port": "id",           # v0.3.5: open web port per host:ip (naabu SYN prefilter) — host→ip→port edge
-    "gadget_candidate": "id",   # chain MATERIAL: weird primitives that are not findings and not noise
-                                # (`gadgets.py`); never promoted to `finding`, impact_state always
-                                # `none_proven`
-    "path_observation": "id",   # step 4: path-like strings an ast-analyzer artifact contained, with
-                                # provenance, shape tags and incumbent corroboration. EVIDENCE, not a
-                                # finding and not an endpoint: nothing is requested because one exists
-                                # (notes/current/AST-ANALYZER-LANE-DESIGN.md)
-    "sink_observation": "id",   # step 6: DOM sources/sinks an ast artifact contained (postMessage,
-                                # innerHTML, eval, location, storage, cookie…). Nothing in Quarry emitted
-                                # this class before; it is EVIDENCE of where attacker-controllable data
-                                # enters or lands, never a proven flow
-    "oob_interaction": "id",    # OOB.1: imported out-of-band callbacks (interactsh); raw in raw/oob/,
-                                # uncorrelated by default until Quarry owns the token namespace (Phase 2)
+    "wildcard_zone": "value",   # cert-derived *.X.apex brute-zones (persisted vertical -> enrich)
+    "web_port": "id",           # open web port per host:ip (naabu SYN prefilter) — host->ip->port edge
+    "gadget_candidate": "id",   # chain material (`gadgets.py`): never promoted to `finding`, and
+                                # impact_state is always `none_proven`
+    "path_observation": "id",   # path-like strings an ast-analyzer artifact contained, with provenance,
+                                # shape tags and incumbent corroboration; evidence, never an endpoint
+    "sink_observation": "id",   # DOM sources/sinks an ast artifact contained (postMessage, innerHTML,
+                                # eval, location, storage, cookie…); evidence, never a proven flow
+    "oob_interaction": "id",    # imported out-of-band callbacks (interactsh), raw in raw/oob/ and
+                                # uncorrelated by default until Quarry owns the token namespace
 }
 
-# ── C09a identity contract — canonical dedup key per entity type ──────────────────────────────────────
-# The OLD key was `str(value).strip().lower()` for EVERY entity, which collapsed case-DISTINCT offensive
-# surface (e.g. `/API` and `/api`, a case-sensitive endpoint/parameter/fingerprint). The contract below
-# lowercases ONLY the case-INSENSITIVE components (DNS names; a URL's scheme+host) and PRESERVES everything
-# case-sensitive (path, query, parameter names, composite ids, secret/cert fingerprints). Same function is
-# used to WRITE and to RELOAD keys so dedup is stable across a reopened run.
+# ── identity contract — canonical dedup key per entity type ───────────────────────────────────────────
+# only case-insensitive components are lowered (DNS names, URL scheme+host); dedup stays stable
 _HOST_KEYED = {"subdomain", "resolved"}                     # key = DNS name (case-insensitive)
-_URL_KEYED = {"live", "url", "js_url", "screenshot"}        # key = URL (scheme+host insensitive; path/query NOT)
+_URL_KEYED = {"live", "url", "js_url", "screenshot"}        # key = URL (scheme+host insensitive, path not)
 _IP_KEYED = {"ip"}                                          # key = IP literal (normalize; case-insensitive)
-# every other entity is id/value-keyed → case is PRESERVED (path/param/fingerprint/composite id carry case)
+# every other entity is id/value-keyed, so path/param/fingerprint/composite-id case is preserved
 
 
 def _canon_host(h: str) -> str:
     """DNS-name canonicalization: lower, strip trailing dot, IDNA2008/UTS-46 non-transitional (so `faß.de`
-    and `xn--fa-hia.de` share one key). Best-effort — a non-domain host (IP literal, wildcard, odd label)
-    that IDNA can't encode falls back to the lowered/dot-stripped form rather than raising."""
+    and `xn--fa-hia.de` share one key). A host IDNA can't encode keeps the lowered/dot-stripped form.
+    """
     h = h.strip().lower().rstrip(".")
     if not h:
         return h
     from . import normalize as _n
-    return _n.idna_ascii(h) or h                 # shared policy; best-effort fallback is THIS site's choice
+    return _n.idna_ascii(h) or h                 # shared policy; the fallback is this site's choice
 
 
 def _canon_url(u: str) -> str:
-    """Canonicalize a URL's scheme + HOSTNAME only (lower + IDNA + trailing-dot strip); PRESERVE path,
-    query, fragment, AND userinfo (a credential-bearing lead) exactly, so `/API` != `/api` and
-    `Admin:SeCrEt@h` != `admin:secret@h`. Unparseable URL (e.g. `http://[::1`) -> preserved verbatim."""
+    """Canonicalize a URL's scheme + hostname only (lower + IDNA + trailing-dot strip); path, query,
+    fragment and userinfo are preserved exactly, so `/API` != `/api` and `Admin:SeCrEt@h` != `admin:secret@h`.
+    An unparseable URL (e.g. `http://[::1`) is preserved verbatim.
+    """
     from urllib.parse import urlsplit, urlunsplit
     u = u.strip()
     try:
         s = urlsplit(u)
         host = s.hostname                                  # may raise ValueError on a malformed authority
-        port = s.port                                       # review#9: .port ALSO raises ValueError (e.g. :99999, :abc)
+        port = s.port                                       # .port also raises ValueError (e.g. :99999, :abc)
     except ValueError:
         return u                                            # unparseable -> preserve (never crash Run.add)
     if not s.scheme and not s.netloc:
@@ -117,7 +104,7 @@ def _canon_url(u: str) -> str:
     netloc = canon_host
     if port is not None:
         netloc += f":{port}"
-    if s.username is not None:                              # userinfo PRESERVED verbatim (case-sensitive creds)
+    if s.username is not None:                              # userinfo verbatim (case-sensitive creds)
         userinfo = s.username + (f":{s.password}" if s.password is not None else "")
         netloc = f"{userinfo}@{netloc}"
     return urlunsplit((s.scheme.lower(), netloc, s.path, s.query, s.fragment))
@@ -142,11 +129,12 @@ def _all_refs(record: dict) -> list:
 
 
 def _subsumed(base: dict, incoming: dict) -> bool:
-    """True when `incoming` carries NOTHING the merged `base` doesn't already hold exactly — a pure
-    duplicate. A new list element, a previously-empty field now filled, OR a CONFLICTING scalar (a different
-    non-empty value) all make it False → the observation is novel and must be logged (never discarded)."""
-    _a = base.get("_alt")                                   # review#9: alternates we've ALREADY logged per field
-    alt = _a if isinstance(_a, dict) else {}                # review#8: tolerate a corrupt/crafted non-dict _alt
+    """True when `incoming` carries nothing the merged `base` doesn't already hold exactly. A new list
+    element, a previously-empty field now filled, or a conflicting scalar all make it False — the
+    observation is novel and must be logged.
+    """
+    _a = base.get("_alt")                                   # alternates already logged, per field;
+    alt = _a if isinstance(_a, dict) else {}                # a corrupt/crafted non-dict _alt is tolerated
     for k, v in incoming.items():
         if k in ("first_seen", "last_seen", "_alt") or v in (None, "", [], {}):
             continue
@@ -158,20 +146,21 @@ def _subsumed(base: dict, incoming: dict) -> bool:
         elif cur in (None, "", [], {}):
             return False                                    # fills a previously-empty field — novel
         else:
-            _seen = alt.get(k)                              # review#4: a corrupt non-list entry (e.g. int) -> []
+            _seen = alt.get(k)                              # a corrupt non-list entry (e.g. int) -> []
             if cur != v and v not in (_seen if isinstance(_seen, list) else []):
-                return False                                # a CONFLICT we have NOT logged before — novel
-        # else: cur==v (dup) OR a conflict whose value is already in the log (_alt) → nothing new
+                return False                                # a conflict we have not logged before — novel
+        # else: cur==v, or a conflict whose value is already in _alt -> nothing new
     return True
 
 
 def _merge_record(base: dict, incoming: dict) -> dict:
-    """C09b provenance merge: union list-valued evidence, fill previously-empty enrichment fields, and
-    NEVER overwrite a non-empty scalar (a conflicting value stays in the immutable observation log). Symmetric
-    provenance: `sources`, `raw_refs`, tags, IPs, and any list field are unioned order-preserving."""
+    """Provenance merge: union list-valued evidence, fill previously-empty enrichment fields, and never
+    overwrite a non-empty scalar (the conflicting value stays in the immutable observation log). `sources`,
+    `raw_refs`, tags, IPs and any list field are unioned order-preserving.
+    """
     merged = dict(base)
-    _a = base.get("_alt")                                   # review#9: per-field conflicting alternates already logged
-    alt = dict(_a) if isinstance(_a, dict) else {}          # review#8: tolerate a corrupt/crafted non-dict _alt
+    _a = base.get("_alt")                                   # conflicting alternates already logged, per field;
+    alt = dict(_a) if isinstance(_a, dict) else {}          # a corrupt/crafted non-dict _alt is tolerated
     for k, v in incoming.items():
         if k in ("raw_ref", "raw_refs", "first_seen", "last_seen", "_alt"):
             continue                                        # refs handled below; timestamps below; _alt is internal
@@ -184,13 +173,12 @@ def _merge_record(base: dict, incoming: dict) -> dict:
             merged[k] = out
         elif cur in (None, "", [], {}):
             merged[k] = v                                   # fill a previously-empty enrichment field
-        elif cur != v:                                      # a CONFLICT: KEEP first value (first non-empty wins),
-            seen = alt.get(k)                               # but REMEMBER the alternate so a repeat is subsumed
-            if not isinstance(seen, list):                  # review#4: normalize a corrupt/non-list entry
+        elif cur != v:                                      # a conflict keeps the first value but remembers
+            seen = alt.get(k)                               # the alternate, so a repeat is subsumed rather
+            if not isinstance(seen, list):                  # than re-appended for ever
                 seen = []
-            if v not in seen:                               # (else an unchanged conflict re-appends forever)
+            if v not in seen:
                 alt[k] = seen + [v]
-        # else: cur==v → nothing to do
     if alt:
         merged["_alt"] = alt                                # conflicting values, preserved in the merged view too
     refs = _all_refs(base)
@@ -200,12 +188,11 @@ def _merge_record(base: dict, incoming: dict) -> dict:
     if refs:
         merged["raw_refs"] = refs
         merged["raw_ref"] = refs[0]                         # back-compat scalar = first evidence
-    # keep the EARLIEST first_seen across observations
+    # earliest first_seen and latest last_seen across observations; both are stamped on every appended
+    # observation, so a reopened run recovers them from the log
     fs = [t for t in (base.get("first_seen"), incoming.get("first_seen")) if t]
     if fs:
         merged["first_seen"] = min(fs)
-    # review#8: keep the LATEST last_seen across observations — persisted (stamped on each appended obs), so a
-    # reopened run recovers it from the log instead of losing an in-memory-only value.
     ls = [t for t in (base.get("last_seen"), incoming.get("last_seen")) if t]
     if ls:
         merged["last_seen"] = max(ls)
@@ -213,10 +200,11 @@ def _merge_record(base: dict, incoming: dict) -> dict:
 
 
 def canonical_key(entity: str, record: dict) -> str:
-    """The dedup identity for a normalized entity — case-correct per the contract above. Empty when the
-    record is not an object or the key field is absent/blank (the record is then not addable)."""
+    """The dedup identity for a normalized entity, case-correct per the contract above. Empty when the
+    record is not an object or the key field is absent/blank (the record is then not addable).
+    """
     if not isinstance(record, dict):
-        return ""                                           # a non-object JSONL row (null/[]/scalar) is not an entity
+        return ""                                           # a non-object JSONL row is not an entity
     raw = str(record.get(ENTITY_KEYS.get(entity, "value"), "")).strip()
     if not raw:
         return ""
@@ -226,33 +214,26 @@ def canonical_key(entity: str, record: dict) -> str:
         return _canon_url(raw)
     if entity in _IP_KEYED:
         return _canon_ip(raw)
-    return raw                                              # id/value: case-PRESERVING (strip only)
+    return raw                                              # id/value: case-preserving (strip only)
 
 
-# ── cross-run identity: what a CAMPAIGN needs from a finished run (settle prerequisite A) ─────────────
-#: fields that describe WHERE and WHEN an observation was made, not WHAT is true. A campaign comparing two
-#: children must not see a new artifact path or a fresh timestamp as discovery — every child would then
-#: look like progress and a fixed point could never be reached.
-#: `_inherited` is bookkeeping about HOW a run got an entity (a campaign seeded it), never a fact about
-#: the world — so an inherited copy fingerprints exactly like the record it came from.
+# ── cross-run identity: what a campaign needs from a finished run ─────────────────────────────────────
+#: provenance fields (where/when observed, plus `_inherited`), excluded from a fingerprint
 RUN_SCOPED_FIELDS = ("first_seen", "last_seen", "raw_ref", "raw_refs", "_inherited")
 
 
 def material(entity: str, record: dict) -> dict:
-    """The MATERIAL content of an entity — what it asserts, with run-scoped bookkeeping removed and every
-    list put in a stable order, so two records are comparable across runs.
-
-    `sources` STAYS: a second, independent source for the same host is a fact about the world, not noise.
-    `_alt` stays too — a conflicting observation is knowledge the union did not hold."""
+    """The material content of an entity — what it asserts, with run-scoped bookkeeping removed and every
+    list in a stable order, so two records are comparable across runs. `sources` and `_alt` stay: a second
+    independent source, and a conflicting observation, are both facts the union does not otherwise hold.
+    """
     if not isinstance(record, dict):
         return {}
     return {k: _canon_value(v) for k, v in record.items() if k not in RUN_SCOPED_FIELDS}
 
 
 def _canon_value(value):
-    """Stable form of any JSON value, at EVERY depth. A shallow pass left lists nested below the first
-    dict order-sensitive, so two records asserting the same thing could fingerprint differently — and a
-    campaign would read that as discovery."""
+    """Stable form of any JSON value at every depth — lists deduped and ordered, dicts key-sorted."""
     if isinstance(value, list):
         seen: list = []
         for x in (_canon_value(i) for i in value):
@@ -271,33 +252,29 @@ def fingerprint(entity: str, record: dict) -> str:
 
 
 def merge(entity: str, base: dict, incoming: dict) -> dict:
-    """The store's own MONOTONIC merge, exposed for cross-run use: lists union, empty fields fill, a
-    conflicting scalar keeps the first value and remembers the alternate. Nothing is ever removed."""
+    """The store's own monotonic merge, exposed for cross-run use: lists union, empty fields fill, a
+    conflicting scalar keeps the first value and remembers the alternate. Nothing is ever removed.
+    """
     return _merge_record(base, incoming)
 
 
 def adds_material(entity: str, base: dict, incoming: dict) -> bool:
-    """Whether merging `incoming` into `base` ADDS a material fact — the campaign's progress test.
+    """Whether merging `incoming` into `base` adds a material fact — the campaign's progress test.
 
-    Not `fingerprint(incoming) != fingerprint(base)`: a DNS answer, a title or a rotating certificate can
-    alternate between runs for ever, and inequality would score every swing as discovery. This asks the
-    merge, which is monotonic — the first swing records the alternate, and a return to the earlier value
-    adds nothing, because the union already holds both."""
+    Asks the monotonic merge rather than comparing fingerprints: a DNS answer, a title or a rotating
+    certificate can alternate between runs for ever, and inequality would score every swing as discovery.
+    """
     return fingerprint(entity, merge(entity, base, incoming)) != fingerprint(entity, base)
 
 
 @dataclass
 class FoldedLog:
-    """What one entity log actually yielded, and whether it could be trusted.
-
-    A campaign must never read "unreadable" as "empty": bootstrapping from a lost log would drop evidence
-    silently, and a fixed point declared over it would claim finished work nobody could see. So the status
-    is part of the answer:
+    """What one entity log yielded, and whether it can be trusted:
 
         absent    no log at all — this run never wrote this entity kind
         valid     read cleanly, every row usable
         degraded  read, but rows were dropped (bad JSON, a non-object row, no identity, bad UTF-8)
-        unusable  could not be read at all — the records here are NOT a corpus
+        unusable  could not be read at all — the records here are not a corpus
     """
     records: dict = field(default_factory=dict)
     status: str = "valid"
@@ -306,17 +283,15 @@ class FoldedLog:
 
     @property
     def trustworthy(self) -> bool:
-        """Whether this view may stand in for the run's evidence. `degraded` is honest but incomplete, and
-        `unknown` means nobody could say — neither may pass for a corpus."""
+        """Whether this view may stand in for the run's evidence — `degraded` is honest but incomplete and
+        `unknown` means nobody could say, so neither may pass for a corpus.
+        """
         return self.status in ("valid", "absent")
 
 
 def fold_run_entity(run_dir, entity: str) -> FoldedLog:
-    """One entity of a FINISHED run, reconciled against what its manifest says the run held.
-
-    A parser's "I read this file cleanly" is not an evidence claim. A log can be deleted after the manifest
-    was written, or truncated on a line boundary — both parse without a single dropped row, and both would
-    hand a campaign a smaller corpus that looks authoritative. So the count the run itself recorded decides:
+    """One entity of a FINISHED run, reconciled against what its manifest says the run held — a clean parse
+    of a deleted or truncated log is not an evidence claim, so the recorded count decides:
 
         manifest unreadable / missing            -> unknown  (nobody can say; not trustworthy)
         no count recorded + no log               -> valid    (an authoritative zero)
@@ -335,16 +310,14 @@ def fold_run_entity(run_dir, entity: str) -> FoldedLog:
     absent_key = entity not in counts
     expected = counts.get(entity)
     if not absent_key and not (type(expected) is int and expected >= 0):
-        # a count that is not an exact non-negative int certifies nothing. `True == 1` and `1.0 == 1` in
-        # Python, so a malformed manifest would have passed a one-record log off as authoritative, and an
-        # explicit `null` would have read as "the run recorded none of this kind".
+        # `True == 1` and `1.0 == 1`, so a count that is not an exact non-negative int certifies nothing
         return FoldedLog(status="unknown",
                          reason=f"manifest count for {entity!r} is not an exact non-negative int")
     folded = fold_observations(run_dir / "normalized" / f"{entity}.jsonl")
     if absent_key:
         if folded.status == "absent":
             return FoldedLog(status="valid", reason="the run recorded no entity of this kind")
-        expected = 0                                   # ...a log with rows the manifest never counted
+        expected = 0                                   # a log with rows the manifest never counted
     if folded.status == "absent":
         return FoldedLog(status="unusable" if expected else "valid",
                          reason=(f"the run recorded {expected} but the log is gone" if expected
@@ -359,8 +332,9 @@ def fold_run_entity(run_dir, entity: str) -> FoldedLog:
 
 
 def fold_observations(path) -> FoldedLog:
-    """The MERGED view of one entity's append-only observation log, for a run nobody has open — the same
-    fold `Run._records_for` does, so a finished run reads exactly as it did while it was live."""
+    """The merged view of one entity's append-only observation log, for a run nobody has open — the same
+    fold `Run._records_for` does, so a finished run reads exactly as it did while it was live.
+    """
     entity = Path(path).stem
     try:
         raw = Path(path).read_bytes()
@@ -374,8 +348,7 @@ def fold_observations(path) -> FoldedLog:
         if not chunk.strip():
             continue
         try:
-            # DECODE PER LINE: one invalid byte used to abort the whole file, losing every valid
-            # observation before and after it. A bad row costs itself and is COUNTED.
+            # decoded per line, so one invalid byte costs that row alone and is counted
             rec = json.loads(chunk.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             dropped += 1
@@ -399,8 +372,7 @@ def _utc() -> str:
 
 
 def _read_started(path: Path):
-    """The recorded `started` timestamp from a run.json / manifest.json, or None if absent/unreadable —
-    so open() can recover the real start without fabricating one."""
+    """The recorded `started` timestamp from a run.json / manifest.json, or None if absent or unreadable."""
     try:
         v = json.loads(path.read_text())
         return v.get("started") if isinstance(v, dict) else None
@@ -409,8 +381,9 @@ def _read_started(path: Path):
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    """Write via a same-directory temp + os.replace so a reader never sees a half-written file and a
-    crash mid-write leaves the previous version intact (C10a)."""
+    """Write via a same-directory temp + os.replace, so a reader never sees a half-written file and a
+    crash mid-write leaves the previous version intact.
+    """
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text)
     os.replace(tmp, path)
@@ -427,15 +400,15 @@ class ToolRunRecord:
     note: str
     cmd: str
     stderr_tail: str = ""
-    cpu_s: float = 0.0                 # per-tool child CPU seconds (H3 telemetry)
-    peak_rss_mb: float = 0.0           # per-tool peak RSS (MB) of the process tree (H3 telemetry)
+    cpu_s: float = 0.0                 # per-tool child CPU seconds
+    peak_rss_mb: float = 0.0           # per-tool peak RSS (MB) of the process tree
 
 
 class Run:
     """One reconnaissance run inside a project: owns its tree, manifest, and entity store.
 
-    Lives at <project_dir>/recon/<run_id>/ — the project dir is derived from the target.yaml
-    location, so a run's output co-locates with its profile (campaign/project model).
+    Lives at <project_dir>/recon/<run_id>/, so a run's output co-locates with the target.yaml profile
+    the project dir was derived from.
     """
 
     def __init__(self, project_dir: Path, target: str, run_id: str | None = None, *, load_started: bool = False):
@@ -450,15 +423,13 @@ class Run:
         for d in (self.raw, self.normalized, self.exports, self.reports):
             d.mkdir(parents=True, exist_ok=True)
         self.manifest_path = self.dir / "manifest.json"
-        self.meta_path = self.dir / "run.json"            # IMMUTABLE creation record (started/run_id/target)
+        self.meta_path = self.dir / "run.json"            # immutable creation record (started/run_id/target)
         self._tool_runs: list[ToolRunRecord] = []
         self._counts_cache: dict[str, int] = {}
-        self._records: dict[str, dict] = {}   # entity -> {canonical_key: MERGED record} (C09b; instance-local)
-        self._folded: dict[str, FoldedLog] = {}   # entity -> the SAME fold, with its trust status
-        # C10a/review#7: OPENING an existing run must NOT fabricate a fresh start time (a ghost). It reads
-        # `started` from the IMMUTABLE run.json written at CREATE — which survives a crash even when the final
-        # manifest was never written (the exact resume situation). Manifest is only a fallback; a fresh
-        # CREATE stamps now and persists run.json so a later open() can never invent a start.
+        self._records: dict[str, dict] = {}       # entity -> {canonical_key: merged record} (instance-local)
+        self._folded: dict[str, FoldedLog] = {}   # entity -> the same fold, with its trust status
+        # opening an existing run reads `started` from run.json (written at create, and surviving a crash
+        # that left no manifest) rather than fabricating a fresh start time
         if load_started:
             self.started = _read_started(self.meta_path) or _read_started(self.manifest_path) or _utc()
         else:
@@ -471,15 +442,16 @@ class Run:
     # ── C10a lifecycle ──
     @staticmethod
     def _mint_run_id() -> str:
-        """Collision-resistant run id: sortable UTC timestamp + 8-hex random suffix. Second-precision alone
-        collided (two runs in the same second reused one directory); the 4-byte suffix (4.3B space) makes a
-        same-second clash negligible, and Run.create() claims the dir atomically to eliminate even that."""
+        """Collision-resistant run id: sortable UTC timestamp + 8-hex random suffix. Second precision alone
+        collides when two runs start in the same second; `Run.create` claims the directory atomically as well.
+        """
         return time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(4).hex()
 
     @classmethod
     def create(cls, project_dir, target) -> "Run":
-        """Start a NEW run — mint a unique id and CLAIM its directory atomically (mkdir exist_ok=False),
-        retrying on the astronomically-unlikely clash. `started` = now."""
+        """Start a NEW run — mint a unique id and claim its directory atomically (mkdir exist_ok=False),
+        retrying on a clash. `started` = now.
+        """
         project_dir = Path(project_dir)
         for _ in range(16):
             rid = cls._mint_run_id()
@@ -492,12 +464,12 @@ class Run:
 
     @classmethod
     def open(cls, project_dir, target, run_id) -> "Run":
-        """Attach to an EXISTING run — must already exist (never fabricate a ghost dir / start time).
-        Reads the recorded `started` from run.json (manifest fallback).
+        """Attach to an EXISTING run, reading the recorded `started` from run.json (manifest fallback).
 
-        review#5: VALIDATE the recorded start BEFORE the constructor mutates the tree (it creates raw/…
-        subdirs). A run with neither a readable run.json NOR a readable manifest is corrupt — raise instead of
-        silently inventing a fresh `started` (a ghost) and half-materializing a directory for it."""
+        Raises when the directory is missing, and when neither run.json nor manifest.json is readable —
+        validated before the constructor materializes any subdirectory, so a corrupt run is never given a
+        fabricated start time.
+        """
         d = Path(project_dir) / "recon" / run_id
         if not d.is_dir():
             raise FileNotFoundError(f"run {run_id!r} not found under {d.parent}")
@@ -513,8 +485,7 @@ class Run:
 
     # ── tool run accounting ──
     def record(self, phase: str, result) -> None:
-        # Redact any secret values out of the recorded command/note/stderr before they ever
-        # hit the manifest (e.g. shosubgo's `-s <shodan-key>` arg). Single choke point.
+        # the single choke point that redacts secrets out of cmd/note/stderr before they reach the manifest
         from . import secrets
         self._tool_runs.append(ToolRunRecord(
             phase=phase, tool=result.tool, status=str(result.status.value),
@@ -534,53 +505,47 @@ class Run:
         return self.normalized / f"{entity}.jsonl"
 
     def add(self, entity: str, record: dict) -> bool:
-        """Record an observation of a normalized entity. Returns True iff its natural key is NEW (so the
-        `sum(add(...))`/`if add(...)` counting semantics across phases are unchanged).
+        """Record an observation of a normalized entity. Returns True iff its natural key is NEW, so the
+        `sum(add(...))` / `if add(...)` counting semantics across phases are unchanged.
 
-        C09a: identity is case-CORRECT (canonical_key) — `/API` != `/api`.
-        C09b: provenance is MERGED, never discarded. A repeat observation of an existing key is UNIONed into
-        the merged view (sources / raw_refs / tags / IPs / list evidence unioned; previously-empty
-        enrichment filled; a conflicting non-empty scalar keeps the first value, and every observation is
-        still appended to the immutable JSONL log, so nothing is lost). Only a VALUE-ADDING observation is
-        appended (a pure duplicate that changes nothing is a no-op), which bounds file growth.
+        Identity is case-correct (`canonical_key`), and provenance is merged rather than discarded: a repeat
+        observation of an existing key is unioned into the merged view, and only a value-adding observation is
+        appended to the immutable log, which bounds file growth.
 
-        review#3: consequently `last_seen` means the time of the last observation that ADDED something (new
-        evidence / a conflicting value) — NOT the last time the entity was seen at all. A pure-duplicate
-        re-sighting is deliberately not appended (growth-bounding), so it does not advance `last_seen`. This
-        narrower "last value-changing observation" semantic is intentional; `first_seen` is exact."""
+        `last_seen` is therefore the time of the last observation that ADDED something, not the last time the
+        entity was seen at all; `first_seen` is exact.
+        """
         key = canonical_key(entity, record)
         if not key:
             return False
         records = self._records_for(entity)
-        # review#8: `_alt` is RESERVED internal merge metadata — strip it from caller/source input so external
-        # data can never inject a value that later crashes or corrupts the conflict tracking.
+        # `_alt` is reserved internal merge metadata: stripping it from caller input keeps external data
+        # from injecting a value that would corrupt the conflict tracking
         record = {k: v for k, v in dict(record).items() if k != "_alt"}
         now = _utc()
         record.setdefault("first_seen", now)
-        record["last_seen"] = now       # review#8: on the APPENDED obs -> durable; review#3: = last VALUE-ADDING obs
+        record["last_seen"] = now                           # stamped on the appended observation -> durable
         if key not in records:
             records[key] = record
             self._append_obs(entity, record)
             return True
-        if not _subsumed(records[key], record):             # novel: new evidence OR a conflicting value
+        if not _subsumed(records[key], record):             # novel: new evidence or a conflicting value
             self._append_obs(entity, record)                # keep the raw observation in the immutable log
             records[key] = _merge_record(records[key], record)   # folds max(last_seen) durably
-        return False                                        # not a NEW entity (counting semantics preserved)
+        return False                                        # not a new entity (counting semantics preserved)
 
     def inherit(self, entity: str, record: dict) -> bool:
         """Record an entity this run was HANDED (a campaign seeded it from earlier children) — present for
-        every downstream lane, and never counted as this run's discovery.
-
-        `add()` answers "is this key NEW?", which is what phases count as production; an inherited entity
-        must not answer yes. Returns whether anything was written (False for a pure duplicate), so a second
-        bootstrap is a no-op rather than a growing log."""
+        every downstream lane, and never counted as this run's discovery, because `add()` answers "is this key
+        new?" and phases count that as production. Returns whether anything was written, so a second bootstrap
+        is a no-op rather than a growing log.
+        """
         key = canonical_key(entity, record)
         if not key:
             return False
         records = self._records_for(entity)
-        # `_alt` is stripped from CALLER input (`add`) because an external source could inject it. This is
-        # the TRUSTED campaign path: the alternates were produced by this store's own merge, and they are
-        # material knowledge — dropping them would hand the child less than the campaign holds.
+        # `_alt` is kept here, unlike in `add`: on this trusted campaign path the alternates came from this
+        # store's own merge, and dropping them would hand the child less than the campaign holds
         record = dict(record)
         record.setdefault("first_seen", _utc())
         record["last_seen"] = _utc()
@@ -599,12 +564,10 @@ class Run:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _records_for(self, entity: str) -> dict:
-        """Lazily materialize the MERGED view {key: record} for an entity by folding its append-only JSONL
-        observation log (so a reopened run recovers the same merged state).
-
-        ONE fold, shared with `fold_observations` — the live and finished views cannot diverge, and the
-        live one inherits per-line byte decoding, so a single invalid byte costs one observation here too
-        rather than raising through whatever asked for the entity."""
+        """Lazily materialize the merged view {key: record} for an entity by folding its append-only JSONL
+        log, so a reopened run recovers the same merged state. One fold, shared with `fold_observations`: the
+        live and finished views cannot diverge, and a single invalid byte costs one observation here too.
+        """
         if entity not in self._records:
             folded = fold_observations(self._entity_file(entity))
             self._folded[entity] = folded
@@ -615,16 +578,16 @@ class Run:
         return set(self._records_for(entity))
 
     def read(self, entity: str) -> list[dict]:
-        """The MERGED entities (one per canonical key, provenance unioned) — not the raw observation lines."""
+        """The merged entities (one per canonical key, provenance unioned) — not the raw observation lines."""
         return list(self._records_for(entity).values())
 
     def read_folded(self, entity: str) -> "FoldedLog":
         """The merged view WITH its trust status (`absent`/`valid`/`degraded`/`unusable`).
 
-        `read()` throws the status away, so a caller cannot tell "this entity has no rows" from "the log
-        could not be read" or "rows were dropped as unreadable". For an ordinary corpus that is a fair
-        simplification; for a record that decides whether we may act — the acquisition-ownership
-        transition log — it is the whole question (review#31, Lumpy)."""
+        `read()` throws the status away, so a caller cannot tell "no rows" from "the log could not be read".
+        For an ordinary corpus that is a fair simplification; for a record that decides whether we may act —
+        the acquisition-ownership transition log — it is the whole question.
+        """
         if entity not in self._folded:
             self._folded[entity] = fold_observations(self._entity_file(entity))
             self._records[entity] = self._folded[entity].records
@@ -639,20 +602,21 @@ class Run:
 
     # ── manifest ──
     def _run_summary(self) -> dict:
-        """Per-run reliability rollup for the manifest: tool status counts + the 'what failed' list + a
-        run VERDICT and a GAPS list. A degraded run must NEVER read as a clean success — `tools_failed`
-        only counts hard FAILED, so partial/blocked/timed_out sources were invisible in the headline.
-        `gaps` names every such source with its `output_lines` (stdout line count — NOT proof of evidence;
-        a -o tool preserves an artifact with zero stdout), and `verdict` is `complete_with_gaps` whenever
-        any source failed OR degraded OR a phase raised OR a required tool was missing.
-        `note`/`stderr_tail` were already redacted by record(); phase_exceptions are redacted here so no
-        free-text bypasses the manifest secret choke point."""
+        """Per-run reliability rollup for the manifest: tool status counts, the failure list, the gaps and
+        limits lists, and a run verdict.
+
+        `tools_failed` counts only hard failures, so `gaps` carries every degraded or missing source with
+        its `output_lines` (stdout lines — not proof of evidence; a -o tool preserves an artifact with
+        zero stdout). `verdict` is `complete_with_gaps` whenever any source failed or degraded or a phase
+        raised or a required tool was missing, `complete_with_limits` when only limits remain.
+
+        `note`/`stderr_tail` are already redacted by record(); phase_exceptions are redacted here, so no
+        free text bypasses the manifest secret choke point."""
         from . import contract, events, secrets
         _DEGRADED = ("partial", "blocked", "timed_out")
         _MISSING = ("not on path", "not installed", "not found")   # skip reason == the tool is absent
-        # a REQUIRED (non-optional) tool skipped because it is MISSING is a coverage gap; an optional /
-        # setup-disabled / passive skip is intentional and fine. (output_lines is stdout only — NOT
-        # proof of evidence; a -o tool preserves an artifact with zero stdout — hence the honest name.)
+        # a required tool skipped because it is missing is a coverage gap; an optional, setup-disabled or
+        # passive skip is intentional
         try:
             from .registry import load_tools
             _required = {t.bin for t in load_tools() if not t.optional}
@@ -673,16 +637,12 @@ class Run:
                   and any(m in why.lower() for m in _MISSING)):
                 gaps.append({"phase": r.phase, "tool": r.tool, "status": "missing",
                              "why": why, "output_lines": 0})       # required tool absent -> coverage gap
-        # review-r3#1/r4#6: in-process provider terminals (run_provider) never hit _tool_runs — fold them here
-        # so a FAILED/PARTIAL provider feeds the verdict AND every provider terminal (incl. clean) increments
-        # tool_status (a `tools_failed` count without a matching status count is a lie). Keyed by
-        # (source_id, work_unit), latest per current generation.
-        provider_limits: list = []                            # external LIMITS (quota/entitlement)
-        # review-B1.4r8#2: an OPERATOR boundary is a limit, but it is OURS. Filing it under
-        # `provider_limits` said the provider refused us — the exact blame-shift the taxonomy exists to
-        # prevent, reintroduced by the field it was recorded in. Separate bucket, and every entry
-        # carries a structured `origin` so a consumer can read either shape.
-        operator_limits: list = []                            # OUR OWN bounds (reserve, withheld budget)
+        # in-process provider terminals are folded in below, so a failed or partial provider feeds the
+        # verdict and every terminal — clean ones included — increments tool_status
+        provider_limits: list = []                            # external limits (quota/entitlement)
+        # an operator boundary is a limit too, but it is ours; a separate bucket and an `origin` field keep
+        # it from reading as a provider refusing us
+        operator_limits: list = []                            # our own bounds (reserve, withheld budget)
         for term in self._read_provider_terminals():
             sid = term.get("source_id", "?")
             st = term.get("status")
@@ -694,33 +654,19 @@ class Run:
             ec = term.get("error_class")
             if ec:
                 entry["error_class"] = ec
-            # review-B0#3: an EXTERNAL PROVIDER LIMIT is not a Quarry defect. Exhausted credits (or a plan
-            # that cannot reach the endpoint) mean the provider stopped us, not that anything went wrong —
-            # so it is a soft LIMIT (complete_with_limits), never a failure or a coverage gap. It still
-            # reaches the operator: coverage is genuinely incomplete and the verdict says so.
-            # Limits are PROVEN classes only (quota/entitlement, from a body or balance) — a bare 403 is
-            # `forbidden` and stays a failure. review-B1.4r7#1: an OPERATOR boundary is a limit too, and
-            # it carries NO provider class by design, so the question is asked of the TERMINAL (status
-            # AND class) rather than of the class alone.
+            # a limit is a soft outcome, never a failure or gap, and only a proven class qualifies — a bare 403
+            # is `forbidden` and stays a failure
             if contract.terminal_is_limit(st, ec):
                 bucket = provider_limits if ec else operator_limits
                 bucket.append({**entry, "status": st, "output_lines": 0,
                                "origin": "provider" if ec else "operator"})
             elif st == "failed":
                 failures.append(entry)
-            else:                                                 # partial / incomplete (crash) -> a coverage gap
+            else:                                                 # partial / incomplete -> a coverage gap
                 gaps.append({**entry, "status": st, "output_lines": 0})
         phase_exceptions = [secrets.redact(n) for n in self.notes if "EXCEPTION" in n]
         # ── coverage counters: reconcile event-level input omissions into the verdict ──────────────
-        # A cap/timeout SITE records tool-level success yet may truncate eligible input; its coverage_partial
-        # event carries eligible/tested/omitted/kind/unit. TRUTH policy (not a threshold): dropping eligible
-        # methodology means the run is NOT clean —
-        #   · a CAP or TIMEOUT with omitted>0 is a GAP (complete_with_gaps), regardless of fraction;
-        #   · an operator-selected SAMPLE, or an external PROVIDER limit, with omitted>0 is a soft LIMIT
-        #     (complete_with_limits, not a gap) — nothing failed and there is nothing to retry this run;
-        #   · an INCONSISTENT triple is coverage:unknown (a gap — never fabricated completion).
-        # The 10%/100 rule is retained ONLY as a `priority` label (major/minor) for triage, NOT to gate.
-        # by_kind is kept so a mixed source is reported honestly (sample/provider stay soft, timeouts gate).
+        # cap/timeout omitted>0 is a gap; sample/limit omitted>0 is a soft limit; inconsistent is unknown
         coverage = self._read_coverage()
         coverage_limits = []
         for cov in coverage:
@@ -741,18 +687,15 @@ class Run:
                     coverage_limits.append(entry)                     # operator subset / provider limit -> soft
                 else:
                     gaps.append(entry)                                # cap/timeout with omitted>0 -> gap
-        # ── STRUCTURED child faults (settle prerequisite D) ────────────────────────────────────────
-        # A campaign must decide whether repeating a child is continuation or repetition of a broken run,
-        # and `failures` does not separate a machinery break from an optional tool's failure while a
-        # REQUIRED missing tool arrives in `gaps` instead. So the machine-readable version says which is
-        # which, in its own field, and nobody has to match prose.
+        # ── structured child faults ────────────────────────────────────────────────────────────────
+        # machinery break · optional tool failure · required tool missing, each in its own field
         faults = [{"kind": "phase_exception", "where": "run", "detail": note}
                   for note in phase_exceptions]
         _optional = set()
         try:
             from .registry import load_tools as _load
             _optional = {t.bin for t in _load() if t.optional}
-        except Exception:                                          # noqa: BLE001 - a report is never a stop
+        except Exception:                                          # noqa: BLE001 — a report is never a stop
             _optional = set()
         for f in failures:
             faults.append({"kind": "optional_tool_failed" if f.get("tool") in _optional else "machinery",
@@ -762,25 +705,23 @@ class Run:
                 faults.append({"kind": "required_tool_missing", "where": g.get("tool"),
                                "detail": g.get("why")})
 
-        # a LIMIT never downgrades a run that also has real gaps — gaps dominate; limits only lift a
-        # otherwise-clean run to complete_with_limits so the incompleteness is still stated.
+        # gaps dominate: a limit only lifts an otherwise-clean run to complete_with_limits
         limits = coverage_limits + provider_limits + operator_limits
         verdict = ("complete_with_gaps" if (failures or gaps or phase_exceptions)
                    else "complete_with_limits" if limits else "complete")
         return {"verdict": verdict, "tool_status": status_counts, "tools_failed": len(failures),
                 "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions,
                 "coverage": coverage, "coverage_limits": coverage_limits,
-                # what each lane still OWES — the supervisor's input, absent meaning UNKNOWN (settle B)
+                # what each lane still owes; absent means unknown, never zero
                 "remainders": self._read_remainders(),
-                # STRUCTURED child faults and provider spend, so a campaign never interprets prose (D)
                 "faults": faults,
                 "provider_spend": self._read_spend(),
                 "provider_limits": provider_limits, "operator_limits": operator_limits}
 
     def _read_spend(self) -> list[dict]:
-        """Provider spend per (lane, provider, measure), SUMMED — a child's bill, in the units it was
-        charged in. Never summed ACROSS measures: pages and query credits are different currencies, and
-        `pages_bought` is not equivalent to charged requests (settle prerequisite D)."""
+        """Provider spend per (lane, provider, measure), summed. Never summed ACROSS measures: pages and query
+        credits are different currencies, and `pages_bought` is not equivalent to charged requests.
+        """
         ev = self.dir / "events.jsonl"
         if not ev.exists():
             return []
@@ -812,12 +753,10 @@ class Run:
         return [totals[k] for k in sorted(totals)]
 
     def _read_remainders(self) -> list[dict]:
-        """The LATEST remainder record per (lane, unit) — what each lane still OWES, for a supervisor that
-        has to decide whether repeating this run could advance anything (settle prerequisite B).
-
-        Latest-per-unit for the same reason coverage is: a lane re-emits its remainder every run, and a run
-        that finished its rotation must be able to CLEAR the one before it. A lane that emitted nothing is
-        absent here — which a supervisor must read as UNKNOWN, never as zero."""
+        """The LATEST remainder record per (lane, unit) — what each lane still owes, for a supervisor deciding
+        whether repeating this run could advance anything. Latest-per-unit so a lane that finished its rotation
+        clears the one before it. A lane that emitted nothing is absent here, which reads as UNKNOWN, not zero.
+        """
         ev = self.dir / "events.jsonl"
         if not ev.exists():
             return []
@@ -836,8 +775,8 @@ class Run:
             lane, unit = rec.get("source_id"), rec.get("unit")
             if not isinstance(lane, str) or not isinstance(unit, str):
                 continue
-            # RECONSTRUCTED and validated before publication: this feeds a supervisor's arithmetic, and a
-            # malformed payload must arrive as UNKNOWN rather than as numbers nobody checked.
+            # reconstructed and validated before publication: this feeds a supervisor's arithmetic, so a
+            # malformed payload arrives as unknown rather than as numbers nobody checked
             from . import remainder as _remainder
             retriable = rec.get("retriable") if isinstance(rec.get("retriable"), dict) else {}
             terminal = rec.get("terminal") if isinstance(rec.get("terminal"), dict) else {}
@@ -856,18 +795,16 @@ class Run:
         return [latest[k] for k in sorted(latest)]
 
     def _read_coverage(self) -> list[dict]:
-        """Aggregate STRUCTURED coverage_partial events (those carrying eligible/tested/omitted) from
-        events.jsonl into a per-source_id rollup, rerun/resume-safe:
-          1. keep only the LATEST record per (source_id, unit) — a repeated phase re-emits the SAME unit
-             every run (including with omitted=0 when it no longer caps), so latest-per-unit lets an
-             uncapped rerun CLEAR a prior cap. Summing raw appends would double-count and never clear.
-          2. aggregate surviving units per source_id, keeping a `by_kind` breakdown so a mixed source
-             reports honestly (sample/provider stay soft limits; cap and timeout counts gate) — no relabeling.
-          3. counters are coerced defensively; a unit with a non-numeric / inconsistent triple flags the
-             source ``valid=False`` and its garbage numbers are NOT summed (verdict treats it as unknown,
-             and manifest generation can never crash on a bad value).
-        Legacy per-item events (no structured counters) are ignored — already covered by degraded tool_runs.
-        Best-effort: a missing/garbled log yields []."""
+        """Aggregate structured coverage_partial events (those carrying eligible/tested/omitted) from
+        events.jsonl into a per-(source_id, measure) rollup, rerun/resume-safe:
+          1. keep only the LATEST record per (source_id, unit), so an uncapped rerun clears a prior cap
+             instead of the raw appends double-counting it;
+          2. aggregate the surviving units, keeping a `by_kind` breakdown so a mixed source reports each
+             kind on its own terms (sample/provider stay soft limits; cap and timeout gate);
+          3. a unit with a non-numeric or inconsistent triple flags the source ``valid=False`` and its
+             numbers are not summed.
+        Legacy per-item events without counters are ignored (already covered by degraded tool_runs), and a
+        missing or garbled log yields []."""
         from . import events
 
         def _int(x):
@@ -879,10 +816,9 @@ class Run:
         ev = self.dir / "events.jsonl"
         if not ev.exists():
             return []
-        # Process the log IN LINE ORDER (append order = happened order): a coverage_reset for a source DROPS
-        # that source's accumulated units; the lines after it are the new generation. No timestamp math, so a
-        # unit sharing the reset's millisecond can't survive, and a vanished unit is cleared by its reset.
-        live: dict[str, dict] = {}                                 # source_id -> {unit: latest rec} (current gen)
+        # read in line order (append order = happened order), so a coverage_reset drops that source's
+        # accumulated units and the lines after it are the new generation, with no timestamp math involved
+        live: dict[str, dict] = {}                                 # source_id -> {unit: latest rec}, current gen
         try:
             for line in ev.read_text(encoding="utf-8", errors="replace").splitlines():
                 try:
@@ -895,15 +831,13 @@ class Run:
                     live.pop(sid, None)                            # new generation: prior units gone
                 elif et == events.COVERAGE_PARTIAL and (rec.get("eligible") is not None
                                                         or rec.get("kind") == events.COVERAGE_UNKNOWN):
-                    # COVERAGE_UNKNOWN is structured-but-uncounted: admit it so "ran, unmeasurable" reaches the
-                    # verdict as a gap. Skipping it made a first run with no stats read as fully covered.
+                    # COVERAGE_UNKNOWN is structured but uncounted; admitted so "ran, unmeasurable" reaches
+                    # the verdict as a gap rather than reading as fully covered
                     live.setdefault(sid, {})[rec.get("unit", sid)] = rec   # latest per unit, this generation
         except Exception:
             pass
-        # aggregate per (source_id, MEASURE) — files and params (different measures) are NEVER summed; each
-        # rollup has one homogeneous denominator. by_kind is kept so a mixed source reports each kind honestly,
-        # and per-unit summaries are retained so a multi-unit rollup keeps HONEST attribution (not just the
-        # first unit's reason).
+        # aggregated per (source_id, measure) so each rollup has one homogeneous denominator; by_kind and
+        # the per-unit summaries keep a mixed or multi-unit rollup attributable
         agg: dict[tuple, dict] = {}
         for sid, units in live.items():
             for rec in units.values():
@@ -917,9 +851,8 @@ class Run:
                 unit_valid = (rec.get("coverage_valid") is not False and None not in (elig, tst, omt)
                               and elig >= 0 and tst >= 0 and omt >= 0 and tst + omt == elig)
                 if not unit_valid:
-                    a["valid"] = False                            # do NOT sum garbage -> no += on a str
-                    # ...but KEEP its reason: an unknown/inconsistent unit is exactly the one an operator needs
-                    # explained, and dropping it left the coverage:unknown gap with `why: null`.
+                    a["valid"] = False                            # never sum garbage -> no += on a str
+                    # its reason is kept: an inconsistent unit is the one an operator needs explained
                     a["unknown"].append({"unit": rec.get("unit", sid), "kind": kind,
                                          "reason": rec.get("reason")})
                     continue
@@ -928,12 +861,12 @@ class Run:
                                    "omitted": omt, "kind": kind, "reason": rec.get("reason")})
                 bk = a["by_kind"].setdefault(kind, {"eligible": 0, "tested": 0, "omitted": 0})
                 bk["eligible"] += elig; bk["tested"] += tst; bk["omitted"] += omt
-        for a in agg.values():                                    # honest aggregate reason (attribution kept in `units`)
+        for a in agg.values():                                    # aggregate reason; attribution stays in `units`
             limited = [u for u in a["units"] if u["omitted"] > 0]
             unk = a["unknown"]
             if unk:
-                # UNMEASURABLE dominates the headline: a rollup that mixes measured and unmeasured units must
-                # not report only the measured part, or a "5348 omitted" line would imply the rest was covered.
+                # unmeasurable dominates the headline, so a mixed rollup never reports only its measured
+                # part and implies the rest was covered
                 a["reason"] = (unk[0]["reason"] if len(unk) == 1 and not a["units"]
                                else f"{len(unk)} of {len(unk) + len(a['units'])} unit(s) unmeasurable"
                                     + (f"; {a['omitted']} {a['measure']} omitted in the rest"
@@ -943,17 +876,15 @@ class Run:
             elif len(limited) > 1:
                 a["reason"] = f"{len(limited)} unit(s) limited; {a['omitted']} {a['measure']} omitted"
             elif a["units"]:
-                a["reason"] = a["units"][0]["reason"]             # fully covered — carry a representative note
+                a["reason"] = a["units"][0]["reason"]             # fully covered — a representative note
         return list(agg.values())
 
     def _read_provider_terminals(self) -> list[dict]:
-        """review-r3#1/r4#6: fold IN-PROCESS provider terminals (run_provider, marked provider=True) into the
-        verdict — they never hit _tool_runs, so a FAILED/PARTIAL provider would otherwise leave the run looking
-        complete, and clean providers would be invisible to the status counts. Returns ALL current-generation
-        terminals (the caller counts every status and gates on failed/partial). GENERATION (review-r4#3): a
-        terminal marked reset_generation supersedes this source's PRIOR terminals (all work_units) — processed in
-        LINE ORDER so a resume/config-change clears stale failures, keeping the LATEST per (source_id, work_unit)
-        within the current generation. The `provider` flag prevents double-counting a subprocess lane."""
+        """In-process provider terminals (run_provider, marked provider=True), which never reach _tool_runs.
+        Returns every current-generation terminal — the caller counts each status and gates on failed and
+        partial. A terminal marked reset_generation supersedes this source's prior terminals across all
+        work units; the log is read in line order, keeping the latest per (source_id, work_unit) within the
+        current generation. The `provider` flag keeps a subprocess lane from being counted twice."""
         from . import events
         ev = self.dir / "events.jsonl"
         if not ev.exists():
@@ -971,14 +902,14 @@ class Run:
                 sid = rec.get("source_id", "?")
                 key = (sid, rec.get("work_unit"))
                 if et == events.TOOL_START:
-                    if rec.get("reset_generation"):               # review-r5#1: reset persisted BEFORE execution
-                        for k in [k for k in latest if k[0] == sid]:   # new generation: drop this source's prior units
+                    if rec.get("reset_generation"):              # the reset is persisted before execution
+                        for k in [k for k in latest if k[0] == sid]:   # drop this source's prior units
                             del latest[k]
-                    # record the START as INCOMPLETE — replaced when the matching terminal arrives; a start with
-                    # NO terminal (crash mid-provider) stays incomplete and gates the verdict.
+                    # the start is recorded as incomplete and replaced by its terminal; a start with no
+                    # terminal (a crash mid-provider) stays incomplete and gates the verdict
                     latest[key] = {"source_id": sid, "work_unit": rec.get("work_unit"),
                                    "status": "incomplete", "reason": "provider started but never finished (crash?)"}
-                else:                                             # TOOL_FINISH — terminal supersedes the start
+                else:                                             # TOOL_FINISH supersedes the start
                     latest[key] = rec
         except Exception:
             return []
@@ -1003,20 +934,16 @@ class Run:
         if metrics:                                 # pointer + headline totals for the telemetry artifact
             manifest["metrics"] = metrics
         if policy:
-            # the EFFECTIVE coverage policy this run applied: every registered bound, its value, who set
-            # it, and what was HELD. Stored so a manifest can be read without the shell history that
-            # produced it (flag-axis step 3).
-            # defensively redacted a SECOND time: the rows are already non-disclosing by construction,
-            # and a manifest sink that trusts its input is exactly how one leak becomes permanent.
+            # the effective coverage policy this run applied, redacted again at this sink because a sink that
+            # trusts its input is how one leak becomes permanent
             manifest["policy"] = secrets.redact_deep(policy)
-        # C11: if any event-sink write FAILED this session, events.jsonl is incomplete — record that fact so
-        # a coverage/verdict folded from it is not read as clean truth (the run itself never crashed on it).
+        # a failed event-sink write means events.jsonl is incomplete, so a coverage/verdict folded from it
+        # is not clean truth
         from . import events as _events
         od = _events.observability_degraded()
         if od:
             manifest["observability_degraded"] = od
-        _events.persist_degraded()                  # review#6: survive to the next resume (accumulates)
-        # C10a: atomic write (temp + os.replace) so a crash mid-write never leaves a truncated manifest.
+        _events.persist_degraded()                  # survives to the next resume (accumulates)
         _atomic_write(self.manifest_path, json.dumps(manifest, indent=2))
         # update state pointers (per-project, under recon/)
         state = self.project_dir / "recon" / "state"
@@ -1025,8 +952,8 @@ class Run:
                       json.dumps({"run_id": self.run_id, "target": self.target,
                                   "finished": manifest["finished"],
                                   "entity_counts": manifest["entity_counts"]}, indent=2))
-        # `current` pointer: swap ATOMICALLY (temp symlink + os.replace) so a concurrent reader never sees
-        # it briefly missing between unlink and re-create.
+        # the `current` pointer is swapped atomically (temp symlink + os.replace), so a concurrent reader
+        # never sees it briefly missing
         cur = state / "current"
         try:
             tmp = state / f".current.{os.getpid()}.tmp"
@@ -1047,8 +974,7 @@ class Run:
         if not candidates:
             return None
         d = candidates[-1]
-        # review#5: recover target from run.json when there is no manifest (a CRASHED run has run.json but no
-        # final manifest) — else `latest()` mislabels a resumable run as target "unknown".
+        # a crashed run has run.json but no final manifest, so the target is recovered from either
         target = "unknown"
         for meta in (d / "manifest.json", d / "run.json"):   # manifest first (richer), run.json fallback
             if meta.exists():
@@ -1059,4 +985,4 @@ class Run:
                 if t:
                     target = t
                     break
-        return Run.open(project_dir, target, d.name)        # C10a: OPEN (load started), never fabricate
+        return Run.open(project_dir, target, d.name)        # open (load started), never fabricate

@@ -1,9 +1,6 @@
-"""Phase 2: Horizontal discovery.
-
-Surfaces MORE in-scope hostnames on owned IP space + cert data. We do NOT pivot to
-new apex roots automatically (scope stays fixed); ASN findings are recorded as
-candidates for human review (design Q7). Methodology: ASN->cert chain,
-kaeferjaeger SNI dataset, tlsx SAN harvest, reverse DNS.
+"""Horizontal discovery: surface more in-scope hostnames on owned IP space + cert data. Scope stays
+fixed — no automatic pivot to new apex roots; ASN findings are review candidates. Methodology:
+ASN→cert chain, kaeferjaeger SNI dataset, tlsx SAN harvest, reverse DNS.
 """
 from __future__ import annotations
 
@@ -11,10 +8,9 @@ import re as _re
 
 from .. import fetch, netguard, normalize
 
-# in-scope hostnames named in a Content-Security-Policy (script-src / connect-src / …) — same shape probe
-# uses on live-host CSP headers, here on the apex's CSP fetched safely (no csprecon auto-follow).
+# in-scope hostnames named in a Content-Security-Policy (script-src / connect-src / …).
 _CSP_HOST = _re.compile(r"\b(?:https?://)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})\b", _re.I)
-# CSP via <meta http-equiv="Content-Security-Policy" content="..."> — ANY attribute order (audit #7).
+# CSP via <meta http-equiv="Content-Security-Policy" content="..."> — any attribute order.
 _META_TAG = _re.compile(r"<meta\b[^>]*>", _re.I)
 _META_HTTPEQUIV = _re.compile(r"""http-equiv\s*=\s*["']?content-security-policy""", _re.I)
 _META_CONTENT = _re.compile(r"""content\s*=\s*["']([^"']*)["']""", _re.I)
@@ -31,13 +27,7 @@ def _meta_csp(html: str) -> list[str]:
 from ..runner import RunResult, Status, have, run as exec_tool, skipped
 
 
-# kaeferjaeger cloud-SNI name harvest reads an OPERATOR-PROVIDED LOCAL dataset — NEVER a remote fetch
-# (audit #3: the registry declares this source `default: off, setup (local dataset, manual)`, but the code
-# used to urlopen ~4 GB of provider SNI dumps on EVERY horizontal run — a plan/registry lie + a VPS-egress
-# footgun). Same model as openintel's local DB: the operator downloads the provider `*_sni.txt` files they
-# want (kaeferjaeger.gay/sni-ip-ranges/<provider>/…) ONCE to ~/.config/quarry/kaeferjaeger/, and we STREAM
-# whatever is there LINE-BY-LINE (bounded RAM, but the COMPLETE file — never a nonrepresentative prefix) for
-# in-scope hosts. Absent dataset -> quiet recorded skip.
+# hostname matcher for the operator's local kaeferjaeger SNI dataset (never fetched remotely).
 _KJ_HOST_RX = _re.compile(r"[a-z0-9_.-]+\.[a-z]{2,}", _re.I)
 
 
@@ -47,10 +37,9 @@ def _kaeferjaeger_dir():
 
 
 def _kaeferjaeger(ctx) -> int:
-    """Passive cloud-SNI name harvest from the operator's LOCAL dataset — NO remote fetch. STREAMS every
-    `*.txt` under ~/.config/quarry/kaeferjaeger/ line-by-line (bounded RAM, complete file) for in-scope
-    hostnames; each match keeps `host<TAB>file:lineno` provenance. Honest status: FAILED if NO file could be
-    read, PARTIAL if some failed, SUCCESS/EMPTY only after every file was fully processed. Returns count."""
+    """Cloud-SNI name harvest from the operator's local dataset (no remote fetch). Streams every `*.txt`
+    under ~/.config/quarry/kaeferjaeger/ line-by-line for in-scope hostnames, keeping `host<TAB>file:lineno`
+    provenance. Status distinguishes no file read / some failed / all processed. Returns the match count."""
     import time
     ddir = _kaeferjaeger_dir()
     files = sorted(ddir.glob("*.txt")) if ddir.is_dir() else []
@@ -61,15 +50,14 @@ def _kaeferjaeger(ctx) -> int:
         return 0
     t0 = time.monotonic()
     raw_path = ctx.run.raw_path("horizontal", "kaeferjaeger", "matches.txt")
-    # matched = every unique in-scope host THIS source found (drives status + raw_path — a rerun where the
-    # entities already exist is still a real match, NOT empty). added = new store entities. provenance is
-    # written once per (host, file) so a host appearing in two provider dumps keeps BOTH sources.
+    # matched = unique in-scope hosts found (drives status + raw_path; a rerun re-finding existing
+    # entities still counts). added = new store entities; provenance is written once per (host, file).
     matched, added, prov_seen, add_seen, read_files, failed = set(), 0, set(), set(), 0, 0
     with raw_path.open("w", encoding="utf-8") as out:
         for f in files:
             try:
                 with f.open("r", encoding="utf-8", errors="replace") as fh:
-                    for lineno, line in enumerate(fh, 1):        # STREAM: RAM bounded to a line, whole file read
+                    for lineno, line in enumerate(fh, 1):        # stream: RAM bounded to a line, whole file read
                         for m in _KJ_HOST_RX.findall(line):
                             h = m.lower().rstrip(".")
                             if not ctx.scope.in_scope(h):
@@ -98,15 +86,12 @@ def _kaeferjaeger(ctx) -> int:
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
 
-    # kaeferjaeger = passive OSINT over the operator's LOCAL SNI dataset (no remote fetch). One line if hits.
     n = _kaeferjaeger(ctx)
     if n:
         ctx.echo(f"  kaeferjaeger: {n} in-scope host(s) matched in local SNI dataset")
 
-    # CSP siblings: related in-scope domains named in the apex's Content-Security-Policy. csprecon is NOT
-    # used — it is an active HTTP requester that AUTO-FOLLOWS redirects (a public apex can 30x to a private/
-    # off-scope host, audit #2). Quarry fetches the CSP itself via fetch.scoped_headers: the apex roots are
-    # resolve-guarded, every hop is scope+IP-guarded, and it paces to a configured http_rl (audit #1/#5).
+    # CSP siblings: in-scope domains named in the apex's Content-Security-Policy, fetched via
+    # fetch.scoped_headers (resolve/scope/IP-guarded, paced to http_rl; not csprecon, which auto-follows).
     if not scope.passive_only:
         roots = netguard.guard_hosts(ctx, prof.apex_domains, phase="horizontal.csp")
         raw = ctx.run.raw_path("horizontal", "csp", "csp.txt")
@@ -114,9 +99,9 @@ def run(ctx) -> None:
         dump = []
         for apex in roots:
             for scheme in ("https", "http"):
-                # transport-safe (audit #2) + self-signed OK (insecure): a bad request never aborts the phase.
+                # transport-safe + self-signed OK (insecure): a bad request never aborts the phase.
                 hdrs, body, final, st = fetch.scoped_headers(ctx, f"{scheme}://{apex}/", insecure=True)
-                if hdrs is None:                          # transport failure OR off-scope redirect -> NOT a usable fetch
+                if hdrs is None:                          # transport failure or off-scope redirect
                     failed += 1
                     continue
                 responses += 1
@@ -132,8 +117,8 @@ def run(ctx) -> None:
                             "subdomain", {"host": h, "sources": ["csp"], "raw_ref": str(raw)}):
                         added += 1
         raw.write_text("\n".join(dump))
-        # honest source-level status (audit #6): FAILED only if NOTHING answered; PARTIAL if some fetches
-        # failed; EMPTY if everything answered but no CSP; SUCCESS only when CSP was actually found.
+        # source-level status: failed if nothing answered, partial if some fetches failed, empty if all
+        # answered without CSP, success only when CSP was found.
         _st = (Status.SKIPPED if not roots else Status.FAILED if responses == 0 else
                Status.PARTIAL if failed else Status.SUCCESS if (dump or added) else Status.EMPTY)
         ctx.run.record("horizontal", RunResult("csp", ["<native scoped CSP fetch>"], _st, 0, 0.0,
@@ -142,8 +127,8 @@ def run(ctx) -> None:
         if added:
             ctx.echo(f"  csp: +{added} in-scope host(s) from apex Content-Security-Policy")
 
-    # cloud-asset candidates: S3/GCS bucket enum from apex/org (non-mutating detect, verify-ownership).
-    # ABOVE the CIDR early-return — it's apex/org-derived and must run for domain-only profiles too.
+    # cloud-asset candidates: S3/GCS bucket enum from apex/org (non-mutating, verify-ownership). Above
+    # the CIDR early-return so it runs for domain-only profiles too.
     if not scope.passive_only:
         from .. import cloud
         nc = cloud.discover(ctx)

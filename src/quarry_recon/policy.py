@@ -1,36 +1,23 @@
-"""The `--unbound` REGISTRY — the free-tool volume ceilings one run may lift.
+"""The `--unbound` registry — the free-tool volume ceilings one run may lift.
 
-`--unbound` is about USING WHAT WE ALREADY HAVE, not obtaining more. The boundary is POLICY OWNERSHIP, not
-execution order — it holds however the phases are later reordered (Lumpy, 2026-08-02):
+`--unbound` processes all eligible retained evidence through free downstream tools without truncating
+it. It never raises a provider page budget, reduces a credit reserve, enables a disabled provider,
+broadens scope, bypasses a contact guard, removes rate / concurrency / resource protection, or implies
+`--timeout 0`.
 
-    ACQUISITION   provider enablement, balance, reserve and page policy decide what Quarry may OBTAIN.
-    OWNERSHIP     once evidence is acquired and stored, Quarry HAS it.
-    PROCESSING    `--unbound` may process all eligible RETAINED evidence through free downstream tools
-                  without truncating it.
+So this table is narrow: free-tool coverage / throughput bounds that participate in `--unbound`, plus
+the held exceptions that must be printed rather than silently skipped. Everything else is an exclusion
+with a reason in `EXCLUDED`, so the classification test can prove a ceiling was reasoned about rather
+than forgotten.
 
-If Shodan's own policy buys five pages and those yield 100,000 names, `--unbound` does not buy page six —
-and it does let the free downstream lanes work through all 100,000. It never raises a provider page budget,
-reduces a credit reserve, enables a disabled provider, broadens scope, bypasses a contact guard, removes
-rate / concurrency / resource protection, or implies `--timeout 0` (`docs/design/FLAG-AXIS-PLAN.md`).
+`identity` says what a change to a bound invalidates:
+    none          nothing — a per-run throughput allowance; the durable rotation continues.
+    work_unit     the lane resumes by `events.work_unit`, so the bound must be in that unit or a bounded
+                  completion claims work it never did.
+    partition     the bound changes how the corpus is split; the ledger stays in use and an inherited
+                  record is never certified clean, so a re-partitioned corpus is re-submitted.
 
-So this table is deliberately NARROW. It holds free-tool COVERAGE / THROUGHPUT bounds that participate in
-`--unbound`, plus the held exceptions that must be printed rather than silently skipped. Everything else —
-resource guards, parser ranges, rate and concurrency, engagement settings, and every paid-provider control
-— is an EXCLUSION with a reason, listed in `EXCLUDED` so the classification test can prove a ceiling was
-reasoned about rather than forgotten. Paid-provider policy stays where it already lives: enablement,
-balance, reserve and per-run page policy, separately authorised. This flag never reinterprets it.
-
-`identity` says what a CHANGE to a bound invalidates — the two persistence models Quarry has:
-
-    none          nothing. A per-run throughput allowance: the durable rotation continues across a change,
-                  and folding it into an identity would re-identify the source for no coverage reason.
-    work_unit     the lane resumes by `events.work_unit`, so a bound that changes what ONE invocation may
-                  cover MUST be in that unit or a bounded completion claims work it never did.
-    partition     the bound changes how the corpus is SPLIT (`sweep.allocate`'s cap). The lane ledger
-                  stays in use and a record belonging to a containing or contained slot is never certified
-                  clean (`budget.RotationProgress.tier`), so a re-partitioned corpus is re-submitted.
-
-This module is pure data plus lookups — nothing imports it yet (step 1 changes no behaviour).
+Pure data plus lookups.
 """
 from __future__ import annotations
 
@@ -39,49 +26,31 @@ from dataclasses import dataclass
 IDENTITIES = ("none", "work_unit", "partition")
 #: how the value is read: a PERFORMANCE knob through the strict parsers, or a module constant
 READERS = ("strict_int", "budget_seconds", "module")
-#: why a ceiling is NOT in this registry. Every one of these is a REASON, never a silent omission.
+#: why a ceiling is not in this registry; each is a reason, never a silent omission.
 EXCLUSION_KINDS = (
     "provider",     # paid / external: enablement, balance, reserve and page policy own it, not a flag
     "resource",     # blast radius, memory, sockets, disk — the scheduler reaches every chunk anyway
-    "parser",       # the range a config VALUE may hold; not a policy of its own
+    "parser",       # the range a config value may hold; not a policy of its own
     "rate",         # pressure on the target or this host: the rate axis, never the volume one
     "engagement",   # chosen per engagement in target.yaml, not by a machine-wide flag
     "identity",     # slot / schema identity: versioned, never relaxed
-    "continuation", # how many times a SUPERVISOR repeats a run — `--settle`'s business, not `--unbound`'s
+    "continuation", # how many times a supervisor repeats a run — `--settle`'s business, not `--unbound`'s
     "not_a_bound",  # a sentinel, name or set that merely matches the naming convention
 )
-#: lanes on the ACQUISITION side: what they may obtain is decided by the provider's own enablement,
-#: balance, reserve and page policy. Nothing here may ever enter the registry (test-enforced) — including
-#: `probe.shodan_host`, whose endpoint is MEASURED FREE (`/shodan/host/{ip}`, zero-balance delta 0,
-#: 2026-07-30). Being free is not why it is out; ownership is.
-#:
-#: The line is OWNERSHIP, not keyed-ness (Lumpy, 2026-08-02): a lane belongs here when QUARRY owns the
-#: provider call, the key or the budget. A lane whose external tool reads its OWN provider configuration —
-#: `subfinder -all` calling whatever the operator configured in subfinder's own config — is outside
-#: Quarry's accounting and authorisation model, and Quarry neither parses nor polices it.
-#:
-#: So: our own HTTP to a provider (`probe.favicon` / `probe.cert` / `probe.shodan_host` and their credit
-#: coordinator, `vertical.censys`, `osint.whoxy`), and tools we hand a key to and enable ourselves
-#: (`vertical.shosubgo`, `vertical.github_subs`). NOT `vertical.openintel`, which is `key`-defaulted for
-#: local dataset SETUP and queries a local DB.
-#:
-#: Every name is a REGISTERED source id (test-enforced) except `osint.whoxy`, which runs in `osint.py` over
-#: plain HTTP outside the source registry — which is also why an acquisition gate cannot live in one
-#: execution path: `run_providers`, `run_contract` and direct HTTP are three different doors.
+#: acquisition-side lanes: what they may obtain is owned by the provider's enablement/balance/reserve/
+#: page policy, never a flag. A lane is here when Quarry owns the call, key or budget (ownership, not free).
 PROVIDER_LANES = ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.censys",
                   "vertical.certspotter", "vertical.crtsh", "vertical.shosubgo", "vertical.github_subs",
                   "osint.whoxy")
-#: ...and the ids above that are NOT in the source registry, listed exactly rather than by prefix.
+#: ...and the ids above that are not in the source registry, listed exactly rather than by prefix.
 PROVIDER_LANES_OUTSIDE_REGISTRY = ("osint.whoxy",)
 
-#: BOUND lanes that are not registered sources, listed EXACTLY (never by prefix — a prefix admits a typo).
-#: The OSINT preflight runs before any phase and has no source registry of its own; `osint.rdap` is a lane
-#: there. Its bound is still a bound: it appears in `quarry policy`, and `--unbound` lifts it.
+#: bound lanes that are not registered sources, listed exactly. The OSINT preflight has no source
+#: registry of its own; a lane's bound still appears in `quarry policy` and `--unbound` lifts it.
 BOUND_LANES_OUTSIDE_REGISTRY = ("osint.asrank", "osint.rdap")
 
-#: WHICH DOOR each acquisition lane executes through. Declared, so the acquisition closure can be checked
-#: against real call sites rather than against the existence of a gate somewhere: a registered provider
-#: that started making its own HTTP calls would otherwise pass a test that only counts gate strings.
+#: which door each acquisition lane executes through, declared so the acquisition closure can be checked
+#: against real call sites rather than the mere existence of a gate.
 PROVIDER_DOORS: dict[str, str] = {
     "probe.favicon": "run_providers",          # the shared Shodan credit coordinator
     "probe.cert": "run_providers",
@@ -90,23 +59,14 @@ PROVIDER_DOORS: dict[str, str] = {
     "vertical.certspotter": "run_provider",
     "vertical.crtsh": "run_provider",
     "vertical.shosubgo": "run_contract",       # an external binary we hand a key to
-    # this one runs the tool DIRECTLY (`exec_tool`), so neither registry gate covers it — it gates itself
+    # runs the tool directly (`exec_tool`), so neither registry gate covers it — it gates itself
     "vertical.github_subs": "direct_tool",
     "osint.whoxy": "direct_http",              # plain HTTP in `osint.py`, outside the source registry
 }
 DOORS = ("run_provider", "run_providers", "run_contract", "direct_http", "direct_tool")
 
-#: EVERY registered source, classified — the mechanism that finds an OMISSION rather than trusting a
-#: hand-kept list. `vertical.certspotter` satisfied the ownership rule and was missing from
-#: `PROVIDER_LANES`; a hard-coded test could not have noticed. A new lane fails the completeness test
-#: until someone says which kind it is.
-#:
-#:   quarry_provider  Quarry makes the call, or supplies the key and enables it -> `PROVIDER_LANES`
-#:   external_tool    a tool that reaches its OWN sources under its OWN configuration (subfinder's
-#:                    providers, gau/waymore's archives, asnmap/caduceus, smap's Shodan mirror). Outside
-#:                    Quarry's accounting and authorisation model — we neither parse nor police it.
-#:   target_facing    contacts the TARGET (or its infrastructure), not a data provider
-#:   local            local computation, local datasets, or an operator-provided corpus
+#: every registered source, classified (the mechanism that finds an omission, not a hand-kept list):
+#: quarry_provider = we call/key it; external_tool = its own config; target_facing = the target; local.
 SOURCE_OWNERSHIP: dict[str, str] = {
     **{lane: "quarry_provider" for lane in
        ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.censys", "vertical.certspotter",
@@ -119,8 +79,8 @@ SOURCE_OWNERSHIP: dict[str, str] = {
         "params.gf", "crawl.js_beautify", "crawl.jsluice_urls", "crawl.jsluice_secrets",
         "crawl.gitleaks", "crawl.trufflehog", "crawl.xnlinkfinder",
         "origin.correlation", "vertical.alterx_permute",
-        # reads bundles ALREADY on disk and contacts nothing; the fetch of an accepted chunk is
-        # `crawl.js_fetch`, which is where the rate and the budget live
+        # reads bundles already on disk and contacts nothing; the accepted-chunk fetch is
+        # `crawl.js_fetch`, where the rate and budget live
         "crawl.jxscout_chunks",
         # analyses bundles already on disk, publishes an artifact, contacts nothing
         "crawl.jxscout_ast")},
@@ -134,9 +94,8 @@ SOURCE_OWNERSHIP: dict[str, str] = {
         "probe.gowitness", "probe.httpx", "probe.naabu_infra", "probe.naabu_web", "probe.nmap_service",
         "probe.tlsx_certs", "vertical.puredns_brute", "vertical.puredns_resolve",
         "vertical.wildcard_http",
-        # both ACTIVE: the CSP lane fetches the apex itself through `fetch.scoped_headers` (guarded,
-        # paced), and the sourcemap lane fetches scoped `sourceMappingURL` targets. Completeness cannot
-        # catch a category that is merely WRONG.
+        # both active: the CSP lane fetches the apex through `fetch.scoped_headers` (guarded, paced), the
+        # sourcemap lane fetches scoped `sourceMappingURL` targets.
         "horizontal.csp", "crawl.sourcemaps")},
 }
 OWNERSHIP_KINDS = ("quarry_provider", "external_tool", "target_facing", "local")
@@ -150,12 +109,12 @@ class Bound:
     lane: str                       # the source_id / lane it bounds
     default: int                    # the value with no config and no flag
     identity: str
-    persistence: str                # what a CHANGE invalidates, in one sentence
+    persistence: str                # what a change invalidates, in one sentence
     relaxable: bool                 # may `--unbound` lift it
-    unbounded_value: int | None = None   # the value that MEANS unbounded for this knob
+    unbounded_value: int | None = None   # the value that means unbounded for this knob
     consumer_honours_unbounded: bool = False   # ...and whether the consumer already implements it
-    held_reason: str = ""           # why it is NOT lifted — PRINTED, never silent
-    const: str | None = None        # "module:NAME" for a constant, for the drift check
+    held_reason: str = ""           # why it is not lifted — printed, never silent
+    const: str | None = None        # "module:name" for a constant, for the drift check
     const_local: bool = False       # ...defined inside a function today, so it is read from the AST
     maximum: int | None = None      # the strict parser's range for a `strict_int` knob
     note: str = ""
@@ -261,7 +220,7 @@ BOUNDS: tuple[Bound, ...] = (
                "unreachable. The loop already stops when a round adds nothing new, so the unbounded "
                "meaning is exactly that convergence; the consumer must be taught to read 0 that way"),
 
-    # ── the one HELD exception in v1 ─────────────────────────────────────────────────────────────
+    # ── the one held exception ───────────────────────────────────────────────────────────────────
     Bound(name="A1D_WORD_CAP", reader="module", lane="enrich.a1d_brute", default=2000,
           identity="partition", const="quarry_recon.phases.enrich:A1D_WORD_CAP",
           persistence="slot boundaries (`sweep.allocate`'s cap); the ledger stays in use and an inherited "
@@ -271,8 +230,8 @@ BOUNDS: tuple[Bound, ...] = (
                       "boundary to exact labels and on vocabulary usefulness tiers (Lumpy, 2026-08-01)"),
 )
 
-#: Ceilings that are NOT `--unbound`'s, with the reason each is excluded. Keyed by "module:NAME" for a
-#: module constant, or by the bare PERFORMANCE key for a knob read through the strict parsers.
+#: ceilings that are not `--unbound`'s, with the reason each is excluded. Keyed by "module:name" for a
+#: module constant, or by the bare PERFORMANCE key for a strict-parser knob.
 EXCLUDED: dict[str, tuple[str, str]] = {
     # paid / external providers — enablement, balance, reserve and page policy own these
     "SHODAN_HOST_BUDGET_S": ("provider", "an ACQUISITION-side lane: external-provider policy retains "
@@ -335,9 +294,6 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.phases.crawl:XNL_WORDLIST_LIMIT": ("resource", "-owl/-os are permutation timekillers"),
     "quarry_recon.fetch:DEFAULT_MAX_BODY": ("resource", "one response is read into memory"),
     "quarry_recon.fetch:DEFAULT_MAX_REDIRECTS": ("resource", "a redirect chain is not coverage"),
-    # the acquisition caps that used to live here (MAX_BODY, _DEEP_MAX_BODY, _OPENAPI_MAX_BODY) are GONE
-    # — a response is streamed to disk whole. What is left bounds MEMORY over an artifact we already
-    # hold, never which bytes we keep, so `--unbound` has nothing to lift here (review#21, Lumpy).
     "quarry_recon.evidence:MAX_PARSE": ("resource", "the artifact is stored WHOLE either way; this is the "
                                         "ceiling on holding one as a str, above which interpretation is "
                                         "deferred and recorded, never dropped"),
@@ -386,7 +342,7 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.netguard:_MAX_WORKERS": ("rate", "local concurrency"),
     "quarry_recon.settings:_CAP": ("rate", "per-tool worker caps"),
 
-    # parser ranges — what a config VALUE may say, not what the run does
+    # parser ranges — what a config value may say, not what the run does
     "quarry_recon.budget:_MAX_BUDGET_S": ("parser", "the strict parser's ceiling for lane budgets"),
     "quarry_recon.phases.params:_NUCLEI_MHE_MAX": ("parser", "the strict range of NUCLEI_MAX_HOST_ERROR"),
     "quarry_recon.phases.vertical:_SUBFINDER_DEFAULT_MIN": ("parser", "the DEFAULT of SUBFINDER_MAX_TIME, "
@@ -429,9 +385,8 @@ def knob(name: str) -> Bound | None:
 
 
 def _module_default(bound: Bound) -> int:
-    """The DEFAULT of a module-constant bound: the live constant where one exists (the module is still
-    where the default lives, and a test that patches it must keep working), else the declared value for a
-    function-local one. The registry's drift test keeps the two equal."""
+    """The default of a module-constant bound: the live constant where one exists, else the declared
+    value for a function-local one. The registry's drift test keeps the two equal."""
     if bound.const and not bound.const_local:
         import importlib
         mod, _, const = bound.const.partition(":")
@@ -440,11 +395,10 @@ def _module_default(bound: Bound) -> int:
 
 
 def limit(name: str) -> int:
-    """The EFFECTIVE value of a module-constant bound — its declared default unless a flag overrode it.
+    """The effective value of a module-constant bound — its declared default unless a flag overrode it.
 
-    A module constant cannot be read by `settings`, so a consumer that wants to honour `--unbound` asks
-    here instead of reading the constant directly. The constant stays the DEFAULT (and the registry's drift
-    test keeps them equal); this only adds the flag layer on top."""
+    A module constant cannot be read by `settings`, so a consumer honouring `--unbound` asks here instead
+    of reading the constant directly; this adds only the flag layer on top."""
     from . import settings
     b = by_name(name)
     if b is None:
@@ -456,11 +410,10 @@ def limit(name: str) -> int:
 
 
 def unbound_overrides() -> dict:
-    """What `--unbound` sets, straight from the registry: every RELAXABLE bound at its unbounded value.
+    """What `--unbound` sets, straight from the registry: every relaxable bound at its unbounded value.
 
-    The flag has no list of its own — a knob that is not registered is not lifted, a HELD one keeps its
-    bound with the reason printed beside it, and provider controls are not here at all (they are excluded,
-    with their own ownership)."""
+    An unregistered knob is not lifted, a held one keeps its bound with the reason printed, and provider
+    controls are not here at all (they are excluded, with their own ownership)."""
     return {b.name: b.unbounded_value for b in BOUNDS if b.relaxable}
 
 
@@ -470,34 +423,33 @@ def relaxable() -> tuple[Bound, ...]:
 
 
 def held() -> tuple[Bound, ...]:
-    """Registry bounds `--unbound` deliberately does NOT lift — printed with their reason, never silent."""
+    """Registry bounds `--unbound` deliberately does not lift — printed with their reason, never silent."""
     return tuple(b for b in BOUNDS if not b.relaxable)
 
 
-# ── the EFFECTIVE policy: what this run will actually apply, and where each value came from ──────────
+# ── the effective policy: what this run will actually apply, and where each value came from ──────────
 def effective(bound: Bound) -> tuple[int, str, str | None, str | None]:
     """`(value, source, rejected, rejected_source)` for one bound.
 
-    The source comes out of the same parse as the value: a configured or flagged value the strict parser
-    REFUSED is attributed to the default, and what was refused is reported rather than hidden behind an
-    author it did not have."""
+    The source comes out of the same parse as the value: a value the strict parser refused is attributed
+    to the default, and what was refused is reported rather than hidden behind an author it did not have."""
     from . import budget, settings
     if bound.reader == "budget_seconds":
         return settings.strict_int_with_source(bound.name, default=0, maximum=budget._MAX_BUDGET_S)
     if bound.reader == "strict_int":
         return settings.strict_int_with_source(bound.name, default=bound.default,
                                                maximum=bound.maximum or bound.default)
-    # a module constant is not configurable, but it IS relaxable — so the same override-aware parse runs
-    # over it, and the report shows a lifted cap as `flag` exactly like a knob (step 4).
+    # a module constant is not configurable but it is relaxable, so the same override-aware parse runs
+    # over it, and the report shows a lifted cap as `flag` exactly like a knob.
     default = _module_default(bound)
-    # FLAG-ONLY: `config.yaml` has no say over a module constant (step 4 review)
+    # flag-only: `config.yaml` has no say over a module constant
     return settings.flag_int(bound.name, default=default,
                              maximum=max(default, bound.unbounded_value or 0, 10 ** 9))
 
 
 def snapshot() -> list[dict]:
-    """The whole effective policy, one row per registered bound. This is what gets printed at run start and
-    persisted into the manifest: a run's ceilings are EVIDENCE, not shell history."""
+    """The whole effective policy, one row per registered bound. Printed at run start and persisted into
+    the manifest: a run's ceilings are evidence, not shell history."""
     rows = []
     for b in BOUNDS:
         value, src, rejected, rejected_src = effective(b)
@@ -510,9 +462,9 @@ def snapshot() -> list[dict]:
 
 
 def render(rows: list[dict] | None = None) -> list[str]:
-    """The operator-facing lines: what is unbounded, what a flag or config changed, and what is HELD with
-    the reason it is held. A bound sitting at its default is summarised rather than listed — the point is
-    what is DIFFERENT from the ordinary run, plus every exception we declined to lift."""
+    """The operator-facing lines: what is unbounded, what a flag or config changed, and what is held with
+    the reason. A bound at its default is summarised rather than listed — the point is what differs from
+    the ordinary run, plus every exception we declined to lift."""
     rows = snapshot() if rows is None else rows
     out, plain, free = [], 0, 0
     for r in rows:
@@ -524,7 +476,7 @@ def render(rows: list[dict] | None = None) -> list[str]:
                        f"{r['rejected_source']} value {r['rejected']} was REJECTED by the strict parser")
         elif r["source"] == "default":
             plain += 1
-            free += bool(r["unbounded"])         # unbounded because that IS the default, not by request
+            free += bool(r["unbounded"])         # unbounded because that is the default, not by request
         elif r["unbounded"]:
             out.append(f"  UNBOUNDED {r['name']} ({r['lane']}) — by {r['source']}")
         else:

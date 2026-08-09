@@ -1,10 +1,10 @@
-"""Content discovery (Phase 11) — candidate-driven, scope-safe ffuf. Default OFF.
+"""Content discovery (Phase 11) — candidate-driven, scope-safe ffuf. Default off.
 
-Intensity via MODES.CONTENT_DISCOVERY: off | light | balanced | deep (11.1 = off/light/balanced,
-flat). Recursion (MODES.CONTENT_RECURSION) is 11.2. Guardrails: skipped in passive mode and when
-off; only live, in-scope, active-allowed hosts (origin-first ORDER, never capped); ffuf -ac autocalibration
-always (kills wildcard/catch-all floods); http_rl -> ffuf -rate. Map-don't-exploit: results are
-url + review candidates, never actions.
+Intensity via MODES.CONTENT_DISCOVERY: off | light | balanced | deep; recursion via
+MODES.CONTENT_RECURSION. Guardrails: skipped in passive mode and when off; only live, in-scope,
+active-allowed hosts (origin-first order, never capped); ffuf -ac autocalibration always (kills
+wildcard/catch-all floods); http_rl → ffuf -rate. Map-don't-exploit: results are url + review
+candidates, never actions.
 """
 from __future__ import annotations
 
@@ -18,17 +18,10 @@ from ..runner import (Status, ffuf_http_row, ffuf_results, ffuf_usable_rows,
                       fresh_artifact_dir as runner_fresh,
                       have, reclassify_ffuf, run as exec_tool, scaled_timeout, skipped)
 
-# No MAX_HOSTS / MAX_RESULTS_PER_HOST. Both were MEMBERSHIP caps: the first silently excluded 473 of 498
-# eligible hosts on the OTC run, the second discarded discovered URLs. Bound THROUGHPUT and ORDER, never
-# membership — full eligible set, ranked-then-fair order, a wall-clock budget that defaults to UNBOUNDED,
-# and a per-target resumable ledger for whatever a bounded run did not reach.
-# review#3 (A1): there is NO row budget. A configurable first-N is still a MEMBERSHIP cap — it permanently
-# discarded already-discovered URLs, and raising the setting later could not recover them because the
-# service resumes instead of re-parsing. The expensive network work has already happened; store ingestion
-# needs no breadth bound. A flood is FLAGGED, never discarded.
-_CONTENT_SCHEMA = 2      # review#4 (A1 r2): the row parser got STRICTER (typed url/status). Bumping the
-                         # adapter schema invalidates work units whose artifacts an older, looser parser
-                         # accepted — otherwise those stay resumable under the new contract.
+# No host or per-host row caps (those discard already-discovered URLs). Bound throughput and order:
+# full eligible set, ranked-fair order, an unbounded-by-default wall-clock budget + resumable ledger.
+_CONTENT_SCHEMA = 2      # bump invalidates work units whose artifacts an older, looser row parser
+                         # accepted, forcing re-run under the current typed url/status parser.
 _NOTABLE = {200, 401, 403}         # statuses worth a review-queue entry
 
 
@@ -66,7 +59,7 @@ def _configleak_words() -> list[str]:
 
 def _merged_wordlist(ctx, wl: Path) -> Path:
     """Union the tier wordlist with the always-on config-leak list (dedup, order-preserving), so the
-    high-signal secret/config paths are checked on EVERY content run regardless of tier."""
+    high-signal secret/config paths are checked on every content run regardless of tier."""
     extra = _configleak_words()
     if not extra:
         return wl
@@ -85,16 +78,14 @@ def _merged_wordlist(ctx, wl: Path) -> Path:
 def _run_one(ctx, url, wl, wl_digest, mc, recurse, ct_to, out, prof):
     """One ffuf content sweep against one service, under the contract.
 
-    Redirect policy (DELIBERATE exception to the follow-redirects rule the classify-probes obey): content
-    discovery RECORDS what exists at a path — a path returning 301/302/307/308 IS a finding (`/admin`->
-    `/login`, `/.git`->redirect: the path exists + where it goes is intel). So we MATCH 3xx (-mc) instead of
-    following (-r): following would classify many distinct paths onto one login/home page, -ac/dedup would
-    then drop them, and the "this path exists" signal is lost. -ac already neutralises the
-    redirect-everything catch-all. (ISC-16, v0.3.)
+    Redirect policy (ISC-16, deliberate exception to the classify-probes' follow rule): a path 3xx is
+    itself a finding (the path exists + where it goes), so we match 3xx (-mc) instead of following (-r) —
+    following would collapse distinct paths onto one login/home page and -ac/dedup would drop them. -ac
+    neutralises the redirect-everything catch-all.
 
-    -maxtime is the GRACEFUL whole-run ceiling (bounds the call incl. recursion sub-jobs) so a slow origin
-    writes its partial -o instead of a hard SIGKILL-empty; exec_tool's timeout is the hard backstop.
-    -noninteractive: batch hygiene (no keybinding console). (T2.2)"""
+    -maxtime is the graceful whole-run ceiling (incl. recursion sub-jobs) so a slow origin writes its
+    partial -o instead of a hard kill; exec_tool's timeout is the hard backstop. -noninteractive: batch
+    hygiene."""
     cmd = ["ffuf", "-u", f"{url.rstrip('/')}/FUZZ", "-w", str(wl), "-ac", "-timeout", "7",
            "-noninteractive",
            "-t", str(settings.workers("ffuf", 40)),   # H2: core-scaled concurrency
@@ -105,22 +96,19 @@ def _run_one(ctx, url, wl, wl_digest, mc, recurse, ct_to, out, prof):
         cmd += ["-rate", str(prof.http_rl)]
     if recurse:                                  # 11.2: balanced/deep only (gated by the caller)
         cmd += ["-recursion", "-recursion-depth", str(recurse)]
-    hard = ct_to + 60 if ct_to else 0            # backstop when bounded; stays UNBOUNDED (0) when ct_to==0
-    # C07 inc3: per-TARGET work_unit (content.ffuf is per-target, NOT single-shot) binds the target URL +
-    # coverage config (match codes, recursion depth, wordlist) + wordlist digest -> re-run on any change.
+    hard = ct_to + 60 if ct_to else 0            # backstop when bounded; unbounded (0) when ct_to==0
+    # per-target work_unit binds the target URL + coverage config (match codes, recursion depth,
+    # wordlist) + wordlist digest → re-run on any change.
     wu = events.work_unit("content.ffuf", inputs={"url": url},
                           config={"mc": mc, "recursion": recurse, "wordlist": wl.name},
                           file_digests={"wordlist": wl_digest}, schema_version=_CONTENT_SCHEMA)
-    errf = out.with_suffix(".stderr.log")        # FULL stderr: the -maxtime marker must not be evictable
+    errf = out.with_suffix(".stderr.log")        # full stderr: the -maxtime marker must not be evictable
     return run_contract("content.ffuf", cmd, work_unit=wu, timeout=hard, stderr_path=errf,
                         reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ct_to or None))
 
 
 def _ingest_status(out) -> tuple:
-    """(trustworthy, clean_rows) for ONE artifact — the completion judgement for the CURRENT attempt only.
-
-    review#1 (A1 r3): aggregating this across every retained attempt meant a dirty run-1 artifact blocked
-    completion forever, even after a clean run-2. Completion is about the attempt just made."""
+    """(trustworthy, clean_rows) for one artifact — the completion judgement for the current attempt only."""
     rows = ffuf_results(out)
     if rows is None:
         return False, False
@@ -129,24 +117,13 @@ def _ingest_status(out) -> tuple:
 
 
 def _ingest(ctx, scope, host, svc, artifacts, current, seen_notable, launched) -> None:
-    """Ingest EVERY retained artifact for one service, then report coverage for the CURRENT one.
+    """Ingest every retained artifact for one service, then report coverage for the current one only.
 
-    review#2 (A1 r2): completion and RETAINED EVIDENCE are separate. Reading only the current attempt left
-    one killed mid-ingest on disk, absent from the ledger and never replayed.
-
-    review#3 (A1 r2): coverage is emitted AFTER consumption and counts rows that actually reached the store.
-
-    review#5 (A1 r3): the denominator is USABLE, IN-SCOPE rows. An out-of-scope row is a deliberate filter,
-    not a coverage loss. Rows failing the TYPE contract are not a Quarry ceiling either, so they read as
-    UNKNOWN rather than as a CAP gap.
-
-    review#2 (A1 r4): HISTORY IS PROVENANCE ONLY. Aggregating schema trust across historical artifacts meant
-    one dirty old artifact emitted COVERAGE_UNKNOWN forever — a clean rerun could never clear the gap even
-    once it earned completion. This generation's coverage verdict is computed from `current` alone (the
-    artifact this lifecycle stands behind); older ones are still replayed so their findings survive."""
-    # review#2 (A1 r5): `notable` used to increment per ROW per ARTIFACT, so one unique notable path became
-    # 10 or 20 in the console as retries and resumes replayed the same rows. Identities are collected in a
-    # per-lifecycle SET; provenance replay no longer inflates the count.
+    Coverage counts rows that reached the store; its denominator is usable, in-scope rows (out-of-scope
+    rows are a deliberate filter, type-contract failures read as unknown, not a cap gap). The verdict is
+    computed from `current` alone — older artifacts are still replayed so their findings survive."""
+    # notable identities are collected in a per-lifecycle set, so provenance replay does not inflate
+    # the count.
     try:
         for out in artifacts:
             rows = ffuf_results(out)
@@ -165,13 +142,12 @@ def _ingest(ctx, scope, host, svc, artifacts, current, seen_notable, launched) -
                                            "sources": ["ffuf"], "raw_ref": str(out)})
                     seen_notable.add(rid)
     except Exception:
-        # review#3 (A1 r2): a store-write failure must never be reported as successful ingestion. (Dropped
-        # while rewriting _ingest for r4 and caught by the existing regression — restored.)
+        # a store-write failure must never be reported as successful ingestion.
         events.coverage_partial("content.ffuf", kind=events.COVERAGE_UNKNOWN, unit=f"results:{svc}",
                                 measure="result_rows",
                                 reason=f"{host}: ingestion failed mid-artifact — row coverage UNMEASURED")
         raise
-    # ── coverage for THIS generation: the current artifact only ──
+    # ── coverage for this generation: the current artifact only ──
     if current is None:
         events.coverage_partial("content.ffuf", kind=events.COVERAGE_UNKNOWN, unit=f"results:{svc}",
                                 measure="result_rows",
@@ -194,8 +170,8 @@ def _ingest(ctx, scope, host, svc, artifacts, current, seen_notable, launched) -
                                        f"— row coverage UNMEASURED")
         return
     in_scope = [r for r in usable if scope.in_scope(normalize.host_of_url(r["url"]))]
-    # unit = the SERVICE identity, same as the raw artifact — http/https/:port on one host are DISTINCT
-    # services and must not share a coverage unit. measure=result_rows so it is never summed with hosts.
+    # unit = the service identity (http/https/:port on one host are distinct services, never sharing a
+    # coverage unit); measure=result_rows so it is never summed with hosts.
     events.coverage_partial("content.ffuf", kind=events.COVERAGE_TIMEOUT, unit=f"results:{svc}",
                             measure="result_rows",
                             eligible=len(in_scope), tested=len(in_scope), omitted=0,
@@ -220,7 +196,7 @@ def run(ctx) -> None:
         return
     wl = _merged_wordlist(ctx, wl)                        # +config-leak quick-hunt (always merged)
 
-    # eligible = every active-allowed live service with a url. NOT capped.
+    # eligible = every active-allowed live service with a url. Not capped.
     cand = [l for l in ctx.run.read("live")
             if scope.active_allowed(normalize.host_of_url(l.get("url", "")))]
     eligible = [l for l in cand if l.get("url")]
@@ -234,18 +210,16 @@ def run(ctx) -> None:
         ctx.echo(f"  ⚠️  recursion depth {recurse} is aggressive — expect a loud / slow scan")
 
     seen_notable: set = set()
-    # review#4 (A1 r3): EXECUTION completion and ARTIFACT usability are separate counters — one
-    # malformed clean run used to increment both ff_clean and ff_partial.
+    # execution completion and artifact usability are separate counters.
     ff_clean = ff_partial = ff_blocked = ff_errors = ff_resumed = ff_unusable = 0
-    # workload-scaled ceiling per host: content brute is the balanced/deep+recursion path, so on a real
-    # target it hits the same flat-1800s wall the vhost/probe ffuf did. Scale by wordlist size × recursion
-    # depth (recursion multiplies the paths fuzzed). Merged wordlist counted once.
+    # workload-scaled ceiling: scale by wordlist size × recursion depth (recursion multiplies the paths
+    # fuzzed). Merged wordlist counted once.
     wl_n = sum(1 for _ in wl.open())
     ct_to = scaled_timeout(wl_n * (recurse + 1), ctx.http_timeout, per_unit=0.4)
-    wl_digest = events.file_digest(wl)                       # C07 inc3: wordlist change → new work_unit
+    wl_digest = events.file_digest(wl)                       # wordlist change → new work_unit
     _mc = "200,204,301,302,307,308,401,403,405"
-    # the ledger is namespaced by the COVERAGE CONFIG: an artifact produced under a different wordlist or
-    # match-code set still validates by digest, and must NOT be treated as this generation's completed work.
+    # the ledger is namespaced by the coverage config: an artifact from a different wordlist or match-code
+    # set validates by digest but is not this generation's completed work.
     cfg_fp = events.work_unit("content.ffuf", inputs={}, config={"mc": _mc, "recursion": recurse,
                                                                 "wordlist": wl.name, "tier": tier},
                               file_digests={"wordlist": wl_digest}, schema_version=_CONTENT_SCHEMA)
@@ -254,13 +228,12 @@ def run(ctx) -> None:
     budget.prune_state(state_base, "content.ffuf", cfg_fp)
     ledger = budget.Ledger(budget.state_path(state_base, "content.ffuf", cfg_fp), lane="content.ffuf")
     ff_budget = budget.Budget(budget.budget_seconds("CONTENT_FFUF_BUDGET_S"))
-    # review#2 (A1): evidence is IMMUTABLE. Reusing one fixed path meant a retry (or a config change)
-    # unlinked an artifact the store already referenced by raw_ref. Each attempt writes into its own dir,
-    # and a RESUMED target reads the artifact the LEDGER recorded — never a recomputed path.
+    # evidence is immutable: each attempt writes into its own dir, and a resumed target reads the
+    # artifact the ledger recorded, never a recomputed path.
     cfg_dir = state_base / "ffuf" / cfg_fp[:16]
     attempt_dir = runner_fresh(cfg_dir)
-    # RANK decides order, never membership: origin (non-CDN) services first, then round-robin by host so one
-    # host's several services cannot drain a bounded run before another host is reached.
+    # rank decides order, never membership: origin (non-CDN) services first, then round-robin by host so
+    # one host's services cannot drain a bounded run before another host is reached.
     ordered = budget.order_ranked_fair(eligible, rank=lambda l: 1 if l.get("cdn") else 0,
                                        group=lambda l: normalize.host_of_url(l.get("url", "")))
     n_resumed = sum(1 for l in ordered if ledger.has(l["url"]))
@@ -270,21 +243,19 @@ def run(ctx) -> None:
     for _l in ordered:
         url = _l["url"]
         host = normalize.host_of_url(url)
-        # review#5 (A1 r2): FULL sha256 service identity. An 8-hex (32-bit) hash let two service URLs
-        # collide, overwriting each other's artifact inside one attempt and sharing one coverage unit.
+        # full sha256 service identity: a short hash could collide two service URLs onto one artifact.
         svc = f"{host}-{hashlib.sha256(url.encode()).hexdigest()}"
         done = ledger.has(url)
         current, ran_clean, launched = None, False, False
         if not done:
-            # review#3 (A1 r3): the budget gates LAUNCHING pending work only. Breaking out on the first
-            # pending service left every already-completed service LATER in the fair order unreplayed and
-            # uncounted — so a coverage generation silently lost those units.
+            # the budget gates launching pending work only; already-completed services later in the fair
+            # order are still replayed and counted.
             if ff_budget.exhausted():
-                pass                                          # the SELECTION measure already accounts for it
+                pass                                          # the selection measure already accounts for it
             else:
                 launched = True
                 current = attempt_dir / f"{svc}.json"
-                current.unlink(missing_ok=True)               # our OWN fresh attempt file, never a recorded one
+                current.unlink(missing_ok=True)               # our own fresh attempt file, never a recorded one
                 r = _run_one(ctx, url, wl, wl_digest, _mc, recurse, ct_to, current, prof)
                 ctx.run.record("content", r)
                 if r.status == Status.BLOCKED:
@@ -294,43 +265,40 @@ def run(ctx) -> None:
                     ff_partial += 1
                     events.coverage_partial("content.ffuf", reason=f"{host}: partial — {r.note}")
                 elif r.status in (Status.SUCCESS, Status.EMPTY):
-                    ff_clean += 1                            # EXECUTION completed (says nothing about rows)
+                    ff_clean += 1                            # execution completed (says nothing about rows)
                 else:
-                    ff_errors += 1                           # FAILED / TIMED_OUT / SKIPPED
+                    ff_errors += 1                           # failed / timed-out / skipped statuses
                     events.coverage_partial("content.ffuf", reason=f"{host}: {r.status.value} — {r.note}")
                 ran_clean = r.status in (Status.SUCCESS, Status.EMPTY)
                 if not current.exists():
                     current = None
                 elif ffuf_results(current) is not None:
-                    # review#1 (A1 r4): retain EVERY trustworthy artifact regardless of execution status. A
-                    # PARTIAL/BLOCKED run's rows are real evidence; gating retention on ran_clean threw them
-                    # away. Retention is not a completion claim.
+                    # retain every trustworthy artifact regardless of execution status — a partial/blocked
+                    # run's rows are real evidence. Retention is not a completion claim.
                     ledger.add_evidence(url, current)
                 attempted += 1
         else:
             ff_resumed += 1
             attempted += 1
-            current = ledger.artifact(url)                   # the completion artifact IS this generation's
-        # review#2 (A1 r3): replay only DIGEST-MATCHING retained evidence. Globbing attempt-*/ trusted any
-        # matching file, so a tampered, planted or symlinked artifact could inject fabricated findings.
+            current = ledger.artifact(url)                   # the completion artifact is this generation's
+        # replay only digest-matching retained evidence, so a tampered or planted artifact cannot inject
+        # fabricated findings.
         artifacts = ledger.evidence(url)
         if current is not None and current not in artifacts:
             artifacts = artifacts + [current]                # the just-run attempt (not yet re-validated)
-        # review#1 (A1 r5): a service the budget never LAUNCHED, with no retained evidence, gets NO row unit.
-        # It used to emit a bogus "no current artifact" UNKNOWN gap on top of the correct selection omission,
-        # so every intentionally-unlaunched service on a bounded run was double-reported.
+        # a service the budget never launched, with no retained evidence, gets no row unit (otherwise the
+        # selection omission would be double-reported as an unknown gap).
         if not launched and not artifacts:
             continue
         _ingest(ctx, scope, host, svc, artifacts, current, seen_notable, launched)
         if done or current is None:
             continue
-        # review#1 (A1 r4): completion requires a CLEAN EXECUTION as well as a usable artifact. Judging the
-        # artifact alone recorded a PARTIAL/BLOCKED run as done — skipped forever — whenever its JSON parsed.
+        # completion requires a clean execution as well as a usable artifact, not just parseable JSON.
         cur_ok, cur_clean = _ingest_status(current)
         if ran_clean and cur_ok and cur_clean:
-            ledger.record(url, current)                      # the EXPLICIT current artifact, never sorted[-1]
+            ledger.record(url, current)                      # the explicit current artifact, never sorted[-1]
         elif ran_clean:
-            ff_unusable += 1                                 # execution completed, OUTPUT unusable
+            ff_unusable += 1                                 # execution completed, output unusable
             events.coverage_partial("content.ffuf",
                                     reason=f"{host}: unusable/untrustworthy ffuf rows — not resumable")
     persisted = ledger.save()
@@ -342,10 +310,10 @@ def run(ctx) -> None:
                             omitted=0 if persisted else 1,
                             reason=("completion state persisted" if persisted else
                                     "completion state could not be persisted; a resume will redo this lane"))
-    # SELECTION: of every eligible service, how many did we get to at all? (the old cap lived here)
+    # selection: of every eligible service, how many did we reach at all?
     budget.report_selection("content.ffuf", measure="hosts", eligible=len(eligible),
                             attempted=attempted, budget=ff_budget, noun="service", durable=persisted)
-    # OUTCOME: of those we attempted, how many produced a COMPLETED scan?
+    # outcome: of those attempted, how many produced a completed scan?
     budget.report_outcome("content.ffuf", measure="hosts_scanned", attempted=attempted,
                           obtained=ff_clean - ff_unusable + ff_resumed,
                           classes={k: v for k, v in (("partial", ff_partial), ("blocked", ff_blocked),

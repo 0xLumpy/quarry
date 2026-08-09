@@ -42,8 +42,7 @@ def evaluate(run, phase: str) -> list[Checkpoint]:
     if phase == "vertical":
         passive = run.count("subdomain")
         resolved = run.count("resolved")
-        # review-B0r4#3: LIMITED is a run that HAPPENED (and was cut short by a provider) — omitting it
-        # made the thinness rules treat a credit-limited source as if it had never executed.
+        # a limited run did execute (credit-capped), so it counts as ran
         ran = {r.tool for r in runs if r.status in (Status.SUCCESS.value, Status.PARTIAL.value,
                                                    Status.EMPTY.value, Status.LIMITED.value)}
         if "subfinder" in ran and passive == 0:

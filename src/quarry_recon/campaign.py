@@ -1,21 +1,9 @@
-"""The campaign's CUMULATIVE STORE — settle prerequisite C.
+"""The campaign's cumulative store: the union of what every child run has learned.
 
-Entities are RUN-SCOPED: a second `Run.create` in the same project starts empty. A supervisor that repeats
-runs therefore needs somewhere for what earlier children learned to live, and — the part that is easy to
-miss — every later child must START from it. Once acquisition closes after child 1
-(`docs/design/SETTLE-DESIGN.md` §4), the hosts a provider found would otherwise simply be ABSENT from child 2's
-corpus, the processing lanes would have nothing to work through, and the campaign would read that as a
-fixed point: `--settle` forgetting the very evidence it exists to finish processing.
-
-So the union is BOTH the oracle and the input:
-
-    ABSORB      a finished child's trustworthy entities are merged in (monotonically, by the store's own
-                rules), and the delta says whether that child made PROGRESS
-    BOOTSTRAP   the next child is seeded from the union with provenance intact, marked INHERITED so its own
-                production stays distinguishable from what it was handed
-
-Nothing here creates runs or decides anything — the supervisor does not exist yet. This is the store the
-supervisor will use, and the invariants it will rely on: absorbing is idempotent, bootstrapping is
+Entities are run-scoped, so a supervisor that repeats runs needs somewhere for earlier children's
+findings to live and every later child to start from (`docs/design/SETTLE-DESIGN.md` §4). It creates no
+runs and decides nothing: it absorbs a finished child's trustworthy entities monotonically (the delta is
+that child's progress) and bootstraps the next child from the union with provenance intact. Both are
 idempotent, an inherited entity is never counted as the child's own discovery, and a child whose evidence
 could not be read is never absorbed as if it were empty.
 """
@@ -30,45 +18,42 @@ from pathlib import Path
 
 from . import store
 
-#: marks an entity a child was HANDED rather than found. Bookkeeping about how this run got it, never a
-#: fact about the world, so `store.RUN_SCOPED_FIELDS` excludes it from material content — an inherited
-#: copy fingerprints exactly like the record it came from.
+#: marks an entity a child was handed rather than found. `store.RUN_SCOPED_FIELDS` excludes it from
+#: material content, so an inherited copy fingerprints exactly like the record it came from.
 INHERITED = "_inherited"
 
 
 @dataclass
 class AbsorbResult:
-    """What a child added to the union — the campaign's progress signal, per entity kind."""
+    """What a child added to the union, per entity kind — the campaign's progress signal."""
     new: int = 0
     enriched: int = 0
     kinds: dict = field(default_factory=dict)          # {entity: {"new": int, "enriched": int}}
-    unusable: dict = field(default_factory=dict)       # {entity: reason} — evidence we could NOT read
+    unusable: dict = field(default_factory=dict)       # {entity: reason} — evidence we could not read
     absorbed: bool = False                             # whether the union was updated at all
 
     @property
     def progressed(self) -> bool:
-        """A child made progress when it added an identity or enriched one. Never when its evidence could
-        not be read: an unreadable child is a question, not a fixed point."""
+        """Progress is an identity added or enriched, and never a child whose evidence could not be read."""
         return self.absorbed and not self.unusable and bool(self.new or self.enriched)
 
 
-#: exactly the keys a recovery entry may carry. An unknown key is not an extension to shrug at — this is
-#: the campaign's audit record of lost evidence, and anything we cannot account for we do not certify.
+#: exactly the keys a recovery entry may carry — an unknown one makes the history unreadable.
 _RECOVERY_KEYS = {"generation", "reason", "at"}
 
 
-# ── acquisition: what a campaign may still OBTAIN ────────────────────────────────────────────────────
-#: whether this process may run ACQUISITION lanes. A campaign closes it after its first child: repeating a
-#: run repeats its provider calls, and a continuation flag may not make that spending decision
-#: (`docs/design/FLAG-AXIS-PLAN.md` §2). Off by default — an ordinary `quarry run` acquires as it always has.
+# ── acquisition: what a campaign may still obtain ────────────────────────────────────────────────────
+
+#: whether this process may run acquisition lanes. Off by default; a campaign closes it after its first
+#: child, because repeating a run repeats its provider calls (`docs/design/FLAG-AXIS-PLAN.md` §2).
 _acquisition_closed = False
-#: why it was closed, so a blocked lane can say what stopped it rather than looking broken.
+#: why it was closed, so a blocked lane can name what stopped it.
 _acquisition_reason = ""
 
 
 @contextlib.contextmanager
 def acquisition_closed(reason: str = "acquisition is closed for this campaign after its first child"):
-    """Close acquisition for the duration — restored afterwards, like every other run-scoped instruction."""
+    """Close acquisition for the duration of the block; the previous setting is restored afterwards."""
     global _acquisition_closed, _acquisition_reason
     before, before_reason = _acquisition_closed, _acquisition_reason
     _acquisition_closed, _acquisition_reason = True, reason
@@ -79,8 +64,7 @@ def acquisition_closed(reason: str = "acquisition is closed for this campaign af
 
 
 def acquisition_allowed(source_id: str) -> tuple[bool, str]:
-    """`(allowed, why_not)` for one lane. Only ACQUISITION lanes are ever refused — everything else is
-    processing, which is exactly what a later child exists to do."""
+    """`(allowed, why_not)` for one lane. Only `policy.PROVIDER_LANES` are ever refused."""
     from . import policy
     if not _acquisition_closed or source_id not in policy.PROVIDER_LANES:
         return True, ""
@@ -88,12 +72,8 @@ def acquisition_allowed(source_id: str) -> tuple[bool, str]:
 
 
 def _valid_recoveries(history, pointer_generation: int) -> bool:
-    """A recovery history is readable only when it could actually have HAPPENED.
-
-    `{generation: int > 0, reason: non-empty str, at: an aware ISO-8601 timestamp}`, entries strictly
-    increasing and none from a generation this pointer has not reached. A duplicate, a descending pair or a
-    recovery "from" generation 999 inside generation 3 is not a history — it is something we cannot read,
-    and an audit record we cannot read may not certify a corpus."""
+    """`{generation: int > 0, reason: non-empty str, at: an aware ISO-8601 timestamp}`, entries strictly
+    increasing and none above `pointer_generation`."""
     if not isinstance(history, list):
         return False
     previous = 0
@@ -112,7 +92,6 @@ def _valid_recoveries(history, pointer_generation: int) -> bool:
 
 
 def _aware_stamp(at) -> bool:
-    """An audit timestamp is readable only when it says WHEN — a naive stamp does not."""
     if not isinstance(at, str) or not at.strip():
         return False
     try:
@@ -122,15 +101,14 @@ def _aware_stamp(at) -> bool:
     return when.tzinfo is not None and when.tzinfo.utcoffset(when) is not None
 
 
-#: exactly the keys ONE campaign recovery may carry. `reason` is what the operator admits was lost; `cause`
-#: is what the ledger itself said was wrong, kept so the admission cannot outlive its evidence.
+#: exactly the keys one campaign recovery may carry: `reason` is what the operator admits was lost,
+#: `cause` is what the ledger itself said was wrong.
 _CAMPAIGN_RECOVERY_KEYS = {"index", "reason", "cause", "at"}
 
 
 def _valid_campaign_recoveries(history) -> bool:
-    """Same rule as the union's (`_valid_recoveries`): an audit record we cannot read may not certify a
-    ledger. Ordered by an explicit ordinal rather than a generation — a campaign recovery ERASES the
-    children, so there is no accumulating number to hang the order on, and a clock is not an order."""
+    """Same rule as `_valid_recoveries`, ordered by an explicit 1-based `index` rather than a
+    generation — a campaign recovery erases the children, so nothing accumulates to order them by."""
     if not isinstance(history, list):
         return False
     for expected, entry in enumerate(history, start=1):
@@ -147,47 +125,39 @@ def _valid_campaign_recoveries(history) -> bool:
 
 
 def _generation_file(generation: int) -> str:
-    """The ONE filename a generation may have. Deriving it (rather than trusting the pointer's string) is
-    what keeps a generation inside its campaign directory."""
+    """The one filename a generation may have; derived, so it stays inside the campaign directory."""
     return f"union-gen{generation:06d}.jsonl"
 
 
 class UnionUnusable(RuntimeError):
-    """The union cannot stand in for what the campaign knows — so nothing may be built on it.
-
-    Raised rather than returned: a supervisor that got an empty corpus back would bootstrap a smaller
-    child, absorb its narrower result and call the difference a fixed point. Refusing loudly is the only
-    answer that cannot be mistaken for progress."""
+    """The union cannot stand in for what the campaign knows, so nothing may be built on it. Raised
+    rather than returned: an empty corpus handed back looks exactly like a campaign that found nothing."""
 
 
 class Union:
-    """The campaign's cumulative entity store, published as immutable GENERATIONS behind one pointer.
+    """The campaign's cumulative entity store, published as immutable generations behind one pointer.
 
     `<project>/recon/campaigns/<id>/union.json` is the pointer; `union-gen<N>.jsonl` are the generations it
-    names. Two files written separately are not one publication — a crash between them would leave a corpus
-    with metadata describing a different one, and no last-known-good to fall back to. So a generation is
-    written COMPLETE first, and the pointer is replaced last: until that single atomic replace lands, the
-    previous generation is still what the campaign reads.
+    names. A generation is written complete first and the pointer replaced last, so until that single
+    atomic replace lands the previous generation is still what the campaign reads.
 
-    Trust states, for the same reason a child's evidence has them — a union that quietly shrank would seed a
-    smaller child, absorb the narrower result and call the difference a fixed point:
+    Trust states:
 
-        new        deliberately created, with NO prior artifact of any kind; empty and authoritative
+        new        deliberately created, with no prior artifact of any kind; empty and authoritative
         valid      the pointer's generation loaded and every row verified against it
         degraded   rows were dropped, or the generation does not match what the pointer recorded
         unusable   there is no pointer, or nothing it names can be read
     """
 
     def __init__(self, path, *, create: bool = False):
-        self.path = Path(path)                       # the POINTER
+        self.path = Path(path)                       # the pointer
         self.dir = self.path.parent
         self.records: dict = {}          # {(kind, key): record}
         self.status = "unusable"
         self.dropped = 0
         self.reason = ""
         self.generation = 0
-        #: every RECOVERY this campaign has ever made, carried forward in the pointer. A union rebuilt
-        #: after evidence loss must never look like one that was only ever accumulated.
+        #: every recovery this campaign has made, carried forward by every later publication.
         self.recoveries: list = []
         self._load(create=create)
 
@@ -201,8 +171,7 @@ class Union:
 
     @property
     def was_recovered(self) -> bool:
-        """Whether this campaign's corpus was ever rebuilt after a loss. A supervisor may not declare a
-        fixed point over a reconstructed union without saying so."""
+        """Whether this campaign's corpus was ever rebuilt after a loss."""
         return bool(self.recoveries)
 
     def require(self) -> None:
@@ -211,25 +180,21 @@ class Union:
             raise UnionUnusable(f"{self.path}: {self.status} — {self.reason}")
 
     def _generations(self):
-        """Every generation file that survives here, or None when the directory cannot be INSPECTED.
-
-        The two answers are different: "nothing is here" licenses creating a campaign, and "I could not
-        look" must never be mistaken for it."""
+        """Every generation file that survives here, or None when the directory could not be inspected."""
         try:
             return sorted(p for p in self.dir.glob("union-gen*.jsonl") if p.is_file())
         except OSError:
             return None
 
-    # ── loading, with everything verified ─────────────────────────────────────────────────────────
+    # ── loading ───────────────────────────────────────────────────────────────────────────────────
     def _load(self, *, create: bool) -> None:
         try:
             pointer = json.loads(self.path.read_text())
             if not isinstance(pointer, dict):
                 raise ValueError("pointer is not an object")
         except FileNotFoundError:
-            # An absent pointer is a NEW campaign only when someone asked for one AND nothing of an
-            # earlier campaign survives here. A deleted pointer beside its generations is evidence loss,
-            # and blessing it as new is exactly the false fixed point this guards against.
+            # an absent pointer is a new campaign only when one was asked for and nothing of an earlier
+            # campaign survives here: a deleted pointer beside its generations is evidence loss.
             leftovers = self._generations()
             if create and leftovers is None:
                 self.status = "unusable"
@@ -247,11 +212,8 @@ class Union:
             return
         name, count, digest = pointer.get("file"), pointer.get("count"), pointer.get("digest")
         gen = pointer.get("generation")
-        # The GENERATION is identity, not decoration. Defaulting a malformed one to 0 let the next
-        # publication write `union-gen000001.jsonl` — over the generation the pointer still names, so the
-        # authoritative corpus would be destroyed BEFORE the swap that was supposed to replace it. And the
-        # file must be exactly the name that generation implies, which also confines it to this directory:
-        # no separators, no traversal, nothing to resolve.
+        # the generation is identity: a malformed one defaulting to 0 would publish over the generation
+        # the pointer still names, and the file must be exactly the name that generation implies.
         if type(gen) is not int or gen <= 0 or name != _generation_file(gen):
             self.status, self.reason = "unusable", "pointer does not identify a generation"
             return
@@ -261,8 +223,7 @@ class Union:
             return
         history = pointer.get("recoveries", [])
         if not _valid_recoveries(history, gen):
-            # the campaign's own admission that evidence was lost. If we cannot READ it, we certainly
-            # cannot certify the corpus it describes.
+            # an audit record we cannot read may not certify the corpus it describes
             self.status, self.reason = "unusable", "pointer's recovery history is unreadable"
             return
         self.recoveries = [dict(r) for r in history]
@@ -290,7 +251,7 @@ class Union:
             try:
                 row = json.loads(chunk.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
-                self.dropped += 1                          # one bad row costs itself, and is COUNTED
+                self.dropped += 1                          # one bad row costs itself, and is counted
                 continue
             if not isinstance(row, dict):
                 self.dropped += 1
@@ -300,8 +261,7 @@ class Union:
                 self.dropped += 1                          # an unregistered kind is not an entity
                 continue
             key = store.canonical_key(kind, rec)
-            # the persisted id and fingerprint are CHECKED, not trusted: a row whose id does not match its
-            # record, or whose fingerprint does not match its content, describes something else
+            # the persisted id and fingerprint are checked, not trusted
             if not key or row.get("id") != key or row.get("fp") != store.fingerprint(kind, rec):
                 self.dropped += 1
                 continue
@@ -309,30 +269,21 @@ class Union:
 
     # ── publishing ────────────────────────────────────────────────────────────────────────────────
     def save(self) -> None:
-        """Publish the current records as the next generation. ORDINARY publication only: a union that is
-        not already trustworthy may not certify itself, or a truncated one would rewrite the pointer for
-        its surviving subset and reappear as a smaller, healthy campaign."""
+        """Publish the current records as the next generation. Ordinary publication only: a union that is
+        not already trustworthy may not certify itself — see `recover`."""
         self.require()
         self._publish()
 
     def recover(self, reason: str) -> None:
-        """Republish a DEGRADED or UNUSABLE union deliberately, with the loss stated.
-
-        Separate from `save()` and impossible to reach by accident: the caller has to name what was lost,
-        and the pointer records that this generation was recovered rather than accumulated."""
+        """Republish a degraded or unusable union deliberately, naming what was lost; the pointer then
+        records that this generation was recovered rather than accumulated."""
         if not reason or not reason.strip():
             raise ValueError("a recovery must state what was lost")
         self._publish(recovered=reason.strip())
 
     def _publish(self, recovered: str = "") -> None:
-        """Write the generation COMPLETE, then swap the single pointer. Until the pointer lands, the
-        previous generation is what the campaign reads; it is left in place, so a failed swap costs
-        nothing.
-
-        EVERYTHING is inside the settlement boundary — the directory, the serialisation, the fingerprints,
-        the generation choice and both writes. A caller has already mutated `self.records` by the time this
-        runs, so anything that raises in preparation would otherwise leave this object `valid` while
-        holding a record no disk published."""
+        """Write the generation complete, then swap the single pointer — a failed swap costs nothing. The
+        whole preparation and both writes are inside the settlement boundary."""
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
             nxt = self._next_generation()
@@ -347,20 +298,17 @@ class Union:
                 history.append({"generation": nxt, "reason": recovered, "at": store._utc()})
             pointer = {"generation": nxt, "file": name, "count": len(self.records),
                        "digest": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-                       # CARRIED FORWARD, every publication: a recovery recorded only in the pointer that
-                       # made it would vanish on the next ordinary save, and the campaign would go back to
-                       # looking like one that never lost anything.
+                       # carried forward by every publication, or the next ordinary save would drop it
                        "recoveries": history}
             store._atomic_write(self.dir / name, body)
             store._atomic_write(self.path, json.dumps(pointer, indent=2))
         except BaseException:
-            # ANY interruption leaves publication UNDECIDED — the swap may have landed a moment before a
-            # cancellation, or not at all. Guessing either way is how an object keeps records no disk holds
-            # (or discards records the disk does hold), so the authoritative pointer is re-read and adopted.
+            # any interruption leaves publication undecided — the swap may have landed a moment before a
+            # cancellation — so the authoritative pointer is re-read and adopted.
             try:
                 self._settle()
             except BaseException:
-                # settling failed too: say so, and let the ORIGINAL failure be the one that propagates
+                # settling failed too: say so, and let the original failure be the one that propagates
                 self.status = "unusable"
                 self.reason = "publication failed and the pointer could not be re-read"
             raise
@@ -369,9 +317,8 @@ class Union:
         self.status, self.dropped, self.reason = "valid", 0, ""
 
     def _next_generation(self) -> int:
-        """A generation number strictly ABOVE every one that survives here — never merely `self.generation
-        + 1`, which is 0-based for a malformed pointer and would publish OVER an existing generation. An
-        immutable generation is only immutable if nothing ever replaces it."""
+        """A generation number strictly above every one that survives here — never merely
+        `self.generation + 1`, which for a malformed pointer would publish over an existing generation."""
         surviving = self._generations()
         if surviving is None:
             raise OSError(f"{self.dir}: the campaign directory could not be inspected")
@@ -393,15 +340,13 @@ class Union:
 
     # ── absorbing a finished child ────────────────────────────────────────────────────────────────
     def absorb(self, run_dir, kinds=None) -> AbsorbResult:
-        """Merge a FINISHED child's entities into the union and report what it added.
+        """Merge a finished child's entities into the union and report what it added.
 
-        Only a TRUSTWORTHY view is absorbed (`store.fold_run_entity`): a deleted, truncated or unreadable
-        log is recorded as unusable rather than folded in as an empty corpus, because the difference
-        between "this child found nothing" and "we could not read what it found" is the difference between
-        a fixed point and a lie."""
+        Only a trustworthy view is absorbed (`store.fold_run_entity`): a deleted, truncated or unreadable
+        log is recorded in `AbsorbResult.unusable` rather than folded in as an empty corpus."""
         self.require()
         out = AbsorbResult()
-        published = dict(self.records)            # the last PUBLISHED state, kept until this one lands
+        published = dict(self.records)            # the last published state, kept until this one lands
         for kind in (kinds if kinds is not None else sorted(store.ENTITY_KEYS)):
             folded = store.fold_run_entity(run_dir, kind)
             if not folded.trustworthy:
@@ -423,9 +368,8 @@ class Union:
         except (KeyboardInterrupt, SystemExit):
             raise                                  # `_publish` already settled against the pointer
         except BaseException as e:
-            # Publication failed or was interrupted, and `_publish` has re-read the pointer — so this
-            # object now holds what the DISK holds, not what this absorb hoped to add. Whether that is the
-            # previous generation or a swap that landed at the last moment, it is authoritative either way.
+            # `_publish` has re-read the pointer, so this object now holds what the disk holds — the
+            # previous generation, or a swap that landed at the last moment. Authoritative either way.
             out.unusable["__union__"] = (f"the union could not be published: {type(e).__name__}: {e}"
                                          if self.trustworthy else self.reason)
             if self.trustworthy and self.records != published:
@@ -436,16 +380,11 @@ class Union:
 
     # ── seeding the next child ────────────────────────────────────────────────────────────────────
     def bootstrap(self, run) -> dict:
-        """Seed a child run from the union, provenance intact, WITHOUT claiming its discoveries.
+        """Seed a child run from the union, provenance intact, without claiming its discoveries.
 
-        Every record keeps its `sources` and its `raw_ref`s — they point into the child that produced them,
-        which is where the evidence actually is — and carries `_inherited`, so this child's own production
-        stays distinguishable from what it started with. `Run.add`'s NEW-key answer is what phases count as
-        discovery, and an inherited entity must never be counted that way, so the seed is written through
-        the observation log directly.
-
-        Idempotent: seeding twice adds nothing, because the merge is monotonic and the second copy is
-        subsumed."""
+        Every record keeps its `sources` and `raw_ref`s and carries `_inherited`. The seed is written
+        through the observation log directly, so `Run.add`'s new-key answer — what phases count as
+        discovery — never counts an inherited entity. Idempotent: seeding twice adds nothing."""
         self.require()
         seeded: dict = {}
         for (kind, _key), rec in sorted(self.records.items()):
@@ -456,11 +395,10 @@ class Union:
         return seeded
 
 
-# ── the campaign SUPERVISOR ──────────────────────────────────────────────────────────────────────────
-#: why a campaign stopped. Every one of them is a NAMED outcome — a supervisor that runs out of reasons
-#: and simply stops has told the operator nothing.
+# ── the campaign supervisor ──────────────────────────────────────────────────────────────────────────
+#: why a campaign stopped — every outcome has a name.
 STOPS = ("fixed_point", "terminal", "unknown", "no_progress", "child_fault", "max_runs", "budget")
-#: consecutive children with no new or enriched identity AND no reduction in the retriable remainder
+#: consecutive children with no new or enriched identity and no reduction in the retriable remainder
 NO_PROGRESS_LIMIT = 2
 #: how many children one campaign may create before it stops and says so
 MAX_CHILDREN = 10
@@ -476,8 +414,7 @@ class Decision:
 
     @property
     def success(self) -> bool:
-        """Only a FIXED POINT is success. Terminal work, unknown lanes, a fault and every bound are
-        outcomes a campaign must state, not quietly finish on."""
+        """Only a fixed point is success; every other stop is an outcome the campaign must state."""
         return self.stop == "fixed_point"
 
 
@@ -486,18 +423,16 @@ def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_c
            previous_retriable: int | None = None) -> Decision:
     """The stop rules, read from a child's manifest summary and what it added to the union.
 
-    Order matters and is fixed: a broken child is not continuation, so CHILD FAULT is asked first; then a
-    lane that should have reported and did not (UNKNOWN — silence is not a fixed point); then the bounds we
-    chose; then progress; and only when every expected lane reported a KNOWN zero, with no terminal
-    remainder outstanding and nothing new learned, is it a FIXED POINT."""
+    Order is fixed: child fault, then a lane that should have reported and did not (unknown), then the
+    bounds, then progress. A fixed point requires every expected lane to have reported a known zero, with
+    no terminal remainder outstanding and nothing new learned."""
     faults = [f for f in summary.get("faults", [])
               if f.get("kind") in ("machinery", "phase_exception", "required_tool_missing")]
     if faults:
         return Decision(stop="child_fault", detail="; ".join(
             f"{f.get('kind')}: {f.get('where')}" for f in faults[:4]))
 
-    # remainders are latest per (lane, UNIT, measure) — a lane may report several. Keeping one row per
-    # lane let a valid unit hide an invalid sibling and dropped the others' counts entirely.
+    # remainders are latest per (lane, unit, measure) — one lane may report several rows
     by_lane: dict = {}
     for row in summary.get("remainders", []):
         if isinstance(row, dict) and isinstance(row.get("lane"), str):
@@ -509,8 +444,7 @@ def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_c
     if invalid or silent:
         return Decision(stop="unknown", detail="; ".join(
             [f"{lane}: reported nothing" for lane in silent]
-            # a lane the manifest itself flagged RAN and could not measure; anything else is a record we
-            # cannot read. Both are unknown, and an operator should not have to guess which happened.
+            # flagged: the lane ran and could not measure. Otherwise: a record we cannot read.
             + [f"{lane}: {'could not measure its remainder' if flagged else 'unreadable remainder'}"
                for lane, flagged in sorted(invalid.items())])[:400])
 
@@ -518,22 +452,19 @@ def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_c
     terminal: dict = {}
     for rows in by_lane.values():
         for row in rows:
-            # RETRIABLE work is model-dependent: on a `rerun_same_work` lane repetition replays the same
-            # prefix, so it can never advance and must not keep a campaign alive.
+            # retriable is model-dependent: a `rerun_same_work` lane replays the same prefix, so
+            # repeating it can never advance and must not keep a campaign alive
             if row.get("model") == "project_progress":
                 rt = row.get("retriable") or {}
                 retriable += int(rt.get("now", 0)) + int(rt.get("cooldown", 0))
-            # TERMINAL work is NOT. The model answers "can another child advance this?", never "does this
-            # work exist?" — skipping the whole row dropped the terminal counts of every rerun_same_work
-            # lane, so a bundle nobody could read, or a loop that stopped on machinery, vanished and the
-            # campaign declared a FIXED POINT over it.
+            # terminal work is counted for every model: the model answers "can another child advance
+            # this?", never "does this work exist?"
             for cause, n in (row.get("terminal") or {}).items():
                 if n:
                     terminal[cause] = terminal.get(cause, 0) + int(n)
 
-    # PROGRESS is either new material or a strict reduction in what is owed: a child that discovered no
-    # identity but took half the remaining work forward is not idle, and stopping it would abandon work
-    # this campaign was measurably completing.
+    # progress is either new material or a strict reduction in what is owed: a child that discovered no
+    # identity but took half the remaining work forward is not idle
     reduced = previous_retriable is not None and retriable < previous_retriable
     progressed = bool(absorbed.progressed) or reduced
     if absorbed.unusable:
@@ -557,8 +488,8 @@ def decide(summary: dict, absorbed: "AbsorbResult", *, expected_lanes=(), idle_c
 
 
 def _readable_remainder(row: dict) -> bool:
-    """Whether one remainder row can be believed. A row the manifest already marked `invalid`, or one whose
-    counts are not exact non-negative ints, is UNKNOWN — and unknown is never zero."""
+    """Whether one remainder row can be believed: a known model and unit, and exact non-negative
+    counts under known terminal causes. Anything else is unknown, and unknown is never zero."""
     from . import remainder as _remainder
     if row.get("model") not in _remainder.MODELS or not isinstance(row.get("unit"), str):
         return False
@@ -572,9 +503,8 @@ def _readable_remainder(row: dict) -> bool:
 
 
 def _unreadable_child(child, index: int, states) -> str:
-    """Why one loaded child cannot be believed, or `""`. Types alone are not enough: a `reserved` child
-    holding a run id, or a `manifested` one without the deltas the supervisor decided on, is a CONTRADICTION
-    — the record and the state disagree, and a partially written ledger looks exactly like that."""
+    """Why one loaded child cannot be believed, or `""`. State and record must agree: a `reserved` child
+    may not name a run, and a `manifested` one must carry the deltas the supervisor decided on."""
     if not isinstance(child, dict) or child.get("index") != index or type(child["index"]) is not int:
         return "is not a readable record"
     state = child.get("state")
@@ -601,7 +531,7 @@ def _unreadable_child(child, index: int, states) -> str:
 
 
 def _readable_stop(stop) -> bool:
-    """A stop is the campaign's OUTCOME. An arbitrary object in its place is not a stop we can report."""
+    """A stop is `{cause: non-empty str, detail: str, success: bool}`, or None while a campaign runs."""
     if stop is None:
         return True
     return (isinstance(stop, dict) and set(stop) == {"cause", "detail", "success"}
@@ -610,9 +540,9 @@ def _readable_stop(stop) -> bool:
 
 
 class Campaign:
-    """The supervisor's LEDGER and lock. It creates no runs itself — a caller drives children — but it owns
-    what makes repetition safe: one project may have only one campaign at a time, and every child is
-    recorded BEFORE it starts, so a crash leaves an interrupted child rather than an orphan run directory.
+    """The supervisor's ledger and lock. It creates no runs itself — a caller drives children — but one
+    project may have only one campaign at a time, and every child is recorded before it starts, so a crash
+    leaves an interrupted child rather than an orphan run directory.
 
         reserved    an id is allocated and nothing has been launched
         started     the child's run directory exists
@@ -628,8 +558,8 @@ class Campaign:
         self.path = self.dir / "ledger.json"
         self.children: list = []
         self.stop: dict | None = None
-        self.recoveries: list = []   # CHRONOLOGICAL, carried forward by every later publication
-        self.status = "new"          # new | valid | unusable — absence may create, corruption may NOT
+        self.recoveries: list = []   # chronological, carried forward by every later publication
+        self.status = "new"          # new | valid | unusable — absence may create, corruption may not
         self.reason = ""
         self._lock = None
         self._load()
@@ -639,17 +569,15 @@ class Campaign:
         return self.status in ("new", "valid")
 
     def require(self) -> None:
-        """Refuse to write over a ledger nobody can read: the next `reserve()` would publish child 1 again
-        and launder a campaign's whole history."""
+        """Refuse to write over a ledger nobody can read: the next `reserve()` would republish child 1."""
         if not self.trustworthy:
             raise UnionUnusable(f"{self.path}: {self.status} — {self.reason}")
 
     def recover(self, reason: str) -> None:
-        """Start recording again over an UNREADABLE ledger, deliberately and with the loss stated.
+        """Start recording again over an unusable ledger, deliberately and with the loss stated.
 
-        Only from `unusable`: recovery erases every child, so on a healthy campaign it is not a repair but
-        the exact laundering `require()` exists to prevent. The admission is appended to a durable history
-        (never a replaceable string) — an audit record that the next publication drops never happened."""
+        Only from `unusable`, because recovery erases every child. The admission is appended to a durable
+        history that every later publication carries forward."""
         if not reason or not reason.strip():
             raise ValueError("a recovery must state what was lost")
         if self.trustworthy:
@@ -661,11 +589,10 @@ class Campaign:
                                       "at": store._utc()}]
         self._commit([], stop=False, recoveries=history)
 
-    # ── the PROJECT lock: two supervisors on one project would duplicate whole runs ────────────────
+    # ── the project lock ───────────────────────────────────────────────────────────────────────────
     def acquire(self):
-        """Take the project-wide campaign lock. Scoped to the PROJECT, not this campaign directory: two
-        supervisors that minted different ids would otherwise take different locks and both spawn children
-        against the same rotation."""
+        """Take the campaign lock. Scoped to the project, not this campaign directory: two supervisors
+        that minted different ids would otherwise take different locks."""
         from . import budget
         self._lock = budget.state_lock(self.project_dir / "recon" / "campaigns" / ".campaign.lock")
         return self._lock
@@ -686,8 +613,7 @@ class Campaign:
             return
         kids = doc.get("children") if isinstance(doc, dict) else None
         if isinstance(doc, dict) and _valid_campaign_recoveries(doc.get("recoveries", [])):
-            # salvaged even when the rest is unreadable: the admission chain must outlive the ledger it
-            # admits to losing, or a second corruption quietly erases the first recovery's confession
+            # salvaged even when the rest is unreadable: the admission chain must outlive the ledger
             self.recoveries = [dict(r) for r in doc.get("recoveries", [])]
         if not isinstance(doc, dict) or not isinstance(kids, list):
             self.status, self.reason = "unusable", "ledger does not describe a campaign"
@@ -696,8 +622,8 @@ class Campaign:
             self.status, self.reason = "unusable", "recovery history is unreadable"
             return
         if doc.get("campaign_id") != self.campaign_id:
-            # a ledger copied from another campaign would otherwise be rewritten under THIS id, with the
-            # other campaign's children counted as ours
+            # a ledger copied from another campaign would be rewritten under this id, with its own
+            # children counted as ours
             self.status, self.reason = "unusable", (f"ledger belongs to campaign "
                                                     f"{doc.get('campaign_id')!r}")
             return
@@ -716,11 +642,8 @@ class Campaign:
         self.status, self.reason = "valid", ""
 
     def _settle(self) -> None:
-        """Adopt whatever the ledger on disk actually says now — the only authority on what was published.
-
-        CONTENT comes from disk; the record OBJECTS are reused per index, so a caller still holding the
-        child it reserved keeps a record this ledger recognises and can retry a transient failure. Identity
-        within a campaign is the index, and rebuilding it from scratch would strand the caller."""
+        """Adopt whatever the ledger on disk says now. The record objects are reused per index, so a
+        caller still holding the child it reserved keeps a record this ledger recognises."""
         previous = self.children
         self.children, self.stop, self.recoveries = [], None, []
         self.status, self.reason = "unusable", "publication was interrupted"
@@ -750,20 +673,12 @@ class Campaign:
             raise ValueError(f"a stop record must be readable to be published: {stop!r}")
 
     def _commit(self, records: list, *, stop=None, recoveries=None, adopt=None) -> None:
-        """Publish `records` and only THEN let this object believe them.
-
-        Every writer used to mutate memory first, so a write that never landed left a trustworthy campaign
-        holding a child no disk had: the failed `reserve()` stayed as child 1 in memory, and the next
-        successful one published it as a phantom alongside child 2. The whole preparation and the write are
-        inside the boundary, and ANY interruption re-reads the authoritative ledger — an atomic write may
-        have landed a moment before a cancellation, and guessing either way is how the two diverge."""
+        """Publish `records` and only then let this object believe them: the whole preparation and the
+        write are inside the boundary, and any interruption re-reads the authoritative ledger."""
         stop = self.stop if stop is None else (None if stop is False else stop)
         recoveries = self.recoveries if recoveries is None else recoveries
-        # the WHOLE document, at the one boundary every writer passes through. Validating only the record a
-        # transition touched left the rest of the snapshot unchecked, and `reserve()` hands the caller the
-        # live dict: a `reserved` child given a run id by hand was published by the next `finish()` and made
-        # the ledger unusable on reopen. No writer can publish what `_load()` refuses — an invariant here,
-        # not a courtesy of cooperative callers.
+        # the whole document, at the one boundary every writer passes through: no writer can publish what
+        # `_load()` would refuse, including a live record a caller mutated by hand.
         self._refuse_unpublishable(records, stop, recoveries)
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -774,7 +689,7 @@ class Campaign:
             try:
                 self._settle()
             except BaseException:
-                # settling failed too: say so, and let the ORIGINAL failure be the one that propagates
+                # settling failed too: say so, and let the original failure be the one that propagates
                 self.status = "unusable"
                 self.reason = "publication failed and the ledger could not be re-read"
             raise
@@ -785,7 +700,7 @@ class Campaign:
 
     # ── child states ──────────────────────────────────────────────────────────────────────────────
     def reserve(self) -> dict:
-        """Record a child BEFORE anything is launched — a crash then leaves an interrupted child in the
+        """Record a child before anything is launched — a crash then leaves an interrupted child in the
         ledger instead of a run directory nobody knows about."""
         self.require()
         child = {"index": len(self.children) + 1, "state": "reserved", "run_id": None}
@@ -793,9 +708,8 @@ class Campaign:
         return child
 
     def _advance(self, child: dict, to: str) -> None:
-        """Every publication is fail-closed and in ORDER. `require()` alone on `reserve()` left three doors
-        open: a reopened corrupt ledger could still be laundered by calling `finish()`. Ownership is checked
-        by IDENTITY — a record from another campaign is not this ledger's to advance."""
+        """Refuse anything but the next state in `STATES`, on a trustworthy ledger, for a record this
+        ledger owns by identity."""
         self.require()
         index = child.get("index") if isinstance(child, dict) else None
         if (type(index) is not int or not (1 <= index <= len(self.children))
@@ -806,21 +720,18 @@ class Campaign:
             raise ValueError(f"child {index}: {state} -> {to} is not a transition this ledger records")
 
     def _transition(self, child: dict, to: str, **fields) -> None:
-        """Advance one child through a CANDIDATE: the live record is never touched until the candidate has
-        been validated and published. Mutating first meant a rejected manifestation left the child marked
-        `manifested` and malformed in memory, where the next `finish()` published it and made the ledger
-        unusable — the validation refused the write and produced exactly the record it refused."""
+        """Advance one child through a candidate: the live record is not touched until the candidate has
+        been validated and published."""
         self._advance(child, to)
         index = child["index"]
         candidate = {**child, **fields, "state": to}
         records = list(self.children)     # `_commit` validates the whole snapshot, candidate included
         records[index - 1] = candidate
-        # the caller keeps holding the record it reserved, so identity — and every later transition —
-        # survives the swap; the update lands only once the disk has agreed
+        # the caller keeps holding the record it reserved, so identity survives the swap
         self._commit(records, adopt=lambda: (child.update(candidate), records.__setitem__(index - 1, child)))
 
     def started(self, child: dict, run_id: str) -> None:
-        self.require()                     # trust is checked before anything else, always
+        self.require()                     # trust is checked before anything else
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("a started child must name its run")
         self._transition(child, "started", run_id=run_id)
@@ -840,5 +751,5 @@ class Campaign:
 
     @property
     def interrupted(self) -> list:
-        """Children the ledger recorded and never saw finish — an honest account of a crash."""
+        """Children the ledger recorded and never saw finish."""
         return [c for c in self.children if c.get("state") != "manifested"]

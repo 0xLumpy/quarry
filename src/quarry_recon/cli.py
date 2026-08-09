@@ -1,4 +1,5 @@
-"""quarry — command surface: install · update · doctor · init · osint · run · report."""
+"""quarry — recon command surface: setup (install · update · doctor · init · notify), scope (set · oos ·
+policy), run (osint · run · report · status · plan), pins (lock), and oob."""
 from __future__ import annotations
 
 import os
@@ -16,35 +17,33 @@ from .registry import health, install_one, load_tools, tools_by_phase, verify_in
 
 
 def _projects_root(opt: str | None) -> Path:
-    """Where `quarry init` creates project dirs. Home-anchored default (~/projects) so a run doesn't
-    depend on the cwd — a project is found the same way no matter where you invoke quarry from.
-    Override explicitly with --projects-dir or $QUARRY_PROJECTS (e.g. to keep them in the cwd)."""
+    """Where `quarry init` creates project dirs; ~/projects unless --projects-dir or $QUARRY_PROJECTS."""
     return Path(opt or os.environ.get("QUARRY_PROJECTS") or (Path.home() / "projects"))
 
 
 def _project_dir(profile) -> Path:
-    """A profile's project dir = the directory its target.yaml lives in. Output (osint/, recon/)
-    co-locates with the profile (campaign/project model)."""
+    """A profile's project dir: the directory its target.yaml lives in. Output co-locates here."""
     return (profile.path.parent if profile.path else Path(".")).resolve()
 
 
 def _existing_run(project, target, run_id):
-    """Resolve a run for read/import commands. An explicit --run must ALREADY exist — Run() mkdirs, so
-    a typo would silently create a ghost run (and, for import, write evidence under it). Fail loud
-    instead. No run_id -> the latest run (or None)."""
+    """Resolve a run for read/import commands. An explicit --run must already exist (never fabricate a ghost
+    dir); no run_id gives the latest, or None.
+    """
     from .store import Run
     if run_id:
         try:
-            return Run.open(project, target, run_id)    # C10a: OPEN (never fabricate a ghost dir/start time)
+            return Run.open(project, target, run_id)    # open, never fabricate a ghost dir
         except FileNotFoundError:
             raise click.ClickException(f"run {run_id!r} not found under {Path(project) / 'recon'}")
     return Run.latest(project)
 
 
 def _resolve_profile(value: str) -> str:
-    """Accept `-t` as a target.yaml path, a project dir, or a bare project name. A name/dir
-    resolves to <projects-root>/<name>/target.yaml — so `quarry run -t 0xlumpy.cc` just works."""
-    p = Path(value).expanduser()      # so a quoted ~ still works (shell expands an unquoted one)
+    """Accept `-t` as a target.yaml path, a project dir, or a bare project name (resolved under the
+    projects root).
+    """
+    p = Path(value).expanduser()      # so a quoted ~ still works
     if p.is_file():
         return str(p)
     if p.is_dir() and (p / "target.yaml").is_file():
@@ -62,18 +61,15 @@ _OOS_REGEX_META = re.compile(r"[\^$\\+?\[\](){}|]")
 
 
 def _to_oos_pattern(value: str) -> str:
-    """Turn an OOS CLI argument into a VALID regex string (validated via re.compile):
-      - bare label       jobs            -> ^jobs\\.              (any host under the `jobs.` label)
-      - bare FQDN        banana.acme.com -> ^banana\\.acme\\.com$  (exact, apex-scoped)
-      - host glob `*`    *.acme.com      -> ^.*\\.acme\\.com$      (any subdomain)
-      - explicit regex   ^jobs\\.         -> kept as-is (must compile)
-    Raises re.error if the result (or an explicit regex) is invalid — caller refuses to write."""
+    """An OOS CLI argument as a validated regex string: a bare label -> subdomain prefix, a bare FQDN ->
+    anchored exact, `*.x` -> subdomain glob, an explicit regex kept as-is. Raises re.error on an invalid
+    result.
+    """
     if _OOS_REGEX_META.search(value):
         re.compile(value)                                      # validate explicit regex
         return value
     if "." not in value:                                       # bare label -> subdomain-prefix
-        # `jobs` means "any host under the `jobs.` label" (matches the template's ^jobs\.). The old
-        # `^jobs$` never matched via .search() against a FQDN, so a bare label was a silent no-op.
+        # a bare label matches any host under that label (^jobs\.)
         pat = "^" + re.escape(value) + r"\."
     else:
         pat = "^" + re.escape(value).replace(r"\*", ".*") + "$"    # FQDN / glob -> anchored regex
@@ -87,7 +83,7 @@ def _c(s, color):  # tiny colorizer
 
 def _echo_syscheck(rep) -> None:
     marks = {"ok": _c("✓", "green"), "warn": _c("⚠", "yellow"), "abort": _c("✗", "red")}
-    for text, lvl in rep["checks"]:   # thresholds live in the README, not every line
+    for text, lvl in rep["checks"]:
         click.echo(f"  {marks[lvl]} {text}")
 
 
@@ -106,18 +102,18 @@ def cli():
 
 
 def _missing_required(phase_filter=None) -> list[str]:
-    """Required (non-optional) tools that are NOT installed, optionally limited to a set of phases.
-    The readiness signal for doctor's verdict + the pre-run gate. Quarry-owned only — tool-native
-    source keys (subfinder/amass configs) are the tool's concern, documented in install/docs."""
+    """Required (non-optional) tools that are not installed, optionally limited to a set of phases —
+    Quarry-owned tools only.
+    """
     return sorted({t.bin for t in load_tools()
                    if not t.optional and not t.installed
                    and (phase_filter is None or t.phase in phase_filter)})
 
 
 def _effective_phases(selected, profile) -> set:
-    """Phases that will ACTUALLY do work under the profile's modes — so the readiness warn doesn't
-    flag tools for phases that self-skip: passive mode drops needs_active phases, and
-    CONTENT_DISCOVERY: off drops content (missing ffuf shouldn't warn when content is off)."""
+    """Phases that will actually do work under the profile's modes, so the readiness warn does not flag
+    tools for phases that self-skip.
+    """
     from .phases import REGISTRY
     eff = {p for p in selected if p in REGISTRY}
     if profile.passive_only:
@@ -127,13 +123,11 @@ def _effective_phases(selected, profile) -> set:
     return eff
 
 
-# ── lock (C08 compatibility lock) ─────────────────────────────────────────────
+# ── lock ──────────────────────────────────────────────────────────────────────
 def _osint_verdict(cdir) -> tuple:
-    """(summary, verdict) for a finished OSINT session directory.
-
-    review-B0r3#5: an UNREADABLE truth is not a clean one. Defaulting a missing or corrupt manifest to
-    "complete" printed confident green over a session whose outcome we could not read at all — the same
-    false-clean shape as the Whoxy empty this batch exists to kill. Anything unreadable is `unknown`."""
+    """(summary, verdict) for a finished OSINT session directory; an unreadable manifest is `unknown`, never
+    `complete`.
+    """
     import json as _json
     try:
         summary = (_json.loads((cdir / "manifest.json").read_text()) or {}).get("summary") or {}
@@ -146,14 +140,13 @@ def _osint_verdict(cdir) -> tuple:
 @click.option("--drift-only", is_flag=True, help="only print tools whose installed version DRIFTS from the pin")
 @click.option("--maintenance", is_flag=True, help="refresh-policy view: tools grouped by maintenance state")
 def lock(drift_only, maintenance):
-    """C08: capture the INSTALLED tool versions on THIS host as a reviewable pin set. Run on a VALIDATED host
-    (the VPS where everything works) — the emitted `version:` lines are copy-pasted into data/tools.yaml so the
-    install becomes reproducible. Also flags DRIFT (installed != pin) and UNPINNED tools."""
+    """Capture installed tool versions on this host as a reviewable pin set (paste `version:` lines into
+    data/tools.yaml). Run on a validated host. Also flags drift and unpinned tools.
+    """
     from .registry import capture_lock, load_tools
     if maintenance:
-        # v0.3.9 refresh-policy snapshot — how often `quarry lock --refresh` (v0.4) should check each tool
-        # upstream. PLANNING ONLY: it NEVER gates verify/drift/install/runtime, so it does NOT probe installed
-        # tools (review-r13#1) — it reads the static registry. `release` shows only when it differs from the pin.
+        # refresh-policy snapshot: planning only, never gates verify/drift/install/runtime, reads the
+        # static registry. `release` shows only when it differs from the pin.
         from collections import defaultdict
         groups = defaultdict(list)
         for t in load_tools():
@@ -175,8 +168,7 @@ def lock(drift_only, maintenance):
     drifts = [r for r in rows if r["drift"] == "DRIFT"]
     unpinned = [r for r in rows if r["drift"] == "unpinned"]
     if drift_only:
-        # review-C08.2r4#3: the monthly verification must report EVERY lock violation (DRIFT and version-unknown)
-        # and EXIT NONZERO — a silent green would mask a wrong/unverifiable binary.
+        # the drift check must report every violation and exit nonzero, or a wrong binary passes silently
         violations = [r for r in rows if r["drift"] in ("DRIFT", "version-unknown")]
         for r in violations:
             click.echo(_c(f"  {r['drift']:<15} {r['bin']:<20} installed={r['installed']}  pin={r['pin']}", "red"))
@@ -203,21 +195,18 @@ def lock(drift_only, maintenance):
 
 
 def _doctor_version(t, ident: str) -> str:
-    """Doctor's version string from the ALREADY-PROBED runtime identity (go module · pipx meta · binary/source
-    receipt) — so doctor AGREES with install and pipx/source tools stop showing a false "version unknown" just
-    because they lack a --version flag. distro tools prefer their real CLI banner over the "distro" sentinel; a
-    long source-ref identity is shortened. Falls back to the banner (display-only, NOT proof of health — the ✓/⚠
-    verdict is separate), then an honest "version unknown"."""
+    """Doctor's version string from the already-probed runtime identity, so doctor agrees with install. A
+    long source-ref is shortened; falls back to the banner, then "version unknown".
+    """
     if ident == "distro":
         return t.version() or _c("distro", "cyan")
     if ident:
         return ident[:12] if len(ident) > 20 and all(c in "0123456789abcdef" for c in ident.lower()) else ident
-    return t.version() or _c("version unknown", "yellow")   # C08.1#1: empty = unparseable, not a pin
+    return t.version() or _c("version unknown", "yellow")   # empty = unparseable, not a pin
 
 
 def _health_reason(h: dict, t) -> str:
-    """Why a PRESENT tool is unverified (drift/identity/capability) — the same failure the install path would
-    act on (reinstall). Identity problems take precedence over the capability probe."""
+    """Why a present tool is unverified (drift/identity/capability). Identity problems take precedence."""
     d = h["drift"]
     if d == "DRIFT":
         return f"drift — installed {h['identity'] or '?'} != pin {t.pin or t.ref}"
@@ -236,21 +225,17 @@ def _health_reason(h: dict, t) -> str:
 def doctor(phase):
     """Audit local setup: tools, versions, API keys, resolvers, wordlists."""
     tools = tools_by_phase(phase) if phase else load_tools()
-    # A `dependency` (bun) is a RUNTIME, not a recon tool: it is audited here but printed with
-    # go/pipx/chromium under [environment], and it is not part of the tool count (Lumpy, 2026-08-07).
-    # A broken one still degrades the verdict — it is only `ok` that counts tools, so the READY line
-    # and the header always quote the same population.
+    # a `dependency` (bun) is a runtime, not a recon tool: audited here, printed under [environment],
+    # and not counted, but a broken one still degrades the verdict
     deps = [t for t in tools if t.dependency]
     tools = [t for t in tools if not t.dependency]
     ok = warn = miss = 0
     click.echo(_c(f"\nQuarry doctor — {len(tools)} tools\n", "cyan"))
     cur_phase = None
-    oob_lines: list[str] = []                # rendered here, printed in the ONE [oob] section below
-    dep_lines: list[str] = []                # ditto, printed in [environment]
+    oob_lines: list[str] = []                # printed in the [oob] section below
+    dep_lines: list[str] = []                # printed in [environment]
     for t in sorted(tools + deps, key=lambda x: (x.phase, x.bin)):
-        # `oob` tools are ACCOUNTED for here (a missing required one is still a blocker) but PRINTED in
-        # the [oob] block, next to the callback server they need. Two [oob] headers in one output was
-        # the tool list and the environment blocks being separate sequences (Lumpy, 2026-08-07).
+        # `oob` tools are accounted for here but printed in the [oob] block, next to their server
         _oob = t.phase == "oob"
         _say = dep_lines.append if t.dependency else (oob_lines.append if _oob else click.echo)
         _w = 24 if t.dependency else 20   # [environment] column, not the tool-list one
@@ -258,13 +243,13 @@ def doctor(phase):
             cur_phase = t.phase
             click.echo(_c(f"[{cur_phase}]", "magenta"))
         if t.installed:
-            h = health(t)                                        # verify-grade verdict, identity probed once
+            h = health(t)                                        # verify-grade verdict
             ver = _doctor_version(t, h["identity"])
             if h["ok"]:
                 ok += 0 if t.dependency else 1
                 _say(f"  {_c('✓', 'green')} {t.bin:<{_w}} {ver}")
             else:
-                warn += 1                                        # present but UNVERIFIED — ✓ would be a lie
+                warn += 1                                        # present but unverified
                 _say(f"  {_c('⚠', 'yellow')} {t.bin:<{_w}} {ver}  "
                      f"{_c('unverified: ' + _health_reason(h, t), 'yellow')}")
         elif t.optional:
@@ -278,11 +263,8 @@ def doctor(phase):
     # environment checks
     click.echo(_c("\n[environment]", "magenta"))
     cfg = Path.home() / ".config/quarry"
-    # Resolvers + wordlists are NOT optional (unlike API keys) — they're standard install artifacts,
-    # and without them core steps can't run (no DNS wordlist → brute skips, no vhost list → vhost enum
-    # skips, etc.). So a missing one is a WARNING with the fix, not a soft "(optional)". wordlists live
-    # under wordlists/ (clean layout); older installs kept them at the config root — check the canonical
-    # path first, then the back-compat one, and show whichever exists.
+    # resolvers + wordlists are required install artifacts, so a missing one is a warning with the fix.
+    # Check the canonical wordlists/ path first, then the back-compat config root.
     for label, name, cands in [("resolvers", "resolvers", [cfg / "resolvers.txt"]),
                          ("trusted-resolvers", "trusted-resolvers", [cfg / "trusted-resolvers.txt"]),
                          ("dns wordlist", "dns-wordlist", [cfg / "wordlists/dns.txt", cfg / "dns-wordlist.txt"]),
@@ -302,8 +284,7 @@ def doctor(phase):
                   (shutil.which("chromium-browser") or shutil.which("google-chrome")))
         mark = _c("✓", "green") if present else _c("✗", "red")
         click.echo(f"  {mark} {label}")
-    # runtimes Quarry provisions itself (bun) — same audit as any tool, printed where the operator
-    # looks for a runtime, not in the tool list of a phase it does no work in.
+    # runtimes Quarry provisions itself (bun), printed under [environment]
     for _l in dep_lines:
         click.echo(_l)
 
@@ -311,17 +292,14 @@ def doctor(phase):
     click.echo(_c("\n[system]", "magenta"))
     _echo_syscheck(bootstrap.system_report("run"))   # post-install: only run space matters
 
-    # secrets.yaml — framework-read keys (present / not set). Quarry-owned keys only; tool-native
-    # source keys (subfinder/amass) live in each tool's own config (documented in install + docs).
+    # secrets.yaml — framework-read keys only; tool-native source keys live in each tool's own config
     click.echo(_c("\n[secrets]", "magenta") + f"  ({secrets.PATH})")
     secrets_present = secrets.PATH.exists()
     if not secrets_present:
         click.echo(f"  {_c('✗', 'red')} secrets.yaml NOT FOUND — run `quarry install` to recreate it "
                    f"from the template (or restore a backup); keys read as unset until it exists")
-    # Every key here is optional, so saying "(optional)" on each row said nothing (Lumpy, 2026-08-07).
-    # What a row DOES say now: not set · set · malformed. The shape check is LOCAL — a regex, never a
-    # request — so `doctor` cannot spend a credit, and it only claims malformed for providers whose
-    # format is actually documented (see `secrets.key_shape`). Values are never printed.
+    # each row is: not set · set · malformed. The shape check is a local regex (never a request, never
+    # a spend), and claims malformed only for providers with a documented format. Values never printed.
     gh = secrets.github_tokens()
     rows = [("github tokens", gh, "github"),
             ("shodan", [secrets.shodan()], "shodan"),
@@ -336,21 +314,18 @@ def doctor(phase):
         bad = [v for v in vals if secrets.key_shape(kind, v) == "malformed"]
         note = f"{len(vals)} token(s)" if kind == "github" else ""
         if bad:
-            # "wrong shape" already says it was not tested — a shape check cannot report a rejection
-            # (Lumpy, 2026-08-07: the explanation was longer than the fact).
+            # a shape check cannot report a rejection
             click.echo(f"  {_c('✗', 'red')} {label:<24} "
                        + (f"{len(bad)} of {len(vals)} wrong shape for this provider"
                           if len(vals) > 1 else "wrong shape for this provider"))
         else:
             click.echo(f"  {_c('✓', 'green')} {label:<24} {note}".rstrip())
-    # Censys Platform — ADVANCED opt-in; shown ONLY when configured (silent otherwise, by design)
+    # Censys Platform — advanced opt-in; shown only when configured
     cen = secrets.censys()
     if cen.get("token") and cen.get("org"):
         click.echo(f"  {_c('✓', 'green')} censys (advanced)          Platform cert search")
-    # template drift: the shipped template can gain new optional keys, but bootstrap NEVER overwrites
-    # an existing secrets.yaml (so it can't clobber your keys) — so surface any key the template has
-    # that your file predates. ONLY when the file exists: a missing file isn't "drift" (every key
-    # would falsely look predated), it's the NOT-FOUND case handled above.
+    # template drift: surface any optional key the shipped template has that an existing secrets.yaml
+    # predates (bootstrap never overwrites it). Only when the file exists.
     if secrets_present:
         try:
             import yaml as _yaml
@@ -392,13 +367,8 @@ def doctor(phase):
     # oob — readiness only: is the tool present + which backend. (The OOB model lives in README, not here.)
     ob = secrets.oob()
     _have_ic = shutil.which("interactsh-client") is not None
-    # ONE [oob] section: the tool that does the callbacks, and the server they come back to (Lumpy,
-    # 2026-08-07). The server ADDRESS is shown — it is not a secret, and seeing it is how an operator
-    # confirms the one they configured is the one in use. The token never appears.
-    #
-    # What is NOT here: the blind-XSS channel. It is resolved from a TARGET's `MODES.BLIND_XSS`, so it
-    # is armed for one engagement and not the next — doctor is installation-scoped and cannot answer it
-    # for "the box". The how and the why live in the docs.
+    # one [oob] section: the callback tool and the server it returns to. The server address is shown
+    # (not a secret), the token never. The blind-XSS channel is target-scoped, so it is not here.
     click.echo(_c("\n[oob]", "magenta"))
     for _l in oob_lines:
         click.echo(_l)
@@ -444,8 +414,9 @@ def notify_cmd(test):
 @click.argument("name")
 @click.option("--url", help="override the source URL (the name still fixes the destination)")
 def set_cmd(name, url):
-    """Fetch/refresh a SINGLE data file by name (resolvers, dns-wordlist, vhost-wordlist,
-    content-balanced, content-deep, trusted-resolvers) — granular alternative to a full install."""
+    """Fetch/refresh a single data file by name (resolvers, dns-wordlist, vhost-wordlist, content-balanced,
+    content-deep, trusted-resolvers) — granular alternative to a full install.
+    """
     from . import bootstrap
     if not bootstrap.set_data_file(name, url, click.echo):
         raise click.ClickException(f"could not set '{name}' — see the message above")
@@ -453,12 +424,9 @@ def set_cmd(name, url):
 
 # ── install / update ─────────────────────────────────────────────────────────
 def _run_tool(t, marker, dry_run) -> bool:
-    """Install/update ONE tool through the shared version-LOCKED path, rendering ONE line — SHARED by `install`
-    and `update` so their output can't drift apart. Success is a NAME-only `<marker> tool ✓` (the version is
-    install-time noise; it lives in `doctor`/`lock`); a FAILURE / dry-run shows the attempted `@ pin` so it's
-    actionable. distro is tagged from `policy`, not the absence of a pin. install_one's progress is buffered:
-    on success only the routine `<bin>: ok (...)` line is dropped (exceptional notes like a legacy relocation
-    stay); on failure everything shows. Returns install_one's ok."""
+    """Install/update one tool through the shared version-locked path, rendering one line. Shared by
+    `install` and `update`. Returns install_one's ok.
+    """
     if t.policy == "distro":
         pin_note = _c(" (distro)", "cyan")
     elif t.pin or t.ref:
@@ -501,9 +469,8 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     # ── 1. system packages + Go toolchain + data (unless --tools-only / --only / --phase) ──
     full = not (only or phase or tools_only)
 
-    # Selection happens FIRST because a `dependency` tool (bun) is a runtime, not a recon tool: it is
-    # provisioned in the toolchain step below and never listed under [3/6] (Lumpy, 2026-08-07). The
-    # filters here read only static fields, so nothing observes the host before it is provisioned.
+    # select first, reading only static fields: a `dependency` (bun) is provisioned in the toolchain
+    # step, never listed under [3/6]
     tools = load_tools()
     if only:
         tools = [t for t in tools if t.bin == only]
@@ -511,21 +478,20 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
         tools = [t for t in tools if t.phase == phase]
     if not include_optional and not only:
         tools = [t for t in tools if not t.optional]
-    # A NARROWED run (--only bun / --phase crawl / --tools-only) has no toolchain step, so there the
-    # dependency stays in the selection it was asked for — it must still be installed.
+    # a narrowed run has no toolchain step, so a dependency stays in the selection it was asked for
     runtimes = [t for t in tools if t.dependency] if full else []
     if full:
         tools = [t for t in tools if not t.dependency]
     failed = []
 
     if full:
-        # install.sh prints this banner FIRST (before the quiet dependency install), so don't duplicate it there
+        # install.sh prints this banner first, so don't duplicate it here
         if not os.environ.get("QUARRY_FROM_INSTALLER"):
             click.echo(_c("\n  ◤ QUARRY — methodology-driven recon automation", "cyan"))
             if not dry_run:
                 click.echo(_c("  ⏳ Full install builds ~25 Go tools + fetches wordlists/templates — this "
                               "takes several minutes.\n     It is not stuck; grab a coffee.", "yellow"))
-        # system-spec precheck (tiered): ok = silent · warn = proceed · below minimum = abort
+        # system-spec precheck: ok silent · warn proceeds · below minimum aborts
         rep = bootstrap.system_report("install")
         click.echo(_c("\n[*] system check", "magenta"))
         _echo_syscheck(rep)
@@ -547,23 +513,18 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
             os.environ["PATH"] = p + os.pathsep + os.environ.get("PATH", "")
 
     def _provision(t) -> bool:
-        """Install one registry entry, ONE line of output. Shared by the runtime step and [3/6]."""
+        """Install one registry entry with one line of output; a present-and-verified tool is left as-is."""
         if t.installed and not only and not dry_run:
-            # review-C08.2r4#1: a PRESENT tool is left as-is ONLY if it VERIFIES (identity + capability); a wrong
-            # binary from a failed prior update no longer passes — it is reinstalled to the pin.
+            # a present tool is left as-is only if it verifies; otherwise it is reinstalled to the pin
             if verify_installed(t):
-                # ONE line, one mark (Lumpy, 2026-08-07). "present + verified (distro)" restated the
-                # section's own premise for every already-installed tool — and for the distro-managed
-                # ones, which apt provisions in [1/6], it read as redundant work happening twice. The
-                # ✓ IS "present and verified"; nothing else here has changed, so a tool that fails
-                # verification still says so on the next line and is reinstalled.
+                # the ✓ is "present and verified"; a tool that fails verification says so and is
+                # reinstalled
                 click.echo(f"  {_c('→', 'cyan')} {t.bin} {_c('✓', 'green')}")
                 return True
             click.echo(f"  {_c('⚠', 'yellow')} {t.bin} present but FAILED verification — reinstalling pin")
         return _run_tool(t, "→", dry_run)
 
-    # runtimes still belong to the [2/6] section above — they run here only because they need the PATH
-    # the block above just set (a version/capability probe calls the binary by name).
+    # runtimes run here, after the PATH is set, because a version probe calls the binary by name
     for t in runtimes:
         if not _provision(t):
             failed.append(t)
@@ -586,10 +547,8 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     if dry_run:
         click.echo(_c("\n(dry-run — nothing was installed)\n", "yellow"))
         return
-    # An optional tool failing is best-effort (nonfatal) ONLY in the FULL bootstrap (install.sh: no --only/
-    # --phase/--tools-only) — there it must not abort before PATH is persisted. Any NARROWED/targeted run
-    # (--only, --phase, --tools-only) fails hard on ANY selected tool: the operator asked for exactly those, so
-    # the printed `--only` retry must NOT report success while the tool is still broken (review fresh-install#1).
+    # an optional tool failing is nonfatal only in the full bootstrap; a narrowed run fails hard on any
+    # selected tool the operator asked for
     soft = [t.bin for t in failed if full and include_optional and t.optional]
     fatal = [t.bin for t in failed if t.bin not in soft]
     for b in soft:
@@ -598,9 +557,9 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
         click.echo(_c(f"\n{len(fatal)} tool(s) failed: {', '.join(fatal)}", "yellow"))
         for b in fatal:
             click.echo(f"retry: quarry install --only {b}")
-        raise SystemExit(1)                              # review-C08.2#6: failures propagate a non-zero exit
+        raise SystemExit(1)                              # failures propagate a non-zero exit
     elif not os.environ.get("QUARRY_FROM_INSTALLER"):
-        # install.sh prints the final banner itself; only conclude here when run standalone
+        # install.sh prints the final banner itself; conclude here only when run standalone
         tail = "" if not soft else f" ({len(soft)} optional failed — see above)"
         click.echo(_c(f"\ninstall complete — required tools ok{tail}\nrun  quarry doctor  to verify", "green"))
 
@@ -608,28 +567,27 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
 @cli.command()
 @click.option("--dry-run", is_flag=True)
 def update(dry_run):
-    """Reinstall INSTALLED tools at their PINNED lock (reproducible), + refresh nuclei templates, resolvers, gf
-    patterns. review-C08.2#1: `update` NEVER floats to @latest / pipx upgrade — bumping a pin is the reviewed
-    `quarry lock` refresh workflow, not a silent update."""
+    """Reinstall installed tools at their pinned lock (reproducible) and refresh templates, resolvers and gf
+    patterns. Never floats to @latest — bumping a pin is the `quarry lock` workflow.
+    """
     from . import bootstrap
 
-    # every INSTALLED tool syncs to its pin — optional or not (the `installed` gate already excludes tools the
-    # host never installed). Skipping installed-optional tools was hiding their drift (e.g. js-beautify).
+    # every installed tool syncs to its pin, optional or not, or an installed-optional tool's drift hides
     tools = [t for t in load_tools() if t.installed]
     click.echo(_c(f"updating {len(tools)} tools (to their pins)", "magenta"))
     failed = []
     for t in tools:
-        if not _run_tool(t, "↻", dry_run):               # SAME locked path + one-line output as install
+        if not _run_tool(t, "↻", dry_run):               # same locked path as install
             failed.append(t.bin)
     click.echo(_c("refreshing data files + templates", "magenta"))
     bootstrap.install_data_files(click.echo, dry_run, update=True)
     bootstrap.run_extras(click.echo, dry_run)
-    bootstrap.cleanup(click.echo, dry_run)   # re-running tool installs refills go caches — clean them (install already does)
+    bootstrap.cleanup(click.echo, dry_run)   # re-running tool installs refills go caches
     if dry_run:
         click.echo(_c("\n(dry-run)\n", "yellow"))
     elif failed:
         click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
-        raise SystemExit(1)                              # review-C08.2#6
+        raise SystemExit(1)
 
 
 # ── init (create a project) ───────────────────────────────────────────────────
@@ -639,8 +597,7 @@ def update(dry_run):
 @click.option("--projects-dir", help="projects root (default ~/projects or $QUARRY_PROJECTS)")
 def init(name, out, projects_dir):
     """Create a project: <projects>/<name>/target.yaml (or -o <dir>). osint + recon co-locate here."""
-    # sanitize: the NAME is the target id (a single path segment), never a path. The location
-    # can be anywhere via -o.
+    # the name is the target id (a single path segment), never a path; the location is -o
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name) or ".." in name:
         raise click.ClickException(
             f"invalid project name {name!r}: use letters/digits/.-_ only, no path separators")
@@ -648,7 +605,7 @@ def init(name, out, projects_dir):
     proj.mkdir(parents=True, exist_ok=True)
     tpl = resources.files("quarry_recon.data").joinpath("target.template.yaml").read_text()
     tpl = tpl.replace("TARGET: example", f"TARGET: {name}")
-    # If the name is a domain, seed APEX_DOMAINS so `quarry init target.com` is ready to run.
+    # if the name is a domain, seed APEX_DOMAINS so `quarry init target.com` is ready to run
     is_domain = bool(re.match(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$", name))
     if is_domain:
         tpl = tpl.replace("  - example.com", f"  - {name}")
@@ -656,7 +613,7 @@ def init(name, out, projects_dir):
     if dest.exists():
         click.confirm(f"{dest} exists — overwrite?", abort=True)
     dest.write_text(tpl)
-    # bare `-t <name>` only resolves under the default projects root; elsewhere point -t at the dir
+    # bare `-t <name>` resolves only under the default projects root; elsewhere point -t at the dir
     ref = name if not (out or projects_dir) else str(proj)
     click.echo(f"{_c('created project', 'green')} {proj}/  (profile: {dest})")
     if is_domain:
@@ -673,9 +630,10 @@ def init(name, out, projects_dir):
               help="project name, project dir, or target.yaml path")
 @click.argument("hosts", nargs=-1, required=True)
 def oos(profile_path, hosts):
-    """Add out-of-scope patterns to a project's target.yaml (under OOS:). A bare host becomes an
-    anchored regex, `*.x` a subdomain glob; a real regex is kept verbatim. Every pattern is
-    validated and the resulting profile must compile before anything is written."""
+    """Add out-of-scope patterns to a project's target.yaml. A bare host becomes an anchored regex, `*.x` a
+    subdomain glob, a real regex is kept verbatim; the resulting profile must compile before anything is
+    written.
+    """
     import yaml
     path = Path(_resolve_profile(profile_path))
     text = path.read_text()
@@ -739,15 +697,15 @@ def oos(profile_path, hosts):
                    "untouched, and scope, contact guards and rate limits never change. This is the "
                    "VOLUME axis, not the waiting one — see `quarry policy --unbound`")
 def osint(profile_path, timeout, unbound):
-    """Pre-flight OSINT: discover scope CANDIDATES + intel. Review-only — never edits scope.
+    """Pre-flight OSINT: discover scope candidates and intel. Review-only — never edits scope.
 
-    Workflow: init → fill anchors → `quarry osint` → review report + suggested.yaml →
-    confirm into target.yaml → `quarry run`. Output lands in the project's osint/ dir.
+    Workflow: init -> fill anchors -> `quarry osint` -> review the report and suggested.yaml -> confirm into
+    target.yaml -> `quarry run`. Output lands in the project's osint/ dir.
     """
     import json
     from . import osint as osint_mod
 
-    if timeout <= 0:      # osint bounds each lookup with min(timeout, N); 0/neg would make every lookup fail instantly
+    if timeout <= 0:      # osint bounds each lookup with min(timeout, N); 0 fails every lookup instantly
         raise click.ClickException("osint --timeout must be > 0 (it's a per-lookup ceiling; there is no unbounded osint)")
     try:
         profile = TargetProfile.load(_resolve_profile(profile_path))
@@ -755,15 +713,13 @@ def osint(profile_path, timeout, unbound):
         raise click.ClickException(str(e))
     scope = profile.scope()
     project = _project_dir(profile)
-    secrets.apply_env()   # export PDCP_API_KEY (chaos) for PD tools, if set
+    secrets.apply_env()   # export PDCP_API_KEY for PD tools, if set
 
     click.echo(_c(f"\n══ Quarry osint · target={profile.target} (pre-flight, review-only) ══", "cyan"))
     click.echo(f"   project: {project}")
     click.echo(f"   anchors: apex={len(profile.apex_domains)} asn={len(profile.asn)} "
                f"org={len(profile.org_names)} brands={len(profile.brands)}\n")
-    # the SAME axis as `quarry run --unbound`, entered before any lane reads a bound and restored on the
-    # way out. Without it the preflight's own bound was unreachable — `--unbound` lived on `run`, which
-    # never calls these lanes, so a withheld remainder named an action no operator could take.
+    # the same axis as `quarry run --unbound`, entered before any lane reads a bound and restored after
     from . import policy as _policy
     from . import settings as _settings
     with _settings.overrides(_policy.unbound_overrides() if unbound else {}):
@@ -777,14 +733,13 @@ def osint(profile_path, timeout, unbound):
     cands = [json.loads(l) for l in cfile.read_text().splitlines() if l.strip()] \
         if cfile.exists() else []
     apex = [c for c in cands if c["type"] == "apex" and c["scope_hint"] != "noise"]
-    # review-B0r2#5: never print an unconditional green "done" over a session a provider cut short —
-    # the verdict is in the manifest, so surface it in the one line the operator actually reads.
+    # surface the manifest verdict, never an unconditional green "done" over a session cut short
     _sum, _verdict = _osint_verdict(cdir)
     click.echo(_c(f"\n══ osint {_verdict.replace('_', ' ')} · {cdir}",
                   "green" if _verdict == "complete" else "yellow"))
     for _lim in _sum.get("provider_limits", []):
         click.echo(_c(f"   provider limit: {_lim.get('tool')} — {_lim.get('why')}", "yellow"))
-    for _lim in _sum.get("operator_limits", []):     # OURS — say so, never "provider limit"
+    for _lim in _sum.get("operator_limits", []):     # ours — say so, never "provider limit"
         click.echo(_c(f"   operator limit: {_lim.get('tool')} — {_lim.get('why')}", "yellow"))
     for _gap in _sum.get("gaps", []):
         click.echo(_c(f"   incomplete: {_gap.get('tool')} — {_gap.get('why')}", "yellow"))
@@ -803,10 +758,9 @@ def osint(profile_path, timeout, unbound):
               help="project name, project dir, or target.yaml path (optional: the policy is machine-wide)")
 @click.option("--unbound", is_flag=True, help="preview the policy `quarry run --unbound` would apply")
 def policy(profile_path, unbound):
-    """Show the EFFECTIVE coverage policy: every bound, its value, who set it, and what is HELD.
-
-    Runs nothing and contacts nothing — the same table `quarry run` prints and stores, so an operator can
-    check what a run WOULD do before spending an hour finding out."""
+    """Show the effective coverage policy: every bound, its value, who set it, and what is held. Runs nothing
+    and contacts nothing.
+    """
     from . import policy as _policy
     from . import settings
     with settings.overrides(_policy.unbound_overrides() if unbound else {}):
@@ -850,15 +804,12 @@ def run(profile_path, phases, passive, timeout, unbound, settle_flag, settle_max
     """Run recon phases against the confirmed scope. Output lands in the project's recon/ dir."""
     from . import settings
 
-    # a bound that binds nothing is a lie: refuse the settle bounds without the axis they bound, rather
-    # than accepting a number this run will never apply.
+    # refuse the settle bounds without the axis they bound
     if not settle_flag and (settle_max_runs is not None or settle_budget is not None):
         raise click.UsageError("--settle-max-runs / --settle-budget bound a campaign; they need --settle")
 
-    # an explicit operator instruction for THIS run: every eligible zone is contacted once, instead of the
-    # allowance handing the rest to a later lifecycle (step 4.3). Entered BEFORE anything reads a bound, so
-    # no lane can start under the rotation the operator just turned off — and RESTORED on the way out, so
-    # one run's instruction never leaks into another sharing this interpreter (step 2).
+    # --unbound for this run: entered before any lane reads a bound, restored on the way out so it
+    # never leaks into another run sharing this interpreter
     from . import policy as _policy
     with settings.overrides(_policy.unbound_overrides() if unbound else {}):
         if not settle_flag:
@@ -869,9 +820,9 @@ def run(profile_path, phases, passive, timeout, unbound, settle_flag, settle_max
 
 
 def _settle_run(profile_path, phases, passive, timeout, *, max_runs, budget_s):
-    """`--settle`: a CAMPAIGN over ordinary runs. The axes compose and imply nothing of each other — each
-    child runs under exactly the policy the other flags established, inside the scope this function is
-    already in, so `--unbound` widens every child and `--timeout` bounds every child's tools."""
+    """`--settle`: a campaign over ordinary runs. The axes compose — `--unbound` widens every child,
+    `--timeout` bounds every child's tools.
+    """
     from . import campaign as _campaign
     from . import budget, settle as _settle
 
@@ -922,8 +873,7 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     scope = profile.scope()
     project = _project_dir(profile)
 
-    # pre-run disk gate on the ACTUAL project filesystem (output growth is the real driver).
-    # Runs BEFORE the run folder is created so a low-disk abort leaves no empty recon/<run_id>/.
+    # pre-run disk gate on the project filesystem, before the run folder is created
     try:
         free_gb = shutil.disk_usage(str(project)).free / (1024 ** 3)
     except OSError:
@@ -937,19 +887,17 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
             click.echo(_c(f"⚠ low disk: {free_gb:.1f} GB free on {project} "
                           "(recommend ≥5 GB for big targets)", "yellow"))
 
-    secrets.apply_env()   # export PDCP_API_KEY (chaos) for PD tools, if set
+    secrets.apply_env()   # export PDCP_API_KEY for PD tools, if set
     from .runner import set_tool_cwd
-    run_obj = Run.create(project, profile.target)   # C10a: collision-resistant id, atomically-claimed dir
-    events.configure(run_obj.dir)   # persist runtime events to <run>/events.jsonl (quarry status reads it)
+    run_obj = Run.create(project, profile.target)   # collision-resistant id, atomically-claimed dir
+    events.configure(run_obj.dir)   # persist runtime events to <run>/events.jsonl
     workdir = run_obj.dir / "work"
     workdir.mkdir(parents=True, exist_ok=True)
-    set_tool_cwd(workdir)   # stray tool files (gowitness db, github-subdomains txt, …) land in the run
+    set_tool_cwd(workdir)   # stray tool files land in the run dir
     ctx = PhaseContext(run=run_obj, profile=profile, scope=scope, workdir=workdir,
                        echo=click.echo, http_timeout=timeout)
-    # the run directory exists and NOTHING has run yet — the only point where a campaign may seed this
-    # child from what earlier children learned (entities are run-scoped, so an unseeded child starts empty
-    # and its emptiness would read as a fixed point). A seed that fails stops the child: an empty corpus is
-    # not a fixed point.
+    # the only point a campaign may seed this child from earlier children (entities are run-scoped); a
+    # seed that fails stops the child, because an empty corpus is not a fixed point
     if prepare is not None:
         prepare(run_obj)
 
@@ -963,8 +911,7 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     click.echo(f"   apexes={len(profile.apex_domains)} cidr={len(profile.cidr)} "
                f"ports={ports_disp} http_rl={profile.http_rl or 'default'}\n")
 
-    # the EFFECTIVE POLICY, printed before any lane reads a bound and persisted with the run: a run's
-    # ceilings are evidence, not shell history — including the ones we deliberately did NOT lift.
+    # the effective policy, printed and persisted before any lane reads a bound: ceilings are evidence
     from . import policy as _policy
     policy_rows = _policy.snapshot()
     click.echo(_c("   ── effective coverage policy ──", "cyan"))
@@ -973,15 +920,14 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     click.echo("")
     events.emit("policy", "run", bounds=policy_rows)
 
-    # readiness gate: warn (don't block) if a REQUIRED tool for the phases that will ACTUALLY run
-    # (mode-gating applied) is missing — better to know before a long run than in the manifest.
+    # readiness gate: warn (never block) if a required tool for the phases that will run is missing
     missing_req = _missing_required(_effective_phases(selected, profile))
     if missing_req:
         click.echo(_c(f"   ⚠ {len(missing_req)} required tool(s) missing for selected phases "
                       f"({', '.join(missing_req[:8])}) — those steps will be skipped. "
                       "Run `quarry doctor`.\n", "yellow"))
 
-    # runtime telemetry (data beats vibes): per-phase wall + child CPU + inventory-at-phase.
+    # runtime telemetry: per-phase wall + child CPU + inventory-at-phase
     import time as _time
     from . import metrics
     _INV = ("subdomain", "resolved", "live", "url", "endpoint", "secret", "finding")
@@ -1001,8 +947,7 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
         try:
             fn(ctx)
         except Exception as e:  # never let one phase kill the run
-            # redact ONCE: an exception message can carry a URL with a key/token — keep it out of the
-            # notes, the terminal/runtime.log echo, AND the notification.
+            # redact once: an exception message can carry a URL with a key/token
             err = secrets.redact(str(e)) or ""
             run_obj.notes.append(f"{name}: EXCEPTION {err}")
             click.echo(_c(f"   ! {name} raised {err}", "red"))
@@ -1012,26 +957,22 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
         phase_metrics.append({"phase": name, "wall_s": p_wall,
                               "cpu_s": round(metrics.rusage()[0] - p_cpu0, 2),
                               "size": {e: run_obj.count(e) for e in _INV}})
-        # incremental flush → a killed / timed-out run KEEPS its telemetry. metrics were previously
-        # written only at run end, so a mid-run kill (exactly when tuning data matters most) lost every
-        # per-tool cpu/RAM sample. Best-effort: a flush failure must never break the run.
+        # incremental flush so a killed run keeps its telemetry; a flush failure must never break the run
         try:
             _rc, _rss = metrics.rusage()
             metrics.write(run_obj, phase_metrics, _time.perf_counter() - run_t0,
                           _rc - run_cpu0, _rss / 1024)
         except Exception:
             pass
-        # log-safe section timer (reconftw-style, our style) — a per-phase elapsed footer. No spinner
-        # / control chars, so tmux + runtime.log stay clean. The live in-tool spinner is separate.
+        # log-safe per-phase elapsed footer: no control chars, so tmux and runtime.log stay clean
         click.echo(_c(f"   ⏱ {name} · {p_wall}s", "cyan"))
         cps = checkpoint.evaluate(run_obj, name)
         all_cps += cps
         for cp in cps:
             click.echo("   " + _c(cp.line(), "yellow" if cp.level == "warn" else "white"))
 
-    # GADGET CANDIDATES — chain material from evidence the run already holds. Runs before the reports so
-    # the digest and the hotlist can carry it; contacts nothing, so it can never change what a run did to
-    # a target. Best effort: a classifier is a REPORT, and losing it may never cost the run.
+    # gadget candidates — chain material from evidence the run holds, before the reports so they carry
+    # it. Contacts nothing; best-effort, since a classifier is a report.
     from . import gadgets
     try:
         n_gadgets = gadgets.classify(run_obj, scope)
@@ -1053,8 +994,7 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
             "# Checkpoints\n\n" + "\n".join(f"- {c.line()}" for c in all_cps) + "\n")
         run_obj.notes += [c.line() for c in all_cps]
 
-    # runtime telemetry → metrics/summary.json, written BEFORE the manifest so the manifest (the run
-    # index) points at it and carries the headline totals.
+    # telemetry -> metrics/summary.json, before the manifest so the manifest points at it
     run_wall = _time.perf_counter() - run_t0
     run_cpu, peak_rss_kb = metrics.rusage()
     tel = metrics.write(run_obj, phase_metrics, run_wall, run_cpu - run_cpu0, peak_rss_kb / 1024)
@@ -1066,13 +1006,13 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
                          "passive_only": profile.passive_only, "ports": profile.ports},
         phases_run=selected, metrics=metrics_summary, policy=policy_rows)
 
-    # honest run verdict — read the ONE canonical summary (same logic the manifest stores), never recompute
+    # read the one canonical summary the manifest stores, never recompute
     summ = run_obj._run_summary()
     verdict, fails, gaps, pexc = (summ["verdict"], summ["failures"], summ["gaps"], summ["phase_exceptions"])
     if verdict == "complete":
         click.echo(_c(f"\n══ complete · {run_obj.dir}", "green"))
     elif verdict == "complete_with_limits":
-        click.echo(_c(f"\n══ complete WITH LIMITS · {run_obj.dir}", "cyan"))    # operator-chosen samples only
+        click.echo(_c(f"\n══ complete WITH LIMITS · {run_obj.dir}", "cyan"))    # operator-chosen samples
     else:
         click.echo(_c(f"\n══ complete WITH GAPS · {run_obj.dir}", "yellow"))
     click.echo(f"   HOTLIST: {run_obj.reports / 'HOTLIST.md'}")
@@ -1084,8 +1024,8 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
         click.echo(_c(f"   ⚠ {len(fails)} tool run(s) failed ({shown}) — see manifest.json "
                       "'summary.failures'", "yellow"))
     if gaps:
-        tool_names = sorted({g['tool'] for g in gaps})                 # DISTINCT tools (a tool with both a
-        detail = sorted({f"{g['tool']}:{g['status']}" for g in gaps})  # partial and blocked run counts once)
+        tool_names = sorted({g['tool'] for g in gaps})                 # distinct tools
+        detail = sorted({f"{g['tool']}:{g['status']}" for g in gaps})
         click.echo(_c(f"   ⚠ {len(gaps)} degraded run(s) across {len(tool_names)} tool(s) "
                       f"({', '.join(detail[:6])}) — coverage incomplete; preserved output remains "
                       "available where present, see manifest.json 'summary.gaps'", "yellow"))
@@ -1093,9 +1033,9 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
         click.echo(_c(f"   ⚠ {len(pexc)} phase exception(s) — see manifest.json 'summary.phase_exceptions'",
                       "yellow"))
     cov = [c for c in (summ.get("coverage") or []) if c["omitted"] > 0 or not c["valid"]]
-    if cov:   # only sources that actually omitted input (or reported inconsistent counters)
+    if cov:   # only sources that omitted input or reported inconsistent counters
         def _lbl(c):
-            name = f"{c['source_id']}.{c['measure']}"          # e.g. crawl.xnlinkfinder.files vs .potential_params
+            name = f"{c['source_id']}.{c['measure']}"          # e.g. crawl.xnlinkfinder.files
             if not c["valid"]:
                 return f"{name} UNKNOWN"
             kinds = "/".join(sorted(k for k, v in c["by_kind"].items() if v["omitted"] > 0)) or "cap"
@@ -1118,12 +1058,10 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
         totals = (f"live={len(run_obj.read('live'))} urls={run_obj.count('url')} "
                   f"secrets={n_sec} confirmed={n_conf} candidates={n_cand}")
         leads = n_sec + sum(1 for f in _fnds if f.get("severity") in ("critical", "high"))
-        # ONE consolidated message, rendered from the manifest's own structured fields — `complete` and
-        # `lead` used to be sent separately with an identical body (which reads as a loop), and the body
-        # shipped the internal verdict token to the operator.
+        # one consolidated message, rendered from the manifest's structured fields
         notify.send_completion(target=profile.target, run_id=run_obj.run_id, summary=summ,
                                totals=totals, leads=leads)
-    return run_obj      # the finished run — a campaign supervisor absorbs its evidence and decides on it
+    return run_obj      # the finished run; a campaign supervisor absorbs its evidence
 
 
 # ── report ───────────────────────────────────────────────────────────────────
@@ -1140,7 +1078,7 @@ def report(profile_path, run_id):
     except ProfileError as e:
         raise click.ClickException(str(e))
     project = _project_dir(profile)
-    run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist (no ghost run)
+    run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
     # minimal scope (report doesn't re-filter)
@@ -1158,7 +1096,7 @@ def report(profile_path, run_id):
 
 @cli.command()
 def plan():
-    """Static dry-run: explain what WOULD run (registry + machine settings). No scanning."""
+    """Static dry-run: explain what would run (registry + machine settings). No scanning."""
     from . import views
     for line in views.plan_lines():
         click.echo(line)
@@ -1185,7 +1123,7 @@ def status(profile_path, run_id, campaign_id):
             raise click.UsageError("--run names a run and --campaign a campaign; ask for one of them")
         _echo_campaign(project, campaign_id)
         return
-    run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist (no ghost run)
+    run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
     for line in views.status_lines(run_obj.dir / "events.jsonl"):
@@ -1193,8 +1131,9 @@ def status(profile_path, run_id, campaign_id):
 
 
 def _echo_campaign(project, campaign_id: str) -> None:
-    """One campaign, read from its LEDGER — the durable record, so a running, finished and interrupted
-    campaign all read the same way, and an unreadable one says so instead of looking empty."""
+    """One campaign, read from its ledger, so running, finished and interrupted campaigns all read the same
+    way and an unreadable one says so.
+    """
     from . import campaign as _campaign
     from . import settle as _settle
 
@@ -1213,14 +1152,9 @@ def _echo_campaign(project, campaign_id: str) -> None:
 
 @cli.group()
 def oob():
-    """Out-of-band (OOB) interaction — one Quarry-owned callback layer.
-
-    Quarry manages interactsh-client internally (default public backend, or override oob.callback_server).
-    poll   = resume a run's owned session and pull DELAYED callbacks, correlated to their source
-             (params.oob_probe).
-    import = compatibility only — ingest EXTERNAL callback logs (Burp/XSSHunter/manual), uncorrelated
-             unless a row matches a Quarry-issued token.
-    """
+    """Out-of-band interaction: one Quarry-owned callback layer over interactsh-client. `poll` resumes a
+    run's owned session and pulls delayed callbacks, correlated to their source; `import` ingests external
+    callback logs, attributed only when a row matches a Quarry-issued token."""
 
 
 @oob.command("import")
@@ -1229,12 +1163,10 @@ def oob():
               help="project name, project dir, or target.yaml path")
 @click.option("--run", "run_id", help="run id (default: latest)")
 def oob_import(src_file, profile_path, run_id):
-    """Import EXTERNAL interactsh -json (JSONL) callback logs into a run as oob_interaction rows.
+    """Import external interactsh -json (JSONL) callback logs into a run as oob_interaction rows.
 
-    Compatibility path only — for callbacks Quarry did NOT issue (Burp Collaborator, XSSHunter, a manual
-    interactsh-client, any external collector). Recorded as evidence WITHOUT attribution; a row correlates
-    only if it matches a Quarry-issued token. Quarry-owned probes are correlated live via the OOB layer
-    (params.oob_probe / `quarry oob poll`). Raw import kept under raw/oob/.
+    Compatibility path for callbacks Quarry did not issue; recorded as evidence without attribution unless a
+    row matches a Quarry-issued token. Raw import kept under raw/oob/.
     """
     from . import oob as oobmod
 
@@ -1249,8 +1181,7 @@ def oob_import(src_file, profile_path, run_id):
     res = oobmod.import_file(run_obj, src_file)
     proto = ", ".join(f"{k}={v}" for k, v in sorted(res["by_protocol"].items())) or "(none)"
     ncorr = res.get("correlated", 0)
-    # correlated only when the imported log carried a Quarry-issued token (owned session on this run);
-    # otherwise every new row is external/stray -> uncorrelated. Report honestly, never claim attribution.
+    # correlated only when the imported log carried a Quarry-issued token; otherwise uncorrelated
     attr = (f"{ncorr} correlated to a Quarry token, {res['added'] - ncorr} uncorrelated"
             if ncorr else "uncorrelated (no matching Quarry-issued token)")
     click.echo(f"oob import: {res['parsed']} parsed · {res['added']} new oob_interaction(s) [{proto}] "
@@ -1264,11 +1195,10 @@ def oob_import(src_file, profile_path, run_id):
 @click.option("--wait", type=click.IntRange(min=0), default=8, show_default=True,
               help="seconds to let the resumed client fetch buffered callbacks")
 def oob_poll(profile_path, run_id, wait):
-    """Resume a run's OWNED interactsh session and poll for DELAYED callbacks (P2.4).
+    """Resume a run's owned interactsh session and poll for delayed callbacks.
 
-    SSRF/blind callbacks often arrive after the scan closes the first client. This re-opens the SAME
-    session (via its -session-file, token_map preserved) so late interactions correlate back to their
-    source. Adds any new (correlated) oob_interaction rows to the run.
+    Re-opens the same session (via its -session-file) so late SSRF/blind interactions correlate back to
+    their source, adding any new correlated oob_interaction rows.
     """
     import time as _time
     from . import oob as oobmod
@@ -1281,7 +1211,7 @@ def oob_poll(profile_path, run_id, wait):
     run_obj = _existing_run(project, profile.target, run_id)
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
-    # carry the configured token so a self-hosted/protected collector can resume (secrets, not persisted)
+    # carry the configured token so a self-hosted collector can resume (not persisted)
     resumed = oobmod.resume_session(run_obj, token=secrets.oob().get("auth_token"))
     if resumed is None:
         raise click.ClickException("no resumable OOB session for this run "

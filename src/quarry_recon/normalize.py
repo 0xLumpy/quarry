@@ -1,8 +1,7 @@
-"""Normalizers — convert raw tool output into stable entities with provenance.
+"""Normalizers — raw tool output to stable entities with provenance.
 
-Each function takes raw text + a source label and yields entity dicts. The phase code
-is responsible for scope-filtering and writing them into the store. Keeping parsing
-here (not inline in phases) means provenance stays consistent after dedup (design §4).
+Each function takes raw text plus a source label and yields entity dicts; scope-filtering and writing them
+into the store belong to the phase code.
 """
 from __future__ import annotations
 
@@ -54,8 +53,7 @@ _DNS_STR_TYPES = ("a", "aaaa", "cname", "ns", "mx", "txt", "caa")
 
 
 def _aslist(v):
-    """Coerce a dnsx field to a list — dnsx may emit a scalar or a dict (e.g. `soa`) instead of a
-    list; iterating those directly would yield chars / dict-keys, not records."""
+    """Coerce a dnsx field to a list — it may arrive as a scalar or a dict (e.g. `soa`) instead."""
     if v is None:
         return []
     if isinstance(v, (str, dict)):
@@ -210,18 +208,11 @@ def jsluice_secrets(raw: str, source: str, raw_ref: str | None = None) -> Iterat
 
 
 def host_of_url(url: str) -> str:
-    """The host an HTTP client would ACTUALLY contact, or "" when that cannot be determined.
+    """The host an HTTP client would actually contact, or "" when that cannot be determined.
 
-    review-B-audit-2#1: this was `^https?://([^/:]+)`, which stops at the first `:` — so
-    `https://acme.com:443@evil.net/graphql` returned `acme.com` while `urlsplit().hostname` and every HTTP
-    client use `evil.net`. Every scope decision in the repo runs through this function (49 call sites,
-    including `fetch.scoped_get`), so a URL could pass an in-scope check and then contact somewhere else.
-
-    Structural now, and FAIL-CLOSED — an empty answer makes a scope check refuse:
-      · only `http`/`https` (a `javascript:`/`data:` URL has no host to contact);
-      · USERINFO is refused outright. `user:pass@host` is exactly the confusion above, and no recon input
-        needs it — a caller that returns "" simply declines to treat the value as an in-scope URL;
-      · an invalid port (or a malformed IPv6 literal) makes `urlsplit` raise, which is also "".
+    Every scope decision in the repo runs through here, so the answer is fail-closed — "" makes a scope
+    check refuse. It is "" for any scheme other than `http`/`https`, for a netloc carrying userinfo
+    (`user:pass@host`, which no recon input needs), and for an invalid port or IPv6 literal.
     """
     try:
         parts = _urlsplit(url.strip())
@@ -239,14 +230,9 @@ def host_of_url(url: str) -> str:
     return host.lower()
 
 def idna_ascii(s: str):
-    """THE single IDNA implementation: IDNA2008 / UTS-46, NON-transitional. Returns the A-label form, or None
-    when the input cannot be encoded.
-
-    review#2 (vhost r4): three call sites shared the POLICY but each re-implemented the encode, so a fourth
-    (the vhost wordlist) drifted onto Python's builtin transitional codec and would have contacted `fass.de`
-    for `faß.de`. The encode now lives here; callers keep their own FAILURE policy, which legitimately
-    differs — config raises ProfileError, store falls back best-effort, this module's strict form returns
-    None because its caller is about to make a request."""
+    """The single IDNA encode in the repo: IDNA2008 / UTS-46, non-transitional. Returns the A-label form,
+    or None when the input cannot be encoded. Callers keep their own failure policy — config raises
+    ProfileError, store falls back best-effort, canon_host_strict returns None."""
     import idna as _idna
     try:
         return _idna.encode(s, uts46=True, transitional=False).decode("ascii")
@@ -255,16 +241,10 @@ def idna_ascii(s: str):
 
 
 def canon_host_strict(h: str):
-    """Canonicalize a hostname under Quarry's ONE IDNA policy — IDNA2008 / UTS-46 NON-transitional — or
-    return None when it cannot be a real hostname.
+    """Canonicalize a hostname under Quarry's one IDNA policy, or None when it cannot be a real hostname.
 
-    review#2 (vhost r3): the vhost wordlist used Python's builtin `str.encode("idna")` codec, which applies
-    TRANSITIONAL mapping: `faß` becomes `fass`, a DIFFERENT domain, so the lane would actively contact a name
-    the operator never scoped. config._canon_domain and store._canon_host both already use the correct policy;
-    this is the shared entry point so a third divergent copy cannot appear.
-
-    Unlike store._canon_host (best-effort, falls back to the lowered form) this is STRICT: anything that is
-    not a syntactically valid hostname returns None, because the caller is about to CONTACT it."""
+    Strict, unlike store._canon_host's best-effort fallback to the lowered form: anything that is not a
+    syntactically valid hostname returns None, because the caller is about to contact it."""
     s = str(h).strip().lower().rstrip(".")
     if not s or "/" in s or ".." in s or any(c.isspace() for c in s):
         return None

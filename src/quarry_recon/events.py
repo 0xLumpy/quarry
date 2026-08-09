@@ -1,22 +1,14 @@
-"""Structured run events — the control-plane RECORD (v0.3 stabilization, step 2).
+"""Structured run events — the control-plane record.
 
-Appends one JSON object per line to ``<run>/events.jsonl``. This file is the record; a console
-renderer / ``quarry status`` / a messenger read FROM it — we never scrape terminal text. Mirrors
-BBOT's control SUBSTRATE (typed events + a Produced/Consumed ledger, its ``scan-stats``), NOT BBOT's
-runtime UI: Quarry stays clean and Quarry-style, no 15s module-list dumps.
+One JSON object per line in `<run>/events.jsonl`. This file IS the record: `quarry status`, a console
+renderer and a messenger read from it, and nothing scrapes terminal text.
 
-Additive + declarative: no phase imports this yet, so there is NO behavior change (same safety as
-step 1's registry). ``contract.run_contract`` and, later, chunked danger-tools emit through it.
+Four rules:
 
-Design rules encoded here:
-- ``emit`` DROPS any optional field whose value is None — no fake precision (a tool that cannot report
-  a queue triple simply does not carry those fields).
-- EVERY event field is redacted via the proven ``secrets.redact`` at the sink before it touches disk —
-  not just cmd/env, but reason/fallback/discovery_context/paths/produced/consumed too, since any of
-  them can later carry a secret.
-- produced/consumed are NEVER computed here from stdout; ``ledger()`` carries REAL parser/store counts
-  that a phase passes in explicitly.
-- Best-effort: a sink failure never breaks a run (recon must not die because a log write failed).
+  · `emit` drops any optional field that is None — a tool with no queue simply carries no queue fields.
+  · every field is redacted at the sink before it touches disk, not only `cmd`/`env`.
+  · produced/consumed are never computed here from stdout; `ledger()` carries real parser counts.
+  · a sink failure never breaks a run, but it IS recorded (see `observability_degraded`).
 """
 from __future__ import annotations
 
@@ -29,12 +21,11 @@ from pathlib import Path
 from . import secrets
 
 
-# ── C07 increment 3: stable work-unit identity (the resume key) ───────────────────────────────────────
-# A work_unit identifies ONE unit of a source's work across runs so C10b resume can skip only genuinely
-# completed units. Target identity ALONE is insufficient: a completed unit must NOT be skipped after a
-# coverage-affecting change (a wider wordlist, a new rate, a changed input file, a parser upgrade). So the
-# unit is a hash over a VERSIONED CANONICAL ENVELOPE binding all of those — change any, get a new unit.
-_WORKUNIT_ENVELOPE_VERSION = 2       # review#10: v2 widens the key to 128-bit (see work_unit truncation)
+# ── work-unit identity (the resume key) ──────────────────────────────────────────────────────────────
+# A work unit identifies one unit of a source's work ACROSS RUNS, so resume skips only what genuinely
+# completed. Target identity alone is not enough: a wider wordlist, a new rate, a changed input file or
+# a parser upgrade must all produce a different unit, so the id hashes a versioned envelope of them.
+_WORKUNIT_ENVELOPE_VERSION = 2       # v2 widened the key to 128 bits
 
 
 def file_digest(path) -> str:
@@ -52,13 +43,11 @@ def file_digest(path) -> str:
 
 
 def work_unit(source_id, *, inputs=None, config=None, file_digests=None, schema_version=1) -> str:
-    """Stable work-unit id = short sha256 over a versioned canonical envelope:
-      - source_id      — the lane
-      - inputs         — normalized SEMANTIC inputs (origin URL, apex, sorted host/port set) — NOT loop index
-      - config         — coverage-affecting configuration (wordlist name, ports, recursion depth, mode, rate)
-      - file_digests   — {label: sha256} of coverage-affecting input files (see file_digest)
-      - schema_version — the adapter's output-schema version (a parser change invalidates old units)
-    Deterministic across runs; any coverage-affecting change flips the id so resume can't skip stale work."""
+    """Stable work-unit id: a short sha256 over source_id, normalized inputs, coverage-affecting config,
+    input-file digests and the adapter's schema version.
+
+    Deterministic across runs, so any coverage-affecting change flips the id and resume cannot skip work
+    whose meaning has moved. Inputs are SEMANTIC — never a loop index."""
     envelope = {
         "v": _WORKUNIT_ENVELOPE_VERSION,
         "source_id": source_id,
@@ -68,14 +57,11 @@ def work_unit(source_id, *, inputs=None, config=None, file_digests=None, schema_
         "schema": schema_version,
     }
     blob = json.dumps(envelope, sort_keys=True, separators=(",", ":"), default=str)
-    # review#10: 128-bit, not 64-bit. This is a resume key across EVERY lane — a collision makes C10b skip
-    # DIFFERENT work as already-done. 64 bits (16 hex) hits a ~2^32 birthday bound; 128 bits (32 hex) is
-    # collision-free for any realistic unit count, and the full digest is free to compute.
+    # 128 bits, not 64: this keys resume across every lane, and a collision makes a run skip DIFFERENT
+    # work as already done. 64 bits hits a ~2^32 birthday bound; the full digest is free to compute.
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
 
-# The event types. LEDGER is its OWN type (was a tool_finish-class update, which gave a source TWO
-# terminal-shaped events and broke the exactly-one-terminal invariant); coverage_reset marks a coverage
-# generation boundary.
+# Event types. LEDGER is its own type, so a source keeps exactly one terminal-shaped event.
 TOOL_START = "tool_start"
 TOOL_PROGRESS = "tool_progress"
 TOOL_FINISH = "tool_finish"
@@ -90,9 +76,8 @@ EVENT_TYPES = (TOOL_START, TOOL_PROGRESS, TOOL_FINISH,
 _sink: Path | None = None
 _coverage_seen: set = set()             # source_ids that emitted a coverage unit THIS session (for the snapshot)
 _provider_seen: set = set()             # source_ids whose provider terminal opened a generation THIS session
-# C11: in-memory record of event-sink write failures THIS session. Best-effort is preserved (a log-write
-# failure never crashes the run), but the loss is no longer SILENT — it's surfaced in the manifest as
-# `observability_degraded` so a run built on an incomplete events.jsonl is a recorded fact, not a clean lie.
+# event-sink write failures this session. Best-effort is preserved, but the loss is not silent: it
+# surfaces as `observability_degraded`, so a run built on an incomplete log is a recorded fact.
 _degraded: dict = {"writes_failed": 0, "first_error": None}
 
 
@@ -119,9 +104,10 @@ def _load_degraded() -> dict:
 
 
 def persist_degraded() -> None:
-    """ATOMICALLY write the accumulated degradation record so the NEXT resume inherits it (review#6). Called
-    from emit() the instant a write first fails (review#4: crash-durable — not deferred to manifest time) AND
-    at manifest time. Best-effort — if this write fails, the in-memory record still reflects the session."""
+    """Atomically write the accumulated degradation record, so the next resume inherits it.
+
+    Written the instant a write first fails, not deferred to manifest time: a crash must not take the
+    marker with it. Best-effort — the in-memory record still reflects this session either way."""
     p = _degraded_path()
     if p is None:
         return
@@ -134,12 +120,11 @@ def persist_degraded() -> None:
 
 
 def configure(run_dir) -> Path:
-    """Point the sink at ``<run_dir>/events.jsonl`` (created if missing). Idempotent; returns path.
-    Clears the per-session coverage-snapshot guard so this process's first coverage unit per source opens a
-    FRESH generation — a resume (new process APPENDING to the same events.jsonl) thereby supersedes the prior
-    run's units, so a capped unit that DISAPPEARS on rerun no longer leaves a stale gap. LOADS the persisted
-    degradation record (review#6: a resume ACCUMULATES it, so a run whose prior session lost events can never
-    be recorded clean)."""
+    """Point the sink at `<run_dir>/events.jsonl` (created if missing). Idempotent; returns path.
+
+    Opens a fresh coverage generation for this process, so a resume supersedes the prior run's units
+    rather than inheriting a gap from one that has since disappeared. Loads the persisted degradation
+    record, which ACCUMULATES: a run whose earlier session lost events can never be recorded clean."""
     global _sink, _coverage_seen, _provider_seen, _degraded
     _sink = Path(run_dir) / "events.jsonl"
     _sink.parent.mkdir(parents=True, exist_ok=True)
@@ -159,9 +144,8 @@ def reset() -> None:
 
 
 def observability_degraded() -> dict | None:
-    """C11: non-None when >=1 event write FAILED this session — the events.jsonl is INCOMPLETE, so any
-    coverage/verdict folded from it is provisional. Returns {writes_failed, first_error}; None when clean.
-    The manifest reads this so a silent telemetry loss becomes a recorded fact."""
+    """Non-None when an event write failed this session: the log is incomplete, so any verdict folded
+    from it is provisional. The manifest carries it, so telemetry loss is a recorded fact."""
     return dict(_degraded) if _degraded["writes_failed"] else None
 
 
@@ -178,9 +162,7 @@ def _redact(v):
 
 
 def emit(event: str, source_id: str, **fields) -> dict:
-    """Append one event. Fields with value None are omitted (no fabricated precision). EVERY field is
-    redacted at this sink (secrets never reach disk regardless of which field carried them). Every
-    event carries ``ts`` and ``source_id``. Best-effort write; returns the record (also used by tests)."""
+    """Append one event, dropping None fields and redacting every value. Returns the record."""
     rec = {"ts": round(time.time(), 3), "event": event, "source_id": source_id}
     for k, val in fields.items():
         if val is not None:
@@ -191,23 +173,20 @@ def emit(event: str, source_id: str, **fields) -> dict:
             with _sink.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, default=str, ensure_ascii=False) + "\n")
         except Exception as e:
-            # C11: best-effort — never break a recon run — but RECORD the loss (was silently swallowed).
+            # best-effort — a log write must not break a run — but the loss is recorded, not swallowed
             _degraded["writes_failed"] += 1
             if _degraded["first_error"] is None:
                 _degraded["first_error"] = f"{type(e).__name__}: {e}"
-            persist_degraded()   # review#4: crash-durable — persist the marker NOW, not only at manifest time
+            persist_degraded()   # now, not at manifest time: a crash must not take the marker with it
     return rec
 
 
 def tool_start(source_id, *, cmd=None, env=None, input_total=None, work_unit=None,
                workers=None, rate=None, timeout=None, provider=None, reset_generation=None,
                parent_id=None, scope_distance=None, discovery_context=None) -> dict:
-    """Emitted before a source runs. cmd/env (like all fields) are redacted at the sink; workers/rate/
-    timeout are the PLANNED contract values (from the registry). ``work_unit`` (C07 inc 3) is the stable
-    resume key for a looped/grouped lane. ``provider``/``reset_generation`` (review-r5#1): an in-process
-    provider stamps its generation reset on the START (persisted BEFORE execution) so a crash between start and
-    terminal still supersedes the prior generation — and a start with no matching terminal reads as INCOMPLETE
-    (a gap), never the prior generation's success. Provenance rides along for v0.4."""
+    """Emitted before a source runs; `work_unit` is the resume key.
+
+    A start with no terminal reads as INCOMPLETE, so a provider stamps its generation reset here."""
     return emit(TOOL_START, source_id,
                 cmd=list(cmd) if cmd is not None else None,
                 env=dict(env) if env else None,
@@ -220,10 +199,7 @@ def tool_progress(source_id, *, input_total=None, current_index=None, work_unit=
                   chunk_index=None, chunk_total=None,
                   elapsed=None, rss=None, artifact_size=None, last_output_at=None,
                   queued=None, running=None, done=None) -> dict:
-    """OPTIONAL progress — every field is optional and None-dropped. Modes (use only what is REAL):
-    input_total/current_index (countable inputs) · chunk_index/chunk_total (chunked) ·
-    elapsed/rss/artifact_size/last_output_at (opaque long-runners) · queued/running/done (true queues).
-    Do NOT invent a queue triple for a tool that has none."""
+    """Optional progress. Pass only what the tool really reports — never invent a queue triple."""
     return emit(TOOL_PROGRESS, source_id,
                 input_total=input_total, current_index=current_index, work_unit=work_unit,
                 chunk_index=chunk_index, chunk_total=chunk_total,
@@ -235,14 +211,8 @@ def tool_finish(source_id, *, status=None, reason=None, duration=None, exit_code
                 rss=None, cpu_s=None, raw_ref=None, artifact_size=None,
                 produced=None, consumed=None, fallback=None, error_class=None, provider=None,
                 reset_generation=None, parent_id=None, scope_distance=None, discovery_context=None) -> dict:
-    """Emitted after a source finishes. produced/consumed are absent unless the caller passes REAL
-    parser/store counts (never guessed here). raw_ref/artifact_size point at the persisted output.
-    ``work_unit`` (C07 inc 3) ties this terminal to the same stable unit as its tool_start (resume key).
-    ``error_class`` (C06) tags a FAILED terminal as auth/quota/transport/parse/server/error so a consumer can
-    tell a real failure from 'nothing found' and pick retry/backoff — never guessed, only set on a failure.
-    ``provider`` (C06) marks an IN-PROCESS provider terminal (run_provider) — providers never hit _tool_runs,
-    so the verdict reads their terminals from the event log; the flag lets it fold them without double-counting
-    a subprocess lane's tool_finish."""
+    """The source's terminal event. `error_class` is set only on a failure, and `provider` marks an
+    in-process lane, which the verdict reads from the event log rather than the subprocess ledger."""
     return emit(TOOL_FINISH, source_id, status=status, reason=reason, duration=duration,
                 exit_code=exit_code, work_unit=work_unit, rss=rss, cpu_s=cpu_s,
                 raw_ref=raw_ref, artifact_size=artifact_size,
@@ -258,44 +228,23 @@ def artifact_written(source_id, *, path=None, count=None, artifact_size=None) ->
                 path=str(path) if path is not None else None, count=count, artifact_size=artifact_size)
 
 
-# kinds of coverage shortfall — they reconcile into the run verdict DIFFERENTLY (see store._run_summary):
-COVERAGE_SAMPLE = "sample"    # operator-CHOSEN subset: a soft LIMIT (complete_with_limits), never a gap
-COVERAGE_PROVIDER = "provider"  # an EXTERNAL provider LIMIT (credits spent / plan) truncated the input: a soft
-                              # LIMIT like sample, NOT a gap — nothing here failed and there is nothing to
-                              # retry in this run. review-B0r4#1: emitting COVERAGE_CAP for a later-page
-                              # quota called the provider's boundary "a hard ceiling of OURS", so a
-                              # depletion produced complete_with_gaps.
-COVERAGE_CAP = "cap"          # a hard ceiling truncated eligible input: a gap whenever omitted>0 (10%/100 = priority only)
-COVERAGE_TIMEOUT = "timeout"  # input the TARGET/network cost us — a per-item timeout, an error-driven skip (e.g.
-                              # nuclei -mhe dropping a host after N request errors), a deps-fail: ALWAYS feeds
-                              # the verdict. The name is narrower than the bucket; the bucket is "not our
-                              # ceiling, not the operator's choice — it was lost in flight".
-COVERAGE_TOOL_OMISSION = "tool_omission"   # the TOOL deterministically declined part of the input for a
-                              # stated reason of its own — not our ceiling (`cap`), not the target/network
-                              # costing us the item (`timeout`), not an operator subset (`sample`) and not
-                              # an external provider limit (`provider`). We submitted it and it was not
-                              # examined, so it is a GAP whenever omitted>0. review#16 (Lumpy): a
-                              # content-type refusal reported as `timeout` is misleading in the manifest,
-                              # which is operator evidence — the label must not become permanent
-                              # vocabulary by accident.
-COVERAGE_OWNERSHIP = "ownership"  # OUR OWN storage/ownership state withheld the input — a receipt that could
-                              # not be written, an artifact we cannot prove we own, a state we cannot
-                              # inspect. review#26 (Lumpy): reporting these as `cap` called an internal
-                              # durability failure "a hard ceiling of ours", which is the same class of
-                              # mislabel that `provider` and `tool_omission` exist to prevent. It GATES
-                              # (only sample/provider are soft) and nothing about it is a ceiling: no
-                              # eligible input was truncated by policy, and an operator clears it by
-                              # resolving the files, not by raising a number.
-COVERAGE_UNKNOWN = "unknown"  # the source RAN but its coverage is UNMEASURABLE (stats missing/corrupt). Carries NO
-                              # counters, so it is never summed — it forces coverage_valid=False, which the verdict
-                              # reads as a GAP. Unmeasured must never be indistinguishable from fully covered.
+# Kinds of coverage shortfall. They reconcile into the verdict differently: only SAMPLE and PROVIDER
+# are soft limits, every other kind gates. Each exists because the wrong label sends an operator to
+# the wrong place — see store._run_summary.
+COVERAGE_SAMPLE = "sample"               # operator-selected subset; soft limit
+COVERAGE_PROVIDER = "provider"           # external provider limit; soft limit
+COVERAGE_CAP = "cap"                     # a Quarry ceiling omitted input; gap
+COVERAGE_TIMEOUT = "timeout"             # the target or network lost the input; gap
+COVERAGE_TOOL_OMISSION = "tool_omission"  # the tool declined input we submitted; gap
+COVERAGE_OWNERSHIP = "ownership"         # local ownership state withheld input; gap
+COVERAGE_UNKNOWN = "unknown"             # coverage cannot be measured; gap
 
 
 def mark_provider_generation(source_id) -> bool:
-    """review-r4#3: True the FIRST time a provider terminal is emitted for `source_id` THIS session. run_provider
-    stamps that terminal reset_generation=True so the verdict supersedes this source's PRIOR-session terminals
-    (a changed work_unit / retry no longer leaves a stale failure gating the run) — the terminal analog of a
-    coverage generation. Cleared by configure()/reset()."""
+    """True the FIRST time a provider terminal is emitted for `source_id` this session.
+
+    The terminal analog of a coverage generation: it supersedes this source's prior-session terminals, so
+    a changed work unit or a retry cannot leave a stale failure gating the run."""
     if source_id in _provider_seen:
         return False
     _provider_seen.add(source_id)
@@ -303,45 +252,23 @@ def mark_provider_generation(source_id) -> bool:
 
 
 def coverage_reset(source_id) -> dict:
-    """Open a new coverage GENERATION for a source. Reconciliation ignores this source's units emitted
-    BEFORE the latest reset, so a unit that disappears on rerun (e.g. a per-host ffuf unit whose host is
-    gone) is superseded instead of leaving a stale gap. Auto-emitted by the first coverage_partial per
-    source per session; callers rarely need it directly."""
+    """Open a new coverage generation: units emitted before the latest reset are ignored, so one that
+    disappears on rerun is superseded rather than left as a stale gap. Auto-emitted per source."""
     return emit(COVERAGE_RESET, source_id)
 
 
 def coverage_partial(source_id, *, reason=None, produced=None,
                      eligible=None, tested=None, omitted=None, kind=None, unit=None, measure=None) -> dict:
-    """Ran but did not fully cover its input (timeout, deps-fail, a hard cap, a designed sample, or an
-    external PROVIDER limit).
+    """Ran but did not fully cover its input.
 
-    Carries structured COUNTERS when the site can count them (None-dropped otherwise, so the legacy
-    timeout callers that pass only ``reason`` are unchanged):
-      - ``eligible`` — countable inputs the source COULD have processed (compute AFTER scope/active gating,
-                       so a passive-skipped source never reports phantom `tested`)
-      - ``tested``   — how many it actually processed
-      - ``omitted``  — eligible - tested (derived when omitted is None)
-      - ``kind``     — COVERAGE_SAMPLE / COVERAGE_CAP / COVERAGE_TIMEOUT. VERDICT policy (truth, not a
-                       threshold): a CAP or TIMEOUT with omitted>0 is a gap regardless of fraction; an
-                       operator SAMPLE is a soft limit; the 10%/100 rule is only a major/minor PRIORITY.
-      - ``unit``     — a STABLE id for the capping unit (default = source_id). Reconciliation keeps only the
-                       LATEST record per (source_id, unit); emit EVERY run (omitted=0 when uncapped) so a
-                       later uncapped rerun clears a prior cap.
-      - ``measure``  — WHAT is being counted (files / hosts / result_rows / …). Counters are aggregated ONLY
-                       within the same (source_id, measure) — files and params are NEVER summed together.
-
-    Counters are validated: non-negative ints with ``tested + omitted == eligible``. An inconsistent triple
-    is flagged ``coverage_valid=False`` so the verdict treats it as UNKNOWN (a gap), never fake completion.
-
-    ``kind=COVERAGE_UNKNOWN`` is the FIRST-CLASS "ran but unmeasurable" record: it carries no counters yet is
-    still a STRUCTURED unit — it opens a generation and reaches the rollup. Without that, an unmeasurable unit
-    was a reason-only event, which (a) the rollup skipped entirely, so a first run with no stats read as fully
-    covered, and (b) did not reset, so a PRIOR run's counters kept standing in for it. Both made unmeasured
-    indistinguishable from complete.
+    Counters are optional and validated: `tested + omitted == eligible`, or `coverage_valid=False` and
+    the verdict reads UNKNOWN. `unit` is what reconciliation replaces (latest record per source+unit, so
+    emit every run — omitted=0 clears a prior cap); `measure` is what aggregation groups by, so files and
+    params are never summed. COVERAGE_UNKNOWN carries no counters and still gates.
     """
     structured = eligible is not None or kind == COVERAGE_UNKNOWN
-    # Auto-open a generation for STRUCTURED coverage only. A legacy reason-only partial must not reset — it
-    # carries no replacement counters, so resetting would wrongly clear the real prior units.
+    # structured coverage only: a reason-only partial carries no replacement counters, so resetting on it
+    # would clear the real prior units
     if structured and source_id not in _coverage_seen:
         _coverage_seen.add(source_id)
         coverage_reset(source_id)
@@ -364,26 +291,21 @@ def coverage_partial(source_id, *, reason=None, produced=None,
 
 
 def tool_blocked(source_id, *, reason=None) -> dict:
-    """Stopped by the target (WAF / rate-limit / forbidden) — not a genuine empty."""
+    """A source Quarry's own gate prevented from running (not registered, a guard refusal, acquisition
+    closed) — distinct from a genuine empty."""
     return emit(TOOL_BLOCKED, source_id, reason=reason)
 
 
 def spend(source_id, *, provider: str, measure: str, amount, unit=None) -> dict:
-    """What one ACQUISITION lane actually spent, in the unit it is charged in.
+    """What one acquisition lane spent, in the unit it is charged in.
 
-    A campaign that repeats runs has to see spending per child, and there is no single number that means
-    "spend": Shodan charges query credits and hands back pages, Whoxy sells pages, and `pages_bought` is
-    not equivalent to charged requests. So the MEASURE is part of the record and nothing is summed across
-    measures (settle prerequisite D)."""
+    There is no single number meaning "spend" — Shodan charges query credits, Whoxy sells pages — so the
+    MEASURE is part of the record and nothing is summed across measures."""
     return emit("spend", source_id, provider=provider, measure=measure,
                 amount=amount if type(amount) is int and amount >= 0 else None, unit=unit)
 
 
 def ledger(source_id, *, produced=None, consumed=None, **extra) -> dict:
-    """Report REAL produced/consumed counts from the parser/store layer (BBOT scan-stats analog =
-    the review-4992 answer). Counts come from the caller's parse/store step, NEVER from stdout.
-    Emitted as a tool_finish-class update tagged ``ledger`` so a scan-stats view can aggregate it.
-    ``extra`` keyword fields (e.g. 4.3.A's reduction_percent / top_collapsed) ride along on the same
-    ledger event so the reduction stays one clear record. Emitted as its OWN LEDGER event (NOT a second
-    tool_finish) so a source has exactly one terminal."""
+    """Real produced/consumed counts from the caller's parse step. Its own event, not a second
+    tool_finish, so a source keeps exactly one terminal."""
     return emit(LEDGER, source_id, produced=produced, consumed=consumed, **extra)
