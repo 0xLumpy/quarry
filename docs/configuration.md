@@ -75,12 +75,13 @@ is the 1440-minute maximum, not unbounded.
 ## Throughput budgets (seconds)
 
 Every `*_BUDGET_S` is a wall-clock **ceiling in seconds**, and `0` (the default) means unbounded. A budget
-bounds how long a lane runs — **never which input is eligible**. Whatever it does not reach is counted and
-picked up on the next run. Set one only to time-box a lane on a large target.
+bounds how long a lane runs — **never which input is eligible**. The budget is checked **between items**, so
+an in-flight item finishes. Whatever it does not reach is counted; a resumable (`project_progress`) lane
+picks it up on a later run, others repeat their prefix. Set one only to time-box a lane on a large target.
 
 ```yaml
 PERFORMANCE:
-  JS_FETCH_BUDGET_S: 1800     # spend at most 30 min downloading JS this run; the rest resumes
+  JS_FETCH_BUDGET_S: 1800     # ~30 min downloading JS this run (an in-flight item may run over); rest resumes
 ```
 
 | Key | Lane it bounds |

@@ -57,6 +57,7 @@ notify:
   webhook:  https://your.endpoint/quarry     # plain JSON POST, for anything else
 ```
 
+Check the configured channels with `quarry notify`, which shows and validates them without sending a run.
 Notification content is redacted like everything else — configured secrets never appear in a message.
 
 ## Operator-supplied data

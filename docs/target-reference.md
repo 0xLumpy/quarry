@@ -86,4 +86,4 @@ MODES:
 
 Run against the profile with `quarry run -t <name>` (a bare name resolves under `~/projects`). Preview the effective coverage
 policy (the machine bounds, not a scope preview) with `quarry policy`. See
-[running-campaigns.md](running-campaigns.md).
+[running.md](running.md).

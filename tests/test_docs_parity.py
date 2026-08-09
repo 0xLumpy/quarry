@@ -16,12 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
 DATA = ROOT / "src" / "quarry_recon" / "data"
 
-#: batch-2 pages not written yet — links to them are allowed to dangle until they land.
-_PENDING = {
-    "installation.md", "quickstart.md", "running.md", "running-campaigns.md",
-    "campaigns.md", "outputs-and-coverage.md", "oob.md", "errors-and-recovery.md",
-    "architecture.md", "tuning.md",
-}
+#: batch-2 pages not written yet — links to them are allowed to dangle until they land. All landed.
+_PENDING: set[str] = set()
 
 
 def _read(name: str) -> str:
@@ -58,14 +54,47 @@ def test_every_secret_block_is_documented():
 def test_all_relative_doc_links_resolve():
     bad = []
     for md in DOCS.glob("*.md"):
-        for target in re.findall(r"\]\(([^)]+\.md)\)", md.read_text()):
-            if target.startswith("http") or "/" in target:
+        for target in re.findall(r"\]\((?!https?:|mailto:|#)([^)]+)\)", md.read_text()):
+            target = target.split("#", 1)[0]          # drop an #anchor; resolve the path part
+            if not target or target in _PENDING:
                 continue
-            if target in _PENDING:
-                continue
-            if not (DOCS / target).exists():
+            # resolve relative to the linking file's dir — covers .md, directory links (design/), and ../
+            if not (md.parent / target).resolve().exists():
                 bad.append(f"{md.name} -> {target}")
     assert not bad, f"broken doc links: {bad}"
+
+
+def test_every_command_is_documented_somewhere():
+    from quarry_recon.cli import cli
+
+    corpus = "\n".join(md.read_text() for md in DOCS.glob("*.md"))
+    # require the actual invocation `quarry <cmd>`, not just the word — a bare "run"/"set" is ordinary prose.
+    missing = [c for c in cli.commands if f"quarry {c}" not in corpus]
+    assert not missing, f"commands never shown as `quarry <cmd>`: {missing}"
+    oob = cli.commands.get("oob")
+    sub_missing = [n for n in getattr(oob, "commands", {}) if f"quarry oob {n}" not in corpus]
+    assert not sub_missing, f"oob subcommands never shown as `quarry oob <cmd>`: {sub_missing}"
+
+
+def test_every_entity_is_documented():
+    from quarry_recon import store
+
+    page = _read("outputs-and-coverage.md")
+    missing = [e for e in store.ENTITY_KEYS if f"`{e}`" not in page]
+    assert not missing, f"outputs-and-coverage.md is missing entities: {missing}"
+
+
+def test_every_coverage_kind_is_documented_with_its_class():
+    from quarry_recon import events
+
+    page = _read("outputs-and-coverage.md")
+    soft = [events.COVERAGE_SAMPLE, events.COVERAGE_PROVIDER]
+    gaps = [events.COVERAGE_CAP, events.COVERAGE_TIMEOUT, events.COVERAGE_TOOL_OMISSION,
+            events.COVERAGE_OWNERSHIP, events.COVERAGE_UNKNOWN]
+    # pin the classification, not just the name: each kind must sit in a row with its soft-limit/gap class.
+    bad = [k for k in soft if f"`{k}` | soft limit" not in page]
+    bad += [k for k in gaps if f"`{k}` | gap" not in page]
+    assert not bad, f"outputs-and-coverage.md miscategorises or omits coverage kinds: {bad}"
 
 
 def test_all_fenced_yaml_examples_parse():
