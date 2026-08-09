@@ -3515,7 +3515,8 @@ md = triage.build(run, scope)
 c_hot = ("1 correlated, 1 uncorrelated" in md and "CORRELATED ssrf-callback <- params.oob_probe" in md)
 csrc = inspect.getsource(climod)
 c_cmd = (CliRunner().invoke(climod.cli, ["oob", "poll", "--help"]).exit_code == 0)
-c_wire = ('resume_session(run_obj, token=secrets.oob().get("auth_token"))' in csrc
+c_wire = ("resume_session(run_obj" in csrc and 'token=_cfg.get("auth_token")' in csrc
+          and 'server=_cfg.get("callback_server")' in csrc      # token coupled to the saved server
           and "close_session" in csrc and "--wait" in csrc)
 sys.exit(0 if (c_corr and c_unc and c_hot and c_cmd and c_wire and c_prov and c_wait) else 1)
 PYEOF

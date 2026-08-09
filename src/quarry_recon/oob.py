@@ -232,12 +232,22 @@ def open_session(run, server=None, token=None, wait: int = 12):
     return session, proc
 
 
-def resume_session(run, token=None, wait: int = 12):
+def _resume_token(saved_server, current_server, token):
+    """The token to reuse on resume: kept only for a self-hosted saved session whose server the current
+    config still matches; a public or changed session gets none."""
+    saved = _server_hosts(saved_server)
+    if not saved or not token:
+        return None
+    return str(token) if set(_server_hosts(current_server)) == set(saved) else None
+
+
+def resume_session(run, token=None, server=None, wait: int = 12):
     """Re-open the run's owned session to poll delayed callbacks, returning (session, proc) with the
     saved token_map intact — this path never rebuilds it (open_session mints a fresh session instead).
 
-    Returns None if there is no saved session, no interactsh-client, or the re-registered domain does
-    not match the saved one.
+    `server`/`token` are the current oob config; the token is coupled to the saved server (see
+    `_resume_token`). Returns None if there is no saved session, no interactsh-client, or the re-registered
+    domain does not match the saved one.
     """
     prev = load_session(run)
     if not prev or not prev.get("session_file") or not shutil.which("interactsh-client"):
@@ -247,8 +257,9 @@ def resume_session(run, token=None, wait: int = 12):
     srv = ",".join(_server_hosts(prev.get("server"))) if prev.get("server") else ""   # bare domains for -server
     if srv:
         cmd += ["-server", srv]
-    if token:
-        cmd += ["-token", str(token)]
+    eff_token = _resume_token(prev.get("server"), server, token)
+    if eff_token:
+        cmd += ["-token", eff_token]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             start_new_session=True)   # own process group -> terminate_group kills the tree
     parsed = _await_register(proc, prev.get("server"), wait)

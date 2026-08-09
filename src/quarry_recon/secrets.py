@@ -115,7 +115,13 @@ def oob() -> dict:
     `auth_token`) overrides the callback backend, for both Quarry's own interactsh-client session
     (-server, a bare host) and nuclei (-iserver, the full URL). Empty means the public backend."""
     o = load().get("oob")
-    return o if isinstance(o, dict) else {}
+    if not isinstance(o, dict):
+        return {}
+    # drop an auth_token with no callback host to authenticate to (the `-server` flag's own normalizer).
+    from .oob import _server_hosts
+    if o.get("auth_token") and not _server_hosts(o.get("callback_server")):
+        o = {k: v for k, v in o.items() if k != "auth_token"}
+    return o
 
 
 def github_tokens_file() -> Path | None:

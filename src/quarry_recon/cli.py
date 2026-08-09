@@ -1211,8 +1211,10 @@ def oob_poll(profile_path, run_id, wait):
     run_obj = _existing_run(project, profile.target, run_id)
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
-    # carry the configured token so a self-hosted collector can resume (not persisted)
-    resumed = oobmod.resume_session(run_obj, token=secrets.oob().get("auth_token"))
+    # current oob config; resume_session couples the token to the saved session's server (not persisted)
+    _cfg = secrets.oob()
+    resumed = oobmod.resume_session(run_obj, token=_cfg.get("auth_token"),
+                                    server=_cfg.get("callback_server"))
     if resumed is None:
         raise click.ClickException("no resumable OOB session for this run "
                                    "(session.json missing, interactsh-client absent, or domain mismatch)")
