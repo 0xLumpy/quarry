@@ -141,8 +141,8 @@ each mode does and when to arm it.
 
 ### API keys and webhooks
 
-`~/.config/quarry/secrets.yaml`, mode 600, created at install. Everything here is optional. Lanes
-that require an unset key are recorded as skipped, not silently dropped.
+`~/.config/quarry/secrets.yaml`, mode 600, created at install. Everything here is optional. Most lanes that need an unset key are recorded as skipped — but a few skip silently (Censys, OpenINTEL,
+shosubgo), and CertSpotter and ProjectDiscovery tools run without their optional keys.
 
 | Entry | Used by |
 |---|---|

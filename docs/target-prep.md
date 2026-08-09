@@ -25,7 +25,7 @@ below produces the **seeds** those phases build on.
 
 ## What the `quarry osint` pre-flight automates (and the keys it needs)
 
-Run **`quarry osint -t projects/<t>/target.yaml`** *before* `quarry run`. It automates the parts of this
+Run **`quarry osint -t <project>`** *before* `quarry run`. It automates the parts of this
 guide that *can* be scripted and writes `osint-report.md` + `target.suggested.yaml` (+ `candidates.jsonl`
 / `intel.jsonl`) to the project's `osint/latest/`. **It never edits scope** — everything it finds is a
 candidate; you confirm and uncomment the good ones into `target.yaml` yourself, then run recon.
@@ -281,7 +281,7 @@ NOTES:
 Then:
 
 ```bash
-quarry run -t projects/acme/target.yaml
+quarry run -t acme
 ```
 
 With `CIDR`/`ASN` set, the horizontal phase now also runs `mapcidr`, `tlsx` SAN harvest,

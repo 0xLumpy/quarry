@@ -47,7 +47,7 @@ quarry install --include-optional           # provision the toolset (+ optional 
 quarry init 0xlumpy
 ```
 
-`projects/0xlumpy/target.yaml`:
+`~/projects/0xlumpy/target.yaml`:
 
 ```yaml
 TARGET: 0xlumpy
@@ -92,7 +92,7 @@ MODES:
 ## 2. Launch
 
 ```bash
-quarry run -t projects/0xlumpy/target.yaml
+quarry run -t 0xlumpy
 ```
 
 Run phases execute in order
@@ -100,7 +100,7 @@ Run phases execute in order
 (OSINT is a separate pre-flight — §3 — run *before* this, on the confirmed scope). Each tool call captures
 stdout/stderr/exit/duration, writes raw output under `raw/<phase>/<tool>/`, classifies the
 result, and normalizes parsed entities into `normalized/*.jsonl`. After each phase the
-checkpoint engine evaluates coverage. Run dir: `projects/0xlumpy/recon/20260620-120000-a1b2c3d4/`.
+checkpoint engine evaluates coverage. Run dir: `~/projects/0xlumpy/recon/20260620-120000-a1b2c3d4/`.
 
 ```
 ══ Quarry run 20260620-120000-a1b2c3d4 · target=0xlumpy · ACTIVE ══
@@ -114,7 +114,7 @@ checkpoint engine evaluates coverage. Run dir: `projects/0xlumpy/recon/20260620-
 ## 3. Pre-flight — `quarry osint` (separate command, run before §2)
 
 ```bash
-quarry osint -t projects/0xlumpy/target.yaml   # → projects/0xlumpy/osint/<ts>/{osint-report.md, target.suggested.yaml, candidates.jsonl, intel.jsonl}
+quarry osint -t 0xlumpy   # → ~/projects/0xlumpy/osint/<ts>/{osint-report.md, target.suggested.yaml, candidates.jsonl, intel.jsonl}
 ```
 
 Apex/ASN/CIDR/org/leak discovery (all passive — queries third parties, not the target). Discovered
@@ -165,7 +165,7 @@ porch-pirate -s 0xlumpy.cc --urls      # endpoints → intel; --globals → inte
 ══ Quarry osint · target=0xlumpy (pre-flight, review-only) ══
   azmap[0xlumpy.cc]: N related + M e-mail domain(s)
   …
-══ osint <verdict> · projects/0xlumpy/osint/<ts>
+══ osint <verdict> · ~/projects/0xlumpy/osint/<ts>
    report:    …/osint-report.md
    suggested: …/target.suggested.yaml
    N apex candidate(s) — review, confirm scope, add to target.yaml
@@ -537,7 +537,7 @@ State pointers: `recon/state/current → recon/20260620-120000-a1b2c3d4`,
 `recon/state/history/20260620-120000-a1b2c3d4.json`.
 
 ```
-══ complete · projects/0xlumpy/recon/20260620-120000-a1b2c3d4
+══ complete · ~/projects/0xlumpy/recon/20260620-120000-a1b2c3d4
    HOTLIST: …/reports/HOTLIST.md
    exports: subdomains.txt=N, resolved.txt=N, live.txt=N, urls.txt=N, …
 ```
@@ -550,7 +550,7 @@ State pointers: `recon/state/current → recon/20260620-120000-a1b2c3d4`,
 ## 14. Full output tree
 
 ```
-projects/0xlumpy/
+~/projects/0xlumpy/
   target.yaml
   osint/<ts>/     candidates.jsonl  intel.jsonl  manifest.json  osint-report.md
                   target.suggested.yaml    # candidate blocks, commented — never auto-scoped
@@ -570,7 +570,7 @@ projects/0xlumpy/
       enrich/{puredns/…, dnsx/…, httpx/…}
       content/ffuf/…              # only if CONTENT_DISCOVERY on
       params/{gf/*.txt, nuclei/{findings,takeover}.jsonl+nuclei.run.log, arjun/*.txt, dalfox/*.jsonl}
-      oob/session.json            # if the OOB callback lane opened a session
+      oob/session/session.json    # if the OOB callback lane opened a session
     normalized/                   # one .jsonl per entity (23 types):
       subdomain resolved dns_record live url js_url endpoint parameter secret ip certificate port
       web_port finding screenshot tech review wildcard_zone ownership_transition gadget_candidate
@@ -591,36 +591,36 @@ projects/0xlumpy/
 ```bash
 # passive only — no active probing (httpx/katana-active/nuclei/dalfox/naabu/waf/enrich/origin skipped;
 # kaeferjaeger, subfinder, CT lanes, gau, waymore -mode U still run)
-quarry run -t projects/0xlumpy/target.yaml --passive
+quarry run -t 0xlumpy --passive
 
 # one or more phases
-quarry run -t projects/0xlumpy/target.yaml --phases vertical
-quarry run -t projects/0xlumpy/target.yaml --phases probe,crawl
+quarry run -t 0xlumpy --phases vertical
+quarry run -t 0xlumpy --phases probe,crawl
 
 # lift free-tool volume ceilings (obtains no new sources; never changes scope/rate/spend)
-quarry run -t projects/0xlumpy/target.yaml --unbound
+quarry run -t 0xlumpy --unbound
 
 # supervisor: keep creating child runs while resumable work still advances (acquisition closed from child 2)
-quarry run -t projects/0xlumpy/target.yaml --settle --settle-max-runs 10 --settle-budget 7200
+quarry run -t 0xlumpy --settle --settle-max-runs 10 --settle-budget 7200
 
 # static dry-run — explain what would run (registry + machine settings), scan nothing
 quarry plan
 
 # regenerate HOTLIST/digest/delta + exports from a stored run, no scanning
-quarry report -t projects/0xlumpy/target.yaml
+quarry report -t 0xlumpy
 
 # per-source state of the latest run (from events.jsonl)
-quarry status -t projects/0xlumpy/target.yaml
+quarry status -t 0xlumpy
 
 # out-of-band callbacks: pull delayed interactsh hits, or import an external -json log
-quarry oob poll -t projects/0xlumpy/target.yaml --wait 8
-quarry oob import <interactsh.jsonl> -t projects/0xlumpy/target.yaml
+quarry oob poll -t 0xlumpy --wait 8
+quarry oob import interactsh.jsonl -t 0xlumpy
 
 # effective coverage policy (bounds, values, who set them) — runs nothing
-quarry policy -t projects/0xlumpy/target.yaml
+quarry policy -t 0xlumpy
 
 # detached on a VPS
-setsid nohup quarry run -t projects/0xlumpy/target.yaml > run.log 2>&1 & disown
+setsid nohup quarry run -t 0xlumpy > run.log 2>&1 & disown
 ```
 
 ---
