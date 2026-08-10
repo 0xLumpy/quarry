@@ -208,14 +208,16 @@ def tool_progress(source_id, *, input_total=None, current_index=None, work_unit=
 
 
 def tool_finish(source_id, *, status=None, reason=None, duration=None, exit_code=None, work_unit=None,
-                rss=None, cpu_s=None, raw_ref=None, artifact_size=None,
+                rss=None, cpu_s=None, raw_ref=None, artifact_size=None, partial_ref=None,
+                stderr_partial_ref=None, faults=None,
                 produced=None, consumed=None, fallback=None, error_class=None, provider=None,
                 reset_generation=None, parent_id=None, scope_distance=None, discovery_context=None) -> dict:
-    """The source's terminal event. `error_class` is set only on a failure, and `provider` marks an
-    in-process lane, which the verdict reads from the event log rather than the subprocess ledger."""
+    """The source's terminal event. `partial_ref`/`stderr_partial_ref` reference retained unpublished
+    stdout/stderr artifacts, `faults` records the typed faults, and `provider` marks an in-process lane."""
     return emit(TOOL_FINISH, source_id, status=status, reason=reason, duration=duration,
                 exit_code=exit_code, work_unit=work_unit, rss=rss, cpu_s=cpu_s,
-                raw_ref=raw_ref, artifact_size=artifact_size,
+                raw_ref=raw_ref, artifact_size=artifact_size, partial_ref=partial_ref,
+                stderr_partial_ref=stderr_partial_ref, faults=faults,
                 produced=produced, consumed=consumed, fallback=fallback, error_class=error_class,
                 provider=provider, reset_generation=reset_generation,
                 parent_id=parent_id, scope_distance=scope_distance,

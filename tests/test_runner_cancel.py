@@ -99,24 +99,26 @@ def test_no_process_survives_cancellation():
 
 def test_a_failed_launch_does_not_poison_later_cpu_measurement():
     """review#3: _cpu_start() ran before Popen but _cpu_finish() only after a successful completion, so a
-    launch failure left the token in _CPU_INFLIGHT forever and EVERY later tool reported CPU unmeasured."""
+    launch failure left the token in _CPU_INFLIGHT forever and EVERY later tool reported CPU unmeasured.
+    QR39-001: a failed launch is now a typed machinery fault, not an escaping exception."""
     import unittest.mock as mock
     runner._CPU_INFLIGHT.clear()
     with mock.patch.object(subprocess, "Popen", side_effect=OSError("EMFILE")):
-        with pytest.raises(OSError):
-            runner.run("sleep", ["sleep", "0"], timeout=5)
+        r = runner.run("sleep", ["sleep", "0"], timeout=5)
+    assert r.status == Status.FAILED and r.started is False
+    assert any(f["kind"] == "machinery" for f in r.meta.get("faults", []))
     assert runner._CPU_INFLIGHT == {}, "token leaked after a failed launch"
     r = runner.run("sleep", ["sleep", "0"], timeout=10)
     assert runner.cpu_measured(r), "a later sequential run was wrongly reported unmeasured"
 
 
 def test_an_unexpected_exception_never_orphans_a_running_child():
-    """review#1 (r4): an exception out of communicate() runs NEITHER the timeout nor the interrupt branch,
-    so nothing killed the child — and the finally then dropped it from the registry, leaving a process
-    alive that cancel_all() can no longer even see.
+    """review#1 (r4): an exception out of wait() runs NEITHER the timeout nor the interrupt branch, so
+    nothing killed the child — and the finally then dropped it from the registry, leaving a process alive
+    that cancel_all() can no longer even see.
 
-    The raise must happen while the child is STILL RUNNING: a decode test that lets `sleep 0` finish
-    first proves nothing, because the process is already dead by the time the exception is raised."""
+    The raise must happen while the child is STILL RUNNING: a test that lets `sleep 0` finish first proves
+    nothing, because the process is already dead by the time the exception is raised."""
     import unittest.mock as mock
     real_popen = subprocess.Popen
     seen = {}
@@ -127,16 +129,16 @@ def test_an_unexpected_exception_never_orphans_a_running_child():
             self.pid = self._p.pid
             seen["proc"] = self._p
 
-        def communicate(self, *a, **kw):
+        def wait(self, timeout=None):
             assert self._p.poll() is None, "child already exited — the test proves nothing"
-            raise UnicodeDecodeError("utf-8", b"", 0, 1, "boom while alive")
+            raise RuntimeError("boom while alive")
 
         def __getattr__(self, n):
             return getattr(self._p, n)
 
     runner._CPU_INFLIGHT.clear()
     with mock.patch.object(subprocess, "Popen", RaiseWhileAlive):
-        with pytest.raises(UnicodeDecodeError):
+        with pytest.raises(RuntimeError):
             runner.run("sleep", ["sleep", "8"], timeout=0)
     p = seen["proc"]
     for _ in range(60):                                  # the kill is best-effort + asynchronous
@@ -151,8 +153,8 @@ def test_an_unexpected_exception_never_orphans_a_running_child():
 def test_an_exited_leader_does_not_leave_its_process_group_alive(tmp_path):
     """review#1 (r5): `poll() is None` answers only for the process LEADER. A leader can exit while its
     children keep the group alive — exactly what terminate_group() exists for (it signals the PGID, which
-    stays valid while any member lives). Here the leader spawns `sleep`, exits, and only THEN does
-    communicate() raise: poll() reports 0, so a leader-gated cleanup skips the still-running group."""
+    stays valid while any member lives). Here the leader spawns `sleep`, exits, and only THEN does wait()
+    raise: poll() reports 0, so a leader-gated cleanup skips the still-running group."""
     import unittest.mock as mock
     pidfile = tmp_path / "grandchild.pid"
     leader_src = (
@@ -170,20 +172,20 @@ def test_an_exited_leader_does_not_leave_its_process_group_alive(tmp_path):
             self.pid = self._p.pid
             seen["proc"] = self._p
 
-        def communicate(self, *a, **kw):
+        def wait(self, timeout=None):
             for _ in range(200):                             # wait for the leader to hand off and exit
                 if pidfile.exists() and self._p.poll() is not None:
                     break
                 time.sleep(0.05)
             assert self._p.poll() is not None, "leader still alive — the test would not exercise the gap"
-            raise UnicodeDecodeError("utf-8", b"", 0, 1, "boom after leader exit")
+            raise RuntimeError("boom after leader exit")
 
         def __getattr__(self, n):
             return getattr(self._p, n)
 
     runner._CPU_INFLIGHT.clear()
     with mock.patch.object(subprocess, "Popen", RaiseAfterLeaderExits):
-        with pytest.raises(UnicodeDecodeError):
+        with pytest.raises(RuntimeError):
             runner.run("python", [sys.executable, "-c", leader_src], timeout=0)
     grandchild = int(pidfile.read_text().strip())
     for _ in range(60):
@@ -217,7 +219,7 @@ def test_cleanup_never_masks_the_exception_in_flight():
             self._p = real_popen(*a, **kw)
             self.pid = self._p.pid
 
-        def communicate(self, *a, **kw):
+        def wait(self, timeout=None):
             raise ValueError("the real cause")
 
         def __getattr__(self, n):
@@ -247,21 +249,20 @@ def test_group_teardown_happens_exactly_once_per_path():
 
     class Fake:
         def __init__(self, *a, **kw):
+            import io
             self.pid = 999998
             self.returncode = None
             self.n = 0
+            self.stdout, self.stderr, self.stdin = io.BytesIO(), io.BytesIO(), io.BytesIO()
 
-        def communicate(self, *a, **kw):
+        def wait(self, timeout=None):
             self.n += 1
             if self.n == 1:
                 raise KeyboardInterrupt
-            return ("", "")
+            return 0
 
         def poll(self):
             return 0                                     # leader gone after the branch's own teardown
-
-        def wait(self, timeout=None):
-            return 0
 
     with mock.patch.object(subprocess, "Popen", Fake):
         with mock.patch.object(runner, "terminate_group", lambda p, grace=None: calls.append(1)):
@@ -296,7 +297,9 @@ def test_group_teardown_is_scoped_to_exceptional_exits(tmp_path):
     assert alive, "a CLEAN run group-killed its children — the teardown is no longer scoped"
 
 
-def test_a_decode_failure_does_not_poison_later_cpu_measurement():
+def test_an_in_flight_exception_does_not_poison_later_cpu_measurement():
+    """An exception raised after the child has already exited must still reclaim the CPU token (QR39-001
+    removed the decode-crash path — binary capture never decodes — so any in-flight exception stands in)."""
     import unittest.mock as mock
     runner._CPU_INFLIGHT.clear()
     real_popen = subprocess.Popen
@@ -306,17 +309,17 @@ def test_a_decode_failure_does_not_poison_later_cpu_measurement():
             self._p = real_popen(*a, **kw)
             self.pid = self._p.pid
 
-        def communicate(self, *a, **kw):
-            self._p.communicate()
-            raise UnicodeDecodeError("utf-8", b"", 0, 1, "boom")
+        def wait(self, timeout=None):
+            self._p.wait()
+            raise RuntimeError("boom")
 
         def __getattr__(self, n):
             return getattr(self._p, n)
 
     with mock.patch.object(subprocess, "Popen", Boom):
-        with pytest.raises(UnicodeDecodeError):
+        with pytest.raises(RuntimeError):
             runner.run("sleep", ["sleep", "0"], timeout=10)
-    assert runner._CPU_INFLIGHT == {}, "token leaked after a decode failure"
+    assert runner._CPU_INFLIGHT == {}, "token leaked after an in-flight exception"
     r = runner.run("sleep", ["sleep", "0"], timeout=10)
     assert runner.cpu_measured(r)
 

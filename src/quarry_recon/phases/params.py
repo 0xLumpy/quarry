@@ -861,7 +861,9 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                 # ask nuclei whether it finished, from its terminal line in the full stderr (the 8-line tail
                 # can be evicted by a trailing [INF] burst, so prefer the file and fall back only if absent)
                 try:
-                    _err = ef.read_text(encoding="utf-8", errors="replace") if ef.is_file() else res.stderr_tail
+                    _current = res.meta.get("stderr_published", True)     # a preserved PRIOR file is not this run's
+                    _err = (ef.read_text(encoding="utf-8", errors="replace")
+                            if _current and ef.is_file() else res.stderr_tail)
                 except OSError:
                     _err = res.stderr_tail
                 prog = _nuclei_progress(_err)

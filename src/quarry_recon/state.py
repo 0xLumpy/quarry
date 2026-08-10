@@ -59,8 +59,11 @@ def _from_dict(cls, d: dict):
 
 
 # ── Fault ─────────────────────────────────────────────────────────────────────────────────────────
-_FAULT_NONBLOCKING = frozenset({"optional_tool_failed"})
-FAULT_KINDS = ("phase_exception", "machinery", "publication", "optional_tool_failed", "required_tool_missing")
+# `diagnostic` = a best-effort/secondary artifact failed (e.g. persisting stderr); it does NOT challenge the
+# completeness of the recon evidence, so it never demotes a clean terminal.
+_FAULT_NONBLOCKING = frozenset({"optional_tool_failed", "diagnostic"})
+FAULT_KINDS = ("phase_exception", "machinery", "publication", "optional_tool_failed", "required_tool_missing",
+               "diagnostic")
 
 
 @dataclass

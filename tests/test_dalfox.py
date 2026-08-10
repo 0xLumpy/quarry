@@ -1235,6 +1235,7 @@ class TestPolicyIsNotExecution:
     def test_started_is_set_ONLY_once_Popen_returns(self, monkeypatch, tmp_path):
         """Drives the REAL `runner.run` with a faked `Popen`, so the contract is exercised without
         spawning anything — the offline gate blocks subprocess outright, marker or not."""
+        import io
         import subprocess as _sp
         from quarry_recon import runner
 
@@ -1242,8 +1243,11 @@ class TestPolicyIsNotExecution:
             pid = 4242
             returncode = 0
 
-            def communicate(self, input=None, timeout=None):
-                return ("", "")
+            def __init__(self):
+                self.stdout, self.stderr, self.stdin = io.BytesIO(b""), io.BytesIO(b""), io.BytesIO()
+
+            def wait(self, timeout=None):
+                return 0
 
             def poll(self):
                 return 0
@@ -1252,12 +1256,13 @@ class TestPolicyIsNotExecution:
         monkeypatch.setattr(_sp, "Popen", lambda *a, **k: _Proc())
         assert runner.run("fake", ["fake"]).started is True
 
-        # …and a launch that RAISES must not claim it
+        # …and a launch that RAISES is a typed machinery fault, never an escape (QR39-001)
         def boom(*a, **k):
             raise OSError("exec format error")
         monkeypatch.setattr(_sp, "Popen", boom)
-        with pytest.raises(OSError):
-            runner.run("fake", ["fake"])
+        r = runner.run("fake", ["fake"])
+        assert r.started is False and r.status is runner.Status.FAILED
+        assert any(f["kind"] == "machinery" for f in r.meta.get("faults", []))
 
     def test_BOTH_records_survive_an_exception_in_the_loop(self, monkeypatch, tmp_path):
         """The policy is knowable before execution and the attempt is a fact — an exception must take

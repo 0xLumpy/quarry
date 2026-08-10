@@ -7,14 +7,18 @@ genuine "nothing found" (design §3).
 from __future__ import annotations
 
 import os
+import select
 import signal
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+
+from .state import Fault
 
 try:
     import resource                              # unix-only; per-tool child CPU via getrusage delta
@@ -210,7 +214,7 @@ def reclassify_ffuf(r: "RunResult", out_file, stderr_file=None, maxtime=None) ->
     # ffuf hit its native -maxtime ceiling: it stops mid-wordlist, finalizes the artifact, then exits
     # clean, so demote to PARTIAL first and the matrix below can never launder a truncated run.
     _err, _full = r.stderr_tail or "", False     # the tail is 8 lines; a persisted file has it complete
-    if stderr_file is not None:
+    if stderr_file is not None and r.meta.get("stderr_published", True):   # never read a preserved PRIOR file
         try:
             if Path(stderr_file).is_file():
                 _err, _full = Path(stderr_file).read_text(errors="replace"), True
@@ -390,9 +394,9 @@ def reset_cancel() -> None:
 def cancel_all(grace: "float | None" = None) -> int:
     """Latch cancellation and terminate every live tool process group. Returns how many were signalled.
 
-    Safe to call from the main thread while workers are blocked in communicate(): the group is killed,
-    communicate() then returns promptly, and each worker unwinds through its own finally. The groups are
-    signalled concurrently under one shared grace deadline, so the cost does not grow with concurrency."""
+    Safe to call from the main thread while workers are blocked in run()'s proc.wait(): the group is killed,
+    wait() then returns promptly, and each worker unwinds through its own finally. The groups are signalled
+    concurrently under one shared grace deadline, so the cost does not grow with concurrency."""
     _CANCELLED.set()
     grace = _TERM_GRACE if grace is None else grace   # resolved at call time (defined later in module)
     with _LIVE_LOCK:
@@ -450,12 +454,10 @@ def _unregister(token: int) -> None:
         _LIVE_PROCS.pop(token, None)
 
 
-def _classify(exit_code: int, out: str, err: str, ok_empty: bool,
+def _classify(exit_code: int, has_out: bool, blocked: bool, transport: bool, ok_empty: bool,
               ok_codes: tuple[int, ...] = (0,)) -> tuple[Status, str]:
-    low_err = err.lower()
-    blocked = any(sig in low_err for sig in BLOCK_SIGNATURES)
-    transport = any(sig in low_err for sig in TRANSPORT_SIGNATURES)   # degraded, not a block
-    has_out = bool(out.strip())
+    # `blocked`/`transport` are scanned incrementally from the whole stderr stream (never a bounded tail),
+    # so a signature early in a large stderr is not lost.
     if exit_code not in ok_codes:
         if blocked:
             return Status.BLOCKED, "nonzero exit + block signature in stderr"
@@ -476,6 +478,8 @@ def _classify(exit_code: int, out: str, err: str, ok_empty: bool,
             return Status.BLOCKED, "clean exit, no output, block signature in stderr"
         if transport:
             return Status.PARTIAL, "clean exit, no stdout, transport error — degraded coverage (completion uncertain)"
+        if not ok_empty:                       # a lane that must produce output: clean-but-empty is a failure
+            return Status.FAILED, "clean exit but no output (output required)"
         return Status.EMPTY, "clean exit, zero output"
     if blocked:
         return Status.PARTIAL, "produced output but block signature in stderr"
@@ -488,16 +492,253 @@ _TERM_GRACE = 3.0        # seconds between SIGTERM and the hard SIGKILL of a too
 _REAP_GRACE = 2.0        # shared post-SIGKILL reap window in cancel_all, never per-process
 _POSIX = (os.name == "posix")
 
+_READ_CHUNK = 65536
+_STDERR_TAIL_BYTES = 8192    # bounded stderr kept in memory for the diagnostic tail; the rest is scanned + dropped
+_SIG_CARRY = 256             # stderr overlap so a block/transport signature straddling two chunks still matches
+_GRACE = 3.0                 # one bounded window covering kill + drain after the deadline (see run())
+
+# byte forms of the classifier signatures, matched against the raw binary stderr stream
+_BLOCK_SIG_B = tuple(s.encode() for s in BLOCK_SIGNATURES)
+_TRANSPORT_SIG_B = tuple(s.encode() for s in TRANSPORT_SIGNATURES)
+
+
+def _read_ready(fd: int, stop: threading.Event) -> "tuple[bytes | None, str]":
+    """select-poll `fd`; returns (chunk, "data"), (b"", "eof"), (None, "stopped") on `stop` with nothing
+    pending, or (None, "error"). select, not a blocking read, so the reader can honour `stop`."""
+    while True:
+        try:
+            ready, _, _ = select.select([fd], [], [], 0.3)
+        except (OSError, ValueError):
+            return None, "error"
+        if ready:
+            try:
+                data = os.read(fd, _READ_CHUNK)
+            except (OSError, ValueError):
+                return None, "error"
+            return data, ("eof" if data == b"" else "data")
+        if stop.is_set():
+            return None, "stopped"
+
+
+def _drain_stdout(src, sink, state: dict, cap: "int | None", stop: threading.Event) -> None:
+    """Stream binary stdout to `sink`; counters and a running sha256 are committed to `state` even when the
+    reader is abandoned (`stop_reason != "eof"`). `cap` bounds retained bytes; a write error detaches the sink."""
+    import hashlib
+    h = hashlib.sha256()
+    written = 0
+    last = b"\n"
+    try:
+        fd = src.fileno()
+    except (OSError, ValueError):
+        state["stop_reason"] = "error"
+        return
+    while True:
+        chunk, reason = _read_ready(fd, stop)
+        if reason != "data":
+            state["stop_reason"] = reason
+            break
+        h.update(chunk)
+        state["bytes"] += len(chunk)
+        state["lines"] += chunk.count(b"\n")
+        last = chunk[-1:]
+        if not state["nonspace"] and chunk.strip():
+            state["nonspace"] = True
+        if sink is not None:
+            take = chunk if cap is None else chunk[: max(0, cap - written)]
+            if take:
+                try:
+                    _write_all(sink, take)
+                    written += len(take)
+                except OSError as e:
+                    state["pub_error"] = str(e)
+                    sink = None
+            if cap is not None and written >= cap and state["bytes"] > written:
+                state["capped"] = True
+    if state["bytes"] and last != b"\n":         # a final unterminated line still counts
+        state["lines"] += 1
+    state["sha256"] = h.hexdigest() if state["bytes"] else ""     # digest retained for a partial too
+    state["complete"] = state["stop_reason"] == "eof"
+
+
+def _drain_stderr(src, sink, state: dict, stop: threading.Event) -> None:
+    """Stream binary stderr to `sink`, scan the whole stream for block/transport signatures (a carry catches
+    one split across chunks), keep a bounded tail. `complete`/`stop_reason` mirror the stdout drain."""
+    tail = bytearray()
+    carry = b""
+    try:
+        fd = src.fileno()
+    except (OSError, ValueError):
+        state["tail"], state["stop_reason"] = b"", "error"
+        return
+    while True:
+        chunk, reason = _read_ready(fd, stop)
+        if reason != "data":
+            state["stop_reason"] = reason
+            break
+        if sink is not None:
+            try:
+                _write_all(sink, chunk)
+            except OSError as e:
+                state["pub_error"] = str(e)
+                sink = None
+        low = (carry + chunk).lower()
+        if not state["blocked"] and any(sig in low for sig in _BLOCK_SIG_B):
+            state["blocked"] = True
+        if not state["transport"] and any(sig in low for sig in _TRANSPORT_SIG_B):
+            state["transport"] = True
+        carry = chunk[-_SIG_CARRY:]
+        tail += chunk
+        if len(tail) > _STDERR_TAIL_BYTES:
+            del tail[:-_STDERR_TAIL_BYTES]
+    state["tail"] = bytes(tail)
+    state["complete"] = state["stop_reason"] == "eof"
+
+
+def _feed_stdin(stdin, data: "bytes | None", src_file: "str | None", state: dict,
+                stop: threading.Event) -> None:
+    """Feed the tool's stdin with nonblocking writes, abandoning a full pipe on `stop`. A source open/read
+    failure is a machinery fault in `state`; a broken pipe from a tool that closed stdin early is ignored."""
+    try:
+        fd = stdin.fileno()
+        os.set_blocking(fd, False)
+    except (OSError, ValueError):
+        return
+    try:
+        if src_file is not None:
+            try:
+                f = open(src_file, "rb")
+            except OSError as e:
+                state["error"] = f"stdin source open failed: {e}"
+                return
+            with f:
+                while True:
+                    try:
+                        block = f.read(_READ_CHUNK)
+                    except OSError as e:
+                        state["error"] = f"stdin source read failed: {e}"
+                        break
+                    if not block:
+                        break
+                    if _nb_write(fd, block, stop) != "done":   # tool closed stdin early, or abandoned on stop
+                        break
+        elif data is not None:
+            _nb_write(fd, data, stop)
+    finally:
+        try:
+            stdin.close()                            # close the write end so the tool sees EOF on stdin
+        except (OSError, ValueError):
+            pass
+
+
+def _nb_write(fd: int, data: bytes, stop: threading.Event) -> str:
+    """Nonblocking-write every byte of `data` to `fd`, select-waiting for writability so the writer wakes to
+    honour `stop`. Returns "done", "epipe" (pipe closed), or "stopped" (abandoned)."""
+    mv = memoryview(data)
+    while mv:
+        if stop.is_set():
+            return "stopped"
+        try:
+            mv = mv[os.write(fd, mv):]
+        except BlockingIOError:
+            try:
+                select.select([], [fd], [], 0.3)
+            except (OSError, ValueError):
+                return "epipe"
+        except (BrokenPipeError, OSError):
+            return "epipe"
+    return "done"
+
+
+def _write_all(fp, data) -> None:
+    """Write every byte to an unbuffered sink (which may accept a chunk short); a write that cannot progress
+    (a full filesystem) raises so the caller records a publication fault."""
+    mv = memoryview(data)
+    while mv:
+        n = fp.write(mv)
+        if not n:
+            raise OSError("short write to output sink")
+        mv = mv[n:]
+
+
+def _open_stage(final: Path):
+    """Create a unique, exclusive private staging file beside `final` and return (fp, path). mkstemp uses
+    O_CREAT|O_EXCL at mode 0600, so it never follows a planted symlink or reuses an existing name."""
+    final.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=str(final.parent), prefix=final.name + ".", suffix=".partial")
+    return os.fdopen(fd, "wb", buffering=0), Path(name)
+
+
+def _close_pipes(proc) -> None:
+    """Close the child's pipe objects. Non-blocking (the drain/feed threads hold no buffer lock — they use the
+    raw fd), so it unblocks a stuck thread and never double-closes at GC. Idempotent."""
+    if proc is None:
+        return
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        try:
+            if pipe is not None:
+                pipe.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _finalize_and_publish(fp, stage: "Path | None", final: "Path | None", state: dict, *,
+                          publish: bool, authoritative: bool = False) -> "Path | None":
+    """Close the sink and atomically move the stage onto `final`; return `final` iff the replace ran
+    (`authoritative` replaces even an empty stage), else retain a non-empty stage as partial evidence."""
+    if fp is not None:
+        try:
+            fp.flush()
+        except (OSError, ValueError) as e:
+            state["pub_error"] = state.get("pub_error") or str(e)
+        try:
+            fp.close()
+        except OSError as e:
+            state["pub_error"] = state.get("pub_error") or str(e)
+    if stage is None or final is None:
+        return None
+    try:
+        size = stage.stat().st_size
+    except OSError:
+        size = 0
+    if publish and not state.get("pub_error") and (size > 0 or authoritative):
+        try:
+            os.replace(stage, final)
+            return final
+        except OSError as e:
+            state["pub_error"] = state.get("pub_error") or str(e)
+    if size == 0:
+        try:
+            stage.unlink()
+        except OSError:
+            pass
+        return None
+    _record_partial(stage, state)                 # unpublished bytes exist: own them as partial evidence
+    return None
+
+
+def _record_partial(stage: Path, state: dict) -> None:
+    """Record a retained staging file (its unique path, on-disk size, digest of the bytes written) as partial
+    evidence in `state`."""
+    import hashlib
+    state["partial_path"] = str(stage)
+    try:
+        h = hashlib.sha256()
+        n = 0
+        with open(stage, "rb") as f:
+            for block in iter(lambda: f.read(_READ_CHUNK), b""):
+                h.update(block)
+                n += len(block)
+        state["partial_bytes"] = n
+        state["partial_sha256"] = h.hexdigest()
+    except OSError:
+        pass
+
 
 def terminate_group(proc, grace: float = _TERM_GRACE) -> None:
-    """Kill a tool's entire process group — SIGTERM, bounded grace, then SIGKILL — so a tool that spawned
-    children (chromium under katana, subshells) leaves no orphan behind.
-
-    Callers MUST launch with `Popen(start_new_session=True)`, which makes the tool a session/group leader
-    with pgid == pid; `proc.pid` is used as the pgid directly, because `os.getpgid` fails once the leader
-    itself has exited while a child still holds the group. Reaps after SIGKILL, so no zombie is left for a
-    caller that doesn't communicate(). Best-effort and race-safe (already-gone is not an error); non-POSIX
-    falls back to single-process terminate→kill. Shared by the runner and the OOB interactsh session."""
+    """Kill a tool's whole process group (SIGTERM, bounded grace, SIGKILL) and reap it, leaving no orphan or
+    zombie. Callers MUST launch with `start_new_session=True`; `proc.pid` is used as the pgid directly because
+    `os.getpgid` fails once the leader has exited while a child still holds the group. Race-safe; non-POSIX
+    falls back to single-process terminate→kill. Shared with the OOB interactsh session."""
     if _POSIX:
         pgid = proc.pid                                # valid while any group member lives
         def _sig(sig):
@@ -542,33 +783,28 @@ def run(
     ok_codes: tuple[int, ...] = (0,),
     env: dict | None = None,
     stderr_path: Path | None = None,
+    max_output_bytes: int | None = None,
 ) -> RunResult:
-    """Run `cmd`, capture everything, persist raw stdout to `raw_path`, classify.
+    """Run `cmd`, streaming binary stdout/stderr to disk, and return a classified RunResult.
 
-    `input_file`, if given, is read whole into memory and fed to the tool's stdin over a pipe — nothing
-    bounds it here, so the caller must keep the source sane. `ok_codes` lists exit codes that are not
-    failures — gitleaks exits 1 when it *finds* leaks, which is success, not error.
-
-    `stderr_path`, if given, persists the complete stderr on every path, including a timeout kill. Opt-in
-    because `stderr_tail` keeps only the last 8 lines — enough for a signature match, but not for a caller
-    that must read a tool's own completion or progress report out of its stderr (nuclei's `Scan completed
-    in …` and `-stats` lines are both evictable by a trailing burst of `[INF]` lines). Such a caller must
-    read this file, never the tail.
+    Contract: exact bytes are staged privately and published atomically to `raw_path`; `stderr_path` holds
+    this run's stderr (`meta['stderr_published']` flags currency). `ok_codes` are non-failure exits;
+    `ok_empty=False` makes clean-but-empty FAILED. `max_output_bytes` caps retained stdout. `timeout` plus
+    one `_GRACE` window bounds execute+kill+drain. Launch/stdin/drain/publication failures are `Fault`s in
+    `meta['faults']`, never raised.
     """
     bin_name = cmd[0]
     if not have(bin_name):
         return RunResult(tool, cmd, Status.SKIPPED, None, 0.0, None, 0,
                          note=f"{bin_name} not on PATH")
 
-    # stdin: `input_file`/`stdin_data` over a pipe via communicate(), else /dev/null (ProjectDiscovery
-    # tools block on an empty inherited stdin). The file is read whole: xnLinkFinder needs a primed pipe.
-    if input_file is not None and stdin_data is None:
-        stdin_data = Path(input_file).read_text(encoding="utf-8", errors="replace")
-    stdin_kw = {"stdin": subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL}
+    # stdin over a pipe when there is input, else /dev/null (ProjectDiscovery tools block on an inherited tty).
+    want_stdin = input_file is not None or stdin_data is not None
+    stdin_bytes = stdin_data.encode("utf-8", "replace") if isinstance(stdin_data, str) else None
+    stdin_kw = {"stdin": subprocess.PIPE if want_stdin else subprocess.DEVNULL}
 
     start = time.monotonic()
-    # Popen (not subprocess.run) so we hold the pid and can sample the process tree's RSS during the run;
-    # CPU comes from a getrusage(CHILDREN) delta. In `communicate(timeout=)`, 0/None means no kill.
+    # Popen (not subprocess.run) so the pid is held for RSS/CPU sampling during the run.
     cpu0 = (resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None)
     cpu_base = (cpu0.ru_utime + cpu0.ru_stime) if cpu0 else 0.0
     _cpu_token = _cpu_start()          # marks this run, and every overlapping one, as CPU-unmeasurable
@@ -579,19 +815,57 @@ def run(
     # (e.g. {"PYTHONHASHSEED": "0"}) without dropping PATH.
     proc_env = {**os.environ, **env} if env else None
 
-    # start_new_session: the tool becomes its own process-group/session leader, so terminate_group can
-    # kill the whole tree and a Ctrl-C hits Quarry, not the tool. Everything below unwinds via the finally.
+    faults: list[dict] = []
+    out_state = {"bytes": 0, "lines": 0, "nonspace": False, "sha256": "", "capped": False,
+                 "pub_error": None, "complete": False, "stop_reason": ""}
+    err_state = {"blocked": False, "transport": False, "tail": b"", "pub_error": None,
+                 "complete": False, "stop_reason": ""}
+    in_state = {"error": None}
+    drain_stop = threading.Event()                # signals the reader threads to abandon an escaped pipe holder
+
+    # a failed staging open leaves stage None (nothing published) and marks pub_error, surfaced once at the end.
+    raw_stage = err_stage = None
+    out_fp = err_fp = None
+    if raw_path is not None:
+        try:
+            out_fp, raw_stage = _open_stage(raw_path)
+        except OSError as e:
+            out_state["pub_error"] = str(e)
+    if stderr_path is not None:
+        try:
+            err_fp, err_stage = _open_stage(stderr_path)
+        except OSError as e:
+            err_state["pub_error"] = str(e)
+
     proc = None
     started = False                               # proven by a pid, never inferred
     live_token = None
     group_settled = False                         # True once this run's process group needs no teardown
+    interrupted = False
+    timed_out = False
+    sampler = None
+    out_published = None
+    stderr_published = False
+    primary_incomplete = False                    # stdout/stdin evidence compromised (stderr is diagnostic-only)
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                env=proc_env, cwd=_TOOL_CWD, start_new_session=True, **stdin_kw)
+        try:
+            # start_new_session: own group (terminate_group kills the tree; Ctrl-C hits Quarry). Binary: exact bytes.
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env=proc_env, cwd=_TOOL_CWD, start_new_session=True, **stdin_kw)
+        except (OSError, ValueError) as e:        # launch failure is a typed machinery fault, never an escape
+            faults.append(Fault("machinery", where=tool, detail=f"launch failed: {e}").to_dict())
+            _finalize_and_publish(out_fp, raw_stage, raw_path, out_state, publish=False)
+            _finalize_and_publish(err_fp, err_stage, stderr_path, err_state, publish=False)
+            for label, where, st in (("stdout", raw_path, out_state), ("stderr", stderr_path, err_state)):
+                if st["pub_error"]:
+                    faults.append(Fault("publication" if label == "stdout" else "diagnostic",
+                                        where=str(where), detail=st["pub_error"]).to_dict())
+            _cpu_finish(_cpu_token)
+            return RunResult(tool, cmd, Status.FAILED, None, round(time.monotonic() - start, 3), None, 0,
+                             note=f"launch failed: {e}", meta={"started": False, "faults": faults})
         started = True                            # a pid exists: the process really did launch
         live_token = _register(proc)              # reachable by cancel_all() from the main thread
-        if _CANCELLED.is_set():
-            # cancellation latched between the check above and the launch
+        if _CANCELLED.is_set():                   # cancellation latched between the check above and the launch
             terminate_group(proc)
 
         def _sample():
@@ -602,79 +876,146 @@ def run(
         sampler = threading.Thread(target=_sample, daemon=True)
         sampler.start()
 
-        timed_out = False
+        t_out = threading.Thread(target=_drain_stdout,
+                                 args=(proc.stdout, out_fp, out_state, max_output_bytes, drain_stop), daemon=True)
+        t_err = threading.Thread(target=_drain_stderr, args=(proc.stderr, err_fp, err_state, drain_stop),
+                                 daemon=True)
+        t_out.start()
+        t_err.start()
+        readers = [t_out, t_err]
+        t_in = None
+        if want_stdin:
+            t_in = threading.Thread(target=_feed_stdin, args=(proc.stdin, stdin_bytes,
+                                    str(input_file) if input_file is not None else None, in_state, drain_stop),
+                                    daemon=True)
+            t_in.start()
+
         try:
-            out, err = proc.communicate(input=stdin_data if stdin_data is not None else None,
-                                        timeout=timeout or None)
+            remaining = None if not timeout else max(0.0, (start + timeout) - time.monotonic())
+            proc.wait(timeout=remaining)          # readers drain concurrently, so a full pipe never deadlocks
         except subprocess.TimeoutExpired:
-            terminate_group(proc)                 # kill the whole group, not just the leader
-            out, err = proc.communicate()         # reap + drain whatever the tool buffered
             timed_out = True
         except KeyboardInterrupt:
-            # operator cancellation: tear the group down, drain/reap, then re-raise — a cancel is never
-            # reported as a tool FAILED/TIMED_OUT
-            terminate_group(proc)
-            try:
-                proc.communicate(timeout=5)
-            except Exception:
-                pass
-            group_settled = True                  # torn down here; the outer guard must not repeat it
-            raise
-        finally:
-            stop.set()                            # sampler shutdown on every path, interrupt included
-            sampler.join(timeout=1)
-        group_settled = True                      # reached only when nothing propagated out of the block
+            interrupted = True                    # operator cancel — never reported as a tool FAILED/TIMED_OUT
+
+        # one bounded window (_GRACE) covers BOTH killing the group and draining the readers, so a small
+        # `timeout` cannot balloon into many seconds of fixed grace.
+        hard = time.monotonic() + _GRACE
+        if timed_out or interrupted:
+            terminate_group(proc, grace=min(1.0, _GRACE))
+        drain_stop.set()
+        threads = ([t_in] if t_in is not None else []) + readers
+        for t in threads:
+            t.join(timeout=max(0.0, hard - time.monotonic()))
+        if any(t.is_alive() for t in threads):
+            # a grandchild escaped into its own session and still holds a pipe: close the pipes so a blocked
+            # read/write returns, then rejoin briefly.
+            _close_pipes(proc)
+            for t in threads:
+                t.join(timeout=0.5)
+
+        # publish whatever bytes were captured (partial included — an incompleteness fault is raised below).
+        out_published = _finalize_and_publish(out_fp, raw_stage, raw_path, out_state,
+                                              publish=out_state["bytes"] > 0)
+        # publish stderr only on a clean EOF drain (`complete`), so an abandoned/incomplete stderr is never
+        # authoritative; otherwise the prior file is kept and the bytes are retained as a stderr partial.
+        if stderr_path is not None:
+            stderr_published = _finalize_and_publish(err_fp, err_stage, stderr_path, err_state,
+                                                     publish=err_state["complete"], authoritative=True) is not None
+
+        for label, st in (("stdout", out_state), ("stderr", err_state)):
+            if st["stop_reason"] not in ("eof", ""):
+                # stdout is primary (machinery, challenges completeness); stderr is diagnostic (non-challenging)
+                kind = "machinery" if label == "stdout" else "diagnostic"
+                faults.append(Fault(kind, where=tool,
+                                    detail=f"{label} drain incomplete ({st['stop_reason']})").to_dict())
+                if label == "stdout":
+                    primary_incomplete = True
+        if in_state["error"]:
+            faults.append(Fault("machinery", where=str(input_file), detail=in_state["error"]).to_dict())
+            primary_incomplete = True
+        if t_in is not None and t_in.is_alive():
+            faults.append(Fault("machinery", where=tool, detail="stdin feed did not complete within grace").to_dict())
+            primary_incomplete = True
+        group_settled = True
     finally:
-        # on any exceptional exit the group is torn down regardless of the leader, which can exit while
-        # its children keep it alive. Guarded throughout, so it never masks the exception in flight.
+        stop.set()                                # sampler shutdown on every path, interrupt included
+        drain_stop.set()                          # readers must never linger, even on an unexpected exit
+        if sampler is not None:
+            sampler.join(timeout=1)
         try:
+            # a leader can exit while its children keep the group alive; tear it down on any exceptional exit.
             if proc is not None and (not group_settled or proc.poll() is None):
                 terminate_group(proc)
         except Exception:
-            pass                                  # best-effort: never mask the original exception
+            pass                                  # best-effort: never mask an exception in flight
+        for fp in (out_fp, err_fp):               # backstop: sinks are normally closed by _finalize_and_publish
+            try:
+                if fp is not None and not fp.closed:
+                    fp.close()
+            except OSError:
+                pass
+        _close_pipes(proc)                        # release pipe descriptors deterministically, not at GC
         if live_token is not None:
             _unregister(live_token)
         _cpu_contended = _cpu_finish(_cpu_token)  # always reclaim the token, however we leave
 
-    dur = time.monotonic() - start
+    if interrupted:
+        raise KeyboardInterrupt
+
+    dur = round(time.monotonic() - start, 3)
     cpu1 = (resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None)
-    # RUSAGE_CHILDREN is process-global, so the delta only attributes cleanly while tools run one at a
-    # time; overlapping deltas would each absorb the others' CPU. Report unmeasured (-1.0) instead.
+    # RUSAGE_CHILDREN is process-global, so the delta only attributes cleanly while tools run one at a time.
     cpu_s = -1.0 if _cpu_contended else (
         round((cpu1.ru_utime + cpu1.ru_stime) - cpu_base, 2) if cpu1 else 0.0)
     rss_mb = round(peak_rss[0], 1)
-    out, err = out or "", err or ""
 
-    # persist the complete stderr before any return branch — a timed-out chunk's stderr is the evidence
-    # that it did not reach its own completion marker. A write failure must not mask the tool's result.
+    for label, where, st in (("stdout", raw_path, out_state), ("stderr", stderr_path, err_state)):
+        if st["pub_error"]:
+            detail = st["pub_error"]
+            if st.get("partial_path"):            # the fault self-describes where the retained bytes are
+                detail += f" — partial retained at {st['partial_path']} ({st.get('partial_bytes')} bytes)"
+            # stdout publication challenges completeness; a lost diagnostic stderr does not (non-challenging kind)
+            kind = "publication" if label == "stdout" else "diagnostic"
+            faults.append(Fault(kind, where=str(where), detail=detail).to_dict())
+            if label == "stdout":
+                primary_incomplete = True
+
+    meta: dict = {"started": started, "stdout_bytes": out_state["bytes"]}
+    if out_state["sha256"]:
+        meta["stdout_sha256"] = out_state["sha256"]
+    if out_state["capped"]:
+        meta["output_capped"] = max_output_bytes
+    if out_state.get("partial_path"):             # unpublished stdout bytes retained: describe the artifact
+        meta["partial_path"] = out_state["partial_path"]
+        meta["partial_bytes"] = out_state.get("partial_bytes")
+        meta["partial_sha256"] = out_state.get("partial_sha256")
     if stderr_path is not None:
-        try:
-            stderr_path.parent.mkdir(parents=True, exist_ok=True)
-            stderr_path.write_text(err)
-        except OSError:
-            pass
+        meta["stderr_published"] = stderr_published    # whether stderr_path holds THIS run's stderr
+    if err_state.get("partial_path"):             # unpublished stderr bytes retained
+        meta["stderr_partial_path"] = err_state["partial_path"]
+        meta["stderr_partial_bytes"] = err_state.get("partial_bytes")
+    if faults:
+        meta["faults"] = faults
+
+    err_tail = "\n".join(err_state["tail"].decode("utf-8", "replace").strip().splitlines()[-8:])
+    raw = out_published                           # a reference only to a published artifact, never observed-but-unwritten
 
     if timed_out:
-        wrote = False
-        if raw_path and out:
-            raw_path.parent.mkdir(parents=True, exist_ok=True)
-            raw_path.write_text(out)
-            wrote = True
-        return RunResult(tool, cmd, Status.TIMED_OUT, None, dur, raw_path if wrote else None,
-                         len(out.splitlines()), note=f"timed out after {timeout}s",
-                         cpu_s=cpu_s, peak_rss_mb=rss_mb, meta={"started": started})
+        return RunResult(tool, cmd, Status.TIMED_OUT, None, dur, raw, out_state["lines"],
+                         stderr_tail=err_tail, note=f"timed out after {timeout}s",
+                         cpu_s=cpu_s, peak_rss_mb=rss_mb, meta=meta)
 
-    if raw_path is not None:
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
-        raw_path.write_text(out)
-
-    status, note = _classify(proc.returncode, out, err, ok_empty, ok_codes)
-    err_tail = "\n".join(err.strip().splitlines()[-8:])
+    status, note = _classify(proc.returncode, out_state["nonspace"], err_state["blocked"],
+                             err_state["transport"], ok_empty, ok_codes)
+    # uncaptured/unpersisted PRIMARY evidence (stdout/stdin) must not read as clean; a diagnostic stderr fault does not.
+    if status in (Status.SUCCESS, Status.EMPTY) and primary_incomplete:
+        status = Status.PARTIAL
+        note = (note + "; " if note else "") + "primary evidence incomplete (machinery/publication fault)"
     return RunResult(
         tool=tool, cmd=cmd, status=status, exit_code=proc.returncode, duration=dur,
-        raw_path=raw_path if out else None, stdout_lines=len(out.splitlines()),
-        stderr_tail=err_tail, note=note, cpu_s=cpu_s, peak_rss_mb=rss_mb,
-        meta={"started": started},
+        raw_path=raw, stdout_lines=out_state["lines"],
+        stderr_tail=err_tail, note=note, cpu_s=cpu_s, peak_rss_mb=rss_mb, meta=meta,
     )
 
 

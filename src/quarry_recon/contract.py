@@ -504,6 +504,10 @@ def _emit_terminal(source_id, src, res, *, work_unit, parent_id, scope_distance,
             artifact_size = res.raw_path.stat().st_size
         except OSError:
             artifact_size = None
+    meta = res.meta or {}
+    partial_ref = meta.get("partial_path")                 # retained unpublished STDOUT, owned durably here
+    stderr_partial_ref = meta.get("stderr_partial_path")   # retained unpublished stderr (its own field)
+    faults = meta.get("faults") or None                    # typed machinery/publication faults, persisted here
     if res.status == Status.BLOCKED:
         events.tool_blocked(source_id, reason=res.note or "blocked")
     elif res.status in _PARTIAL:
@@ -511,7 +515,8 @@ def _emit_terminal(source_id, src, res, *, work_unit, parent_id, scope_distance,
     events.tool_finish(source_id, status=res.status.value, reason=res.note or None,
                        duration=round(res.duration, 2), exit_code=res.exit_code, work_unit=work_unit,
                        rss=res.peak_rss_mb, cpu_s=res.cpu_s,
-                       raw_ref=raw_ref, artifact_size=artifact_size,
+                       raw_ref=raw_ref, artifact_size=artifact_size, partial_ref=partial_ref,
+                       stderr_partial_ref=stderr_partial_ref, faults=faults,
                        fallback=src.get("fallback"),
                        parent_id=parent_id, scope_distance=scope_distance,
                        discovery_context=discovery_context)

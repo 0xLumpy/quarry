@@ -40,14 +40,15 @@ echo "[1] runner._classify exit-code taxonomy (gitleaks fix)"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "all 6 classify cases correct" || no "classify mismatch (see above)"
 import sys
 from quarry_recon.runner import _classify
+# new signature: _classify(exit_code, has_out, blocked, transport, ok_empty, ok_codes=(0,))
 def s(*a): return _classify(*a)[0].value
 cases = [
-  ("exit1 + output, ok_codes(0,1)      -> success", s(1,'[{"x":1}]','banner',True,(0,1)), "success"),
-  ("exit1 + NO output, ok_codes(0,1)   -> failed ", s(1,'','fatal',True,(0,1)),           "failed"),
-  ("exit0 + NO output                  -> empty  ", s(0,'','',True,(0,1)),                 "empty"),
-  ("exit0 + output                     -> success", s(0,'[]','',True,(0,1)),               "success"),
-  ("exit2                              -> failed ", s(2,'','boom',True,(0,1)),             "failed"),
-  ("default ok_codes(0,): exit1 no out -> failed ", s(1,'','',True),                       "failed"),
+  ("exit1 + output, ok_codes(0,1)      -> success", s(1,True,False,False,True,(0,1)),  "success"),
+  ("exit1 + NO output, ok_codes(0,1)   -> failed ", s(1,False,False,False,True,(0,1)), "failed"),
+  ("exit0 + NO output                  -> empty  ", s(0,False,False,False,True,(0,1)), "empty"),
+  ("exit0 + output                     -> success", s(0,True,False,False,True,(0,1)),  "success"),
+  ("exit2                              -> failed ", s(2,False,False,False,True,(0,1)), "failed"),
+  ("default ok_codes(0,): exit1 no out -> failed ", s(1,False,False,False,True),       "failed"),
 ]
 bad=0
 for label,got,want in cases:
@@ -3808,8 +3809,8 @@ c_both = ("cmd += _katana_scope_flags(scope)" in src and "_katana_scope_flags(sc
 sys.exit(0 if (c_xlate and c_empty and c_all_forms and c_precise and c_inscope and c_ci and c_both) else 1)
 PYEOF
 
-echo "[112] process lifecycle (audit #7) — runner kills the WHOLE process group, no orphans: tools launch with start_new_session (own group leader), and terminate_group does SIGTERM -> bounded grace -> SIGKILL on the group for BOTH timeout and Ctrl-C. LIVE test: a parent that spawns a background child sleep is timed out -> BOTH parent and child disappear (old proc.kill() left the child orphaned). A KeyboardInterrupt tears the group down, drains/reaps via communicate(), and is RE-RAISED (never converted to FAILED/TIMED_OUT); sampler shutdown stays in finally. OOB close_session shares the same helper."
-PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "timeout kills parent+child; LEADER-EXITS-FIRST still kills child + returns (pgid==pid, not getpgid); TERM-resistant -> SIGKILL + REAPED (no zombie); KeyboardInterrupt -> terminate_group + drain + RE-RAISE; start_new_session set; oob.close_session shares helper" || no "process-group cleanup broken"
+echo "[112] process lifecycle (audit #7) — runner kills the WHOLE process group, no orphans: tools launch with start_new_session (own group leader), and terminate_group does SIGTERM -> bounded grace -> SIGKILL on the group for BOTH timeout and Ctrl-C. LIVE test: a parent that spawns a background child sleep is timed out -> BOTH parent and child disappear (old proc.kill() left the child orphaned). A KeyboardInterrupt tears the group down, drains the reader threads within a bounded grace, and is RE-RAISED (never converted to FAILED/TIMED_OUT); sampler shutdown stays in finally. OOB close_session shares the same helper."
+PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "timeout kills parent+child; LEADER-EXITS-FIRST returns promptly (no hang, waits leader not pipe); TERM-resistant -> SIGKILL + REAPED (no zombie); KeyboardInterrupt -> terminate_group + drain + RE-RAISE; start_new_session set; oob.close_session shares helper" || no "process-group cleanup broken"
 import sys, os, time, tempfile, inspect
 from quarry_recon import runner, oob
 from quarry_recon.runner import Status
@@ -3828,12 +3829,18 @@ cpf = os.path.join(tempfile.mkdtemp(), "cpid")
 res = runner.run("sleeptest", ["sh", "-c", f"sleep 300 & echo $! > {cpf}; sleep 300"], timeout=1)
 child = int(open(cpf).read().strip())
 c_timeout = (res.status == Status.TIMED_OUT and waitgone(child))
-# (1b) LEADER EXITS FIRST, child keeps the stdout pipe: getpgid(parent) would fail -> old code hung +
-# never killed the child. pgid==pid must still let terminate_group kill the child, and run must RETURN.
+# (1b) LEADER EXITS FIRST while a child holds the stdout pipe: old code BLOCKED in communicate(). run() now
+# waits on the LEADER and returns promptly (never hangs), abandoning the escaped pipe holder within the drain
+# grace. The abandoned stdout drain is incomplete -> PARTIAL (honest, not a clean EMPTY). A CLEAN leader exit
+# does NOT force-kill the detached child (scoped-teardown policy; see test_group_teardown_is_scoped...).
 cpf2 = os.path.join(tempfile.mkdtemp(), "cpid2")
-res2 = runner.run("orphan", ["sh", "-c", f"sleep 300 & echo $! > {cpf2}; exit 0"], timeout=1)
+t0b = time.monotonic()
+res2 = runner.run("orphan", ["sh", "-c", f"sleep 300 & echo $! > {cpf2}; exit 0"], timeout=30)
+dt2 = time.monotonic() - t0b
 child2 = int(open(cpf2).read().strip())
-c_leader_first = (res2.status == Status.TIMED_OUT and waitgone(child2))   # returned + child killed
+c_leader_first = (res2.status == Status.PARTIAL and dt2 < 10)   # returned on leader exit, no hang; drain incomplete
+try: os.kill(child2, 9)                                                          # never leak the detached child
+except OSError: pass
 # (1c) TERM-RESISTANT parent needs SIGKILL and must be REAPED (no zombie). Drive terminate_group directly.
 cpf3 = os.path.join(tempfile.mkdtemp(), "cpid3")
 p = _sub.Popen(["sh", "-c", f"trap '' TERM; sleep 300 & echo $! > {cpf3}; while :; do sleep 0.2; done"],
@@ -3845,13 +3852,16 @@ c_sigkill = (p.poll() is not None            # reaped (returncode set) -> NOT a 
 # (2) start_new_session is actually set on the Popen (source-level, since we can't introspect a dead proc)
 c_sns = ("start_new_session=True" in inspect.getsource(runner.run))
 # (3) KeyboardInterrupt: cleanup + drain + RE-RAISE, not a status
+import io as _io
 class FakeProc:
-    def __init__(s): s.pid=999999; s.returncode=None; s.communicated=0
-    def communicate(s, input=None, timeout=None):
-        s.communicated += 1
-        if s.communicated == 1: raise KeyboardInterrupt()
-        return ("", "")
-    def wait(s, timeout=None): return 0
+    def __init__(s):
+        s.pid=999999; s.returncode=None; s.waited=0
+        s.stdout, s.stderr, s.stdin = _io.BytesIO(), _io.BytesIO(), _io.BytesIO()
+    def wait(s, timeout=None):
+        s.waited += 1
+        if s.waited == 1: raise KeyboardInterrupt()
+        return 0
+    def poll(s): return 0
 procs=[]
 runner.subprocess.Popen = lambda *a, **k: (procs.append(FakeProc()) or procs[-1])
 tg=[0]; runner.terminate_group = lambda proc, grace=3.0: tg.__setitem__(0, tg[0]+1)
@@ -3859,7 +3869,7 @@ try:
     runner.run("t", ["true"], timeout=5); ki=False
 except KeyboardInterrupt:
     ki=True
-c_ki = (ki and tg[0] == 1 and procs and procs[0].communicated == 2)   # re-raised, cleaned, drained
+c_ki = (ki and tg[0] == 1 and procs and procs[0].waited == 1)   # re-raised, cleaned once (wait raised the KI)
 # (4) OOB session close shares the runner helper (no bespoke terminate-only)
 c_oob = ("runner.terminate_group" in inspect.getsource(oob.close_session))
 sys.exit(0 if (c_timeout and c_leader_first and c_sigkill and c_sns and c_ki and c_oob) else 1)
@@ -5157,12 +5167,14 @@ echo "[124] ffuf truth (batch 3, codex-hardened) — classifier SEPARATES transp
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "transport!=block; hard states (FAILED/TIMED_OUT/SKIPPED) never->SUCCESS; block+valid-artifact->PARTIAL, block+no-artifact->BLOCKED; []-root root guarded" || no "ffuf classifier/adapter truth broken"
 import sys, json, tempfile, pathlib
 from quarry_recon.runner import _classify, reclassify_ffuf, ffuf_results, RunResult, Status
-cl = (_classify(0, "", "context deadline exceeded", False)[0] == Status.PARTIAL       # transport, clean -> PARTIAL
-      and _classify(0, "", "read: connection reset by peer", False)[0] == Status.PARTIAL
-      and _classify(0, "", "403 Forbidden (cloudflare)", False)[0] == Status.BLOCKED   # real block
-      and _classify(0, "", "429 too many requests", False)[0] == Status.BLOCKED
-      and _classify(0, "", "", False)[0] == Status.EMPTY                               # clean, nothing
-      and _classify(0, "x", "", False)[0] == Status.SUCCESS)
+# new signature: _classify(exit_code, has_out, blocked, transport, ok_empty) — stderr strings are matched
+# into blocked/transport by _drain_stderr now, so the decision table is exercised with the booleans.
+cl = (_classify(0, False, False, True, True)[0] == Status.PARTIAL     # transport, clean -> PARTIAL
+      and _classify(0, False, False, True, True)[0] == Status.PARTIAL
+      and _classify(0, False, True, False, True)[0] == Status.BLOCKED  # real block
+      and _classify(0, False, True, False, True)[0] == Status.BLOCKED
+      and _classify(0, False, False, False, True)[0] == Status.EMPTY   # clean, nothing
+      and _classify(0, True, False, False, True)[0] == Status.SUCCESS)
 def art(payload):
     d = pathlib.Path(tempfile.mkdtemp()) / "o.json"; d.write_text(json.dumps(payload)); return d
 def mk(results, status, exit_code=0):

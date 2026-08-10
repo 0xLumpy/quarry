@@ -83,7 +83,9 @@ def test_command_result_rejects_bad_input():
 # ── Fault ──────────────────────────────────────────────────────────────────────────────────────
 def test_fault_rules():
     assert state.Fault("machinery").challenges_completeness is True
+    assert state.Fault("publication").challenges_completeness is True
     assert state.Fault("optional_tool_failed").challenges_completeness is False
+    assert state.Fault("diagnostic").challenges_completeness is False    # best-effort stderr, non-challenging
     with pytest.raises(state.ContractError):
         state.Fault("bogus")
     with pytest.raises(state.ContractError):
