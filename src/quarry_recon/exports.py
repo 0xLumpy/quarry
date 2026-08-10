@@ -26,20 +26,22 @@ def write_delta(run) -> None:
     for src, n in sorted(by_src.items(), key=lambda kv: -kv[1]):
         out.append(f"- {src}: {n}")
 
-    # new-since-previous-run: diff against the most recent *other* run in the project
-    import json
-    from pathlib import Path
-    runs_dir = Path(run.project_dir) / "recon"
-    prev = sorted([d for d in runs_dir.iterdir()
-                   if d.is_dir() and d.name not in (run.run_id, "state")])
-    if prev:
-        prev_subs_file = prev[-1] / "exports" / "subdomains.txt"
+    # diff against this run's immediate chronological predecessor (none if this run isn't located)
+    from .store import Run
+    ordered = Run.list_runs(run.project_dir)
+    names = [d.name for d in ordered]
+    prev_dir = None
+    if run.run_id in names:
+        i = names.index(run.run_id)
+        prev_dir = ordered[i - 1] if i > 0 else None
+    if prev_dir:
+        prev_subs_file = prev_dir / "exports" / "subdomains.txt"
         if prev_subs_file.exists():
             prev_set = set(prev_subs_file.read_text().split())
             cur_set = set(run.values("subdomain"))
             new = sorted(cur_set - prev_set)
             gone = sorted(prev_set - cur_set)
-            out.append(f"\n## vs previous run ({prev[-1].name})")
+            out.append(f"\n## vs previous run ({prev_dir.name})")
             out.append(f"- new subdomains: {len(new)}")
             out.append(f"- disappeared: {len(gone)}")
             for h in new[:50]:

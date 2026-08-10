@@ -371,6 +371,10 @@ def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+#: directories under recon/ that are not runs (one authority, so no enumerator re-lists them as runs).
+RESERVED_RECON_DIRS = frozenset({"state", "campaigns"})
+
+
 def _read_started(path: Path):
     """The recorded `started` timestamp from a run.json / manifest.json, or None if absent or unreadable."""
     try:
@@ -378,6 +382,39 @@ def _read_started(path: Path):
         return v.get("started") if isinstance(v, dict) else None
     except (OSError, json.JSONDecodeError, ValueError):
         return None
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _parse_started(s) -> "datetime | None":
+    """A timezone-aware datetime from an ISO `started` string, or None if it is malformed or naive."""
+    if not isinstance(s, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo is not None else None
+
+
+def _run_identity(d: Path) -> "tuple[dict, datetime] | None":
+    """`(metadata, started)` for a real run directory, or None. Requires `run_id == dir name`, a non-empty
+    string `target`, and a parseable timezone-aware `started`."""
+    for name in ("run.json", "manifest.json"):
+        v = _read_json(d / name)
+        if not isinstance(v, dict) or v.get("run_id") != d.name:
+            continue
+        if not (isinstance(v.get("target"), str) and v["target"].strip()):
+            continue
+        dt = _parse_started(v.get("started"))
+        if dt is not None:
+            return v, dt
+    return None
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -965,24 +1002,27 @@ class Run:
             _atomic_write(state / "current.txt", str(self.dir.resolve()))
 
     @staticmethod
+    def list_runs(project_dir: Path) -> "list[Path]":
+        """Real run directories under recon/, oldest→newest by parsed `started` (name breaks ties). Reserved
+        namespaces (`state`, `campaigns`), symlinks, non-directories and invalid-identity dirs are excluded."""
+        root = Path(project_dir) / "recon"
+        if not root.is_dir():
+            return []
+        runs = []
+        for d in root.iterdir():
+            if d.name in RESERVED_RECON_DIRS or d.is_symlink() or not d.is_dir():
+                continue
+            ident = _run_identity(d)
+            if ident is not None:
+                runs.append((ident[1], d.name, d))
+        runs.sort(key=lambda t: (t[0], t[1]))
+        return [d for _, _, d in runs]
+
+    @staticmethod
     def latest(project_dir: Path) -> "Run | None":
-        runs_dir = Path(project_dir) / "recon"
-        if not runs_dir.exists():
-            return None
-        candidates = sorted([d for d in runs_dir.iterdir()
-                             if d.is_dir() and d.name != "state"])
+        candidates = Run.list_runs(project_dir)
         if not candidates:
             return None
         d = candidates[-1]
-        # a crashed run has run.json but no final manifest, so the target is recovered from either
-        target = "unknown"
-        for meta in (d / "manifest.json", d / "run.json"):   # manifest first (richer), run.json fallback
-            if meta.exists():
-                try:
-                    t = json.loads(meta.read_text()).get("target")
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if t:
-                    target = t
-                    break
-        return Run.open(project_dir, target, d.name)        # open (load started), never fabricate
+        ident = _run_identity(d)                             # the validated identity is the target authority
+        return Run.open(project_dir, ident[0]["target"] if ident else "unknown", d.name)
