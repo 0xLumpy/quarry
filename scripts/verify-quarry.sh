@@ -442,7 +442,7 @@ PYEOF
 echo "[20] exposed-fetch skips off-scope redirect body, records redirect review"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "off-scope redirect: 0 secrets, redirect review logged" || no "off-scope redirect body extracted / not recorded"
 import sys, tempfile
-from quarry_recon import netguard as _NG; _NG.resolve = lambda h, timeout=5: (["93.184.216.34"], "ok")  # audit#1: hosts resolve GLOBAL (guard passes)
+from quarry_recon import netguard as _NG; _NG._STUB = {"all": ["93.184.216.34"]}  # audit#1: hosts resolve GLOBAL (guard passes)
 from pathlib import Path
 from quarry_recon import evidence as e, fetch as f
 
@@ -486,7 +486,7 @@ PYEOF
 echo "[21] graphql introspection: enabled counted, disabled noted, in-scope only"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "introspection enabled=1/ENABLED review; disabled=0/blocked review" || no "graphql probe broken"
 import sys, tempfile, urllib.request
-from quarry_recon import netguard as _NG; _NG.resolve = lambda h, timeout=5: (["93.184.216.34"], "ok")  # audit#1: hosts resolve GLOBAL (guard passes)
+from quarry_recon import netguard as _NG; _NG._STUB = {"all": ["93.184.216.34"]}  # audit#1: hosts resolve GLOBAL (guard passes)
 from pathlib import Path
 from quarry_recon import evidence as e
 
@@ -534,7 +534,7 @@ PYEOF
 echo "[22] exposed-fetch/graphql pace to RATELIMIT.HTTP (no burst on capped target)"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "http_rl=5 -> sleep(0.2)/request; unset -> no sleep" || no "rate pacing not honored"
 import sys, tempfile, urllib.request
-from quarry_recon import netguard as _NG; _NG.resolve = lambda h, timeout=5: (["93.184.216.34"], "ok")  # audit#1: hosts resolve GLOBAL (guard passes)
+from quarry_recon import netguard as _NG; _NG._STUB = {"all": ["93.184.216.34"]}  # audit#1: hosts resolve GLOBAL (guard passes)
 from pathlib import Path
 from quarry_recon import evidence as e
 from quarry_recon import fetch as f
@@ -576,7 +576,7 @@ PYEOF
 echo "[23] actuator: env=real+secret; heapdump detected via _links (endpoint not requested); benign; no shutdown"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "env mined; heapdump via _links high-pri (no GET); benign noted; shutdown untouched" || no "actuator probe broken"
 import sys, tempfile, urllib.request
-from quarry_recon import netguard as _NG; _NG.resolve = lambda h, timeout=5: (["93.184.216.34"], "ok")  # audit#1: hosts resolve GLOBAL (guard passes)
+from quarry_recon import netguard as _NG; _NG._STUB = {"all": ["93.184.216.34"]}  # audit#1: hosts resolve GLOBAL (guard passes)
 from pathlib import Path
 from quarry_recon import evidence as e
 
@@ -636,7 +636,7 @@ PYEOF
 echo "[24] fetch.scoped_get: off-scope redirect->None, in-scope->body, bounded read(max+1)"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "off-scope->None; in-scope->data; read bounded to max_body+1" || no "scoped_get guard broken"
 import sys
-from quarry_recon import netguard as _NG; _NG.resolve = lambda h, timeout=5: (["93.184.216.34"], "ok")  # audit#1: hosts resolve GLOBAL (guard passes)
+from quarry_recon import netguard as _NG; _NG._STUB = {"all": ["93.184.216.34"]}  # audit#1: hosts resolve GLOBAL (guard passes)
 from quarry_recon import fetch as f
 
 class Scope:
@@ -1123,7 +1123,7 @@ PYEOF
 echo "[41] deep-evidence: DEEP_EVIDENCE true->downloads+mines heapdump; default (off) never fetches it; NO acquisition cap — the dump is streamed whole and mined in overlapping windows (a secret on a boundary survives, and is published once)"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "config parses off/on; deep mode downloads heapdump + mines AKIA; review=DOWNLOADED (deep-evidence); no size cap: 8-byte windows still find the key once and keep the artifact whole" || no "deep-evidence broken"
 import sys, os, tempfile, urllib.request
-from quarry_recon import netguard as _NG; _NG.resolve = lambda h, timeout=5: (["93.184.216.34"], "ok")  # audit#1: hosts resolve GLOBAL (guard passes)
+from quarry_recon import netguard as _NG; _NG._STUB = {"all": ["93.184.216.34"]}  # audit#1: hosts resolve GLOBAL (guard passes)
 from pathlib import Path
 from quarry_recon import evidence as e
 from quarry_recon.config import TargetProfile
@@ -2549,7 +2549,7 @@ P.exec_tool=fake; P.have=lambda t:True; settings.web_port_prefilter=lambda:True;
 # (pubmap, a_known): global-only A in pubmap; a_known distinguishes 'no A data' (d) from 'A but private' (b).
 # netguard.guard_hosts now owns the block decision (b private -> blocked+review, not probed); patch resolve hermetic.
 from quarry_recon import netguard as NG
-NG.resolve = lambda h, timeout=5: (["127.0.0.1"], "ok") if h == "b.acme.com" else (["8.8.8.8"], "ok")  # b -> scan-box self-hit (withheld)
+NG._STUB = {"map": {"b.acme.com": ["127.0.0.1"]}, "default": ["8.8.8.8"]}  # b -> scan-box self-hit (withheld)
 pubmap,aknown=P._host_public_ip_map(Ctx(),["a.acme.com","b.acme.com","c.acme.com","d.acme.com"])
 priv=(pubmap["a.acme.com"]==["1.2.3.4"] and pubmap["b.acme.com"]==[] and set(pubmap["c.acme.com"])=={"1.2.3.4","5.6.7.8"}
       and "b.acme.com" in aknown and "d.acme.com" not in aknown)
@@ -3595,7 +3595,7 @@ PYEOF
 echo "[107] scope safety — scoped_get follows redirects PER-HOP with a scope check BEFORE contacting (audit #1, direct-fetch path only; httpx/ffuf follow-redirects are separate): off-scope/metadata hop NEVER requested; in-scope chain -> terminal body; plain 200 unchanged; EVERY response is closed (no fd/conn leak); redirect-limit exhaustion returns EMPTY body NOT None (never mislabeled off-scope); only real redirect statuses (301/302/303/307/308, not 304) are followed; sensitive headers (Authorization/Cookie) dropped on host/scheme change; redirects followed non-mutating (GET)"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "off-scope hop never contacted; in-scope chain->body; plain 200 ok; ALL responses closed; exhaustion->empty-not-None; only real 3xx followed; cross-host strips Authorization" || no "scoped_get redirect scope enforcement broken"
 import sys
-from quarry_recon import netguard as _NG; _NG.resolve = lambda h, timeout=5: (["93.184.216.34"], "ok")  # audit#1: hosts resolve GLOBAL (guard passes)
+from quarry_recon import netguard as _NG; _NG._STUB = {"all": ["93.184.216.34"]}  # audit#1: hosts resolve GLOBAL (guard passes)
 from types import SimpleNamespace
 from quarry_recon import fetch
 class Resp:
@@ -4996,17 +4996,17 @@ policy = (all(N.is_self_attack_ip(ip) for ip in self_ips)                       
           and "::ffff:127.0.0.0/104" in N.self_deny_list()                             # #4: mapped-loopback in the tool deny too
           and "10.0.0.0/8" not in N.self_deny_list())                                  # deny is SELF-only (private is contacted)
 # resolve bounded + state machine
-N.socket.getaddrinfo = lambda *a, **k: (time.sleep(0.3), [(2,1,6,"",("8.8.8.8",0))])[1]
+N._STUB = {"mode": "slow", "delay": 0.3}
 t0 = time.time(); ips, st = N.resolve("slow", timeout=0.02); dt = time.time() - t0
 bounded = (st == "indeterminate" and dt < 0.25)
-N.socket.getaddrinfo = lambda *a, **k: [(2,1,6,"",("8.8.8.8",0))]; okst = N.resolve("x")[1] == "ok"
-N.socket.getaddrinfo = lambda *a, **k: (_ for _ in ()).throw(socket.gaierror(socket.EAI_NONAME, "n")); nx = N.resolve("x")[1] == "nxdomain"
-N.socket.getaddrinfo = lambda *a, **k: (_ for _ in ()).throw(socket.gaierror(socket.EAI_AGAIN, "t")); ind = N.resolve("x")[1] == "indeterminate"
+N._STUB = {"all": ["8.8.8.8"]}; okst = N.resolve("x")[1] == "ok"
+N._STUB = {"gaierror": socket.EAI_NONAME}; nx = N.resolve("x")[1] == "nxdomain"
+N._STUB = {"gaierror": socket.EAI_AGAIN}; ind = N.resolve("x")[1] == "indeterminate"
 resolver = bounded and okst and nx and ind and not hasattr(N, "_resolve_cache")
 # contact_state (native fetch): private->contact by default, metadata->self, block_private flips private
 STATE = {"pub": (["8.8.8.8"], "ok"), "priv": (["10.0.0.5"], "ok"), "meta": (["169.254.169.254"], "ok"),
          "gone": ([], "nxdomain"), "flap": ([], "indeterminate")}
-N.resolve = lambda h, timeout=5: STATE.get(h, ([], "indeterminate"))
+N._STUB = {"states": STATE}
 cs = (N.contact_state("pub")[0] == "contact"
       and N.contact_state("priv")[0] == "contact"                          # private contacted by default
       and N.contact_state("priv", block_private=True)[0] == "private_blocked"
@@ -5022,8 +5022,8 @@ PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "global contacted; blocked+unreso
 import sys, io, urllib.error
 from types import SimpleNamespace
 from quarry_recon import fetch, netguard
-netguard.resolve = lambda h, timeout=5: {"ok.test": (["8.8.8.8"], "ok"), "evil.test": (["127.0.0.1"], "ok"),
-                                          "flap.test": (["8.8.8.8"], "ok")}.get(h, ([], "indeterminate"))  # unres.test -> indeterminate
+netguard._STUB = {"states": {"ok.test": (["8.8.8.8"], "ok"), "evil.test": (["127.0.0.1"], "ok"),
+                             "flap.test": (["8.8.8.8"], "ok")}}  # unres.test -> indeterminate (miss)
 closed = {"n": 0}
 class FakeErr(urllib.error.HTTPError):
     def close(self): closed["n"] += 1; super().close()
@@ -5077,7 +5077,7 @@ LIVE = {"pub.test": (["8.8.8.8"], "ok"), "priv.test": (["192.168.0.5"], "ok"),
         "meta.test": (["169.254.169.254"], "ok"), "mixedpriv.test": (["8.8.8.8"], "ok"),
         "stale.test": (["169.254.169.254"], "ok"),                          # ...but CURRENTLY resolves METADATA (audit #2)
         "unk-priv.test": (["10.9.9.9"], "ok"), "dead.test": ([], "nxdomain")}
-netguard.resolve = lambda h, timeout=5: LIVE.get(h, ([], "nxdomain"))
+netguard._STUB = {"states": LIVE, "miss": [[], "nxdomain"]}
 def mk(block):
     reviews, probed = [], []
     class Run:
@@ -5115,8 +5115,8 @@ from quarry_recon.phases import horizontal
 from quarry_recon.config import TargetProfile
 resolved = [{"host": "pub.t", "a": ["8.8.8.8"]}, {"host": "meta.t", "a": ["169.254.169.254"]},
             {"host": "priv.t", "a": ["10.0.0.9"]}]
-N.resolve = lambda h, timeout=5: {"pub.t": (["8.8.8.8"], "ok"), "meta.t": (["169.254.169.254"], "ok"),
-                                  "priv.t": (["10.0.0.9"], "ok")}.get(h, ([], "nxdomain"))   # fresh-resolve stub
+N._STUB = {"states": {"pub.t": (["8.8.8.8"], "ok"), "meta.t": (["169.254.169.254"], "ok"),
+                      "priv.t": (["10.0.0.9"], "ok")}, "miss": [[], "nxdomain"]}   # fresh-resolve stub
 def mk(block):
     reviews = []
     class Run:
@@ -5356,7 +5356,7 @@ def fexec(t, c, **k):
     return RunResult(t, c, Status.SUCCESS, 0, 1.0, rp, 0)
 probe.exec_tool = fexec; probe.have = lambda t: True; import quarry_recon.contract as _CT; _CT._run = fexec
 settings.web_port_prefilter = lambda: True; settings.workers = lambda t, dv: 10
-NG.resolve = lambda h, timeout=5: (["8.8.8.8"], "ok")               # all hosts resolve GLOBAL (none withheld)
+NG._STUB = {"all": ["8.8.8.8"]}               # all hosts resolve GLOBAL (none withheld)
 probe.fingerprint_hosts(Ctx2(), ["ded.com", "zero.com", "mixed.com", "cdn.com"], "probe")
 probed = {}
 for ports, hs in HTTPX:

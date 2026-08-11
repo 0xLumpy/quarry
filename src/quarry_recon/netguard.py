@@ -1,22 +1,15 @@
-"""Self-attack guard. Contact is the default, and the guard does two independent things:
-
-  record   a resolved host whose answers include a private or self address becomes a
-           review(internal-resolution) finding, whether or not we go on to contact it;
-  deny     contact is refused only for destinations that are the scan box itself — loopback,
-           link-local, cloud metadata endpoints, the unspecified address, own interface addresses.
-
-Private space (10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7) is contacted unless the profile sets
-block_private_targets. guard_hosts/guard_urls fresh-resolve every outbound host at the tool boundary and
-decide on the current answer; resolution is bounded and never cached, and a host that fails to resolve is
-passed through rather than suppressed. httpx additionally receives self_deny_list() as its own `-deny`;
-nuclei/dalfox/arjun have no connect-time IP deny, so a host that rebinds public -> metadata between our
-resolve and the tool's is a residual risk.
-"""
+"""Self-attack guard. `record`: a host resolving private/self is a review(internal-resolution) finding.
+`deny`: contact refused only for the scan box itself (loopback, link-local, cloud metadata, unspecified,
+own-interface addrs); private space is contacted unless block_private_targets. Hosts fresh-resolve at the
+tool boundary (bounded, uncached); a public->metadata rebind between resolve and tool is a residual risk."""
 from __future__ import annotations
 
 import ipaddress
+import multiprocessing as _mp
 import socket
 import threading
+import time
+from multiprocessing import connection as _mpc
 
 _NEG_ERRNOS = {getattr(socket, n) for n in ("EAI_NONAME", "EAI_NODATA")
                if getattr(socket, n, None) is not None}
@@ -122,61 +115,152 @@ def _getaddrinfo(host: str) -> list[str]:
     return sorted({i[4][0] for i in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)})
 
 
+# fork is unsafe only from a multithreaded process: single-threaded callers fork, multithreaded use forkserver.
+# `_STUB` injects a test resolver as a picklable arg passed to each worker (no monkeypatch inheritance).
+_MP = _mp.get_context("forkserver")   # for Value/Event/etc.; picklable to a forkserver child and fork-inherited
+_STUB = None                     # None=real; {"mode":"hang"} | {"map":{host:[ips]}} | {"gaierror":errno}
+_MAX_WORKERS = 16                # max outstanding queries in flight at once
+_KILL_GRACE = 0.5                # SIGTERM -> SIGKILL window for a stuck resolver worker
+_WORKER_NAME = "netguard-resolver"
+_DEFAULT_TIMEOUT = 5.0           # every query has a finite per-worker deadline
+
+
+def _spawn_context():
+    return _mp.get_context("forkserver") if threading.active_count() > 1 else _mp.get_context("fork")
+
+
+def _do_resolve(host, stub) -> tuple[list[str], str]:
+    """Per-host lookup + classification inside a worker: the injected stub, else real getaddrinfo."""
+    if stub is not None:
+        if stub.get("mode") == "hang":
+            while True:
+                time.sleep(1)
+        if stub.get("mode") == "slow":        # answers after the deadline: the late reply must be discarded
+            time.sleep(stub.get("delay", 2.0))
+            return ["9.9.9.9"], "ok"
+        gate = stub.get("gate")               # (counter, event): hold the worker in its slot to observe the cap
+        if gate is not None:
+            counter, event = gate
+            with counter.get_lock():
+                counter.value += 1
+            event.wait()
+            with counter.get_lock():
+                counter.value -= 1
+            return ["1.2.3.4"], "ok"
+        if "gaierror" in stub:
+            return [], ("nxdomain" if stub["gaierror"] in _NEG_ERRNOS else "indeterminate")
+        if "all" in stub:                     # same answer for every host
+            return (sorted(stub["all"]), "ok") if stub["all"] else ([], "nxdomain")
+        states = stub.get("states")           # exact per-host (ips, state); a miss uses `miss` (default indeterminate)
+        if states is not None:
+            v = states.get(host)
+            if v is not None:
+                return list(v[0]), v[1]
+            miss = stub.get("miss") or ([], "indeterminate")
+            return list(miss[0]), miss[1]
+        m = stub.get("map") or {}             # per-host ips (else `default`); presence => ok, absence => nxdomain
+        ips = m.get(host, stub.get("default"))
+        return (sorted(ips), "ok") if ips else ([], "nxdomain")
+    try:
+        ips = _getaddrinfo(host)
+        return ips, ("ok" if ips else "nxdomain")
+    except socket.gaierror as e:
+        return [], ("nxdomain" if e.errno in _NEG_ERRNOS else "indeterminate")
+    except Exception:
+        return [], "indeterminate"
+
+
+def _resolve_child(conn, host, stub) -> None:
+    try:
+        conn.send(_do_resolve(host, stub))
+    except Exception:
+        conn.send(([], "indeterminate"))
+    finally:
+        conn.close()
+
+
+def _reclaim(proc) -> None:
+    if getattr(proc, "pid", None) is None:
+        return                                # never started (start raised before fork) — nothing to reclaim
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(_KILL_GRACE)
+    if proc.is_alive():
+        proc.kill()
+    proc.join()
+
+
+def active_worker_count() -> int:
+    """Live resolver worker processes (by name) — the stuck-worker gate; back to baseline after every batch."""
+    return sum(1 for c in _mp.active_children() if c.name == _WORKER_NAME)
+
+
+def _resolve_batch(hosts, *, timeout: float, max_outstanding: int, budget_s: float = 0.0) -> dict:
+    """Resolve `hosts` in <= `max_outstanding` killable workers; a query killed at `timeout` or unreached by a
+    positive `budget_s` stays ([], 'indeterminate')."""
+    out: dict = {h: ([], "indeterminate") for h in hosts}
+    if not hosts:
+        return out
+    to = timeout if isinstance(timeout, (int, float)) and timeout > 0 else _DEFAULT_TIMEOUT
+    stub = _STUB                              # snapshot the injected resolver; passed to every worker as an arg
+    ctx = _spawn_context()                    # fork (single-threaded) or forkserver (multithreaded)
+    pending = list(hosts)
+    inflight: dict = {}                       # recv-conn -> (proc, host, kill_at)
+    stop_at = time.monotonic() + budget_s if budget_s > 0 else None
+    try:
+        while pending or inflight:
+            while pending and len(inflight) < max_outstanding and (stop_at is None or time.monotonic() < stop_at):
+                h = pending.pop(0)
+                r, w = ctx.Pipe(False)
+                proc = ctx.Process(target=_resolve_child, args=(w, h, stub), daemon=True, name=_WORKER_NAME)
+                try:
+                    proc.start()              # inside the guard: a start() that forks then raises is reclaimed
+                    inflight[r] = (proc, h, time.monotonic() + to)    # finite deadline; never None
+                except BaseException:
+                    _reclaim(proc)
+                    raise
+                w.close()
+            if not inflight:
+                break                         # budget spent; unreached hosts keep the indeterminate default
+            wait_s = max(0.0, min(k for _, _, k in inflight.values()) - time.monotonic())
+            for r in _mpc.wait(list(inflight), timeout=wait_s):
+                proc, h, kill_at = inflight.pop(r)
+                try:
+                    ans = r.recv()
+                    out[h] = ans if time.monotonic() < kill_at else ([], "indeterminate")   # discard a late answer
+                except Exception:
+                    out[h] = ([], "indeterminate")
+                finally:
+                    r.close()
+                    _reclaim(proc)            # always reclaim, even if recv raised — never orphan a worker
+            now = time.monotonic()
+            for r, (proc, h, kill_at) in list(inflight.items()):
+                if now >= kill_at:
+                    inflight.pop(r)
+                    r.close()                 # discard any answer the killed worker is mid-write
+                    _reclaim(proc)
+        return out
+    finally:
+        for r, (proc, _h, _k) in inflight.items():
+            r.close()
+            _reclaim(proc)
+
+
 def resolve(host: str, timeout: float = 5.0) -> tuple[list[str], str]:
-    """Bounded A+AAAA resolution -> (ips, state), state one of 'ok' / 'nxdomain' / 'indeterminate'.
-    A hang is abandoned and reported indeterminate. No caching."""
+    """Bounded A+AAAA resolution -> (ips, state) in 'ok' / 'nxdomain' / 'indeterminate'. A hang is killed and
+    reported indeterminate. No caching."""
     if not host:
         return [], "indeterminate"
-    box: dict = {}
-
-    def _work():
-        try:
-            box["ips"] = _getaddrinfo(host)
-        except socket.gaierror as e:
-            box["errno"] = e.errno
-        except Exception:
-            box["errno"] = None
-
-    t = threading.Thread(target=_work, name=f"netguard-dns-{host[:32]}", daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        return [], "indeterminate"
-    if "ips" in box:
-        return box["ips"], ("ok" if box["ips"] else "nxdomain")
-    return [], ("nxdomain" if box.get("errno") in _NEG_ERRNOS else "indeterminate")
-
-
-_MAX_WORKERS = 16
+    return _resolve_batch([host], timeout=timeout, max_outstanding=1)[host]
 
 
 def resolve_many(hosts, *, timeout: float = 5.0) -> dict:
-    """Resolve many hosts with bounded concurrency -> {host: (ips, state)}. Workers are daemons, so they
-    never block shutdown; a host that did not finish stays ([], 'indeterminate')."""
-    import queue
+    """Resolve many hosts with bounded outstanding workers -> {host: (ips, state)}. A worker that does not
+    finish is killed and reclaimed, so a large failing corpus leaves no live worker."""
     uniq = [h for h in dict.fromkeys(hosts) if h]
-    out: dict = {h: ([], "indeterminate") for h in uniq}
     if not uniq:
-        return out
-    q: queue.Queue = queue.Queue()
-    for h in uniq:
-        q.put(h)
-
-    def _worker():
-        while True:
-            try:
-                h = q.get_nowait()
-            except queue.Empty:
-                return
-            out[h] = resolve(h, timeout=timeout)
-
-    workers = [threading.Thread(target=_worker, name="netguard-dns-batch", daemon=True)
-               for _ in range(min(_MAX_WORKERS, len(uniq)))]
-    for w in workers:
-        w.start()
-    for w in workers:
-        w.join(timeout * 2 + 5)
-    return out
+        return {}
+    return _resolve_batch(uniq, timeout=timeout, max_outstanding=min(_MAX_WORKERS, len(uniq)))
 
 
 def contact_state(host, stored_ips=None, *, block_private=False, timeout=5.0):

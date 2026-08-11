@@ -30,14 +30,27 @@ def _blocked(*a, **k):
                         "genuinely needs one)")
 
 
+def _family_aware_connect(original):
+    """Deny an AF_INET/INET6 (network) connect; permit AF_UNIX — that is internal IPC (e.g. multiprocessing's
+    forkserver), not network, and blocking it would break the killable-worker resolver."""
+    def guard(self, *a, **k):
+        if getattr(self, "family", None) == getattr(socket, "AF_UNIX", object()):
+            return original(self, *a, **k)
+        raise NetworkDenied("offline test attempted a network connect (mark it `live`/`integration`)")
+    return guard
+
+
 # (target-object, attribute) pairs to patch. Patch the CONNECT/RESOLVE/SEND entry points and subprocess
 # spawn — NOT socket.socket itself (replacing the class breaks `ssl.SSLSocket(socket.socket)` subclassing).
+# connect/connect_ex are family-aware (AF_UNIX IPC allowed); everything else is a hard deny.
 def _blockers():
     return [
-        (socket.socket, "connect"), (socket.socket, "connect_ex"), (socket.socket, "sendto"),
-        (socket, "create_connection"), (socket, "getaddrinfo"),
-        (socket, "gethostbyname"), (socket, "gethostbyname_ex"),
-        (subprocess, "Popen"), (subprocess, "run"),
+        (socket.socket, "connect", _family_aware_connect(socket.socket.connect)),
+        (socket.socket, "connect_ex", _family_aware_connect(socket.socket.connect_ex)),
+        (socket.socket, "sendto", _blocked),
+        (socket, "create_connection", _blocked), (socket, "getaddrinfo", _blocked),
+        (socket, "gethostbyname", _blocked), (socket, "gethostbyname_ex", _blocked),
+        (subprocess, "Popen", _blocked), (subprocess, "run", _blocked),
     ]
 
 
@@ -49,9 +62,9 @@ def pytest_configure(config):
     import os
     if not os.environ.get("QUARRY_OFFLINE_CI"):
         return
-    for obj, attr in _blockers():
+    for obj, attr, replacement in _blockers():
         _saved.append((obj, attr, getattr(obj, attr)))
-        setattr(obj, attr, _blocked)
+        setattr(obj, attr, replacement)
 
 
 def pytest_unconfigure(config):
@@ -66,8 +79,8 @@ def _network_deny(request, monkeypatch):
     """Block network+subprocess for every test not marked `live`/`integration`."""
     if request.node.get_closest_marker("live") or request.node.get_closest_marker("integration"):
         return
-    for obj, attr in _blockers():
-        monkeypatch.setattr(obj, attr, _blocked)
+    for obj, attr, replacement in _blockers():
+        monkeypatch.setattr(obj, attr, replacement)
 
 
 # ── shared fixtures ──
