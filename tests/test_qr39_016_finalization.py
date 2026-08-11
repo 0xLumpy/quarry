@@ -28,7 +28,7 @@ def _one_phase(monkeypatch, fn=lambda ctx: None):
 
 
 def _invoke(tmp_path, *args):
-    return CliRunner(mix_stderr=False).invoke(cli, [args[0], "-t", str(_profile(tmp_path)), *args[1:]])
+    return CliRunner().invoke(cli, [args[0], "-t", str(_profile(tmp_path)), *args[1:]])
 
 
 def _run(tmp_path, monkeypatch, *args):

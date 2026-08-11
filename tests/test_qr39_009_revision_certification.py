@@ -58,7 +58,7 @@ def _failed_finalisation(tmp_path, monkeypatch, runner):
 
 
 def test_a_fault_clearing_resume_keeps_the_revision_certified(tmp_path, monkeypatch):
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     run_dir = _failed_finalisation(tmp_path, monkeypatch, runner)
     before = json.loads((run_dir / "manifest.json").read_text())
     assert before["summary"]["faults"], "the run did not record the publication fault this test needs"
@@ -100,7 +100,7 @@ def test_a_fault_clearing_resume_keeps_the_revision_certified(tmp_path, monkeypa
 def test_a_change_to_evidence_still_uncertifies_the_revision(tmp_path, monkeypatch, mutate):
     """The guard is scoped, not removed: everything the manifest records except the answered bookkeeping
     still certifies, `summary.gaps` and `summary.coverage` included."""
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     _one_phase(monkeypatch)
     assert runner.invoke(cli, ["run", "-t", str(_profile(tmp_path)), "--phases", "horizontal"]).exit_code == 0
     run_dir = _run_dir(tmp_path)
@@ -121,7 +121,7 @@ def test_a_change_to_evidence_still_uncertifies_the_revision(tmp_path, monkeypat
 def test_the_digest_ignores_the_answered_bookkeeping_and_nothing_else(tmp_path, monkeypatch):
     """Only `summary.faults` and `summary.verdict` are exempt — the pair `reconcile_finalization` rewrites.
     Reformatting is not evidence either, so the digest is over canonical content, not the file's bytes."""
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     _one_phase(monkeypatch)
     assert runner.invoke(cli, ["run", "-t", str(_profile(tmp_path)), "--phases", "horizontal"]).exit_code == 0
     run_dir = _run_dir(tmp_path)

@@ -112,7 +112,7 @@ def test_a_legacy_ledger_without_a_view_still_loads_and_replays(tmp_path):
 def test_report_renders_the_revision_not_the_base(tmp_path, monkeypatch):
     from quarry_recon import phases
     monkeypatch.setattr(phases, "REGISTRY", {"horizontal": (lambda ctx: None, "Horizontal", False)})
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     assert runner.invoke(cli, ["run", "-t", str(_profile(tmp_path)), "--phases", "horizontal"]).exit_code == 0
     run_dir = next(iter((tmp_path / "recon").glob("2*")))
 

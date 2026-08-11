@@ -37,7 +37,7 @@ def _one_phase(monkeypatch, fn=lambda ctx: None):
 
 
 def _invoke(tmp_path, *args):
-    return CliRunner(mix_stderr=False).invoke(cli, [args[0], "-t", str(_profile(tmp_path)), *args[1:]])
+    return CliRunner().invoke(cli, [args[0], "-t", str(_profile(tmp_path)), *args[1:]])
 
 
 def _run(tmp_path, monkeypatch, *args):
@@ -240,7 +240,7 @@ def test_a_campaign_that_never_finished_is_gapped_and_names_the_resume(tmp_path)
     (["doctor", "--json", "--phase"], 2),         # an option missing its argument
 ])
 def test_click_parse_errors_carry_a_document_and_exit_two(argv, code):
-    res = CliRunner(mix_stderr=False).invoke(cli, argv)
+    res = CliRunner().invoke(cli, argv)
     doc = json.loads(res.stdout)                  # the whole of stdout parses: prose stayed on stderr
     assert res.exit_code == code and doc["exit_code"] == code
     assert doc["outcome"] == "invalid" and doc["schema_version"] == state.SCHEMA_VERSION
@@ -256,7 +256,7 @@ def test_a_phases_value_that_looks_like_a_flag_is_a_value_not_a_json_request(tmp
 
 @pytest.mark.parametrize("argv", [["--help"], ["--version"], ["run", "--help"]])
 def test_help_and_version_still_exit_zero(argv):
-    res = CliRunner(mix_stderr=False).invoke(cli, argv)
+    res = CliRunner().invoke(cli, argv)
     assert res.exit_code == 0, res.stderr
     assert res.stdout.strip()
 
@@ -271,7 +271,7 @@ def test_no_command_returns_an_undocumented_exit_one(tmp_path, monkeypatch):
                  ["init", "bad/name"],
                  ["doctor", "--phase", "nosuchphase"],
                  ["install", "--only", "nosuchtool"]):
-        res = CliRunner(mix_stderr=False).invoke(cli, argv)
+        res = CliRunner().invoke(cli, argv)
         seen[argv[0] + " " + (argv[1] if len(argv) > 1 else "")] = res.exit_code
         assert res.exit_code in state.EXIT_CODES, (argv, res.exit_code, res.stderr)
         assert res.exit_code != 1, (argv, res.stderr)
@@ -286,7 +286,7 @@ def test_lock_drift_is_a_coverage_verdict_not_a_bare_failure(monkeypatch):
     monkeypatch.setattr(registry, "load_tools", lambda: [tool])
     monkeypatch.setattr(cli_mod, "load_tools", lambda: [tool])
     monkeypatch.setattr(registry, "installed_identity", lambda t: "")
-    res = CliRunner(mix_stderr=False).invoke(cli, ["lock", "--drift-only", "--json"])
+    res = CliRunner().invoke(cli, ["lock", "--drift-only", "--json"])
     doc = json.loads(res.stdout)
     assert res.exit_code == 4 and doc["gaps"] and doc["command"] == "lock"
 
@@ -617,7 +617,7 @@ def test_a_revision_that_cannot_be_certified_is_machinery_not_bad_input(tmp_path
     src.write_text(json.dumps({"protocol": "dns", "unique-id": "c2", "full-id": "def.oast.me",
                                "q-type": "A", "remote-address": "203.0.113.9",
                                "timestamp": "2026-08-10T12:00:00Z"}) + "\n")
-    res = CliRunner(mix_stderr=False).invoke(
+    res = CliRunner().invoke(
         cli, ["oob", "import", str(src), "-t", str(_profile(tmp_path)), "--json"])
     doc = json.loads(res.stdout)
     assert res.exit_code == 5, res.stderr          # machinery, not exit 2 "invalid input"
@@ -720,7 +720,7 @@ def test_interactions_refused_past_the_envelope_are_a_gap(tmp_path, monkeypatch)
     real = oob.import_file
     monkeypatch.setattr(oob, "import_file",
                         lambda *a, **k: {**real(*a, **k), "refused": 3})
-    res = CliRunner(mix_stderr=False).invoke(
+    res = CliRunner().invoke(
         cli, ["oob", "import", str(src), "-t", str(_profile(tmp_path)), "--json"])
     doc = json.loads(res.stdout)
     assert res.exit_code == 4, res.stderr
@@ -733,7 +733,7 @@ def test_an_import_that_refused_nothing_is_clean(tmp_path, monkeypatch):
     src.write_text(json.dumps({"protocol": "dns", "unique-id": "c1", "full-id": "abc.oast.me",
                                "q-type": "A", "remote-address": "203.0.113.9",
                                "timestamp": "2026-08-10T12:00:00Z"}) + "\n")
-    res = CliRunner(mix_stderr=False).invoke(
+    res = CliRunner().invoke(
         cli, ["oob", "import", str(src), "-t", str(_profile(tmp_path))])
     assert res.exit_code == 0, res.stderr
 
@@ -1028,7 +1028,7 @@ def test_an_import_that_refused_nothing_still_reports_a_standing_debt(tmp_path, 
     real = oob.import_file
     monkeypatch.setattr(oob, "import_file",
                         lambda *a, **k: {**real(*a, **k), "refused": 0, "outstanding": 4})
-    res = CliRunner(mix_stderr=False).invoke(
+    res = CliRunner().invoke(
         cli, ["oob", "import", str(src), "-t", str(_profile(tmp_path)), "--json"])
     doc = json.loads(res.stdout)
     assert res.exit_code == 4, res.stderr

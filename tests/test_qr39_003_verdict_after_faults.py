@@ -139,7 +139,7 @@ def test_a_run_whose_checkpoint_fires_does_not_finalise_clean(tmp_path, monkeypa
         for i in range(20):
             ctx.run.add("resolved", {"host": f"h{i}.example.com", "source": "t"})
     monkeypatch.setattr(phases, "REGISTRY", {"probe": (thin, "Probe", False)})
-    res = CliRunner(mix_stderr=False).invoke(
+    res = CliRunner().invoke(
         cli, ["run", "-t", str(_profile(tmp_path)), "--phases", "probe", "--json"])
     doc = json.loads(res.stdout)
     assert res.exit_code == 4, res.stderr

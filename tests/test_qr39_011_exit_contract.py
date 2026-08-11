@@ -35,7 +35,7 @@ def _one_phase(monkeypatch, fn, *, label="Horizontal", needs_active=False):
 
 def _run(tmp_path, monkeypatch, fn, *args):
     _one_phase(monkeypatch, fn)
-    return CliRunner(mix_stderr=False).invoke(
+    return CliRunner().invoke(
         cli, ["run", "-t", str(_profile(tmp_path)), "--phases", "horizontal", *args])
 
 
@@ -108,7 +108,7 @@ def test_clean_run_exits_zero(tmp_path, monkeypatch):
 
 
 def test_invalid_selector_exits_two(tmp_path):
-    res = CliRunner(mix_stderr=False).invoke(cli, ["run", "-t", str(_profile(tmp_path)), "--phases", "typo"])
+    res = CliRunner().invoke(cli, ["run", "-t", str(_profile(tmp_path)), "--phases", "typo"])
     assert res.exit_code == 2, res.stderr
 
 
@@ -152,7 +152,7 @@ def _doctor_with(monkeypatch, *, installed: bool, verified: bool = True):
     monkeypatch.setattr(cli_mod, "load_tools", lambda: [tool])
     monkeypatch.setattr(cli_mod, "health", lambda t: {"ok": verified, "drift": "ok" if verified else "DRIFT",
                                                      "identity": "v1.0.0", "capability": True})
-    return CliRunner(mix_stderr=False).invoke(cli, ["doctor", "--json"])
+    return CliRunner().invoke(cli, ["doctor", "--json"])
 
 
 @pytest.mark.parametrize("installed,verified,code,kind", [
@@ -177,7 +177,7 @@ def test_doctor_readiness_verdict_reaches_the_exit_status(monkeypatch, installed
 def test_json_stdout_carries_one_document_and_no_prose(tmp_path, monkeypatch, argv, expected):
     _one_phase(monkeypatch, lambda ctx: None)
     argv = [argv[0], "-t", str(_profile(tmp_path))] + argv[1:]
-    res = CliRunner(mix_stderr=False).invoke(cli, argv)
+    res = CliRunner().invoke(cli, argv)
     doc = json.loads(res.stdout)                       # the WHOLE stdout parses: no prose fore or aft
     assert res.exit_code == expected, res.stderr
     assert set(doc) == DOC_KEYS
@@ -217,7 +217,7 @@ def test_an_escaping_exception_is_a_machinery_failure_with_our_credential_redact
     def boom(*a, **k):
         raise RuntimeError(f"GET https://api.shodan.io/v1?key={token} failed")
     monkeypatch.setattr(cli_mod, "_run_phases", boom)
-    res = CliRunner(mix_stderr=False).invoke(
+    res = CliRunner().invoke(
         cli, ["run", "-t", str(_profile(tmp_path)), "--phases", "horizontal", "--json"])
     doc = json.loads(res.stdout)
     assert res.exit_code == 5 and doc["faults"][0]["kind"] == "machinery"
