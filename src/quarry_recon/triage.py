@@ -426,6 +426,13 @@ def build(run, scope) -> str:
 # (sources + raw_ref + why + confidence). Discovered values are shown whole with a short preview
 # alongside; only Quarry's own configured keys are redacted.
 
+def _store_ref(run, entity: str, record: dict) -> str:
+    """The run-relative file holding this observation. A combined view answers per row, so a callback that
+    arrived after the run finished points at its supplement segment rather than a log it is not in."""
+    resolve = getattr(run, "store_ref", None)
+    return resolve(entity, record) if resolve else f"normalized/{entity}.jsonl"
+
+
 def _item(type_: str, value, why: str, confidence: str, sources, raw_ref: str, tags,
           location: str | None = None, identity: str | None = None) -> dict:
     val = _sanitize_url(secrets.redact(value)) if isinstance(value, str) else value
@@ -598,7 +605,7 @@ def collect(run, scope) -> dict:
             why = "out-of-band interaction — UNCORRELATED (no source attribution until a Quarry-issued token matches)"
             tags = ["oob", proto, "unknown-oob", "external-service-interaction", "uncorrelated"]
         add("oob", _item("oob_interaction", f"{proto} · {dom} · from {o.get('remote_address', '?')}",
-            why, "candidate", o.get("sources"), "normalized/oob_interaction.jsonl", tags,
+            why, "candidate", o.get("sources"), _store_ref(run, "oob_interaction", o), tags,
             location=o.get("raw_ref")))
 
     # gadgets: its own queue of chain material, never a finding. `impact_state` rides along so no

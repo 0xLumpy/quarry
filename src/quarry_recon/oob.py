@@ -62,35 +62,63 @@ def parse_interactsh(text: str) -> list[dict]:
     return out
 
 
-def import_file(run, path) -> dict:
-    """Copy the raw import to ``raw/oob/``, parse it, add oob_interaction rows to the store. Returns
-    ``{parsed, added, by_protocol, correlated}``; each row's ``raw_ref`` points at the stored raw file.
+def import_file(run, path, *, scope=None) -> dict:
+    """Copy the raw import beside the run's other raw evidence, parse it, add oob_interaction rows. Returns
+    ``{parsed, added, by_protocol, correlated, revision}``; each row's ``raw_ref`` points at the stored
+    raw file.
 
     When the run has a Quarry-owned session, imported rows carrying one of its tokens are correlated;
-    the rest stay uncorrelated.
+    the rest stay uncorrelated. A run that already finished is never rewritten: its rows go to a
+    supplement and `revision` names the combined view they were published into.
     """
     src = Path(path)
     text = src.read_text(encoding="utf-8", errors="replace")
     # content-hash prefix: two different files sharing a name must not clobber each other's raw
     # evidence, while identical content re-imports to the same file (raw_ref stays stable)
     digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
-    raw = run.raw_path("oob", "import", f"{digest}-{src.name}")
+    from . import revision as _revision
+    raw = _revision.raw_path(run, "oob", "import", f"{digest}-{src.name}")
     privfs.write_private(raw, text)             # 0600: imported callback data can carry correlated secrets
     rows = parse_interactsh(text)
     session = load_session(run)                 # None if this run never opened a Quarry-owned session
     if session and session.get("token_map"):
         correlate(rows, session)                # upgrade rows whose token matches; others untouched
+    for row in rows:
+        row["raw_ref"] = str(raw)
+    return {"parsed": len(rows), **_ingest(run, rows, origin="oob.import", scope=scope)}
+
+
+def import_polled(run, session: dict, rows: list[dict], *, scope=None) -> dict:
+    """Persist rows read from the run's owned session. Same revision rules as ``import_file``: a finished
+    run is supplemented, never rewritten."""
+    for row in rows:
+        row.setdefault("raw_ref", session.get("log"))
+    return _ingest(run, rows, origin="oob.poll", scope=scope)
+
+
+def _ingest(run, rows: list[dict], *, origin: str, scope=None) -> dict:
+    """Route rows to the live store or to a supplement revision, and publish the revision if one was
+    opened. Returns ``{added, by_protocol, correlated, revision}``."""
+    from . import revision as _revision
+
+    sink = _revision.ingest(run, origin)
     added = 0
     correlated = 0
     by_protocol: dict[str, int] = {}
     for row in rows:
-        row["raw_ref"] = str(raw)
-        if run.add("oob_interaction", row):
+        if sink.add("oob_interaction", row):
             added += 1
             by_protocol[row["protocol"]] = by_protocol.get(row["protocol"], 0) + 1
             if row.get("correlation") == "correlated":
                 correlated += 1
-    return {"parsed": len(rows), "added": added, "by_protocol": by_protocol, "correlated": correlated}
+    published = sink.commit(scope)
+    # the corpus envelope may have turned rows away; the caller reports an incomplete ingest, so it may
+    # not have to read the pointer to learn that
+    return {"added": added, "by_protocol": by_protocol, "correlated": correlated,
+            "refused": int(sink.refused),
+            # what this ingest turned away, and what the run still owes across every revision
+            "outstanding": len(published.refused) if published is not None else 0,
+            "revision": published}
 
 
 # ── the Quarry-owned interactsh session ──────────────────────────────────────────────────────────
@@ -145,7 +173,11 @@ def _parse_registered(text: str, server=None):
     return None
 
 
-def session_path(run) -> Path:
+def session_path(run, *, create: bool = True) -> Path:
+    """The owned session file. `create=False` is the pure read path — it materializes no directory, so
+    looking for a session never writes into a run that has already finished."""
+    if not create:
+        return run.raw / "oob" / "session" / "session.json"
     return run.raw_path("oob", "session", "session.json")
 
 
@@ -158,8 +190,11 @@ def save_session(run, session: dict) -> Path:
 
 
 def load_session(run) -> dict | None:
+    p = session_path(run, create=False)
+    if not p.is_file():
+        return None                      # short-circuit: the symlink-safe walk would create the parent
     try:
-        with os.fdopen(privfs.open_ro_private(session_path(run)), "r", encoding="utf-8") as fh:  # symlink-safe read
+        with os.fdopen(privfs.open_ro_private(p), "r", encoding="utf-8") as fh:  # symlink-safe read
             obj = json.loads(fh.read())
     except (OSError, ValueError):
         return None
