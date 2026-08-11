@@ -17,10 +17,100 @@ import hashlib
 import json
 import os
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
 from pathlib import Path
+
+
+def _record_bytes(rec) -> int:
+    """Serialized on-disk size of one record, the unit the byte envelope is measured in."""
+    return len(json.dumps(rec, ensure_ascii=False).encode("utf-8"))
+
+
+def _utf8_safe(s: str) -> bool:
+    """Whether `s` is UTF-8-encodable — a lone surrogate is not, and would crash the sqlite bind."""
+    try:
+        s.encode("utf-8")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+#: recent refused identities kept in RAM only to suppress redundant ledger writes; the append-only ledger,
+#: not this cache, is the exact record, so resident memory stays bounded however many identities are refused.
+REFUSED_DEDUP_CACHE = 256
+
+#: the only refusal kinds a ledger line may carry; any other value is a damaged line (fail closed).
+_REFUSAL_KINDS = frozenset({"key", "bytes", "corpus", "growth"})
+
+#: a refused key longer than this is damage — a canonical key never is, and it bounds the fold's batch RAM.
+_MAX_LEDGER_KEY = 8192
+
+#: a ledger line longer than this is damage, rejected before it is materialized/parsed so a giant line
+#: (e.g. a 72 MiB key) never lands in memory; comfortably fits one max key plus the JSON envelope.
+_MAX_LEDGER_LINE = 16 * 1024
+
+#: ledger fold batch size; small so batch RAM (<= batch * _MAX_LEDGER_KEY) stays well under the RSS budget.
+_LEDGER_BATCH = 1000
+
+
+def _iter_ledger_lines(fh, cap: int):
+    """Yield each newline-delimited line as bytes (<= `cap`), or None for a line longer than `cap` — which is
+    drained chunk by chunk and never materialized, so resident memory stays ~cap regardless of line size."""
+    buf = b""
+    draining = False                                    # inside an over-length line, discarding to its newline
+    while True:
+        chunk = fh.read(65536)
+        if not chunk:
+            break
+        if draining:
+            nl = chunk.find(b"\n")
+            if nl < 0:
+                continue                                # still inside the giant line: discard the whole chunk
+            chunk = chunk[nl + 1:]                       # resume after its newline
+            draining = False
+            yield None                                  # the over-length line, reported once as damage
+        buf += chunk
+        while True:
+            nl = buf.find(b"\n")
+            if nl < 0:
+                break
+            line = buf[:nl]
+            buf = buf[nl + 1:]
+            yield line if len(line) <= cap else None
+        if len(buf) > cap:                              # a partial line already over the cap -> drain the rest
+            draining = True
+            buf = b""
+    if draining:
+        yield None
+    elif buf:
+        yield buf if len(buf) <= cap else None
+
+
+class _BoundedKeySet:
+    """A fixed-capacity LRU membership set: bounds resident memory while catching the common repeat."""
+    __slots__ = ("_cap", "_d")
+
+    def __init__(self, cap: int):
+        self._cap = cap
+        self._d: "OrderedDict[str, None]" = OrderedDict()
+
+    def __contains__(self, k: str) -> bool:
+        if k in self._d:
+            self._d.move_to_end(k)
+            return True
+        return False
+
+    def add(self, k: str) -> None:
+        self._d[k] = None
+        self._d.move_to_end(k)
+        while len(self._d) > self._cap:
+            self._d.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._d)
 
 # priority thresholds, never a gate: any cap/timeout with omitted>0 is already a gap. These only label it
 # `major` (omitted >= 10% or >= 100 absolute, boundaries inclusive) vs `minor`, for operator triage.
@@ -280,6 +370,8 @@ class FoldedLog:
     status: str = "valid"
     dropped: int = 0
     reason: str = ""
+    refused: int = 0                          # == len(refused_keys); distinct identities past the envelope
+    refused_keys: set = field(default_factory=set)   # the distinct keys refused, for an exact remainder
 
     @property
     def trustworthy(self) -> bool:
@@ -290,15 +382,7 @@ class FoldedLog:
 
 
 def fold_run_entity(run_dir, entity: str) -> FoldedLog:
-    """One entity of a FINISHED run, reconciled against what its manifest says the run held — a clean parse
-    of a deleted or truncated log is not an evidence claim, so the recorded count decides:
-
-        manifest unreadable / missing            -> unknown  (nobody can say; not trustworthy)
-        no count recorded + no log               -> valid    (an authoritative zero)
-        a count recorded + no log                -> unusable (evidence expected, evidence gone)
-        parsed count != the recorded count       -> degraded (something was lost or added since)
-        parsed count == the recorded count       -> the parser's own verdict stands
-    """
+    """One entity of a finished run vs its manifest: count mismatch / envelope refusal / durability gap -> degraded, unreadable manifest -> unknown; the envelope is enforced on the fold."""
     run_dir = Path(run_dir)
     try:
         manifest = json.loads((run_dir / "manifest.json").read_text())
@@ -313,58 +397,159 @@ def fold_run_entity(run_dir, entity: str) -> FoldedLog:
         # `True == 1` and `1.0 == 1`, so a count that is not an exact non-negative int certifies nothing
         return FoldedLog(status="unknown",
                          reason=f"manifest count for {entity!r} is not an exact non-negative int")
-    folded = fold_observations(run_dir / "normalized" / f"{entity}.jsonl")
-    if absent_key:
-        if folded.status == "absent":
-            return FoldedLog(status="valid", reason="the run recorded no entity of this kind")
-        expected = 0                                   # a log with rows the manifest never counted
-    if folded.status == "absent":
-        return FoldedLog(status="unusable" if expected else "valid",
-                         reason=(f"the run recorded {expected} but the log is gone" if expected
-                                 else "the run recorded no entity of this kind"))
-    if folded.status == "unusable":
-        return folded
+    # live refusals never reach the log; the manifest's persisted state decides, unreadable fails closed
+    gap_reason = _manifest_gap_reason(manifest, entity)
+    from . import envelope
+    folded = fold_observations(run_dir / "normalized" / f"{entity}.jsonl",
+                               max_keys=envelope.MAX_KEYS_PER_ENTITY,
+                               max_bytes_per_key=envelope.MAX_BYTES_PER_KEY,
+                               max_corpus_bytes=envelope.MAX_CORPUS_BYTES_PER_ENTITY,
+                               on_refused=lambda k, kind: None)   # bounded: refusals discarded, never held
+    if absent_key and folded.status == "absent":
+        result = FoldedLog(status="valid", reason="the run recorded no entity of this kind")
+    elif absent_key:
+        result = _reconcile_fold(folded, 0)            # a log with rows the manifest never counted
+    elif folded.status == "absent":
+        result = FoldedLog(status="unusable" if expected else "valid",
+                           reason=(f"the run recorded {expected} but the log is gone" if expected
+                                   else "the run recorded no entity of this kind"))
+    elif folded.status == "unusable":
+        result = folded
+    else:
+        result = _reconcile_fold(folded, expected)
+    if gap_reason and result.trustworthy:      # a persisted refusal/durability gap is never trustworthy
+        return FoldedLog(records=result.records, status="degraded", dropped=result.dropped, reason=gap_reason)
+    return result
+
+
+def _reconcile_fold(folded: FoldedLog, expected: int) -> FoldedLog:
+    """A present log vs its recorded count: a count change or any byte/growth refusal degrades it."""
     if len(folded.records) != expected:
         return FoldedLog(records=folded.records, status="degraded", dropped=folded.dropped,
-                         reason=(f"the run recorded {expected} entit(ies), the log yields "
-                                 f"{len(folded.records)}"))
+                         reason=f"the run recorded {expected} entit(ies), the log yields {len(folded.records)}")
+    if folded.refused:
+        return FoldedLog(records=folded.records, status="degraded", dropped=folded.dropped,
+                         refused=folded.refused,
+                         reason=f"{folded.refused} observation(s) refused past the corpus envelope")
     return folded
 
 
-def fold_observations(path) -> FoldedLog:
-    """The merged view of one entity's append-only observation log, for a run nobody has open — the same
-    fold `Run._records_for` does, so a finished run reads exactly as it did while it was live.
+def _manifest_gap_reason(manifest: dict, entity: str) -> str:
+    """Why the manifest's persisted state keeps `entity` degraded, or "" if genuinely clean; a durability gap or any remainder not cleanly parseable/attributable fails closed, never read as zero."""
+    if not isinstance(manifest, dict):
+        return "manifest unreadable"
+    if manifest.get("envelope_degraded"):
+        return "envelope durability degraded (persisted)"
+    if "envelope_remainder" not in manifest:
+        return ""                                       # no refusal record and no durability gap -> clean
+    env_rem = manifest.get("envelope_remainder")
+    if not isinstance(env_rem, dict) or not isinstance(env_rem.get("remainders"), list):
+        return "malformed envelope_remainder"           # present but unreadable -> fail closed, never zero
+    from . import envelope as _envelope, state as _state
+    prefix = _envelope.ENVELOPE_LANE + ":"              # the record's authoritative grouping: store.envelope:<entity>
+    outstanding = 0
+    for record in env_rem["remainders"]:
+        # parse via the contract (required fields, model/measure, int counters); an unparseable record, or one
+        # whose lane/unit is not a known store.envelope:<entity>, fails closed
+        if not isinstance(record, dict):
+            return "malformed envelope_remainder"
+        try:
+            rem = _state.parse_remainder(record)
+        except (KeyError, TypeError, ValueError):
+            return "malformed envelope_remainder"
+        if set(record) - set(rem.as_record()):          # an unknown top-level key the contract does not permit
+            return "malformed envelope_remainder"
+        if rem.lane != _envelope.ENVELOPE_LANE or not rem.unit.startswith(prefix):
+            return "malformed envelope_remainder"
+        unit_entity = rem.unit[len(prefix):]
+        if unit_entity not in ENTITY_KEYS:              # an unknown entity in the unit -> not attributable
+            return "malformed envelope_remainder"
+        if unit_entity != entity:
+            continue                                    # grouped under another entity: not this fold's concern
+        # ours: retriable + all terminal causes count; a mismatched entity or unknown retriable key keeps at
+        # least one unit outstanding (fail closed)
+        work = rem.now + rem.cooldown + sum(rem.terminal.values())
+        det = rem.detail.get("entity")
+        src_retriable = record.get("retriable")
+        identity_ok = (det in ENTITY_KEYS and det == unit_entity
+                       and not (isinstance(src_retriable, dict) and set(src_retriable) - {"now", "cooldown"}))
+        outstanding += work if identity_ok else max(work, 1)
+    return f"{outstanding} unit(s) of outstanding envelope work" if outstanding else ""
+
+
+def fold_observations(path, *, max_keys: int | None = None, max_bytes_per_key: int | None = None,
+                      max_corpus_bytes: int | None = None, on_refused=None) -> FoldedLog:
+    """Stream one entity's append-only log into its merged view (peak RSS = one line + the materialized set).
+    Enforces the given envelope limits: a new key is refused past `max_keys`/`max_bytes_per_key`/
+    `max_corpus_bytes`, and an existing key may not grow past the byte ceilings; each refusal goes to
+    `on_refused(key, kind)` if given (bounded), else into `refused_keys`. All limits None -> unbounded read.
     """
     entity = Path(path).stem
+    merged: dict = {}
+    dropped = 0
+    corpus_bytes = 0
+    refused_keys: set = set()
+    refused_count = 0
+    bytes_active = max_bytes_per_key is not None or max_corpus_bytes is not None
+
+    def _refuse(k: str, kind: str) -> None:
+        nonlocal refused_count
+        refused_count += 1
+        if on_refused is not None:
+            on_refused(k, kind)                      # streamed: the caller keeps the durable, exact record
+        else:
+            refused_keys.add(k)
+
     try:
-        raw = Path(path).read_bytes()
+        with open(path, "rb") as fh:
+            for line in fh:                          # one line resident at a time; the file is never held whole
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line.decode("utf-8"))   # per-line decode: one bad byte costs its row alone
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    dropped += 1
+                    continue
+                if not isinstance(rec, dict):
+                    dropped += 1
+                    continue
+                k = canonical_key(entity, rec)
+                if not k:
+                    dropped += 1
+                    continue
+                if k in merged:
+                    cand = _merge_record(merged[k], rec)
+                    if not bytes_active:
+                        merged[k] = cand
+                        continue
+                    delta = _record_bytes(cand) - _record_bytes(merged[k])
+                    if max_bytes_per_key is not None and _record_bytes(cand) > max_bytes_per_key:
+                        _refuse(k, "growth")         # keep base; a key may not grow past the per-key ceiling
+                    elif max_corpus_bytes is not None and delta > 0 and corpus_bytes + delta > max_corpus_bytes:
+                        _refuse(k, "growth")
+                    else:
+                        merged[k] = cand
+                        corpus_bytes += max(0, delta)
+                    continue
+                rb = _record_bytes(rec) if bytes_active else 0
+                if max_bytes_per_key is not None and rb > max_bytes_per_key:
+                    _refuse(k, "bytes")              # one record larger than the per-key ceiling
+                elif max_keys is not None and len(merged) >= max_keys:
+                    _refuse(k, "key")                # the distinct-key ceiling
+                elif max_corpus_bytes is not None and corpus_bytes + rb > max_corpus_bytes:
+                    _refuse(k, "corpus")             # the summed-bytes ceiling
+                else:
+                    merged[k] = rec
+                    corpus_bytes += rb
     except FileNotFoundError:
         return FoldedLog(status="absent", reason="no observation log")
     except OSError as e:
         return FoldedLog(status="unusable", reason=f"{type(e).__name__}: {e}")
-    merged: dict = {}
-    dropped = 0
-    for chunk in raw.splitlines():
-        if not chunk.strip():
-            continue
-        try:
-            # decoded per line, so one invalid byte costs that row alone and is counted
-            rec = json.loads(chunk.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            dropped += 1
-            continue
-        if not isinstance(rec, dict):
-            dropped += 1
-            continue
-        k = canonical_key(entity, rec)
-        if not k:
-            dropped += 1
-            continue
-        merged[k] = _merge_record(merged[k], rec) if k in merged else rec
+    refused = len(refused_keys) if on_refused is None else refused_count
     if dropped:
-        return FoldedLog(records=merged, status="degraded", dropped=dropped,
-                         reason=f"{dropped} unusable observation row(s)")
-    return FoldedLog(records=merged)
+        return FoldedLog(records=merged, status="degraded", dropped=dropped, refused=refused,
+                         refused_keys=refused_keys, reason=f"{dropped} unusable observation row(s)")
+    return FoldedLog(records=merged, refused=refused, refused_keys=refused_keys)
 
 
 def _utc() -> str:
@@ -419,11 +604,10 @@ def _run_identity(d: Path) -> "tuple[dict, datetime] | None":
 
 def _atomic_write(path: Path, text: str) -> None:
     """Write via a same-directory temp + os.replace, so a reader never sees a half-written file and a
-    crash mid-write leaves the previous version intact.
-    """
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    crash mid-write leaves the previous version intact. Created 0600, O_NOFOLLOW: sensitive from creation,
+    never chmod-after-write."""
+    from . import privfs
+    privfs.write_private(path, text)
 
 
 @dataclass
@@ -457,14 +641,28 @@ class Run:
         self.normalized = self.dir / "normalized"
         self.exports = self.dir / "exports"
         self.reports = self.dir / "reports"
+        from . import privfs
         for d in (self.raw, self.normalized, self.exports, self.reports):
-            d.mkdir(parents=True, exist_ok=True)
+            privfs.private_dir(d)                            # recon/ and the run tree are 0700
         self.manifest_path = self.dir / "manifest.json"
         self.meta_path = self.dir / "run.json"            # immutable creation record (started/run_id/target)
         self._tool_runs: list[ToolRunRecord] = []
         self._counts_cache: dict[str, int] = {}
         self._records: dict[str, dict] = {}       # entity -> {canonical_key: merged record} (instance-local)
         self._folded: dict[str, FoldedLog] = {}   # entity -> the same fold, with its trust status
+        # identities refused past the corpus envelope. Durable records, RAM bounded regardless of N:
+        # live refusals append to `_refused_path`; reopen-fold refusals are rewritten per entity under
+        # `_fold_refused_dir` (idempotent across reopens); the exact distinct count is folded from both by an
+        # external (sqlite) dedup, never a resident set.
+        self._envelope_path = self.dir / "envelope-remainder.json"       # summary marker (existence + finalised count)
+        self._refused_path = self.dir / "envelope-refused.jsonl"         # append-only ledger of live refusals
+        self._fold_refused_dir = self.dir / "envelope-fold-refused"      # per-entity, rewritten reopen-fold refusals
+        self._degraded_path = self.dir / "envelope-degraded.json"        # durable durability-failure marker
+        self._refused_cache: dict[str, _BoundedKeySet] = {}              # entity -> bounded recent-refusal cache
+        self._envelope_marked = self._envelope_path.exists()            # marker already written this/a prior run
+        self._envelope_durability: dict[str, str] = {}                  # cause -> surfaced durability failure
+        self._marker_unwritable = False                                # the durability marker itself could not persist
+        self._corpus_bytes: dict[str, int] = {}                # entity -> summed serialized bytes of the corpus
         # opening an existing run reads `started` from run.json (written at create, and surviving a crash
         # that left no manifest) rather than fabricating a fresh start time
         if load_started:
@@ -475,6 +673,9 @@ class Run:
                 _atomic_write(self.meta_path, json.dumps(
                     {"run_id": self.run_id, "target": target, "started": self.started}))
         self.notes: list[str] = []
+        # a durability failure recorded in a prior session (ledger unwritable / damaged) must keep this reopen
+        # gapped — load it so the run never re-finalises as clean/complete
+        self._load_durability_marker()
 
     # ── C10a lifecycle ──
     @staticmethod
@@ -489,11 +690,13 @@ class Run:
         """Start a NEW run — mint a unique id and claim its directory atomically (mkdir exist_ok=False),
         retrying on a clash. `started` = now.
         """
+        from . import privfs
         project_dir = Path(project_dir)
+        privfs.private_dir(project_dir / "recon")            # 0700 recon root before the run dir is claimed
         for _ in range(16):
             rid = cls._mint_run_id()
             try:
-                (project_dir / "recon" / rid).mkdir(parents=True, exist_ok=False)
+                os.mkdir(project_dir / "recon" / rid, privfs.DIR_MODE)   # claim atomically and 0700
             except FileExistsError:
                 continue
             return cls(project_dir, target, run_id=rid)
@@ -516,8 +719,9 @@ class Run:
 
     # ── raw evidence ──
     def raw_path(self, phase: str, tool: str, name: str) -> Path:
+        from . import privfs
         p = self.raw / phase / tool
-        p.mkdir(parents=True, exist_ok=True)
+        privfs.private_dir(p)                                # raw evidence dirs are 0700
         return p / name
 
     # ── tool run accounting ──
@@ -563,12 +767,24 @@ class Run:
         record.setdefault("first_seen", now)
         record["last_seen"] = now                           # stamped on the appended observation -> durable
         if key not in records:
+            line = json.dumps(record, ensure_ascii=False)
+            reason = self._envelope_admits_new(entity, records, len(line.encode("utf-8")))
+            if reason:
+                self._refuse_over_envelope(entity, key, reason)   # bound the corpus; record the refusal durably
+                return False
             records[key] = record
-            self._append_obs(entity, record)
+            self._append_line(entity, line)
+            self._corpus_bytes[entity] = self._corpus_bytes_for(entity) + len(line.encode("utf-8"))
             return True
         if not _subsumed(records[key], record):             # novel: new evidence or a conflicting value
-            self._append_obs(entity, record)                # keep the raw observation in the immutable log
-            records[key] = _merge_record(records[key], record)   # folds max(last_seen) durably
+            merged = _merge_record(records[key], record)
+            delta = self._blob_len(merged) - self._blob_len(records[key])
+            if self._envelope_admits_growth(entity, merged, delta):
+                self._append_obs(entity, record)            # keep the raw observation in the immutable log
+                records[key] = merged                       # folds max(last_seen) durably
+                self._corpus_bytes[entity] = self._corpus_bytes_for(entity) + max(0, delta)
+            else:
+                self._refuse_over_envelope(entity, key, "growth")   # unbounded growth of a key -> owed, not held
         return False                                        # not a new entity (counting semantics preserved)
 
     def inherit(self, entity: str, record: dict) -> bool:
@@ -587,26 +803,296 @@ class Run:
         record.setdefault("first_seen", _utc())
         record["last_seen"] = _utc()
         if key not in records:
+            line = json.dumps(record, ensure_ascii=False)
+            reason = self._envelope_admits_new(entity, records, len(line.encode("utf-8")))
+            if reason:
+                self._refuse_over_envelope(entity, key, reason)   # bound the corpus; record the refusal durably
+                return False
             records[key] = record
-            self._append_obs(entity, record)
+            self._append_line(entity, line)
+            self._corpus_bytes[entity] = self._corpus_bytes_for(entity) + len(line.encode("utf-8"))
             return True
         if _subsumed(records[key], record):
             return False
+        merged = _merge_record(records[key], record)
+        delta = self._blob_len(merged) - self._blob_len(records[key])
+        if not self._envelope_admits_growth(entity, merged, delta):
+            self._refuse_over_envelope(entity, key, "growth")     # unbounded growth of a key -> owed, not held
+            return False
         self._append_obs(entity, record)
-        records[key] = _merge_record(records[key], record)
+        records[key] = merged
+        self._corpus_bytes[entity] = self._corpus_bytes_for(entity) + max(0, delta)
         return True
 
     def _append_obs(self, entity: str, record: dict) -> None:
-        with self._entity_file(entity).open("a") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._append_line(entity, json.dumps(record, ensure_ascii=False))
+
+    def _append_line(self, entity: str, line: str) -> None:
+        from . import privfs
+        # 0600, O_NOFOLLOW append: the normalized log (incl. secret.jsonl) is never group/other-readable
+        privfs.append_private(self._entity_file(entity), line + "\n")
+
+    # ── corpus envelope: bound materialized keys and corpus bytes, refuse—never drop—the overflow ──
+    @staticmethod
+    def _envelope_cap() -> int:
+        from . import envelope
+        return envelope.MAX_KEYS_PER_ENTITY
+
+    @staticmethod
+    def _blob_len(record: dict) -> int:
+        return _record_bytes(record)
+
+    def _corpus_bytes_for(self, entity: str) -> int:
+        """The summed serialized bytes of an entity's materialized corpus, computed once then maintained."""
+        if entity not in self._corpus_bytes:
+            self._corpus_bytes[entity] = sum(self._blob_len(r) for r in self._records_for(entity).values())
+        return self._corpus_bytes[entity]
+
+    def _envelope_admits_new(self, entity: str, records: dict, blob_len: int) -> str | None:
+        """Why a new key may not be materialized (`bytes`/`key`/`corpus`), or None if it fits."""
+        from . import envelope
+        if blob_len > envelope.MAX_BYTES_PER_KEY:
+            return "bytes"                                      # one record larger than the per-key ceiling
+        if len(records) >= self._envelope_cap():
+            return "key"                                        # the distinct-key ceiling
+        if self._corpus_bytes_for(entity) + blob_len > envelope.MAX_CORPUS_BYTES_PER_ENTITY:
+            return "corpus"                                     # the summed-bytes ceiling
+        return None
+
+    def _envelope_admits_growth(self, entity: str, merged: dict, delta: int) -> bool:
+        """Whether merging may grow an existing key: refused if the merged record breaches the per-key
+        ceiling or its growth breaches the corpus ceiling (so a key cannot grow without bound)."""
+        from . import envelope
+        if self._blob_len(merged) > envelope.MAX_BYTES_PER_KEY:
+            return False
+        if delta > 0 and self._corpus_bytes_for(entity) + delta > envelope.MAX_CORPUS_BYTES_PER_ENTITY:
+            return False
+        return True
+
+    def _refuse_over_envelope(self, entity: str, key: str, kind: str) -> None:
+        """Append one live refused identity to the durable ledger (bounded dedup cache, deduped on read); a
+        write failure is surfaced, never swallowed, and the marker is written on the first refusal."""
+        cache = self._refused_cache.setdefault(entity, _BoundedKeySet(REFUSED_DEDUP_CACHE))
+        if key in cache:
+            return                                              # recently recorded: skip the redundant write
+        try:
+            self._append_refused(entity, key, kind)             # durable, per refusal — no lossy sampling
+        except OSError as e:
+            self._mark_durability_degraded(f"ledger:{entity}",
+                                           f"envelope refusal ledger unwritable for {entity!r} "
+                                           f"({type(e).__name__})")
+            return                                              # a lost refusal must not read as clean/complete
+        cache.add(key)
+        if not self._envelope_marked:
+            self._envelope_marked = True
+            self._write_marker_stub()                          # a durable marker exists from the first refusal
+
+    def _mark_durability_degraded(self, cause: str, why: str) -> None:
+        """Surface a refusal-durability failure (ledger unwritable / damaged) once per cause, persisting it to a
+        DURABLE marker so a reopen still sees the gap. If that marker write ALSO fails, that is surfaced loudly
+        too (its own exception note), never swallowed — a lost gap must not be silent."""
+        if cause in self._envelope_durability:
+            return
+        msg = f"EXCEPTION: {why}; the refused-identity remainder may be incomplete"
+        self._envelope_durability[cause] = msg
+        self.notes.append(msg)
+        try:
+            _atomic_write(self._degraded_path,
+                          json.dumps({"degraded": dict(self._envelope_durability)}, indent=2))
+        except OSError as e:
+            if not self._marker_unwritable:                     # surface once: the gap will not survive a crash
+                self._marker_unwritable = True
+                self.notes.append(f"EXCEPTION: envelope durability marker unwritable ({type(e).__name__}); "
+                                  f"a refusal gap will not survive a crash")
+
+    def _load_durability_marker(self) -> None:
+        # recover durability failures from both the standalone marker and the finalized manifest, so a gap
+        # survives reopen even when the separate marker itself could not be written (the manifest path could)
+        for src in (self._degraded_path, self.manifest_path):
+            try:
+                doc = json.loads(src.read_text())
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            degraded = doc.get("degraded") or doc.get("envelope_degraded") if isinstance(doc, dict) else None
+            for cause, msg in (degraded or {}).items():
+                if isinstance(cause, str) and isinstance(msg, str) and cause not in self._envelope_durability:
+                    self._envelope_durability[cause] = msg
+                    self.notes.append(msg)                      # re-surface on reopen, so the gap persists
+
+    def _append_refused(self, entity: str, key: str, kind: str) -> None:
+        from . import privfs
+        privfs.append_private(self._refused_path,
+                              json.dumps({"entity": entity, "key": key, "kind": kind}, ensure_ascii=False) + "\n")
+
+    def _fold_refused_path(self, entity: str):
+        return self._fold_refused_dir / f"{entity}.jsonl"
+
+    def _refusal_sources(self) -> list:
+        """Every durable refusal file: the live append ledger plus each rewritten per-entity fold file. An
+        unreadable fold dir fails closed (a durable gap), never a silent skip that reads as clean."""
+        srcs = [self._refused_path]
+        if self._fold_refused_dir.exists():
+            try:
+                srcs += sorted(self._fold_refused_dir.iterdir())
+            except OSError as e:
+                self._mark_durability_degraded("fold_dir",
+                                               f"envelope fold-refusal dir unreadable ({type(e).__name__})")
+        return srcs
+
+    def _ledger_distinct_by_kind(self) -> dict:
+        """Exact distinct refused identities per (known entity, kind), folded from every refusal file via an
+        on-disk sqlite dedup: memory is one insert batch and the group set is bounded to the entity enum, never
+        a resident set of all identities. Fails CLOSED — a malformed, non-object, or out-of-vocabulary line is
+        counted as damage and surfaced as a durable gap. No refusal files -> recover an old count-only marker."""
+        import sqlite3
+        import tempfile
+        sources = [p for p in self._refusal_sources() if p.exists()]
+        if not sources:
+            return self._recover_marker_counts()
+        fd, dbpath = tempfile.mkstemp(dir=self.dir, prefix=".envcount-", suffix=".db")
+        os.close(fd)
+        damaged = 0
+        out: dict[str, dict[str, int]] = {}
+        try:
+            con = sqlite3.connect(dbpath)
+            con.execute("PRAGMA journal_mode=OFF")
+            con.execute("PRAGMA synchronous=OFF")
+            con.execute("CREATE TABLE r(entity TEXT, key TEXT, kind TEXT, "
+                        "PRIMARY KEY(entity, key)) WITHOUT ROWID")   # PK dedups; first kind wins
+            for src in sources:
+                batch: list = []
+                try:
+                    with open(src, "rb") as fh:
+                        for line in _iter_ledger_lines(fh, _MAX_LEDGER_LINE):
+                            if line is None:            # an over-length line, rejected before materialize/parse
+                                damaged += 1
+                                continue
+                            if not line.strip():
+                                continue
+                            try:
+                                rec = json.loads(line.decode("utf-8"))
+                            except (UnicodeDecodeError, json.JSONDecodeError):
+                                damaged += 1
+                                continue
+                            if not isinstance(rec, dict):
+                                damaged += 1                    # valid JSON, wrong shape -> damage, never rec.get crash
+                                continue
+                            e, k, kind = rec.get("entity"), rec.get("key"), rec.get("kind")
+                            # out-of-vocabulary entity/kind, an over-long key, or a key sqlite cannot encode
+                            # (a lone surrogate) is damage: fails closed and bounds finalize RAM to the enum
+                            # and a small batch of length-capped keys
+                            if (not isinstance(e, str) or e not in ENTITY_KEYS or not isinstance(k, str)
+                                    or not isinstance(kind, str) or kind not in _REFUSAL_KINDS
+                                    or len(k) > _MAX_LEDGER_KEY or not _utf8_safe(k)):
+                                damaged += 1
+                                continue
+                            batch.append((e, k, kind))
+                            if len(batch) >= _LEDGER_BATCH:     # bounded: one small batch resident, flushed to disk
+                                con.executemany("INSERT OR IGNORE INTO r VALUES(?,?,?)", batch)
+                                batch.clear()
+                    if batch:
+                        con.executemany("INSERT OR IGNORE INTO r VALUES(?,?,?)", batch)
+                except OSError:
+                    damaged += 1
+            for e, kind, n in con.execute("SELECT entity, kind, COUNT(*) FROM r GROUP BY entity, kind"):
+                out.setdefault(e, {})[kind] = n
+            con.close()
+        finally:
+            for p in (dbpath, dbpath + "-journal", dbpath + "-wal", dbpath + "-shm"):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        if damaged:
+            self._mark_durability_degraded("ledger:damaged",
+                                            f"{damaged} refusal-ledger line(s) unreadable")
+        return out or self._recover_marker_counts()
+
+    def _recover_marker_counts(self) -> dict:
+        """A pre-ledger run (older code) kept only the summary marker's counts, without identities; recover them
+        so its remainder is not silently lost, tallied under `key`."""
+        out: dict[str, dict[str, int]] = {}
+        try:
+            doc = json.loads(self._envelope_path.read_text())
+        except (OSError, json.JSONDecodeError, ValueError):
+            return out
+        for rem in (doc.get("remainders") or []) if isinstance(doc, dict) else []:
+            ent = (rem.get("detail") or {}).get("entity") if isinstance(rem, dict) else None
+            n = (rem.get("terminal") or {}).get("unschedulable") if isinstance(rem, dict) else None
+            if isinstance(ent, str) and type(n) is int and n > 0:
+                out[ent] = {"key": n}
+        return out
+
+    def _write_marker_stub(self) -> None:
+        """A cheap existence marker on the first refusal, so a mid-ingest reopen sees that overflow happened
+        without paying the full ledger fold; the exact count is refreshed into it at finalize."""
+        try:
+            from . import envelope
+            _atomic_write(self._envelope_path, json.dumps({**envelope.declaration(), "overflow": True}, indent=2))
+        except OSError:
+            pass
+
+    def _persist_envelope_remainder(self) -> None:
+        env = self.envelope_remainder()
+        if env is not None:
+            _atomic_write(self._envelope_path, json.dumps(env, indent=2))
+
+    def envelope_remainder(self) -> dict | None:
+        """The durable record of identities this run refused past the declared corpus envelope, or None if it
+        stayed within it — the exact distinct keys (folded from the refusal files, bounded) a later run on a
+        raised bound still owes."""
+        counts = self._ledger_distinct_by_kind()
+        if not counts:
+            return None
+        from . import envelope
+        remainders = [envelope.overflow_remainder(e, sum(by_kind.values()), by_kind=by_kind).as_record()
+                      for e, by_kind in sorted(counts.items())]
+        return {**envelope.declaration(), "remainders": remainders}
 
     def _records_for(self, entity: str) -> dict:
-        """Lazily materialize the merged view {key: record} for an entity by folding its append-only JSONL
-        log, so a reopened run recovers the same merged state. One fold, shared with `fold_observations`: the
-        live and finished views cannot diverge, and a single invalid byte costs one observation here too.
-        """
+        """Lazily materialize {key: record} by folding the entity log under the full envelope. Reopen-fold
+        refusals are REWRITTEN per entity (truncate-then-stream), so repeated reopens yield the same rows,
+        never a growing pile, and the fold never holds the refused set resident."""
         if entity not in self._records:
-            folded = fold_observations(self._entity_file(entity))
+            from . import envelope, privfs
+            # only a log that exists on disk can fold-refuse; a live-only run never touches the fold ledger
+            if not self._entity_file(entity).exists():
+                self._folded[entity] = fold_observations(self._entity_file(entity))
+                self._records[entity] = self._folded[entity].records
+                return self._records[entity]
+            privfs.private_dir(self._fold_refused_dir)
+            refused_any = [False]
+            try:
+                fd = privfs.open_private(self._fold_refused_path(entity), append=False)   # truncate: idempotent
+            except OSError as e:
+                self._mark_durability_degraded(f"fold:{entity}",
+                                               f"envelope fold-refusal file unwritable for {entity!r} "
+                                               f"({type(e).__name__})")
+                fd = None
+
+            def _sink(k: str, kind: str) -> None:
+                refused_any[0] = True
+                if fd is None:
+                    return
+                os.write(fd, (json.dumps({"entity": entity, "key": k, "kind": kind},
+                                         ensure_ascii=False) + "\n").encode("utf-8"))
+
+            try:
+                folded = fold_observations(
+                    self._entity_file(entity), max_keys=self._envelope_cap(),
+                    max_bytes_per_key=envelope.MAX_BYTES_PER_KEY,
+                    max_corpus_bytes=envelope.MAX_CORPUS_BYTES_PER_ENTITY, on_refused=_sink)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+            if not refused_any[0]:                # nothing refused now: clear any stale file (e.g. a raised bound)
+                try:
+                    self._fold_refused_path(entity).unlink()
+                except OSError:
+                    pass
+            elif not self._envelope_marked:
+                self._envelope_marked = True
+                self._write_marker_stub()
             self._folded[entity] = folded
             self._records[entity] = folded.records
         return self._records[entity]
@@ -626,8 +1112,7 @@ class Run:
         the acquisition-ownership transition log — it is the whole question.
         """
         if entity not in self._folded:
-            self._folded[entity] = fold_observations(self._entity_file(entity))
-            self._records[entity] = self._folded[entity].records
+            self._records_for(entity)          # the same capped, streaming, refused-aware fold
         return self._folded[entity]
 
     def count(self, entity: str) -> int:
@@ -650,6 +1135,9 @@ class Run:
         `note`/`stderr_tail` are already redacted by record(); phase_exceptions are redacted here, so no
         free text bypasses the manifest secret choke point."""
         from . import contract, events, secrets
+        # fold the refusal ledger first: a damaged/unwritable ledger surfaces a durable exception into notes,
+        # which phase_exceptions (below) must see so an overflow with a broken ledger never reads as clean
+        env_remainder = self.envelope_remainder()
         _DEGRADED = ("partial", "blocked", "timed_out")
         _MISSING = ("not on path", "not installed", "not found")   # skip reason == the tool is absent
         # a required tool skipped because it is missing is a coverage gap; an optional, setup-disabled or
@@ -742,6 +1230,19 @@ class Run:
                 faults.append({"kind": "required_tool_missing", "where": g.get("tool"),
                                "detail": g.get("why")})
 
+        # ── corpus-envelope overflow ──────────────────────────────────────────────────────
+        # refused identities are lost coverage this run, so they gate the verdict as a gap and ride the
+        # remainders a supervisor reads; without this an overflowed run finalises as clean/complete
+        remainders = self._read_remainders()
+        env = env_remainder
+        if env is not None:
+            for rec in env["remainders"]:
+                remainders.append(rec)
+                n = rec["terminal"].get("unschedulable", 0)
+                gaps.append({"phase": "store", "tool": rec["unit"], "status": "envelope_overflow",
+                             "why": f"{n} identit(ies) refused past the corpus envelope", "output_lines": 0,
+                             "omitted": n})
+
         # gaps dominate: a limit only lifts an otherwise-clean run to complete_with_limits
         limits = coverage_limits + provider_limits + operator_limits
         verdict = ("complete_with_gaps" if (failures or gaps or phase_exceptions)
@@ -750,7 +1251,7 @@ class Run:
                 "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions,
                 "coverage": coverage, "coverage_limits": coverage_limits,
                 # what each lane still owes; absent means unknown, never zero
-                "remainders": self._read_remainders(),
+                "remainders": remainders,
                 "faults": faults,
                 "provider_spend": self._read_spend(),
                 "provider_limits": provider_limits, "operator_limits": operator_limits}
@@ -968,6 +1469,14 @@ class Run:
             "notes": [secrets.redact(n) for n in self.notes],
             "summary": self._run_summary(),
         }
+        from . import envelope as _envelope
+        manifest["envelope"] = _envelope.declaration()       # the corpus bound this run enforced
+        env_remainder = self.envelope_remainder()
+        if env_remainder is not None:                        # keys refused past the envelope, durably owed
+            manifest["envelope_remainder"] = env_remainder
+            self._persist_envelope_remainder()               # refresh the standalone durable file to the final count
+        if self._envelope_durability:                        # durability failures the reopen must re-surface even
+            manifest["envelope_degraded"] = dict(self._envelope_durability)   # if the separate marker was unwritable
         if metrics:                                 # pointer + headline totals for the telemetry artifact
             manifest["metrics"] = metrics
         if policy:
@@ -983,8 +1492,9 @@ class Run:
         _events.persist_degraded()                  # survives to the next resume (accumulates)
         _atomic_write(self.manifest_path, json.dumps(manifest, indent=2))
         # update state pointers (per-project, under recon/)
+        from . import privfs
         state = self.project_dir / "recon" / "state"
-        (state / "history").mkdir(parents=True, exist_ok=True)
+        privfs.private_dir(state / "history")                # 0700 state root
         _atomic_write(state / "history" / f"{self.run_id}.json",
                       json.dumps({"run_id": self.run_id, "target": self.target,
                                   "finished": manifest["finished"],

@@ -24,7 +24,8 @@ def _swept(**kw):
 class TestTheModelIsDeclared:
     def test_every_declared_lane_is_a_REGISTERED_source(self):
         known = set(sources.all_sources())
-        assert set(remainder.LANE_MODEL) <= known, set(remainder.LANE_MODEL) - known
+        scanner_lanes = set(remainder.LANE_MODEL) - remainder.SYNTHETIC_LANES   # internal lanes are not sources
+        assert scanner_lanes <= known, scanner_lanes - known
 
     def test_every_SWEEP_lane_declares_a_model(self):
         """A lane that reports a remainder without declaring how it behaves across runs is a lane whose

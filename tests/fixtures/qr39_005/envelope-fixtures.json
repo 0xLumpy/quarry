@@ -1,0 +1,9 @@
+{
+  "envelope_version": 3,
+  "note": "Versioned corpus-envelope fixtures (QR39-005). Sizes are DISTINCT subdomain keys ingested into one Run; thresholds pin the declared RSS/ingest/reopen/disk envelope. Bump envelope_version when quarry_recon.envelope changes.",
+  "fixtures": [
+    {"name": "small", "keys": 1000,   "disk_mb_max": 1.0,  "reopen_rss_mb_max": 12},
+    {"name": "med",   "keys": 10000,  "disk_mb_max": 3.0,  "reopen_rss_mb_max": 40},
+    {"name": "large", "keys": 100000, "disk_mb_max": 16.0, "reopen_rss_mb_max": 160}
+  ]
+}

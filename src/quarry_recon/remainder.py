@@ -17,9 +17,15 @@ from . import events
 #: how a lane's remainder behaves across runs. Only `project_progress` may keep a campaign alive.
 MODELS = ("project_progress", "rerun_same_work")
 
+#: internal (non-scanner) lanes: they declare a model but are not registered sources, so they are exempt
+#: from the registered-source check. Their remainder is attributed to the store, not a provider.
+SYNTHETIC_LANES = frozenset({"store.envelope"})
+
 #: every lane that can report a remainder, and its model. Declared, never inferred from a number, and
 #: test-enforced: a lane that reports without declaring is one whose remainder nobody can interpret.
 LANE_MODEL: dict[str, str] = {
+    # corpus-envelope overflow: a raised bound advances the refused keys
+    "store.envelope": "project_progress",
     # sweep lanes: the rotation ledger is project-scoped, so a later child continues where this one
     # stopped (`budget.rotation_session`'s per-lane ledger, per-slot content-bound completion)
     "enrich.a1d_brute": "project_progress",
