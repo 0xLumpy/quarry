@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import runner
+from . import privfs, runner
 
 
 def _interaction_id(rec: dict) -> str:
@@ -75,7 +75,7 @@ def import_file(run, path) -> dict:
     # evidence, while identical content re-imports to the same file (raw_ref stays stable)
     digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
     raw = run.raw_path("oob", "import", f"{digest}-{src.name}")
-    raw.write_text(text, encoding="utf-8")
+    privfs.write_private(raw, text)             # 0600: imported callback data can carry correlated secrets
     rows = parse_interactsh(text)
     session = load_session(run)                 # None if this run never opened a Quarry-owned session
     if session and session.get("token_map"):
@@ -151,17 +151,27 @@ def session_path(run) -> Path:
 
 def save_session(run, session: dict) -> Path:
     """Persist the session to raw/oob/session.json atomically — the token_map must survive a crash
-    mid-write."""
+    mid-write. Written 0600, O_NOFOLLOW: the token_map is a private map."""
     p = session_path(run)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(session, indent=2), encoding="utf-8")
-    os.replace(tmp, p)                            # atomic on POSIX — no torn session.json
+    privfs.write_private(p, json.dumps(session, indent=2))
     return p
 
 
 def load_session(run) -> dict | None:
-    p = session_path(run)
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    try:
+        with os.fdopen(privfs.open_ro_private(session_path(run)), "r", encoding="utf-8") as fh:  # symlink-safe read
+            obj = json.loads(fh.read())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(obj, dict):                    # a non-object session (string/list) is not usable
+        return None
+    for key in ("unique_id", "log"):                 # string fields used by .lower() / Path(); coerce a bad type
+        if key in obj and not isinstance(obj[key], str):
+            obj[key] = ""
+    tm = obj.get("token_map")                        # a token maps to an attribution dict; drop malformed entries
+    obj["token_map"] = {k: v for k, v in tm.items() if isinstance(k, str) and isinstance(v, dict)} \
+        if isinstance(tm, dict) else {}
+    return obj
 
 
 def _drain(stream, q: "queue.Queue") -> None:
@@ -210,6 +220,10 @@ def open_session(run, server=None, token=None, wait: int = 12):
         return None
     log = run.raw_path("oob", "session", "interactions.jsonl")
     sf = run.raw_path("oob", "session", "interactsh.session")
+    # pre-create 0600 so the client appends into private files (its own O_CREAT keeps an existing mode);
+    # the containing dir is already 0700 via raw_path
+    privfs.touch_private(log)
+    privfs.touch_private(sf)
     # -session-file makes the session resumable: a later client on the same file re-opens the same
     # correlation id, so closing after a poll does not lose delayed callbacks
     cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(sf)]
@@ -287,7 +301,8 @@ def correlate(rows: list[dict], session: dict) -> list[dict]:
     tmap = session.get("token_map") or {}
     suffix = "." + uid
     for r in rows:
-        fid = (r.get("interaction_domain") or "").lower().rstrip(".")
+        dom = r.get("interaction_domain")
+        fid = dom.lower().rstrip(".") if isinstance(dom, str) else ""   # a non-str field is not a domain
         token = fid[:-len(suffix)] if (uid and fid.endswith(suffix)) else None
         m = tmap.get(token) if token else None
         if m:
@@ -305,7 +320,10 @@ def correlate(rows: list[dict], session: dict) -> list[dict]:
 def poll_session(run, session: dict) -> list[dict]:
     """Read the owned session's -json log so far -> correlated oob_interaction rows. Side-effect-free,
     so it can be polled repeatedly; the caller decides what to persist."""
-    log = Path(session.get("log", ""))
+    lp = session.get("log")
+    if not isinstance(lp, str) or not lp:            # no/blank/non-str log path -> nothing to poll
+        return []
+    log = Path(lp)
     if not log.exists():
         return []
     return correlate(parse_interactsh(log.read_text(encoding="utf-8", errors="replace")), session)

@@ -18,7 +18,7 @@ import os
 import time
 from pathlib import Path
 
-from . import secrets
+from . import privfs, secrets
 
 
 # ── work-unit identity (the resume key) ──────────────────────────────────────────────────────────────
@@ -93,9 +93,10 @@ def _load_degraded() -> dict:
     """Load the ACCUMULATED degradation record persisted by a prior session (so a resume inherits it).
     Fresh {writes_failed:0} when absent/unreadable."""
     p = _degraded_path()
-    if p and p.exists():
+    if p:
         try:
-            v = json.loads(p.read_text())
+            with os.fdopen(privfs.open_ro_private(p), "r", encoding="utf-8") as fh:   # symlink-safe read
+                v = json.loads(fh.read())
             if isinstance(v, dict) and "writes_failed" in v:
                 return {"writes_failed": int(v["writes_failed"]), "first_error": v.get("first_error")}
         except (OSError, json.JSONDecodeError, ValueError, TypeError):
@@ -112,9 +113,7 @@ def persist_degraded() -> None:
     if p is None:
         return
     try:
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(_degraded))
-        os.replace(tmp, p)                                  # atomic: a crash mid-write can't leave a torn file
+        privfs.write_private(p, json.dumps(_degraded))      # 0600, O_NOFOLLOW, atomic exclusive temp
     except OSError:
         pass
 
@@ -127,7 +126,7 @@ def configure(run_dir) -> Path:
     record, which ACCUMULATES: a run whose earlier session lost events can never be recorded clean."""
     global _sink, _coverage_seen, _provider_seen, _degraded
     _sink = Path(run_dir) / "events.jsonl"
-    _sink.parent.mkdir(parents=True, exist_ok=True)
+    privfs.private_dir(_sink.parent)             # 0700 parent: the sink is untraversable by group/other
     _coverage_seen = set()
     _provider_seen = set()
     _degraded = _load_degraded()
@@ -169,8 +168,8 @@ def emit(event: str, source_id: str, **fields) -> dict:
             rec[k] = _redact(val)
     if _sink is not None:
         try:
-            # explicit utf-8 (events carry redacted UTF-8 payloads; Windows would else default to cp)
-            with _sink.open("a", encoding="utf-8") as fh:
+            # 0600 sink (privfs), utf-8 (events carry redacted UTF-8 payloads; Windows would else default to cp)
+            with os.fdopen(privfs.open_private(_sink, append=True), "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, default=str, ensure_ascii=False) + "\n")
         except Exception as e:
             # best-effort — a log write must not break a run — but the loss is recorded, not swallowed

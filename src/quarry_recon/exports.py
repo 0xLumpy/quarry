@@ -5,11 +5,13 @@ The JSONL store remains the source of truth; exports can be regenerated anytime.
 """
 from __future__ import annotations
 
+from . import privfs
+
 
 def _write(run, name: str, lines) -> int:
     p = run.exports / name
     items = sorted(set(x for x in lines if x))
-    p.write_text("\n".join(items) + ("\n" if items else ""))
+    privfs.write_private(p, "\n".join(items) + ("\n" if items else ""))
     return len(items)
 
 
@@ -46,7 +48,7 @@ def write_delta(run) -> None:
             out.append(f"- disappeared: {len(gone)}")
             for h in new[:50]:
                 out.append(f"  + {h}")
-    (run.reports / "delta.md").write_text("\n".join(out) + "\n")
+    privfs.write_private(run.reports / "delta.md", "\n".join(out) + "\n")
 
 
 def write_all(run) -> dict[str, int]:
@@ -63,7 +65,8 @@ def write_all(run) -> dict[str, int]:
     secrets = run.read("secret")
     if secrets:
         import json
-        (run.exports / "secrets.jsonl").write_text(
-            "\n".join(json.dumps(s, ensure_ascii=False) for s in secrets) + "\n")
+        # full discovered secret values — written 0600, never a group/other-readable export
+        privfs.write_private(run.exports / "secrets.jsonl",
+                             "\n".join(json.dumps(s, ensure_ascii=False) for s in secrets) + "\n")
         counts["secrets.jsonl"] = len(secrets)
     return counts

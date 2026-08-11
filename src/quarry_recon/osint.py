@@ -20,7 +20,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import budget, events, osint_report, secrets, settings, whoxy_page
+from . import budget, events, osint_report, privfs, secrets, settings, whoxy_page
 from .contract import (PROVIDER_PARSE, PROVIDER_TRANSPORT, ProviderBodyError, capture_error_body,
                        provider_error_class, whoxy_envelope)
 from .runner import RunResult, Status, fresh_artifact_dir, have, run as exec_tool, skipped
@@ -96,7 +96,7 @@ class OsintSession:
         self.ts = ts or time.strftime("%Y%m%d-%H%M%S")
         self.dir = self.project_dir / "osint" / self.ts
         self.raw = self.dir / "raw"
-        self.raw.mkdir(parents=True, exist_ok=True)
+        privfs.private_dir(self.raw)                         # osint/ session tree is 0700
         self.started = _utc()
         self._cands: dict[tuple, dict] = {}     # (type, value) -> candidate
         self._intel: list[dict] = []
@@ -106,7 +106,7 @@ class OsintSession:
 
     def raw_path(self, source: str, name: str) -> Path:
         p = self.raw / source
-        p.mkdir(parents=True, exist_ok=True)
+        privfs.private_dir(p)                                # 0700 raw evidence dir
         return p / name
 
     def record(self, result) -> None:
@@ -193,11 +193,12 @@ class OsintSession:
 
     def finalize(self, profile) -> Path:
         cands = self.candidates()
-        (self.dir / "candidates.jsonl").write_text(
-            "\n".join(json.dumps(c, ensure_ascii=False) for c in cands) + ("\n" if cands else ""))
-        (self.dir / "intel.jsonl").write_text(
-            "\n".join(json.dumps(i, ensure_ascii=False) for i in self._intel) + ("\n" if self._intel else ""))
-        (self.dir / "manifest.json").write_text(json.dumps({
+        # OSINT evidence is private (0600): candidate/intel values can name a target's private assets
+        privfs.write_private(self.dir / "candidates.jsonl",
+                             "\n".join(json.dumps(c, ensure_ascii=False) for c in cands) + ("\n" if cands else ""))
+        privfs.write_private(self.dir / "intel.jsonl",
+                             "\n".join(json.dumps(i, ensure_ascii=False) for i in self._intel) + ("\n" if self._intel else ""))
+        privfs.write_private(self.dir / "manifest.json", json.dumps({
             "target": self.target, "ts": self.ts, "started": self.started, "finished": _utc(),
             "profile_anchors": {"apex": profile.apex_domains, "asn": profile.asn,
                                 "org_names": profile.org_names, "brands": profile.brands},
@@ -206,9 +207,9 @@ class OsintSession:
             "summary": self.outcome(),
         }, indent=2))
         report = osint_report.render(self, profile, cands, self._intel, MANUAL_TODO)
-        (self.dir / "osint-report.md").write_text(report)
-        (self.dir / "target.suggested.yaml").write_text(
-            osint_report.suggested_yaml(profile, cands))
+        privfs.write_private(self.dir / "osint-report.md", report)
+        privfs.write_private(self.dir / "target.suggested.yaml",
+                             osint_report.suggested_yaml(profile, cands))
         # latest pointer (per-project)
         link = self.project_dir / "osint" / "latest"
         try:
@@ -216,7 +217,7 @@ class OsintSession:
                 link.unlink()
             os.symlink(self.dir.resolve(), link)
         except OSError:
-            (self.project_dir / "osint" / "latest.txt").write_text(str(self.dir.resolve()))
+            privfs.write_private(self.project_dir / "osint" / "latest.txt", str(self.dir.resolve()))
         return self.dir / "osint-report.md"
 
 
@@ -227,7 +228,7 @@ def _azmap(s: OsintSession, apex: str, echo, timeout: int) -> None:
         data = _http(f"https://azmap.dev/api/tenant?domain={apex}&extract=true",
                      timeout=min(timeout, 30))
         raw = s.raw_path("azmap", f"{apex}.json")
-        raw.write_text(data)
+        privfs.write_private(raw, data)
         obj = json.loads(data)
         # union, not `or`: related and e-mail domains are both evidence, with different reasons
         related = [d for d in (obj.get("related_domains") or []) if d != apex]
@@ -255,7 +256,7 @@ def _whois(s: OsintSession, apex: str, echo, timeout: int) -> set[str]:
         p = subprocess.run(["whois", apex], capture_output=True, text=True,
                            timeout=min(timeout, 30), stdin=subprocess.DEVNULL)
         raw = s.raw_path("whois", f"{apex}.txt")
-        raw.write_text(p.stdout)
+        privfs.write_private(raw, p.stdout)
         # `whois` can exit nonzero without raising, so the exit code is checked separately
         if p.returncode != 0:
             s.note_failure("whois", f"{apex}: exit {p.returncode} "
@@ -283,7 +284,7 @@ def _dmarc(s: OsintSession, apex: str, echo, timeout: int) -> None:
                            capture_output=True, text=True, timeout=min(timeout, 15),
                            stdin=subprocess.DEVNULL)
         raw = s.raw_path("dmarc", f"{apex}.txt")
-        raw.write_text(p.stdout)
+        privfs.write_private(raw, p.stdout)
         if p.returncode != 0:                          # dig exits nonzero without raising
             s.note_failure("dmarc", f"{apex}: dig exit {p.returncode}")
         for email in _EMAIL_RE.findall(p.stdout):       # rua/ruf mailto addresses
@@ -672,7 +673,7 @@ def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
             """One immutable artifact per response, so a candidate always cites the file that contains it."""
             seq["n"] += 1
             raw = s.raw_path("asrank", f"{_slug}.{seq['n']:03d}-{kind}.json")
-            raw.write_text(json.dumps(doc, indent=2, ensure_ascii=False))
+            privfs.write_private(raw, json.dumps(doc, indent=2, ensure_ascii=False))
             return str(raw)
 
         try:
@@ -894,7 +895,7 @@ def _rdap(s: OsintSession, profile, echo, timeout: int) -> None:
         try:
             data = _http(f"https://rdap.org/ip/{ip}", timeout=min(timeout, 30))
             raw = s.raw_path("rdap", f"{ip}.json")
-            raw.write_text(data)
+            privfs.write_private(raw, data)
             obj = json.loads(data)
         except Exception as e:
             echo(f"    rdap[{ip}]: {e}")
