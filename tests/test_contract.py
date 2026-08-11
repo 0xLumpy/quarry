@@ -61,6 +61,16 @@ class TestTerminalEventGuarantee:
         contract.run_contract("vertical.subfinder", ["subfinder"])
         assert any(e["event"] == "tool_blocked" for e in _events(tmp_path))
 
+    @pytest.mark.parametrize("cmd", [[], None])
+    def test_invalid_argv_still_emits_a_typed_terminal(self, tmp_path, cmd):
+        res = contract.run_contract("vertical.subfinder", cmd)
+        assert res.status == Status.FAILED and res.started is False
+        evs = _events(tmp_path)
+        assert [e["event"] for e in evs] == ["tool_start", "tool_finish"]
+        assert evs[0]["cmd"] == []
+        assert evs[1]["status"] == "failed"
+        assert evs[1]["faults"][0]["kind"] == "machinery"
+
 
 class TestUnknownSourceFailsLoud:
     def test_unknown_source_not_executed(self, tmp_path, monkeypatch):

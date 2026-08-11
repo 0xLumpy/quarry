@@ -24,7 +24,7 @@ from dataclasses import dataclass as _dataclass
 from pathlib import Path as _Path
 
 from . import events, normalize, sources
-from .runner import Status, run as _run, skipped
+from .runner import Status, _preflight_argv, run as _run, skipped
 
 # Non-clean terminal statuses that warrant a dedicated event before the normal tool_finish.
 _PARTIAL = (Status.PARTIAL, Status.TIMED_OUT)
@@ -1153,7 +1153,10 @@ def run_contract(source_id, cmd, *, input_total=None, env=None, reclassify=None,
         return skipped(source_id, _campaign.acquisition_allowed(source_id)[1])
     tool = src.get("tool") or source_id.split(".", 1)[-1]
 
-    events.tool_start(source_id, cmd=cmd, env=env, input_total=input_total, work_unit=work_unit,
+    # Event serialization must not run caller-defined container methods before runner preflight. Invalid argv
+    # still receives a start/finish lifecycle, but its start carries the only safe representation: an empty argv.
+    event_cmd, _argv_error = _preflight_argv(cmd)
+    events.tool_start(source_id, cmd=event_cmd or [], env=env, input_total=input_total, work_unit=work_unit,
                       workers=src.get("workers"), rate=src.get("rate"),
                       timeout=run_kwargs.get("timeout", src.get("timeout")),
                       parent_id=parent_id, scope_distance=scope_distance,

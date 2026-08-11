@@ -336,6 +336,36 @@ class RunResult:
         return self.status in (Status.SUCCESS, Status.PARTIAL, Status.LIMITED)
 
 
+def _preflight_argv(cmd) -> "tuple[list[str] | None, str | None]":
+    """Validate and normalize argv without invoking caller-defined container/string methods.
+
+    ``subprocess.Popen`` accepts several sequence-like shapes, but accepting arbitrary iterables here would
+    let iteration or string coercion run user code before the invocation is known to be well formed. Quarry's
+    contract is deliberately narrower: a concrete list/tuple of strings, with a non-empty, NUL-free executable
+    and NUL-free arguments. Empty strings remain valid in argument positions after argv[0].
+    """
+    if type(cmd) not in (list, tuple):
+        return None, "argv must be a list or tuple of strings"
+    if not cmd:
+        return None, "argv must contain an executable"
+    for index, arg in enumerate(cmd):
+        if type(arg) is not str:
+            return None, f"argv[{index}] must be a string"
+        if "\x00" in arg:
+            return None, f"argv[{index}] contains a NUL byte"
+    if not cmd[0]:
+        return None, "argv[0] must be a non-empty executable"
+    return list(cmd), None
+
+
+def _preflight_failure(tool: str, safe_cmd: "list[str] | None", detail: str) -> RunResult:
+    """A side-effect-free, completeness-challenging invocation refusal."""
+    message = f"preflight validation failed: {detail}"
+    fault = Fault("machinery", where=tool, detail=message).to_dict()
+    return RunResult(tool, safe_cmd or [], Status.FAILED, None, 0.0, None, 0,
+                     note=message, meta={"started": False, "faults": [fault]})
+
+
 def have(bin_name: str) -> bool:
     return shutil.which(bin_name) is not None
 
@@ -522,9 +552,11 @@ def _read_ready(fd: int, stop: threading.Event) -> "tuple[bytes | None, str]":
 
 def _drain_stdout(src, sink, state: dict, cap: "int | None", stop: threading.Event) -> None:
     """Stream binary stdout to `sink`; counters and a running sha256 are committed to `state` even when the
-    reader is abandoned (`stop_reason != "eof"`). `cap` bounds retained bytes; a write error detaches the sink."""
+    reader is abandoned (`stop_reason != "eof"`). `cap` bounds retained bytes; observed and successfully
+    retained streams are measured independently, and a write error detaches the sink."""
     import hashlib
-    h = hashlib.sha256()
+    observed_h = hashlib.sha256()
+    retained_h = hashlib.sha256()
     written = 0
     last = b"\n"
     try:
@@ -537,7 +569,7 @@ def _drain_stdout(src, sink, state: dict, cap: "int | None", stop: threading.Eve
         if reason != "data":
             state["stop_reason"] = reason
             break
-        h.update(chunk)
+        observed_h.update(chunk)
         state["bytes"] += len(chunk)
         state["lines"] += chunk.count(b"\n")
         last = chunk[-1:]
@@ -548,6 +580,7 @@ def _drain_stdout(src, sink, state: dict, cap: "int | None", stop: threading.Eve
             if take:
                 try:
                     _write_all(sink, take)
+                    retained_h.update(take)
                     written += len(take)
                 except OSError as e:
                     state["pub_error"] = str(e)
@@ -556,7 +589,9 @@ def _drain_stdout(src, sink, state: dict, cap: "int | None", stop: threading.Eve
                 state["capped"] = True
     if state["bytes"] and last != b"\n":         # a final unterminated line still counts
         state["lines"] += 1
-    state["sha256"] = h.hexdigest() if state["bytes"] else ""     # digest retained for a partial too
+    state["sha256"] = observed_h.hexdigest() if state["bytes"] else ""
+    state["retained_bytes"] = written
+    state["retained_sha256"] = retained_h.hexdigest()
     state["complete"] = state["stop_reason"] == "eof"
 
 
@@ -682,9 +717,11 @@ def _close_pipes(proc) -> None:
 
 
 def _finalize_and_publish(fp, stage: "Path | None", final: "Path | None", state: dict, *,
-                          publish: bool, authoritative: bool = False) -> "Path | None":
+                          publish: bool, authoritative: bool = False,
+                          retain_empty: bool = False) -> "Path | None":
     """Close the sink and atomically move the stage onto `final`; return `final` iff the replace ran
-    (`authoritative` replaces even an empty stage), else retain a non-empty stage as partial evidence."""
+    (`authoritative` replaces even an empty stage), else retain a non-empty stage as partial evidence.
+    `retain_empty` owns an intentionally empty partial (notably a hit stdout cap of zero)."""
     if fp is not None:
         try:
             fp.flush()
@@ -706,7 +743,7 @@ def _finalize_and_publish(fp, stage: "Path | None", final: "Path | None", state:
             return final
         except OSError as e:
             state["pub_error"] = state.get("pub_error") or str(e)
-    if size == 0:
+    if size == 0 and not retain_empty:
         try:
             stage.unlink()
         except OSError:
@@ -789,10 +826,31 @@ def run(
 
     Contract: exact bytes are staged privately and published atomically to `raw_path`; `stderr_path` holds
     this run's stderr (`meta['stderr_published']` flags currency). `ok_codes` are non-failure exits;
-    `ok_empty=False` makes clean-but-empty FAILED. `max_output_bytes` caps retained stdout. `timeout` plus
-    one `_GRACE` window bounds execute+kill+drain. Launch/stdin/drain/publication failures are `Fault`s in
-    `meta['faults']`, never raised.
+    `ok_empty=False` makes clean-but-empty FAILED. `max_output_bytes` is an exact non-negative integer cap
+    on retained stdout; a hit cap owns the prefix as a non-authoritative partial and challenges completeness.
+    `timeout` plus one `_GRACE` window bounds execute+kill+drain. Preflight/launch/stdin/drain/publication
+    failures are `Fault`s in `meta['faults']`, never raised.
     """
+    # Validate argv, stdin-source selection and the retention cap before PATH lookup, directory creation,
+    # staging, source reads, or subprocess launch. The remaining arguments are migrated to the typed worker
+    # request in the next Phase 1 slice; do not describe this preparatory check as the complete boundary.
+    argv, argv_error = _preflight_argv(cmd)
+    preflight_errors = []
+    if argv_error:
+        preflight_errors.append(argv_error)
+    if stdin_data is not None and input_file is not None:
+        preflight_errors.append("stdin_data and input_file are mutually exclusive")
+    if stdin_data is not None and not isinstance(stdin_data, str):
+        preflight_errors.append("stdin_data must be a string or None")
+    if (max_output_bytes is not None
+            and (type(max_output_bytes) is not int or max_output_bytes < 0)):
+        preflight_errors.append("max_output_bytes must be an exact non-negative integer or None")
+    elif max_output_bytes is not None and raw_path is None:
+        preflight_errors.append("max_output_bytes requires raw_path so retained stdout has an evidence sink")
+    if preflight_errors:
+        return _preflight_failure(tool, argv, "; ".join(preflight_errors))
+
+    cmd = argv                              # normalized concrete list; preflight proved this is not None
     bin_name = cmd[0]
     if not have(bin_name):
         return RunResult(tool, cmd, Status.SKIPPED, None, 0.0, None, 0,
@@ -817,7 +875,8 @@ def run(
 
     faults: list[dict] = []
     out_state = {"bytes": 0, "lines": 0, "nonspace": False, "sha256": "", "capped": False,
-                 "pub_error": None, "complete": False, "stop_reason": ""}
+                 "retained_bytes": 0, "retained_sha256": "", "pub_error": None,
+                 "complete": False, "stop_reason": ""}
     err_state = {"blocked": False, "transport": False, "tail": b"", "pub_error": None,
                  "complete": False, "stop_reason": ""}
     in_state = {"error": None}
@@ -914,9 +973,11 @@ def run(
             for t in threads:
                 t.join(timeout=0.5)
 
-        # publish whatever bytes were captured (partial included — an incompleteness fault is raised below).
+        # A hit retention cap is incomplete evidence, never the authoritative final artifact. Preserve any prior
+        # final and own this attempt's retained prefix under its exclusive staging name (including cap=0).
         out_published = _finalize_and_publish(out_fp, raw_stage, raw_path, out_state,
-                                              publish=out_state["bytes"] > 0)
+                                              publish=out_state["bytes"] > 0 and not out_state["capped"],
+                                              retain_empty=out_state["capped"])
         # publish stderr only on a clean EOF drain (`complete`), so an abandoned/incomplete stderr is never
         # authoritative; otherwise the prior file is kept and the bytes are retained as a stderr partial.
         if stderr_path is not None:
@@ -936,6 +997,15 @@ def run(
             primary_incomplete = True
         if t_in is not None and t_in.is_alive():
             faults.append(Fault("machinery", where=tool, detail="stdin feed did not complete within grace").to_dict())
+            primary_incomplete = True
+        if out_state["capped"]:
+            retained = out_state.get("partial_bytes", out_state["retained_bytes"])
+            faults.append(Fault(
+                "publication", where=str(raw_path),
+                detail=(f"stdout retention cap {max_output_bytes} bytes truncated the observed stream "
+                        f"({out_state['bytes']} observed, {retained} retained); "
+                        f"partial retained at {out_state.get('partial_path', '<unavailable>')}")
+            ).to_dict())
             primary_incomplete = True
         group_settled = True
     finally:
@@ -981,11 +1051,27 @@ def run(
             if label == "stdout":
                 primary_incomplete = True
 
-    meta: dict = {"started": started, "stdout_bytes": out_state["bytes"]}
+    retained_bytes = (out_state.get("partial_bytes") if out_state.get("partial_path")
+                      else out_state["retained_bytes"] if out_published is not None else 0)
+    retained_sha256 = (out_state.get("partial_sha256") if out_state.get("partial_path")
+                       else out_state["retained_sha256"] if out_published is not None else None)
+    meta: dict = {
+        "started": started,
+        # Compatibility: these continue to describe every byte observed from the stdout pipe.
+        "stdout_bytes": out_state["bytes"],
+        "stdout_observed_bytes": out_state["bytes"],
+        # Explicit persistence measurement: authoritative final or owned partial, never inferred from observed.
+        "stdout_retained_bytes": retained_bytes,
+    }
     if out_state["sha256"]:
         meta["stdout_sha256"] = out_state["sha256"]
+        meta["stdout_observed_sha256"] = out_state["sha256"]
+    if retained_sha256 is not None:
+        meta["stdout_retained_sha256"] = retained_sha256
     if out_state["capped"]:
         meta["output_capped"] = max_output_bytes
+        meta["stdout_truncated"] = True
+        meta["stdout_truncated_bytes"] = out_state["bytes"] - retained_bytes
     if out_state.get("partial_path"):             # unpublished stdout bytes retained: describe the artifact
         meta["partial_path"] = out_state["partial_path"]
         meta["partial_bytes"] = out_state.get("partial_bytes")

@@ -12,6 +12,7 @@ import os
 import shutil
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -70,6 +71,74 @@ def test_binary_stdout_keeps_exact_bytes_and_digest(tmp_path):
     assert raw.read_bytes() == payload
     assert r.meta["stdout_sha256"] == hashlib.sha256(payload).hexdigest()
     assert r.stdout_lines == payload.count(b"\n")
+
+
+@pytest.mark.parametrize("cap", [None, 6])
+def test_unlimited_or_exact_cap_publishes_complete_stdout(tmp_path, cap):
+    from quarry_recon import runner
+    raw = tmp_path / "out.bin"
+    payload = b"abcdef"
+    r = runner.run("printf", ["printf", "%s", payload.decode()], raw_path=raw,
+                   timeout=10, max_output_bytes=cap)
+    digest = hashlib.sha256(payload).hexdigest()
+    assert r.status == Status.SUCCESS and r.raw_path == raw and raw.read_bytes() == payload
+    assert r.meta["stdout_bytes"] == r.meta["stdout_observed_bytes"] == len(payload)
+    assert r.meta["stdout_retained_bytes"] == len(payload)
+    assert r.meta["stdout_sha256"] == r.meta["stdout_observed_sha256"] == digest
+    assert r.meta["stdout_retained_sha256"] == digest
+    assert "output_capped" not in r.meta and "stdout_truncated" not in r.meta
+    assert not r.meta.get("faults") and not list(tmp_path.glob("*.partial"))
+
+
+@pytest.mark.parametrize("cap", [0, 3])
+def test_hit_output_cap_is_a_typed_partial_and_preserves_prior_final(tmp_path, cap):
+    from quarry_recon import runner
+    raw = tmp_path / "out.bin"
+    raw.write_bytes(b"PRIOR")
+    payload = b"abcdef"
+    r = runner.run("printf", ["printf", "%s", payload.decode()], raw_path=raw,
+                   timeout=10, max_output_bytes=cap)
+    assert r.status == Status.PARTIAL and r.raw_path is None
+    assert raw.read_bytes() == b"PRIOR"                              # capped prefix is never authoritative
+    assert "publication" in _kinds(r)
+    assert any(f["challenges_completeness"] for f in r.meta["faults"] if f["kind"] == "publication")
+    partial = r.meta.get("partial_path")
+    assert partial and Path(partial).read_bytes() == payload[:cap]    # cap=0 still owns a unique empty partial
+    assert r.meta["partial_bytes"] == r.meta["stdout_retained_bytes"] == cap
+    assert r.meta["partial_sha256"] == r.meta["stdout_retained_sha256"] == hashlib.sha256(payload[:cap]).hexdigest()
+    assert r.meta["stdout_bytes"] == r.meta["stdout_observed_bytes"] == len(payload)
+    assert r.meta["stdout_sha256"] == r.meta["stdout_observed_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert r.meta["output_capped"] == cap and r.meta["stdout_truncated"] is True
+    assert r.meta["stdout_truncated_bytes"] == len(payload) - cap
+
+
+def test_each_hit_output_cap_owns_a_unique_partial(tmp_path):
+    from quarry_recon import runner
+    raw = tmp_path / "out.bin"
+    first = runner.run("printf", ["printf", "%s", "abcdef"], raw_path=raw,
+                       timeout=10, max_output_bytes=2)
+    second = runner.run("printf", ["printf", "%s", "abcdef"], raw_path=raw,
+                        timeout=10, max_output_bytes=2)
+    p1, p2 = Path(first.meta["partial_path"]), Path(second.meta["partial_path"])
+    assert p1 != p2 and p1.read_bytes() == p2.read_bytes() == b"ab"
+
+
+def test_hit_cap_is_durable_in_the_contract_terminal_event(tmp_path):
+    from quarry_recon import contract, events
+    events.configure(tmp_path)
+    try:
+        result = contract.run_contract(
+            "vertical.subfinder", ["printf", "%s", "abcdef"],
+            raw_path=tmp_path / "out.bin", timeout=10, max_output_bytes=2,
+        )
+        finish = _last_finish(tmp_path)
+        assert result.status == Status.PARTIAL and finish["status"] == "partial"
+        assert finish["partial_ref"] == result.meta["partial_path"]
+        fault = [f for f in finish["faults"] if f["kind"] == "publication"]
+        assert len(fault) == 1 and fault[0]["challenges_completeness"] is True
+        assert "retention cap 2 bytes" in fault[0]["detail"]
+    finally:
+        events.reset()
 
 
 def test_non_utf8_stdout_never_crashes_the_run(tmp_path):
