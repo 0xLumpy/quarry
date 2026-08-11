@@ -1227,7 +1227,7 @@ src = pathlib.Path(cli.__file__).read_text()
 def body(fn):
     m = re.search(r"\ndef " + fn + r"\(.*?\n(.*?)\n(?:@cli|def |# ── )", src, re.S)
     return m.group(1) if m else ""
-sys.exit(0 if ("bootstrap.cleanup(" in body("install") and "bootstrap.cleanup(" in body("update")) else 1)
+sys.exit(0 if ("bootstrap.cleanup(" in body("_install") and "bootstrap.cleanup(" in body("_update")) else 1)
 PYEOF
 
 # ── Check 42: banner ports collapse — default vs explicit (v0.2 polish) — offline ──
@@ -3100,7 +3100,7 @@ sys.exit(0 if (c_knob and c_jsl and c_debt and c_plan_debt and c_docs and c_vali
 PYEOF
 
 echo "[97] OOB substrate Phase 1 / OOB.1 — oob_interaction entity + raw/oob storage: store.ENTITY_KEYS has oob_interaction keyed on 'id' (dedups); Run.add/read/count round-trip; raw_path('oob',...) -> raw/oob/; emitters are ONLY params.oob_probe (P2.3) + cli 'oob poll' (P2.4) — no stray phase emitter"
-PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "oob_interaction entity registered (dedup on id); round-trips via Run.add/read/count; raw/oob/ path resolves; emitters = params.oob_probe + cli 'oob poll' ONLY (no stray phase emitter)" || no "OOB.1 entity broken"
+PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "oob_interaction entity registered (dedup on id); round-trips via Run.add/read/count; raw/oob/ path resolves; emitter sink is oob._ingest (driven by params.oob_probe + cli oob import/poll); no stray phase emitter" || no "OOB.1 entity broken"
 import sys, tempfile, pathlib, inspect
 from quarry_recon.store import Run, ENTITY_KEYS
 c_reg = ENTITY_KEYS.get("oob_interaction") == "id"
@@ -3117,7 +3117,9 @@ pdir = pathlib.Path(inspect.getfile(_ph)).parent
 # params.py (P2.3 oob_probe) is the ONLY phase that emits oob_interaction; every other phase must not.
 # P2.4 adds a SECOND intended emitter: cli 'oob poll' (delayed callbacks) — so cli MUST emit, phases must not.
 emitters = [p.name for p in pdir.glob("*.py") if p.name != "params.py" and 'add("oob_interaction"' in p.read_text()]
-c_decl = (not emitters and 'add("oob_interaction"' in inspect.getsource(_cli))
+import quarry_recon.oob as _oobmod                       # the emitter sink moved into oob._ingest
+c_decl = (not emitters and 'add("oob_interaction"' in inspect.getsource(_oobmod)
+          and "import_polled" in inspect.getsource(_cli))
 sys.exit(0 if (c_reg and c_rt and c_raw and c_decl) else 1)
 PYEOF
 
@@ -3411,7 +3413,7 @@ class _R:
         l = s.store.setdefault(e, [])
         if any(x.get("id") == rec.get("id") for x in l): return False
         l.append(rec); return True
-    def record(s, ph, r): s.records.append(r)
+    def record(s, ph, r, **kw): s.records.append(r)
 class _S:
     def __init__(s, p=False): s.passive_only = p
     def active_allowed(s, h): return True
@@ -3754,7 +3756,7 @@ class Run:
     def values(s, ent): return [s._key(e) for e in s.ents.get(ent, [])]
     def count(s, ent): return len(s.ents.get(ent, []))
     def read(s, ent): return s.ents.get(ent, [])
-    def record(s, ph, r): s.records.append(r)
+    def record(s, ph, r, **kw): s.records.append(r)
 class Ctx:
     def __init__(s):
         s.run=Run(); s.http_timeout=600

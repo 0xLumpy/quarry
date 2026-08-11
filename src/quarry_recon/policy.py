@@ -311,6 +311,29 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.sweep:_UNSELECTABLE_DETAIL": ("resource", "a diagnostic list bound; the counters beside "
                                                             "it are authoritative"),
 
+    # acquisition + corpus envelopes — structural truthfulness/safety ceilings, not per-run volume knobs.
+    # Overflow is refused with a durable remainder, never dropped; `--unbound` uses work a run already has.
+    "quarry_recon.contract:_FREE_RESERVE_DEFAULT": ("resource", "the default free-space reserve kept on the "
+                                                    "artifact filesystem; an always-on host guard"),
+    "quarry_recon.contract:_LAYER_CAP_ATTR": ("not_a_bound", "a layer->attribute-name map naming which byte "
+                                              "layer bound a stream, not a numeric ceiling"),
+    "quarry_recon.envelope:MAX_BYTES_PER_KEY": ("resource", "the supported per-key corpus byte envelope; "
+                                                "growth past it is refused with a durable remainder"),
+    "quarry_recon.envelope:MAX_CORPUS_BYTES_PER_ENTITY": ("resource", "the supported per-entity corpus byte "
+                                                          "envelope; overflow refused with a durable remainder"),
+    "quarry_recon.envelope:MAX_KEYS_PER_ENTITY": ("resource", "the supported per-entity distinct-key envelope; "
+                                                  "overflow refused with a durable remainder"),
+    "quarry_recon.envelope:RSS_BUDGET_MB": ("resource", "resident-memory budget for the bounded finalize; work "
+                                            "spills to on-disk sqlite past it, nothing dropped"),
+    "quarry_recon.store:_MAX_LEDGER_KEY": ("resource", "a ledger key longer than this is damage, rejected "
+                                           "before it is materialized"),
+    "quarry_recon.store:_MAX_LEDGER_LINE": ("resource", "a ledger line longer than this is damage, rejected "
+                                            "before it is materialized/parsed"),
+
+    # parser ranges for the acquisition byte knobs
+    "quarry_recon.contract:_ACQUIRE_BYTES_MAX": ("parser", "the strict parser's ceiling for the ACQUIRE_* "
+                                                 "byte knobs (1 PiB)"),
+
     # continuation — the supervisor's own bounds. `--unbound` is about one run's volume; how many runs a
     # campaign creates, and when it gives up, is `--settle`'s question and carries its own named stops.
     "quarry_recon.campaign:MAX_CHILDREN": ("continuation", "children one campaign may create"),

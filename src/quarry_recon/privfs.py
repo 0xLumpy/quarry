@@ -46,9 +46,12 @@ def _walk_dirfd(directory) -> int:
                 nfd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
                 created = False
             except FileNotFoundError:
-                os.mkdir(comp, DIR_MODE, dir_fd=dfd)
+                try:
+                    os.mkdir(comp, DIR_MODE, dir_fd=dfd)
+                    created = True
+                except FileExistsError:
+                    created = False          # a concurrent walker made it; adopt and harden it below
                 nfd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
-                created = True
             os.close(dfd)
             dfd = nfd
         if not created and not _harden_fd(dfd, is_dir=True):
