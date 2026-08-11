@@ -17,3 +17,6 @@ venv/
 .quarry/
 runs/
 targets/
+
+# local agent/editor config, never versioned
+.claude/
