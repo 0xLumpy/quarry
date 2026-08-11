@@ -6,8 +6,9 @@ Quarry runs a full recon methodology from one CLI: subdomain discovery, DNS and 
 fingerprinting, crawling, JS analysis, content discovery and parameter scanning — across 38 tools
 and 66 sources, into one structured JSONL store you can grep, export and hand to a human.
 
-It is built for long runs on real targets. Every tool run is classified, the bounded lanes report
-what they covered and what they skipped, and omitted input is counted rather than dropped.
+It is built for long runs on real targets. Typed tool outcomes, explicit coverage, durable evidence and
+honest remainder are core contracts. `v0.3.9` does not yet enforce those contracts uniformly across every
+lane; the pending integrity release tracks the gaps instead of presenting them as complete.
 
 > [!IMPORTANT]
 > Quarry performs active network and application testing by default. Use it only on systems you are
@@ -21,14 +22,16 @@ Quarry is under active development. Commands, schemas, and report formats may st
 
 - **Nine phases** — horizontal, vertical, dns, probe, crawl, enrich, origin, content, params —
   selectable per run with `--phases`
-- **Structured store** — 23 entity types as append-only JSONL with provenance back to raw evidence
-- **Coverage accounting** — the bounded lanes report eligible / tested / omitted with a reason
+- **Structured store** — 23 entity types as append-only observation JSONL, folded by canonical identity
+  with provenance back to raw evidence
+- **Coverage accounting** — instrumented bounded lanes report eligible / tested / omitted with a reason
 - **OSINT pre-flight** — a separate command that proposes scope candidates for human review
 - **Ranked output** — HOTLIST for humans, `digest.json` for tooling
-- **Pinned installs** — every managed tool has a version, ref or digest (`nmap` is distro-managed
-  by policy); `install` and `update` cannot reach `@latest`
-- **Scope enforcement** — one matcher every phase consults; out-of-scope hosts are collected but
-  never contacted
+- **Version-managed installs** — registry tools declare a version, ref or digest (`nmap` is
+  distro-managed by policy); complete activation rollback and runtime-identity enforcement remain
+  release gates
+- **Scope model** — engagement matchers separate authorized contact from passive candidates; uniform
+  connect-time protected-destination enforcement remains a release gate
 - **Cost control** — paid sources have credit reserves and per-project evidence reuse
 
 ## Requirements
@@ -155,7 +158,12 @@ shosubgo), and CertSpotter and ProjectDiscovery tools run without their optional
 | `notify` | run notifications (Slack/Discord/Telegram/webhook) |
 | `oob` | out-of-band callback server (defaults to the public interactsh pool) |
 
-Your keys never appear in run manifests, logs or recorded commands.
+Quarry masks exact configured key values in its recorded text as defense in depth. In `v0.3.9` this is
+literal replacement, not a guarantee for encoded, transformed, or split representations. The pending
+integrity release tracks the stronger boundary: each child receives only its declared credentials, and
+Quarry-owned credentials are excluded by construction from manifests, logs, reports, and recorded
+commands. Target-discovered secrets are evidence and **must** remain complete in private output; current
+lossy paths are tracked as release defects rather than documented as acceptable redaction.
 
 ## Phases
 
@@ -186,13 +194,17 @@ it never edits scope.
   recon/<run_id>/
     run.json             immutable creation record (run id, target, start)
     manifest.json        run record, per-tool status, coverage, failures
+    state.json           lifecycle and derived-view publication generations
     events.jsonl         append-only execution + coverage events (what `status` reads)
     raw/                 tool output, preserved before parsing
-    normalized/*.jsonl   entities with provenance
+    normalized/*.jsonl   append-only canonical observation rows with provenance
     exports/*.txt        flat lists (subdomains, live, urls, js)
     reports/HOTLIST.md   ranked queues for manual testing
     reports/digest.json  the same content, structured
     reports/delta.md     what is new since the previous run
+    revisions/
+      revision.json      pointer to the certified late-evidence combined view
+      revNNNN/           append-only supplement plus its reports/exports
   recon/state/           run history and lane rotations, shared across runs
   state/                 purchased Shodan pages — paid evidence, reused by later runs
   osint/state/           purchased Whoxy pages — paid evidence, reused by later runs
@@ -201,10 +213,14 @@ it never edits scope.
 The two `state/` directories hold evidence you paid credits for. Delete them and a later run that
 needs the same page has to buy it again.
 
-Findings are recorded at full value — a secret you cannot read is not a finding. Your own configured
-credentials are stripped from recorded commands, notes, manifests and notifications. Separately,
-single oversized bodies are not kept: JS above 15 MB and sourcemaps above 20 MB are skipped and
-counted as an omission.
+The output contract requires target evidence and private operator reports to be full-fidelity — a
+discovered secret you cannot read is not useful evidence. Quarry-owned API/provider, notification and OOB
+credentials are operational inputs, not evidence, and must not enter operational records. A normal private
+report is not a share-safe or AI-safe export: those surfaces require separately requested, policy-labelled
+derived views and never replace canonical evidence. `v0.3.9` still has open implementation gaps against
+these boundaries, recorded in the [current-HEAD audit](docs/audit/CURRENT-HEAD.md#head-08-truthful-lossless-private-reports-and-complete-provenance).
+Separately, single oversized bodies are not kept: JS above 15 MB and sourcemaps above 20 MB are skipped and
+counted as an omission. See [outputs and coverage](docs/outputs-and-coverage.md).
 
 ## Commands
 
@@ -239,15 +255,16 @@ counted as an omission.
 
 ## How results are qualified
 
-Every tool run is classified `success`, `empty`, `partial`, `blocked`, `timed-out`, `failed` or
-`skipped`. Zero output is never reported as "nothing found" when it could be a missing key, a bad
-resolver set, a WAF, a rate limit or a timeout.
+Migrated tool lanes classify execution as `success`, `empty`, `partial`, `blocked`, `timed-out`, `failed`
+or `skipped`. Instrumented coverage distinguishes zero observations from missing credentials, bad
+resolvers, target/tool blocking, limits and timeouts. `v0.3.9` still has silent or lossy paths, so these are
+not yet universal guarantees; see the [current audit](docs/audit/CURRENT-HEAD.md).
 
-The bounded lanes — vertical, probe, crawl, content, params and the A1d brute in enrich — also
+Instrumented bounded lanes in vertical, probe, crawl, content, params and enrich also
 report coverage: how much input they were eligible for, how much they tested, and what they omitted
 (capped, timed out, sampled, limited by a provider, declined by the tool, or unmeasurable). Such a
-lane never claims `complete` when it could not measure itself; it says `unknown`. The horizontal,
-dns and origin phases are not instrumented yet and report tool status only.
+record can say `unknown` when it cannot measure itself. This does not prove that every lane emitted a
+record; horizontal, dns and origin remain less completely instrumented.
 
 Some work carries across runs and some does not:
 
@@ -260,13 +277,17 @@ There is no `--resume <run_id>`.
 
 ## Scope and safety
 
-For authorized testing only. Quarry maps attack surface. It does not chain or weaponize what it
-finds, but several opt-in modes do act on the target — see the mode table above.
+For authorized testing only. Quarry maps attack surface and performs active verification. Its accepted
+broad Nuclei policy can issue state-changing requests, file writes or command payloads on a matching
+vulnerable target; several additional impact-sensitive modes are opt-in. Review the program rules and
+profile before execution.
 
 - Scope is `APEX_DOMAINS` plus any `CIDR` you configure. Related hosts found on owned
   infrastructure are recorded as review candidates, never scanned as new roots.
-- Out-of-scope hosts are collected as evidence and never contacted.
-- The scan host itself, loopback, link-local and cloud metadata addresses are always withheld.
+- The scope matcher withholds out-of-scope hostnames from planned active work while retaining passive
+  observations. Uniform enforcement by the actual connected peer is an open integrity gate.
+- Scanner-self, loopback, link-local and cloud-metadata destinations are protected by policy. `v0.3.9`
+  does not yet prove that exclusion at connect time across rebinding, proxy, direct-IP and CIDR paths.
 - In-scope names that resolve to private, CGNAT or ULA addresses **are** contacted by default.
   Set `MODES.BLOCK_PRIVATE_TARGETS: true` when the engagement or your scan location requires
   otherwise.
@@ -290,6 +311,10 @@ uncorrelated unless they carry a Quarry-issued token.
 
 ## Documentation
 
+- [docs/governance/PRODUCT-CONTRACT.md](docs/governance/PRODUCT-CONTRACT.md) — current product and evidence invariants
+- [docs/audit/CURRENT-HEAD.md](docs/audit/CURRENT-HEAD.md) — audited current-HEAD closure and open blockers
+- [docs/releases/v0.3.10.md](docs/releases/v0.3.10.md) — stabilization scope and status
+- [docs/releases/RELEASE-GATES.md](docs/releases/RELEASE-GATES.md) — release evidence and promotion contract
 - [docs/target-prep.md](docs/target-prep.md) — building a target profile
 - [docs/example.md](docs/example.md) — a full run, command by command
 - [docs/osint-broadening.md](docs/osint-broadening.md) — widening scope safely
@@ -303,15 +328,20 @@ uncorrelated unless they carry a Quarry-issued token.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate   # Debian/Ubuntu/Kali enforce PEP 668
 pip install -e '.[dev]'
-pytest                        # offline by default; network is blocked
-bash scripts/verify-quarry.sh
+pytest -m offline             # current offline-CI selection
+pytest                        # default opt-in exclusions; see tests/README.md
+bash scripts/verify-quarry.sh # mixed development diagnostics; SKIP is not a release pass
 ```
 
 The default selection excludes the opt-in markers: `-m integration` runs real binaries against
-fixtures, `-m live` contacts the network, `-m requires_tool` needs a binary on PATH.
+fixtures, `-m live` contacts the network, `-m requires_tool` needs a binary on PATH. The current workflow
+does not yet satisfy every [release gate](docs/releases/RELEASE-GATES.md); see
+[tests/README.md](tests/README.md) for the exact distinction.
 
 ## Status
 
 `v0.3.9`. The nine phases and the store layout have been in place since v0.2; v0.3 added coverage
-accounting, resumable scheduling, provider cost control and pinned installs. A query layer over the
-store is the next milestone.
+accounting, resumable scheduling, provider cost control and pinned installs. The next release is the
+foundational v0.3.10 integrity/truth stabilization; its current promotion status is tracked in the
+[release register](docs/releases/v0.3.10.md). A query layer follows that stabilization rather than serving
+as its substitute.

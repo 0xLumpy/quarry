@@ -73,7 +73,7 @@ _ROLE = {
     "ffuf": "Candidate-driven content and path discovery over live hosts.",
     "gf": "Buckets URLs into vulnerability-class candidate queues by pattern.",
     "arjun": "Discovers hidden request parameters on endpoints.",
-    "nuclei": "Template-based non-intrusive scanning with built-in out-of-band checks.",
+    "nuclei": "Broad active template verification with built-in out-of-band checks.",
     "dalfox": "Reflected-XSS candidate scanning.",
     "interactsh-client": "Opens and polls Quarry's out-of-band callback session (public or configured Interactsh server).",
     "gungnir": "Continuous CT-log monitoring for new certificates and subdomains.",

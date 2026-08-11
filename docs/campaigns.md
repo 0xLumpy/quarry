@@ -56,6 +56,9 @@ Running, finished, and interrupted campaigns all read the same way — the view 
 
 ## What a campaign cannot change
 
-It creates no scope and decides nothing about a run's contents. An inherited entity is never counted as a
-child's own discovery, and a child whose evidence could not be read is never absorbed as if it were empty.
+It creates no scope and decides nothing about a run's contents. The intended contract keeps inherited
+entities separate from a child's own discovery and refuses unreadable child evidence rather than treating
+it as empty. `v0.3.9` still has open campaign-history/terminal-truth cases under
+[`HEAD-04`](audit/CURRENT-HEAD.md#head-04-manifest-and-campaign-terminal-truth), so a campaign status is
+not release proof until that gate closes.
 The detailed scheduling contract lives in [`design/STEP4-SCHEDULING-DESIGN.md`](design/STEP4-SCHEDULING-DESIGN.md).

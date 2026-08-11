@@ -1,27 +1,38 @@
 # openintel-subs — advanced optional passive source (our plan)
 
-> **Verified state 2026-08-03 (`2bcd00a`): BUILT** — the silent opt-in lane exists as designed (`vertical.openintel`, local dataset, never a registered tool).
+> **Current status (audited 2026-08-11 at `4e4825c`): implementation present; release verification
+> open.** `vertical.openintel` is a registered source backed by an operator-local dataset, while the
+> executable is intentionally not managed as a registered install/update tool. `BUILT` below refers to
+> the cited historical milestone, not current gate closure. See `C-TOOLS`, `C-OUTPUT-CONTRACT`, and
+> `C-SOURCE-REGISTRY` in the [release gates](../releases/RELEASE-GATES.md).
 
 
-**What / why (for us):** extra PASSIVE subdomain coverage from a LOCAL OpenINTEL top1M subs DB
-(~40M subs from 5 yrs of OpenINTEL forward-DNS on the Cisco Umbrella/Tranco top1M). A different
-dataset than subfinder → **coverage** bucket. It's a self-contained Go binary + a ~2.5 GB SQLite
-`subs.db` (in `~/workspace/Methodology/openintel-subs-dist/`).
+**What / why (historical snapshot):** extra PASSIVE subdomain coverage from a LOCAL OpenINTEL top1M subs
+DB (then measured at about 40M names from five years of OpenINTEL forward DNS over Umbrella/Tranco
+top-lists). A different dataset than subfinder → **coverage** bucket. It used a self-contained Go binary
+plus an approximately 2.5 GB operator-local SQLite `subs.db`; that local build path is not a repository
+or installation contract.
 
-**Design decision (2026-07-05): advanced opt-in, SILENT unless configured.**
-- **NOT a registered tool** (not in `tools.yaml`) → `install` / `update` / `doctor` ignore it.
-- Configured via `secrets.yaml`:
+**Design decision (2026-07-05; current configuration home corrected): advanced opt-in, SILENT unless
+configured.**
+
+- **Registered source, not a managed tool**: it appears as `vertical.openintel` in `sources.yaml` but is
+  not in `tools.yaml`; `install` and `update` do not provision it.
+- Configure the non-secret local paths in `config.yaml`:
   ```yaml
   openintel:
     binary: /opt/openintel-subs/openintel-subs-linux
     db:     /opt/openintel-subs/subs.db
   ```
-- `secrets.openintel()` → `{}` unless the block is set. `vertical` runs it ONLY when **both**
-  `binary` and `db` are set AND present; otherwise it's silently skipped (no message, no warning).
-- `doctor` shows an `openintel-subs (advanced)` line **only when configured** (✓/✗ on path presence);
-  invisible otherwise.
+- `settings.openintel()` reads `config.yaml` and retains backward compatibility with the legacy
+  `secrets.yaml` block. An entirely unconfigured lane is silent. If both paths are configured but either
+  is unusable, the lane records `SKIPPED` so configuration failure is observable.
+- `doctor` shows an `openintel-subs (advanced)` line only when both path settings are present, with ✓/✗
+  based on path presence; it is invisible otherwise.
 - In `vertical` it runs `openintel-subs query -d <apex> -s -b <db>`, in-scope hosts → `subdomain`
-  (`sources:[openintel]`, raw_ref). Best-effort — any failure yields nothing, never breaks the run.
+  (`sources:[openintel]`, raw_ref). Configured execution uses the common runner and records its result. A
+  non-clean result produces no normalized hosts and does not abort the phase, but remains visible in run
+  evidence rather than being converted to a clean empty.
 
 **Why this shape:** Lumpy can use it for his own runs; a published-tool user never has to care (no
 noise, no missing-dep spam). Advanced users who build/obtain the DB can flip the switch.
@@ -29,9 +40,10 @@ noise, no missing-dep spam). Advanced users who build/obtain the DB can flip the
 **Getting the DB:** user-provided (the binary + subs.db). Not auto-downloaded — the raw OpenINTEL
 feeds are research-grade parquet (TB-scale, `openintel.nl/data`), impractical to fetch/build in an
 install. FUTURE option (if we ever host a pre-built, daily-rebuilt subs.db): `quarry install/update`
-could fetch it — but that's infra we'd run; not now.
+could fetch it, but only after the package/source identity, archive-fetch, provenance, and rollback gates
+apply to that corpus; that infrastructure does not exist now.
 
 **Other OpenINTEL datasets (looked 2026-07-05):** CT-forward-DNS → already covered (crt.sh +
 certspotter) · reverse-DNS → dnsx `-ptr` · ccTLD apex lists → minor OSINT-breadth · **Zonestream
 (real-time zone changes) → worth revisiting for a future continuous-monitoring / gungnir phase.**
-openintel-subs (top1M subs) is the one unique practical add today.
+openintel-subs (top1M subs) was the one unique practical addition selected in that review.

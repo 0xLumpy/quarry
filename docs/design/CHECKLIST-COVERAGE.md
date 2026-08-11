@@ -1,22 +1,27 @@
-# Quarry Coverage Tracker
+# Quarry methodology coverage snapshot (historical)
 
-> **Verified state 2026-08-03 (`2bcd00a`): LIVING DOCUMENT.** This is the TBHM Phase-1 coverage ledger — do not build a second one. Update a row when its status changes; open gaps belong in the operator's verified backlog, kept outside this repo.
+> **Status (audited 2026-08-11 at `4e4825c`): historical self-assessment; not a current closure or
+> release ledger.** The symbols below record claimed feature presence at the 2026-08-03 snapshot. They do
+> not prove correctness, completeness, current behavior, or release readiness.
 
+The current authorities are the [product contract](../governance/PRODUCT-CONTRACT.md),
+[`CURRENT-HEAD.md`](../audit/CURRENT-HEAD.md), the [`v0.3.10` release ledger](../releases/v0.3.10.md), and
+the [roadmap](../roadmap.md). Future methodology gaps must be recorded there rather than in an
+operator-private off-repository backlog. This snapshot remains useful for reconstructing design intent.
 
-Living map: `QUARRY-METHODOLOGY-VALIDATION.md` (the 17-phase methodology) → framework reality.
-Build new work (esp. the Phase 13/14 digest) **against this**, not vibes. Update a row when its
-status changes.
+Historical map: the operator-private `QUARRY-METHODOLOGY-VALIDATION.md` (17-phase methodology) → the
+framework state claimed at that time. Do not update these symbols as current closure evidence.
 
-**Status:** ✅ implemented · 🟡 partial · 👤 manual (by-design prompt, surfaced to the human) ·
+**Historical status legend:** ✅ implemented · 🟡 partial · 👤 manual (by-design prompt, surfaced to the human) ·
 🔮 future (roadmap) · ⚔️ private (attack-side / downstream manual+AI handoff)
 
 | Phase | Status | Quarry locus | Notes / gaps |
 |------|:---:|---|---|
 | 0 Scope review + profile | ✅ | `init` · `target.yaml` · `oos` · RATELIMIT · NOTES | gap: platform-scope API (H1/Bugcrowd/Intigriti) + disclosed-report dedup are 👤 |
-| 1 Pre-flight OSINT | ✅ | `osint.py` + `docs/osint-broadening.md` | Automated: `asnmap`·`azmap`·`dig`-DMARC·`whois`·`whoxy`·`porch-pirate` + **RDAP candidate enrichment (1A)** + **key-health (1A)**; manifest now redacts cmd/note. Web-gated sources (bgp.he.net/CAIDA/RDAP-UI, acquisitions, BuiltWith, cloud-cert) → 👤 **documented playbook (1B)**, report points to it. 1C `osint --import` deferred. |
+| 1 Pre-flight OSINT | ✅ | `osint.py` + `docs/osint-broadening.md` | Automated: `asnmap`·`azmap`·`dig`-DMARC·`whois`·`whoxy`·`porch-pirate` + **RDAP candidate enrichment (1A)** + **key-health (1A)**. The snapshot's command/note masking is not proof of the current credential/evidence boundary: canonical/private target evidence must remain lossless while Quarry-owned credentials are excluded by construction. Web-gated sources (bgp.he.net/CAIDA/RDAP-UI, acquisitions, BuiltWith, cloud-cert) → 👤 **documented playbook (1B)**, report points to it. 1C `osint --import` deferred. |
 | 2 Scope consolidation | ✅ | human-confirm → `target.yaml` | the map-don't-exploit seam; humans approve candidates |
 | 3 Passive subdomains | ✅ | vertical (`subfinder`·`github-subdomains`·`shosubgo`) | |
-| 4 DNS brute/resolve/permute/recurse | ✅ | vertical (`puredns`·`alterx`·`dnsx` + recursion loop) | wildcard→HTTP differentiation still 🔮 (v0.3) |
+| 4 DNS brute/resolve/permute/recurse | ✅ | vertical (`puredns`·`alterx`·`dnsx` + recursion loop) | The snapshot's “wildcard→HTTP differentiation future” note is superseded: `vertical.wildcard_http` exists in current source. Current release conformance remains open. |
 | 5 Horizontal / cert + relationship loops | 🟡 | horizontal (`asnmap`·`mapcidr`·`tlsx`·`caduceus`·`csprecon`·kaeferjaeger) + CSP-via-probe | **watch items:** kaeferjaeger 403; Caduceus/tlsx fragility |
 | 6 HTTP probe / fingerprint / screenshots | ✅ | probe (`httpx`·`gowitness`·`smap`) + enrich | core ✅; late hosts (crawl/CSP) now get WAF+screenshot+smap via enrich (verified 2026-07-04). Only the full recrawl loop is 🔮 |
 | 7 Port scan / service | 🟡 | probe (`naabu`·`smap`) + enrich | ✅ when CIDR present; late hosts get enrich smap now. naabu still CIDR-gated |
@@ -31,21 +36,32 @@ status changes.
 | 16 Reporting / continuous | 🟡 | `manifest.json`·`exports`·`osint_report.py` | PoC/report builder = 🔮 future |
 
 ## Cross-cutting watch items
-- **enrich follow-on** (Phase 6/7/8): late-discovered hosts reach params/nuclei but get **no screenshot, WAF detection, smap, or recrawl** this run. Logged in ROADMAP.
+
+- **enrich follow-on** (Phase 6/7/8): the old “no screenshot/WAF/smap” note is superseded by the current
+  `enrich` implementation; recrawl remains absent. This source observation is not release verification.
 - **kaeferjaeger 403** + **Caduceus/tlsx fragility** (Phase 5) — keep an eye; CSP-via-probe partly compensates.
-- **wildcard→HTTP differentiation** (Phase 4) — 🔮 v0.3.
-- **secret redaction** — ✅ done (mask+fingerprint across gitleaks/trufflehog/jsluice).
+- **wildcard→HTTP differentiation** (Phase 4) — present as `vertical.wildcard_http`; release verification open.
+- **credential/evidence separation** — the snapshot implemented mask+fingerprint, but that is not closure.
+  Current policy requires lossless target-secret evidence in canonical/private surfaces, credential
+  exclusion from operational surfaces, and separate policy-derived share/AI views (`C-SECRETS`).
 
 ## Highest-leverage automatable gaps (build order, rough)
+
 1. **Phase 13/14 digest + handoff** (v0.4) — ranked, provenance-rich, quarry-attack/hackbot-ready output. The bridge to the offensive side.
 2. **Phase 1 OSINT automation** — convert `MANUAL_TODO` items that *can* be automated (RDAP/ASN, linked-seeds, Shodan-passive); leave inherently-web ones (bgp.he.net browsing) as prompts.
-3. **Phase 11 content discovery** (v0.5) — the one whole missing phase.
+3. **Phase 11 content discovery** — the old “whole missing phase” claim is superseded by the current
+   candidate-driven `content` phase; digest surfacing, tailored wordlists, and release verification remain.
 4. **Phase 9 JS depth** — sourcemap unpacking, beautify, deeper route mining.
-5. **Phase 6/7 enrich follow-on** — screenshot/WAF/smap/recrawl for late hosts.
+5. **Phase 6/7 enrich follow-on** — recrawl for late hosts and release verification of the existing
+   screenshot/WAF/smap paths.
 6. **Phase 0 platform-scope API** + **Phase 16 report builder**.
 
-## Framework validation rubric (apply per phase)
-Systemic answers to the checklist's per-phase QA questions:
+## Historical framework validation rubric
+
+These are the snapshot's self-assessed answers to the checklist's per-phase QA questions. They are useful
+requirements and hypotheses, not current release evidence; each claim must be re-established through the
+applicable gate.
+
 - raw evidence ✅ · normalized output ✅ · provenance (source/reason/confidence/raw-ref) ✅
 - OOS + passive respected ✅ · rate-limits only-when-configured ✅
 - failures/timeouts/blocks distinguishable from empty ✅ (status taxonomy)
@@ -55,23 +71,30 @@ Systemic answers to the checklist's per-phase QA questions:
 - newly-discovered fed into correct queues 🟡 (enrich closed crawl/CSP→resolve/takeover; recrawl loop 🔮)
 - report shows confidence/reason/source 🟡 (→ digest v0.4)
 - API-docs/GraphQL/WS/mobile/OAuth-JWT/cloud/CICD normalized into queues 🔮 (mostly not yet)
-- OOB approved+configured before any callback 🔮
+- OOB public-default posture is accepted by design; backend provenance and independent per-owner disable
+  controls remain open
 
 ## Tool-integration discipline
+
 Per-tool mini-record required before add/change (Tool·Purpose·docs·install·version·deps·keys·
 cmd·IO·exit-codes·failure-modes·timeout/rate·security·entities·raw·normalizer·consumers·verify).
 Known special cases — status:
+
 - gitleaks nonzero = leaks found ✅ · dnsx CNAME incl. non-A-resolved known subs ✅ ·
   httpx response headers for CSP ✅ · katana response-store→xnLinkFinder ✅ · waymore response mode ✅
-- dalfox consumes clean candidate lists ✅ · ffuf same 🔮 (v0.5)
+- dalfox consumes clean candidate lists ✅ · current ffuf integration is candidate-driven; release
+  verification remains open
 - subfinder `-stats` key-health 🔮 · nuclei knobs documented 🟡
 - porch-pirate/Swagger must feed normalized endpoint/param stores (not just write a file) → ✅ **DONE (parse_openapi writes endpoint/parameter entities into the store)**
-- GitHub code-search qualifiers + source refs 🔮 · interactsh config/redaction/approval 🔮
+- GitHub code-search qualifiers + source refs 🔮 · Interactsh backend provenance and independent disable
+  controls remain open; public Interactsh as the default is accepted by design
 - source-code public-intel vs in-scope distinction 🔮 (code-host-intel)
 
 ## Open validation gaps → status
+
 - Re-probe CSP/crawl hosts same run → ✅ DONE (enrich) · output-hygiene spot-check → ✅ DONE (v0.2)
-- CNAME-only brute discovery → 🔮 ROADMAP · OOB/interactsh integration → 🔮 ROADMAP
+- CNAME-only brute discovery → 🔮 historical roadmap item · OOB/Interactsh backend provenance and
+  independent disable controls → open; public default accepted by design
 - RDAP automation IP→owner→CIDR → ✅ **DONE (osint.py RDAP candidate enrichment)** · acquisition/subsidiary scoring → 🔮 (Phase 1)
 - tool-native key-health beyond subfinder → 🔮
 - private AI digest schema (files consumed/created, immutable evidence) → 🔮 v0.4
@@ -81,10 +104,15 @@ Known special cases — status:
 - OAuth/OIDC/JWT classification (tag auth-flow endpoints, never test) → 🔮 NEW
 - cloud/container/mobile candidate queues (map, don't expand scope) → 🔮 NEW
 
-## NEW items surfaced (not yet in ROADMAP)
+## Historical items surfaced
+
 API-doc parsing → normalized endpoints · OAuth/JWT endpoint tagging · cloud/mobile candidate
 queues · RDAP automation · acquisition scoring · tool key-health · platform-scope schema ·
-private-AI-digest schema definition. (Feed these into the ROADMAP re-sequencing.)
+private-AI-digest schema definition. Reconcile any surviving item into the current
+[roadmap](../roadmap.md); this snapshot does not own sequencing.
 
 ---
-*Source: the 17-phase methodology validation checklist (operator-private, kept outside this repo). Pair every phase/step with implemented/partial/manual/future/private as the framework evolves.*
+
+*Source: the 17-phase methodology validation checklist (operator-private, kept outside this repo). The
+implemented/partial/manual/future/private labels are preserved as the historical snapshot's vocabulary;
+current status is maintained only in the authoritative ledgers linked above.*

@@ -74,7 +74,7 @@ Credential ownership and setup live in [secrets.md](secrets.md) and [external-in
 |------|------|------|------|
 | `gf` | Buckets URLs into vulnerability-class candidate queues by pattern. | optional | [tomnomnom/gf](https://github.com/tomnomnom/gf) |
 | `arjun` | Discovers hidden request parameters on endpoints. | standard | [s0md3v/Arjun](https://github.com/s0md3v/Arjun) |
-| `nuclei` | Template-based non-intrusive scanning with built-in out-of-band checks. | standard | [projectdiscovery/nuclei](https://github.com/projectdiscovery/nuclei) |
+| `nuclei` | Broad active template verification with built-in out-of-band checks. | standard | [projectdiscovery/nuclei](https://github.com/projectdiscovery/nuclei) |
 | `dalfox` | Reflected-XSS candidate scanning. | standard | [hahwul/dalfox](https://github.com/hahwul/dalfox) |
 
 ## Out-of-band interaction

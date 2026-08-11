@@ -18,5 +18,8 @@ venv/
 runs/
 targets/
 
+# Local source-corpus attestations, pseudonym keys, and fixture staging.
+.golden-private/
+
 # local agent/editor config, never versioned
 .claude/

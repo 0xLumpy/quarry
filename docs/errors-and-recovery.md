@@ -61,32 +61,46 @@ leaving a run stopped mid-flight: losing telemetry still commits the evidence, a
 be written leaves `finalization_failed` instead of a `finalizing` run with nothing to read.
 
 A report-only failure after the base commit exits 5 and leaves `finalization_failed`; the recon evidence
-and its manifest are intact. Resume the derived views — no rescanning — with:
+and its committed manifest are intact. Resume the derived views — no rescanning — with:
 
 ```bash
 quarry report -t acme --run <run_id>          # republish what is missing or stale
 quarry report -t acme --run <run_id> --force  # republish every view
 ```
 
-Each view is stamped with the generation of the base evidence it was built from — a content address over
-every record, so enriching one in place makes the views that used it stale even though the count did not
-change. A resume republishes only stale or missing views unless you pass `--force`.
+Each view is stamped with the generation of the evidence it was built from. For a base-only run that is
+the committed base generation; when certified late evidence exists it is the published combined
+generation. A resume republishes only stale or missing views unless you pass `--force`.
 
-Re-finalising reopens the run (`finished → finalizing`) and closes it again, because **a manifest may only
-change while the run is `finalizing`**. That is what keeps the two directions honest: a resume that
-republishes a view clears the publication fault it answered, and a regeneration that fails records one and
-leaves `finalization_failed`. A run resting in `finished` has an immutable manifest.
+Re-finalising temporarily reopens the lifecycle (`finished | finalization_failed → finalizing`) so its
+success or failure can be recorded, then closes it again. It does **not** reopen the base evidence:
+`run.json`, `normalized/*.jsonl` and the evidence-bearing manifest fields stay sealed. Derived base views
+may be republished when no late-evidence revision exists. `report` may reconcile only the manifest's
+derived-publication bookkeeping
+(`summary.faults` and the verdict implied by those faults). A cleared publication fault is not a change to
+the evidence a revision certifies; changing counts, coverage, gaps, tool runs, profile or other
+evidence-bearing manifest content is.
+
+Late OOB evidence for a committed run is written as an append-only supplement under `<run>/revisions/`.
+The last-published `revision.json` pointer identifies the certified segment chain and combined entity
+counts. Its combined reports and exports live under the pointed-to `revNNNN/` directory; the base run's
+`reports/` and `exports/` remain the base generation. `quarry report` prints the path it actually
+republished. The pointer is published last, so an interrupted publication leaves the preceding revision
+active rather than exposing a half-written generation.
+
+This describes the supported command path. In `v0.3.9`, complete repository-boundary sealing and
+multi-revision composition are still open release blockers; callers must not mutate a run directory or
+use internal `Run` writers as an alternative to the revision publisher. See
+[`HEAD-02`](audit/CURRENT-HEAD.md#head-02-repository-boundary-object-identity-and-sealed-run-immutability) and
+[`HEAD-03`](audit/CURRENT-HEAD.md#head-03-revision-composition-certification-and-pointer-last-publication).
 
 `<run>/state.json` fails closed. An absent file is a run written before this contract (a committed
 manifest means it finished); a file that is present but unreadable reads as `unknown`, never `finished`,
 and Quarry refuses to advance or overwrite it — inspect or remove it deliberately.
 
-Because a finished run's verdict is sealed, late `Fault`/`Gap` records are refused against it — reopening
-is the only way to add one, and that is what re-finalising does.
-
-A re-finalisation that actually changes the manifest (clearing a fault it answered, or recording a new
-one) changes the bytes a published late-evidence revision certifies against. When that happens, `report`
-says so: the run's supplemented rows are not in the republished views.
+Late observations are not added by reopening the base run. They must use the supplement/revision path.
+The finalisation reopen exists only to republish derived views and reconcile publication faults. Ordinary
+base-evidence writes against a committed run are outside this recovery contract.
 
 The manifest is "committed" only when it is readable, its `entity_counts` are exact non-negative integers
 and its `summary` carries every field the writer emits — a present but damaged manifest is not a

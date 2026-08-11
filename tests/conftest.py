@@ -1,6 +1,6 @@
-"""Shared pytest fixtures + the offline network-deny guard for the Quarry CI.
+"""Shared pytest fixtures and the current Python-level offline deny guard.
 
-Two layers enforce "offline CI makes no network call" (C18):
+Two layers make ordinary Python network/subprocess entry points fail loudly:
 
 1. A SESSION guard installed in ``pytest_configure`` when ``QUARRY_OFFLINE_CI`` is set (the CI workflow
    sets it). Because it is installed BEFORE collection, it also covers IMPORT-TIME network — e.g.
@@ -9,9 +9,11 @@ Two layers enforce "offline CI makes no network call" (C18):
 2. A per-test AUTOUSE fixture for local dev runs (no env var), so plain ``pytest`` still blocks runtime
    network for every test not marked ``live``/``integration``.
 
-Both use the same ``_BLOCKERS`` set, which covers sockets, resolver helpers, UDP, AND subprocess — a
-scanner launched via ``subprocess``/``exec_tool`` would otherwise get normal network despite the socket
-patches (they only affect the pytest process, not a child).
+Both use the same ``_BLOCKERS`` set, which covers selected socket, resolver, UDP, and subprocess entry
+points—a scanner launched via ``subprocess``/``exec_tool`` would otherwise get normal network despite the socket
+patches (they affect the pytest process, not a child). This is a useful tripwire, not an OS isolation
+boundary or proof that every possible native/network API is denied. Release isolation is specified in
+``docs/releases/RELEASE-GATES.md``.
 """
 from __future__ import annotations
 

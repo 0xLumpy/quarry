@@ -1,12 +1,15 @@
 # Quarry operator flags — the axis model (plan, 2026-08-02)
 
-> **Verified state 2026-08-03 (`2bcd00a`): steps 1-5 BUILT** (`policy.py`, scoped overrides, effective-policy print/persist, `--unbound`, `--settle`). Step 6 (`--preset`) is the only open item.
+> **Current status (audited 2026-08-11 at `4e4825c`): steps 1–5 implemented; current release
+> verification open.** `policy.py`, scoped overrides, effective-policy print/persist, `--unbound`, and
+> `--settle` remain in the tree. `--preset` is not implemented and is outside the `v0.3.10` integrity
+> release.
 
-
-Status: **APPROVED IN PRINCIPLE, NOT BUILT.** Revised 2026-08-02 after Codex's review of this plan (four
-findings, all verified against source and accepted). Written after Lumpy's brainstorm + reference survey
-(ProjectDiscovery, BBOT, reconFTW, ZAP, ffuf) and one audit pass over the current knob surface.
-Tree at `1cb0a63`, nothing in flight.
+This is a **historical approved plan and implementation-rationale record**. It was revised 2026-08-02
+after review and written against `1cb0a63`; `DONE`, `BUILT`, and “verified” below refer to the cited
+historical milestones, not current release-gate closure. Current intent and status are governed by the
+[product contract](../governance/PRODUCT-CONTRACT.md), [current audit ledger](../audit/CURRENT-HEAD.md),
+[`v0.3.10` ledger](../releases/v0.3.10.md), and [release gates](../releases/RELEASE-GATES.md).
 
 ## 1. The four axes
 
@@ -39,8 +42,10 @@ still excluded, because the provider owns what it may obtain.
 ## 2b. What `--unbound` may never touch
 
 * rate limits and concurrency (pressure on the target / on this host),
-* scope, OOS rules, contact guards, the self/private deny list,
-* parser validation, evidence contracts, redaction,
+* scope and OOS rules, the operator-selectable private-reach control, and the independent scanner-self and
+  metadata exclusions,
+* parser validation and evidence-surface contracts, including lossless canonical/private evidence and
+  exclusion by construction of Quarry-owned credentials from operational telemetry,
 * per-invocation chunk sizes (`MAX_BATCH_WORDS`, per-call caps) — they bound blast radius and memory,
   and the scheduler reaches every chunk anyway,
 * admission cooldown and rotation fairness (ordering, not coverage),
@@ -144,6 +149,9 @@ COLLECTION budget to 1440m: an outer-kill flag deciding coverage, and moving the
 
 ## 7. `--settle` (designed later, after the volume axis)
 
+The requirements below are retained as the pre-implementation acceptance sketch. They do not establish
+that current settlement satisfies `HEAD-04` / `QR39-012`.
+
 A SUPERVISOR over runs, not a knob inside one: Quarry's evidence contract is one run = one run dir = one
 manifest = one verdict, and "preserve each attempt as its own run evidence" is exactly that. `quarry run
 --settle` creates child runs and a campaign ledger over their ids.
@@ -163,7 +171,7 @@ It needs, before any code:
 4. a no-progress counter (N runs with no new entities and no new attempted pairs -> stop, say so);
 5. every attempt kept as its own run evidence, with the ledger naming the stop cause.
 
-## 8. Build order
+## 8. Historical build order
 
 Revised after Codex's review — semantics are fixed BEFORE they are printed, because a policy report that
 publishes `--timeout 0` changing subfinder's volume would enshrine the defect it is meant to expose.

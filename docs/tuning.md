@@ -53,9 +53,10 @@ PERFORMANCE:
   ARJUN_BUDGET_S: 1800
 ```
 
-Consequence: each lane is checked between items against that many seconds (an in-flight item finishes), then
-stores its remainder. Membership is never dropped — only deferred. Continue resumable lanes with
-`quarry run -t acme --settle`.
+Consequence: each lane is checked between items against that many seconds (an in-flight item finishes),
+then records its lane-specific remainder where that scheduler supports it. Inspect the manifest: only
+`project_progress` remainders advance across runs, while other lanes repeat work or may report a terminal
+gap. Continue resumable lanes with `quarry run -t acme --settle`.
 
 ## Widen free-tool work for one run
 
@@ -63,7 +64,8 @@ stores its remainder. Membership is never dropped — only deferred. Continue re
 quarry run -t acme --unbound
 ```
 
-Consequence: every registered free-work volume ceiling lifts to unbounded for this process. It obtains no
+Consequence: every registered **relaxable** free-work volume ceiling lifts to its declared unbounded
+meaning for this process. It obtains no
 new sources and never changes scope, rate, spending, concurrency, or tool enablement.
 
 ## Remove the outer process timeout

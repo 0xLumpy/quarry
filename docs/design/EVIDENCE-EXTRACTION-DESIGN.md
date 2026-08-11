@@ -2,10 +2,18 @@
 
 Reference for `src/quarry_recon/evidence.py`.
 
+> **Status (audited 2026-08-11 at `4e4825c`): implementation rationale, not release closure.** The
+> extraction and classification paths exist, but occurrence provenance and full-fidelity rendering are
+> incomplete in some normalizers/reports. Current conformance is tracked by
+> [`HEAD-08`](../audit/CURRENT-HEAD.md#head-08-truthful-lossless-private-reports-and-complete-provenance)
+> and the [product contract](../governance/PRODUCT-CONTRACT.md).
+
 ## The map/attack boundary
 
-The rule is not "don't touch anything", it is **don't accidentally perform impact** (Lumpy,
-2026-07-02). Recon may collect evidence from unauthenticated, in-scope, non-mutating access: an exposed
+This section governs Quarry's **native evidence-extraction probes**, not the separately accepted broad
+Nuclei policy in [`ADR-039-01`](../governance/decisions/ADR-039-01-broad-nuclei.md). For these native
+lanes, the rule is not “don't touch anything”; it is **don't accidentally perform impact** (Lumpy,
+2026-07-02). They may collect evidence from unauthenticated, in-scope, non-mutating access: an exposed
 `.env`, `.git/config` or config file is GET-fetched and its secret read and recorded. Recon must not
 send attack payloads, use the credentials it finds, change state, bypass controls, or prove exploit
 impact — that is `quarry-attack`.
@@ -19,12 +27,15 @@ requests it; deep-evidence mode is an explicit operator opt-in that downloads it
 
 ## Discovered evidence is reported in full
 
-Only Quarry's own configured credentials are redacted. Every discovered value is stored complete on its
-entity and shown whole by every local artifact (HOTLIST, digest, exports). `secrets.redact` strips
-*Quarry's own* configured credentials from anything that leaves the box (notify/messenger); `secrets.mask`
-only builds a short `preview` field beside the complete discovered value, for recognition, never a
-substitute for it. Storing only a preview would lose the finding — one artifact can hold many values, and
-"grep the raw file" is not reporting the secret you found.
+The required boundary is that every discovered value remains complete on its entity and in every
+full-fidelity private artifact. `secrets.mask` may build a short `preview` field beside the complete value
+for recognition, never as a substitute. Storing only a preview would lose the finding—one artifact can
+hold many values, and “grep the raw file” is not reporting the occurrence Quarry found.
+
+Quarry's own configured credentials are a separate operational class and must be excluded from recordable
+values by typed invocation boundaries. The current `secrets.redact` literal replacement is defense in
+depth, not proof of that boundary. At the audited revision, some normalizers lose occurrence context and
+some report paths mask or omit discovered values; those are open defects, not a change to this design.
 
 ## Secret classification: shape is not a claim
 

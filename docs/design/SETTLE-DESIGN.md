@@ -1,11 +1,23 @@
 # `--settle` — the continuation axis (design, 2026-08-02, rev 4)
 
-> **Verified state 2026-08-03 (`2bcd00a`): BUILT** — `settle.py` + `campaign.py` + `quarry run --settle`. Resuming an INTERRUPTED campaign was added later (QR39-012): a campaign that stated an outcome is still refused (`settle.AlreadyRun`); one that was killed continues from its ledger.
+> **Current status (audited 2026-08-11 at `4e4825c`): implemented, release verification open.**
+> `settle.py`, `campaign.py`, and `quarry run --settle` exist, including interrupted-campaign resume.
+> The current audit nevertheless reopens campaign terminal truth under `HEAD-04` / `QR39-012`; see
+> [`CURRENT-HEAD.md`](../audit/CURRENT-HEAD.md) and work package `V310-04` in the
+> [`v0.3.10` ledger](../releases/v0.3.10.md).
 
+This is a **historical design and implementation-rationale record**, written against `d858e8c` and
+implemented over later revisions. Rev 2 folded in six review findings, rev 3 seven more (two P0s), and
+rev 4 five more, including the ACQUISITION OWNERSHIP RULE. `DONE`, `BUILT`, and “verified” below mean the
+milestone reported at the cited historical revision; they do not mean current release-gate `verified` or
+`closed`. Current authority lives in the [product contract](../governance/PRODUCT-CONTRACT.md), current
+audit ledger, release ledger, and [release gates](../releases/RELEASE-GATES.md).
 
-Status: **DESIGN ONLY, NOT BUILT.** Step 5 of `docs/design/FLAG-AXIS-PLAN.md`; steps 1–4 are done. Written
-against `d858e8c`. Rev 2 folded in six review findings, rev 3 seven more (two P0s), rev 4 five more
-including the ACQUISITION OWNERSHIP RULE. Every claim below was checked in the code.
+**Current evidence-contract correction:** the campaign union is a rebuildable **derived projection** of
+immutable child-run observations, not canonical evidence and not an authority that may rewrite a child.
+Phrases below such as “canonical merged entity” and “cumulative store” describe its historical merge and
+bootstrap semantics only. Any replacement must bind its source run/generation identities and preserve
+provenance back to the immutable observations.
 
 ## 1. What it is
 
@@ -282,7 +294,10 @@ A supervisor that creates runs needs the same care the rotation got:
 
 plus a `campaign` event per transition, so `quarry status` can show a live campaign.
 
-## 7. Build order (after this design is approved)
+## 7. Historical build order
+
+The following was the pre-implementation order. Later `BUILT` annotations record what existed at the
+cited revision; current conformance remains subject to the release gates linked above.
 
 1. **PREREQUISITE A** — canonical identity, MERGE and material fingerprint per entity kind, exposed for a
    finished run; no supervisor yet.
@@ -304,7 +319,8 @@ The CLI passes `launch`, so this module never owns what a run is. Both bounds ar
 destroy the evidence it was producing. `quarry status --campaign` reads the ledger, so a running, finished
 and interrupted campaign read the same way, and an unreadable one says so instead of looking empty.
 
-**RESUMING an INTERRUPTED campaign is implemented** (QR39-012). A campaign that recorded a stop is still
+**RESUMING an INTERRUPTED campaign was implemented at the cited historical revision** (QR39-012). This is
+not closure of the current `QR39-012` acceptance criterion. A campaign that recorded a stop is still
 refused (`settle.AlreadyRun`): its history is closed. One that was killed continues, and each of the four
 things a real resume owes is discharged before the loop runs again: the interrupted child is reconciled
 against its run directory (a run that wrote its manifest is absorbed and decided, one that did not is

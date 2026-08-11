@@ -122,8 +122,9 @@ APEX_DOMAINS:
 
 ## `OOS` — out-of-scope patterns
 
-From the program brief's exclusions. These are **regex matched against the full host** — the
-framework still *collects* them passively but never actively scans them.
+From the program brief's exclusions. These are **regex matched against the full host**. The framework
+still retains them passively, but the scope planner makes them ineligible for active work. The separate
+connect-time boundary must prove that the actual peer honors that decision.
 
 ```yaml
 OOS:

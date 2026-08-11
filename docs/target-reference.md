@@ -15,7 +15,7 @@ Empty sections skip cleanly — the minimum viable profile is one `APEX_DOMAINS`
 |-------|--------|
 | `TARGET` | engagement name (required) |
 | `APEX_DOMAINS` | in-scope apex roots (required). Discovery is anchored here by suffix match. `*.` is stripped to the root. |
-| `OOS` | out-of-scope patterns — **regex against the full host**. Collected passively, never actively contacted. Prefer anchored patterns; a loose one silently drops in-scope hosts. Add from the CLI with `quarry oos`. |
+| `OOS` | out-of-scope patterns — **regex against the full host**. Retained passively but ineligible for planned active contact. Prefer anchored patterns; a loose one silently drops in-scope hosts. Actual-peer/connect-time enforcement is tracked separately. Add from the CLI with `quarry oos`. |
 | `CIDR` | in-scope IP ranges. Empty: no range expansion, no infra port scan. Setting it makes tlsx SAN, Caduceus, and reverse DNS *eligible* on the ranges (active runs, when the tool is installed). |
 | `ASN` | ASN seeds. **Context only** — `quarry osint` expands them to CIDR candidates, but active range scanning still needs an explicit `CIDR`. An ASN alone never triggers a scan. |
 | `ORG_NAMES` | organisation names. Anchor `quarry osint` broadening (ASRank ASN discovery, reverse-WHOIS) and seed cloud-bucket candidates. |
@@ -64,7 +64,7 @@ group is **consent-sensitive** — it arms active or credential-using work and s
 | `SCREENSHOTS` | `true` | gowitness screenshots of live hosts |
 | `TAKEOVER` | `true` | collect CNAMEs and run subdomain-takeover templates |
 | `PORTSCAN` | `false` | infra port scan (naabu top-1000 → nmap). Needs `true` **and** `CIDR`. Distinct from the web-port SYN prefilter, which is machine config. |
-| `BLOCK_PRIVATE_TARGETS` | `false` | when `false`, in-scope names resolving to private / CGNAT / ULA addresses are contacted and recorded as leads. The scan host itself and cloud metadata are always withheld regardless. |
+| `BLOCK_PRIVATE_TARGETS` | `false` | when `false`, in-scope names resolving to private / CGNAT / ULA addresses are contacted and recorded as leads. Scanner-self, loopback, link-local and metadata destinations remain protected by policy; complete connect-time enforcement across every lane is an open `v0.3.9` release gate. |
 | `CONTENT_DISCOVERY` | `"off"` | ffuf content discovery intensity: `off` \| `light` \| `balanced` \| `deep` |
 | `CONTENT_RECURSION` | `0` | recursion depth for balanced/deep content discovery (capped at 5) |
 | `JS_AST` | `false` | AST analysis of downloaded JS bundles (local, memory-hungry) → path/sink observations |

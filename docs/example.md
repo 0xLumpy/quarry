@@ -479,7 +479,9 @@ nuclei -l <work>/takeover_targets.txt -tags takeover -jsonl -o raw/params/nuclei
 ```
 → `finding` (severity high, `confirmed:false`).
 
-**nuclei** non-intrusive scan with interactsh OOB over live hosts (chunked/resumable):
+**nuclei broad active verification** with Interactsh OOB over live hosts (chunked/resumable). The selected
+medium-through-critical template corpus excludes the `intrusive`, `fuzz`, `dos`, and `brute-force` tags,
+but matching templates can still issue state-changing requests, write files, or execute a payload:
 ```bash
 nuclei -l <work>/nuclei_targets.txt -jsonl -o raw/params/nuclei/findings.jsonl \
   -etags intrusive,fuzz,dos,brute-force -s critical,high,medium -stats -si 30 \

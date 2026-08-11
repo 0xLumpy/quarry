@@ -58,7 +58,10 @@ notify:
 ```
 
 Check the configured channels with `quarry notify`, which shows and validates them without sending a run.
-Notification content is redacted like everything else — configured secrets never appear in a message.
+Notification content applies Quarry's configured-secret masking. In `v0.3.9` that is exact-value defense
+in depth, not proof against encoded, transformed, or split representations. Do not send target evidence to
+a notification channel unless that channel is approved for it; the release contract requires
+Quarry-owned credentials to be excluded structurally rather than relying on text repair.
 
 ## Operator-supplied data
 

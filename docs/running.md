@@ -48,7 +48,7 @@ These are independent — each changes a different thing:
 |------|------|
 | `--passive` | force passive-only for this run (overrides the profile) — no active probing or scanning |
 | `--timeout <s>` | a **floor** on the outer per-tool process kill (default 1800). `0` = no outer kill. Some tools (httpx, ffuf, nuclei, naabu) get larger workload-scaled ceilings; a tool's own internal budget is separate. |
-| `--unbound` | lift every registered free-work **volume** ceiling to its unbounded meaning. Obtains no new sources; never changes scope, rate, spending, concurrency, or tool enablement. |
+| `--unbound` | lift every registered **relaxable** free-work volume ceiling to its declared unbounded meaning. Obtains no new sources; never changes scope, rate, spending, concurrency, or tool enablement. |
 | `--settle` | supervise: keep creating child runs while resumable work advances — see [campaigns.md](campaigns.md) |
 
 `--passive` still runs the passive sources (kaeferjaeger, subfinder, CT lanes, gau, waymore URLs);

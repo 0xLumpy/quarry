@@ -526,7 +526,7 @@ tools:
     maintenance_state: active
     version: "v3.11.0"
     phase: params
-    role: non-intrusive template scan; built-in interactsh OOB
+    role: broad active template verification; built-in interactsh OOB
     install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
     update: nuclei -update; nuclei -update-templates
     version_cmd: nuclei -version

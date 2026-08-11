@@ -1,10 +1,17 @@
-# Quarry verification key
+# Quarry verification key (historical partial index)
 
-> **Verified state 2026-08-03 (`2bcd00a`): LIVING DOCUMENT.** The gate it documents now lives at `scripts/verify-quarry.sh` and is versioned with the repo.
+> **Status (audited 2026-08-11 at `4e4825c`): historical diagnostic documentation; not a release gate.**
+> This page describes only checks 0–8 of a script that has since grown through check 146. The script mixes
+> source-checkout assertions, optional host tools, and live-range contact; it permits `SKIP`. A pass from
+> it cannot satisfy Quarry's current release contract.
 
+The authoritative lane taxonomy, skip rules, isolation requirements, and promotion evidence are in
+[`RELEASE-GATES.md`](../releases/RELEASE-GATES.md). Current release status is in the
+[`v0.3.10` ledger](../releases/v0.3.10.md). Keep `scripts/verify-quarry.sh` as a useful historical and
+developer diagnostic until its checks are classified and migrated; do not cite it as release closure.
 
-Targeted regression checks, one per shipped fix. Run **in convolute** — periodically, not
-after every small change — instead of a full pipeline run.
+The historical usage was targeted regression checks, one per shipped fix, run periodically instead of a
+full pipeline. It remains useful for diagnostics, subject to the warning above.
 
 ```bash
 bash scripts/verify-quarry.sh          # runs all checks, prints PASS/FAIL/SKIP, exits nonzero on FAIL
@@ -13,12 +20,14 @@ bash scripts/verify-quarry.sh          # runs all checks, prints PASS/FAIL/SKIP,
 # engagement data. It is safe to version and to publish; override with RANGE_APEX=<your-range>.
 ```
 
-**Prereqs:** this box can import the Quarry **source** (`QUARRY_SRC`, default `~/workspace/quarry/src`)
+**Historical prerequisites:** the process can import the Quarry **source** (`QUARRY_SRC`, historically
+defaulting to the original checkout's `src/`)
 and, for DNS checks, reach the live range (`RANGE_APEX`, default `0xlumpy.cc`). DNS checks `SKIP`
 (not fail) when `dnsx` is absent or the range is unreachable — so the offline checks still run
 anywhere. Checks assert against the **source tree we edit**, not the pipx-installed build.
 
-Last full pass: **2026-06-27 — PASS=9 FAIL=0 SKIP=0** (from this box, range live).
+Historical recorded run: **2026-06-27 — PASS=9 FAIL=0 SKIP=0** (from the original box, range live).
+It is not bound to the current candidate identity and is not current verification evidence.
 
 ---
 
@@ -51,8 +60,9 @@ CNAME→NXDOMAIN sim) is flagged dangling. Mirrors the `review.takeover_candidat
 
 ### [3] CSP-sibling discovery — `probe.py` (needs range)
 httpx runs with `-irh`; the probe phase parses `header.content_security_policy` over **live
-hosts** and adds in-scope siblings as subdomains (`sources:[csp]`). Asserts `internal` is
-discovered from **www's** CSP. (csprecon-over-apex in horizontal is kept but can't see this —
+hosts** and adds in-scope siblings as subdomains (`sources:[csp]`). The first version asserted
+`internal`; the current shell check uses the renamed `cf-edge-9d2c` fixture and discovers it from
+**www's** CSP. (csprecon-over-apex in horizontal is kept but can't see this —
 the CSP lives on www, not the bare apex.)
 
 ### [4] arjun → dalfox handoff — `params.py` (hermetic)
@@ -72,14 +82,21 @@ fixture with fake secrets, asserts the report file is non-empty with findings. C
 `/dev/stdout`-writes-0-bytes breakage that the offline classify test (check 1) missed and that
 cost the aws+jwt secrets on the Test-2 VPS run.
 
-> Note: check [3]'s CSP host is `cf-edge-9d2c` (range renamed `internal → cf-edge-9d2c`
-> post-Test-1 so the CSP-only channel can't be masked by a brute-findable name).
+> Note: the range renamed `internal → cf-edge-9d2c` post-Test-1 so the CSP-only channel cannot be
+> masked by a brute-findable name.
 
-### [7] secret entities redacted — `secrets.mask`/`fingerprint` (hermetic)
-Normalized secret entities (gitleaks/trufflehog/jsluice) must carry only a **masked preview**
-(`AKIA…IJ4L (20 chars)`) + a **fingerprint** id — never the raw secret. Raw evidence stays in
-the controlled raw/ files. Asserts mask hides the body and the fingerprint is stable + raw-free.
-(Methodology: secret candidates redacted in normalized storage / reports / AI prompts.)
+### [7] historical target-secret masking check — superseded as an acceptance criterion
+
+This check asserts the old implementation's masked-preview plus fingerprint behavior for normalized
+gitleaks/trufflehog/jsluice entities. That behavior is **not** Quarry's current evidence contract:
+target-derived secret occurrences remain lossless in canonical evidence and full-fidelity private
+operator reports. Quarry-owned credentials are instead excluded by construction from operational
+telemetry and unrelated child environments. Share and AI views are separate explicit derivations and may
+apply a recorded minimization policy.
+
+The check may remain as characterization of the old representation, but it cannot pass `C-SECRETS` or a
+report-integrity gate. Its replacement must use distinct synthetic canaries for target evidence and
+Quarry credentials and verify every sink without destroying the target occurrence.
 
 ### [8] enrich phase wired in — `phases/__init__.py` (hermetic)
 Late-discovered hosts (crawl links, CSP siblings) need a catch-up resolve/takeover/probe. The
@@ -89,7 +106,9 @@ vertical CNAME pass ran before crawl — enrich closes that.)
 
 ---
 
-## Adding a check
-When a fix lands, add: (a) a `[]`-numbered block in `verify-quarry.sh` printing `ok`/`no`, and
-(b) a row here describing what it proves + its commit. Keep each check fast and hermetic; gate
-anything needing the range behind a reachability `SKIP`.
+## Adding verification now
+
+New release assertions belong in the classified test lane and machine-readable gate named by
+[`RELEASE-GATES.md`](../releases/RELEASE-GATES.md). A required check must not become green through
+reachability `SKIP`. If a numbered shell check is still useful as a developer diagnostic, label its I/O
+and prerequisites precisely and link it to—not substitute it for—the authoritative gate evidence.

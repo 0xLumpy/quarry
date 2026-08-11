@@ -42,15 +42,21 @@ block is not checked. The provider is the final authority; Quarry never blocks a
 
 ## What is redacted, and what is not
 
-`redact()` masks only **Quarry's own configured** secrets (the values above, length ≥ 6) wherever they are
-recorded or sent — local manifests, commands, notes, reports, and events, as well as outbound
-notifications. It does **not** redact non-secret fields — `censys.org`, `telegram.chat_id`, and
-`oob.callback_server` are identifiers, not credentials, and stay readable.
+`redact()` attempts to mask only **Quarry's own configured** secrets (the values above, length ≥ 6) in
+recorded or sent text such as manifests, display commands, notes, events, and notifications. In `v0.3.9`
+it performs literal replacement: encoded, transformed, split, or overlapping representations are not a
+proven confidentiality boundary, and a coincidental substring can alter benign telemetry. Treat it as
+defense in depth. The pending integrity contract requires typed per-tool credential delivery and exclusion
+from recordable values by construction.
 
-A **discovered** secret — one a scanner finds on the target — is different: it is evidence, kept **whole**
-on its entity and shown in full by local artifacts (HOTLIST, digest, exports). Only a short non-usable
-`preview` and a `fingerprint` sit beside it for recognition and dedup. Quarry redacts *your* keys, never
-the target's findings.
+The function does **not** mask non-secret fields such as `censys.org`, `telegram.chat_id`, and
+`oob.callback_server`; those are identifiers and stay readable.
+
+A **discovered** secret — one a scanner finds on the target — is different: it is evidence and is intended
+to remain **whole** on its entity and in every full-fidelity private artifact. A short `preview` and a
+`fingerprint` may sit beside it for recognition and deduplication, but they do not replace the value.
+`v0.3.9` still has report paths where literal configured-secret masking or lossy rendering violates that
+rule; those are release defects, not a reason to destructively redact the evidence.
 
 ## Reserved
 

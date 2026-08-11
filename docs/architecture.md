@@ -8,19 +8,22 @@ as-built view; the detailed rationale lives under [`design/`](design/).
 ```
 target.yaml
     → scope + mode validation            (config.py: what is authorized, what is armed)
-    → phase / source registry            (sources.yaml: which lanes are eligible, and why)
+    → phase planning + source policy      (phase registry plus sources.yaml where adopted)
     → guarded tool + native acquisition  (runner + contract: nearly every tool through one choke point)
-    → raw evidence                       (raw/<phase>/<tool>/: tool output, plus Quarry's inputs/state)
-    → normalized JSONL + provenance      (store: typed, append-only observations)
+    → raw evidence                       (retained tool/acquisition bytes plus inputs/state)
+    → normalized JSONL + provenance      (store: append-only observation rows)
     → events, coverage, remainder, ownership
     → manifest verdict                   (complete / with_limits / with_gaps)
-    → reports + exports
+    → generation-addressed reports + exports
+    → optional certified late-evidence revision
     → optional --settle campaign union   (child runs merged forward)
 ```
 
 The pipeline is nine phases — `horizontal → vertical → dns → probe → crawl → enrich → origin → content →
-params` — sharing one evidence store. Each tool call is captured, classified, and normalized; each phase
-is followed by a coverage checkpoint.
+params` — sharing one evidence store. Migrated tool/acquisition paths produce typed results and retained
+artifacts; legacy/direct paths that do not yet meet that contract are listed in the current audit. Each
+phase is followed by a coverage checkpoint, but a checkpoint cannot account for a silent/unregistered
+lane by inference.
 
 ## Boundaries
 
@@ -33,25 +36,36 @@ Five separations carry most of the design:
 - **Acquisition vs interpretation.** On the migrated evidence-acquisition lanes a response is acquired whole
   and stored before it is parsed, so a bounded or failed parse still leaves the bytes and is re-runnable.
   Other paths (JS fetching among them) keep their own per-item acquisition guards.
-- **Raw evidence vs normalized observation.** Raw is what a tool emitted (plus Quarry's run inputs/state);
-  the **normalized** store is canonical — the typed, deduplicated reading the reports are built from. Raw is
-  kept for re-derivation and audit.
+- **Raw evidence vs normalized observation.** Raw retains the tool/acquisition bytes Quarry successfully
+  took ownership of (plus run inputs/state); its result record says whether the stream was complete.
+  Normalized JSONL contains the append-only semantic observations. Its folded/deduplicated readings and
+  reports are derived views; raw is retained for re-derivation and audit. The current store does not yet
+  preserve every relationship through folding, which is tracked in the current-HEAD audit.
 - **Run vs campaign.** A run is one pass with its own evidence. A campaign (`--settle`) is a supervisor
   that continues resumable work across child runs — it owns no evidence of its own, only the union.
+- **Sealed base vs late evidence.** A committed base run is intended to be immutable. Delayed OOB evidence
+  is published as a certified revision of the combined view. The current repository-boundary and
+  multi-revision residuals are release blockers, not alternate supported write paths.
 
 ## Control plane
 
-Two registries govern what runs. `data/tools.yaml` (the [tool index](tools.md)) is the install/version
-registry. `data/sources.yaml` is the source registry: one entry per `phase.source` lane, carrying its
-tier (weight), class (passive/active/deep), and default (on/off/key) with an auditable non-runtime reason
-for anything off by default. A source not in the registry never reaches the runner. Most tools run through that runner; the exceptions
-are launched directly — the long-lived OOB callback client (`interactsh-client`) and the OSINT native calls
-(`whois`, `dig`).
+Two registries describe much of what runs. `data/tools.yaml` (the [tool index](tools.md)) is the
+install/version registry. `data/sources.yaml` records adopted `phase.source` lanes, carrying tier, class,
+default state and a reason for anything off by default. It is not yet an enforced complete runtime
+boundary: several native evidence lanes and direct tool calls remain outside its lifecycle. Those gaps are
+listed in the [current-HEAD audit](audit/CURRENT-HEAD.md) and must close before an external plugin contract
+is claimed. Most external tools use the central runner; long-lived OOB and selected native/legacy paths are
+explicit exceptions today.
 
 Coverage and provenance are first-class: most entities record which source produced them (a few, like
 `wildcard_zone`, do not), and a lane that falls short records why where it emits structured coverage (see
 [outputs-and-coverage.md](outputs-and-coverage.md)). `complete` means nothing was flagged, not that every
 possible lane ran.
+
+Lifecycle and machine-result records are typed in `state.py`. Base evidence commits before derived views;
+finalization is resumable, and late OOB evidence uses `revision.py`. Campaign settlement persists child
+obligations and union state. These mechanisms are real foundations, while semantic manifest validation,
+repository sealing, revision composition and campaign-history truth remain open release invariants.
 
 ## Design references
 

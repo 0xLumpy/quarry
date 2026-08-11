@@ -1,7 +1,9 @@
 # Quarry documentation
 
-Quarry is an offensive bug-bounty recon framework: a deterministic methodology engine that maps a target's
-attack surface, records provenance and coverage, and never asserts a finding it did not observe.
+Quarry is an offensive bug-bounty recon framework: a methodology engine intended to map a target's attack
+surface while recording provenance and coverage. Its current integrity release is specifically closing
+paths that infer or flatten claims without sufficient evidence; see the
+[current audit](audit/CURRENT-HEAD.md).
 
 Start with the [main README](../README.md) for what Quarry is and a first install. This manual is the
 operator reference, organised by task.
@@ -24,7 +26,8 @@ operator reference, organised by task.
 ## Configure
 
 - [Configuration](configuration.md) — machine settings (`config.yaml`): concurrency, budgets, spending.
-- [Secrets](secrets.md) — the credentials Quarry owns (`secrets.yaml`) and how they are redacted.
+- [Secrets](secrets.md) — the credentials Quarry owns (`secrets.yaml`), their delivery boundary, and the
+  limits of current text masking.
 - [External integrations](external-integrations.md) — outside-tool keys, self-hosted OOB, notifications, operator-supplied data.
 - [Tuning](tuning.md) — goal-based recipes for changing the settings above.
 
@@ -33,6 +36,17 @@ operator reference, organised by task.
 - [Architecture](architecture.md) — how evidence moves through the phases, and the ownership boundaries.
 - [Tools](tools.md) — every actionable tool Quarry integrates, credited to its upstream project.
 - [Example run](example.md) — a complete, command-by-command worked campaign.
+
+## Develop and release
+
+- [Governance](governance/README.md) — authority, status language, and the accepted product contract.
+- [Current-HEAD audit](audit/CURRENT-HEAD.md) — verified closures, reopened invariants, and release blockers.
+- [Market baseline](audit/MARKET-BASELINE-2026-08.md) — sourced comparison with BBOT, reconFTW,
+  ProjectDiscovery, and OWASP Amass/OAM.
+- [v0.3.10 ledger](releases/v0.3.10.md) — the sole scope and closure record for the pending release.
+- [Release gates](releases/RELEASE-GATES.md) — hermetic, integration, corpus, package, fault, and publication evidence.
+- [Roadmap](roadmap.md) — future sequencing and the deferred reporting prototype.
+- [Golden corpus](design/GOLDEN-CORPUS.md) — private attestation and synthetic fixture rules.
 
 Design rationale (quota, scheduling, evidence, Dalfox, Shodan) lives under [`design/`](design/) — internal,
 not part of the operator path.

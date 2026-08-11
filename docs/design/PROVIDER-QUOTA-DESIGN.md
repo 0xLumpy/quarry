@@ -1,13 +1,17 @@
 # Provider quota / credit semantics — findings + design (raised 2026-07-27, Lumpy)
 
-> **Verified state 2026-08-03 (`2bcd00a`): B0 + B1 BUILT** (Shodan credit budget across all pivot lanes, Whoxy paginator). B2 (Censys) is BLOCKED BY ENTITLEMENT, not by code — the Platform search API is org-gated. The quota SEMANTICS below still govern every provider lane.
+> **Current status (audited 2026-08-11 at `4e4825c`): B0/B1 implementation present; release
+> verification open.** The Shodan credit coordinator, Whoxy paginator, and Censys entitlement lifecycle
+> path remain in the tree. Censys Platform global search remains externally entitlement-gated; that fact
+> does not close the adapter's release gates.
 
-
-Originally a pre-Batch-B research note (2026-07-27). **As built (`2bcd00a`): B0 + B1 shipped** — Shodan
-credit budget across the pivot lanes and the Whoxy paginator; B2 (Censys) is blocked by entitlement, not
-code. The semantics below govern every provider lane and are what the code cites; the defect list and
-"proposed shape" are kept as the reasoning that produced the build, past tense. Items still marked MEASURE
-were assumptions to confirm against the live API.
+Originally a pre-Batch-B research note (2026-07-27), this is now a **historical research and
+implementation-rationale record**. `DONE`, `BUILT`, `shipped`, and “verified” below refer to the cited
+historical revisions, not current release-gate `verified` or `closed`. Current provider conformance is
+governed by the [product contract](../governance/PRODUCT-CONTRACT.md),
+[`CURRENT-HEAD.md`](../audit/CURRENT-HEAD.md), and `C-TOOLS`, `C-OUTPUT-CONTRACT`, `C-SECRETS`, and
+`C-POLICY-TRACE` in the [release gates](../releases/RELEASE-GATES.md). Items still marked `MEASURE` were
+assumptions to confirm against the live API.
 
 ## The principle (Lumpy's, adopted)
 
@@ -27,11 +31,13 @@ Distinct classes, never collapsed (Lumpy r1):
     from an HTTP status alone**
   - `transport` · `5xx server` unchanged
 
-**Missing optional credentials are NOT COVERAGE_UNKNOWN** (Lumpy r2). An unconfigured optional provider
-emits an explicit **SKIPPED** lifecycle — it must not make every ordinary run read as incomplete. A
-provider that IS configured but cannot run because the account lacks entitlement is `provider_entitlement`
-and DOES contribute to `complete_with_limits`. (Supersedes my earlier "silence -> UNKNOWN" framing for
-the Censys gate: the fix there is an explicit SKIPPED, not a gap.)
+**Missing optional credentials are NOT COVERAGE_UNKNOWN** (Lumpy r2). An optional provider that was not
+configured must not make every ordinary run incomplete. The current release contract requires each
+planned obligation to have an explicit executed, omitted, refused, bounded, or not-applicable decision;
+the present implementation is not uniform here, because some entirely unconfigured lanes remain silent.
+A provider that is configured but cannot run because provider evidence proves the account lacks
+entitlement contributes a provider limit. Full lifecycle reconciliation remains open under
+`C-POLICY-TRACE`; silence must never be interpreted as completed coverage.
 
 ## Defects this addressed (all resolved in `2bcd00a`)
 
@@ -139,16 +145,23 @@ run, and cost no query credits.
    never become another hidden cap. Same rule as A1/A2: rank sets ORDER, never MEMBERSHIP.
 5. Deterministic pivot ordering + persisted remainder, `0` = all eligible pivots (breadth policy intact —
    the provider's balance is the ceiling, not a Quarry cap).
-6. Every skipped-because-unconfigured provider emits an explicit **SKIPPED** lifecycle, never silence
-   (Censys) — and never a coverage gap.
+6. The intended shape gives every planned optional-provider obligation an explicit **SKIPPED** or
+   not-applicable disposition without making absence of optional credentials a coverage gap. The current
+   Censys path explicitly records a configured token without the required organization; entirely
+   unconfigured lanes are not yet uniform, so this is a release-gate requirement rather than a closure
+   claim.
 
 ## Sequence (Lumpy, approved)
 
 - **B0 — DONE (`883120e`, 6 rounds).** Shared taxonomy (`Status.LIMITED`, `COVERAGE_PROVIDER`,
   `provider_limits` -> `complete_with_limits` with gaps dominating), Whoxy envelope + schema validation,
   caps removed, per-query accounting, OSINT session verdict with subprocess-exit-code checks.
-- **B1** — Shodan `/api-info`, sanitized error bodies, credit-aware resumable pivots.
-- **B2** — Censys lifecycle correction; later, a separate Free *lookup* lane for known assets.
+- **B1 — DONE at the cited historical revision.** Shodan `/api-info`, credential-safe operational error
+  records while retaining full provider evidence in private raw artifacts, and credit-aware resumable
+  pivots.
+- **B2 — lifecycle correction implemented; capability still constrained.** The configured-token/no-org
+  Censys state records an entitlement skip. Platform global search remains org-gated; a separate
+  Free-reachable lookup lane for known assets is deferred.
 - **xnLinkFinder** — afterwards, its own architectural batch.
 
 ## Whoxy is under-used (Lumpy, direction — NOT B0)

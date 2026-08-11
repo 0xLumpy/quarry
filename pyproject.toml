@@ -29,16 +29,16 @@ where = ["src"]
 quarry_recon = ["data/*.yaml", "data/*.txt"]
 
 [tool.pytest.ini_options]
-# Default run is OFFLINE and hermetic: the conftest network-deny fixture blocks every socket for any test
-# NOT marked `live`/`integration`, so `pytest` alone can never touch a target. Opt into the others
-# explicitly (`-m live` / `-m integration`). CI runs `-m "offline"`.
+# Default selection excludes live/integration/tool tests. The conftest Python-level deny guard is a
+# development tripwire for the remaining tests; it is not the OS isolation boundary required by the
+# release-gate contract. CI currently selects `-m "offline"`.
 testpaths = ["tests"]
 markers = [
-    "offline: hermetic — no network, no external binary (the CI gate; network is hard-denied)",
+    "offline: intended hermetic lane — no network or external binary (current CI selection)",
     "requires_tool: needs a real external binary on PATH (skips when absent)",
     "integration: runs a real external binary against fixtures (no live target)",
     "live: contacts the live range/network (never in offline CI)",
 ]
-# Default run EXCLUDES live/integration/requires_tool — they are opt-in only (explicit `-m live` etc.).
-# So plain `pytest` is hermetic; CI uses `-m offline` (positive selection) which overrides this.
+# Default run excludes live/integration/requires_tool; explicit marker selection opts into them. Complete
+# lane classification and OS isolation remain open release prerequisites.
 addopts = "--strict-markers -ra -m 'not live and not integration and not requires_tool'"

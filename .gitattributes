@@ -1,0 +1,2 @@
+# Archived audit inputs are byte-preserved; retain their intentional Markdown hard-break spaces.
+docs/archive/audit-v0.3.9/*.md -whitespace

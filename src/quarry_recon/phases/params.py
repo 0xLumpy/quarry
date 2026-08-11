@@ -1,7 +1,7 @@
 """Phase 7: params + lightweight scanning.
 
 gf vuln-class buckets over the URL corpus -> ranked candidate queues; arjun param
-discovery; non-intrusive nuclei with built-in interactsh OOB; dalfox reflected-XSS on
+discovery; broad active nuclei verification with built-in interactsh OOB; dalfox reflected-XSS on
 reflected candidates and a native Location probe for open-redirect candidates (dalfox
 does not do redirect). Scanner output is stored as candidates (confirmed:false), never
 as confirmed findings.
@@ -639,7 +639,7 @@ def _nuclei_progress(text: str) -> dict:
 
 def _nuclei_cmd(targets_file, out_file, prof, mhe: int) -> list[str]:
     """The nuclei main-scan command for one target file; identical flags for every chunk, only -l/-o
-    differ (non-intrusive, severity-scoped, governor-scaled -c/-bs, explicit host-error policy, shared
+    differ (broad active, severity-scoped, governor-scaled -c/-bs, explicit host-error policy, shared
     OOB endpoint)."""
     cmd = ["nuclei", "-l", str(targets_file), "-jsonl", "-o", str(out_file),
            "-etags", "intrusive,fuzz,dos,brute-force",
@@ -2372,7 +2372,7 @@ def run(ctx) -> None:
     if not live:
         ctx.run.record("params", skipped("nuclei", "no active-allowed live hosts"))
         return
-    # ── nuclei (non-intrusive, OOB interactsh, severity-scoped) — chunked + resumable ──
+    # ── nuclei (broad active, OOB interactsh, severity-scoped) — chunked + resumable ──
 
     # the long-pole. Work is rate-bound, so templates are not gated and batches are not parallelized (that
     # would blow the RoE); hosts are chunked for resume, progress and per-batch isolation. See _nuclei_scan.
