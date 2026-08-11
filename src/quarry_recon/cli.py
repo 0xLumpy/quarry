@@ -13,7 +13,7 @@ import click
 from . import __version__, events, secrets
 from .config import ProfileError, TargetProfile
 from .campaign import MAX_CHILDREN as _MAX_CHILDREN
-from .registry import health, install_one, load_tools, tools_by_phase, verify_installed
+from .registry import health, install_one, load_tools, tool_phases, tools_by_phase, verify_installed
 
 
 def _projects_root(opt: str | None) -> Path:
@@ -108,6 +108,25 @@ def _missing_required(phase_filter=None) -> list[str]:
     return sorted({t.bin for t in load_tools()
                    if not t.optional and not t.installed
                    and (phase_filter is None or t.phase in phase_filter)})
+
+
+def _select_phases(phases: "str | None") -> list:
+    """Validate a --phases selector and return it in canonical order. Unknown/empty/duplicate tokens raise
+    UsageError (exit 2) BEFORE any run is created; an omitted selector means the full canonical set. The
+    canonical order is preserved so an out-of-order selector never starves a dependent lane."""
+    from .phases import ORDER
+    if phases is None:                                   # flag omitted -> the full canonical set
+        return list(ORDER)
+    tokens = [p.strip() for p in phases.split(",")]      # an explicit "" is one empty token -> invalid below
+    if any(tok == "" for tok in tokens):
+        raise click.UsageError("empty phase name in --phases (stray or trailing comma?)")
+    unknown = [t for t in tokens if t not in set(ORDER)]
+    if unknown:
+        raise click.UsageError(f"unknown phase(s): {', '.join(unknown)}. valid: {', '.join(ORDER)}")
+    dupes = sorted({t for t in tokens if tokens.count(t) > 1})
+    if dupes:
+        raise click.UsageError(f"duplicate phase(s): {', '.join(dupes)}")
+    return [p for p in ORDER if p in set(tokens)]
 
 
 def _effective_phases(selected, profile) -> set:
@@ -224,6 +243,8 @@ def _health_reason(h: dict, t) -> str:
 @click.option("--phase", help="only audit tools for this phase")
 def doctor(phase):
     """Audit local setup: tools, versions, API keys, resolvers, wordlists."""
+    if phase is not None and phase not in tool_phases():
+        raise click.UsageError(f"unknown phase '{phase}'. valid: {', '.join(sorted(tool_phases()))}")
     tools = tools_by_phase(phase) if phase else load_tools()
     # a `dependency` (bun) is a runtime, not a recon tool: audited here, printed under [environment],
     # and not counted, but a broken one still degrades the verdict
@@ -466,12 +487,22 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     """Full blank-VPS install: system pkgs -> Go -> tools -> wordlists/templates."""
     from . import bootstrap
 
+    # an explicitly-empty selector is invalid; only a truly omitted flag means "everything"
+    for _flag, _val in (("--only", only), ("--phase", phase)):
+        if _val is not None and _val.strip() == "":
+            raise click.UsageError(f"{_flag} was given an empty value; omit it to install everything")
+
     # ── 1. system packages + Go toolchain + data (unless --tools-only / --only / --phase) ──
     full = not (only or phase or tools_only)
 
     # select first, reading only static fields: a `dependency` (bun) is provisioned in the toolchain
     # step, never listed under [3/6]
     tools = load_tools()
+    # validate the selector before any install side effect (invalid -> exit 2, nothing installed)
+    if only and only not in {t.bin for t in tools}:
+        raise click.UsageError(f"unknown tool '{only}'. run `quarry doctor` to list installable tools")
+    if phase and phase not in tool_phases():
+        raise click.UsageError(f"unknown phase '{phase}'. valid: {', '.join(sorted(tool_phases()))}")
     if only:
         tools = [t for t in tools if t.bin == only]
     elif phase:
@@ -483,6 +514,7 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     if full:
         tools = [t for t in tools if not t.dependency]
     failed = []
+    step_results = []          # typed InstallResult per bootstrap step; a required failure blocks
 
     if full:
         # install.sh prints this banner first, so don't duplicate it here
@@ -502,9 +534,9 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
         if rep["level"] == "warn":
             click.echo(_c("  below recommended — the run may be slow or unstable; continuing.", "yellow"))
         click.echo(_c("\n[1/6] system packages", "magenta"))
-        bootstrap.install_system_packages(click.echo, dry_run)
+        step_results.append(bootstrap.install_system_packages(click.echo, dry_run))
         click.echo(_c("\n[2/6] runtimes", "magenta"))
-        bootstrap.ensure_golang(click.echo, dry_run)
+        step_results.append(bootstrap.ensure_golang(click.echo, dry_run))
 
     # make freshly-installed Go/pipx bins visible to subsequent tool installs
     for p in (str(Path.home() / "go/bin"), str(Path.home() / ".local/bin"),
@@ -538,9 +570,9 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     # ── 3. data files + extras + cleanup ──
     if full:
         click.echo(_c("\n[4/6] data files (resolvers, wordlists)", "magenta"))
-        bootstrap.install_data_files(click.echo, dry_run)
+        step_results.append(bootstrap.install_data_files(click.echo, dry_run))
         click.echo(_c("\n[5/6] extras (gf patterns, nuclei templates)", "magenta"))
-        bootstrap.run_extras(click.echo, dry_run)
+        step_results.append(bootstrap.run_extras(click.echo, dry_run))
         click.echo(_c("\n[6/6] cleanup (reclaim disk)", "magenta"))
         bootstrap.cleanup(click.echo, dry_run)
 
@@ -551,13 +583,17 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
     # selected tool the operator asked for
     soft = [t.bin for t in failed if full and include_optional and t.optional]
     fatal = [t.bin for t in failed if t.bin not in soft]
+    blocked = [r for r in step_results if r.blocks]      # required bootstrap steps that failed
     for b in soft:
         click.echo(_c(f"  optional tool failed: {b} — retry: quarry install --only {b}", "yellow"))
-    if fatal:
-        click.echo(_c(f"\n{len(fatal)} tool(s) failed: {', '.join(fatal)}", "yellow"))
-        for b in fatal:
-            click.echo(f"retry: quarry install --only {b}")
-        raise SystemExit(1)                              # failures propagate a non-zero exit
+    for r in blocked:
+        click.echo(_c(f"  required step failed: {r.name} — {r.detail or 'see above'}", "yellow"))
+    if fatal or blocked:
+        if fatal:
+            click.echo(_c(f"\n{len(fatal)} tool(s) failed: {', '.join(fatal)}", "yellow"))
+            for b in fatal:
+                click.echo(f"retry: quarry install --only {b}")
+        raise SystemExit(1)                              # required failures propagate a non-zero exit
     elif not os.environ.get("QUARRY_FROM_INSTALLER"):
         # install.sh prints the final banner itself; conclude here only when run standalone
         tail = "" if not soft else f" ({len(soft)} optional failed — see above)"
@@ -580,13 +616,17 @@ def update(dry_run):
         if not _run_tool(t, "↻", dry_run):               # same locked path as install
             failed.append(t.bin)
     click.echo(_c("refreshing data files + templates", "magenta"))
-    bootstrap.install_data_files(click.echo, dry_run, update=True)
+    data_res = bootstrap.install_data_files(click.echo, dry_run, update=True)
     bootstrap.run_extras(click.echo, dry_run)
     bootstrap.cleanup(click.echo, dry_run)   # re-running tool installs refills go caches
     if dry_run:
         click.echo(_c("\n(dry-run)\n", "yellow"))
-    elif failed:
-        click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
+    elif failed or data_res.blocks:
+        if data_res.blocks:
+            click.echo(_c(f"  required step failed: {data_res.name} — {data_res.detail or 'see above'}",
+                          "yellow"))
+        if failed:
+            click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
         raise SystemExit(1)
 
 
@@ -808,6 +848,9 @@ def run(profile_path, phases, passive, timeout, unbound, settle_flag, settle_max
     if not settle_flag and (settle_max_runs is not None or settle_budget is not None):
         raise click.UsageError("--settle-max-runs / --settle-budget bound a campaign; they need --settle")
 
+    # validate the phase selector before any run/campaign side effect (invalid -> exit 2, no run)
+    _select_phases(phases)
+
     # --unbound for this run: entered before any lane reads a bound, restored on the way out so it
     # never leaks into another run sharing this interpreter
     from . import policy as _policy
@@ -860,7 +903,7 @@ def _settle_run(profile_path, phases, passive, timeout, *, max_runs, budget_s):
 
 def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     """The run itself, inside whatever policy overrides the flags established."""
-    from .phases import ORDER, REGISTRY, PhaseContext
+    from .phases import REGISTRY, PhaseContext
     from .store import Run
     from . import checkpoint, exports, triage
 
@@ -901,8 +944,7 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     if prepare is not None:
         prepare(run_obj)
 
-    selected = [p.strip() for p in phases.split(",")] if phases else ORDER
-    selected = [p for p in selected if p in REGISTRY]
+    selected = _select_phases(phases)   # validated + canonical-ordered (invalid raised before the run)
 
     click.echo(_c(f"\n══ Quarry run {run_obj.run_id} · target={profile.target} · "
                   f"{'PASSIVE' if profile.passive_only else 'ACTIVE'} ══", "cyan"))
@@ -981,17 +1023,18 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     except Exception as e:                                    # noqa: BLE001
         run_obj.notes.append(f"gadgets: EXCEPTION {secrets.redact(str(e))}")
 
-    # reports + exports
+    # reports + exports — evidence carrying discovered findings; written 0600, O_NOFOLLOW
+    from . import privfs
     exp = exports.write_all(run_obj)
     exports.write_delta(run_obj)
     hot = triage.build(run_obj, scope)
-    (run_obj.reports / "HOTLIST.md").write_text(hot)
+    privfs.write_private(run_obj.reports / "HOTLIST.md", hot)
     import json as _json
-    (run_obj.reports / "digest.json").write_text(
-        _json.dumps(triage.digest_json(run_obj, scope), indent=2, ensure_ascii=False))
+    privfs.write_private(run_obj.reports / "digest.json",
+                         _json.dumps(triage.digest_json(run_obj, scope), indent=2, ensure_ascii=False))
     if all_cps:
-        (run_obj.reports / "checkpoints.md").write_text(
-            "# Checkpoints\n\n" + "\n".join(f"- {c.line()}" for c in all_cps) + "\n")
+        privfs.write_private(run_obj.reports / "checkpoints.md",
+                             "# Checkpoints\n\n" + "\n".join(f"- {c.line()}" for c in all_cps) + "\n")
         run_obj.notes += [c.line() for c in all_cps]
 
     # telemetry -> metrics/summary.json, before the manifest so the manifest points at it
@@ -1084,12 +1127,13 @@ def report(profile_path, run_id):
     # minimal scope (report doesn't re-filter)
     from .config import ScopeMatcher
     scope = ScopeMatcher([], [], [], False)
+    from . import privfs
     exp = exports.write_all(run_obj)
     exports.write_delta(run_obj)
-    (run_obj.reports / "HOTLIST.md").write_text(triage.build(run_obj, scope))
+    privfs.write_private(run_obj.reports / "HOTLIST.md", triage.build(run_obj, scope))
     import json as _json
-    (run_obj.reports / "digest.json").write_text(
-        _json.dumps(triage.digest_json(run_obj, scope), indent=2, ensure_ascii=False))
+    privfs.write_private(run_obj.reports / "digest.json",
+                         _json.dumps(triage.digest_json(run_obj, scope), indent=2, ensure_ascii=False))
     click.echo(f"regenerated {run_obj.reports / 'HOTLIST.md'} + digest.json + delta.md")
     click.echo(f"exports: {', '.join(f'{k}={v}' for k, v in exp.items() if v)}")
 
