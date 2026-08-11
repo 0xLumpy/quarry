@@ -1039,7 +1039,6 @@ class TestGenerationsMoveTogether:
                                   lambda: contract.ProviderResult({"a.acme.com"}, partial=True,
                                                                   partial_kind="pagination", pages=5),
                                   work_unit="wu-a")
-            first = Run(run.dir).summary() if hasattr(Run, "summary") else None
             # session 2: a NEW session for the same source, stopped by spent credits on page 1
             events.reset()
             events.configure(run.dir)

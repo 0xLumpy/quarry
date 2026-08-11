@@ -610,6 +610,49 @@ def _atomic_write(path: Path, text: str) -> None:
     privfs.write_private(path, text)
 
 
+#: every key `Run._run_summary` emits. A committed summary carries all of them, so a partial object is
+#: recognised as damage instead of being reconciled into the verdict its missing keys were to carry.
+SUMMARY_KEYS = frozenset({"verdict", "tool_status", "tools_failed", "failures", "gaps",
+                          "phase_exceptions", "coverage", "coverage_limits", "remainders", "faults",
+                          "provider_spend", "provider_limits", "operator_limits"})
+
+
+def summary_well_formed(summary) -> bool:
+    """Whether a stored summary is the shape the writer emits. A dict missing required keys is damage: an
+    empty one reconciles to `verdict: complete` because it carries nothing to contradict it."""
+    return isinstance(summary, dict) and SUMMARY_KEYS.issubset(summary)
+
+
+def manifest_committed(manifest_path) -> bool:
+    """Whether a base manifest is committed — the one rule, so every reader agrees on what a commitment is.
+
+    Readable, carrying exact non-negative entity counters and a well-formed summary. A manifest whose
+    shape cannot be trusted is a damaged file: reading a commitment out of it would let a run that never
+    sealed, or one whose record was mangled, report a verdict it never reached.
+    """
+    manifest = _read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        return False
+    counts = manifest.get("entity_counts")
+    if not isinstance(counts, dict):
+        return False
+    # `type is int` rejects a bool counter, and a negative one is not a count of anything
+    if not all(isinstance(k, str) and type(v) is int and v >= 0 for k, v in counts.items()):
+        return False
+    return summary_well_formed(manifest.get("summary"))
+
+
+def _verdict_for(summary: dict) -> str:
+    """The one verdict rule, read from a serialized summary, so the in-process fold and the manifest
+    reconciliation cannot drift apart. Gaps dominate; a limit only lifts an otherwise-clean run."""
+    challenged = [f for f in summary.get("faults") or [] if (f or {}).get("challenges_completeness")]
+    if summary.get("failures") or summary.get("gaps") or summary.get("phase_exceptions") or challenged:
+        return "complete_with_gaps"
+    limits = ((summary.get("coverage_limits") or []) + (summary.get("provider_limits") or [])
+              + (summary.get("operator_limits") or []))
+    return "complete_with_limits" if limits else "complete"
+
+
 @dataclass
 class ToolRunRecord:
     phase: str
@@ -623,6 +666,7 @@ class ToolRunRecord:
     stderr_tail: str = ""
     cpu_s: float = 0.0                 # per-tool child CPU seconds
     peak_rss_mb: float = 0.0           # per-tool peak RSS (MB) of the process tree
+    depends_on: str = ""               # registry bin this source needs; the source→tool edge the verdict reads
 
 
 class Run:
@@ -646,6 +690,11 @@ class Run:
             privfs.private_dir(d)                            # recon/ and the run tree are 0700
         self.manifest_path = self.dir / "manifest.json"
         self.meta_path = self.dir / "run.json"            # immutable creation record (started/run_id/target)
+        self.state_path = self.dir / "state.json"         # finalisation state machine + per-stage generations
+        self._verdict_sealed = False                      # a fault committed after the verdict is a contract break
+        self._sealed_summary: dict | None = None          # the summary the manifest carries, computed once
+        self._faults: list = []                           # typed Fault records folded into the verdict
+        self._gaps: list = []                             # typed Gap records folded into the verdict
         self._tool_runs: list[ToolRunRecord] = []
         self._counts_cache: dict[str, int] = {}
         self._records: dict[str, dict] = {}       # entity -> {canonical_key: merged record} (instance-local)
@@ -699,7 +748,9 @@ class Run:
                 os.mkdir(project_dir / "recon" / rid, privfs.DIR_MODE)   # claim atomically and 0700
             except FileExistsError:
                 continue
-            return cls(project_dir, target, run_id=rid)
+            run = cls(project_dir, target, run_id=rid)
+            run.write_state("created")
+            return run
         raise RuntimeError("could not mint a unique run id after 16 attempts")
 
     @classmethod
@@ -725,7 +776,7 @@ class Run:
         return p / name
 
     # ── tool run accounting ──
-    def record(self, phase: str, result) -> None:
+    def record(self, phase: str, result, *, depends_on: str | None = None) -> None:
         # the single choke point that redacts secrets out of cmd/note/stderr before they reach the manifest
         from . import secrets
         self._tool_runs.append(ToolRunRecord(
@@ -734,12 +785,205 @@ class Run:
             stdout_lines=result.stdout_lines, note=secrets.redact(result.note),
             cmd=secrets.redact(" ".join(result.cmd)), stderr_tail=secrets.redact(result.stderr_tail),
             cpu_s=getattr(result, "cpu_s", 0.0), peak_rss_mb=getattr(result, "peak_rss_mb", 0.0),
+            depends_on=depends_on or "",
         ))
 
     def tool_runs(self, phase: str | None = None) -> list[ToolRunRecord]:
         if phase is None:
             return list(self._tool_runs)
         return [r for r in self._tool_runs if r.phase == phase]
+
+    # ── committed faults / gaps: the verdict is computed only after these are in ──
+    def _refuse_if_sealed(self, what: str) -> None:
+        """A verdict this instance already computed, or one a previous process committed and closed, is
+        sealed: a record arriving now would restate it and then be silently dropped, since nothing re-reads
+        `_faults`/`_gaps` after the seal.
+
+        The persisted half is what makes it hold across processes — `_verdict_sealed` is instance memory,
+        and every caller reaching a finished run does so through a fresh `Run.open`. Re-finalising is still
+        possible because `report` reopens the run (`finished -> finalizing`) before it republishes.
+        """
+        from .state import ContractError
+        if self._verdict_sealed:
+            raise ContractError(f"{what} committed after the verdict was sealed")
+        if self.state == "finished":
+            raise ContractError(f"{what} committed against finished run {self.run_id} — reopen it "
+                                f"(`finalizing`) to re-finalise")
+
+    def commit_fault(self, fault) -> None:
+        """Record a typed Fault against this run. Refused once the verdict is sealed."""
+        from .state import ContractError, Fault
+        if not isinstance(fault, Fault):
+            raise ContractError(f"commit_fault takes a Fault, got {fault!r}")
+        self._refuse_if_sealed(f"fault {fault.kind!r}")
+        if fault not in self._faults:            # the same fault committed twice is the same fact
+            self._faults.append(fault)
+
+    def commit_gap(self, gap) -> None:
+        """Record a typed Gap against this run. Refused once the verdict is sealed."""
+        from .state import ContractError, Gap
+        if not isinstance(gap, Gap):
+            raise ContractError(f"commit_gap takes a Gap, got {gap!r}")
+        self._refuse_if_sealed(f"gap {gap.kind!r}")
+        if gap not in self._gaps:
+            self._gaps.append(gap)
+
+    def unseal_verdict(self) -> None:
+        """Reopen the run for a re-seal: a finalisation fault raised after the base commit still reaches the
+        verdict, and a resumed finalisation recomputes it."""
+        self._verdict_sealed = False
+        self._sealed_summary = None
+
+    # ── finalisation state machine ──
+    def manifest_committed(self) -> bool:
+        """Whether this run's base manifest is committed. `manifest_committed(path)` is the one rule."""
+        return manifest_committed(self.manifest_path)
+
+    def _read_state(self) -> dict:
+        """The persisted finalisation record.
+
+        An ABSENT file is a run written before this contract: a committed manifest means its finalisation
+        finished, anything else is still `created`. A file that is PRESENT but unreadable is a different
+        fact and fails closed as `unknown` — inferring `finished` from a manifest there would let a
+        corrupt lifecycle record read as a completed one.
+        """
+        from .state import RUN_STATES, STATE_UNKNOWN
+        if not self.state_path.exists():
+            if self.manifest_path.exists() and not self.manifest_committed():
+                # a damaged manifest is not a commitment, and with no lifecycle record to read there is
+                # nothing left that could say how this run ended
+                return {"schema_version": 1, "run_id": self.run_id, "stages": {},
+                        "state": STATE_UNKNOWN, "unreadable": True}
+            return {"schema_version": 1, "run_id": self.run_id, "stages": {},
+                    "state": "finished" if self.manifest_committed() else "created"}
+        d = _read_json(self.state_path)
+        if self._well_formed_state(d):
+            return d
+        return {"schema_version": 1, "run_id": self.run_id, "stages": {},
+                "state": STATE_UNKNOWN, "unreadable": True}
+
+    def _well_formed_state(self, d) -> bool:
+        """Whether a persisted lifecycle record is this run's, and shaped the way this reader understands.
+
+        A record carrying a known state word is not enough: one copied from another run, written by a
+        version this reader does not know, or holding malformed stages would otherwise read as `finished`
+        here and then crash the finalisation that trusted it.
+        """
+        from .state import RUN_STATES, SUPPORTED_SCHEMA
+        if not isinstance(d, dict) or d.get("state") not in RUN_STATES:
+            return False
+        sv = d.get("schema_version")
+        if type(sv) is not int or sv not in SUPPORTED_SCHEMA:      # `type is int` rejects a bool
+            return False
+        if d.get("run_id") != self.run_id:      # a record from another run answers for nothing here
+            return False
+        stages = d.get("stages")
+        if not isinstance(stages, dict):
+            return False
+        return all(isinstance(name, str) and isinstance(rec, dict) for name, rec in stages.items())
+
+    @property
+    def state(self) -> str:
+        return self._read_state()["state"]
+
+    @property
+    def finalization_stages(self) -> dict:
+        return dict(self._read_state().get("stages") or {})
+
+    def write_state(self, dst: str, *, detail: str | None = None) -> None:
+        """Advance the finalisation state machine and persist it. Only the declared transitions are legal,
+        and an unreadable record is never overwritten — it is evidence, and guessing past it is how a
+        corrupt run re-finalises as a clean one."""
+        from .state import ContractError, run_transition_ok
+        rec = self._read_state()
+        src = rec["state"]
+        if rec.get("unreadable"):
+            raise ContractError(f"run {self.run_id} has an unreadable {self.state_path.name} — refusing to "
+                                f"advance it to {dst!r}; inspect or remove the file deliberately")
+        if src != dst and not run_transition_ok(src, dst):
+            raise ContractError(f"illegal run-state transition {src!r} -> {dst!r}")
+        rec.update({"schema_version": 1, "run_id": self.run_id, "state": dst,
+                    "generation": self.generation(), "updated": _utc(), "detail": detail})
+        _atomic_write(self.state_path, json.dumps(rec, indent=2))
+
+    def generation(self) -> str:
+        """Content address of the base evidence a derived view is generated from; a view stamped with a
+        different generation is stale and regenerates.
+
+        Every record's own fingerprint is folded in, not just how many there are: enriching a record in
+        place leaves the count untouched, and a view built from the thinner record is stale all the same.
+        """
+        h = hashlib.sha256(self.run_id.encode("utf-8"))
+        for entity in sorted(ENTITY_KEYS):
+            if not self._entity_file(entity).exists():
+                continue
+            records = self._records_for(entity)
+            h.update(f"\n{entity}:{len(records)}".encode("utf-8"))
+            for key in sorted(records):
+                h.update(f"\n{key}={fingerprint(entity, records[key])}".encode("utf-8"))
+        return h.hexdigest()[:16]
+
+    def stage_current(self, stage: str) -> bool:
+        """Whether a derived view is already published for the current generation."""
+        rec = self.finalization_stages.get(stage) or {}
+        return rec.get("status") == "done" and rec.get("generation") == self.generation()
+
+    def finalization_failed(self) -> bool:
+        """Whether a derived view is recorded failed for the current generation; a stale failure from an
+        older base evidence set does not gate."""
+        g = self.generation()
+        return any(r.get("status") == "failed" and r.get("generation") == g
+                   for r in self.finalization_stages.values())
+
+    def mark_stage(self, stage: str, status: str, *, detail: str | None = None) -> None:
+        from .state import ContractError
+        rec = self._read_state()
+        if rec.get("unreadable"):
+            raise ContractError(f"run {self.run_id} has an unreadable {self.state_path.name} — refusing to "
+                                f"record stage {stage!r} over it")
+        rec.setdefault("stages", {})[stage] = {"generation": self.generation(), "status": status,
+                                               "detail": detail, "updated": _utc()}
+        rec["schema_version"], rec["run_id"] = 1, self.run_id
+        _atomic_write(self.state_path, json.dumps(rec, indent=2))
+
+    def reconcile_finalization(self) -> dict | None:
+        """Bring the committed manifest's summary back in step with the finalisation stages, and return it.
+
+        A publication fault is a claim about a derived view at one generation. A resume that republishes
+        that view has answered the claim, so it must not survive in the manifest — otherwise `report`
+        exits 0 while a later `status` reads the stale fault and exits 5. Only `summary.faults` and the
+        verdict it implies are touched; the base evidence the manifest records is never rewritten, and a
+        run with no committed manifest has nothing to reconcile.
+        """
+        from .state import Fault
+        manifest = _read_json(self.manifest_path)
+        # a damaged summary is not reconciled: filling in what it lacks would author the verdict rather
+        # than bring one back in step with the stages
+        if not isinstance(manifest, dict) or not summary_well_formed(manifest.get("summary")):
+            return None
+        summary = dict(manifest["summary"])
+        stages = self.finalization_stages
+        gen = self.generation()
+        kept = []
+        for fault in summary.get("faults") or []:
+            stage = (fault or {}).get("where")
+            rec = stages.get(stage) or {}
+            answered = (fault.get("kind") == "publication" and rec.get("status") == "done"
+                        and rec.get("generation") == gen)
+            if not answered:
+                kept.append(fault)
+        for stage, rec in sorted(stages.items()):      # a stage failing NOW is a fault the manifest owes
+            if rec.get("status") != "failed" or rec.get("generation") != gen:
+                continue
+            entry = Fault("publication", where=stage, detail=rec.get("detail")).to_dict()
+            if entry not in kept:
+                kept.append(entry)
+        summary["faults"] = kept
+        summary["verdict"] = _verdict_for(summary)
+        manifest["summary"] = summary
+        _atomic_write(self.manifest_path, json.dumps(manifest, indent=2))
+        self._sealed_summary, self._verdict_sealed = summary, True
+        return summary
 
     # ── normalized entities (JSONL, append, dedup on natural key) ──
     def _entity_file(self, entity: str) -> Path:
@@ -1138,7 +1382,8 @@ class Run:
         # fold the refusal ledger first: a damaged/unwritable ledger surfaces a durable exception into notes,
         # which phase_exceptions (below) must see so an overflow with a broken ledger never reads as clean
         env_remainder = self.envelope_remainder()
-        _DEGRADED = ("partial", "blocked", "timed_out")
+        # a degraded tool status, and the Gap kind that names why the input was lost
+        _DEGRADED = {"partial": "tool_omission", "blocked": "unknown", "timed_out": "timeout"}
         _MISSING = ("not on path", "not installed", "not found")   # skip reason == the tool is absent
         # a required tool skipped because it is missing is a coverage gap; an optional, setup-disabled or
         # passive skip is intentional
@@ -1156,12 +1401,14 @@ class Run:
             if r.status == "failed":
                 failures.append({"phase": r.phase, "tool": r.tool, "why": why})
             elif r.status in _DEGRADED:
-                gaps.append({"phase": r.phase, "tool": r.tool, "status": r.status,
+                gaps.append({"phase": r.phase, "tool": r.tool, "status": r.status, "kind": _DEGRADED[r.status],
                              "why": why, "output_lines": r.stdout_lines})
-            elif (r.status == "skipped" and r.tool in _required
-                  and any(m in why.lower() for m in _MISSING)):
-                gaps.append({"phase": r.phase, "tool": r.tool, "status": "missing",
-                             "why": why, "output_lines": 0})       # required tool absent -> coverage gap
+            elif r.status == "skipped" and any(m in why.lower() for m in _MISSING) and (
+                    r.tool in _required or r.depends_on in _required):
+                # the absent binary, whether the source is recorded under its own name or declares the edge
+                gaps.append({"phase": r.phase, "tool": r.tool, "status": "missing", "kind": "required_tool_missing",
+                             "why": why, "output_lines": 0,
+                             "missing_tool": r.depends_on or r.tool})   # required tool absent -> coverage gap
         # in-process provider terminals are folded in below, so a failed or partial provider feeds the
         # verdict and every terminal — clean ones included — increments tool_status
         provider_limits: list = []                            # external limits (quota/entitlement)
@@ -1188,7 +1435,7 @@ class Run:
             elif st == "failed":
                 failures.append(entry)
             else:                                                 # partial / incomplete -> a coverage gap
-                gaps.append({**entry, "status": st, "output_lines": 0})
+                gaps.append({**entry, "status": st, "kind": "tool_omission", "output_lines": 0})
         phase_exceptions = [secrets.redact(n) for n in self.notes if "EXCEPTION" in n]
         # ── coverage counters: reconcile event-level input omissions into the verdict ──────────────
         # cap/timeout omitted>0 is a gap; sample/limit omitted>0 is a soft limit; inconsistent is unknown
@@ -1198,14 +1445,15 @@ class Run:
             sid = cov["source_id"]
             base = {"phase": sid.split(".", 1)[0], "tool": sid, "measure": cov["measure"], "why": cov["reason"]}
             if not cov["valid"]:
-                gaps.append({**base, "status": "coverage:unknown", "output_lines": cov["tested"],
+                gaps.append({**base, "status": "coverage:unknown", "kind": "unknown",
+                             "output_lines": cov["tested"],
                              "eligible": cov["eligible"], "omitted": cov["omitted"]})
                 continue
             for kind, c in cov["by_kind"].items():
                 if c["omitted"] <= 0:
                     continue                                          # fully covered this run — no gap/limit
                 frac = round(c["omitted"] / c["eligible"], 3) if c["eligible"] else 0.0
-                entry = {**base, "status": f"coverage:{kind}", "output_lines": c["tested"],
+                entry = {**base, "status": f"coverage:{kind}", "kind": kind, "output_lines": c["tested"],
                          "eligible": c["eligible"], "omitted": c["omitted"], "omitted_fraction": frac,
                          "priority": "major" if _coverage_gates(frac, c["omitted"]) else "minor"}
                 if kind in (events.COVERAGE_SAMPLE, events.COVERAGE_PROVIDER):
@@ -1213,9 +1461,10 @@ class Run:
                 else:
                     gaps.append(entry)                                # cap/timeout with omitted>0 -> gap
         # ── structured child faults ────────────────────────────────────────────────────────────────
-        # machinery break · optional tool failure · required tool missing, each in its own field
-        faults = [{"kind": "phase_exception", "where": "run", "detail": note}
-                  for note in phase_exceptions]
+        # machinery break · optional tool failure · required tool missing, each a typed Fault carrying
+        # whether it challenges completeness, so the verdict never has to re-derive that from a label
+        from .state import Fault
+        faults = [Fault("phase_exception", where="run", detail=note) for note in phase_exceptions]
         _optional = set()
         try:
             from .registry import load_tools as _load
@@ -1223,12 +1472,13 @@ class Run:
         except Exception:                                          # noqa: BLE001 — a report is never a stop
             _optional = set()
         for f in failures:
-            faults.append({"kind": "optional_tool_failed" if f.get("tool") in _optional else "machinery",
-                           "where": f.get("tool") or f.get("phase"), "detail": f.get("why")})
+            faults.append(Fault("optional_tool_failed" if f.get("tool") in _optional else "machinery",
+                                where=f.get("tool") or f.get("phase"), detail=f.get("why")))
         for g in gaps:
             if g.get("status") == "missing":
-                faults.append({"kind": "required_tool_missing", "where": g.get("tool"),
-                               "detail": g.get("why")})
+                faults.append(Fault("required_tool_missing", where=g.get("tool"), detail=g.get("why")))
+        # faults committed against the run itself (event-sink loss, finalisation breaks) — in before the verdict
+        faults += list(self._faults)
 
         # ── corpus-envelope overflow ──────────────────────────────────────────────────────
         # refused identities are lost coverage this run, so they gate the verdict as a gap and ride the
@@ -1240,21 +1490,44 @@ class Run:
                 remainders.append(rec)
                 n = rec["terminal"].get("unschedulable", 0)
                 gaps.append({"phase": "store", "tool": rec["unit"], "status": "envelope_overflow",
+                             "kind": "cap",
                              "why": f"{n} identit(ies) refused past the corpus envelope", "output_lines": 0,
                              "omitted": n})
 
-        # gaps dominate: a limit only lifts an otherwise-clean run to complete_with_limits
-        limits = coverage_limits + provider_limits + operator_limits
-        verdict = ("complete_with_gaps" if (failures or gaps or phase_exceptions)
-                   else "complete_with_limits" if limits else "complete")
-        return {"verdict": verdict, "tool_status": status_counts, "tools_failed": len(failures),
-                "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions,
-                "coverage": coverage, "coverage_limits": coverage_limits,
-                # what each lane still owes; absent means unknown, never zero
-                "remainders": remainders,
-                "faults": faults,
-                "provider_spend": self._read_spend(),
-                "provider_limits": provider_limits, "operator_limits": operator_limits}
+        # gaps committed against the run itself (checkpoint challenges, finalisation coverage loss)
+        for g in self._gaps:
+            gaps.append({"phase": (g.source_id or "run").split(".", 1)[0], "tool": g.source_id,
+                         "status": f"coverage:{g.kind}", "kind": g.kind, "measure": g.measure,
+                         "why": g.reason, "output_lines": g.tested or 0})
+
+        summary = {
+            "tool_status": status_counts, "tools_failed": len(failures),
+            "failures": failures, "gaps": gaps, "phase_exceptions": phase_exceptions,
+            "coverage": coverage, "coverage_limits": coverage_limits,
+            # what each lane still owes; absent means unknown, never zero
+            "remainders": remainders,
+            "faults": [f.to_dict() for f in faults],
+            "provider_spend": self._read_spend(),
+            "provider_limits": provider_limits, "operator_limits": operator_limits}
+        self._verdict_sealed = True
+        self._sealed_summary = {"verdict": _verdict_for(summary), **summary}
+        return self._sealed_summary
+
+    def summary(self) -> dict:
+        """The one canonical summary. Computed once per seal; a reopened run reads the committed manifest
+        rather than recomputing a verdict from an empty in-process tool ledger."""
+        from .state import ContractError
+        if self._sealed_summary is not None:
+            return self._sealed_summary
+        if self.manifest_path.exists():
+            # a committed manifest is the verdict; a damaged one has none, and recomputing here would
+            # answer from an empty in-process ledger — a clean verdict invented for a broken record
+            stored = (_read_json(self.manifest_path) or {}).get("summary")
+            if not summary_well_formed(stored):
+                raise ContractError(f"run {self.run_id} has a manifest whose summary is unreadable or "
+                                    f"incomplete — refusing to recompute a verdict over it")
+            return stored
+        return self._run_summary()
 
     def _read_spend(self) -> list[dict]:
         """Provider spend per (lane, provider, measure), summed. Never summed ACROSS measures: pages and query
@@ -1456,6 +1729,21 @@ class Run:
     def write_manifest(self, profile_summary: dict, phases_run: list[str],
                        metrics: dict | None = None, policy: list | None = None) -> None:
         from . import secrets
+        from .state import ContractError
+        # a run resting in `finished` carries an immutable manifest: rewriting it requires the deliberate
+        # `finished -> finalizing` reopen, so nothing can quietly restate a committed verdict
+        if self.state == "finished":
+            raise ContractError(f"run {self.run_id} is finished — reopen it (`finalizing`) before "
+                                f"rewriting its manifest")
+        # a failed event-sink write means events.jsonl is incomplete, so a coverage/verdict folded from it
+        # is not clean truth — committed before the summary, or the verdict is computed without it
+        from . import events as _events
+        self.unseal_verdict()                   # this write recomputes the summary, so faults may still land
+        od = _events.observability_degraded()
+        if od:
+            from .state import Fault
+            self.commit_fault(Fault("machinery", where="events.jsonl",
+                                    detail=f"{od['writes_failed']} event write(s) failed: {od['first_error']}"))
         manifest = {
             "run_id": self.run_id,
             "target": self.target,
@@ -1483,10 +1771,6 @@ class Run:
             # the effective coverage policy this run applied, redacted again at this sink because a sink that
             # trusts its input is how one leak becomes permanent
             manifest["policy"] = secrets.redact_deep(policy)
-        # a failed event-sink write means events.jsonl is incomplete, so a coverage/verdict folded from it
-        # is not clean truth
-        from . import events as _events
-        od = _events.observability_degraded()
         if od:
             manifest["observability_degraded"] = od
         _events.persist_degraded()                  # survives to the next resume (accumulates)

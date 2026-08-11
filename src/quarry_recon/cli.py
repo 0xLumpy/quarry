@@ -13,6 +13,7 @@ import click
 from . import __version__, events, secrets
 from .config import ProfileError, TargetProfile
 from .campaign import MAX_CHILDREN as _MAX_CHILDREN
+from .exit_contract import ContractGroup as _ContractGroup, json_option as _ec_json_option
 from .registry import health, install_one, load_tools, tool_phases, tools_by_phase, verify_installed
 
 
@@ -95,7 +96,9 @@ def _chromium() -> str | None:
     return None
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+# ContractGroup so a Click-decided exit (unknown flag, missing option, missing option argument) leaves
+# through the same contract as a command body, with the same `--json` document
+@click.group(cls=_ContractGroup, context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, prog_name="quarry")
 def cli():
     """Quarry — methodology-driven reconnaissance automation."""
@@ -158,10 +161,16 @@ def _osint_verdict(cdir) -> tuple:
 @cli.command()
 @click.option("--drift-only", is_flag=True, help="only print tools whose installed version DRIFTS from the pin")
 @click.option("--maintenance", is_flag=True, help="refresh-policy view: tools grouped by maintenance state")
-def lock(drift_only, maintenance):
+@_ec_json_option
+def lock(drift_only, maintenance, as_json):
     """Capture installed tool versions on this host as a reviewable pin set (paste `version:` lines into
     data/tools.yaml). Run on a validated host. Also flags drift and unpinned tools.
     """
+    from . import exit_contract as _ec
+    _ec.run_command("lock", as_json, lambda: _lock(drift_only, maintenance))
+
+
+def _lock(drift_only, maintenance):
     from .registry import capture_lock, load_tools
     if maintenance:
         # refresh-policy snapshot: planning only, never gates verify/drift/install/runtime, reads the
@@ -193,9 +202,14 @@ def lock(drift_only, maintenance):
             click.echo(_c(f"  {r['drift']:<15} {r['bin']:<20} installed={r['installed']}  pin={r['pin']}", "red"))
         if violations:
             click.echo(_c(f"\n{len(violations)} lock violation(s)", "red"))
-            raise SystemExit(1)
+            # a binary we cannot vouch for is coverage we cannot vouch for, the same verdict doctor gives
+            from .state import CommandResult, Gap
+            return CommandResult("lock", coverage="gapped", remediation="quarry install",
+                                 gaps=[Gap(source_id="registry", kind="unknown", omitted=len(violations),
+                                           reason=f"{len(violations)} installed tool(s) do not verify "
+                                                  f"against the lock")])
         click.echo(_c("\nall installed tools verify against the lock", "green"))
-        return
+        return None
     unknown = [r for r in rows if r["drift"] == "version-unknown"]
     # emit a reviewable YAML pin block from what's installed here (the known-good versions)
     click.echo(_c("\n# C08 pin capture — installed versions on this host (paste `version:` into data/tools.yaml)\n", "cyan"))
@@ -241,8 +255,14 @@ def _health_reason(h: dict, t) -> str:
 # ── doctor ──────────────────────────────────────────────────────────────────
 @cli.command()
 @click.option("--phase", help="only audit tools for this phase")
-def doctor(phase):
+@_ec_json_option
+def doctor(phase, as_json):
     """Audit local setup: tools, versions, API keys, resolvers, wordlists."""
+    from . import exit_contract as _ec
+    _ec.run_command("doctor", as_json, lambda: _doctor(phase))
+
+
+def _doctor(phase):
     if phase is not None and phase not in tool_phases():
         raise click.UsageError(f"unknown phase '{phase}'. valid: {', '.join(sorted(tool_phases()))}")
     tools = tools_by_phase(phase) if phase else load_tools()
@@ -400,16 +420,25 @@ def doctor(phase):
         click.echo(f"  {_c('·', 'yellow')} {'callback server:':<20} not set")
 
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
+    from .state import CommandResult, Gap
     scope_note = f" for phase {phase}" if phase else ""
+    gaps: list = []
     if miss:
         verdict = _c(f"✗ NOT READY — {miss} required tool(s) missing{scope_note}", "red") + \
             "  → quarry install"
+        gaps.append(Gap(source_id="registry", kind="required_tool_missing", omitted=miss,
+                        reason=f"{miss} required tool(s) missing{scope_note}"))
     elif warn:
         verdict = _c(f"⚠ DEGRADED — {warn} present but UNVERIFIED (drift/identity/capability){scope_note}", "yellow") + \
             "  → quarry install  (reinstalls to the pin)"
+        # an unverified binary is coverage we cannot vouch for, not a bound we chose
+        gaps.append(Gap(source_id="registry", kind="unknown", omitted=warn,
+                        reason=f"{warn} tool(s) present but unverified{scope_note}"))
     else:
         verdict = _c("✓ READY", "green") + f" — {ok} tools installed + verified, all required present{scope_note}"
     click.echo(f"\n{verdict}\n")
+    return CommandResult("doctor", coverage="gapped" if gaps else "clean", gaps=gaps,
+                         remediation="quarry install" if gaps else None)
 
 
 # ── notify ───────────────────────────────────────────────────────────────────
@@ -483,8 +512,15 @@ def _run_tool(t, marker, dry_run) -> bool:
 @click.option("--include-optional", is_flag=True, help="also install optional tools")
 @click.option("--tools-only", is_flag=True, help="skip system packages / Go / data files")
 @click.option("--yes", "-y", is_flag=True, help="install even if the host is below minimum requirements")
-def install(dry_run, phase, only, include_optional, tools_only, yes):
+@_ec_json_option
+def install(dry_run, phase, only, include_optional, tools_only, yes, as_json):
     """Full blank-VPS install: system pkgs -> Go -> tools -> wordlists/templates."""
+    from . import exit_contract as _ec
+    _ec.run_command("install", as_json,
+                    lambda: _install(dry_run, phase, only, include_optional, tools_only, yes))
+
+
+def _install(dry_run, phase, only, include_optional, tools_only, yes):
     from . import bootstrap
 
     # an explicitly-empty selector is invalid; only a truly omitted flag means "everything"
@@ -528,7 +564,8 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
         click.echo(_c("\n[*] system check", "magenta"))
         _echo_syscheck(rep)
         if rep["level"] == "abort" and not yes and not dry_run:
-            raise click.ClickException(
+            from . import exit_contract as _ec
+            raise _ec.Refused(
                 "host is below minimum requirements — aborting. See README → Requirements. "
                 "Override with --yes.")
         if rep["level"] == "warn":
@@ -578,7 +615,7 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
 
     if dry_run:
         click.echo(_c("\n(dry-run — nothing was installed)\n", "yellow"))
-        return
+        return None
     # an optional tool failing is nonfatal only in the full bootstrap; a narrowed run fails hard on any
     # selected tool the operator asked for
     soft = [t.bin for t in failed if full and include_optional and t.optional]
@@ -593,19 +630,32 @@ def install(dry_run, phase, only, include_optional, tools_only, yes):
             click.echo(_c(f"\n{len(fatal)} tool(s) failed: {', '.join(fatal)}", "yellow"))
             for b in fatal:
                 click.echo(f"retry: quarry install --only {b}")
-        raise SystemExit(1)                              # required failures propagate a non-zero exit
-    elif not os.environ.get("QUARRY_FROM_INSTALLER"):
+        from . import exit_contract as _ec
+        why = ([f"{len(fatal)} tool(s) failed: {', '.join(fatal)}"] if fatal else []) \
+            + [f"required step failed: {r.name}" for r in blocked]
+        # the installer is machinery: a failed step is exit 5, not a coverage gap
+        raise _ec.MachineryFailure("; ".join(why) or "install failed", where="install")
+    if not os.environ.get("QUARRY_FROM_INSTALLER"):
         # install.sh prints the final banner itself; conclude here only when run standalone
         tail = "" if not soft else f" ({len(soft)} optional failed — see above)"
         click.echo(_c(f"\ninstall complete — required tools ok{tail}\nrun  quarry doctor  to verify", "green"))
+    # an optional tool that failed in the full bootstrap is declared best-effort: it is named above and the
+    # install still succeeds, so install.sh can persist PATH
+    return None
 
 
 @cli.command()
 @click.option("--dry-run", is_flag=True)
-def update(dry_run):
+@_ec_json_option
+def update(dry_run, as_json):
     """Reinstall installed tools at their pinned lock (reproducible) and refresh templates, resolvers and gf
     patterns. Never floats to @latest — bumping a pin is the `quarry lock` workflow.
     """
+    from . import exit_contract as _ec
+    _ec.run_command("update", as_json, lambda: _update(dry_run))
+
+
+def _update(dry_run):
     from . import bootstrap
 
     # every installed tool syncs to its pin, optional or not, or an installed-optional tool's drift hides
@@ -627,7 +677,12 @@ def update(dry_run):
                           "yellow"))
         if failed:
             click.echo(_c(f"\n{len(failed)} tool(s) failed: {', '.join(failed)}", "yellow"))
-        raise SystemExit(1)
+        from . import exit_contract as _ec
+        # same machinery as install: a tool that would not reinstall to its pin is not a coverage gap
+        why = ([f"{len(failed)} tool(s) failed: {', '.join(failed)}"] if failed else []) \
+            + ([f"required step failed: {data_res.name}"] if data_res.blocks else [])
+        raise _ec.MachineryFailure("; ".join(why), where="update")
+    return None
 
 
 # ── init (create a project) ───────────────────────────────────────────────────
@@ -736,17 +791,23 @@ def oos(profile_path, hosts):
                    "obtains nothing extra: provider enablement, credit reserves and page budgets are "
                    "untouched, and scope, contact guards and rate limits never change. This is the "
                    "VOLUME axis, not the waiting one — see `quarry policy --unbound`")
-def osint(profile_path, timeout, unbound):
+@_ec_json_option
+def osint(profile_path, timeout, unbound, as_json):
     """Pre-flight OSINT: discover scope candidates and intel. Review-only — never edits scope.
 
     Workflow: init -> fill anchors -> `quarry osint` -> review the report and suggested.yaml -> confirm into
     target.yaml -> `quarry run`. Output lands in the project's osint/ dir.
     """
+    from . import exit_contract as _ec
+    _ec.run_command("osint", as_json, lambda: _osint(profile_path, timeout, unbound))
+
+
+def _osint(profile_path, timeout, unbound):
     import json
     from . import osint as osint_mod
 
     if timeout <= 0:      # osint bounds each lookup with min(timeout, N); 0 fails every lookup instantly
-        raise click.ClickException("osint --timeout must be > 0 (it's a per-lookup ceiling; there is no unbounded osint)")
+        raise click.UsageError("osint --timeout must be > 0 (it's a per-lookup ceiling; there is no unbounded osint)")
     try:
         profile = TargetProfile.load(_resolve_profile(profile_path))
     except ProfileError as e:
@@ -790,6 +851,18 @@ def osint(profile_path, timeout, unbound):
         click.echo(f"     - {c['value']}  [{c['scope_hint']}/{c['confidence']}]")
     if len(apex) > 8:
         click.echo(f"     … +{len(apex) - 8} more in the report")
+
+    # the session's own verdict decides the status: a bound we or a provider declared is exit 3, an
+    # incomplete lane or an unreadable manifest is exit 4
+    from .state import CommandResult, Gap
+    gaps = [Gap(source_id=g.get("tool") or "osint", kind="tool_omission", reason=g.get("why"))
+            for g in _sum.get("gaps", [])]
+    if _verdict == "unknown":
+        gaps.append(Gap(source_id="osint", kind="unknown", reason="session manifest unreadable"))
+    bounded = bool(_sum.get("provider_limits") or _sum.get("operator_limits")
+                   or _verdict == "complete_with_limits")
+    return CommandResult("osint", coverage="gapped" if gaps else
+                         "intentionally_bounded" if bounded else "clean", gaps=gaps)
 
 
 # ── policy ───────────────────────────────────────────────────────────────────
@@ -840,34 +913,56 @@ def policy(profile_path, unbound):
 @click.option("--settle-budget", type=click.IntRange(min=0), default=None,
               help="wall-clock seconds after which no FURTHER child is started (0 = none). It never kills "
                    "a running child — that is --timeout's axis. Needs --settle")
-def run(profile_path, phases, passive, timeout, unbound, settle_flag, settle_max_runs, settle_budget):
+@click.option("--settle-resume", "settle_resume", default=None,
+              help="continue the campaign with this id instead of minting a new one: its interrupted child "
+                   "is settled from the ledger and the loop goes on from there, so a killed campaign never "
+                   "repeats the acquisition child 1 already paid for. With --settle and no id, a project "
+                   "with exactly one resumable campaign is continued automatically. Needs --settle")
+@_ec_json_option
+def run(profile_path, phases, passive, timeout, unbound, settle_flag, settle_max_runs, settle_budget,
+        settle_resume, as_json):
     """Run recon phases against the confirmed scope. Output lands in the project's recon/ dir."""
+    from . import exit_contract as _ec
     from . import settings
 
-    # refuse the settle bounds without the axis they bound
-    if not settle_flag and (settle_max_runs is not None or settle_budget is not None):
-        raise click.UsageError("--settle-max-runs / --settle-budget bound a campaign; they need --settle")
+    finished: dict = {}
 
-    # validate the phase selector before any run/campaign side effect (invalid -> exit 2, no run)
-    _select_phases(phases)
+    def body():
+        # refuse the settle bounds without the axis they bound
+        if not settle_flag and (settle_max_runs is not None or settle_budget is not None
+                                or settle_resume is not None):
+            raise click.UsageError("--settle-max-runs / --settle-budget / --settle-resume bound a "
+                                   "campaign; they need --settle")
 
-    # --unbound for this run: entered before any lane reads a bound, restored on the way out so it
-    # never leaks into another run sharing this interpreter
-    from . import policy as _policy
-    with settings.overrides(_policy.unbound_overrides() if unbound else {}):
-        if not settle_flag:
-            _run_phases(profile_path, phases, passive, timeout)
-            return
-        _settle_run(profile_path, phases, passive, timeout,
-                    max_runs=settle_max_runs, budget_s=settle_budget)
+        # validate the phase selector before any run/campaign side effect (invalid -> exit 2, no run)
+        _select_phases(phases)
+
+        # --unbound for this run: entered before any lane reads a bound, restored on the way out so it
+        # never leaks into another run sharing this interpreter
+        from . import policy as _policy
+        with settings.overrides(_policy.unbound_overrides() if unbound else {}):
+            if not settle_flag:
+                run_obj = _run_phases(profile_path, phases, passive, timeout, finished=finished)
+                return _ec.from_summary("run", run_obj.summary(), run_id=run_obj.run_id)
+            return _settle_run(profile_path, phases, passive, timeout,
+                               max_runs=settle_max_runs, budget_s=settle_budget,
+                               campaign_id=settle_resume)
+
+    _ec.run_command("run", as_json, body, run_id=lambda: finished.get("run_id"))
 
 
-def _settle_run(profile_path, phases, passive, timeout, *, max_runs, budget_s):
+#: campaign stops that are a declared bound rather than lost coverage (exit 3, not 4). `terminal` is not
+#: one of them: its causes are classified per-cause by `remainder.terminal_class`.
+_SETTLE_BOUNDED = frozenset({"max_runs", "budget"})
+
+
+def _settle_run(profile_path, phases, passive, timeout, *, max_runs, budget_s, campaign_id=None):
     """`--settle`: a campaign over ordinary runs. The axes compose — `--unbound` widens every child,
     `--timeout` bounds every child's tools.
     """
     from . import campaign as _campaign
     from . import budget, settle as _settle
+    from . import exit_contract as _ec
 
     try:
         profile = TargetProfile.load(_resolve_profile(profile_path))
@@ -878,14 +973,60 @@ def _settle_run(profile_path, phases, passive, timeout, *, max_runs, budget_s):
     def launch(index, prepare):
         return _run_phases(profile_path, phases, passive, timeout, prepare=prepare)
 
+    # a kill that is answered with a fresh campaign re-mints child 1 and buys its acquisition again, so a
+    # single interrupted campaign is continued by default; several is a choice only the operator can make
+    if campaign_id is None:
+        skipped = _settle.skipped_resumable(project, profile.target)
+        # the classification is the settle module's, not a reading of its reasons: a campaign confirmed to
+        # be another target's is knowing whose it is, and only what nobody can place is a cost to mint over
+        lost = set(_settle.unconfirmable_resumable(project, profile.target))
+        # scoped to this target: a campaign's union is one target's corpus, so another target's
+        # interrupted campaign is never the one to continue by default
+        candidates = _settle.resumable_campaigns(project, profile.target)
+        if len(candidates) > 1:
+            # ambiguous is not the same answer as none: minting here would start yet another campaign and
+            # buy child 1's acquisition again, so the operator chooses
+            raise _ec.Refused(
+                f"{len(candidates)} interrupted campaigns could be continued: {', '.join(candidates)} — "
+                f"choose one with --settle-resume <id>, or start a new one with --settle-resume ''")
+        campaign_id = _settle.resumable(project, profile.target)
+        if campaign_id:
+            click.echo(_c(f"   ↻ continuing the interrupted campaign {campaign_id} "
+                          f"(start a new one with --settle-resume '')", "cyan"))
+        elif lost:
+            # nobody can say whether this evidence was ours, so minting over it is a choice with a cost:
+            # the operator makes it, naming a campaign to continue or asking explicitly for a fresh one
+            raise _ec.Refused(
+                f"{len(lost)} interrupted campaign(s) here cannot be confirmed, and a new campaign would "
+                f"repeat acquisition they already paid for: "
+                + "; ".join(f"{cid} ({why})" for cid, why in skipped if cid in lost)
+                + " — continue one with --settle-resume <id>, or start fresh with --settle-resume ''")
+        elif skipped:
+            # confirmed as somebody else's: accounted for, so a new campaign starts — named, not silent
+            click.echo(_c(f"   ⚠ {len(skipped)} interrupted campaign(s) skipped, starting a new one:",
+                          "yellow"))
+            for cid, why in skipped:
+                click.echo(_c(f"     {cid}: {why}", "yellow"))
+    campaign_id = campaign_id or None            # `--settle-resume ''` is "mint a new one", not an id
+
     try:
         out = _settle.settle(project_dir=project, target=profile.target, launch=launch,
                              max_runs=max_runs or _campaign.MAX_CHILDREN, budget_s=budget_s or 0,
+                             campaign_id=campaign_id,
                              echo=lambda line: click.echo(_c(line, "cyan")))
+    except _campaign.InvalidCampaignId as e:
+        raise click.UsageError(str(e))     # a mistyped id is a bad selector, not broken machinery
+    except _campaign.InvalidRunId as e:
+        # a child id is not operator input: a ledger pointing outside the project is damaged machinery
+        raise _ec.MachineryFailure(str(e), where="campaign ledger", after_start=False)
     except budget.StateBusy as e:
-        raise click.ClickException(f"another campaign is already running on this project ({e})")
-    except (_campaign.UnionUnusable, _settle.AlreadyRun) as e:
-        raise click.ClickException(str(e))
+        raise _ec.Refused(f"another campaign is already running on this project ({e})")
+    except _settle.CampaignRefused as e:
+        # every refusal to continue a campaign — closed history, wrong target — is refused before any
+        # child runs, so it is the contract's refusal, not an invalid invocation
+        raise _ec.Refused(str(e))
+    except _campaign.UnionUnusable as e:
+        raise _ec.MachineryFailure(str(e), where="campaign union", after_start=False)
 
     colour = "green" if out.clean else "yellow"
     click.echo(_c(f"\n══ campaign {out.campaign_id} · {out.stop.replace('_', ' ')} · "
@@ -900,12 +1041,181 @@ def _settle_run(profile_path, phases, passive, timeout, *, max_runs, budget_s):
                    f"+{child.enriched} enriched · {child.retriable} owed")
     click.echo(f"   ledger: {project / 'recon' / 'campaigns' / out.campaign_id / 'ledger.json'}")
 
+    from . import remainder as _remainder
+    from .state import CommandResult, Fault
+    last_run = out.children[-1].run_id if out.children else None
+    # a `terminal` stop is not one outcome: an entitlement we accepted is a bound, an unschedulable or
+    # missing dependency is coverage nobody could get, and machinery that broke is a fault
+    terminal = _remainder.terminal_class(out.terminal) if out.stop == "terminal" else None
+    if out.stop == "child_fault" or terminal == "fault":
+        return CommandResult("run", outcome="failed", campaign_id=out.campaign_id,
+                             machinery_after_start=True,
+                             faults=[Fault("machinery", where="campaign", detail=out.detail or out.stop)],
+                             run_id=last_run)
+    # a child that ran under a declared bound reports the same evidence a standalone run does, so it must
+    # reach the same status rather than converging to clean
+    limited = any(c.verdict == "complete_with_limits" for c in out.children)
+    # a rebuilt union is lost evidence, so it outranks any named bound the campaign stopped on
+    bounded = out.stop in _SETTLE_BOUNDED or terminal == "bounded" or limited
+    coverage = ("gapped" if out.recovered else "clean" if out.clean and not limited else
+                "intentionally_bounded" if bounded else "gapped")
+    return CommandResult("run", coverage=coverage, campaign_id=out.campaign_id, run_id=last_run,
+                         remediation=out.detail or None)
 
-def _run_phases(profile_path, phases, passive, timeout, prepare=None):
-    """The run itself, inside whatever policy overrides the flags established."""
+
+def _contained(run_obj, stage: str, fn) -> None:
+    """The base commit, inside the same containment the derived views get: a telemetry or manifest write
+    that fails must leave a run recorded `finalization_failed`, not a `finalizing` one with no manifest and
+    nothing saying why. Never returns normally on failure."""
+    from . import exit_contract as _ec
+    try:
+        fn()
+        return
+    except Exception as e:                                    # noqa: BLE001
+        detail = secrets.redact(str(e)) or type(e).__name__
+    # recorded before the raise, so `status` and `report` read the failure rather than infer it
+    run_obj.mark_stage(stage, "failed", detail=detail)
+    run_obj.write_state("finalization_failed", detail=f"{stage}: {detail}")
+    click.echo(_c(f"   ! finalisation stage {stage} failed — {detail}", "red"))
+    raise _ec.MachineryFailure(f"{stage} failed — {detail}", where=stage)
+
+
+def _finalize_stage(run_obj, stage: str, fn, *, force: bool, present=None) -> str:
+    """One derived view, and what became of it: `skipped` when already published for this generation,
+    `failed` when it raised (a committed publication fault, never a lost run), else `done`.
+
+    `present` answers whether the artifact is actually on disk. The generation stamp records what was
+    rendered, not what survived, so a view deleted since is stale however current the stamp looks.
+    """
+    if not force and run_obj.stage_current(stage) and (present is None or present()):
+        return "skipped"
+    try:
+        fn()
+    except Exception as e:                                    # noqa: BLE001
+        from .state import Fault
+        detail = secrets.redact(str(e)) or type(e).__name__
+        run_obj.mark_stage(stage, "failed", detail=detail)
+        run_obj.commit_fault(Fault("publication", where=stage, detail=detail))
+        click.echo(_c(f"   ! finalisation stage {stage} failed — {detail}", "red"))
+        return "failed"
+    run_obj.mark_stage(stage, "done")
+    return "done"
+
+
+def _publish_views(run_obj, scope, *, checkpoints=(), force: bool = False,
+                   republished: list | None = None) -> dict:
+    """Every derived view of a committed run, in one place so `run` and the `report` resume publish the
+    same set the same way. `republished` collects the stages this call actually rewrote."""
+    import json as _json
+    from . import exports, privfs, triage
+
+    exp: dict = {}
+
+    def _exports():
+        exp.update(exports.write_all(run_obj) or {})
+        exports.write_delta(run_obj)
+
+    def _hotlist():
+        privfs.write_private(run_obj.reports / "HOTLIST.md", triage.build(run_obj, scope))
+
+    def _digest():
+        privfs.write_private(run_obj.reports / "digest.json",
+                             _json.dumps(triage.digest_json(run_obj, scope), indent=2, ensure_ascii=False))
+
+    def _checkpoints():
+        if checkpoints:
+            privfs.write_private(run_obj.reports / "checkpoints.md",
+                                 "# Checkpoints\n\n" + "\n".join(f"- {c.line()}" for c in checkpoints) + "\n")
+
+    # a view deleted since it was stamped is stale, so it is rebuilt rather than skipped as current and
+    # then certified away. Two sources, because neither sees everything: the revision pointer knows every
+    # file it recorded (and is empty for a base run or an uncertifiable revision), and the artifact checks
+    # below cover what no pointer lists.
+    from . import revision as _revision
+    missing = set(_revision.missing_views(run_obj.dir))
+
+    def _present(own, owns):
+        return lambda: own() and not any(owns(name) for name in missing)
+
+    def _has(*names):
+        return lambda: all((run_obj.reports / n).exists() for n in names)
+
+    for stage, fn, own, owns in (
+            ("exports", _exports, lambda: run_obj.exports.is_dir() and any(run_obj.exports.iterdir()),
+             lambda n: n.startswith("exports/") or n == "delta.md"),
+            ("hotlist", _hotlist, _has("HOTLIST.md"), lambda n: n == "HOTLIST.md"),
+            ("digest", _digest, _has("digest.json"), lambda n: n == "digest.json"),
+            ("checkpoints", _checkpoints, _has("checkpoints.md") if checkpoints else (lambda: True),
+             lambda n: n == "checkpoints.md")):
+        if _finalize_stage(run_obj, stage, fn, force=force, present=_present(own, owns)) != "skipped" \
+                and republished is not None:
+            republished.append(stage)
+    return exp
+
+
+def _reconcile_base(run_obj) -> None:
+    """Reconcile the committed manifest with what finalisation just did."""
+    run_obj.reconcile_finalization()
+
+
+def _revision_gap(run_obj):
+    """A published revision nobody can certify, as the Gap it is — its late evidence is missing from the
+    views being rendered, so nothing built on them may report clean. `absent` is not this: no late
+    evidence was ever recorded, and rendering the base is the whole answer."""
+    from . import revision as _revision
+    from .state import Gap
+    status, reason = _revision.certification(run_obj.dir)
+    if status != "unusable":
+        return None
+    return Gap(source_id="revision", kind="unknown",
+               reason=f"the published revision cannot be certified ({reason or 'unusable'}) — its late "
+                      f"evidence is not in these views")
+
+
+def _refusal_gap(run_obj):
+    """Interactions the corpus envelope is still refusing, carried across revisions.
+
+    A standing refusal is evidence INCOMPLETE, not evidence lost: the revision stays certified, so this is
+    its own gap and never the uncertifiable one. Durable, so a later reader reports the same shortfall the
+    ingest did rather than a clean run.
+    """
+    from . import revision as _revision
+    from .state import Gap
+    n = len(_revision.refusals(run_obj.dir))
+    if not n:
+        return None
+    return Gap(source_id="oob", kind="cap", omitted=n,
+               reason=f"{n} interaction(s) refused past the corpus envelope")
+
+
+def _with_gap(result, *gaps):
+    """The same machine result carrying more gaps, so a coverage loss can never leave a clean verdict."""
+    from .state import CommandResult
+    found = [g for g in gaps if g is not None]
+    if not found:
+        return result
+    return CommandResult(result.command, outcome=result.outcome, coverage="gapped",
+                         run_id=result.run_id, campaign_id=result.campaign_id,
+                         faults=list(result.faults), gaps=list(result.gaps) + found,
+                         remediation=result.remediation, interrupted=result.interrupted,
+                         machinery_after_start=result.machinery_after_start)
+
+
+def _report_view(run_obj):
+    """A committed run's certified combined view, else the run itself; bookkeeping stays on the base run.
+    `base_finished` is the read predicate and stays true mid-refinalisation, which is when report renders."""
+    from . import revision as _revision
+    if not _revision.base_finished(run_obj.dir):
+        return run_obj
+    return _revision.combined_view(run_obj) or run_obj
+
+
+def _run_phases(profile_path, phases, passive, timeout, prepare=None, finished=None):
+    """The run itself, inside whatever policy overrides the flags established. `finished` collects the run
+    id as soon as it exists, so a fault mid-run still names the run it happened in."""
     from .phases import REGISTRY, PhaseContext
     from .store import Run
-    from . import checkpoint, exports, triage
+    from . import checkpoint
 
     try:
         profile = TargetProfile.load(_resolve_profile(profile_path))
@@ -923,7 +1233,8 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
         free_gb = None
     if free_gb is not None:
         if free_gb < 2:
-            raise click.ClickException(
+            from . import exit_contract as _ec
+            raise _ec.Refused(
                 f"only {free_gb:.1f} GB free on {project} — a run needs ≥2 GB (output growth). "
                 "Free space and retry.")
         if free_gb < 5:
@@ -933,6 +1244,8 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     secrets.apply_env()   # export PDCP_API_KEY for PD tools, if set
     from .runner import set_tool_cwd
     run_obj = Run.create(project, profile.target)   # collision-resistant id, atomically-claimed dir
+    if finished is not None:
+        finished["run_id"] = run_obj.run_id
     events.configure(run_obj.dir)   # persist runtime events to <run>/events.jsonl
     workdir = run_obj.dir / "work"
     workdir.mkdir(parents=True, exist_ok=True)
@@ -943,6 +1256,7 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     # seed that fails stops the child, because an empty corpus is not a fixed point
     if prepare is not None:
         prepare(run_obj)
+    run_obj.write_state("running")
 
     selected = _select_phases(phases)   # validated + canonical-ordered (invalid raised before the run)
 
@@ -1013,8 +1327,20 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
         for cp in cps:
             click.echo("   " + _c(cp.line(), "yellow" if cp.level == "warn" else "white"))
 
-    # gadget candidates — chain material from evidence the run holds, before the reports so they carry
-    # it. Contacts nothing; best-effort, since a classifier is a report.
+    # every checkpoint that challenges what the tool statuses already account for reaches the verdict as a
+    # typed gap; committed before the base manifest, so it is in when the verdict is computed
+    for cp in all_cps:
+        g = cp.gap()
+        if g is not None:
+            run_obj.commit_gap(g)
+    if all_cps:
+        run_obj.notes += [c.line() for c in all_cps]
+
+    # ── finalisation ──────────────────────────────────────────────────────────
+    # base evidence commits first and alone; every derived view below is idempotent, generation-addressed
+    # and resumable, so a late report failure can never leave the run ambiguous
+    run_obj.write_state("finalizing")
+
     from . import gadgets
     try:
         n_gadgets = gadgets.classify(run_obj, scope)
@@ -1023,34 +1349,44 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     except Exception as e:                                    # noqa: BLE001
         run_obj.notes.append(f"gadgets: EXCEPTION {secrets.redact(str(e))}")
 
-    # reports + exports — evidence carrying discovered findings; written 0600, O_NOFOLLOW
-    from . import privfs
-    exp = exports.write_all(run_obj)
-    exports.write_delta(run_obj)
-    hot = triage.build(run_obj, scope)
-    privfs.write_private(run_obj.reports / "HOTLIST.md", hot)
-    import json as _json
-    privfs.write_private(run_obj.reports / "digest.json",
-                         _json.dumps(triage.digest_json(run_obj, scope), indent=2, ensure_ascii=False))
-    if all_cps:
-        privfs.write_private(run_obj.reports / "checkpoints.md",
-                             "# Checkpoints\n\n" + "\n".join(f"- {c.line()}" for c in all_cps) + "\n")
-        run_obj.notes += [c.line() for c in all_cps]
-
-    # telemetry -> metrics/summary.json, before the manifest so the manifest points at it
+    # telemetry -> metrics/summary.json, before the manifest so the manifest points at it. It is a derived
+    # view like any other: losing it costs the run its telemetry, never its evidence
     run_wall = _time.perf_counter() - run_t0
-    run_cpu, peak_rss_kb = metrics.rusage()
-    tel = metrics.write(run_obj, phase_metrics, run_wall, run_cpu - run_cpu0, peak_rss_kb / 1024)
-    metrics_summary = {"artifact": "metrics/summary.json", **tel["totals"],
-                       "slowest_tool": tel["long_poles"]["tools"][0] if tel["long_poles"]["tools"] else None}
+    tele: dict = {}
+    metrics_summary: dict = {}
 
-    run_obj.write_manifest(
-        profile_summary={"apex_domains": profile.apex_domains, "cidr": profile.cidr,
-                         "passive_only": profile.passive_only, "ports": profile.ports},
-        phases_run=selected, metrics=metrics_summary, policy=policy_rows)
+    def _write_metrics():
+        run_cpu, peak_rss_kb = metrics.rusage()
+        tel = metrics.write(run_obj, phase_metrics, run_wall, run_cpu - run_cpu0, peak_rss_kb / 1024)
+        tele.update(tel)
+        metrics_summary.update({"artifact": "metrics/summary.json", **tel["totals"],
+                                "slowest_tool": (tel["long_poles"]["tools"][0]
+                                                 if tel["long_poles"]["tools"] else None)})
+
+    def _seal():
+        run_obj.write_manifest(
+            profile_summary={"apex_domains": profile.apex_domains, "cidr": profile.cidr,
+                             "passive_only": profile.passive_only, "ports": profile.ports},
+            phases_run=selected, metrics=metrics_summary or None, policy=policy_rows)
+
+    _finalize_stage(run_obj, "metrics", _write_metrics, force=True)
+    # the base commit is contained too: without a manifest there is no verdict to resume to, so a run that
+    # cannot write one is recorded finalization_failed rather than left `finalizing` with nothing to read
+    _contained(run_obj, "manifest", _seal)      # base commit: the evidence and its verdict are durable now
+
+    # derived views; the manifest is re-sealed below either way, so the committed verdict always reflects
+    # what publication did and a finished run's verdict is sealed against a late fault
+    run_obj.unseal_verdict()
+    exp = _publish_views(run_obj, scope, checkpoints=all_cps) or {}
+    failed = run_obj.finalization_failed()
+    # the re-seal is machinery too: without containment a failure here leaves the run `finalizing` while
+    # the committed manifest still claims what publication has since disproved
+    _contained(run_obj, "reseal", _seal)
+    run_obj.write_state("finalization_failed" if failed else "finished",
+                        detail="a derived view could not be published" if failed else None)
 
     # read the one canonical summary the manifest stores, never recompute
-    summ = run_obj._run_summary()
+    summ = run_obj.summary()
     verdict, fails, gaps, pexc = (summ["verdict"], summ["failures"], summ["gaps"], summ["phase_exceptions"])
     if verdict == "complete":
         click.echo(_c(f"\n══ complete · {run_obj.dir}", "green"))
@@ -1075,6 +1411,9 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
     if pexc:
         click.echo(_c(f"   ⚠ {len(pexc)} phase exception(s) — see manifest.json 'summary.phase_exceptions'",
                       "yellow"))
+    if run_obj.state == "finalization_failed":
+        click.echo(_c(f"   ✗ finalisation incomplete — base evidence is committed; resume the derived "
+                      f"views with: quarry report -t <target> --run {run_obj.run_id}", "red"))
     cov = [c for c in (summ.get("coverage") or []) if c["omitted"] > 0 or not c["valid"]]
     if cov:   # only sources that omitted input or reported inconsistent counters
         def _lbl(c):
@@ -1086,8 +1425,8 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
         parts = [_lbl(c) for c in sorted(cov, key=lambda c: -c["omitted"])]
         click.echo(_c(f"   ▤ coverage: {', '.join(parts[:6])} — see manifest.json 'summary.coverage'", "cyan"))
 
-    if tel["long_poles"]["tools"]:
-        lp = tel["long_poles"]["tools"][0]
+    if (tele.get("long_poles") or {}).get("tools"):
+        lp = tele["long_poles"]["tools"][0]
         click.echo(f"   ⏱ {round(run_wall)}s total · slowest tool: {lp['tool']} {lp['wall_s']}s "
                    f"· metrics/summary.json")
 
@@ -1112,30 +1451,70 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None):
 @click.option("-t", "--target", "profile_path", required=True,
               help="project name, project dir, or target.yaml path")
 @click.option("--run", "run_id", help="run id (default: latest)")
-def report(profile_path, run_id):
-    """Regenerate hotlist + exports from a stored run in the project (no scanning)."""
-    from . import exports, triage
+@click.option("--force", "force", is_flag=True,
+              help="republish every derived view, not only the ones missing or stale against the current "
+                   "base evidence")
+@_ec_json_option
+def report(profile_path, run_id, force, as_json):
+    """Regenerate hotlist + exports from a stored run in the project (no scanning).
 
-    try:
-        profile = TargetProfile.load(_resolve_profile(profile_path))
-    except ProfileError as e:
-        raise click.ClickException(str(e))
-    project = _project_dir(profile)
-    run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist
-    if run_obj is None:
-        raise click.ClickException(f"no runs found under {project}/recon/")
-    # minimal scope (report doesn't re-filter)
-    from .config import ScopeMatcher
-    scope = ScopeMatcher([], [], [], False)
-    from . import privfs
-    exp = exports.write_all(run_obj)
-    exports.write_delta(run_obj)
-    privfs.write_private(run_obj.reports / "HOTLIST.md", triage.build(run_obj, scope))
-    import json as _json
-    privfs.write_private(run_obj.reports / "digest.json",
-                         _json.dumps(triage.digest_json(run_obj, scope), indent=2, ensure_ascii=False))
-    click.echo(f"regenerated {run_obj.reports / 'HOTLIST.md'} + digest.json + delta.md")
-    click.echo(f"exports: {', '.join(f'{k}={v}' for k, v in exp.items() if v)}")
+    Also the resume path for a run whose finalisation failed: the base evidence is untouched, and only the
+    views that are missing or stale against it are republished (`--force` rewrites them all).
+    """
+    from . import exit_contract as _ec
+    got: dict = {}
+
+    def body():
+        try:
+            profile = TargetProfile.load(_resolve_profile(profile_path))
+        except ProfileError as e:
+            raise click.ClickException(str(e))
+        project = _project_dir(profile)
+        run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist
+        if run_obj is None:
+            raise click.ClickException(f"no runs found under {project}/recon/")
+        got["run_id"] = run_obj.run_id
+        # a run whose base evidence never committed has no verdict to republish views against; saying so
+        # is the only honest answer, and it is never a success. A damaged manifest is not a commitment
+        if not run_obj.manifest_committed():
+            raise _ec.MachineryFailure(
+                f"run {run_obj.run_id} has no committed manifest — its base evidence was never sealed or "
+                f"the manifest is unreadable, so there is nothing to finalise; re-run it",
+                where="finalization")
+        # minimal scope (report doesn't re-filter)
+        from .config import ScopeMatcher
+        scope = ScopeMatcher([], [], [], False)
+        # re-finalising always reopens: the manifest may only change while `finalizing`, and a regeneration
+        # that fails has to be able to record that it did
+        run_obj.write_state("finalizing", detail="resumed by report")
+        view = _report_view(run_obj)
+        republished: list = []
+        exp = _publish_views(view, scope, force=force, republished=republished)
+        if view is not run_obj:
+            from . import revision as _revision
+            # re-hashing the regenerated views and reconciling the manifest are both machinery: uncontained,
+            # a failure here returns 5 and leaves the run stuck `finalizing` with nothing recording why
+            _contained(run_obj, "reseal_views", lambda: _revision.reseal_views(run_obj.dir))
+        click.echo(f"{'republished ' + ', '.join(republished) if republished else 'every view was current'}"
+                   f" — {view.reports / 'HOTLIST.md'}")
+        click.echo(f"exports: {', '.join(f'{k}={v}' for k, v in exp.items() if v)}")
+        failed = run_obj.finalization_failed()
+        # a stage answered by this pass must not leave its old fault standing in the manifest, and one that
+        # failed now must appear there: either way the committed verdict matches what just happened
+        _contained(run_obj, "reconcile", lambda: _reconcile_base(run_obj))
+        run_obj.write_state("finalization_failed" if failed else "finished")
+        if failed:
+            raise _ec.MachineryFailure("a derived view could not be published — see the stage detail in "
+                                       f"{run_obj.state_path}", where="finalization")
+        # late evidence missing from these views, and rows the envelope turned away, are both coverage the
+        # report does not have: neither may leave it clean
+        gaps = [g for g in (_revision_gap(run_obj), _refusal_gap(run_obj)) if g is not None]
+        for g in gaps:
+            click.echo(_c(f"   ⚠ {g.reason}", "yellow"))
+        from .state import CommandResult
+        return _with_gap(CommandResult("report", run_id=run_obj.run_id), *gaps)
+
+    _ec.run_command("report", as_json, body, run_id=lambda: got.get("run_id"))
 
 
 @cli.command()
@@ -1153,30 +1532,70 @@ def plan():
 @click.option("--campaign", "campaign_id", is_flag=False, flag_value="", default=None,
               help="show a `--settle` CAMPAIGN instead of one run: its children, what each added, what is "
                    "still owed and why it stopped (default: the latest campaign)")
-def status(profile_path, run_id, campaign_id):
+@_ec_json_option
+def status(profile_path, run_id, campaign_id, as_json):
     """Render current/last-known per-source state from a run's events.jsonl (no scanning)."""
+    from . import exit_contract as _ec
     from . import views
+    got: dict = {}
 
-    try:
-        profile = TargetProfile.load(_resolve_profile(profile_path))
-    except ProfileError as e:
-        raise click.ClickException(str(e))
-    project = _project_dir(profile)
-    if campaign_id is not None:
-        if run_id:
-            raise click.UsageError("--run names a run and --campaign a campaign; ask for one of them")
-        _echo_campaign(project, campaign_id)
-        return
-    run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist
-    if run_obj is None:
-        raise click.ClickException(f"no runs found under {project}/recon/")
-    for line in views.status_lines(run_obj.dir / "events.jsonl"):
-        click.echo(line)
+    def body():
+        try:
+            profile = TargetProfile.load(_resolve_profile(profile_path))
+        except ProfileError as e:
+            raise click.ClickException(str(e))
+        project = _project_dir(profile)
+        if campaign_id is not None:
+            if run_id:
+                raise click.UsageError("--run names a run and --campaign a campaign; ask for one of them")
+            from . import campaign as _campaign
+            try:
+                return _echo_campaign(project, campaign_id)
+            except _campaign.InvalidCampaignId as e:
+                raise click.UsageError(str(e))   # a mistyped id is a bad selector, not broken machinery
+            except _campaign.InvalidRunId as e:
+                raise _ec.MachineryFailure(str(e), where="campaign ledger", after_start=False)
+        run_obj = _existing_run(project, profile.target, run_id)   # explicit --run must exist
+        if run_obj is None:
+            raise click.ClickException(f"no runs found under {project}/recon/")
+        got["run_id"] = run_obj.run_id
+        for line in views.status_lines(run_obj.dir / "events.jsonl"):
+            click.echo(line)
+        # status reports the run's verdict, not its own health. A committed manifest IS that verdict; a
+        # run that never closed has none, and saying so is the honest answer
+        st = run_obj.state
+        from .state import CommandResult, Fault, Gap
+        resume = f"resume it: quarry report -t <target> --run {run_obj.run_id}"
+        # a recorded finalisation failure is what happened to this run, whatever its manifest was left
+        # saying: the manifest may predate the failure entirely, and reading it would report that stale
+        # verdict as the answer
+        if st == "finalization_failed":
+            failed = [(name, rec) for name, rec in sorted(run_obj.finalization_stages.items())
+                      if (rec or {}).get("status") == "failed"]
+            faults = [Fault("publication", where=name, detail=(rec or {}).get("detail"))
+                      for name, rec in failed] or [Fault("publication", where="finalization")]
+            return CommandResult("status", outcome="failed", machinery_after_start=True,
+                                 run_id=run_obj.run_id, faults=faults, remediation=resume)
+        # a damaged manifest is not a commitment: there is no verdict to report from it
+        committed = (_ec.from_summary("status", run_obj.summary(), run_id=run_obj.run_id)
+                     if run_obj.manifest_committed() else None)
+        # late evidence missing from what the run renders, and rows its envelope turned away
+        gaps = (_revision_gap(run_obj), _refusal_gap(run_obj))
+        if st == "finished" and committed is not None:
+            return _with_gap(committed, *gaps)
+        if committed is not None and committed.exit_code not in (0, 3):
+            return _with_gap(committed, *gaps)  # the committed verdict already names what went wrong
+        return _with_gap(CommandResult("status", coverage="gapped", run_id=run_obj.run_id,
+                                       gaps=[Gap(source_id="run", kind="unknown",
+                                                 reason=f"run state is {st}, not finished")],
+                                       remediation=resume), *gaps)
+
+    _ec.run_command("status", as_json, body, run_id=lambda: got.get("run_id"))
 
 
-def _echo_campaign(project, campaign_id: str) -> None:
+def _echo_campaign(project, campaign_id: str):
     """One campaign, read from its ledger, so running, finished and interrupted campaigns all read the same
-    way and an unreadable one says so.
+    way and an unreadable one says so. The ledger's recorded stop is the verdict this command reports.
     """
     from . import campaign as _campaign
     from . import settle as _settle
@@ -1192,6 +1611,52 @@ def _echo_campaign(project, campaign_id: str) -> None:
         raise click.ClickException(f"no campaign {campaign_id} under {project}/recon/campaigns/")
     for line in _settle.report_lines(ledger):
         click.echo(_c(line, "yellow" if not ledger.trustworthy else "cyan"))
+    return _campaign_result(ledger, campaign_id)
+
+
+def _campaign_result(ledger, campaign_id: str):
+    """A campaign's own outcome as the machine result — the same verdict `run --settle` reported when it
+    stopped, read back from the ledger so a status check never contradicts the run that wrote it."""
+    from . import remainder as _remainder
+    from .state import CommandResult, Fault, Gap
+
+    def gapped(reason, *, kind="unknown", remediation=None):
+        return CommandResult("status", coverage="gapped", campaign_id=campaign_id, remediation=remediation,
+                             gaps=[Gap(source_id="campaign", kind=kind, reason=reason)])
+
+    if not ledger.trustworthy:
+        return gapped(f"campaign ledger is {ledger.status}: {ledger.reason}")
+    stop = ledger.stop
+    if not stop:      # recorded children and no stop: interrupted, and what it owes is unmeasured
+        return gapped("the campaign recorded no stop — it did not finish",
+                      remediation=f"continue it: quarry run -t <target> --settle "
+                                  f"--settle-resume {campaign_id}")
+    cause = stop["cause"]
+    # a terminal is classified per-cause; a ledger that predates the breakdown cannot tell a bound from a
+    # fault, and unmeasured is a gap
+    terminal = _remainder.terminal_class(stop["terminal"]) if isinstance(stop.get("terminal"), dict) \
+        else None
+    if cause == "child_fault" or terminal == "fault":
+        return CommandResult("status", outcome="failed", campaign_id=campaign_id,
+                             machinery_after_start=True,
+                             faults=[Fault("machinery", where="campaign", detail=stop["detail"] or cause)],
+                             remediation=stop["detail"] or None)
+    if cause == "terminal" and terminal is None:
+        return gapped(f"terminal: {stop['detail']}" if stop["detail"] else "terminal work remains")
+    if any(c.get("state") == "abandoned" for c in ledger.children):
+        return gapped("a child run could not be measured and was abandoned")
+    if ledger.recoveries:
+        return gapped("this campaign's ledger was recovered after an evidence loss")
+    # a child that ran under a declared bound reports the same evidence a standalone run does, so it must
+    # reach the same status: converging it to clean would make `--settle` hide what `run` states
+    limited = any(c.get("verdict") == "complete_with_limits" for c in ledger.children)
+    bounded = cause in _SETTLE_BOUNDED or terminal == "bounded" or limited
+    if stop["success"] and not limited:
+        return CommandResult("status", campaign_id=campaign_id)
+    if bounded:
+        return CommandResult("status", coverage="intentionally_bounded", campaign_id=campaign_id,
+                             remediation=stop["detail"] or None)
+    return gapped(f"{cause}: {stop['detail']}" if stop["detail"] else cause)
 
 
 @cli.group()
@@ -1206,12 +1671,22 @@ def oob():
 @click.option("-t", "--target", "profile_path", required=True,
               help="project name, project dir, or target.yaml path")
 @click.option("--run", "run_id", help="run id (default: latest)")
-def oob_import(src_file, profile_path, run_id):
+@_ec_json_option
+def oob_import(src_file, profile_path, run_id, as_json):
     """Import external interactsh -json (JSONL) callback logs into a run as oob_interaction rows.
 
     Compatibility path for callbacks Quarry did not issue; recorded as evidence without attribution unless a
-    row matches a Quarry-issued token. Raw import kept under raw/oob/.
+    row matches a Quarry-issued token. Raw import kept under raw/oob/. A finished run is not rewritten: its
+    rows land in an append-only supplement under revisions/ and a new revision of the combined view is
+    published, with its own counts, digests and reports.
     """
+    from . import exit_contract as _ec
+    got: dict = {}
+    _ec.run_command("oob import", as_json, lambda: _oob_import(src_file, profile_path, run_id, got),
+                    run_id=lambda: got.get("run_id"))
+
+
+def _oob_import(src_file, profile_path, run_id, got):
     from . import oob as oobmod
 
     try:
@@ -1222,14 +1697,16 @@ def oob_import(src_file, profile_path, run_id):
     run_obj = _existing_run(project, profile.target, run_id)
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
-    res = oobmod.import_file(run_obj, src_file)
+    got["run_id"] = run_obj.run_id
+    res = _oob_ingest(lambda: oobmod.import_file(run_obj, src_file, scope=profile.scope()))
     proto = ", ".join(f"{k}={v}" for k, v in sorted(res["by_protocol"].items())) or "(none)"
     ncorr = res.get("correlated", 0)
     # correlated only when the imported log carried a Quarry-issued token; otherwise uncorrelated
     attr = (f"{ncorr} correlated to a Quarry token, {res['added'] - ncorr} uncorrelated"
             if ncorr else "uncorrelated (no matching Quarry-issued token)")
     click.echo(f"oob import: {res['parsed']} parsed · {res['added']} new oob_interaction(s) [{proto}] "
-               f"· {attr} -> {run_obj.dir / 'normalized' / 'oob_interaction.jsonl'}")
+               f"· {attr} -> {_oob_sink(run_obj, res)}")
+    return _oob_result("oob import", run_obj, res)
 
 
 @oob.command("poll")
@@ -1238,12 +1715,20 @@ def oob_import(src_file, profile_path, run_id):
 @click.option("--run", "run_id", help="run id (default: latest)")
 @click.option("--wait", type=click.IntRange(min=0), default=8, show_default=True,
               help="seconds to let the resumed client fetch buffered callbacks")
-def oob_poll(profile_path, run_id, wait):
+@_ec_json_option
+def oob_poll(profile_path, run_id, wait, as_json):
     """Resume a run's owned interactsh session and poll for delayed callbacks.
 
     Re-opens the same session (via its -session-file) so late SSRF/blind interactions correlate back to
     their source, adding any new correlated oob_interaction rows.
     """
+    from . import exit_contract as _ec
+    got: dict = {}
+    _ec.run_command("oob poll", as_json, lambda: _oob_poll(profile_path, run_id, wait, got),
+                    run_id=lambda: got.get("run_id"))
+
+
+def _oob_poll(profile_path, run_id, wait, got):
     import time as _time
     from . import oob as oobmod
 
@@ -1255,6 +1740,7 @@ def oob_poll(profile_path, run_id, wait):
     run_obj = _existing_run(project, profile.target, run_id)
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
+    got["run_id"] = run_obj.run_id
     # current oob config; resume_session couples the token to the saved session's server (not persisted)
     _cfg = secrets.oob()
     resumed = oobmod.resume_session(run_obj, token=_cfg.get("auth_token"),
@@ -1263,19 +1749,55 @@ def oob_poll(profile_path, run_id, wait):
         raise click.ClickException("no resumable OOB session for this run "
                                    "(session.json missing, interactsh-client absent, or domain mismatch)")
     session, proc = resumed
-    added = correlated = 0
     try:
         if wait:
             _time.sleep(wait)                       # let the resumed client fetch buffered callbacks
-        for row in oobmod.poll_session(run_obj, session):
-            row.setdefault("raw_ref", session.get("log"))
-            if run_obj.add("oob_interaction", row):
-                added += 1
-                correlated += 1 if row.get("correlation") == "correlated" else 0
+        rows = oobmod.poll_session(run_obj, session)
     finally:
         oobmod.close_session(proc)
-    click.echo(f"oob poll: +{added} new interaction(s) ({correlated} correlated) "
-               f"-> {run_obj.dir / 'normalized' / 'oob_interaction.jsonl'}")
+    res = _oob_ingest(lambda: oobmod.import_polled(run_obj, session, rows, scope=profile.scope()))
+    click.echo(f"oob poll: +{res['added']} new interaction(s) ({res['correlated']} correlated) "
+               f"-> {_oob_sink(run_obj, res)}")
+    return _oob_result("oob poll", run_obj, res)
+
+
+def _oob_result(command: str, run_obj, res):
+    """What an OOB ingest leaves behind: callbacks the corpus envelope refused are held and not stored.
+
+    Reported on what STANDS across every revision, not just what this ingest turned away — an import that
+    refused nothing still runs against a run that owes rows, and saying `clean` there would contradict the
+    `status` that follows it."""
+    from .state import CommandResult, Gap
+    refused, outstanding = int(res.get("refused") or 0), int(res.get("outstanding") or 0)
+    standing = outstanding or refused
+    if not standing:
+        return CommandResult(command, run_id=run_obj.run_id)
+    reason = f"{standing} interaction(s) refused past the corpus envelope"
+    if refused and refused != standing:
+        reason += f" ({refused} in this ingest)"
+    return CommandResult(command, coverage="gapped", run_id=run_obj.run_id,
+                         gaps=[Gap(source_id="oob", kind="cap", omitted=standing, reason=reason)],
+                         remediation="raise the corpus envelope and re-import")
+
+
+def _oob_ingest(work):
+    """Run one OOB ingest; a revision that cannot be published or certified is machinery, not bad input."""
+    from . import exit_contract as _ec
+    from .revision import RevisionError
+
+    try:
+        return work()
+    except RevisionError as e:
+        raise _ec.MachineryFailure(str(e), where="revision")
+
+
+def _oob_sink(run_obj, res) -> str:
+    """Where the rows landed: a finished run's supplement revision, else the run's own entity log."""
+    rev = res.get("revision")
+    if rev is None:
+        return str(run_obj.dir / "normalized" / "oob_interaction.jsonl")
+    return (f"revision {rev.revision} · oob_interaction={rev.entity_counts.get('oob_interaction', 0)} "
+            f"· {run_obj.dir / 'revisions' / rev.views.get('dir', '')}")
 
 
 if __name__ == "__main__":

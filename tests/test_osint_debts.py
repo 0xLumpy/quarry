@@ -324,6 +324,9 @@ class TestThePreflightBoundIsReachable:
             seen["cap"] = policy.limit("RDAP_LOOKUPS")
             (project / "osint").mkdir(parents=True, exist_ok=True)
             (project / "osint" / "osint-report.md").write_text("x")
+            # the real lane closes the session with a manifest; without one the verdict is `unknown`
+            (project / "osint" / "manifest.json").write_text(
+                json.dumps({"summary": {"verdict": "complete"}}))
             return project / "osint" / "osint-report.md"
 
         monkeypatch.setattr(osint_mod, "run", fake_run)

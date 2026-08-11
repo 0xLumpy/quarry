@@ -16,10 +16,20 @@ class Checkpoint:
     level: str        # "warn" | "info"
     phase: str
     message: str
+    #: a thinness rule the tool statuses do not already account for; it must reach the verdict as a Gap.
+    #: A checkpoint that only restates a recorded tool status is already a gap in the summary.
+    challenges: bool = False
 
     def line(self) -> str:
         icon = "⚠️ " if self.level == "warn" else "ℹ️ "
         return f"{icon}[{self.phase}] {self.message}"
+
+    def gap(self):
+        """The typed Gap this checkpoint asserts, or None when it challenges nothing new."""
+        from .state import Gap
+        if not self.challenges:
+            return None
+        return Gap(source_id=f"{self.phase}.checkpoint", kind="unknown", reason=self.message)
 
 
 def evaluate(run, phase: str) -> list[Checkpoint]:
@@ -47,15 +57,18 @@ def evaluate(run, phase: str) -> list[Checkpoint]:
                                                    Status.EMPTY.value, Status.LIMITED.value)}
         if "subfinder" in ran and passive == 0:
             cps.append(Checkpoint("warn", phase,
-                "passive subdomain enum returned ZERO for all roots — check API keys (subfinder -stats) and scope."))
+                "passive subdomain enum returned ZERO for all roots — check API keys (subfinder -stats) and scope.",
+                challenges=True))
         if passive and resolved == 0:
             cps.append(Checkpoint("warn", phase,
-                f"{passive} candidate subs but 0 resolved — resolver/validation problem, not an empty target."))
+                f"{passive} candidate subs but 0 resolved — resolver/validation problem, not an empty target.",
+                challenges=True))
         elif passive:
             ratio = resolved / passive if passive else 0
             if ratio < 0.10:
                 cps.append(Checkpoint("warn", phase,
-                    f"resolve ratio low ({resolved}/{passive}={ratio:.0%}) — check resolvers/wildcards."))
+                    f"resolve ratio low ({resolved}/{passive}={ratio:.0%}) — check resolvers/wildcards.",
+                    challenges=True))
         # source-diversity sanity: passive should not be carried by a single source alone
         srcs = {s for sub in run.read("subdomain") for s in sub.get("sources", [])}
         if passive > 50 and len(srcs) == 1:
@@ -67,13 +80,15 @@ def evaluate(run, phase: str) -> list[Checkpoint]:
         live = run.count("live")
         if resolved >= 10 and live == 0:
             cps.append(Checkpoint("warn", phase,
-                f"{resolved} resolved hosts but 0 live HTTP services — httpx blocked, wrong ports, or rate-limited."))
+                f"{resolved} resolved hosts but 0 live HTTP services — httpx blocked, wrong ports, or rate-limited.",
+                challenges=True))
 
     if phase == "crawl":
         live = run.count("live")
         urls = run.count("url")
         if live and urls == 0:
             cps.append(Checkpoint("warn", phase,
-                "live hosts present but 0 URLs collected — crawl/archive sources blocked or empty."))
+                "live hosts present but 0 URLs collected — crawl/archive sources blocked or empty.",
+                challenges=True))
 
     return cps

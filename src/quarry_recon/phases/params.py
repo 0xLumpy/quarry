@@ -2238,7 +2238,9 @@ def _oob_probe(ctx, scope, prof):
         ctx.run.record("params", skipped("oob_probe", "passive-only mode"))
         return None
     if not have("interactsh-client"):
-        ctx.run.record("params", skipped("oob_probe", "interactsh-client not installed"))
+        # the source keeps its own identity; `depends_on` names the required binary the verdict must miss
+        ctx.run.record("params", skipped("oob_probe", "interactsh-client not installed"),
+                       depends_on="interactsh-client")
         return None
     raw = active_review_values(ctx, "ssrf")
     cands, _canon = _canonicalize_candidates(raw)

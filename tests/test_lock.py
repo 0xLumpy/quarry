@@ -738,7 +738,8 @@ class TestDriftOnlyExit:
         monkeypatch.setattr(Tool, "installed", property(lambda self: True))
         monkeypatch.setattr(reg, "installed_identity", lambda t: "")          # version-unknown violation
         res = CliRunner().invoke(cli_mod.cli, ["lock", "--drift-only"])
-        assert res.exit_code == 1 and "version-unknown" in res.output
+        # exit 4 by the exit contract: a binary we cannot vouch for is coverage we cannot vouch for
+        assert res.exit_code == 4 and "version-unknown" in res.output
 
     def test_drift_only_green_when_all_ok(self, monkeypatch):
         from click.testing import CliRunner

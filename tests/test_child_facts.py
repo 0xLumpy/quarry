@@ -31,7 +31,9 @@ class TestChildFaults:
         finally:
             events.reset()
         faults = json.loads(run.manifest_path.read_text())["summary"]["faults"]
-        assert faults == [{"kind": "machinery", "where": "httpx", "detail": "the tool exploded"}], faults
+        # a typed Fault: the campaign reads the kind, and whether it challenges completeness, not prose
+        assert faults == [{"kind": "machinery", "where": "httpx", "detail": "the tool exploded",
+                           "challenges_completeness": True}], faults
 
     def test_an_OPTIONAL_tool_failing_is_not_machinery(self, tmp_path, monkeypatch):
         """Repeating a run is continuation; repeating a BROKEN run is not. An optional tool that failed is

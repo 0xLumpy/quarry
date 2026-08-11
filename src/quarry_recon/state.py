@@ -311,10 +311,16 @@ class PolicyDecision:
 
 # ── RunState ──────────────────────────────────────────────────────────────────────────────────
 RUN_STATES = ("created", "running", "finalizing", "finished", "finalization_failed")
+#: a persisted lifecycle record that exists but cannot be read. Not a state a run may be IN and not a
+#: legal transition source or target, so every advance from it fails closed.
+STATE_UNKNOWN = "unknown"
+#: `finished -> finalizing` is the deliberate reopen: re-finalising a finished run (`quarry report`)
+#: must be able to record that the regeneration failed, and the manifest is only ever rewritten while
+#: `finalizing`, so a run resting in `finished` still carries an immutable manifest.
 _RUN_TRANSITIONS = {
     "created": {"running"}, "running": {"finalizing"},
     "finalizing": {"finished", "finalization_failed"},
-    "finalization_failed": {"finalizing"}, "finished": set(),
+    "finalization_failed": {"finalizing"}, "finished": {"finalizing"},
 }
 
 
