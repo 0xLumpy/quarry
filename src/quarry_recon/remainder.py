@@ -51,6 +51,29 @@ UNIT_MODEL: dict[tuple, str] = {
 #: again (`budget.ADMISSION_COOLDOWN_GENS`), so it is retriable with a wait.
 TERMINAL_CAUSES = ("unschedulable", "entitlement", "dependency", "machinery")
 
+#: what a terminal cause IS, for a caller that must state an outcome: a bound we accepted, coverage
+#: nobody could schedule, or machinery that broke. Only `entitlement` is a bound we chose to live with,
+#: so only it may be reported as a bounded run rather than as lost coverage.
+TERMINAL_DISPOSITIONS = {"entitlement": "bounded", "unschedulable": "gap", "dependency": "gap",
+                         "machinery": "fault"}
+
+#: least to most serious; the order a mixed terminal is resolved in.
+TERMINAL_CLASSES = ("bounded", "gap", "fault")
+
+
+def terminal_disposition(cause: str) -> str:
+    """One terminal cause as an outcome class. Anything this taxonomy cannot account for is a `fault`: a
+    terminal nobody declared is machinery, never a bound we may claim we chose."""
+    return TERMINAL_DISPOSITIONS.get(cause, "fault")
+
+
+def terminal_class(causes) -> str:
+    """The one class for a terminal's causes — the most serious wins, and a `{cause: count}` mapping is
+    read by its non-zero causes. A terminal that names none is a `gap`: nothing was recorded to classify,
+    which is coverage nobody can claim, not machinery anybody saw break."""
+    named = [c for c, n in causes.items() if n] if isinstance(causes, dict) else list(causes)
+    return max([terminal_disposition(c) for c in named] or ["gap"], key=TERMINAL_CLASSES.index)
+
 
 @dataclass
 class Remainder:
@@ -94,6 +117,91 @@ class Remainder:
                 "retriable": {"now": self.now, "cooldown": self.cooldown},
                 "terminal": {c: self.terminal.get(c, 0) for c in TERMINAL_CAUSES},
                 "detail": dict(self.detail)}
+
+
+#: how one obligation was disposed of by one child. Only `remainder` keeps a campaign alive, and only
+#: `unknown` forbids a verdict — an obligation nobody disposed of is never a zero.
+DISPOSITIONS = ("known_zero", "remainder", "terminal", "not_applicable", "unknown")
+
+#: exactly the keys one persisted obligation carries.
+_OBLIGATION_KEYS = {"lane", "unit", "measure", "disposition", "retriable", "terminal", "why"}
+
+
+@dataclass
+class Obligation:
+    """One `(lane, unit, measure)` a campaign must dispose of before it may call anything settled.
+
+    An empty unit is the lane itself, carried from before the lane named any unit; it labels the lane's
+    disposition and never counts, so the lane's units carry the numbers exactly once.
+    """
+    lane: str
+    unit: str = ""
+    measure: str = ""
+    disposition: str = "unknown"
+    retriable: int = 0
+    terminal: dict = field(default_factory=dict)
+    why: str = ""
+
+    @property
+    def key(self) -> tuple:
+        return (self.lane, self.unit, self.measure)
+
+    def validate(self) -> None:
+        for name in ("lane", "unit", "measure", "why"):
+            if type(getattr(self, name)) is not str:
+                raise ValueError(f"an obligation needs an exact {name}")
+        if not self.lane.strip():
+            raise ValueError("an obligation needs a lane")
+        if self.disposition not in DISPOSITIONS:
+            raise ValueError(f"{self.lane}: unknown disposition {self.disposition!r}")
+        if type(self.retriable) is not int or self.retriable < 0:
+            raise ValueError(f"{self.lane}: retriable must be an exact non-negative int")
+        for cause, value in self.terminal.items():
+            if cause not in TERMINAL_CAUSES:
+                raise ValueError(f"{self.lane}: unknown terminal cause {cause!r}")
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{self.lane}: terminal {cause} must be an exact non-negative int")
+
+    def as_record(self) -> dict:
+        return {"lane": self.lane, "unit": self.unit, "measure": self.measure,
+                "disposition": self.disposition, "retriable": self.retriable,
+                "terminal": dict(self.terminal), "why": self.why}
+
+    @classmethod
+    def from_record(cls, record) -> "Obligation":
+        """Rebuild a persisted obligation, refusing anything a reader cannot believe."""
+        if not isinstance(record, dict) or set(record) != _OBLIGATION_KEYS:
+            raise ValueError(f"an obligation record carries exactly {sorted(_OBLIGATION_KEYS)}")
+        if not isinstance(record["terminal"], dict):
+            raise ValueError("an obligation's terminal counts must be an object")
+        ob = cls(**{**record, "terminal": dict(record["terminal"])})
+        ob.validate()
+        return ob
+
+    @classmethod
+    def of(cls, remainder: "Remainder") -> "Obligation":
+        """How one reported remainder disposes of its obligation."""
+        remainder.validate()
+        terminal = {c: n for c, n in remainder.terminal.items() if n}
+        owed = remainder.retriable
+        if owed:
+            disposition, why = "remainder", ""
+        elif terminal:
+            disposition, why = "terminal", "no repetition resolves this"
+        elif remainder.now or remainder.cooldown:
+            # owed, and real, but a later child replays the same prefix: `--unbound`'s business
+            disposition, why = "not_applicable", "repetition cannot reach this remainder"
+        else:
+            disposition, why = "known_zero", ""
+        return cls(lane=remainder.lane, unit=remainder.unit, measure=remainder.measure,
+                   disposition=disposition, retriable=owed, terminal=terminal, why=why)
+
+
+def roster(lanes=None) -> dict:
+    """One open obligation per declared lane, before any child has run: a lane nobody has heard from yet
+    is unknown, never absent."""
+    return {(lane, "", ""): Obligation(lane=lane)
+            for lane in sorted(LANE_MODEL if lanes is None else lanes)}
 
 
 def emit(remainder: Remainder) -> dict:

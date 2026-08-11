@@ -182,5 +182,5 @@ publishes `--timeout 0` changing subfinder's volume would enshrine the defect it
    progress TERMINATES instead of looping for ever.
 5. `--settle` design doc (`docs/design/SETTLE-DESIGN.md`, written 2026-08-02) — DONE, and BUILT through its own
    §7 build order (prerequisites A-D, the acquisition closure, the supervisor, the CLI driver `2bcd00a`).
-   Deliberately NOT built: resuming an existing campaign (see `settle.AlreadyRun`).
+   An INTERRUPTED campaign resumes from its ledger; one that recorded a stop is refused (`settle.AlreadyRun`).
 6. `--preset` / capability posture — only once there is more than one thing to preset

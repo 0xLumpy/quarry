@@ -135,7 +135,7 @@ class TestTheStopRules:
                             expected_lanes=["enrich.a1d_brute"])
         assert d.stop == "unknown" and "subdomain" in d.detail, d
 
-    @pytest.mark.parametrize("kind", ["machinery", "phase_exception", "required_tool_missing"])
+    @pytest.mark.parametrize("kind", ["machinery", "phase_exception"])
     def test_a_BROKEN_child_ends_it_first(self, kind):
         """Repeating a run that broke is not continuation — and it is asked BEFORE anything else, so one
         child can never be classified two ways."""
@@ -143,6 +143,16 @@ class TestTheStopRules:
                                      remainders=[_rem(now=9)]), _absorbed(new=5),
                             expected_lanes=["enrich.a1d_brute"])
         assert d.stop == "child_fault" and kind in d.detail, d
+
+    def test_a_MISSING_required_tool_is_coverage_we_lack_not_machinery(self):
+        """It rides the child's gaps (`exit_contract.from_summary` strips it from the faults), so calling
+        it a child fault reported lost coverage as broken machinery."""
+        summary = _summary(faults=[{"kind": "required_tool_missing", "where": "katana"}],
+                           remainders=[_rem()], verdict="complete_with_gaps")
+        summary["gaps"] = [{"phase": "crawl", "tool": "katana", "status": "missing"}]
+        d = campaign.decide(summary, _absorbed(), expected_lanes=["enrich.a1d_brute"])
+        assert (d.stop, d.success) == ("fixed_point_with_gaps", False), d
+        assert "katana" in d.detail
 
     def test_an_OPTIONAL_tool_failure_is_not_a_child_fault(self):
         d = campaign.decide(_summary(faults=[{"kind": "optional_tool_failed", "where": "gowitness"}],

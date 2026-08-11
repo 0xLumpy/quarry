@@ -1,6 +1,6 @@
 # `--settle` — the continuation axis (design, 2026-08-02, rev 4)
 
-> **Verified state 2026-08-03 (`2bcd00a`): BUILT** — `settle.py` + `campaign.py` + `quarry run --settle`. Everything here is implemented EXCEPT resuming a campaign, which is refused by design (`settle.AlreadyRun` carries the four-part protocol a real resume must satisfy).
+> **Verified state 2026-08-03 (`2bcd00a`): BUILT** — `settle.py` + `campaign.py` + `quarry run --settle`. Resuming an INTERRUPTED campaign was added later (QR39-012): a campaign that stated an outcome is still refused (`settle.AlreadyRun`); one that was killed continues from its ledger.
 
 
 Status: **DESIGN ONLY, NOT BUILT.** Step 5 of `docs/design/FLAG-AXIS-PLAN.md`; steps 1–4 are done. Written
@@ -263,9 +263,16 @@ A supervisor that creates runs needs the same care the rotation got:
   rotation); a campaign-local lock may still guard ledger integrity;
 * **ATOMIC** writes (temp + `os.replace`), like every other state file;
 * **CHILD STATES**: `reserved` (id allocated, nothing launched) -> `started` (run dir created) ->
-  `manifested` (manifest read, deltas computed). A crash between two of them leaves a child recorded in its
-  last known state, so the next supervisor sees an INTERRUPTED child rather than an orphan run directory or
-  a campaign that quietly claims it finished.
+  `manifested` (the committed manifest read, deltas computed); either of the first two may end in
+  `abandoned` (nobody can measure this child, and the campaign says so rather than counting it as
+  anything). A crash between two of them leaves a child recorded in its last known state, so the next
+  supervisor sees an INTERRUPTED child rather than an orphan run directory or a campaign that quietly
+  claims it finished, and the resume in §7 settles exactly that child;
+* **A CHILD'S VERDICT IS THE ONE IT COMMITTED.** The supervisor reads `manifest.json`'s `summary`, never a
+  recomputed one: a run is unsealed again for its derived views (`cli._run_phases`), so recomputing after
+  it returns can produce a verdict the child never published — and one a resume, which has only the
+  manifest, could never reproduce. A child that returns without a committed manifest is refused, not
+  summarised.
 
     recon/campaigns/<campaign_id>/ledger.json
     {campaign_id, target, started, finished, flags,
@@ -297,22 +304,66 @@ The CLI passes `launch`, so this module never owns what a run is. Both bounds ar
 destroy the evidence it was producing. `quarry status --campaign` reads the ledger, so a running, finished
 and interrupted campaign read the same way, and an unreadable one says so instead of looking empty.
 
-**RESUMING a campaign is NOT implemented, deliberately.** Every existing campaign is refused
-(`settle.AlreadyRun`), interrupted ones included. Appending child N+1 to a ledger this process did not
-build is not a resume: child 2 would start with acquisition CLOSED although nothing was ever acquired, the
-interrupted child's evidence would never be absorbed, the loop's carried state (roster / previous
-remainder / idle streak) would start empty, and one quiet child could then declare a FIXED POINT over a
-ledger still holding an unfinished child. A real resume must first: reconcile the interrupted child and its
-run directory; rebuild the carried state from the ledger; decide the acquisition closure from what was
-RECORDED as executed rather than from the child number; and refuse success while any child is interrupted.
+**RESUMING an INTERRUPTED campaign is implemented** (QR39-012). A campaign that recorded a stop is still
+refused (`settle.AlreadyRun`): its history is closed. One that was killed continues, and each of the four
+things a real resume owes is discharged before the loop runs again: the interrupted child is reconciled
+against its run directory (a run that wrote its manifest is absorbed and decided, one that did not is
+`abandoned` by name and never folded in as if it were complete); the carried state — roster, previous
+remainder, idle streak — is rebuilt from the ledger, where each manifested child persists the obligation
+roster it left; the acquisition closure is decided by whether any child was RECORDED with a run rather than
+by the child number; and no child stays interrupted, because every stop settles the ledger it leaves and an
+abandoned child costs the campaign `Outcome.clean`. Absorbing is idempotent by run id — the union's pointer
+carries the deltas each run was published with — so a kill between absorbing and recording replays that
+child's own discoveries instead of recounting them as zero.
+
+A resume is offered and accepted only where nothing can be adopted by accident, so `settle()` refuses
+(`settle.CampaignRefused`) before it takes the lease and before any child: an id that is not one confined
+path segment under `recon/campaigns/` (`campaign.InvalidCampaignId` — an id is a directory name, and
+`--settle-resume` is operator input); a campaign that recorded a stop (`AlreadyRun`); and one whose target
+is not the caller's OR cannot be confirmed at all (`WrongTarget`). The target is read from the children's
+own `run.json`, because the ledger carries no target: unreadable, unnamed or disagreeing children mean the
+campaign is unconfirmable, and an unconfirmable campaign is refused rather than adopted under whatever
+target asked for it — its union is one target's corpus, and a child seeded from it files one target's
+evidence under another's. `settle.resumable_campaigns()` applies exactly these rules, so what it offers an
+operator is what `settle()` accepts, and `settle.skipped_resumable()` returns `(campaign_id, why_not)` for
+every interrupted campaign it passed over — a caller that mints a new campaign in silence has just paid
+for child one's acquisition a second time over the remains of one that already did. Of those,
+`settle.unconfirmable_resumable()` names the ones a caller cannot rule out as ITS OWN — an unreadable
+ledger, a union that is gone, a target nobody can confirm — as distinct from a campaign confirmed to
+belong to another target, which is knowing whose it is rather than failing to. Only the first kind is
+evidence possibly lost, so only the first kind should make a caller refuse rather than notice.
+
+Three things a resume must carry across the kill, because an incarnation is not the campaign:
+
+* **THE UNION IS READ AGAINST THE LEDGER.** An absent pointer is a fresh start only for a campaign that
+  has manifested nothing. If the ledger records manifested children, their corpus existed — so an absent
+  union is that corpus LOST, and creating an empty one would republish the loss as authoritative (every
+  later child would rediscover what the campaign already knew as if it were new). Only a ledger with no
+  manifested child may be handed an empty union; anything else is `unusable`.
+* **THE BUDGET IS THE CAMPAIGN'S, NOT THE INVOCATION'S.** Each child records what it cost (`elapsed_s`),
+  a resume sums those into what has already been spent, and `--settle-budget` is measured against the
+  total. A fresh timer per restart turned the budget into a per-restart allowance, so a kill and a resume
+  bought another full budget. A child the campaign never saw finish is charged too: the ledger stamps
+  `started_at` when it launches one, and a resume charges the interrupted child from that stamp (or its
+  run's own creation record) to the last activity its run directory shows. Where neither end can be
+  established the spend is UNMEASURED, never free — with a budget in force the campaign stops `unknown`
+  rather than launch another child against a bound it cannot show it is inside.
+* **A CHILD'S RUN ID IS CONFINED LIKE THE CAMPAIGN'S OWN ID.** Both are single path segments joined to
+  reach evidence, so both are validated by the same rule (`campaign.valid_segment`) — at the ledger
+  loader, so a damaged ledger is `unusable` rather than a route to a run directory outside the project,
+  and at `Campaign.started`, so one can never be written.
 
 Two decisions the build forced:
 
-* **The ROSTER is what the campaign has HEARD.** §3's UNKNOWN rule needs to know which lanes should have
-  reported. A roster derived from the phase registry over-claims (a sweep lane with no wildcard zones never
-  runs, and its silence would stop every campaign as unknown); one derived from evidence under-claims. So
-  the campaign accumulates the lanes that have reported to it, and a lane that reported once and then goes
-  silent is UNKNOWN. A lane nobody ever heard from cannot be missed —
+* **The ROSTER is complete before child one; its dispositions come from evidence.** §3's UNKNOWN rule needs
+  to know which lanes should have reported. A roster derived from the phase registry over-claims (a sweep
+  lane with no wildcard zones never runs, and its silence would stop every campaign as unknown); one
+  derived only from what has been heard under-claims — it is empty for child one, so a lane that ran and
+  said nothing was invisible exactly once. So every declared lane (`remainder.LANE_MODEL`) is an open
+  obligation from the start and each child must dispose of it: `not_applicable` when nothing shows the lane
+  ran, `unknown` when it ran or has reported before and says nothing now, otherwise what it reported.
+  Silence is tracked per exact `(lane, unit, measure)`, so a lane cannot retire one unit by reporting
+  another —
 * **...which is why a lane that RAN and could not measure now says so** (`remainder.unknown()`, emitted
   where `remainder_known` is false). Staying silent made "ran and cannot say" indistinguishable from "never
   ran", so the roster simply dropped it and the campaign could call a fixed point over work nobody

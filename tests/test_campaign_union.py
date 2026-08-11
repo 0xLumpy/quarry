@@ -35,11 +35,23 @@ class TestAbsorbingAChild:
         rows = (union.dir / json.loads(union.path.read_text())["file"]).read_text().splitlines()
         assert len(rows) == 2, rows
 
-    def test_absorbing_the_SAME_child_twice_adds_nothing(self, tmp_path):
+    def test_absorbing_the_SAME_run_twice_REPLAYS_what_it_added(self, tmp_path):
+        """The union already holds it, so a second merge finds nothing new — which is not the same fact
+        as the child having added nothing, and a resume that read it that way would invent a fixed point."""
         run = _finished(tmp_path, ("subdomain", {"host": "a.acme.com", "sources": ["crtsh"]}))
         union = campaign.Union.for_campaign(tmp_path, "c1", create=True)
         assert union.absorb(run.dir).new == 1
+        generation, records = union.generation, dict(union.records)
         again = union.absorb(run.dir)
+        assert (again.new, again.enriched, again.progressed) == (1, 0, True), again
+        assert (union.generation, union.records) == (generation, records), "a replay published again"
+
+    def test_ANOTHER_child_that_re_sees_a_known_identity_adds_nothing(self, tmp_path):
+        first = _finished(tmp_path, ("subdomain", {"host": "a.acme.com", "sources": ["crtsh"]}))
+        union = campaign.Union.for_campaign(tmp_path, "c1", create=True)
+        assert union.absorb(first.dir).new == 1
+        second = _finished(tmp_path, ("subdomain", {"host": "a.acme.com", "sources": ["crtsh"]}))
+        again = union.absorb(second.dir)
         assert (again.new, again.enriched, again.progressed) == (0, 0, False), again
 
     def test_ENRICHMENT_of_a_known_identity_is_progress(self, tmp_path):

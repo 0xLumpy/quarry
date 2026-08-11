@@ -120,9 +120,10 @@ class TestTheBounds:
         supervisor that did it would destroy the evidence the child was producing."""
         plan = [{"hosts": [f"h{i}.acme.com"], "remainders": [_rem(now=9)]} for i in range(4)]
         launcher = _Launcher(tmp_path, plan)
-        clock = iter([0, 0, 0.5, 99, 99, 99])          # elapsed at each check
+        # a clock the loop cannot outrun: inside the budget until two children have run, past it after —
+        # so the only place the stop can land is BETWEEN children, whatever the loop reads it
         out = settle.settle(project_dir=tmp_path, target="acme.com", launch=launcher, budget_s=10,
-                            _now=lambda: next(clock))
+                            _now=lambda: 0.0 if len(launcher.calls) < 2 else 99.0)
         assert out.stop == "budget" and "10s budget" in out.detail, out
         assert len(launcher.calls) == 2, "a child already running is never cut short by the budget"
         assert all(c["state"] == "manifested" for c in
@@ -321,10 +322,10 @@ class TestACampaignIsNotResumedByACCIDENT:
             _settle(tmp_path, [{"remainders": [_rem()]}], campaign_id="c-fixed")
 
     @pytest.mark.parametrize("make_run", [False, True])
-    def test_an_INTERRUPTED_campaign_is_refused_not_continued(self, tmp_path, make_run):
-        """Appending child N+1 is not a resume. Child 2 would start with acquisition closed although
-        nothing was ever acquired, child 1's evidence would never be absorbed, and one quiet child would
-        let the campaign declare a fixed point over a ledger that still holds an unfinished child."""
+    def test_an_INTERRUPTED_campaign_is_RESUMED_not_refused(self, tmp_path, make_run):
+        """What may not happen by accident is continuing a campaign that already stated an outcome.
+        Refusing an interrupted one instead stranded it: its children were recorded and no invocation
+        could ever finish or close them. The kill boundaries are pinned in `test_qr39_012_settlement`."""
         def dies(index, prepare):
             if make_run:
                 prepare(store.Run.create(tmp_path, "acme.com"))
@@ -332,11 +333,12 @@ class TestACampaignIsNotResumedByACCIDENT:
 
         with pytest.raises(RuntimeError):
             settle.settle(project_dir=tmp_path, target="acme.com", launch=dies, campaign_id="c-fixed")
-        with pytest.raises(settle.AlreadyRun, match="is interrupted while"):
-            _settle(tmp_path, [{"remainders": [_rem()]}], campaign_id="c-fixed")
+        out, _ = _settle(tmp_path, [{"hosts": ["a.acme.com"], "remainders": [_rem()]},
+                                    {"hosts": ["b.acme.com"], "remainders": [_rem()]},
+                                    {"remainders": [_rem()]}], campaign_id="c-fixed")
         ledger = campaign.Campaign(tmp_path, "c-fixed")
-        assert len(ledger.children) == 1 and ledger.stop is None, \
-            "a campaign with an unfinished child may not acquire an outcome"
+        assert (out.resumed, out.stop, out.abandoned) == (True, "fixed_point", int(make_run)), out
+        assert ledger.interrupted == [] and ledger.stop["cause"] == "fixed_point"
 
 
 class TestTheFlagsThatDriveIt:
@@ -378,8 +380,15 @@ class TestTheFlagsThatDriveIt:
     def test_a_plain_run_never_becomes_a_CAMPAIGN(self, monkeypatch):
         from quarry_recon import cli as cli_mod, settle as _settle
         called: list = []
+        # the stand-in returns what the real `_run_phases` returns — a finished run the exit contract reads
+        finished = type("R", (), {"run_id": "r1", "summary": lambda self: {"verdict": "complete"}})()
+
+        def _ran(*a, **kw):
+            called.append("run")
+            return finished
+
         monkeypatch.setattr(_settle, "settle", lambda **kw: called.append(kw))
-        monkeypatch.setattr(cli_mod, "_run_phases", lambda *a, **kw: called.append("run"))
+        monkeypatch.setattr(cli_mod, "_run_phases", _ran)
         res = self._invoke(["run", "-t", "acme"], monkeypatch)
         assert called == ["run"] and res.exit_code == 0
 
