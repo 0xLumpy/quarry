@@ -95,6 +95,20 @@ PERFORMANCE:
 | `WILDCARD_BUDGET_S` | vertical — wildcard differentiation |
 | `SHODAN_HOST_BUDGET_S` | probe — free per-IP Shodan record lane (costs no credit; only time bounds it) |
 
+## Acquisition byte ceilings
+
+Byte governors on native acquisitions. All three `*_MAX_BYTES` default to `0` (unbounded) — paid and hostile
+evidence is kept **whole**. The always-on host guard is the free-space reserve: an acquisition stops before
+the artifact filesystem falls below it, keeps the partial it has, and records a typed truncation (an
+`incomplete` acquisition), never a silent success.
+
+| Key | Default | Effect |
+|-----|---------|--------|
+| `ACQUIRE_RESPONSE_MAX_BYTES` | 0 | ceiling on a single response (0 = unbounded) |
+| `ACQUIRE_RUN_MAX_BYTES` | 0 | cumulative acquired bytes this run (0 = unbounded) |
+| `ACQUIRE_PROJECT_MAX_BYTES` | 0 | cumulative acquired bytes across the project (0 = unbounded) |
+| `ACQUIRE_FREE_RESERVE_BYTES` | 1 GiB | minimum free space kept on the artifact filesystem |
+
 ## Provider spending
 
 Paid lanes (Shodan, Whoxy). A **reserve** is credits the run will not touch. A malformed **reserve** or

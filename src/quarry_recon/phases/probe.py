@@ -24,8 +24,8 @@ from .. import (budget, contract, events, netguard, normalize, pace, secrets, se
                 shodan_sched, store)
 from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PACE_BUSY, PROVIDER_PARSE,
                         PROVIDER_RATE_LIMIT,
-                        IncompleteAcquisition, ProviderResult, ProviderSkip, ResponseTooLarge,
-                        capture_error_body,
+                        AcquisitionBudgetExhausted, IncompleteAcquisition, ProviderResult, ProviderSkip,
+                        ResponseTooLarge, capture_error_body, default_governor,
                         is_provider_limit, provider_error_class, read_bounded, run_contract,
                         run_provider, stream_to_file)
 from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir, have,
@@ -258,6 +258,23 @@ def _parse_owned_page(path):
 _ERROR_CLASSIFY_BYTES = 64 * 1024
 
 
+def _partial_size_and_digest(path, *, fallback: int):
+    """(size, sha256) of a retained partial so a paid partial exports its real digest; falls back to the
+    reported byte count with no digest when the file cannot be read."""
+    if path is None:
+        return fallback, None
+    h = hashlib.sha256()
+    n = 0
+    try:
+        with open(path, "rb") as fh:
+            for block in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(block)
+                n += len(block)
+        return n, h.hexdigest()
+    except OSError:
+        return fallback, None
+
+
 def _shodan_page(key, facet, v, page, *, sink):
     """ONE page of a Shodan search, as the coordinator's `(matches, total, error)` triple. NEVER raises.
 
@@ -271,12 +288,19 @@ def _shodan_page(key, facet, v, page, *, sink):
     url = (f"https://api.shodan.io/shodan/host/search?key={key}"
            f"&query={urllib.parse.quote(f'{facet}:{v}')}&page={page}")
     sink = Path(sink)
+    # admit against the disk governor before the paid open: an exhausted/tripped budget must not spend a
+    # credit for bytes we cannot keep, and leaves nothing owned (raises, so no request is issued)
+    gov = default_governor()
+    sink.parent.mkdir(parents=True, exist_ok=True)
+    denied = gov.admit(sink.parent)
+    if denied is not None:
+        raise AcquisitionBudgetExhausted(denied)
     size = 0
     digest = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
         with urllib.request.urlopen(req, timeout=20) as r:
-            size, digest = stream_to_file(r, sink)
+            size, digest = stream_to_file(r, sink, governor=gov)
         if size > SHODAN_PARSE_LIMIT:
             raise ShodanPageTooLargeToParse(
                 f"shodan: page is {size} bytes, beyond SHODAN_PARSE_LIMIT ({SHODAN_PARSE_LIMIT}) — the "
@@ -287,16 +311,21 @@ def _shodan_page(key, facet, v, page, *, sink):
         # the ownership scan reads it as an unowned paid response)
         err_sink = None
         response = e                      # the ORIGINAL response, whatever `e` becomes below
-        if size == 0 and hasattr(e, "read"):
+        if isinstance(e, IncompleteAcquisition):
+            # the paid 200 body was cut by our disk policy (truncated) or a transport break: the `.part`
+            # bytes are ours and owned, so report their real count and digest, never zero/None
+            err_sink = e.partial
+            size, digest = _partial_size_and_digest(e.partial, fallback=e.bytes_written)
+        elif size == 0 and hasattr(e, "read"):
             err_sink = sink.with_name(sink.name + ".error")
             try:
-                size, digest = stream_to_file(e, err_sink)
+                size, digest = stream_to_file(e, err_sink, governor=gov)
             except IncompleteAcquisition as inc:
                 # the partial bytes are ours: the incomplete acquisition carries its own class and
-                # `.part` to the coordinator instead of the status code's
+                # `.part` to the coordinator, with the retained bytes' real digest
                 inc.__cause__ = e
-                e, size, digest = inc, inc.bytes_written, None
-                err_sink = inc.partial
+                e, err_sink = inc, inc.partial
+                size, digest = _partial_size_and_digest(inc.partial, fallback=inc.bytes_written)
             except Exception:
                 size, digest, err_sink = 0, None, None
             if size and err_sink is not None:

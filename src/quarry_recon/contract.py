@@ -15,8 +15,12 @@ import hashlib as _hashlib
 import json as _json
 import os as _os
 import re as _re
+import shutil as _shutil
 import socket as _socket
+import sys as _sys
+import threading as _threading
 import urllib.error as _urlerr
+from dataclasses import dataclass as _dataclass
 from pathlib import Path as _Path
 
 from . import events, normalize, sources
@@ -152,10 +156,7 @@ def error_detail(exc) -> "str | None":
 
 
 class IncompleteAcquisition(RuntimeError):
-    """An acquired response that did not arrive whole.
-
-    The evidence is partial (and, for a paid lane, the credit is already spent), so nothing retries
-    automatically."""
+    """An acquired response that did not arrive whole; the partial is kept and nothing retries."""
 
     error_class = "incomplete"
 
@@ -165,39 +166,444 @@ class IncompleteAcquisition(RuntimeError):
         self.partial = partial
 
 
-def stream_to_file(r, dest, *, chunk: int = 1024 * 1024, deadline_s: float = 300.0) -> "tuple[int, str]":
-    """Stream a response to `dest` atomically -> (bytes, sha256). No byte ceiling.
+class AcquisitionTruncated(IncompleteAcquisition):
+    """A stream stopped at our disk/byte policy — an incomplete acquisition whose cause is ours."""
 
-    Memory and time are bounded instead; a byte cap would only convert an acquired response into
-    incomplete evidence (and, for a paid lane, spend money for nothing). A break mid-stream leaves the
-    bytes as `.part` and raises IncompleteAcquisition."""
+    error_class = "truncated"
+
+    def __init__(self, message: str, *, bytes_written: int = 0, partial=None, limit_kind: str = "",
+                 limit_bytes: int = 0):
+        super().__init__(message, bytes_written=bytes_written, partial=partial)
+        self.limit_kind = limit_kind
+        self.limit_bytes = limit_bytes
+
+
+class AcquisitionBudgetExhausted(RuntimeError):
+    """Our disk/byte governor refused to issue a request (decided before contact): nothing contacted,
+    spent, or owned. Distinct from a provider limit and from pacing."""
+
+    error_class = "disk_budget"
+
+    def __init__(self, layer: str):
+        super().__init__(f"acquisition budget exhausted at the {layer} policy")
+        self.layer = layer
+
+
+#: byte ceilings default off (0 = unbounded): a streamed body, paid or hostile, is kept whole and the
+#: always-on host guard is the free-space reserve, not an arbitrary size cap.
+_ACQUIRE_BYTES_MAX = 1 << 50                        # a sane parse ceiling for the knobs (1 PiB)
+_FREE_RESERVE_DEFAULT = 1024 * 1024 * 1024          # keep at least 1 GiB free on the artifact filesystem
+
+#: the layer that bound a truncation, so a raised bound is reproducible from the receipt
+LAYER_RESPONSE, LAYER_RUN, LAYER_PROJECT, LAYER_RESERVE = (
+    "response_bytes", "run_bytes", "project_bytes", "free_space_reserve")
+#: which governor field holds each layer's configured bound
+_LAYER_CAP_ATTR = {LAYER_RESPONSE: "response_max", LAYER_RUN: "run_max",
+                   LAYER_PROJECT: "project_max", LAYER_RESERVE: "reserve_bytes"}
+
+
+@_dataclass(frozen=True)
+class Truncation:
+    """A policy truncation as a typed remainder: which layer bound the stream and its bound in bytes."""
+
+    kind: str
+    limit: int
+
+    def __post_init__(self):
+        if self.kind not in _LAYER_CAP_ATTR:
+            raise ValueError(f"unknown truncation layer {self.kind!r}")
+        if isinstance(self.limit, bool) or not isinstance(self.limit, int) or self.limit < 0:
+            raise ValueError(f"truncation limit must be a non-negative int, got {self.limit!r}")
+
+    def as_receipt(self) -> dict:
+        return {"kind": self.kind, "limit": self.limit}
+
+    @classmethod
+    def from_receipt(cls, doc) -> "Truncation":
+        """Rebuild from a receipt's `truncation` field, rejecting any shape we did not write."""
+        if not isinstance(doc, dict):
+            raise ValueError(f"truncation must be an object, got {type(doc).__name__}")
+        extra = set(doc) - {"kind", "limit"}
+        if extra:
+            raise ValueError(f"truncation carries unexpected field(s) {sorted(extra)}")
+        return cls(doc.get("kind"), doc.get("limit"))
+
+
+class _UnreadableProjectState(Exception):
+    """The durable project counter is present but cannot be trusted; the caller must fail closed."""
+
+
+def _load_project_bytes(path) -> int:
+    """Best-effort durable total (missing/garbled → 0). Only for the in-memory mirror; the binding read
+    is `_load_project_bytes_strict`, taken under the file lock."""
+    try:
+        return _load_project_bytes_strict(path)
+    except _UnreadableProjectState:
+        return 0
+
+
+def _load_project_bytes_strict(path) -> int:
+    """The durable project total. A missing file is 0 (a fresh project); a present but unreadable/garbled
+    file raises so the caller refuses rather than resuming from a false zero."""
+    p = _Path(path)
+    try:
+        raw = p.read_text()
+    except FileNotFoundError:
+        return 0
+    except OSError as e:
+        raise _UnreadableProjectState(f"project counter {p} unreadable: {e}") from e
+    try:
+        n = _json.loads(raw).get("bytes")
+    except (ValueError, AttributeError) as e:
+        raise _UnreadableProjectState(f"project counter {p} is not valid JSON: {e}") from e
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise _UnreadableProjectState(f"project counter {p} has a bad value {n!r}")
+    return n
+
+
+def _write_all_fd(fd, data: bytes) -> None:
+    """Write every byte of `data` to `fd`; a partial `os.write` must not leave a truncated file."""
+    view = memoryview(data)
+    off = 0
+    while off < len(view):
+        n = _os.write(fd, view[off:])
+        if n <= 0:
+            raise OSError("short write left the counter file incomplete")
+        off += n
+
+
+def _store_project_bytes(path, total: int) -> None:
+    p = _Path(path)
+    tmp = p.with_name(p.name + ".tmp")
+    # fsync the temp file then the parent dir, so a committed reservation survives a crash rather than
+    # rolling back and reopening already-consumed capacity
+    fd = _os.open(tmp, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+    try:
+        _write_all_fd(fd, _json.dumps({"bytes": int(total)}).encode())
+        _os.fsync(fd)
+    finally:
+        _os.close(fd)
+    _os.replace(tmp, p)                             # atomic: a crash mid-write cannot tear the counter
+    dfd = _os.open(p.parent, _os.O_RDONLY)
+    try:
+        _os.fsync(dfd)                              # make the rename itself durable
+    finally:
+        _os.close(dfd)
+
+
+@_dataclass
+class DiskGovernor:
+    """Byte ceilings (response/run/project) + a free-space reserve (0 = layer off); persisted counters plus
+    an `_inflight` reservation. Protocol: take → commit(persisted) → settle; project bytes lock a file."""
+
+    response_max: int = 0
+    run_max: int = 0
+    project_max: int = 0
+    reserve_bytes: int = _FREE_RESERVE_DEFAULT
+    run_streamed: int = 0
+    project_streamed: int = 0
+    free_fn: object = None                          # injectable free-space probe; else shutil.disk_usage
+    project_state: object = None                    # durable project-counter file (locked); None = in-memory only
+    run_key: str = ""                               # identity of the run this governor scopes; a change rebuilds it
+
+    def __post_init__(self):
+        self._lock = _threading.RLock()             # serializes admit/take/commit/settle across threads
+        self._inflight = 0                          # bytes granted this instant but not yet on disk
+        if self.project_state is not None:
+            self.project_streamed = _load_project_bytes(self.project_state)
+
+    def _free(self, path):
+        # a failed probe is unknown free space, treated as tripped by the caller (fail closed)
+        if self.free_fn is not None:
+            return self.free_fn(path)
+        try:
+            return _shutil.disk_usage(path).free
+        except OSError:
+            return None
+
+    def _lockpath(self):
+        s = _Path(self.project_state)
+        return s.with_name(s.name + ".lock")
+
+    def _inmem_room(self, path, written: int) -> "tuple[int | None, str | None]":
+        """(room, binding layer) from the in-memory layers (response/run/reserve, and project when it has
+        no durable file), charging persisted + in-flight. Caller holds `_lock`."""
+        caps = []
+        if self.response_max:
+            caps.append((self.response_max - written, LAYER_RESPONSE))
+        if self.run_max:
+            caps.append((self.run_max - self.run_streamed - self._inflight, LAYER_RUN))
+        if self.project_max and self.project_state is None:
+            caps.append((self.project_max - self.project_streamed - self._inflight, LAYER_PROJECT))
+        if self.reserve_bytes:
+            free = self._free(path)
+            # fail closed: uninspectable free space trips the reserve; in-flight grants are subtracted so
+            # two concurrent streams cannot both spend the same free space
+            caps.append((0 if free is None else free - self.reserve_bytes - self._inflight, LAYER_RESERVE))
+        if not caps:
+            return None, None
+        room, layer = min(caps, key=lambda c: c[0])
+        return max(0, room), layer
+
+    def _reserve_project(self, want: int) -> "int | None":
+        """Reserve up to `want` durable project bytes under the file lock (read-modify-write). Granted
+        bytes, or None to fail closed when the counter is unreadable, the lock is held, or the write fails."""
+        from . import budget
+        try:
+            with budget.state_lock(self._lockpath()):
+                current = _load_project_bytes_strict(self.project_state)
+                take = max(0, min(want, self.project_max - current))
+                _store_project_bytes(self.project_state, current + take)
+                self.project_streamed = current + take
+                return take
+        except (budget.StateBusy, _UnreadableProjectState, OSError):
+            return None
+
+    def _refund_project(self, amount: int) -> None:
+        """Return `amount` over-reserved durable project bytes (a short/failed write). A refund we cannot
+        persist over-counts usage — the fail-closed direction — so it is not surfaced as an error."""
+        from . import budget
+        try:
+            with budget.state_lock(self._lockpath()):
+                current = _load_project_bytes_strict(self.project_state)
+                total = max(0, current - amount)
+                _store_project_bytes(self.project_state, total)
+                self.project_streamed = total
+        except (budget.StateBusy, _UnreadableProjectState, OSError):
+            pass
+
+    def admit(self, path) -> "str | None":
+        """Pre-contact gate: the binding layer name when there is NO budget to begin, else None. An
+        unreadable/held durable project counter fails closed (refuses)."""
+        with self._lock:
+            room, layer = self._inmem_room(path, 0)
+            if room is not None and room <= 0:
+                return layer
+            if self.project_max and self.project_state is not None:
+                from . import budget
+                try:
+                    with budget.state_lock(self._lockpath()):
+                        current = _load_project_bytes_strict(self.project_state)
+                except (budget.StateBusy, _UnreadableProjectState, OSError):
+                    return LAYER_PROJECT
+                if self.project_max - current <= 0:
+                    return LAYER_PROJECT
+        return None
+
+    def take(self, path, written: int, want: int) -> "tuple[int, str | None]":
+        """Grant up to `want` bytes for a response `written` bytes in, reserving them so a concurrent
+        stream sees the reservation. `commit` later charges what actually reaches disk."""
+        with self._lock:
+            room, layer = self._inmem_room(path, written)
+            granted = want if room is None else max(0, min(want, room))
+            binding = layer if (room is not None and granted < want) else None
+            if self.project_max and self.project_state is not None:
+                pg = self._reserve_project(granted)
+                if pg is None:
+                    return 0, LAYER_PROJECT          # durable project state unreadable/held: refuse
+                if pg < granted:
+                    granted, binding = pg, LAYER_PROJECT
+            self._inflight += granted
+            return granted, binding
+
+    def commit(self, n: int) -> None:
+        """`n` reserved bytes reached disk: move them from in-flight to the persisted run/project totals."""
+        with self._lock:
+            self._inflight -= n
+            self.run_streamed += n
+            if self.project_max and self.project_state is None:
+                self.project_streamed += n
+
+    def settle(self, granted_total: int, written: int) -> None:
+        """Close a response: release the reserved bytes that never reached disk (a truncation stop or a
+        failed write), so counters charge persisted bytes, not granted ones."""
+        leftover = granted_total - written
+        if leftover <= 0:
+            return
+        with self._lock:
+            self._inflight -= leftover
+        if self.project_max and self.project_state is not None:
+            self._refund_project(leftover)
+
+
+def _governor_ceiling(key: str, value: int, source, rejected, rejected_source) -> int:
+    """Fail-closed: a value the operator set but the parser refused is rejected, never silently replaced
+    by the unbounded default."""
+    if rejected is not None:
+        raise ValueError(f"{key}={rejected} is not a usable byte ceiling (from {rejected_source}); "
+                         f"refusing to run with an unbounded default in its place")
+    return value
+
+
+def _current_scope() -> "tuple[str, object]":
+    """(run_key, project_state_path) from the configured event sink: `<project>/recon/<run>/events.jsonl`
+    → run identity is the run dir, the project counter lives at `<project>/recon/state/`. Unconfigured
+    (tests, no run) yields no scope, so the governor is in-memory only."""
+    from . import events
+    sink = getattr(events, "_sink", None)
+    if sink is None:
+        return "", None
+    run_dir = _Path(sink).parent
+    return str(run_dir), run_dir.parent / "state" / "acquire-project-bytes.json"
+
+
+def _build_governor(*, run_key: str = "", project_state=None) -> DiskGovernor:
+    from . import settings
+    m = _ACQUIRE_BYTES_MAX
+    return DiskGovernor(
+        response_max=_governor_ceiling("ACQUIRE_RESPONSE_MAX_BYTES",
+            *settings.strict_int_with_source("ACQUIRE_RESPONSE_MAX_BYTES", default=0, maximum=m)),
+        run_max=_governor_ceiling("ACQUIRE_RUN_MAX_BYTES",
+            *settings.strict_int_with_source("ACQUIRE_RUN_MAX_BYTES", default=0, maximum=m)),
+        project_max=_governor_ceiling("ACQUIRE_PROJECT_MAX_BYTES",
+            *settings.strict_int_with_source("ACQUIRE_PROJECT_MAX_BYTES", default=0, maximum=m)),
+        reserve_bytes=_governor_ceiling("ACQUIRE_FREE_RESERVE_BYTES",
+            *settings.strict_int_with_source("ACQUIRE_FREE_RESERVE_BYTES",
+                                             default=_FREE_RESERVE_DEFAULT, maximum=m)),
+        run_key=run_key, project_state=project_state)
+
+
+_shared_governor: "DiskGovernor | None" = None
+_shared_governor_lock = _threading.Lock()           # so concurrent first callers share ONE governor
+
+
+def default_governor() -> DiskGovernor:
+    """The process-shared governor: run bytes reset per run (rebuilt on run change), project bytes durable
+    across runs; ceilings off unless configured, reserve always on. Raises on a malformed ceiling."""
+    global _shared_governor
+    run_key, project_state = _current_scope()
+    with _shared_governor_lock:
+        if _shared_governor is None or _shared_governor.run_key != run_key:
+            _shared_governor = _build_governor(run_key=run_key, project_state=project_state)
+        return _shared_governor
+
+
+def reset_shared_governor() -> None:
+    """Drop the process-shared governor so the next acquisition rebuilds it from current settings/scope."""
+    global _shared_governor
+    with _shared_governor_lock:
+        _shared_governor = None
+
+
+def _ondisk_size(fh) -> "int | None":
+    """The file's real on-disk size, or None if it cannot be stat'd."""
+    try:
+        return _os.fstat(fh.fileno()).st_size
+    except OSError:
+        return None
+
+
+def _path_size(path) -> int:
+    """The file's size on disk, or 0 when it is absent/unstattable."""
+    try:
+        return _os.stat(path).st_size
+    except OSError:
+        return 0
+
+
+def _open_part_wb(part):
+    """Open the staging `.part` write-only, no-follow so a planted `<dest>.part` symlink cannot truncate or
+    publish an external target; a leftover regular file is truncated and reused."""
+    fd = _os.open(part, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC | _os.O_NOFOLLOW, 0o600)
+    return _os.fdopen(fd, "wb")
+
+
+def _fsync_quiet(fh) -> None:
+    # a sync failure must not mask the cause we are already raising
+    try:
+        _os.fsync(fh.fileno())
+    except OSError:
+        pass
+
+
+def stream_to_file(r, dest, *, chunk: int = 1024 * 1024, deadline_s: float = 300.0,
+                   governor: "DiskGovernor | None" = None) -> "tuple[int, str]":
+    """Stream a response to `dest` atomically -> (bytes, sha256), bounded by `governor` (bytes/free-space/
+    time); a policy stop raises AcquisitionTruncated, a broken transport raises IncompleteAcquisition."""
     import time as _time
+    gov = governor if governor is not None else default_governor()
     dest = _Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     digest = _hashlib.sha256()
     written = 0
+    granted_total = 0
+    opened = False                                      # only a `.part` this call opened may be measured/charged
     end = _time.monotonic() + deadline_s if deadline_s and deadline_s > 0 else None
     try:
-        with open(part, "wb") as fh:
+        with _open_part_wb(part) as fh:                 # O_NOFOLLOW: a symlinked/failed open never gets here
+            opened = True
             while True:
                 if end is not None and _time.monotonic() > end:
                     raise TimeoutError(f"still receiving after {deadline_s:g}s")
                 buf = r.read(chunk)
                 if not buf:
                     break
-                fh.write(buf)
-                digest.update(buf)
-                written += len(buf)
+                # take reserves; commit charges only the bytes measured on disk. A short landing or a short
+                # grant is the policy boundary
+                granted, layer = gov.take(dest.parent, written, len(buf))
+                granted_total += granted
+                write_error = None
+                if granted:
+                    try:
+                        fh.write(buf[:granted]); fh.flush()
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as we:
+                        write_error = we             # bytes may have partly landed: charge them below, then raise
+                    # charge exactly what reached disk (measured), whether the write/flush succeeded or failed,
+                    # so a flush failure never refunds bytes retained on disk
+                    size = _ondisk_size(fh)
+                    landed = min(max(0, size - written), granted) if size is not None else 0
+                    if landed:
+                        digest.update(buf[:landed]); written += landed; gov.commit(landed)
+                else:
+                    landed = 0
+                if write_error is not None:
+                    _fsync_quiet(fh)
+                    raise IncompleteAcquisition(
+                        f"write failed after {written} byte(s) reached disk: {write_error}",
+                        bytes_written=written, partial=part) from write_error
+                if landed < granted:
+                    # fewer bytes reached disk than we handed the sink: what is on disk is all there is
+                    _fsync_quiet(fh)
+                    raise IncompleteAcquisition(
+                        f"short write: {landed} of {granted} granted byte(s) reached disk after {written} total",
+                        bytes_written=written, partial=part)
+                if granted < len(buf):
+                    _fsync_quiet(fh)
+                    raise AcquisitionTruncated(
+                        f"acquisition stopped at the {layer} policy after {written} byte(s)",
+                        bytes_written=written, partial=part, limit_kind=layer,
+                        limit_bytes=getattr(gov, _LAYER_CAP_ATTR[layer], 0))
             fh.flush()
             _os.fsync(fh.fileno())
     except (KeyboardInterrupt, SystemExit):
         raise
+    except IncompleteAcquisition:
+        raise                                           # our own truncation/short-write already carries partial+cause
     except Exception as e:
         # the partial file stays: a request that half-arrived is evidence of what we got
         raise IncompleteAcquisition(f"response incomplete after {written} byte(s): {e}",
                                     bytes_written=written, partial=part) from e
-    _os.replace(part, dest)
+    finally:
+        # only a `.part` this call opened; post-close: charge the close-flush delta, release the rest, and
+        # sync the in-flight exception's count to what was charged
+        if opened:
+            extra = _path_size(part) - written
+            if extra > 0:
+                gov.commit(extra); written += extra
+            gov.settle(granted_total, written)
+            exc = _sys.exc_info()[1]
+            if isinstance(exc, IncompleteAcquisition):
+                exc.bytes_written = written
+    # publish is part of the acquisition: a failed replace leaves the body in `.part`, so raise a typed
+    # incomplete carrying its path + count (probe/fetch recompute the digest) rather than a bare OSError
+    try:
+        _os.replace(part, dest)
+    except OSError as e:
+        raise IncompleteAcquisition(f"acquired {written} byte(s) but publication failed: {e}",
+                                    bytes_written=written, partial=part) from e
     return written, digest.hexdigest()
 
 
@@ -444,8 +850,8 @@ def whoxy_reverse_page(doc, *, param: str, value: str, provider: str = "whoxy",
                                         f"answer page {page!r}", provider)
             return [], 0, False
         if has_carrier and "current_page" in doc and "total_pages" in doc:
-            # SHAPE B — a strict PAGED empty: an empty collection plus BOTH pagination fields, valid.
-            # the carrier must be a real (empty) LIST — a null one is malformed, not empty.
+            # shape B — a strict paged empty: an empty collection plus both pagination fields, valid.
+            # the carrier must be a real (empty) list — a null one is malformed, not empty.
             if not (isinstance(sr, list) or isinstance(dl, list)):
                 raise ProviderBodyError(PROVIDER_PARSE,
                                         f"zero-result carrier is not a list "

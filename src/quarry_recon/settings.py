@@ -203,6 +203,8 @@ def strict_int_with_source(key: str, *, default: int,
     if written == "default":
         return default, "default", None, None
     raw = _overrides[key] if key in _overrides else performance().get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default, "default", None, None         # a null/blank knob is unset, not a rejected value
     value = None
     if isinstance(raw, bool):
         value = None                                  # a bool is not an int here, ever

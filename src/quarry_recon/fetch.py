@@ -183,15 +183,16 @@ class Acquisition:
     zero — several lanes branch on status before completeness."""
 
     __slots__ = ("path", "bytes", "sha256", "complete", "partial", "error",
-                 "contacted", "disposition", "final", "status")
+                 "contacted", "disposition", "final", "status", "truncation")
 
     def __init__(self, path, size, sha256, complete, partial=None, error=None,
-                 contacted=True, disposition=None, final=None, status=None):
+                 contacted=True, disposition=None, final=None, status=None, truncation=None):
         self.path, self.bytes, self.sha256 = path, size, sha256
         self.complete, self.partial, self.error = complete, partial, error
         self.contacted = contacted
         self.disposition = disposition or ("complete" if complete else "incomplete")
         self.final, self.status = final, status
+        self.truncation = truncation      # a typed `contract.Truncation` distinguishes it from a generic incomplete
 
 
 #: the acquisition receipt sits beside the partial artifact and binds it to the request that produced
@@ -216,11 +217,12 @@ class AcquisitionRefused(Exception):
     `Acquisition` rather than letting the caller's `except` count it as a network attempt."""
 
     def __init__(self, disposition, message, *, bytes_=0, partial=None, final=None, status=None,
-                 digest=""):
+                 digest="", truncation=None):
         super().__init__(message)
         self.disposition, self.bytes, self.partial = disposition, bytes_, partial
         self.final, self.status = final, status
         self.digest = digest             # a verified replay keeps the digest it checked
+        self.truncation = truncation     # a replayed truncation carries its typed remainder forward
 
 
 def _digest_file(path, chunk: int = 1024 * 1024) -> "tuple[int, str]":
@@ -329,6 +331,17 @@ def _read_receipt(path):
     st = doc.get("status")
     if st is not None and (isinstance(st, bool) or not isinstance(st, int) or not 0 <= st <= 599):
         bad.append("status (HTTP status int or absent)")
+    # an incomplete receipt may carry a typed policy truncation: validate its shape so a replay
+    # reconstructs it rather than reducing every incomplete to a generic one
+    trunc = doc.get("truncation")
+    if trunc is not None:
+        try:
+            contract.Truncation.from_receipt(trunc)
+        except ValueError:
+            bad.append("truncation ({kind: layer, limit: non-negative int})")
+        # a truncation is a policy stop: a whole body cannot also be a truncated one
+        if doc.get("complete") is True:
+            bad.append("truncation on a complete acquisition (contradictory)")
     if bad:
         raise AcquisitionRefused("receipt-damaged",
                                  f"acquisition receipt {path} is missing or malformed: "
@@ -428,10 +441,14 @@ def _reconcile(dest, part, rec_path, ident, url):
                                  f"partial evidence cannot be shown and is NOT re-fetched automatically",
                                  bytes_=recorded, final=final, status=status)
     size, sha = _verify_file(part, recorded, digest, what="partial evidence")
+    # `_read_receipt` already validated the shape; rebuild the typed remainder so a replay reports the
+    # truncation as one rather than a generic incomplete
+    trunc = contract.Truncation.from_receipt(rec["truncation"]) if rec.get("truncation") is not None else None
     raise AcquisitionRefused("replayed-incomplete",
                              f"a prior acquisition of this URL was incomplete ({rec.get('error')}); "
                              f"NOT re-requested — remove {rec_path.name} and {part.name} to try again",
-                             bytes_=size, digest=sha, partial=part, final=final, status=status)
+                             bytes_=size, digest=sha, partial=part, final=final, status=status,
+                             truncation=trunc)
 
 
 def _publish_receipt(rec_path, doc) -> str:
@@ -468,18 +485,20 @@ def _publish_receipt(rec_path, doc) -> str:
 
 def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None, method="GET",
                     headers=None, max_redirects=DEFAULT_MAX_REDIRECTS,
-                    chunk=1024 * 1024, deadline_s=300.0, policy=None):
-    """Same guards as `scoped_get`, but the body is streamed to `dest` with no byte ceiling.
+                    chunk=1024 * 1024, deadline_s=300.0, policy=None, governor=None):
+    """Same guards as `scoped_get`, but the body is streamed to `dest` under `governor`'s disk policy.
 
     Returns `(Acquisition|None, final_url, status)`; None means the hop was never contacted, as in
     `scoped_get`. An `Acquisition` with `contacted` False is a refusal decided from the state on disk —
     no request was made — and `disposition` says which one.
 
-    There is no byte cap because the request already happened and the bytes already crossed the wire; a
-    cap would only convert a fetched body into no evidence. Acquisition and interpretation are separate
-    questions and only the second has a legitimate memory bound. So: fixed-memory chunks (`chunk` is what
-    is held in RAM), hashed while streaming, published in one `os.replace`; a broken transport keeps the
-    partial bytes with `complete=False`. `deadline_s` bounds time, not size. Nothing retries."""
+    The body is not size-capped for its own sake — the request already happened and the bytes already
+    crossed the wire — but a `DiskGovernor` bounds free space (and any configured byte ceiling) so a
+    hostile infinite body cannot fill the host: at the boundary the partial is KEPT with `complete=False`
+    (it reconciles as an incomplete acquisition) and the receipt records the binding layer as the
+    durable, reproducible remainder.
+    Fixed-memory chunks (`chunk` is what is held in RAM), hashed while streaming, published in one
+    `os.replace`; a broken transport keeps the partial too. `deadline_s` bounds time. Nothing retries."""
     dest = Path(dest)
     part = dest.with_name(dest.name + ".part")
     rec_path = dest.with_name(dest.name + _RECEIPT_SUFFIX)
@@ -491,8 +510,23 @@ def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None, 
         return (Acquisition(dest if r.disposition == "replayed-complete" else None,
                             r.bytes, r.digest, r.disposition == "replayed-complete",
                             partial=r.partial, error=str(r), contacted=False,
-                            disposition=r.disposition, final=r.final, status=r.status),
+                            disposition=r.disposition, final=r.final, status=r.status,
+                            truncation=getattr(r, "truncation", None)),
                 r.final or url, r.status or 0)
+    # admit against the byte governor before contacting: an exhausted/tripped or misconfigured budget
+    # must not open the request (no spend) and must leave no receipt
+    try:
+        gov = governor if governor is not None else contract.default_governor()
+    except ValueError as e:
+        return (Acquisition(None, 0, "", False, contacted=False, disposition="budget-invalid",
+                            error=f"acquisition budget misconfigured; NOT contacted: {e}",
+                            final=url, status=0), url, 0)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    denied = gov.admit(dest.parent)
+    if denied is not None:
+        return (Acquisition(None, 0, "", False, contacted=False, disposition="budget-exhausted",
+                            error=f"acquisition budget exhausted at the {denied} policy; NOT contacted",
+                            final=url, status=0), url, 0)
     with _walk(ctx, url, origin_host, timeout=timeout, data=data, method=method, headers=headers,
                max_redirects=max_redirects) as (resp, final, status, contacted):
         if not contacted:
@@ -508,7 +542,8 @@ def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None, 
                                 disposition="complete-unowned" if note else "complete"),
                     final, status)
         try:
-            n, sha = contract.stream_to_file(resp, dest, chunk=chunk, deadline_s=deadline_s)
+            n, sha = contract.stream_to_file(resp, dest, chunk=chunk, deadline_s=deadline_s,
+                                             governor=gov)
         except contract.IncompleteAcquisition as e:
             # the arrived bytes stay on disk with a receipt binding them to the request: an acquisition
             # gap, reported as one — never a silent empty result and never an automatic retry.
@@ -516,14 +551,20 @@ def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None, 
             psha = ""
             if partial is not None and Path(partial).exists():
                 written, psha = _digest_file(partial)     # what is on disk, not what we think we wrote
-            note = _publish_receipt(rec_path, {"ident": ident, "url": url, "method": method,
-                                               "final": final, "status": status, "bytes": written,
-                                               "digest": psha, "complete": False, "error": str(e)})
+            rec = {"ident": ident, "url": url, "method": method, "final": final, "status": status,
+                   "bytes": written, "digest": psha, "complete": False, "error": str(e)}
+            # a policy truncation is a typed remainder: the binding layer + bound ride the receipt so a
+            # raised bound is reproducible, distinct from a transport break with no configured cause.
+            trunc = None
+            if isinstance(e, contract.AcquisitionTruncated):
+                trunc = contract.Truncation(e.limit_kind, e.limit_bytes)
+                rec["truncation"] = trunc.as_receipt()
+            note = _publish_receipt(rec_path, rec)
             # transport gap and ownership gap are separate facts: a failed receipt write makes the
             # disposition `-unowned` so the next lifecycle refuses the partial rather than trusting it.
-            return (Acquisition(None, written, "", False, partial=partial, error=str(e) + note,
+            return (Acquisition(None, written, psha, False, partial=partial, error=str(e) + note,
                                 disposition="incomplete-unowned" if note else "incomplete",
-                                final=final, status=status), final, status)
+                                final=final, status=status, truncation=trunc), final, status)
         # bind the complete acquisition too, or another method/body/policy for the same URL overwrites
         # it. Written after the artifact; a failed write leaves it complete-but-unowned (orphan-complete).
         note = _publish_receipt(rec_path, {"ident": ident, "url": url, "method": method,

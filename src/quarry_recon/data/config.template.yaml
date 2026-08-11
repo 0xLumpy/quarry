@@ -44,6 +44,14 @@ PERFORMANCE:
   WILDCARD_BUDGET_S:
   SHODAN_HOST_BUDGET_S:      # the free per-IP lane; costs no credit, so only time bounds it
 
+  # Acquisition byte ceilings. 0 = unbounded, the default: paid/hostile evidence is kept WHOLE. The
+  # always-on host guard is the free-space reserve — an acquisition stops before the artifact
+  # filesystem falls below it, keeps the partial, and records a typed truncation.
+  ACQUIRE_RESPONSE_MAX_BYTES:  # per single response (default 0 = unbounded)
+  ACQUIRE_RUN_MAX_BYTES:       # cumulative acquired bytes this run (default 0 = unbounded)
+  ACQUIRE_PROJECT_MAX_BYTES:   # cumulative across the project (default 0 = unbounded)
+  ACQUIRE_FREE_RESERVE_BYTES:  # keep at least this free on the artifact fs (default 1 GiB)
+
   # Provider spending. Reserves are credits a run will NOT touch. An unparseable value here issues
   # no paid request at all, rather than spending.
   SHODAN_CREDIT_RESERVE:     # query credits held back (default 0 = spend what is available)

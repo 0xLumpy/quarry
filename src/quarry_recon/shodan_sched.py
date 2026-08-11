@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import budget, events, pace
+from . import budget, contract, events, pace
 
 #: v2: pages carry `bought_at` and live in a project-scoped store. A schema bump isolates the previous
 #: generation rather than deleting it — paid evidence is never pruned automatically.
@@ -246,6 +246,8 @@ class LaneOutcome:
     acquisition_invalid: int = 0
     #: requests our rate boundary declined to issue. No socket opened and no credit moved.
     pace_refused: int = 0
+    #: requests our disk/byte governor declined to issue. No socket opened and no credit moved.
+    budget_refused: int = 0
     #: pages recovered by parsing bytes we already owned — no provider contact, no credit
     pages_parsed_late: int = 0
     #: paid responses we refused to treat as pages: the bytes are kept and the objection is named, or
@@ -1076,6 +1078,14 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
                 res.stop_cause = res.stop_cause or f"{PACE_BUSY}:{e}"
                 tried.discard(attempt)
                 break
+            except contract.AcquisitionBudgetExhausted as e:
+                # our disk governor issued NO request: no credit moved and nothing to own, kept distinct
+                # from pacing and from a provider limit
+                o.budget_refused += 1
+                st.stopped = "disk_budget"
+                res.stop_cause = res.stop_cause or f"disk_budget:{e.layer}"
+                tried.discard(attempt)
+                break
             spent += 1                                    # a request was issued — that is the credit
             st.attempted = True
             progressed = True
@@ -1086,11 +1096,12 @@ def _work(states, res, *, balance, search, ingest, ledger, attempt_dir, max_page
                 err_raw = getattr(err, "raw_path", None)
                 note_rejected(o, st.pivot, page, reason=f"{cls}: {err}", attempt_dir=attempt_dir,
                               body=getattr(err, "body_bytes", None), raw_path=err_raw,
-                              count=(cls in ("parse", "oversize", "incomplete")))
+                              count=(cls in ("parse", "oversize", "incomplete", "truncated")))
                 # the receipt is committed here, before any judgement about readability: bytes on disk is not
                 # ownership, and a response published only as a rejection is bought again by the next run
                 if err_raw is not None and Path(err_raw).is_file():
-                    state = ACQ_INCOMPLETE if cls == "incomplete" else (
+                    # a policy `truncated` partial is owned exactly like a transport `incomplete` one
+                    state = ACQ_INCOMPLETE if cls in ("incomplete", "truncated") else (
                         ACQ_UNPARSED if cls == "oversize" else None)
                     if state is not None:
                         if state == ACQ_INCOMPLETE:
