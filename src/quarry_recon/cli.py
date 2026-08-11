@@ -31,13 +31,16 @@ def _existing_run(project, target, run_id):
     """Resolve a run for read/import commands. An explicit --run must already exist (never fabricate a ghost
     dir); no run_id gives the latest, or None.
     """
+    from .repository_identity import InvalidRunId
     from .store import Run
-    if run_id:
+    if run_id is not None:
         try:
             return Run.open(project, target, run_id)    # open, never fabricate a ghost dir
+        except InvalidRunId as e:
+            raise click.UsageError(str(e))              # operator selector: invalid before any run is opened
         except FileNotFoundError:
             raise click.ClickException(f"run {run_id!r} not found under {Path(project) / 'recon'}")
-    return Run.latest(project)
+    return Run.latest(project, target)
 
 
 def _resolve_profile(value: str) -> str:
@@ -1546,7 +1549,7 @@ def status(profile_path, run_id, campaign_id, as_json):
             raise click.ClickException(str(e))
         project = _project_dir(profile)
         if campaign_id is not None:
-            if run_id:
+            if run_id is not None:
                 raise click.UsageError("--run names a run and --campaign a campaign; ask for one of them")
             from . import campaign as _campaign
             try:

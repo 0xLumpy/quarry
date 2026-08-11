@@ -13,15 +13,21 @@ Every normalized entity keeps provenance back to the raw evidence that produced 
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import stat
 import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
 from pathlib import Path
+
+from .repository_identity import (RUN_RESERVED_IDS, valid_run_id, validate_artifact_component,
+                                  validate_run_id)
+from .state import ContractError
 
 
 def _record_bytes(rec) -> int:
@@ -153,6 +159,14 @@ ENTITY_KEYS = {
     "oob_interaction": "id",    # imported out-of-band callbacks (interactsh), raw in raw/oob/ and
                                 # uncorrelated by default until Quarry owns the token namespace
 }
+
+
+def validate_entity(entity: str) -> str:
+    """Return a registered entity kind, or refuse before cache lookup or path construction."""
+    if type(entity) is not str or entity not in ENTITY_KEYS:
+        shown = repr(entity[:96]) if type(entity) is str else f"<{type(entity).__name__}>"
+        raise ContractError(f"unknown entity kind {shown}")
+    return entity
 
 # ── identity contract — canonical dedup key per entity type ───────────────────────────────────────────
 # only case-insensitive components are lowered (DNS names, URL scheme+host); dedup stays stable
@@ -293,9 +307,10 @@ def canonical_key(entity: str, record: dict) -> str:
     """The dedup identity for a normalized entity, case-correct per the contract above. Empty when the
     record is not an object or the key field is absent/blank (the record is then not addable).
     """
+    entity = validate_entity(entity)
     if not isinstance(record, dict):
         return ""                                           # a non-object JSONL row is not an entity
-    raw = str(record.get(ENTITY_KEYS.get(entity, "value"), "")).strip()
+    raw = str(record.get(ENTITY_KEYS[entity], "")).strip()
     if not raw:
         return ""
     if entity in _HOST_KEYED:
@@ -317,6 +332,7 @@ def material(entity: str, record: dict) -> dict:
     list in a stable order, so two records are comparable across runs. `sources` and `_alt` stay: a second
     independent source, and a conflicting observation, are both facts the union does not otherwise hold.
     """
+    validate_entity(entity)
     if not isinstance(record, dict):
         return {}
     return {k: _canon_value(v) for k, v in record.items() if k not in RUN_SCOPED_FIELDS}
@@ -337,6 +353,7 @@ def _canon_value(value):
 
 def fingerprint(entity: str, record: dict) -> str:
     """A stable digest of `material()` — equal iff two records assert the same thing."""
+    validate_entity(entity)
     return hashlib.sha256(json.dumps(material(entity, record), sort_keys=True,
                                      ensure_ascii=False).encode("utf-8")).hexdigest()[:32]
 
@@ -345,6 +362,7 @@ def merge(entity: str, base: dict, incoming: dict) -> dict:
     """The store's own monotonic merge, exposed for cross-run use: lists union, empty fields fill, a
     conflicting scalar keeps the first value and remembers the alternate. Nothing is ever removed.
     """
+    validate_entity(entity)
     return _merge_record(base, incoming)
 
 
@@ -383,6 +401,7 @@ class FoldedLog:
 
 def fold_run_entity(run_dir, entity: str) -> FoldedLog:
     """One entity of a finished run vs its manifest: count mismatch / envelope refusal / durability gap -> degraded, unreadable manifest -> unknown; the envelope is enforced on the fold."""
+    entity = validate_entity(entity)
     run_dir = Path(run_dir)
     try:
         manifest = json.loads((run_dir / "manifest.json").read_text())
@@ -557,16 +576,27 @@ def _utc() -> str:
 
 
 #: directories under recon/ that are not runs (one authority, so no enumerator re-lists them as runs).
-RESERVED_RECON_DIRS = frozenset({"state", "campaigns"})
+RESERVED_RECON_DIRS = RUN_RESERVED_IDS
+
+# Identity documents are tiny today.  Bound an untrusted repository read so a planted file cannot make
+# `status`/`latest` allocate without limit before it has even established which run it is reading.
+_MAX_IDENTITY_BYTES = 4 * 1024 * 1024
+_DIR_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) \
+                  | getattr(os, "O_CLOEXEC", 0)
+_FILE_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NONBLOCK", 0))
+_MALFORMED_IDENTITY = object()
 
 
-def _read_started(path: Path):
-    """The recorded `started` timestamp from a run.json / manifest.json, or None if absent or unreadable."""
-    try:
-        v = json.loads(path.read_text())
-        return v.get("started") if isinstance(v, dict) else None
-    except (OSError, json.JSONDecodeError, ValueError):
-        return None
+class _InvalidRunIdentity(ContractError):
+    """One run's identity is structurally unsafe, malformed, or contradictory."""
+
+
+def _identity_stat(fd: int) -> tuple[int, int, int, int, int, int, int]:
+    """The fields that must remain stable while one identity document is read."""
+    info = os.fstat(fd)
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
 
 
 def _read_json(path: Path):
@@ -587,19 +617,195 @@ def _parse_started(s) -> "datetime | None":
     return dt if dt.tzinfo is not None else None
 
 
-def _run_identity(d: Path) -> "tuple[dict, datetime] | None":
-    """`(metadata, started)` for a real run directory, or None. Requires `run_id == dir name`, a non-empty
-    string `target`, and a parseable timezone-aware `started`."""
+def _read_identity_file(run_fd: int, name: str):
+    """Read one identity document relative to an already-open run directory.
+
+    Missing and malformed regular contents are recoverable compatibility states when the other identity
+    is valid.  Anything present must still be a stable regular file opened no-follow: an unsafe object is
+    repository damage, not a malformed document that another file may mask.
+    """
+    try:
+        fd = os.open(name, _FILE_OPEN_FLAGS, dir_fd=run_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        error = _InvalidRunIdentity if e.errno in (errno.ELOOP, errno.ENOTDIR) else ContractError
+        raise error(f"run identity {name} cannot be opened safely: {type(e).__name__}: {e}") from e
+    try:
+        before = _identity_stat(fd)
+        if not stat.S_ISREG(before[2]):
+            raise _InvalidRunIdentity(f"run identity {name} is not a regular file")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(fd, min(65536, _MAX_IDENTITY_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > _MAX_IDENTITY_BYTES:
+                if _identity_stat(fd) != before:
+                    raise _InvalidRunIdentity(f"run identity {name} changed while it was being read")
+                return _MALFORMED_IDENTITY
+        if _identity_stat(fd) != before:
+            raise _InvalidRunIdentity(f"run identity {name} changed while it was being read")
+        try:
+            value = json.loads(b"".join(chunks).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+            return _MALFORMED_IDENTITY
+        if not isinstance(value, dict):
+            return _MALFORMED_IDENTITY
+        return value
+    finally:
+        os.close(fd)
+
+
+def _validated_identity_record(record: dict, name: str, run_id: str) -> "tuple[dict, datetime] | None":
+    recorded_id = record.get("run_id")
+    target = record.get("target")
+    started = _parse_started(record.get("started"))
+    if not valid_run_id(recorded_id) or not isinstance(target, str) or not target.strip() or started is None:
+        return None
+    if recorded_id != run_id:
+        raise _InvalidRunIdentity(f"run identity {name} names {recorded_id!r}, not directory {run_id!r}")
+    return record, started
+
+
+def _run_identity_from_fd(run_fd: int, run_id: str) -> "tuple[dict, datetime]":
+    """Reconcile every present identity authority below one no-follow-opened run directory."""
+    records = []
     for name in ("run.json", "manifest.json"):
-        v = _read_json(d / name)
-        if not isinstance(v, dict) or v.get("run_id") != d.name:
+        record = _read_identity_file(run_fd, name)
+        if record is None or record is _MALFORMED_IDENTITY:
             continue
-        if not (isinstance(v.get("target"), str) and v["target"].strip()):
-            continue
-        dt = _parse_started(v.get("started"))
-        if dt is not None:
-            return v, dt
-    return None
+        validated = _validated_identity_record(record, name, run_id)
+        if validated is not None:
+            records.append((name, *validated))
+    if not records:
+        raise _InvalidRunIdentity(f"run {run_id!r} has no well-formed run.json or manifest.json identity")
+    authority_name, authority, started = records[0]
+    expected = (authority["run_id"], authority["target"], authority["started"])
+    for name, record, _parsed in records[1:]:
+        observed = (record["run_id"], record["target"], record["started"])
+        if observed != expected:
+            raise _InvalidRunIdentity(f"run identities {authority_name} and {name} disagree on "
+                                      "run_id, target or started")
+    return authority, started
+
+
+def _open_run_fd(project_dir: Path, run_id: str) -> int:
+    """Open an existing real run directory relative to a no-follow repository root."""
+    run_id = validate_run_id(run_id)                 # before the id participates in any path/open operation
+    root = Path(project_dir) / "recon"
+    try:
+        root_fd = os.open(root, _DIR_OPEN_FLAGS)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"run {run_id!r} not found under {root}") from e
+    except OSError as e:
+        raise ContractError(f"repository root {root} cannot be opened safely: {type(e).__name__}: {e}") from e
+    try:
+        try:
+            return os.open(run_id, _DIR_OPEN_FLAGS, dir_fd=root_fd)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"run {run_id!r} not found under {root}") from e
+        except OSError as e:
+            raise ContractError(f"run {run_id!r} is not a safe real directory: "
+                                f"{type(e).__name__}: {e}") from e
+    finally:
+        os.close(root_fd)
+
+
+def read_run_identity(project_dir: Path, run_id: str) -> dict:
+    """Read one reconciled run identity without creating or repairing repository state."""
+    run_id = validate_run_id(run_id)
+    run_fd = _open_run_fd(Path(project_dir), run_id)
+    try:
+        identity, _started = _run_identity_from_fd(run_fd, run_id)
+        return dict(identity)
+    finally:
+        os.close(run_fd)
+
+
+def read_run_creation_target(project_dir: Path, run_id: str) -> str:
+    """Read the target from a child's no-follow creation record.
+
+    Campaign recovery deliberately does not require an interpretable ``started`` timestamp here: budget
+    accounting owns that separate question and can fail closed only when a budget was requested.  The
+    directory/run ID and target still reconcile with any readable manifest identity.
+    """
+    run_id = validate_run_id(run_id)
+    run_fd = _open_run_fd(Path(project_dir), run_id)
+    try:
+        creation = _read_identity_file(run_fd, "run.json")
+        if creation is None or creation is _MALFORMED_IDENTITY or not isinstance(creation, dict):
+            raise _InvalidRunIdentity(f"run {run_id!r} has no readable run.json creation record")
+        if creation.get("run_id") != run_id:
+            raise _InvalidRunIdentity(f"run.json names {creation.get('run_id')!r}, not directory {run_id!r}")
+        target = creation.get("target")
+        if type(target) is not str or not target.strip():
+            raise _InvalidRunIdentity(f"run {run_id!r} creation record names no target")
+        manifest = _read_identity_file(run_fd, "manifest.json")
+        if isinstance(manifest, dict):
+            manifest_id, manifest_target = manifest.get("run_id"), manifest.get("target")
+            if type(manifest_id) is str and manifest_id != run_id:
+                raise _InvalidRunIdentity(f"manifest.json names {manifest_id!r}, not directory {run_id!r}")
+            if type(manifest_target) is str and manifest_target.strip() and manifest_target != target:
+                raise _InvalidRunIdentity("run.json and manifest.json disagree on target")
+        return target
+    finally:
+        os.close(run_fd)
+
+
+def _run_snapshots(project_dir: Path) -> "list[tuple[datetime, str, Path, dict]]":
+    """Validated identity snapshots for selectable runs, oldest first.
+
+    Each identity is read exactly once through a no-follow run descriptor.  Consumers carry this snapshot
+    forward rather than reopening path metadata; the later repository-authority slice will pin descriptor
+    lifetime across mutations as well.
+    """
+    root = Path(project_dir) / "recon"
+    try:
+        root_fd = os.open(root, _DIR_OPEN_FLAGS)
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        raise ContractError(f"repository root {root} cannot be listed safely: "
+                            f"{type(e).__name__}: {e}") from e
+    runs = []
+    try:
+        try:
+            names = os.listdir(root_fd)
+        except OSError as e:
+            raise ContractError(f"repository root {root} cannot be listed: {type(e).__name__}: {e}") from e
+        for name in names:
+            if not valid_run_id(name):
+                continue
+            try:
+                run_fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=root_fd)
+            except OSError as e:
+                if e.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                    continue                              # symlink, non-directory, or vanished entry
+                raise ContractError(f"run {name!r} cannot be opened while enumerating {root}: "
+                                    f"{type(e).__name__}: {e}") from e
+            try:
+                try:
+                    identity, started = _run_identity_from_fd(run_fd, name)
+                except _InvalidRunIdentity:
+                    continue                              # damaged identities are not selectable as a run
+            finally:
+                os.close(run_fd)
+            runs.append((started, name, root / name, identity))
+    finally:
+        os.close(root_fd)
+    runs.sort(key=lambda item: (item[0], item[1]))
+    return runs
+
+
+def validate_target(target: str) -> str:
+    """Return a non-empty exact target identity, or refuse before repository side effects."""
+    if type(target) is not str or not target.strip():
+        raise ContractError("a run target must be a non-empty string")
+    return target
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -669,6 +875,9 @@ class ToolRunRecord:
     depends_on: str = ""               # registry bin this source needs; the source→tool edge the verdict reads
 
 
+_RUN_CONSTRUCTION_AUTHORITY = object()
+
+
 class Run:
     """One reconnaissance run inside a project: owns its tree, manifest, and entity store.
 
@@ -676,18 +885,22 @@ class Run:
     the project dir was derived from.
     """
 
-    def __init__(self, project_dir: Path, target: str, run_id: str | None = None, *, load_started: bool = False):
+    def __init__(self, project_dir: Path, target: str, run_id: str | None = None, *, load_started: bool = False,
+                 _identity: dict | None = None, _authority=None):
+        if _authority is not _RUN_CONSTRUCTION_AUTHORITY:
+            raise ContractError("construct runs through Run.create(), Run.open() or Run.latest()")
         self.project_dir = Path(project_dir)
-        self.target = target
-        self.run_id = run_id or self._mint_run_id()
+        self.target = validate_target(target)
+        self.run_id = validate_run_id(run_id if run_id is not None else self._mint_run_id())
         self.dir = self.project_dir / "recon" / self.run_id
         self.raw = self.dir / "raw"
         self.normalized = self.dir / "normalized"
         self.exports = self.dir / "exports"
         self.reports = self.dir / "reports"
-        from . import privfs
-        for d in (self.raw, self.normalized, self.exports, self.reports):
-            privfs.private_dir(d)                            # recon/ and the run tree are 0700
+        if not load_started:
+            from . import privfs
+            for d in (self.raw, self.normalized, self.exports, self.reports):
+                privfs.private_dir(d)                        # recon/ and the run tree are 0700
         self.manifest_path = self.dir / "manifest.json"
         self.meta_path = self.dir / "run.json"            # immutable creation record (started/run_id/target)
         self.state_path = self.dir / "state.json"         # finalisation state machine + per-stage generations
@@ -715,7 +928,9 @@ class Run:
         # opening an existing run reads `started` from run.json (written at create, and surviving a crash
         # that left no manifest) rather than fabricating a fresh start time
         if load_started:
-            self.started = _read_started(self.meta_path) or _read_started(self.manifest_path) or _utc()
+            if _identity is None:
+                raise ContractError("an opened run requires a validated repository identity")
+            self.started = _identity["started"]
         else:
             self.started = _utc()
             if not self.meta_path.exists():
@@ -735,42 +950,55 @@ class Run:
         return time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(4).hex()
 
     @classmethod
-    def create(cls, project_dir, target) -> "Run":
-        """Start a NEW run — mint a unique id and claim its directory atomically (mkdir exist_ok=False),
-        retrying on a clash. `started` = now.
+    def create(cls, project_dir, target, *, run_id: str | None = None) -> "Run":
+        """Start a new run and claim its directory atomically.
+
+        Production callers omit ``run_id`` and retry collision-resistant minted IDs.  A validated explicit
+        ID is useful for imports and deterministic fixtures, but it is still a create operation: an existing
+        directory raises instead of becoming an unchecked attachment. ``started`` is now.
         """
         from . import privfs
+        target = validate_target(target)                        # before recon/ or a run claim can be created
+        if run_id is not None:
+            run_id = validate_run_id(run_id)                    # before recon/ can be created
         project_dir = Path(project_dir)
         privfs.private_dir(project_dir / "recon")            # 0700 recon root before the run dir is claimed
-        for _ in range(16):
-            rid = cls._mint_run_id()
+        attempts = 1 if run_id is not None else 16
+        for _ in range(attempts):
+            rid = run_id if run_id is not None else cls._mint_run_id()
             try:
                 os.mkdir(project_dir / "recon" / rid, privfs.DIR_MODE)   # claim atomically and 0700
             except FileExistsError:
+                if run_id is not None:
+                    raise
                 continue
-            run = cls(project_dir, target, run_id=rid)
+            run = cls(project_dir, target, run_id=rid, _authority=_RUN_CONSTRUCTION_AUTHORITY)
             run.write_state("created")
             return run
         raise RuntimeError("could not mint a unique run id after 16 attempts")
 
     @classmethod
     def open(cls, project_dir, target, run_id) -> "Run":
-        """Attach to an EXISTING run, reading the recorded `started` from run.json (manifest fallback).
+        """Attach to an existing reconciled run without modifying any repository object.
 
-        Raises when the directory is missing, and when neither run.json nor manifest.json is readable —
-        validated before the constructor materializes any subdirectory, so a corrupt run is never given a
-        fabricated start time.
+        A crashed run may have only ``run.json`` and a legacy run may have only ``manifest.json``.  A
+        malformed regular secondary document is ignored for recovery, but every well-formed identity must
+        agree with the directory and each other.  Symlinked/non-regular identity objects always fail closed.
         """
-        d = Path(project_dir) / "recon" / run_id
-        if not d.is_dir():
-            raise FileNotFoundError(f"run {run_id!r} not found under {d.parent}")
-        if _read_started(d / "run.json") is None and _read_started(d / "manifest.json") is None:
-            raise ValueError(f"run {run_id!r} has no readable run.json/manifest — refusing to fabricate a start")
-        return cls(project_dir, target, run_id=run_id, load_started=True)
+        target = validate_target(target)
+        run_id = validate_run_id(run_id)              # refuse before joining/opening caller-controlled input
+        identity = read_run_identity(Path(project_dir), run_id)
+        if target != identity["target"]:
+            raise ContractError(f"run {run_id!r} belongs to target {identity['target']!r}, not {target!r}")
+        return cls(project_dir, identity["target"], run_id=run_id, load_started=True, _identity=identity,
+                   _authority=_RUN_CONSTRUCTION_AUTHORITY)
 
     # ── raw evidence ──
     def raw_path(self, phase: str, tool: str, name: str) -> Path:
         from . import privfs
+        phase = validate_artifact_component(phase, "raw phase")
+        tool = validate_artifact_component(tool, "raw tool")
+        name = validate_artifact_component(name, "raw filename")
         p = self.raw / phase / tool
         privfs.private_dir(p)                                # raw evidence dirs are 0700
         return p / name
@@ -987,7 +1215,7 @@ class Run:
 
     # ── normalized entities (JSONL, append, dedup on natural key) ──
     def _entity_file(self, entity: str) -> Path:
-        return self.normalized / f"{entity}.jsonl"
+        return self.normalized / f"{validate_entity(entity)}.jsonl"
 
     def add(self, entity: str, record: dict) -> bool:
         """Record an observation of a normalized entity. Returns True iff its natural key is NEW, so the
@@ -1169,7 +1397,7 @@ class Run:
                               json.dumps({"entity": entity, "key": key, "kind": kind}, ensure_ascii=False) + "\n")
 
     def _fold_refused_path(self, entity: str):
-        return self._fold_refused_dir / f"{entity}.jsonl"
+        return self._fold_refused_dir / f"{validate_entity(entity)}.jsonl"
 
     def _refusal_sources(self) -> list:
         """Every durable refusal file: the live append ledger plus each rewritten per-entity fold file. An
@@ -1297,6 +1525,7 @@ class Run:
         """Lazily materialize {key: record} by folding the entity log under the full envelope. Reopen-fold
         refusals are REWRITTEN per entity (truncate-then-stream), so repeated reopens yield the same rows,
         never a growing pile, and the fold never holds the refused set resident."""
+        entity = validate_entity(entity)
         if entity not in self._records:
             from . import envelope, privfs
             # only a log that exists on disk can fold-refuse; a live-only run never touches the fold ledger
@@ -1346,7 +1575,7 @@ class Run:
 
     def read(self, entity: str) -> list[dict]:
         """The merged entities (one per canonical key, provenance unioned) — not the raw observation lines."""
-        return list(self._records_for(entity).values())
+        return list(self._records_for(validate_entity(entity)).values())
 
     def read_folded(self, entity: str) -> "FoldedLog":
         """The merged view WITH its trust status (`absent`/`valid`/`degraded`/`unusable`).
@@ -1355,15 +1584,17 @@ class Run:
         For an ordinary corpus that is a fair simplification; for a record that decides whether we may act —
         the acquisition-ownership transition log — it is the whole question.
         """
+        entity = validate_entity(entity)
         if entity not in self._folded:
             self._records_for(entity)          # the same capped, streaming, refused-aware fold
         return self._folded[entity]
 
     def count(self, entity: str) -> int:
-        return len(self._records_for(entity))
+        return len(self._records_for(validate_entity(entity)))
 
     def values(self, entity: str) -> list[str]:
-        key_field = ENTITY_KEYS.get(entity, "value")
+        entity = validate_entity(entity)
+        key_field = ENTITY_KEYS[entity]
         return [str(r.get(key_field, "")) for r in self.read(entity) if r.get(key_field)]
 
     # ── manifest ──
@@ -1797,26 +2028,19 @@ class Run:
 
     @staticmethod
     def list_runs(project_dir: Path) -> "list[Path]":
-        """Real run directories under recon/, oldest→newest by parsed `started` (name breaks ties). Reserved
-        namespaces (`state`, `campaigns`), symlinks, non-directories and invalid-identity dirs are excluded."""
-        root = Path(project_dir) / "recon"
-        if not root.is_dir():
-            return []
-        runs = []
-        for d in root.iterdir():
-            if d.name in RESERVED_RECON_DIRS or d.is_symlink() or not d.is_dir():
-                continue
-            ident = _run_identity(d)
-            if ident is not None:
-                runs.append((ident[1], d.name, d))
-        runs.sort(key=lambda t: (t[0], t[1]))
-        return [d for _, _, d in runs]
+        """Reconciled real run directories, oldest→newest, without following or modifying repository data."""
+        return [path for _started, _name, path, _identity in _run_snapshots(Path(project_dir))]
 
     @staticmethod
-    def latest(project_dir: Path) -> "Run | None":
-        candidates = Run.list_runs(project_dir)
-        if not candidates:
+    def latest(project_dir: Path, target: str | None = None) -> "Run | None":
+        if target is not None:
+            target = validate_target(target)
+        snapshots = _run_snapshots(Path(project_dir))
+        if not snapshots:
             return None
-        d = candidates[-1]
-        ident = _run_identity(d)                             # the validated identity is the target authority
-        return Run.open(project_dir, ident[0]["target"] if ident else "unknown", d.name)
+        _started, run_id, _path, identity = snapshots[-1]
+        if target is not None and identity["target"] != target:
+            raise ContractError(f"latest run {run_id!r} belongs to target {identity['target']!r}, "
+                                f"not {target!r}")
+        return Run(project_dir, identity["target"], run_id=run_id, load_started=True, _identity=identity,
+                   _authority=_RUN_CONSTRUCTION_AUTHORITY)

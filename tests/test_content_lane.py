@@ -522,7 +522,7 @@ class TestContentReviewRound4:
         _drive(tmp_path, monkeypatch, live,
                body=json.dumps({"results": [{"url": ["bad"], "status": 200}]}))
         _drive(tmp_path, monkeypatch, live, body=_rows(("https://h.ex.com/ok", 200)))
-        st = Run(tmp_path / "proj", "t", run_id="r1")
+        st = Run.create(tmp_path / "proj", "t", run_id="r1")
         (st.dir / "events.jsonl").write_text((tmp_path / "events.jsonl").read_text())
         gaps = [g for g in st._run_summary()["gaps"]
                 if g["tool"] == "content.ffuf" and g["measure"] == "result_rows"]

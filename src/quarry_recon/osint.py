@@ -105,6 +105,9 @@ class OsintSession:
         self.notes: list[str] = []
 
     def raw_path(self, source: str, name: str) -> Path:
+        from .repository_identity import validate_artifact_component
+        source = validate_artifact_component(source, "OSINT source")
+        name = validate_artifact_component(name, "OSINT raw filename")
         p = self.raw / source
         privfs.private_dir(p)                                # 0700 raw evidence dir
         return p / name

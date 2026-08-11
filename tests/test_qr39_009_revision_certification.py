@@ -16,6 +16,7 @@ from click.testing import CliRunner
 
 from quarry_recon import revision, triage
 from quarry_recon.cli import cli
+from quarry_recon.state import ContractError
 from quarry_recon.store import Run
 
 pytestmark = pytest.mark.offline
@@ -88,16 +89,18 @@ def test_a_fault_clearing_resume_keeps_the_revision_certified(tmp_path, monkeypa
     assert "qlate.csession01" in (run_dir / "revisions" / certified.views["dir"] / "HOTLIST.md").read_text()
 
 
-@pytest.mark.parametrize("mutate", [
-    pytest.param(lambda m: m["entity_counts"].__setitem__("oob_interaction", 1), id="entity_counts"),
-    pytest.param(lambda m: m["entity_counts"].__setitem__("subdomain", 99), id="a-count-moves"),
-    pytest.param(lambda m: m.__setitem__("tool_runs", [{"tool": "invented"}]), id="tool_runs"),
-    pytest.param(lambda m: m.__setitem__("target", "elsewhere.example"), id="target"),
-    pytest.param(lambda m: m.__setitem__("envelope", {"forged": True}), id="envelope"),
-    pytest.param(lambda m: m["summary"].__setitem__("gaps", [{"tool": "invented"}]), id="summary.gaps"),
-    pytest.param(lambda m: m["summary"].__setitem__("coverage", [{"omitted": 5}]), id="summary.coverage"),
+@pytest.mark.parametrize("mutate,identity_conflict", [
+    pytest.param(lambda m: m["entity_counts"].__setitem__("oob_interaction", 1), False, id="entity_counts"),
+    pytest.param(lambda m: m["entity_counts"].__setitem__("subdomain", 99), False, id="a-count-moves"),
+    pytest.param(lambda m: m.__setitem__("tool_runs", [{"tool": "invented"}]), False, id="tool_runs"),
+    pytest.param(lambda m: m.__setitem__("target", "elsewhere.example"), True, id="target"),
+    pytest.param(lambda m: m.__setitem__("envelope", {"forged": True}), False, id="envelope"),
+    pytest.param(lambda m: m["summary"].__setitem__("gaps", [{"tool": "invented"}]), False,
+                 id="summary.gaps"),
+    pytest.param(lambda m: m["summary"].__setitem__("coverage", [{"omitted": 5}]), False,
+                 id="summary.coverage"),
 ])
-def test_a_change_to_evidence_still_uncertifies_the_revision(tmp_path, monkeypatch, mutate):
+def test_a_change_to_evidence_still_uncertifies_the_revision(tmp_path, monkeypatch, mutate, identity_conflict):
     """The guard is scoped, not removed: everything the manifest records except the answered bookkeeping
     still certifies, `summary.gaps` and `summary.coverage` included."""
     runner = CliRunner()
@@ -115,7 +118,11 @@ def test_a_change_to_evidence_still_uncertifies_the_revision(tmp_path, monkeypat
 
     stale = revision.read(run_dir)
     assert stale.status == "unusable" and "changed after revision 1" in stale.reason
-    assert revision.combined_view(Run.open(tmp_path, "t", run_dir.name)) is None
+    if identity_conflict:
+        with pytest.raises(ContractError, match="identities .* disagree"):
+            Run.open(tmp_path, "t", run_dir.name)
+    else:
+        assert revision.combined_view(Run.open(tmp_path, "t", run_dir.name)) is None
 
 
 def test_the_digest_ignores_the_answered_bookkeeping_and_nothing_else(tmp_path, monkeypatch):

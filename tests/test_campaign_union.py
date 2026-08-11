@@ -13,6 +13,7 @@ import pathlib
 import pytest
 
 from quarry_recon import campaign, store
+from quarry_recon.state import ContractError
 
 
 def _finished(tmp_path, *entities, target="t"):
@@ -254,17 +255,44 @@ class TestTheUnionCarriesItsOwnTrust:
         assert campaign.Union(union.path).dropped == 1
 
     def test_an_UNREGISTERED_kind_is_not_an_entity(self, tmp_path):
-        """A row that would key perfectly well under the default field — only the REGISTRY says it is not
-        an entity Quarry holds, and a union that accepted it would seed a child with invented kinds."""
+        """The closed registry rejects an invented kind before keying, and a planted union row is dropped."""
         union = self._union(tmp_path, hosts=("a.acme.com",))
         rec = {"value": "whatever"}
         row = {"kind": "not_an_entity", "id": "whatever", "record": rec,
-               "fp": store.fingerprint("not_an_entity", rec)}
-        assert store.canonical_key("not_an_entity", rec) == "whatever"      # it WOULD key
+               "fp": "planted"}
+        with pytest.raises(ContractError, match="unknown entity"):
+            store.canonical_key("not_an_entity", rec)
         gen = union.dir / json.loads(union.path.read_text())["file"]
         gen.write_text(json.dumps(row) + "\n")
         reopened = campaign.Union(union.path)
         assert reopened.dropped == 1 and reopened.records == {}, reopened
+
+    def test_absorb_rejects_every_requested_kind_before_reading_the_child(self, tmp_path, monkeypatch):
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        monkeypatch.setattr(campaign._revision, "view_identity",
+                            lambda _path: pytest.fail("child view was read before kinds were validated"))
+        with pytest.raises(ContractError, match="unknown entity"):
+            union.absorb(tmp_path / "recon" / "never-read", kinds=["subdomain", "invented"])
+
+    def test_absorb_refuses_a_run_path_outside_the_campaign_project(self, tmp_path, monkeypatch):
+        outside = _finished(tmp_path / "outside", ("subdomain", {"host": "outside.example"}))
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        monkeypatch.setattr(campaign._revision, "view_identity",
+                            lambda _path: pytest.fail("external child view was read"))
+
+        with pytest.raises(ContractError, match="outside this campaign's project"):
+            union.absorb(outside.dir)
+
+    def test_absorb_refuses_a_symlinked_child_run_before_view_reads(self, tmp_path, monkeypatch):
+        outside = _finished(tmp_path / "outside", ("subdomain", {"host": "outside.example"}))
+        union = self._union(tmp_path, hosts=("a.acme.com",))
+        child = tmp_path / "recon" / outside.run_id
+        child.symlink_to(outside.dir, target_is_directory=True)
+        monkeypatch.setattr(campaign._revision, "view_identity",
+                            lambda _path: pytest.fail("symlinked child view was read"))
+
+        with pytest.raises(ContractError, match="not a safe real directory"):
+            union.absorb(child)
 
     def test_a_union_with_NO_POINTER_is_unusable(self, tmp_path):
         """The generations survive, but nothing says which one is the campaign — and a supervisor may not

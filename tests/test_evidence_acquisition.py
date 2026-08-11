@@ -2375,7 +2375,7 @@ class TestTheTransitionLogIsTRUST_AWARE:
     def test_the_store_exposes_that_status_at_all(self, tmp_path):
         """The reader can only be trust-aware if the store hands the trust over."""
         from quarry_recon import store
-        run = store.Run(tmp_path, "t.example")
+        run = store.Run.create(tmp_path, "t.example")
         run.add("review", {"id": "a", "klass": "x", "value": "v"})
         folded = run.read_folded("review")
         assert folded.status in ("valid", "absent") and folded.dropped == 0
@@ -2384,7 +2384,7 @@ class TestTheTransitionLogIsTRUST_AWARE:
 
     def test_a_degraded_review_log_is_visible_through_the_real_store(self, tmp_path):
         from quarry_recon import store
-        run = store.Run(tmp_path, "t.example")
+        run = store.Run.create(tmp_path, "t.example")
         run.add("review", {"id": "a", "klass": "x", "value": "v"})
         p = run._entity_file("review")
         p.write_text(p.read_text() + "{not json\n")
@@ -2469,7 +2469,7 @@ class TestThroughTheREALStore:
     @staticmethod
     def _run(tmp_path):
         from quarry_recon import store
-        return store.Run(tmp_path, "t.example")
+        return store.Run.create(tmp_path, "t.example")
 
     @staticmethod
     def _reopen(run):
@@ -2576,7 +2576,7 @@ class TestALostOwnershipLogIsVISIBLE:
     @staticmethod
     def _wrecked_run(tmp_path):
         from quarry_recon import store
-        run = store.Run(tmp_path, "t.example")
+        run = store.Run.create(tmp_path, "t.example")
         run.add(evidence.OWNERSHIP_ENTITY, {"id": "ownership:k:1", "klass": "acquisition-refused",
                                             "state_key": "k", "state": "refused", "state_seq": 1,
                                             "state_fp": "0" * 64, "value": "v"})
@@ -2613,7 +2613,7 @@ class TestALostOwnershipLogIsVISIBLE:
     def test_a_healthy_log_carries_no_such_warning(self, tmp_path):
         from quarry_recon import store
         events.reset(); events.configure(tmp_path)
-        run = store.Run(tmp_path, "t.example")
+        run = store.Run.create(tmp_path, "t.example")
         run.add("review", {"id": "a", "klass": "exposure", "value": "v"})
         out = self._report(run)
         assert "NOT AUTHORITATIVE" not in out
@@ -2632,7 +2632,7 @@ class TestAnAmbiguousKeyIsREAD_ONLY:
         key grew a row on every refusal while still reporting `unknown`."""
         from quarry_recon import store
         events.reset(); events.configure(tmp_path)
-        run = store.Run(tmp_path, "t.example")
+        run = store.Run.create(tmp_path, "t.example")
         run.add(evidence.OWNERSHIP_ENTITY, self._row("k", 1, "ok"))
         run.add(evidence.OWNERSHIP_ENTITY, self._row("k", 1, "refused"))     # same id -> merged conflict -> ambiguous
         run._records.clear(); run._folded.clear()
@@ -2650,7 +2650,7 @@ class TestAnAmbiguousKeyIsREAD_ONLY:
         """Ambiguity is per path: one undecidable key does not freeze the rest of the log."""
         from quarry_recon import store
         events.reset(); events.configure(tmp_path)
-        run = store.Run(tmp_path, "t.example")
+        run = store.Run.create(tmp_path, "t.example")
         run.add(evidence.OWNERSHIP_ENTITY, self._row("k", 1, "ok"))
         run.add(evidence.OWNERSHIP_ENTITY, self._row("k", 1, "refused"))
         run._records.clear(); run._folded.clear()
@@ -2670,7 +2670,7 @@ class TestTheOwnershipLogIsISOLATED:
     @staticmethod
     def _run(tmp_path):
         from quarry_recon import store
-        return store.Run(tmp_path, "t.example")
+        return store.Run.create(tmp_path, "t.example")
 
     def _row(self, key, seq, state):
         r = {"id": f"ownership:{key}:{seq}", "klass": "acquisition-refused", "state_key": key,

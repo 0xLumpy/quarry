@@ -141,7 +141,10 @@ def _folded(tmp_path):
     would still pass if `coverage_reset` vanished and a prior generation's units stayed live. This is the
     operator-visible truth: surviving units, their kinds, and the run verdict."""
     from quarry_recon.store import Run
-    st = Run(tmp_path / "_folded", "t", run_id="r1")
+    try:
+        st = Run.create(tmp_path / "_folded", "t", run_id="r1")
+    except FileExistsError:
+        st = Run.open(tmp_path / "_folded", "t", "r1")
     (st.dir / "events.jsonl").write_text((tmp_path / "events.jsonl").read_text())
     summ = st._run_summary()
     units = {}

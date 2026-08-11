@@ -104,6 +104,9 @@ def _require_disposition(run_dir) -> str:
 def raw_path(run, phase: str, tool: str, name: str) -> Path:
     """Where raw evidence acquired now belongs: the run's own `raw/` while it is live, `revisions/raw/`
     once it is sealed, because a sealed run's raw tree is part of what its manifest certifies."""
+    phase = store.validate_artifact_component(phase, "raw phase")
+    tool = store.validate_artifact_component(tool, "raw tool")
+    name = store.validate_artifact_component(name, "raw filename")
     if _require_disposition(run.dir) == LIVE:
         return run.raw_path(phase, tool, name)
     return privfs.private_dir(revisions_dir(run.dir) / "raw" / phase / tool) / name

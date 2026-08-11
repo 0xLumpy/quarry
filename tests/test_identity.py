@@ -108,7 +108,10 @@ class TestStoreDedupAndReplay:
 
     def _run(self, tmp_path):
         from quarry_recon.store import Run
-        return Run(tmp_path, "t", run_id="fixed")           # fixed id so a reopen hits the same normalized dir
+        try:
+            return Run.create(tmp_path, "t", run_id="fixed")
+        except FileExistsError:
+            return Run.open(tmp_path, "t", "fixed")         # fixed id so a reopen hits the same normalized dir
 
     def test_case_distinct_urls_both_added(self, tmp_path):
         run = self._run(tmp_path)

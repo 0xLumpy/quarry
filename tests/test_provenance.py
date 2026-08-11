@@ -14,7 +14,10 @@ pytestmark = pytest.mark.offline
 
 
 def _run(tmp_path):
-    return Run(tmp_path, "t", run_id="fixed")
+    try:
+        return Run.create(tmp_path, "t", run_id="fixed")
+    except FileExistsError:
+        return Run.open(tmp_path, "t", "fixed")
 
 
 class TestMergeRules:

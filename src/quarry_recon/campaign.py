@@ -12,50 +12,16 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-import re
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from . import remainder as _remainder, revision as _revision, state as _state, store
-
-#: a campaign id and a child's run id are both one path segment: everything either owns is reached by
-#: joining it, so anything that could leave its directory is refused before a path is built. Minted ids
-#: are `c<stamp>-<hex>` and `<stamp>-<hex>`; the rule is wider so a deliberately named one still works.
-_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_SEGMENT_RULE = ("one segment of letters, digits, '.', '-' or '_' starting with a letter or digit, at "
-                 "most 64 characters")
-
-
-class InvalidCampaignId(ValueError):
-    """A campaign id that is not one confined path segment."""
-
-
-class InvalidRunId(ValueError):
-    """A child run id that is not one confined path segment."""
-
-
-def valid_segment(name) -> bool:
-    return isinstance(name, str) and bool(_SEGMENT.match(name))
-
-
-def valid_campaign_id(campaign_id) -> bool:
-    return valid_segment(campaign_id)
-
-
-def validate_campaign_id(campaign_id: str) -> str:
-    """The id, or refuse it — an id is a directory name, never a route out of the campaigns directory."""
-    if not valid_segment(campaign_id):
-        raise InvalidCampaignId(f"{campaign_id!r} is not a campaign id: {_SEGMENT_RULE}")
-    return campaign_id
-
-
-def validate_run_id(run_id: str) -> str:
-    """The id, or refuse it — a child's run id is joined to reach its evidence, so a damaged ledger may
-    not point the campaign at a directory outside the project."""
-    if not valid_segment(run_id):
-        raise InvalidRunId(f"{run_id!r} is not a run id: {_SEGMENT_RULE}")
-    return run_id
+from .repository_identity import (InvalidCampaignId, InvalidRunId, valid_campaign_id,
+                                  valid_run_id, valid_segment, validate_campaign_id,
+                                  validate_run_id)
+from .state import ContractError
 
 
 #: marks an entity a child was handed rather than found. `store.RUN_SCOPED_FIELDS` excludes it from
@@ -111,7 +77,7 @@ def _valid_absorptions(absorbed) -> bool:
     if not isinstance(absorbed, dict):
         return False
     for run_id, record in absorbed.items():
-        if not isinstance(run_id, str) or not run_id.strip():
+        if not valid_run_id(run_id):
             return False
         if not isinstance(record, dict) or not _ABSORBED_KEYS <= set(record):
             return False
@@ -236,6 +202,12 @@ class Union:
     def __init__(self, path, *, create: bool = False, absent_is_damage: str = ""):
         self.path = Path(path)                       # the pointer
         self.dir = self.path.parent
+        if (self.path.name != "union.json" or self.dir.parent.name != "campaigns"
+                or self.dir.parent.parent.name != "recon"):
+            raise ContractError(f"{self.path}: a campaign union must live at "
+                                "<project>/recon/campaigns/<campaign-id>/union.json")
+        validate_campaign_id(self.dir.name)
+        self.project_dir = self.dir.parent.parent.parent
         #: why an absent union would be evidence loss rather than a fresh start, when it would be
         self.absent_is_damage = absent_is_damage
         self.records: dict = {}          # {(kind, key): record}
@@ -457,15 +429,24 @@ class Union:
         view it was absorbed from: the same view twice replays the deltas it was published with, because a
         second merge finds nothing new and that is not the same fact, while a run whose combined view has
         changed is folded again."""
+        selected = tuple(sorted(store.ENTITY_KEYS) if kinds is None else kinds)
+        for kind in selected:
+            store.validate_entity(kind)              # reject the complete request before reading the child view
         self.require()
-        run_id = Path(run_dir).name
+        supplied = Path(run_dir)
+        run_id = validate_run_id(supplied.name)
+        expected = self.project_dir / "recon" / run_id
+        if Path(os.path.abspath(os.fspath(supplied))) != Path(os.path.abspath(os.fspath(expected))):
+            raise ContractError(f"run {run_id!r} is outside this campaign's project repository")
+        store.read_run_identity(self.project_dir, run_id)       # reject symlink/non-run paths before view reads
+        run_dir = expected
         view = list(_revision.view_identity(run_dir))
         held = self.absorbed.get(run_id)
         if held is not None and _absorbed_view(held) == view:
             return AbsorbResult.from_record(held)
         out = AbsorbResult()
         published = dict(self.records)            # the last published state, kept until this one lands
-        for kind in (kinds if kinds is not None else sorted(store.ENTITY_KEYS)):
+        for kind in selected:
             folded = _revision.combined_fold(run_dir, kind)
             if not folded.trustworthy:
                 out.unusable[kind] = f"{folded.status}: {folded.reason}"
@@ -726,13 +707,13 @@ def _unreadable_child(child, index: int, states) -> str:
             return "is reserved but already names a run"
     elif state == "abandoned":
         # abandoned from `reserved` never launched, so it names no run; from `started` it names the one
-        if run_id is not None and not valid_segment(run_id):
+        if run_id is not None and not valid_run_id(run_id):
             return "is abandoned with an unreadable run id"
         if not isinstance(child.get("reason"), str) or not child["reason"].strip():
             return "is abandoned without a reason"
     elif not isinstance(run_id, str) or not run_id.strip():
         return f"is {state} without a run id"
-    elif not valid_segment(run_id):
+    elif not valid_run_id(run_id):
         # the id is joined to reach this child's evidence, so it may not leave the project
         return f"is {state} under a run id that is not one path segment"
     if state == "manifested":

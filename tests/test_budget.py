@@ -165,13 +165,13 @@ class TestCoverageReports:
 
     def _gaps(self, tmp_path):
         from quarry_recon.store import Run
-        st = Run(tmp_path, "t", run_id="r1")
+        st = Run.create(tmp_path, "t", run_id="r1")
         return st, [g for g in st._run_summary()["gaps"] if g["tool"] == self.LANE]
 
     def _fresh(self, tmp_path):
         from quarry_recon.store import Run
         events.reset()
-        st = Run(tmp_path, "t", run_id="r1")
+        st = Run.create(tmp_path, "t", run_id="r1")
         events.configure(st.dir)
         return st
 

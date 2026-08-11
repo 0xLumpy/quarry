@@ -1763,7 +1763,7 @@ class TestTemplateDefectsRound8:
         """Assert the operator-visible outcome, not just the emitted events."""
         from quarry_recon.store import Run
         events.reset()
-        st = Run(tmp_path / "proj", "t", run_id="r1")
+        st = Run.create(tmp_path / "proj", "t", run_id="r1")
         events.configure(st.dir)
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 2}, body=_map_body("a.ts", "C"))

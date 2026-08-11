@@ -46,7 +46,7 @@ def _late(run, tmp_path, name: str, full_id: str, remote: str):
 
 
 def _union(tmp_path) -> campaign.Union:
-    return campaign.Union(tmp_path / "recon" / "campaigns" / "c1" / "union.json", create=True)
+    return campaign.Union(tmp_path / "proj" / "recon" / "campaigns" / "c1" / "union.json", create=True)
 
 
 def _oob_slots(union) -> list:
@@ -62,7 +62,7 @@ def test_a_run_absorbed_after_its_revision_carries_the_late_callback(tmp_path):
 
     assert out.unusable == {}
     assert out.kinds["oob_interaction"] == {"new": 1, "enriched": 0}
-    union = campaign.Union(tmp_path / "recon" / "campaigns" / "c1" / "union.json")
+    union = campaign.Union(tmp_path / "proj" / "recon" / "campaigns" / "c1" / "union.json")
     assert len(_oob_slots(union)) == 1
     assert union.absorbed[run.run_id]["view"] == [rev.revision, rev.digest]
 

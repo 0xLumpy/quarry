@@ -14,7 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import campaign as _campaign
+from . import campaign as _campaign, store as _store
+from .state import ContractError
 
 #: a campaign id is minted like a run id: second precision alone collides, and a reused id would continue
 #: another campaign's ledger as child 2.
@@ -31,7 +32,7 @@ def _claim(project_dir) -> str:
     """Mint an id and claim its directory atomically, so even a same-instant clash cannot share one."""
     root = Path(project_dir) / "recon" / "campaigns"
     for _ in range(16):
-        cid = new_campaign_id()
+        cid = _campaign.validate_campaign_id(new_campaign_id())
         try:
             (root / cid).mkdir(parents=True, exist_ok=False)
         except FileExistsError:
@@ -62,14 +63,10 @@ def campaign_target(project_dir, campaign_id: str) -> tuple[str | None, str]:
         run_id = child.get("run_id")
         if not run_id:
             continue                        # never launched: it ran against nothing
-        doc = _read(Path(project_dir) / "recon" / run_id / "run.json")
-        # the record must name the run it sits in (`store._run_identity`'s rule): a copied one would
-        # answer for another run's target
-        if not isinstance(doc, dict) or doc.get("run_id") != run_id:
+        try:
+            target = _store.read_run_creation_target(project_dir, run_id)
+        except (FileNotFoundError, ContractError):
             return None, f"child {child.get('index')} ({run_id}) has no readable creation record"
-        target = doc.get("target")
-        if not isinstance(target, str) or not target.strip():
-            return None, f"child {child.get('index')} ({run_id}) records no target"
         named.add(target)
     if len(named) > 1:
         return None, "its children ran against " + ", ".join(repr(t) for t in sorted(named))
@@ -212,7 +209,9 @@ def settle(*, project_dir, target: str, launch, max_runs: int = _campaign.MAX_CH
     """
     say = echo or (lambda _line: None)
     now = _now or time.monotonic
-    cid = campaign_id or _claim(project_dir)
+    target = _store.validate_target(target)        # before a new campaign directory can be claimed
+    cid = (_campaign.validate_campaign_id(campaign_id)
+           if campaign_id is not None else _claim(project_dir))
     ledger = _campaign.Campaign(project_dir, cid)
     ledger.require()                     # a fresh id is `new`; a reopened corrupt one refuses here
     if ledger.stop:

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from quarry_recon import campaign, remainder, settle, store
+from quarry_recon.state import ContractError
 
 pytestmark = pytest.mark.offline
 
@@ -550,6 +551,17 @@ class TestACampaignIsOneTargetsCorpus:
         assert settle.campaign_target(tmp_path, "c-t3") == (None, "child 1 (%s) has no readable creation "
                                                             "record" % launcher.calls[0]["run_id"])
 
+    def test_a_symlinked_creation_record_cannot_answer_for_a_campaign_child(self, tmp_path):
+        launcher = self._kill_for(tmp_path, "c-t-symlink", "other.com")
+        meta = tmp_path / "recon" / launcher.calls[0]["run_id"] / "run.json"
+        external = tmp_path / "external-run.json"
+        external.write_bytes(meta.read_bytes())
+        meta.unlink()
+        meta.symlink_to(external)
+
+        target, why = settle.campaign_target(tmp_path, "c-t-symlink")
+        assert target is None and "no readable creation record" in why
+
     @pytest.mark.parametrize("wreck", ["{not json", '{"run_id": "x", "target": "other.com"}',
                                        '{"target": ""}'])
     def test_an_UNREADABLE_child_refuses_the_campaign_it_cannot_speak_for(self, tmp_path, wreck):
@@ -673,6 +685,26 @@ class TestACampaignIdCannotLeaveItsDirectory:
             settle.settle(project_dir=tmp_path, target="acme.com", campaign_id="../escape",
                           launch=lambda index, prepare: None)
         assert not outside.exists(), "a path outside recon/campaigns was created"
+        assert not (tmp_path / "recon").exists()
+
+    @pytest.mark.parametrize("bad", ["", 0, False])
+    def test_falsey_explicit_ids_are_invalid_not_requests_to_mint(self, tmp_path, bad):
+        with pytest.raises(campaign.InvalidCampaignId):
+            settle.settle(project_dir=tmp_path, target="acme.com", campaign_id=bad,
+                          launch=lambda index, prepare: pytest.fail("invalid campaign launched"))
+        assert not (tmp_path / "recon").exists()
+
+    def test_a_bad_minted_id_is_validated_before_the_campaign_root_is_created(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(settle, "new_campaign_id", lambda: "../escape")
+        with pytest.raises(campaign.InvalidCampaignId):
+            settle._claim(tmp_path)
+        assert not (tmp_path / "recon").exists()
+
+    @pytest.mark.parametrize("bad", [None, 0, "", "   "])
+    def test_invalid_target_is_refused_before_a_campaign_is_claimed(self, tmp_path, bad):
+        with pytest.raises(ContractError):
+            settle.settle(project_dir=tmp_path, target=bad,
+                          launch=lambda index, prepare: pytest.fail("invalid target launched"))
         assert not (tmp_path / "recon").exists()
 
     @pytest.mark.parametrize("good", ["c20260811-085256-af1a507d", "c1", "c-fixed", "a.b_c-1", "Z9"])
