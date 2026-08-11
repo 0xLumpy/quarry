@@ -137,7 +137,7 @@ tools:
     ref: 6bfa47197d78e68b79041d494e280174cb2d6ae1
     repo: blechschmidt/massdns
     runtime: source
-    install: 'mkdir -p ~/.local/bin/.stage && rm -rf /tmp/_massdns && git clone -q https://github.com/blechschmidt/massdns /tmp/_massdns && git -C /tmp/_massdns checkout -q {ref} && make -C /tmp/_massdns >/dev/null && cp /tmp/_massdns/bin/{bin} ~/.local/bin/.stage/{bin} && rm -rf /tmp/_massdns'
+    install: 'set -e; D="$(mktemp -d)"; mkdir -p ~/.local/bin/.stage && git clone -q https://github.com/blechschmidt/massdns "$D/massdns" && git -C "$D/massdns" checkout -q {ref} && make -C "$D/massdns" >/dev/null && cp "$D/massdns/bin/{bin}" ~/.local/bin/.stage/{bin} && rm -rf "$D"'
     version_cmd: massdns --help
     cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/blechschmidt/massdns
@@ -147,6 +147,7 @@ tools:
   - bin: jxscout-chunks
     maintenance_state: frozen
     phase: crawl
+    lock_key: jxscout-tree      # shares the ~/.local/share/quarry/jxscout tree with jxscout-ast; one install lock
     role: lazy-CHUNK candidate discovery from an already-downloaded JS bundle (webpack/vite loaders)
     # The upstream project is a Burp/Caido-style intercepting proxy with its own SQLite event bus that
     # FETCHES what it finds. We use none of that: the piece with value is one embedded script, invoked
@@ -163,9 +164,9 @@ tools:
     ref: 3a1018a694fd630137b1c19525abcb47315404d4
     repo: francisconeves97/jxscout
     runtime: source
-    # clone at the exact ref -> VERIFY the engine's own sha256 -> stage a shim that runs it under node.
-    # The GPL file is never modified: the shim is ours, the tree stays whole beside it.
-    install: 'set -e; rm -rf /tmp/_jxscout; git clone -q https://github.com/francisconeves97/jxscout /tmp/_jxscout && git -C /tmp/_jxscout checkout -q {ref} && echo "157118f58497a8f1208e80bb24f58aa1b25e3847898d07a414cd473a6d0f6f81  /tmp/_jxscout/internal/modules/chunk-discoverer/chunk-discoverer.js" | sha256sum -c - >/dev/null && mkdir -p ~/.local/share/quarry && rm -rf ~/.local/share/quarry/jxscout && mv /tmp/_jxscout ~/.local/share/quarry/jxscout && rm -rf ~/.local/share/quarry/jxscout/.git && cp ~/.local/share/quarry/jxscout/internal/modules/chunk-discoverer/chunk-discoverer.js ~/.local/share/quarry/jxscout-chunk-discoverer.cjs && mkdir -p ~/.local/bin/.stage && printf ''#!/bin/sh\nexec node "$HOME/.local/share/quarry/jxscout-chunk-discoverer.cjs" "$@"\n'' > ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin}'
+    # verify sha256 + a live node run in the temp dir first, then swap tree+cjs in under a trap that restores
+    # last-good as one unit on any failure; the GPL file is never modified (the shim is ours).
+    install: 'set -e; D="$(mktemp -d)"; Q="$HOME/.local/share/quarry"; git clone -q https://github.com/francisconeves97/jxscout "$D/jxscout"; git -C "$D/jxscout" checkout -q {ref}; echo "157118f58497a8f1208e80bb24f58aa1b25e3847898d07a414cd473a6d0f6f81  $D/jxscout/internal/modules/chunk-discoverer/chunk-discoverer.js" | sha256sum -c - >/dev/null; cp "$D/jxscout/internal/modules/chunk-discoverer/chunk-discoverer.js" "$D/cjs"; node "$D/cjs" "$D/jxscout/pkg/chunk-discoverer/tests/files/2.js" 0 >/dev/null; rm -rf "$D/jxscout/.git"; mkdir -p "$Q"; rm -rf "$Q/jxscout.new" "$Q/.cjs.new" "$Q/jxscout.last-good" "$Q/.cjs.last-good"; mv "$D/jxscout" "$Q/jxscout.new"; cp "$D/cjs" "$Q/.cjs.new"; trap ''if [ -e "$Q/jxscout.last-good" ]; then rm -rf "$Q/jxscout"; mv "$Q/jxscout.last-good" "$Q/jxscout"; if [ -e "$Q/.cjs.last-good" ]; then mv "$Q/.cjs.last-good" "$Q/jxscout-chunk-discoverer.cjs"; fi; else rm -rf "$Q/jxscout" "$Q/jxscout-chunk-discoverer.cjs"; fi; rm -rf "$Q/jxscout.new" "$Q/.cjs.new"'' EXIT; if [ -e "$Q/jxscout" ]; then mv "$Q/jxscout" "$Q/jxscout.last-good"; fi; if [ -e "$Q/jxscout-chunk-discoverer.cjs" ]; then cp -p "$Q/jxscout-chunk-discoverer.cjs" "$Q/.cjs.last-good"; fi; mv "$Q/jxscout.new" "$Q/jxscout"; mv "$Q/.cjs.new" "$Q/jxscout-chunk-discoverer.cjs"; trap - EXIT; rm -rf "$Q/jxscout.last-good" "$Q/.cjs.last-good"; mkdir -p ~/.local/bin/.stage; printf ''#!/bin/sh\nexec node "$HOME/.local/share/quarry/jxscout-chunk-discoverer.cjs" "$@"\n'' > ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin}'
     # The engine is CommonJS while the tree's package.json declares `"type": "module"` for its own build,
     # so node refuses it IN PLACE. The byte-identical `.cjs` copy beside the tree is what makes the module
     # system unambiguous — the file's CONTENT is untouched (same sha256 the install just verified), only
@@ -216,7 +217,7 @@ tools:
     artifacts:
       linux/amd64: {url: "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64-baseline.zip", sha256: "a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7"}
       linux/arm64: {url: "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-aarch64.zip",       sha256: "a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b"}
-    install: 'set -e; mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o /tmp/_bun.zip && echo "{sha256}  /tmp/_bun.zip" | sha256sum -c - >/dev/null && rm -rf /tmp/_bun && unzip -q -o /tmp/_bun.zip -d /tmp/_bun && cp "$(find /tmp/_bun -type f -name bun | head -1)" ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin} && rm -rf /tmp/_bun.zip /tmp/_bun'
+    install: 'set -e; D="$(mktemp -d)"; mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o "$D/bun.zip" && echo "{sha256}  $D/bun.zip" | sha256sum -c - >/dev/null && unzip -q -o "$D/bun.zip" -d "$D/bun" && cp "$(find "$D/bun" -type f -name bun | head -1)" ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin} && rm -rf "$D"'
     version_cmd: bun --version
     doc: https://bun.sh
     deps: [curl, unzip]
@@ -227,6 +228,7 @@ tools:
   - bin: jxscout-ast
     maintenance_state: frozen
     phase: crawl
+    lock_key: jxscout-tree      # shares the ~/.local/share/quarry/jxscout tree with jxscout-chunks; one install lock
     role: AST analysis of an already-downloaded JS bundle — DOM sources/sinks and path-like strings
     # The OTHER half of the same pinned tree the chunk engine comes from, and it needs a different
     # runtime: MEASURED, `ast-analyzer.js` runs under BUN and fails under node ("Failed to load native
@@ -242,7 +244,7 @@ tools:
     ref: 3a1018a694fd630137b1c19525abcb47315404d4
     repo: francisconeves97/jxscout
     runtime: source
-    install: 'set -e; if ! command -v bun >/dev/null; then echo "jxscout-ast needs bun (the analyzer fails under node): install bun first" >&2; exit 1; fi; if [ ! -d ~/.local/share/quarry/jxscout ]; then rm -rf /tmp/_jxscout_ast; git clone -q https://github.com/francisconeves97/jxscout /tmp/_jxscout_ast && git -C /tmp/_jxscout_ast checkout -q {ref} && mkdir -p ~/.local/share/quarry && rm -rf ~/.local/share/quarry/jxscout && mv /tmp/_jxscout_ast ~/.local/share/quarry/jxscout && rm -rf ~/.local/share/quarry/jxscout/.git; fi; printf ''d1531754a223b21f4c49c2eaed2d16dbef552fac4ebbd69b62739c7c6c48ab65  %s/.local/share/quarry/jxscout/internal/modules/ast-analyzer/ast-analyzer.js\n8a8a0259a16112e633ecd54013ac15c00d24a9d54ec566404ce7d5e66e1d3d54  %s/.local/share/quarry/jxscout/internal/modules/ast-analyzer/parser.linux-x64-gnu.node\n'' "$HOME" "$HOME" | sha256sum -c - >/dev/null && mkdir -p ~/.local/bin/.stage && printf ''#!/bin/sh\nA="$HOME/.local/share/quarry/jxscout/internal/modules/ast-analyzer"\nNAPI_RS_NATIVE_LIBRARY_PATH="$A/parser.linux-x64-gnu.node" exec bun run "$A/ast-analyzer.js" "$@"\n'' > ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin}'
+    install: 'set -e; if ! command -v bun >/dev/null; then echo "jxscout-ast needs bun (the analyzer fails under node): install bun first" >&2; exit 1; fi; Q="$HOME/.local/share/quarry"; if [ ! -d "$Q/jxscout" ]; then D="$(mktemp -d)"; trap ''rm -rf "$D"'' EXIT; git clone -q https://github.com/francisconeves97/jxscout "$D/jxscout_ast"; git -C "$D/jxscout_ast" checkout -q {ref}; printf ''d1531754a223b21f4c49c2eaed2d16dbef552fac4ebbd69b62739c7c6c48ab65  %s/jxscout_ast/internal/modules/ast-analyzer/ast-analyzer.js\n8a8a0259a16112e633ecd54013ac15c00d24a9d54ec566404ce7d5e66e1d3d54  %s/jxscout_ast/internal/modules/ast-analyzer/parser.linux-x64-gnu.node\n'' "$D" "$D" | sha256sum -c - >/dev/null; rm -rf "$D/jxscout_ast/.git"; mkdir -p "$Q"; mv "$D/jxscout_ast" "$Q/jxscout"; fi; printf ''d1531754a223b21f4c49c2eaed2d16dbef552fac4ebbd69b62739c7c6c48ab65  %s/.local/share/quarry/jxscout/internal/modules/ast-analyzer/ast-analyzer.js\n8a8a0259a16112e633ecd54013ac15c00d24a9d54ec566404ce7d5e66e1d3d54  %s/.local/share/quarry/jxscout/internal/modules/ast-analyzer/parser.linux-x64-gnu.node\n'' "$HOME" "$HOME" | sha256sum -c - >/dev/null; mkdir -p ~/.local/bin/.stage; printf ''#!/bin/sh\nA="$HOME/.local/share/quarry/jxscout/internal/modules/ast-analyzer"\nNAPI_RS_NATIVE_LIBRARY_PATH="$A/parser.linux-x64-gnu.node" exec bun run "$A/ast-analyzer.js" "$@"\n'' > ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin}'
     # RUNS the analyzer on upstream's own example file: proof that bun executed it and that the native
     # parser loaded, not merely that a shim exists on PATH.
     capability: 'jxscout-ast $HOME/.local/share/quarry/jxscout/internal/modules/ast-analyzer/example/test.js'
@@ -459,7 +461,7 @@ tools:
     artifacts:
       linux/amd64: {url: "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz",   sha256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"}
       linux/arm64: {url: "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_arm64.tar.gz", sha256: "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"}
-    install: 'mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o /tmp/{bin}.tgz && echo "{sha256}  /tmp/{bin}.tgz" | sha256sum -c - && tar -xzf /tmp/{bin}.tgz -C ~/.local/bin/.stage {bin} && chmod +x ~/.local/bin/.stage/{bin} && rm -f /tmp/{bin}.tgz'
+    install: 'set -e; D="$(mktemp -d)"; mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o "$D/{bin}.tgz" && echo "{sha256}  $D/{bin}.tgz" | sha256sum -c - && tar -xzf "$D/{bin}.tgz" -C ~/.local/bin/.stage {bin} && chmod +x ~/.local/bin/.stage/{bin} && rm -rf "$D"'
     version_cmd: gitleaks version
     doc: https://github.com/gitleaks/gitleaks
     deps: [curl]
@@ -475,7 +477,7 @@ tools:
     artifacts:
       linux/amd64: {url: "https://github.com/trufflesecurity/trufflehog/releases/download/v3.95.9/trufflehog_3.95.9_linux_amd64.tar.gz", sha256: "f6d1106b85107d79527ed7a5b98b592beadd8b770dc3c9e8c1ad99e1b2cf127e"}
       linux/arm64: {url: "https://github.com/trufflesecurity/trufflehog/releases/download/v3.95.9/trufflehog_3.95.9_linux_arm64.tar.gz", sha256: "9d9c2ec4ea36a089a9c5aaafe1969d176013ddf9f44d68e8cd75291aed8c83ed"}
-    install: 'mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o /tmp/{bin}.tgz && echo "{sha256}  /tmp/{bin}.tgz" | sha256sum -c - && tar -xzf /tmp/{bin}.tgz -C ~/.local/bin/.stage {bin} && chmod +x ~/.local/bin/.stage/{bin} && rm -f /tmp/{bin}.tgz'
+    install: 'set -e; D="$(mktemp -d)"; mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o "$D/{bin}.tgz" && echo "{sha256}  $D/{bin}.tgz" | sha256sum -c - && tar -xzf "$D/{bin}.tgz" -C ~/.local/bin/.stage {bin} && chmod +x ~/.local/bin/.stage/{bin} && rm -rf "$D"'
     version_cmd: trufflehog --version
     doc: https://github.com/trufflesecurity/trufflehog
     deps: [curl]
@@ -552,7 +554,7 @@ tools:
     artifacts:
       linux/amd64: {url: "https://github.com/hahwul/dalfox/releases/download/v3.2.0/dalfox-v3.2.0-linux-x86_64-musl.tar.gz",  sha256: "4664e8dac304d35f4537655bf9b64ef6c529d47c485ec2610112b3328b3e51f9"}
       linux/arm64: {url: "https://github.com/hahwul/dalfox/releases/download/v3.2.0/dalfox-v3.2.0-linux-aarch64-musl.tar.gz", sha256: "e64e585f9bec69b6f40380c7be57de3b49131560c744f9bc9d71789afb5604a2"}
-    install: 'mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o /tmp/{bin}.tgz && echo "{sha256}  /tmp/{bin}.tgz" | sha256sum -c - && tar -xzf /tmp/{bin}.tgz -C ~/.local/bin/.stage --strip-components=1 --wildcards "*/{bin}" && chmod +x ~/.local/bin/.stage/{bin} && rm -f /tmp/{bin}.tgz'
+    install: 'set -e; D="$(mktemp -d)"; mkdir -p ~/.local/bin/.stage && curl -fsSL {url} -o "$D/{bin}.tgz" && echo "{sha256}  $D/{bin}.tgz" | sha256sum -c - && tar -xzf "$D/{bin}.tgz" -C ~/.local/bin/.stage --strip-components=1 --wildcards "*/{bin}" && chmod +x ~/.local/bin/.stage/{bin} && rm -rf "$D"'
     version_cmd: dalfox --version
     doc: https://github.com/hahwul/dalfox
     deps: [curl]

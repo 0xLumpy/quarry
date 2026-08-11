@@ -361,7 +361,7 @@ class TestInstallOne:
 
     def _patch_go(self, monkeypatch, *, drift="ok", cap=(0, "v2.14.0"), cmds=None):
         monkeypatch.setattr(registry, "run_shell", lambda c, d: (cmds.append(c) if cmds is not None else None, (0, ""))[1])
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: cap)
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: cap)
         monkeypatch.setattr(Tool, "installed", property(lambda self: True))
         monkeypatch.setattr(registry, "installed_identity", lambda t: "v2.14.0")
         monkeypatch.setattr(registry, "drift", lambda t: drift)
@@ -426,9 +426,9 @@ class TestInstallOne:
         if isinstance(probe, list):
             seq = list(probe)
             monkeypatch.setattr(registry, "_probe",
-                                lambda c, timeout=15: seq.pop(0) if seq else (127, ""))
+                                lambda c, timeout=15, pass_fd=None: seq.pop(0) if seq else (127, ""))
         else:
-            monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: probe)
+            monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: probe)
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(dest))     # managed dest resolves (no shadow)
         t = _tool(bin="gitleaks", runtime="binary", pin="v8.30.1", version_cmd="gitleaks version",
                   artifacts={"linux/amd64": {"url": "https://x/g.tgz", "sha256": _VALID_SHA}},
@@ -498,9 +498,9 @@ class TestInstallOne:
         assert registry.install_one(replace(t, pin="v5.0"), lambda m: None) is True
         assert dest.read_text() == "NEW"
 
-    def test_source_receipt_write_failure_fails_verification(self, monkeypatch, tmp_path):
-        # review-C08.2r2#4/r4#2: a receipt-write failure (after activation) must FAIL verification, not report
-        # success — the binary is active but unverifiable, so `install` reinstalls next time (recoverable).
+    def test_source_receipt_write_failure_rolls_back_to_last_good(self, monkeypatch, tmp_path):
+        # QR39-008: a receipt-write failure after the swap must ROLL BACK to the previous healthy binary,
+        # never leave an active-but-unverified payload in place.
         monkeypatch.setenv("HOME", str(tmp_path))
         stage = tmp_path / ".local" / "bin" / ".stage" / "massdns"
         dest = tmp_path / ".local" / "bin" / "massdns"
@@ -511,14 +511,14 @@ class TestInstallOne:
                 stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text("NEW")
             return (0, "")
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, ""))
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, ""))
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(dest))    # resolves to managed dest (no shadow)
         monkeypatch.setattr(registry, "_write_receipt",
                             lambda b, ref, sha: (_ for _ in ()).throw(OSError("receipt unwritable")))
         t = _tool(bin="massdns", runtime="source", ref="deadbeef", version_cmd="massdns --help", cap_codes=[0, 1],
                   install="git clone x && git checkout {ref} && cp bin/{bin} ~/.local/bin/.stage/{bin}")
-        assert registry.install_one(t, lambda m: None) is False              # verification failed
-        assert dest.read_text() == "NEW"                                     # activated; receipt gap -> reinstall recovers
+        assert registry.install_one(t, lambda m: None) is False              # activation failed
+        assert dest.read_text() == "OLD"                                     # rolled back to the last-good binary
 
 
 class TestCliNoFloat:
@@ -538,14 +538,14 @@ class TestCliNoFloat:
                 sp.parent.mkdir(parents=True, exist_ok=True); sp.write_text("bin")
             return (0, "")
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, ""))   # capability rc 0; version via version_eq
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, ""))   # capability rc 0; version via version_eq
         monkeypatch.setattr(registry, "version_eq", lambda a, b: True)           # staged version matches (not the focus)
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(tmp_path / ".local" / "bin" / b))  # no shadow
         monkeypatch.setattr(Tool, "installed", property(lambda self: True))
         monkeypatch.setattr(registry, "installed_identity", lambda t: t.pin or t.ref or "installed")
         monkeypatch.setattr(registry, "drift", lambda t: "ok")
         for fn in ("install_data_files", "run_extras", "cleanup"):
-            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: None)
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: bootstrap.InstallResult('mock', True, True))
         return CliRunner().invoke(cli_mod.cli, argv), cmds
 
     def test_update_never_runs_latest_or_pipx_upgrade(self, monkeypatch, tmp_path):
@@ -566,7 +566,7 @@ class TestCliNoFloat:
         monkeypatch.setattr(cli_mod, "install_one",
                             lambda t, echo, dry_run=False: (updated.append(t.bin), True)[1])
         for fn in ("install_data_files", "run_extras", "cleanup"):
-            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: None)
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: bootstrap.InstallResult('mock', True, True))
         res = CliRunner().invoke(cli_mod.cli, ["update"])
         assert res.exit_code == 0
         assert "js-beautify" in updated and "↻ js-beautify ✓" in res.output   # optional+installed synced, 1 line
@@ -579,7 +579,7 @@ class TestCliNoFloat:
         monkeypatch.setattr(registry, "run_shell", lambda c, d: (1, "boom"))   # every install fails
         monkeypatch.setattr(Tool, "installed", property(lambda self: False))
         for fn in ("install_data_files", "run_extras", "cleanup", "install_system_packages"):
-            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: True)
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: bootstrap.InstallResult('mock', True, True))
         res = CliRunner().invoke(cli_mod.cli, ["install", "--only", "subfinder", "--yes"])
         assert res.exit_code != 0
 
@@ -590,7 +590,7 @@ class TestCliNoFloat:
         monkeypatch.setattr(bootstrap, "system_report", lambda who: {"level": "ok"})
         monkeypatch.setattr(cli_mod, "_echo_syscheck", lambda rep: None)
         for fn in ("install_system_packages", "ensure_golang", "install_data_files", "run_extras", "cleanup"):
-            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: True)
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: bootstrap.InstallResult('mock', True, True))
         # install_one: REQUIRED tools succeed, OPTIONAL tools fail
         monkeypatch.setattr(cli_mod, "install_one", lambda t, echo, dry_run=False: not t.optional)
         return cli_mod
@@ -626,26 +626,27 @@ class TestGoArchiveChecksum:
         monkeypatch.setattr(bootstrap.platform, "machine", lambda: "x86_64")
         monkeypatch.setattr(bootstrap.platform, "system", lambda: "Linux")
         msgs = []
-        assert bootstrap.ensure_golang(msgs.append, dry=False) is False
+        assert bootstrap.ensure_golang(msgs.append, dry=False).ok is False
         assert any("not pinned" in m or "UNVERIFIED" in m for m in msgs)
 
-    def test_verified_go_archive_runs_sha_check(self, monkeypatch):
+    def test_verified_go_archive_passes_the_pinned_digest_to_the_safe_installer(self, monkeypatch):
         from quarry_recon import bootstrap
-        cmds = []
+        seen = {}
         monkeypatch.setattr(bootstrap.shutil, "which", lambda b: None)
         monkeypatch.setattr(bootstrap, "load_bootstrap", lambda: self._bs("a" * 64))
         monkeypatch.setattr(bootstrap.platform, "machine", lambda: "x86_64")
         monkeypatch.setattr(bootstrap.platform, "system", lambda: "Linux")
-        monkeypatch.setattr(bootstrap, "_sh", lambda cmd, dry, to: (cmds.append(cmd), (0, ""))[1])
-        assert bootstrap.ensure_golang(lambda m: None, dry=False) is True
-        assert "sha256sum -c" in cmds[0] and ("a" * 64) in cmds[0]              # the archive is checksum-verified
+        monkeypatch.setattr(bootstrap, "_install_golang_safe",
+                            lambda echo, url, sha: (seen.update(sha=sha, url=url), (True, ""))[1])
+        assert bootstrap.ensure_golang(lambda m: None, dry=False).ok is True
+        assert seen["sha"] == "a" * 64                                          # the pinned digest is verified
 
 
 def _health_env(monkeypatch, *, installed=True, identity="v1", cap_rc=0):
     # the REAL health seams (identity probed once + capability probe) — not the drift() wrapper
     monkeypatch.setattr(Tool, "installed", property(lambda self: installed))
     monkeypatch.setattr(registry, "installed_identity", lambda t: identity)
-    monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (cap_rc, ""))
+    monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (cap_rc, ""))
 
 
 class TestVerifyInstalled:
@@ -699,7 +700,7 @@ class TestHealth:
         monkeypatch.setattr(Tool, "installed", property(lambda self: True))
         monkeypatch.setattr(registry, "installed_identity",
                             lambda t: (calls.__setitem__("n", calls["n"] + 1), "v1")[1])
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, ""))
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, ""))
         registry.health(_tool(pin="v1", version_cmd="x -version"))
         assert calls["n"] == 1                                 # NOT re-probed for display + verdict
 
@@ -835,9 +836,9 @@ class TestIdentityR6:
                 stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text("NEW")
             return (0, "")
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, "v8.30.1"))
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, "v8.30.1"))
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(dest))
-        monkeypatch.setattr(registry, "_file_sha256", lambda p: "")            # binary unhashable
+        monkeypatch.setattr(registry, "_fd_sha256", lambda fd: "")             # staged descriptor unhashable
         t = _tool(bin="gitleaks", runtime="binary", pin="v8.30.1", version_cmd="gitleaks version",
                   artifacts={"linux/amd64": {"url": "https://x/g.tgz", "sha256": _VALID_SHA}},
                   install="curl {url} ... ~/.local/bin/.stage {bin}")
@@ -963,7 +964,7 @@ class TestGoBinaryMigration:
                 stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text("V3-NEW")
             return (0, "") if stage_ok else (1, "")
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, "v3.1.2"))
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, "v3.1.2"))
         monkeypatch.setattr(registry, "_go_bin_dir", lambda: gobin)
         # PATH resolves the legacy go copy FIRST while it exists; only after relocation does dest win
         monkeypatch.setattr(registry.shutil, "which",
@@ -1015,7 +1016,7 @@ class TestReclaimTransactional:
                 stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text("V3-NEW")
             return (0, "")
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, "v3.1.2"))
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, "v3.1.2"))
         monkeypatch.setattr(registry, "_go_bin_dir", lambda: gobin)
         # while legacy exists it shadows; after reclaim, either dest resolves ("dest") or nothing does ("none")
         def which(b):
@@ -1030,7 +1031,7 @@ class TestReclaimTransactional:
 
     def test_hash_failure_leaves_legacy_intact(self, monkeypatch, tmp_path):
         t, legacy, dest, gobin = self._mig(monkeypatch, tmp_path)
-        monkeypatch.setattr(registry, "_file_sha256", lambda p: "")     # unhashable -> fail BEFORE reclaim
+        monkeypatch.setattr(registry, "_fd_sha256", lambda fd: "")      # unhashable -> fail BEFORE reclaim
         assert registry.install_one(t, lambda m: None) is False
         assert legacy.read_text() == "V2-OLD"                           # legacy untouched (transactional)
         assert not list(gobin.glob("dalfox.quarry-replaced-*"))
@@ -1100,7 +1101,7 @@ class TestInstallOutput:
         monkeypatch.setattr(bootstrap, "system_report", lambda w: {"level": "ok"})
         monkeypatch.setattr(cli_mod, "_echo_syscheck", lambda r: None)
         for fn in ("install_system_packages", "ensure_golang", "install_data_files", "run_extras", "cleanup"):
-            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: True)
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: bootstrap.InstallResult('mock', True, True))
         return cli_mod
 
     def test_success_is_one_clean_line_diagnostics_suppressed(self, monkeypatch, tmp_path):
@@ -1207,7 +1208,7 @@ class TestAnInstallFailureSAYSWhatHappened:
                 stage_p.write_text("NEW")
             return (code, out)
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15: (0, "v8.30.1"))
+        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, "v8.30.1"))
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(tmp_path / ".local/bin/gitleaks"))
         t = _tool(bin="gitleaks", runtime="binary", pin="v8.30.1", version_cmd="gitleaks version",
                   artifacts={"linux/amd64": {"url": "https://x/g.tgz", "sha256": _VALID_SHA}},
@@ -1330,7 +1331,7 @@ class TestARuntimeDependencyIsNotAToolInTheOutput:
         monkeypatch.setattr(bootstrap, "system_report", lambda who="install": {"level": "ok", "checks": []})
         monkeypatch.setattr(cli_mod, "_echo_syscheck", lambda rep: None)
         for fn in ("install_system_packages", "ensure_golang", "install_data_files", "run_extras", "cleanup"):
-            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: True)
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: bootstrap.InstallResult('mock', True, True))
         done = []
         monkeypatch.setattr(cli_mod, "install_one",
                             lambda t, echo, dry_run=False: (done.append(t.bin), True)[1])
@@ -1462,11 +1463,11 @@ class TestTheGoLineSaysOnlyWhatIsHappening:
     the case an operator needs is the REFUSAL, which prints its own line."""
 
     @staticmethod
-    def _run(monkeypatch, *, code=0, tail="", sha_ok=True):
+    def _run(monkeypatch, *, ok=True, detail="", sha_ok=True):
         from quarry_recon import bootstrap
         msgs = []
         monkeypatch.setattr(bootstrap.shutil, "which", lambda b: None)     # nothing installed
-        monkeypatch.setattr(bootstrap, "_sh", lambda *a, **k: (code, tail))
+        monkeypatch.setattr(bootstrap, "_install_golang_safe", lambda echo, url, sha: (ok, detail))
         if not sha_ok:
             real = bootstrap.load_bootstrap
 
@@ -1475,33 +1476,34 @@ class TestTheGoLineSaysOnlyWhatIsHappening:
                 bs["golang"] = dict(bs["golang"], sha256={})
                 return bs
             monkeypatch.setattr(bootstrap, "load_bootstrap", _no_sha)
-        ok = bootstrap.ensure_golang(msgs.append, dry=False)
-        return ok, msgs
+        res = bootstrap.ensure_golang(msgs.append, dry=False)
+        return res, msgs
 
     def test_the_line_is_version_and_platform(self, monkeypatch):
-        _ok, msgs = self._run(monkeypatch)
+        _res, msgs = self._run(monkeypatch)
         line = next(m for m in msgs if "installing Go" in m)
         assert re.fullmatch(r"  installing Go \d+\.\d+(\.\d+)? \w+/\w+", line), line
 
     def test_the_recited_guarantees_are_gone(self, monkeypatch):
-        _ok, msgs = self._run(monkeypatch)
+        _res, msgs = self._run(monkeypatch)
         joined = " ".join(msgs)
         for noise in ("declared version", "sha256-verified", "min "):
             assert noise not in joined, joined
 
     def test_the_outcome_line_is_unchanged(self, monkeypatch):
-        ok, msgs = self._run(monkeypatch)
-        assert ok and "  go install: ok" in msgs
+        res, msgs = self._run(monkeypatch)
+        assert res.ok and "  go install: ok" in msgs
 
     def test_a_FAILURE_still_says_why(self, monkeypatch):
-        ok, msgs = self._run(monkeypatch, code=1, tail="sha256sum: WARNING: 1 computed checksum did NOT match")
-        assert ok is False
+        res, msgs = self._run(monkeypatch, ok=False,
+                              detail="sha256 mismatch: 1 computed checksum did NOT match")
+        assert res.ok is False
         assert any("go install: FAILED" in m and "did NOT match" in m for m in msgs), msgs
 
     def test_an_UNPINNED_archive_still_refuses_loudly(self, monkeypatch):
         """The guarantee is enforced by the code, not by the sentence — and when it bites, it speaks."""
-        ok, msgs = self._run(monkeypatch, sha_ok=False)
-        assert ok is False
+        res, msgs = self._run(monkeypatch, sha_ok=False)
+        assert res.ok is False
         assert any("not pinned" in m and "UNVERIFIED" in m for m in msgs), msgs
         assert not any("installing Go" in m for m in msgs), "it must not claim to install anything"
 
@@ -1522,7 +1524,7 @@ class TestTheToolsSectionIsOneLinePerTool:
         monkeypatch.setattr(cli, "_run_tool", lambda t, m, d: True)
         for fn in ("install_system_packages", "ensure_golang", "install_data_files", "run_extras",
                    "cleanup"):
-            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: True)
+            monkeypatch.setattr(bootstrap, fn, lambda *a, **k: bootstrap.InstallResult('mock', True, True))
         monkeypatch.setattr(bootstrap, "system_report",
                             lambda ctx="install": {"level": "ok", "checks": []})
         return CliRunner().invoke(cli.install, ["--include-optional"]).output

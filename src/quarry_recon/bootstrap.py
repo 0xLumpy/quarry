@@ -4,15 +4,50 @@ Anything that cannot be automated (no sudo, unsupported OS) is reported, never s
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import os
 import platform
 import re
+import shlex
 import shutil
+import stat
 import subprocess
+import tarfile
+import tempfile
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
 import yaml
+
+
+@dataclass
+class InstallResult:
+    """One install/bootstrap step's typed outcome; `blocks` is true only for a failed required step."""
+    name: str
+    ok: bool
+    required: bool
+    kind: str | None = None          # required_tool_missing | optional_tool_failed | machinery
+    detail: str | None = None
+
+    @property
+    def blocks(self) -> bool:
+        return self.required and not self.ok
+
+
+def _ok(name: str, *, required: bool = True) -> InstallResult:
+    return InstallResult(name, True, required)
+
+
+def _failed(name: str, detail: str, *, required: bool = True,
+            kind: str = "machinery") -> InstallResult:
+    return InstallResult(name, False, required,
+                         kind=("optional_tool_failed" if not required else kind), detail=detail)
+
+
+class _ArchiveError(Exception):
+    """A downloaded archive failed verification or carries an unsafe member — never extracted."""
 
 
 def load_bootstrap() -> dict:
@@ -52,16 +87,41 @@ def _sh(cmd: str, dry: bool, timeout: int = 1800) -> tuple[int, str]:
 
 
 def _curl_to(url: str, dest: Path, dry: bool, timeout: int = 300) -> tuple[int, str]:
-    """Download `url` → `dest` via argv, never a shell string — the url is user input."""
+    """Download `url` -> `dest` via argv (`--fail` makes an HTTP 4xx/5xx a nonzero exit); returns (rc, tail)."""
     if dry:
         return 0, "(dry-run)"
     try:
-        p = subprocess.run(["curl", "-sSL", url, "-o", str(dest)],
+        p = subprocess.run(["curl", "--fail", "-sSL", url, "-o", str(dest)],
                            capture_output=True, text=True, timeout=timeout)
         tail = "\n".join((p.stdout + p.stderr).strip().splitlines()[-3:])
         return p.returncode, tail
     except subprocess.SubprocessError as e:
         return 1, str(e)
+
+
+def _download_atomic(url: str, dest: Path, dry: bool, timeout: int = 300) -> tuple[int, str]:
+    """Download to a temp sibling then atomic-replace `dest` only on non-empty success; returns (rc, tail)."""
+    if dry:
+        return _curl_to(url, dest, True, timeout)   # dry-run still shows the url->dest routing
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
+    code, tail = _curl_to(url, tmp, False, timeout)
+    if code != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return (code or 1), tail
+    os.replace(str(tmp), str(dest))
+    return 0, tail
+
+
+def _write_atomic(dest: Path, text: str) -> None:
+    """Write `text` to a temp sibling then atomic-replace `dest` — never truncates the live file in place."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
+    tmp.write_text(text)
+    os.replace(str(tmp), str(dest))
 
 
 def _tool_deps(mgr: str) -> list[str]:
@@ -114,12 +174,12 @@ def _chromium_state(dry: bool, cc: int, lc: int, tail: str) -> str:
             + (f": {err[-1][:120]}" if err else ""))
 
 
-def install_system_packages(echo, dry: bool) -> bool:
+def install_system_packages(echo, dry: bool) -> InstallResult:
     bs = load_bootstrap()
     mgr, prefix = detect_pkg_manager()
     if mgr is None:
         echo("  ! unsupported OS — install system packages manually (see README.md)")
-        return False
+        return _failed("system-packages", "unsupported OS — no package manager")
 
     base = list(bs["system_packages"].get(mgr, []))
     tool_deps = _tool_deps(mgr)
@@ -150,10 +210,124 @@ def install_system_packages(echo, dry: bool) -> bool:
             echo(f"  chromium + headless libs: {_chromium_state(dry, cc, lc, tail)}")
         else:
             echo(f"  chromium: {'ok' if cc == 0 else 'manual install needed'}")
-    return code == 0
+    return _ok("system-packages") if code == 0 else _failed("system-packages", tail[:80] or "some packages failed")
 
 
-def ensure_golang(echo, dry: bool) -> bool:
+def _safe_tar_members(tf: tarfile.TarFile, base: Path) -> list:
+    """Reject absolute/traversal/symlink/special members; every member must resolve inside `base`."""
+    safe = []
+    for m in tf.getmembers():
+        if m.issym() or m.islnk() or not (m.isfile() or m.isdir()):
+            raise _ArchiveError(f"unsafe archive member (link/special): {m.name!r}")
+        target = (base / m.name).resolve()
+        if target != base and base not in target.parents:
+            raise _ArchiveError(f"archive member escapes extraction dir: {m.name!r}")
+        safe.append(m)
+    return safe
+
+
+def _verify_and_extract(archive: Path, sha: str, dest: Path) -> None:
+    """Hash and extract from the same no-follow descriptor (verified bytes == extracted bytes)."""
+    fd = os.open(str(archive), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise _ArchiveError("archive is not a regular file")
+        h = hashlib.sha256()
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+        got = h.hexdigest()
+        if got != sha:
+            raise _ArchiveError(f"sha256 mismatch: {got} != {sha}")
+        fh.seek(0)
+        dest.mkdir(parents=True, exist_ok=True)
+        base = dest.resolve()
+        with tarfile.open(fileobj=fh, mode="r:gz") as tf:
+            tf.extractall(dest, members=_safe_tar_members(tf, base))
+
+
+def _renameat2_exchange_cmd(sudo: str, a: str, b: str) -> str:
+    """Shell command that atomically swaps two pathnames via glibc renameat2(RENAME_EXCHANGE); nonzero when unavailable."""
+    py = ("import ctypes,sys\n"
+          "l=ctypes.CDLL(None,use_errno=True)\n"
+          "try:\n"
+          " r=l.renameat2(-100,sys.argv[1].encode(),-100,sys.argv[2].encode(),2)\n"
+          "except AttributeError:\n"
+          " sys.exit(1)\n"
+          "sys.exit(0 if r==0 else 1)")
+    return f"{sudo}python3 -c {shlex.quote(py)} {shlex.quote(a)} {shlex.quote(b)}"
+
+
+def _swap_in_golang(cand: Path) -> tuple[bool, str]:
+    """Activate the verified go tree via atomic RENAME_EXCHANGE (move/fallback otherwise), keeping .last-good for rollback."""
+    sudo = _sudo()
+    new = f"/usr/local/go.new.{os.getpid()}"
+    lastgood = "/usr/local/go.last-good"
+    if _sh(f"{sudo}rm -rf {new} {lastgood}", False, 60)[0] != 0:
+        return False, "could not clear prior staging dirs"
+    if _sh(f"{sudo}cp -a {shlex.quote(str(cand))} {new}", False, 300)[0] != 0:
+        _sh(f"{sudo}rm -rf {new}", False, 60)                 # live tree untouched — only staging is cleared
+        return False, "staging copy failed"
+
+    live_exists = _sh(f"{sudo}sh -c 'test -e /usr/local/go'", False, 30)[0] == 0
+    have_lastgood = False
+    if not live_exists:
+        if _sh(f"{sudo}mv {new} /usr/local/go", False, 120)[0] != 0:
+            _sh(f"{sudo}rm -rf {new}", False, 60)
+            return False, "activation move failed"
+    elif _sh(_renameat2_exchange_cmd(sudo, new, "/usr/local/go"), False, 60)[0] == 0:
+        # exchanged (go=new, new=old); preserve old as last-good, else exchange back and drop the new tree
+        if _sh(f"{sudo}mv {new} {lastgood}", False, 120)[0] != 0:
+            if _sh(_renameat2_exchange_cmd(sudo, new, "/usr/local/go"), False, 60)[0] != 0:
+                return False, ("could NOT preserve the previous tree AND could not restore it — /usr/local/go "
+                               "may be inconsistent")
+            _sh(f"{sudo}rm -rf {new}", False, 60)             # `new` now holds the rejected new tree
+            return False, "could NOT preserve the previous tree — restored the original, live install unchanged"
+        have_lastgood = True
+    else:
+        # no renameat2: displace the live tree only now that the replacement is proven staged
+        if _sh(f"{sudo}sh -c 'mv /usr/local/go {lastgood} && mv {new} /usr/local/go'", False, 120)[0] != 0:
+            _sh(f"{sudo}sh -c 'rm -rf {new}; if [ ! -e /usr/local/go ] && [ -e {lastgood} ]; then "
+                f"mv {lastgood} /usr/local/go; fi'", False, 60)
+            return False, "activation swap failed"
+        have_lastgood = _sh(f"{sudo}sh -c 'test -e {lastgood}'", False, 30)[0] == 0
+
+    if _sh(f"{sudo}ln -sf /usr/local/go/bin/go /usr/local/bin/go", False, 60)[0] != 0:
+        # post-activation failure: restore last-good only if we truly have it, and report honestly either way
+        if not have_lastgood:
+            return False, "symlink step failed after activation and there is no last-good — /usr/local/go may be inconsistent"
+        restored = _sh(_renameat2_exchange_cmd(sudo, lastgood, "/usr/local/go"), False, 60)[0] == 0
+        if not restored:
+            restored = _sh(f"{sudo}sh -c 'rm -rf /usr/local/go && mv {lastgood} /usr/local/go'", False, 120)[0] == 0
+        _sh(f"{sudo}sh -c 'rm -rf {lastgood}; ln -sf /usr/local/go/bin/go /usr/local/bin/go'", False, 60)
+        if restored:
+            return False, "symlink step failed after activation — restored last-good"
+        return False, "symlink step failed AND last-good could NOT be restored — /usr/local/go may be inconsistent"
+    _sh(f"{sudo}rm -rf {lastgood}", False, 60)                # activation confirmed; drop the rollback copy
+    return True, ""
+
+
+def _install_golang_safe(echo, url: str, sha: str) -> tuple[bool, str]:
+    """Full staged go install in a private 0700 op dir; the current toolchain is untouched until verified."""
+    op = Path(tempfile.mkdtemp(prefix="quarry-go."))
+    try:
+        arc = op / "go.tgz"
+        code, tail = _curl_to(url, arc, False)
+        if code != 0 or not arc.exists():
+            return False, f"download failed: {tail[:60]}"
+        stage = op / "root"
+        try:
+            _verify_and_extract(arc, sha, stage)
+        except (_ArchiveError, OSError, tarfile.TarError) as e:
+            return False, str(e)
+        cand = stage / "go"
+        if not (cand / "bin" / "go").is_file():
+            return False, "archive did not contain go/bin/go"
+        return _swap_in_golang(cand)
+    finally:
+        shutil.rmtree(op, ignore_errors=True)
+
+
+def ensure_golang(echo, dry: bool) -> InstallResult:
     bs = load_bootstrap()["golang"]
     min_version = tuple(int(p) for p in str(bs.get("min_version", "0")).split("."))
     if shutil.which("go"):
@@ -164,7 +338,7 @@ def ensure_golang(echo, dry: bool) -> bool:
             version = tuple(int(p) for p in found.group(1).split(".")) if found else (0,)
             if version >= min_version:
                 echo(f"  go present: {label}")
-                return True
+                return _ok("go")
             echo(f"  go present but too old: {label}; need >= {bs['min_version']}")
         except subprocess.SubprocessError:
             pass
@@ -172,7 +346,8 @@ def ensure_golang(echo, dry: bool) -> bool:
             "arm64": "arm64"}.get(platform.machine().lower())
     if arch is None:
         echo(f"  unsupported CPU architecture {platform.machine()!r} — cannot install a verified Go toolchain")
-        return False
+        return _failed("go", f"unsupported CPU architecture {platform.machine()!r}",
+                       kind="required_tool_missing")
     osname = "darwin" if platform.system() == "Darwin" else "linux"
     # policy: an existing Go passes on min_version; an install takes the declared `version`, sha256-verified
     target = bs["version"]
@@ -180,32 +355,48 @@ def ensure_golang(echo, dry: bool) -> bool:
     sha = (bs.get("sha256") or {}).get(plat)
     if not (isinstance(sha, str) and re.fullmatch(r"[a-f0-9]{64}", sha)):
         echo(f"  Go archive sha256 not pinned for {plat} — refusing an UNVERIFIED /usr/local/go replacement (C08)")
-        return False
+        return _failed("go", f"archive sha256 not pinned for {plat}", kind="required_tool_missing")
     url = bs["url"].format(version=f"go{target}", os=osname, arch=arch)
     echo(f"  installing Go {target} {osname}/{arch}")
-    cmd = (f"wget -q {url} -O /tmp/go.tgz && echo '{sha}  /tmp/go.tgz' | sha256sum -c - && "
-           f"{_sudo()}rm -rf /usr/local/go && "
-           f"{_sudo()}tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz && "
-           f"{_sudo()}ln -sf /usr/local/go/bin/go /usr/local/bin/go")
-    code, tail = _sh(cmd, dry, 600)
-    echo(f"  go install: {'ok' if code == 0 else 'FAILED — ' + tail[:80]}")
-    return code == 0
+    if dry:
+        return _ok("go")
+    # under the same shared-resource install lock as the tool paths
+    from .registry import _install_lock
+    with _install_lock("go-toolchain") as locked:
+        if not locked:
+            echo("  go install: another install/update is in progress — skipped")
+            return _failed("go", "another install/update is in progress", kind="required_tool_missing")
+        ok, detail = _install_golang_safe(echo, url, sha)
+    echo(f"  go install: {'ok' if ok else 'FAILED — ' + detail[:80]}")
+    return _ok("go") if ok else _failed("go", detail, kind="required_tool_missing")
 
 
-def install_data_files(echo, dry: bool, update: bool = False) -> None:
+def install_data_files(echo, dry: bool, update: bool = False) -> InstallResult:
     bs = load_bootstrap()
+    failures = []
     for df in bs.get("data_files", []):
         dest = Path(os.path.expanduser(df["dest"]))
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists() and dest.stat().st_size > 0 and not (update and df.get("update")):
             echo(f"  {df['name']}: present")
             continue
-        code, _ = _curl_to(df["url"], dest, dry)
-        if (code != 0 or (not dry and (not dest.exists() or dest.stat().st_size == 0))) and df.get("fallback"):
+        # download to a temp then atomic-replace: a failed/empty fetch leaves the previous file intact
+        code, _ = _download_atomic(df["url"], dest, dry)
+        if code == 0:
+            echo(f"  {df['name']}: ok")
+            continue
+        # a failed refresh keeps an existing valid file (no fallback clobber) but is recorded so update reports it
+        if not dry and dest.exists() and dest.stat().st_size > 0:
+            echo(f"  {df['name']}: refresh FAILED — kept existing file")
+            failures.append(df["name"])
+            continue
+        if df.get("fallback"):                                # first-time provisioning only
             if not dry:
-                dest.write_text(df["fallback"])
-            code = 0
-        echo(f"  {df['name']}: {'ok' if code == 0 else 'FAILED'}")
+                _write_atomic(dest, df["fallback"])
+            echo(f"  {df['name']}: fetch failed — wrote bundled fallback")
+            continue
+        echo(f"  {df['name']}: FAILED")
+        failures.append(df["name"])
 
     # framework secrets store — created once, chmod 600, never overwritten
     sp = Path.home() / ".config" / "quarry" / "secrets.yaml"
@@ -230,13 +421,13 @@ def install_data_files(echo, dry: bool, update: bool = False) -> None:
             cp.write_text(tpl)
         echo("  config.yaml: created")
 
+    if failures:
+        return _failed("data-files", "failed: " + ", ".join(failures))
+    return _ok("data-files")
+
 
 def set_data_file(name: str, url: str | None, echo, dry: bool = False) -> bool:
-    """Fetch/refresh one data file by name, overwriting unconditionally.
-
-    The name (from bootstrap.yaml `data_files`) fixes the destination; `url` only overrides the source.
-    On failure writes the bundled fallback when one exists and no custom url was given, else returns False.
-    """
+    """Fetch/refresh one data file by name; on failure keep an existing valid file or write the bundled fallback, else False."""
     bs = load_bootstrap()
     df = next((d for d in bs.get("data_files", []) if d["name"] == name), None)
     if df is None:
@@ -246,10 +437,15 @@ def set_data_file(name: str, url: str | None, echo, dry: bool = False) -> bool:
     dest = Path(os.path.expanduser(df["dest"]))
     dest.parent.mkdir(parents=True, exist_ok=True)
     src = url or df["url"]
-    code, tail = _curl_to(src, dest, dry)
-    if not dry and (code != 0 or not dest.exists() or dest.stat().st_size == 0):
-        if df.get("fallback") and not url:                      # custom url = user's problem, no fallback
-            dest.write_text(df["fallback"])
+    # atomic replace: a failed/empty refresh leaves the existing resolver/wordlist file intact
+    code, tail = _download_atomic(src, dest, dry)
+    if not dry and code != 0:
+        # a failed refresh must not overwrite an existing valid file with fallback content, nor report success
+        if dest.exists() and dest.stat().st_size > 0:
+            echo(f"  {name}: refresh FAILED ({tail[:80] or 'empty output'}) — kept existing file → {dest}")
+            return False
+        if df.get("fallback") and not url:                      # first-time provisioning only; custom url = no fallback
+            _write_atomic(dest, df["fallback"])
             echo(f"  {name}: fetch failed — wrote bundled fallback → {dest}")
             return True
         echo(f"  {name}: FAILED ({tail[:100] or 'empty output'})")
@@ -258,8 +454,9 @@ def set_data_file(name: str, url: str | None, echo, dry: bool = False) -> bool:
     return True
 
 
-def run_extras(echo, dry: bool) -> None:
+def run_extras(echo, dry: bool) -> InstallResult:
     bs = load_bootstrap()
+    failures = []
     for ex in bs.get("extras", []):
         if ex.get("needs") and not shutil.which(ex["needs"]):
             echo(f"  {ex['name']}: skipped (needs {ex['needs']})")
@@ -271,6 +468,11 @@ def run_extras(echo, dry: bool) -> None:
                 continue
         code, tail = _sh(ex["run"], dry, 600)
         echo(f"  {ex['name']}: {'ok' if code == 0 else 'failed — ' + tail[:60]}")
+        if code != 0:
+            failures.append(ex["name"])
+    # extras are optional: a failure is reported but never blocks the install
+    return _ok("extras", required=False) if not failures else \
+        _failed("extras", "failed: " + ", ".join(failures), required=False)
 
 
 def cleanup(echo, dry: bool) -> None:
