@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
-from .runner_protocol import ContainmentKind
+from .runner_protocol import ContainmentAssurance, ContainmentKind
 
 _CGROUP2_SUPER_MAGIC = 0x63677270
 _MAX_PROC_TEXT = 1 << 20
@@ -48,13 +48,6 @@ _WRITE_FLAGS = os.O_WRONLY | _O_NOFOLLOW | _O_CLOEXEC
 _PROC_ROOT = "/proc"
 _MOUNTINFO = "/proc/self/mountinfo"
 _SELF_CGROUP = "/proc/self/cgroup"
-
-
-class ContainmentAssurance(str, Enum):
-    """The strongest statement an acquired backend is allowed to make."""
-
-    PROCESS_GROUP = "process_group"
-    COOPERATIVE_TREE = "cooperative_tree"
 
 
 class ContainmentReason(str, Enum):
@@ -178,7 +171,8 @@ class ContainmentSettlement:
     removed: bool
     reason: ContainmentReason
     os_errno: int | None = None
-    assurance: ContainmentAssurance = ContainmentAssurance.COOPERATIVE_TREE
+    containment_assurance: ContainmentAssurance = (
+        ContainmentAssurance.COOPERATIVE_SCOPE)
 
     def __post_init__(self) -> None:
         for value in (self.killed, self.empty, self.removed):
@@ -188,8 +182,8 @@ class ContainmentSettlement:
             raise TypeError("invalid settlement reason")
         if self.os_errno is not None and type(self.os_errno) is not int:
             raise TypeError("invalid settlement errno")
-        if self.assurance is not ContainmentAssurance.COOPERATIVE_TREE:
-            raise ValueError("direct settlement has cooperative-tree assurance")
+        if self.containment_assurance is not ContainmentAssurance.COOPERATIVE_SCOPE:
+            raise ValueError("direct settlement has cooperative-scope assurance")
         if self.removed and not (self.killed and self.empty):
             raise ValueError("removed containment must be killed and empty")
         if self.removed != (self.reason is ContainmentReason.SETTLED):
@@ -202,7 +196,11 @@ class ContainmentSettlement:
 
     @property
     def tree_settled(self) -> bool:
-        """Never claim the escape-protected proof required for a clean run."""
+        """Never claim escape-protected proof for cooperative containment.
+
+        The parent protocol separately decides whether the request's declared policy
+        permits a recursively settled cooperative scope to be classified as clean.
+        """
         return False
 
     @property
@@ -216,7 +214,7 @@ class PgidFallback:
 
     pgid: int
     kind: ContainmentKind = ContainmentKind.PGID
-    assurance: ContainmentAssurance = ContainmentAssurance.PROCESS_GROUP
+    containment_assurance: ContainmentAssurance = ContainmentAssurance.PROCESS_GROUP
     cooperative_settlement_capable: bool = False
     tree_proof_capable: bool = False
     escape_protected: bool = False
@@ -224,7 +222,7 @@ class PgidFallback:
     def __post_init__(self) -> None:
         _positive_pid(self.pgid)
         if (self.kind is not ContainmentKind.PGID
-                or self.assurance is not ContainmentAssurance.PROCESS_GROUP
+                or self.containment_assurance is not ContainmentAssurance.PROCESS_GROUP
                 or self.cooperative_settlement_capable
                 or self.tree_proof_capable or self.escape_protected):
             raise ValueError("invalid PGID fallback assurance")
@@ -712,7 +710,7 @@ class DirectCgroupV2:
     """Exclusive parent handle for one acquired cooperative cgroup-v2 leaf."""
 
     kind = ContainmentKind.CGROUP_V2
-    assurance = ContainmentAssurance.COOPERATIVE_TREE
+    containment_assurance = ContainmentAssurance.COOPERATIVE_SCOPE
     cooperative_settlement_capable = True
     tree_proof_capable = False
     escape_protected = False

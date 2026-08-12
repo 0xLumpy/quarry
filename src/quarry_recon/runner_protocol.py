@@ -23,8 +23,9 @@ from pathlib import (Path, PosixPath, PurePath, PurePosixPath,
                      PureWindowsPath, WindowsPath)
 
 # Version 1 has not yet had a production caller or persisted transcript.  The
-# PREPARED launch handshake was added while this protocol was still preparatory,
-# before compatibility with an external peer or stored frame existed.
+# PREPARED launch handshake and request-bound clean-settlement policy were added
+# while this protocol was still preparatory, before compatibility with an external
+# peer or stored frame existed.
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 1 << 20
 MAX_JSON_DEPTH = 32
@@ -103,6 +104,32 @@ class ExecutionTerminal(str, Enum):
 class ContainmentKind(str, Enum):
     PGID = "pgid"
     CGROUP_V2 = "cgroup_v2"
+
+
+class CleanSettlementPolicy(str, Enum):
+    """Minimum containment assurance a request accepts as clean.
+
+    Quarry's current product contract permits a parent-verified cooperative scope:
+    installed tools are trusted, while their target-derived input is hostile.  A
+    stricter caller can require an escape-protected backend.  A process group never
+    satisfies either policy.
+    """
+
+    COOPERATIVE_SCOPE = "cooperative_scope"
+    ESCAPE_PROTECTED_ONLY = "escape_protected_only"
+
+
+class ContainmentAssurance(str, Enum):
+    """Assurance class of the parent-selected containment backend.
+
+    This is a capability/boundary property, not proof that settlement was achieved.
+    ``ValidatedSettlement.mechanically_settled`` and ``tree_proven`` record the
+    achieved outcomes.
+    """
+
+    PROCESS_GROUP = "process_group"
+    COOPERATIVE_SCOPE = "cooperative_scope"
+    ESCAPE_PROTECTED_TREE = "escape_protected_tree"
 
 
 def new_request_id(random_bytes: bytes) -> str:
@@ -322,6 +349,7 @@ class WorkerRequest:
     stdin_sha256: str | None = field(repr=False)
     descriptor_claims: tuple[DescriptorClaim, ...]
     max_output_bytes: int | None
+    clean_settlement_policy: CleanSettlementPolicy
 
     def __post_init__(self) -> None:
         _request_id(self.request_id)
@@ -390,6 +418,8 @@ class WorkerRequest:
             _nonnegative_int(self.max_output_bytes, "max_output_bytes")
             if not self.stdout_requested:
                 raise ProtocolError("output cap requires stdout", "max_output_bytes")
+        if type(self.clean_settlement_policy) is not CleanSettlementPolicy:
+            raise ProtocolError("invalid enum", "clean_settlement_policy")
         digest = _optional_digest(self.stdin_sha256, "stdin_sha256")
         if self.stdin_mode is StdinMode.DATA:
             if self.stdin_bytes is None:
@@ -433,6 +463,7 @@ class WorkerRequest:
             "stdin_sha256": self.stdin_sha256,
             "descriptor_claims": [claim.to_dict() for claim in self.descriptor_claims],
             "max_output_bytes": self.max_output_bytes,
+            "clean_settlement_policy": self.clean_settlement_policy.value,
         }
 
     @classmethod
@@ -440,7 +471,7 @@ class WorkerRequest:
         expected = frozenset({
             "request_id", "tool", "argv", "timeout", "ok_empty", "ok_codes",
             "environment", "cwd", "stdin_mode", "stdin_bytes", "stdin_sha256",
-            "descriptor_claims", "max_output_bytes",
+            "descriptor_claims", "max_output_bytes", "clean_settlement_policy",
         })
         _exact_keys(doc, expected, "request")
         if (type(doc["argv"]) is not list or type(doc["ok_codes"]) is not list
@@ -477,6 +508,9 @@ class WorkerRequest:
             descriptor_claims=tuple(
                 DescriptorClaim.from_dict(claim) for claim in doc["descriptor_claims"]),
             max_output_bytes=doc["max_output_bytes"],
+            clean_settlement_policy=_enum(
+                CleanSettlementPolicy, doc["clean_settlement_policy"],
+                "clean_settlement_policy"),
         )
 
 
@@ -526,7 +560,10 @@ class NormalizedInvocation:
 def normalize_invocation(*, request_id, tool, cmd, timeout=1800, stdin_data=None,
                          input_file=None, ok_empty=True, ok_codes=(0,), env=None,
                          base_environment=None, cwd=None, raw_path=None, stderr_path=None,
-                         max_output_bytes=None) -> NormalizedInvocation:
+                         max_output_bytes=None,
+                         clean_settlement_policy: CleanSettlementPolicy =
+                         CleanSettlementPolicy.COOPERATIVE_SCOPE,
+                         ) -> NormalizedInvocation:
     """Validate and normalize the current runner facade without side effects."""
     rid = _request_id(request_id)
     tool = _exact_string(tool, "tool")
@@ -545,6 +582,8 @@ def normalize_invocation(*, request_id, tool, cmd, timeout=1800, stdin_data=None
     timeout = _timeout(timeout)
     if type(ok_empty) is not bool:
         raise ProtocolError("invalid boolean", "ok_empty")
+    if type(clean_settlement_policy) is not CleanSettlementPolicy:
+        raise ProtocolError("invalid enum", "clean_settlement_policy")
     if type(ok_codes) not in (list, tuple) or not ok_codes:
         raise ProtocolError("invalid exit-code set", "ok_codes")
     codes = tuple(ok_codes)
@@ -620,6 +659,7 @@ def normalize_invocation(*, request_id, tool, cmd, timeout=1800, stdin_data=None
         stdin_mode=stdin_mode, stdin_bytes=stdin_bytes, stdin_sha256=stdin_sha256,
         descriptor_claims=claims,
         max_output_bytes=max_output_bytes,
+        clean_settlement_policy=clean_settlement_policy,
     )
     # A normalized invocation must be frameable; callers may not discover a
     # control-plane size failure after staging descriptors or launching a worker.
@@ -727,18 +767,29 @@ class StreamSettlement:
 class ReadyFrame:
     request_id: str
     worker_pid: int
+    request_sha256: str = field(repr=False)
 
     def __post_init__(self) -> None:
         _request_id(self.request_id)
         _positive_int(self.worker_pid, "worker_pid")
+        if _optional_digest(self.request_sha256, "request_sha256") is None:
+            raise ProtocolError("ready needs a request digest", "request_sha256")
 
     def to_dict(self) -> dict:
-        return {"request_id": self.request_id, "worker_pid": self.worker_pid}
+        return {
+            "request_id": self.request_id,
+            "worker_pid": self.worker_pid,
+            "request_sha256": self.request_sha256,
+        }
 
     @classmethod
     def from_dict(cls, doc: dict) -> "ReadyFrame":
-        _exact_keys(doc, frozenset({"request_id", "worker_pid"}), "ready")
-        return cls(request_id=doc["request_id"], worker_pid=doc["worker_pid"])
+        _exact_keys(
+            doc, frozenset({"request_id", "worker_pid", "request_sha256"}), "ready")
+        return cls(
+            request_id=doc["request_id"], worker_pid=doc["worker_pid"],
+            request_sha256=doc["request_sha256"],
+        )
 
 
 @dataclass(frozen=True, repr=False)
@@ -1029,6 +1080,11 @@ class ParentSettlementContext:
     means the named containment is parent-owned and has the required controls.
     ``containment_bound`` means the parent independently observed that exact tool
     inside it. ``containment_empty`` is the final recursive membership result.
+    ``containment_assurance`` is the parent-selected backend's assurance class, not
+    an achieved outcome or a worker-provided flag.  The current direct cgroup-v2
+    backend is a cooperative scope and deliberately does not imply escape
+    protection.  Mechanical settlement records whether the selected backend
+    actually completed its work.
     None of these booleans is received from the worker.
     """
 
@@ -1043,6 +1099,7 @@ class ParentSettlementContext:
     expected_launcher_pgid: int | None
     expected_containment_kind: ContainmentKind
     expected_containment_id: str
+    containment_assurance: ContainmentAssurance
     worker_returncode: int
     worker_reaped: bool
     control_eof: bool
@@ -1085,6 +1142,14 @@ class ParentSettlementContext:
         if type(self.expected_containment_kind) is not ContainmentKind:
             raise ProtocolError("invalid enum", "expected_containment_kind")
         _containment_id(self.expected_containment_id)
+        if type(self.containment_assurance) is not ContainmentAssurance:
+            raise ProtocolError("invalid enum", "containment_assurance")
+        expected_assurance = {
+            ContainmentKind.PGID: ContainmentAssurance.PROCESS_GROUP,
+            ContainmentKind.CGROUP_V2: ContainmentAssurance.COOPERATIVE_SCOPE,
+        }[self.expected_containment_kind]
+        if self.containment_assurance is not expected_assurance:
+            raise ProtocolError("containment assurance mismatch", "containment_assurance")
         _bounded_int(self.worker_returncode, "worker_returncode", minimum=MIN_EXIT_CODE,
                      maximum=MAX_EXIT_CODE)
         _nonnegative_int(self.trailing_control_bytes, "trailing_control_bytes")
@@ -1103,21 +1168,53 @@ class ParentSettlementContext:
 
 @dataclass(frozen=True)
 class ValidatedSettlement:
-    """Mechanical/capture proof, deliberately not semantic result classification."""
+    """Parent-derived settlement and capture proof.
+
+    ``tree_proven`` is deliberately narrower than ``clean_eligible``: it is true
+    only for a mechanically settled, escape-protected tree.  A cooperative scope
+    may be clean-eligible under the immutable request policy while recording both
+    ``tree_proven=False`` and ``escape_protected=False``.
+    """
 
     worker: WorkerSettlement = field(repr=False)
     mechanically_settled: bool
+    containment_assurance: ContainmentAssurance
+    escape_protected: bool
     tree_proven: bool
+    clean_eligible: bool
     capture_complete: bool
     _authority: object = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self._authority is not _VALIDATION_AUTHORITY:
             raise ProtocolError("validated settlement requires parent authority", "authority")
-        for name in ("mechanically_settled", "tree_proven", "capture_complete"):
+        if type(self.worker) is not WorkerSettlement:
+            raise ProtocolError("invalid worker settlement", "worker")
+        if type(self.containment_assurance) is not ContainmentAssurance:
+            raise ProtocolError("invalid enum", "containment_assurance")
+        for name in ("mechanically_settled", "escape_protected", "tree_proven",
+                     "clean_eligible", "capture_complete"):
             if type(getattr(self, name)) is not bool:
                 raise ProtocolError("invalid boolean", name)
-        if self.capture_complete and not (self.mechanically_settled and self.tree_proven):
+        expected_escape_protected = (
+            self.containment_assurance is ContainmentAssurance.ESCAPE_PROTECTED_TREE)
+        if self.escape_protected is not expected_escape_protected:
+            raise ProtocolError("escape protection and assurance disagree",
+                                "escape_protected")
+        expected_tree_proven = self.mechanically_settled and self.escape_protected
+        if self.tree_proven is not expected_tree_proven:
+            raise ProtocolError("tree proof and assurance disagree", "tree_proven")
+        if self.clean_eligible and (not self.mechanically_settled
+                                    or self.containment_assurance
+                                    is ContainmentAssurance.PROCESS_GROUP):
+            raise ProtocolError("clean eligibility and assurance disagree",
+                                "clean_eligible")
+        if self.escape_protected and (
+                self.clean_eligible is not self.mechanically_settled):
+            raise ProtocolError("escape-protected settlement must be clean eligible",
+                                "clean_eligible")
+        if self.capture_complete and not (self.mechanically_settled
+                                          and self.clean_eligible):
             raise ProtocolError("complete capture lacks settlement proof", "capture_complete")
 
 
@@ -1138,6 +1235,8 @@ def validate_parent_settlement(context: ParentSettlementContext) -> ValidatedSet
     transcript = validate_control_sequence(transcript_frames)
     request = context.request
     settlement = transcript.settlement
+    if context.ready.request_sha256 != request_digest(request):
+        raise ProtocolError("ready request digest mismatch", "request_sha256")
     if request.request_id != settlement.request_id:
         raise ProtocolError("request and settlement mismatch", "request_id")
     if context.ready.worker_pid != context.expected_worker_pid:
@@ -1232,17 +1331,23 @@ def validate_parent_settlement(context: ParentSettlementContext) -> ValidatedSet
     mechanically_settled = (
         authority_settled and settlement.process_group_settled and streams_settled
     )
-    tree_proven = (
-        mechanically_settled
-        and context.expected_containment_kind is ContainmentKind.CGROUP_V2
-        and context.containment_verified
-        and context.containment_empty
+    escape_protected = (
+        context.containment_assurance is ContainmentAssurance.ESCAPE_PROTECTED_TREE
+    )
+    tree_proven = mechanically_settled and escape_protected
+    clean_eligible = mechanically_settled and (
+        escape_protected
+        or (
+            context.containment_assurance is ContainmentAssurance.COOPERATIVE_SCOPE
+            and request.clean_settlement_policy
+            is CleanSettlementPolicy.COOPERATIVE_SCOPE
+        )
     )
     stdout = streams[StreamRole.STDOUT]
     stderr = streams[StreamRole.STDERR]
     stdin = streams[StreamRole.STDIN]
     capture_complete = (
-        mechanically_settled and tree_proven and evidence_bound
+        mechanically_settled and clean_eligible and evidence_bound
         and settlement.terminal is ExecutionTerminal.COMPLETE
         and stdin.terminal is StreamTerminal.COMPLETE
         and stdout.terminal is StreamTerminal.EOF
@@ -1250,7 +1355,9 @@ def validate_parent_settlement(context: ParentSettlementContext) -> ValidatedSet
     )
     return ValidatedSettlement(
         worker=settlement, mechanically_settled=mechanically_settled,
-        tree_proven=tree_proven, capture_complete=capture_complete,
+        containment_assurance=context.containment_assurance,
+        escape_protected=escape_protected, tree_proven=tree_proven,
+        clean_eligible=clean_eligible, capture_complete=capture_complete,
         _authority=_VALIDATION_AUTHORITY,
     )
 
@@ -1363,6 +1470,17 @@ def encode_request(request: WorkerRequest) -> bytes:
     if type(request) is not WorkerRequest:
         raise ProtocolError("invalid worker request", "request")
     return _encode("request", request.to_dict())
+
+
+def request_digest(request: WorkerRequest) -> str:
+    """Authenticate the exact canonical request accepted by one worker.
+
+    The fixed prefix keeps this digest in a protocol-specific domain; hashing the
+    complete canonical frame also binds the protocol version and record kind.
+    """
+    return hashlib.sha256(
+        b"quarry-runner-request-v1\0" + encode_request(request)
+    ).hexdigest()
 
 
 def decode_request(frame: bytes) -> WorkerRequest:

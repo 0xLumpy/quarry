@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from quarry_recon import runner_containment as containment
-from quarry_recon.runner_protocol import ContainmentKind
+from quarry_recon.runner_protocol import ContainmentAssurance, ContainmentKind
 
 pytestmark = pytest.mark.offline
 
@@ -204,7 +204,8 @@ def test_acquisition_proves_leaf_controls_and_scopes_assurance(monkeypatch, tmp_
     try:
         assert leaf.is_dir()
         assert handle.kind is ContainmentKind.CGROUP_V2
-        assert handle.assurance is containment.ContainmentAssurance.COOPERATIVE_TREE
+        assert (handle.containment_assurance
+                is ContainmentAssurance.COOPERATIVE_SCOPE)
         assert handle.cooperative_settlement_capable is True
         assert handle.tree_proof_capable is False
         assert handle.escape_protected is False
@@ -717,7 +718,8 @@ def test_close_attempts_every_descriptor_when_one_close_fails(monkeypatch, tmp_p
 def test_pgid_fallback_can_never_claim_tree_proof():
     fallback = containment.PgidFallback(1234)
     assert fallback.kind is ContainmentKind.PGID
-    assert fallback.assurance is containment.ContainmentAssurance.PROCESS_GROUP
+    assert (fallback.containment_assurance
+            is ContainmentAssurance.PROCESS_GROUP)
     assert fallback.tree_proof_capable is False
     assert fallback.escape_protected is False
 

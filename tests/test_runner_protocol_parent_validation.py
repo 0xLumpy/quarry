@@ -107,8 +107,14 @@ def _settlement(streams, **overrides):
     return protocol.WorkerSettlement(**values)
 
 
-def _ready(**overrides):
-    values = {"request_id": RID, "worker_pid": WORKER_PID}
+def _ready(request=None, **overrides):
+    request_sha256 = (
+        protocol.request_digest(request) if request is not None else "04" * 32)
+    values = {
+        "request_id": RID,
+        "worker_pid": WORKER_PID,
+        "request_sha256": request_sha256,
+    }
     values.update(overrides)
     return protocol.ReadyFrame(**values)
 
@@ -174,7 +180,12 @@ def _clean_case(tmp_path, *, stdin_data=None, input_file=None,
     settlement = _settlement(streams)
     kind = containment_kind or protocol.ContainmentKind.CGROUP_V2
     containment_id = CGROUP_ID if kind is protocol.ContainmentKind.CGROUP_V2 else str(TOOL_PID)
-    ready = _ready()
+    assurance = (
+        protocol.ContainmentAssurance.COOPERATIVE_SCOPE
+        if kind is protocol.ContainmentKind.CGROUP_V2
+        else protocol.ContainmentAssurance.PROCESS_GROUP
+    )
+    ready = _ready(invocation.worker)
     prepared = _prepared(containment_kind=kind, containment_id=containment_id)
     started = _started(containment_kind=kind, containment_id=containment_id)
     context = protocol.ParentSettlementContext(
@@ -189,6 +200,7 @@ def _clean_case(tmp_path, *, stdin_data=None, input_file=None,
         expected_launcher_pgid=TOOL_PID,
         expected_containment_kind=kind,
         expected_containment_id=containment_id,
+        containment_assurance=assurance,
         worker_returncode=0,
         worker_reaped=True,
         control_eof=True,
@@ -398,6 +410,24 @@ def test_launch_control_frames_round_trip_with_exact_kinds():
 
 
 @pytest.mark.parametrize("mutation", [
+    lambda body: body.pop("request_sha256"),
+    lambda body: body.__setitem__("extra", 1),
+    lambda body: body.__setitem__("request_sha256", True),
+    lambda body: body.__setitem__("request_sha256", "A" * 64),
+    lambda body: body.__setitem__("request_sha256", "04" * 31),
+])
+def test_ready_frame_wire_schema_and_request_digest_fail_closed(mutation):
+    body = _ready().to_dict()
+    mutation(body)
+    with pytest.raises(protocol.ProtocolError):
+        protocol.decode_ready(_frame({
+            "version": protocol.PROTOCOL_VERSION,
+            "kind": "ready",
+            "body": body,
+        }))
+
+
+@pytest.mark.parametrize("mutation", [
     lambda body: body.pop("launcher_pid"),
     lambda body: body.__setitem__("extra", 1),
     lambda body: body.__setitem__("launcher_pid", True),
@@ -551,13 +581,69 @@ def test_prepared_and_started_identity_and_intent_must_match(prepared_change,
 # -- Parent authority binds settlement to stages, stdin, cap, and real process --
 
 
-def test_cgroup_bound_parent_validation_is_the_only_clean_authority(tmp_path):
+def test_cooperative_cgroup_is_clean_only_under_request_bound_policy(tmp_path):
     context = _clean_case(tmp_path)
     result = protocol.validate_parent_settlement(context)
     assert result.mechanically_settled is True
-    assert result.tree_proven is True
+    assert (result.containment_assurance
+            is protocol.ContainmentAssurance.COOPERATIVE_SCOPE)
+    assert result.escape_protected is False
+    assert result.tree_proven is False
+    assert result.clean_eligible is True
     assert result.capture_complete is True
-    assert not hasattr(result, "clean_eligible")
+
+
+def test_strict_request_cannot_be_laundered_to_cooperative_policy(tmp_path):
+    strict = _clean_case(tmp_path)
+    strict_request = replace(
+        strict.request,
+        clean_settlement_policy=protocol.CleanSettlementPolicy.ESCAPE_PROTECTED_ONLY,
+    )
+    strict = replace(
+        strict,
+        request=strict_request,
+        ready=_ready(strict_request),
+    )
+    cooperative_request = replace(
+        strict_request,
+        clean_settlement_policy=protocol.CleanSettlementPolicy.COOPERATIVE_SCOPE,
+    )
+    with pytest.raises(protocol.ProtocolError, match="request digest mismatch"):
+        protocol.validate_parent_settlement(
+            replace(strict, request=cooperative_request))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("tool", "different-tool"),
+    ("argv", ("/usr/bin/printf", "different")),
+    ("timeout", 31),
+    ("ok_empty", False),
+    ("ok_codes", (0, 7)),
+    ("environment", (("PATH", "/bin"),)),
+    ("max_output_bytes", 0),
+])
+def test_ready_digest_rejects_other_request_substitution(tmp_path, field, value):
+    context = _clean_case(tmp_path)
+    substituted = replace(context.request, **{field: value})
+    with pytest.raises(protocol.ProtocolError, match="request digest mismatch"):
+        protocol.validate_parent_settlement(replace(context, request=substituted))
+
+
+def test_strict_request_records_cooperative_scope_as_unclean(tmp_path):
+    context = _clean_case(tmp_path)
+    strict_request = replace(
+        context.request,
+        clean_settlement_policy=protocol.CleanSettlementPolicy.ESCAPE_PROTECTED_ONLY,
+    )
+    result = protocol.validate_parent_settlement(replace(
+        context, request=strict_request, ready=_ready(strict_request)))
+    assert result.mechanically_settled is True
+    assert (result.containment_assurance
+            is protocol.ContainmentAssurance.COOPERATIVE_SCOPE)
+    assert result.escape_protected is False
+    assert result.tree_proven is False
+    assert result.clean_eligible is False
+    assert result.capture_complete is False
 
 
 def test_validated_settlement_cannot_be_constructed_without_parent_validator(tmp_path):
@@ -565,8 +651,19 @@ def test_validated_settlement_cannot_be_constructed_without_parent_validator(tmp
     worker = context.settlement
     with pytest.raises(protocol.ProtocolError, match="authority"):
         protocol.ValidatedSettlement(
-            worker=worker, mechanically_settled=True, tree_proven=True,
+            worker=worker, mechanically_settled=True,
+            containment_assurance=protocol.ContainmentAssurance.COOPERATIVE_SCOPE,
+            escape_protected=False, tree_proven=False, clean_eligible=True,
             capture_complete=True, _authority=object())
+
+
+def test_validated_settlement_rejects_non_exact_worker_even_with_authority():
+    with pytest.raises(protocol.ProtocolError, match="worker settlement"):
+        protocol.ValidatedSettlement(
+            worker=object(), mechanically_settled=True,
+            containment_assurance=protocol.ContainmentAssurance.COOPERATIVE_SCOPE,
+            escape_protected=False, tree_proven=False, clean_eligible=True,
+            capture_complete=True, _authority=protocol._VALIDATION_AUTHORITY)
 
 
 @pytest.mark.parametrize("field,value", [
@@ -605,7 +702,7 @@ def test_parent_accepts_prepared_fast_failure_but_never_as_clean(tmp_path, termi
     )
     context = protocol.ParentSettlementContext(
         request=invocation.worker,
-        ready=_ready(),
+        ready=_ready(invocation.worker),
         prepared=_prepared(),
         started=None,
         settlement=_settlement(
@@ -623,6 +720,7 @@ def test_parent_accepts_prepared_fast_failure_but_never_as_clean(tmp_path, termi
         expected_launcher_pgid=TOOL_PID,
         expected_containment_kind=protocol.ContainmentKind.CGROUP_V2,
         expected_containment_id=CGROUP_ID,
+        containment_assurance=protocol.ContainmentAssurance.COOPERATIVE_SCOPE,
         worker_returncode=0,
         worker_reaped=True,
         control_eof=True,
@@ -636,6 +734,10 @@ def test_parent_accepts_prepared_fast_failure_but_never_as_clean(tmp_path, termi
     )
     result = protocol.validate_parent_settlement(context)
     assert result.mechanically_settled is False
+    assert (result.containment_assurance
+            is protocol.ContainmentAssurance.COOPERATIVE_SCOPE)
+    assert result.escape_protected is False
+    assert result.clean_eligible is False
     assert result.tree_proven is False
     assert result.capture_complete is False
 
@@ -649,7 +751,7 @@ def test_unprepared_fast_failure_has_no_launcher_parent_proof(tmp_path):
     )
     context = protocol.ParentSettlementContext(
         request=invocation.worker,
-        ready=_ready(),
+        ready=_ready(invocation.worker),
         prepared=None,
         started=None,
         settlement=_settlement(
@@ -667,6 +769,7 @@ def test_unprepared_fast_failure_has_no_launcher_parent_proof(tmp_path):
         expected_launcher_pgid=None,
         expected_containment_kind=protocol.ContainmentKind.CGROUP_V2,
         expected_containment_id=CGROUP_ID,
+        containment_assurance=protocol.ContainmentAssurance.COOPERATIVE_SCOPE,
         worker_returncode=0,
         worker_reaped=True,
         control_eof=True,
@@ -680,6 +783,10 @@ def test_unprepared_fast_failure_has_no_launcher_parent_proof(tmp_path):
     )
     result = protocol.validate_parent_settlement(context)
     assert result.mechanically_settled is False
+    assert (result.containment_assurance
+            is protocol.ContainmentAssurance.COOPERATIVE_SCOPE)
+    assert result.escape_protected is False
+    assert result.clean_eligible is False
     assert result.tree_proven is False
     assert result.capture_complete is False
 
@@ -757,14 +864,16 @@ def test_unrequested_output_may_be_observed_but_never_retain_a_claim(tmp_path):
         size=1, sha256=_digest(b"x"), lines=0,
     )
     context = protocol.ParentSettlementContext(
-        request=invocation.worker, ready=_ready(), prepared=_prepared(),
+        request=invocation.worker, ready=_ready(invocation.worker), prepared=_prepared(),
         started=_started(),
         settlement=settlement, descriptor_proofs=(proof,),
         expected_worker_pid=WORKER_PID,
         expected_launcher_pid=TOOL_PID,
         expected_launcher_pgid=TOOL_PID,
         expected_containment_kind=protocol.ContainmentKind.CGROUP_V2,
-        expected_containment_id=CGROUP_ID, worker_returncode=0,
+        expected_containment_id=CGROUP_ID,
+        containment_assurance=protocol.ContainmentAssurance.COOPERATIVE_SCOPE,
+        worker_returncode=0,
         worker_reaped=True, control_eof=True, trailing_control_bytes=0,
         prepared_identity_verified=True, tool_identity_verified=True,
         containment_verified=True,
@@ -940,18 +1049,49 @@ def test_pgid_fallback_cannot_launder_worker_tree_testimony_into_clean(tmp_path)
     context = _clean_case(tmp_path,
                           containment_kind=protocol.ContainmentKind.PGID)
     result = protocol.validate_parent_settlement(context)
+    assert (result.containment_assurance
+            is protocol.ContainmentAssurance.PROCESS_GROUP)
+    assert result.escape_protected is False
     assert result.tree_proven is False
+    assert result.clean_eligible is False
     assert result.capture_complete is False
 
 
-def test_cgroup_truth_requires_independent_binding_and_empty_membership(tmp_path):
+def test_cooperative_scope_truth_requires_independent_binding_and_empty_membership(
+        tmp_path):
     context = _clean_case(tmp_path)
-    assert protocol.validate_parent_settlement(context).tree_proven is True
+    result = protocol.validate_parent_settlement(context)
+    assert result.clean_eligible is True
+    assert result.tree_proven is False
     for field in ("tool_identity_verified", "containment_verified",
                   "containment_bound", "containment_empty"):
         _assert_refused_or_unclean(
             lambda field=field: protocol.validate_parent_settlement(
                 replace(context, **{field: False})))
+
+
+@pytest.mark.parametrize("kind,assurance", [
+    (protocol.ContainmentKind.PGID,
+     protocol.ContainmentAssurance.COOPERATIVE_SCOPE),
+    (protocol.ContainmentKind.PGID,
+     protocol.ContainmentAssurance.ESCAPE_PROTECTED_TREE),
+    (protocol.ContainmentKind.CGROUP_V2,
+     protocol.ContainmentAssurance.PROCESS_GROUP),
+    (protocol.ContainmentKind.CGROUP_V2,
+     protocol.ContainmentAssurance.ESCAPE_PROTECTED_TREE),
+])
+def test_containment_kind_cannot_forge_a_stronger_or_mismatched_assurance(
+        tmp_path, kind, assurance):
+    context = _clean_case(tmp_path, containment_kind=kind)
+    with pytest.raises(protocol.ProtocolError, match="assurance mismatch"):
+        replace(context, containment_assurance=assurance)
+
+
+@pytest.mark.parametrize("value", ["cooperative_scope", True, object()])
+def test_parent_assurance_requires_the_exact_enum(tmp_path, value):
+    context = _clean_case(tmp_path)
+    with pytest.raises(protocol.ProtocolError, match="containment_assurance"):
+        replace(context, containment_assurance=value)
 
 
 def test_parent_context_repr_does_not_disclose_request_credentials(tmp_path):

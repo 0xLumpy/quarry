@@ -163,12 +163,55 @@ def test_stdin_data_preserves_nul_and_rejects_unpaired_surrogates():
 
 def test_request_is_frozen_and_control_frame_round_trips_canonically():
     request = _request().worker
+    assert (request.clean_settlement_policy
+            is protocol.CleanSettlementPolicy.COOPERATIVE_SCOPE)
     with pytest.raises(FrozenInstanceError):
         request.tool = "changed"
     frame = protocol.encode_request(request)
     assert protocol.decode_request(frame) == request
     assert protocol.encode_request(protocol.decode_request(frame)) == frame
     assert len(frame) == struct.unpack(">I", frame[:4])[0] + 4
+
+
+def test_clean_settlement_policy_is_request_bound_and_round_trips():
+    request = _request(
+        clean_settlement_policy=(
+            protocol.CleanSettlementPolicy.ESCAPE_PROTECTED_ONLY),
+    ).worker
+    assert (request.clean_settlement_policy
+            is protocol.CleanSettlementPolicy.ESCAPE_PROTECTED_ONLY)
+    assert protocol.decode_request(protocol.encode_request(request)) == request
+
+
+def test_request_digest_binds_the_canonical_frame_and_policy():
+    cooperative = _request().worker
+    strict = replace(
+        cooperative,
+        clean_settlement_policy=(
+            protocol.CleanSettlementPolicy.ESCAPE_PROTECTED_ONLY),
+    )
+    digest = protocol.request_digest(cooperative)
+    assert digest == protocol.request_digest(
+        protocol.decode_request(protocol.encode_request(cooperative)))
+    assert digest != protocol.request_digest(strict)
+    assert len(digest) == 64
+    assert set(digest) <= set("0123456789abcdef")
+
+
+@pytest.mark.parametrize("value", ["cooperative_scope", True, object()])
+def test_clean_settlement_policy_requires_the_exact_enum(value):
+    with pytest.raises(protocol.ProtocolError, match="clean_settlement_policy"):
+        _request(clean_settlement_policy=value)
+    with pytest.raises(protocol.ProtocolError, match="clean_settlement_policy"):
+        replace(_request().worker, clean_settlement_policy=value)
+
+
+@pytest.mark.parametrize("value", ["invented", True, None])
+def test_wire_clean_settlement_policy_is_typed(value):
+    body = _request().worker.to_dict()
+    body["clean_settlement_policy"] = value
+    with pytest.raises(protocol.ProtocolError, match="clean_settlement_policy"):
+        protocol.WorkerRequest.from_dict(body)
 
 
 def test_request_frame_contains_private_control_data_but_errors_do_not():
