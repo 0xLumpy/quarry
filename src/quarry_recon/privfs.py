@@ -6,10 +6,13 @@ import errno
 import hashlib
 import json
 import os
+import signal
 import stat
+import threading
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 
 DIR_MODE = 0o700
@@ -278,6 +281,42 @@ class PrivateReplaceUncertain(PrivatePathError):
 
 class PrivateReplaceCommittedWithFault(PrivatePathError):
     """A replacement committed durably, but settlement also observed a fault."""
+
+
+_STAGE_OPERATIONS = frozenset({
+    "prepare", "seal", "replace", "abort", "abort_handoff",
+})
+_STAGE_STATES = frozenset({
+    "open", "sealed", "handoff_prepared", "publishing", "committed",
+    "replaced_uncertain", "aborted", "prepared", "worker_owned",
+    "transfer_uncertain", "settled", "fenced",
+})
+
+
+class PrivateStageStateError(PrivatePathError):
+    """A fixed, credential-safe private-stage lifecycle refusal."""
+
+    def __init__(self, operation: str, state: str) -> None:
+        if (type(operation) is not str or operation not in _STAGE_OPERATIONS
+                or type(state) is not str or state not in _STAGE_STATES):
+            raise TypeError("invalid private stage operation or state")
+        self.operation = operation
+        self.state = state
+        super().__init__(
+            f"private stage operation {operation} is invalid in state {state}",
+        )
+
+
+class PrivateStageHandoffError(PrivatePathError):
+    """A fixed, credential-safe batch handoff or cleanup failure."""
+
+    def __init__(self, operation: str) -> None:
+        if type(operation) is not str or operation not in {"prepare", "abort_handoff"}:
+            raise TypeError("invalid private stage handoff operation")
+        self.operation = operation
+        self.cleanup_errors: tuple[BaseException, ...] = ()
+        self.close_errors: tuple[BaseException, ...] = ()
+        super().__init__(f"private stage handoff {operation} failed")
 
 
 def validate_relative_components(
@@ -849,6 +888,7 @@ def repair_legacy_mode_at(
 
 
 _PRIVATE_STAGE_CONSTRUCTOR = object()
+_PRIVATE_STAGE_BATCH_CONSTRUCTOR = object()
 
 
 class PrivateFileStage:
@@ -873,6 +913,7 @@ class PrivateFileStage:
         "_sealed_signature",
         "_sealed_digest",
         "_state",
+        "_lifecycle_lock",
     )
 
     def __init__(
@@ -902,6 +943,7 @@ class PrivateFileStage:
         object.__setattr__(self, "_sealed_signature", None)
         object.__setattr__(self, "_sealed_digest", None)
         object.__setattr__(self, "_state", "open")
+        object.__setattr__(self, "_lifecycle_lock", threading.RLock())
 
     def __setattr__(self, name, value) -> None:
         raise AttributeError("private stage claims are read-only")
@@ -964,23 +1006,100 @@ class PrivateFileStage:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        if self.state not in {"committed", "replaced_uncertain", "aborted"}:
-            try:
-                self.abort()
-            except BaseException as cleanup_error:
-                if exc is None:
-                    raise
+        # Once handoff preparation succeeds the batch, not this per-file handle,
+        # owns every writer and pin.  Letting the stage context manager attempt a
+        # second cleanup would both violate that ownership boundary and turn a
+        # successful prepare into a lifecycle error.
+        with self._lifecycle_lock:
+            if self.state in {"open", "sealed"}:
                 try:
-                    exc.private_cleanup_error = cleanup_error
-                except BaseException:
-                    pass
+                    self.abort()
+                except BaseException as cleanup_error:
+                    if exc is None:
+                        raise
+                    try:
+                        exc.private_cleanup_error = cleanup_error
+                    except BaseException:
+                        pass
 
 
-def _validate_live_stage(stage: PrivateFileStage) -> None:
+class PrivateStageHandoffBatch:
+    """Opaque parent-owned writers prepared for one not-yet-spawned worker.
+
+    ``pass_fds`` is a borrowed ordered descriptor tuple, not a transfer of Python
+    ownership.  Until a later spawn slice consumes the batch, only this object owns
+    those writers.  The batch deliberately renders neither descriptors, paths nor
+    its request correlation value.
+    """
+
+    __slots__ = (
+        "_stages", "_writer_fds", "_pin_fds", "_request_id", "_state",
+    )
+
+    def __init__(
+        self,
+        *,
+        stages: tuple[PrivateFileStage, ...],
+        writer_fds: tuple[int, ...],
+        pin_fds: tuple[int, ...],
+        request_id: str,
+        _constructor_token: object,
+    ) -> None:
+        if _constructor_token is not _PRIVATE_STAGE_BATCH_CONSTRUCTOR:
+            raise PrivatePathUnsafe(
+                "private stage handoffs must be created by the strict staging API",
+            )
+        object.__setattr__(self, "_stages", stages)
+        object.__setattr__(self, "_writer_fds", writer_fds)
+        object.__setattr__(self, "_pin_fds", pin_fds)
+        object.__setattr__(self, "_request_id", request_id)
+        object.__setattr__(self, "_state", "prepared")
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError("private stage handoff claims are read-only")
+
+    def __delattr__(self, name) -> None:
+        raise AttributeError("private stage handoff claims are read-only")
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        return self._writer_fds if self._state == "prepared" else ()
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def abort(self) -> None:
+        abort_unspawned_private_stage_handoff(self)
+
+    def __enter__(self) -> "PrivateStageHandoffBatch":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        # Join any in-flight batch lifecycle operation before deciding whether
+        # cleanup remains ours.  Otherwise an already-invalidated abort could still
+        # be physically closing its writers while this context returns.
+        with _hold_stage_lifecycle(self._stages):
+            if self.state == "prepared":
+                try:
+                    self.abort()
+                except BaseException as cleanup_error:
+                    if exc is None:
+                        raise
+                    try:
+                        exc.private_cleanup_error = cleanup_error
+                    except BaseException:
+                        pass
+
+    def __repr__(self) -> str:
+        return f"PrivateStageHandoffBatch(stages={len(self._stages)}, state={self._state!r})"
+
+
+def _validate_live_stage(stage: PrivateFileStage, operation: str) -> None:
     if type(stage) is not PrivateFileStage:
         raise PrivatePathUnsafe("private stage handle has the wrong type")
     if stage.state not in {"open", "sealed"}:
-        raise PrivatePathUnsafe("private stage is no longer live", components=stage.components)
+        raise PrivateStageStateError(operation, stage.state)
     parent = os.fstat(stage.parent_fd)
     _validate_strict_dir_stat(parent, stage.components[:-1])
     if _identity(parent) != stage.parent_identity:
@@ -989,6 +1108,72 @@ def _validate_live_stage(stage: PrivateFileStage) -> None:
 
 def _set_stage(stage: PrivateFileStage, field: str, value) -> None:
     object.__setattr__(stage, f"_{field}", value)
+
+
+@contextmanager
+def _hold_stage_lifecycle(stages: tuple[PrivateFileStage, ...]):
+    """Serialize a small stage set in process-stable canonical order."""
+    ordered = tuple(sorted(stages, key=id))
+    if len(ordered) == 1:
+        with ordered[0]._lifecycle_lock:
+            yield
+    elif len(ordered) == 2:
+        with ordered[0]._lifecycle_lock:
+            with ordered[1]._lifecycle_lock:
+                yield
+    elif len(ordered) == 3:
+        with ordered[0]._lifecycle_lock:
+            with ordered[1]._lifecycle_lock:
+                with ordered[2]._lifecycle_lock:
+                    yield
+    else:
+        raise PrivateStageHandoffError("prepare")
+
+
+@contextmanager
+def _defer_stage_transition_signals():
+    """Best-effort per-thread signal deferral around ownership transitions.
+
+    Production cancellation is cooperative supervisor state, never an asynchronous
+    exception injected into these primitives.  POSIX masks are per thread, so this
+    helper cannot promise process-wide SIGINT/SIGTERM atomicity once other threads
+    exist; the surrounding reconciliation remains the fail-closed backstop.
+    """
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if pthread_sigmask is None:
+        yield
+        return
+    blocked = {signal.SIGINT, signal.SIGTERM}
+    previous = pthread_sigmask(signal.SIG_BLOCK, blocked)
+    try:
+        yield
+    finally:
+        # A pending Python signal may raise here.  Callers deliberately place this
+        # restoration inside their outer reconciliation fence.
+        pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def _serialized_stage_lifecycle(function):
+    @wraps(function)
+    def serialized(stage, *args, **kwargs):
+        if type(stage) is not PrivateFileStage:
+            return function(stage, *args, **kwargs)
+        with stage._lifecycle_lock:
+            return function(stage, *args, **kwargs)
+    return serialized
+
+
+def _serialized_batch_lifecycle(function):
+    @wraps(function)
+    def serialized(batch, *args, **kwargs):
+        if type(batch) is not PrivateStageHandoffBatch:
+            return function(batch, *args, **kwargs)
+        with _hold_stage_lifecycle(batch._stages):
+            # State is deliberately checked by the wrapped operation only after
+            # every member lock is held.  The stage locks are the sole lifecycle
+            # hierarchy, avoiding a batch-vs-stage lock inversion.
+            return function(batch, *args, **kwargs)
+    return serialized
 
 
 def _release_stage_fds(stage: PrivateFileStage, state: str) -> list[BaseException]:
@@ -1012,6 +1197,231 @@ def _same_private_inode(left_fd: int, right_fd: int) -> bool:
         and left.st_nlink == right.st_nlink == 1
         and left.st_size == right.st_size
     )
+
+
+def _validate_handoff_request_id(request_id) -> str:
+    if (type(request_id) is not str or len(request_id) != 32
+            or any(char not in "0123456789abcdef" for char in request_id)):
+        raise PrivateStageHandoffError("prepare")
+    return request_id
+
+
+def _begin_unspawned_handoff_abort(
+    batch: PrivateStageHandoffBatch,
+    stages: tuple[PrivateFileStage, ...],
+) -> None:
+    """Invalidate the logical batch authority before physical cleanup begins."""
+    object.__setattr__(batch, "_writer_fds", ())
+    object.__setattr__(batch, "_pin_fds", ())
+    object.__setattr__(batch, "_state", "aborted")
+    for stage in stages:
+        object.__setattr__(stage, "_file_fd", -1)
+        object.__setattr__(stage, "_state", "aborted")
+
+
+def _validate_open_stage_for_handoff(stage) -> None:
+    if type(stage) is not PrivateFileStage:
+        raise PrivateStageHandoffError("prepare")
+    if stage.state != "open":
+        raise PrivateStageStateError("prepare", stage.state)
+    _validate_live_stage(stage, "prepare")
+    observed = os.fstat(stage.file_fd)
+    if observed.st_nlink == 0:
+        raise PrivatePathUnsafe(
+            "private stage name was substituted", components=stage.components,
+        )
+    _validate_strict_file_stat(observed, stage.components)
+    if _identity(observed) != stage.file_identity:
+        raise PrivatePathUnsafe(
+            "private stage file identity changed", components=stage.components,
+        )
+
+
+def prepare_private_stage_handoff(
+    stages: tuple[PrivateFileStage, ...], request_id: str,
+) -> PrivateStageHandoffBatch:
+    """Atomically move one to three OPEN stage writers into an unspawned batch.
+
+    No child exists at this boundary.  Every named inode is independently pinned
+    read-only before logical ownership changes.  If validation, pinning or the small
+    in-process transition is interrupted, all stages retain their original writer
+    ownership and every newly opened pin is closed.
+    """
+    _require_strict_capabilities()
+    request_id = _validate_handoff_request_id(request_id)
+    if type(stages) is not tuple or not 1 <= len(stages) <= 3:
+        raise PrivateStageHandoffError("prepare")
+    if any(type(stage) is not PrivateFileStage for stage in stages):
+        raise PrivateStageHandoffError("prepare")
+    if len({id(stage) for stage in stages}) != len(stages):
+        raise PrivateStageHandoffError("prepare")
+    with _hold_stage_lifecycle(stages):
+        return _prepare_private_stage_handoff_locked(stages, request_id)
+
+
+def _prepare_private_stage_handoff_locked(
+    stages: tuple[PrivateFileStage, ...], request_id: str,
+) -> PrivateStageHandoffBatch:
+    # Preallocation means recording an opened pin cannot allocate or fail.  The
+    # transition also uses best-effort per-thread signal deferral; production
+    # cancellation is cooperative and ordinary public lifecycle calls are locked.
+    pins = [-1] * len(stages)
+    writer_fds = tuple(stage.file_fd for stage in stages)
+    changed_count = 0
+    try:
+        with _defer_stage_transition_signals():
+            identities = set()
+            for index, stage in enumerate(stages):
+                _validate_open_stage_for_handoff(stage)
+                if stage.file_identity in identities:
+                    raise PrivateStageHandoffError("prepare")
+                identities.add(stage.file_identity)
+                pins[index] = _open_strict_file_in(
+                    stage.parent_fd, stage.temporary_name, stage.components,
+                )
+                if not _same_private_inode(stage.file_fd, pins[index]):
+                    raise PrivatePathUnsafe(
+                        "private stage name was substituted", components=stage.components,
+                    )
+
+            # Only object-field assignments remain.  Keep the original descriptors
+            # local until every transition completes so reconciliation never reopens
+            # a path.  The lifecycle locks exclude ordinary concurrent operations.
+            for index, stage in enumerate(stages):
+                # Mark the member as requiring reconciliation before entering an
+                # injectable setter; the setter may mutate and then raise.
+                changed_count = index + 1
+                _set_stage(stage, "file_fd", -1)
+                _set_stage(stage, "state", "handoff_prepared")
+            batch = PrivateStageHandoffBatch(
+                stages=stages,
+                writer_fds=writer_fds,
+                pin_fds=tuple(pins),
+                request_id=request_id,
+                _constructor_token=_PRIVATE_STAGE_BATCH_CONSTRUCTOR,
+            )
+        return batch
+    except BaseException as primary:
+        restoration_errors: list[BaseException] = []
+        try:
+            with _defer_stage_transition_signals():
+                for index in range(changed_count):
+                    stage = stages[index]
+                    try:
+                        # Bypass the injectable transition seam while restoring the
+                        # exact original authority; same-process object tampering is
+                        # outside this module's documented trust boundary.
+                        object.__setattr__(stage, "_file_fd", writer_fds[index])
+                        object.__setattr__(stage, "_state", "open")
+                    except BaseException as exc:
+                        restoration_errors.append(exc)
+        except BaseException as exc:
+            restoration_errors.append(exc)
+        if restoration_errors:
+            # Restoration itself is uncertain.  With no child in existence the
+            # only safe resolution is to consume every original authority and
+            # quarantine all named claims rather than leak inaccessible writers.
+            emergency_errors: list[BaseException] = []
+            for index, stage in enumerate(stages):
+                pin = pins[index]
+                retained = pin if pin >= 0 else writer_fds[index]
+                try:
+                    if retained >= 0:
+                        _discard_named_claim(
+                            stage.parent_fd, stage.temporary_name, retained,
+                            stage.components,
+                        )
+                except BaseException as exc:
+                    emergency_errors.append(exc)
+                parent_fd, anchor_fd = stage.parent_fd, stage.anchor_fd
+                object.__setattr__(stage, "_file_fd", -1)
+                object.__setattr__(stage, "_parent_fd", -1)
+                object.__setattr__(stage, "_anchor_fd", -1)
+                object.__setattr__(stage, "_state", "aborted")
+                emergency_errors.extend(_close_fds(parent_fd, anchor_fd))
+            close_errors = _close_fds(*writer_fds, *pins)
+            error = PrivateStageHandoffError("prepare")
+            error.cleanup_errors = tuple(restoration_errors + emergency_errors)
+            error.close_errors = tuple(close_errors)
+            raise error from primary
+        close_errors = _close_fds(*pins)
+        if changed_count:
+            error = PrivateStageHandoffError("prepare")
+            error.close_errors = tuple(close_errors)
+            raise error from primary
+        try:
+            primary.cleanup_errors = ()
+            primary.close_errors = tuple(close_errors)
+        except BaseException:
+            pass
+        raise
+
+
+@_serialized_batch_lifecycle
+def abort_unspawned_private_stage_handoff(batch: PrivateStageHandoffBatch) -> None:
+    """Consume an unspawned batch, quarantine its names and close every authority.
+
+    The caller must have synchronous proof that no child was created.  This slice
+    cannot be used after spawn.  Logical ownership is invalidated before cleanup so
+    cancellation or close faults can never make a descriptor publishable again.
+    """
+    _require_strict_capabilities()
+    if type(batch) is not PrivateStageHandoffBatch:
+        raise PrivateStageHandoffError("abort_handoff")
+    if batch.state == "aborted":
+        return
+    if batch.state != "prepared":
+        raise PrivateStageStateError("abort_handoff", batch.state)
+
+    stages = batch._stages
+    writers = batch._writer_fds
+    pins = batch._pin_fds
+    transition_error: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    try:
+        # Best-effort per-thread deferral narrows the transition window.  Production
+        # cancellation is cooperative; the unconditional reconciliation below is
+        # the fail-closed backstop for one asynchronous BaseException.
+        with _defer_stage_transition_signals():
+            _begin_unspawned_handoff_abort(batch, stages)
+    except BaseException as exc:
+        transition_error = exc
+
+    # Reconcile from captured authority even when cancellation interrupted the
+    # transition.  Direct primitive assignments deliberately bypass injectable
+    # lifecycle seams.  Repeated arbitrary exception injection and hostile
+    # same-process object mutation are outside this primitive's trust boundary.
+    object.__setattr__(batch, "_writer_fds", ())
+    object.__setattr__(batch, "_pin_fds", ())
+    object.__setattr__(batch, "_state", "aborted")
+    for stage in stages:
+        object.__setattr__(stage, "_file_fd", -1)
+        object.__setattr__(stage, "_state", "aborted")
+
+    for stage, pin in zip(stages, pins):
+        try:
+            _discard_named_claim(
+                stage.parent_fd, stage.temporary_name, pin, stage.components,
+            )
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+    close_errors.extend(_close_fds(*writers, *pins))
+    for stage in stages:
+        parent_fd = stage.parent_fd
+        anchor_fd = stage.anchor_fd
+        object.__setattr__(stage, "_parent_fd", -1)
+        object.__setattr__(stage, "_anchor_fd", -1)
+        close_errors.extend(_close_fds(parent_fd, anchor_fd))
+    if transition_error is not None or cleanup_errors or close_errors:
+        error = PrivateStageHandoffError("abort_handoff")
+        error.cleanup_errors = tuple(
+            (() if transition_error is None else (transition_error,)) + tuple(cleanup_errors)
+        )
+        error.close_errors = tuple(close_errors)
+        cause = transition_error or (cleanup_errors[0] if cleanup_errors else close_errors[0])
+        raise error from cause
 
 
 def _discard_named_claim(
@@ -1187,10 +1597,11 @@ def _open_settled_stage(
         raise
 
 
+@_serialized_stage_lifecycle
 def seal_private_stage(stage: PrivateFileStage) -> None:
     """Flush and close a stage's write descriptor, freezing it for publication."""
     _require_strict_capabilities()
-    _validate_live_stage(stage)
+    _validate_live_stage(stage, "seal")
     if stage.state == "sealed":
         return
     before = os.fstat(stage.file_fd)
@@ -1307,6 +1718,7 @@ def _destination_matches_stage(stage: PrivateFileStage) -> bool:
         )
 
 
+@_serialized_stage_lifecycle
 def replace_private_stage(stage: PrivateFileStage) -> None:
     """Durably replace the destination with a settled same-directory stage.
 
@@ -1317,9 +1729,9 @@ def replace_private_stage(stage: PrivateFileStage) -> None:
     other code executing as this same process and UID.
     """
     _require_strict_capabilities()
-    _validate_live_stage(stage)
+    _validate_live_stage(stage, "replace")
     seal_private_stage(stage)
-    _validate_live_stage(stage)
+    _validate_live_stage(stage, "replace")
     _validate_declared_stage_parent(stage)
     _validate_named_stage(stage)
     _validate_replace_destination(stage)
@@ -1411,13 +1823,18 @@ def replace_private_stage(stage: PrivateFileStage) -> None:
         raise clean_rename_error
 
 
+@_serialized_stage_lifecycle
 def abort_private_stage(stage: PrivateFileStage) -> None:
     """Quarantine and close an unpublished stage.  A landed replacement is never removed."""
     _require_strict_capabilities()
     if type(stage) is not PrivateFileStage:
         raise PrivatePathUnsafe("private stage handle has the wrong type")
+    if stage.state == "handoff_prepared":
+        raise PrivateStageStateError("abort", stage.state)
     if stage.state in {"publishing", "committed", "replaced_uncertain", "aborted"}:
         return
+    if stage.state not in {"open", "sealed"}:
+        raise PrivateStageStateError("abort", stage.state)
     cleanup_error: BaseException | None = None
     try:
         _discard_named_claim(
