@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 
+from . import _fd_claims
+
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 _MAX_WORKER_PID = (1 << 31) - 1
@@ -857,9 +859,13 @@ def _open_strict_file_in(
         if _claim is None:
             fd = os.open(component, _FILE_OPEN_FLAGS, dir_fd=parent_fd)
         else:
-            object.__setattr__(_claim, "_fd", os.open(component, _FILE_OPEN_FLAGS, dir_fd=parent_fd))
-            object.__setattr__(_claim, "_disposition", "pending")
-            fd = _claim._fd
+            fd = _fd_claims.populate_allocation_slot(
+                _claim,
+                lambda: os.open(
+                    component, _FILE_OPEN_FLAGS, dir_fd=parent_fd,
+                ),
+                invalid_error=lambda: PrivateStageHandoffError("prepare"),
+            )
     except OSError as exc:
         if _claim is not None and _claim._fd < 0:
             object.__setattr__(_claim, "_disposition", "unallocated")
@@ -1141,94 +1147,18 @@ _PRIVATE_STAGE_CONSTRUCTOR = object()
 _PRIVATE_STAGE_BATCH_CONSTRUCTOR = object()
 _PRIVATE_STAGE_TRANSFER_AUTHORITY_CONSTRUCTOR = object()
 _PRIVATE_STAGE_PARENT_CLOSE_RECEIPT_CONSTRUCTOR = object()
-_PRIVATE_DESCRIPTOR_CLAIM_CONSTRUCTOR = object()
 _PRIVATE_STAGE_BATCH_CLAIM_CONSTRUCTOR = object()
 _PRIVATE_STAGE_CLEANUP_LEDGER_CONSTRUCTOR = object()
 
 
+_PrivateDescriptorClaim = _fd_claims.DescriptorClaim
 _DESCRIPTOR_CLAIM_KINDS = frozenset({
     "writer", "pin", "parent", "anchor",
     "source_writer", "source_parent", "source_anchor",
 })
-_DESCRIPTOR_CLAIM_TERMINAL = frozenset({
-    "closed_clean", "closed_after_fault", "close_ambiguous", "gone",
-    "identity_rejected", "unallocated",
-})
-_MAX_DESCRIPTOR_CLAIM_ERRORS = 2
-_MAX_DESCRIPTOR_CLAIM_DROPPED = (1 << 63) - 1
-
-
-class _PrivateDescriptorClaim:
-    """One exact, privately retained descriptor with monotonic close progress."""
-
-    __slots__ = (
-        "_fd", "_identity", "_owned_identity", "_fresh_owned", "_kind",
-        "_components", "_disposition",
-        "_close_attempts", "_errors", "_dropped_error_count", "_metadata_fault",
-        "_lock",
-    )
-
-    def __init__(
-        self,
-        *,
-        fd: int,
-        identity: tuple[int, int],
-        kind: str,
-        components: tuple[str, ...],
-        _constructor_token: object,
-    ) -> None:
-        if (_constructor_token is not _PRIVATE_DESCRIPTOR_CLAIM_CONSTRUCTOR
-                or type(fd) is not int or fd < -1
-                or type(identity) is not tuple or len(identity) != 2
-                or any(type(value) is not int or value < 0 for value in identity)
-                or type(kind) is not str or kind not in _DESCRIPTOR_CLAIM_KINDS
-                or type(components) is not tuple):
-            raise PrivateStageHandoffError("prepare")
-        object.__setattr__(self, "_fd", fd)
-        object.__setattr__(self, "_identity", identity)
-        object.__setattr__(self, "_owned_identity", None)
-        object.__setattr__(self, "_fresh_owned", fd == -1)
-        object.__setattr__(self, "_kind", kind)
-        object.__setattr__(self, "_components", components)
-        object.__setattr__(
-            self, "_disposition", "allocating" if fd == -1 else "pending",
-        )
-        object.__setattr__(self, "_close_attempts", 0)
-        object.__setattr__(self, "_errors", ())
-        object.__setattr__(self, "_dropped_error_count", 0)
-        object.__setattr__(self, "_metadata_fault", False)
-        object.__setattr__(self, "_lock", threading.RLock())
-
-    def __setattr__(self, name, value) -> None:
-        raise AttributeError("private descriptor claims are read-only")
-
-    def __delattr__(self, name) -> None:
-        raise AttributeError("private descriptor claims are read-only")
-
-    @property
-    def fd(self) -> int:
-        with self._lock:
-            return self._fd
-
-    @property
-    def kind(self) -> str:
-        return self._kind
-
-    @property
-    def disposition(self) -> str:
-        with self._lock:
-            return self._disposition
-
-    @property
-    def errors(self) -> tuple[BaseException, ...]:
-        with self._lock:
-            return self._errors
-
-    def __repr__(self) -> str:
-        return (
-            "PrivateDescriptorClaim("
-            f"kind={self._kind!r}, disposition={self._disposition!r})"
-        )
+_DESCRIPTOR_CLAIM_TERMINAL = _fd_claims.TERMINAL_DISPOSITIONS
+_MAX_DESCRIPTOR_CLAIM_ERRORS = _fd_claims.MAX_CLAIM_ERRORS
+_MAX_DESCRIPTOR_CLAIM_DROPPED = _fd_claims.MAX_DROPPED_ERRORS
 
 
 @dataclass(frozen=True, slots=True, repr=False, init=False)
@@ -1758,15 +1688,12 @@ def _set_stage(stage: PrivateFileStage, field: str, value) -> None:
 def _record_descriptor_claim_error(
     claim: _PrivateDescriptorClaim, error: BaseException,
 ) -> None:
-    with claim._lock:
-        if len(claim._errors) < _MAX_DESCRIPTOR_CLAIM_ERRORS:
-            object.__setattr__(claim, "_errors", claim._errors + (error,))
-        else:
-            object.__setattr__(
-                claim,
-                "_dropped_error_count",
-                min(claim._dropped_error_count + 1, _MAX_DESCRIPTOR_CLAIM_DROPPED),
-            )
+    _fd_claims.record_error(
+        claim,
+        error,
+        max_errors=_MAX_DESCRIPTOR_CLAIM_ERRORS,
+        max_dropped=_MAX_DESCRIPTOR_CLAIM_DROPPED,
+    )
 
 
 def _validate_descriptor_claim_metadata(
@@ -1807,12 +1734,13 @@ def _new_descriptor_claim(
     kind: str,
     components: tuple[str, ...],
 ) -> _PrivateDescriptorClaim:
-    return _PrivateDescriptorClaim(
-        fd=fd,
-        identity=identity,
-        kind=kind,
-        components=components,
-        _constructor_token=_PRIVATE_DESCRIPTOR_CLAIM_CONSTRUCTOR,
+    return _fd_claims.new_claim(
+        fd,
+        identity,
+        kind,
+        components,
+        allowed_kinds=_DESCRIPTOR_CLAIM_KINDS,
+        invalid_error=lambda: PrivateStageHandoffError("prepare"),
     )
 
 
@@ -1823,135 +1751,64 @@ def _duplicate_private_claim(
     allow_unlinked: bool = False,
 ) -> _PrivateDescriptorClaim:
     """Populate one transaction-registered claim before validating its duplicate."""
-    if (type(claim) is not _PrivateDescriptorClaim
-            or claim._fd != -1 or claim._disposition != "allocating"):
-        raise PrivateStageHandoffError("prepare")
-    try:
-        object.__setattr__(claim, "_fd", fcntl.fcntl(source_fd, fcntl.F_DUPFD_CLOEXEC, 0))
-        object.__setattr__(claim, "_disposition", "pending")
-        observed = os.fstat(claim._fd)
-        object.__setattr__(claim, "_owned_identity", _identity(observed))
-        if _identity(observed) != claim._identity:
-            raise PrivatePathUnsafe(
-                "private descriptor identity changed", components=claim._components,
+    return _fd_claims.populate_claim(
+        claim,
+        lambda: fcntl.fcntl(source_fd, fcntl.F_DUPFD_CLOEXEC, 0),
+        allow_unlinked=allow_unlinked,
+        fstat=os.fstat,
+        identity_of=_identity,
+        validate_metadata=lambda candidate, observed, unlinked: (
+            _validate_descriptor_claim_metadata(
+                candidate, observed, allow_unlinked=unlinked,
             )
-        _validate_descriptor_claim_metadata(
-            claim, observed, allow_unlinked=allow_unlinked,
-        )
-        return claim
-    except BaseException as primary:
-        if claim._fd < 0:
-            object.__setattr__(claim, "_disposition", "unallocated")
-        else:
-            _record_descriptor_claim_error(claim, primary)
-        raise
+        ),
+        make_identity_error=lambda components: PrivatePathUnsafe(
+            "private descriptor identity changed", components=components,
+        ),
+        record_claim_error=_record_descriptor_claim_error,
+        invalid_error=lambda: PrivateStageHandoffError("prepare"),
+    )
 
 
 def _inspect_descriptor_claim(
     claim: _PrivateDescriptorClaim, *, allow_unlinked: bool,
 ) -> os.stat_result | None:
     """Authenticate a pending claim, terminalizing only proved gone/foreign FDs."""
-    try:
-        observed = os.fstat(claim._fd)
-    except OSError as exc:
-        if exc.errno != errno.EBADF:
-            raise
-        _record_descriptor_claim_error(claim, exc)
-        object.__setattr__(claim, "_fd", -1)
-        object.__setattr__(claim, "_disposition", "gone")
-        return None
-    if claim._fresh_owned and claim._owned_identity is None:
-        # The descriptor was allocated directly into this unexposed claim slot.
-        # An interruption before allocation validation cannot turn it into an
-        # ambient numeric authority; adopt the observed inode solely for cleanup.
-        object.__setattr__(claim, "_owned_identity", _identity(observed))
-    cleanup_identity = (
-        claim._identity
-        if claim._owned_identity is None
-        else claim._owned_identity
+    return _fd_claims.inspect_claim(
+        claim,
+        allow_unlinked=allow_unlinked,
+        fstat=os.fstat,
+        identity_of=_identity,
+        validate_metadata=lambda candidate, observed, unlinked: (
+            _validate_descriptor_claim_metadata(
+                candidate, observed, allow_unlinked=unlinked,
+            )
+        ),
+        is_metadata_error=lambda error: isinstance(error, PrivatePathError),
+        make_identity_error=lambda components: PrivatePathUnsafe(
+            "private descriptor identity changed", components=components,
+        ),
+        record_claim_error=_record_descriptor_claim_error,
     )
-    if _identity(observed) != cleanup_identity:
-        error = PrivatePathUnsafe(
-            "private descriptor identity changed", components=claim._components,
-        )
-        _record_descriptor_claim_error(claim, error)
-        object.__setattr__(claim, "_fd", -1)
-        object.__setattr__(claim, "_disposition", "identity_rejected")
-        return None
-    try:
-        _validate_descriptor_claim_metadata(
-            claim, observed, allow_unlinked=allow_unlinked,
-        )
-    except PrivatePathError as exc:
-        _record_descriptor_claim_error(claim, exc)
-        object.__setattr__(claim, "_metadata_fault", True)
-    return observed
 
 
 def _drain_private_descriptor_claim(
     claim: _PrivateDescriptorClaim, *, allow_unlinked: bool = True,
 ) -> tuple[BaseException, ...]:
     """Settle one descriptor with bounded, identity-checked close recovery."""
-    with claim._lock:
-        if claim._disposition in _DESCRIPTOR_CLAIM_TERMINAL:
-            return ()
-        before_errors = len(claim._errors)
-        observed = _inspect_descriptor_claim(claim, allow_unlinked=allow_unlinked)
-        if observed is None:
-            return claim._errors[before_errors:]
-
-        while claim._close_attempts < 2:
-            object.__setattr__(claim, "_disposition", "close_started")
-            object.__setattr__(claim, "_close_attempts", claim._close_attempts + 1)
-            close_fault: BaseException | None = None
-            try:
-                close_fault = _close_owned(claim._fd)
-            except BaseException as exc:
-                close_fault = exc
-            if close_fault is None:
-                object.__setattr__(claim, "_fd", -1)
-                object.__setattr__(
-                    claim,
-                    "_disposition",
-                    "closed_clean" if not claim._errors else "closed_after_fault",
-                )
-                return claim._errors[before_errors:]
-
-            _record_descriptor_claim_error(claim, close_fault)
-            try:
-                current = os.fstat(claim._fd)
-            except OSError as exc:
-                if exc.errno == errno.EBADF:
-                    object.__setattr__(claim, "_fd", -1)
-                    object.__setattr__(claim, "_disposition", "close_ambiguous")
-                    return claim._errors[before_errors:]
-                _record_descriptor_claim_error(claim, exc)
-                object.__setattr__(claim, "_disposition", "close_started")
-                return claim._errors[before_errors:]
-            except BaseException as exc:
-                _record_descriptor_claim_error(claim, exc)
-                object.__setattr__(claim, "_disposition", "close_started")
-                return claim._errors[before_errors:]
-            cleanup_identity = (
-                claim._identity
-                if claim._owned_identity is None
-                else claim._owned_identity
-            )
-            if _identity(current) != cleanup_identity:
-                error = PrivatePathUnsafe(
-                    "private descriptor identity changed during close",
-                    components=claim._components,
-                )
-                _record_descriptor_claim_error(claim, error)
-                object.__setattr__(claim, "_fd", -1)
-                object.__setattr__(claim, "_disposition", "identity_rejected")
-                return claim._errors[before_errors:]
-
-        # The exact private descriptor remains live after its lifetime close budget.
-        # Keep the claim pending for external/process-level recovery; never erase it
-        # or manufacture a clean parent-close receipt.
-        object.__setattr__(claim, "_disposition", "close_started")
-        return claim._errors[before_errors:]
+    return _fd_claims.drain_claim(
+        claim,
+        allow_unlinked=allow_unlinked,
+        inspect=_inspect_descriptor_claim,
+        close_owned=_close_owned,
+        fstat=os.fstat,
+        identity_of=_identity,
+        make_close_identity_error=lambda components: PrivatePathUnsafe(
+            "private descriptor identity changed during close",
+            components=components,
+        ),
+        record_claim_error=_record_descriptor_claim_error,
+    )
 
 
 def _drain_private_stage_ledger(
@@ -1962,31 +1819,13 @@ def _drain_private_stage_ledger(
     """Drain selected claims; one control fault cannot strand a suffix."""
     if type(ledger) is not _PrivateStageCleanupLedger:
         raise PrivateStageHandoffError("fence")
-    errors: list[BaseException] = []
-
-    def drain_pass() -> None:
-        for claim in ledger.claims:
-            if (kinds is not None and claim._kind not in kinds) or (
-                claim._disposition in _DESCRIPTOR_CLAIM_TERMINAL
-            ):
-                continue
-            try:
-                errors.extend(_drain_private_descriptor_claim(claim))
-            except BaseException as exc:
-                _record_descriptor_claim_error(claim, exc)
-                errors.append(exc)
-
-    with ledger._lock:
-        try:
-            drain_pass()
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            try:
-                drain_pass()
-            except BaseException as exc:
-                errors.append(exc)
-    return tuple(errors)
+    return _fd_claims.drain_claims(
+        lambda: ledger.claims,
+        ledger._lock,
+        kinds=kinds,
+        drain=_drain_private_descriptor_claim,
+        record_claim_error=_record_descriptor_claim_error,
+    )
 
 
 @contextmanager
