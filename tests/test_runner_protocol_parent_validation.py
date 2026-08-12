@@ -113,6 +113,19 @@ def _ready(**overrides):
     return protocol.ReadyFrame(**values)
 
 
+def _prepared(**overrides):
+    values = {
+        "request_id": RID,
+        "worker_pid": WORKER_PID,
+        "launcher_pid": TOOL_PID,
+        "launcher_pgid": TOOL_PID,
+        "containment_kind": protocol.ContainmentKind.CGROUP_V2,
+        "containment_id": CGROUP_ID,
+    }
+    values.update(overrides)
+    return protocol.PreparedFrame(**values)
+
+
 def _started(**overrides):
     values = {
         "request_id": RID,
@@ -162,20 +175,25 @@ def _clean_case(tmp_path, *, stdin_data=None, input_file=None,
     kind = containment_kind or protocol.ContainmentKind.CGROUP_V2
     containment_id = CGROUP_ID if kind is protocol.ContainmentKind.CGROUP_V2 else str(TOOL_PID)
     ready = _ready()
+    prepared = _prepared(containment_kind=kind, containment_id=containment_id)
     started = _started(containment_kind=kind, containment_id=containment_id)
     context = protocol.ParentSettlementContext(
         request=invocation.worker,
         ready=ready,
+        prepared=prepared,
         started=started,
         settlement=settlement,
         descriptor_proofs=tuple(proofs),
         expected_worker_pid=WORKER_PID,
+        expected_launcher_pid=TOOL_PID,
+        expected_launcher_pgid=TOOL_PID,
         expected_containment_kind=kind,
         expected_containment_id=containment_id,
         worker_returncode=0,
         worker_reaped=True,
         control_eof=True,
         trailing_control_bytes=0,
+        prepared_identity_verified=True,
         tool_identity_verified=True,
         containment_verified=True,
         containment_bound=True,
@@ -357,18 +375,43 @@ def test_descriptor_claims_cross_the_wire_but_parent_proofs_do_not(tmp_path):
     assert not hasattr(decoded, "descriptor_proofs")
 
 
-# -- READY/STARTED are strict, ordered, request-bound control frames ------------
+# -- READY/PREPARED/STARTED are strict, ordered, request-bound control frames ---
 
 
-def test_ready_and_started_frames_round_trip_with_exact_kinds():
+def test_launch_control_frames_round_trip_with_exact_kinds():
     ready = _ready()
+    prepared = _prepared()
     started = _started()
     assert protocol.decode_ready(protocol.encode_ready(ready)) == ready
+    assert protocol.decode_prepared(protocol.encode_prepared(prepared)) == prepared
+    assert protocol.encode_prepared(protocol.decode_prepared(
+        protocol.encode_prepared(prepared))) == protocol.encode_prepared(prepared)
     assert protocol.decode_started(protocol.encode_started(started)) == started
     with pytest.raises(protocol.ProtocolError):
         protocol.decode_started(protocol.encode_ready(ready))
     with pytest.raises(protocol.ProtocolError):
+        protocol.decode_started(protocol.encode_prepared(prepared))
+    with pytest.raises(protocol.ProtocolError):
+        protocol.decode_prepared(protocol.encode_started(started))
+    with pytest.raises(protocol.ProtocolError):
         protocol.decode_ready(protocol.encode_started(started))
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda body: body.pop("launcher_pid"),
+    lambda body: body.__setitem__("extra", 1),
+    lambda body: body.__setitem__("launcher_pid", True),
+    lambda body: body.__setitem__("containment_kind", "invented"),
+])
+def test_prepared_frame_wire_schema_fails_closed(mutation):
+    body = _prepared().to_dict()
+    mutation(body)
+    with pytest.raises(protocol.ProtocolError):
+        protocol.decode_prepared(_frame({
+            "version": protocol.PROTOCOL_VERSION,
+            "kind": "prepared",
+            "body": body,
+        }))
 
 
 def test_worker_is_never_the_tool_group_leader():
@@ -376,10 +419,20 @@ def test_worker_is_never_the_tool_group_leader():
         _started(worker_pid=TOOL_PID)
 
 
+def test_worker_and_parked_launcher_are_distinct_identities():
+    with pytest.raises(protocol.ProtocolError, match="differ from launcher"):
+        _prepared(worker_pid=TOOL_PID)
+    with pytest.raises(protocol.ProtocolError, match="group leader"):
+        _prepared(launcher_pgid=TOOL_PID + 1)
+
+
 def test_control_reprs_hide_containment_identifiers():
+    prepared = _prepared(containment_id="framework-secret-value")
     started = _started(containment_id="framework-secret-value")
     settlement = _settlement(_clean_streams())
-    transcript = protocol.validate_control_sequence((_ready(), started, settlement))
+    transcript = protocol.validate_control_sequence(
+        (_ready(), prepared, started, settlement))
+    assert "framework-secret-value" not in repr(prepared)
     assert "framework-secret-value" not in repr(started)
     assert "framework-secret-value" not in repr(transcript)
 
@@ -389,6 +442,8 @@ def test_control_reprs_hide_containment_identifiers():
 def test_containment_identifiers_are_bounded_safe_correlations(containment_id):
     with pytest.raises(protocol.ProtocolError):
         _started(containment_id=containment_id)
+    with pytest.raises(protocol.ProtocolError):
+        _prepared(containment_id=containment_id)
 
 
 def test_launched_and_launch_failed_control_sequences_are_unambiguous():
@@ -406,12 +461,19 @@ def test_launched_and_launch_failed_control_sequences_are_unambiguous():
         process_tree_settled=True,
         tool_pid=None,
     )
-    launched = protocol.validate_control_sequence((_ready(), _started(),
-                                                   _settlement(_clean_streams())))
+    launched = protocol.validate_control_sequence(
+        (_ready(), _prepared(), _started(), _settlement(_clean_streams())))
     unlaunched = protocol.validate_control_sequence((_ready(), launch_failed))
-    assert launched.ready == _ready() and launched.started == _started()
+    prepared_failure = protocol.validate_control_sequence(
+        (_ready(), _prepared(), launch_failed))
+    assert launched.ready == _ready() and launched.prepared == _prepared()
+    assert launched.started == _started()
     assert launched.settlement.launched is True
-    assert unlaunched.started is None and unlaunched.settlement.launched is False
+    assert unlaunched.prepared is None and unlaunched.started is None
+    assert unlaunched.settlement.launched is False
+    assert prepared_failure.prepared == _prepared()
+    assert prepared_failure.started is None
+    assert prepared_failure.settlement.launched is False
 
 
 def test_worker_testimony_never_exposes_parent_cleanliness_properties():
@@ -431,8 +493,11 @@ def _clean_streams():
 @pytest.mark.parametrize("frames", [
     lambda: (_started(), _ready(), _settlement(_clean_streams())),
     lambda: (_ready(), _settlement(_clean_streams()), _started()),
-    lambda: (_ready(), _ready(), _started(), _settlement(_clean_streams())),
-    lambda: (_ready(), _started(), _started(), _settlement(_clean_streams())),
+    lambda: (_ready(), _started(), _settlement(_clean_streams())),
+    lambda: (_ready(), _ready(), _prepared(), _settlement(_clean_streams())),
+    lambda: (_ready(), _prepared(), _prepared(), _settlement(_clean_streams())),
+    lambda: (_ready(), _prepared(), _started(), _started(),
+             _settlement(_clean_streams())),
     lambda: (_ready(), _started()),
 ])
 def test_out_of_order_duplicate_trailing_and_incomplete_sequences_fail(frames):
@@ -440,7 +505,11 @@ def test_out_of_order_duplicate_trailing_and_incomplete_sequences_fail(frames):
         protocol.validate_control_sequence(frames())
 
 
-@pytest.mark.parametrize("frames", [(_ready(),), (_ready(), _started())])
+@pytest.mark.parametrize("frames", [
+    (_ready(),),
+    (_ready(), _prepared()),
+    (_ready(), _prepared(), _started()),
+])
 def test_worker_crash_before_settlement_never_forms_a_terminal_transcript(frames):
     with pytest.raises(protocol.ProtocolError):
         protocol.validate_control_sequence(frames)
@@ -449,14 +518,34 @@ def test_worker_crash_before_settlement_never_forms_a_terminal_transcript(frames
 def test_sequence_ids_pids_and_tool_identity_must_agree():
     settlement = _settlement(_clean_streams())
     for frames in (
-        (_ready(request_id=OTHER_RID), _started(), settlement),
-        (_ready(), _started(worker_pid=WORKER_PID + 99), settlement),
-        (_ready(), _started(tool_pid=TOOL_PID + 1, tool_pgid=TOOL_PID + 1), settlement),
+        (_ready(request_id=OTHER_RID), _prepared(), _started(), settlement),
+        (_ready(), _prepared(worker_pid=WORKER_PID + 99), _started(), settlement),
+        (_ready(), _prepared(), _started(worker_pid=WORKER_PID + 99), settlement),
+        (_ready(), _prepared(),
+         _started(tool_pid=TOOL_PID + 1, tool_pgid=TOOL_PID + 1), settlement),
+        (_ready(), _prepared(), _started(),
+         replace(settlement, tool_pid=TOOL_PID + 1)),
     ):
         with pytest.raises(protocol.ProtocolError):
             protocol.validate_control_sequence(frames)
     with pytest.raises(protocol.ProtocolError):
         _started(tool_pgid=TOOL_PID + 1)
+
+
+@pytest.mark.parametrize("prepared_change,started_change", [
+    ({"request_id": OTHER_RID}, {}),
+    ({"launcher_pid": TOOL_PID + 1, "launcher_pgid": TOOL_PID + 1}, {}),
+    ({}, {"containment_id": "quarry/other"}),
+    ({"containment_kind": protocol.ContainmentKind.PGID,
+      "containment_id": str(TOOL_PID)}, {}),
+])
+def test_prepared_and_started_identity_and_intent_must_match(prepared_change,
+                                                            started_change):
+    with pytest.raises(protocol.ProtocolError):
+        protocol.validate_control_sequence((
+            _ready(), _prepared(**prepared_change), _started(**started_change),
+            _settlement(_clean_streams()),
+        ))
 
 
 # -- Parent authority binds settlement to stages, stdin, cap, and real process --
@@ -484,6 +573,7 @@ def test_validated_settlement_cannot_be_constructed_without_parent_validator(tmp
     ("worker_reaped", False),
     ("control_eof", False),
     ("trailing_control_bytes", 1),
+    ("prepared_identity_verified", False),
     ("tool_identity_verified", False),
     ("containment_verified", False),
     ("containment_bound", False),
@@ -491,6 +581,8 @@ def test_validated_settlement_cannot_be_constructed_without_parent_validator(tmp
     ("stages_closed", False),
     ("worker_returncode", 1),
     ("expected_worker_pid", WORKER_PID + 99),
+    ("expected_launcher_pid", TOOL_PID + 99),
+    ("expected_launcher_pgid", TOOL_PID + 99),
     ("expected_containment_kind", protocol.ContainmentKind.PGID),
     ("expected_containment_id", "different/containment"),
 ])
@@ -498,6 +590,98 @@ def test_parent_cannot_return_clean_before_every_authority_settles(tmp_path, fie
     context = _clean_case(tmp_path)
     _assert_refused_or_unclean(
         lambda: protocol.validate_parent_settlement(replace(context, **{field: value})))
+
+
+@pytest.mark.parametrize("terminal", [
+    protocol.ExecutionTerminal.LAUNCH_FAILED,
+    protocol.ExecutionTerminal.CANCELLED,
+])
+def test_parent_accepts_prepared_fast_failure_but_never_as_clean(tmp_path, terminal):
+    invocation = _invocation(tmp_path)
+    streams = tuple(
+        _stream(role, protocol.StreamTerminal.CANCELLED,
+                observed_digest=None)
+        for role in protocol.StreamRole
+    )
+    context = protocol.ParentSettlementContext(
+        request=invocation.worker,
+        ready=_ready(),
+        prepared=_prepared(),
+        started=None,
+        settlement=_settlement(
+            streams,
+            terminal=terminal,
+            launched=False,
+            exit_code=None,
+            process_group_settled=True,
+            process_tree_settled=True,
+            tool_pid=None,
+        ),
+        descriptor_proofs=(),
+        expected_worker_pid=WORKER_PID,
+        expected_launcher_pid=TOOL_PID,
+        expected_launcher_pgid=TOOL_PID,
+        expected_containment_kind=protocol.ContainmentKind.CGROUP_V2,
+        expected_containment_id=CGROUP_ID,
+        worker_returncode=0,
+        worker_reaped=True,
+        control_eof=True,
+        trailing_control_bytes=0,
+        prepared_identity_verified=True,
+        tool_identity_verified=False,
+        containment_verified=True,
+        containment_bound=True,
+        containment_empty=True,
+        stages_closed=True,
+    )
+    result = protocol.validate_parent_settlement(context)
+    assert result.mechanically_settled is False
+    assert result.tree_proven is False
+    assert result.capture_complete is False
+
+
+def test_unprepared_fast_failure_has_no_launcher_parent_proof(tmp_path):
+    invocation = _invocation(tmp_path)
+    streams = tuple(
+        _stream(role, protocol.StreamTerminal.NOT_STARTED,
+                observed_digest=None)
+        for role in protocol.StreamRole
+    )
+    context = protocol.ParentSettlementContext(
+        request=invocation.worker,
+        ready=_ready(),
+        prepared=None,
+        started=None,
+        settlement=_settlement(
+            streams,
+            terminal=protocol.ExecutionTerminal.LAUNCH_FAILED,
+            launched=False,
+            exit_code=None,
+            process_group_settled=True,
+            process_tree_settled=True,
+            tool_pid=None,
+        ),
+        descriptor_proofs=(),
+        expected_worker_pid=WORKER_PID,
+        expected_launcher_pid=None,
+        expected_launcher_pgid=None,
+        expected_containment_kind=protocol.ContainmentKind.CGROUP_V2,
+        expected_containment_id=CGROUP_ID,
+        worker_returncode=0,
+        worker_reaped=True,
+        control_eof=True,
+        trailing_control_bytes=0,
+        prepared_identity_verified=False,
+        tool_identity_verified=False,
+        containment_verified=True,
+        containment_bound=False,
+        containment_empty=True,
+        stages_closed=True,
+    )
+    result = protocol.validate_parent_settlement(context)
+    assert result.mechanically_settled is False
+    assert result.tree_proven is False
+    assert result.capture_complete is False
 
 
 @pytest.mark.parametrize("missing_role", [protocol.StreamRole.STDOUT,
@@ -573,13 +757,17 @@ def test_unrequested_output_may_be_observed_but_never_retain_a_claim(tmp_path):
         size=1, sha256=_digest(b"x"), lines=0,
     )
     context = protocol.ParentSettlementContext(
-        request=invocation.worker, ready=_ready(), started=_started(),
+        request=invocation.worker, ready=_ready(), prepared=_prepared(),
+        started=_started(),
         settlement=settlement, descriptor_proofs=(proof,),
         expected_worker_pid=WORKER_PID,
+        expected_launcher_pid=TOOL_PID,
+        expected_launcher_pgid=TOOL_PID,
         expected_containment_kind=protocol.ContainmentKind.CGROUP_V2,
         expected_containment_id=CGROUP_ID, worker_returncode=0,
         worker_reaped=True, control_eof=True, trailing_control_bytes=0,
-        tool_identity_verified=True, containment_verified=True,
+        prepared_identity_verified=True, tool_identity_verified=True,
+        containment_verified=True,
         containment_bound=True, containment_empty=True, stages_closed=True,
     )
     _assert_refused_or_unclean(lambda: protocol.validate_parent_settlement(context))

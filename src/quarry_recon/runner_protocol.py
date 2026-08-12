@@ -22,6 +22,9 @@ from enum import Enum
 from pathlib import (Path, PosixPath, PurePath, PurePosixPath,
                      PureWindowsPath, WindowsPath)
 
+# Version 1 has not yet had a production caller or persisted transcript.  The
+# PREPARED launch handshake was added while this protocol was still preparatory,
+# before compatibility with an external peer or stored frame existed.
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 1 << 20
 MAX_JSON_DEPTH = 32
@@ -739,6 +742,62 @@ class ReadyFrame:
 
 
 @dataclass(frozen=True, repr=False)
+class PreparedFrame:
+    """Worker testimony that a pre-exec launcher is parked.
+
+    This record declares the identity and containment intent that the parent must
+    independently bind before sending GO.  It is not evidence that the process was
+    bound, that GO was sent, that exec succeeded, or that containment is effective.
+    """
+
+    request_id: str
+    worker_pid: int
+    launcher_pid: int
+    launcher_pgid: int
+    containment_kind: ContainmentKind
+    containment_id: str
+
+    def __post_init__(self) -> None:
+        _request_id(self.request_id)
+        _positive_int(self.worker_pid, "worker_pid")
+        _positive_int(self.launcher_pid, "launcher_pid")
+        _positive_int(self.launcher_pgid, "launcher_pgid")
+        if self.launcher_pgid != self.launcher_pid:
+            raise ProtocolError("launcher group leader mismatch", "launcher_pgid")
+        if self.worker_pid == self.launcher_pid:
+            raise ProtocolError("worker must differ from launcher", "worker_pid")
+        if type(self.containment_kind) is not ContainmentKind:
+            raise ProtocolError("invalid enum", "containment_kind")
+        _containment_id(self.containment_id)
+
+    def __repr__(self) -> str:
+        return (f"PreparedFrame(request_id={self.request_id!r}, "
+                f"worker_pid={self.worker_pid}, launcher_pid={self.launcher_pid}, "
+                f"containment_kind={self.containment_kind.value!r})")
+
+    def to_dict(self) -> dict:
+        return {
+            "request_id": self.request_id, "worker_pid": self.worker_pid,
+            "launcher_pid": self.launcher_pid, "launcher_pgid": self.launcher_pgid,
+            "containment_kind": self.containment_kind.value,
+            "containment_id": self.containment_id,
+        }
+
+    @classmethod
+    def from_dict(cls, doc: dict) -> "PreparedFrame":
+        expected = frozenset({"request_id", "worker_pid", "launcher_pid",
+                              "launcher_pgid", "containment_kind", "containment_id"})
+        _exact_keys(doc, expected, "prepared")
+        return cls(
+            request_id=doc["request_id"], worker_pid=doc["worker_pid"],
+            launcher_pid=doc["launcher_pid"], launcher_pgid=doc["launcher_pgid"],
+            containment_kind=_enum(ContainmentKind, doc["containment_kind"],
+                                   "containment_kind"),
+            containment_id=doc["containment_id"],
+        )
+
+
+@dataclass(frozen=True, repr=False)
 class StartedFrame:
     request_id: str
     worker_pid: int
@@ -879,36 +938,52 @@ class WorkerSettlement:
 @dataclass(frozen=True, repr=False)
 class ControlTranscript:
     ready: ReadyFrame
+    prepared: PreparedFrame | None
     started: StartedFrame | None
     settlement: WorkerSettlement
 
     def __repr__(self) -> str:
         return (f"ControlTranscript(request_id={self.ready.request_id!r}, "
+                f"prepared={self.prepared is not None}, "
                 f"launched={self.started is not None})")
 
 
 def validate_control_sequence(frames: tuple) -> ControlTranscript:
-    if type(frames) is not tuple or len(frames) not in (2, 3):
+    if type(frames) is not tuple or len(frames) not in (2, 3, 4):
         raise ProtocolError("invalid control sequence", "control")
     if type(frames[0]) is not ReadyFrame or type(frames[-1]) is not WorkerSettlement:
         raise ProtocolError("invalid control sequence", "control")
     ready = frames[0]
     settlement = frames[-1]
+    prepared = None
     started = None
     if len(frames) == 3:
-        if type(frames[1]) is not StartedFrame:
+        if type(frames[1]) is not PreparedFrame:
             raise ProtocolError("invalid control sequence", "control")
-        started = frames[1]
+        prepared = frames[1]
+    elif len(frames) == 4:
+        if type(frames[1]) is not PreparedFrame or type(frames[2]) is not StartedFrame:
+            raise ProtocolError("invalid control sequence", "control")
+        prepared, started = frames[1:3]
     if settlement.launched != (started is not None):
         raise ProtocolError("control launch state mismatch", "control")
-    records = tuple(record for record in (ready, started, settlement) if record is not None)
+    records = tuple(record for record in (ready, prepared, started, settlement)
+                    if record is not None)
     if any(record.request_id != ready.request_id for record in records):
         raise ProtocolError("control request mismatch", "control")
     if any(record.worker_pid != ready.worker_pid for record in records):
         raise ProtocolError("control worker mismatch", "control")
-    if started is not None and settlement.tool_pid != started.tool_pid:
-        raise ProtocolError("control tool mismatch", "control")
-    return ControlTranscript(ready=ready, started=started, settlement=settlement)
+    if started is not None:
+        if (started.tool_pid != prepared.launcher_pid
+                or started.tool_pgid != prepared.launcher_pgid):
+            raise ProtocolError("control launcher mismatch", "control")
+        if (started.containment_kind is not prepared.containment_kind
+                or started.containment_id != prepared.containment_id):
+            raise ProtocolError("control containment mismatch", "control")
+        if settlement.tool_pid != started.tool_pid:
+            raise ProtocolError("control tool mismatch", "control")
+    return ControlTranscript(ready=ready, prepared=prepared, started=started,
+                             settlement=settlement)
 
 
 @dataclass(frozen=True)
@@ -947,9 +1022,11 @@ class DescriptorProof:
 class ParentSettlementContext:
     """Parent-owned facts used to validate worker testimony.
 
-    ``tool_identity_verified`` means the parent matched the STARTED PID/PGID to
-    the process it created. ``containment_verified`` means the named containment
-    is parent-owned and has the required non-delegated controls.
+    ``prepared_identity_verified`` means the parent independently matched the
+    PREPARED launcher PID/PGID to the parked process it created; PREPARED itself is
+    only worker testimony. ``tool_identity_verified`` means the parent matched the
+    STARTED PID/PGID to the process it allowed to exec. ``containment_verified``
+    means the named containment is parent-owned and has the required controls.
     ``containment_bound`` means the parent independently observed that exact tool
     inside it. ``containment_empty`` is the final recursive membership result.
     None of these booleans is received from the worker.
@@ -957,16 +1034,20 @@ class ParentSettlementContext:
 
     request: WorkerRequest = field(repr=False)
     ready: ReadyFrame
+    prepared: PreparedFrame | None
     started: StartedFrame | None
     settlement: WorkerSettlement
     descriptor_proofs: tuple[DescriptorProof, ...] = field(repr=False)
     expected_worker_pid: int
+    expected_launcher_pid: int | None
+    expected_launcher_pgid: int | None
     expected_containment_kind: ContainmentKind
     expected_containment_id: str
     worker_returncode: int
     worker_reaped: bool
     control_eof: bool
     trailing_control_bytes: int
+    prepared_identity_verified: bool
     tool_identity_verified: bool
     containment_verified: bool
     containment_bound: bool
@@ -978,6 +1059,8 @@ class ParentSettlementContext:
             raise ProtocolError("invalid worker request", "request")
         if type(self.ready) is not ReadyFrame or type(self.settlement) is not WorkerSettlement:
             raise ProtocolError("invalid control record", "control")
+        if self.prepared is not None and type(self.prepared) is not PreparedFrame:
+            raise ProtocolError("invalid control record", "prepared")
         if self.started is not None and type(self.started) is not StartedFrame:
             raise ProtocolError("invalid control record", "started")
         if type(self.descriptor_proofs) is not tuple:
@@ -990,13 +1073,23 @@ class ParentSettlementContext:
         if len(set(roles)) != len(roles):
             raise ProtocolError("duplicate descriptor proof", "descriptor_proofs")
         _positive_int(self.expected_worker_pid, "expected_worker_pid")
+        if self.prepared is None:
+            if self.expected_launcher_pid is not None or self.expected_launcher_pgid is not None:
+                raise ProtocolError("unexpected launcher identity", "expected_launcher_pid")
+            if self.prepared_identity_verified is not False:
+                raise ProtocolError("unprepared launcher cannot be verified",
+                                    "prepared_identity_verified")
+        else:
+            _positive_int(self.expected_launcher_pid, "expected_launcher_pid")
+            _positive_int(self.expected_launcher_pgid, "expected_launcher_pgid")
         if type(self.expected_containment_kind) is not ContainmentKind:
             raise ProtocolError("invalid enum", "expected_containment_kind")
         _containment_id(self.expected_containment_id)
         _bounded_int(self.worker_returncode, "worker_returncode", minimum=MIN_EXIT_CODE,
                      maximum=MAX_EXIT_CODE)
         _nonnegative_int(self.trailing_control_bytes, "trailing_control_bytes")
-        for name in ("worker_reaped", "control_eof", "tool_identity_verified",
+        for name in ("worker_reaped", "control_eof", "prepared_identity_verified",
+                     "tool_identity_verified",
                      "containment_verified", "containment_bound",
                      "containment_empty", "stages_closed"):
             if type(getattr(self, name)) is not bool:
@@ -1035,8 +1128,13 @@ def _stream_map(settlement: WorkerSettlement) -> dict[StreamRole, StreamSettleme
 def validate_parent_settlement(context: ParentSettlementContext) -> ValidatedSettlement:
     if type(context) is not ParentSettlementContext:
         raise ProtocolError("invalid parent settlement context", "context")
-    transcript_frames = ((context.ready, context.settlement) if context.started is None
-                         else (context.ready, context.started, context.settlement))
+    transcript_records = [context.ready]
+    if context.prepared is not None:
+        transcript_records.append(context.prepared)
+    if context.started is not None:
+        transcript_records.append(context.started)
+    transcript_records.append(context.settlement)
+    transcript_frames = tuple(transcript_records)
     transcript = validate_control_sequence(transcript_frames)
     request = context.request
     settlement = transcript.settlement
@@ -1045,14 +1143,22 @@ def validate_parent_settlement(context: ParentSettlementContext) -> ValidatedSet
     if context.ready.worker_pid != context.expected_worker_pid:
         raise ProtocolError("worker identity mismatch", "worker_pid")
 
-    binding_ok = True
-    if transcript.started is None:
-        binding_ok = False
-    else:
-        binding_ok = (
-            transcript.started.containment_kind is context.expected_containment_kind
-            and transcript.started.containment_id == context.expected_containment_id
-        )
+    if transcript.prepared is not None:
+        if (transcript.prepared.launcher_pid != context.expected_launcher_pid
+                or transcript.prepared.launcher_pgid != context.expected_launcher_pgid):
+            raise ProtocolError("prepared identity mismatch", "launcher_pid")
+    prepared_bound = (
+        transcript.prepared is not None
+        and context.prepared_identity_verified
+        and transcript.prepared.containment_kind is context.expected_containment_kind
+        and transcript.prepared.containment_id == context.expected_containment_id
+    )
+    binding_ok = (
+        prepared_bound
+        and transcript.started is not None
+        and transcript.started.containment_kind is context.expected_containment_kind
+        and transcript.started.containment_id == context.expected_containment_id
+    )
 
     expected_roles = tuple(claim.role for claim in request.descriptor_claims)
     proof_roles = tuple(proof.role for proof in context.descriptor_proofs)
@@ -1112,6 +1218,7 @@ def validate_parent_settlement(context: ParentSettlementContext) -> ValidatedSet
         and context.worker_returncode == 0
         and context.control_eof
         and context.trailing_control_bytes == 0
+        and context.prepared_identity_verified
         and context.tool_identity_verified
         and context.containment_verified
         and context.containment_bound
@@ -1270,6 +1377,16 @@ def encode_ready(ready: ReadyFrame) -> bytes:
 
 def decode_ready(frame: bytes) -> ReadyFrame:
     return ReadyFrame.from_dict(_decode(frame, "ready"))
+
+
+def encode_prepared(prepared: PreparedFrame) -> bytes:
+    if type(prepared) is not PreparedFrame:
+        raise ProtocolError("invalid prepared frame", "prepared")
+    return _encode("prepared", prepared.to_dict())
+
+
+def decode_prepared(frame: bytes) -> PreparedFrame:
+    return PreparedFrame.from_dict(_decode(frame, "prepared"))
 
 
 def encode_started(started: StartedFrame) -> bytes:
