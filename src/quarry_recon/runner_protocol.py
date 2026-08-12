@@ -101,6 +101,13 @@ class ExecutionTerminal(str, Enum):
     WORKER_FAILED = "worker_failed"
 
 
+class WorkerCommandKind(str, Enum):
+    """Parent decisions accepted by the worker command channel."""
+
+    ABORT = "abort"
+    GO = "go"
+
+
 class ContainmentKind(str, Enum):
     PGID = "pgid"
     CGROUP_V2 = "cgroup_v2"
@@ -793,6 +800,56 @@ class ReadyFrame:
 
 
 @dataclass(frozen=True, repr=False)
+class WorkerCommand:
+    """One request- and worker-bound parent decision.
+
+    The request digest is private control traffic and is deliberately omitted from
+    rendering.  A command is correlation testimony only; in particular, ``GO`` is
+    not containment, stage-transfer, or publication authority by itself.
+    """
+
+    request_id: str
+    request_sha256: str = field(repr=False)
+    worker_pid: int = field(repr=False)
+    command: WorkerCommandKind
+
+    def __post_init__(self) -> None:
+        _request_id(self.request_id)
+        if _optional_digest(self.request_sha256, "request_sha256") is None:
+            raise ProtocolError("command needs a request digest", "request_sha256")
+        _positive_int(self.worker_pid, "worker_pid")
+        if type(self.command) is not WorkerCommandKind:
+            raise ProtocolError("invalid enum", "command")
+
+    def __repr__(self) -> str:
+        return f"WorkerCommand(command={self.command.value!r})"
+
+    def to_dict(self) -> dict:
+        return {
+            "request_id": self.request_id,
+            "request_sha256": self.request_sha256,
+            "worker_pid": self.worker_pid,
+            "command": self.command.value,
+        }
+
+    @classmethod
+    def from_dict(cls, doc: dict) -> "WorkerCommand":
+        _exact_keys(
+            doc,
+            frozenset({
+                "request_id", "request_sha256", "worker_pid", "command",
+            }),
+            "command",
+        )
+        return cls(
+            request_id=doc["request_id"],
+            request_sha256=doc["request_sha256"],
+            worker_pid=doc["worker_pid"],
+            command=_enum(WorkerCommandKind, doc["command"], "command"),
+        )
+
+
+@dataclass(frozen=True, repr=False)
 class PreparedFrame:
     """Worker testimony that a pre-exec launcher is parked.
 
@@ -1439,7 +1496,8 @@ def _encode(kind: str, body: dict) -> bytes:
     return struct.pack(">I", len(payload)) + payload
 
 
-def _decode(frame: bytes, expected_kind: str) -> dict:
+def _decode_envelope(frame: bytes) -> tuple[str, dict]:
+    """Decode one bounded envelope exactly once, without choosing its model."""
     if type(frame) is not bytes or len(frame) < 4:
         raise ProtocolError("truncated frame", "frame")
     declared = struct.unpack(">I", frame[:4])[0]
@@ -1459,11 +1517,18 @@ def _decode(frame: bytes, expected_kind: str) -> dict:
     _exact_keys(doc, frozenset({"version", "kind", "body"}), "frame")
     if type(doc["version"]) is not int or doc["version"] != PROTOCOL_VERSION:
         raise ProtocolError("unsupported protocol version", "version")
-    if type(doc["kind"]) is not str or doc["kind"] != expected_kind:
+    if type(doc["kind"]) is not str:
         raise ProtocolError("unexpected frame kind", "kind")
     if type(doc["body"]) is not dict:
         raise ProtocolError("expected object", "body")
-    return doc["body"]
+    return doc["kind"], doc["body"]
+
+
+def _decode(frame: bytes, expected_kind: str) -> dict:
+    kind, body = _decode_envelope(frame)
+    if kind != expected_kind:
+        raise ProtocolError("unexpected frame kind", "kind")
+    return body
 
 
 def encode_request(request: WorkerRequest) -> bytes:
@@ -1497,6 +1562,16 @@ def decode_ready(frame: bytes) -> ReadyFrame:
     return ReadyFrame.from_dict(_decode(frame, "ready"))
 
 
+def encode_command(command: WorkerCommand) -> bytes:
+    if type(command) is not WorkerCommand:
+        raise ProtocolError("invalid worker command", "command")
+    return _encode("launch_command", command.to_dict())
+
+
+def decode_command(frame: bytes) -> WorkerCommand:
+    return WorkerCommand.from_dict(_decode(frame, "launch_command"))
+
+
 def encode_prepared(prepared: PreparedFrame) -> bytes:
     if type(prepared) is not PreparedFrame:
         raise ProtocolError("invalid prepared frame", "prepared")
@@ -1525,3 +1600,19 @@ def encode_settlement(settlement: WorkerSettlement) -> bytes:
 
 def decode_settlement(frame: bytes) -> WorkerSettlement:
     return WorkerSettlement.from_dict(_decode(frame, "settlement"))
+
+
+def decode_control_frame(
+    frame: bytes,
+) -> ReadyFrame | PreparedFrame | StartedFrame | WorkerSettlement:
+    """Strictly dispatch one worker-to-parent control frame after one JSON parse."""
+    kind, body = _decode_envelope(frame)
+    model = {
+        "ready": ReadyFrame,
+        "prepared": PreparedFrame,
+        "started": StartedFrame,
+        "settlement": WorkerSettlement,
+    }.get(kind)
+    if model is None:
+        raise ProtocolError("unexpected control frame kind", "kind")
+    return model.from_dict(body)
