@@ -628,6 +628,7 @@ def test_abort_quarantines_a_source_substitution_instead_of_deleting_it(private_
     stage = privfs.stage_private_bytes(root_fd, ("result",), b"trusted")
     privfs.seal_private_stage(stage)
     original_name = stage.temporary_name
+    parent_fd = stage.parent_fd
     real_rename = os.rename
     swapped = False
 
@@ -640,7 +641,7 @@ def test_abort_quarantines_a_source_substitution_instead_of_deleting_it(private_
                 source,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 0o600,
-                dir_fd=stage.parent_fd,
+                dir_fd=parent_fd,
             )
             os.write(planted, b"substitute")
             os.close(planted)

@@ -3,6 +3,7 @@ O_NOFOLLOW through a directory fd so no symlinked level can redirect a write out
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 
 DIR_MODE = 0o700
 FILE_MODE = 0o600
+_MAX_WORKER_PID = (1 << 31) - 1
 
 
 def _harden_fd(fd: int, *, is_dir: bool) -> bool:
@@ -228,6 +230,7 @@ def _detect_strict_capability_gaps() -> tuple[str, ...]:
         (os.unlink in supports_dir_fd, "descriptor-relative unlink"),
         (hasattr(os, "fchmod"), "descriptor chmod"),
         (hasattr(os, "fsync"), "descriptor fsync"),
+        (hasattr(fcntl, "F_DUPFD_CLOEXEC"), "atomic close-on-exec descriptor duplicate"),
     )
     return tuple(name for available, name in required if not available)
 
@@ -285,10 +288,12 @@ class PrivateReplaceCommittedWithFault(PrivatePathError):
 
 _STAGE_OPERATIONS = frozenset({
     "prepare", "seal", "replace", "abort", "abort_handoff",
+    "abort_spawn", "borrow_spawn", "mark_spawned", "bind_worker", "transfer", "fence",
 })
 _STAGE_STATES = frozenset({
     "open", "sealed", "handoff_prepared", "publishing", "committed",
-    "replaced_uncertain", "aborted", "prepared", "worker_owned",
+    "replaced_uncertain", "aborted", "prepared", "spawn_prepared",
+    "worker_spawned_unverified", "worker_claim_bound", "parent_writers_closed",
     "transfer_uncertain", "settled", "fenced",
 })
 
@@ -311,12 +316,95 @@ class PrivateStageHandoffError(PrivatePathError):
     """A fixed, credential-safe batch handoff or cleanup failure."""
 
     def __init__(self, operation: str) -> None:
-        if type(operation) is not str or operation not in {"prepare", "abort_handoff"}:
+        if type(operation) is not str or operation not in {
+            "prepare", "abort_handoff", "abort_spawn", "mark_spawned",
+            "borrow_spawn", "bind_worker", "transfer", "fence",
+        }:
             raise TypeError("invalid private stage handoff operation")
         self.operation = operation
         self.cleanup_errors: tuple[BaseException, ...] = ()
         self.close_errors: tuple[BaseException, ...] = ()
         super().__init__(f"private stage handoff {operation} failed")
+
+
+class PrivateStageTransferUncertain(PrivateStageHandoffError):
+    """The registered parent writer-close boundary did not settle cleanly.
+
+    The immutable inode facts are safe to use for later quarantine and audit, but
+    this exception is deliberately not a successful transfer receipt and conveys
+    no writable descriptor, path, request correlation value, process proof or
+    content claim.
+    """
+
+    def __init__(
+        self, *, claimed_worker_pid: int,
+        file_identities: tuple[tuple[int, int], ...],
+    ) -> None:
+        super().__init__("transfer")
+        self.claimed_worker_pid = claimed_worker_pid
+        self.file_identities = file_identities
+
+    def __repr__(self) -> str:
+        return (
+            "PrivateStageTransferUncertain("
+            f"stages={len(self.file_identities)}, state='transfer_uncertain')"
+        )
+
+
+class PrivateStageBindUncertain(PrivateStageHandoffError):
+    """A caller-attested worker-claim bind was interrupted at its boundary.
+
+    ``authority`` is the sole opaque recovery capability.  It is intentionally
+    omitted from rendering; a supervisor may use it only to complete transfer
+    after independently validating process identity, containment and readiness.
+    """
+
+    def __init__(
+        self,
+        *,
+        authority: object,
+        claimed_worker_pid: int | None,
+        file_identities: tuple[tuple[int, int], ...],
+    ) -> None:
+        super().__init__("bind_worker")
+        self.authority = authority
+        self.claimed_worker_pid = claimed_worker_pid
+        self.file_identities = file_identities
+
+    def __repr__(self) -> str:
+        return (
+            "PrivateStageBindUncertain("
+            f"stages={len(self.file_identities)}, state='worker_claim_bound')"
+        )
+
+
+class PrivateStageSpawnUncertain(PrivateStageHandoffError):
+    """A spawn callback ran, but recording its PID correlation was interrupted.
+
+    When this exception escapes through the normal cooperative path, the callback
+    wrapper has attempted to fence and consume ``authority``.  The field is opaque
+    diagnostic correlation, not process or recovery authority.  An unrelated
+    asynchronous escape follows the spawn wrapper's explicit supervisor-recovery
+    contract instead.
+    """
+
+    def __init__(
+        self,
+        *,
+        authority: object,
+        claimed_worker_pid: int | None,
+        file_identities: tuple[tuple[int, int], ...],
+    ) -> None:
+        super().__init__("mark_spawned")
+        self.authority = authority
+        self.claimed_worker_pid = claimed_worker_pid
+        self.file_identities = file_identities
+
+    def __repr__(self) -> str:
+        return (
+            "PrivateStageSpawnUncertain("
+            f"stages={len(self.file_identities)}, state='worker_spawned_unverified')"
+        )
 
 
 def validate_relative_components(
@@ -392,6 +480,141 @@ def _close_fds(*fds: int) -> list[BaseException]:
         error = _close_owned(fd)
         if error is not None:
             errors.append(error)
+    return errors
+
+
+def _close_fds_once(*fds: int) -> list[BaseException]:
+    """Attempt every owned close once, including when an injected seam raises.
+
+    A close that reports failure is ownership-ambiguous: retrying the integer can
+    close an unrelated descriptor if the kernel already released and reused it.
+    This helper therefore records the fault and advances exactly once per input.
+    """
+    errors = []
+    for fd in fds:
+        try:
+            error = _close_owned(fd)
+        except BaseException as exc:
+            errors.append(exc)
+        else:
+            if error is not None:
+                errors.append(error)
+    return errors
+
+
+def _close_exposed_stage_writers_once(
+    claims: tuple[tuple[int, tuple[int, int]], ...],
+    *,
+    allow_unlinked: bool = False,
+) -> list[BaseException]:
+    """Authenticate and close each externally exposed stage writer at most once.
+
+    ``pass_fds`` crosses into Popen and callers can accidentally close one of those
+    integers before settlement.  File-descriptor reuse would otherwise let cleanup
+    close an unrelated object.  Each claim is therefore checked immediately before
+    close against its immutable stage inode plus the strict file contract.  A stale,
+    reused or malformed integer is recorded and deliberately *not* closed.
+
+    Same-process code racing a replacement between ``fstat`` and ``close`` remains
+    outside Quarry's documented security boundary; canonical lifecycle locks prevent
+    all supported repository operations from doing so.
+    """
+    errors: list[BaseException] = []
+    for claim in claims:
+        errors.extend(
+            _close_one_exposed_stage_writer_once(
+                claim, allow_unlinked=allow_unlinked,
+            )
+        )
+    return errors
+
+
+def _close_one_exposed_stage_writer_once(
+    claim: tuple[int, tuple[int, int]], *, allow_unlinked: bool = False,
+) -> list[BaseException]:
+    """Identity-authenticate and attempt one exposed file descriptor close."""
+    fd, expected_identity = claim
+    errors: list[BaseException] = []
+    try:
+        observed = os.fstat(fd)
+        if _identity(observed) != expected_identity:
+            raise PrivatePathUnsafe("private stage writer identity changed")
+    except BaseException as exc:
+        # EBADF or a different inode means this integer is no longer our claim;
+        # closing it could destroy an unrelated newly reused descriptor.
+        errors.append(exc)
+        return errors
+    try:
+        if allow_unlinked and observed.st_nlink == 0:
+            if not stat.S_ISREG(observed.st_mode):
+                raise PrivatePathUnsafe("managed file is not a regular file")
+            if observed.st_uid != os.geteuid():
+                raise PrivatePathUnsafe("managed file is not owned by the current user")
+            if stat.S_IMODE(observed.st_mode) != FILE_MODE:
+                raise LegacyModeMismatch(
+                    components=(), expected=FILE_MODE,
+                    actual=stat.S_IMODE(observed.st_mode),
+                )
+        else:
+            _validate_strict_file_stat(observed, ())
+    except BaseException as exc:
+        # Exact inode identity is already proved.  A metadata anomaly makes the
+        # result non-clean, but retaining this actual writer would leak mutable
+        # authority, so it still receives its one close attempt below.
+        errors.append(exc)
+    try:
+        close_error = _close_owned(fd)
+    except BaseException as exc:
+        errors.append(exc)
+    else:
+        if close_error is not None:
+            errors.append(close_error)
+    return errors
+
+
+def _close_exposed_stage_dirs_once(
+    claims: tuple[tuple[int, tuple[int, int], tuple[str, ...]], ...],
+) -> list[BaseException]:
+    """Authenticate and close public stage directory descriptors once.
+
+    Identity is checked before metadata.  A stale or reused numeric descriptor is
+    skipped so cleanup cannot close an unrelated directory.  When identity matches,
+    a type/owner/mode anomaly is recorded but the authentic stage directory is still
+    closed once to consume retained authority.
+    """
+    errors: list[BaseException] = []
+    for claim in claims:
+        errors.extend(_close_one_exposed_stage_dir_once(claim))
+    return errors
+
+
+def _close_one_exposed_stage_dir_once(
+    claim: tuple[int, tuple[int, int], tuple[str, ...]],
+) -> list[BaseException]:
+    """Identity-authenticate and attempt one exposed directory close."""
+    fd, expected_identity, components = claim
+    errors: list[BaseException] = []
+    try:
+        observed = os.fstat(fd)
+        if _identity(observed) != expected_identity:
+            raise PrivatePathUnsafe(
+                "private stage directory identity changed",
+                components=components,
+            )
+    except BaseException as exc:
+        errors.append(exc)
+        return errors
+    try:
+        _validate_strict_dir_stat(observed, components)
+    except BaseException as exc:
+        errors.append(exc)
+    try:
+        close_error = _close_owned(fd)
+    except BaseException as exc:
+        errors.append(exc)
+    else:
+        if close_error is not None:
+            errors.append(close_error)
     return errors
 
 
@@ -615,15 +838,42 @@ def open_strict_root_at(anchor_fd: int, component: str) -> int:
         raise
 
 
-def _open_strict_file_in(parent_fd: int, component: str, components: tuple[str, ...]) -> int:
+def _open_strict_file_in(
+    parent_fd: int,
+    component: str,
+    components: tuple[str, ...],
+    *,
+    _claim=None,
+) -> int:
+    """Open a strict file, optionally populating a pre-registered claim slot.
+
+    The internal claim form assigns the syscall result directly into its retained
+    slot before Python reaches another source line.  Validation faults deliberately
+    leave that private descriptor in the cleanup ledger instead of attempting an
+    untracked best-effort close.
+    """
+    fd = -1
     try:
-        fd = os.open(component, _FILE_OPEN_FLAGS, dir_fd=parent_fd)
+        if _claim is None:
+            fd = os.open(component, _FILE_OPEN_FLAGS, dir_fd=parent_fd)
+        else:
+            object.__setattr__(_claim, "_fd", os.open(component, _FILE_OPEN_FLAGS, dir_fd=parent_fd))
+            object.__setattr__(_claim, "_disposition", "pending")
+            fd = _claim._fd
     except OSError as exc:
+        if _claim is not None and _claim._fd < 0:
+            object.__setattr__(_claim, "_disposition", "unallocated")
         _classify_open_error(exc, parent_fd, component, components, expect_dir=False)
         raise AssertionError("unreachable")
     try:
-        _validate_strict_file_stat(os.fstat(fd), components)
+        observed = os.fstat(fd)
+        if _claim is not None:
+            object.__setattr__(_claim, "_owned_identity", _identity(observed))
+        _validate_strict_file_stat(observed, components)
     except BaseException as primary:
+        if _claim is not None:
+            _record_descriptor_claim_error(_claim, primary)
+            raise
         close_errors = _close_fds(fd)
         _attach_close_errors(primary, close_errors)
         raise
@@ -889,6 +1139,144 @@ def repair_legacy_mode_at(
 
 _PRIVATE_STAGE_CONSTRUCTOR = object()
 _PRIVATE_STAGE_BATCH_CONSTRUCTOR = object()
+_PRIVATE_STAGE_TRANSFER_AUTHORITY_CONSTRUCTOR = object()
+_PRIVATE_STAGE_PARENT_CLOSE_RECEIPT_CONSTRUCTOR = object()
+_PRIVATE_DESCRIPTOR_CLAIM_CONSTRUCTOR = object()
+_PRIVATE_STAGE_BATCH_CLAIM_CONSTRUCTOR = object()
+_PRIVATE_STAGE_CLEANUP_LEDGER_CONSTRUCTOR = object()
+
+
+_DESCRIPTOR_CLAIM_KINDS = frozenset({
+    "writer", "pin", "parent", "anchor",
+    "source_writer", "source_parent", "source_anchor",
+})
+_DESCRIPTOR_CLAIM_TERMINAL = frozenset({
+    "closed_clean", "closed_after_fault", "close_ambiguous", "gone",
+    "identity_rejected", "unallocated",
+})
+_MAX_DESCRIPTOR_CLAIM_ERRORS = 2
+_MAX_DESCRIPTOR_CLAIM_DROPPED = (1 << 63) - 1
+
+
+class _PrivateDescriptorClaim:
+    """One exact, privately retained descriptor with monotonic close progress."""
+
+    __slots__ = (
+        "_fd", "_identity", "_owned_identity", "_fresh_owned", "_kind",
+        "_components", "_disposition",
+        "_close_attempts", "_errors", "_dropped_error_count", "_metadata_fault",
+        "_lock",
+    )
+
+    def __init__(
+        self,
+        *,
+        fd: int,
+        identity: tuple[int, int],
+        kind: str,
+        components: tuple[str, ...],
+        _constructor_token: object,
+    ) -> None:
+        if (_constructor_token is not _PRIVATE_DESCRIPTOR_CLAIM_CONSTRUCTOR
+                or type(fd) is not int or fd < -1
+                or type(identity) is not tuple or len(identity) != 2
+                or any(type(value) is not int or value < 0 for value in identity)
+                or type(kind) is not str or kind not in _DESCRIPTOR_CLAIM_KINDS
+                or type(components) is not tuple):
+            raise PrivateStageHandoffError("prepare")
+        object.__setattr__(self, "_fd", fd)
+        object.__setattr__(self, "_identity", identity)
+        object.__setattr__(self, "_owned_identity", None)
+        object.__setattr__(self, "_fresh_owned", fd == -1)
+        object.__setattr__(self, "_kind", kind)
+        object.__setattr__(self, "_components", components)
+        object.__setattr__(
+            self, "_disposition", "allocating" if fd == -1 else "pending",
+        )
+        object.__setattr__(self, "_close_attempts", 0)
+        object.__setattr__(self, "_errors", ())
+        object.__setattr__(self, "_dropped_error_count", 0)
+        object.__setattr__(self, "_metadata_fault", False)
+        object.__setattr__(self, "_lock", threading.RLock())
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError("private descriptor claims are read-only")
+
+    def __delattr__(self, name) -> None:
+        raise AttributeError("private descriptor claims are read-only")
+
+    @property
+    def fd(self) -> int:
+        with self._lock:
+            return self._fd
+
+    @property
+    def kind(self) -> str:
+        return self._kind
+
+    @property
+    def disposition(self) -> str:
+        with self._lock:
+            return self._disposition
+
+    @property
+    def errors(self) -> tuple[BaseException, ...]:
+        with self._lock:
+            return self._errors
+
+    def __repr__(self) -> str:
+        return (
+            "PrivateDescriptorClaim("
+            f"kind={self._kind!r}, disposition={self._disposition!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False, init=False)
+class PrivateStageParentCloseReceipt:
+    """Proof that registered parent writer FDs matched and close returned cleanly.
+
+    This receipt does not prove the absence of aliases, child inheritance, process
+    identity, containment, content stability, GO release or publication.  The PID
+    is only an untrusted correlation claim for a supervisor to compose with its own
+    Popen handle, transcript and containment evidence.  ``repr`` omits correlation
+    and filesystem identity values so logs cannot expose ambient authority facts.
+    """
+
+    request_id: str
+    claimed_worker_pid: int
+    file_identities: tuple[tuple[int, int], ...]
+    state: str = "parent_writers_closed"
+
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        claimed_worker_pid: int,
+        file_identities: tuple[tuple[int, int], ...],
+        _constructor_token: object,
+    ) -> None:
+        if (_constructor_token is not _PRIVATE_STAGE_PARENT_CLOSE_RECEIPT_CONSTRUCTOR
+                or type(request_id) is not str or len(request_id) != 32
+                or any(char not in "0123456789abcdef" for char in request_id)
+                or type(claimed_worker_pid) is not int
+                or not 1 <= claimed_worker_pid <= _MAX_WORKER_PID
+                or type(file_identities) is not tuple
+                or not 1 <= len(file_identities) <= 3
+                or any(type(identity) is not tuple or len(identity) != 2
+                       or any(type(value) is not int or value < 0 for value in identity)
+                       for identity in file_identities)
+                or len(set(file_identities)) != len(file_identities)):
+            raise PrivateStageHandoffError("transfer")
+        object.__setattr__(self, "request_id", request_id)
+        object.__setattr__(self, "claimed_worker_pid", claimed_worker_pid)
+        object.__setattr__(self, "file_identities", file_identities)
+        object.__setattr__(self, "state", "parent_writers_closed")
+
+    def __repr__(self) -> str:
+        return (
+            "PrivateStageParentCloseReceipt("
+            f"stages={len(self.file_identities)}, state={self.state!r})"
+        )
 
 
 class PrivateFileStage:
@@ -902,6 +1290,7 @@ class PrivateFileStage:
 
     __slots__ = (
         "_anchor_fd",
+        "_anchor_identity",
         "_parent_fd",
         "_file_fd",
         "_temporary_name",
@@ -914,6 +1303,7 @@ class PrivateFileStage:
         "_sealed_digest",
         "_state",
         "_lifecycle_lock",
+        "_cleanup_ledger",
     )
 
     def __init__(
@@ -925,13 +1315,18 @@ class PrivateFileStage:
         temporary_name: str,
         destination_name: str,
         components: tuple[str, ...],
+        anchor_identity: tuple[int, int] | None = None,
         parent_identity: tuple[int, int],
         file_identity: tuple[int, int],
         _constructor_token: object,
     ) -> None:
         if _constructor_token is not _PRIVATE_STAGE_CONSTRUCTOR:
             raise PrivatePathUnsafe("private stages must be created by the strict staging API")
+        if (type(anchor_identity) is not tuple or len(anchor_identity) != 2
+                or any(type(value) is not int or value < 0 for value in anchor_identity)):
+            raise PrivatePathUnsafe("private stage anchor identity is invalid")
         object.__setattr__(self, "_anchor_fd", anchor_fd)
+        object.__setattr__(self, "_anchor_identity", anchor_identity)
         object.__setattr__(self, "_parent_fd", parent_fd)
         object.__setattr__(self, "_file_fd", file_fd)
         object.__setattr__(self, "_temporary_name", temporary_name)
@@ -944,6 +1339,7 @@ class PrivateFileStage:
         object.__setattr__(self, "_sealed_digest", None)
         object.__setattr__(self, "_state", "open")
         object.__setattr__(self, "_lifecycle_lock", threading.RLock())
+        object.__setattr__(self, "_cleanup_ledger", None)
 
     def __setattr__(self, name, value) -> None:
         raise AttributeError("private stage claims are read-only")
@@ -954,6 +1350,10 @@ class PrivateFileStage:
     @property
     def anchor_fd(self) -> int:
         return self._anchor_fd
+
+    @property
+    def anchor_identity(self) -> tuple[int, int]:
+        return self._anchor_identity
 
     @property
     def parent_fd(self) -> int:
@@ -1011,7 +1411,7 @@ class PrivateFileStage:
         # second cleanup would both violate that ownership boundary and turn a
         # successful prepare into a lifecycle error.
         with self._lifecycle_lock:
-            if self.state in {"open", "sealed"}:
+            if self.state in {"open", "sealed", "aborted"}:
                 try:
                     self.abort()
                 except BaseException as cleanup_error:
@@ -1023,37 +1423,156 @@ class PrivateFileStage:
                         pass
 
 
+class _PrivateStageBatchClaim:
+    """Private descriptor claims belonging to one immutable stage identity."""
+
+    __slots__ = ("_stage", "_writer", "_pin", "_parent", "_anchor")
+
+    def __init__(
+        self,
+        *,
+        stage: PrivateFileStage,
+        writer: _PrivateDescriptorClaim,
+        pin: _PrivateDescriptorClaim,
+        parent: _PrivateDescriptorClaim,
+        anchor: _PrivateDescriptorClaim,
+        _constructor_token: object,
+    ) -> None:
+        if (_constructor_token is not _PRIVATE_STAGE_BATCH_CLAIM_CONSTRUCTOR
+                or type(stage) is not PrivateFileStage
+                or any(type(claim) is not _PrivateDescriptorClaim for claim in (
+                    writer, pin, parent, anchor,
+                ))
+                or (writer._kind, pin._kind, parent._kind, anchor._kind)
+                != ("writer", "pin", "parent", "anchor")):
+            raise PrivateStageHandoffError("prepare")
+        object.__setattr__(self, "_stage", stage)
+        object.__setattr__(self, "_writer", writer)
+        object.__setattr__(self, "_pin", pin)
+        object.__setattr__(self, "_parent", parent)
+        object.__setattr__(self, "_anchor", anchor)
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError("private stage batch claims are read-only")
+
+    def __delattr__(self, name) -> None:
+        raise AttributeError("private stage batch claims are read-only")
+
+    @property
+    def writer(self) -> _PrivateDescriptorClaim:
+        return self._writer
+
+    @property
+    def pin(self) -> _PrivateDescriptorClaim:
+        return self._pin
+
+    @property
+    def parent(self) -> _PrivateDescriptorClaim:
+        return self._parent
+
+    @property
+    def anchor(self) -> _PrivateDescriptorClaim:
+        return self._anchor
+
+    def __repr__(self) -> str:
+        return "PrivateStageBatchClaim(descriptors=4)"
+
+
+class _PrivateStageCleanupLedger:
+    """Retained cleanup authority; terminal state never erases pending claims."""
+
+    __slots__ = ("_stage_claims", "_extra_claims", "_lock")
+
+    def __init__(
+        self,
+        *,
+        stage_claims: tuple[_PrivateStageBatchClaim, ...] = (),
+        extra_claims: tuple[_PrivateDescriptorClaim, ...] = (),
+        _constructor_token: object,
+    ) -> None:
+        if (_constructor_token is not _PRIVATE_STAGE_CLEANUP_LEDGER_CONSTRUCTOR
+                or type(stage_claims) is not tuple
+                or type(extra_claims) is not tuple
+                or any(type(claim) is not _PrivateStageBatchClaim
+                       for claim in stage_claims)
+                or any(type(claim) is not _PrivateDescriptorClaim
+                       for claim in extra_claims)):
+            raise PrivateStageHandoffError("prepare")
+        object.__setattr__(self, "_stage_claims", stage_claims)
+        object.__setattr__(self, "_extra_claims", extra_claims)
+        object.__setattr__(self, "_lock", threading.RLock())
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError("private cleanup ledgers are read-only")
+
+    def __delattr__(self, name) -> None:
+        raise AttributeError("private cleanup ledgers are read-only")
+
+    @property
+    def stage_claims(self) -> tuple[_PrivateStageBatchClaim, ...]:
+        return self._stage_claims
+
+    @property
+    def claims(self) -> tuple[_PrivateDescriptorClaim, ...]:
+        grouped = tuple(
+            claim
+            for stage_claim in self._stage_claims
+            for claim in (
+                stage_claim._writer, stage_claim._pin,
+                stage_claim._parent, stage_claim._anchor,
+            )
+        )
+        return grouped + self._extra_claims
+
+    @property
+    def pending(self) -> bool:
+        with self._lock:
+            return any(
+                claim.disposition not in _DESCRIPTOR_CLAIM_TERMINAL
+                for claim in self.claims
+            )
+
+    def __repr__(self) -> str:
+        pending = sum(
+            claim._disposition not in _DESCRIPTOR_CLAIM_TERMINAL
+            for claim in self.claims
+        )
+        return f"PrivateStageCleanupLedger(claims={len(self.claims)}, pending={pending})"
+
+
 class PrivateStageHandoffBatch:
     """Opaque parent-owned writers prepared for one not-yet-spawned worker.
 
-    ``pass_fds`` is a borrowed ordered descriptor tuple, not a transfer of Python
-    ownership.  Until a later spawn slice consumes the batch, only this object owns
-    those writers.  The batch deliberately renders neither descriptors, paths nor
-    its request correlation value.
+    Writers are never exposed through this general lifecycle handle.  The internal
+    spawn callback receives their ordered tuple only while canonical lifecycle locks
+    remain held, and no raw tuple-returning API exists.  Neither object renders
+    descriptors, paths nor request identity.
     """
 
     __slots__ = (
-        "_stages", "_writer_fds", "_pin_fds", "_request_id", "_state",
+        "_stages", "_request_id", "_state",
+        "_transfer_authority", "_transfer_receipt", "_cleanup_ledger",
     )
 
     def __init__(
         self,
         *,
         stages: tuple[PrivateFileStage, ...],
-        writer_fds: tuple[int, ...],
-        pin_fds: tuple[int, ...],
+        cleanup_ledger: _PrivateStageCleanupLedger,
         request_id: str,
         _constructor_token: object,
     ) -> None:
-        if _constructor_token is not _PRIVATE_STAGE_BATCH_CONSTRUCTOR:
+        if (_constructor_token is not _PRIVATE_STAGE_BATCH_CONSTRUCTOR
+                or type(cleanup_ledger) is not _PrivateStageCleanupLedger):
             raise PrivatePathUnsafe(
                 "private stage handoffs must be created by the strict staging API",
             )
         object.__setattr__(self, "_stages", stages)
-        object.__setattr__(self, "_writer_fds", writer_fds)
-        object.__setattr__(self, "_pin_fds", pin_fds)
         object.__setattr__(self, "_request_id", request_id)
         object.__setattr__(self, "_state", "prepared")
+        object.__setattr__(self, "_transfer_authority", None)
+        object.__setattr__(self, "_transfer_receipt", None)
+        object.__setattr__(self, "_cleanup_ledger", cleanup_ledger)
 
     def __setattr__(self, name, value) -> None:
         raise AttributeError("private stage handoff claims are read-only")
@@ -1063,7 +1582,9 @@ class PrivateStageHandoffBatch:
 
     @property
     def pass_fds(self) -> tuple[int, ...]:
-        return self._writer_fds if self._state == "prepared" else ()
+        # Compatibility tombstone: exposing writers before reservation lets an
+        # accidental close/reuse make generic abort target an unrelated descriptor.
+        return ()
 
     @property
     def state(self) -> str:
@@ -1080,9 +1601,23 @@ class PrivateStageHandoffBatch:
         # cleanup remains ours.  Otherwise an already-invalidated abort could still
         # be physically closing its writers while this context returns.
         with _hold_stage_lifecycle(self._stages):
+            operation = None
             if self.state == "prepared":
+                operation = self.abort
+            elif self.state == "aborted" and self._cleanup_ledger.pending:
+                operation = self.abort
+            elif self.state in {
+                "spawn_prepared", "worker_spawned_unverified", "worker_claim_bound",
+                "parent_writers_closed", "transfer_uncertain",
+            }:
+                # This fences evidence authority only; it neither asserts nor waits
+                # for process settlement.
+                operation = lambda: fence_private_stage_handoff(self)
+            elif self.state == "fenced" and self._cleanup_ledger.pending:
+                operation = lambda: fence_private_stage_handoff(self)
+            if operation is not None:
                 try:
-                    self.abort()
+                    operation()
                 except BaseException as cleanup_error:
                     if exc is None:
                         raise
@@ -1095,19 +1630,363 @@ class PrivateStageHandoffBatch:
         return f"PrivateStageHandoffBatch(stages={len(self._stages)}, state={self._state!r})"
 
 
+class _PrivateStageTransferAuthority:
+    """Opaque one-shot spawn and transfer permission for one exact batch."""
+
+    __slots__ = (
+        "_batch", "_request_id", "_file_identities", "_claimed_worker_pid",
+        "_borrowed", "_bound", "_consumed",
+    )
+
+    def __init__(
+        self,
+        *,
+        batch: PrivateStageHandoffBatch,
+        request_id: str,
+        file_identities: tuple[tuple[int, int], ...],
+        _constructor_token: object,
+    ) -> None:
+        if _constructor_token is not _PRIVATE_STAGE_TRANSFER_AUTHORITY_CONSTRUCTOR:
+            raise PrivateStageHandoffError("bind_worker")
+        object.__setattr__(self, "_batch", batch)
+        object.__setattr__(self, "_request_id", request_id)
+        object.__setattr__(self, "_file_identities", file_identities)
+        object.__setattr__(self, "_claimed_worker_pid", None)
+        object.__setattr__(self, "_borrowed", False)
+        object.__setattr__(self, "_bound", False)
+        object.__setattr__(self, "_consumed", False)
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError("private stage transfer authorities are read-only")
+
+    def __delattr__(self, name) -> None:
+        raise AttributeError("private stage transfer authorities are read-only")
+
+    @property
+    def pass_fds(self) -> tuple[int, ...]:
+        """Compatibility tombstone; spawning is callback-owned and lock-scoped."""
+        return ()
+
+    def __repr__(self) -> str:
+        state = (
+            "consumed" if self._consumed
+            else "bound" if self._bound
+            else "spawn_prepared"
+        )
+        return f"PrivateStageTransferAuthority(state={state!r})"
+
+
+def _inspect_stage_directory_claims_at(
+    stage: PrivateFileStage, *, parent_fd: int, anchor_fd: int,
+) -> tuple[BaseException, ...]:
+    """Prove directory identities and return non-identity metadata anomalies.
+
+    An identity failure raises immediately: no descriptor-relative operation may use
+    that numeric descriptor.  Once exact identity is proved, a mode/type/owner fault
+    is returned instead so fail-closed cleanup can still operate through and close
+    the authentic directory while reporting the policy anomaly.
+    """
+    metadata_errors: list[BaseException] = []
+    for fd, expected_identity, components, label in (
+        (anchor_fd, stage.anchor_identity, (), "anchor"),
+        (parent_fd, stage.parent_identity, stage.components[:-1], "parent"),
+    ):
+        observed = os.fstat(fd)
+        if _identity(observed) != expected_identity:
+            raise PrivatePathUnsafe(
+                f"private stage {label} identity changed",
+                components=stage.components,
+            )
+        try:
+            _validate_strict_dir_stat(observed, components)
+        except BaseException as exc:
+            metadata_errors.append(exc)
+    return tuple(metadata_errors)
+
+
+def _validate_stage_directory_claims_at(
+    stage: PrivateFileStage, *, parent_fd: int, anchor_fd: int,
+) -> None:
+    metadata_errors = _inspect_stage_directory_claims_at(
+        stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+    )
+    if metadata_errors:
+        raise metadata_errors[0]
+
+
+def _validate_stage_directory_claims(stage: PrivateFileStage) -> None:
+    """Authenticate both public directory descriptors before strict relative I/O."""
+    _validate_stage_directory_claims_at(
+        stage, parent_fd=stage.parent_fd, anchor_fd=stage.anchor_fd,
+    )
+
+
+def _stage_directory_close_claims(
+    stage: PrivateFileStage,
+    *,
+    parent_fd: int | None = None,
+    anchor_fd: int | None = None,
+) -> tuple[tuple[int, tuple[int, int], tuple[str, ...]], ...]:
+    return (
+        (
+            stage.parent_fd if parent_fd is None else parent_fd,
+            stage.parent_identity,
+            stage.components[:-1],
+        ),
+        (
+            stage.anchor_fd if anchor_fd is None else anchor_fd,
+            stage.anchor_identity,
+            (),
+        ),
+    )
+
+
 def _validate_live_stage(stage: PrivateFileStage, operation: str) -> None:
     if type(stage) is not PrivateFileStage:
         raise PrivatePathUnsafe("private stage handle has the wrong type")
     if stage.state not in {"open", "sealed"}:
         raise PrivateStageStateError(operation, stage.state)
-    parent = os.fstat(stage.parent_fd)
-    _validate_strict_dir_stat(parent, stage.components[:-1])
-    if _identity(parent) != stage.parent_identity:
-        raise PrivatePathUnsafe("private stage parent identity changed", components=stage.components)
+    if stage._cleanup_ledger is not None:
+        raise PrivateStageStateError(operation, stage.state)
+    _validate_stage_directory_claims(stage)
 
 
 def _set_stage(stage: PrivateFileStage, field: str, value) -> None:
     object.__setattr__(stage, f"_{field}", value)
+
+
+def _record_descriptor_claim_error(
+    claim: _PrivateDescriptorClaim, error: BaseException,
+) -> None:
+    with claim._lock:
+        if len(claim._errors) < _MAX_DESCRIPTOR_CLAIM_ERRORS:
+            object.__setattr__(claim, "_errors", claim._errors + (error,))
+        else:
+            object.__setattr__(
+                claim,
+                "_dropped_error_count",
+                min(claim._dropped_error_count + 1, _MAX_DESCRIPTOR_CLAIM_DROPPED),
+            )
+
+
+def _validate_descriptor_claim_metadata(
+    claim: _PrivateDescriptorClaim, observed: os.stat_result, *, allow_unlinked: bool,
+) -> None:
+    if claim._kind in {"parent", "anchor", "source_parent", "source_anchor"}:
+        _validate_strict_dir_stat(observed, claim._components)
+        return
+    if allow_unlinked and observed.st_nlink == 0:
+        if not stat.S_ISREG(observed.st_mode):
+            raise PrivatePathUnsafe(
+                "managed file is not a regular file", components=claim._components,
+            )
+        if observed.st_uid != os.geteuid():
+            raise PrivatePathUnsafe(
+                "managed file is not owned by the current user",
+                components=claim._components,
+            )
+        if stat.S_IMODE(observed.st_mode) != FILE_MODE:
+            raise LegacyModeMismatch(
+                components=claim._components,
+                expected=FILE_MODE,
+                actual=stat.S_IMODE(observed.st_mode),
+            )
+    else:
+        _validate_strict_file_stat(observed, claim._components)
+    if claim._kind == "writer":
+        flags = fcntl.fcntl(claim._fd, fcntl.F_GETFL)
+        if flags & os.O_ACCMODE not in {os.O_WRONLY, os.O_RDWR}:
+            raise PrivatePathUnsafe(
+                "private stage writer is not writable", components=claim._components,
+            )
+
+
+def _new_descriptor_claim(
+    fd: int,
+    identity: tuple[int, int],
+    kind: str,
+    components: tuple[str, ...],
+) -> _PrivateDescriptorClaim:
+    return _PrivateDescriptorClaim(
+        fd=fd,
+        identity=identity,
+        kind=kind,
+        components=components,
+        _constructor_token=_PRIVATE_DESCRIPTOR_CLAIM_CONSTRUCTOR,
+    )
+
+
+def _duplicate_private_claim(
+    claim: _PrivateDescriptorClaim,
+    source_fd: int,
+    *,
+    allow_unlinked: bool = False,
+) -> _PrivateDescriptorClaim:
+    """Populate one transaction-registered claim before validating its duplicate."""
+    if (type(claim) is not _PrivateDescriptorClaim
+            or claim._fd != -1 or claim._disposition != "allocating"):
+        raise PrivateStageHandoffError("prepare")
+    try:
+        object.__setattr__(claim, "_fd", fcntl.fcntl(source_fd, fcntl.F_DUPFD_CLOEXEC, 0))
+        object.__setattr__(claim, "_disposition", "pending")
+        observed = os.fstat(claim._fd)
+        object.__setattr__(claim, "_owned_identity", _identity(observed))
+        if _identity(observed) != claim._identity:
+            raise PrivatePathUnsafe(
+                "private descriptor identity changed", components=claim._components,
+            )
+        _validate_descriptor_claim_metadata(
+            claim, observed, allow_unlinked=allow_unlinked,
+        )
+        return claim
+    except BaseException as primary:
+        if claim._fd < 0:
+            object.__setattr__(claim, "_disposition", "unallocated")
+        else:
+            _record_descriptor_claim_error(claim, primary)
+        raise
+
+
+def _inspect_descriptor_claim(
+    claim: _PrivateDescriptorClaim, *, allow_unlinked: bool,
+) -> os.stat_result | None:
+    """Authenticate a pending claim, terminalizing only proved gone/foreign FDs."""
+    try:
+        observed = os.fstat(claim._fd)
+    except OSError as exc:
+        if exc.errno != errno.EBADF:
+            raise
+        _record_descriptor_claim_error(claim, exc)
+        object.__setattr__(claim, "_fd", -1)
+        object.__setattr__(claim, "_disposition", "gone")
+        return None
+    if claim._fresh_owned and claim._owned_identity is None:
+        # The descriptor was allocated directly into this unexposed claim slot.
+        # An interruption before allocation validation cannot turn it into an
+        # ambient numeric authority; adopt the observed inode solely for cleanup.
+        object.__setattr__(claim, "_owned_identity", _identity(observed))
+    cleanup_identity = (
+        claim._identity
+        if claim._owned_identity is None
+        else claim._owned_identity
+    )
+    if _identity(observed) != cleanup_identity:
+        error = PrivatePathUnsafe(
+            "private descriptor identity changed", components=claim._components,
+        )
+        _record_descriptor_claim_error(claim, error)
+        object.__setattr__(claim, "_fd", -1)
+        object.__setattr__(claim, "_disposition", "identity_rejected")
+        return None
+    try:
+        _validate_descriptor_claim_metadata(
+            claim, observed, allow_unlinked=allow_unlinked,
+        )
+    except PrivatePathError as exc:
+        _record_descriptor_claim_error(claim, exc)
+        object.__setattr__(claim, "_metadata_fault", True)
+    return observed
+
+
+def _drain_private_descriptor_claim(
+    claim: _PrivateDescriptorClaim, *, allow_unlinked: bool = True,
+) -> tuple[BaseException, ...]:
+    """Settle one descriptor with bounded, identity-checked close recovery."""
+    with claim._lock:
+        if claim._disposition in _DESCRIPTOR_CLAIM_TERMINAL:
+            return ()
+        before_errors = len(claim._errors)
+        observed = _inspect_descriptor_claim(claim, allow_unlinked=allow_unlinked)
+        if observed is None:
+            return claim._errors[before_errors:]
+
+        while claim._close_attempts < 2:
+            object.__setattr__(claim, "_disposition", "close_started")
+            object.__setattr__(claim, "_close_attempts", claim._close_attempts + 1)
+            close_fault: BaseException | None = None
+            try:
+                close_fault = _close_owned(claim._fd)
+            except BaseException as exc:
+                close_fault = exc
+            if close_fault is None:
+                object.__setattr__(claim, "_fd", -1)
+                object.__setattr__(
+                    claim,
+                    "_disposition",
+                    "closed_clean" if not claim._errors else "closed_after_fault",
+                )
+                return claim._errors[before_errors:]
+
+            _record_descriptor_claim_error(claim, close_fault)
+            try:
+                current = os.fstat(claim._fd)
+            except OSError as exc:
+                if exc.errno == errno.EBADF:
+                    object.__setattr__(claim, "_fd", -1)
+                    object.__setattr__(claim, "_disposition", "close_ambiguous")
+                    return claim._errors[before_errors:]
+                _record_descriptor_claim_error(claim, exc)
+                object.__setattr__(claim, "_disposition", "close_started")
+                return claim._errors[before_errors:]
+            except BaseException as exc:
+                _record_descriptor_claim_error(claim, exc)
+                object.__setattr__(claim, "_disposition", "close_started")
+                return claim._errors[before_errors:]
+            cleanup_identity = (
+                claim._identity
+                if claim._owned_identity is None
+                else claim._owned_identity
+            )
+            if _identity(current) != cleanup_identity:
+                error = PrivatePathUnsafe(
+                    "private descriptor identity changed during close",
+                    components=claim._components,
+                )
+                _record_descriptor_claim_error(claim, error)
+                object.__setattr__(claim, "_fd", -1)
+                object.__setattr__(claim, "_disposition", "identity_rejected")
+                return claim._errors[before_errors:]
+
+        # The exact private descriptor remains live after its lifetime close budget.
+        # Keep the claim pending for external/process-level recovery; never erase it
+        # or manufacture a clean parent-close receipt.
+        object.__setattr__(claim, "_disposition", "close_started")
+        return claim._errors[before_errors:]
+
+
+def _drain_private_stage_ledger(
+    ledger: _PrivateStageCleanupLedger,
+    *,
+    kinds: frozenset[str] | None = None,
+) -> tuple[BaseException, ...]:
+    """Drain selected claims; one control fault cannot strand a suffix."""
+    if type(ledger) is not _PrivateStageCleanupLedger:
+        raise PrivateStageHandoffError("fence")
+    errors: list[BaseException] = []
+
+    def drain_pass() -> None:
+        for claim in ledger.claims:
+            if (kinds is not None and claim._kind not in kinds) or (
+                claim._disposition in _DESCRIPTOR_CLAIM_TERMINAL
+            ):
+                continue
+            try:
+                errors.extend(_drain_private_descriptor_claim(claim))
+            except BaseException as exc:
+                _record_descriptor_claim_error(claim, exc)
+                errors.append(exc)
+
+    with ledger._lock:
+        try:
+            drain_pass()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            try:
+                drain_pass()
+            except BaseException as exc:
+                errors.append(exc)
+    return tuple(errors)
 
 
 @contextmanager
@@ -1178,13 +2057,28 @@ def _serialized_batch_lifecycle(function):
 
 def _release_stage_fds(stage: PrivateFileStage, state: str) -> list[BaseException]:
     file_fd = stage.file_fd
+    file_identity = stage.file_identity
     parent_fd = stage.parent_fd
     anchor_fd = stage.anchor_fd
+    directory_claims = _stage_directory_close_claims(
+        stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+    )
     _set_stage(stage, "file_fd", -1)
     _set_stage(stage, "parent_fd", -1)
     _set_stage(stage, "anchor_fd", -1)
     _set_stage(stage, "state", state)
-    return _close_fds(file_fd, parent_fd, anchor_fd)
+    errors: list[BaseException] = []
+    try:
+        errors.extend(
+            _close_exposed_stage_writers_once(((file_fd, file_identity),))
+        )
+    except BaseException as exc:
+        errors.append(exc)
+    try:
+        errors.extend(_close_exposed_stage_dirs_once(directory_claims))
+    except BaseException as exc:
+        errors.append(exc)
+    return errors
 
 
 def _same_private_inode(left_fd: int, right_fd: int) -> bool:
@@ -1199,24 +2093,109 @@ def _same_private_inode(left_fd: int, right_fd: int) -> bool:
     )
 
 
-def _validate_handoff_request_id(request_id) -> str:
+def _validate_handoff_request_id(request_id, operation: str = "prepare") -> str:
     if (type(request_id) is not str or len(request_id) != 32
             or any(char not in "0123456789abcdef" for char in request_id)):
-        raise PrivateStageHandoffError("prepare")
+        raise PrivateStageHandoffError(operation)
     return request_id
 
 
-def _begin_unspawned_handoff_abort(
-    batch: PrivateStageHandoffBatch,
+def _validate_handoff_worker_pid(worker_pid, operation: str) -> int:
+    if type(worker_pid) is not int or not 1 <= worker_pid <= _MAX_WORKER_PID:
+        raise PrivateStageHandoffError(operation)
+    return worker_pid
+
+
+def _reconcile_stages_aborted_direct(
     stages: tuple[PrivateFileStage, ...],
+    ledger: _PrivateStageCleanupLedger,
 ) -> None:
-    """Invalidate the logical batch authority before physical cleanup begins."""
-    object.__setattr__(batch, "_writer_fds", ())
-    object.__setattr__(batch, "_pin_fds", ())
-    object.__setattr__(batch, "_state", "aborted")
+    """Make every member abort-only while retaining the canonical cleanup graph."""
     for stage in stages:
-        object.__setattr__(stage, "_file_fd", -1)
+        object.__setattr__(stage, "_cleanup_ledger", ledger)
         object.__setattr__(stage, "_state", "aborted")
+        object.__setattr__(stage, "_file_fd", -1)
+        object.__setattr__(stage, "_parent_fd", -1)
+        object.__setattr__(stage, "_anchor_fd", -1)
+
+
+def _reconcile_batch_aborted_direct(
+    batch: PrivateStageHandoffBatch,
+    authority: object,
+    stages: tuple[PrivateFileStage, ...],
+    ledger: _PrivateStageCleanupLedger,
+) -> None:
+    """Consume batch lifecycle authority and retain all cleanup claims."""
+    if type(authority) is _PrivateStageTransferAuthority:
+        object.__setattr__(authority, "_consumed", True)
+    object.__setattr__(batch, "_transfer_authority", None)
+    object.__setattr__(batch, "_transfer_receipt", None)
+    object.__setattr__(batch, "_state", "aborted")
+    object.__setattr__(batch, "_cleanup_ledger", ledger)
+    _reconcile_stages_aborted_direct(stages, ledger)
+
+
+def _reconcile_failed_prepare_cleanup(
+    stages: tuple[PrivateFileStage, ...],
+    ledger: _PrivateStageCleanupLedger,
+    batch: PrivateStageHandoffBatch | None,
+) -> tuple[BaseException, ...]:
+    """Terminalize a failed prepare and drain even after one control interruption."""
+    errors: list[BaseException] = []
+    authority = None if batch is None else batch._transfer_authority
+
+    def reconcile() -> None:
+        if batch is None:
+            _reconcile_stages_aborted_direct(stages, ledger)
+        else:
+            _reconcile_batch_aborted_direct(
+                batch, authority, stages, ledger,
+            )
+
+    try:
+        with _defer_stage_transition_signals():
+            reconcile()
+    except BaseException as exc:
+        errors.append(exc)
+    finally:
+        # The direct second reconciliation bypasses no injectable helper and is the
+        # backstop for a one-shot cooperative interruption between member updates.
+        reconcile()
+        try:
+            errors.extend(_drain_private_stage_ledger(ledger))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            try:
+                errors.extend(_drain_private_stage_ledger(ledger))
+            except BaseException as exc:
+                errors.append(exc)
+    return tuple(errors)
+
+
+def _settle_failed_prepare_cleanup(
+    stages: tuple[PrivateFileStage, ...],
+    ledger: _PrivateStageCleanupLedger,
+    batch: PrivateStageHandoffBatch | None,
+) -> tuple[BaseException, ...]:
+    """One outer catch around reconciliation-handler entry and cleanup."""
+    errors: list[BaseException] = []
+    try:
+        errors.extend(_reconcile_failed_prepare_cleanup(stages, ledger, batch))
+    except BaseException as exc:
+        errors.append(exc)
+    finally:
+        # Handler-entry interruption may have skipped the inner helper entirely.
+        authority = None if batch is None else batch._transfer_authority
+        if batch is None:
+            _reconcile_stages_aborted_direct(stages, ledger)
+        else:
+            _reconcile_batch_aborted_direct(batch, authority, stages, ledger)
+        try:
+            errors.extend(_drain_private_stage_ledger(ledger))
+        except BaseException as exc:
+            errors.append(exc)
+    return tuple(errors)
 
 
 def _validate_open_stage_for_handoff(stage) -> None:
@@ -1224,7 +2203,14 @@ def _validate_open_stage_for_handoff(stage) -> None:
         raise PrivateStageHandoffError("prepare")
     if stage.state != "open":
         raise PrivateStageStateError("prepare", stage.state)
+    if stage._cleanup_ledger is not None:
+        raise PrivateStageHandoffError("prepare")
     _validate_live_stage(stage, "prepare")
+    if stage.expected_digest is not None:
+        # A stage carrying an exact-byte publication claim cannot also be a mutable
+        # sink handed to a worker.  Callers must create a fresh unclaimed stage for
+        # streamed capture and authenticate its bytes only after worker settlement.
+        raise PrivateStageHandoffError("prepare")
     observed = os.fstat(stage.file_fd)
     if observed.st_nlink == 0:
         raise PrivatePathUnsafe(
@@ -1242,10 +2228,11 @@ def prepare_private_stage_handoff(
 ) -> PrivateStageHandoffBatch:
     """Atomically move one to three OPEN stage writers into an unspawned batch.
 
-    No child exists at this boundary.  Every named inode is independently pinned
-    read-only before logical ownership changes.  If validation, pinning or the small
-    in-process transition is interrupted, all stages retain their original writer
-    ownership and every newly opened pin is closed.
+    No child exists at this boundary.  Original descriptors are first captured in a
+    retained cleanup ledger while caller-visible stage fields are tombstoned.  Writer,
+    read-pin, parent and anchor authority is then duplicated into private CLOEXEC
+    claims and the retained originals are settled.  A successful batch therefore owns
+    no numeric descriptor that was previously exposed through a stage object.
     """
     _require_strict_capabilities()
     request_id = _validate_handoff_request_id(request_id)
@@ -1256,171 +2243,970 @@ def prepare_private_stage_handoff(
     if len({id(stage) for stage in stages}) != len(stages):
         raise PrivateStageHandoffError("prepare")
     with _hold_stage_lifecycle(stages):
-        return _prepare_private_stage_handoff_locked(stages, request_id)
+        # Complete validation before allocating any private descriptor so an
+        # ordinary refusal preserves every original stage and exception type.
+        identities = set()
+        for stage in stages:
+            _validate_open_stage_for_handoff(stage)
+            if stage.file_identity in identities:
+                raise PrivateStageHandoffError("prepare")
+            identities.add(stage.file_identity)
+        try:
+            return _prepare_private_stage_handoff_locked(stages, request_id)
+        except PrivateStageHandoffError:
+            raise
+        except BaseException as primary:
+            cleanup_errors: list[BaseException] = []
+            ledgers = {
+                id(stage._cleanup_ledger): stage._cleanup_ledger
+                for stage in stages
+                if type(stage._cleanup_ledger) is _PrivateStageCleanupLedger
+            }
+            if len(ledgers) == 1:
+                ledger = next(iter(ledgers.values()))
+                cleanup_errors.extend(
+                    _settle_failed_prepare_cleanup(stages, ledger, None)
+                )
+            error = PrivateStageHandoffError("prepare")
+            error.cleanup_errors = tuple(cleanup_errors)
+            error.close_errors = tuple(cleanup_errors)
+            raise error from primary
 
 
 def _prepare_private_stage_handoff_locked(
     stages: tuple[PrivateFileStage, ...], request_id: str,
 ) -> PrivateStageHandoffBatch:
-    # Preallocation means recording an opened pin cannot allocate or fail.  The
-    # transition also uses best-effort per-thread signal deferral; production
-    # cancellation is cooperative and ordinary public lifecycle calls are locked.
-    pins = [-1] * len(stages)
-    writer_fds = tuple(stage.file_fd for stage in stages)
-    changed_count = 0
+    """Outer typed-error boundary for the private prepare transaction."""
     try:
-        with _defer_stage_transition_signals():
-            identities = set()
-            for index, stage in enumerate(stages):
-                _validate_open_stage_for_handoff(stage)
-                if stage.file_identity in identities:
-                    raise PrivateStageHandoffError("prepare")
-                identities.add(stage.file_identity)
-                pins[index] = _open_strict_file_in(
-                    stage.parent_fd, stage.temporary_name, stage.components,
-                )
-                if not _same_private_inode(stage.file_fd, pins[index]):
-                    raise PrivatePathUnsafe(
-                        "private stage name was substituted", components=stage.components,
-                    )
-
-            # Only object-field assignments remain.  Keep the original descriptors
-            # local until every transition completes so reconciliation never reopens
-            # a path.  The lifecycle locks exclude ordinary concurrent operations.
-            for index, stage in enumerate(stages):
-                # Mark the member as requiring reconciliation before entering an
-                # injectable setter; the setter may mutate and then raise.
-                changed_count = index + 1
-                _set_stage(stage, "file_fd", -1)
-                _set_stage(stage, "state", "handoff_prepared")
-            batch = PrivateStageHandoffBatch(
-                stages=stages,
-                writer_fds=writer_fds,
-                pin_fds=tuple(pins),
-                request_id=request_id,
-                _constructor_token=_PRIVATE_STAGE_BATCH_CONSTRUCTOR,
-            )
-        return batch
-    except BaseException as primary:
-        restoration_errors: list[BaseException] = []
-        try:
-            with _defer_stage_transition_signals():
-                for index in range(changed_count):
-                    stage = stages[index]
-                    try:
-                        # Bypass the injectable transition seam while restoring the
-                        # exact original authority; same-process object tampering is
-                        # outside this module's documented trust boundary.
-                        object.__setattr__(stage, "_file_fd", writer_fds[index])
-                        object.__setattr__(stage, "_state", "open")
-                    except BaseException as exc:
-                        restoration_errors.append(exc)
-        except BaseException as exc:
-            restoration_errors.append(exc)
-        if restoration_errors:
-            # Restoration itself is uncertain.  With no child in existence the
-            # only safe resolution is to consume every original authority and
-            # quarantine all named claims rather than leak inaccessible writers.
-            emergency_errors: list[BaseException] = []
-            for index, stage in enumerate(stages):
-                pin = pins[index]
-                retained = pin if pin >= 0 else writer_fds[index]
-                try:
-                    if retained >= 0:
-                        _discard_named_claim(
-                            stage.parent_fd, stage.temporary_name, retained,
-                            stage.components,
-                        )
-                except BaseException as exc:
-                    emergency_errors.append(exc)
-                parent_fd, anchor_fd = stage.parent_fd, stage.anchor_fd
-                object.__setattr__(stage, "_file_fd", -1)
-                object.__setattr__(stage, "_parent_fd", -1)
-                object.__setattr__(stage, "_anchor_fd", -1)
-                object.__setattr__(stage, "_state", "aborted")
-                emergency_errors.extend(_close_fds(parent_fd, anchor_fd))
-            close_errors = _close_fds(*writer_fds, *pins)
-            error = PrivateStageHandoffError("prepare")
-            error.cleanup_errors = tuple(restoration_errors + emergency_errors)
-            error.close_errors = tuple(close_errors)
-            raise error from primary
-        close_errors = _close_fds(*pins)
-        if changed_count:
-            error = PrivateStageHandoffError("prepare")
-            error.close_errors = tuple(close_errors)
-            raise error from primary
-        try:
-            primary.cleanup_errors = ()
-            primary.close_errors = tuple(close_errors)
-        except BaseException:
-            pass
+        return _prepare_private_stage_handoff_transaction_locked(stages, request_id)
+    except PrivateStageHandoffError:
         raise
+    except BaseException as primary:
+        cleanup_errors: list[BaseException] = []
+        ledgers = {
+            id(stage._cleanup_ledger): stage._cleanup_ledger
+            for stage in stages
+            if type(stage._cleanup_ledger) is _PrivateStageCleanupLedger
+        }
+        if len(ledgers) == 1:
+            ledger = next(iter(ledgers.values()))
+            cleanup_errors.extend(
+                _settle_failed_prepare_cleanup(stages, ledger, None)
+            )
+        error = PrivateStageHandoffError("prepare")
+        error.cleanup_errors = tuple(cleanup_errors)
+        error.close_errors = tuple(cleanup_errors)
+        raise error from primary
+
+
+def _prepare_private_stage_handoff_transaction_locked(
+    stages: tuple[PrivateFileStage, ...], request_id: str,
+) -> PrivateStageHandoffBatch:
+    private_stage_claims: list[_PrivateStageBatchClaim] = []
+    source_by_stage: list[tuple[
+        _PrivateDescriptorClaim,
+        _PrivateDescriptorClaim,
+        _PrivateDescriptorClaim,
+    ]] = []
+    ledger: _PrivateStageCleanupLedger | None = None
+    batch: PrivateStageHandoffBatch | None = None
+    completed = False
+    primary: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
+    try:
+        for stage in stages:
+            writer = _new_descriptor_claim(
+                -1, stage.file_identity, "writer", stage.components,
+            )
+            parent = _new_descriptor_claim(
+                -1, stage.parent_identity, "parent", stage.components[:-1],
+            )
+            anchor = _new_descriptor_claim(
+                -1, stage.anchor_identity, "anchor", (),
+            )
+            pin = _new_descriptor_claim(
+                -1, stage.file_identity, "pin", stage.components,
+            )
+            private_stage_claims.append(_PrivateStageBatchClaim(
+                stage=stage,
+                writer=writer,
+                pin=pin,
+                parent=parent,
+                anchor=anchor,
+                _constructor_token=_PRIVATE_STAGE_BATCH_CLAIM_CONSTRUCTOR,
+            ))
+            source_by_stage.append((
+                _new_descriptor_claim(
+                    stage.file_fd, stage.file_identity,
+                    "source_writer", stage.components,
+                ),
+                _new_descriptor_claim(
+                    stage.parent_fd, stage.parent_identity,
+                    "source_parent", stage.components[:-1],
+                ),
+                _new_descriptor_claim(
+                    stage.anchor_fd, stage.anchor_identity,
+                    "source_anchor", (),
+                ),
+            ))
+
+        ledger = _PrivateStageCleanupLedger(
+            stage_claims=tuple(private_stage_claims),
+            extra_claims=tuple(
+                claim for stage_sources in source_by_stage for claim in stage_sources
+            ),
+            _constructor_token=_PRIVATE_STAGE_CLEANUP_LEDGER_CONSTRUCTOR,
+        )
+        batch = PrivateStageHandoffBatch(
+            stages=stages,
+            cleanup_ledger=ledger,
+            request_id=request_id,
+            _constructor_token=_PRIVATE_STAGE_BATCH_CONSTRUCTOR,
+        )
+
+        # The complete ownership graph is reachable and every stage is abort-only
+        # before the first private FD allocation.  Allocation helpers populate only
+        # pre-registered slots, while the original public integers live in retained
+        # source claims after their stage properties are tombstoned.
+        with _defer_stage_transition_signals():
+            _reconcile_stages_aborted_direct(stages, ledger)
+
+        for stage, stage_claim, sources in zip(
+            stages, private_stage_claims, source_by_stage,
+        ):
+            source_writer, source_parent, source_anchor = sources
+            _duplicate_private_claim(stage_claim.writer, source_writer.fd)
+            _duplicate_private_claim(stage_claim.parent, source_parent.fd)
+            _duplicate_private_claim(stage_claim.anchor, source_anchor.fd)
+            _open_strict_file_in(
+                stage_claim.parent.fd,
+                stage.temporary_name,
+                stage.components,
+                _claim=stage_claim.pin,
+            )
+            pin_observed = os.fstat(stage_claim.pin.fd)
+            _validate_descriptor_claim_metadata(
+                stage_claim.pin, pin_observed, allow_unlinked=False,
+            )
+            if not _same_private_inode(stage_claim.writer.fd, stage_claim.pin.fd):
+                raise PrivatePathUnsafe(
+                    "private stage name was substituted", components=stage.components,
+                )
+
+        source_errors = _drain_private_stage_ledger(
+            ledger,
+            kinds=frozenset({
+                "source_writer", "source_parent", "source_anchor",
+            }),
+        )
+        source_clean = all(
+            claim._disposition == "closed_clean" and not claim._errors
+            for stage_sources in source_by_stage
+            for claim in stage_sources
+        )
+        if source_errors or not source_clean:
+            raise PrivateStageHandoffError("prepare")
+
+        with _defer_stage_transition_signals():
+            for stage in stages:
+                _set_stage(stage, "state", "handoff_prepared")
+        completed = True
+    except BaseException as exc:
+        completed = False
+        primary = exc
+    finally:
+        if not completed and ledger is not None:
+            cleanup_errors.extend(
+                _settle_failed_prepare_cleanup(stages, ledger, batch)
+            )
+
+    if (not completed and ledger is not None and not ledger.pending
+            and not cleanup_errors
+            and all(not claim.errors for claim in ledger.claims)):
+        # A semantic prepare refusal with wholly clean descriptor settlement needs no
+        # retained recovery authority.  Fault-bearing terminal ledgers remain attached
+        # as the bounded audit record; pending ledgers remain the only cleanup handle.
+        for stage in stages:
+            if stage._cleanup_ledger is ledger:
+                object.__setattr__(stage, "_cleanup_ledger", None)
+
+    if completed and batch is not None:
+        return batch
+    if primary is None:
+        primary = PrivateStageHandoffError("prepare")
+    error = PrivateStageHandoffError("prepare")
+    error.cleanup_errors = tuple(cleanup_errors)
+    error.close_errors = tuple(cleanup_errors)
+    raise error from primary
 
 
 @_serialized_batch_lifecycle
 def abort_unspawned_private_stage_handoff(batch: PrivateStageHandoffBatch) -> None:
-    """Consume an unspawned batch, quarantine its names and close every authority.
+    """Consume an unspawned batch and drain its entirely private descriptor ledger.
 
     The caller must have synchronous proof that no child was created.  This slice
-    cannot be used after spawn.  Logical ownership is invalidated before cleanup so
-    cancellation or close faults can never make a descriptor publishable again.
+    cannot be used after spawn.  Unique temporary names remain unpublished orphan
+    candidates for a future authority-locked GC; this operation performs no rename,
+    unlink or publication.
     """
     _require_strict_capabilities()
     if type(batch) is not PrivateStageHandoffBatch:
         raise PrivateStageHandoffError("abort_handoff")
-    if batch.state == "aborted":
-        return
-    if batch.state != "prepared":
+    if batch.state not in {"prepared", "aborted"}:
         raise PrivateStageStateError("abort_handoff", batch.state)
-
     stages = batch._stages
-    writers = batch._writer_fds
-    pins = batch._pin_fds
-    transition_error: BaseException | None = None
+    ledger = batch._cleanup_ledger
+    if type(ledger) is not _PrivateStageCleanupLedger:
+        raise PrivateStageHandoffError("abort_handoff")
+    if batch.state == "aborted" and not ledger.pending:
+        return
+    authority = batch._transfer_authority
+    transition_errors: list[BaseException] = []
     cleanup_errors: list[BaseException] = []
-    close_errors: list[BaseException] = []
     try:
-        # Best-effort per-thread deferral narrows the transition window.  Production
-        # cancellation is cooperative; the unconditional reconciliation below is
-        # the fail-closed backstop for one asynchronous BaseException.
         with _defer_stage_transition_signals():
-            _begin_unspawned_handoff_abort(batch, stages)
+            _reconcile_batch_aborted_direct(batch, authority, stages, ledger)
     except BaseException as exc:
-        transition_error = exc
+        transition_errors.append(exc)
+    finally:
+        # This direct retry is reconciliation after authority was captured.  A
+        # cooperative one-shot cancellation cannot leave a partially aborted set.
+        _reconcile_batch_aborted_direct(batch, authority, stages, ledger)
+        cleanup_errors.extend(_drain_private_stage_ledger(ledger))
+    if transition_errors or cleanup_errors or ledger.pending:
+        error = PrivateStageHandoffError("abort_handoff")
+        error.cleanup_errors = tuple(transition_errors + cleanup_errors)
+        error.close_errors = tuple(cleanup_errors)
+        cause = (
+            transition_errors[0] if transition_errors
+            else cleanup_errors[0] if cleanup_errors
+            else error
+        )
+        raise error from cause
 
-    # Reconcile from captured authority even when cancellation interrupted the
-    # transition.  Direct primitive assignments deliberately bypass injectable
-    # lifecycle seams.  Repeated arbitrary exception injection and hostile
-    # same-process object mutation are outside this primitive's trust boundary.
-    object.__setattr__(batch, "_writer_fds", ())
-    object.__setattr__(batch, "_pin_fds", ())
+
+def _validate_prepared_handoff_shape(
+    batch: PrivateStageHandoffBatch, operation: str, *, stage_state: str,
+) -> tuple[PrivateFileStage, ...]:
+    stages = batch._stages
+    ledger = batch._cleanup_ledger
+    if (type(stages) is not tuple or not 1 <= len(stages) <= 3
+            or any(type(stage) is not PrivateFileStage for stage in stages)
+            or len({id(stage) for stage in stages}) != len(stages)
+            or type(ledger) is not _PrivateStageCleanupLedger
+            or len(ledger.stage_claims) != len(stages)
+            or any(stage_claim._stage is not stage
+                   for stage_claim, stage in zip(ledger.stage_claims, stages))
+            or any(
+                (
+                    stage_claim.writer.kind,
+                    stage_claim.pin.kind,
+                    stage_claim.parent.kind,
+                    stage_claim.anchor.kind,
+                ) != ("writer", "pin", "parent", "anchor")
+                or stage_claim.writer._identity != stage.file_identity
+                or stage_claim.pin._identity != stage.file_identity
+                or stage_claim.parent._identity != stage.parent_identity
+                or stage_claim.anchor._identity != stage.anchor_identity
+                for stage_claim, stage in zip(ledger.stage_claims, stages)
+            )
+            or any(
+                claim.disposition != "pending"
+                or claim.fd < 0
+                for stage_claim in ledger.stage_claims
+                for claim in (
+                    stage_claim.writer, stage_claim.pin,
+                    stage_claim.parent, stage_claim.anchor,
+                )
+            )
+            or len({
+                claim.fd
+                for stage_claim in ledger.stage_claims
+                for claim in (
+                    stage_claim.writer, stage_claim.pin,
+                    stage_claim.parent, stage_claim.anchor,
+                )
+            }) != 4 * len(stages)
+            or any(stage.state != stage_state or stage.file_fd != -1
+                   for stage in stages)):
+        raise PrivateStageHandoffError(operation)
+    return stages
+
+
+@_serialized_batch_lifecycle
+def _prepare_private_stage_transfer_authority(
+    batch: PrivateStageHandoffBatch, *, request_id: str,
+) -> _PrivateStageTransferAuthority:
+    """Reserve an exact-batch transfer authority before any child exists.
+
+    This step performs every validation and allocation needed by post-spawn bind,
+    then moves the batch to ``spawn_prepared`` under its canonical locks.  The batch
+    no longer permits generic abort.  The returned authority can be used only by the
+    callback-owned spawn boundary or the exact no-child recovery path; it never
+    exposes a raw ``pass_fds`` tuple.
+    """
+    _require_strict_capabilities()
+    if type(batch) is not PrivateStageHandoffBatch:
+        raise PrivateStageHandoffError("bind_worker")
+    request_id = _validate_handoff_request_id(request_id, "bind_worker")
+    if batch.state != "prepared":
+        raise PrivateStageStateError("bind_worker", batch.state)
+    stages = _validate_prepared_handoff_shape(
+        batch, "bind_worker", stage_state="handoff_prepared",
+    )
+    if request_id != batch._request_id or batch._transfer_authority is not None:
+        raise PrivateStageHandoffError("bind_worker")
+
+    authority = _PrivateStageTransferAuthority(
+        batch=batch,
+        request_id=request_id,
+        file_identities=tuple(stage.file_identity for stage in stages),
+        _constructor_token=_PRIVATE_STAGE_TRANSFER_AUTHORITY_CONSTRUCTOR,
+    )
+    try:
+        with _defer_stage_transition_signals():
+            object.__setattr__(batch, "_transfer_authority", authority)
+            object.__setattr__(batch, "_state", "spawn_prepared")
+            for stage in stages:
+                object.__setattr__(stage, "_state", "spawn_prepared")
+        return authority
+    except BaseException as primary:
+        # No child exists yet, so restoration to the exact pre-reservation state is
+        # both safe and preferable to stranding a capability the caller never saw.
+        object.__setattr__(authority, "_consumed", True)
+        object.__setattr__(batch, "_transfer_authority", None)
+        object.__setattr__(batch, "_state", "prepared")
+        for stage in stages:
+            object.__setattr__(stage, "_state", "handoff_prepared")
+        error = PrivateStageHandoffError("bind_worker")
+        raise error from primary
+
+
+def _validate_spawn_transfer_authority(
+    batch: PrivateStageHandoffBatch, authority, operation: str,
+) -> _PrivateStageTransferAuthority:
+    if (type(authority) is not _PrivateStageTransferAuthority
+            or authority._consumed is not False
+            or authority._bound is not False
+            or authority._batch is not batch
+            or batch._transfer_authority is not authority
+            or authority._request_id != batch._request_id):
+        raise PrivateStageHandoffError(operation)
+    return authority
+
+
+def _borrow_private_stage_spawn_fds(
+    batch: PrivateStageHandoffBatch, authority,
+) -> tuple[int, ...]:
+    """Compatibility refusal: a writer tuple may not escape a locked attempt."""
+    raise PrivateStageHandoffError("borrow_spawn")
+
+
+def _spawn_with_private_stage_handoff(
+    batch: PrivateStageHandoffBatch, authority, spawn_callable,
+) -> tuple[object, _PrivateStageTransferAuthority]:
+    """Invoke one trusted Popen callback inside the locked inheritance boundary.
+
+    ``spawn_callable`` receives the ordered ``pass_fds`` tuple only while every
+    canonical stage lock is held.  It must invoke Popen synchronously, return that
+    child object, and never retain the tuple.  The returned object's exact integer
+    ``pid`` is recorded only as an untrusted correlation claim; neither the object
+    nor its PID proves process identity, containment, readiness or parking.
+
+    The caller MUST establish and retain independently killable containment before
+    invoking this helper.  Natural callback/validation faults and cooperative
+    cancellation enter a best-effort fence while the lifecycle locks remain held.
+    Python cannot make cleanup-handler entry atomic against arbitrary asynchronous
+    exception injection: such an escape may leave a reachable ``spawn_prepared`` or
+    ``worker_spawned_unverified`` batch with borrowed, unconsumed authority and a
+    pending private ledger.  It creates no close receipt, GO or publication claim.
+    On every abnormal escape the supervisor MUST treat the child outcome as unknown,
+    kill/reap its containment, then replay ``fence_private_stage_handoff`` from a
+    cooperative cleanup path.  This wrapper never returns the raw writer tuple, and
+    the trusted callback must neither retain nor duplicate it.
+    """
+    _require_strict_capabilities()
+    if type(batch) is not PrivateStageHandoffBatch or not callable(spawn_callable):
+        raise PrivateStageHandoffError("borrow_spawn")
+    stages = batch._stages
+    if (type(stages) is not tuple or not 1 <= len(stages) <= 3
+            or any(type(stage) is not PrivateFileStage for stage in stages)):
+        raise PrivateStageHandoffError("borrow_spawn")
+
+    with _hold_stage_lifecycle(stages):
+        if batch.state != "spawn_prepared":
+            raise PrivateStageStateError("borrow_spawn", batch.state)
+        authority = _validate_spawn_transfer_authority(
+            batch, authority, "borrow_spawn",
+        )
+        if authority._borrowed is not False:
+            raise PrivateStageHandoffError("borrow_spawn")
+        _validate_prepared_handoff_shape(
+            batch, "borrow_spawn", stage_state="spawn_prepared",
+        )
+        ledger = batch._cleanup_ledger
+        if type(ledger) is not _PrivateStageCleanupLedger:
+            raise PrivateStageHandoffError("borrow_spawn")
+        writer_claims = tuple(
+            stage_claim._writer for stage_claim in ledger.stage_claims
+        )
+        writers = tuple(claim.fd for claim in writer_claims)
+        if len(authority._file_identities) != len(writers):
+            raise PrivateStageHandoffError("borrow_spawn")
+        try:
+            for claim, expected_identity in zip(
+                writer_claims, authority._file_identities,
+            ):
+                if (claim._disposition != "pending"
+                        or claim._identity != expected_identity):
+                    raise PrivateStageHandoffError("borrow_spawn")
+                observed = os.fstat(claim.fd)
+                if _identity(observed) != expected_identity:
+                    raise PrivatePathUnsafe("private stage writer identity changed")
+                _validate_descriptor_claim_metadata(
+                    claim, observed, allow_unlinked=False,
+                )
+        except BaseException as primary:
+            error = PrivateStageHandoffError("borrow_spawn")
+            raise error from primary
+
+        child = None
+        result = None
+        primary: BaseException | None = None
+        try:
+            # This mutation leaves an exact, reachable recovery graph before callback
+            # entry.  Ordinary faults enter the best-effort fence below; the docstring
+            # defines the supervisor obligation for arbitrary async handler interruption.
+            object.__setattr__(authority, "_borrowed", True)
+            child = spawn_callable(writers)
+            worker_pid = _validate_handoff_worker_pid(
+                child.pid, "mark_spawned",
+            )
+            _mark_private_stage_worker_spawned_locked(
+                batch, authority, worker_pid=worker_pid,
+            )
+            result = (child, authority)
+        except BaseException as exc:
+            primary = exc
+        finally:
+            # This backstop covers ordinary callback/validation faults and cooperative
+            # cancellation, including an interruption handled by the inner body.  It
+            # is deliberately not described as atomic against arbitrary async injection
+            # at this cleanup handler's own entry; the retained ledger remains replayable.
+            unresolved = (
+                authority._borrowed is True
+                and batch.state not in {
+                    "worker_spawned_unverified", "worker_claim_bound",
+                    "parent_writers_closed", "transfer_uncertain", "fenced",
+                    "aborted",
+                }
+            )
+            if primary is not None or unresolved:
+                cleanup_errors: list[BaseException] = []
+                try:
+                    fence_private_stage_handoff(batch)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                finally:
+                    if batch.state != "fenced" or batch._cleanup_ledger.pending:
+                        try:
+                            fence_private_stage_handoff(batch)
+                        except BaseException as exc:
+                            cleanup_errors.append(exc)
+                if primary is None:
+                    primary = (
+                        cleanup_errors[0]
+                        if cleanup_errors
+                        else PrivateStageHandoffError("borrow_spawn")
+                    )
+                elif cleanup_errors:
+                    try:
+                        primary.private_cleanup_error = cleanup_errors[0]
+                    except BaseException:
+                        pass
+
+        if primary is not None:
+            # The callback may have created a child even if it never returned.
+            # Supervisor integration must kill/reap containment on this failure.
+            raise primary
+        if result is None:
+            error = PrivateStageHandoffError("borrow_spawn")
+            try:
+                fence_private_stage_handoff(batch)
+            except BaseException as cleanup_error:
+                error.private_cleanup_error = cleanup_error
+            raise error
+        return result
+
+
+def _validate_unverified_transfer_authority(
+    batch: PrivateStageHandoffBatch, authority,
+) -> _PrivateStageTransferAuthority:
+    if (type(authority) is not _PrivateStageTransferAuthority
+            or authority._consumed is not False
+            or authority._bound is not False
+            or authority._batch is not batch
+            or batch._transfer_authority is not authority
+            or authority._request_id != batch._request_id
+            or type(authority._claimed_worker_pid) is not int
+            or not 1 <= authority._claimed_worker_pid <= _MAX_WORKER_PID):
+        raise PrivateStageHandoffError("bind_worker")
+    return authority
+
+
+def _force_aborted_spawn_state(
+    batch: PrivateStageHandoffBatch,
+    authority: _PrivateStageTransferAuthority,
+    stages: tuple[PrivateFileStage, ...],
+) -> None:
+    """Consume every logical capability before failed-spawn cleanup begins."""
+    object.__setattr__(authority, "_consumed", True)
+    object.__setattr__(batch, "_transfer_authority", None)
+    object.__setattr__(batch, "_transfer_receipt", None)
     object.__setattr__(batch, "_state", "aborted")
     for stage in stages:
         object.__setattr__(stage, "_file_fd", -1)
-        object.__setattr__(stage, "_state", "aborted")
-
-    for stage, pin in zip(stages, pins):
-        try:
-            _discard_named_claim(
-                stage.parent_fd, stage.temporary_name, pin, stage.components,
-            )
-        except BaseException as exc:
-            cleanup_errors.append(exc)
-
-    close_errors.extend(_close_fds(*writers, *pins))
-    for stage in stages:
-        parent_fd = stage.parent_fd
-        anchor_fd = stage.anchor_fd
         object.__setattr__(stage, "_parent_fd", -1)
         object.__setattr__(stage, "_anchor_fd", -1)
-        close_errors.extend(_close_fds(parent_fd, anchor_fd))
-    if transition_error is not None or cleanup_errors or close_errors:
-        error = PrivateStageHandoffError("abort_handoff")
-        error.cleanup_errors = tuple(
-            (() if transition_error is None else (transition_error,)) + tuple(cleanup_errors)
+        object.__setattr__(stage, "_cleanup_ledger", batch._cleanup_ledger)
+        object.__setattr__(stage, "_state", "aborted")
+
+
+@_serialized_batch_lifecycle
+def _abort_private_stage_spawn(batch: PrivateStageHandoffBatch, authority) -> None:
+    """Resolve one reserved authority after Popen proves no child was created.
+
+    Only the exact unbound authority can consume a ``spawn_prepared`` batch.  The
+    private descriptor ledger is drained while unique unpublished names remain for
+    future authority-locked GC.  A replay of the same consumed authority is harmless;
+    no other lifecycle may use this recovery path.
+    """
+    _require_strict_capabilities()
+    if type(batch) is not PrivateStageHandoffBatch:
+        raise PrivateStageHandoffError("abort_spawn")
+    ledger = batch._cleanup_ledger
+    if type(ledger) is not _PrivateStageCleanupLedger:
+        raise PrivateStageHandoffError("abort_spawn")
+    if batch.state == "aborted":
+        if (type(authority) is _PrivateStageTransferAuthority
+                and authority._batch is batch
+                and authority._bound is False
+                and authority._consumed is True):
+            cleanup_errors = list(_drain_private_stage_ledger(ledger))
+            if not cleanup_errors and not ledger.pending:
+                return
+            error = PrivateStageHandoffError("abort_spawn")
+            error.cleanup_errors = tuple(cleanup_errors)
+            error.close_errors = tuple(cleanup_errors)
+            raise error from (cleanup_errors[0] if cleanup_errors else error)
+        raise PrivateStageHandoffError("abort_spawn")
+    if batch.state != "spawn_prepared":
+        raise PrivateStageStateError("abort_spawn", batch.state)
+
+    stages = _validate_prepared_handoff_shape(
+        batch, "abort_spawn", stage_state="spawn_prepared",
+    )
+    authority = _validate_spawn_transfer_authority(batch, authority, "abort_spawn")
+    transition_errors: list[BaseException] = []
+
+    try:
+        with _defer_stage_transition_signals():
+            _force_aborted_spawn_state(batch, authority, stages)
+    except BaseException as exc:
+        transition_errors.append(exc)
+        # Reconcile through primitive assignments, bypassing the injectable helper.
+        object.__setattr__(authority, "_consumed", True)
+        object.__setattr__(batch, "_transfer_authority", None)
+        object.__setattr__(batch, "_transfer_receipt", None)
+        object.__setattr__(batch, "_state", "aborted")
+        for stage in stages:
+            object.__setattr__(stage, "_file_fd", -1)
+            object.__setattr__(stage, "_parent_fd", -1)
+            object.__setattr__(stage, "_anchor_fd", -1)
+            object.__setattr__(stage, "_cleanup_ledger", ledger)
+            object.__setattr__(stage, "_state", "aborted")
+    cleanup_errors = list(_drain_private_stage_ledger(ledger))
+    if transition_errors or cleanup_errors or ledger.pending:
+        error = PrivateStageHandoffError("abort_spawn")
+        error.cleanup_errors = tuple(transition_errors + cleanup_errors)
+        error.close_errors = tuple(cleanup_errors)
+        cause = (transition_errors + cleanup_errors)[0] if (
+            transition_errors or cleanup_errors
+        ) else error
+        raise error from cause
+
+
+def _force_worker_spawned_unverified_state(
+    batch: PrivateStageHandoffBatch,
+    authority: _PrivateStageTransferAuthority,
+    stages: tuple[PrivateFileStage, ...],
+    claimed_worker_pid: int | None,
+) -> None:
+    object.__setattr__(batch, "_transfer_authority", authority)
+    object.__setattr__(batch, "_state", "worker_spawned_unverified")
+    if claimed_worker_pid is not None:
+        object.__setattr__(authority, "_claimed_worker_pid", claimed_worker_pid)
+    for stage in stages:
+        object.__setattr__(stage, "_state", "worker_spawned_unverified")
+
+
+def _mark_private_stage_worker_spawned_locked(
+    batch: PrivateStageHandoffBatch, authority, *, worker_pid: int,
+) -> _PrivateStageTransferAuthority:
+    """Record a spawn callback's untrusted PID claim while all locks are held.
+
+    Exact authority validation is the declaration boundary: after it passes, the
+    batch can never return to a no-child state.  The integer is retained only as an
+    unverified correlation fact.  No identity, containment, readiness, GO or
+    publication claim is made.
+    """
+    _require_strict_capabilities()
+    if type(batch) is not PrivateStageHandoffBatch:
+        raise PrivateStageHandoffError("mark_spawned")
+    if batch.state != "spawn_prepared":
+        raise PrivateStageStateError("mark_spawned", batch.state)
+    authority = _validate_spawn_transfer_authority(batch, authority, "mark_spawned")
+    if authority._borrowed is not True:
+        raise PrivateStageHandoffError("mark_spawned")
+    stages = batch._stages
+    valid_pid: int | None = None
+    try:
+        _validate_prepared_handoff_shape(
+            batch, "mark_spawned", stage_state="spawn_prepared",
         )
-        error.close_errors = tuple(close_errors)
-        cause = transition_error or (cleanup_errors[0] if cleanup_errors else close_errors[0])
+        valid_pid = _validate_handoff_worker_pid(worker_pid, "mark_spawned")
+        with _defer_stage_transition_signals():
+            _force_worker_spawned_unverified_state(
+                batch, authority, stages, valid_pid,
+            )
+        return authority
+    except BaseException as primary:
+        # Bypass the injectable transition seam during reconciliation.
+        object.__setattr__(batch, "_transfer_authority", authority)
+        object.__setattr__(batch, "_state", "worker_spawned_unverified")
+        if valid_pid is not None:
+            object.__setattr__(authority, "_claimed_worker_pid", valid_pid)
+        for stage in stages:
+            object.__setattr__(stage, "_state", "worker_spawned_unverified")
+        error = PrivateStageSpawnUncertain(
+            authority=authority,
+            claimed_worker_pid=valid_pid,
+            file_identities=authority._file_identities,
+        )
+        raise error from primary
+
+
+def _mark_private_stage_worker_spawned(
+    batch: PrivateStageHandoffBatch, authority, *, worker_pid: int,
+) -> _PrivateStageTransferAuthority:
+    """Compatibility refusal: marking is valid only on a locked attempt object."""
+    raise PrivateStageHandoffError("mark_spawned")
+
+
+@_serialized_batch_lifecycle
+def _bind_private_stage_transfer_authority(
+    batch: PrivateStageHandoffBatch, authority, *, worker_pid: int,
+) -> _PrivateStageTransferAuthority:
+    """Bind a caller-attested worker correlation claim to the exact batch.
+
+    The caller is responsible for independently proving process identity,
+    containment and readiness.  A repeated integer PID is not authentication.
+    Once the exact batch/authority and correlation value pass, every later fault
+    reconciles to ``worker_claim_bound``.  This function does not release GO.
+    """
+    _require_strict_capabilities()
+    if type(batch) is not PrivateStageHandoffBatch:
+        raise PrivateStageHandoffError("bind_worker")
+    if batch.state != "worker_spawned_unverified":
+        raise PrivateStageStateError("bind_worker", batch.state)
+    authority = _validate_unverified_transfer_authority(batch, authority)
+    stages = batch._stages
+
+    # Refuse a malformed or mismatched correlation claim without upgrading state.
+    proved_pid = _validate_handoff_worker_pid(worker_pid, "bind_worker")
+    if proved_pid != authority._claimed_worker_pid:
+        raise PrivateStageHandoffError("bind_worker")
+    _validate_prepared_handoff_shape(
+        batch, "bind_worker", stage_state="worker_spawned_unverified",
+    )
+
+    # The exact caller-attested value now matches.  A transition fault reconciles
+    # to claim-bound and returns the opaque recovery capability in a typed error.
+    try:
+        with _defer_stage_transition_signals():
+            _force_worker_claim_bound_state(batch, authority, stages)
+            object.__setattr__(authority, "_bound", True)
+    except BaseException as primary:
+        object.__setattr__(batch, "_transfer_authority", authority)
+        object.__setattr__(batch, "_state", "worker_claim_bound")
+        object.__setattr__(authority, "_claimed_worker_pid", proved_pid)
+        object.__setattr__(authority, "_bound", True)
+        for stage in stages:
+            object.__setattr__(stage, "_state", "worker_claim_bound")
+        error = PrivateStageBindUncertain(
+            authority=authority,
+            claimed_worker_pid=proved_pid,
+            file_identities=authority._file_identities,
+        )
+        raise error from primary
+    return authority
+
+
+def _validate_stage_transfer_authority(
+    batch: PrivateStageHandoffBatch, authority,
+) -> _PrivateStageTransferAuthority:
+    if (type(authority) is not _PrivateStageTransferAuthority
+            or authority._consumed is not False
+            or authority._bound is not True
+            or authority._batch is not batch
+            or batch._transfer_authority is not authority
+            or authority._request_id != batch._request_id
+            or type(authority._claimed_worker_pid) is not int
+            or not 1 <= authority._claimed_worker_pid <= _MAX_WORKER_PID):
+        raise PrivateStageHandoffError("transfer")
+    return authority
+
+
+def _force_worker_claim_bound_state(
+    batch: PrivateStageHandoffBatch,
+    authority: _PrivateStageTransferAuthority,
+    stages: tuple[PrivateFileStage, ...],
+) -> None:
+    object.__setattr__(batch, "_transfer_authority", authority)
+    object.__setattr__(batch, "_state", "worker_claim_bound")
+    for stage in stages:
+        object.__setattr__(stage, "_state", "worker_claim_bound")
+
+
+def _force_transfer_state(
+    batch: PrivateStageHandoffBatch,
+    authority: _PrivateStageTransferAuthority,
+    stages: tuple[PrivateFileStage, ...],
+    state: str,
+    receipt: PrivateStageParentCloseReceipt | None,
+) -> None:
+    """Primitive reconciliation after the operation captured every authority."""
+    object.__setattr__(authority, "_consumed", True)
+    object.__setattr__(authority, "_borrowed", False)
+    object.__setattr__(batch, "_transfer_authority", None)
+    object.__setattr__(batch, "_transfer_receipt", receipt)
+    object.__setattr__(batch, "_state", state)
+    for stage in stages:
+        object.__setattr__(stage, "_file_fd", -1)
+        object.__setattr__(stage, "_state", state)
+
+
+def _reconcile_transfer_state_direct(
+    batch: PrivateStageHandoffBatch,
+    authority: _PrivateStageTransferAuthority,
+    stages: tuple[PrivateFileStage, ...],
+    state: str,
+    receipt: PrivateStageParentCloseReceipt | None,
+) -> None:
+    """Non-seam fallback used after the operation has captured all claims."""
+    object.__setattr__(authority, "_consumed", True)
+    object.__setattr__(authority, "_borrowed", False)
+    object.__setattr__(batch, "_transfer_authority", None)
+    object.__setattr__(batch, "_transfer_receipt", receipt)
+    object.__setattr__(batch, "_state", state)
+    for stage in stages:
+        object.__setattr__(stage, "_file_fd", -1)
+        object.__setattr__(stage, "_state", state)
+
+
+@_serialized_batch_lifecycle
+def transfer_private_stage_handoff(
+    batch: PrivateStageHandoffBatch, authority,
+) -> PrivateStageParentCloseReceipt:
+    """Authenticate and close every registered parent-side stage writer.
+
+    Clean completion proves only that each registered numeric descriptor still
+    named its expected stage inode and that close returned successfully.  It does
+    not prove absence of aliases, child inheritance, process identity, containment,
+    content stability, GO release or publication.  A close fault consumes the
+    authority and permanently marks the batch ``transfer_uncertain``.
+    """
+    _require_strict_capabilities()
+    if type(batch) is not PrivateStageHandoffBatch:
+        raise PrivateStageHandoffError("transfer")
+    if batch.state != "worker_claim_bound":
+        raise PrivateStageStateError("transfer", batch.state)
+    stages = _validate_prepared_handoff_shape(
+        batch, "transfer", stage_state="worker_claim_bound",
+    )
+    authority = _validate_stage_transfer_authority(batch, authority)
+
+    file_identities = authority._file_identities
+    ledger = batch._cleanup_ledger
+    if type(ledger) is not _PrivateStageCleanupLedger:
+        raise PrivateStageHandoffError("transfer")
+    writer_claims = tuple(
+        stage_claim._writer for stage_claim in ledger.stage_claims
+    )
+    if (len(writer_claims) != len(file_identities)
+            or any(claim._identity != identity
+                   for claim, identity in zip(writer_claims, file_identities))):
+        raise PrivateStageHandoffError("transfer")
+    receipt = PrivateStageParentCloseReceipt(
+        request_id=batch._request_id,
+        claimed_worker_pid=authority._claimed_worker_pid,
+        file_identities=file_identities,
+        _constructor_token=_PRIVATE_STAGE_PARENT_CLOSE_RECEIPT_CONSTRUCTOR,
+    )
+    uncertain = PrivateStageTransferUncertain(
+        claimed_worker_pid=authority._claimed_worker_pid,
+        file_identities=file_identities,
+    )
+    transition_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    try:
+        with _defer_stage_transition_signals():
+            _force_transfer_state(
+                batch, authority, stages, "transfer_uncertain", None,
+            )
+    except BaseException as exc:
+        transition_errors.append(exc)
+    finally:
+        _reconcile_transfer_state_direct(
+            batch, authority, stages, "transfer_uncertain", None,
+        )
+        close_errors.extend(
+            _drain_private_stage_ledger(
+                ledger, kinds=frozenset({"writer"}),
+            )
+        )
+
+    writers_clean = all(
+        claim._disposition == "closed_clean" and not claim._errors
+        for claim in writer_claims
+    )
+    if not transition_errors and not close_errors and writers_clean:
+        try:
+            with _defer_stage_transition_signals():
+                _force_transfer_state(
+                    batch, authority, stages, "parent_writers_closed", receipt,
+                )
+            return receipt
+        except BaseException as exc:
+            transition_errors.append(exc)
+            _reconcile_transfer_state_direct(
+                batch, authority, stages, "transfer_uncertain", None,
+            )
+
+    uncertain.cleanup_errors = tuple(transition_errors)
+    uncertain.close_errors = tuple(close_errors)
+    cause = (
+        transition_errors[0] if transition_errors
+        else close_errors[0] if close_errors
+        else PrivateStageHandoffError("transfer")
+    )
+    raise uncertain from cause
+
+
+def _force_fenced_state(
+    batch: PrivateStageHandoffBatch, stages: tuple[PrivateFileStage, ...],
+) -> None:
+    authority = batch._transfer_authority
+    if type(authority) is _PrivateStageTransferAuthority:
+        object.__setattr__(authority, "_consumed", True)
+        object.__setattr__(authority, "_borrowed", False)
+    object.__setattr__(batch, "_transfer_authority", None)
+    object.__setattr__(batch, "_transfer_receipt", None)
+    object.__setattr__(batch, "_state", "fenced")
+    for stage in stages:
+        object.__setattr__(stage, "_file_fd", -1)
+        object.__setattr__(stage, "_parent_fd", -1)
+        object.__setattr__(stage, "_anchor_fd", -1)
+        object.__setattr__(stage, "_cleanup_ledger", batch._cleanup_ledger)
+        object.__setattr__(stage, "_state", "fenced")
+
+
+def _reconcile_fenced_state_direct(
+    batch: PrivateStageHandoffBatch,
+    authority: object,
+    stages: tuple[PrivateFileStage, ...],
+) -> None:
+    """Non-seam terminal reconciliation after all fence claims are captured."""
+    if type(authority) is _PrivateStageTransferAuthority:
+        object.__setattr__(authority, "_consumed", True)
+        object.__setattr__(authority, "_borrowed", False)
+    object.__setattr__(batch, "_transfer_authority", None)
+    object.__setattr__(batch, "_transfer_receipt", None)
+    object.__setattr__(batch, "_state", "fenced")
+    for stage in stages:
+        object.__setattr__(stage, "_file_fd", -1)
+        object.__setattr__(stage, "_parent_fd", -1)
+        object.__setattr__(stage, "_anchor_fd", -1)
+        object.__setattr__(stage, "_cleanup_ledger", batch._cleanup_ledger)
+        object.__setattr__(stage, "_state", "fenced")
+
+
+@_serialized_batch_lifecycle
+def fence_private_stage_handoff(batch: PrivateStageHandoffBatch) -> None:
+    """Fail closed by draining a nonpublishable batch's private descriptor ledger.
+
+    ``spawn_prepared`` is accepted only as ambiguous-attempt recovery when Popen's
+    outcome was lost; it does not assert whether a child existed.  Unverified and
+    caller-attested workers may likewise be live or unreapable.  Unique temporary
+    names remain unpublished orphan candidates for later authority-locked GC.  This
+    primitive records no process-settlement fact, never signals/releases a worker,
+    and never renames, publishes or unlinks.
+    """
+    _require_strict_capabilities()
+    if type(batch) is not PrivateStageHandoffBatch:
+        raise PrivateStageHandoffError("fence")
+    ledger = batch._cleanup_ledger
+    if type(ledger) is not _PrivateStageCleanupLedger:
+        raise PrivateStageHandoffError("fence")
+    if batch.state == "fenced":
+        cleanup_errors = list(_drain_private_stage_ledger(ledger))
+        if not cleanup_errors and not ledger.pending:
+            return
+        error = PrivateStageHandoffError("fence")
+        error.cleanup_errors = tuple(cleanup_errors)
+        error.close_errors = tuple(cleanup_errors)
+        raise error from (cleanup_errors[0] if cleanup_errors else error)
+    writer_states = {
+        "spawn_prepared", "worker_spawned_unverified", "worker_claim_bound",
+    }
+    if batch.state not in writer_states | {
+        "parent_writers_closed", "transfer_uncertain",
+    }:
+        raise PrivateStageStateError("fence", batch.state)
+
+    stages = batch._stages
+    expected_state = batch.state
+    if (type(stages) is not tuple or not 1 <= len(stages) <= 3
+            or any(type(stage) is not PrivateFileStage for stage in stages)
+            or any(stage.state != expected_state or stage.file_fd != -1
+                   for stage in stages)):
+        raise PrivateStageHandoffError("fence")
+    if expected_state in writer_states:
+        authority = batch._transfer_authority
+        if (type(authority) is not _PrivateStageTransferAuthority
+                or authority._batch is not batch
+                or authority._consumed is not False
+                or len(authority._file_identities) != len(ledger.stage_claims)):
+            raise PrivateStageHandoffError("fence")
+
+    transition_errors: list[BaseException] = []
+    fence_authority = batch._transfer_authority
+    try:
+        with _defer_stage_transition_signals():
+            _force_fenced_state(batch, stages)
+    except BaseException as exc:
+        transition_errors.append(exc)
+    finally:
+        _reconcile_fenced_state_direct(batch, fence_authority, stages)
+        cleanup_errors = list(_drain_private_stage_ledger(ledger))
+
+    if transition_errors or cleanup_errors or ledger.pending:
+        error = PrivateStageHandoffError("fence")
+        error.cleanup_errors = tuple(transition_errors + cleanup_errors)
+        error.close_errors = tuple(cleanup_errors)
+        cause = (transition_errors + cleanup_errors)[0] if (
+            transition_errors or cleanup_errors
+        ) else error
         raise error from cause
 
 
@@ -1429,6 +3215,8 @@ def _discard_named_claim(
     name: str,
     retained_fd: int,
     components: tuple[str, ...],
+    *,
+    _verification_claim: _PrivateDescriptorClaim | None = None,
 ) -> None:
     """Quarantine a name, then prove whether it names ``retained_fd``.
 
@@ -1458,20 +3246,34 @@ def _discard_named_claim(
             "private stage claim disappeared before cleanup", components=components,
         )
 
-    quarantined_fd = _open_strict_file_in(parent_fd, quarantine, components)
-    with _owned_fd(quarantined_fd):
-        if not _same_private_inode(quarantined_fd, retained_fd):
+    if _verification_claim is None:
+        quarantined_fd = _open_strict_file_in(parent_fd, quarantine, components)
+        with _owned_fd(quarantined_fd):
+            if not _same_private_inode(quarantined_fd, retained_fd):
+                raise PrivatePathUnsafe(
+                    "private stage cleanup quarantined a substituted name",
+                    components=components,
+                )
+    else:
+        _open_strict_file_in(
+            parent_fd,
+            quarantine,
+            components,
+            _claim=_verification_claim,
+        )
+        if not _same_private_inode(_verification_claim.fd, retained_fd):
             raise PrivatePathUnsafe(
                 "private stage cleanup quarantined a substituted name",
                 components=components,
             )
-        # Do not unlink here: POSIX has no descriptor-bound unlink, so a second
-        # validate-then-unlink window would let a substituted name be deleted.  The
-        # quarantined file is harmless and remains available for authority-locked GC.
+    # Do not unlink here: POSIX has no descriptor-bound unlink, so a second
+    # validate-then-unlink window would let a substituted name be deleted.  The
+    # quarantined file is harmless and remains available for authority-locked GC.
 
 
 def _validate_declared_stage_parent(stage: PrivateFileStage) -> None:
     """Refuse publication when the pinned parent no longer has its declared name."""
+    _validate_stage_directory_claims(stage)
     declared = open_strict_dir_at(stage.anchor_fd, stage.components[:-1])
     with _owned_fd(declared):
         if _identity(os.fstat(declared)) != stage.parent_identity:
@@ -1492,6 +3294,7 @@ def create_private_stage(anchor_fd: int, components: tuple[str, ...]) -> Private
     temporary_name = ""
     try:
         parent = open_strict_dir_at(owned_anchor, components[:-1])
+        anchor_stat = os.fstat(owned_anchor)
         parent_stat = os.fstat(parent)
         for _ in range(32):
             temporary_name = f".quarry-{os.urandom(16).hex()}.stage"
@@ -1518,6 +3321,7 @@ def create_private_stage(anchor_fd: int, components: tuple[str, ...]) -> Private
             temporary_name=temporary_name,
             destination_name=components[-1],
             components=components,
+            anchor_identity=_identity(anchor_stat),
             parent_identity=_identity(parent_stat),
             file_identity=_identity(file_stat),
             _constructor_token=_PRIVATE_STAGE_CONSTRUCTOR,
@@ -1577,6 +3381,7 @@ def _open_settled_stage(
     stage: PrivateFileStage,
     sealed_signature: tuple[int, int, int, int, int, int, int],
 ) -> tuple[int, tuple[int, str]]:
+    _validate_stage_directory_claims(stage)
     read_fd = _open_strict_file_in(stage.parent_fd, stage.temporary_name, stage.components)
     try:
         if _file_signature(os.fstat(read_fd)) != sealed_signature:
@@ -1665,6 +3470,7 @@ def seal_private_stage(stage: PrivateFileStage) -> None:
 
 
 def _validate_named_stage(stage: PrivateFileStage) -> None:
+    _validate_stage_directory_claims(stage)
     named_fd = _open_strict_file_in(stage.parent_fd, stage.temporary_name, stage.components)
     with _owned_fd(named_fd):
         observed = os.fstat(named_fd)
@@ -1681,6 +3487,7 @@ def _validate_named_stage(stage: PrivateFileStage) -> None:
 
 
 def _validate_replace_destination(stage: PrivateFileStage) -> None:
+    _validate_stage_directory_claims(stage)
     try:
         destination_fd = _open_strict_file_in(
             stage.parent_fd, stage.destination_name, stage.components,
@@ -1692,6 +3499,7 @@ def _validate_replace_destination(stage: PrivateFileStage) -> None:
 
 
 def _destination_matches_stage(stage: PrivateFileStage) -> bool:
+    _validate_stage_directory_claims(stage)
     try:
         destination_fd = _open_strict_file_in(
             stage.parent_fd, stage.destination_name, stage.components,
@@ -1743,6 +3551,7 @@ def replace_private_stage(stage: PrivateFileStage) -> None:
         # conservatively treated as a possibly-landed replacement.
         _set_stage(stage, "state", "publishing")
         try:
+            _validate_stage_directory_claims(stage)
             os.rename(
                 stage.temporary_name,
                 stage.destination_name,
@@ -1767,6 +3576,7 @@ def replace_private_stage(stage: PrivateFileStage) -> None:
             )
         else:
             _set_stage(stage, "state", "replaced_uncertain")
+            _validate_stage_directory_claims(stage)
             _fsync_managed(stage.parent_fd)
 
             # Keep the settled inode pinned through directory fsync, then re-check
@@ -1823,51 +3633,161 @@ def replace_private_stage(stage: PrivateFileStage) -> None:
         raise clean_rename_error
 
 
-@_serialized_stage_lifecycle
-def abort_private_stage(stage: PrivateFileStage) -> None:
-    """Quarantine and close an unpublished stage.  A landed replacement is never removed."""
+def _abort_private_stage_locked(stage: PrivateFileStage) -> None:
+    """Quarantine and close an unpublished stage; never remove a landed replacement.
+
+    Unlike a worker batch fence, this ordinary unspawned-stage path owns the name and
+    moves it once to a random non-authoritative discard name.  Relative I/O uses a
+    private authenticated parent duplicate, and the quarantined inode is compared to
+    a private retained duplicate.  Descriptor cleanup is ledger-backed.  Replay can
+    resolve pre-authentication or re-authentication interruptions while close budget
+    remains; two reported exact-live close faults require external recovery.
+    """
     _require_strict_capabilities()
     if type(stage) is not PrivateFileStage:
         raise PrivatePathUnsafe("private stage handle has the wrong type")
     if stage.state == "handoff_prepared":
         raise PrivateStageStateError("abort", stage.state)
-    if stage.state in {"publishing", "committed", "replaced_uncertain", "aborted"}:
+    if stage.state in {"publishing", "committed", "replaced_uncertain"}:
+        return
+    if stage.state == "aborted":
+        ledger = stage._cleanup_ledger
+        if type(ledger) is not _PrivateStageCleanupLedger or not ledger.pending:
+            return
+        cleanup_errors = list(_drain_private_stage_ledger(ledger))
+        if not ledger.pending:
+            object.__setattr__(stage, "_cleanup_ledger", None)
+        if cleanup_errors or ledger.pending:
+            error = PrivatePathError(
+                "private stage cleanup remains uncertain",
+                components=stage.components,
+            )
+            error.close_errors = tuple(cleanup_errors)
+            raise error from (cleanup_errors[0] if cleanup_errors else error)
         return
     if stage.state not in {"open", "sealed"}:
         raise PrivateStageStateError("abort", stage.state)
-    cleanup_error: BaseException | None = None
+    retained_ledger = stage._cleanup_ledger
+    retained_claims = () if retained_ledger is None else retained_ledger.claims
+    cleanup_parent = _new_descriptor_claim(
+        -1, stage.parent_identity, "parent", stage.components[:-1],
+    )
+    cleanup_retained = _new_descriptor_claim(
+        -1, stage.file_identity, "pin", stage.components,
+    )
+    quarantine_verifier = _new_descriptor_claim(
+        -1, stage.file_identity, "pin", stage.components,
+    )
+    source_claims = (
+            _new_descriptor_claim(
+                stage.file_fd, stage.file_identity,
+                "source_writer", stage.components,
+            ),
+            _new_descriptor_claim(
+                stage.parent_fd, stage.parent_identity,
+                "source_parent", stage.components[:-1],
+            ),
+            _new_descriptor_claim(
+                stage.anchor_fd, stage.anchor_identity,
+                "source_anchor", (),
+            ),
+    )
+    ledger = _PrivateStageCleanupLedger(
+        extra_claims=retained_claims + source_claims + (
+            cleanup_parent, cleanup_retained, quarantine_verifier,
+        ),
+        _constructor_token=_PRIVATE_STAGE_CLEANUP_LEDGER_CONSTRUCTOR,
+    )
+    source_file_fd = stage.file_fd
+    source_parent_fd = stage.parent_fd
+    quarantine_error: BaseException | None = None
+    transition_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
     try:
-        _discard_named_claim(
-            stage.parent_fd,
-            stage.temporary_name,
-            stage.file_fd,
-            stage.components,
-        )
+        # Attach the complete recovery graph and become abort-only before the first
+        # private allocation or name mutation.  Every later syscall result is stored
+        # directly in one of these pre-registered slots.
+        with _defer_stage_transition_signals():
+            _reconcile_stages_aborted_direct((stage,), ledger)
+        try:
+            _duplicate_private_claim(cleanup_parent, source_parent_fd)
+            _duplicate_private_claim(
+                cleanup_retained, source_file_fd, allow_unlinked=True,
+            )
+            _discard_named_claim(
+                cleanup_parent.fd,
+                stage.temporary_name,
+                cleanup_retained.fd,
+                stage.components,
+                _verification_claim=quarantine_verifier,
+            )
+        except BaseException as exc:
+            quarantine_error = exc
     except BaseException as exc:
-        cleanup_error = exc
+        transition_errors.append(exc)
     finally:
-        file_fd = stage.file_fd
-        parent_fd = stage.parent_fd
-        anchor_fd = stage.anchor_fd
-        _set_stage(stage, "file_fd", -1)
-        _set_stage(stage, "parent_fd", -1)
-        _set_stage(stage, "anchor_fd", -1)
-        _set_stage(stage, "state", "aborted")
-        close_errors = _close_fds(file_fd, parent_fd, anchor_fd)
-    if cleanup_error is not None:
+        _reconcile_stages_aborted_direct((stage,), ledger)
+        close_errors.extend(_drain_private_stage_ledger(ledger))
+    if not ledger.pending:
+        object.__setattr__(stage, "_cleanup_ledger", None)
+    if quarantine_error is not None:
         error = PrivatePathUnsafe(
             "private stage cleanup refused an absent or substituted claim",
             components=stage.components,
         )
+        error.cleanup_errors = tuple(transition_errors)
         error.close_errors = tuple(close_errors)
-        raise error from cleanup_error
-    if close_errors:
+        raise error from quarantine_error
+    if transition_errors or close_errors or ledger.pending:
         error = PrivatePathError(
-            "private stage cleanup completed but descriptor close failed",
+            "private stage cleanup completed with descriptor faults",
             components=stage.components,
         )
+        error.cleanup_errors = tuple(transition_errors)
         error.close_errors = tuple(close_errors)
-        raise error from close_errors[0]
+        cause = (
+            transition_errors[0] if transition_errors
+            else close_errors[0] if close_errors
+            else error
+        )
+        raise error from cause
+
+
+@_serialized_stage_lifecycle
+def abort_private_stage(stage: PrivateFileStage) -> None:
+    """Run ordinary stage cleanup behind a final typed reconciliation boundary."""
+    try:
+        # Keep handler entry inside a second boundary.  A one-shot interruption after
+        # the locked transaction returns or raises is therefore translated only after
+        # its retained descriptor graph has been reconciled below.
+        try:
+            result = _abort_private_stage_locked(stage)
+        except BaseException:
+            raise
+        return result
+    except PrivatePathError:
+        raise
+    except BaseException as primary:
+        cleanup_errors: list[BaseException] = []
+        ledger = (
+            stage._cleanup_ledger
+            if type(stage) is PrivateFileStage
+            and type(stage._cleanup_ledger) is _PrivateStageCleanupLedger
+            else None
+        )
+        if ledger is not None:
+            cleanup_errors.extend(
+                _settle_failed_prepare_cleanup((stage,), ledger, None)
+            )
+            if not ledger.pending:
+                object.__setattr__(stage, "_cleanup_ledger", None)
+        error = PrivatePathError(
+            "private stage cleanup completed with descriptor faults",
+            components=stage.components if type(stage) is PrivateFileStage else (),
+        )
+        error.cleanup_errors = tuple(cleanup_errors)
+        error.close_errors = tuple(cleanup_errors)
+        raise error from primary
 
 
 def durable_replace_private(
