@@ -1267,7 +1267,11 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
             "puredns", cmd,
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*res.relative_to(ctx.run.dir).parts),
-            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            stderr=RepositoryOutput.discard(),
+            native_outputs=(RepositoryNativeOutput.file(
+                6, *md.relative_to(ctx.run.dir).parts,
+            ),),
+            timeout=ctx.http_timeout,
         )
         if _n_all != _n_new:                              # dedup SAVINGS is optimization telemetry, NOT a gap
             r.note = (f"frontier: {_n_new} new candidate(s), {_n_all - _n_new} already-settled skipped; "
@@ -1275,7 +1279,8 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
         ctx.run.record("vertical", r)
         resolved_now: set[str] = set()
         if r.raw_path:
-            ips = _massdns_a(md)                # host -> [A records]
+            ips = (_massdns_a(md) if native_output_current(r, md)
+                   else {})                     # only this invocation's authenticated host -> A records
             for e in normalize.hosts(r.raw_path.read_text(), "puredns-resolve", str(res)):
                 resolved_now.add(e["host"])     # every resolved name (in/out of scope) is settled
                 if scope.in_scope(e["host"]):

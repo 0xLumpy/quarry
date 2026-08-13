@@ -3667,6 +3667,55 @@ class TestTheRecursionRoundsPolicy:
         assert len(iters) == 5, iters               # four productive rounds, then one that adds nothing
         assert "a4.acme.com" in run.values("resolved"), run.values("resolved")
 
+    def test_noncurrent_massdns_prior_never_supplies_addresses(self, tmp_path, monkeypatch):
+        from quarry_recon import store
+        from quarry_recon.phases import vertical
+        from quarry_recon.runner import RunResult as _RR
+
+        run = store.Run.create(tmp_path, "t")
+        events.reset(); events.configure(run.dir)
+        calls = []
+
+        def fake_exec(tool, cmd, **kwargs):
+            assert tool == "puredns"
+            calls.append((cmd, kwargs))
+            raw_path = _declared_path(kwargs)
+            md = pathlib.Path(cmd[cmd.index("--write-massdns") + 1])
+            raw_path.write_text("fresh.acme.com\n" if len(calls) == 1 else "")
+            md.write_text("fresh.acme.com. A 203.0.113.99\n")  # preserved PRIOR final
+            return _RR(
+                tool, cmd, crawl.Status.SUCCESS, 0, 0.1, raw_path, 1,
+                meta={
+                    "native_outputs": {"current_paths": []},
+                    "native_output_ownership_settled": True,
+                },
+            )
+
+        monkeypatch.setattr(vertical, "exec_tool", fake_exec)
+        monkeypatch.setattr(vertical, "have", lambda _tool: False)  # no alterx; resolver still runs
+        ctx = _Ctx(run.dir, [])
+        ctx.run = run
+        ctx.scope = type("S", (), {
+            "in_scope": staticmethod(lambda _host: True),
+            "is_oos": staticmethod(lambda _host: False),
+            "passive_only": False,
+        })()
+        prof = type("P", (), {
+            "apex_domains": ["acme.com"], "dns_rate": 0, "http_rl": 0,
+            "takeover": False,
+        })()
+        try:
+            vertical._recursive_permute(
+                ctx, prof, ctx.scope, tmp_path / "trusted.txt", None, set(),
+            )
+        finally:
+            events.reset()
+
+        row = next(item for item in run.read("resolved") if item["host"] == "fresh.acme.com")
+        assert row["a"] == [], "a preserved massdns final was attributed to this invocation"
+        policy = calls[0][1]["native_outputs"][0]
+        assert policy.bindings[0].argv_index == 6
+
     def test_CANDIDATES_that_never_RESOLVE_still_terminate(self, tmp_path, monkeypatch):
         """The case the frontier check cannot catch: alterx keeps producing NEW candidates every round, so
         there is always new work to submit, and none of it resolves. Only the resolved-count convergence
