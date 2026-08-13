@@ -17,6 +17,7 @@ from ..contract import run_contract
 from ..runner import (Status, ffuf_http_row, ffuf_results, ffuf_usable_rows,
                       fresh_artifact_dir as runner_fresh,
                       have, reclassify_ffuf, run as exec_tool, scaled_timeout, skipped)
+from ..runner_repository import RepositoryOutput
 
 # No host or per-host row caps (those discard already-discovered URLs). Bound throughput and order:
 # full eligible set, ranked-fair order, an unbounded-by-default wall-clock budget + resumable ledger.
@@ -103,8 +104,14 @@ def _run_one(ctx, url, wl, wl_digest, mc, recurse, ct_to, out, prof):
                           config={"mc": mc, "recursion": recurse, "wordlist": wl.name},
                           file_digests={"wordlist": wl_digest}, schema_version=_CONTENT_SCHEMA)
     errf = out.with_suffix(".stderr.log")        # full stderr: the -maxtime marker must not be evictable
-    return run_contract("content.ffuf", cmd, work_unit=wu, timeout=hard, stderr_path=errf,
-                        reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ct_to or None))
+    return run_contract(
+        "content.ffuf", cmd,
+        repository=ctx.run,
+        stdout=RepositoryOutput.discard(),
+        stderr=RepositoryOutput.publish_path(ctx.run, errf),
+        work_unit=wu, timeout=hard,
+        reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ct_to or None),
+    )
 
 
 def _ingest_status(out) -> tuple:

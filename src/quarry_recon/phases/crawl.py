@@ -22,6 +22,7 @@ from .. import (ast_obs, budget, cgroup, events, fetch, normalize, policy, regis
                 remainder, secrets, settings, store)
 from ..contract import registered, run_contract
 from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
+from ..runner_repository import RepositoryOutput
 
 # deep-mine patterns; each findall() yields the value to store (full match or capture group).
 _WS_RX = re.compile(r"\bwss?://[A-Za-z0-9.\-_/:?=&%]+", re.I)                       # ws/wss endpoint URLs
@@ -106,8 +107,10 @@ def _jsluice_run(ctx, sub, files, raw, origin):
     degraded = 0
     with raw.open("w", encoding="utf-8") as fh:
         for i, f in enumerate(files, 1):
-            res = exec_tool("jsluice", ["jsluice", sub, "-j"], raw_path=scratch,
-                            timeout=ctx.http_timeout,
+            res = exec_tool("jsluice", ["jsluice", sub, "-j"],
+                            repository=ctx.run,
+                            stdout=RepositoryOutput.publish_path(ctx.run, scratch),
+                            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
                             stdin_data=f.read_bytes().decode("utf-8", "replace"))
             if res.status not in (Status.SUCCESS, Status.EMPTY):
                 degraded += 1
@@ -149,7 +152,9 @@ def _beautify_run(ctx, files):
         try:
             tmp.write_bytes(f.read_bytes())
             res = exec_tool("js-beautify", ["js-beautify", "-r", str(tmp)],
-                            raw_path=scratch, timeout=JS_BEAUTIFY_TIMEOUT)
+                            repository=ctx.run,
+                            stdout=RepositoryOutput.publish_path(ctx.run, scratch),
+                            stderr=RepositoryOutput.discard(), timeout=JS_BEAUTIFY_TIMEOUT)
         except Exception:
             res = None
         cpu_total += getattr(res, "cpu_s", 0.0) or 0.0
@@ -444,7 +449,12 @@ def _jxscout_analyze(ctx, artifact, limit: int, timeout: int = 60) -> tuple:
         # bypass the contract's events and ledger. The work unit is the bundle's content plus the guess limit.
         wu = events.work_unit("crawl.jxscout_chunks", inputs={"bundle": str(artifact)},
                               config={"brute_limit": max(0, limit)})
-        res = run_contract("crawl.jxscout_chunks", cmd, work_unit=wu, timeout=timeout)
+        res = run_contract(
+            "crawl.jxscout_chunks", cmd,
+            repository=ctx.run,
+            stdout=RepositoryOutput.discard(),
+            stderr=RepositoryOutput.discard(), work_unit=wu, timeout=timeout,
+        )
         lines: list = []
         ceiling = _JXSCOUT_OUTPUT_MB * 1024 * 1024
         at_ceiling = False
@@ -721,7 +731,13 @@ def _ast_analyze(ctx, artifact: Path, digest: str, engine: str, ledger=None) -> 
                                                        "gigabytes doing it"), meta
         wu = events.work_unit("crawl.jxscout_ast", inputs={"bundle": digest}, config=ident)
         try:
-            res = run_contract("crawl.jxscout_ast", cmd, work_unit=wu, timeout=_AST_WALL_S + 30)
+            res = run_contract(
+                "crawl.jxscout_ast", cmd,
+                repository=ctx.run,
+                stdout=RepositoryOutput.discard(),
+                stderr=RepositoryOutput.discard(),
+                work_unit=wu, timeout=_AST_WALL_S + 30,
+            )
         finally:
             # always: a timeout kills the systemd-run client, never the service it started.
             meta["unit_settled"] = cgroup.stop(unit)
@@ -1539,7 +1555,12 @@ def run(ctx) -> None:
         kat_wu = events.work_unit("crawl.katana_standard",
                                   file_digests={"targets": events.file_digest(targets)},
                                   config={"depth": 2, "jc": True, "kf": "all"})
-        r = run_contract("crawl.katana_standard", cmd, work_unit=kat_wu, raw_path=kat, timeout=ctx.http_timeout)
+        r = run_contract(
+            "crawl.katana_standard", cmd,
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish_path(ctx.run, kat),
+            stderr=RepositoryOutput.discard(), work_unit=kat_wu, timeout=ctx.http_timeout,
+        )
         ctx.run.record("crawl", r)
         if r.raw_path:
             ctx.echo(f"  katana: +{_collect_url(ctx, r.raw_path.read_text(), 'katana', str(kat))} urls")
@@ -1570,7 +1591,10 @@ def run(ctx) -> None:
                                          "-timeout", "20", "-silent"] +
                                         _katana_scope_flags(scope) +   # the same OOS exclusion on the headless pass
                                         (["-rl", str(prof.http_rl)] if prof.http_rl else []),
-                              work_unit=kh_wu, raw_path=kh, timeout=ctx.http_timeout)
+                              repository=ctx.run,
+                              stdout=RepositoryOutput.publish_path(ctx.run, kh),
+                              stderr=RepositoryOutput.discard(),
+                              work_unit=kh_wu, timeout=ctx.http_timeout)
                 ctx.run.record("crawl", r)
                 if r.raw_path:
                     ctx.echo(f"  katana headless SPA: +{_collect_url(ctx, r.raw_path.read_text(), 'katana-headless', str(kh))} urls")
@@ -1583,7 +1607,10 @@ def run(ctx) -> None:
     # as args and nothing is piped. The resume unit is the apex set plus the gau config.
     gau_wu = events.work_unit("crawl.gau", inputs={"apexes": sorted(prof.apex_domains)}, config={"subs": True})
     r = run_contract("crawl.gau", ["gau", "--subs", "--threads", "5"] + prof.apex_domains,
-                     work_unit=gau_wu, raw_path=gau_raw, timeout=ctx.http_timeout)
+                     repository=ctx.run,
+                     stdout=RepositoryOutput.publish_path(ctx.run, gau_raw),
+                     stderr=RepositoryOutput.discard(),
+                     work_unit=gau_wu, timeout=ctx.http_timeout)
     ctx.run.record("crawl", r)
     if r.raw_path:
         ctx.echo(f"  gau: +{_collect_url(ctx, r.raw_path.read_text(), 'gau', str(gau_raw))} urls")
@@ -1604,7 +1631,12 @@ def run(ctx) -> None:
         sid = "crawl.waymore_responses" if mode == "B" else "crawl.waymore_urls"
         wu = events.work_unit(sid, inputs={"apex": d, "mode": mode},
                               config={"limit": prof.waymore_limit if mode == "B" else None, "ci": "d"})
-        r = run_contract(sid, cmd, work_unit=wu, timeout=ctx.http_timeout)
+        r = run_contract(
+            sid, cmd,
+            repository=ctx.run,
+            stdout=RepositoryOutput.discard(),
+            stderr=RepositoryOutput.discard(), work_unit=wu, timeout=ctx.http_timeout,
+        )
         ctx.run.record("crawl", r)
         if wm.exists():
             _collect_url(ctx, wm.read_text(), "waymore", str(wm))
@@ -1730,6 +1762,9 @@ def run(ctx) -> None:
             # reclassify (status-only) inside the contract so the terminal event carries the final file-output
             # status. The ingest below re-reads the report, fail-closed.
             r = run_contract("crawl.gitleaks", ["gitleaks", "dir", str(sd), "-r", str(rep), "-f", "json"],
+                             repository=ctx.run,
+                             stdout=RepositoryOutput.discard(),
+                             stderr=RepositoryOutput.discard(),
                              work_unit=gl_wu,
                              reclassify=lambda res: (_gitleaks_status(res, rep), res)[1],
                              ok_codes=(0, 1), timeout=ctx.http_timeout)
@@ -1754,7 +1789,12 @@ def run(ctx) -> None:
         th_cmd = ["trufflehog", "filesystem", *[str(d) for d in scan_dirs], "--json", "--no-update"]
         if not prof.verify_secrets:
             th_cmd.append("--no-verification")
-        r = exec_tool("trufflehog", th_cmd, raw_path=th, timeout=ctx.http_timeout)
+        r = exec_tool(
+            "trufflehog", th_cmd,
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish_path(ctx.run, th),
+            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        )
         ctx.run.record("crawl", r)
         if r.raw_path:
             for line in r.raw_path.read_text().splitlines():
@@ -2493,8 +2533,13 @@ def _xnl_run(ctx, tag: str, blob, written: int, *, spo: bool = False) -> dict:
     cmd += ["-d", "0"]
     # PYTHONHASHSEED=0: xnLinkFinder dedups via list(set(...)), whose iteration order is hash-seed
     # randomized, so on link-dense input the extracted set varies run to run without a pinned seed.
-    r = exec_tool("xnLinkFinder", cmd, timeout=ctx.http_timeout, input_file=blob,
-                  env={"PYTHONHASHSEED": "0"})
+    r = exec_tool(
+        "xnLinkFinder", cmd,
+        repository=ctx.run,
+        stdout=RepositoryOutput.discard(),
+        stderr=RepositoryOutput.discard(),
+        timeout=ctx.http_timeout, input_file=blob, env={"PYTHONHASHSEED": "0"},
+    )
     ctx.run.record("crawl", r)
     # `-ow` truncates the four artifacts at start, so a killed run leaves whatever was flushed: real
     # evidence, and not a completed extraction. Both facts travel out of here.
