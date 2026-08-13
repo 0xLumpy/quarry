@@ -1,13 +1,14 @@
 """Hermetic parent-side checks for the fixed worker bootstrap."""
 from __future__ import annotations
 
+import inspect
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +22,24 @@ pytestmark = pytest.mark.offline
 
 RID = "81" * 16
 FAKE_PID = 42001
+FAKE_LAUNCHER_PID = 42002
+PREPARED_ABORT_ENV = "QUARRY_RUNNER_PREPARED_ABORT"
 SECRET_VALUES = ("secret-tool", "secret-target", "environment-secret")
+
+
+@pytest.fixture(autouse=True)
+def _authenticate_fake_parked_launcher(monkeypatch):
+    """Give hermetic peers an independently authenticated parked identity."""
+    monkeypatch.setattr(
+        supervisor,
+        "capture_parked_process_identity",
+        lambda pid, parent: SimpleNamespace(
+            process=SimpleNamespace(pid=pid),
+            parent=parent,
+            state="T",
+        ),
+        raising=False,
+    )
 
 
 def _request():
@@ -30,6 +48,20 @@ def _request():
         tool="fixture",
         cmd=[SECRET_VALUES[0], SECRET_VALUES[1]],
         timeout=30,
+        env={"TOKEN": SECRET_VALUES[2]},
+        base_environment={"PATH": "/private/tool/path"},
+    ).worker
+
+
+def _staged_request():
+    return protocol.normalize_invocation(
+        request_id="83" * 16,
+        tool="fixture",
+        cmd=[SECRET_VALUES[0], SECRET_VALUES[1]],
+        timeout=30,
+        input_file="/private/stage/stdin",
+        raw_path="/private/stage/stdout",
+        stderr_path="/private/stage/stderr",
         env={"TOKEN": SECRET_VALUES[2]},
         base_environment={"PATH": "/private/tool/path"},
     ).worker
@@ -49,19 +81,21 @@ def _streams():
     )
 
 
-def _settlement(request, *, detail="parent_abort", terminal=None):
-    return protocol.WorkerSettlement(
-        request_id=request.request_id,
-        terminal=terminal or protocol.ExecutionTerminal.CANCELLED,
-        launched=False,
-        exit_code=None,
-        process_group_settled=False,
-        process_tree_settled=False,
-        streams=_streams(),
-        worker_pid=FAKE_PID,
-        tool_pid=None,
-        detail=detail,
-    )
+def _settlement(request, *, detail="parent_abort", terminal=None, **overrides):
+    values = {
+        "request_id": request.request_id,
+        "terminal": terminal or protocol.ExecutionTerminal.CANCELLED,
+        "launched": False,
+        "exit_code": None,
+        "process_group_settled": True,
+        "process_tree_settled": False,
+        "streams": _streams(),
+        "worker_pid": FAKE_PID,
+        "tool_pid": None,
+        "detail": detail,
+    }
+    values.update(overrides)
+    return protocol.WorkerSettlement(**values)
 
 
 class _PipeChild:
@@ -244,11 +278,20 @@ def _ready(request):
     )
 
 
-def _honest_abort_peer(command_fd, control_fd):
-    request = protocol.decode_request(runner_ipc.read_frame(
-        command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
-    ))
-    runner_ipc.write_all(control_fd, protocol.encode_ready(_ready(request)))
+def _prepared(request, **overrides):
+    values = {
+        "request_id": request.request_id,
+        "worker_pid": FAKE_PID,
+        "launcher_pid": FAKE_LAUNCHER_PID,
+        "launcher_pgid": FAKE_LAUNCHER_PID,
+        "containment_kind": protocol.ContainmentKind.CGROUP_V2,
+        "containment_id": f"direct/quarry-{request.request_id}",
+    }
+    values.update(overrides)
+    return protocol.PreparedFrame(**values)
+
+
+def _read_prepared_abort(command_fd, request, prepared):
     command = protocol.decode_command(runner_ipc.read_frame(
         command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
     ))
@@ -258,7 +301,24 @@ def _honest_abort_peer(command_fd, control_fd):
         request_sha256=protocol.request_digest(request),
         worker_pid=FAKE_PID,
         command=protocol.WorkerCommandKind.ABORT,
+        prepared_sha256=protocol.prepared_digest(prepared),
     )
+    return command
+
+
+def _honest_abort_peer(command_fd, control_fd):
+    request = protocol.decode_request(runner_ipc.read_frame(
+        command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
+    ))
+    prepared = _prepared(request)
+    # Coalescing is a normal pipe behavior.  The parent must consume both exact
+    # frames before it decides whether a prepared-bound command is authorized.
+    runner_ipc.write_all(
+        control_fd,
+        protocol.encode_ready(_ready(request))
+        + protocol.encode_prepared(prepared),
+    )
+    _read_prepared_abort(command_fd, request, prepared)
     runner_ipc.write_all(
         control_fd, protocol.encode_settlement(_settlement(request)),
     )
@@ -277,6 +337,69 @@ def _factory(monkeypatch, handler, calls):
         return _PipeChild(handler)
 
     return make
+
+
+def _run_unauthorized_peer(monkeypatch, control_wire_factory):
+    """Run a peer that closes control and proves the parent wrote no command."""
+    observed = []
+    command_read_finished = threading.Event()
+    child_box = []
+
+    def peer(command_fd, control_fd):
+        request = protocol.decode_request(runner_ipc.read_frame(
+            command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
+        ))
+        runner_ipc.write_all(control_fd, control_wire_factory(request))
+        os.close(control_fd)
+        try:
+            observed.append(os.read(command_fd, 1))
+        except OSError:
+            observed.append(None)
+        finally:
+            command_read_finished.set()
+        return 0
+
+    monkeypatch.setattr(
+        supervisor,
+        "capture_process_identity",
+        lambda pid: SimpleNamespace(pid=pid, start_time_ticks=123456),
+    )
+
+    def factory(_argv, **_kwargs):
+        child = _PipeChild(
+            peer, kill_hook=lambda: command_read_finished.wait(1),
+        )
+        child_box.append(child)
+        return child
+
+    outcome = supervisor.bootstrap_worker(
+        _request(), deadline=time.monotonic() + 2, popen_factory=factory,
+    )
+    assert command_read_finished.wait(1)
+    assert observed == [b""]
+    assert not outcome.abort_command_sent
+    assert not outcome.transaction_complete
+    assert outcome.worker_reaped
+    return outcome
+
+
+def test_bootstrap_public_signature_and_outcome_shape_remain_stable():
+    signature = inspect.signature(supervisor.bootstrap_worker)
+    assert tuple(signature.parameters) == (
+        "request", "deadline", "clock", "popen_factory",
+    )
+    assert signature.parameters["request"].kind \
+        is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    assert all(
+        signature.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        for name in ("deadline", "clock", "popen_factory")
+    )
+    assert tuple(item.name for item in fields(supervisor.BootstrapOutcome)) == (
+        "reason", "request_id", "worker_pid", "worker_start_time_ticks",
+        "ready", "settlement", "worker_returncode", "worker_spawned",
+        "worker_reaped", "control_eof", "observed_trailing_control_bytes",
+        "abort_command_sent", "parent_pipes_closed", "kill_requested",
+    )
 
 
 def test_supervisor_uses_only_the_fixed_isolated_spawn_shape(monkeypatch):
@@ -301,15 +424,241 @@ def test_supervisor_uses_only_the_fixed_isolated_spawn_shape(monkeypatch):
         "close_fds": True,
         "start_new_session": True,
         "shell": False,
-        "env": {supervisor.EXPECTED_PARENT_PID_ENV: str(os.getpid())},
+        "env": {
+            supervisor.EXPECTED_PARENT_PID_ENV: str(os.getpid()),
+            supervisor.PREPARED_ABORT_ENV: "1",
+        },
         "bufsize": 0,
         "text": False,
         "cwd": "/",
     }
+    assert supervisor.PREPARED_ABORT_ENV == PREPARED_ABORT_ENV
     rendered = repr(calls) + repr(outcome)
     assert "pass_fds" not in kwargs
     for secret in SECRET_VALUES:
         assert secret not in rendered
+
+
+def test_prelaunch_abort_of_staged_request_transfers_no_stage_authority(
+    monkeypatch,
+):
+    """Claims describe a future launch; ABORT must not require or transfer FDs."""
+    calls = []
+    request = _staged_request()
+    outcome = supervisor.bootstrap_worker(
+        request, deadline=time.monotonic() + 2,
+        popen_factory=_factory(monkeypatch, _honest_abort_peer, calls),
+    )
+    assert outcome.reason is supervisor.BootstrapReason.ABORTED
+    assert outcome.settlement.launched is False
+    assert all(
+        stream.terminal is protocol.StreamTerminal.NOT_STARTED
+        for stream in outcome.settlement.streams
+    )
+    argv, kwargs = calls[0]
+    assert argv == [
+        supervisor.sys.executable, "-I", "-m", "quarry_recon.runner_worker",
+    ]
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["close_fds"] is True
+    assert "pass_fds" not in kwargs
+    assert set(kwargs["env"]) == {
+        supervisor.EXPECTED_PARENT_PID_ENV,
+        supervisor.PREPARED_ABORT_ENV,
+    }
+    rendered = repr(calls) + repr(outcome)
+    assert "/private/stage/stdin" not in rendered
+    assert "/private/stage/stdout" not in rendered
+    assert "/private/stage/stderr" not in rendered
+    for secret in SECRET_VALUES:
+        assert secret not in rendered
+
+
+def test_ready_without_prepared_never_authorizes_parent_command(monkeypatch):
+    outcome = _run_unauthorized_peer(
+        monkeypatch,
+        lambda request: protocol.encode_ready(_ready(request)),
+    )
+    assert outcome.reason is supervisor.BootstrapReason.CONTROL_FAILED
+    assert outcome.ready == _ready(_request())
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"request_id": "82" * 16},
+        {"worker_pid": FAKE_PID + 7},
+        {"containment_kind": protocol.ContainmentKind.PGID},
+        {"containment_id": f"direct/quarry-{'82' * 16}"},
+    ],
+    ids=(
+        "request", "worker", "containment-kind", "containment-id",
+    ),
+)
+def test_untrusted_prepared_intent_never_authorizes_parent_command(
+    monkeypatch, change,
+):
+    monkeypatch.setattr(
+        supervisor,
+        "capture_parked_process_identity",
+        lambda *_args: pytest.fail(
+            "invalid PREPARED intent reached process authentication"
+        ),
+    )
+    outcome = _run_unauthorized_peer(
+        monkeypatch,
+        lambda request: (
+            protocol.encode_ready(_ready(request))
+            + protocol.encode_prepared(_prepared(request, **change))
+        ),
+    )
+    assert outcome.reason is supervisor.BootstrapReason.CONTROL_FAILED
+
+
+@pytest.mark.parametrize("proof_change", [
+    {"process_pid": FAKE_LAUNCHER_PID + 1},
+    {"parent_pid": FAKE_PID + 1},
+    {"state": "S"},
+], ids=("launcher", "parent", "not-stopped"))
+def test_untrusted_parked_identity_never_authorizes_parent_command(
+    monkeypatch, proof_change,
+):
+    def forged_proof(pid, parent):
+        parent_proof = parent
+        if "parent_pid" in proof_change:
+            parent_proof = SimpleNamespace(
+                pid=proof_change["parent_pid"],
+                start_time_ticks=parent.start_time_ticks,
+            )
+        return SimpleNamespace(
+            process=SimpleNamespace(
+                pid=proof_change.get("process_pid", pid),
+            ),
+            parent=parent_proof,
+            state=proof_change.get("state", "T"),
+        )
+
+    monkeypatch.setattr(
+        supervisor, "capture_parked_process_identity", forged_proof,
+    )
+    outcome = _run_unauthorized_peer(
+        monkeypatch,
+        lambda request: (
+            protocol.encode_ready(_ready(request))
+            + protocol.encode_prepared(_prepared(request))
+        ),
+    )
+    assert outcome.reason is supervisor.BootstrapReason.IDENTITY_FAILED
+
+
+def test_prepared_authentication_uses_exact_launcher_and_worker_identity(
+    monkeypatch,
+):
+    calls = []
+
+    def authenticate(pid, parent):
+        calls.append((pid, parent))
+        return SimpleNamespace(
+            process=SimpleNamespace(pid=pid), parent=parent, state="T",
+        )
+
+    monkeypatch.setattr(
+        supervisor, "capture_parked_process_identity", authenticate,
+    )
+    outcome = supervisor.bootstrap_worker(
+        _request(), deadline=time.monotonic() + 2,
+        popen_factory=_factory(monkeypatch, _honest_abort_peer, []),
+    )
+    assert outcome.reason is supervisor.BootstrapReason.ABORTED
+    assert len(calls) == 1
+    launcher_pid, worker_identity = calls[0]
+    assert launcher_pid == FAKE_LAUNCHER_PID
+    assert worker_identity.pid == FAKE_PID
+    assert worker_identity.start_time_ticks == 123456
+
+
+@pytest.mark.parametrize("sequence", [
+    lambda request: protocol.encode_prepared(_prepared(request)),
+    lambda request: (
+        protocol.encode_ready(_ready(request))
+        + protocol.encode_ready(_ready(request))
+    ),
+    lambda request: (
+        protocol.encode_ready(_ready(request))
+        + protocol.encode_settlement(_settlement(request))
+    ),
+    lambda request: (
+        protocol.encode_ready(_ready(request))
+        + protocol.encode_prepared(_prepared(request))
+        + protocol.encode_prepared(_prepared(request))
+    ),
+    lambda request: protocol.encode_ready(_ready(request)) + b"\x00\x00\x00\x01x",
+], ids=(
+    "prepared-before-ready", "duplicate-ready", "settlement-before-prepared",
+    "duplicate-prepared", "malformed-after-ready",
+))
+def test_invalid_prepared_order_and_duplicates_never_authorize_command(
+    monkeypatch, sequence,
+):
+    outcome = _run_unauthorized_peer(monkeypatch, sequence)
+    assert outcome.reason in {
+        supervisor.BootstrapReason.READY_FAILED,
+        supervisor.BootstrapReason.CONTROL_FAILED,
+    }
+
+
+@pytest.mark.parametrize("mode", [
+    "group-unsettled", "tree-settled", "launched", "wrong-terminal",
+    "wrong-detail", "stream-started", "wrong-request", "wrong-worker",
+])
+def test_post_abort_settlement_requires_exact_negative_parked_truth(
+    monkeypatch, mode,
+):
+    def peer(command_fd, control_fd):
+        request = protocol.decode_request(runner_ipc.read_frame(
+            command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
+        ))
+        prepared = _prepared(request)
+        runner_ipc.write_all(
+            control_fd,
+            protocol.encode_ready(_ready(request))
+            + protocol.encode_prepared(prepared),
+        )
+        _read_prepared_abort(command_fd, request, prepared)
+        changes = {
+            "group-unsettled": {"process_group_settled": False},
+            "tree-settled": {"process_tree_settled": True},
+            "launched": {"launched": True, "tool_pid": FAKE_LAUNCHER_PID},
+            "wrong-terminal": {
+                "terminal": protocol.ExecutionTerminal.WORKER_FAILED,
+            },
+            "wrong-detail": {"detail": "command_mismatch"},
+            "stream-started": {
+                "streams": (
+                    replace(
+                        _streams()[0],
+                        terminal=protocol.StreamTerminal.CANCELLED,
+                    ),
+                    *_streams()[1:],
+                ),
+            },
+            "wrong-request": {"request_id": "82" * 16},
+            "wrong-worker": {"worker_pid": FAKE_PID + 1},
+        }[mode]
+        runner_ipc.write_all(
+            control_fd,
+            protocol.encode_settlement(_settlement(request, **changes)),
+        )
+        return 0
+
+    outcome = supervisor.bootstrap_worker(
+        _request(), deadline=time.monotonic() + 2,
+        popen_factory=_factory(monkeypatch, peer, []),
+    )
+    assert outcome.abort_command_sent
+    assert outcome.reason is supervisor.BootstrapReason.CONTROL_FAILED
+    assert not outcome.transaction_complete
+    assert outcome.worker_reaped
 
 
 def test_successful_outcome_proves_exact_negative_transaction(monkeypatch):
@@ -339,6 +688,10 @@ def test_successful_outcome_proves_exact_negative_transaction(monkeypatch):
     assert outcome.abort_command_sent is True
     assert outcome.ready == _ready(request)
     assert outcome.settlement == _settlement(request)
+    assert outcome.settlement.process_group_settled is True
+    # PREPARED is private transaction state; the established public outcome shape
+    # remains unchanged.
+    assert not hasattr(outcome, "prepared")
 
 
 def test_bootstrap_outcome_is_frozen_nonforgeable_and_credential_safe(monkeypatch):
@@ -739,10 +1092,9 @@ def test_malformed_duplicate_trailing_and_crash_never_complete(monkeypatch, mode
         runner_ipc.write_all(control_fd, protocol.encode_ready(ready))
         if mode == "wrong_ready":
             return 0
-        protocol.decode_command(runner_ipc.read_frame(
-            command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
-        ))
-        runner_ipc.require_eof(command_fd)
+        prepared = _prepared(request)
+        runner_ipc.write_all(control_fd, protocol.encode_prepared(prepared))
+        _read_prepared_abort(command_fd, request, prepared)
         wire = protocol.encode_settlement(_settlement(request))
         if mode == "duplicate":
             wire += protocol.encode_settlement(_settlement(request))
@@ -768,9 +1120,11 @@ def test_settlement_before_parent_abort_delivery_never_completes(monkeypatch):
             command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
         ))
         os.close(command_fd)
+        prepared = _prepared(request)
         runner_ipc.write_all(
             control_fd,
             protocol.encode_ready(_ready(request))
+            + protocol.encode_prepared(prepared)
             + protocol.encode_settlement(_settlement(request)),
         )
         return 0
@@ -799,18 +1153,19 @@ def test_early_settlement_cannot_be_laundered_by_later_abort_delivery(
         request = protocol.decode_request(runner_ipc.read_frame(
             command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
         ))
-        runner_ipc.write_all(control_fd, protocol.encode_ready(_ready(request)))
+        prepared = _prepared(request)
+        runner_ipc.write_all(
+            control_fd,
+            protocol.encode_ready(_ready(request))
+            + protocol.encode_prepared(prepared),
+        )
         assert ambiguous_command_write.wait(1)
         runner_ipc.write_all(
             control_fd, protocol.encode_settlement(_settlement(request)),
         )
         # Keep the request channel open and eventually drain the authentic command.
         # This proves that later delivery cannot repair an impossible transcript.
-        command = protocol.decode_command(runner_ipc.read_frame(
-            command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
-        ))
-        runner_ipc.require_eof(command_fd)
-        assert command.command is protocol.WorkerCommandKind.ABORT
+        _read_prepared_abort(command_fd, request, prepared)
         command_drained.set()
         return 0
 
@@ -1911,11 +2266,13 @@ def test_valid_transcript_eof_with_live_worker_is_killed_then_reaped_in_budget(
         request = protocol.decode_request(runner_ipc.read_frame(
             command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
         ))
-        runner_ipc.write_all(control_fd, protocol.encode_ready(_ready(request)))
-        protocol.decode_command(runner_ipc.read_frame(
-            command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
-        ))
-        runner_ipc.require_eof(command_fd)
+        prepared = _prepared(request)
+        runner_ipc.write_all(
+            control_fd,
+            protocol.encode_ready(_ready(request))
+            + protocol.encode_prepared(prepared),
+        )
+        _read_prepared_abort(command_fd, request, prepared)
         runner_ipc.write_all(
             control_fd, protocol.encode_settlement(_settlement(request)),
         )

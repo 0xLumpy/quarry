@@ -40,7 +40,7 @@ def test_real_fixed_worker_completes_authenticated_prelaunch_abort(monkeypatch):
     assert outcome.settlement is not None
     assert outcome.settlement.terminal is protocol.ExecutionTerminal.CANCELLED
     assert outcome.settlement.launched is False
-    assert outcome.settlement.process_group_settled is False
+    assert outcome.settlement.process_group_settled is True
     assert outcome.settlement.process_tree_settled is False
     assert all(
         stream.terminal is protocol.StreamTerminal.NOT_STARTED

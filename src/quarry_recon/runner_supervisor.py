@@ -1,8 +1,9 @@
 """Parent-owned bootstrap supervisor for Quarry's killable worker boundary.
 
-This preparatory supervisor proves only the fixed worker transport.  It always
-issues a request-bound pre-launch abort and therefore never launches a tool,
-transfers a stage, claims containment, or authorizes publication.
+The supervisor proves a fixed worker plus its parked, non-executing launcher.
+It authenticates READY and PREPARED, then issues an exact prepared-frame-bound
+abort.  It never releases the launcher, transfers a stage, or authorizes
+publication.
 """
 from __future__ import annotations
 
@@ -17,11 +18,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from . import runner_ipc
-from .runner_containment import capture_process_identity
+from .runner_containment import (
+    capture_parked_process_identity,
+    capture_process_identity,
+)
 from .runner_protocol import (
     MAX_FRAME_BYTES,
+    ContainmentKind,
     ControlTranscript,
     ExecutionTerminal,
+    PreparedFrame,
     ProtocolError,
     ReadyFrame,
     StreamTerminal,
@@ -32,10 +38,11 @@ from .runner_protocol import (
     decode_control_frame,
     encode_command,
     encode_request,
+    prepared_digest,
     request_digest,
     validate_control_sequence,
 )
-from .runner_worker import EXPECTED_PARENT_PID_ENV
+from .runner_worker import EXPECTED_PARENT_PID_ENV, PREPARED_ABORT_ENV
 
 
 _BOOTSTRAP_OUTCOME_AUTHORITY = object()
@@ -168,7 +175,7 @@ class BootstrapOutcome:
                 raise ValueError("mismatched successful bootstrap outcome")
             if (settlement.terminal is not ExecutionTerminal.CANCELLED
                     or settlement.launched
-                    or settlement.process_group_settled
+                    or not settlement.process_group_settled
                     or settlement.process_tree_settled
                     or settlement.detail != "parent_abort"
                     or any(stream.terminal is not StreamTerminal.NOT_STARTED
@@ -225,6 +232,7 @@ class _BootstrapOwner:
     worker_spawned: bool = False
     worker_pid: int | None = None
     worker_start_time_ticks: int | None = None
+    worker_identity: object | None = None
     input_pipe: object | None = None
     output_pipe: object | None = None
     input_close_attempted: bool = False
@@ -242,6 +250,7 @@ class _BootstrapOwner:
     pending_cancellation: BaseException | None = None
     failure: BootstrapReason | None = None
     ready: ReadyFrame | None = None
+    prepared: PreparedFrame | None = None
     settlement: WorkerSettlement | None = None
     control_eof: bool = False
     observed_trailing_control_bytes: int = 0
@@ -691,7 +700,7 @@ def _drive_abort_protocol(
     clock,
     real_deadline: float,
 ) -> None:
-    """Drive REQUEST -> READY -> ABORT -> CANCELLED over owned channels."""
+    """Drive REQUEST -> READY -> PREPARED -> ABORT -> CANCELLED."""
     input_pipe = owner.input_pipe
     output_pipe = owner.output_pipe
     selector = owner.selector
@@ -793,7 +802,7 @@ def _drive_abort_protocol(
                     owner.failure = BootstrapReason.CONTROL_FAILED
                     break
                 for wire_frame in wire_frames:
-                    if len(frames) >= 2:
+                    if len(frames) >= 3:
                         owner.observed_trailing_control_bytes = min(
                             owner.observed_trailing_control_bytes
                             + len(wire_frame),
@@ -816,11 +825,39 @@ def _drive_abort_protocol(
                             owner.failure = BootstrapReason.READY_FAILED
                             break
                         owner.ready = record
+                    elif len(frames) == 1:
+                        if type(record) is not PreparedFrame:
+                            owner.failure = BootstrapReason.CONTROL_FAILED
+                            break
+                        if (record.request_id != request.request_id
+                                or record.worker_pid != owner.worker_pid
+                                or record.launcher_pid != record.launcher_pgid
+                                or record.containment_kind is not ContainmentKind.CGROUP_V2
+                                or record.containment_id
+                                != f"direct/quarry-{request.request_id}"
+                                or owner.worker_identity is None):
+                            owner.failure = BootstrapReason.CONTROL_FAILED
+                            break
+                        try:
+                            proof = capture_parked_process_identity(
+                                record.launcher_pid, owner.worker_identity,
+                            )
+                        except BaseException as exc:
+                            owner.remember(exc)
+                            owner.failure = BootstrapReason.IDENTITY_FAILED
+                            break
+                        if (proof.process.pid != record.launcher_pid
+                                or proof.parent != owner.worker_identity
+                                or proof.state not in ("T", "t")):
+                            owner.failure = BootstrapReason.IDENTITY_FAILED
+                            break
+                        owner.prepared = record
                         write_wire = encode_command(WorkerCommand(
                             request_id=request.request_id,
                             request_sha256=digest,
                             worker_pid=owner.worker_pid,
                             command=WorkerCommandKind.ABORT,
+                            prepared_sha256=prepared_digest(record),
                         ))
                         write_offset = 0
                         write_phase = "command"
@@ -847,13 +884,13 @@ def _drive_abort_protocol(
 
     if owner.failure is not None:
         return
-    if (not owner.control_eof or owner.ready is None
+    if (not owner.control_eof or owner.ready is None or owner.prepared is None
             or owner.settlement is None or not owner.abort_command_sent):
         owner.failure = BootstrapReason.CONTROL_FAILED
         return
     try:
         transcript: ControlTranscript = validate_control_sequence(
-            (owner.ready, owner.settlement),
+            (owner.ready, owner.prepared, owner.settlement),
         )
     except ProtocolError:
         owner.failure = BootstrapReason.CONTROL_FAILED
@@ -862,7 +899,7 @@ def _drive_abort_protocol(
     if (settled.request_id != request.request_id
             or settled.worker_pid != owner.worker_pid
             or settled.terminal is not ExecutionTerminal.CANCELLED
-            or settled.launched or settled.process_group_settled
+            or settled.launched or not settled.process_group_settled
             or settled.process_tree_settled
             or settled.detail != "parent_abort"
             or any(stream.terminal is not StreamTerminal.NOT_STARTED
@@ -877,7 +914,7 @@ def bootstrap_worker(
     clock=time.monotonic,
     popen_factory=subprocess.Popen,
 ) -> BootstrapOutcome:
-    """Prove the fixed worker transport by completing a pre-launch abort.
+    """Prove the parked worker boundary by completing a pre-launch abort.
 
     This process must retain exclusive child-status ownership for the call:
     ``SIGCHLD`` must use its default disposition and no independent reaper may
@@ -907,7 +944,10 @@ def bootstrap_worker(
         return _outcome(request, reason=BootstrapReason.UNSUPPORTED)
 
     argv = [sys.executable, "-I", "-m", "quarry_recon.runner_worker"]
-    bootstrap_env = {EXPECTED_PARENT_PID_ENV: str(os.getpid())}
+    bootstrap_env = {
+        EXPECTED_PARENT_PID_ENV: str(os.getpid()),
+        PREPARED_ABORT_ENV: "1",
+    }
     try:
         decoder = runner_ipc.IncrementalFrameDecoder(MAX_FRAME_BYTES)
         request_wire = encode_request(request)
@@ -957,6 +997,7 @@ def bootstrap_worker(
                     if identity.pid != owner.worker_pid:
                         raise RuntimeError("worker identity mismatch")
                     owner.worker_start_time_ticks = identity.start_time_ticks
+                    owner.worker_identity = identity
                 except BaseException as exc:
                     owner.remember(exc)
                     owner.failure = BootstrapReason.IDENTITY_FAILED

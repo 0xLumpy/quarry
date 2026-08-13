@@ -21,6 +21,7 @@ pytestmark = pytest.mark.offline
 RID = "a1" * 16
 WORKER_PID = 44001
 LAUNCHER_PID = 44002
+PREPARED_ABORT_ENV = "QUARRY_RUNNER_PREPARED_ABORT"
 STDOUT_FD_ENV = "QUARRY_RUNNER_STDOUT_FD"
 STDERR_FD_ENV = "QUARRY_RUNNER_STDERR_FD"
 
@@ -453,6 +454,83 @@ def test_output_fd_metadata_is_consumed_and_cleared(monkeypatch):
     assert STDERR_FD_ENV not in os.environ
 
 
+def test_prepared_abort_mode_is_explicit_canonical_and_one_shot(monkeypatch):
+    assert runner_worker.PREPARED_ABORT_ENV == PREPARED_ABORT_ENV
+    monkeypatch.delenv(PREPARED_ABORT_ENV, raising=False)
+    assert runner_worker._pop_prepared_abort_mode() is False
+    assert PREPARED_ABORT_ENV not in os.environ
+
+    monkeypatch.setenv(PREPARED_ABORT_ENV, "1")
+    assert runner_worker._pop_prepared_abort_mode() is True
+    assert PREPARED_ABORT_ENV not in os.environ
+
+
+@pytest.mark.parametrize("value", [
+    "", "0", "01", "+1", " 1", "1 ", "true", "environment-secret",
+])
+def test_prepared_abort_mode_rejects_noncanonical_values_without_reflection(
+        monkeypatch, value):
+    monkeypatch.setenv(PREPARED_ABORT_ENV, value)
+    with pytest.raises(RuntimeError) as error:
+        runner_worker._pop_prepared_abort_mode()
+    assert str(error.value) == "worker_metadata_invalid"
+    if value:
+        assert value not in str(error.value)
+    assert PREPARED_ABORT_ENV not in os.environ
+
+
+def test_explicit_prepared_mode_dispatches_stage_free_request_to_parked_path(
+        monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner_worker, "_arm_parent_death", lambda _pid: None)
+    monkeypatch.setattr(runner_worker.os, "getpid", lambda: WORKER_PID)
+
+    def parked(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 73
+
+    monkeypatch.setattr(runner_worker, "_run_prepared_abort_worker", parked)
+    assert runner_worker._run_worker(
+        10, 11, expected_parent_pid=8001,
+        stdout_fd=None, stderr_fd=None, prepared_abort=True,
+    ) == 73
+    assert calls == [(
+        (10, 11, WORKER_PID),
+        {"stdout_fd": None, "stderr_fd": None},
+    )]
+
+
+def test_explicit_false_preserves_stage_free_legacy_decode_path(monkeypatch):
+    monkeypatch.setattr(runner_worker, "_arm_parent_death", lambda _pid: None)
+    monkeypatch.setattr(runner_worker.os, "getpid", lambda: WORKER_PID)
+    monkeypatch.setattr(
+        runner_worker,
+        "_run_prepared_abort_worker",
+        lambda *_args, **_kwargs: pytest.fail("legacy path dispatched parked worker"),
+    )
+    # Invalid descriptors terminate at the legacy request decoder.  Reaching that
+    # typed result proves explicit False did not select the parked transaction.
+    assert runner_worker._run_worker(
+        -1, -1, expected_parent_pid=8001,
+        stdout_fd=None, stderr_fd=None, prepared_abort=False,
+    ) == runner_worker._EXIT_BOOTSTRAP_INVALID
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "1"])
+def test_non_boolean_private_mode_is_rejected_before_dispatch(monkeypatch, value):
+    monkeypatch.setattr(runner_worker, "_arm_parent_death", lambda _pid: None)
+    monkeypatch.setattr(runner_worker.os, "getpid", lambda: WORKER_PID)
+    monkeypatch.setattr(
+        runner_worker,
+        "_run_prepared_abort_worker",
+        lambda *_args, **_kwargs: pytest.fail("invalid mode reached parked worker"),
+    )
+    with pytest.raises(RuntimeError, match="^worker_metadata_invalid$"):
+        runner_worker._run_worker(
+            10, 11, expected_parent_pid=8001, prepared_abort=value,
+        )
+
+
 def _request_with_outputs(*, stdout: bool, stderr: bool, stdin_file: bool = False):
     return protocol.normalize_invocation(
         request_id=RID,
@@ -546,6 +624,9 @@ def test_existing_run_worker_call_shape_remains_accepted():
     )
     assert signature.parameters["stdout_fd"].kind is inspect.Parameter.KEYWORD_ONLY
     assert signature.parameters["stderr_fd"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["prepared_abort"].kind \
+        is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["prepared_abort"].default is False
 
 
 def _proc_launcher_facts(pid: int):

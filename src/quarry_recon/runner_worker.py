@@ -43,6 +43,7 @@ from .runner_containment import (
 
 
 EXPECTED_PARENT_PID_ENV = "QUARRY_RUNNER_EXPECTED_PARENT_PID"
+PREPARED_ABORT_ENV = "QUARRY_RUNNER_PREPARED_ABORT"
 STDOUT_FD_ENV = "QUARRY_RUNNER_STDOUT_FD"
 STDERR_FD_ENV = "QUARRY_RUNNER_STDERR_FD"
 _PR_SET_PDEATHSIG = 1
@@ -98,6 +99,15 @@ def _pop_output_fd_metadata() -> tuple[int | None, int | None]:
     stdout_raw = os.environ.pop(STDOUT_FD_ENV, None)
     stderr_raw = os.environ.pop(STDERR_FD_ENV, None)
     return _parse_output_fd(stdout_raw), _parse_output_fd(stderr_raw)
+
+
+def _pop_prepared_abort_mode() -> bool:
+    raw = os.environ.pop(PREPARED_ABORT_ENV, None)
+    if raw is None:
+        return False
+    if raw != "1":
+        raise _metadata_failure()
+    return True
 
 
 def _validate_output_fds(
@@ -641,10 +651,15 @@ def _run_prepared_abort_transaction(
         request = decode_request(runner_ipc.read_frame(
             request_fd, max_frame_bytes=MAX_FRAME_BYTES,
         ))
-        _validate_output_fds(
-            request, stdout_fd, stderr_fd,
-            request_fd=request_fd, control_fd=control_fd,
-        )
+        # The fixed supervisor uses explicit stage-free PREPARED mode only to
+        # prove and abort the launcher, so request claims need no dummy writer.
+        # Once any private writer is supplied, however, its roles must match the
+        # request exactly before the transaction can testify PREPARED.
+        if stdout_fd is not None or stderr_fd is not None:
+            _validate_output_fds(
+                request, stdout_fd, stderr_fd,
+                request_fd=request_fd, control_fd=control_fd,
+            )
     except BaseException as primary:
         _settle_after_boundary(launcher, primary)
         return _EXIT_BOOTSTRAP_INVALID
@@ -772,11 +787,14 @@ def _run_worker(
     *,
     stdout_fd: int | None = None,
     stderr_fd: int | None = None,
+    prepared_abort: bool = False,
 ) -> int:
     """Run one legacy or parked transaction over blocking descriptors."""
     _arm_parent_death(expected_parent_pid)
     worker_pid = os.getpid()
-    if stdout_fd is not None or stderr_fd is not None:
+    if (type(prepared_abort) is not bool):
+        raise _metadata_failure()
+    if prepared_abort or stdout_fd is not None or stderr_fd is not None:
         return _run_prepared_abort_worker(
             request_fd, control_fd, worker_pid,
             stdout_fd=stdout_fd, stderr_fd=stderr_fd,
@@ -853,6 +871,7 @@ def main() -> int:
     """Process entry point; never render private failures to stderr."""
     try:
         expected_parent_pid = _expected_parent_pid()
+        prepared_abort = _pop_prepared_abort_mode()
         stdout_fd, stderr_fd = _pop_output_fd_metadata()
         # The bootstrap environment contains only fixed numeric metadata.  Remove
         # even that value before accepting the target-effective request over IPC.
@@ -860,6 +879,7 @@ def main() -> int:
         return _run_worker(
             0, 1, expected_parent_pid,
             stdout_fd=stdout_fd, stderr_fd=stderr_fd,
+            prepared_abort=prepared_abort,
         )
     except BaseException:
         return _EXIT_BOOTSTRAP_INVALID
