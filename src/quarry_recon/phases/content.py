@@ -16,8 +16,10 @@ from .. import budget, events, normalize, settings
 from ..contract import run_contract
 from ..runner import (Status, ffuf_http_row, ffuf_results, ffuf_usable_rows,
                       fresh_artifact_dir as runner_fresh,
-                      have, reclassify_ffuf, run as exec_tool, scaled_timeout, skipped)
+                      have, native_output_current, reclassify_ffuf, run as exec_tool,
+                      scaled_timeout, skipped)
 from ..runner_repository import RepositoryOutput
+from ..runner_native import RepositoryNativeOutput
 
 # No host or per-host row caps (those discard already-discovered URLs). Bound throughput and order:
 # full eligible set, ranked-fair order, an unbounded-by-default wall-clock budget + resumable ledger.
@@ -104,11 +106,13 @@ def _run_one(ctx, url, wl, wl_digest, mc, recurse, ct_to, out, prof):
                           config={"mc": mc, "recursion": recurse, "wordlist": wl.name},
                           file_digests={"wordlist": wl_digest}, schema_version=_CONTENT_SCHEMA)
     errf = out.with_suffix(".stderr.log")        # full stderr: the -maxtime marker must not be evictable
-    return run_contract(
-        "content.ffuf", cmd,
+    return run_contract("content.ffuf", cmd,
         repository=ctx.run,
         stdout=RepositoryOutput.discard(),
         stderr=RepositoryOutput.publish(*errf.relative_to(ctx.run.dir).parts),
+        native_outputs=(RepositoryNativeOutput.file(
+            16, *out.relative_to(ctx.run.dir).parts,
+        ),),
         work_unit=wu, timeout=hard,
         reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ct_to or None),
     )
@@ -262,7 +266,6 @@ def run(ctx) -> None:
             else:
                 launched = True
                 current = attempt_dir / f"{svc}.json"
-                current.unlink(missing_ok=True)               # our own fresh attempt file, never a recorded one
                 r = _run_one(ctx, url, wl, wl_digest, _mc, recurse, ct_to, current, prof)
                 ctx.run.record("content", r)
                 if r.status == Status.BLOCKED:
@@ -277,7 +280,7 @@ def run(ctx) -> None:
                     ff_errors += 1                           # failed / timed-out / skipped statuses
                     events.coverage_partial("content.ffuf", reason=f"{host}: {r.status.value} — {r.note}")
                 ran_clean = r.status in (Status.SUCCESS, Status.EMPTY)
-                if not current.exists():
+                if not native_output_current(r, current) or not current.exists():
                     current = None
                 elif ffuf_results(current) is not None:
                     # retain every trustworthy artifact regardless of execution status — a partial/blocked

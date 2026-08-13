@@ -147,6 +147,8 @@ def ffuf_results(out_file) -> "list | None":
     A caller can then distinguish "ffuf completed and served this" from "no trustworthy artifact"."""
     import json as _json
     from pathlib import Path as _Path
+    if out_file is None:
+        return None
     try:
         data = _json.loads(_Path(out_file).read_text() or "{}")
     except (OSError, _json.JSONDecodeError, ValueError):
@@ -204,9 +206,11 @@ def reclassify_ffuf(r: "RunResult", out_file, stderr_file=None, maxtime=None) ->
                                   invalid artifact (a real block before the write)
       - PARTIAL (transport)    -> stay PARTIAL, with or without hits
       - clean                  -> hits => SUCCESS; 0 => EMPTY
-    A missing / invalid `-o` keeps the classifier verdict. Callers MUST clear `out_file` before invoking
-    ffuf so a stale prior-run artifact can't fake completion. Sets `stdout_lines` to the result count and
-    returns the mutated RunResult."""
+    A missing / invalid `-o` keeps the classifier verdict. Repository-native callers bind `out_file`
+    through a native-output receipt; unmanaged callers remain responsible for a fresh path. Sets
+    `stdout_lines` to the result count and returns the mutated RunResult."""
+    if not native_output_current(r, out_file):
+        out_file = None
     if r.status in (Status.SKIPPED, Status.LIMITED):
         # LIMITED is a proven provider boundary and is never re-derived from an artifact: the matrix
         # would either launder it into SUCCESS or demote it to a degraded PARTIAL.
@@ -1429,6 +1433,8 @@ def native_output_current(result: RunResult, path) -> bool:
     native = result.meta.get("native_outputs")
     if native is None:
         return True
+    if path is None:
+        return False
     if type(native) is not dict or type(native.get("current_paths")) is not list:
         return False
     candidate = os.path.abspath(os.path.normpath(os.fspath(path)))

@@ -29,10 +29,11 @@ from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PACE_BUSY, PR
                         is_provider_limit, provider_error_class, read_bounded, run_contract,
                         run_provider, stream_to_file)
 from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir, have,
-                      nuclei_timeout, reclassify_ffuf,
+                      native_output_current, nuclei_timeout, reclassify_ffuf,
                       reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
                       skipped)
 from ..runner_repository import RepositoryOutput
+from ..runner_native import RepositoryNativeOutput
 
 # Serialized-object / token markers in Set-Cookie + response headers; passive format evidence only.
 # Distinctive markers only — pickle (`gAR`) / Ruby-Marshal (`BAg`) prefixes collide too easily.
@@ -1399,11 +1400,13 @@ def _vhost_scan(ctx, base, apex, out, wl, wl_digest, mc, ffuf_to, prof):
                           config={"mc": mc, "wordlist": wl.name},
                           file_digests={"wordlist": wl_digest}, schema_version=_VHOST_SCHEMA)
     errf = out.with_suffix(".stderr.log")            # FULL stderr: the -maxtime marker must not be evictable
-    r = run_contract(
-        "probe.ffuf_vhost", cmd,
+    r = run_contract("probe.ffuf_vhost", cmd,
         repository=ctx.run,
         stdout=RepositoryOutput.discard(),
         stderr=RepositoryOutput.publish(*errf.relative_to(ctx.run.dir).parts),
+        native_outputs=(RepositoryNativeOutput.file(
+            17, *out.relative_to(ctx.run.dir).parts,
+        ),),
         work_unit=wu, timeout=hard,
         reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ffuf_to or None),
     )   # graceful -maxtime; hard backstop
@@ -1533,7 +1536,6 @@ def _vhost_enum(ctx) -> None:
             if not vh_budget.exhausted():        # the budget gates LAUNCHING only; replay is unconditional
                 launched = True
                 current = attempt_dir / f"{unit_id}.json"
-                current.unlink(missing_ok=True)  # our OWN fresh attempt file, never a recorded one
                 r = _vhost_scan(ctx, base, apex, current, eff[apex]["path"],
                                 eff[apex]["digest"], _mc, ffuf_to, prof)
                 ctx.run.record("probe", r)
@@ -1551,7 +1553,7 @@ def _vhost_enum(ctx) -> None:
                     events.coverage_partial("probe.ffuf_vhost",
                                             reason=f"{base}/{apex}: {r.status.value} — {r.note}")
                 ran_clean = r.status in (Status.SUCCESS, Status.EMPTY)
-                if not current.exists():
+                if not native_output_current(r, current) or not current.exists():
                     current = None
                 elif ffuf_results(current) is not None:
                     ledger.add_evidence(item, current)   # retain ANY trustworthy artifact; not a completion

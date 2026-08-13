@@ -69,6 +69,16 @@ class TestFfuf:
         a = self._art(tmp_path, {"results": [{"u": 1}]})
         assert reclassify_ffuf(_r(Status.EMPTY), a).status == Status.SUCCESS
 
+    def test_preserved_final_is_not_current_without_native_receipt_claim(self, tmp_path):
+        prior = self._art(tmp_path, {"results": [{"u": 1}]})
+        result = _r(Status.EMPTY)
+        result.meta["native_outputs"] = {"current_paths": []}
+
+        reclassify_ffuf(result, prior)
+
+        assert result.status == Status.PARTIAL
+        assert "missing/malformed" in result.note
+
     def test_blocked_matrix_keyed_on_exit(self, tmp_path):
         empty = self._art(tmp_path, {"results": []})
         # clean exit + block signature + 0 → PARTIAL (completed); nonzero exit + 0 → stays BLOCKED
