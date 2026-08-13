@@ -14,6 +14,7 @@ from .. import normalize, policy
 from .. import settings
 from ..runner import (RunResult, Status, fresh_artifact_dir, have, nuclei_timeout, reclassify_from_files,
                       run as exec_tool, scaled_timeout, skipped)
+from ..runner_repository import RepositoryOutput
 from .. import budget, events, remainder, sweep
 from ..contract import registered
 
@@ -256,7 +257,12 @@ def _a1d_recursive_brute(ctx) -> set[str]:
         if prof.dns_rate:
             cmd += ["--rate-limit", str(prof.dns_rate)]
         br = ctx.run.raw_path("enrich", "puredns", f"a1d-brute-{apex}-{unit}.txt")
-        r = exec_tool("puredns", cmd, raw_path=br, timeout=ctx.http_timeout)
+        r = exec_tool(
+            "puredns", cmd,
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish(*br.relative_to(ctx.run.dir).parts),
+            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        )
         ctx.run.record("enrich", r)
         if r.status is not Status.SKIPPED and apex not in apexes_run:
             # an invocation that never spawned is not an apex we brute-forced
@@ -376,8 +382,12 @@ def run(ctx) -> None:
     # 1. resolve (A) — pull the late hosts into `resolved`
     if have("dnsx"):
         res = ctx.run.raw_path("enrich", "dnsx", "resolved.txt")
-        r = exec_tool("dnsx", ["dnsx", "-l", str(targets), "-a", "-resp", "-json", "-silent"],
-                      raw_path=res, timeout=ctx.http_timeout)
+        r = exec_tool(
+            "dnsx", ["dnsx", "-l", str(targets), "-a", "-resp", "-json", "-silent"],
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish(*res.relative_to(ctx.run.dir).parts),
+            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        )
         ctx.run.record("enrich", r)
         if r.raw_path:
             for e in normalize.dnsx_resolved(r.raw_path.read_text(), "dnsx", str(res)):
@@ -391,8 +401,12 @@ def run(ctx) -> None:
         cn = ctx.run.raw_path("enrich", "dnsx", "cnames.jsonl")
         # -a so dangling = has CNAME but no A in THIS result (enrich itself can add a no-A host
         # to `resolved` with a:[], so resolved-set membership is not a reliable dangling signal).
-        r = exec_tool("dnsx", ["dnsx", "-l", str(targets), "-cname", "-a", "-json", "-silent"],
-                      raw_path=cn, timeout=ctx.http_timeout)
+        r = exec_tool(
+            "dnsx", ["dnsx", "-l", str(targets), "-cname", "-a", "-json", "-silent"],
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish(*cn.relative_to(ctx.run.dir).parts),
+            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        )
         ctx.run.record("enrich", r)
         if r.raw_path:
             ntk = 0
@@ -449,7 +463,11 @@ def run(ctx) -> None:
                 if prof.http_rl:
                     wcmd += ["-rl", str(prof.http_rl)]
                 ctx.run.record("enrich", exec_tool(
-                    "nuclei", wcmd, timeout=nuclei_timeout(len(new_live), ctx.http_timeout)))
+                    "nuclei", wcmd,
+                    repository=ctx.run,
+                    stdout=RepositoryOutput.discard(),
+                    stderr=RepositoryOutput.discard(),
+                    timeout=nuclei_timeout(len(new_live), ctx.http_timeout)))
                 if wo.exists():
                     for line in wo.read_text().splitlines():
                         try:
@@ -469,6 +487,9 @@ def run(ctx) -> None:
                     ["gowitness", "scan", "file", "-f", str(lf),
                      "--screenshot-path", str(shot_dir), "--write-jsonl",
                      "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
+                    repository=ctx.run,
+                    stdout=RepositoryOutput.discard(),
+                    stderr=RepositoryOutput.discard(),
                     timeout=ctx.http_timeout)
                 # same reclassification as probe; count this attempt's dir only, so a reused/
                 # pre-populated dir cannot inflate the count (the dir is fresh per invocation)
@@ -484,7 +505,12 @@ def run(ctx) -> None:
                 si = ctx.write_list("enrich_smap.txt", sm_targets)
                 sm = ctx.run.raw_path("enrich", "smap", "smap.json")
                 sm.unlink(missing_ok=True)              # -o file: clear stale before the run
-                sr = exec_tool("smap", ["smap", "-iL", str(si), "-oJ", str(sm)], timeout=600)
+                sr = exec_tool(
+                    "smap", ["smap", "-iL", str(si), "-oJ", str(sm)],
+                    repository=ctx.run,
+                    stdout=RepositoryOutput.discard(),
+                    stderr=RepositoryOutput.discard(), timeout=600,
+                )
                 # parse + reclassify + ingest via the same shared helper probe uses (-oJ structured;
                 # status reflects yield), so enrich's passive port yield is not lost as raw-only.
                 from .probe import _smap_ingest
