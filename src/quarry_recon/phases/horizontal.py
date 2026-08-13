@@ -181,7 +181,10 @@ def run(ctx) -> None:
         stderr=RepositoryOutput.discard(), timeout=120,
     )
     ctx.run.record("horizontal", r)
-    ips_file = ips_path if r.ok else cidr_file
+    # ``raw_path`` is the runner's publication proof.  A clean process whose
+    # repository publication fenced is PARTIAL (and therefore ``r.ok``), but
+    # its fixed final may still contain a prior invocation's bytes.
+    ips_file = r.raw_path if r.raw_path == ips_path else cidr_file
 
     # tls SAN harvest on the ranges -> in-scope hostnames
     if scope.passive_only:

@@ -1236,8 +1236,11 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
                 stderr=RepositoryOutput.discard(), timeout=600,
             )
             ctx.run.record("vertical", r)
-            if perms.exists():
-                cand += perms.read_text().splitlines()
+            # The fixed round name may preserve an earlier invocation's final
+            # when current publication fails.  Consume only the artifact named
+            # by this invocation's repository publication proof.
+            if r.raw_path == perms:
+                cand += r.raw_path.read_text().splitlines()
 
         if scope.passive_only:
             # passive = no target contact: `dnsx -a` resolves against the target's DNS, so it is skipped;
