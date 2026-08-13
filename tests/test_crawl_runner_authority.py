@@ -63,7 +63,7 @@ def test_jsluice_retains_unique_chunks_and_claim_publishes_the_aggregate(
     assert not list(aggregate.parent.glob("*.part"))
 
 
-def test_beautify_explicitly_discards_both_streams_without_a_run_log(
+def test_beautify_publishes_stdout_to_the_outer_generation_and_discards_stderr(
     tmp_path, monkeypatch,
 ):
     ctx = _running_context(tmp_path)
@@ -75,10 +75,16 @@ def test_beautify_explicitly_discards_both_streams_without_a_run_log(
 
     def fake_exec(tool, cmd, **kwargs):
         seen.append(kwargs)
+        output = kwargs["stdout"]
+        path = ctx.run._replace_artifact(
+            store.MutationScope.BASE_EVIDENCE,
+            output.components,
+            b"const x = 1;\n",
+        )
         return SimpleNamespace(
-            tool=tool, cmd=cmd, status=crawl.Status.SUCCESS, raw_path=None,
+            tool=tool, cmd=cmd, status=crawl.Status.SUCCESS, raw_path=path,
             duration=0.01, exit_code=0, note="", stderr_tail="", stdout_lines=0,
-            cpu_s=0.0, peak_rss_mb=0.0,
+            cpu_s=0.0, peak_rss_mb=0.0, meta={},
         )
 
     monkeypatch.setattr(crawl, "exec_tool", fake_exec)
@@ -91,6 +97,8 @@ def test_beautify_explicitly_discards_both_streams_without_a_run_log(
 
     assert (ok, degraded, status) == (1, 0, crawl.Status.SUCCESS)
     assert len(seen) == 1 and seen[0]["repository"] is ctx.run
-    assert seen[0]["stdout"] == RepositoryOutput.discard()
+    assert seen[0]["stdout"] == RepositoryOutput.publish(
+        *source.with_suffix(".js.beauty").relative_to(ctx.run.dir).parts,
+    )
     assert seen[0]["stderr"] == RepositoryOutput.discard()
-    assert not (ctx.run.raw / "crawl" / "js_beautify").exists()
+    assert source.read_text() == "const x = 1;\n"

@@ -21,7 +21,9 @@ from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
 from .. import (ast_obs, budget, cgroup, events, fetch, normalize, policy, registry,
                 remainder, secrets, settings, store)
 from ..contract import registered, run_contract
-from ..runner import Status, have, reclassify_from_artifact, run as exec_tool, skipped
+from ..runner import (Status, have, native_output_current, reclassify_from_artifact,
+                      run as exec_tool, skipped)
+from ..runner_native import RepositoryNativeOutput
 from ..runner_repository import RepositoryOutput
 
 # deep-mine patterns; each findall() yields the value to store (full match or capture group).
@@ -47,7 +49,7 @@ def _gitleaks_status(r, rep):
     """Validate the report, set `r.status` from it, and return the validated findings or None."""
     if r.status == Status.SKIPPED:
         return None                                        # never ran -> no report to ingest
-    items = _gitleaks_report(rep)
+    items = _gitleaks_report(rep) if native_output_current(r, rep) else None
     reclassify_from_artifact(r, None if items is None else len(items), label="gitleaks")
     return items
 
@@ -158,7 +160,7 @@ def _beautify_run(ctx, files):
     recorded result.
     """
     sid = "crawl.js_beautify"
-    events.tool_start(sid, cmd=["js-beautify", "-r"], input_total=len(files), discovery_context="js")
+    events.tool_start(sid, cmd=["js-beautify"], input_total=len(files), discovery_context="js")
     t0 = time.monotonic()
     degraded = ok = 0
     cpu_total = 0.0
@@ -166,17 +168,17 @@ def _beautify_run(ctx, files):
     for i, f in enumerate(files, 1):
         tmp = f.with_suffix(f.suffix + ".beauty")          # beautify a copy, never the only original
         try:
-            tmp.write_bytes(f.read_bytes())
-            res = exec_tool("js-beautify", ["js-beautify", "-r", str(tmp)],
+            res = exec_tool("js-beautify", ["js-beautify", str(f)],
                             repository=ctx.run,
-                            stdout=RepositoryOutput.discard(),
+                            stdout=RepositoryOutput.publish(*tmp.relative_to(ctx.run.dir).parts),
                             stderr=RepositoryOutput.discard(), timeout=JS_BEAUTIFY_TIMEOUT)
         except Exception:
             res = None
         cpu_total += getattr(res, "cpu_s", 0.0) or 0.0
         rss_peak = max(rss_peak, getattr(res, "peak_rss_mb", 0.0) or 0.0)
         swapped = False
-        if res is not None and res.status in (Status.SUCCESS, Status.EMPTY) and tmp.exists():
+        if (res is not None and res.status in (Status.SUCCESS, Status.EMPTY)
+                and res.raw_path == tmp and native_output_current(res, tmp) and tmp.exists()):
             try:
                 tmp.replace(f)                              # atomic swap-in only after a clean run
                 swapped = True
@@ -184,7 +186,6 @@ def _beautify_run(ctx, files):
             except Exception:
                 pass                                        # swap failed -> degraded, original kept
         if not swapped:
-            tmp.unlink(missing_ok=True)                     # degraded -> keep the untouched original
             degraded += 1
             reason = res.status.value if res is not None else "exception"
             events.coverage_partial(sid, reason=f"{f.name}: {reason}")
@@ -197,7 +198,7 @@ def _beautify_run(ctx, files):
     # record an aggregate result so the manifest/metrics can explain resource use + degradation
     ctx.run.record("crawl", type("R", (), {
         "tool": "js-beautify", "status": status, "exit_code": None, "duration": dur,  # synthetic multi-proc: no single exit code
-        "stdout_lines": ok, "cmd": ["js-beautify", "-r"], "stderr_tail": "",
+        "stdout_lines": ok, "cmd": ["js-beautify"], "stderr_tail": "",
         "note": f"{ok}/{len(files)} beautified" + (f", {degraded} degraded" if degraded else ""),
         "cpu_s": round(cpu_total, 2), "peak_rss_mb": round(rss_peak, 1)})())
     return ok, degraded, status
@@ -1552,9 +1553,9 @@ def run(ctx) -> None:
 
     # ── active crawl (katana) + store responses for xnLinkFinder ──
     kat_resp = ctx.run.dir / "raw" / "crawl" / "katana_resp"
+    kat_resp_current = False
     if not scope.passive_only and targets.stat().st_size:
         kat = ctx.run.raw_path("crawl", "katana", "katana.txt")
-        kat_resp.mkdir(parents=True, exist_ok=True)
         # katana is network-bound, so crawl concurrency (-c) and parallel-host count (-p) come from
         # settings. The headless SPA pass below stays low: it spawns chromium.
         cmd = ["katana", "-list", str(targets), "-jc", "-d", "2", "-kf", "all",
@@ -1570,13 +1571,17 @@ def run(ctx) -> None:
         kat_wu = events.work_unit("crawl.katana_standard",
                                   file_digests={"targets": events.file_digest(targets)},
                                   config={"depth": 2, "jc": True, "kf": "all"})
-        r = run_contract(
-            "crawl.katana_standard", cmd,
+        r = run_contract("crawl.katana_standard", cmd,
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*kat.relative_to(ctx.run.dir).parts),
-            stderr=RepositoryOutput.discard(), work_unit=kat_wu, timeout=ctx.http_timeout,
+            stderr=RepositoryOutput.discard(),
+            native_outputs=(RepositoryNativeOutput.tree(
+                ((16, ()),), *kat_resp.relative_to(ctx.run.dir).parts,
+            ),),
+            work_unit=kat_wu, timeout=ctx.http_timeout,
         )
         ctx.run.record("crawl", r)
+        kat_resp_current = native_output_current(r, kat_resp)
         if r.raw_path:
             ctx.echo(f"  katana: +{_collect_url(ctx, r.raw_path.read_text(), 'katana', str(kat))} urls")
 
@@ -1634,7 +1639,6 @@ def run(ctx) -> None:
     # -mode B downloads archived responses so xnLinkFinder can mine them; -oijs saves inline JS
     for d in prof.apex_domains:
         wdir = ctx.run.dir / "raw" / "crawl" / "waymore" / d
-        wdir.mkdir(parents=True, exist_ok=True)
         wm = wdir / "waymore.txt"   # name xnLinkFinder auto-detects in the dir
         mode = "B" if not scope.passive_only else "U"
         # -ci d (one capture/day) and -l <cap> bound response volume; the runner timeout catches the rest.
@@ -1646,17 +1650,26 @@ def run(ctx) -> None:
         sid = "crawl.waymore_responses" if mode == "B" else "crawl.waymore_urls"
         wu = events.work_unit(sid, inputs={"apex": d, "mode": mode},
                               config={"limit": prof.waymore_limit if mode == "B" else None, "ci": "d"})
+        native_outputs = ((RepositoryNativeOutput.tree(
+            ((13, ()), (6, ("waymore.txt",))),
+            *wdir.relative_to(ctx.run.dir).parts,
+        ),) if mode == "B" else (RepositoryNativeOutput.file(
+            6, *wm.relative_to(ctx.run.dir).parts, required=False,
+        ),))
         r = run_contract(
             sid, cmd,
             repository=ctx.run,
             stdout=RepositoryOutput.discard(),
-            stderr=RepositoryOutput.discard(), work_unit=wu, timeout=ctx.http_timeout,
+            stderr=RepositoryOutput.discard(), native_outputs=native_outputs,
+            work_unit=wu, timeout=ctx.http_timeout,
         )
         ctx.run.record("crawl", r)
-        if wm.exists():
+        waymore_current = native_output_current(r, wdir if mode == "B" else wm)
+        if waymore_current and wm.exists():
             _collect_url(ctx, wm.read_text(), "waymore", str(wm))
         # mine the response dir (only if responses were actually downloaded)
-        if mode == "B" and len([p for p in wdir.iterdir() if p.name != "waymore.txt"]) > 1:
+        if (mode == "B" and waymore_current
+                and len([p for p in wdir.iterdir() if p.name != "waymore.txt"]) > 1):
             # collected, not run: every input is mined under one source lifecycle at the end of the phase, so
             # `crawl.xnlinkfinder` has one terminal instead of four competing ones.
             xnl_units.append((str(wdir), f"waymore-{d}", True))
@@ -1748,7 +1761,7 @@ def run(ctx) -> None:
         xnl_units.append((str(js_derived_dir), "js", False))
 
     # ── xnLinkFinder over katana's stored responses ──
-    if kat_resp.exists() and any(kat_resp.iterdir()):
+    if kat_resp_current and kat_resp.exists() and any(kat_resp.iterdir()):
         xnl_units.append((str(kat_resp), "katana-resp", False))
 
     # (waymore response mining happens per-apex above via -mode B + xnLinkFinder)
@@ -1763,7 +1776,6 @@ def run(ctx) -> None:
         for sd in scan_dirs:
             rep = ctx.run.raw_path("crawl", "gitleaks",
                                    "report.json" if sd == js_derived_dir else "report-sourcemap.json")
-            rep.unlink(missing_ok=True)                    # a stale report must not fabricate findings
             # gitleaks runs twice under one source_id, so each invocation needs its own work unit: the dir name
             # plus a per-file content digest, because a same-size edit must still re-scan.
             digests = {}
@@ -1780,10 +1792,14 @@ def run(ctx) -> None:
                              repository=ctx.run,
                              stdout=RepositoryOutput.discard(),
                              stderr=RepositoryOutput.discard(),
+                             native_outputs=(RepositoryNativeOutput.file(
+                                 4, *rep.relative_to(ctx.run.dir).parts,
+                             ),),
                              work_unit=gl_wu,
                              reclassify=lambda res: (_gitleaks_status(res, rep), res)[1],
                              ok_codes=(0, 1), timeout=ctx.http_timeout)
-            items = _gitleaks_report(rep)                  # validated findings for ingest (status already set)
+            items = (_gitleaks_report(rep) if native_output_current(r, rep)
+                     else None)                            # authenticated findings for ingest
             for item in (items or []):
                 sec = item.get("Secret", "")
                 # fingerprint from the secret; fall back to rule+file+line so an empty Secret cannot
@@ -2053,11 +2069,17 @@ def _xnl_decode(shot: tuple) -> tuple:
     return out, bad, False
 
 
-def _xnl_snapshot(outs: dict) -> dict:
+def _xnl_snapshot(outs: dict, result=None) -> dict:
     """Read a unit's four artifacts once: `{key: (state, bytes)}`. The bytes that produce the entities are
     the bytes bound into the ledger, so parsing, publication and verification cannot disagree.
     """
-    return {k: _xnl_read(outs[k]) for k in ("links", "params", "secrets", "wordlist")}
+    meta = getattr(result, "meta", None)
+    legacy = result is None or not isinstance(meta, dict) or "native_outputs" not in meta
+    return {
+        k: (_xnl_read(outs[k]) if legacy or native_output_current(result, outs[k])
+            else ("absent", b""))
+        for k in ("links", "params", "secrets", "wordlist")
+    }
 
 
 def _xnl_lines(path) -> tuple:
@@ -2298,7 +2320,7 @@ def _xnl_mine(ctx, sid: str, units: list, state_dir, ledger, st: dict) -> None:
                 continue
             run = _xnl_run(ctx, tag, prep["blob"], prep["written"], spo=spo)
             # one read of each artifact; these exact bytes parse, publish and are digest-bound.
-            snap = _xnl_snapshot(run["outs"])
+            snap = _xnl_snapshot(run["outs"], run["result"])
             # the carrier joins the accounting before any entity is written, so a sink that raises — or a
             # cancellation — cannot leave the terminal claiming "nothing extracted" over a non-empty store.
             res = _xnl_result(tag)
@@ -2529,23 +2551,39 @@ def _xnl_run(ctx, tag: str, blob, written: int, *, spo: bool = False) -> dict:
     outs = _xnl_outputs(ctx, tag)
     out_links, out_params, out_secrets, out_wl = (outs["links"], outs["params"], outs["secrets"],
                                                   outs["wordlist"])
-    # xnLinkFinder appends to existing output files unless -ow, so the per-tag outputs are cleared and -ow
-    # passed: a stale artifact from an earlier invocation would otherwise inflate the count.
-    for _o in (out_links, out_params, out_secrets, out_wl):
-        _o.unlink(missing_ok=True)
+    # -ow is retained for the tool's own semantics; the facade rewrites every output slot to a
+    # worker-private destination, so no prior final can be appended to or truncated.
     cmd = ["xnLinkFinder", "-sp", str(roots), "-sf", str(roots), "-ow",
            "-o", str(out_links), "-op", str(out_params), "-all", "-mfs", "0"]
-    if spo:
-        # -spo (scope-prefix-original) is meaningful because `-sp` is always supplied above.
-        cmd.append("-spo")
     # -owl and -os hang for minutes on a large blob, so they run only on small input; a large dir gets a
     # derived wordlist below, and -os is covered by trufflehog/gitleaks/jsluice
     small = _xnl_wants_secrets(written)
     if small:
         cmd += ["-owl", str(out_wl), "-os", str(out_secrets)]
+    if spo:
+        # -spo (scope-prefix-original) is meaningful because `-sp` is always supplied above. Append it
+        # after output bindings so their argv indices remain fixed across the two concrete commands.
+        cmd.append("-spo")
     # always -d 0: this lane extracts from bytes we hold and requests nothing. Any depth makes
     # xnLinkFinder fetch what it extracts under its unanchored `-sf` regex, so depth is not a caller arg.
     cmd += ["-d", "0"]
+    native_outputs = (
+        RepositoryNativeOutput.file(
+            7, *out_links.relative_to(ctx.run.dir).parts, required=False,
+        ),
+        RepositoryNativeOutput.file(
+            9, *out_params.relative_to(ctx.run.dir).parts, required=False,
+        ),
+    )
+    if small:
+        native_outputs += (
+            RepositoryNativeOutput.file(
+                14, *out_wl.relative_to(ctx.run.dir).parts, required=False,
+            ),
+            RepositoryNativeOutput.file(
+                16, *out_secrets.relative_to(ctx.run.dir).parts, required=False,
+            ),
+        )
     # PYTHONHASHSEED=0: xnLinkFinder dedups via list(set(...)), whose iteration order is hash-seed
     # randomized, so on link-dense input the extracted set varies run to run without a pinned seed.
     r = exec_tool(
@@ -2553,13 +2591,15 @@ def _xnl_run(ctx, tag: str, blob, written: int, *, spo: bool = False) -> dict:
         repository=ctx.run,
         stdout=RepositoryOutput.discard(),
         stderr=RepositoryOutput.discard(),
+        native_outputs=native_outputs,
         timeout=ctx.http_timeout, input_file=blob, env={"PYTHONHASHSEED": "0"},
     )
     ctx.run.record("crawl", r)
     # `-ow` truncates the four artifacts at start, so a killed run leaves whatever was flushed: real
     # evidence, and not a completed extraction. Both facts travel out of here.
     extraction_complete = r.status in (Status.SUCCESS, Status.EMPTY)
-    return {"status": r.status, "complete": extraction_complete, "outs": outs, "small": small}
+    return {"status": r.status, "complete": extraction_complete, "outs": outs,
+            "small": small, "result": r}
 
 
 def _xnl_result(tag: str) -> dict:
@@ -2715,8 +2755,11 @@ def _xnl_ingest(ctx, tag: str, snap: dict, *, blob=None, written: int = 0, repla
         # decision (`vertical._target_wordlist`), not this pass's.
         derived = ("\n".join(sorted(words)) + "\n").encode()
         out_wl = _xnl_outputs(ctx, tag)["wordlist"]
-        out_wl.write_bytes(derived)
-        snap["wordlist"] = ("ok", derived)     # OUR artifact now, and the bytes that will be published
+        digest = hashlib.sha256(derived).hexdigest()
+        if budget.publish_bytes(out_wl, derived, digest=digest):
+            snap["wordlist"] = ("ok", derived) # OUR artifact now, and the bytes that will be published
+        else:
+            snap["wordlist"] = ("unreadable", b"")
         events.coverage_partial("crawl.xnlinkfinder",
                                 reason=f"{tag}: -owl skipped ({written // (1024*1024)}MB input, timekiller) — "
                                        f"wordlist DERIVED from links/params ({len(words)}); -os skipped "
