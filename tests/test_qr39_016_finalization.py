@@ -144,10 +144,11 @@ def test_a_published_view_is_generation_addressed_and_skipped_when_current(tmp_p
     assert run.stage_current("hotlist") and not run.finalization_failed()
 
 
-def test_new_base_evidence_makes_every_view_stale(tmp_path, monkeypatch):
+def test_finished_run_rejects_new_base_evidence_and_keeps_views_current(tmp_path, monkeypatch):
     _run(tmp_path, monkeypatch)
     run = Run.open(tmp_path, "t", _run_dir(tmp_path).name)
     before = run.generation()
-    assert run.add("subdomain", {"host": "a.example.com", "source": "t"})
-    assert run.generation() != before
-    assert not run.stage_current("hotlist"), "a view stamped with older evidence is not current"
+    with pytest.raises(state.ContractError, match="base evidence is sealed"):
+        run.add("subdomain", {"host": "a.example.com", "source": "t"})
+    assert run.generation() == before
+    assert run.stage_current("hotlist"), "a refused base mutation cannot stale a derived view"
