@@ -582,6 +582,57 @@ def test_direct_containment_acquisition_refusal_is_unsupported_without_spawn(
     assert not outcome.transaction_complete
 
 
+@pytest.mark.parametrize(
+    "acquire_exception",
+    [
+        containment.ContainmentFailure(
+            containment.ContainmentReason.LEAF_CREATE_FAILED,
+        ),
+        OSError("injected acquisition machinery failure"),
+    ],
+    ids=("typed", "os-error"),
+)
+def test_direct_containment_acquisition_machinery_failure_is_typed_without_spawn(
+    fake_direct_containment, acquire_exception,
+):
+    fake_direct_containment.acquire_exception = acquire_exception
+    spawn_calls = []
+
+    outcome = supervisor.bootstrap_worker(
+        _request(), deadline=time.monotonic() + 1,
+        popen_factory=lambda *args, **kwargs: spawn_calls.append((args, kwargs)),
+    )
+
+    assert fake_direct_containment.acquire_calls == [RID]
+    assert fake_direct_containment.handles == []
+    assert spawn_calls == []
+    assert outcome.reason is supervisor.BootstrapReason.CONTAINMENT_FAILED
+    assert not outcome.worker_spawned
+    assert not outcome.transaction_complete
+
+
+@pytest.mark.parametrize("cancellation_type", [KeyboardInterrupt, SystemExit])
+def test_direct_containment_acquisition_cancellation_is_exact_without_spawn(
+    fake_direct_containment, cancellation_type,
+):
+    cancellation = cancellation_type("cancel containment acquisition")
+    fake_direct_containment.acquire_exception = cancellation
+    spawn_calls = []
+
+    with pytest.raises(cancellation_type) as caught:
+        supervisor.bootstrap_worker(
+            _request(), deadline=time.monotonic() + 1,
+            popen_factory=lambda *args, **kwargs: spawn_calls.append(
+                (args, kwargs)
+            ),
+        )
+
+    assert caught.value is cancellation
+    assert fake_direct_containment.acquire_calls == [RID]
+    assert fake_direct_containment.handles == []
+    assert spawn_calls == []
+
+
 @pytest.mark.parametrize("mode", ["unverified", "error"])
 def test_parent_never_commands_when_exact_parked_binding_fails(
     monkeypatch, fake_direct_containment, mode,
@@ -708,6 +759,173 @@ def test_containment_settlement_uses_trusted_real_monotonic_deadline(
     assert outcome.reason is supervisor.BootstrapReason.ABORTED
     assert fake_direct_containment.handle.settlement_deadlines == [1050.0]
     assert fake_direct_containment.handle.terminal is True
+
+
+@pytest.mark.parametrize("cancellation_type", [KeyboardInterrupt, SystemExit])
+def test_containment_settlement_cancellation_reconciles_then_reraises_after_reap(
+    monkeypatch, fake_direct_containment, cancellation_type,
+):
+    cancellation = cancellation_type("cancel first containment settlement entry")
+    child_box = []
+    acquire = supervisor.acquire_direct_cgroup_v2
+
+    def acquire_with_one_shot_cancellation(request_id):
+        handle = acquire(request_id)
+
+        def settle(deadline):
+            handle.settlement_deadlines.append(deadline)
+            fake_direct_containment.events.append(("settle", deadline))
+            if len(handle.settlement_deadlines) == 1:
+                raise cancellation
+            result = containment.ContainmentSettlement(
+                True, True, True, containment.ContainmentReason.SETTLED,
+            )
+            handle.terminal = True
+            return result
+
+        handle.kill_settle_remove = settle
+        return handle
+
+    monkeypatch.setattr(
+        supervisor, "acquire_direct_cgroup_v2",
+        acquire_with_one_shot_cancellation,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "capture_process_identity",
+        lambda pid: SimpleNamespace(pid=pid, start_time_ticks=123456),
+    )
+
+    def factory(_argv, **_kwargs):
+        child = _PipeChild(_honest_abort_peer)
+        child_box.append(child)
+        return child
+
+    with pytest.raises(cancellation_type) as caught:
+        supervisor.bootstrap_worker(
+            _request(), deadline=time.monotonic() + 2,
+            popen_factory=factory,
+        )
+
+    handle = fake_direct_containment.handle
+    child = child_box[0]
+    assert caught.value is cancellation
+    assert len(handle.settlement_deadlines) == 2
+    assert handle.close_calls == 0
+    assert handle.terminal is True
+    assert not child._thread.is_alive()
+    assert child.returncode == 0
+
+
+@pytest.mark.parametrize("cancellation_type", [KeyboardInterrupt, SystemExit])
+def test_containment_fallback_close_cancellation_retries_then_reraises_after_reap(
+    monkeypatch, fake_direct_containment, cancellation_type,
+):
+    cancellation = cancellation_type("cancel first containment close entry")
+    child_box = []
+    fake_direct_containment.settlement_result = containment.ContainmentSettlement(
+        True, False, False, containment.ContainmentReason.DEADLINE_EXPIRED,
+    )
+    acquire = supervisor.acquire_direct_cgroup_v2
+
+    def acquire_with_one_shot_close_cancellation(request_id):
+        handle = acquire(request_id)
+
+        def close():
+            handle.close_calls += 1
+            fake_direct_containment.events.append(("close", None))
+            if handle.close_calls == 1:
+                raise cancellation
+            handle.terminal = True
+
+        handle.close = close
+        return handle
+
+    monkeypatch.setattr(
+        supervisor, "acquire_direct_cgroup_v2",
+        acquire_with_one_shot_close_cancellation,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "capture_process_identity",
+        lambda pid: SimpleNamespace(pid=pid, start_time_ticks=123456),
+    )
+
+    def factory(_argv, **_kwargs):
+        child = _PipeChild(_honest_abort_peer)
+        child_box.append(child)
+        return child
+
+    with pytest.raises(cancellation_type) as caught:
+        supervisor.bootstrap_worker(
+            _request(), deadline=time.monotonic() + 2,
+            popen_factory=factory,
+        )
+
+    handle = fake_direct_containment.handle
+    child = child_box[0]
+    assert caught.value is cancellation
+    assert len(handle.settlement_deadlines) == 1
+    assert handle.close_calls == 2
+    assert handle.terminal is True
+    assert not child._thread.is_alive()
+    assert child.returncode == 0
+
+
+def test_expired_cleanup_reaps_exact_worker_before_containment_settlement():
+    events = []
+    settled = containment.ContainmentSettlement(
+        True, True, True, containment.ContainmentReason.SETTLED,
+    )
+
+    class Child:
+        pid = FAKE_PID
+        stdin = None
+        stdout = None
+
+        def __init__(self):
+            self.returncode = None
+            self.wait_calls = 0
+
+        def poll(self):
+            events.append(("poll", self.returncode))
+            return self.returncode
+
+        def kill(self):
+            events.append(("kill", None))
+            self.returncode = -signal.SIGKILL
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            pytest.fail("an expired cleanup budget must not enter blocking wait")
+
+    class Handle:
+        def kill_settle_remove(self, deadline):
+            events.append(("settle", deadline))
+            assert owner.worker_reaped is True
+            assert owner.worker_returncode == -signal.SIGKILL
+            return settled
+
+        def close(self):
+            pytest.fail("a settled containment must not use fallback close")
+
+    child = Child()
+    owner = supervisor._BootstrapOwner(
+        containment=Handle(), child=child, worker_spawned=True,
+        worker_pid=FAKE_PID, failure=supervisor.BootstrapReason.DEADLINE,
+    )
+    real_deadline = supervisor._REAL_MONOTONIC() - 1
+
+    supervisor._settle_owned_child(
+        owner, deadline=10.0, clock=lambda: 11.0,
+        real_deadline=real_deadline,
+    )
+
+    assert child.wait_calls == 0
+    assert owner.worker_reaped is True
+    assert owner.worker_returncode == -signal.SIGKILL
+    assert owner.containment_terminal is True
+    assert [event for event, _value in events] == ["poll", "kill", "poll", "settle"]
 
 
 def test_ready_without_prepared_never_authorizes_parent_command(monkeypatch):
@@ -1063,6 +1281,42 @@ def test_private_outcome_rejects_aborted_without_spawned_worker():
             parent_pipes_closed=True,
             kill_requested=False,
         )
+
+
+@pytest.mark.parametrize(
+    "missing_witness", ["_containment_bound", "_containment_settled"],
+    ids=("binding", "settlement"),
+)
+def test_private_outcome_requires_hidden_containment_witnesses_for_aborted(
+    missing_witness,
+):
+    request = _request()
+    values = {
+        "reason": supervisor.BootstrapReason.ABORTED,
+        "worker_pid": FAKE_PID,
+        "worker_start_time_ticks": 1,
+        "ready": _ready(request),
+        "settlement": _settlement(request),
+        "worker_returncode": 0,
+        "worker_spawned": True,
+        "worker_reaped": True,
+        "control_eof": True,
+        "observed_trailing_control_bytes": 0,
+        "abort_command_sent": True,
+        "parent_pipes_closed": True,
+        "kill_requested": False,
+        "_containment_bound": True,
+        "_containment_settled": True,
+    }
+    values[missing_witness] = False
+
+    with pytest.raises(ValueError, match="incomplete successful bootstrap"):
+        supervisor._outcome(request, **values)
+
+    values[missing_witness] = True
+    outcome = supervisor._outcome(request, **values)
+    assert outcome.reason is supervisor.BootstrapReason.ABORTED
+    assert outcome.transaction_complete is True
 
 
 def test_private_authority_rejects_aborted_outcome_with_wrong_ready_digest(
