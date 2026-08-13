@@ -1087,18 +1087,18 @@ def _finalize_stage(run_obj, stage: str, fn, *, force: bool, present=None) -> st
     """One derived view, and what became of it: `skipped` when already published for this generation,
     `failed` when it raised (a committed publication fault, never a lost run), else `done`.
 
-    `present` answers whether the artifact is actually on disk. The generation stamp records what was
-    rendered, not what survived, so a view deleted since is stale however current the stamp looks.
+    A failed stage is durable immediately and reconciliation turns it into the
+    manifest's publication fault. `present` answers whether the artifact is
+    actually on disk. The generation stamp records what was rendered, not what
+    survived, so a deleted view is stale however current its stamp looks.
     """
     if not force and run_obj.stage_current(stage) and (present is None or present()):
         return "skipped"
     try:
         fn()
     except Exception as e:                                    # noqa: BLE001
-        from .state import Fault
         detail = secrets.redact(str(e)) or type(e).__name__
         run_obj.mark_stage(stage, "failed", detail=detail)
-        run_obj.commit_fault(Fault("publication", where=stage, detail=detail))
         click.echo(_c(f"   ! finalisation stage {stage} failed — {detail}", "red"))
         return "failed"
     run_obj.mark_stage(stage, "done")
@@ -1340,10 +1340,8 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None, finished=N
         run_obj.notes += [c.line() for c in all_cps]
 
     # ── finalisation ──────────────────────────────────────────────────────────
-    # base evidence commits first and alone; every derived view below is idempotent, generation-addressed
-    # and resumable, so a late report failure can never leave the run ambiguous
-    run_obj.write_state("finalizing")
-
+    # Every classifier which can add an entity or emit coverage runs before the
+    # irreversible seal. Derived rendering below is read-only over this base.
     from . import gadgets
     try:
         n_gadgets = gadgets.classify(run_obj, scope)
@@ -1351,6 +1349,9 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None, finished=N
             click.echo(_c(f"   ⛓ {n_gadgets} gadget candidate(s) — chain material, not findings", "cyan"))
     except Exception as e:                                    # noqa: BLE001
         run_obj.notes.append(f"gadgets: EXCEPTION {secrets.redact(str(e))}")
+
+    from . import evidence as _evidence
+    _evidence.classify_ownership(run_obj)
 
     # telemetry -> metrics/summary.json, before the manifest so the manifest points at it. It is a derived
     # view like any other: losing it costs the run its telemetry, never its evidence
@@ -1366,25 +1367,31 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None, finished=N
                                 "slowest_tool": (tel["long_poles"]["tools"][0]
                                                  if tel["long_poles"]["tools"] else None)})
 
-    def _seal():
-        run_obj.write_manifest(
-            profile_summary={"apex_domains": profile.apex_domains, "cidr": profile.cidr,
-                             "passive_only": profile.passive_only, "ports": profile.ports},
-            phases_run=selected, metrics=metrics_summary or None, policy=policy_rows)
+    metrics_error = None
+    try:
+        _write_metrics()
+    except Exception as e:                                    # noqa: BLE001
+        metrics_error = secrets.redact(str(e)) or type(e).__name__
 
-    _finalize_stage(run_obj, "metrics", _write_metrics, force=True)
-    # the base commit is contained too: without a manifest there is no verdict to resume to, so a run that
-    # cannot write one is recorded finalization_failed rather than left `finalizing` with nothing to read
-    _contained(run_obj, "manifest", _seal)      # base commit: the evidence and its verdict are durable now
+    prepared_manifest = run_obj.begin_finalization(
+        profile_summary={"apex_domains": profile.apex_domains, "cidr": profile.cidr,
+                         "passive_only": profile.passive_only, "ports": profile.ports},
+        phases_run=selected, metrics=metrics_summary or None, policy=policy_rows,
+    )
+    if metrics_error is None:
+        run_obj.mark_stage("metrics", "done")
+    else:
+        run_obj.mark_stage("metrics", "failed", detail=metrics_error)
+        click.echo(_c(f"   ! finalisation stage metrics failed — {metrics_error}", "red"))
 
-    # derived views; the manifest is re-sealed below either way, so the committed verdict always reflects
-    # what publication did and a finished run's verdict is sealed against a late fault
-    run_obj.unseal_verdict()
+    # Without a manifest there is no verdict to resume to, so publication is
+    # contained even though its bytes were computed atomically with the seal.
+    _contained(run_obj, "manifest", lambda: run_obj.publish_manifest(prepared_manifest))
+
+    # Derived views and publication bookkeeping are the only mutable surface now.
     exp = _publish_views(run_obj, scope, checkpoints=all_cps) or {}
     failed = run_obj.finalization_failed()
-    # the re-seal is machinery too: without containment a failure here leaves the run `finalizing` while
-    # the committed manifest still claims what publication has since disproved
-    _contained(run_obj, "reseal", _seal)
+    _contained(run_obj, "reconcile", lambda: _reconcile_base(run_obj))
     run_obj.write_state("finalization_failed" if failed else "finished",
                         detail="a derived view could not be published" if failed else None)
 
@@ -1487,9 +1494,9 @@ def report(profile_path, run_id, force, as_json):
         # minimal scope (report doesn't re-filter)
         from .config import ScopeMatcher
         scope = ScopeMatcher([], [], [], False)
-        # re-finalising always reopens: the manifest may only change while `finalizing`, and a regeneration
-        # that fails has to be able to record that it did
-        run_obj.write_state("finalizing", detail="resumed by report")
+        # Re-finalising reopens only derived-publication bookkeeping. Base
+        # evidence remains permanently ineligible for mutation.
+        run_obj.reopen_finalization(detail="resumed by report")
         view = _report_view(run_obj)
         republished: list = []
         exp = _publish_views(view, scope, force=force, republished=republished)

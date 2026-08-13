@@ -21,7 +21,7 @@ from click.testing import CliRunner
 
 from quarry_recon import events, store
 from quarry_recon.cli import cli
-from quarry_recon.state import ContractError
+from quarry_recon.state import ContractError, Gap
 
 
 pytestmark = pytest.mark.offline
@@ -84,7 +84,7 @@ def test_begin_finalization_fsyncs_canonical_base_files_and_directories_before_s
     def observe(fd):
         path = _fd_path(fd)
         if path is not None:
-            synced[path] = (stat.S_IFMT(os.fstat(fd).st_mode), run.state)
+            synced.setdefault(path, (stat.S_IFMT(os.fstat(fd).st_mode), run.state))
         return real_fsync(fd)
 
     monkeypatch.setattr(store.os, "fsync", observe)
@@ -130,6 +130,7 @@ def test_a_base_fsync_failure_leaves_the_run_unsealed(tmp_path, monkeypatch):
     assert run.state == "running"
     assert not run.manifest_path.exists()
     assert run.count("subdomain") == 1
+    run.commit_gap(Gap(source_id="fixture.retry", kind="unknown"))
 
 
 @pytest.mark.parametrize("contender", ["append", "claim"])
@@ -271,6 +272,15 @@ def test_a_process_append_settles_before_the_waiting_seal(tmp_path, monkeypatch)
     assert reopened.count("subdomain") == 1
 
 
+def test_legacy_finalizing_transition_cannot_bypass_a_live_claim(tmp_path):
+    run = _running_run(tmp_path, run_id="state-api-claim")
+
+    with run.artifact_claim("raw", "fixture", "held.bin"):
+        with pytest.raises(ContractError, match="live artifact claim"):
+            run.write_state("finalizing")
+        assert run.state == "running"
+
+
 def test_finished_run_reopens_only_derived_publication_metadata(tmp_path):
     run = _running_run(tmp_path, run_id="derived-reopen")
     assert run.add("subdomain", {"host": "seed.acme.example", "source": "fixture"})
@@ -282,6 +292,8 @@ def test_finished_run_reopens_only_derived_publication_metadata(tmp_path):
     reopened = store.Run.open(tmp_path, "acme.example", run.run_id)
     reopened.reopen_finalization(detail="fixture report")
     assert reopened.state == "finalizing"
+    with pytest.raises(ContractError, match="reconcile only derived"):
+        reopened.write_manifest({}, ["horizontal"])
     with pytest.raises(ContractError):
         reopened.add("subdomain", {"host": "late.acme.example", "source": "fixture"})
     reopened.mark_stage("hotlist", "failed", detail="fixture publication failure")
@@ -334,7 +346,7 @@ def test_cli_runs_base_classifiers_and_events_before_begin_finalization(tmp_path
         classified = True
         return real_classify(run, scope)
 
-    def begin(run):
+    def begin(run, **kwargs):
         rows = [json.loads(line) for line in (run.dir / "events.jsonl").read_text().splitlines()]
         observed["classified"] = classified
         observed["ownership"] = any(
@@ -342,7 +354,7 @@ def test_cli_runs_base_classifiers_and_events_before_begin_finalization(tmp_path
             and row.get("source_id") == "evidence.ownership"
             for row in rows
         )
-        return real_begin(run)
+        return real_begin(run, **kwargs)
 
     monkeypatch.setattr(gadgets, "classify", classify)
     monkeypatch.setattr(store.Run, "begin_finalization", begin)

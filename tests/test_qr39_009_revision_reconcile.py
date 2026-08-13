@@ -29,9 +29,11 @@ def _profile(tmp_path: Path) -> Path:
     return p
 
 
-def _finished_run(tmp_path) -> Run:
+def _finished_run(tmp_path, *, urls=()) -> Run:
     run = Run.create(tmp_path / "proj", "example.com")
     run.add("subdomain", {"host": "a.example.com"})
+    for url in urls:
+        run.add("url", {"url": url})
     run.write_state("running")
     run.write_state("finalizing")
     run.write_manifest({}, ["horizontal"], metrics=None, policy=None)
@@ -139,8 +141,7 @@ def test_report_renders_the_revision_not_the_base(tmp_path, monkeypatch):
 
 # ── every raw_ref a revised digest names is a file that exists ────────────────────────────────────
 def test_every_raw_ref_in_a_revised_digest_resolves(tmp_path):
-    run = _finished_run(tmp_path)
-    run.add("url", {"url": "https://a.example.com/x"})
+    run = _finished_run(tmp_path, urls=("https://a.example.com/x",))
     rev = _late(run, tmp_path, "cb.jsonl", "qlate.csession01", "203.0.113.9")
 
     digest = json.loads((run.dir / "revisions" / rev.views["dir"] / "digest.json").read_text())

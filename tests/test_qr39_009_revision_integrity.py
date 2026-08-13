@@ -171,7 +171,6 @@ def test_a_supplement_is_refused_while_the_manifest_is_mid_flight(tmp_path):
     assert not (run.dir / "revisions" / "revision.json").exists()
     assert not (run.dir / "normalized" / "oob_interaction.jsonl").exists()
 
-    run.write_manifest({}, ["horizontal"], metrics=None, policy=None)   # the second seal
     run.write_state("finished")
     published = _import(run, tmp_path, "cb.jsonl", "q1.csession01")["revision"]
     assert published.revision == 1

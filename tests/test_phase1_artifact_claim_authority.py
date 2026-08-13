@@ -7,6 +7,7 @@ the caller receives only a disposable writer, never an ambient final ``Path``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import select
@@ -273,7 +274,8 @@ def test_budget_pruning_cannot_delete_checkpoint_evidence_after_the_seal(tmp_pat
     run = _running_run(tmp_path, run_id="sealed-budget-prune")
     state_base = run.raw_path("content", "fixture", "anchor").parent
     old = budget.state_path(state_base, "content.fixture", "old-fingerprint")
-    old.write_text("owned checkpoint evidence")
+    body = b"owned checkpoint evidence"
+    assert budget.publish_bytes(old, body, digest=hashlib.sha256(body).hexdigest())
     run.begin_finalization()
     before = _tree_snapshot(tmp_path)
 

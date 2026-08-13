@@ -48,11 +48,15 @@ _RUN_LOCKS_GUARD = threading.Lock()
 _RUN_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _RUN_LOCK_LOCAL = threading.local()
 
-_BASE_ARTIFACT_ROOTS = frozenset({
-    "raw", "normalized", "metrics", "events.jsonl", "events.degraded.json",
-    "tool-runs.jsonl", "envelope-remainder.json", "envelope-refused.jsonl",
-    "envelope-fold-refused", "envelope-degraded.json",
+_BASE_ARTIFACT_DIRECTORY_ROOTS = frozenset({
+    "raw", "normalized", "metrics", "envelope-fold-refused",
 })
+_BASE_ARTIFACT_FILE_ROOTS = frozenset({
+    "events.jsonl", "events.degraded.json",
+    "tool-runs.jsonl", "envelope-remainder.json", "envelope-refused.jsonl",
+    "envelope-degraded.json",
+})
+_BASE_ARTIFACT_ROOTS = _BASE_ARTIFACT_DIRECTORY_ROOTS | _BASE_ARTIFACT_FILE_ROOTS
 _CLAIM_SUFFIX = ".claim"
 
 
@@ -939,6 +943,21 @@ class ToolRunRecord:
     depends_on: str = ""               # registry bin this source needs; the source→tool edge the verdict reads
 
 
+@dataclass(frozen=True)
+class _PreparedManifest:
+    """Opaque bytes computed while base evidence is still mutable.
+
+    Publication happens only after ``begin_finalization`` has flushed and
+    sealed that base.  Keeping serialized bytes here prevents a post-seal
+    manifest build from lazily folding or repairing canonical evidence.
+    """
+
+    run_id: str
+    target: str
+    manifest_text: str
+    history_text: str
+
+
 class _ArtifactClaim:
     """Opaque, single-use authority for one unpublished base artifact.
 
@@ -1378,6 +1397,123 @@ class Run:
                 raise
         return self.dir.joinpath(*components)
 
+    @staticmethod
+    def _validate_base_file_stat(observed, components: tuple[str, ...]) -> None:
+        from . import privfs
+        if (not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE):
+            joined = "/".join(components)
+            raise ContractError(f"canonical base file {joined!r} is unsafe")
+
+    @staticmethod
+    def _validate_base_directory_stat(observed, components: tuple[str, ...]) -> None:
+        from . import privfs
+        if (not stat.S_ISDIR(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or stat.S_IMODE(observed.st_mode) != privfs.DIR_MODE):
+            joined = "/".join(components) or "."
+            raise ContractError(f"canonical base directory {joined!r} is unsafe")
+
+    def _fsync_base_file_at(
+        self, parent_fd: int, name: str, components: tuple[str, ...],
+    ) -> None:
+        fd = -1
+        try:
+            fd = os.open(name, _FILE_OPEN_FLAGS, dir_fd=parent_fd)
+            before = os.fstat(fd)
+            self._validate_base_file_stat(before, components)
+            os.fsync(fd)
+            after = os.fstat(fd)
+            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            self._validate_base_file_stat(after, components)
+            self._validate_base_file_stat(named, components)
+            if ((after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                    or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)):
+                raise ContractError(
+                    f"canonical base file {'/'.join(components)!r} changed while sealing",
+                )
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
+                raise ContractError(
+                    f"canonical base file {'/'.join(components)!r} is unsafe",
+                ) from exc
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _fsync_base_directory_at(
+        self, parent_fd: int, name: str, components: tuple[str, ...],
+    ) -> None:
+        fd = -1
+        try:
+            fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=parent_fd)
+            before = os.fstat(fd)
+            self._validate_base_directory_stat(before, components)
+            for child in sorted(os.listdir(fd)):
+                child_components = components + (child,)
+                try:
+                    observed = os.stat(child, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    raise ContractError(
+                        f"canonical base entry {'/'.join(child_components)!r} changed while sealing",
+                    ) from None
+                if stat.S_ISREG(observed.st_mode):
+                    self._fsync_base_file_at(fd, child, child_components)
+                elif stat.S_ISDIR(observed.st_mode):
+                    self._fsync_base_directory_at(fd, child, child_components)
+                else:
+                    raise ContractError(
+                        f"canonical base entry {'/'.join(child_components)!r} is unsafe",
+                    )
+            os.fsync(fd)
+            after = os.fstat(fd)
+            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            self._validate_base_directory_stat(after, components)
+            self._validate_base_directory_stat(named, components)
+            if ((after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                    or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)):
+                raise ContractError(
+                    f"canonical base directory {'/'.join(components)!r} changed while sealing",
+                )
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ContractError(
+                    f"canonical base directory {'/'.join(components)!r} is unsafe",
+                ) from exc
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _flush_base_evidence(self) -> None:
+        """Flush every canonical base inode and its directory chain before sealing.
+
+        The run authority is held by the caller.  Traversal is descriptor-relative,
+        refuses links and non-private objects, and deliberately excludes lifecycle,
+        manifest, report, export and revision objects.
+        """
+        run_fd = _open_run_fd(self.project_dir, self.run_id)
+        try:
+            for name in ("run.json", *sorted(_BASE_ARTIFACT_ROOTS)):
+                try:
+                    observed = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if name == "run.json" or name in _BASE_ARTIFACT_FILE_ROOTS:
+                    if not stat.S_ISREG(observed.st_mode):
+                        raise ContractError(f"canonical base file {name!r} is unsafe")
+                    self._fsync_base_file_at(run_fd, name, (name,))
+                else:
+                    if not stat.S_ISDIR(observed.st_mode):
+                        raise ContractError(f"canonical base directory {name!r} is unsafe")
+                    self._fsync_base_directory_at(run_fd, name, (name,))
+            os.fsync(run_fd)
+        finally:
+            os.close(run_fd)
+
     @contextmanager
     def artifact_claim(self, *components):
         """Hold an opaque durable base-artifact authority until terminal settlement.
@@ -1397,11 +1533,20 @@ class Run:
             with self._mutation(MutationScope.CONTROL):
                 self._release_artifact_claim_marker(marker_name, marker_identity)
 
-    def begin_finalization(self) -> None:
-        """Irreversibly seal base evidence after every artifact owner settled."""
+    def begin_finalization(
+        self, *, profile_summary: dict | None = None,
+        phases_run: list[str] | None = None, metrics: dict | None = None,
+        policy: list | None = None, detail: str | None = None,
+    ) -> _PreparedManifest | None:
+        """Irreversibly seal base evidence after every artifact owner settled.
+
+        Production passes the manifest inputs so its exact bytes are computed
+        while this same authority is held, before the durability walk and state
+        transition.  The zero-argument form remains the lifecycle primitive.
+        """
         with self._mutation(MutationScope.CONTROL):
             state = self.state
-            if state not in {"running", "finalization_failed", "finished"}:
+            if state != "running":
                 raise ContractError(
                     f"run {self.run_id} cannot begin finalization from {state!r}",
                 )
@@ -1410,7 +1555,42 @@ class Run:
                 raise ContractError(
                     f"run {self.run_id} has {live} live artifact claim(s)",
                 )
-            self.write_state("finalizing")
+            try:
+                prepared = None
+                if phases_run is not None:
+                    prepared = self._prepare_manifest_locked(
+                        profile_summary or {}, phases_run, metrics, policy,
+                        base_mutations=True,
+                    )
+                elif any(value is not None for value in (profile_summary, metrics, policy)):
+                    raise TypeError("phases_run is required when preparing a final manifest")
+                self._flush_base_evidence()
+                self._write_state_locked("finalizing", detail=detail)
+                return prepared
+            except BaseException:
+                # A failed durability walk did not cross the seal boundary. Do
+                # not leave this live handle's verdict cache sealed either.
+                if self.state == "running":
+                    self.unseal_verdict()
+                raise
+
+    def reopen_finalization(self, *, detail: str | None = None) -> None:
+        """Reopen only derived-publication metadata for a committed base.
+
+        This transition never grants ``BASE_EVIDENCE`` authority: both eligible
+        sources are already sealed states, and the destination remains sealed.
+        """
+        with self._mutation(MutationScope.FINALIZATION_METADATA):
+            state = self.state
+            if state not in {"finished", "finalization_failed"}:
+                raise ContractError(
+                    f"run {self.run_id} cannot reopen finalization from {state!r}",
+                )
+            if not self.manifest_committed():
+                raise ContractError(
+                    f"run {self.run_id} has no committed manifest to re-finalize",
+                )
+            self._write_state_locked("finalizing", detail=detail)
 
     # ── C10a lifecycle ──
     @staticmethod
@@ -1611,8 +1791,7 @@ class Run:
                 self._gaps.append(gap)
 
     def unseal_verdict(self) -> None:
-        """Reopen the run for a re-seal: a finalisation fault raised after the base commit still reaches the
-        verdict, and a resumed finalisation recomputes it."""
+        """Clear only this handle's cached summary; never grant repository mutation authority."""
         self._verdict_sealed = False
         self._sealed_summary = None
 
@@ -1672,7 +1851,7 @@ class Run:
     def finalization_stages(self) -> dict:
         return dict(self._read_state().get("stages") or {})
 
-    def write_state(self, dst: str, *, detail: str | None = None) -> None:
+    def _write_state_locked(self, dst: str, *, detail: str | None = None) -> None:
         """Advance the finalisation state machine and persist it. Only the declared transitions are legal,
         and an unreadable record is never overwritten — it is evidence, and guessing past it is how a
         corrupt run re-finalises as a clean one."""
@@ -1687,6 +1866,19 @@ class Run:
         rec.update({"schema_version": 1, "run_id": self.run_id, "state": dst,
                     "generation": self.generation(), "updated": _utc(), "detail": detail})
         _atomic_write(self.state_path, json.dumps(rec, indent=2))
+
+    def write_state(self, dst: str, *, detail: str | None = None) -> None:
+        """Compatibility lifecycle API routed through the authoritative seal/reopen operations."""
+        if dst == "finalizing":
+            source = self.state
+            if source == "running":
+                self.begin_finalization(detail=detail)
+                return
+            if source in {"finished", "finalization_failed"}:
+                self.reopen_finalization(detail=detail)
+                return
+        with self._mutation(MutationScope.CONTROL):
+            self._write_state_locked(dst, detail=detail)
 
     def generation(self) -> str:
         """Content address of the base evidence a derived view is generated from; a view stamped with a
@@ -1717,8 +1909,13 @@ class Run:
         return any(r.get("status") == "failed" and r.get("generation") == g
                    for r in self.finalization_stages.values())
 
+    @_scoped_mutation(MutationScope.FINALIZATION_METADATA)
     def mark_stage(self, stage: str, status: str, *, detail: str | None = None) -> None:
         from .state import ContractError
+        if self.state != "finalizing":
+            raise ContractError(
+                f"run {self.run_id} must be in finalizing to record derived stage metadata",
+            )
         rec = self._read_state()
         if rec.get("unreadable"):
             raise ContractError(f"run {self.run_id} has an unreadable {self.state_path.name} — refusing to "
@@ -1728,6 +1925,7 @@ class Run:
         rec["schema_version"], rec["run_id"] = 1, self.run_id
         _atomic_write(self.state_path, json.dumps(rec, indent=2))
 
+    @_scoped_mutation(MutationScope.FINALIZATION_METADATA)
     def reconcile_finalization(self) -> dict | None:
         """Bring the committed manifest's summary back in step with the finalisation stages, and return it.
 
@@ -1743,6 +1941,10 @@ class Run:
         # than bring one back in step with the stages
         if not isinstance(manifest, dict) or not summary_well_formed(manifest.get("summary")):
             return None
+        if self.state != "finalizing":
+            raise ContractError(
+                f"run {self.run_id} must be explicitly reopened before derived reconciliation",
+            )
         summary = dict(manifest["summary"])
         stages = self.finalization_stages
         gen = self.generation()
@@ -2108,18 +2310,35 @@ class Run:
         return {**envelope.declaration(), "remainders": remainders}
 
     def _records_for(self, entity: str) -> dict:
-        """Lazily materialize {key: record} by folding the entity log under the full envelope. Reopen-fold
-        refusals are REWRITTEN per entity (truncate-then-stream), so repeated reopens yield the same rows,
-        never a growing pile, and the fold never holds the refused set resident."""
+        """Lazily materialize ``{key: record}`` under the full envelope.
+
+        While base evidence is live, fold refusals are rewritten per entity so
+        their durable count remains exact. A sealed/report fold is read-only and
+        relies on the refusal ledger committed before the seal.
+        """
         entity = validate_entity(entity)
         self._refresh_entity_cache(entity)
-        if entity not in self._records:
-            from . import envelope, privfs
-            # only a log that exists on disk can fold-refuse; a live-only run never touches the fold ledger
-            if not self._entity_file(entity).exists():
-                self._folded[entity] = fold_observations(self._entity_file(entity))
-                self._records[entity] = self._folded[entity].records
-                return self._records[entity]
+        if entity in self._records:
+            return self._records[entity]
+        # A live fold may durably account for over-envelope rows. A report/reopen
+        # fold is strictly read-only: the pre-seal manifest already records what
+        # was refused, and derived rendering cannot author new base ledgers.
+        if self.state in {"created", "running"}:
+            with self._mutation(MutationScope.BASE_EVIDENCE):
+                return self._fold_records_for(entity, persist_refusals=True)
+        return self._fold_records_for(entity, persist_refusals=False)
+
+    def _fold_records_for(self, entity: str, *, persist_refusals: bool) -> dict:
+        if entity in self._records:
+            return self._records[entity]
+        from . import envelope, privfs
+        # only a log that exists on disk can fold-refuse; a live-only run never touches the fold ledger
+        if not self._entity_file(entity).exists():
+            self._folded[entity] = fold_observations(self._entity_file(entity))
+            self._records[entity] = self._folded[entity].records
+            return self._records[entity]
+        fd = None
+        if persist_refusals:
             privfs.private_dir(self._fold_refused_dir)
             refused_any = [False]
             try:
@@ -2129,22 +2348,25 @@ class Run:
                                                f"envelope fold-refusal file unwritable for {entity!r} "
                                                f"({type(e).__name__})")
                 fd = None
+        else:
+            refused_any = [False]
 
-            def _sink(k: str, kind: str) -> None:
-                refused_any[0] = True
-                if fd is None:
-                    return
-                os.write(fd, (json.dumps({"entity": entity, "key": k, "kind": kind},
-                                         ensure_ascii=False) + "\n").encode("utf-8"))
+        def _sink(k: str, kind: str) -> None:
+            refused_any[0] = True
+            if fd is None:
+                return
+            os.write(fd, (json.dumps({"entity": entity, "key": k, "kind": kind},
+                                     ensure_ascii=False) + "\n").encode("utf-8"))
 
-            try:
-                folded = fold_observations(
-                    self._entity_file(entity), max_keys=self._envelope_cap(),
-                    max_bytes_per_key=envelope.MAX_BYTES_PER_KEY,
-                    max_corpus_bytes=envelope.MAX_CORPUS_BYTES_PER_ENTITY, on_refused=_sink)
-            finally:
-                if fd is not None:
-                    os.close(fd)
+        try:
+            folded = fold_observations(
+                self._entity_file(entity), max_keys=self._envelope_cap(),
+                max_bytes_per_key=envelope.MAX_BYTES_PER_KEY,
+                max_corpus_bytes=envelope.MAX_CORPUS_BYTES_PER_ENTITY, on_refused=_sink)
+        finally:
+            if fd is not None:
+                os.close(fd)
+        if persist_refusals:
             if not refused_any[0]:                # nothing refused now: clear any stale file (e.g. a raised bound)
                 try:
                     self._fold_refused_path(entity).unlink()
@@ -2153,9 +2375,9 @@ class Run:
             elif not self._envelope_marked:
                 self._envelope_marked = True
                 self._write_marker_stub()
-            self._folded[entity] = folded
-            self._records[entity] = folded.records
-            self._entity_signatures[entity] = self._entity_signature(entity)
+        self._folded[entity] = folded
+        self._records[entity] = folded.records
+        self._entity_signatures[entity] = self._entity_signature(entity)
         return self._records[entity]
 
     def _seen_keys(self, entity: str) -> set:
@@ -2546,21 +2768,19 @@ class Run:
             return []
         return list(latest.values())
 
-    def write_manifest(self, profile_summary: dict, phases_run: list[str],
-                       metrics: dict | None = None, policy: list | None = None) -> None:
+    def _prepare_manifest_locked(
+        self, profile_summary: dict, phases_run: list[str],
+        metrics: dict | None = None, policy: list | None = None,
+        *, base_mutations: bool,
+    ) -> _PreparedManifest:
+        """Build immutable manifest bytes under an already-held run authority."""
         from . import secrets
-        from .state import ContractError
-        # a run resting in `finished` carries an immutable manifest: rewriting it requires the deliberate
-        # `finished -> finalizing` reopen, so nothing can quietly restate a committed verdict
-        if self.state == "finished":
-            raise ContractError(f"run {self.run_id} is finished — reopen it (`finalizing`) before "
-                                f"rewriting its manifest")
         # a failed event-sink write means events.jsonl is incomplete, so a coverage/verdict folded from it
         # is not clean truth — committed before the summary, or the verdict is computed without it
         from . import events as _events
         self.unseal_verdict()                   # this write recomputes the summary, so faults may still land
         od = _events.observability_degraded()
-        if od:
+        if od and base_mutations:
             from .state import Fault
             self.commit_fault(Fault("machinery", where="events.jsonl",
                                     detail=f"{od['writes_failed']} event write(s) failed: {od['first_error']}"))
@@ -2582,7 +2802,9 @@ class Run:
         env_remainder = self.envelope_remainder()
         if env_remainder is not None:                        # keys refused past the envelope, durably owed
             manifest["envelope_remainder"] = env_remainder
-            self._persist_envelope_remainder()               # refresh the standalone durable file to the final count
+            if base_mutations:
+                # refresh the standalone durable file to the exact final count before the base seal
+                self._persist_envelope_remainder()
         if self._envelope_durability:                        # durability failures the reopen must re-surface even
             manifest["envelope_degraded"] = dict(self._envelope_durability)   # if the separate marker was unwritable
         if metrics:                                 # pointer + headline totals for the telemetry artifact
@@ -2593,27 +2815,91 @@ class Run:
             manifest["policy"] = secrets.redact_deep(policy)
         if od:
             manifest["observability_degraded"] = od
-        _events.persist_degraded()                  # survives to the next resume (accumulates)
-        _atomic_write(self.manifest_path, json.dumps(manifest, indent=2))
-        # update state pointers (per-project, under recon/)
-        from . import privfs
-        state = self.project_dir / "recon" / "state"
-        privfs.private_dir(state / "history")                # 0700 state root
-        _atomic_write(state / "history" / f"{self.run_id}.json",
-                      json.dumps({"run_id": self.run_id, "target": self.target,
-                                  "finished": manifest["finished"],
-                                  "entity_counts": manifest["entity_counts"]}, indent=2))
-        # the `current` pointer is swapped atomically (temp symlink + os.replace), so a concurrent reader
-        # never sees it briefly missing
-        cur = state / "current"
-        try:
-            tmp = state / f".current.{os.getpid()}.tmp"
-            if tmp.is_symlink() or tmp.exists():
-                tmp.unlink()
-            os.symlink(self.dir.resolve(), tmp)
-            os.replace(tmp, cur)
-        except OSError:
-            _atomic_write(state / "current.txt", str(self.dir.resolve()))
+        if base_mutations:
+            _events.persist_degraded()              # survives the base seal and the next process
+        history = {
+            "run_id": self.run_id,
+            "target": self.target,
+            "finished": manifest["finished"],
+            "entity_counts": manifest["entity_counts"],
+        }
+        return _PreparedManifest(
+            run_id=self.run_id,
+            target=self.target,
+            manifest_text=json.dumps(manifest, indent=2),
+            history_text=json.dumps(history, indent=2),
+        )
+
+    def publish_manifest(self, prepared: _PreparedManifest) -> None:
+        """Publish exact pre-seal manifest bytes as finalization metadata."""
+        if type(prepared) is not _PreparedManifest:
+            raise TypeError("publish_manifest requires a prepared manifest")
+        if prepared.run_id != self.run_id or prepared.target != self.target:
+            raise ContractError("prepared manifest belongs to a different run")
+        state_now = self.state
+        scope = (
+            MutationScope.BASE_EVIDENCE
+            if state_now in {"created", "running"}
+            else MutationScope.FINALIZATION_METADATA
+        )
+        with self._mutation(scope):
+            current = self.state
+            if current == "finalizing":
+                if os.path.lexists(self.manifest_path):
+                    raise ContractError(
+                        "the base manifest is already published; reconcile only derived-publication metadata",
+                    )
+            elif current not in {"created", "running"}:
+                raise ContractError(
+                    f"run {self.run_id} cannot publish a base manifest in state {current!r}",
+                )
+            _atomic_write(self.manifest_path, prepared.manifest_text)
+            # update state pointers (per-project, under recon/)
+            from . import privfs
+            state = self.project_dir / "recon" / "state"
+            privfs.private_dir(state / "history")                # 0700 state root
+            _atomic_write(state / "history" / f"{self.run_id}.json", prepared.history_text)
+            # the `current` pointer is swapped atomically (temp symlink + os.replace), so a concurrent reader
+            # never sees it briefly missing
+            cur = state / "current"
+            try:
+                tmp = state / f".current.{os.getpid()}.tmp"
+                if tmp.is_symlink() or tmp.exists():
+                    tmp.unlink()
+                os.symlink(self.dir.resolve(), tmp)
+                os.replace(tmp, cur)
+            except OSError:
+                _atomic_write(state / "current.txt", str(self.dir.resolve()))
+
+    def write_manifest(self, profile_summary: dict, phases_run: list[str],
+                       metrics: dict | None = None, policy: list | None = None) -> None:
+        """Compatibility writer; production seals precomputed bytes via ``begin_finalization``.
+
+        Legacy/test callers may still commit an initial manifest before lifecycle
+        finalization.  A finalizing caller is restricted to a read-only rebuild;
+        it cannot persist a remainder or manufacture a base fault after the seal.
+        """
+        state_now = self.state
+        if state_now == "finished":
+            raise ContractError(f"run {self.run_id} is finished — reopen it (`finalizing`) before "
+                                f"rewriting its manifest")
+        if state_now == "finalization_failed":
+            raise ContractError(
+                f"run {self.run_id} is sealed — reopen derived finalization instead of rewriting its "
+                "base manifest",
+            )
+        if state_now == "finalizing" and os.path.lexists(self.manifest_path):
+            raise ContractError(
+                "the base manifest is already published; reconcile only derived-publication metadata",
+            )
+        base_mutations = state_now in {"created", "running"}
+        scope = MutationScope.BASE_EVIDENCE if base_mutations else MutationScope.FINALIZATION_METADATA
+        with self._mutation(scope):
+            prepared = self._prepare_manifest_locked(
+                profile_summary, phases_run, metrics, policy,
+                base_mutations=base_mutations,
+            )
+            self.publish_manifest(prepared)
 
     @staticmethod
     def list_runs(project_dir: Path) -> "list[Path]":

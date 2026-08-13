@@ -320,9 +320,10 @@ def _has_conflict(r) -> bool:
     return isinstance(alt, dict) and any(alt.get(f) for f in _PROTECTED_TRANSITION_FIELDS)
 
 
-def _ownership_index(ctx) -> tuple:
+def _ownership_index(ctx, *, record_coverage: bool = True) -> tuple:
     """`({state_key: [transition, …]}, ambiguous_keys, authoritative)`, built once per context. Authority is
-    global and the health is reported every read. See docs/design/EVIDENCE-EXTRACTION-DESIGN.md.
+    global; live callers record its health, while derived/report callers request a read-only fold. See
+    docs/design/EVIDENCE-EXTRACTION-DESIGN.md.
     """
     idx = getattr(ctx, "_ownership_idx", None)
     if idx is not None:
@@ -362,22 +363,23 @@ def _ownership_index(ctx) -> tuple:
             ambiguous.add(k)
     # authority is global: an untrustworthy log gives no key a current state and takes no appends
     authoritative = (trust == "valid" and not corrupt)
-    if authoritative and not ambiguous:
-        events.coverage_partial("evidence.ownership", kind=events.COVERAGE_OWNERSHIP,
-                                measure="ownership_state", unit="evidence.ownership.log",
-                                eligible=len(idx), tested=len(idx), omitted=0,
-                                reason=f"ownership transition log read cleanly ({len(idx)} path(s))")
-    else:
-        detail = [] if trust == "valid" else [trust]
-        if corrupt:
-            detail.append(f"{corrupt} ownership transition row(s) are malformed and were ignored")
-        if ambiguous:
-            detail.append(f"{len(ambiguous)} path(s) hold DUPLICATE sequence numbers, so their current "
-                          f"state is undecidable and nothing is claimed for them")
-        events.coverage_partial("evidence.ownership", kind=events.COVERAGE_UNKNOWN,
-                                measure="ownership_state", unit="evidence.ownership.log",
-                                reason="; ".join(detail) + " — the lifecycle of those paths is UNKNOWN, "
-                                                           "not clean")
+    if record_coverage:
+        if authoritative and not ambiguous:
+            events.coverage_partial("evidence.ownership", kind=events.COVERAGE_OWNERSHIP,
+                                    measure="ownership_state", unit="evidence.ownership.log",
+                                    eligible=len(idx), tested=len(idx), omitted=0,
+                                    reason=f"ownership transition log read cleanly ({len(idx)} path(s))")
+        else:
+            detail = [] if trust == "valid" else [trust]
+            if corrupt:
+                detail.append(f"{corrupt} ownership transition row(s) are malformed and were ignored")
+            if ambiguous:
+                detail.append(f"{len(ambiguous)} path(s) hold DUPLICATE sequence numbers, so their current "
+                              f"state is undecidable and nothing is claimed for them")
+            events.coverage_partial("evidence.ownership", kind=events.COVERAGE_UNKNOWN,
+                                    measure="ownership_state", unit="evidence.ownership.log",
+                                    reason="; ".join(detail) + " — the lifecycle of those paths is UNKNOWN, "
+                                                               "not clean")
     try:
         ctx._ownership_idx, ctx._ownership_ambiguous = idx, ambiguous
         ctx._ownership_authoritative = authoritative
@@ -421,11 +423,11 @@ def _publish_state(ctx, key: str, state: str, *, klass: str, value: str, source:
     return True
 
 
-def current_ownership_rows(run) -> tuple:
+def current_ownership_rows(run, *, record_coverage: bool = False) -> tuple:
     """`(rows, authoritative)` for a report: the current transition for each path, through the single
     trust-aware resolver so a log the lane refuses to act on is not rendered as fact."""
     ctx = SimpleNamespace(run=run)
-    idx, ambiguous, authoritative = _ownership_index(ctx)
+    idx, ambiguous, authoritative = _ownership_index(ctx, record_coverage=record_coverage)
     rows = []
     for key, log in idx.items():
         if not log:
@@ -436,6 +438,11 @@ def current_ownership_rows(run) -> tuple:
             row["undecidable"] = True
         rows.append(row)
     return rows, authoritative
+
+
+def classify_ownership(run) -> tuple:
+    """Fold and record ownership health while base events are still writable."""
+    return current_ownership_rows(run, record_coverage=True)
 
 
 def _ownership_ok(ctx, source: str, url: str, dest, acq) -> None:

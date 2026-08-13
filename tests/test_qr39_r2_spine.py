@@ -123,20 +123,20 @@ def test_a_noop_report_leaves_the_committed_manifest_byte_identical(tmp_path, mo
 # ── 2. the base commit is contained ───────────────────────────────────────────────────────────────
 def test_a_manifest_that_cannot_be_written_is_resumable_not_stuck(tmp_path, monkeypatch):
     from quarry_recon import store
-    real = store.Run.write_manifest
-    monkeypatch.setattr(store.Run, "write_manifest",
+    real = store.Run.publish_manifest
+    monkeypatch.setattr(store.Run, "publish_manifest",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("no space left on device")))
     res = _run(tmp_path, monkeypatch)
     assert res.exit_code == 5, res.stderr
     rec = _state(tmp_path)
     assert rec["state"] == "finalization_failed"          # never left mid-flight in `finalizing`
     assert rec["stages"]["manifest"]["status"] == "failed"
-    monkeypatch.setattr(store.Run, "write_manifest", real)
+    monkeypatch.setattr(store.Run, "publish_manifest", real)
 
 
 def test_report_on_a_run_with_no_committed_manifest_never_exits_zero(tmp_path, monkeypatch):
     from quarry_recon import store
-    monkeypatch.setattr(store.Run, "write_manifest",
+    monkeypatch.setattr(store.Run, "publish_manifest",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("no space left on device")))
     _run(tmp_path, monkeypatch)
     assert not (_run_dir(tmp_path) / "manifest.json").exists()
@@ -405,18 +405,15 @@ def test_a_refused_campaign_is_refused_not_a_traceback(tmp_path, monkeypatch, ex
     assert "Traceback" not in res.stderr
 
 
-# ── 10. content-addressed views, and a resume that republishes only what is stale ─────────────────
-def test_enriching_a_record_in_place_makes_the_views_stale(tmp_path, monkeypatch):
+# ── 10. sealed base views, and a resume that republishes only what is stale ───────────────────────
+def test_a_finished_base_cannot_be_enriched_in_place(tmp_path, monkeypatch):
     _run(tmp_path, monkeypatch)
     run = Run.open(tmp_path, "t", _run_dir(tmp_path).name)
-    assert run.add("subdomain", {"host": "a.example.com", "source": "x"})
-    before, count = run.generation(), run.count("subdomain")
-    # `add` answers "was this a NEW identity"; enriching one is False, and still changes what is stored
-    run.add("subdomain", {"host": "a.example.com", "source": "y", "tech": "nginx"})
-    # the count did not move; the content did, and a view built from the thinner record is stale
-    assert run.count("subdomain") == count
-    assert run.generation() != before
-    assert not run.stage_current("hotlist")
+    before = run.generation()
+    with pytest.raises(state.ContractError):
+        run.add("subdomain", {"host": "a.example.com", "source": "late", "tech": "nginx"})
+    assert run.generation() == before
+    assert run.stage_current("hotlist")
 
 
 def test_a_resume_republishes_only_the_stale_views(tmp_path, monkeypatch):
@@ -529,23 +526,18 @@ def test_a_damaged_manifest_with_no_lifecycle_record_is_unknown(tmp_path, monkey
     assert Run.open(tmp_path, "t", d.name).state == state.STATE_UNKNOWN
 
 
-# ── the re-seal is contained ──────────────────────────────────────────────────────────────────────
-def test_a_failing_second_seal_is_recorded_not_left_finalizing(tmp_path, monkeypatch):
+# ── derived reconciliation is contained ───────────────────────────────────────────────────────────
+def test_a_failing_derived_reconciliation_is_recorded_not_left_finalizing(tmp_path, monkeypatch):
     from quarry_recon import store
-    real, calls = store.Run.write_manifest, {"n": 0}
-
-    def flaky(self, *a, **k):
-        calls["n"] += 1
-        if calls["n"] >= 2:                        # the base commit lands, the re-seal does not
-            raise OSError("volume went read-only after the base commit")
-        return real(self, *a, **k)
-
-    monkeypatch.setattr(store.Run, "write_manifest", flaky)
+    monkeypatch.setattr(
+        store.Run, "reconcile_finalization",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("volume went read-only after the base commit")),
+    )
     res = _run(tmp_path, monkeypatch)
     assert res.exit_code == 5, res.stderr
     rec = _state(tmp_path)
     assert rec["state"] == "finalization_failed"   # not stuck `finalizing` over a manifest since disproved
-    assert rec["stages"]["reseal"]["status"] == "failed"
+    assert rec["stages"]["reconcile"]["status"] == "failed"
 
 
 # ── several resumable campaigns is a choice, not a default ────────────────────────────────────────
