@@ -12,11 +12,14 @@ Provider outcome semantics: docs/design/PROVIDER-QUOTA-DESIGN.md.
 from __future__ import annotations
 
 import hashlib as _hashlib
+import fcntl as _fcntl
 import json as _json
+import math as _math
 import os as _os
 import re as _re
 import shutil as _shutil
 import socket as _socket
+import stat as _stat
 import sys as _sys
 import threading as _threading
 import urllib.error as _urlerr
@@ -309,8 +312,22 @@ class DiskGovernor:
     def __post_init__(self):
         self._lock = _threading.RLock()             # serializes admit/take/commit/settle across threads
         self._inflight = 0                          # bytes granted this instant but not yet on disk
+        self._legacy_inflight = 0
+        self._base_run_streamed = self.run_streamed
+        self._base_project_streamed = self.project_streamed
+        self._descriptor_state = (0, {})
         if self.project_state is not None:
             self.project_streamed = _load_project_bytes(self.project_state)
+
+    def _sync_descriptor_totals(self) -> None:
+        """Rebuild public totals from stable per-stream facts; safe to repeat."""
+        settled_charged, active = self._descriptor_state
+        charged = settled_charged + sum(facts[1] for facts in active.values())
+        inflight = sum(facts[0] - facts[1] for facts in active.values())
+        self._inflight = self._legacy_inflight + inflight
+        self.run_streamed = self._base_run_streamed + charged
+        if self.project_max and self.project_state is None:
+            self.project_streamed = self._base_project_streamed + charged
 
     def _free(self, path):
         # a failed probe is unknown free space, treated as tripped by the caller (fail closed)
@@ -403,16 +420,18 @@ class DiskGovernor:
                     return 0, LAYER_PROJECT          # durable project state unreadable/held: refuse
                 if pg < granted:
                     granted, binding = pg, LAYER_PROJECT
-            self._inflight += granted
+            self._legacy_inflight += granted
+            self._sync_descriptor_totals()
             return granted, binding
 
     def commit(self, n: int) -> None:
         """`n` reserved bytes reached disk: move them from in-flight to the persisted run/project totals."""
         with self._lock:
-            self._inflight -= n
-            self.run_streamed += n
+            self._legacy_inflight -= n
+            self._base_run_streamed += n
             if self.project_max and self.project_state is None:
-                self.project_streamed += n
+                self._base_project_streamed += n
+            self._sync_descriptor_totals()
 
     def settle(self, granted_total: int, written: int) -> None:
         """Close a response: release the reserved bytes that never reached disk (a truncation stop or a
@@ -421,9 +440,129 @@ class DiskGovernor:
         if leftover <= 0:
             return
         with self._lock:
-            self._inflight -= leftover
+            self._legacy_inflight -= leftover
+            self._sync_descriptor_totals()
         if self.project_max and self.project_state is not None:
             self._refund_project(leftover)
+
+    def _begin_descriptor_stream(self) -> "_DescriptorStreamReservation":
+        """Create an inert token; activation happens only under both stream fences."""
+        return _DescriptorStreamReservation(self)
+
+    def _activate_descriptor_stream(
+        self, reservation: "_DescriptorStreamReservation",
+    ) -> None:
+        """Install a token before its first grant; safe to repeat during unwind."""
+        if reservation.governor is not self:
+            raise RuntimeError("descriptor stream reservation belongs to another governor")
+        if self.project_max and self.project_state is not None:
+            raise ValueError("managed descriptor streaming refuses a durable project limit")
+        with self._lock:
+            settled_charged, active = self._descriptor_state
+            if reservation.token in active:
+                return
+            if reservation.terminal_written is not None:
+                raise RuntimeError("descriptor stream reservation is already terminal")
+            next_active = dict(active)
+            next_active[reservation.token] = (0, 0)
+            self._descriptor_state = (settled_charged, next_active)
+            self._sync_descriptor_totals()
+
+    def _take_descriptor_stream(
+        self, reservation: "_DescriptorStreamReservation", path, written: int, want: int,
+    ) -> "tuple[int, str | None]":
+        if reservation.governor is not self:
+            raise RuntimeError("descriptor stream reservation is not active")
+        with self._lock:
+            settled_charged, active = self._descriptor_state
+            facts = active.get(reservation.token)
+            if facts is None:
+                raise RuntimeError("descriptor stream reservation is not active")
+            room, layer = self._inmem_room(path, written)
+            granted = want if room is None else max(0, min(want, room))
+            binding = layer if (room is not None and granted < want) else None
+            next_active = dict(active)
+            next_active[reservation.token] = (facts[0] + granted, facts[1])
+            self._descriptor_state = (settled_charged, next_active)
+            self._sync_descriptor_totals()
+            return granted, binding
+
+    def _reconcile_descriptor_stream(
+        self, reservation: "_DescriptorStreamReservation", written: int, *, terminal: bool,
+    ) -> None:
+        """Charge a token to an absolute on-disk total and optionally release its remainder.
+
+        Repeating this method after a cleanup fault cannot double-charge committed
+        bytes or double-release an in-flight grant.
+        """
+        if reservation.governor is not self:
+            raise RuntimeError("descriptor stream reservation belongs to another governor")
+        with self._lock:
+            settled_charged, active = self._descriptor_state
+            facts = active.get(reservation.token)
+            if facts is None:
+                if terminal and reservation.terminal_written in (None, written):
+                    reservation.terminal_written = written
+                    self._sync_descriptor_totals()
+                    return
+                raise RuntimeError("descriptor stream reservation is not active")
+            granted, charged = facts
+            if written < charged or written > granted:
+                raise RuntimeError("descriptor stream byte accounting is inconsistent")
+            next_active = dict(active)
+            if terminal:
+                reservation.terminal_written = written
+                next_active.pop(reservation.token)
+                self._descriptor_state = (settled_charged + written, next_active)
+            else:
+                next_active[reservation.token] = (granted, written)
+                self._descriptor_state = (settled_charged, next_active)
+            self._sync_descriptor_totals()
+
+    def _forfeit_descriptor_stream(
+        self, reservation: "_DescriptorStreamReservation", minimum_charge: int,
+    ) -> int:
+        """Terminally charge an uninspectable stream without releasing unknown bytes."""
+        if reservation.governor is not self:
+            raise RuntimeError("descriptor stream reservation belongs to another governor")
+        with self._lock:
+            settled_charged, active = self._descriptor_state
+            facts = active.get(reservation.token)
+            if facts is None:
+                if reservation.terminal_written is not None:
+                    self._sync_descriptor_totals()
+                    return reservation.terminal_written
+                raise RuntimeError("descriptor stream reservation is not active")
+            granted, charged = facts
+            conservative_charge = max(granted, charged, minimum_charge)
+            next_active = dict(active)
+            next_active.pop(reservation.token)
+            reservation.terminal_written = conservative_charge
+            self._descriptor_state = (
+                settled_charged + conservative_charge, next_active,
+            )
+            self._sync_descriptor_totals()
+            return conservative_charge
+
+
+class _DescriptorStreamReservation:
+    """Mutable governor facts which survive all descriptor-stream unwind paths."""
+
+    __slots__ = ("governor", "token", "terminal_written")
+
+    def __init__(self, governor: DiskGovernor) -> None:
+        self.governor = governor
+        self.token = object()
+        self.terminal_written = None
+
+    def take(self, path, written: int, want: int) -> "tuple[int, str | None]":
+        return self.governor._take_descriptor_stream(self, path, written, want)
+
+    def reconcile(self, written: int, *, terminal: bool) -> None:
+        self.governor._reconcile_descriptor_stream(self, written, terminal=terminal)
+
+    def forfeit(self, minimum_charge: int) -> int:
+        return self.governor._forfeit_descriptor_stream(self, minimum_charge)
 
 
 def _governor_ceiling(key: str, value: int, source, rejected, rejected_source) -> int:
@@ -607,123 +746,304 @@ def stream_to_file(r, dest, *, chunk: int = 1024 * 1024, deadline_s: float = 300
     return written, digest.hexdigest()
 
 
+def _preferred_stream_fault(primary, faults: "list[BaseException]"):
+    """The operation's exact cancellation outranks every cleanup failure."""
+    if primary is not None and not isinstance(primary, Exception):
+        return primary
+    cancellation = next((fault for fault in faults if not isinstance(fault, Exception)), None)
+    return cancellation or primary or (faults[0] if faults else None)
+
+
+class _DescriptorStreamLedger:
+    """One mutable truth for descriptor bytes, digest and governor reservation."""
+
+    __slots__ = (
+        "fd", "budget_path", "governor", "reservation", "state", "identity",
+        "accounting_uncertainty", "accounting_charged", "accounting_observed",
+    )
+
+    def __init__(self, fd: int, budget_path, governor: DiskGovernor) -> None:
+        self.fd = fd
+        self.budget_path = budget_path
+        self.governor = governor
+        self.reservation = governor._begin_descriptor_stream()
+        self.state = (_hashlib.sha256(), 0, b"", 0, 0, None)
+        observed = _os.fstat(fd)
+        self.identity = (observed.st_dev, observed.st_ino)
+        self.accounting_uncertainty = None
+        self.accounting_charged = None
+        self.accounting_observed = None
+
+    def activate(self) -> None:
+        self.governor._activate_descriptor_stream(self.reservation)
+
+    @property
+    def digest(self):
+        return self.state[0]
+
+    @property
+    def written(self) -> int:
+        return self.state[1]
+
+    @property
+    def active(self):
+        return self.state[2]
+
+    @property
+    def active_offset(self) -> int:
+        return self.state[3]
+
+    @property
+    def active_granted(self) -> int:
+        return self.state[4]
+
+    @property
+    def binding(self):
+        return self.state[5]
+
+    def begin_chunk(self, body) -> None:
+        if type(body) is not bytes:
+            raise TypeError("managed acquisition response read must return exact bytes")
+        self.state = (self.digest, self.written, body, 0, 0, None)
+
+    def take(self) -> None:
+        granted, binding = self.reservation.take(
+            self.budget_path, self.written, len(self.active),
+        )
+        self.state = (
+            self.digest, self.written, self.active, self.active_offset,
+            granted, binding,
+        )
+
+    def refuse_ownership(self, reason: str, *, observed_size: "int | None" = None,
+                         cause=None) -> None:
+        self.accounting_uncertainty = reason
+        self.accounting_observed = observed_size
+        self.accounting_charged = self.reservation.forfeit(
+            max(self.written, observed_size or 0),
+        )
+        raise OSError(reason) from cause
+
+    def reconcile_descriptor(self, *, terminal: bool = False) -> None:
+        try:
+            observed = _os.fstat(self.fd)
+            position = _os.lseek(self.fd, 0, _os.SEEK_CUR)
+        except OSError as exc:
+            self.refuse_ownership(
+                "managed acquisition descriptor cannot be reconciled",
+                cause=exc,
+            )
+        if ((observed.st_dev, observed.st_ino) != self.identity
+                or position != observed.st_size):
+            self.refuse_ownership(
+                "managed acquisition descriptor lost exclusive sequential ownership",
+                observed_size=observed.st_size,
+            )
+        on_disk = observed.st_size
+        digest, written, active, active_offset, active_granted, binding = self.state
+        available = active_granted - active_offset
+        extra = on_disk - written
+        if extra < 0 or extra > available:
+            self.refuse_ownership(
+                "managed acquisition descriptor changed outside its stream authority",
+                observed_size=on_disk,
+            )
+        if extra:
+            next_digest = digest.copy()
+            next_digest.update(active[active_offset:active_offset + extra])
+            self.state = (
+                next_digest, on_disk, active, active_offset + extra,
+                active_granted, binding,
+            )
+        self.reservation.reconcile(self.written, terminal=terminal)
+
+    def settle(self) -> None:
+        # Never release a grant while the descriptor's size is unknown.  An
+        # outer fence retries this whole idempotent sequence after interruption.
+        self.reconcile_descriptor(terminal=True)
+
+    def attach(self, exc) -> None:
+        if exc is None:
+            return
+        try:
+            if self.accounting_uncertainty is not None:
+                exc.bytes_written = self.accounting_observed
+                exc.sha256 = None
+                exc.content_uncertain = True
+                exc.acquisition_accounting_uncertainty = self.accounting_uncertainty
+                exc.acquisition_accounting_charged_bytes = self.accounting_charged
+                exc.acquisition_observed_bytes = self.accounting_observed
+            else:
+                exc.bytes_written = self.written
+                exc.sha256 = self.digest.hexdigest()
+        except BaseException:
+            pass
+
+    def result(self) -> "tuple[int, str]":
+        return self.written, self.digest.hexdigest()
+
+
+class _DescriptorStreamSettlement:
+    """Idempotent settlement authority shared by two already-active fences."""
+
+    __slots__ = ("ledger", "primary", "faults")
+
+    def __init__(self, ledger: _DescriptorStreamLedger) -> None:
+        self.ledger = ledger
+        self.primary = None
+        self.faults: list[BaseException] = []
+
+    def remember(self, fault) -> None:
+        if fault is not None:
+            self.primary = _preferred_stream_fault(self.primary, [fault])
+
+    def reconcile(self) -> None:
+        try:
+            self.ledger.settle()
+        except BaseException as exc:
+            self.faults.append(exc)
+
+
+class _DescriptorStreamFence:
+    """One cancellation recovery layer over a shared descriptor settlement."""
+
+    __slots__ = ("settlement",)
+
+    def __init__(self, settlement: _DescriptorStreamSettlement) -> None:
+        self.settlement = settlement
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _kind, primary, _traceback) -> bool:
+        self.settlement.remember(primary)
+        self.settlement.reconcile()
+        preferred = _preferred_stream_fault(
+            self.settlement.primary, self.settlement.faults,
+        )
+        self.settlement.ledger.attach(preferred)
+        if preferred is not None and self.settlement.faults:
+            try:
+                preferred.acquisition_cleanup_errors = tuple(self.settlement.faults)
+            except BaseException:
+                pass
+        if preferred is not None and preferred is not primary:
+            if primary is not None:
+                raise preferred from primary
+            raise preferred
+        return False
+
+
+def preflight_stream_to_fd(*, chunk: int = 1024 * 1024,
+                           deadline_s: float = 300.0,
+                           governor: "DiskGovernor | None" = None) -> DiskGovernor:
+    """Validate descriptor-stream policy before a caller contacts a provider."""
+    if type(chunk) is not int or chunk <= 0:
+        raise ValueError("managed acquisition chunk must be an exact positive integer")
+    try:
+        usable_deadline = (type(deadline_s) in {int, float}
+                           and not isinstance(deadline_s, bool)
+                           and deadline_s >= 0 and _math.isfinite(deadline_s))
+    except OverflowError:
+        usable_deadline = False
+    if not usable_deadline:
+        raise ValueError("managed acquisition deadline must be a finite non-negative number")
+    gov = governor if governor is not None else default_governor()
+    if type(gov) is not DiskGovernor:
+        raise TypeError("managed acquisition governor must be an exact DiskGovernor")
+    if gov.project_max and gov.project_state is not None:
+        raise ValueError("managed descriptor streaming refuses a durable project limit")
+    return gov
+
+
+def _stream_to_fd_body(r, writer_fd: int, chunk: int, deadline_s: float,
+                       end, ledger: _DescriptorStreamLedger,
+                       governor: DiskGovernor) -> "tuple[int, str]":
+    """The response loop; its caller holds both settlement fences."""
+    import time as _time
+
+    try:
+        while True:
+            if end is not None and _time.monotonic() > end:
+                raise TimeoutError(f"still receiving after {deadline_s:g}s")
+            incoming = r.read(chunk)
+            ledger.begin_chunk(incoming)
+            if not ledger.active:
+                break
+            ledger.take()
+            while ledger.active_offset < ledger.active_granted:
+                before = ledger.written
+                try:
+                    _os.write(
+                        writer_fd,
+                        ledger.active[ledger.active_offset:ledger.active_granted],
+                    )
+                except InterruptedError:
+                    continue
+                ledger.reconcile_descriptor()
+                if ledger.written <= before:
+                    raise OSError("managed acquisition write made no progress")
+            if ledger.active_granted < len(ledger.active):
+                raise AcquisitionTruncated(
+                    f"acquisition stopped at the {ledger.binding} policy after "
+                    f"{ledger.written} byte(s)",
+                    bytes_written=ledger.written, partial=None,
+                    limit_kind=ledger.binding,
+                    limit_bytes=getattr(governor, _LAYER_CAP_ATTR[ledger.binding], 0),
+                )
+        _os.fsync(writer_fd)
+    except (KeyboardInterrupt, SystemExit, IncompleteAcquisition):
+        raise
+    except Exception as exc:
+        raise IncompleteAcquisition(
+            f"response incomplete after {ledger.written} byte(s): {exc}",
+            bytes_written=ledger.written, partial=None,
+        ) from exc
+    return ledger.result()
+
+
 def stream_to_fd(r, writer_fd: int, *, budget_path, mirror_fd: int | None = None,
                  chunk: int = 1024 * 1024,
                  deadline_s: float = 300.0,
                  governor: "DiskGovernor | None" = None) -> "tuple[int, str]":
-    """Stream into a repository-owned unpublished descriptor.
+    """Stream once into an empty repository-owned unpublished descriptor.
 
-    This is the managed counterpart to :func:`stream_to_file`: it never creates,
-    renames, publishes or retains an ambient path.  The caller owns terminal
-    publication/fencing and the descriptor lifetime.  When ``mirror_fd`` is
-    supplied, every primary byte is also written to that private descriptor;
-    this lets a transaction select final-versus-partial publication after EOF
-    without reading the response twice.  Ordinary incompleteness carries exact
-    primary-prefix bytes and digest; cancellation remains a ``BaseException`` so
-    the repository transaction can settle before propagating it.
+    The caller owns descriptor lifetime, keeps the borrowed descriptor unaliased
+    for exclusive sequential writes, and owns terminal publication/fencing.  A
+    mutable ledger is active before the first grant, and two settlement fences
+    reconcile physical bytes, SHA-256 and governor accounting before any return
+    or exception escapes.  ``mirror_fd`` is retained only as an explicit
+    compatibility refusal: duplicating physical writes while charging one
+    logical body violates the disk-reserve contract.
     """
     import time as _time
 
     if type(writer_fd) is not int or writer_fd < 0:
         raise TypeError("managed acquisition writer must be an open descriptor")
-    if (mirror_fd is not None
-            and (type(mirror_fd) is not int or mirror_fd < 0 or mirror_fd == writer_fd)):
-        raise TypeError("managed acquisition mirror must be a distinct open descriptor")
-    gov = governor if governor is not None else default_governor()
-    digest = _hashlib.sha256()
-    written = granted_total = 0
-    active = b""
-    active_offset = 0
-    end = _time.monotonic() + deadline_s if deadline_s and deadline_s > 0 else None
-    primary = None
-    try:
-        while True:
-            if end is not None and _time.monotonic() > end:
-                raise TimeoutError(f"still receiving after {deadline_s:g}s")
-            active = r.read(chunk)
-            active_offset = 0
-            if not active:
-                break
-            granted, layer = gov.take(budget_path, written, len(active))
-            granted_total += granted
-            while active_offset < granted:
-                try:
-                    landed = _os.write(writer_fd, active[active_offset:granted])
-                except InterruptedError:
-                    continue
-                if landed <= 0:
-                    raise OSError("managed acquisition write made no progress")
-                landed_bytes = active[active_offset:active_offset + landed]
-                if mirror_fd is not None:
-                    mirror_offset = 0
-                    while mirror_offset < len(landed_bytes):
-                        try:
-                            mirrored = _os.write(
-                                mirror_fd, landed_bytes[mirror_offset:],
-                            )
-                        except InterruptedError:
-                            continue
-                        if mirrored <= 0:
-                            raise OSError(
-                                "managed acquisition mirror write made no progress",
-                            )
-                        mirror_offset += mirrored
-                digest.update(landed_bytes)
-                active_offset += landed
-                written += landed
-                gov.commit(landed)
-            if granted < len(active):
-                raise AcquisitionTruncated(
-                    f"acquisition stopped at the {layer} policy after {written} byte(s)",
-                    bytes_written=written, partial=None, limit_kind=layer,
-                    limit_bytes=getattr(gov, _LAYER_CAP_ATTR[layer], 0),
-                )
-        _os.fsync(writer_fd)
-        if mirror_fd is not None:
-            _os.fsync(mirror_fd)
-    except (KeyboardInterrupt, SystemExit) as exc:
-        primary = exc
-        raise
-    except IncompleteAcquisition as exc:
-        primary = exc
-        raise
-    except Exception as exc:
-        primary = IncompleteAcquisition(
-            f"response incomplete after {written} byte(s): {exc}",
-            bytes_written=written, partial=None,
+    if mirror_fd is not None:
+        raise ValueError("managed acquisition mirror writes are not supported; stream one private stage")
+    gov = preflight_stream_to_fd(
+        chunk=chunk, deadline_s=deadline_s, governor=governor,
+    )
+    initial = _os.fstat(writer_fd)
+    descriptor_flags = _fcntl.fcntl(writer_fd, _fcntl.F_GETFL)
+    if (not _stat.S_ISREG(initial.st_mode) or initial.st_uid != _os.geteuid()
+            or initial.st_nlink != 1 or _stat.S_IMODE(initial.st_mode) != 0o600
+            or descriptor_flags & _os.O_ACCMODE == _os.O_RDONLY
+            or descriptor_flags & _os.O_APPEND
+            or _os.lseek(writer_fd, 0, _os.SEEK_CUR) != 0 or initial.st_size != 0):
+        raise ValueError(
+            "managed acquisition writer must be an empty private regular descriptor at offset zero",
         )
-        raise primary from exc
-    finally:
-        # Account for a syscall wrapper that reports an exception after bytes
-        # landed.  The offered prefix is known even though the descriptor is
-        # intentionally write-only.
-        cleanup_errors = []
-        try:
-            on_disk = _os.fstat(writer_fd).st_size
-        except OSError as exc:
-            on_disk = written
-            cleanup_errors.append(exc)
-        extra = max(0, on_disk - written)
-        if extra:
-            digest.update(active[active_offset:active_offset + extra])
-            written += extra
-            try:
-                gov.commit(extra)
-            except BaseException as exc:
-                cleanup_errors.append(exc)
-        try:
-            gov.settle(granted_total, written)
-        except BaseException as exc:
-            cleanup_errors.append(exc)
-        current = primary or _sys.exc_info()[1]
-        if isinstance(current, (IncompleteAcquisition, KeyboardInterrupt, SystemExit)):
-            current.bytes_written = written
-            current.sha256 = digest.hexdigest()
-            if cleanup_errors:
-                current.acquisition_cleanup_errors = tuple(cleanup_errors)
-        elif cleanup_errors:
-            raise cleanup_errors[0]
-    return written, digest.hexdigest()
+    ledger = _DescriptorStreamLedger(writer_fd, budget_path, gov)
+    settlement = _DescriptorStreamSettlement(ledger)
+    end = _time.monotonic() + deadline_s if deadline_s else None
+    with _DescriptorStreamFence(settlement):
+        with _DescriptorStreamFence(settlement):
+            ledger.activate()
+            return _stream_to_fd_body(
+                r, writer_fd, chunk, deadline_s, end, ledger, gov,
+            )
 
 
 class ResponseTooLarge(ValueError):
