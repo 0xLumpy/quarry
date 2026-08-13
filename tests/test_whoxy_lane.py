@@ -285,9 +285,12 @@ class TestMachineryFailuresStayBestEffort:
         monkeypatch.setattr(osint, "_whoxy_get", lambda url, timeout=None: (BAL, None))
         monkeypatch.setattr(settings, "performance", dict)
         monkeypatch.setattr(wp, "SPEND_LOCK", tmp_path / "spend.lock")
+        # Establish the session authority before faulting the process-wide flock
+        # primitive: this test is about a Whoxy lane lock failure, not failure to
+        # acquire the OSINT repository's own mandatory mutation lock.
+        sess = osint.OsintSession(tmp_path / "project", "acme.com")
         self._flock_raises(monkeypatch, "EROFS")
 
-        sess = osint.OsintSession(tmp_path / "project", "acme.com")
         osint._whoxy(sess, {"a@x.com"}, [], lambda m: None, 30)
         v = sess.outcome()
         assert v["verdict"] == "complete_with_gaps", v

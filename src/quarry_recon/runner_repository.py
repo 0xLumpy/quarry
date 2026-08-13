@@ -677,12 +677,8 @@ class _DurableOsintClaim:
 
     @classmethod
     def acquire(cls, session, request_id: str) -> "_DurableOsintClaim":
-        claim_dir = session.dir / ".execution-claims"
         with session._execution_mutation():
-            privfs.private_dir(claim_dir)
-            directory_fd = os.open(
-                claim_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            )
+            directory_fd = session._open_execution_claims_dir()
             fd = -1
             try:
                 fd = os.open(
@@ -730,11 +726,8 @@ class _DurableOsintClaim:
     def release(self) -> None:
         if self.released:
             return
-        claim_dir = self.session.dir / ".execution-claims"
         with self.session._execution_mutation():
-            directory_fd = os.open(
-                claim_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            )
+            directory_fd = self.session._open_execution_claims_dir()
             marker_fd = -1
             try:
                 marker_fd = os.open(
@@ -759,10 +752,6 @@ class _DurableOsintClaim:
                 if marker_fd >= 0:
                     os.close(marker_fd)
                 os.close(directory_fd)
-            try:
-                os.rmdir(claim_dir)
-            except OSError:
-                pass
             session_fd = os.open(
                 self.session.dir,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,

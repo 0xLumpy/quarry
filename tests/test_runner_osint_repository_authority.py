@@ -327,7 +327,9 @@ def test_session_root_substitution_refuses_before_claim_stage_or_spawn(
         _run_supervisor(session, invocation, stdout, stderr)
 
     assert not spawned
-    assert not (original / ".execution-claims").exists()
+    # The claims directory is a permanent pinned part of session authority; the
+    # failed execution must not add a marker to the original authority.
+    assert list((original / ".execution-claims").iterdir()) == []
     assert _tree_snapshot(outside if replacement == "symlink" else session.dir) == replacement_before
 
 
@@ -662,3 +664,131 @@ def test_output_authority_never_accepts_or_serializes_an_ambient_path(tmp_path):
     assert os.fsencode(outside) not in wire
     assert str(session.dir) not in repr(stdout)
     assert not isinstance(stdout, (str, Path, os.PathLike))
+
+
+@pytest.mark.parametrize(
+    "reserved", [".execution-sealing", ".execution-finalized", "manifest.json"],
+)
+def test_every_reserved_terminal_object_including_dangling_symlink_seals_session(
+    tmp_path, reserved,
+):
+    session = _session(tmp_path, session_id=f"{SESSION_ID}-{reserved.strip('.').replace('.', '-')}")
+    terminal = session.dir / reserved
+    terminal.symlink_to(session.dir / "does-not-exist")
+
+    with pytest.raises(RuntimeError, match="finalized"):
+        session.output()
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink", "file"])
+def test_claim_directory_substitution_is_refused_by_execution_and_finalizer(
+    tmp_path, monkeypatch, replacement,
+):
+    session = _session(tmp_path, session_id=f"{SESSION_ID}-claims-{replacement}")
+    stdout, stderr = _policies(session, publish=False)
+    invocation = _invocation(session, stdout, stderr, request_byte="2e")
+    claims = session.dir / ".execution-claims"
+    original = session.dir / ".execution-claims-original"
+    claims.rename(original)
+    outside = tmp_path / f"outside-{replacement}"
+    if replacement == "directory":
+        claims.mkdir(mode=0o700)
+    elif replacement == "symlink":
+        outside.mkdir(mode=0o700)
+        claims.symlink_to(outside, target_is_directory=True)
+    else:
+        claims.write_bytes(b"not a directory")
+        claims.chmod(0o600)
+
+    spawned = []
+    monkeypatch.setattr(
+        runner_repository,
+        "supervise_execution",
+        lambda *args, **kwargs: spawned.append((args, kwargs)),
+    )
+    with pytest.raises((RuntimeError, OSError), match="identity|unsafe|unavailable"):
+        _run_supervisor(session, invocation, stdout, stderr)
+    with pytest.raises((RuntimeError, OSError), match="identity|unsafe|unavailable"):
+        session.finalize(_profile())
+
+    assert not spawned
+    assert list(original.iterdir()) == []
+
+
+def test_same_session_id_cannot_rebind_a_different_target(tmp_path):
+    original = _session(tmp_path)
+    before = _tree_snapshot(original.dir)
+
+    reopened = _session(tmp_path)
+    assert reopened.started == original.started
+    with pytest.raises(RuntimeError, match="target|identity"):
+        osint.OsintSession(tmp_path, "different.example", ts=SESSION_ID)
+
+    assert _tree_snapshot(original.dir) == before
+
+
+def test_lock_file_or_authority_record_substitution_is_refused_before_spawn(
+    tmp_path, monkeypatch,
+):
+    for suffix, replaced in (("lock", "lock"), ("record", "record")):
+        session = _session(tmp_path, session_id=f"{SESSION_ID}-{suffix}")
+        stdout, stderr = _policies(session, publish=False)
+        invocation = _invocation(session, stdout, stderr, request_byte="3f")
+        path = (session._execution_lock_path if replaced == "lock"
+                else session.dir / ".session-authority.json")
+        path.rename(path.with_name(path.name + ".original"))
+        path.write_bytes(b"{}\n" if replaced == "record" else b"")
+        path.chmod(0o600)
+        spawned = []
+        monkeypatch.setattr(
+            runner_repository,
+            "supervise_execution",
+            lambda *args, **kwargs: spawned.append((args, kwargs)),
+        )
+
+        with pytest.raises((RuntimeError, OSError), match="identity|authority|safe"):
+            _run_supervisor(session, invocation, stdout, stderr)
+        assert not spawned
+        assert _claim_markers(session) == []
+
+
+def test_constructor_does_not_unlock_after_lock_acquisition_fails(tmp_path, monkeypatch):
+    real_flock = osint.fcntl.flock
+    calls = []
+
+    def fail_acquire(fd, operation):
+        calls.append(operation)
+        if operation == osint.fcntl.LOCK_EX:
+            raise FixtureClockFault("fixture acquisition failure")
+        raise AssertionError("unlock must not run after failed acquisition")
+
+    monkeypatch.setattr(osint.fcntl, "flock", fail_acquire)
+    with pytest.raises(FixtureClockFault, match="acquisition failure"):
+        _session(tmp_path, session_id=f"{SESSION_ID}-lock-fault")
+    assert calls == [osint.fcntl.LOCK_EX]
+    monkeypatch.setattr(osint.fcntl, "flock", real_flock)
+
+
+def test_session_creation_and_terminal_markers_fsync_files_and_directories(
+    tmp_path, monkeypatch,
+):
+    real_fsync = os.fsync
+    synced = []
+
+    def observe(fd):
+        try:
+            synced.append((os.readlink(f"/proc/self/fd/{fd}"), stat.S_IFMT(os.fstat(fd).st_mode)))
+        except OSError:
+            synced.append(("<unavailable>", stat.S_IFMT(os.fstat(fd).st_mode)))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", observe)
+    session = _session(tmp_path, session_id=f"{SESSION_ID}-durable")
+    session.finalize(_profile())
+
+    paths = [path for path, _kind in synced]
+    kinds = [kind for _path, kind in synced]
+    assert any(path.endswith(f"/osint/{session.ts}") for path in paths), synced
+    assert any(path.endswith("/.execution-sealing") for path in paths), synced
+    assert any(path.endswith("/.execution-finalized") for path in paths), synced
+    assert kinds.count(stat.S_IFREG) >= 2 and kinds.count(stat.S_IFDIR) >= 3, synced

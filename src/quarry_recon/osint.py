@@ -46,6 +46,9 @@ _EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", re.IGNORECASE)
 _OSINT_LOCKS_GUARD = threading.Lock()
 _OSINT_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _OSINT_LOCK_LOCAL = threading.local()
+_OSINT_AUTHORITY_NAME = ".session-authority.json"
+_OSINT_CLAIMS_NAME = ".execution-claims"
+_OSINT_AUTHORITY_SCHEMA = 1
 
 
 def _shared_osint_lock(key: tuple[str, str]) -> threading.RLock:
@@ -109,26 +112,225 @@ class OsintSession:
     def __init__(self, project_dir: Path, target: str, ts: str | None = None):
         from .repository_identity import validate_artifact_component
 
+        if type(target) is not str or not target:
+            raise ValueError("OSINT target must be a non-empty string")
         self.project_dir = Path(project_dir)
         self.target = target
         self.ts = validate_artifact_component(
             ts or time.strftime("%Y%m%d-%H%M%S"), "OSINT session id",
         )
-        self.dir = self.project_dir / "osint" / self.ts
+        self._osint_root = self.project_dir / "osint"
+        self.dir = self._osint_root / self.ts
         self.raw = self.dir / "raw"
-        privfs.private_dir(self.raw)                         # osint/ session tree is 0700
-        self.started = _utc()
+        self._execution_claims_path = self.dir / _OSINT_CLAIMS_NAME
+        self._execution_authority_path = self.dir / _OSINT_AUTHORITY_NAME
+        self._execution_lock = threading.RLock()
+        self._execution_finalized = False
+
+        # The project OSINT root and lock directory are the bootstrap authority.
+        # The per-session flock then makes create-vs-open one serialized decision,
+        # including across processes.
+        privfs.private_dir(self._osint_root)
+        root_observed = self._private_directory_stat(self._osint_root, "OSINT root")
+        self._execution_osint_root_identity = (root_observed.st_dev, root_observed.st_ino)
+        privfs.private_dir(self._execution_lock_path.parent)
+        locks_observed = self._private_directory_stat(
+            self._execution_lock_path.parent, "OSINT lock directory",
+        )
+        self._execution_locks_identity = (locks_observed.st_dev, locks_observed.st_ino)
+
+        key = self._execution_authority_key
+        lock = _shared_osint_lock(key)
+        with lock:
+            lock_fd = self._materialize_execution_lock_file()
+            locked = False
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                locked = True
+                self._initialize_execution_authority()
+            finally:
+                try:
+                    if locked:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+
         self._cands: dict[tuple, dict] = {}     # (type, value) -> candidate
         self._intel: list[dict] = []
         self._tool_runs: list[dict] = []
         self._lane_failures: list[dict] = []    # native lanes that only echo (azmap/whois/dmarc/rdap)
         self.notes: list[str] = []
-        self._execution_lock = threading.RLock()
-        self._execution_finalized = False
-        observed = os.stat(self.dir, follow_symlinks=False)
-        self._execution_identity = (observed.st_dev, observed.st_ino)
-        raw_observed = os.stat(self.raw, follow_symlinks=False)
-        self._execution_raw_identity = (raw_observed.st_dev, raw_observed.st_ino)
+
+    @staticmethod
+    def _private_directory_stat(path: Path, label: str) -> os.stat_result:
+        try:
+            observed = os.stat(path, follow_symlinks=False)
+        except OSError:
+            raise RuntimeError(f"{label} identity is unavailable") from None
+        if (not stat.S_ISDIR(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or stat.S_IMODE(observed.st_mode) != privfs.DIR_MODE):
+            raise RuntimeError(f"{label} identity is unsafe")
+        return observed
+
+    @staticmethod
+    def _validate_private_directory_fd(
+        fd: int, identity: tuple[int, int], label: str,
+    ) -> os.stat_result:
+        observed = os.fstat(fd)
+        if (not stat.S_ISDIR(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or stat.S_IMODE(observed.st_mode) != privfs.DIR_MODE
+                or (observed.st_dev, observed.st_ino) != identity):
+            raise RuntimeError(f"{label} identity changed")
+        return observed
+
+    @classmethod
+    def _open_exact_directory(
+        cls, path: Path, identity: tuple[int, int], label: str,
+    ) -> int:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            raise RuntimeError(f"{label} identity is unavailable") from None
+        try:
+            cls._validate_private_directory_fd(fd, identity, label)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _identity_json(observed: os.stat_result) -> list[int]:
+        return [observed.st_dev, observed.st_ino]
+
+    @staticmethod
+    def _write_all(fd: int, payload: bytes) -> None:
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("OSINT authority write made no progress")
+            view = view[written:]
+
+    def _read_authority_record(self, session_fd: int) -> tuple[dict, tuple[int, int]]:
+        try:
+            fd = privfs.open_strict_file_at(session_fd, (_OSINT_AUTHORITY_NAME,))
+        except Exception:
+            raise RuntimeError("existing OSINT session has no safe authority record") from None
+        try:
+            observed = os.fstat(fd)
+            chunks, total = [], 0
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 1024 * 1024:
+                    raise RuntimeError("OSINT authority record is too large")
+                chunks.append(chunk)
+            try:
+                record = json.loads(b"".join(chunks).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                raise RuntimeError("OSINT authority record is malformed") from None
+            if type(record) is not dict:
+                raise RuntimeError("OSINT authority record is malformed")
+            return record, (observed.st_dev, observed.st_ino)
+        finally:
+            os.close(fd)
+
+    def _initialize_execution_authority(self) -> None:
+        root_fd = self._open_exact_directory(
+            self._osint_root, self._execution_osint_root_identity, "OSINT root",
+        )
+        session_fd = -1
+        raw_fd = -1
+        claims_fd = -1
+        try:
+            root_observed = os.fstat(root_fd)
+            try:
+                session_fd = os.open(
+                    self.ts, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+                created = False
+            except FileNotFoundError:
+                os.mkdir(self.ts, privfs.DIR_MODE, dir_fd=root_fd)
+                os.fsync(root_fd)  # make the new session directory entry durable
+                session_fd = os.open(
+                    self.ts, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+                os.fsync(session_fd)  # and explicitly persist the new directory itself
+                created = True
+
+            session_observed = os.fstat(session_fd)
+            if (not stat.S_ISDIR(session_observed.st_mode)
+                    or session_observed.st_uid != os.geteuid()
+                    or stat.S_IMODE(session_observed.st_mode) != privfs.DIR_MODE):
+                raise RuntimeError("OSINT session identity is unsafe")
+
+            if created:
+                os.mkdir("raw", privfs.DIR_MODE, dir_fd=session_fd)
+                os.mkdir(_OSINT_CLAIMS_NAME, privfs.DIR_MODE, dir_fd=session_fd)
+                os.fsync(session_fd)
+            raw_fd = os.open(
+                "raw", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=session_fd,
+            )
+            claims_fd = os.open(
+                _OSINT_CLAIMS_NAME,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=session_fd,
+            )
+            raw_observed = os.fstat(raw_fd)
+            claims_observed = os.fstat(claims_fd)
+            for label, observed in (
+                ("OSINT raw directory", raw_observed),
+                ("OSINT claims directory", claims_observed),
+            ):
+                if (not stat.S_ISDIR(observed.st_mode)
+                        or observed.st_uid != os.geteuid()
+                        or stat.S_IMODE(observed.st_mode) != privfs.DIR_MODE):
+                    raise RuntimeError(f"{label} identity is unsafe")
+            if created:
+                os.fsync(raw_fd)
+                os.fsync(claims_fd)
+
+            started = _utc()
+            expected = {
+                "schema": _OSINT_AUTHORITY_SCHEMA,
+                "session_id": self.ts,
+                "target": self.target,
+                "started": started,
+                "osint_root_identity": self._identity_json(root_observed),
+                "session_identity": self._identity_json(session_observed),
+                "raw_identity": self._identity_json(raw_observed),
+                "claims_identity": self._identity_json(claims_observed),
+                "locks_identity": list(self._execution_locks_identity),
+                "lock_identity": list(self._execution_lock_identity),
+            }
+            if created:
+                privfs.durable_replace_private(
+                    session_fd, (_OSINT_AUTHORITY_NAME,),
+                    json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+                )
+                record, authority_identity = self._read_authority_record(session_fd)
+            else:
+                record, authority_identity = self._read_authority_record(session_fd)
+                expected["started"] = record.get("started")
+
+            if record != expected or type(record.get("started")) is not str:
+                raise RuntimeError("OSINT session authority does not match target or identity")
+            self.started = record["started"]
+            self._execution_identity = (session_observed.st_dev, session_observed.st_ino)
+            self._execution_raw_identity = (raw_observed.st_dev, raw_observed.st_ino)
+            self._execution_claims_identity = (claims_observed.st_dev, claims_observed.st_ino)
+            self._execution_authority_identity = authority_identity
+        finally:
+            for fd in (claims_fd, raw_fd, session_fd, root_fd):
+                if fd >= 0:
+                    os.close(fd)
 
     @property
     def _execution_authority_key(self) -> tuple[str, str]:
@@ -147,10 +349,27 @@ class OsintSession:
         return self.dir / ".execution-finalized"
 
     def _materialize_execution_lock_file(self) -> int:
-        lock_dir = privfs.private_dir(self._execution_lock_path.parent)
-        directory_fd = os.open(
-            lock_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        root_fd = self._open_exact_directory(
+            self._osint_root, self._execution_osint_root_identity, "OSINT root",
         )
+        directory_fd = -1
+        try:
+            try:
+                directory_fd = os.open(
+                    ".locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+            except OSError:
+                raise RuntimeError("OSINT lock directory identity is unavailable") from None
+            self._validate_private_directory_fd(
+                directory_fd, self._execution_locks_identity, "OSINT lock directory",
+            )
+        except BaseException:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+            raise
+        finally:
+            os.close(root_fd)
         try:
             fd = os.open(
                 self._execution_lock_path.name,
@@ -168,34 +387,143 @@ class OsintSession:
                 raise RuntimeError("OSINT execution lock identity is unsafe")
             if stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE:
                 os.fchmod(fd, privfs.FILE_MODE)
+            identity = (observed.st_dev, observed.st_ino)
+            pinned = getattr(self, "_execution_lock_identity", None)
+            if pinned is not None and identity != pinned:
+                raise RuntimeError("OSINT execution lock identity changed")
+            self._execution_lock_identity = identity
             return fd
         except BaseException:
             os.close(fd)
             raise
 
     def _require_execution_identity(self) -> None:
+        root_fd = -1
+        session_fd = -1
+        raw_fd = -1
+        claims_fd = -1
         try:
-            observed = os.stat(self.dir, follow_symlinks=False)
-            raw_observed = os.stat(self.raw, follow_symlinks=False)
-        except OSError:
-            raise RuntimeError("OSINT session identity is unavailable") from None
-        if (not stat.S_ISDIR(observed.st_mode)
-                or observed.st_uid != os.geteuid()
-                or stat.S_IMODE(observed.st_mode) != privfs.DIR_MODE
-                or (observed.st_dev, observed.st_ino) != self._execution_identity
-                or not stat.S_ISDIR(raw_observed.st_mode)
-                or raw_observed.st_uid != os.geteuid()
-                or stat.S_IMODE(raw_observed.st_mode) != privfs.DIR_MODE
-                or (raw_observed.st_dev, raw_observed.st_ino)
-                != self._execution_raw_identity):
-            raise RuntimeError("OSINT session identity changed")
+            try:
+                root_fd = self._open_exact_directory(
+                    self._osint_root, self._execution_osint_root_identity, "OSINT root",
+                )
+                session_fd = os.open(
+                    self.ts, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+                self._validate_private_directory_fd(
+                    session_fd, self._execution_identity, "OSINT session",
+                )
+                raw_fd = os.open(
+                    "raw", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=session_fd,
+                )
+                self._validate_private_directory_fd(
+                    raw_fd, self._execution_raw_identity, "OSINT raw directory",
+                )
+                claims_fd = os.open(
+                    _OSINT_CLAIMS_NAME,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=session_fd,
+                )
+                self._validate_private_directory_fd(
+                    claims_fd, self._execution_claims_identity, "OSINT claims directory",
+                )
+            except OSError:
+                raise RuntimeError("OSINT session identity is unavailable") from None
+            record, authority_identity = self._read_authority_record(session_fd)
+        finally:
+            for fd in (claims_fd, raw_fd, session_fd, root_fd):
+                if fd >= 0:
+                    os.close(fd)
+        expected = {
+            "schema": _OSINT_AUTHORITY_SCHEMA,
+            "session_id": self.ts,
+            "target": self.target,
+            "started": self.started,
+            "osint_root_identity": list(self._execution_osint_root_identity),
+            "session_identity": list(self._execution_identity),
+            "raw_identity": list(self._execution_raw_identity),
+            "claims_identity": list(self._execution_claims_identity),
+            "locks_identity": list(self._execution_locks_identity),
+            "lock_identity": list(self._execution_lock_identity),
+        }
+        if (record != expected
+                or authority_identity != self._execution_authority_identity):
+            raise RuntimeError("OSINT session authority identity changed")
+
+    def _open_execution_claims_dir(self) -> int:
+        session_fd = self._open_exact_directory(
+            self.dir, self._execution_identity, "OSINT session",
+        )
+        try:
+            fd = os.open(
+                _OSINT_CLAIMS_NAME,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=session_fd,
+            )
+            try:
+                self._validate_private_directory_fd(
+                    fd, self._execution_claims_identity, "OSINT claims directory",
+                )
+                return fd
+            except BaseException:
+                os.close(fd)
+                raise
+        finally:
+            os.close(session_fd)
+
+    def _reserved_execution_object_exists(self, name: str) -> bool:
+        session_fd = self._open_exact_directory(
+            self.dir, self._execution_identity, "OSINT session",
+        )
+        try:
+            try:
+                os.stat(name, dir_fd=session_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                raise RuntimeError("OSINT terminal object cannot be classified") from None
+            return True  # every object type, including a dangling symlink, is terminal
+        finally:
+            os.close(session_fd)
+
+    def _create_durable_execution_marker(self, name: str, payload: bytes) -> None:
+        session_fd = self._open_exact_directory(
+            self.dir, self._execution_identity, "OSINT session",
+        )
+        fd = -1
+        try:
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+                privfs.FILE_MODE,
+                dir_fd=session_fd,
+            )
+            self._write_all(fd, payload)
+            os.fsync(fd)
+            observed = os.fstat(fd)
+            named = os.stat(name, dir_fd=session_fd, follow_symlinks=False)
+            if (not stat.S_ISREG(observed.st_mode)
+                    or (observed.st_dev, observed.st_ino)
+                    != (named.st_dev, named.st_ino)
+                    or observed.st_uid != os.geteuid()
+                    or observed.st_nlink != 1
+                    or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE):
+                raise RuntimeError("OSINT terminal marker identity is unsafe")
+            os.fsync(session_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            os.close(session_fd)
 
     def _require_execution_open(self) -> None:
         self._require_execution_identity()
         if (self._execution_finalized
-                or self._execution_sealing_path.exists()
-                or self._execution_terminal_path.exists()
-                or (self.dir / "manifest.json").exists()):
+                or self._reserved_execution_object_exists(".execution-sealing")
+                or self._reserved_execution_object_exists(".execution-finalized")
+                or self._reserved_execution_object_exists("manifest.json")):
             self._execution_finalized = True
             raise RuntimeError("OSINT session is finalized")
 
@@ -349,15 +677,18 @@ class OsintSession:
     def finalize(self, profile) -> Path:
         """Seal the session only after every durable execution claim settled."""
         with self._execution_mutation():
-            claim_dir = self.dir / ".execution-claims"
-            if claim_dir.exists() and any(claim_dir.iterdir()):
-                raise RuntimeError("OSINT session has a live execution claim")
+            claim_fd = self._open_execution_claims_dir()
+            try:
+                if os.listdir(claim_fd):
+                    raise RuntimeError("OSINT session has a live execution claim")
+            finally:
+                os.close(claim_fd)
             # Durable before the first final artifact: a crash cannot reopen a
             # partly finalized session as writable evidence.
-            privfs.write_private(self._execution_sealing_path, "sealing\n")
-            result = self._finalize(profile)
-            privfs.write_private(self._execution_terminal_path, "finalized\n")
+            self._create_durable_execution_marker(".execution-sealing", b"sealing\n")
             self._execution_finalized = True
+            result = self._finalize(profile)
+            self._create_durable_execution_marker(".execution-finalized", b"finalized\n")
             return result
 
     def _finalize(self, profile) -> Path:
