@@ -343,7 +343,6 @@ def _js_download(ctx):
     eligible = [u for u in ctx.run.values("js_url")
                 if ctx.scope.active_allowed(normalize.host_of_url(u))]
     raw_dir = ctx.run.dir / "raw" / "crawl" / "js_files"
-    raw_dir.mkdir(parents=True, exist_ok=True)
     # state lives outside js_files/: that dir is scanned by the secret scanners and mined by
     # xnLinkFinder, so a ledger inside it would feed them its own URLs and sha256 digests.
     ledger = budget.Ledger(raw_dir.parent / "js_fetch.state.json", lane="crawl.js_fetch")
@@ -2250,6 +2249,86 @@ def _xnl_replay_bundle(ledger, state_dir, wu: str) -> dict | None:
     return snap
 
 
+def _repository_write_all(descriptor: int, data: bytes) -> None:
+    """Write exact bytes to one descriptor retained by a repository owner."""
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("repository artifact write made no progress")
+        view = view[written:]
+
+
+def _xnl_artifact_claim(run: store.Run, components: tuple[str, ...]):
+    """Acquire one exact repository claim; test doubles adapt this seam explicitly."""
+    if type(run) is not store.Run:
+        raise TypeError("XNL bounded input requires exact Run authority")
+    return run.artifact_claim(*components)
+
+
+def _xnl_publish_run_bytes(
+    run: store.Run,
+    components: tuple[str, ...],
+    data: bytes,
+) -> bool:
+    """Publish one run-local XNL artifact through an exact artifact claim."""
+    if type(run) is not store.Run or type(data) is not bytes:
+        raise TypeError("XNL materialization requires exact Run bytes authority")
+    try:
+        with run.artifact_claim(*components) as claim:
+            writer = claim.open_writer()
+            _repository_write_all(writer, data)
+            claim.publish()
+    except Exception:
+        return False
+    return True
+
+
+def _xnl_publish_run_absence(
+    run: store.Run,
+    components: tuple[str, ...],
+) -> bool:
+    """Commit an authenticated absence without ambiently unlinking a prior final."""
+    if type(run) is not store.Run:
+        raise TypeError("XNL absence requires exact Run authority")
+    destination = run.dir.joinpath(*components)
+    policy = RepositoryNativeOutput.file(
+        1, *components, required=False,
+    )
+    owner = _NativeFacadeOwner(NativeOutputAdoption())
+    operation_fault = None
+    finish_fault = None
+    try:
+        with _NativeFacadeFence(owner):
+            with _NativeFacadeFence(owner):
+                owner.transaction = prepare_native_outputs(
+                    run,
+                    ("quarry-owned-absence", str(destination)),
+                    (policy,),
+                    adoption=owner.adoption,
+                )
+                owner.receipt, finish_fault = _finish_native_outputs(
+                    owner.transaction, owner.adoption, clean=True,
+                )
+    except BaseException as exc:
+        operation_fault = exc
+    fault = _preferred_native_fault(
+        operation_fault, finish_fault, owner.cleanup_fault,
+    )
+    if fault is not None and not isinstance(fault, Exception):
+        raise fault
+    receipt = owner.receipt
+    committed = () if receipt is None else receipt.committed
+    return bool(
+        fault is None
+        and receipt is not None
+        and receipt.clean
+        and len(committed) == 1
+        and committed[0].components == components
+        and not committed[0].present
+    )
+
+
 def _xnl_materialize(ctx, tag: str, snap: dict) -> None:
     """Write an owned unit's verified bytes into this run's raw tree, for the operator to inspect.
 
@@ -2259,10 +2338,17 @@ def _xnl_materialize(ctx, tag: str, snap: dict) -> None:
     outs = _xnl_outputs(ctx, tag)
     for key, dst in outs.items():
         state, data = snap[key]
-        if state != "ok":
-            dst.unlink(missing_ok=True)      # the mining run produced no such artifact; neither do we
-            continue
-        dst.write_bytes(data)
+        components = tuple(dst.relative_to(ctx.run.dir).parts)
+        if state == "ok":
+            settled = _xnl_publish_run_bytes(ctx.run, components, data)
+        elif state == "absent":
+            settled = _xnl_publish_run_absence(ctx.run, components)
+        else:
+            settled = False
+        if not settled:
+            raise OSError(
+                f"{tag}: {key} could not be materialized through repository authority",
+            )
 
 
 def _xnl_lane(ctx, units: list) -> None:
@@ -2515,10 +2601,11 @@ def _xnl_terminal(ctx, sid: str, fp: str, units: list, st: dict) -> None:
 def _xnl_outputs(ctx, tag: str) -> dict:
     """The four artifacts one unit writes, under this run's raw tree."""
     safe = tag.replace("/", "_").replace(".", "_")
-    return {"links": ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe}_links.txt"),
-            "params": ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe}_params.txt"),
-            "secrets": ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe}_secrets.json"),
-            "wordlist": ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe}_wordlist.txt")}
+    root = ctx.run.dir / "raw" / "crawl" / "xnLinkFinder"
+    return {"links": root / f"{safe}_links.txt",
+            "params": root / f"{safe}_params.txt",
+            "secrets": root / f"{safe}_secrets.json",
+            "wordlist": root / f"{safe}_wordlist.txt"}
 
 
 def _xnl_blob(ctx, indir: str, tag: str) -> dict:
@@ -2530,46 +2617,54 @@ def _xnl_blob(ctx, indir: str, tag: str) -> dict:
     safe_tag = tag.replace("/", "_").replace(".", "_")
     # only stdin parses file content offline, so the dir is concatenated into a blob and streamed via
     # stdin; the copy stops exactly at the byte cap and `capped` records any omission
-    blob = ctx.run.raw_path("crawl", "xnLinkFinder", f"{safe_tag}_input.txt")
+    blob = ctx.run.dir / "raw" / "crawl" / "xnLinkFinder" / f"{safe_tag}_input.txt"
+    components = tuple(blob.relative_to(ctx.run.dir).parts)
     written = 0
     capped = False
     files_completed = 0                              # files read to EOF (honest `tested`)
     partial_files = 0                                # files cut off mid-body by the byte cap; not tested
     unreadable = 0                                   # files that raised on open/read; not tested
     files = [f for f in sorted(Path(indir).rglob("*")) if f.is_file()]
-    with blob.open("wb") as bf:
-        # forces offline-content mode: xnLinkFinder reads a first line of "http"/"//" as a URL list to crawl,
-        # so a leading blank line forces fileContent mode — offline, deterministic
-        bf.write(b"\n")
-        written += 1
-        for i, f in enumerate(files):
-            if written >= XNL_MAX_INPUT:
-                capped = True                            # remaining files omitted
-                break
-            eof = False
-            try:
-                with f.open("rb") as src:
-                    while written < XNL_MAX_INPUT:
-                        chunk = src.read(min(1 << 20, XNL_MAX_INPUT - written))
-                        if not chunk:
-                            eof = True                   # read the whole file
-                            break
-                        bf.write(chunk)
-                        written += len(chunk)
-                    else:
-                        if src.read(1):                  # hit the cap mid-file -> more remained
-                            capped = True
-                            partial_files += 1           # not fully tested: this file is partly omitted
+    try:
+        with _xnl_artifact_claim(ctx.run, components) as claim:
+            writer = claim.open_writer()
+            # A leading blank line forces fileContent mode: xnLinkFinder would
+            # otherwise treat http/`//` first lines as a URL list to crawl.
+            _repository_write_all(writer, b"\n")
+            written += 1
+            for f in files:
+                if written >= XNL_MAX_INPUT:
+                    capped = True                        # remaining files omitted
+                    break
+                eof = False
+                try:
+                    with f.open("rb") as src:
+                        while written < XNL_MAX_INPUT:
+                            chunk = src.read(min(1 << 20, XNL_MAX_INPUT - written))
+                            if not chunk:
+                                eof = True               # read the whole file
+                                break
+                            _repository_write_all(writer, chunk)
+                            written += len(chunk)
                         else:
-                            eof = True                   # ended exactly at the cap boundary
-            except Exception:
-                unreadable += 1                          # not tested, and not a silent success
-                continue
-            if eof:
-                files_completed += 1                     # only a fully-read file counts as tested
-            if written < XNL_MAX_INPUT:
-                bf.write(b"\n")
-                written += 1
+                            if src.read(1):              # cap hit mid-file
+                                capped = True
+                                partial_files += 1
+                            else:
+                                eof = True
+                except Exception:
+                    unreadable += 1
+                    continue
+                if eof:
+                    files_completed += 1
+                if written < XNL_MAX_INPUT:
+                    _repository_write_all(writer, b"\n")
+                    written += 1
+            claim.publish()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        written = 0
     # input coverage per tag, every run so an uncapped rerun clears it. `tested` counts files read to
     # EOF only; a capped or raised one is `omitted`. Measure is `files`, never summed with params.
     _n_files = len(files)
@@ -2582,7 +2677,7 @@ def _xnl_blob(ctx, indir: str, tag: str) -> dict:
     return {"blob": blob, "written": written, "capped": capped, "files": _n_files,
             "files_completed": files_completed, "partial_files": partial_files,
             "unreadable_files": unreadable,
-            "digest": events.file_digest(blob) if blob.exists() else ""}
+            "digest": events.file_digest(blob) if written else ""}
 
 
 def _xnl_run(ctx, tag: str, blob, written: int, *, spo: bool = False) -> dict:

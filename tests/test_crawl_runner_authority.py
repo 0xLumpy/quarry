@@ -1,8 +1,11 @@
 """Focused crawl callers at the Phase 1 runner ownership boundary."""
 from __future__ import annotations
 
+import ast
 import base64
+import inspect
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,10 +18,128 @@ from quarry_recon.runner_repository import ArtifactDisposition, RepositoryOutput
 pytestmark = pytest.mark.offline
 
 
+EXPECTED_NATIVE_SINKS = {
+    ("content", "_run_one", "content.ffuf", (16,)),
+    ("crawl", "run", "crawl.katana_standard", (16,)),
+    ("crawl", "run", "<dynamic>", (6, 13)),
+    ("crawl", "run", "crawl.gitleaks", (4,)),
+    ("crawl", "_xnl_run", "xnLinkFinder", (7, 9, 14, 16)),
+    ("enrich", "run", "nuclei", (7,)),
+    ("enrich", "run", "gowitness", (6, 9)),
+    ("enrich", "run", "smap", (4,)),
+    ("params", "_arjun_exec", "arjun", (4,)),
+    ("params", "_nuclei_scan", "nuclei", (5,)),
+    ("params", "_dalfox_xss_fast", "dalfox", (6,)),
+    ("params", "run", "nuclei", (7,)),
+    ("probe", "_vhost_scan", "probe.ffuf_vhost", (17,)),
+    ("probe", "_cdn_shared_ips", "cdncheck", (7,)),
+    ("probe", "_web_port_prefilter", "naabu", (11,)),
+    ("probe", "run", "nuclei", (7,)),
+    ("probe", "run", "probe.gowitness", (6, 9)),
+    ("probe", "run", "probe.nmap_service", (9,)),
+    ("probe", "run", "smap", (4,)),
+    ("vertical", "_recursive_permute", "puredns", (6,)),
+    ("vertical", "run", "vertical.shosubgo", (6,)),
+}
+
+
 def _running_context(tmp_path):
     run = store.Run.create(tmp_path, "acme.example", run_id="crawl-runner-authority")
     run.write_state("running")
     return SimpleNamespace(run=run, http_timeout=10)
+
+
+def _native_policy_indices(call: ast.Call, function: ast.FunctionDef) -> tuple[int, ...]:
+    keyword = next(key for key in call.keywords if key.arg == "native_outputs")
+    policy_nodes = [keyword.value]
+    if isinstance(keyword.value, ast.Name):
+        name = keyword.value.id
+        policy_nodes = [
+            node.value
+            for node in ast.walk(function)
+            if ((isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == name
+                         for target in node.targets))
+                or (isinstance(node, ast.AugAssign)
+                    and isinstance(node.target, ast.Name)
+                    and node.target.id == name))
+        ]
+    indices = set()
+    for root in policy_nodes:
+        for node in ast.walk(root):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "RepositoryNativeOutput"):
+                continue
+            if (node.func.attr == "file" and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and type(node.args[0].value) is int):
+                indices.add(node.args[0].value)
+            elif node.func.attr == "tree" and node.args:
+                indices.update(
+                    item.elts[0].value
+                    for item in ast.walk(node.args[0])
+                    if (isinstance(item, ast.Tuple) and len(item.elts) == 2
+                        and isinstance(item.elts[0], ast.Constant)
+                        and type(item.elts[0].value) is int)
+                )
+    return tuple(sorted(indices))
+
+
+def test_native_output_sink_inventory_is_exact_and_static():
+    """Every managed argv sink is a finite, reviewable production call site."""
+    from quarry_recon import phases
+
+    observed = set()
+    for module_path in sorted(Path(phases.__file__).parent.glob("*.py")):
+        if module_path.stem == "__init__":
+            continue
+        tree = ast.parse(module_path.read_text())
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self):
+                self.functions = []
+
+            def visit_FunctionDef(self, node):
+                self.functions.append(node)
+                self.generic_visit(node)
+                self.functions.pop()
+
+            def visit_Call(self, node):
+                if any(key.arg == "native_outputs" for key in node.keywords):
+                    tool = (
+                        node.args[0].value
+                        if node.args and isinstance(node.args[0], ast.Constant)
+                        else "<dynamic>"
+                    )
+                    observed.add((
+                        module_path.stem,
+                        self.functions[-1].name,
+                        tool,
+                        _native_policy_indices(node, self.functions[-1]),
+                    ))
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+
+    assert observed == EXPECTED_NATIVE_SINKS
+
+
+def test_crawl_has_no_ambient_canonical_native_sink_mutations():
+    """The former Crawl bypasses stay absent at the source boundary."""
+    source = inspect.getsource(crawl)
+    materialize = inspect.getsource(crawl._xnl_materialize)
+    blob = inspect.getsource(crawl._xnl_blob)
+    outputs = inspect.getsource(crawl._xnl_outputs)
+    assert "def _stage_dir(" not in source
+    assert "def _publish_tree(" not in source
+    assert "write_bytes" not in materialize and ".unlink(" not in materialize
+    assert 'blob.open("wb")' not in blob
+    assert ".raw_path(" not in blob and ".raw_path(" not in outputs
+    assert "raw_dir.mkdir(parents=True, exist_ok=True)" not in source
+    assert "map_dir.mkdir(parents=True, exist_ok=True)" not in source
+    assert "cache_dir.mkdir(parents=True, exist_ok=True)" not in source
 
 
 def test_jsluice_retains_unique_chunks_and_claim_publishes_the_aggregate(
@@ -338,3 +459,185 @@ def test_js_tree_cancellation_fences_stage_and_preserves_prior(
         ctx.run.project_dir / "recon" / "state" / "native-stages" / ctx.run.run_id
     )
     assert not stages.exists() or list(stages.iterdir()) == []
+
+
+def test_xnl_blob_claim_blocks_seal_and_publishes_bounded_input(
+    tmp_path, monkeypatch,
+):
+    ctx = _running_context(tmp_path)
+    source = tmp_path / "xnl-input"
+    source.mkdir()
+    (source / "app.js").write_bytes(b"const endpoint = '/api';")
+    seal_state = []
+    real_write = crawl._repository_write_all
+
+    def write_while_sealing(descriptor, data):
+        if not seal_state:
+            try:
+                ctx.run.begin_finalization()
+            except store.ContractError:
+                seal_state.append("blocked-by-claim")
+            else:
+                seal_state.append(ctx.run.state)
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(crawl, "_repository_write_all", write_while_sealing)
+    prep = crawl._xnl_blob(ctx, str(source), "js")
+
+    assert seal_state == ["blocked-by-claim"]
+    assert prep["digest"] and prep["written"] == prep["blob"].stat().st_size
+    assert prep["blob"].read_bytes().startswith(b"\n")
+    assert ctx.run.state == "running"
+    assert ctx.run._live_artifact_claim_count() == 0
+
+
+def test_xnl_blob_non_run_owner_fails_closed_before_managed_path_effect(tmp_path):
+    source = tmp_path / "xnl-fake-owner-input"
+    source.mkdir()
+    (source / "app.js").write_bytes(b"const x = 1;")
+    fake_root = tmp_path / "fake-run"
+    ctx = SimpleNamespace(run=SimpleNamespace(dir=fake_root))
+
+    prep = crawl._xnl_blob(ctx, str(source), "js")
+
+    assert prep["written"] == 0 and prep["digest"] == ""
+    assert not fake_root.exists()
+
+
+def test_xnl_blob_cancellation_fences_stage_and_preserves_prior(
+    tmp_path, monkeypatch,
+):
+    ctx = _running_context(tmp_path)
+    components = ("raw", "crawl", "xnLinkFinder", "js_input.txt")
+    prior = ctx.run._replace_artifact(
+        store.MutationScope.BASE_EVIDENCE, components, b"prior bounded input",
+    )
+    source = tmp_path / "xnl-cancel-input"
+    source.mkdir()
+    (source / "app.js").write_bytes(b"replacement")
+    cancellation = KeyboardInterrupt("cancel XNL input publication")
+    real_write = crawl._repository_write_all
+    calls = 0
+
+    def cancel_after_write(descriptor, data):
+        nonlocal calls
+        calls += 1
+        real_write(descriptor, data)
+        if calls == 2:
+            raise cancellation
+
+    monkeypatch.setattr(crawl, "_repository_write_all", cancel_after_write)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        crawl._xnl_blob(ctx, str(source), "js")
+
+    assert raised.value is cancellation
+    assert prior.read_bytes() == b"prior bounded input"
+    assert ctx.run._live_artifact_claim_count() == 0
+
+
+def test_xnl_materialize_commits_present_and_absent_under_one_run_authority(
+    tmp_path,
+):
+    ctx = _running_context(tmp_path)
+    outs = crawl._xnl_outputs(ctx, "js")
+    ctx.run._replace_artifact(
+        store.MutationScope.BASE_EVIDENCE,
+        tuple(outs["secrets"].relative_to(ctx.run.dir).parts),
+        b"planted stale secret",
+    )
+    snapshot = {
+        "links": ("ok", b"https://api.acme.example/x\n"),
+        "params": ("ok", b"q\n"),
+        "secrets": ("absent", b""),
+        "wordlist": ("absent", b""),
+    }
+
+    crawl._xnl_materialize(ctx, "js", snapshot)
+
+    assert outs["links"].read_bytes() == snapshot["links"][1]
+    assert outs["params"].read_bytes() == snapshot["params"][1]
+    assert not outs["secrets"].exists() and not outs["wordlist"].exists()
+    assert ctx.run._live_artifact_claim_count() == 0
+
+
+def test_xnl_snapshot_refuses_preserved_prior_without_current_receipt(tmp_path):
+    ctx = _running_context(tmp_path)
+    outs = crawl._xnl_outputs(ctx, "js")
+    for key, path in outs.items():
+        ctx.run._replace_artifact(
+            store.MutationScope.BASE_EVIDENCE,
+            tuple(path.relative_to(ctx.run.dir).parts),
+            f"stale {key}\n".encode(),
+        )
+    result = SimpleNamespace(meta={"native_outputs": {"current_paths": []}})
+
+    snapshot = crawl._xnl_snapshot(outs, result)
+
+    assert snapshot == {
+        "links": ("absent", b""),
+        "params": ("absent", b""),
+        "secrets": ("absent", b""),
+        "wordlist": ("absent", b""),
+    }
+
+
+def test_xnl_materialize_seal_race_fails_closed_without_prior_mutation(
+    tmp_path, monkeypatch,
+):
+    ctx = _running_context(tmp_path)
+    outs = crawl._xnl_outputs(ctx, "js")
+    links_components = tuple(outs["links"].relative_to(ctx.run.dir).parts)
+    ctx.run._replace_artifact(
+        store.MutationScope.BASE_EVIDENCE, links_components, b"prior links\n",
+    )
+    snapshot = {
+        "links": ("ok", b"replacement links\n"),
+        "params": ("absent", b""),
+        "secrets": ("absent", b""),
+        "wordlist": ("absent", b""),
+    }
+    real_publish = crawl._xnl_publish_run_bytes
+    fired = False
+
+    def seal_then_publish(run, components, data):
+        nonlocal fired
+        if not fired:
+            fired = True
+            run.begin_finalization()
+        return real_publish(run, components, data)
+
+    monkeypatch.setattr(crawl, "_xnl_publish_run_bytes", seal_then_publish)
+    with pytest.raises(OSError, match="could not be materialized"):
+        crawl._xnl_materialize(ctx, "js", snapshot)
+
+    assert fired and outs["links"].read_bytes() == b"prior links\n"
+    assert ctx.run.state == "finalizing"
+    assert ctx.run._live_artifact_claim_count() == 0
+
+
+def test_xnl_present_materialization_cancellation_preserves_exact_exception(
+    tmp_path, monkeypatch,
+):
+    ctx = _running_context(tmp_path)
+    outs = crawl._xnl_outputs(ctx, "js")
+    cancellation = KeyboardInterrupt("cancel XNL materialization")
+    real_write = crawl._repository_write_all
+
+    def cancel_after_write(descriptor, data):
+        real_write(descriptor, data)
+        raise cancellation
+
+    monkeypatch.setattr(crawl, "_repository_write_all", cancel_after_write)
+    snapshot = {
+        "links": ("ok", b"current\n"),
+        "params": ("absent", b""),
+        "secrets": ("absent", b""),
+        "wordlist": ("absent", b""),
+    }
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        crawl._xnl_materialize(ctx, "js", snapshot)
+
+    assert raised.value is cancellation
+    assert not outs["links"].exists()
+    assert ctx.run._live_artifact_claim_count() == 0

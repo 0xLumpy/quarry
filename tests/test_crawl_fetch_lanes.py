@@ -15,6 +15,7 @@ import os
 import pathlib
 import shutil
 import uuid
+from contextlib import contextmanager
 
 import pytest
 
@@ -67,6 +68,65 @@ class _Run:
 
     def record(self, *a, **k):
         pass
+
+
+class _FakeArtifactClaim:
+    """Minimal explicit adapter for legacy fake-Run tests only."""
+
+    def __init__(self, final):
+        self.final = final
+        self.stage = final.with_name(f"{final.name}.claim-{uuid.uuid4().hex}")
+        self.writer = -1
+        self.published = False
+
+    def open_writer(self):
+        self.final.parent.mkdir(parents=True, exist_ok=True)
+        self.writer = os.open(self.stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        return self.writer
+
+    def publish(self):
+        if self.writer >= 0:
+            os.close(self.writer)
+            self.writer = -1
+        os.replace(self.stage, self.final)
+        self.published = True
+
+    def fence(self):
+        if self.writer >= 0:
+            os.close(self.writer)
+            self.writer = -1
+        self.stage.unlink(missing_ok=True)
+
+
+@contextmanager
+def _fake_artifact_claim(final):
+    claim = _FakeArtifactClaim(final)
+    try:
+        yield claim
+    finally:
+        if not claim.published:
+            claim.fence()
+
+
+def _install_fake_xnl_repository(monkeypatch):
+    """Adapt only this module's fake Run; production remains exact-Run-only."""
+    monkeypatch.setattr(
+        crawl, "_xnl_artifact_claim",
+        lambda run, components: _fake_artifact_claim(run.dir.joinpath(*components)),
+    )
+
+    def publish_bytes(run, components, data):
+        destination = run.dir.joinpath(*components)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        return True
+
+    def publish_absence(run, components):
+        run.dir.joinpath(*components).unlink(missing_ok=True)
+        return True
+
+    monkeypatch.setattr(crawl, "_xnl_publish_run_bytes", publish_bytes)
+    monkeypatch.setattr(crawl, "_xnl_publish_run_absence", publish_absence)
 
 
 class _Ctx:
@@ -2167,6 +2227,7 @@ class TestXnLinkFinderNeverCrawls:
                                   "note": "", "duration": 0.0, "exit_code": 0})()
 
         monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        _install_fake_xnl_repository(monkeypatch)
         ctx = _Ctx(tmp_path, [])
         src = tmp_path / "indir"
         src.mkdir(parents=True, exist_ok=True)
@@ -2234,6 +2295,7 @@ class TestXnLinkFinderNeverCrawls:
                                   "note": "", "duration": 0.0, "exit_code": 0})()
 
         monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        _install_fake_xnl_repository(monkeypatch)
         ctx = _Ctx(tmp_path, [])
         src = tmp_path / "indir2"
         src.mkdir(parents=True, exist_ok=True)
@@ -2359,6 +2421,7 @@ class TestXnLinkFinderIngestionBoundary:
                                   "note": "", "duration": 0.0, "exit_code": 0})()
 
         monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        _install_fake_xnl_repository(monkeypatch)
         events.reset(); events.configure(tmp_path)
         ctx = _Ctx(tmp_path, [])
         ctx.scope = TestXnLinkFinderOutputIsUntrusted._S()
@@ -2527,6 +2590,7 @@ class TestXnLinkFinderAcceptanceIsNotStorage:
                                   "note": "", "duration": 0.0, "exit_code": 0})()
 
         monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        _install_fake_xnl_repository(monkeypatch)
         events.reset(); events.configure(tmp_path)
         ctx = _Ctx(tmp_path, [])
         ctx.scope = TestXnLinkFinderAuthorityIsParsedNotGuessed._S()
@@ -2634,6 +2698,7 @@ class TestXnLinkFinderBoundarySemantics:
                                   "note": "", "duration": 0.0, "exit_code": 0})()
 
         monkeypatch.setattr(crawl, "exec_tool", fake_exec)
+        _install_fake_xnl_repository(monkeypatch)
         monkeypatch.setattr(pathlib.Path, "read_bytes",
                             lambda self: (_ for _ in ()).throw(PermissionError("denied"))
                             if self.name.endswith(("_links.txt", "_params.txt")) else b"")
@@ -2767,6 +2832,7 @@ class TestXnLinkFinderHasOneLifecycle:
             ctx.run.add = lambda *a, **k: (_add(*a, **k), False)[1]
         if add is not None:
             ctx.run.add = add
+        _install_fake_xnl_repository(monkeypatch)
         prepared = []
         for name in units:
             d = tmp_path / "in" / name
@@ -2802,6 +2868,7 @@ class TestXnLinkFinderHasOneLifecycle:
         events.reset(); events.configure(tmp_path)
         ctx = _Ctx(tmp_path, [])
         ctx.scope = self._S()
+        _install_fake_xnl_repository(monkeypatch)
         a = tmp_path / "a"
         a.mkdir()
         (a / "f.js").write_text("one")
@@ -2957,6 +3024,7 @@ class TestXnLinkFinderResumesAcrossREALRUNS:
         (run.dir / "raw" / "crawl" / "xnLinkFinder").mkdir(parents=True, exist_ok=True)
         ctx.scope = self._S()
         ctx.scope.passive_only = False
+        _install_fake_xnl_repository(monkeypatch)
         crawl._xnl_lane(ctx, [(str(indir), "js", False)])
         evs = [json.loads(l) for l in (run.dir / "events.jsonl").read_text().splitlines()]
         return calls, added, evs
@@ -3309,6 +3377,7 @@ class TestXnLinkFinderLifecycleBoundary:
         ctx.scope.passive_only = False
         if add is not None:
             ctx.run.add = add
+        _install_fake_xnl_repository(monkeypatch)
         d = tmp_path / "in" / "js"
         d.mkdir(parents=True, exist_ok=True)
         (d / "a.js").write_text("var x = 1;")
@@ -3645,6 +3714,7 @@ class TestXnLinkFinderLifecycleBoundary:
         ctx = _Ctx(tmp_path, [])
         ctx.scope = self._S()
         ctx.scope.passive_only = False
+        _install_fake_xnl_repository(monkeypatch)
         d = tmp_path / "in" / "js"
         d.mkdir(parents=True)
         (d / "a.js").write_text("var x = 1;")
@@ -3675,6 +3745,7 @@ class TestXnLinkFinderLifecycleBoundary:
         ctx = _Ctx(tmp_path, [])
         ctx.scope = self._S()
         ctx.scope.passive_only = False
+        _install_fake_xnl_repository(monkeypatch)
         d = tmp_path / "in" / "js"
         d.mkdir(parents=True)
         (d / "a.js").write_text("var x = 1;")
@@ -3704,6 +3775,7 @@ class TestXnLinkFinderLifecycleBoundary:
         ctx = _Ctx(tmp_path, [])
         ctx.scope = self._S()
         ctx.scope.passive_only = False
+        _install_fake_xnl_repository(monkeypatch)
         d = tmp_path / "in" / "js"
         d.mkdir(parents=True)
         (d / "a.js").write_text("var x = 1;")
