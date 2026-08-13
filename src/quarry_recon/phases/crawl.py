@@ -100,27 +100,45 @@ def _jsluice_run(ctx, sub, files, raw, origin):
     nothing to mine is empty, not degraded. One slow file times out only itself.
     """
     sid = f"crawl.jsluice_{sub}"
-    raw.parent.mkdir(parents=True, exist_ok=True)
-    scratch = raw.with_suffix(".part")            # runner.run needs a file target; reused per chunk
     events.tool_start(sid, cmd=["jsluice", sub, "-j"], input_total=len(files), discovery_context=origin)
     t0 = time.monotonic()
     degraded = 0
-    with raw.open("w", encoding="utf-8") as fh:
-        for i, f in enumerate(files, 1):
-            res = exec_tool("jsluice", ["jsluice", sub, "-j"],
-                            repository=ctx.run,
-                            stdout=RepositoryOutput.publish_path(ctx.run, scratch),
-                            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
-                            stdin_data=f.read_bytes().decode("utf-8", "replace"))
-            if res.status not in (Status.SUCCESS, Status.EMPTY):
-                degraded += 1
-                events.coverage_partial(sid, reason=f"{f.name}: {res.status.value}")
-            if res.raw_path and scratch.exists():
-                fh.write(scratch.read_text(encoding="utf-8", errors="replace"))
-            events.tool_progress(sid, current_index=i, input_total=len(files),
-                                 artifact_size=raw.stat().st_size)
-    scratch.unlink(missing_ok=True)
-    size = raw.stat().st_size if raw.exists() else None
+    aggregate = RepositoryOutput.publish_path(ctx.run, raw)
+    written = 0
+    with ctx.run.artifact_claim(*aggregate.components) as aggregate_claim:
+        aggregate_fd = aggregate_claim.open_writer()
+        try:
+            for i, f in enumerate(files, 1):
+                # Each invocation owns an immutable, independently useful artifact.  The aggregate is
+                # assembled through a separate repository claim; no reusable ambient scratch name is
+                # overwritten or unlinked between executions.
+                chunk = raw.with_name(f"{raw.stem}.chunk-{uuid.uuid4().hex}.jsonl")
+                res = exec_tool(
+                    "jsluice", ["jsluice", sub, "-j"],
+                    repository=ctx.run,
+                    stdout=RepositoryOutput.publish_path(ctx.run, chunk),
+                    stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+                    stdin_data=f.read_bytes().decode("utf-8", "replace"),
+                )
+                if res.status not in (Status.SUCCESS, Status.EMPTY):
+                    degraded += 1
+                    events.coverage_partial(sid, reason=f"{f.name}: {res.status.value}")
+                if res.raw_path:
+                    payload = res.raw_path.read_bytes()
+                    view = memoryview(payload)
+                    while view:
+                        count = os.write(aggregate_fd, view)
+                        if count <= 0:
+                            raise OSError("jsluice aggregate write made no progress")
+                        written += count
+                        view = view[count:]
+                events.tool_progress(
+                    sid, current_index=i, input_total=len(files), artifact_size=written,
+                )
+        finally:
+            os.close(aggregate_fd)
+        aggregate_claim.publish()
+    size = written
     status = Status.PARTIAL if degraded else Status.SUCCESS
     events.tool_finish(sid, status=status.value,
                        reason=(f"{degraded}/{len(files)} file(s) degraded" if degraded else None),
@@ -140,8 +158,6 @@ def _beautify_run(ctx, files):
     recorded result.
     """
     sid = "crawl.js_beautify"
-    scratch = ctx.run.raw_path("crawl", "js_beautify", "run.log")   # discard stdout; -r mutates the file
-    scratch.parent.mkdir(parents=True, exist_ok=True)
     events.tool_start(sid, cmd=["js-beautify", "-r"], input_total=len(files), discovery_context="js")
     t0 = time.monotonic()
     degraded = ok = 0
@@ -153,7 +169,7 @@ def _beautify_run(ctx, files):
             tmp.write_bytes(f.read_bytes())
             res = exec_tool("js-beautify", ["js-beautify", "-r", str(tmp)],
                             repository=ctx.run,
-                            stdout=RepositoryOutput.publish_path(ctx.run, scratch),
+                            stdout=RepositoryOutput.discard(),
                             stderr=RepositoryOutput.discard(), timeout=JS_BEAUTIFY_TIMEOUT)
         except Exception:
             res = None
@@ -173,7 +189,6 @@ def _beautify_run(ctx, files):
             reason = res.status.value if res is not None else "exception"
             events.coverage_partial(sid, reason=f"{f.name}: {reason}")
         events.tool_progress(sid, current_index=i, input_total=len(files))
-    scratch.unlink(missing_ok=True)
     status = Status.PARTIAL if degraded else Status.SUCCESS
     dur = round(time.monotonic() - t0, 2)
     events.tool_finish(sid, status=status.value,
