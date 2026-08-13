@@ -13,6 +13,7 @@ filesystem transaction directly.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -54,6 +55,7 @@ _CREATE_STAGE_FLAGS = (
 )
 _RENAME_EXCHANGE = 2
 _CONSTRUCTOR = object()
+_TREE_BUILDER_CONSTRUCTOR = object()
 _MAX_POLICIES = 64
 
 
@@ -266,6 +268,47 @@ class NativeOutputReceipt:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class NativeTreeBuildReceipt:
+    """Immutable terminal fact for one transaction-owned tree builder."""
+
+    policy_index: int
+    sealed: bool
+    aborted: bool
+    cleanup_settled: bool
+    directories: int = 0
+    files: int = 0
+    size: int = 0
+    sha256: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.policy_index) is not int or self.policy_index < 0:
+            raise TypeError("invalid native tree builder policy index")
+        if (type(self.sealed) is not bool or type(self.aborted) is not bool
+                or self.sealed == self.aborted):
+            raise TypeError("native tree builder must have one terminal state")
+        if type(self.cleanup_settled) is not bool:
+            raise TypeError("invalid native tree builder cleanup state")
+        for value in (self.directories, self.files, self.size):
+            if type(value) is not int or value < 0:
+                raise TypeError("invalid native tree builder count")
+        if self.sealed:
+            if (not self.cleanup_settled or type(self.sha256) is not str
+                    or len(self.sha256) != 64
+                    or any(char not in "0123456789abcdef" for char in self.sha256)):
+                raise TypeError("sealed native tree builder lacks exact evidence")
+        elif (self.directories or self.files or self.size or self.sha256 is not None):
+            raise ValueError("aborted native tree builder cannot authenticate bytes")
+
+    def __repr__(self) -> str:
+        return (
+            "NativeTreeBuildReceipt("
+            f"policy_index={self.policy_index}, sealed={self.sealed}, "
+            f"aborted={self.aborted}, cleanup_settled={self.cleanup_settled}, "
+            f"directories={self.directories}, files={self.files}, size={self.size})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class _TreeEntry:
     suffix: tuple[str, ...] = field(repr=False)
     directory: bool
@@ -321,6 +364,9 @@ class _PolicySettlement:
 @dataclass(slots=True)
 class _FinishLedger:
     requested_clean: bool
+    builders_done: bool = False
+    builders_settled: bool = True
+    builder_fault: BaseException | None = None
     validation_done: bool = False
     snapshots: tuple[_Snapshot, ...] | None = None
     validation_fault: BaseException | None = None
@@ -1349,6 +1395,532 @@ def _create_owned_tree(parent_fd: int, owner: _TreePublishOwner) -> None:
     os.fsync(parent_fd)
 
 
+def _preferred_builder_fault(
+    faults: tuple[BaseException | None, ...],
+) -> BaseException | None:
+    """Keep the first cancellation, otherwise the first ordinary fault."""
+    for fault in faults:
+        if fault is not None and not isinstance(fault, Exception):
+            return fault
+    return next((fault for fault in faults if fault is not None), None)
+
+
+class NativeTreeBuilder:
+    """Opaque descriptor-relative writer for one transaction-owned TREE stage.
+
+    Destination methods accept validated repository components only.  The sole
+    path-like input is an already-open source root descriptor for ``copy_file``;
+    callers never receive a destination path or destination descriptor.
+    """
+
+    __slots__ = (
+        "_transaction", "_policy_index", "_stage_name", "_fd", "_identity",
+        "_owned_fds", "_blocked_fds", "_effects", "_receipt", "_fault",
+        "_cancellation", "_constructor_token",
+    )
+
+    def __init__(
+        self,
+        transaction: "NativeOutputTransaction",
+        policy_index: int,
+        stage_name: str,
+        *,
+        _constructor_token,
+    ) -> None:
+        if (_constructor_token is not _TREE_BUILDER_CONSTRUCTOR
+                or type(transaction) is not NativeOutputTransaction):
+            raise ContractError(
+                "construct native tree builders through open_tree_builder",
+            )
+        self._transaction = transaction
+        self._policy_index = policy_index
+        self._stage_name = stage_name
+        self._fd = -1
+        self._identity = None
+        self._owned_fds: dict[int, tuple[int, int] | None] = {}
+        self._blocked_fds: set[int] = set()
+        self._effects: set[tuple[str, ...]] = set()
+        self._receipt = None
+        self._fault = None
+        self._cancellation = None
+        self._constructor_token = _constructor_token
+
+    def __repr__(self) -> str:
+        state = (
+            "sealed" if self._receipt is not None and self._receipt.sealed
+            else "aborted" if self._receipt is not None
+            else "faulted" if self._fault is not None
+            else "open"
+        )
+        return (
+            "NativeTreeBuilder("
+            f"policy_index={self._policy_index}, state={state!r})"
+        )
+
+    @property
+    def receipt(self) -> NativeTreeBuildReceipt | None:
+        return self._receipt
+
+    def _remember_fault(self, fault: BaseException | None) -> None:
+        if fault is None:
+            return
+        if (self._fault is None
+                or (isinstance(self._fault, Exception)
+                    and not isinstance(fault, Exception))):
+            self._fault = fault
+        if (self._cancellation is None
+                and not isinstance(fault, Exception)):
+            self._cancellation = fault
+
+    def _track_fd(self, fd: int) -> int:
+        # Publish ownership immediately after open/dup returns, before the
+        # first validating syscall can be interrupted.
+        self._owned_fds[fd] = None
+        observed = os.fstat(fd)
+        self._owned_fds[fd] = _identity(observed)
+        return fd
+
+    def _open_owned(
+        self,
+        name: str,
+        flags: int,
+        *,
+        dir_fd: int,
+        mode: int | None = None,
+    ) -> int:
+        if mode is None:
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        else:
+            fd = os.open(name, flags, mode, dir_fd=dir_fd)
+        return self._track_fd(fd)
+
+    def _dup_owned(self, fd: int) -> int:
+        return self._track_fd(os.dup(fd))
+
+    def _close_tracked(
+        self,
+        fd: int,
+    ) -> tuple[bool, BaseException | None]:
+        if fd not in self._owned_fds:
+            return True, None
+        if fd in self._blocked_fds:
+            return False, None
+        expected = self._owned_fds[fd]
+        faults: list[BaseException] = []
+        settled = False
+        try:
+            os.close(fd)
+        except BaseException as exc:
+            faults.append(exc)
+            try:
+                observed = os.fstat(fd)
+            except OSError as probe_fault:
+                if probe_fault.errno == errno.EBADF:
+                    settled = True
+                else:
+                    faults.append(probe_fault)
+            except BaseException as probe_fault:
+                faults.append(probe_fault)
+            else:
+                if expected is not None and _identity(observed) != expected:
+                    # Our descriptor closed and its number was reused.  Never
+                    # close the new owner's descriptor.
+                    settled = True
+                else:
+                    # POSIX does not permit blindly retrying close after an
+                    # ambiguous report: the number could be reused for the
+                    # same inode.  Retain the transaction claim instead.
+                    self._blocked_fds.add(fd)
+        else:
+            settled = True
+        if settled:
+            self._owned_fds.pop(fd, None)
+            self._blocked_fds.discard(fd)
+            if self._fd == fd:
+                self._fd = -1
+        return settled, _preferred_builder_fault(tuple(faults))
+
+    def _close_many(
+        self,
+        descriptors: tuple[int, ...],
+    ) -> tuple[bool, BaseException | None]:
+        settled = True
+        faults: list[BaseException | None] = []
+        for fd in descriptors:
+            if fd < 0:
+                continue
+            closed, fault = self._close_tracked(fd)
+            settled &= closed
+            faults.append(fault)
+        return settled, _preferred_builder_fault(tuple(faults))
+
+    def _raise_operation_fault(
+        self,
+        primary: BaseException | None,
+        cleanup: BaseException | None,
+    ) -> None:
+        self._remember_fault(primary)
+        self._remember_fault(cleanup)
+        fault = _preferred_builder_fault((primary, cleanup))
+        if fault is not None:
+            if primary is not None and fault is not primary:
+                raise fault from primary
+            raise fault
+
+    def _validate_stage_name(self) -> None:
+        transaction = self._transaction
+        transaction._validate_root()
+        observed = os.stat(
+            self._stage_name,
+            dir_fd=transaction._root_fd,
+            follow_symlinks=False,
+        )
+        if (self._identity is not None
+                and _identity(observed) != self._identity):
+            raise ContractError("native tree builder stage identity changed")
+        if not stat.S_ISDIR(observed.st_mode):
+            raise ContractError("native tree builder stage type changed")
+
+    def _assert_active(self) -> None:
+        transaction = self._transaction
+        if (type(transaction) is not NativeOutputTransaction
+                or transaction._builders.get(self._policy_index) is not self):
+            raise ContractError("native tree builder owner changed")
+        if self._receipt is not None:
+            raise ContractError("native tree builder is already terminal")
+        if transaction._receipt is not None or transaction._finish_ledger is not None:
+            raise ContractError("native tree builder transaction is finishing")
+        if self._fd < 0 or self._identity is None:
+            raise ContractError("native tree builder is not pinned")
+        self._validate_stage_name()
+
+    def _pin(self) -> None:
+        transaction = self._transaction
+        transaction._validate_root()
+        observed = os.stat(
+            self._stage_name,
+            dir_fd=transaction._root_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(observed.st_mode):
+            raise ContractError("native tree builder policy stage is not a directory")
+        fd = self._open_owned(
+            self._stage_name,
+            _DIR_FLAGS,
+            dir_fd=transaction._root_fd,
+        )
+        self._fd = fd
+        pinned = os.fstat(fd)
+        _validate_private_dir(pinned, normalize=False, fd=fd)
+        if _identity(pinned) != _identity(observed):
+            raise ContractError("native tree builder stage name changed")
+        self._identity = _identity(pinned)
+        self._validate_stage_name()
+
+    @staticmethod
+    def _components(
+        components: tuple[str, ...],
+        label: str,
+        *,
+        allow_empty: bool,
+    ) -> tuple[str, ...]:
+        if type(components) is not tuple:
+            raise TypeError(f"{label} must be an exact component tuple")
+        if not allow_empty and not components:
+            raise ContractError(f"{label} cannot be empty")
+        return tuple(
+            validate_artifact_component(component, label)
+            for component in components
+        )
+
+    def _open_directory_chain(
+        self,
+        anchor_fd: int,
+        components: tuple[str, ...],
+        *,
+        create: bool,
+        destination_prefix: tuple[str, ...] = (),
+    ) -> int:
+        opened: list[int] = []
+        primary = None
+        result = -1
+        try:
+            current = self._dup_owned(anchor_fd)
+            opened.append(current)
+            root = os.fstat(current)
+            _validate_private_dir(root, normalize=False, fd=current)
+            for depth, component in enumerate(components, start=1):
+                created = False
+                try:
+                    child = self._open_owned(
+                        component, _DIR_FLAGS, dir_fd=current,
+                    )
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    self._effects.add(
+                        destination_prefix + components[:depth],
+                    )
+                    os.mkdir(component, privfs.DIR_MODE, dir_fd=current)
+                    child = self._open_owned(
+                        component, _DIR_FLAGS, dir_fd=current,
+                    )
+                    os.fchmod(child, privfs.DIR_MODE)
+                    os.fsync(current)
+                    created = True
+                opened.append(child)
+                pinned = os.fstat(child)
+                _validate_private_dir(pinned, normalize=False, fd=child)
+                named = os.stat(
+                    component, dir_fd=current, follow_symlinks=False,
+                )
+                if _identity(named) != _identity(pinned):
+                    raise ContractError("native tree directory name changed")
+                if created:
+                    os.fsync(child)
+                current = child
+            result = opened.pop()
+        except BaseException as exc:
+            primary = exc
+        settled, cleanup = self._close_many(tuple(reversed(opened)))
+        if not settled and cleanup is None:
+            cleanup = ContractError("native tree directory descriptor did not close")
+        if primary is not None or cleanup is not None:
+            if result >= 0:
+                extra_settled, extra_fault = self._close_many((result,))
+                if not extra_settled and extra_fault is None:
+                    extra_fault = ContractError(
+                        "native tree result descriptor did not close",
+                    )
+                cleanup = _preferred_builder_fault((cleanup, extra_fault))
+            self._raise_operation_fault(primary, cleanup)
+        return result
+
+    def mkdir(self, *components: str) -> None:
+        """Create or authenticate one private directory chain."""
+        self._assert_active()
+        suffix = self._components(
+            tuple(components), "native tree destination", allow_empty=False,
+        )
+        directory = -1
+        primary = None
+        try:
+            directory = self._open_directory_chain(
+                self._fd, suffix, create=True,
+            )
+            os.fsync(directory)
+        except BaseException as exc:
+            primary = exc
+        settled, cleanup = self._close_many((directory,))
+        if not settled and cleanup is None:
+            cleanup = ContractError("native tree directory did not close")
+        self._raise_operation_fault(primary, cleanup)
+
+    def write_bytes(self, data: bytes, *components: str) -> None:
+        """Create one exact private 0600 file below the TREE root."""
+        self._assert_active()
+        if type(data) is not bytes:
+            raise TypeError("native tree data must be exact bytes")
+        suffix = self._components(
+            tuple(components), "native tree destination", allow_empty=False,
+        )
+        self._effects.add(suffix)
+        parent = target = -1
+        primary = None
+        try:
+            parent = self._open_directory_chain(
+                self._fd, suffix[:-1], create=True,
+            )
+            target = self._open_owned(
+                suffix[-1],
+                _CREATE_FILE_FLAGS,
+                dir_fd=parent,
+                mode=privfs.FILE_MODE,
+            )
+            os.fchmod(target, privfs.FILE_MODE)
+            _write_all(target, data)
+            os.fsync(target)
+            written = os.fstat(target)
+            _validate_private_file(written, normalize=False, fd=target)
+            named = os.stat(
+                suffix[-1], dir_fd=parent, follow_symlinks=False,
+            )
+            if (_file_signature(named) != _file_signature(written)
+                    or written.st_size != len(data)):
+                raise ContractError("native tree byte write changed")
+            os.fsync(parent)
+        except BaseException as exc:
+            primary = exc
+        settled, cleanup = self._close_many((target, parent))
+        if not settled and cleanup is None:
+            cleanup = ContractError("native tree byte-write descriptor did not close")
+        self._raise_operation_fault(primary, cleanup)
+
+    def copy_file(
+        self,
+        source_root_fd: int,
+        source_components: tuple[str, ...],
+        *destination_components: str,
+    ) -> None:
+        """Copy one stable regular file from a pinned external source root."""
+        self._assert_active()
+        if type(source_root_fd) is not int or source_root_fd < 0:
+            raise TypeError("native tree source root must be an open descriptor")
+        source_suffix = self._components(
+            source_components, "native tree source", allow_empty=False,
+        )
+        destination_suffix = self._components(
+            tuple(destination_components),
+            "native tree destination",
+            allow_empty=False,
+        )
+        self._effects.add(destination_suffix)
+        source_parent = source = destination_parent = destination = -1
+        primary = None
+        try:
+            source_parent = self._open_directory_chain(
+                source_root_fd, source_suffix[:-1], create=False,
+            )
+            source = self._open_owned(
+                source_suffix[-1], _FILE_FLAGS, dir_fd=source_parent,
+            )
+            before = os.fstat(source)
+            _validate_private_file(before, normalize=False, fd=source)
+            named_before = os.stat(
+                source_suffix[-1],
+                dir_fd=source_parent,
+                follow_symlinks=False,
+            )
+            if _file_signature(named_before) != _file_signature(before):
+                raise ContractError("native tree source name changed")
+
+            destination_parent = self._open_directory_chain(
+                self._fd, destination_suffix[:-1], create=True,
+            )
+            destination = self._open_owned(
+                destination_suffix[-1],
+                _CREATE_FILE_FLAGS,
+                dir_fd=destination_parent,
+                mode=privfs.FILE_MODE,
+            )
+            os.fchmod(destination, privfs.FILE_MODE)
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = os.read(source, 1024 * 1024)
+                if not chunk:
+                    break
+                _write_all(destination, chunk)
+                digest.update(chunk)
+                size += len(chunk)
+            os.fsync(destination)
+            after = os.fstat(source)
+            named_after = os.stat(
+                source_suffix[-1],
+                dir_fd=source_parent,
+                follow_symlinks=False,
+            )
+            if (_file_signature(after) != _file_signature(before)
+                    or _file_signature(named_after) != _file_signature(before)
+                    or size != before.st_size):
+                raise ContractError("native tree source changed while copying")
+            written = os.fstat(destination)
+            _validate_private_file(written, normalize=False, fd=destination)
+            named_destination = os.stat(
+                destination_suffix[-1],
+                dir_fd=destination_parent,
+                follow_symlinks=False,
+            )
+            if (_file_signature(named_destination) != _file_signature(written)
+                    or written.st_size != size):
+                raise ContractError("native tree destination changed while copying")
+            # Keep the content digest live until all identity checks completed;
+            # seal independently authenticates the entire resulting tree.
+            if len(digest.hexdigest()) != 64:  # pragma: no cover - hashlib invariant
+                raise ContractError("native tree copy digest failed")
+            os.fsync(destination_parent)
+        except BaseException as exc:
+            primary = exc
+        settled, cleanup = self._close_many((
+            destination, destination_parent, source, source_parent,
+        ))
+        if not settled and cleanup is None:
+            cleanup = ContractError("native tree copy descriptor did not close")
+        self._raise_operation_fault(primary, cleanup)
+
+    def _close_pinned(self) -> tuple[bool, BaseException | None]:
+        return self._close_many((self._fd,))
+
+    def seal(self) -> NativeTreeBuildReceipt:
+        """Authenticate and durably close the exact current tree generation."""
+        if self._receipt is not None:
+            if self._receipt.sealed:
+                return self._receipt
+            raise ContractError("aborted native tree builder cannot be sealed")
+        self._assert_active()
+        if self._fault is not None or self._cancellation is not None:
+            raise ContractError("faulted native tree builder cannot be sealed")
+        if set(self._owned_fds) != {self._fd}:
+            raise ContractError("native tree builder has unsettled descriptors")
+        primary = None
+        entries = None
+        try:
+            self._validate_stage_name()
+            entries = _snapshot_tree_recursive(self._fd, (), normalize=False)
+            self._validate_stage_name()
+        except BaseException as exc:
+            primary = exc
+        settled, cleanup = self._close_pinned()
+        if not settled and cleanup is None:
+            cleanup = ContractError("native tree builder descriptor did not close")
+        fault = _preferred_builder_fault((primary, cleanup))
+        self._remember_fault(primary)
+        self._remember_fault(cleanup)
+        if primary is None and settled and entries is not None:
+            receipt = NativeTreeBuildReceipt(
+                policy_index=self._policy_index,
+                sealed=True,
+                aborted=False,
+                cleanup_settled=True,
+                directories=sum(entry.directory for entry in entries),
+                files=sum(not entry.directory for entry in entries),
+                size=sum(entry.size for entry in entries if not entry.directory),
+                sha256=_tree_digest(entries),
+            )
+            self._receipt = receipt
+        if fault is not None:
+            if primary is not None and fault is not primary:
+                raise fault from primary
+            raise fault
+        if self._receipt is None:
+            raise ContractError("native tree builder could not be sealed")
+        return self._receipt
+
+    def abort(self) -> NativeTreeBuildReceipt:
+        """Idempotently fence every descriptor without publishing the tree."""
+        if self._receipt is not None:
+            return self._receipt
+        settled = True
+        faults: list[BaseException | None] = []
+        attempt_settled, fault = self._close_many(tuple(self._owned_fds))
+        settled &= attempt_settled
+        faults.append(fault)
+        if self._owned_fds:
+            settled = False
+        fault = _preferred_builder_fault(tuple(faults))
+        self._remember_fault(fault)
+        receipt = NativeTreeBuildReceipt(
+            policy_index=self._policy_index,
+            sealed=False,
+            aborted=True,
+            cleanup_settled=settled,
+        )
+        self._receipt = receipt
+        if fault is not None:
+            raise fault
+        return receipt
+
+
 class NativeOutputTransaction:
     """One durable claim spanning private native output staging and publication."""
 
@@ -1356,7 +1928,7 @@ class NativeOutputTransaction:
         "run", "policies", "rewritten_cmd", "_base_fd", "_root_fd",
         "_root_name", "_root_identity", "_root_present", "_claim_name",
         "_claim_identity", "_claim_present", "_receipt", "_finish_ledger",
-        "_stage_names", "_adoption", "_constructor_token",
+        "_stage_names", "_builders", "_adoption", "_constructor_token",
     )
 
     def __init__(
@@ -1391,6 +1963,7 @@ class NativeOutputTransaction:
         self._receipt = None
         self._finish_ledger = None
         self._stage_names = stage_names
+        self._builders: dict[int, NativeTreeBuilder] = {}
         self._adoption = adoption
         self._constructor_token = _constructor_token
         adoption._adopt_transaction(self)
@@ -1408,6 +1981,48 @@ class NativeOutputTransaction:
         if self._receipt is None:
             self.finish(clean=False)
         return False
+
+    def open_tree_builder(self, policy_index: int = 0) -> NativeTreeBuilder:
+        """Pin one TREE stage behind a destination-path-free build capability."""
+        if type(self) is not NativeOutputTransaction:
+            raise TypeError("native tree builder requires an exact transaction")
+        if type(policy_index) is not int:
+            raise TypeError("native tree builder policy index must be an exact int")
+        if policy_index < 0 or policy_index >= len(self.policies):
+            raise IndexError("native tree builder policy index is out of range")
+        if self.policies[policy_index].kind is not NativeOutputKind.TREE:
+            raise ContractError("native tree builder requires a TREE policy")
+        if self._receipt is not None or self._finish_ledger is not None:
+            raise ContractError("native output transaction is already finishing")
+        if policy_index in self._builders:
+            raise ContractError("native tree builder policy is already owned")
+        builder = NativeTreeBuilder(
+            self,
+            policy_index,
+            self._stage_names[policy_index],
+            _constructor_token=_TREE_BUILDER_CONSTRUCTOR,
+        )
+        # Publish ownership before pinning a descriptor.  A reported fault at
+        # the helper return boundary therefore remains fenceable by finish().
+        self._builders[policy_index] = builder
+        primary = None
+        try:
+            builder._pin()
+        except BaseException as exc:
+            primary = exc
+        if primary is not None:
+            cleanup = None
+            try:
+                builder.abort()
+            except BaseException as exc:
+                cleanup = exc
+            fault = _preferred_builder_fault((primary, cleanup))
+            if fault is not None:
+                if fault is not primary:
+                    raise fault from primary
+                raise fault
+            raise primary
+        return builder
 
     def _validate_root(self) -> None:
         observed = os.fstat(self._root_fd)
@@ -1439,6 +2054,35 @@ class NativeOutputTransaction:
                 ))
         os.fsync(self._root_fd)
         return tuple(snapshots)
+
+    def _validate_builder_snapshots(
+        self,
+        snapshots: tuple[_Snapshot, ...],
+    ) -> None:
+        """Bind every sealed builder to the generation finish will publish."""
+        for policy_index, builder in self._builders.items():
+            receipt = builder.receipt
+            if receipt is None or not receipt.sealed:
+                raise ContractError("native tree builder is not sealed")
+            if builder._identity is None:
+                raise ContractError("native tree builder lacks a stage identity")
+            named = os.stat(
+                self._stage_names[policy_index],
+                dir_fd=self._root_fd,
+                follow_symlinks=False,
+            )
+            snapshot = snapshots[policy_index]
+            if (_identity(named) != builder._identity
+                    or not snapshot.evidence.present
+                    or snapshot.evidence.size != receipt.size
+                    or snapshot.evidence.sha256 != receipt.sha256
+                    or sum(entry.directory for entry in snapshot.entries)
+                    != receipt.directories
+                    or sum(not entry.directory for entry in snapshot.entries)
+                    != receipt.files):
+                raise ContractError(
+                    "native tree builder generation changed after seal",
+                )
 
     def _source_file_fd(self, name: str) -> int:
         self._validate_root()
@@ -1614,6 +2258,12 @@ class NativeOutputTransaction:
         try:
             self._validate_root()
             source = os.open(name, _DIR_FLAGS, dir_fd=self._root_fd)
+            builder = self._builders.get(settlement.evidence.policy_index)
+            if (builder is not None
+                    and _identity(os.fstat(source)) != builder._identity):
+                raise ContractError(
+                    "native tree builder stage changed before publication",
+                )
             with self.run._mutation(store.MutationScope.BASE_EVIDENCE):
                 self.run._ensure_artifact_parent(policy.components)
                 anchor = store._open_run_fd(self.run.project_dir, self.run.run_id)
@@ -1922,6 +2572,43 @@ class NativeOutputTransaction:
     ) -> None:
         self._receipt = receipt
 
+    def _settle_tree_builders(self, ledger: _FinishLedger) -> None:
+        """Close every builder before validation, preserving cancellation."""
+        if ledger.builders_done:
+            return
+        settled = True
+        builder_faults: list[BaseException | None] = []
+        refused = False
+        for builder in tuple(self._builders.values()):
+            receipt = builder.receipt
+            if (ledger.requested_clean
+                    and (receipt is None or not receipt.sealed
+                         or builder._fault is not None
+                         or builder._cancellation is not None)):
+                refused = True
+            if receipt is None:
+                try:
+                    receipt = builder.abort()
+                except BaseException as exc:
+                    builder_faults.append(exc)
+                    receipt = builder.receipt
+            builder_faults.append(builder._fault)
+            if builder._cancellation is not None and ledger.cancellation is None:
+                ledger.cancellation = builder._cancellation
+            if receipt is None or not receipt.cleanup_settled:
+                settled = False
+        if refused and ledger.validation_fault is None:
+            ledger.validation_fault = ContractError(
+                "native tree builder must be fault-free and sealed before clean finish",
+            )
+        ledger.builders_settled = settled
+        ledger.builder_fault = _preferred_builder_fault(tuple(builder_faults))
+        if (ledger.builder_fault is not None
+                and not isinstance(ledger.builder_fault, Exception)
+                and ledger.cancellation is None):
+            ledger.cancellation = ledger.builder_fault
+        ledger.builders_done = True
+
     def finish(self, *, clean: bool) -> NativeOutputReceipt:
         """Resume, fence or publish this attempt and return its exact partition."""
         if type(clean) is not bool:
@@ -1933,8 +2620,11 @@ class NativeOutputTransaction:
             ledger = _FinishLedger(clean)
             self._finish_ledger = ledger
 
+        if not ledger.builders_done:
+            self._settle_tree_builders(ledger)
+
         if not ledger.validation_done:
-            if not ledger.requested_clean:
+            if not ledger.requested_clean or ledger.validation_fault is not None:
                 ledger.settlements = [
                     _PolicySettlement(
                         _default_evidence(index, policy),
@@ -1947,6 +2637,7 @@ class NativeOutputTransaction:
             else:
                 try:
                     snapshots = self._snapshots()
+                    self._validate_builder_snapshots(snapshots)
                 except BaseException as exc:
                     ledger.validation_fault = exc
                     ledger.cancellation = (
@@ -2007,7 +2698,7 @@ class NativeOutputTransaction:
             except BaseException as exc:
                 attempt_settled = self._reconcile_attempt_absence()
                 cleanup_fault = exc
-            ledger.cleanup_settled = attempt_settled
+            ledger.cleanup_settled = ledger.builders_settled and attempt_settled
             ledger.cleanup_fault = cleanup_fault
             ledger.cleanup_done = True
             if cleanup_fault is not None and not isinstance(cleanup_fault, Exception):
@@ -2058,6 +2749,8 @@ class NativeOutputTransaction:
             fault_operation, fault = "validate", ledger.validation_fault
         elif publication_fault is not None:
             fault_operation, fault = "publish", publication_fault
+        elif ledger.builder_fault is not None:
+            fault_operation, fault = "cleanup", ledger.builder_fault
         elif ledger.cleanup_fault is not None:
             fault_operation, fault = "cleanup", ledger.cleanup_fault
         elif ledger.release_fault is not None:

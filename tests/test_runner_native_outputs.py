@@ -16,6 +16,7 @@ from quarry_recon.runner_native import (
     NativeOutputAdoption,
     NativeOutputTransaction,
     NativeOutputUnsupported,
+    NativeTreeBuilder,
     RepositoryNativeOutput,
     prepare_native_outputs,
 )
@@ -86,6 +87,318 @@ def _reap_child(child: int) -> int:
     waited, status = os.waitpid(child, 0)
     assert waited == child
     return status
+
+
+def _tree_builder_transaction(
+    run: store.Run,
+    components: tuple[str, ...] = ("raw", "crawl", "derived"),
+) -> tuple[NativeOutputTransaction, Path]:
+    final = run.dir.joinpath(*components)
+    policy = RepositoryNativeOutput.tree(
+        ((3, ()),), *components,
+    )
+    transaction = prepare_native_outputs(
+        run,
+        _python_command("import sys", final),
+        (policy,),
+    )
+    return transaction, final
+
+
+def test_tree_builder_descriptor_relative_write_seal_and_publish(tmp_path):
+    run = _running_run(tmp_path, "native-builder-write")
+    transaction, final = _tree_builder_transaction(run)
+
+    builder = transaction.open_tree_builder(0)
+    assert type(builder) is NativeTreeBuilder
+    builder.mkdir("empty")
+    builder.write_bytes(b"source", "nested", "app.js")
+    builder.write_bytes(b'{"version":3}', "maps", "app.js.map")
+    build_receipt = builder.seal()
+
+    assert build_receipt is builder.seal()
+    assert build_receipt.sealed and not build_receipt.aborted
+    assert build_receipt.cleanup_settled
+    assert build_receipt.directories == 3
+    assert build_receipt.files == 2
+    assert build_receipt.size == len(b"source") + len(b'{"version":3}')
+    receipt = transaction.finish(clean=True)
+
+    assert receipt.clean and receipt.committed[0].present
+    assert (final / "empty").is_dir()
+    assert (final / "nested" / "app.js").read_bytes() == b"source"
+    assert (final / "maps" / "app.js.map").read_bytes() == b'{"version":3}'
+    assert run._live_artifact_claim_count() == 0
+
+
+def test_tree_builder_copies_from_pinned_private_source_root(tmp_path):
+    run = _running_run(tmp_path, "native-builder-copy")
+    transaction, final = _tree_builder_transaction(run)
+    source_root = tmp_path / "private-source"
+    source_root.mkdir(mode=0o700)
+    source_dir = source_root / "nested"
+    source_dir.mkdir(mode=0o700)
+    source = source_dir / "payload.bin"
+    source.write_bytes(b"\x00external\xff")
+    source.chmod(0o600)
+    source_fd = os.open(source_root, runner_native._DIR_FLAGS)
+    try:
+        builder = transaction.open_tree_builder()
+        builder.copy_file(
+            source_fd,
+            ("nested", "payload.bin"),
+            "evidence", "payload.bin",
+        )
+        builder.seal()
+    finally:
+        os.close(source_fd)
+
+    receipt = transaction.finish(clean=True)
+
+    assert receipt.clean
+    assert (final / "evidence" / "payload.bin").read_bytes() == b"\x00external\xff"
+    assert stat.S_IMODE((final / "evidence").stat().st_mode) == 0o700
+    assert stat.S_IMODE((final / "evidence" / "payload.bin").stat().st_mode) == 0o600
+
+
+def test_tree_builder_exact_policy_and_component_validation_precedes_effects(
+    tmp_path,
+):
+    run = _running_run(tmp_path, "native-builder-closed-inputs")
+    transaction, _final = _tree_builder_transaction(run)
+
+    with pytest.raises(TypeError, match="exact int"):
+        transaction.open_tree_builder(True)
+    with pytest.raises(IndexError, match="out of range"):
+        transaction.open_tree_builder(1)
+    with pytest.raises(ContractError, match="construct native tree builders"):
+        NativeTreeBuilder(transaction, 0, "output-00.tree", _constructor_token=None)
+
+    builder = transaction.open_tree_builder()
+    with pytest.raises(ContractError):
+        builder.write_bytes(b"no", "/absolute")
+    with pytest.raises(TypeError, match="exact bytes"):
+        builder.write_bytes(bytearray(b"no"), "mutable.bin")
+    with pytest.raises(ContractError, match="already owned"):
+        transaction.open_tree_builder()
+    assert builder.seal().files == 0
+    assert transaction.finish(clean=True).clean
+
+    file_final = run.dir / "raw" / "probe" / "file.jsonl"
+    file_transaction = prepare_native_outputs(
+        run,
+        _python_command("import sys", file_final),
+        (RepositoryNativeOutput.file(3, "raw", "probe", "file.jsonl"),),
+    )
+    with pytest.raises(ContractError, match="TREE policy"):
+        file_transaction.open_tree_builder()
+    file_transaction.finish(clean=False)
+
+
+def test_clean_finish_refuses_unsealed_builder_and_preserves_prior(tmp_path):
+    run = _running_run(tmp_path, "native-builder-unsealed")
+    first, final = _tree_builder_transaction(run)
+    first_builder = first.open_tree_builder()
+    first_builder.write_bytes(b"prior", "generation")
+    first_builder.seal()
+    assert first.finish(clean=True).clean
+
+    second, _same_final = _tree_builder_transaction(run)
+    second_builder = second.open_tree_builder()
+    second_builder.write_bytes(b"current", "generation")
+
+    receipt = second.finish(clean=True)
+
+    assert not receipt.clean
+    assert len(receipt.unpublished) == 1
+    assert not receipt.committed and not receipt.uncertain
+    assert receipt.fault_operation == "validate"
+    assert receipt.fault_type == "ContractError"
+    assert second_builder.receipt is not None and second_builder.receipt.aborted
+    assert second_builder.receipt.cleanup_settled
+    assert (final / "generation").read_bytes() == b"prior"
+    assert not receipt.claim_retained and receipt.cleanup_settled
+    assert run._live_artifact_claim_count() == 0
+
+
+def test_tree_builder_seal_binds_exact_generation_until_finish(tmp_path):
+    run = _running_run(tmp_path, "native-builder-seal-generation")
+    transaction, final = _tree_builder_transaction(run)
+    builder = transaction.open_tree_builder()
+    builder.write_bytes(b"sealed", "generation")
+    builder.seal()
+    staged = Path(transaction.rewritten_cmd[3])
+    (staged / "generation").write_bytes(b"mutated")
+    (staged / "generation").chmod(0o600)
+
+    receipt = transaction.finish(clean=True)
+
+    assert not receipt.clean and len(receipt.unpublished) == 1
+    assert receipt.fault_operation == "validate"
+    assert receipt.fault_type == "ContractError"
+    assert not final.exists()
+    assert not receipt.claim_retained and receipt.cleanup_settled
+    assert run._live_artifact_claim_count() == 0
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "fifo", "hardlink", "mode"])
+def test_tree_builder_rejects_unsafe_external_source_without_publication(
+    tmp_path, unsafe,
+):
+    run = _running_run(tmp_path, f"native-builder-unsafe-{unsafe}")
+    transaction, final = _tree_builder_transaction(run)
+    source_root = tmp_path / f"source-{unsafe}"
+    source_root.mkdir(mode=0o700)
+    source = source_root / "payload"
+    if unsafe == "symlink":
+        target = source_root / "target"
+        target.write_bytes(b"target")
+        target.chmod(0o600)
+        source.symlink_to(target.name)
+    elif unsafe == "fifo":
+        os.mkfifo(source, 0o600)
+    else:
+        source.write_bytes(b"unsafe")
+        source.chmod(0o600 if unsafe == "hardlink" else 0o644)
+        if unsafe == "hardlink":
+            os.link(source, source_root / "alias")
+    source_fd = os.open(source_root, runner_native._DIR_FLAGS)
+    try:
+        builder = transaction.open_tree_builder()
+        with pytest.raises((ContractError, OSError)):
+            builder.copy_file(source_fd, ("payload",), "payload")
+    finally:
+        os.close(source_fd)
+
+    receipt = transaction.finish(clean=True)
+
+    assert not receipt.clean and len(receipt.unpublished) == 1
+    assert receipt.fault_operation == "validate"
+    assert not final.exists()
+    assert run._live_artifact_claim_count() == 0
+
+
+def test_tree_builder_rejects_source_mutation_during_copy(tmp_path, monkeypatch):
+    run = _running_run(tmp_path, "native-builder-source-mutation")
+    transaction, final = _tree_builder_transaction(run)
+    source_root = tmp_path / "source-mutation"
+    source_root.mkdir(mode=0o700)
+    source = source_root / "payload"
+    source.write_bytes(b"before")
+    source.chmod(0o600)
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+    source_fd = os.open(source_root, runner_native._DIR_FLAGS)
+    real_read = runner_native.os.read
+    injected = False
+
+    def read_then_mutate(fd, size):
+        nonlocal injected
+        chunk = real_read(fd, size)
+        observed = os.fstat(fd)
+        if not injected and (observed.st_dev, observed.st_ino) == source_identity:
+            injected = True
+            source.write_bytes(b"after-mutation-is-longer")
+            source.chmod(0o600)
+        return chunk
+
+    try:
+        builder = transaction.open_tree_builder()
+        monkeypatch.setattr(runner_native.os, "read", read_then_mutate)
+        with pytest.raises(ContractError, match="changed while copying"):
+            builder.copy_file(source_fd, ("payload",), "payload")
+    finally:
+        os.close(source_fd)
+
+    receipt = transaction.finish(clean=True)
+
+    assert injected
+    assert not receipt.clean and receipt.fault_operation == "validate"
+    assert not final.exists()
+    assert run._live_artifact_claim_count() == 0
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_tree_builder_finish_preserves_close_boundary_cancellation(
+    tmp_path, monkeypatch, interruption,
+):
+    run = _running_run(
+        tmp_path, f"native-builder-close-{interruption.__name__.lower()}",
+    )
+    transaction, final = _tree_builder_transaction(run)
+    builder = transaction.open_tree_builder()
+    builder.write_bytes(b"partial", "partial")
+    pinned = builder._fd
+    cancellation = interruption("fixture builder close cancellation")
+    real_close = runner_native.os.close
+    injected = False
+
+    def close_then_interrupt(fd):
+        nonlocal injected
+        result = real_close(fd)
+        if fd == pinned and not injected:
+            injected = True
+            raise cancellation
+        return result
+
+    monkeypatch.setattr(runner_native.os, "close", close_then_interrupt)
+    with pytest.raises(interruption) as caught:
+        transaction.finish(clean=False)
+
+    assert caught.value is cancellation
+    receipt = transaction.finish(clean=False)
+    assert builder.receipt is not None and builder.receipt.aborted
+    assert builder.receipt.cleanup_settled
+    assert not receipt.clean and receipt.fault_type == interruption.__name__
+    assert not receipt.claim_retained and receipt.cleanup_settled
+    assert not final.exists()
+    assert run._live_artifact_claim_count() == 0
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_tree_builder_cleanup_cancellation_wins_over_ordinary_write_fault(
+    tmp_path, monkeypatch, interruption,
+):
+    run = _running_run(
+        tmp_path, f"native-builder-precedence-{interruption.__name__.lower()}",
+    )
+    transaction, final = _tree_builder_transaction(run)
+    builder = transaction.open_tree_builder()
+    primary = RuntimeError("fixture ordinary write primary")
+    cancellation = interruption("fixture builder cleanup cancellation")
+    real_close = runner_native.os.close
+    real_write = runner_native._write_all
+    candidate_fd = None
+    injected = False
+
+    def fail_write(fd, data):
+        nonlocal candidate_fd
+        candidate_fd = fd
+        raise primary
+
+    def close_then_interrupt(fd):
+        nonlocal injected
+        result = real_close(fd)
+        if fd == candidate_fd and not injected:
+            injected = True
+            raise cancellation
+        return result
+
+    monkeypatch.setattr(runner_native, "_write_all", fail_write)
+    monkeypatch.setattr(runner_native.os, "close", close_then_interrupt)
+    with pytest.raises(interruption) as caught:
+        builder.write_bytes(b"partial", "partial")
+    monkeypatch.setattr(runner_native, "_write_all", real_write)
+
+    assert caught.value is cancellation
+    assert caught.value.__cause__ is primary
+    with pytest.raises(interruption) as repeated:
+        transaction.finish(clean=False)
+    assert repeated.value is cancellation
+    receipt = transaction.finish(clean=False)
+    assert not receipt.clean and receipt.fault_type == interruption.__name__
+    assert not receipt.claim_retained and receipt.cleanup_settled
+    assert not final.exists()
+    assert run._live_artifact_claim_count() == 0
 
 
 def test_exact_file_binding_is_private_then_durably_committed(tmp_path):
