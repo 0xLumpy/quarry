@@ -458,13 +458,14 @@ def test_stream_to_fd_source_line_cancellation_is_exact_and_settled(
         assert governor._descriptor_state == (len(retained), {}), target_line
 
 
+@pytest.mark.parametrize("invocation", [1, 2, 3])
 @pytest.mark.parametrize("kind", [KeyboardInterrupt, SystemExit])
-def test_second_fence_exit_source_line_cancellation_has_terminal_metadata(
-    tmp_path, kind,
+def test_each_fence_exit_source_line_cancellation_has_terminal_metadata(
+    tmp_path, kind, invocation,
 ):
     operation = contract._DescriptorStreamFence.__exit__
     discovery_path, discovery_fd, discovery_governor = _stream_case(
-        tmp_path, "second-fence-discovery",
+        tmp_path, f"fence-{invocation}-discovery",
     )
     try:
         lines = _executed_lines(
@@ -481,11 +482,11 @@ def test_second_fence_exit_source_line_cancellation_has_terminal_metadata(
 
     for index, target_line in enumerate(sorted(lines)):
         path, fd, governor = _stream_case(
-            tmp_path, f"second-fence-{kind.__name__}-{index}",
+            tmp_path, f"fence-{invocation}-{kind.__name__}-{index}",
         )
         try:
             cancellation = _cancel_on_invocation(
-                operation, target_line, 2,
+                operation, target_line, invocation,
                 lambda: contract.stream_to_fd(
                     io.BytesIO(b"known-body"), fd,
                     budget_path=path.parent, chunk=64, governor=governor,

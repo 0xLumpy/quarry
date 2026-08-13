@@ -1157,13 +1157,21 @@ def stream_to_fd(r, writer_fd: int, *, budget_path, mirror_fd: int | None = None
     ledger = _DescriptorStreamLedger(writer_fd, budget_path, gov)
     settlement = _DescriptorStreamSettlement(ledger)
     end = _time.monotonic() + deadline_s if deadline_s else None
-    with _DescriptorStreamFence(settlement, finalize=True):
-        with _DescriptorStreamFence(settlement):
+    finalizer = _DescriptorStreamFence(settlement, finalize=True)
+    # This handler is active before any fence starts unwinding.  In particular,
+    # cancellation at the first traced line of the outermost ``__exit__`` has
+    # not yet entered that method's own try block, so recover it here.
+    try:
+        with finalizer:
             with _DescriptorStreamFence(settlement):
-                ledger.activate()
-                return _stream_to_fd_body(
-                    r, writer_fd, chunk, deadline_s, end, ledger, gov,
-                )
+                with _DescriptorStreamFence(settlement):
+                    ledger.activate()
+                    return _stream_to_fd_body(
+                        r, writer_fd, chunk, deadline_s, end, ledger, gov,
+                    )
+    except BaseException as primary:
+        finalizer._leave(primary)
+        raise
 
 
 class ResponseTooLarge(ValueError):
