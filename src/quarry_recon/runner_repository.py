@@ -354,7 +354,8 @@ def _batch_ownership_settled(batch: PrivateStageHandoffBatch | None) -> bool:
                 "committed_with_fault",
             }
             and type(ledger) is privfs._PrivateStageCleanupLedger
-            and not ledger.pending)
+            and not ledger.pending
+            and not privfs._publication_cleanup_pending(batch))
 
 
 def _fence_batch(batch: PrivateStageHandoffBatch | None) -> BaseException | None:
