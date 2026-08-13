@@ -23,8 +23,9 @@ from urllib.parse import urlsplit
 
 from .. import budget, events, evidence, fetch, netguard, normalize, oob, secrets, settings
 from ..runner import (RunResult, Status, cancel_all as runner_cancel_all, fresh_artifact_dir, have,
-                      nuclei_timeout, reset_cancel as runner_reset_cancel, run as exec_tool,
-                      scaled_timeout, skipped)
+                      native_output_current, nuclei_timeout, reset_cancel as runner_reset_cancel,
+                      run as exec_tool, scaled_timeout, skipped)
+from ..runner_native import RepositoryNativeOutput
 from ..runner_repository import RepositoryOutput
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
@@ -267,7 +268,6 @@ def _arjun_exec(repository, url: str, rate: int, threads: int, paths: tuple, tim
     journal, coverage generation and entity store keep their ordering guarantees. A worker only
     produces facts."""
     out_f, std_f, err_f = paths
-    out_f.unlink(missing_ok=True)          # fresh attempt file; a stale -oT must not fake output
     cmd = ["arjun", "-u", url, "-oT", str(out_f), "-t", str(threads)]
     if rate:
         cmd += ["--rate-limit", str(rate)]              # this process's share of the global lane rate
@@ -275,13 +275,18 @@ def _arjun_exec(repository, url: str, rate: int, threads: int, paths: tuple, tim
         "arjun", cmd,
         repository=repository,
         stdout=RepositoryOutput.publish(*std_f.relative_to(repository.dir).parts),
-        stderr=RepositoryOutput.publish(*err_f.relative_to(repository.dir).parts), timeout=timeout,
+        stderr=RepositoryOutput.publish(*err_f.relative_to(repository.dir).parts),
+        native_outputs=(RepositoryNativeOutput.file(
+            4, *out_f.relative_to(repository.dir).parts, required=False,
+        ),),
+        timeout=timeout,
     )
     try:
         text = std_f.read_text(encoding="utf-8", errors="replace") if std_f.exists() else ""
     except OSError:
         text = ""                          # unreadable stdout -> no signals -> unknown (fails closed)
-    rows, malformed = _arjun_rows(out_f, url)
+    rows, malformed = (_arjun_rows(out_f, url) if native_output_current(r, out_f)
+                       else (None, 0))
     verdict, detail = _arjun_verdict(r.exit_code == 0, _arjun_signals(text), rows,
                                      target=url, malformed=malformed)
     return {"url": url, "result": r, "verdict": verdict, "detail": detail,
@@ -863,6 +868,9 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                                 repository=ctx.run,
                                 stdout=RepositoryOutput.discard(),
                                 stderr=RepositoryOutput.publish(*ef.relative_to(ctx.run.dir).parts),
+                                native_outputs=(RepositoryNativeOutput.file(
+                                    5, *cf.relative_to(ctx.run.dir).parts, required=False,
+                                ),),
                                 timeout=nuclei_timeout(len(batch), ctx.http_timeout))
                 if res.stderr_tail:
                     with log.open("a", encoding="utf-8") as lf:
@@ -878,13 +886,33 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                 prog = _nuclei_progress(_err)
                 # execution-complete is `exit_code == 0` only; coverage is the -stats counters (absent ->
                 # unknown). `Scan completed in …` is corroborating telemetry and must not gate resumability.
-                complete = res.exit_code == 0
+                native_meta = res.meta.get("native_outputs")
+                native_clean = (native_meta is None or (
+                    type(native_meta) is dict and native_meta.get("clean") is True
+                    and res.meta.get("native_output_ownership_settled") is True
+                ))
+                cf_current = native_output_current(res, cf)
+                complete = res.exit_code == 0 and native_clean
                 terminal_seen = bool(prog["completed"])      # telemetry: did we recognize nuclei's own terminal?
                 planned, requests = prog["planned"], prog["requests"]
                 # keep a chunk's findings regardless of outcome — real even if WAF/timeout-degraded
                 if complete:
-                    if not cf.exists():
-                        cf.touch()                           # explicit zero-byte artifact for a clean-empty
+                    if not cf_current or (native_meta is None and not cf.exists()):
+                        # Nuclei may omit `-o` when there are no findings. Publish the explicit empty
+                        # completion artifact through a repository claim after the native transaction
+                        # authenticated that this clean invocation produced no file.
+                        _empty_digest = hashlib.sha256(b"").hexdigest()
+                        cf_current = budget.publish_bytes(cf, b"", digest=_empty_digest)
+                    if not cf_current or not cf.is_file():
+                        complete = False
+                        incomplete += 1
+                        if res.status in (Status.SUCCESS, Status.EMPTY):
+                            res.status = Status.PARTIAL
+                            res.note = "nuclei: clean-empty artifact could not be published"
+                        _emit_coverage(ci, planned, requests,
+                                       why="execution completed but its empty artifact was not durable")
+                        chunk_status = Status.PARTIAL.value
+                        continue
                     done_map[str(ci)] = rel                  # execution complete -> controls skip
                     _add_evidence(str(ci), rel)              # ...and joins this chunk's evidence history
                     _bind(rel, cf)                           # content binding: a later edit invalidates the skip
@@ -904,7 +932,7 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                                        f"— chunk stays retryable")
                     # a chunk that produced output appends to its evidence list; a degraded retry with no
                     # output appends nothing, so an earlier attempt's findings are never erased
-                    if cf.exists() and cf.stat().st_size > 0:
+                    if cf_current and cf.exists() and cf.stat().st_size > 0:
                         _add_evidence(str(ci), rel)
                         _bind(rel, cf)
                         _save()
@@ -1957,6 +1985,9 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                                     repository=ctx.run,
                                     stdout=RepositoryOutput.discard(),
                                     stderr=RepositoryOutput.discard(),
+                                    native_outputs=(RepositoryNativeOutput.file(
+                                        6, *cf.relative_to(ctx.run.dir).parts, required=False,
+                                    ),),
                                     ok_codes=(0, 1),
                                     timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
                     # proven by the runner, never inferred: a missing binary, a cancelled launch or a Popen
@@ -1981,7 +2012,9 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 continue
             # dalfox v3 exit contract: 0 = clean/no-findings, 1 = clean/with-findings, >=2 = error. Exit code
             # and parsed artifact must agree, or the chunk is PARTIAL/retryable; findings are ingested below.
-            n_findings, art = scan_dalfox_jsonl(cf)
+            n_findings, art = (scan_dalfox_jsonl(cf)
+                               if native_output_current(res, cf)
+                               else (0, DalfoxArtifact(readable=False)))
             rc = res.exit_code
                         # execution completion decides resume, coverage is reported separately: membership is
                         # reconciled from the batch's own signatures.
@@ -2372,10 +2405,13 @@ def run(ctx) -> None:
                 repository=ctx.run,
                 stdout=RepositoryOutput.discard(),
                 stderr=RepositoryOutput.discard(),
+                native_outputs=(RepositoryNativeOutput.file(
+                    7, *tk_out.relative_to(ctx.run.dir).parts, required=False,
+                ),),
                 timeout=nuclei_timeout(len(subs), ctx.http_timeout),
             )
             ctx.run.record("params", r)
-            if tk_out.exists():
+            if native_output_current(r, tk_out) and tk_out.exists():
                 import json as _json
                 for line in tk_out.read_text().splitlines():
                     try:
