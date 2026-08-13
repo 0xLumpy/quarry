@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import select
 import signal
 import sys
+import time
 
 from . import runner_ipc
 from .runner_protocol import (
@@ -26,10 +28,12 @@ from .runner_protocol import (
     StreamRole,
     StreamSettlement,
     StreamTerminal,
+    WorkerRequest,
     WorkerCommandKind,
     WorkerSettlement,
     decode_command,
     decode_request,
+    encode_request,
     encode_prepared,
     encode_ready,
     encode_settlement,
@@ -247,16 +251,97 @@ def _launcher_child(
     os._exit(0)
 
 
+def _execution_launcher_child(
+    *,
+    worker_pid: int,
+    release_read: int,
+    release_write: int,
+    stdin_read: int,
+    stdin_write: int,
+    stdout_read: int,
+    stdout_write: int,
+    stderr_read: int,
+    stderr_write: int,
+    exec_status_read: int,
+    exec_status_write: int,
+    inherited_fds: tuple[int, ...],
+) -> None:
+    """Park without target material, then exec one exact private request.
+
+    The worker is the only process with the release writer.  SIGCONT is merely a
+    scheduling event: until a complete canonical request arrives and the release
+    channel reaches EOF, this child cannot reach ``execve``.  The status writer is
+    close-on-exec, so EOF on the worker's status reader is positive kernel evidence
+    that the image transition completed.
+    """
+    try:
+        for fd in (release_write, stdin_write, stdout_read, stderr_read,
+                   exec_status_read):
+            _close_quietly(fd)
+        _arm_parent_death(worker_pid)
+        os.setsid()
+        if os.getpid() != os.getpgrp() or os.getpid() != os.getsid(0):
+            raise RuntimeError("launcher_identity_invalid")
+
+        keep = {
+            release_read, stdin_read, stdout_write, stderr_write,
+            exec_status_write,
+        }
+        _close_child_fds_except(keep)
+        os.kill(os.getpid(), signal.SIGSTOP)
+
+        release_wire = runner_ipc.read_frame(
+            release_read, max_frame_bytes=MAX_FRAME_BYTES,
+        )
+        runner_ipc.require_eof(release_read)
+        request = decode_request(release_wire)
+        _close_quietly(release_read)
+
+        if stdin_read != 0:
+            os.dup2(stdin_read, 0, inheritable=True)
+        if stdout_write != 1:
+            os.dup2(stdout_write, 1, inheritable=True)
+        if stderr_write != 2:
+            os.dup2(stderr_write, 2, inheritable=True)
+        for fd in (stdin_read, stdout_write, stderr_write):
+            if fd not in (0, 1, 2):
+                _close_quietly(fd)
+        if request.cwd is not None:
+            os.chdir(request.cwd)
+        environment = {key: value for key, value in request.environment}
+        os.execvpe(request.argv[0], list(request.argv), environment)
+    except BaseException:
+        try:
+            os.write(exec_status_write, b"\x01")
+        except BaseException:
+            pass
+    os._exit(127)
+
+
 class _ParkedLauncher:
     """Exclusive status/release authority for one exact forked child."""
 
-    def __init__(self, pid: int, release_write: int) -> None:
+    def __init__(
+        self,
+        pid: int,
+        release_write: int,
+        *,
+        stdin_write: int = -1,
+        stdout_read: int = -1,
+        stderr_read: int = -1,
+        exec_status_read: int = -1,
+    ) -> None:
         self.pid = pid
         self.pgid = pid
         self.start_time_ticks: int | None = None
         self.returncode: int | None = None
         self._release_write = release_write
         self._release_close_attempted = False
+        self.stdin_write_fd = stdin_write
+        self.stdout_read_fd = stdout_read
+        self.stderr_read_fd = stderr_read
+        self._exec_status_read = exec_status_read
+        self._released = False
         self._reaped = False
         self._stop_wait_state = "not_started"
         self._stop_wait_result: tuple[int, int] | None = None
@@ -342,6 +427,58 @@ class _ParkedLauncher:
             return None
         return self._finish_wait_result(waited_pid, status)
 
+    def release_for_exec(
+        self,
+        request: WorkerRequest,
+        *,
+        deadline: float | None = None,
+        clock=time.monotonic,
+    ) -> bool:
+        """Release one exact request and prove its successful image transition."""
+        if (type(request) is not WorkerRequest or self._reaped or self._released
+                or self._release_write < 0 or self._exec_status_read < 0
+                or not callable(clock)):
+            return False
+        if deadline is not None and (
+                type(deadline) not in (int, float) or type(deadline) is bool):
+            return False
+        wire = encode_request(request)
+        try:
+            # Waking the child is not authority: it still blocks on the complete
+            # framed release plus EOF.  Wake before the potentially pipe-sized
+            # write so a large, still-bounded request cannot deadlock on capacity.
+            os.kill(self.pid, signal.SIGCONT)
+            runner_ipc.write_all(self._release_write, wire)
+            os.close(self._release_write)
+            self._release_write = -1
+            self._release_close_attempted = True
+            while True:
+                timeout = None
+                if deadline is not None:
+                    timeout = max(0.0, float(deadline) - float(clock()))
+                    if timeout <= 0:
+                        return False
+                readable, _, _ = select.select(
+                    (self._exec_status_read,), (), (), timeout,
+                )
+                if not readable:
+                    return False
+                try:
+                    status = os.read(self._exec_status_read, 1)
+                except InterruptedError:
+                    continue
+                break
+        except BaseException:
+            raise
+        finally:
+            if self._exec_status_read >= 0:
+                _close_quietly(self._exec_status_read)
+                self._exec_status_read = -1
+        if status:
+            return False
+        self._released = True
+        return True
+
     def abort_and_reap(self) -> int:
         if self._reaped:
             return 0 if self.returncode is None else self.returncode
@@ -366,6 +503,15 @@ class _ParkedLauncher:
             reconciled = self._reconcile_ambiguous_wait()
             if self._reaped:
                 return 0 if reconciled is None else reconciled
+
+        for attribute in (
+            "stdin_write_fd", "stdout_read_fd", "stderr_read_fd",
+            "_exec_status_read",
+        ):
+            fd = getattr(self, attribute, -1)
+            if fd >= 0:
+                _close_quietly(fd)
+                setattr(self, attribute, -1)
 
         if self._release_write >= 0 and not self._release_close_attempted:
             release_write = self._release_write
@@ -416,6 +562,96 @@ class _PreparedAbortOwner:
         self.release_write = -1
         self.pid = -1
         self.launcher = None
+
+
+class _ExecutionLauncherOwner:
+    """Stable allocation graph for one release-gated execution launcher."""
+
+    def __init__(self) -> None:
+        self.release_read = -1
+        self.release_write = -1
+        self.stdin_read = -1
+        self.stdin_write = -1
+        self.stdout_read = -1
+        self.stdout_write = -1
+        self.stderr_read = -1
+        self.stderr_write = -1
+        self.exec_status_read = -1
+        self.exec_status_write = -1
+        self.pid = -1
+        self.launcher = None
+
+
+def _close_execution_child_ends(owner: _ExecutionLauncherOwner) -> None:
+    for attribute in (
+        "release_read", "stdin_read", "stdout_write", "stderr_write",
+        "exec_status_write",
+    ):
+        fd = getattr(owner, attribute)
+        if fd >= 0:
+            _close_quietly(fd)
+            setattr(owner, attribute, -1)
+
+
+def _adopt_execution_launcher(owner: _ExecutionLauncherOwner) -> _ParkedLauncher | None:
+    if owner.launcher is None and owner.pid > 0:
+        owner.launcher = _ParkedLauncher(
+            owner.pid,
+            owner.release_write,
+            stdin_write=owner.stdin_write,
+            stdout_read=owner.stdout_read,
+            stderr_read=owner.stderr_read,
+            exec_status_read=owner.exec_status_read,
+        )
+    launcher = owner.launcher
+    if launcher is not None:
+        owner.release_write = -1
+        owner.stdin_write = -1
+        owner.stdout_read = -1
+        owner.stderr_read = -1
+        owner.exec_status_read = -1
+    _close_execution_child_ends(owner)
+    return launcher
+
+
+def _close_execution_owner_fds(owner: _ExecutionLauncherOwner) -> None:
+    for attribute in (
+        "release_read", "release_write", "stdin_read", "stdin_write",
+        "stdout_read", "stdout_write", "stderr_read", "stderr_write",
+        "exec_status_read", "exec_status_write",
+    ):
+        fd = getattr(owner, attribute)
+        if fd >= 0:
+            _close_quietly(fd)
+            setattr(owner, attribute, -1)
+
+
+class _ExecutionLauncherFence:
+    """Cleanup layer shared by launcher allocation and execution ownership."""
+
+    def __init__(self, owner: _ExecutionLauncherOwner) -> None:
+        self._owner = owner
+
+    def __enter__(self) -> _ExecutionLauncherFence:
+        return self
+
+    def __exit__(self, _kind, primary, _traceback) -> bool:
+        if primary is None:
+            return False
+        owner = self._owner
+        launcher = _adopt_execution_launcher(owner)
+        if launcher is not None and not _launcher_terminal(launcher):
+            try:
+                _settle_launcher(launcher)
+            except BaseException as cleanup:
+                if not isinstance(primary, Exception):
+                    raise primary
+                raise cleanup
+        else:
+            _close_execution_owner_fds(owner)
+        if not isinstance(primary, Exception):
+            raise primary
+        return False
 
 
 class _PreparedAbortFence:
@@ -500,6 +736,58 @@ def _spawn_parked_launcher(
         for fd in {fd for fd in (stdout_fd, stderr_fd) if fd is not None}:
             _close_quietly(fd)
         raise primary
+
+
+def _spawn_execution_launcher(
+    *,
+    inherited_fds: tuple[int, ...],
+    _owner: _ExecutionLauncherOwner | None = None,
+) -> _ParkedLauncher:
+    """Fork one target-blind launcher whose tool pipes remain worker-owned."""
+    if (type(inherited_fds) is not tuple or len(inherited_fds) != 2
+            or any(type(fd) is not int or fd < 0 for fd in inherited_fds)
+            or len(set(inherited_fds)) != 2):
+        raise RuntimeError("launcher_metadata_invalid")
+    try:
+        identities = tuple(_fd_identity(fd) for fd in inherited_fds)
+    except OSError:
+        raise RuntimeError("launcher_metadata_invalid") from None
+    if len(set(identities)) != len(identities):
+        raise RuntimeError("launcher_metadata_invalid")
+
+    owner = _ExecutionLauncherOwner() if _owner is None else _owner
+    if (type(owner) is not _ExecutionLauncherOwner or owner.pid != -1
+            or owner.launcher is not None):
+        raise RuntimeError("launcher_owner_invalid")
+    with _ExecutionLauncherFence(owner):
+        with _ExecutionLauncherFence(owner):
+            owner.release_read, owner.release_write = os.pipe()
+            owner.stdin_read, owner.stdin_write = os.pipe()
+            owner.stdout_read, owner.stdout_write = os.pipe()
+            owner.stderr_read, owner.stderr_write = os.pipe()
+            owner.exec_status_read, owner.exec_status_write = os.pipe()
+            os.set_inheritable(owner.exec_status_write, False)
+            worker_pid = os.getpid()
+            owner.pid = os.fork()
+            if owner.pid == 0:  # pragma: no cover - Linux integration exercises this
+                _execution_launcher_child(
+                    worker_pid=worker_pid,
+                    release_read=owner.release_read,
+                    release_write=owner.release_write,
+                    stdin_read=owner.stdin_read,
+                    stdin_write=owner.stdin_write,
+                    stdout_read=owner.stdout_read,
+                    stdout_write=owner.stdout_write,
+                    stderr_read=owner.stderr_read,
+                    stderr_write=owner.stderr_write,
+                    exec_status_read=owner.exec_status_read,
+                    exec_status_write=owner.exec_status_write,
+                    inherited_fds=inherited_fds,
+                )
+            launcher = _adopt_execution_launcher(owner)
+            if launcher is None:
+                raise RuntimeError("launcher_owner_invalid")
+            return launcher
 
 
 def _not_started_streams() -> tuple[StreamSettlement, ...]:
