@@ -30,6 +30,7 @@ from .runner_protocol import (
 
 _CHUNK_BYTES = 64 * 1024
 _SELECT_SLICE = 0.05
+_SETTLEMENT_GRACE_SECONDS = 5.0
 
 
 def _valid_deadline(value, name: str, *, optional: bool) -> float | None:
@@ -470,9 +471,10 @@ def _run_stream_engine(
     """Execute, settle, and testify about one already-contained launcher.
 
     ``execution_deadline`` and ``settlement_deadline`` are absolute readings from
-    ``clock``.  A ``None`` execution deadline means no execution cutoff (the
-    normalized timeout-zero contract); the settlement deadline remains the hard
-    bound for stream ownership and cleanup.
+    ``clock``.  A pair of ``None`` values means no execution cutoff (the
+    normalized timeout-zero contract).  Release remains bounded, and a bounded
+    settlement grace starts only after the exact leader exits.  A finite
+    execution always has a finite outer settlement deadline.
     """
     if not callable(clock):
         raise RuntimeError("stream_clock_invalid")
@@ -482,11 +484,11 @@ def _run_stream_engine(
         execution_deadline, "execution_deadline", optional=True,
     )
     settlement_deadline = _valid_deadline(
-        settlement_deadline, "settlement_deadline", optional=False,
+        settlement_deadline, "settlement_deadline", optional=True,
     )
-    assert settlement_deadline is not None
     if (execution_deadline is not None
-            and execution_deadline > settlement_deadline):
+            and (settlement_deadline is None
+                 or execution_deadline > settlement_deadline)):
         raise RuntimeError("stream_deadline_invalid")
     _validate_inputs(
         request,
@@ -497,10 +499,13 @@ def _run_stream_engine(
         stderr_stage_fd=stderr_stage_fd,
     )
 
-    release_deadline = settlement_deadline
-    if execution_deadline is not None:
-        release_deadline = min(release_deadline, execution_deadline)
-    if float(clock()) >= release_deadline:
+    now = float(clock())
+    if execution_deadline is None:
+        release_deadline = now + _SETTLEMENT_GRACE_SECONDS
+    else:
+        assert settlement_deadline is not None
+        release_deadline = min(settlement_deadline, execution_deadline)
+    if now >= release_deadline:
         _abort_and_reap(launcher)
         return WorkerSettlement(
             request_id=request.request_id,
@@ -550,6 +555,7 @@ def _run_stream_engine(
     settlement_cutoff = False
     stdin_state: _InputState | None = None
     outputs: tuple[_OutputState, ...] = ()
+    drain_deadline: float | None = None
     try:
         stdin_pipe = _detach_launcher_fd(launcher, "stdin_write_fd")
         owned_fds.add(stdin_pipe)
@@ -595,6 +601,9 @@ def _run_stream_engine(
             if _leader_exited(launcher.pid, launcher):
                 exit_code = _abort_and_reap(launcher)
                 reaped = True
+                drain_deadline = now + _SETTLEMENT_GRACE_SECONDS
+                if settlement_deadline is not None:
+                    drain_deadline = min(drain_deadline, settlement_deadline)
                 if stdin_state.open:
                     stdin_state.stop(selector, StreamTerminal.PEER_CLOSED)
                 break
@@ -602,31 +611,42 @@ def _run_stream_engine(
                 execution_cutoff = True
                 _abort_and_reap(launcher)
                 reaped = True
+                assert settlement_deadline is not None
+                drain_deadline = settlement_deadline
                 if stdin_state.open:
                     stdin_state.stop(selector, StreamTerminal.DEADLINE)
                 break
-            if now >= settlement_deadline:
+            if (settlement_deadline is not None
+                    and now >= settlement_deadline):
                 settlement_cutoff = True
                 exit_code = _abort_and_reap(launcher)
                 reaped = True
+                drain_deadline = settlement_deadline
                 if stdin_state.open:
                     stdin_state.stop(selector, StreamTerminal.DEADLINE)
                 break
 
-            nearest = settlement_deadline
-            if execution_deadline is not None:
-                nearest = min(nearest, execution_deadline)
-            timeout = min(_SELECT_SLICE, max(0.0, nearest - now))
+            nearest = execution_deadline
+            if settlement_deadline is not None:
+                nearest = (
+                    settlement_deadline if nearest is None
+                    else min(nearest, settlement_deadline)
+                )
+            timeout = _SELECT_SLICE
+            if nearest is not None:
+                timeout = min(timeout, max(0.0, nearest - now))
             for key, _events in selector.select(timeout):
                 state = key.data
                 state.consume_ready(selector)
 
+        if drain_deadline is None:
+            raise RuntimeError("stream_drain_deadline_invalid")
         while any(output.open for output in outputs):
             now = float(clock())
-            if now >= settlement_deadline:
+            if now >= drain_deadline:
                 settlement_cutoff = True
                 break
-            timeout = min(_SELECT_SLICE, max(0.0, settlement_deadline - now))
+            timeout = min(_SELECT_SLICE, max(0.0, drain_deadline - now))
             for key, _events in selector.select(timeout):
                 state = key.data
                 # stdin has already been closed before the reaped state.

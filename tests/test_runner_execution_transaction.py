@@ -23,12 +23,12 @@ DATA = b"private input\x00with binary bytes\n"
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
-def _invocation():
+def _invocation(*, timeout=30):
     return protocol.normalize_invocation(
         request_id=RID,
         tool="fixture",
         cmd=["tool-secret", "target-secret"],
-        timeout=30,
+        timeout=timeout,
         stdin_data=DATA.decode("utf-8"),
         raw_path="/tmp/quarry-execution.stdout",
         stderr_path="/tmp/quarry-execution.stderr",
@@ -233,8 +233,9 @@ def _exchange(
     wire_stdin_data=None,
     launcher=None,
     stream_behavior="complete",
+    timeout=30,
 ):
-    invocation = _invocation()
+    invocation = _invocation(timeout=timeout)
     request = invocation.worker
     events = []
     launcher = (
@@ -372,6 +373,19 @@ def test_execution_go_is_exactly_ordered_and_streams_own_stage_descriptors(
     assert kwargs["stdout_stage_fd"] == 81
     assert kwargs["stderr_stage_fd"] == 82
     assert callable(kwargs["on_started"])
+
+
+def test_timeout_zero_defers_settlement_deadline_until_natural_exit(monkeypatch):
+    request, returncode, records, _launcher, stream_calls, _events = _exchange(
+        monkeypatch, timeout=0,
+    )
+
+    assert returncode == 0
+    assert records[-1].terminal is protocol.ExecutionTerminal.COMPLETE
+    assert request.timeout == 0
+    kwargs = stream_calls[0][2]
+    assert kwargs["execution_deadline"] is None
+    assert kwargs["settlement_deadline"] is None
 
 
 @pytest.mark.parametrize(

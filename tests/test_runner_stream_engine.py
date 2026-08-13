@@ -276,3 +276,46 @@ def test_timeout_zero_has_no_execution_cutoff_for_natural_exit(tmp_path):
     assert settlement.exit_code == 0
     assert staged_stdout == b"natural"
     assert staged_stderr == b"exit"
+
+
+def test_timeout_zero_accepts_no_preexisting_settlement_deadline(tmp_path):
+    invocation = protocol.normalize_invocation(
+        request_id=os.urandom(16).hex(),
+        tool="stream-fixture",
+        cmd=(sys.executable, "-c", "import os; os.write(1,b'unbounded')"),
+        timeout=0,
+        env={},
+        base_environment={},
+        raw_path=tmp_path / "unbounded.stdout",
+        stderr_path=tmp_path / "unbounded.stderr",
+    )
+    stdout_stage = os.open(
+        tmp_path / "unbounded.stdout.stage",
+        os.O_RDWR | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    stderr_stage = os.open(
+        tmp_path / "unbounded.stderr.stage",
+        os.O_RDWR | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    launcher = _spawn_launcher()
+    try:
+        assert launcher.prove_stopped() is True
+        settlement = runner_streams._run_stream_engine(
+            invocation.worker,
+            launcher,
+            stdout_stage_fd=stdout_stage,
+            stderr_stage_fd=stderr_stage,
+            execution_deadline=None,
+            settlement_deadline=None,
+        )
+        assert settlement.terminal is protocol.ExecutionTerminal.COMPLETE
+        assert _stage_bytes(stdout_stage) == b"unbounded"
+    finally:
+        try:
+            launcher.abort_and_reap()
+        finally:
+            _close_launcher_fds(launcher)
+            os.close(stdout_stage)
+            os.close(stderr_stage)

@@ -40,6 +40,35 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def test_control_wait_slices_semantically_unbounded_budget():
+    class Selector:
+        def __init__(self):
+            self.timeouts = []
+
+        def select(self, timeout):
+            self.timeouts.append(timeout)
+            return []
+
+    selector = Selector()
+    events, consumed = supervisor._select_control(selector, (1 << 53) - 1)
+
+    assert events == []
+    assert consumed is False
+    assert selector.timeouts == [supervisor._CONTROL_SELECT_SLICE_SECONDS]
+
+
+def test_control_wait_consumes_a_finite_short_budget():
+    class Selector:
+        def select(self, timeout):
+            assert timeout == 0.25
+            return []
+
+    events, consumed = supervisor._select_control(Selector(), 0.25)
+
+    assert events == []
+    assert consumed is True
+
+
 def _read_exact(fd: int, size: int) -> bytes:
     chunks = []
     remaining = size

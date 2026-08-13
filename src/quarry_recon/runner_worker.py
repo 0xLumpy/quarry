@@ -1271,10 +1271,11 @@ def _run_execution_transaction(
 
     now = time.monotonic()
     execution_deadline = None if request.timeout == 0 else now + float(request.timeout)
-    # Worker teardown is independently bounded even for timeout=0.  The parent
-    # retains the stronger absolute transaction deadline and can kill this owner.
+    # Timeout zero leaves execution unbounded.  The stream owner still bounds
+    # release and starts a fixed drain grace after natural leader exit; finite
+    # executions retain one absolute execution-plus-settlement budget.
     settlement_deadline = (
-        now + 5.0 if execution_deadline is None else execution_deadline + 5.0
+        None if execution_deadline is None else execution_deadline + 5.0
     )
     try:
         settlement = _run_stream_engine(

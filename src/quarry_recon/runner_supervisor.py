@@ -84,6 +84,7 @@ _REAL_MONOTONIC = time.monotonic
 _READ_CHUNK_BYTES = 64 * 1024
 _REAP_RESERVE_SECONDS = 0.10
 _REAL_CLOCK_SAMPLE_ATTEMPTS = 2
+_CONTROL_SELECT_SLICE_SECONDS = 60.0
 _MAX_SAFE_DEADLINE = (1 << 53) - 1
 _MAX_TRAILING_BYTES = (1 << 53) - 1
 
@@ -369,6 +370,17 @@ def _remaining(deadline: float, clock, real_deadline: float) -> float:
             or now_value > _MAX_SAFE_DEADLINE):
         return real_remaining
     return min(real_remaining, max(0.0, deadline - now_value))
+
+
+def _select_control(selector, remaining: float):
+    """Wait without handing a platform selector an unrepresentable timeout.
+
+    The boolean result says that an empty wait consumed the caller's complete
+    remaining budget.  A semantic no-ceiling execution therefore polls in
+    finite OS-safe slices without being misclassified as expired.
+    """
+    wait = min(remaining, _CONTROL_SELECT_SLICE_SECONDS)
+    return selector.select(wait), wait >= remaining
 
 
 def _real_remaining(
@@ -858,11 +870,13 @@ def _drive_abort_protocol(
             owner.failure = BootstrapReason.DEADLINE
             break
         try:
-            events = selector.select(remaining)
+            events, budget_consumed = _select_control(selector, remaining)
         except BaseException as exc:
             owner.remember(exc)
             owner.failure = BootstrapReason.CONTROL_FAILED
             break
+        if not events and not budget_consumed:
+            continue
         if not events:
             owner.failure = BootstrapReason.DEADLINE
             break
@@ -1655,11 +1669,15 @@ def _drive_execution_protocol(
             _set_execution_failure(owner, ExecutionReason.DEADLINE)
             break
         try:
-            events = owner.selector.select(remaining)
+            events, budget_consumed = _select_control(
+                owner.selector, remaining,
+            )
         except BaseException as exc:
             owner.remember(exc)
             _set_execution_failure(owner, ExecutionReason.CONTROL_FAILED)
             break
+        if not events and not budget_consumed:
+            continue
         if not events:
             _set_execution_failure(owner, ExecutionReason.DEADLINE)
             break
