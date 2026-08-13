@@ -29,6 +29,15 @@ _SKIPPED = "\x1b[1;91m[-]\x1b[0m Skipped {u} due to errors"
 _UNSTABLE = "\x1b[1;91m[-]\x1b[0m Webpage is returning different content on each request. Skipping."
 
 
+def _declared_path(kwargs, policy_name):
+    policy = kwargs.get(policy_name)
+    disposition = getattr(getattr(policy, "disposition", None), "value", None)
+    repository = kwargs.get("repository")
+    if repository is None or disposition != "publish":
+        return None
+    return repository.dir.joinpath(*policy.components)
+
+
 class _Run:
     def __init__(self, d):
         self.dir = d
@@ -68,6 +77,8 @@ def _fake_arjun(behaviour):
     launched = []
 
     def fake(tool, cmd, *, raw_path=None, stderr_path=None, timeout=None, **kw):
+        raw_path = raw_path or _declared_path(kw, "stdout")
+        stderr_path = stderr_path or _declared_path(kw, "stderr")
         if tool != "arjun":
             return RunResult(tool, cmd, Status.SKIPPED, None, 0.0, None, 0)
         url = cmd[cmd.index("-u") + 1]
@@ -341,6 +352,8 @@ def test_targets_actually_run_concurrently(tmp_path, monkeypatch):
     gate = threading.Barrier(4, timeout=5)         # only passes if 4 workers are in flight together
 
     def fake(tool, cmd, *, raw_path=None, stderr_path=None, timeout=None, **kw):
+        raw_path = raw_path or _declared_path(kw, "stdout")
+        stderr_path = stderr_path or _declared_path(kw, "stderr")
         u = cmd[cmd.index("-u") + 1]
         gate.wait()                                 # raises BrokenBarrierError if they are serialized
         raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,6 +381,8 @@ def test_one_active_target_per_host(tmp_path, monkeypatch):
     live, peak, lock = {"n": 0}, {"n": 0}, threading.Lock()
 
     def fake(tool, cmd, *, raw_path=None, stderr_path=None, timeout=None, **kw):
+        raw_path = raw_path or _declared_path(kw, "stdout")
+        stderr_path = stderr_path or _declared_path(kw, "stderr")
         u = cmd[cmd.index("-u") + 1]
         with lock:
             live["n"] += 1
@@ -399,6 +414,8 @@ def test_the_global_rate_is_split_between_workers_not_handed_to_each(tmp_path, m
     rates = []
 
     def fake(tool, cmd, *, raw_path=None, stderr_path=None, timeout=None, **kw):
+        raw_path = raw_path or _declared_path(kw, "stdout")
+        stderr_path = stderr_path or _declared_path(kw, "stderr")
         u = cmd[cmd.index("-u") + 1]
         rates.append(int(cmd[cmd.index("--rate-limit") + 1]) if "--rate-limit" in cmd else None)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -494,6 +511,8 @@ def test_single_host_scope_uses_the_whole_rate(tmp_path, monkeypatch):
     rates = []
 
     def fake(tool, cmd, *, raw_path=None, stderr_path=None, timeout=None, **kw):
+        raw_path = raw_path or _declared_path(kw, "stdout")
+        stderr_path = stderr_path or _declared_path(kw, "stderr")
         u = cmd[cmd.index("-u") + 1]
         rates.append(int(cmd[cmd.index("--rate-limit") + 1]))
         raw_path.parent.mkdir(parents=True, exist_ok=True)

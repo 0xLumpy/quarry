@@ -25,6 +25,7 @@ from .. import budget, events, evidence, fetch, netguard, normalize, oob, secret
 from ..runner import (RunResult, Status, cancel_all as runner_cancel_all, fresh_artifact_dir, have,
                       nuclei_timeout, reset_cancel as runner_reset_cancel, run as exec_tool,
                       scaled_timeout, skipped)
+from ..runner_repository import RepositoryOutput
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
 
@@ -259,7 +260,7 @@ def _arjun_pool(configured: int, hosts: int, rl: int) -> int:
     return max(1, min(n, rl)) if rl else n
 
 
-def _arjun_exec(url: str, rate: int, threads: int, paths: tuple, timeout: int) -> dict:
+def _arjun_exec(repository, url: str, rate: int, threads: int, paths: tuple, timeout: int) -> dict:
     """Run one arjun process for one target and return everything the parent needs to classify it.
 
     Does no ledger/event/store writes: those stay single-threaded in the parent so the append-only
@@ -270,7 +271,12 @@ def _arjun_exec(url: str, rate: int, threads: int, paths: tuple, timeout: int) -
     cmd = ["arjun", "-u", url, "-oT", str(out_f), "-t", str(threads)]
     if rate:
         cmd += ["--rate-limit", str(rate)]              # this process's share of the global lane rate
-    r = exec_tool("arjun", cmd, raw_path=std_f, stderr_path=err_f, timeout=timeout)
+    r = exec_tool(
+        "arjun", cmd,
+        repository=repository,
+        stdout=RepositoryOutput.publish(*std_f.relative_to(repository.dir).parts),
+        stderr=RepositoryOutput.publish(*err_f.relative_to(repository.dir).parts), timeout=timeout,
+    )
     try:
         text = std_f.read_text(encoding="utf-8", errors="replace") if std_f.exists() else ""
     except OSError:
@@ -439,7 +445,7 @@ def _arjun_lane(ctx, prof, corpus) -> None:
                 host, slot = normalize.host_of_url(u), free.pop(0)
                 busy_hosts.add(host)
                 attempted += 1
-                active[pool.submit(_arjun_exec, u, shares[slot], threads, _paths(u),
+                active[pool.submit(_arjun_exec, ctx.run, u, shares[slot], threads, _paths(u),
                                    ctx.http_timeout)] = (u, host, slot)
             if not active:
                 break                        # nothing running and nothing submittable -> done
@@ -854,7 +860,10 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             chunk_status = Status.FAILED.value               # promoted only after all bookkeeping below
             try:                                             # chunk terminal always fires (finally)
                 res = exec_tool("nuclei", _nuclei_cmd(bf, cf, prof, mhe),
-                                timeout=nuclei_timeout(len(batch), ctx.http_timeout), stderr_path=ef)
+                                repository=ctx.run,
+                                stdout=RepositoryOutput.discard(),
+                                stderr=RepositoryOutput.publish(*ef.relative_to(ctx.run.dir).parts),
+                                timeout=nuclei_timeout(len(batch), ctx.http_timeout))
                 if res.stderr_tail:
                     with log.open("a", encoding="utf-8") as lf:
                         lf.write(res.stderr_tail + "\n")
@@ -1945,6 +1954,9 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             try:
                 with blind_oob_credential(_plan_for_run["secret"]) as _cred:
                     res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof, len(batch), _cred),
+                                    repository=ctx.run,
+                                    stdout=RepositoryOutput.discard(),
+                                    stderr=RepositoryOutput.discard(),
                                     ok_codes=(0, 1),
                                     timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
                     # proven by the runner, never inferred: a missing binary, a cancelled launch or a Popen
@@ -2315,7 +2327,12 @@ def run(ctx) -> None:
     if corpus and have("gf"):
         for pat in GF_PATTERNS:
             raw = ctx.run.raw_path("params", "gf", f"{pat}.txt")
-            r = exec_tool("gf", ["gf", pat], input_file=corpus_file, raw_path=raw, timeout=120)
+            r = exec_tool(
+                "gf", ["gf", pat],
+                repository=ctx.run,
+                stdout=RepositoryOutput.publish(*raw.relative_to(ctx.run.dir).parts),
+                stderr=RepositoryOutput.discard(), input_file=corpus_file, timeout=120,
+            )
             ctx.run.record("params", r)
             if r.raw_path:
                 for line in r.raw_path.read_text().splitlines():
@@ -2350,7 +2367,13 @@ def run(ctx) -> None:
             if prof.http_rl:                       # else native default (empty = fast)
                 tk_cmd += ["-rl", str(prof.http_rl)]
             _apply_nuclei_oob(tk_cmd)              # same OOB endpoint as the main scan (no drift)
-            r = exec_tool("nuclei", tk_cmd, timeout=nuclei_timeout(len(subs), ctx.http_timeout))
+            r = exec_tool(
+                "nuclei", tk_cmd,
+                repository=ctx.run,
+                stdout=RepositoryOutput.discard(),
+                stderr=RepositoryOutput.discard(),
+                timeout=nuclei_timeout(len(subs), ctx.http_timeout),
+            )
             ctx.run.record("params", r)
             if tk_out.exists():
                 import json as _json

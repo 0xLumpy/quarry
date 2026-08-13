@@ -19,6 +19,15 @@ pytestmark = pytest.mark.offline
 
 _NOKEY = object()          # sentinel: PERFORMANCE has no NUCLEI_MAX_HOST_ERROR key at all
 
+
+def _declared_stderr(kwargs):
+    policy = kwargs.get("stderr")
+    disposition = getattr(getattr(policy, "disposition", None), "value", None)
+    repository = kwargs.get("repository")
+    if repository is None or disposition != "publish":
+        return None
+    return repository.dir.joinpath(*policy.components)
+
 # A realistic tail of nuclei's stderr: ANSI-coloured [INF] lines, periodic -stats JSON, and the terminal
 # `Scan completed in` line — with the final stats line printed AFTER it, exactly as the real tool does.
 _STAT = ('{"duration":"0:54:29","errors":"5635","hosts":"50","matched":"0","percent":"99",'
@@ -183,6 +192,7 @@ class TestExecutionVsCoverage:
             exit_code = None if status is Status.TIMED_OUT else 0
 
         def fn(tool, cmd, timeout=None, stderr_path=None, **k):
+            stderr_path = stderr_path or _declared_stderr(k)
             cf = Path(cmd[cmd.index("-o") + 1])
             if findings:
                 cf.write_text('{"x":1}\n')
@@ -328,6 +338,7 @@ class TestExecutionVsCoverage:
         from pathlib import Path
 
         def fn(tool, cmd, timeout=None, stderr_path=None, **k):
+            stderr_path = stderr_path or _declared_stderr(k)
             seen.append(stderr_path)
             cf = Path(cmd[cmd.index("-o") + 1]); cf.write_text('{"x":1}\n')
             if stderr_path is not None:
@@ -404,6 +415,7 @@ class TestResumeReportsPersistedCoverage:
         from pathlib import Path
 
         def mixed(tool, cmd, timeout=None, stderr_path=None, **k):
+            stderr_path = stderr_path or _declared_stderr(k)
             calls["n"] += 1
             cf = Path(cmd[cmd.index("-o") + 1]); cf.write_text('{"x":1}\n')
             # only the first chunk reports stats; the rest complete without counters
@@ -540,6 +552,7 @@ class TestArtifactDigestBinding:
         from pathlib import Path
 
         def track(tool, cmd, timeout=None, stderr_path=None, **k):
+            stderr_path = stderr_path or _declared_stderr(k)
             ran.append(Path(cmd[cmd.index("-o") + 1]).name)
             cf = Path(cmd[cmd.index("-o") + 1]); cf.write_text('{"re":1}\n')
             if stderr_path is not None:
@@ -560,6 +573,7 @@ class TestArtifactDigestBinding:
         from pathlib import Path
 
         def track(tool, cmd, timeout=None, stderr_path=None, **k):
+            stderr_path = stderr_path or _declared_stderr(k)
             ran.append(Path(cmd[cmd.index("-o") + 1]).name)
             cf = Path(cmd[cmd.index("-o") + 1]); cf.write_text('{"re":1}\n')
             if stderr_path is not None:
