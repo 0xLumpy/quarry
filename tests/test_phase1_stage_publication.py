@@ -1,14 +1,16 @@
 """Phase 1 worker-stage settlement and durable publication contracts.
 
 The worker is only the writable capture owner.  These tests exercise the parent
-boundary that authenticates exact stage bytes after worker reap and consumes the
-batch in one terminal publication decision.
+boundary that authenticates exact stage bytes after worker reap, publishes each
+artifact with its own atomic rename/durability decision, and retains a truthful
+typed partition when a later member cannot commit cleanly.
 """
 from __future__ import annotations
 
 import dataclasses
 import hashlib
 import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -70,12 +72,16 @@ def _make_transferred_batch(
     payloads: tuple[bytes, ...],
     *,
     stem: str = "result",
+    components: tuple[tuple[str, ...], ...] | None = None,
     request_id: str = REQUEST_ID,
     retain_writer: int | None = None,
 ):
+    if components is None:
+        components = tuple((f"{stem}-{index}",) for index in range(len(payloads)))
+    assert len(components) == len(payloads)
     stages = tuple(
-        privfs.create_private_stage(root_fd, (f"{stem}-{index}",))
-        for index in range(len(payloads))
+        privfs.create_private_stage(root_fd, destination)
+        for destination in components
     )
     for stage, payload in zip(stages, payloads):
         _write_exact(stage.file_fd, payload)
@@ -110,6 +116,8 @@ def _fence_if_owned(batch) -> None:
         "parent_writers_closed", "transfer_uncertain", "settled", "publishing",
     }:
         privfs.fence_private_stage_handoff(batch)
+    elif batch.state in {"partial", "committed", "committed_with_fault"}:
+        privfs.cleanup_private_stage_handoff(batch)
 
 
 def _assert_state_error(error, operation: str, state: str) -> None:
@@ -300,6 +308,38 @@ def test_publication_rejects_name_substitution_after_settlement(private_root):
     assert held.read_bytes() == b"trusted"
 
 
+def test_publication_rejects_duplicate_destinations_before_any_rename(
+    private_root, monkeypatch,
+):
+    root, root_fd = private_root
+    _private_file(root / "result", b"old")
+    stages, batch, receipt, _ = _make_transferred_batch(
+        root_fd,
+        (b"first", b"second"),
+        components=(("result",), ("result",)),
+    )
+    proofs = privfs.settle_private_stage_handoff(
+        batch, receipt, worker_reaped=True, claims=_claims(2),
+    )
+    real_rename = os.rename
+    rename_calls = []
+
+    def record_rename(source, destination, *args, **kwargs):
+        rename_calls.append((source, destination))
+        return real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(privfs.os, "rename", record_rename)
+    with pytest.raises(privfs.PrivateStageHandoffError) as caught:
+        privfs.publish_private_stage_handoff(batch, proofs)
+
+    assert caught.value.operation == "publish"
+    assert not isinstance(caught.value, privfs.PrivateStagePublicationPartial)
+    assert rename_calls == []
+    assert batch.state == "fenced"
+    assert tuple(stage.state for stage in stages) == ("fenced", "fenced")
+    assert (root / "result").read_bytes() == b"old"
+
+
 def test_nonlanded_rename_failure_preserves_prior_final_and_consumes_batch(
     private_root, monkeypatch,
 ):
@@ -317,16 +357,22 @@ def test_nonlanded_rename_failure_preserves_prior_final_and_consumes_batch(
         return real_rename(source, destination, *args, **kwargs)
 
     monkeypatch.setattr(privfs.os, "rename", fail_stage)
-    with pytest.raises(privfs.PrivateStageHandoffError) as caught:
+    with pytest.raises(privfs.PrivateStagePublicationPartial) as caught:
         privfs.publish_private_stage_handoff(batch, proofs)
-    assert caught.value.operation == "publish"
-    assert isinstance(caught.value.__cause__, OSError)
-    assert batch.state == "fenced"
+    partial = caught.value
+    assert type(partial) is privfs.PrivateStagePublicationPartial
+    assert (partial.operation, partial.state) == ("publish", "partial")
+    assert partial.committed == ()
+    assert partial.uncertain == ()
+    assert partial.unpublished == proofs
+    assert isinstance(partial.__cause__, OSError)
+    assert batch.state == "partial"
+    assert stage.state == "unpublished"
     assert (root / "result-0").read_bytes() == b"old"
 
     with pytest.raises(privfs.PrivateStageStateError) as replay:
         privfs.publish_private_stage_handoff(batch, proofs)
-    _assert_state_error(replay.value, "publish", "fenced")
+    _assert_state_error(replay.value, "publish", "partial")
 
 
 def test_publication_cancellation_before_rename_fences_and_preserves_prior_final(
@@ -351,18 +397,52 @@ def test_publication_cancellation_before_rename_fences_and_preserves_prior_final
     assert (root / "result-0").read_bytes() == b"old"
 
 
-def test_batch_failure_cannot_leave_an_unauthenticated_partial_final(
+def test_landed_member_with_directory_fsync_fault_is_exactly_uncertain(
     private_root, monkeypatch,
 ):
-    """A failed all-sinks transaction must preserve every prior authoritative final."""
     root, root_fd = private_root
-    _private_file(root / "result-0", b"old-out")
-    _private_file(root / "result-1", b"old-err")
+    _private_file(root / "result-0", b"old")
+    (stage,), batch, receipt, _ = _make_transferred_batch(root_fd, (b"new",))
+    proofs = privfs.settle_private_stage_handoff(
+        batch, receipt, worker_reaped=True, claims=_claims(1),
+    )
+    real_fsync = privfs._fsync_managed
+
+    def fail_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("directory fsync failed")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(privfs, "_fsync_managed", fail_directory)
+    with pytest.raises(privfs.PrivateStagePublicationPartial) as caught:
+        privfs.publish_private_stage_handoff(batch, proofs)
+
+    partial = caught.value
+    assert (partial.operation, partial.state) == ("publish", "partial")
+    assert partial.committed == ()
+    assert partial.uncertain == proofs
+    assert partial.unpublished == ()
+    assert len(partial.uncertain) == 1
+    assert isinstance(partial.__cause__, OSError)
+    assert batch.state == "partial"
+    assert stage.state == "uncertain"
+    assert (root / "result-0").read_bytes() == b"new"
+
+
+def test_later_failure_returns_truthful_partial_and_preserves_unattempted_priors(
+    private_root, monkeypatch,
+):
+    """A durable prefix stays authoritative; failed and later members stay old."""
+    root, root_fd = private_root
+    old = (b"old-in", b"old-out", b"old-err")
+    new = (b"new-in", b"new-out", b"new-err")
+    for index, payload in enumerate(old):
+        _private_file(root / f"result-{index}", payload)
     stages, batch, receipt, _ = _make_transferred_batch(
-        root_fd, (b"new-out", b"new-err"),
+        root_fd, new,
     )
     proofs = privfs.settle_private_stage_handoff(
-        batch, receipt, worker_reaped=True, claims=_claims(2),
+        batch, receipt, worker_reaped=True, claims=_claims(3),
     )
     real_rename = os.rename
 
@@ -372,12 +452,123 @@ def test_batch_failure_cannot_leave_an_unauthenticated_partial_final(
         return real_rename(source, destination, *args, **kwargs)
 
     monkeypatch.setattr(privfs.os, "rename", fail_second)
-    with pytest.raises(privfs.PrivateStageHandoffError) as caught:
+    with pytest.raises(privfs.PrivateStagePublicationPartial) as caught:
         privfs.publish_private_stage_handoff(batch, proofs)
-    assert caught.value.operation == "publish"
-    assert batch.state == "fenced"
-    assert (root / "result-0").read_bytes() == b"old-out"
-    assert (root / "result-1").read_bytes() == b"old-err"
+    partial = caught.value
+    assert type(partial) is privfs.PrivateStagePublicationPartial
+    assert (partial.operation, partial.state) == ("publish", "partial")
+    assert partial.committed == proofs[:1]
+    assert partial.uncertain == ()
+    assert partial.unpublished == proofs[1:]
+    assert isinstance(partial.__cause__, OSError)
+    assert batch.state == "partial"
+    assert tuple(stage.state for stage in stages) == (
+        "committed", "unpublished", "unpublished",
+    )
+    assert tuple((root / f"result-{index}").read_bytes() for index in range(3)) == (
+        new[0], old[1], old[2],
+    )
+
+    # Publication facts are immutable.  Cleanup is a separate idempotent drain
+    # and may neither retry a rename nor rewrite the terminal proof partition.
+    before = tuple(sorted((path.name, path.read_bytes()) for path in root.iterdir()))
+    assert privfs.cleanup_private_stage_handoff(batch) is None
+    assert privfs.cleanup_private_stage_handoff(batch) is None
+    assert batch.state == "partial"
+    assert tuple(sorted((path.name, path.read_bytes()) for path in root.iterdir())) == before
+    with pytest.raises(privfs.PrivateStageStateError) as publish_replay:
+        privfs.publish_private_stage_handoff(batch, proofs)
+    _assert_state_error(publish_replay.value, "publish", "partial")
+    with pytest.raises(privfs.PrivateStageStateError) as settle_replay:
+        privfs.settle_private_stage_handoff(
+            batch, receipt, worker_reaped=True, claims=_claims(3),
+        )
+    _assert_state_error(settle_replay.value, "settle", "partial")
+
+
+def test_members_publish_by_direct_rename_then_directory_fsync(
+    private_root, monkeypatch,
+):
+    root, root_fd = private_root
+    stages, batch, receipt, _ = _make_transferred_batch(
+        root_fd, (b"out", b"err"),
+    )
+    proofs = privfs.settle_private_stage_handoff(
+        batch, receipt, worker_reaped=True, claims=_claims(2),
+    )
+    stage_names = {stage.temporary_name: index for index, stage in enumerate(stages)}
+    real_rename = os.rename
+    real_fsync = privfs._fsync_managed
+    events = []
+
+    def record_rename(source, destination, *args, **kwargs):
+        if source in stage_names:
+            events.append(("rename", stage_names[source], destination))
+        return real_rename(source, destination, *args, **kwargs)
+
+    def record_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            events.append(("dir_fsync",))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(privfs.os, "rename", record_rename)
+    monkeypatch.setattr(privfs, "_fsync_managed", record_fsync)
+
+    assert privfs.publish_private_stage_handoff(batch, proofs) is proofs
+    assert events == [
+        ("rename", 0, "result-0"),
+        ("dir_fsync",),
+        ("rename", 1, "result-1"),
+        ("dir_fsync",),
+    ]
+    assert tuple((root / f"result-{index}").read_bytes() for index in range(2)) == (
+        b"out", b"err",
+    )
+
+
+def test_global_final_reauthentication_prevents_false_batch_success(
+    private_root, monkeypatch,
+):
+    root, root_fd = private_root
+    stages, batch, receipt, _ = _make_transferred_batch(
+        root_fd, (b"new-out", b"new-err"),
+    )
+    proofs = privfs.settle_private_stage_handoff(
+        batch, receipt, worker_reaped=True, claims=_claims(2),
+    )
+    real_rename = os.rename
+    substituted = False
+
+    def substitute_first_while_second_lands(source, destination, *args, **kwargs):
+        nonlocal substituted
+        if (source, destination) == (
+            stages[1].temporary_name, stages[1].destination_name,
+        ) and not substituted:
+            substituted = True
+            real_rename(
+                root / stages[0].destination_name,
+                root / "held-authenticated-first",
+            )
+            _private_file(root / stages[0].destination_name, b"hostile")
+        return real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(
+        privfs.os, "rename", substitute_first_while_second_lands,
+    )
+    with pytest.raises(privfs.PrivateStagePublicationPartial) as caught:
+        privfs.publish_private_stage_handoff(batch, proofs)
+
+    partial = caught.value
+    assert substituted is True
+    assert (partial.operation, partial.state) == ("publish", "partial")
+    assert partial.committed == (proofs[1],)
+    assert partial.uncertain == (proofs[0],)
+    assert partial.unpublished == ()
+    assert batch.state == "partial"
+    assert tuple(stage.state for stage in stages) == ("uncertain", "committed")
+    assert (root / "held-authenticated-first").read_bytes() == b"new-out"
+    assert (root / "result-0").read_bytes() == b"hostile"
+    assert (root / "result-1").read_bytes() == b"new-err"
 
 
 def test_clean_publication_is_exact_and_cannot_be_replayed(private_root):
@@ -396,6 +587,12 @@ def test_clean_publication_is_exact_and_cannot_be_replayed(private_root):
     assert tuple((root / f"result-{index}").read_bytes()
                  for index in range(2)) == payloads
 
+    before = tuple(sorted((path.name, path.read_bytes()) for path in root.iterdir()))
+    assert privfs.cleanup_private_stage_handoff(batch) is None
+    assert privfs.cleanup_private_stage_handoff(batch) is None
+    assert batch.state == "committed"
+    assert tuple(sorted((path.name, path.read_bytes()) for path in root.iterdir())) == before
+
     with pytest.raises(privfs.PrivateStageStateError) as publish_replay:
         privfs.publish_private_stage_handoff(batch, proofs)
     _assert_state_error(publish_replay.value, "publish", "committed")
@@ -404,6 +601,55 @@ def test_clean_publication_is_exact_and_cannot_be_replayed(private_root):
             batch, receipt, worker_reaped=True, claims=_claims(2),
         )
     _assert_state_error(settle_replay.value, "settle", "committed")
+
+
+def test_committed_cleanup_fault_has_a_replayable_descriptor_only_drain(
+    private_root, monkeypatch,
+):
+    root, root_fd = private_root
+    _private_file(root / "result-0", b"old")
+    _, batch, receipt, _ = _make_transferred_batch(root_fd, (b"new",))
+    proofs = privfs.settle_private_stage_handoff(
+        batch, receipt, worker_reaped=True, claims=_claims(1),
+    )
+    retained_fds = tuple(
+        claim.fd
+        for claim in batch._cleanup_ledger.claims
+        if claim.fd >= 0
+    )
+    real_drain = privfs._drain_private_stage_ledger
+    close_fault = OSError("descriptor drain interrupted")
+
+    def withhold_cleanup(_ledger, *args, **kwargs):
+        return (close_fault,)
+
+    monkeypatch.setattr(
+        privfs, "_drain_private_stage_ledger", withhold_cleanup,
+    )
+    with pytest.raises(privfs.PrivateStagePublicationCommittedWithFault) as caught:
+        privfs.publish_private_stage_handoff(batch, proofs)
+
+    committed_fault = caught.value
+    assert (committed_fault.operation, committed_fault.state) == (
+        "publish", "committed_with_fault",
+    )
+    assert batch.state == "committed_with_fault"
+    assert batch._cleanup_ledger.pending is True
+    assert (root / "result-0").read_bytes() == b"new"
+    with pytest.raises(privfs.PrivateStageStateError) as replay:
+        privfs.publish_private_stage_handoff(batch, proofs)
+    _assert_state_error(replay.value, "publish", "committed_with_fault")
+
+    monkeypatch.setattr(privfs, "_drain_private_stage_ledger", real_drain)
+    before = tuple(sorted((path.name, path.read_bytes()) for path in root.iterdir()))
+    assert privfs.cleanup_private_stage_handoff(batch) is None
+    assert privfs.cleanup_private_stage_handoff(batch) is None
+    assert batch.state == "committed_with_fault"
+    assert batch._cleanup_ledger.pending is False
+    assert tuple(sorted((path.name, path.read_bytes()) for path in root.iterdir())) == before
+    for fd in retained_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
 
 
 @pytest.mark.parametrize("operation", ["abort", "seal", "replace"])
