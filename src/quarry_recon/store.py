@@ -47,15 +47,31 @@ class MutationScope(str, Enum):
 _RUN_LOCKS_GUARD = threading.Lock()
 _RUN_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _PROJECT_LOCKS: dict[str, threading.RLock] = {}
+_ACQUISITION_ACTIVE: dict[
+    tuple[str, str, str], tuple[tuple[int, int], int, object]
+] = {}
+_LIVE_MANAGED_ACQUISITIONS: dict[int, object] = {}
 _RUN_LOCK_LOCAL = threading.local()
 
 
 def _reset_mutation_locks_after_fork() -> None:
     """Discard process-local mutexes whose owners do not survive a fork."""
-    global _RUN_LOCKS_GUARD, _RUN_LOCKS, _PROJECT_LOCKS, _RUN_LOCK_LOCAL
+    global _RUN_LOCKS_GUARD, _RUN_LOCKS, _PROJECT_LOCKS
+    global _ACQUISITION_ACTIVE, _LIVE_MANAGED_ACQUISITIONS, _RUN_LOCK_LOCAL
+    inherited_acquisitions = tuple(_LIVE_MANAGED_ACQUISITIONS.values())
+    for transaction in inherited_acquisitions:
+        try:
+            transaction._close_inherited_graph_at_fork()
+        except BaseException:
+            # The child must never mutate a parent's names or OFD locks.  Every
+            # owned slot is independently tombstoned/closed by the transaction,
+            # so one bad descriptor cannot prevent attempts on the suffix.
+            pass
     _RUN_LOCKS_GUARD = threading.Lock()
     _RUN_LOCKS = {}
     _PROJECT_LOCKS = {}
+    _ACQUISITION_ACTIVE = {}
+    _LIVE_MANAGED_ACQUISITIONS = {}
     _RUN_LOCK_LOCAL = threading.local()
 
 
@@ -2752,6 +2768,615 @@ class _NestedMutationOwner:
             raise ContractError("repository mutation depth is invalid")
 
 
+class ManagedAcquisitionRefused(ContractError):
+    """A durable destination lease cannot safely authorize provider contact."""
+
+
+class _ManagedAcquisitionRelocatedBusy(Exception):
+    """Internal retry signal for a live marker overlap under another OFD."""
+
+
+def _managed_acquisition_marker_material(
+    run_id: str, components: tuple[str, ...],
+) -> tuple[str, str, bytes]:
+    """Return the deterministic registry name, full key and canonical body."""
+    encoded = json.dumps(
+        {
+            "domain": "quarry-managed-http-acquisition-v1",
+            "run_id": run_id,
+            "components": list(components),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    key = hashlib.sha256(encoded).hexdigest()
+    body = json.dumps(
+        {
+            "schema_version": 1,
+            "kind": "managed-http-acquisition",
+            "run_id": run_id,
+            "components": list(components),
+            "key": key,
+            "pid": os.getpid(),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"{key[:32]}{_CLAIM_SUFFIX}", key, body
+
+
+class _ManagedAcquisitionMarker:
+    """Exact durable destination lease spanning provider contact.
+
+    Creation and every namespace transition happen under a short Run mutation.
+    Waiting for another process happens only on the pinned marker descriptor,
+    outside Run/project authority.  A still-named unlocked marker is crash
+    evidence and is never silently recycled.
+    """
+
+    __slots__ = (
+        "run", "components", "name", "key", "body", "directory", "marker",
+        "release_owner", "created", "owned", "locked",
+        "ready", "released", "abandoned", "pid",
+    )
+
+    def __init__(self, run, components: tuple[str, ...]) -> None:
+        self.run = run
+        self.components = components
+        self.name, self.key, self.body = _managed_acquisition_marker_material(
+            run.run_id, components,
+        )
+        self.directory = _OwnedDescriptor()
+        self.marker = _OwnedDescriptor()
+        self.release_owner = None
+        self.created = False
+        self.owned = False
+        self.locked = False
+        self.ready = False
+        self.released = False
+        self.abandoned = False
+        self.pid = os.getpid()
+
+    @property
+    def local_key(self) -> tuple[str, str, str]:
+        return (*self.run._authority_key, self.key)
+
+    def require_origin_process(self) -> None:
+        if os.getpid() != self.pid:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition lease was inherited across fork",
+            )
+
+    def close_inherited_copy(self) -> None:
+        """Close child copies without changing the parent's OFD flock/name."""
+        faults = _close_owned_descriptors_twice((self.marker, self.directory))
+        self.locked = False
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            raise preferred
+
+    def _validate_marker_stat(self, observed) -> None:
+        from . import privfs
+        if (not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition lease marker is unsafe",
+            )
+
+    def _validate_marker_body(self) -> bytes:
+        before = os.fstat(self.marker.fd)
+        self._validate_marker_stat(before)
+        os.lseek(self.marker.fd, 0, os.SEEK_SET)
+        raw = os.read(self.marker.fd, 64 * 1024 + 1)
+        after = os.fstat(self.marker.fd)
+        if len(raw) > 64 * 1024:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition lease marker changed while inspected",
+            )
+        if ((before.st_dev, before.st_ino, before.st_mode, before.st_nlink,
+             before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_mode, after.st_nlink,
+                    after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition lease marker changed while inspected",
+            )
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition lease marker is damaged or substituted",
+            ) from exc
+        if (not isinstance(doc, dict)
+                or doc.get("schema_version") != 1
+                or doc.get("kind") != "managed-http-acquisition"
+                or doc.get("run_id") != self.run.run_id
+                or doc.get("components") != list(self.components)
+                or doc.get("key") != self.key):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition lease marker belongs to another destination",
+            )
+        return raw
+
+    def _find_relocated_marker_locked(self) -> None:
+        """Refuse an exact destination marker left under a release name.
+
+        A process may die after the reversible deterministic-to-quarantine
+        rename.  Scan only when the deterministic name is absent, authenticate
+        each strict 32-hex claim through a fenced descriptor, and compare the
+        complete canonical body.  This keeps a crash from granting a second
+        provider contact while leaving unrelated destinations concurrent.
+        """
+        candidate = _OwnedDescriptor()
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners(
+                (candidate,), "managed acquisition relocated marker scan",
+            ),
+        )
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                for name in os.listdir(self.directory.fd):
+                    token = (
+                        name[:-len(_CLAIM_SUFFIX)]
+                        if name.endswith(_CLAIM_SUFFIX) else ""
+                    )
+                    if name == self.name:
+                        continue
+                    if (len(token) != 32
+                            or any(ch not in "0123456789abcdef" for ch in token)):
+                        raise ManagedAcquisitionRefused(
+                            "managed acquisition claim registry contains an unexplained entry",
+                        )
+                    listed = os.stat(
+                        name, dir_fd=self.directory.fd,
+                        follow_symlinks=False,
+                    )
+                    self._validate_marker_stat(listed)
+                    candidate.open(
+                        name,
+                        os.O_RDONLY | os.O_NOFOLLOW
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NONBLOCK", 0),
+                        dir_fd=self.directory.fd,
+                    )
+                    before = os.fstat(candidate.fd)
+                    self._validate_marker_stat(before)
+                    named = os.stat(
+                        name, dir_fd=self.directory.fd,
+                        follow_symlinks=False,
+                    )
+                    if ((named.st_dev, named.st_ino) != candidate.identity
+                            or (before.st_dev, before.st_ino)
+                            != candidate.identity
+                            or (listed.st_dev, listed.st_ino)
+                            != candidate.identity):
+                        raise ManagedAcquisitionRefused(
+                            "managed acquisition relocated marker changed while scanned",
+                        )
+                    os.lseek(candidate.fd, 0, os.SEEK_SET)
+                    raw = os.read(candidate.fd, 64 * 1024 + 1)
+                    after = os.fstat(candidate.fd)
+                    if self._snapshot_marker_stat(before) != self._snapshot_marker_stat(after):
+                        raise ManagedAcquisitionRefused(
+                            "managed acquisition relocated marker changed while read",
+                        )
+                    try:
+                        doc = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                        raise ManagedAcquisitionRefused(
+                            "managed acquisition claim registry contains a damaged marker",
+                        )
+                    if (not isinstance(doc, dict)
+                            or doc.get("schema_version") != 1
+                            or doc.get("kind") != "managed-http-acquisition"
+                            or doc.get("run_id") != self.run.run_id
+                            or not isinstance(doc.get("components"), list)
+                            or not isinstance(doc.get("key"), str)):
+                        raise ManagedAcquisitionRefused(
+                            "managed acquisition claim registry contains an unknown marker",
+                        )
+                    if (doc.get("components") == list(self.components)
+                            and doc.get("key") == self.key):
+                        try:
+                            fcntl.flock(
+                                candidate.fd,
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                        except BlockingIOError as exc:
+                            raise _ManagedAcquisitionRelocatedBusy() from exc
+                        raise ManagedAcquisitionRefused(
+                            "managed acquisition lease is crash-stale under a release name; prior contact is unknown",
+                        )
+                    fault = candidate.close_once()
+                    if fault is not None:
+                        raise fault
+                    candidate = _OwnedDescriptor()
+
+    @staticmethod
+    def _snapshot_marker_stat(observed):
+        return (
+            observed.st_dev, observed.st_ino, observed.st_mode,
+            observed.st_nlink, observed.st_size,
+            observed.st_mtime_ns, observed.st_ctime_ns,
+        )
+
+    def validate_owned_locked(self) -> None:
+        """Authenticate this exact still-held lease inside a Run mutation epoch."""
+        self.require_origin_process()
+        if (not self.owned or not self.locked or self.released or self.abandoned
+                or self.marker.fd < 0 or self.directory.fd < 0
+                or self.marker.identity is None or self.directory.identity is None):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition destination lease is not live",
+            )
+        self._pin_registry_locked()
+        active = self.run._active_mutation_owner()
+        directory_stat = os.fstat(self.directory.fd)
+        if (active is None
+                or (directory_stat.st_dev, directory_stat.st_ino)
+                != self.directory.identity
+                or self.directory.identity != active.claim_registry.identity):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition claim registry identity changed",
+            )
+        named = self._named_identity()
+        observed = os.fstat(self.marker.fd)
+        self._validate_marker_stat(observed)
+        if (named != self.marker.identity
+                or (observed.st_dev, observed.st_ino) != self.marker.identity):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition lease marker was substituted while live",
+            )
+        if self._validate_marker_body() != self.body:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition lease marker body changed while owned",
+            )
+        # Take/refresh the nonblocking lock on the exact owner descriptor.  A
+        # lost lock with no contender is safely reacquired before any artifact
+        # effect; a different live OFD holding this inode makes this operation
+        # fail immediately, so this exact descriptor owns the lock on return.
+        try:
+            fcntl.flock(self.marker.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition destination lease lock moved to another owner",
+            ) from exc
+
+    def _pin_registry_locked(self) -> None:
+        active = self.run._active_mutation_owner()
+        if active is None:
+            raise ContractError("managed acquisition lease has no mutation authority")
+        if self.directory.fd < 0:
+            self.directory.expected_identity = active.claim_registry.identity
+            self.directory.duplicate(active.claim_registry.fd)
+        elif self.directory.identity != active.claim_registry.identity:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition claim registry identity changed",
+            )
+
+    def _open_attempt_locked(self) -> bool:
+        """Open/create one marker.  True means this call created and locked it."""
+        from . import privfs
+        self._pin_registry_locked()
+        flags = (os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                 | getattr(os, "O_CLOEXEC", 0))
+        # Pre-arm cleanup before the allocation line.  If tracing cancellation
+        # lands immediately after ``open`` adopted the new fd, settlement can
+        # still prove/unlink that exact pre-contact marker.  With no adopted fd
+        # this pre-arm is side-effect free and is simply disarmed below.
+        self.created = True
+        self.owned = True
+        try:
+            try:
+                os.stat(
+                    self.name, dir_fd=self.directory.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                self._find_relocated_marker_locked()
+            self.marker.open(self.name, flags, privfs.FILE_MODE, dir_fd=self.directory.fd)
+        except FileExistsError:
+            self.created = False
+            self.owned = False
+            self.marker.open(
+                self.name,
+                os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=self.directory.fd,
+            )
+            named = os.stat(self.name, dir_fd=self.directory.fd, follow_symlinks=False)
+            observed = os.fstat(self.marker.fd)
+            self._validate_marker_stat(observed)
+            if ((named.st_dev, named.st_ino) != self.marker.identity
+                    or (observed.st_dev, observed.st_ino) != self.marker.identity):
+                raise ManagedAcquisitionRefused(
+                    "managed acquisition lease marker was substituted while opened",
+                )
+            self._validate_marker_body()
+            return False
+
+        os.fchmod(self.marker.fd, privfs.FILE_MODE)
+        view = memoryview(self.body)
+        while view:
+            written = os.write(self.marker.fd, view)
+            if written <= 0:
+                raise OSError("managed acquisition lease write made no progress")
+            view = view[written:]
+        os.fsync(self.marker.fd)
+        self._validate_marker_body()
+        # The new inode cannot already have a cooperative owner.  Acquire its
+        # lifecycle lock before the BASE mutation exposing it is released.
+        fcntl.flock(self.marker.fd, fcntl.LOCK_EX | fcntl.LOCK_NB); self.locked = True  # noqa: E702 - one traced ownership seam
+        os.fsync(self.directory.fd)
+        self.ready = True
+        return True
+
+    def _named_identity(self) -> tuple[int, int] | None:
+        try:
+            named = os.stat(
+                self.name, dir_fd=self.directory.fd, follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        self._validate_marker_stat(named)
+        return named.st_dev, named.st_ino
+
+    def _named_identity_while_owner_busy(self) -> tuple[int, int] | None:
+        """Read the deterministic name during the exact two-link overlap."""
+        try:
+            named = os.stat(
+                self.name, dir_fd=self.directory.fd, follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        from . import privfs
+        if (not stat.S_ISREG(named.st_mode)
+                or named.st_uid != os.geteuid()
+                or stat.S_IMODE(named.st_mode) != privfs.FILE_MODE
+                or named.st_nlink not in {1, 2}):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition lease marker is unsafe while its owner settles",
+            )
+        return named.st_dev, named.st_ino
+
+    def _check_local_owner(self) -> None:
+        with _RUN_LOCKS_GUARD:
+            active_local = _ACQUISITION_ACTIVE.get(self.local_key)
+        if active_local is not None:
+            expected, owner_thread, _owner_token = active_local
+            if owner_thread == threading.get_ident():
+                raise ManagedAcquisitionRefused(
+                    "managed acquisition destination is already claimed by this thread",
+                )
+            with self.run._mutation(MutationScope.CONTROL):
+                active = self.run._active_mutation_owner()
+                if active is None:
+                    raise ContractError(
+                        "managed acquisition local lease has no mutation authority",
+                    )
+                try:
+                    named = os.stat(
+                        self.name,
+                        dir_fd=active.claim_registry.fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    named_identity = None
+                else:
+                    from . import privfs
+                    if (not stat.S_ISREG(named.st_mode)
+                            or named.st_uid != os.geteuid()
+                            or stat.S_IMODE(named.st_mode) != privfs.FILE_MODE
+                            or named.st_nlink not in {1, 2}):
+                        raise ManagedAcquisitionRefused(
+                            "managed acquisition lease marker is unsafe while locally owned",
+                        )
+                    named_identity = named.st_dev, named.st_ino
+            # A missing name may be the clean owner's unlink-before-unlock
+            # interval.  A different named inode is a live substitution and
+            # must refuse immediately instead of deadlocking behind its victim.
+            if named_identity is not None and named_identity != expected:
+                raise ManagedAcquisitionRefused(
+                    "managed acquisition lease marker was substituted while live",
+                )
+
+    def _release_local(self) -> None:
+        with _RUN_LOCKS_GUARD:
+            active_local = _ACQUISITION_ACTIVE.get(self.local_key)
+            if (active_local is not None
+                    and active_local[0] == self.marker.identity
+                    and active_local[2] is self):
+                _ACQUISITION_ACTIVE.pop(self.local_key, None)
+
+    def _close_attempt(self) -> None:
+        faults: list[BaseException] = []
+        if self.locked and self.marker.fd >= 0:
+            try:
+                self.locked = False; fcntl.flock(self.marker.fd, fcntl.LOCK_UN)  # noqa: E702 - tombstone before effect
+            except BaseException as exc:
+                faults.append(exc)
+        faults.extend(_close_owned_descriptors_twice((self.marker, self.directory)))
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            raise preferred
+        self.marker = _OwnedDescriptor()
+        self.directory = _OwnedDescriptor()
+        self.created = False
+
+    def _wait_for_existing(self) -> bool:
+        """Wait outside mutation.  True requests a clean retry after unlink."""
+        while True:
+            try:
+                fcntl.flock(self.marker.fd, fcntl.LOCK_EX | fcntl.LOCK_NB); self.locked = True  # noqa: E702 - one traced ownership seam
+                break
+            except BlockingIOError:
+                named = self._named_identity_while_owner_busy()
+                if named is not None and named != self.marker.identity:
+                    raise ManagedAcquisitionRefused(
+                        "managed acquisition lease marker was substituted while live",
+                    )
+                time.sleep(0.01)
+
+        with self.run._mutation(MutationScope.CONTROL):
+            self._pin_registry_locked()
+            named = self._named_identity()
+            observed = os.fstat(self.marker.fd)
+            if named is None and observed.st_nlink == 0:
+                self._close_attempt()
+                return True
+            if named != self.marker.identity:
+                raise ManagedAcquisitionRefused(
+                    "managed acquisition lease marker changed after its owner settled",
+                )
+            self._validate_marker_body()
+        raise ManagedAcquisitionRefused(
+            "managed acquisition lease is crash-stale; prior contact is unknown",
+        )
+
+    def acquire(self) -> None:
+        self.require_origin_process()
+        self._check_local_owner()
+        try:
+            while True:
+                try:
+                    with self.run._mutation(MutationScope.BASE_EVIDENCE):
+                        created = self._open_attempt_locked()
+                except _ManagedAcquisitionRelocatedBusy:
+                    self.created = False
+                    self.owned = False
+                    time.sleep(0.01)
+                    continue
+                if created:
+                    try:
+                        with _RUN_LOCKS_GUARD:
+                            _ACQUISITION_ACTIVE[self.local_key] = (
+                                self.marker.identity, threading.get_ident(), self,
+                            )
+                    except BaseException:
+                        # The durable marker+flock already own serialization.
+                        # Settlement does not depend on the advisory map and the
+                        # outer transaction will drain both exact owners.
+                        raise
+                    return
+                if self._wait_for_existing():
+                    continue
+        except BaseException:
+            self._release_local()
+            raise
+
+    def _settle_locked(self, pre_unlink=None) -> None:
+        """Run the stable quarantine release while the marker flock is held."""
+        if self.release_owner is None:
+            self.release_owner = _ManagedPairRelease(
+                self, pre_unlink or (lambda: None),
+            )
+        self.release_owner.execute()
+
+    def settle(self, pre_unlink=None) -> None:
+        """Idempotently release an owned marker; never remove a stale prior."""
+        self.require_origin_process()
+        if self.abandoned:
+            self.abandon()
+            raise ContractError(
+                "managed acquisition lease was abandoned with durable crash evidence",
+            )
+        faults: list[BaseException] = []
+        if not self.owned:
+            self.released = True
+        elif self.marker.fd < 0 and self.marker.identity is None and not self.ready:
+            # A pre-armed create was interrupted before adopting a descriptor;
+            # no marker inode can have escaped this owner.
+            self.released = True
+        elif self.marker.fd < 0:
+            # This owner adopted a durable generation but a prior settlement
+            # pass drained its descriptor without proving the name absent.
+            # Never convert that unresolved generation into a false release.
+            self.abandoned = True
+        if self.owned and self.ready and not self.released:
+            if self.release_owner is None:
+                self.release_owner = _ManagedPairRelease(
+                    self, pre_unlink or (lambda: None),
+                )
+            settlement = _SettlementOwner(self.release_owner.settle)
+            try:
+                with _SettlementFence(settlement):
+                    with _SettlementFence(settlement):
+                        self._settle_locked(pre_unlink)
+            except BaseException as exc:
+                faults.append(exc)
+            if self.release_owner.restored and not self.released:
+                self.abandoned = True
+        # A quarantine-only generation must never lose its flock.  Without the
+        # deterministic name, another process could otherwise acquire fresh
+        # contact authority.  Persistent restoration faults are deliberately
+        # fail-stop and remain in the live transaction registry.
+        if (self.release_owner is not None
+                and self.release_owner.needs_restoration):
+            preferred = _preferred_settlement_fault(None, faults)
+            if preferred is not None:
+                raise preferred
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker quarantine could not be restored",
+            )
+        if self.locked and self.marker.fd >= 0:
+            try:
+                self.locked = False; fcntl.flock(self.marker.fd, fcntl.LOCK_UN)  # noqa: E702 - tombstone before effect
+            except BaseException as exc:
+                faults.append(exc)
+        faults.extend(_close_owned_descriptors_twice((self.marker, self.directory)))
+        self._release_local()
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            raise preferred
+        if self.owned and not self.released:
+            raise ContractError("managed acquisition lease did not settle")
+
+    def abandon(self) -> None:
+        """Drop ephemeral ownership while retaining a durable uncertain marker.
+
+        An unresolved body/companion CAS must keep the named claim so sealing
+        and later contact fail closed.  It must not, however, strand this
+        process's flock, descriptors or keyed local mutex.  Later callers can
+        therefore promptly authenticate the still-named marker and classify it
+        as crash-stale instead of deadlocking behind a dead Python owner.
+        """
+        self.require_origin_process()
+        self.abandoned = True
+        faults: list[BaseException] = []
+        if (self.release_owner is not None
+                and self.release_owner.needs_restoration):
+            try:
+                with self.run._mutation(MutationScope.CONTROL):
+                    self.release_owner.ensure_restored()
+            except BaseException as exc:
+                faults.append(exc)
+            if self.release_owner.needs_restoration:
+                preferred = _preferred_settlement_fault(None, faults)
+                if preferred is not None:
+                    raise preferred
+                raise ManagedAcquisitionRefused(
+                    "managed acquisition marker quarantine remains live",
+                )
+        if self.locked and self.marker.fd >= 0:
+            try:
+                self.locked = False; fcntl.flock(self.marker.fd, fcntl.LOCK_UN)  # noqa: E702 - tombstone before effect
+            except BaseException as exc:
+                faults.append(exc)
+        faults.extend(_close_owned_descriptors_twice((self.marker, self.directory)))
+        self._release_local()
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            raise preferred
+        if (self.marker.fd >= 0 or self.directory.fd >= 0
+                or self.locked):
+            raise ContractError(
+                "managed acquisition uncertain lease did not abandon ephemeral ownership",
+            )
+
+
 class _ArtifactMarkerRelease:
     """Persistent allocation and release ownership for one exact claim marker."""
 
@@ -3222,9 +3847,90 @@ class _ArtifactClaim:
             privfs.replace_private_stage(self._stage)
         self._state = "published"
 
+    def _settle_writer(self) -> None:
+        """Close the one borrowed writer before namespace publication."""
+        writer_faults = _close_owned_descriptors_twice((self._writer_owner,))
+        self._writer_fd = self._writer_owner.fd
+        preferred = _preferred_settlement_fault(None, writer_faults)
+        if preferred is not None:
+            raise preferred
+        if not self._writer_owner.terminal or self._writer_is_live():
+            raise ContractError("artifact writer is still live")
+
+    def publish_if_absent(self, *target_components: str) -> bool:
+        """CAS the streamed stage to one same-parent canonical leaf.
+
+        The opaque claim retains lifecycle ownership through both successful
+        publication and a proven existing target.  A typed private-filesystem
+        exception remains the truth for committed-with-fault or uncertain
+        outcomes; the stage state is folded before that exact exception escapes.
+        """
+        components = self._require_artifact()
+        target = (
+            _validated_artifact_components(tuple(target_components))
+            if target_components else components
+        )
+        if target[:-1] != components[:-1]:
+            raise ContractError(
+                "managed acquisition publication may change only its final leaf",
+            )
+        if self._stage is None:
+            raise ContractError("artifact claim has no opened writer")
+        self._settle_writer()
+        from . import privfs
+        try:
+            with self._run._mutation(MutationScope.BASE_EVIDENCE):
+                published = privfs.publish_private_stage_if_absent(
+                    self._stage, target,
+                )
+        except BaseException:
+            if self._stage.state == "committed":
+                self._state = "published"
+            raise
+        if published:
+            self._state = "published"
+            return True
+        self.fence()
+        return False
+
+    @staticmethod
+    def _stage_graph_terminal(stage) -> bool:
+        """Return true only when a private stage has no live cleanup graph."""
+        if stage is None:
+            return True
+        if stage.state not in {"aborted", "committed", "fenced"}:
+            return False
+        ledger = getattr(stage, "_cleanup_ledger", None)
+        if ledger is not None and ledger.pending:
+            return False
+        if any(
+            getattr(stage, name) >= 0
+            for name in ("file_fd", "parent_fd", "anchor_fd")
+        ):
+            return False
+        target_claim = getattr(stage, "_noreplace_target_claim", None)
+        return target_claim is None or getattr(target_claim, "_fd", -1) < 0
+
+    def _terminal(self) -> bool:
+        """Return true only for a nominal and physically settled claim graph."""
+        discard_terminal = (
+            self._stage is None
+            or self._stage.state in {"committed", "fenced"}
+            or self._discard_settled
+        )
+        return (
+            self._state in {"published", "fenced"}
+            and self._writer_owner.fd < 0
+            and self._open_anchor.fd < 0
+            and self._cleanup_parent.fd < 0
+            and self._cleanup_anchor.fd < 0
+            and self._stage_graph_terminal(self._stage)
+            and discard_terminal
+        )
+
     def fence(self) -> None:
         """Settle an unpublished stage without creating an authoritative final."""
-        if self._state in {"published", "fenced"}:
+        if self._terminal():
             return
         from . import privfs
         faults: list[BaseException] = []
@@ -3235,9 +3941,8 @@ class _ArtifactClaim:
                         self._writer_owner, self._open_anchor,
                     )))
                     self._writer_fd = self._writer_owner.fd
-                    if self._stage is not None and self._stage.state not in {
-                        "aborted", "committed", "fenced",
-                    }:
+                    if (self._stage is not None
+                            and not self._stage_graph_terminal(self._stage)):
                         privfs.abort_private_stage(self._stage)
                     if (self._stage is not None
                             and self._stage.state == "aborted"
@@ -3272,10 +3977,7 @@ class _ArtifactClaim:
             faults.extend(_close_owned_descriptors_twice((
                 self._cleanup_parent, self._cleanup_anchor,
             )))
-            stage_terminal = (
-                self._stage is None
-                or self._stage.state in {"aborted", "committed", "fenced"}
-            )
+            stage_terminal = self._stage_graph_terminal(self._stage)
             discard_terminal = (
                 self._stage is None
                 or self._stage.state in {"committed", "fenced"}
@@ -3285,7 +3987,8 @@ class _ArtifactClaim:
                     and self._open_anchor.fd < 0
                     and self._cleanup_parent.fd < 0
                     and self._cleanup_anchor.fd < 0):
-                self._state = "fenced"
+                if self._state != "published":
+                    self._state = "fenced"
                 break
         preferred = _preferred_settlement_fault(None, faults)
         if preferred is not None:
@@ -3294,18 +3997,1554 @@ class _ArtifactClaim:
             except BaseException:
                 pass
             raise preferred
-        if self._state != "fenced":
+        if not self._terminal():
             raise ContractError("artifact claim did not reach terminal fencing")
 
     def _settle(self) -> None:
         """Idempotently settle content ownership, then its durable marker."""
-        if self._state not in {"published", "fenced"}:
+        if not self._terminal():
             self.fence()
-        if self._state in {"published", "fenced"}:
+        if self._terminal():
             with self._run._mutation(MutationScope.CONTROL):
                 self._marker_release.settle()
         if not self._marker_release.released:
             raise ContractError("artifact claim marker remains live")
+
+
+@dataclass(frozen=True)
+class ManagedAcquisitionSnapshot:
+    """Authenticated immutable facts for one named acquisition object."""
+
+    components: tuple[str, ...]
+    identity: tuple[int, int]
+    signature: tuple[int, int, int, int, int, int, int]
+    size: int
+    digest: str
+    data: bytes | None = None
+
+
+@dataclass(frozen=True)
+class ManagedRemoval:
+    """Truthful terminal state for one requested acquisition discard."""
+
+    state: str
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class ManagedAcquisitionCertificate:
+    """Opaque terminal proof for one exact body/receipt pair."""
+
+    body: ManagedAcquisitionSnapshot
+    receipt: ManagedAcquisitionSnapshot
+
+
+@dataclass(frozen=True)
+class ManagedDiscardLedger:
+    """Truthful per-object terminal facts for a composite discard."""
+
+    body: ManagedRemoval
+    receipt: ManagedRemoval
+
+
+class _ManagedDiscardSlot:
+    """Stable per-name owner across call/result-adoption cancellation gaps."""
+
+    __slots__ = ("components", "expected", "result", "invocations")
+
+    def __init__(self, components, expected) -> None:
+        self.components = components
+        self.expected = expected
+        self.result = ManagedRemoval("pending")
+        self.invocations = 0
+
+    def adopt(self, result: ManagedRemoval) -> None:
+        if type(result) is not ManagedRemoval:
+            result = ManagedRemoval("uncertain", "discard result is invalid")
+        if (result.state == "absent" and self.expected is not None
+                and self.invocations > 0):
+            result = ManagedRemoval("removed")
+        self.result = result
+
+
+class _ManagedDiscardComposite:
+    """Stable two-object discard ledger installed before the first unlink."""
+
+    __slots__ = (
+        "transaction", "body", "receipt", "primary", "faults",
+    )
+
+    def __init__(
+        self, transaction,
+        body_components, body_expected,
+        receipt_components, receipt_expected,
+    ) -> None:
+        self.transaction = transaction
+        self.body = _ManagedDiscardSlot(body_components, body_expected)
+        self.receipt = _ManagedDiscardSlot(
+            receipt_components, receipt_expected,
+        )
+        self.primary = None
+        self.faults: list[BaseException] = []
+
+    @property
+    def ledger(self) -> ManagedDiscardLedger:
+        preferred = self.preferred()
+        detail = (
+            "discard could not be reconciled"
+            if preferred is None
+            else f"{type(preferred).__name__}: {preferred}"
+        )
+        def reported(slot):
+            if slot.result.state == "pending":
+                return ManagedRemoval("uncertain", detail)
+            return slot.result
+        return ManagedDiscardLedger(reported(self.body), reported(self.receipt))
+
+    def remember(self, fault: BaseException | None) -> None:
+        if fault is not None:
+            self.primary = _preferred_settlement_fault(
+                self.primary, [fault],
+            )
+
+    def _remove(self, slot: _ManagedDiscardSlot) -> None:
+        if slot.result.state != "pending":
+            return
+        slot.invocations += 1
+        try:
+            result = self.transaction.remove_if_matches(
+                slot.components, slot.expected,
+            )
+        except BaseException as exc:
+            result = getattr(exc, "managed_removal", None)
+            self.faults.append(exc)
+            if (type(result) is ManagedRemoval
+                    and result.state in {
+                        "removed", "removed-with-fault", "absent", "changed",
+                    }):
+                slot.adopt(result)
+        else:
+            slot.adopt(result)
+
+    def reconcile(self) -> None:
+        for _pass in range(2):
+            self._remove(self.body)
+            self._remove(self.receipt)
+
+    def preferred(self) -> BaseException | None:
+        return _preferred_settlement_fault(self.primary, self.faults)
+
+    def attach(self, fault: BaseException) -> None:
+        try:
+            fault.managed_discard = self.ledger
+        except BaseException:
+            pass
+
+
+def _settle_managed_discard_escape(
+    owner: _ManagedDiscardComposite, primary: BaseException,
+) -> None:
+    owner.remember(primary)
+    try:
+        owner.reconcile()
+    except BaseException as exc:
+        owner.faults.append(exc)
+    preferred = owner.preferred() or primary
+    owner.attach(preferred)
+    if preferred is primary:
+        raise primary
+    raise preferred from primary
+
+
+def _managed_discard_execute(owner: _ManagedDiscardComposite):
+    owner.reconcile()
+    preferred = owner.preferred()
+    if preferred is not None:
+        owner.attach(preferred)
+        raise preferred
+    return owner.ledger
+
+
+def _managed_discard_middle(owner: _ManagedDiscardComposite):
+    try: return _managed_discard_execute(owner)
+    except BaseException as primary:
+        _settle_managed_discard_escape(owner, primary)
+    raise AssertionError("unreachable managed discard boundary")
+
+
+def _managed_discard_inner(owner: _ManagedDiscardComposite):
+    try: return _managed_discard_middle(owner)
+    except BaseException as primary:
+        _settle_managed_discard_escape(owner, primary)
+    raise AssertionError("unreachable managed discard boundary")
+
+
+def _managed_discard_outer(owner: _ManagedDiscardComposite):
+    try: return _managed_discard_inner(owner)
+    except BaseException as primary:
+        _settle_managed_discard_escape(owner, primary)
+    raise AssertionError("unreachable managed discard boundary")
+
+
+class _ManagedDiscardFence:
+    """Repeat composite reconciliation around every public escape boundary."""
+
+    __slots__ = ("owner",)
+
+    def __init__(self, owner: _ManagedDiscardComposite) -> None:
+        self.owner = owner
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, primary, _traceback) -> bool:
+        self.owner.remember(primary)
+        try:
+            self.owner.reconcile()
+        except BaseException as exc:
+            self.owner.faults.append(exc)
+        preferred = self.owner.preferred()
+        if preferred is None:
+            return False
+        self.owner.attach(preferred)
+        if preferred is primary:
+            return False
+        if primary is None:
+            raise preferred
+        raise preferred from primary
+
+
+def _managed_discard_fenced(owner: _ManagedDiscardComposite):
+    outer = _ManagedDiscardFence(owner)
+    inner = _ManagedDiscardFence(owner)
+    with outer:
+        with inner:
+            return _managed_discard_outer(owner)
+
+
+def _managed_discard_public_middle(owner: _ManagedDiscardComposite):
+    try: return _managed_discard_fenced(owner)
+    except BaseException as primary:
+        _settle_managed_discard_escape(owner, primary)
+    raise AssertionError("unreachable managed discard public boundary")
+
+
+def _managed_discard_public_inner(owner: _ManagedDiscardComposite):
+    try: return _managed_discard_public_middle(owner)
+    except BaseException as primary:
+        _settle_managed_discard_escape(owner, primary)
+    raise AssertionError("unreachable managed discard public boundary")
+
+
+def _managed_discard_public_outer(owner: _ManagedDiscardComposite):
+    try: return _managed_discard_public_inner(owner)
+    except BaseException as primary:
+        _settle_managed_discard_escape(owner, primary)
+    raise AssertionError("unreachable managed discard public boundary")
+
+
+def _managed_discard_public_export(owner: _ManagedDiscardComposite):
+    try: return _managed_discard_public_outer(owner)
+    except BaseException as primary:
+        _settle_managed_discard_escape(owner, primary)
+    raise AssertionError("unreachable managed discard public boundary")
+
+
+def _managed_discard_public_reserved(owner: _ManagedDiscardComposite):
+    try: return _managed_discard_public_export(owner)
+    except BaseException as primary:
+        _settle_managed_discard_escape(owner, primary)
+    raise AssertionError("unreachable managed discard public boundary")
+
+
+def _managed_discard_public_final(owner: _ManagedDiscardComposite):
+    try: return _managed_discard_public_reserved(owner)
+    except BaseException as primary:
+        _settle_managed_discard_escape(owner, primary)
+    raise AssertionError("unreachable managed discard public boundary")
+
+
+def _managed_discard_public(owner: _ManagedDiscardComposite):
+    return _managed_discard_public_final(owner)
+
+
+def _managed_discard_pair_middle(
+    transaction, body_components, body_expected,
+    receipt_components, receipt_expected,
+):
+    return transaction._discard_pair_owned(
+        body_components, body_expected, receipt_components, receipt_expected,
+    )
+
+
+def _managed_discard_pair_inner(
+    transaction, body_components, body_expected,
+    receipt_components, receipt_expected,
+):
+    return _managed_discard_pair_middle(
+        transaction, body_components, body_expected,
+        receipt_components, receipt_expected,
+    )
+
+
+def _managed_discard_pair_export(
+    transaction, body_components, body_expected,
+    receipt_components, receipt_expected,
+):
+    # This chain is deliberately effect-free until ``_discard_pair_owned`` has
+    # installed the stable composite.  A cancellation on an earlier trampoline
+    # therefore truthfully means both requested names remain unattempted.
+    return _managed_discard_pair_inner(
+        transaction, body_components, body_expected,
+        receipt_components, receipt_expected,
+    )
+
+
+class _ManagedPairRelease:
+    """Release one durable marker while an exact second name overlaps it.
+
+    The deterministic lease remains visible through the terminal pair
+    postcheck.  A random valid ``*.claim`` hard link then remains visible while
+    the deterministic name is removed.  Thus every nonterminal instant keeps
+    at least one scan-recognizable name bound to the exact locked inode.
+    """
+
+    __slots__ = (
+        "marker", "validate_pair", "quarantine", "started", "move_possible",
+        "moved", "move_durable", "postchecked", "delete_possible",
+        "terminal", "restored", "primary", "faults",
+    )
+
+    def __init__(self, marker, validate_pair) -> None:
+        self.marker = marker
+        self.validate_pair = validate_pair
+        self.quarantine = f"{os.urandom(16).hex()}{_CLAIM_SUFFIX}"
+        self.started = False
+        self.move_possible = False
+        self.moved = False
+        self.move_durable = False
+        self.postchecked = False
+        self.delete_possible = False
+        self.terminal = False
+        self.restored = False
+        self.primary = None
+        self.faults: list[BaseException] = []
+
+    def _named(self, name: str, *, allow_two_links: bool = False):
+        try:
+            observed = os.stat(
+                name, dir_fd=self.marker.directory.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        from . import privfs
+        if (not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE
+                or observed.st_nlink not in (
+                    {1, 2} if allow_two_links else {1}
+                )):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker release name is unsafe",
+            )
+        identity = (observed.st_dev, observed.st_ino)
+        if identity != self.marker.marker.identity:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker release name was substituted",
+            )
+        return identity
+
+    def _positions_locked(self, *, allow_both: bool = False) -> tuple[bool, bool]:
+        deterministic = self._named(
+            self.marker.name, allow_two_links=allow_both,
+        ) is not None
+        quarantine = self._named(
+            self.quarantine, allow_two_links=allow_both,
+        ) is not None
+        if deterministic and quarantine and not allow_both:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker exists under two release names",
+            )
+        observed = os.fstat(self.marker.marker.fd)
+        expected_links = int(deterministic) + int(quarantine)
+        if ((observed.st_dev, observed.st_ino) != self.marker.marker.identity
+                or observed.st_nlink != expected_links):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker release inode changed",
+            )
+        return deterministic, quarantine
+
+    def _validate_exact_body_locked(self) -> None:
+        observed = os.fstat(self.marker.marker.fd)
+        self.marker._validate_marker_stat(observed)
+        os.lseek(self.marker.marker.fd, 0, os.SEEK_SET)
+        if os.read(self.marker.marker.fd, 64 * 1024 + 1) != self.marker.body:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker body changed during release",
+            )
+
+    def _provisional_unlink_locked(self) -> None:
+        """Create and durably authenticate the exact overlapping name."""
+        self.marker.validate_owned_locked()
+        deterministic, quarantine = self._positions_locked(allow_both=True)
+        if deterministic and quarantine:
+            self.moved = True
+        elif deterministic and not quarantine:
+            self.move_possible = True
+            os.link(
+                self.marker.name, self.quarantine,
+                src_dir_fd=self.marker.directory.fd,
+                dst_dir_fd=self.marker.directory.fd,
+                follow_symlinks=False,
+            )
+            deterministic, quarantine = self._positions_locked(allow_both=True)
+            if not deterministic or not quarantine:
+                raise ManagedAcquisitionRefused(
+                    "managed acquisition marker overlap link did not commit",
+                )
+            self.moved = True
+        else:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker changed before overlap",
+            )
+        os.fsync(self.marker.directory.fd)
+        self.move_durable = True
+
+    @property
+    def needs_restoration(self) -> bool:
+        return self.move_possible and not self.terminal and not self.restored
+
+    def ensure_restored(self) -> None:
+        """Return uncertainty to one exact deterministic marker name."""
+        if self.terminal or self.restored:
+            return
+        self.marker.require_origin_process()
+        self.marker._pin_registry_locked()
+        deterministic, quarantine = self._positions_locked(allow_both=True)
+        if deterministic and quarantine:
+            self._unlink_exact_name_locked(self.quarantine, expected_after=1)
+            os.fsync(self.marker.directory.fd)
+            if self.marker._named_identity() != self.marker.marker.identity:
+                raise ManagedAcquisitionRefused(
+                    "managed acquisition marker deterministic name was not restored",
+                )
+            self._validate_exact_body_locked()
+            self.restored = True
+            self.marker.abandoned = True
+            return
+        if deterministic:
+            self._validate_exact_body_locked()
+            os.fsync(self.marker.directory.fd)
+            self.restored = True
+            self.marker.abandoned = True
+            return
+        if not quarantine:
+            if self.delete_possible and os.fstat(self.marker.marker.fd).st_nlink == 0:
+                # The final unlink committed but its result assignment/fault
+                # escaped.  Only an exact terminal pair permits adopting it.
+                self.validate_pair()
+                os.fsync(self.marker.directory.fd)
+                self.marker.released = True
+                self.marker.ready = False
+                self.terminal = True
+                return
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker has no recoverable release name",
+            )
+        # Legacy recovery for an overlap whose deterministic unlink committed:
+        # recreate that name before removing quarantine.
+        os.link(
+            self.quarantine, self.marker.name,
+            src_dir_fd=self.marker.directory.fd,
+            dst_dir_fd=self.marker.directory.fd,
+            follow_symlinks=False,
+        )
+        os.fsync(self.marker.directory.fd)
+        named = os.stat(
+            self.marker.name, dir_fd=self.marker.directory.fd,
+            follow_symlinks=False,
+        )
+        quarantined = os.stat(
+            self.quarantine, dir_fd=self.marker.directory.fd,
+            follow_symlinks=False,
+        )
+        identity = self.marker.marker.identity
+        if ((named.st_dev, named.st_ino) != identity
+                or (quarantined.st_dev, quarantined.st_ino) != identity
+                or os.fstat(self.marker.marker.fd).st_nlink != 2):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker restoration link changed",
+            )
+        self._unlink_exact_name_locked(self.quarantine, expected_after=1)
+        os.fsync(self.marker.directory.fd)
+        if self.marker._named_identity() != identity:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker deterministic name was not restored",
+            )
+        self._validate_exact_body_locked()
+        self.restored = True
+        self.marker.abandoned = True
+
+    def _unlink_exact_name_locked(self, name: str, *, expected_after: int) -> None:
+        """Authenticate and unlink on one traced authority line, then reconcile."""
+        identity = self.marker.marker.identity
+        named = os.stat(
+            name, dir_fd=self.marker.directory.fd, follow_symlinks=False,
+        )
+        if ((named.st_dev, named.st_ino) != identity
+                or named.st_nlink not in {1, 2}):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker release name was substituted",
+            )
+        # Keep the final authority check and namespace effect on one physical
+        # traced line.  A wrapper can run only after the effect and is handled
+        # by the descriptor/name reconciliation below.
+        named = os.stat(name, dir_fd=self.marker.directory.fd, follow_symlinks=False); os.unlink(name, dir_fd=self.marker.directory.fd)  # noqa: E702 - one traced authority boundary
+        if (named.st_dev, named.st_ino) != identity:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker release name changed at unlink",
+            )
+        observed = os.fstat(self.marker.marker.fd)
+        if observed.st_nlink != expected_after:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker unlink changed the wrong inode",
+            )
+
+    def _delete_quarantine_locked(self) -> None:
+        deterministic, quarantine = self._positions_locked(allow_both=True)
+        if not deterministic or not quarantine:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker overlap is incomplete",
+            )
+        self.delete_possible = True
+        self._unlink_exact_name_locked(self.marker.name, expected_after=1)
+        # The random exact name still blocks every contender while the
+        # deterministic name is absent.  Remove it only after reconciling the
+        # first unlink through the pinned marker descriptor.
+        self._unlink_exact_name_locked(self.quarantine, expected_after=0)
+        if os.fstat(self.marker.marker.fd).st_nlink != 0:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition marker terminal unlink did not commit",
+            )
+        os.fsync(self.marker.directory.fd)
+        self.marker.released = True
+        self.marker.ready = False
+        self.terminal = True
+
+    def execute(self) -> None:
+        if self.terminal:
+            return
+        self.started = True
+        try:
+            self.validate_pair()
+            self._provisional_unlink_locked()
+            self.validate_pair()
+            self.postchecked = True
+            self._delete_quarantine_locked()
+        except BaseException as exc:
+            self.primary = _preferred_settlement_fault(self.primary, [exc])
+            raise
+
+    def settle(self) -> None:
+        if self.terminal:
+            return
+        faults: list[BaseException] = []
+        # Before a possible rename, one retry may still complete.  Once the
+        # deterministic name may have moved, only exact restoration is safe.
+        if not self.move_possible:
+            try:
+                self.execute()
+            except BaseException as exc:
+                faults.append(exc)
+        if not self.terminal:
+            try:
+                self.ensure_restored()
+            except BaseException as exc:
+                faults.append(exc)
+            if not self.terminal:
+                self.marker.released = False
+                if self.restored:
+                    self.marker.abandoned = True
+        self.faults.extend(faults)
+        preferred = _preferred_settlement_fault(self.primary, self.faults)
+        if preferred is not None:
+            raise preferred
+        if not self.terminal:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition terminal pair release remained uncertain",
+            )
+
+
+class _ManagedAcquisitionCompanion:
+    """Stable adoption record for one exact companion byte generation.
+
+    Constructing this record has no descriptor or namespace effects.  The
+    transaction adopts the complete record with one attribute store before it
+    opens a stage, so cancellation cannot leave an artifact owner whose frozen
+    byte identity is missing.
+    """
+
+    __slots__ = ("identity", "artifact", "staged")
+
+    def __init__(
+        self, run, components: tuple[str, ...], marker,
+        identity: tuple[tuple[str, ...], int, bytes],
+    ) -> None:
+        self.identity = identity
+        self.artifact = _ArtifactClaim(run, components, marker)
+        self.staged = False
+
+
+class _ManagedAcquisitionTransaction:
+    """Opaque descriptor-relative transaction behind one destination lease."""
+
+    __slots__ = (
+        "run", "components", "marker", "artifact", "anchor", "parent",
+        "active", "settled", "companion", "contact_attempted",
+        "terminal_certificate", "retain_reason", "clean_precontact",
+        "discard_started",
+    )
+
+    def __init__(
+        self, run, components: tuple[str, ...], marker: _ManagedAcquisitionMarker,
+    ) -> None:
+        self.run = run
+        self.components = components
+        self.marker = marker
+        self.artifact = _ArtifactClaim(run, components, marker)
+        self.anchor = _OwnedDescriptor(run._run_directory_identity)
+        self.parent = _OwnedDescriptor()
+        self.active = False
+        self.settled = False
+        self.companion = None
+        self.contact_attempted = False
+        self.terminal_certificate = None
+        self.retain_reason = None
+        self.clean_precontact = False
+        self.discard_started = False
+
+    def _require_origin_process(self) -> None:
+        self.marker.require_origin_process()
+
+    @staticmethod
+    def _close_inherited_number(owner, name: str, identity) -> None:
+        """Child-only authenticated close of one inherited numeric slot."""
+        fd = getattr(owner, name, -1)
+        if type(fd) is not int or fd < 0:
+            return
+        try:
+            observed = os.fstat(fd)
+        except OSError:
+            observed = None
+        if name == "fd":
+            owner.fd = -1
+            owner.terminal = True
+        else:
+            object.__setattr__(owner, name, -1)
+        if (observed is None or type(identity) is not tuple
+                or (observed.st_dev, observed.st_ino) != identity):
+            return
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    @classmethod
+    def _close_inherited_stage(cls, stage) -> None:
+        """Child-only close of every descriptor reachable from one stage."""
+        if stage is None:
+            return
+        for name, identity in (
+            ("_file_fd", getattr(stage, "file_identity", None)),
+            ("_parent_fd", getattr(stage, "parent_identity", None)),
+            ("_anchor_fd", getattr(stage, "anchor_identity", None)),
+        ):
+            cls._close_inherited_number(stage, name, identity)
+        ledger = getattr(stage, "_cleanup_ledger", None)
+        for claim in (() if ledger is None else ledger.claims):
+            identity = getattr(claim, "_owned_identity", None)
+            if identity is None:
+                identity = getattr(claim, "_identity", None)
+            cls._close_inherited_number(claim, "_fd", identity)
+        target_claim = getattr(stage, "_noreplace_target_claim", None)
+        if target_claim is not None:
+            identity = getattr(target_claim, "_owned_identity", None)
+            if identity is None:
+                identity = getattr(target_claim, "_identity", None)
+            cls._close_inherited_number(target_claim, "_fd", identity)
+
+    def _close_inherited_graph_at_fork(self) -> None:
+        """Close-only child hook; never unlink, publish, abort or LOCK_UN."""
+        companion_artifact = (
+            None if self.companion is None else self.companion.artifact
+        )
+        claims = (self.artifact,) + (
+            () if companion_artifact is None
+            else (companion_artifact,)
+        )
+        owners = tuple(
+            owner
+            for claim in claims
+            for owner in (
+                claim._writer_owner, claim._open_anchor,
+                claim._cleanup_parent, claim._cleanup_anchor,
+            )
+        ) + (
+            self.parent, self.anchor, self.marker.marker,
+            self.marker.directory,
+        )
+        for owner in owners:
+            self._close_inherited_number(owner, "fd", owner.identity)
+        self._close_inherited_stage(self.artifact._stage)
+        if companion_artifact is not None:
+            self._close_inherited_stage(companion_artifact._stage)
+        self.marker.locked = False
+
+    @staticmethod
+    def _stage_terminal(stage) -> bool:
+        return _ArtifactClaim._stage_graph_terminal(stage)
+
+    def activate(self) -> None:
+        self._require_origin_process()
+        with self.run._mutation(MutationScope.BASE_EVIDENCE):
+            owner = self.run._active_mutation_owner()
+            if owner is None:
+                raise ContractError(
+                    "managed acquisition transaction has no mutation authority",
+                )
+            self.anchor.duplicate(owner.run_anchor.fd)
+            _open_strict_directory_into(
+                self.parent, self.anchor.fd, self.components[:-1],
+            )
+        self.active = True
+
+    def _target(self, components: tuple[str, ...]) -> tuple[str, ...]:
+        components = _validated_artifact_components(components)
+        if components[:-1] != self.components[:-1]:
+            raise ContractError(
+                "managed acquisition transaction is limited to one pinned parent",
+            )
+        return components
+
+    def mark_contact_attempted(self) -> None:
+        """Monotonically arm fail-closed settlement before an opener call."""
+        self._require_origin_process()
+        with self.run._mutation(MutationScope.BASE_EVIDENCE):
+            self._reauthenticate_locked()
+            self.contact_attempted = True
+            self.clean_precontact = False
+
+    def retain_uncertain(self, reason: str = "managed acquisition is uncertain") -> None:
+        """Require durable stale evidence while draining ephemeral ownership."""
+        self._require_origin_process()
+        if type(reason) is not str or not reason:
+            raise ValueError("managed acquisition uncertainty reason is invalid")
+        if self.retain_reason is None:
+            self.retain_reason = reason
+        self.clean_precontact = False
+
+    def settle_precontact(self) -> None:
+        """Authorize clean marker release only when no contact was attempted."""
+        self._require_origin_process()
+        if self.contact_attempted:
+            raise ContractError(
+                "contacted acquisition cannot settle as a precontact refusal",
+            )
+        self.clean_precontact = True
+
+    @staticmethod
+    def _snapshot_matches(
+        expected: ManagedAcquisitionSnapshot,
+        observed: ManagedAcquisitionSnapshot | None,
+    ) -> bool:
+        return (
+            observed is not None
+            and observed.components == expected.components
+            and observed.identity == expected.identity
+            and observed.signature == expected.signature
+            and observed.size == expected.size
+            and observed.digest == expected.digest
+            and (expected.data is None or observed.data == expected.data)
+        )
+
+    def certify_pair(
+        self,
+        body: ManagedAcquisitionSnapshot,
+        receipt: ManagedAcquisitionSnapshot,
+    ) -> ManagedAcquisitionCertificate:
+        """Certify exact current body+receipt names in one mutation epoch."""
+        self._require_origin_process()
+        if (type(body) is not ManagedAcquisitionSnapshot
+                or type(receipt) is not ManagedAcquisitionSnapshot):
+            raise TypeError("managed acquisition pair snapshots are invalid")
+        body_components = self._target(body.components)
+        receipt_components = self._target(receipt.components)
+        if self.retain_reason is not None:
+            raise ManagedAcquisitionRefused(
+                "managed acquisition was already retained as uncertain",
+            )
+        with self.run._mutation(MutationScope.BASE_EVIDENCE):
+            self._reauthenticate_locked()
+            current_body, current_receipt = self._snapshot_pair_locked(
+                body_components, receipt_components,
+            )
+            if (not self._snapshot_matches(body, current_body)
+                    or not self._snapshot_matches(receipt, current_receipt)):
+                self.retain_uncertain(
+                    "managed acquisition terminal pair changed during certification",
+                )
+                raise ManagedAcquisitionRefused(
+                    "managed acquisition terminal pair is no longer current",
+                )
+            certificate = ManagedAcquisitionCertificate(
+                current_body, current_receipt,
+            )
+            if (self.terminal_certificate is not None
+                    and self.terminal_certificate != certificate):
+                self.retain_uncertain(
+                    "managed acquisition terminal certificate changed",
+                )
+                raise ManagedAcquisitionRefused(
+                    "managed acquisition terminal certificate changed",
+                )
+            self.terminal_certificate = certificate
+            self.clean_precontact = False
+            return certificate
+
+    def _reauthenticate_locked(self) -> None:
+        if not self.active or self.anchor.fd < 0 or self.parent.fd < 0:
+            raise ContractError("managed acquisition transaction is not live")
+        owner = self.run._active_mutation_owner()
+        if owner is None:
+            raise ContractError(
+                "managed acquisition transaction has no mutation authority",
+            )
+        self.marker.validate_owned_locked()
+        if ((os.fstat(self.anchor.fd).st_dev, os.fstat(self.anchor.fd).st_ino)
+                != owner.run_anchor.identity):
+            raise ManagedAcquisitionRefused(
+                "managed acquisition Run identity changed during contact",
+            )
+        verifier = _OwnedDescriptor(self.parent.identity)
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners(
+                (verifier,), "managed acquisition parent verifier",
+            ),
+        )
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                _open_strict_directory_into(
+                    verifier, owner.run_anchor.fd, self.components[:-1],
+                )
+                if verifier.identity != self.parent.identity:
+                    raise ManagedAcquisitionRefused(
+                        "managed acquisition destination parent changed",
+                    )
+
+    @staticmethod
+    def _snapshot_signature(observed) -> tuple[int, int, int, int, int, int, int]:
+        return (
+            observed.st_dev, observed.st_ino, observed.st_mode,
+            observed.st_nlink, observed.st_size,
+            observed.st_mtime_ns, observed.st_ctime_ns,
+        )
+
+    def _snapshot_pair_locked(
+        self,
+        body_components: tuple[str, ...],
+        receipt_components: tuple[str, ...],
+        *, release_certificate: ManagedAcquisitionCertificate | None = None,
+    ) -> tuple[ManagedAcquisitionSnapshot | None,
+               ManagedAcquisitionSnapshot | None]:
+        """Pin and authenticate both terminal names through one epoch."""
+        body_owner = _OwnedDescriptor()
+        receipt_owner = _OwnedDescriptor()
+        owners = (body_owner, receipt_owner)
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners(
+                owners, "managed acquisition pair certificate descriptors",
+            ),
+        )
+
+        def opened_snapshot(owner, components, *, capture: bool):
+            before = os.fstat(owner.fd)
+            self.run._validate_base_file_stat(before, components)
+            digest = hashlib.sha256()
+            chunks: list[bytes] = []
+            captured = 0
+            while True:
+                chunk = os.read(owner.fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                if capture:
+                    if captured + len(chunk) > 1024 * 1024:
+                        raise ManagedAcquisitionRefused(
+                            "managed acquisition companion exceeds its read bound",
+                        )
+                    chunks.append(chunk)
+                    captured += len(chunk)
+            after = os.fstat(owner.fd)
+            before_signature = self._snapshot_signature(before)
+            if self._snapshot_signature(after) != before_signature:
+                raise ManagedAcquisitionRefused(
+                    "managed acquisition pair changed while inspected",
+                )
+            return before_signature, digest.hexdigest(), (
+                b"".join(chunks) if capture else None
+            )
+
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                missing = []
+                for owner, components in (
+                    (body_owner, body_components),
+                    (receipt_owner, receipt_components),
+                ):
+                    try:
+                        owner.open(
+                            components[-1], _FILE_OPEN_FLAGS,
+                            dir_fd=self.parent.fd,
+                        )
+                    except FileNotFoundError:
+                        missing.append(owner)
+                if missing:
+                    return None, None
+                body_signature, body_digest, _body_data = opened_snapshot(
+                    body_owner, body_components, capture=False,
+                )
+                receipt_signature, receipt_digest, receipt_data = opened_snapshot(
+                    receipt_owner, receipt_components, capture=True,
+                )
+                named_body = os.stat(
+                    body_components[-1], dir_fd=self.parent.fd,
+                    follow_symlinks=False,
+                )
+                named_receipt = os.stat(
+                    receipt_components[-1], dir_fd=self.parent.fd,
+                    follow_symlinks=False,
+                )
+                if (self._snapshot_signature(named_body) != body_signature
+                        or self._snapshot_signature(named_receipt)
+                        != receipt_signature):
+                    raise ManagedAcquisitionRefused(
+                        "managed acquisition pair names changed while certified",
+                    )
+                pair = (
+                    ManagedAcquisitionSnapshot(
+                        body_components,
+                        (body_signature[0], body_signature[1]),
+                        body_signature, body_signature[4], body_digest,
+                    ),
+                    ManagedAcquisitionSnapshot(
+                        receipt_components,
+                        (receipt_signature[0], receipt_signature[1]),
+                        receipt_signature, receipt_signature[4], receipt_digest,
+                        receipt_data,
+                    ),
+                )
+                if release_certificate is not None:
+                    if (not self._snapshot_matches(
+                            release_certificate.body, pair[0],
+                        ) or not self._snapshot_matches(
+                            release_certificate.receipt, pair[1],
+                        )):
+                        return pair
+                    def validate_pinned_pair():
+                        for owner, components, expected in (
+                            (body_owner, body_components,
+                             release_certificate.body),
+                            (receipt_owner, receipt_components,
+                             release_certificate.receipt),
+                        ):
+                            before = os.fstat(owner.fd)
+                            os.lseek(owner.fd, 0, os.SEEK_SET)
+                            digest = hashlib.sha256()
+                            while True:
+                                chunk = os.read(owner.fd, 1024 * 1024)
+                                if not chunk:
+                                    break
+                                digest.update(chunk)
+                            after = os.fstat(owner.fd)
+                            named = os.stat(
+                                components[-1], dir_fd=self.parent.fd,
+                                follow_symlinks=False,
+                            )
+                            if (self._snapshot_signature(before)
+                                    != expected.signature
+                                    or self._snapshot_signature(after)
+                                    != expected.signature
+                                    or self._snapshot_signature(named)
+                                    != expected.signature
+                                    or digest.hexdigest() != expected.digest):
+                                raise ManagedAcquisitionRefused(
+                                    "managed acquisition terminal pair changed at release",
+                                )
+
+                    # Both exact inodes remain pinned through a provisional
+                    # marker unlink and its postcheck.  Any mismatch, fault or
+                    # cancellation restores the deterministic durable marker
+                    # before this BASE mutation can release the old flock.
+                    release = self.marker.release_owner = _ManagedPairRelease(
+                        self.marker, validate_pinned_pair,
+                    )
+                    settlement = _SettlementOwner(release.settle)
+                    with _SettlementFence(settlement):
+                        with _SettlementFence(settlement):
+                            release.execute()
+                    if release.terminal:
+                        self.marker.settle()
+                return pair
+
+    def snapshot(
+        self, components: tuple[str, ...], *, content_limit: int | None = None,
+    ) -> ManagedAcquisitionSnapshot | None:
+        """Read/hash one strict named object through the pinned parent."""
+        self._require_origin_process()
+        components = self._target(components)
+        if content_limit is not None and (
+            type(content_limit) is not int or content_limit < 0
+        ):
+            raise ValueError("managed acquisition content limit is invalid")
+        slot = _OwnedDescriptor()
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners(
+                (slot,), "managed acquisition snapshot descriptor",
+            ),
+        )
+        with self.run._mutation(MutationScope.BASE_EVIDENCE):
+            self._reauthenticate_locked()
+            try:
+                with _SettlementFence(settlement):
+                    with _SettlementFence(settlement):
+                        try:
+                            slot.open(
+                                components[-1], _FILE_OPEN_FLAGS,
+                                dir_fd=self.parent.fd,
+                            )
+                        except FileNotFoundError:
+                            return None
+                        before = os.fstat(slot.fd)
+                        self.run._validate_base_file_stat(before, components)
+                        digest = hashlib.sha256()
+                        chunks: list[bytes] = []
+                        captured = 0
+                        while True:
+                            chunk = os.read(slot.fd, 1024 * 1024)
+                            if not chunk:
+                                break
+                            digest.update(chunk)
+                            if content_limit is not None:
+                                if captured + len(chunk) > content_limit:
+                                    raise ManagedAcquisitionRefused(
+                                        "managed acquisition companion exceeds its read bound",
+                                    )
+                                chunks.append(chunk)
+                                captured += len(chunk)
+                        after = os.fstat(slot.fd)
+                        named = os.stat(
+                            components[-1], dir_fd=self.parent.fd,
+                            follow_symlinks=False,
+                        )
+                        before_signature = self._snapshot_signature(before)
+                        if (self._snapshot_signature(after) != before_signature
+                                or self._snapshot_signature(named) != before_signature):
+                            raise ManagedAcquisitionRefused(
+                                "managed acquisition object changed while inspected",
+                            )
+                        return ManagedAcquisitionSnapshot(
+                            components=components,
+                            identity=(before.st_dev, before.st_ino),
+                            signature=before_signature,
+                            size=before.st_size,
+                            digest=digest.hexdigest(),
+                            data=(b"".join(chunks)
+                                  if content_limit is not None else None),
+                        )
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
+                    raise ManagedAcquisitionRefused(
+                        "managed acquisition object is unsafe",
+                    ) from exc
+                raise
+
+    def open_writer(self) -> int:
+        self._require_origin_process()
+        with self.run._mutation(MutationScope.BASE_EVIDENCE):
+            self._reauthenticate_locked()
+            return self.artifact.open_writer()
+
+    def publish_body_if_absent(
+        self, components: tuple[str, ...] | None = None,
+    ) -> bool:
+        self._require_origin_process()
+        target = self.components if components is None else self._target(components)
+        with self.run._mutation(MutationScope.BASE_EVIDENCE):
+            self._reauthenticate_locked()
+            return self.artifact.publish_if_absent(*target)
+
+    def _companion_stage_identity_locked(
+        self, companion: _ManagedAcquisitionCompanion,
+    ) -> tuple[int, bytes]:
+        """Authenticate the exact bytes retained after an interrupted write."""
+        artifact = companion.artifact
+        stage = artifact._stage
+        if stage is None or stage.state != "open":
+            raise ContractError(
+                "managed acquisition companion stage cannot be reconciled",
+            )
+        artifact._settle_writer()
+        reader = _OwnedDescriptor(stage.file_identity)
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners(
+                (reader,), "managed acquisition companion verifier",
+            ),
+        )
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                reader.open(
+                    stage.temporary_name, _FILE_OPEN_FLAGS,
+                    dir_fd=stage.parent_fd,
+                )
+                before = _identity_stat(reader.fd)
+                self.run._validate_base_file_stat(
+                    os.fstat(reader.fd), stage.components,
+                )
+                digest = hashlib.sha256()
+                while True:
+                    chunk = os.read(reader.fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                after = _identity_stat(reader.fd)
+                named = os.stat(
+                    stage.temporary_name, dir_fd=stage.parent_fd,
+                    follow_symlinks=False,
+                )
+                named_signature = (
+                    named.st_dev, named.st_ino, named.st_mode, named.st_nlink,
+                    named.st_size, named.st_mtime_ns, named.st_ctime_ns,
+                )
+                if before != after or before != named_signature:
+                    raise ManagedAcquisitionRefused(
+                        "managed acquisition companion stage changed while reconciled",
+                    )
+                return before[4], digest.digest()
+
+    @staticmethod
+    def _seal_companion_exact_locked(
+        companion: _ManagedAcquisitionCompanion,
+    ) -> None:
+        """Bind the requested generation into privfs' sealed CAS proof."""
+        from . import privfs
+        stage = companion.artifact._stage
+        if stage is None:
+            raise ContractError(
+                "managed acquisition companion has no stage to authenticate",
+            )
+        if stage.state in {"open", "sealed"}:
+            privfs.seal_private_stage(stage)
+        elif stage.state != "replaced_uncertain":
+            raise ContractError(
+                "managed acquisition companion stage cannot replay exact bytes",
+            )
+        expected = (
+            companion.identity[1], companion.identity[2].hex(),
+        )
+        if stage.sealed_digest != expected:
+            raise ContractError(
+                "managed acquisition companion stage does not match exact bytes",
+            )
+
+    def publish_companion_if_absent(
+        self, components: tuple[str, ...], data: bytes,
+    ) -> bool:
+        self._require_origin_process()
+        components = self._target(components)
+        if type(data) is not bytes:
+            raise TypeError("managed acquisition companion must be exact bytes")
+        identity = (components, len(data), hashlib.sha256(data).digest())
+        companion = self.companion
+        if companion is not None and companion.identity != identity:
+            raise ContractError(
+                "managed acquisition companion publication changed on replay",
+            )
+        # Adopt the companion lifecycle before its first descriptor or stage
+        # effect.  It deliberately shares the transaction marker, but the
+        # transaction (not either ArtifactClaim) settles that marker once both
+        # artifact ledgers are terminal.
+        if companion is None:
+            self.companion = companion = _ManagedAcquisitionCompanion(
+                self.run, components, self.marker, identity,
+            )
+        artifact = companion.artifact
+        with self.run._mutation(MutationScope.BASE_EVIDENCE):
+            self._reauthenticate_locked()
+            if artifact._state == "published":
+                if artifact._terminal():
+                    return True
+                raise ContractError(
+                    "managed acquisition companion commit is not terminal",
+                )
+            if artifact._state == "fenced":
+                if artifact._terminal():
+                    return False
+                raise ContractError(
+                    "managed acquisition companion refusal is not terminal",
+                )
+            if artifact._stage is None:
+                writer = artifact.open_writer()
+                _write_all_descriptor(writer, data)
+                companion.staged = True
+            elif not companion.staged:
+                observed = self._companion_stage_identity_locked(companion)
+                if observed != identity[1:]:
+                    raise ContractError(
+                        "managed acquisition companion staging is partial or changed",
+                    )
+                companion.staged = True
+            self._seal_companion_exact_locked(companion)
+            return artifact.publish_if_absent(*components)
+
+    def _remove_if_matches_inner(
+        self, components: tuple[str, ...],
+        expected: ManagedAcquisitionSnapshot | None,
+    ) -> ManagedRemoval:
+        """Remove only the exact snapshotted inode, reconciling unlink faults."""
+        self._require_origin_process()
+        components = self._target(components)
+        if expected is None:
+            current = self.snapshot(components)
+            return ManagedRemoval("absent" if current is None else "changed")
+        if (type(expected) is not ManagedAcquisitionSnapshot
+                or expected.components != components):
+            raise TypeError("managed acquisition discard snapshot is invalid")
+        # Adopt whichever strict inode currently owns the name, then compare it
+        # to the prior snapshot.  A legitimate foreign replacement is a
+        # truthful ``changed`` result, not a descriptor-allocation failure.
+        slot = _OwnedDescriptor()
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners(
+                (slot,), "managed acquisition discard descriptor",
+            ),
+        )
+        primary = None
+        result = ManagedRemoval("unremoved")
+        with self.run._mutation(MutationScope.BASE_EVIDENCE):
+            self._reauthenticate_locked()
+            with _SettlementFence(settlement):
+                with _SettlementFence(settlement):
+                    try:
+                        slot.open(
+                            components[-1], _FILE_OPEN_FLAGS,
+                            dir_fd=self.parent.fd,
+                        )
+                    except FileNotFoundError:
+                        return ManagedRemoval("absent")
+                    before = os.fstat(slot.fd)
+                    self.run._validate_base_file_stat(before, components)
+                    if self._snapshot_signature(before) != expected.signature:
+                        return ManagedRemoval("changed")
+                    digest = hashlib.sha256()
+                    while True:
+                        chunk = os.read(slot.fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                    if digest.hexdigest() != expected.digest:
+                        return ManagedRemoval("changed")
+                    try:
+                        os.unlink(components[-1], dir_fd=self.parent.fd)
+                    except BaseException as exc:
+                        primary = exc
+                    try:
+                        named = os.stat(
+                            components[-1], dir_fd=self.parent.fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        named = None
+                    retained = os.fstat(slot.fd)
+                    if named is None and retained.st_nlink == 0:
+                        try:
+                            os.fsync(self.parent.fd)
+                        except BaseException as exc:
+                            if primary is None:
+                                primary = exc
+                        result = ManagedRemoval(
+                            "removed" if primary is None else "removed-with-fault",
+                            "" if primary is None else f"{type(primary).__name__}: {primary}",
+                        )
+                    elif named is not None and (
+                        named.st_dev, named.st_ino
+                    ) != expected.identity:
+                        result = ManagedRemoval("changed")
+                    else:
+                        result = ManagedRemoval(
+                            "unremoved",
+                            "unlink did not commit" if primary is None
+                            else f"{type(primary).__name__}: {primary}",
+                        )
+        if primary is not None and not isinstance(primary, Exception):
+            try:
+                primary.managed_removal = result
+            except BaseException:
+                pass
+            raise primary
+        return result
+
+    def _reconcile_removal_escape(
+        self, components: tuple[str, ...],
+        expected: ManagedAcquisitionSnapshot | None,
+        primary: BaseException,
+    ) -> None:
+        """Attach terminal named truth before an exact escape is re-raised."""
+        self._require_origin_process()
+        result = None
+        reconciliation_error = None
+        try:
+            components = self._target(components)
+            current = self.snapshot(components)
+            if expected is None:
+                result = ManagedRemoval(
+                    "absent" if current is None else "changed",
+                )
+            elif current is None:
+                result = ManagedRemoval("removed")
+            elif (current.identity == expected.identity
+                    and current.signature == expected.signature
+                    and current.digest == expected.digest):
+                result = ManagedRemoval("unremoved")
+            else:
+                result = ManagedRemoval("changed")
+        except BaseException as exc:
+            reconciliation_error = exc
+            result = ManagedRemoval(
+                "uncertain", f"{type(exc).__name__}: {exc}",
+            )
+        for name, value in (
+            ("managed_removal", result),
+            ("managed_removal_reconciliation_error", reconciliation_error),
+        ):
+            try:
+                setattr(primary, name, value)
+            except BaseException:
+                pass
+        raise primary
+
+    def _remove_if_matches_public_inner(
+        self, components: tuple[str, ...],
+        expected: ManagedAcquisitionSnapshot | None,
+    ) -> ManagedRemoval:
+        try:
+            return self._remove_if_matches_inner(components, expected)
+        except BaseException as primary:
+            self._reconcile_removal_escape(components, expected, primary)
+        raise AssertionError("unreachable managed removal boundary")
+
+    def _remove_if_matches_public_outer(
+        self, components: tuple[str, ...],
+        expected: ManagedAcquisitionSnapshot | None,
+    ) -> ManagedRemoval:
+        try:
+            return self._remove_if_matches_public_inner(components, expected)
+        except BaseException as primary:
+            self._reconcile_removal_escape(components, expected, primary)
+        raise AssertionError("unreachable managed removal boundary")
+
+    def remove_if_matches(
+        self, components: tuple[str, ...],
+        expected: ManagedAcquisitionSnapshot | None,
+    ) -> ManagedRemoval:
+        """Cancellation-fenced public conditional-discard boundary."""
+        try:
+            return self._remove_if_matches_public_outer(components, expected)
+        except BaseException as primary:
+            self._reconcile_removal_escape(components, expected, primary)
+        raise AssertionError("unreachable managed removal boundary")
+
+    def discard_pair(
+        self,
+        body_components: tuple[str, ...],
+        body_expected: ManagedAcquisitionSnapshot | None,
+        receipt_components: tuple[str, ...],
+        receipt_expected: ManagedAcquisitionSnapshot | None,
+    ) -> ManagedDiscardLedger:
+        """Conditionally discard body+receipt under one cancellation ledger."""
+        return _managed_discard_pair_export(
+            self, body_components, body_expected,
+            receipt_components, receipt_expected,
+        )
+
+
+    def _discard_pair_owned(
+        self,
+        body_components: tuple[str, ...],
+        body_expected: ManagedAcquisitionSnapshot | None,
+        receipt_components: tuple[str, ...],
+        receipt_expected: ManagedAcquisitionSnapshot | None,
+    ) -> ManagedDiscardLedger:
+        self._require_origin_process()
+        body_components = self._target(body_components)
+        receipt_components = self._target(receipt_components)
+        if self.contact_attempted:
+            raise ContractError(
+                "contacted acquisition cannot become a discard transaction",
+            )
+        # This public operation is itself the explicit proof that this lease is
+        # a no-provider-contact discard.  Arm that fact before the stable
+        # composite owner performs its first conditional unlink.
+        self.discard_started = True
+        self.clean_precontact = True
+        owner = _ManagedDiscardComposite(
+            self, body_components, body_expected,
+            receipt_components, receipt_expected,
+        )
+        return _managed_discard_public(owner)
+
+    @property
+    def settlement_state(self) -> str:
+        """Return ``released``, ``retained-uncertain`` or ``live``."""
+        ephemeral_drained = (
+            self.marker.marker.fd < 0
+            and self.marker.directory.fd < 0
+            and not self.marker.locked
+            and self.parent.fd < 0
+            and self.anchor.fd < 0
+        )
+        if self.marker.released and ephemeral_drained:
+            return "released"
+        if self.marker.abandoned and ephemeral_drained:
+            return "retained-uncertain"
+        return "live"
+
+    def _release_certificate_locked(self) -> bool:
+        certificate = self.terminal_certificate
+        if type(certificate) is not ManagedAcquisitionCertificate:
+            return False
+        current_body, current_receipt = self._snapshot_pair_locked(
+            certificate.body.components, certificate.receipt.components,
+            release_certificate=certificate,
+        )
+        return (
+            self._snapshot_matches(certificate.body, current_body)
+            and self._snapshot_matches(certificate.receipt, current_receipt)
+            and self.marker.released
+        )
+
+    def settle(self) -> None:
+        if os.getpid() != self.marker.pid:
+            # Contextlib must run ``__exit__`` in a forked child without
+            # mutating the parent's namespace or shared OFD flock.  Closing
+            # the child's fd-table references is safe; every inherited public
+            # operation remains refused by the PID pin.
+            faults: list[BaseException] = []
+            try:
+                self.marker.close_inherited_copy()
+            except BaseException as exc:
+                faults.append(exc)
+            faults.extend(_close_owned_descriptors_twice((self.parent, self.anchor)))
+            preferred = _preferred_settlement_fault(None, faults)
+            if preferred is not None:
+                raise preferred
+            raise ManagedAcquisitionRefused(
+                "managed acquisition context cannot settle in a forked child",
+            )
+        if self.settlement_state == "released":
+            self.settled = True
+            return
+        faults: list[BaseException] = []
+        try:
+            if not self.artifact._terminal():
+                self.artifact.fence()
+        except BaseException as exc:
+            faults.append(exc)
+        companion = (
+            None if self.companion is None else self.companion.artifact
+        )
+        if companion is not None and not companion._terminal():
+            try:
+                companion.fence()
+            except BaseException as exc:
+                faults.append(exc)
+        content_terminal = self.artifact._terminal()
+        companion_terminal = (
+            companion is None
+            or companion._terminal()
+        )
+        content_graph_terminal = content_terminal and companion_terminal
+        must_retain = (
+            self.marker.abandoned
+            or self.retain_reason is not None
+            or (
+                self.active
+                and
+                self.terminal_certificate is None
+                and not self.clean_precontact
+            )
+        )
+        if content_graph_terminal and not must_retain:
+            if self.terminal_certificate is None:
+                try:
+                    with self.run._mutation(MutationScope.CONTROL):
+                        self.marker.settle()
+                except BaseException as exc:
+                    faults.append(exc)
+            else:
+                try:
+                    with self.run._mutation(MutationScope.BASE_EVIDENCE):
+                        self._reauthenticate_locked()
+                        try:
+                            certificate_current = self._release_certificate_locked()
+                        except BaseException:
+                            self.retain_uncertain(
+                                "managed acquisition terminal pair could not be revalidated",
+                            )
+                            raise
+                        if not certificate_current:
+                            self.retain_uncertain(
+                                "managed acquisition terminal pair changed before release",
+                            )
+                            raise ManagedAcquisitionRefused(
+                                "managed acquisition terminal pair changed before release",
+                            )
+                except BaseException as exc:
+                    faults.append(exc)
+        if (not content_graph_terminal or self.marker.abandoned
+                or self.retain_reason is not None
+                or (
+                    self.active
+                    and
+                    self.terminal_certificate is None
+                    and not self.clean_precontact
+                )):
+            if self.retain_reason is None:
+                self.retain_reason = (
+                    "managed acquisition did not settle to a certified terminal pair"
+                )
+            try:
+                self.marker.abandon()
+            except BaseException as exc:
+                faults.append(exc)
+        faults.extend(_close_owned_descriptors_twice((self.parent, self.anchor)))
+        graph_terminal = (
+            content_terminal and companion_terminal
+            and self.parent.fd < 0 and self.anchor.fd < 0
+            and self.marker.marker.fd < 0 and self.marker.directory.fd < 0
+            and not self.marker.locked
+        )
+        if graph_terminal:
+            with _RUN_LOCKS_GUARD:
+                _LIVE_MANAGED_ACQUISITIONS.pop(id(self), None)
+        self.settled = content_graph_terminal and self.settlement_state == "released"
+        if self.settlement_state == "retained-uncertain":
+            faults.append(ManagedAcquisitionRefused(
+                "managed acquisition lease was abandoned with durable crash evidence",
+            ))
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            raise preferred
 
 
 class _ArtifactAppendTransaction:
@@ -4079,9 +6318,37 @@ class Run:
                     marker.allocate()
                 yield claim
         claim._settlement_faults.extend(settlement.faults)
-        if (claim._state not in {"published", "fenced"}
+        if (not claim._terminal()
                 or not claim._marker_release.released):
             raise ContractError("artifact claim did not reach terminal settlement")
+
+    @contextmanager
+    def managed_acquisition_claim(self, *components):
+        """Hold one deterministic destination lease across provider contact.
+
+        The deterministic durable marker ``flock`` spans the whole context.
+        Run/project mutation authority is acquired only for
+        short marker, snapshot, stage, publication, discard and release
+        transitions.  Callers get an opaque transaction and never receive a
+        namespace descriptor.
+        """
+        validated = _validated_artifact_components(tuple(components))
+        marker = _ManagedAcquisitionMarker(self, validated)
+        transaction = _ManagedAcquisitionTransaction(self, validated, marker)
+        settlement = _SettlementOwner(transaction.settle)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                with _RUN_LOCKS_GUARD:
+                    _LIVE_MANAGED_ACQUISITIONS[id(transaction)] = transaction
+                marker.acquire()
+                transaction.activate()
+                yield transaction
+        transaction.artifact._settlement_faults.extend(settlement.faults)
+        if (transaction.artifact._state not in {"published", "fenced"}
+                or transaction.settlement_state == "live"):
+            raise ContractError(
+                "managed acquisition claim did not reach terminal settlement",
+            )
 
     def begin_finalization(
         self, *, profile_summary: dict | None = None,
