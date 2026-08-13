@@ -2,6 +2,7 @@
 O_NOFOLLOW through a directory fd so no symlinked level can redirect a write outside the tree."""
 from __future__ import annotations
 
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -9,6 +10,7 @@ import json
 import os
 import signal
 import stat
+import sys
 import threading
 import unicodedata
 from contextlib import contextmanager
@@ -288,10 +290,24 @@ class PrivateReplaceCommittedWithFault(PrivatePathError):
     """A replacement committed durably, but settlement also observed a fault."""
 
 
+class PrivatePublishIfAbsentUncertain(PrivateReplaceUncertain):
+    """A no-replace publication may have landed but is not durably settled."""
+
+    operation = "publish_if_absent"
+    state = "uncertain"
+
+
+class PrivatePublishIfAbsentCommittedWithFault(PrivateReplaceCommittedWithFault):
+    """A no-replace publication committed, but its action or cleanup faulted."""
+
+    operation = "publish_if_absent"
+    state = "committed_with_fault"
+
+
 _STAGE_OPERATIONS = frozenset({
     "prepare", "seal", "replace", "abort", "abort_handoff",
     "abort_spawn", "borrow_spawn", "mark_spawned", "bind_worker", "transfer",
-    "settle", "publish", "cleanup", "fence",
+    "settle", "publish", "publish_if_absent", "cleanup", "fence",
 })
 _STAGE_STATES = frozenset({
     "open", "sealed", "handoff_prepared", "publishing", "committed",
@@ -1477,6 +1493,7 @@ class PrivateFileStage:
         "_state",
         "_lifecycle_lock",
         "_cleanup_ledger",
+        "_noreplace_components",
     )
 
     def __init__(
@@ -1513,6 +1530,7 @@ class PrivateFileStage:
         object.__setattr__(self, "_state", "open")
         object.__setattr__(self, "_lifecycle_lock", threading.RLock())
         object.__setattr__(self, "_cleanup_ledger", None)
+        object.__setattr__(self, "_noreplace_components", None)
 
     def __setattr__(self, name, value) -> None:
         raise AttributeError("private stage claims are read-only")
@@ -4556,6 +4574,650 @@ def _destination_matches_stage(stage: PrivateFileStage) -> bool:
         )
 
 
+_RENAME_NOREPLACE = 1
+
+
+def _renameat2_noreplace(
+    source_parent_fd: int,
+    source_name: str,
+    destination_parent_fd: int,
+    destination_name: str,
+) -> None:
+    """Invoke Linux ``renameat2(RENAME_NOREPLACE)`` through pinned parents."""
+    if not sys.platform.startswith("linux"):
+        raise PrivatePathUnsupported(
+            "atomic no-replace publication requires Linux renameat2",
+        )
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(library, "renameat2")
+    except (AttributeError, OSError) as exc:
+        raise PrivatePathUnsupported(
+            "atomic no-replace publication requires Linux renameat2",
+        ) from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = renameat2(
+        source_parent_fd,
+        os.fsencode(source_name),
+        destination_parent_fd,
+        os.fsencode(destination_name),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        number = ctypes.get_errno() or errno.EIO
+        if number == getattr(errno, "ENOSYS", -1):
+            raise PrivatePathUnsupported(
+                "atomic no-replace publication requires Linux renameat2",
+            )
+        raise OSError(number, os.strerror(number), destination_name)
+
+
+def _noreplace_target_components(
+    stage: PrivateFileStage, target_components,
+) -> tuple[str, ...]:
+    target = validate_relative_components(target_components, allow_empty=False)
+    if (len(target) != len(stage.components)
+            or target[:-1] != stage.components[:-1]
+            or target[-1] == stage.temporary_name):
+        raise PrivatePathUnsafe(
+            "no-replace target must change only the final leaf in the pinned parent",
+            components=target,
+        )
+    return target
+
+
+def _new_noreplace_cleanup_ledger(
+    stage: PrivateFileStage,
+) -> _PrivateStageCleanupLedger:
+    claims = (
+        _new_descriptor_claim(
+            stage.file_fd, stage.file_identity, "pin", stage.components,
+        ),
+        _new_descriptor_claim(
+            stage.parent_fd, stage.parent_identity, "parent",
+            stage.components[:-1],
+        ),
+        _new_descriptor_claim(
+            stage.anchor_fd, stage.anchor_identity, "anchor", (),
+        ),
+    )
+    return _PrivateStageCleanupLedger(
+        extra_claims=claims,
+        _constructor_token=_PRIVATE_STAGE_CLEANUP_LEDGER_CONSTRUCTOR,
+    )
+
+
+def _noreplace_cleanup_claims(
+    stage: PrivateFileStage,
+) -> tuple[_PrivateDescriptorClaim, _PrivateDescriptorClaim, _PrivateDescriptorClaim]:
+    ledger = stage._cleanup_ledger
+    claims = () if type(ledger) is not _PrivateStageCleanupLedger else ledger._extra_claims
+    if (type(ledger) is not _PrivateStageCleanupLedger or ledger._stage_claims
+            or len(claims) != 3
+            or tuple(claim._kind for claim in claims) != ("pin", "parent", "anchor")):
+        raise PrivateStageStateError("publish_if_absent", stage.state)
+    return claims
+
+
+def _noreplace_fds(stage: PrivateFileStage) -> tuple[int, int, int]:
+    pin, parent, anchor = _noreplace_cleanup_claims(stage)
+    fds = pin.fd, parent.fd, anchor.fd
+    if any(fd < 0 for fd in fds):
+        raise PrivateStageStateError("publish_if_absent", stage.state)
+    _validate_stage_directory_claims_at(
+        stage, parent_fd=fds[1], anchor_fd=fds[2],
+    )
+    retained = os.fstat(fds[0])
+    _validate_strict_file_stat(retained, stage.components)
+    if _identity(retained) != stage.file_identity:
+        raise PrivatePathUnsafe(
+            "private no-replace stage pin identity changed",
+            components=stage.components,
+        )
+    return fds
+
+
+def _validate_declared_noreplace_parent(
+    stage: PrivateFileStage, *, parent_fd: int, anchor_fd: int,
+) -> None:
+    _validate_stage_directory_claims_at(
+        stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+    )
+    declared = open_strict_dir_at(anchor_fd, stage.components[:-1])
+    with _owned_fd(declared):
+        if _identity(os.fstat(declared)) != stage.parent_identity:
+            raise PrivatePathUnsafe(
+                "private stage parent no longer matches its declared path",
+                components=stage.components,
+            )
+
+
+def _noreplace_named_stage_matches(
+    stage: PrivateFileStage, *, parent_fd: int, pin_fd: int,
+) -> bool:
+    try:
+        named_fd = _open_strict_file_in(
+            parent_fd, stage.temporary_name, stage.components,
+        )
+    except PrivatePathMissing:
+        return False
+    with _owned_fd(named_fd):
+        named = os.fstat(named_fd)
+        retained = os.fstat(pin_fd)
+        if (_identity(named) != stage.file_identity
+                or _identity(retained) != stage.file_identity):
+            raise PrivatePathUnsafe(
+                "private stage name was substituted", components=stage.components,
+            )
+        if (_file_signature(named) != _file_signature(retained)
+                or stage.sealed_digest is None
+                or _digest_fd(named_fd) != stage.sealed_digest
+                or _digest_fd(pin_fd) != stage.sealed_digest):
+            raise PrivatePathUnsafe(
+                "private stage content changed after sealing",
+                components=stage.components,
+            )
+    return True
+
+
+def _noreplace_destination_matches_stage(
+    stage: PrivateFileStage,
+    target: tuple[str, ...],
+    *,
+    parent_fd: int,
+    pin_fd: int,
+) -> bool:
+    try:
+        destination_fd = _open_strict_file_in(
+            parent_fd, target[-1], target,
+        )
+    except PrivatePathMissing:
+        return False
+    with _owned_fd(destination_fd):
+        landed = os.fstat(destination_fd)
+        retained = os.fstat(pin_fd)
+        if _identity(landed) != stage.file_identity:
+            return False
+        if (_identity(retained) != stage.file_identity
+                or landed.st_size != retained.st_size
+                or stage.sealed_digest is None
+                or _digest_fd(destination_fd) != stage.sealed_digest
+                or _digest_fd(pin_fd) != stage.sealed_digest):
+            raise PrivatePathUnsafe(
+                "published no-replace stage bytes changed",
+                components=target,
+            )
+    return True
+
+
+def _noreplace_target_exists_stably(
+    stage: PrivateFileStage,
+    target: tuple[str, ...],
+    *,
+    parent_fd: int,
+) -> bool:
+    try:
+        target_fd = _open_strict_file_in(parent_fd, target[-1], target)
+    except PrivatePathMissing:
+        return False
+    with _owned_fd(target_fd):
+        before = os.fstat(target_fd)
+        try:
+            named = os.stat(
+                target[-1], dir_fd=parent_fd, follow_symlinks=False,
+            )
+        except FileNotFoundError as exc:
+            raise PrivatePathUnsafe(
+                "no-replace target changed during observation", components=target,
+            ) from exc
+        _validate_strict_file_stat(named, target)
+        if _file_signature(named) != _file_signature(before):
+            raise PrivatePathUnsafe(
+                "no-replace target changed during observation", components=target,
+            )
+    return True
+
+
+def _arm_noreplace_stage(
+    stage: PrivateFileStage, target: tuple[str, ...],
+) -> None:
+    ledger = _new_noreplace_cleanup_ledger(stage)
+    object.__setattr__(stage, "_noreplace_components", target)
+    object.__setattr__(stage, "_cleanup_ledger", ledger)
+    object.__setattr__(stage, "_state", "publishing")
+
+
+def _disarm_noreplace_stage(stage: PrivateFileStage) -> None:
+    claims = _noreplace_cleanup_claims(stage)
+    if any(claim.disposition != "pending" for claim in claims):
+        raise PrivatePublishIfAbsentUncertain(
+            "no-replace cleanup ownership cannot be handed back cleanly",
+            components=stage._noreplace_components or stage.components,
+        )
+    object.__setattr__(stage, "_state", "sealed")
+    object.__setattr__(stage, "_cleanup_ledger", None)
+    object.__setattr__(stage, "_noreplace_components", None)
+
+
+def _noreplace_cancellation(*values) -> BaseException | None:
+    pending = list(values)
+    visited: set[int] = set()
+    while pending and len(visited) < 32:
+        candidate = pending.pop(0)
+        if not isinstance(candidate, BaseException) or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if not isinstance(candidate, Exception):
+            return candidate
+        cause = getattr(candidate, "__cause__", None)
+        if isinstance(cause, BaseException):
+            pending.append(cause)
+        for name in ("close_errors", "cleanup_errors"):
+            errors = getattr(candidate, name, ())
+            if type(errors) is tuple:
+                pending.extend(errors)
+    return None
+
+
+def _raise_noreplace_cancellation(
+    cancellation: BaseException,
+    *,
+    state: str,
+    target: tuple[str, ...],
+    action_error: BaseException | None = None,
+    reconciliation_error: BaseException | None = None,
+    close_errors: tuple[BaseException, ...] = (),
+) -> None:
+    for name, value in (
+        ("operation", "publish_if_absent"),
+        ("state", state),
+        ("target_components", target),
+        ("action_error", action_error),
+        ("reconciliation_error", reconciliation_error),
+        ("close_errors", close_errors),
+    ):
+        try:
+            setattr(cancellation, name, value)
+        except BaseException:
+            pass
+    raise cancellation
+
+
+def _mark_noreplace_uncertain(
+    stage: PrivateFileStage,
+    target: tuple[str, ...],
+    *,
+    primary: BaseException,
+    action_error: BaseException | None,
+) -> None:
+    object.__setattr__(stage, "_state", "replaced_uncertain")
+    cancellation = _noreplace_cancellation(primary, action_error)
+    if cancellation is not None:
+        _raise_noreplace_cancellation(
+            cancellation,
+            state="uncertain",
+            target=target,
+            action_error=action_error,
+            reconciliation_error=primary,
+        )
+    error = PrivatePublishIfAbsentUncertain(
+        "private no-replace publication did not settle durably",
+        components=target,
+    )
+    error.action_error = action_error
+    error.reconciliation_error = primary
+    error.cleanup_pending = True
+    raise error from primary
+
+
+def _drain_noreplace_cleanup(
+    stage: PrivateFileStage,
+) -> tuple[tuple[BaseException, ...], bool]:
+    ledger = stage._cleanup_ledger
+    if type(ledger) is not _PrivateStageCleanupLedger:
+        return (), False
+    errors = tuple(_drain_private_stage_ledger(ledger))
+    claims = _noreplace_cleanup_claims(stage)
+    for field, claim in zip(("file_fd", "parent_fd", "anchor_fd"), claims):
+        if claim.disposition in _DESCRIPTOR_CLAIM_TERMINAL:
+            object.__setattr__(stage, f"_{field}", -1)
+    return errors, ledger.pending
+
+
+def _finish_noreplace_commit(
+    stage: PrivateFileStage,
+    target: tuple[str, ...],
+    *,
+    primary: BaseException | None,
+) -> bool:
+    object.__setattr__(stage, "_state", "committed")
+    cleanup_errors, cleanup_pending = _drain_noreplace_cleanup(stage)
+    cancellation = _noreplace_cancellation(primary, *cleanup_errors)
+    if cancellation is not None:
+        _raise_noreplace_cancellation(
+            cancellation,
+            state="committed",
+            target=target,
+            action_error=primary,
+            close_errors=cleanup_errors,
+        )
+    if primary is not None or cleanup_errors or cleanup_pending:
+        error = PrivatePublishIfAbsentCommittedWithFault(
+            "private no-replace publication committed with a settlement fault",
+            components=target,
+        )
+        error.action_error = primary
+        error.cleanup_errors = cleanup_errors
+        error.close_errors = cleanup_errors
+        error.cleanup_pending = cleanup_pending
+        raise error from (
+            primary if primary is not None
+            else cleanup_errors[0] if cleanup_errors
+            else error
+        )
+    return True
+
+
+def _reconcile_noreplace_action(
+    stage: PrivateFileStage,
+    target: tuple[str, ...],
+    action_error: BaseException | None,
+) -> bool:
+    try:
+        pin_fd, parent_fd, anchor_fd = _noreplace_fds(stage)
+    except BaseException as ownership_error:
+        _mark_noreplace_uncertain(
+            stage,
+            target,
+            primary=ownership_error,
+            action_error=action_error,
+        )
+    try:
+        landed = _noreplace_destination_matches_stage(
+            stage, target, parent_fd=parent_fd, pin_fd=pin_fd,
+        )
+    except BaseException as observation_error:
+        try:
+            source_intact = _noreplace_named_stage_matches(
+                stage, parent_fd=parent_fd, pin_fd=pin_fd,
+            )
+        except BaseException:
+            source_intact = False
+        if source_intact:
+            _disarm_noreplace_stage(stage)
+            cancellation = _noreplace_cancellation(
+                action_error, observation_error,
+            )
+            if cancellation is not None:
+                _raise_noreplace_cancellation(
+                    cancellation,
+                    state="unpublished",
+                    target=target,
+                    action_error=action_error,
+                    reconciliation_error=observation_error,
+                )
+            raise observation_error
+        _mark_noreplace_uncertain(
+            stage,
+            target,
+            primary=observation_error,
+            action_error=action_error,
+        )
+
+    if landed:
+        object.__setattr__(stage, "_state", "replaced_uncertain")
+        try:
+            _validate_declared_noreplace_parent(
+                stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+            )
+            _fsync_managed(parent_fd)
+            _validate_declared_noreplace_parent(
+                stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+            )
+            if not _noreplace_destination_matches_stage(
+                stage, target, parent_fd=parent_fd, pin_fd=pin_fd,
+            ):
+                raise PrivatePathUnsafe(
+                    "durable no-replace stage left its target path",
+                    components=target,
+                )
+        except BaseException as settlement_error:
+            _mark_noreplace_uncertain(
+                stage,
+                target,
+                primary=settlement_error,
+                action_error=action_error,
+            )
+        return _finish_noreplace_commit(
+            stage, target, primary=action_error,
+        )
+
+    try:
+        source_intact = _noreplace_named_stage_matches(
+            stage, parent_fd=parent_fd, pin_fd=pin_fd,
+        )
+    except BaseException as source_error:
+        _mark_noreplace_uncertain(
+            stage,
+            target,
+            primary=source_error,
+            action_error=action_error,
+        )
+    if not source_intact:
+        error = PrivatePathUnsafe(
+            "no-replace publication retained neither authenticated name",
+            components=target,
+        )
+        _mark_noreplace_uncertain(
+            stage,
+            target,
+            primary=error,
+            action_error=action_error,
+        )
+
+    try:
+        target_exists = _noreplace_target_exists_stably(
+            stage, target, parent_fd=parent_fd,
+        )
+    except BaseException as target_error:
+        _disarm_noreplace_stage(stage)
+        cancellation = _noreplace_cancellation(action_error, target_error)
+        if cancellation is not None:
+            _raise_noreplace_cancellation(
+                cancellation,
+                state="unpublished",
+                target=target,
+                action_error=action_error,
+                reconciliation_error=target_error,
+            )
+        raise target_error
+    _disarm_noreplace_stage(stage)
+
+    cancellation = _noreplace_cancellation(action_error)
+    if cancellation is not None:
+        _raise_noreplace_cancellation(
+            cancellation,
+            state="unpublished",
+            target=target,
+            action_error=action_error,
+        )
+    if (target_exists and isinstance(action_error, OSError)
+            and action_error.errno == errno.EEXIST):
+        return False
+    if action_error is not None:
+        raise action_error
+    raise PrivatePathError(
+        "no-replace publication reported success without landing",
+        components=target,
+    )
+
+
+def _start_noreplace_action(
+    stage: PrivateFileStage, target: tuple[str, ...],
+) -> bool:
+    try:
+        _arm_noreplace_stage(stage, target)
+    except BaseException as arm_error:
+        if stage._cleanup_ledger is None:
+            object.__setattr__(stage, "_noreplace_components", None)
+            raise
+        if stage.state == "sealed":
+            object.__setattr__(stage, "_state", "publishing")
+        return _reconcile_noreplace_action(stage, target, arm_error)
+
+    action_error: BaseException | None = None
+    try:
+        _, parent_fd, _ = _noreplace_fds(stage)
+        _renameat2_noreplace(
+            parent_fd,
+            stage.temporary_name,
+            parent_fd,
+            target[-1],
+        )
+    except BaseException as exc:
+        action_error = exc
+    return _reconcile_noreplace_action(stage, target, action_error)
+
+
+def _resume_noreplace_action(
+    stage: PrivateFileStage, target: tuple[str, ...],
+) -> bool:
+    landed = False
+    try:
+        pin_fd, parent_fd, anchor_fd = _noreplace_fds(stage)
+        if _noreplace_destination_matches_stage(
+            stage, target, parent_fd=parent_fd, pin_fd=pin_fd,
+        ):
+            landed = True
+            _validate_declared_noreplace_parent(
+                stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+            )
+            _fsync_managed(parent_fd)
+            _validate_declared_noreplace_parent(
+                stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+            )
+            if not _noreplace_destination_matches_stage(
+                stage, target, parent_fd=parent_fd, pin_fd=pin_fd,
+            ):
+                raise PrivatePathUnsafe(
+                    "durable no-replace stage left its target path",
+                    components=target,
+                )
+        else:
+            source_intact = _noreplace_named_stage_matches(
+                stage, parent_fd=parent_fd, pin_fd=pin_fd,
+            )
+            if not source_intact:
+                raise PrivatePathUnsafe(
+                    "uncertain no-replace stage retained neither authenticated name",
+                    components=target,
+                )
+            target_exists = _noreplace_target_exists_stably(
+                stage, target, parent_fd=parent_fd,
+            )
+    except BaseException as replay_error:
+        _mark_noreplace_uncertain(
+            stage,
+            target,
+            primary=replay_error,
+            action_error=None,
+        )
+
+    if landed:
+        return _finish_noreplace_commit(stage, target, primary=None)
+    _disarm_noreplace_stage(stage)
+    if target_exists:
+        return False
+    return _start_noreplace_action(stage, target)
+
+
+def _publish_private_stage_if_absent_locked(
+    stage: PrivateFileStage, target_components: tuple[str, ...],
+) -> bool:
+    """Durably publish one sealed same-parent stage only when the target is absent.
+
+    ``True`` means the exact staged inode is durably committed.  ``False`` means a
+    strict prior target won the compare-and-swap; it was not modified and the stage
+    remains sealed, unpublished and abortable.  Uncertain outcomes retain an opaque
+    descriptor cleanup ledger on ``stage`` and can be replayed with the same target.
+    """
+    _require_strict_capabilities()
+    if type(stage) is not PrivateFileStage:
+        raise PrivatePathUnsafe("private stage handle has the wrong type")
+    target = _noreplace_target_components(stage, target_components)
+
+    retained_target = stage._noreplace_components
+    if stage.state == "replaced_uncertain":
+        if retained_target != target:
+            raise PrivateStageStateError("publish_if_absent", stage.state)
+        return _resume_noreplace_action(stage, target)
+    if stage.state not in {"open", "sealed"}:
+        raise PrivateStageStateError("publish_if_absent", stage.state)
+    if retained_target is not None or stage._cleanup_ledger is not None:
+        raise PrivateStageStateError("publish_if_absent", stage.state)
+
+    _validate_live_stage(stage, "publish_if_absent")
+    seal_private_stage(stage)
+    _validate_live_stage(stage, "publish_if_absent")
+    _validate_declared_stage_parent(stage)
+    _validate_named_stage(stage)
+    if _noreplace_target_exists_stably(
+        stage, target, parent_fd=stage.parent_fd,
+    ):
+        _validate_declared_stage_parent(stage)
+        _validate_named_stage(stage)
+        return False
+    return _start_noreplace_action(stage, target)
+
+
+@_serialized_stage_lifecycle
+def publish_private_stage_if_absent(
+    stage: PrivateFileStage, target_components: tuple[str, ...],
+) -> bool:
+    """Cancellation-fenced public boundary for no-replace publication."""
+    try:
+        return _publish_private_stage_if_absent_locked(stage, target_components)
+    except BaseException as primary:
+        if isinstance(primary, Exception) or type(stage) is not PrivateFileStage:
+            raise
+        target = stage._noreplace_components
+        ledger = stage._cleanup_ledger
+        if target is None:
+            raise
+        if ledger is None and stage.state in {"open", "sealed"}:
+            object.__setattr__(stage, "_noreplace_components", None)
+            _raise_noreplace_cancellation(
+                primary,
+                state="unpublished",
+                target=target,
+            )
+        if (type(ledger) is _PrivateStageCleanupLedger
+                and stage.state in {"open", "sealed"}):
+            _disarm_noreplace_stage(stage)
+            _raise_noreplace_cancellation(
+                primary,
+                state="unpublished",
+                target=target,
+            )
+        if type(ledger) is not _PrivateStageCleanupLedger:
+            raise
+        if stage.state == "committed":
+            return _finish_noreplace_commit(
+                stage, target, primary=primary,
+            )
+        if stage.state in {"publishing", "replaced_uncertain"}:
+            return _reconcile_noreplace_action(stage, target, primary)
+        raise
+
+
 @_serialized_stage_lifecycle
 def replace_private_stage(stage: PrivateFileStage) -> None:
     """Durably replace the destination with a settled same-directory stage.
@@ -4676,6 +5338,28 @@ def _abort_private_stage_locked(stage: PrivateFileStage) -> None:
     _require_strict_capabilities()
     if type(stage) is not PrivateFileStage:
         raise PrivatePathUnsafe("private stage handle has the wrong type")
+    if (stage._noreplace_components is not None
+            and type(stage._cleanup_ledger) is _PrivateStageCleanupLedger
+            and stage.state in {
+                "sealed", "publishing", "replaced_uncertain", "committed",
+            }):
+        if stage.state in {"sealed", "publishing"}:
+            object.__setattr__(stage, "_state", "replaced_uncertain")
+        cleanup_errors, cleanup_pending = _drain_noreplace_cleanup(stage)
+        if cleanup_errors or cleanup_pending:
+            error = PrivatePathError(
+                "private no-replace cleanup retained descriptor faults",
+                components=stage._noreplace_components,
+            )
+            error.operation = "cleanup"
+            error.state = stage.state
+            error.cleanup_errors = cleanup_errors
+            error.close_errors = cleanup_errors
+            error.cleanup_pending = cleanup_pending
+            raise error from (
+                cleanup_errors[0] if cleanup_errors else error
+            )
+        return
     if stage.state == "handoff_prepared":
         raise PrivateStageStateError("abort", stage.state)
     if stage.state in {"publishing", "committed", "replaced_uncertain"}:
