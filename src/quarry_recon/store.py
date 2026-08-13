@@ -14,20 +14,63 @@ Every normalized entity keeps provenance back to the raw evidence that produced 
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
 import stat
+import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
+from functools import wraps
 
 from pathlib import Path
 
 from .repository_identity import (RUN_RESERVED_IDS, valid_run_id, validate_artifact_component,
                                   validate_run_id)
 from .state import ContractError
+
+
+class MutationScope(str, Enum):
+    """The closed vocabulary for repository-owned mutation authority."""
+
+    BASE_EVIDENCE = "base_evidence"
+    FINALIZATION_METADATA = "finalization_metadata"
+    REVISION = "revision"
+    CONTROL = "control"
+
+
+_RUN_LOCKS_GUARD = threading.Lock()
+_RUN_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+_RUN_LOCK_LOCAL = threading.local()
+_LIVE_ARTIFACT_CLAIMS: dict[tuple[str, str], int] = {}
+
+
+def _run_lock_key(project_dir: Path, run_id: str) -> tuple[str, str]:
+    return str(Path(project_dir).resolve()), run_id
+
+
+def _shared_run_lock(key: tuple[str, str]) -> threading.RLock:
+    with _RUN_LOCKS_GUARD:
+        lock = _RUN_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _RUN_LOCKS[key] = lock
+        return lock
+
+
+def _scoped_mutation(scope: MutationScope):
+    def decorate(function):
+        @wraps(function)
+        def wrapped(self, *args, **kwargs):
+            with self._mutation(scope):
+                return function(self, *args, **kwargs)
+        return wrapped
+    return decorate
 
 
 def _record_bytes(rec) -> int:
@@ -893,6 +936,13 @@ class Run:
         self.target = validate_target(target)
         self.run_id = validate_run_id(run_id if run_id is not None else self._mint_run_id())
         self.dir = self.project_dir / "recon" / self.run_id
+        observed_run_dir = os.stat(self.dir, follow_symlinks=False)
+        if (not stat.S_ISDIR(observed_run_dir.st_mode)
+                or observed_run_dir.st_uid != os.geteuid()):
+            raise ContractError(f"run {self.run_id!r} directory identity is unsafe")
+        self._run_directory_identity = (
+            observed_run_dir.st_dev, observed_run_dir.st_ino,
+        )
         self.raw = self.dir / "raw"
         self.normalized = self.dir / "normalized"
         self.exports = self.dir / "exports"
@@ -940,6 +990,138 @@ class Run:
         # a durability failure recorded in a prior session (ledger unwritable / damaged) must keep this reopen
         # gapped — load it so the run never re-finalises as clean/complete
         self._load_durability_marker()
+
+    @property
+    def _authority_key(self) -> tuple[str, str]:
+        return _run_lock_key(self.project_dir, self.run_id)
+
+    @property
+    def _lock_path(self) -> Path:
+        return self.project_dir / "recon" / "state" / "locks" / f"{self.run_id}.lock"
+
+    def _materialize_lock_file(self) -> int:
+        """Open the sole out-of-band per-run advisory lock with private modes."""
+        from . import privfs
+        lock_dir = privfs.private_dir(self._lock_path.parent)
+        directory_fd = os.open(
+            lock_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            fd = os.open(
+                self._lock_path.name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                privfs.FILE_MODE,
+                dir_fd=directory_fd,
+            )
+        finally:
+            os.close(directory_fd)
+        try:
+            observed = os.fstat(fd)
+            if (not stat.S_ISREG(observed.st_mode)
+                    or observed.st_uid != os.geteuid()
+                    or observed.st_nlink != 1):
+                raise ContractError("repository lock identity is unsafe")
+            if stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE:
+                os.fchmod(fd, privfs.FILE_MODE)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @contextmanager
+    def _mutation(self, scope: MutationScope):
+        """Serialize one run mutation through the shared RLock and one flock."""
+        if type(scope) is not MutationScope:
+            raise TypeError("invalid repository mutation scope")
+        key = self._authority_key
+        lock = _shared_run_lock(key)
+        with lock:
+            held = getattr(_RUN_LOCK_LOCAL, "held", None)
+            if held is None:
+                held = {}
+                _RUN_LOCK_LOCAL.held = held
+            depth, fd = held.get(key, (0, -1))
+            if depth == 0:
+                fd = self._materialize_lock_file()
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except BaseException:
+                    os.close(fd)
+                    raise
+            held[key] = (depth + 1, fd)
+            try:
+                self._require_scope(scope)
+                yield
+            finally:
+                current_depth, current_fd = held[key]
+                if current_depth == 1:
+                    try:
+                        fcntl.flock(current_fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(current_fd)
+                        del held[key]
+                else:
+                    held[key] = (current_depth - 1, current_fd)
+
+    def _require_scope(self, scope: MutationScope) -> None:
+        try:
+            observed = os.stat(self.dir, follow_symlinks=False)
+        except OSError:
+            raise ContractError(f"run {self.run_id!r} directory identity is unavailable") from None
+        if (not stat.S_ISDIR(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or (observed.st_dev, observed.st_ino) != self._run_directory_identity):
+            raise ContractError(f"run {self.run_id!r} directory identity changed")
+        identity = read_run_identity(self.project_dir, self.run_id)
+        if identity["target"] != self.target:
+            raise ContractError(f"run {self.run_id!r} identity changed")
+        state = self.state
+        if state == "unknown":
+            raise ContractError(f"run {self.run_id} has unknown lifecycle state")
+        if scope is MutationScope.BASE_EVIDENCE and state not in {"created", "running"}:
+            raise ContractError(
+                f"base evidence is sealed for run {self.run_id} in state {state!r}",
+            )
+        if scope is MutationScope.FINALIZATION_METADATA and state not in {
+            "finalizing", "finalization_failed", "finished",
+        }:
+            raise ContractError(
+                f"finalization metadata is unavailable in state {state!r}",
+            )
+
+    @contextmanager
+    def artifact_claim(self):
+        """Hold one live base-artifact authority until its writer is terminal."""
+        key = self._authority_key
+        with self._mutation(MutationScope.BASE_EVIDENCE):
+            with _RUN_LOCKS_GUARD:
+                _LIVE_ARTIFACT_CLAIMS[key] = _LIVE_ARTIFACT_CLAIMS.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            with _shared_run_lock(key):
+                with _RUN_LOCKS_GUARD:
+                    remaining = _LIVE_ARTIFACT_CLAIMS.get(key, 0) - 1
+                    if remaining > 0:
+                        _LIVE_ARTIFACT_CLAIMS[key] = remaining
+                    else:
+                        _LIVE_ARTIFACT_CLAIMS.pop(key, None)
+
+    def begin_finalization(self) -> None:
+        """Irreversibly seal base evidence after every artifact owner settled."""
+        with self._mutation(MutationScope.CONTROL):
+            state = self.state
+            if state not in {"running", "finalization_failed", "finished"}:
+                raise ContractError(
+                    f"run {self.run_id} cannot begin finalization from {state!r}",
+                )
+            with _RUN_LOCKS_GUARD:
+                live = _LIVE_ARTIFACT_CLAIMS.get(self._authority_key, 0)
+            if live:
+                raise ContractError(
+                    f"run {self.run_id} has {live} live artifact claim(s)",
+                )
+            self.write_state("finalizing")
 
     # ── C10a lifecycle ──
     @staticmethod
@@ -995,26 +1177,28 @@ class Run:
 
     # ── raw evidence ──
     def raw_path(self, phase: str, tool: str, name: str) -> Path:
-        from . import privfs
-        phase = validate_artifact_component(phase, "raw phase")
-        tool = validate_artifact_component(tool, "raw tool")
-        name = validate_artifact_component(name, "raw filename")
-        p = self.raw / phase / tool
-        privfs.private_dir(p)                                # raw evidence dirs are 0700
-        return p / name
+        with self._mutation(MutationScope.BASE_EVIDENCE):
+            from . import privfs
+            phase = validate_artifact_component(phase, "raw phase")
+            tool = validate_artifact_component(tool, "raw tool")
+            name = validate_artifact_component(name, "raw filename")
+            p = self.raw / phase / tool
+            privfs.private_dir(p)                            # raw evidence dirs are 0700
+            return p / name
 
     # ── tool run accounting ──
     def record(self, phase: str, result, *, depends_on: str | None = None) -> None:
         # the single choke point that redacts secrets out of cmd/note/stderr before they reach the manifest
-        from . import secrets
-        self._tool_runs.append(ToolRunRecord(
-            phase=phase, tool=result.tool, status=str(result.status.value),
-            exit_code=result.exit_code, duration=round(result.duration, 2),
-            stdout_lines=result.stdout_lines, note=secrets.redact(result.note),
-            cmd=secrets.redact(" ".join(result.cmd)), stderr_tail=secrets.redact(result.stderr_tail),
-            cpu_s=getattr(result, "cpu_s", 0.0), peak_rss_mb=getattr(result, "peak_rss_mb", 0.0),
-            depends_on=depends_on or "",
-        ))
+        with self._mutation(MutationScope.BASE_EVIDENCE):
+            from . import secrets
+            self._tool_runs.append(ToolRunRecord(
+                phase=phase, tool=result.tool, status=str(result.status.value),
+                exit_code=result.exit_code, duration=round(result.duration, 2),
+                stdout_lines=result.stdout_lines, note=secrets.redact(result.note),
+                cmd=secrets.redact(" ".join(result.cmd)), stderr_tail=secrets.redact(result.stderr_tail),
+                cpu_s=getattr(result, "cpu_s", 0.0), peak_rss_mb=getattr(result, "peak_rss_mb", 0.0),
+                depends_on=depends_on or "",
+            ))
 
     def tool_runs(self, phase: str | None = None) -> list[ToolRunRecord]:
         if phase is None:
@@ -1043,18 +1227,25 @@ class Run:
         from .state import ContractError, Fault
         if not isinstance(fault, Fault):
             raise ContractError(f"commit_fault takes a Fault, got {fault!r}")
-        self._refuse_if_sealed(f"fault {fault.kind!r}")
-        if fault not in self._faults:            # the same fault committed twice is the same fact
-            self._faults.append(fault)
+        scope = (
+            MutationScope.FINALIZATION_METADATA
+            if fault.kind == "publication"
+            else MutationScope.BASE_EVIDENCE
+        )
+        with self._mutation(scope):
+            self._refuse_if_sealed(f"fault {fault.kind!r}")
+            if fault not in self._faults:        # the same fault committed twice is the same fact
+                self._faults.append(fault)
 
     def commit_gap(self, gap) -> None:
         """Record a typed Gap against this run. Refused once the verdict is sealed."""
         from .state import ContractError, Gap
         if not isinstance(gap, Gap):
             raise ContractError(f"commit_gap takes a Gap, got {gap!r}")
-        self._refuse_if_sealed(f"gap {gap.kind!r}")
-        if gap not in self._gaps:
-            self._gaps.append(gap)
+        with self._mutation(MutationScope.BASE_EVIDENCE):
+            self._refuse_if_sealed(f"gap {gap.kind!r}")
+            if gap not in self._gaps:
+                self._gaps.append(gap)
 
     def unseal_verdict(self) -> None:
         """Reopen the run for a re-seal: a finalisation fault raised after the base commit still reaches the
@@ -1217,6 +1408,7 @@ class Run:
     def _entity_file(self, entity: str) -> Path:
         return self.normalized / f"{validate_entity(entity)}.jsonl"
 
+    @_scoped_mutation(MutationScope.BASE_EVIDENCE)
     def add(self, entity: str, record: dict) -> bool:
         """Record an observation of a normalized entity. Returns True iff its natural key is NEW, so the
         `sum(add(...))` / `if add(...)` counting semantics across phases are unchanged.
@@ -1259,6 +1451,7 @@ class Run:
                 self._refuse_over_envelope(entity, key, "growth")   # unbounded growth of a key -> owed, not held
         return False                                        # not a new entity (counting semantics preserved)
 
+    @_scoped_mutation(MutationScope.BASE_EVIDENCE)
     def inherit(self, entity: str, record: dict) -> bool:
         """Record an entity this run was HANDED (a campaign seeded it from earlier children) — present for
         every downstream lane, and never counted as this run's discovery, because `add()` answers "is this key
