@@ -537,7 +537,11 @@ def test_policy_mismatch_is_rejected_before_claim_stage_or_supervisor(
 
     after = tuple(sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")))
     assert after == before
-    assert not (tmp_path / "recon" / "state" / "claims" / run.run_id).exists()
+    # Every valid Run owns a permanent, creation-bound registry.  Rejection
+    # before supervision must leave that registry empty, not fabricate/remove it.
+    assert not list(
+        (tmp_path / "recon" / "state" / "claims" / run.run_id).iterdir()
+    )
 
 
 @pytest.mark.parametrize("components", [

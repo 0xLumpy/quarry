@@ -26,6 +26,12 @@ def _fill(run: Run, entity: str, n: int) -> int:
     return sum(run.add(entity, {"host": f"h{i}.example.com"}) for i in range(n))
 
 
+def _make_private(path: Path) -> Path:
+    """Fixtures impersonating current canonical files must satisfy 0600."""
+    os.chmod(path, 0o600)
+    return path
+
+
 def _vmrss_kb() -> int:
     with open("/proc/self/status") as f:
         for line in f:
@@ -176,6 +182,7 @@ def test_reopen_of_a_pre_oversized_log_is_bounded(tmp_path: Path, monkeypatch):
     with path.open("w") as fh:
         for i in range(100):
             fh.write(json.dumps({"host": f"h{i}.example.com"}) + "\n")
+    _make_private(path)
     folded = fold_observations(path, max_keys=30)
     assert len(folded.records) == 30 and folded.refused == 70
 
@@ -283,6 +290,7 @@ def test_reopen_refuses_an_over_byte_single_key_record(tmp_path: Path, monkeypat
     path = run.normalized / "subdomain.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"host": "h.example.com", "blob": "x" * 2000}) + "\n")   # ~2 KiB, one key
+    _make_private(path)
     reopened = Run.open(tmp_path, "audit", run.run_id)
     assert reopened.count("subdomain") == 0                        # the over-byte record is never materialised
     rem = reopened.envelope_remainder()["remainders"][0]
@@ -298,6 +306,7 @@ def test_reopen_refuses_new_keys_past_the_corpus_byte_ceiling(tmp_path: Path, mo
     with path.open("w") as fh:
         for i in range(50):
             fh.write(json.dumps({"host": f"h{i}.example.com"}) + "\n")
+    _make_private(path)
     reopened = Run.open(tmp_path, "audit", run.run_id)
     n = reopened.count("subdomain")
     assert 0 < n < 50                                             # the corpus-byte ceiling bound it below the key cap
@@ -346,6 +355,7 @@ def test_finished_and_campaign_fold_refuse_an_oversized_record(tmp_path: Path, m
     path = run.normalized / "subdomain.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"host": "h.example.com", "blob": "x" * 2000}) + "\n")   # ~2 KiB, one key
+    _make_private(path)
     run.write_manifest({}, [], metrics=None, policy=None)
     folded = fold_run_entity(run.dir, "subdomain")
     assert len(folded.records) == 0                              # the oversized record is never materialised
@@ -393,6 +403,7 @@ def test_reopen_does_not_duplicate_refusal_rows(tmp_path: Path, monkeypatch):
     with path.open("w") as fh:
         for i in range(5):
             fh.write(json.dumps({"host": f"h{i}.example.com"}) + "\n")   # 4 over a cap of 1
+    _make_private(path)
     for _ in range(5):
         Run.open(tmp_path, "audit", run.run_id).count("subdomain")       # five reopens each re-fold the log
     final = Run.open(tmp_path, "audit", run.run_id)
@@ -421,6 +432,7 @@ def test_finished_fold_degrades_on_a_growth_refusal_with_unchanged_count(tmp_pat
     with path.open("w") as fh:
         fh.write(json.dumps({"host": "h.example.com"}) + "\n")
         fh.write(json.dumps({"host": "h.example.com", "blob": "x" * 500}) + "\n")   # growth past the ceiling
+    _make_private(path)
     run.write_manifest({}, [], metrics=None, policy=None)
     folded = fold_run_entity(run.dir, "subdomain")
     assert len(folded.records) == 1                            # the distinct-key count is unchanged
@@ -438,6 +450,7 @@ def test_an_unreadable_fold_ledger_dir_fails_closed(tmp_path: Path, monkeypatch)
     with path.open("w") as fh:
         for i in range(5):
             fh.write(json.dumps({"host": f"h{i}.example.com"}) + "\n")
+    _make_private(path)
     Run.open(tmp_path, "audit", run.run_id).count("subdomain")     # writes envelope-fold-refused/subdomain.jsonl
     os.chmod(run._fold_refused_dir, 0o000)
     try:
@@ -480,18 +493,18 @@ def test_finalize_groups_are_bounded_by_the_entity_enum(tmp_path: Path, monkeypa
 
 
 def test_a_durability_marker_write_failure_is_surfaced(tmp_path: Path, monkeypatch):
-    import quarry_recon.store as store_mod
+    from quarry_recon import privfs
     monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
     run = Run.create(tmp_path, "audit")
     run.add("subdomain", {"host": "kept.example.com"})
-    orig = store_mod._atomic_write
+    orig = privfs.stage_private_bytes
 
-    def _block_marker(path, text):
-        if str(path).endswith("envelope-degraded.json"):
+    def _block_marker(anchor_fd, components, data):
+        if components == ("envelope-degraded.json",):
             raise OSError("read-only fs")                       # ledger AND marker share an unwritable fs
-        return orig(path, text)
+        return orig(anchor_fd, components, data)
 
-    monkeypatch.setattr(store_mod, "_atomic_write", _block_marker)
+    monkeypatch.setattr(privfs, "stage_private_bytes", _block_marker)
     monkeypatch.setattr(run, "_append_refused",
                         lambda e, k, ki: (_ for _ in ()).throw(OSError("disk full")))
     for i in range(3):
