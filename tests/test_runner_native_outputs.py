@@ -1156,3 +1156,53 @@ def test_raw_adoption_fence_preserves_release_cancellation(
     assert receipt.fault_type == interruption.__name__
     assert run._live_artifact_claim_count() == 0
     assert _attempt_directories(run) == []
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_prepare_preserves_cleanup_cancellation_over_ordinary_primary(
+    tmp_path, monkeypatch, interruption,
+):
+    run = _running_run(
+        tmp_path, f"native-prepare-cleanup-{interruption.__name__.lower()}",
+    )
+    final = run.dir / "raw" / "probe" / "nuclei.jsonl"
+    policy = RepositoryNativeOutput.file(3, "raw", "probe", "nuclei.jsonl")
+    adoption = NativeOutputAdoption()
+    primary = RuntimeError("fixture ordinary prepare primary")
+    cancellation = interruption("fixture prepare cleanup cancellation")
+    real_create = runner_native._create_prepare_root
+    real_cleanup = runner_native._cleanup_prepare_ownership
+    calls = 0
+
+    def create_then_fail(owner):
+        real_create(owner)
+        raise primary
+
+    def cleanup_then_interrupt(*arguments):
+        nonlocal calls
+        result = real_cleanup(*arguments)
+        calls += 1
+        if calls == 1:
+            raise cancellation
+        return result
+
+    monkeypatch.setattr(runner_native, "_create_prepare_root", create_then_fail)
+    monkeypatch.setattr(
+        runner_native, "_cleanup_prepare_ownership", cleanup_then_interrupt,
+    )
+    with pytest.raises(interruption) as interrupted:
+        prepare_native_outputs(
+            run,
+            _python_command("import sys", final),
+            (policy,),
+            adoption=adoption,
+        )
+
+    assert interrupted.value is cancellation
+    assert interrupted.value.__cause__ is primary
+    receipt = adoption.fence()
+    assert receipt is not None
+    assert receipt.cleanup_settled and not receipt.claim_retained
+    assert receipt.fault_type == interruption.__name__
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []

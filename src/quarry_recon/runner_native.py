@@ -2223,9 +2223,19 @@ def prepare_native_outputs(
             adoption=adoption,
             _constructor_token=_CONSTRUCTOR,
         )
-    except BaseException:
-        try:
-            adoption.fence()
-        except BaseException:
-            pass
+    except BaseException as primary:
+        cancellation = primary if not isinstance(primary, Exception) else None
+        for _attempt in range(2):
+            try:
+                receipt = adoption.fence()
+            except BaseException as cleanup_fault:
+                if (cancellation is None
+                        and not isinstance(cleanup_fault, Exception)):
+                    cancellation = cleanup_fault
+                continue
+            if (receipt is None
+                    or (receipt.cleanup_settled and not receipt.claim_retained)):
+                break
+        if cancellation is not None and cancellation is not primary:
+            raise cancellation from primary
         raise
