@@ -407,6 +407,8 @@ def test_bootstrap_public_signature_and_outcome_shape_remain_stable():
         "worker_reaped", "control_eof", "observed_trailing_control_bytes",
         "abort_command_sent", "parent_pipes_closed", "kill_requested",
     )
+    assert supervisor.BootstrapReason.CONTAINMENT_FAILED.value \
+        == "containment_failed"
 
 
 def test_supervisor_uses_only_the_fixed_isolated_spawn_shape(monkeypatch):
@@ -550,12 +552,22 @@ def test_parent_acquires_binds_then_commands_exact_direct_containment(
     assert handle.terminal is True
 
 
-def test_direct_containment_acquisition_failure_has_zero_spawn_side_effect(
-    fake_direct_containment,
+@pytest.mark.parametrize(
+    "acquire_exception",
+    [
+        containment.ContainmentUnsupported(
+            containment.ContainmentReason.CGROUP_V2_MOUNT_MISSING,
+        ),
+        containment.ContainmentRefused(
+            containment.ContainmentReason.DELEGATION_REFUSED,
+        ),
+    ],
+    ids=("unsupported", "refused"),
+)
+def test_direct_containment_acquisition_refusal_is_unsupported_without_spawn(
+    fake_direct_containment, acquire_exception,
 ):
-    fake_direct_containment.acquire_exception = containment.ContainmentUnsupported(
-        containment.ContainmentReason.CGROUP_V2_MOUNT_MISSING,
-    )
+    fake_direct_containment.acquire_exception = acquire_exception
     spawn_calls = []
     outcome = supervisor.bootstrap_worker(
         _request(), deadline=time.monotonic() + 1,
@@ -565,7 +577,7 @@ def test_direct_containment_acquisition_failure_has_zero_spawn_side_effect(
     assert fake_direct_containment.acquire_calls == [RID]
     assert fake_direct_containment.handles == []
     assert spawn_calls == []
-    assert outcome.reason is not supervisor.BootstrapReason.ABORTED
+    assert outcome.reason is supervisor.BootstrapReason.UNSUPPORTED
     assert not outcome.worker_spawned
     assert not outcome.transaction_complete
 
@@ -594,7 +606,7 @@ def test_parent_never_commands_when_exact_parked_binding_fails(
     handle = fake_direct_containment.handle
     assert len(handle.bind_proofs) == 1
     assert not outcome.transaction_complete
-    assert outcome.reason is not supervisor.BootstrapReason.ABORTED
+    assert outcome.reason is supervisor.BootstrapReason.CONTAINMENT_FAILED
     assert outcome.abort_command_sent is False
     assert len(handle.settlement_deadlines) == 1
     assert handle.terminal is True
@@ -674,7 +686,7 @@ def test_containment_settlement_must_be_exact_before_aborted_outcome(
     handle = fake_direct_containment.handle
     assert outcome.abort_command_sent is True
     assert outcome.worker_reaped
-    assert outcome.reason is supervisor.BootstrapReason.CONTROL_FAILED
+    assert outcome.reason is supervisor.BootstrapReason.CONTAINMENT_FAILED
     assert not outcome.transaction_complete
     assert len(handle.settlement_deadlines) == 1
     assert handle.close_calls == 1
