@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import threading
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +29,38 @@ _OOB_SESSION_COMPONENTS = ("raw", "oob", "session", "session.json")
 _OOB_LOG_COMPONENTS = ("raw", "oob", "session", "interactions.jsonl")
 _OOB_CLIENT_SESSION_COMPONENTS = ("raw", "oob", "session", "interactsh.session")
 _SESSION_REFERENCE_FIELDS = frozenset({"log", "session_file"})
+
+
+@contextmanager
+def _owned_descriptor(what, *, expected_identity=None):
+    """Activate two settlement passes before one descriptor can be allocated."""
+    from . import store as _store
+    owner = _store._OwnedDescriptor(expected_identity)
+    settlement = _store._SettlementOwner(
+        lambda: _store._settle_descriptor_owners(
+            (owner,), what,
+        ),
+    )
+    with _store._SettlementFence(settlement):
+        with _store._SettlementFence(settlement):
+            yield owner
+
+
+@contextmanager
+def _owned_run_anchor(run):
+    """Keep one exact run descriptor owned across a bounded OOB operation."""
+    from . import store as _store
+    with _owned_descriptor(
+        "OOB run descriptor",
+        expected_identity=run._run_directory_identity,
+    ) as owner:
+        _store._open_run_fd_into(
+            owner,
+            run.project_dir,
+            run.run_id,
+            expected_identity=run._run_directory_identity,
+        )
+        yield owner.fd
 
 
 def _repository_ref(run, path, *, field: str) -> str:
@@ -67,31 +99,30 @@ def resolve_session_ref(run, value, *, field: str, require_file: bool = True) ->
         _store.validate_artifact_component(part, f"OOB {field} component {index}")
         for index, part in enumerate(ref.parts)
     )
-    anchor_fd = _store._open_run_fd(run.project_dir, run.run_id)
-    parent_fd = -1
-    fd = -1
-    try:
-        parent_fd = privfs.open_strict_dir_at(anchor_fd, components[:-1])
-        if require_file:
-            try:
-                fd = os.open(
-                    components[-1],
-                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                    dir_fd=parent_fd,
-                )
-            except OSError as exc:
-                raise ContractError(f"OOB {field} is not a safe private file") from exc
-            observed = os.fstat(fd)
-            named = os.stat(components[-1], dir_fd=parent_fd, follow_symlinks=False)
-            if ((observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)
-                    or not privfs.is_private(run.dir.joinpath(*components))):
-                raise ContractError(f"OOB {field} is not a safe private file")
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        if parent_fd >= 0:
-            os.close(parent_fd)
-        os.close(anchor_fd)
+    with _owned_run_anchor(run) as anchor_fd:
+        with _owned_descriptor("OOB session parent descriptor") as parent:
+            _store._open_strict_directory_into(
+                parent, anchor_fd, components[:-1],
+            )
+            if require_file:
+                with _owned_descriptor("OOB session file descriptor") as file_owner:
+                    try:
+                        file_owner.open(
+                            components[-1],
+                            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                            dir_fd=parent.fd,
+                        )
+                    except OSError as exc:
+                        raise ContractError(
+                            f"OOB {field} is not a safe private file",
+                        ) from exc
+                    observed = os.fstat(file_owner.fd)
+                    named = os.stat(
+                        components[-1], dir_fd=parent.fd, follow_symlinks=False,
+                    )
+                    if ((observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)
+                            or not privfs.is_private(run.dir.joinpath(*components))):
+                        raise ContractError(f"OOB {field} is not a safe private file")
     return run.dir.joinpath(*components)
 
 

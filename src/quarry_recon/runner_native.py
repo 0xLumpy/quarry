@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import stat
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -58,6 +59,43 @@ _CONSTRUCTOR = object()
 _TREE_BUILDER_CONSTRUCTOR = object()
 _MAX_POLICIES = 64
 _MAX_REPOSITORY_IDENTITY_BYTES = 4 * 1024 * 1024
+
+
+@contextmanager
+def _settled_descriptors(owners, what):
+    """Activate two settlement passes for one preinstalled owner tuple."""
+    settlement = store._SettlementOwner(
+        lambda: store._settle_descriptor_owners(
+            owners, what,
+        ),
+    )
+    with store._SettlementFence(settlement):
+        with store._SettlementFence(settlement):
+            yield owners
+
+
+@contextmanager
+def _owned_descriptor(what, *, expected_identity=None):
+    """Activate two settlement passes before one descriptor can be allocated."""
+    owner = store._OwnedDescriptor(expected_identity)
+    with _settled_descriptors((owner,), what):
+        yield owner
+
+
+@contextmanager
+def _owned_run_anchor(run: store.Run):
+    """Keep one exact run descriptor owned across native publication."""
+    with _owned_descriptor(
+        "native runner descriptor",
+        expected_identity=run._run_directory_identity,
+    ) as owner:
+        store._open_run_fd_into(
+            owner,
+            run.project_dir,
+            run.run_id,
+            expected_identity=run._run_directory_identity,
+        )
+        yield owner.fd
 
 
 class NativeOutputKind(str, Enum):
@@ -363,20 +401,48 @@ class _PublishResult:
 class _FilePublishOwner:
     components: tuple[str, ...]
     temporary_name: str
-    anchor_fd: int = -1
-    parent_fd: int = -1
-    file_fd: int = -1
+    anchor_descriptor: store._OwnedDescriptor = field(
+        default_factory=store._OwnedDescriptor,
+        repr=False,
+    )
+    parent_descriptor: store._OwnedDescriptor = field(
+        default_factory=store._OwnedDescriptor,
+        repr=False,
+    )
+    file_descriptor: store._OwnedDescriptor = field(
+        default_factory=store._OwnedDescriptor,
+        repr=False,
+    )
     file_identity: tuple[int, int] | None = None
     present: bool = False
     stage: object | None = None
+
+    @property
+    def anchor_fd(self) -> int:
+        return self.anchor_descriptor.fd
+
+    @property
+    def parent_fd(self) -> int:
+        return self.parent_descriptor.fd
+
+    @property
+    def file_fd(self) -> int:
+        return self.file_descriptor.fd
 
 
 @dataclass(slots=True)
 class _TreePublishOwner:
     name: str
-    fd: int = -1
+    descriptor: store._OwnedDescriptor = field(
+        default_factory=store._OwnedDescriptor,
+        repr=False,
+    )
     identity: tuple[int, int] | None = None
     present: bool = False
+
+    @property
+    def fd(self) -> int:
+        return self.descriptor.fd
 
 
 @dataclass(slots=True)
@@ -1313,27 +1379,52 @@ def _fence_private_stage(run: store.Run, stage) -> bool:
     with run._mutation(store.MutationScope.CONTROL):
         try:
             privfs.abort_private_stage(stage)
-        except BaseException:
+        except Exception:
             return False
-        anchor = store._open_run_fd(run.project_dir, run.run_id)
-        parent = -1
-        try:
-            parent = privfs.open_strict_dir_at(anchor, components[:-1])
-            for name in os.listdir(parent):
-                if not (name.startswith(".quarry-discard-") and name.endswith(".stage")):
-                    continue
-                observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
-                if _identity(observed) == identity:
-                    os.unlink(name, dir_fd=parent)
-                    os.fsync(parent)
+        with _owned_run_anchor(run) as anchor:
+            with _owned_descriptor("native discard parent descriptor") as parent:
+                store._open_strict_directory_into(
+                    parent, anchor, components[:-1],
+                )
+                try:
+                    for name in os.listdir(parent.fd):
+                        if not (name.startswith(".quarry-discard-") and name.endswith(".stage")):
+                            continue
+                        observed = os.stat(
+                            name, dir_fd=parent.fd, follow_symlinks=False,
+                        )
+                        if _identity(observed) == identity:
+                            os.unlink(name, dir_fd=parent.fd)
+                            os.fsync(parent.fd)
+                            return True
                     return True
-            return True
-        except BaseException:
-            return False
-        finally:
-            if parent >= 0:
-                os.close(parent)
-            os.close(anchor)
+                except Exception:
+                    return False
+
+
+def _settle_untransferred_file_name(
+    owner: _FilePublishOwner,
+    parent_fd: int,
+) -> None:
+    """Remove one exact pre-stage file while its parent descriptor is pinned."""
+    try:
+        observed = os.stat(
+            owner.temporary_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        os.fsync(parent_fd)
+        owner.present = False
+    else:
+        if (owner.file_identity is not None
+                and _identity(observed) != owner.file_identity):
+            raise ContractError("native file stage identity changed")
+        if not stat.S_ISREG(observed.st_mode):
+            raise ContractError("native file stage type changed")
+        os.unlink(owner.temporary_name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        owner.present = False
 
 
 def _create_owned_file_stage(
@@ -1342,14 +1433,14 @@ def _create_owned_file_stage(
     owner: _FilePublishOwner,
 ) -> None:
     """Create a privfs-compatible stage while publishing every owner transition."""
-    owner.anchor_fd = privfs.open_strict_dir_at(anchor_fd, ())
-    owner.parent_fd = privfs.open_strict_dir_at(
-        owner.anchor_fd, policy.components[:-1],
+    store._open_strict_directory_into(owner.anchor_descriptor, anchor_fd, ())
+    store._open_strict_directory_into(
+        owner.parent_descriptor, owner.anchor_fd, policy.components[:-1],
     )
     anchor_identity = _identity(os.fstat(owner.anchor_fd))
     parent_identity = _identity(os.fstat(owner.parent_fd))
     owner.present = True
-    owner.file_fd = os.open(
+    owner.file_descriptor.open(
         owner.temporary_name,
         _CREATE_STAGE_FLAGS,
         privfs.FILE_MODE,
@@ -1375,16 +1466,20 @@ def _create_owned_file_stage(
 
 
 def _close_untransferred_file_owner(owner: _FilePublishOwner) -> bool:
-    settled = True
-    for attribute in ("file_fd", "parent_fd", "anchor_fd"):
-        fd = getattr(owner, attribute)
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except BaseException:
-                settled = False
-            setattr(owner, attribute, -1)
-    return settled
+    try:
+        store._settle_descriptor_owners(
+            (
+                owner.file_descriptor,
+                owner.parent_descriptor,
+                owner.anchor_descriptor,
+            ),
+            "native file stage descriptors",
+        )
+    except BaseException as fault:
+        if not isinstance(fault, Exception):
+            raise
+        return False
+    return True
 
 
 def _fence_owned_file_stage(run: store.Run, owner: _FilePublishOwner) -> bool:
@@ -1405,33 +1500,20 @@ def _fence_owned_file_stage(run: store.Run, owner: _FilePublishOwner) -> bool:
     try:
         with run._mutation(store.MutationScope.CONTROL):
             if owner.present:
+                if owner.file_identity is None:
+                    owner.file_identity = owner.file_descriptor.identity
                 if owner.parent_fd < 0:
-                    anchor = store._open_run_fd(run.project_dir, run.run_id)
-                    try:
-                        owner.parent_fd = privfs.open_strict_dir_at(
-                            anchor, owner.components[:-1],
-                        )
-                    finally:
-                        os.close(anchor)
-                try:
-                    observed = os.stat(
-                        owner.temporary_name,
-                        dir_fd=owner.parent_fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    os.fsync(owner.parent_fd)
-                    owner.present = False
+                    with _owned_run_anchor(run) as anchor:
+                        with _owned_descriptor(
+                            "native file recovery parent descriptor",
+                        ) as parent:
+                            store._open_strict_directory_into(
+                                parent, anchor, owner.components[:-1],
+                            )
+                            _settle_untransferred_file_name(owner, parent.fd)
                 else:
-                    if (owner.file_identity is not None
-                            and _identity(observed) != owner.file_identity):
-                        raise ContractError("native file stage identity changed")
-                    if not stat.S_ISREG(observed.st_mode):
-                        raise ContractError("native file stage type changed")
-                    os.unlink(owner.temporary_name, dir_fd=owner.parent_fd)
-                    os.fsync(owner.parent_fd)
-                    owner.present = False
-    except BaseException:
+                    _settle_untransferred_file_name(owner, owner.parent_fd)
+    except Exception:
         settled = False
     return _close_untransferred_file_owner(owner) and settled and not owner.present
 
@@ -1440,7 +1522,7 @@ def _create_owned_tree(parent_fd: int, owner: _TreePublishOwner) -> None:
     """Create a pre-named tree candidate into its mutable ownership ledger."""
     owner.present = True
     os.mkdir(owner.name, privfs.DIR_MODE, dir_fd=parent_fd)
-    owner.fd = os.open(owner.name, _DIR_FLAGS, dir_fd=parent_fd)
+    owner.descriptor.open(owner.name, _DIR_FLAGS, dir_fd=parent_fd)
     os.fchmod(owner.fd, privfs.DIR_MODE)
     observed = os.fstat(owner.fd)
     _validate_private_dir(observed, normalize=False, fd=owner.fd)
@@ -2389,9 +2471,13 @@ class NativeOutputTransaction:
                     "native tree builder generation changed after seal",
                 )
 
-    def _source_file_fd(self, name: str) -> int:
+    def _open_source_file_into(
+        self,
+        destination: store._OwnedDescriptor,
+        name: str,
+    ) -> None:
         self._validate_root()
-        return os.open(name, _FILE_FLAGS, dir_fd=self._root_fd)
+        destination.open(name, _FILE_FLAGS, dir_fd=self._root_fd)
 
     def _publish_file(
         self,
@@ -2410,129 +2496,159 @@ class NativeOutputTransaction:
                 f".quarry-native-file-{os.urandom(16).hex()}.stage",
             )
             settlement.file_owner = owner
-        source = -1
         fault = None
         disposition = "unpublished"
         cleanup_settled = True
+        source = store._OwnedDescriptor()
         try:
-            source = self._source_file_fd(name)
-            before = os.fstat(source)
-            _validate_private_file(before, normalize=False, fd=source)
-            with self.run._mutation(store.MutationScope.BASE_EVIDENCE):
-                self.run._ensure_artifact_parent(policy.components)
-                anchor = store._open_run_fd(self.run.project_dir, self.run.run_id)
+            with _settled_descriptors(
+                (
+                    owner.file_descriptor,
+                    owner.parent_descriptor,
+                    owner.anchor_descriptor,
+                    source,
+                ),
+                "native file publication descriptors",
+            ):
                 try:
-                    _create_owned_file_stage(anchor, policy, owner)
-                finally:
-                    os.close(anchor)
-                stage = owner.stage
-                if type(stage) is not privfs.PrivateFileStage:
-                    raise ContractError("native file stage construction did not settle")
-                digest = hashlib.sha256()
-                size = 0
-                while True:
-                    chunk = os.read(source, 1024 * 1024)
-                    if not chunk:
-                        break
-                    _write_all(stage.file_fd, chunk)
-                    digest.update(chunk)
-                    size += len(chunk)
-                after = os.fstat(source)
-                if (_file_signature(after) != _file_signature(before)
-                        or size != snapshot.evidence.size
-                        or digest.hexdigest() != snapshot.evidence.sha256):
-                    raise ContractError("native file changed before publication")
-                privfs._set_stage(
-                    stage,
-                    "expected_digest",
-                    (snapshot.evidence.size, snapshot.evidence.sha256),
-                )
-                privfs.replace_private_stage(stage)
-                owner.present = False
-            disposition = "committed"
-        except privfs.PrivateReplaceCommittedWithFault as exc:
-            owner.present = False
-            disposition, cleanup_settled, fault = "committed", False, exc
-        except privfs.PrivateReplaceUncertain as exc:
-            disposition, cleanup_settled, fault = "uncertain", False, exc
-        except BaseException as exc:
-            fault = exc
-            stage = owner.stage
-            if stage is not None and stage.state in {"publishing", "replaced_uncertain"}:
-                disposition, cleanup_settled = "uncertain", False
-            elif stage is not None and stage.state == "committed":
-                owner.present = False
-                disposition, cleanup_settled = "committed", False
-            else:
-                cleanup_settled = _fence_owned_file_stage(self.run, owner)
-        finally:
-            if source >= 0:
-                try:
-                    os.close(source)
+                    self._open_source_file_into(source, name)
+                    before = os.fstat(source.fd)
+                    _validate_private_file(before, normalize=False, fd=source.fd)
+                    with self.run._mutation(store.MutationScope.BASE_EVIDENCE):
+                        self.run._ensure_artifact_parent(policy.components)
+                        with _owned_run_anchor(self.run) as anchor:
+                            _create_owned_file_stage(anchor, policy, owner)
+                        stage = owner.stage
+                        if type(stage) is not privfs.PrivateFileStage:
+                            raise ContractError("native file stage construction did not settle")
+                        digest = hashlib.sha256()
+                        size = 0
+                        while True:
+                            chunk = os.read(source.fd, 1024 * 1024)
+                            if not chunk:
+                                break
+                            _write_all(stage.file_fd, chunk)
+                            digest.update(chunk)
+                            size += len(chunk)
+                        after = os.fstat(source.fd)
+                        if (_file_signature(after) != _file_signature(before)
+                                or size != snapshot.evidence.size
+                                or digest.hexdigest() != snapshot.evidence.sha256):
+                            raise ContractError("native file changed before publication")
+                        privfs._set_stage(
+                            stage,
+                            "expected_digest",
+                            (snapshot.evidence.size, snapshot.evidence.sha256),
+                        )
+                        privfs.replace_private_stage(stage)
+                        owner.present = False
+                    disposition = "committed"
+                except privfs.PrivateReplaceCommittedWithFault as exc:
+                    owner.present = False
+                    disposition, cleanup_settled, fault = "committed", False, exc
+                except privfs.PrivateReplaceUncertain as exc:
+                    disposition, cleanup_settled, fault = "uncertain", False, exc
                 except BaseException as exc:
-                    cleanup_settled = False
-                    if fault is None:
-                        fault = exc
+                    fault = exc
+                    stage = owner.stage
+                    if stage is not None and stage.state in {"publishing", "replaced_uncertain"}:
+                        disposition, cleanup_settled = "uncertain", False
+                    elif stage is not None and stage.state == "committed":
+                        owner.present = False
+                        disposition, cleanup_settled = "committed", False
+                    else:
+                        cleanup_settled = _fence_owned_file_stage(self.run, owner)
+        except BaseException as ownership_fault:
+            cleanup_settled = False
+            fault = store._preferred_settlement_fault(fault, [ownership_fault])
         settlement.record(_PublishResult(disposition, cleanup_settled, fault))
 
     def _publish_file_absence(self, policy: RepositoryNativeOutput) -> _PublishResult:
         fault = None
         disposition = "unpublished"
         cleanup_settled = True
-        parent = -1
-        prior = -1
         backup = f".quarry-native-prior-{os.urandom(16).hex()}"
         prior_identity = None
         action_started = False
         try:
             with self.run._mutation(store.MutationScope.BASE_EVIDENCE):
-                anchor = store._open_run_fd(self.run.project_dir, self.run.run_id)
-                try:
-                    try:
-                        parent = privfs.open_strict_dir_at(anchor, policy.components[:-1])
-                    except privfs.PrivatePathMissing:
-                        return _PublishResult("committed")
-                finally:
-                    os.close(anchor)
-                try:
-                    prior = os.open(policy.components[-1], _FILE_FLAGS, dir_fd=parent)
-                except FileNotFoundError:
-                    return _PublishResult("committed")
-                observed = os.fstat(prior)
-                _validate_private_file(observed, normalize=False, fd=prior)
-                prior_identity = _identity(observed)
-                action_started = True
-                os.rename(
-                    policy.components[-1], backup,
-                    src_dir_fd=parent, dst_dir_fd=parent,
-                )
-                if _named_identity(parent, backup) != prior_identity:
-                    raise ContractError("native output absence could not retain prior evidence")
-                os.fsync(parent)
-                if _named_identity(parent, policy.components[-1]) is not None:
-                    raise ContractError("native output absence did not settle")
-                disposition = "committed"
-                try:
-                    os.unlink(backup, dir_fd=parent)
-                    os.fsync(parent)
-                except BaseException as cleanup_error:
-                    cleanup_settled, fault = False, cleanup_error
-        except BaseException as exc:
-            fault = exc
-            if action_started and prior_identity is not None:
-                final_identity = _named_identity(parent, policy.components[-1]) if parent >= 0 else None
-                backup_identity = _named_identity(parent, backup) if parent >= 0 else None
-                if final_identity is None and backup_identity == prior_identity:
-                    disposition, cleanup_settled = "uncertain", False
-                elif final_identity == prior_identity:
-                    disposition = "unpublished"
-                else:
-                    disposition, cleanup_settled = "uncertain", False
-        finally:
-            if prior >= 0:
-                os.close(prior)
-            if parent >= 0:
-                os.close(parent)
+                with _owned_run_anchor(self.run) as anchor:
+                    with _owned_descriptor(
+                        "native absence parent descriptor",
+                    ) as parent:
+                        try:
+                            store._open_strict_directory_into(
+                                parent, anchor, policy.components[:-1],
+                            )
+                        except privfs.PrivatePathMissing:
+                            disposition = "committed"
+                            parent_missing = True
+                        else:
+                            parent_missing = False
+                        if not parent_missing:
+                            with _owned_descriptor(
+                                "native absence prior descriptor",
+                            ) as prior:
+                                try:
+                                    prior.open(
+                                        policy.components[-1],
+                                        _FILE_FLAGS,
+                                        dir_fd=parent.fd,
+                                    )
+                                except FileNotFoundError:
+                                    disposition = "committed"
+                                    prior_missing = True
+                                else:
+                                    prior_missing = False
+                                if not prior_missing:
+                                    try:
+                                        observed = os.fstat(prior.fd)
+                                        _validate_private_file(
+                                            observed, normalize=False, fd=prior.fd,
+                                        )
+                                        prior_identity = _identity(observed)
+                                        action_started = True
+                                        os.rename(
+                                            policy.components[-1], backup,
+                                            src_dir_fd=parent.fd,
+                                            dst_dir_fd=parent.fd,
+                                        )
+                                        if _named_identity(parent.fd, backup) != prior_identity:
+                                            raise ContractError(
+                                                "native output absence could not retain prior evidence",
+                                            )
+                                        os.fsync(parent.fd)
+                                        if _named_identity(
+                                            parent.fd, policy.components[-1],
+                                        ) is not None:
+                                            raise ContractError(
+                                                "native output absence did not settle",
+                                            )
+                                        disposition = "committed"
+                                        try:
+                                            os.unlink(backup, dir_fd=parent.fd)
+                                            os.fsync(parent.fd)
+                                        except BaseException as cleanup_error:
+                                            cleanup_settled, fault = False, cleanup_error
+                                    except BaseException as exc:
+                                        fault = exc
+                                        if action_started and prior_identity is not None:
+                                            final_identity = _named_identity(
+                                                parent.fd, policy.components[-1],
+                                            )
+                                            backup_identity = _named_identity(
+                                                parent.fd, backup,
+                                            )
+                                            if (final_identity is None
+                                                    and backup_identity == prior_identity):
+                                                disposition, cleanup_settled = "uncertain", False
+                                            elif final_identity == prior_identity:
+                                                disposition = "unpublished"
+                                            else:
+                                                disposition, cleanup_settled = "uncertain", False
+        except BaseException as ownership_fault:
+            cleanup_settled = False
+            fault = store._preferred_settlement_fault(fault, [ownership_fault])
         return _PublishResult(disposition, cleanup_settled, fault)
 
     def _publish_tree(
@@ -2551,141 +2667,164 @@ class NativeOutputTransaction:
                 f".quarry-native-tree-{os.urandom(16).hex()}",
             )
             settlement.tree_owner = owner
-        source = -1
-        parent = -1
-        prior = -1
         prior_identity = None
         action_started = False
         exchanged = False
         disposition = "unpublished"
         cleanup_settled = True
         fault = None
+        source = store._OwnedDescriptor()
+        parent = store._OwnedDescriptor()
+        prior = store._OwnedDescriptor()
+        final = store._OwnedDescriptor()
         try:
-            self._validate_root()
-            source = os.open(name, _DIR_FLAGS, dir_fd=self._root_fd)
-            builder = self._builders.get(settlement.evidence.policy_index)
-            if (builder is not None
-                    and _identity(os.fstat(source)) != builder._identity):
-                raise ContractError(
-                    "native tree builder stage changed before publication",
-                )
-            with self.run._mutation(store.MutationScope.BASE_EVIDENCE):
-                self.run._ensure_artifact_parent(policy.components)
-                anchor = store._open_run_fd(self.run.project_dir, self.run.run_id)
+            with _settled_descriptors(
+                (final, prior, parent, source, owner.descriptor),
+                "native tree publication descriptors",
+            ):
                 try:
-                    parent = privfs.open_strict_dir_at(anchor, policy.components[:-1])
-                finally:
-                    os.close(anchor)
-                _create_owned_tree(parent, owner)
-                _copy_tree_snapshot(source, owner.fd, snapshot)
-                os.fsync(owner.fd)
-                try:
-                    prior = privfs.open_strict_dir_at(parent, (policy.components[-1],))
-                except privfs.PrivatePathMissing:
-                    prior = -1
-                if prior >= 0:
-                    prior_identity = _identity(os.fstat(prior))
-                    action_started = True
-                    try:
-                        _rename_exchange(
-                            parent, owner.name, parent, policy.components[-1],
+                    self._validate_root()
+                    source.open(name, _DIR_FLAGS, dir_fd=self._root_fd)
+                    builder = self._builders.get(settlement.evidence.policy_index)
+                    if (builder is not None
+                            and _identity(os.fstat(source.fd)) != builder._identity):
+                        raise ContractError(
+                            "native tree builder stage changed before publication",
                         )
-                    except BaseException as exchange_error:
-                        final_identity = _named_identity(parent, policy.components[-1])
-                        hidden_identity = _named_identity(parent, owner.name)
-                        if (final_identity == owner.identity
-                                and hidden_identity == prior_identity):
-                            exchanged = True
-                            fault = exchange_error
-                        elif (final_identity == prior_identity
-                                and hidden_identity == owner.identity):
-                            raise
+                    with self.run._mutation(store.MutationScope.BASE_EVIDENCE):
+                        self.run._ensure_artifact_parent(policy.components)
+                        with _owned_run_anchor(self.run) as anchor:
+                            store._open_strict_directory_into(
+                                parent, anchor, policy.components[:-1],
+                            )
+                        _create_owned_tree(parent.fd, owner)
+                        _copy_tree_snapshot(source.fd, owner.fd, snapshot)
+                        os.fsync(owner.fd)
+                        try:
+                            store._open_strict_directory_into(
+                                prior, parent.fd, (policy.components[-1],),
+                            )
+                        except privfs.PrivatePathMissing:
+                            pass
+                        if prior.fd >= 0:
+                            prior_identity = _identity(os.fstat(prior.fd))
+                            action_started = True
+                            try:
+                                _rename_exchange(
+                                    parent.fd,
+                                    owner.name,
+                                    parent.fd,
+                                    policy.components[-1],
+                                )
+                            except BaseException as exchange_error:
+                                final_identity = _named_identity(
+                                    parent.fd, policy.components[-1],
+                                )
+                                hidden_identity = _named_identity(
+                                    parent.fd, owner.name,
+                                )
+                                if (final_identity == owner.identity
+                                        and hidden_identity == prior_identity):
+                                    exchanged = True
+                                    fault = exchange_error
+                                elif (final_identity == prior_identity
+                                        and hidden_identity == owner.identity):
+                                    raise
+                                else:
+                                    raise privfs.PrivateReplaceUncertain(
+                                        "native tree exchange outcome is uncertain",
+                                        components=policy.components,
+                                    ) from exchange_error
+                            else:
+                                exchanged = True
+                            owner.present = False
                         else:
-                            raise privfs.PrivateReplaceUncertain(
-                                "native tree exchange outcome is uncertain",
-                                components=policy.components,
-                            ) from exchange_error
-                    else:
-                        exchanged = True
-                    owner.present = False
-                else:
-                    action_started = True
-                    try:
-                        os.rename(
-                            owner.name,
-                            policy.components[-1],
-                            src_dir_fd=parent,
-                            dst_dir_fd=parent,
+                            action_started = True
+                            try:
+                                os.rename(
+                                    owner.name,
+                                    policy.components[-1],
+                                    src_dir_fd=parent.fd,
+                                    dst_dir_fd=parent.fd,
+                                )
+                            except BaseException as rename_error:
+                                final_identity = _named_identity(
+                                    parent.fd, policy.components[-1],
+                                )
+                                hidden_identity = _named_identity(
+                                    parent.fd, owner.name,
+                                )
+                                if (final_identity == owner.identity
+                                        and hidden_identity is None):
+                                    fault = rename_error
+                                elif (final_identity is None
+                                        and hidden_identity == owner.identity):
+                                    raise
+                                else:
+                                    raise privfs.PrivateReplaceUncertain(
+                                        "native tree rename outcome is uncertain",
+                                        components=policy.components,
+                                    ) from rename_error
+                            owner.present = False
+                        os.fsync(parent.fd)
+                        store._open_strict_directory_into(
+                            final, parent.fd, (policy.components[-1],),
                         )
-                    except BaseException as rename_error:
-                        final_identity = _named_identity(parent, policy.components[-1])
-                        hidden_identity = _named_identity(parent, owner.name)
-                        if final_identity == owner.identity and hidden_identity is None:
-                            fault = rename_error
-                        elif final_identity is None and hidden_identity == owner.identity:
-                            raise
+                        if _identity(os.fstat(final.fd)) != owner.identity:
+                            raise ContractError("native tree final identity changed")
+                        final_entries = _snapshot_tree_recursive(
+                            final.fd, (), normalize=False,
+                        )
+                        if (final_entries != snapshot.entries
+                                or _tree_digest(final_entries) != snapshot.evidence.sha256):
+                            raise ContractError("native tree final bytes changed")
+                        disposition = "committed"
+                        if exchanged and prior_identity is not None:
+                            try:
+                                _remove_named_tree(
+                                    parent.fd,
+                                    owner.name,
+                                    expected_identity=prior_identity,
+                                )
+                            except BaseException as cleanup_error:
+                                cleanup_settled = False
+                                if fault is None:
+                                    fault = cleanup_error
+                except privfs.PrivateReplaceUncertain as exc:
+                    disposition, cleanup_settled, fault = "uncertain", False, exc
+                except BaseException as exc:
+                    if fault is None:
+                        fault = exc
+                    if owner.identity is None:
+                        owner.identity = owner.descriptor.identity
+                    if action_started and parent.fd >= 0 and owner.identity is not None:
+                        final_identity = _named_identity(
+                            parent.fd, policy.components[-1],
+                        )
+                        hidden_identity = _named_identity(parent.fd, owner.name)
+                        if final_identity == owner.identity:
+                            owner.present = False
+                            disposition, cleanup_settled = "uncertain", False
+                        elif hidden_identity == owner.identity:
+                            owner.present = True
+                            disposition = "unpublished"
                         else:
-                            raise privfs.PrivateReplaceUncertain(
-                                "native tree rename outcome is uncertain",
-                                components=policy.components,
-                            ) from rename_error
-                    owner.present = False
-                os.fsync(parent)
-                final = privfs.open_strict_dir_at(parent, (policy.components[-1],))
-                try:
-                    if _identity(os.fstat(final)) != owner.identity:
-                        raise ContractError("native tree final identity changed")
-                    final_entries = _snapshot_tree_recursive(final, (), normalize=False)
-                    if (final_entries != snapshot.entries
-                            or _tree_digest(final_entries) != snapshot.evidence.sha256):
-                        raise ContractError("native tree final bytes changed")
-                finally:
-                    os.close(final)
-                disposition = "committed"
-                if exchanged and prior_identity is not None:
-                    try:
-                        _remove_named_tree(
-                            parent,
-                            owner.name,
-                            expected_identity=prior_identity,
-                        )
-                    except BaseException as cleanup_error:
-                        cleanup_settled = False
-                        if fault is None:
-                            fault = cleanup_error
-        except privfs.PrivateReplaceUncertain as exc:
-            disposition, cleanup_settled, fault = "uncertain", False, exc
-        except BaseException as exc:
-            if fault is None:
-                fault = exc
-            if action_started and parent >= 0 and owner.identity is not None:
-                final_identity = _named_identity(parent, policy.components[-1])
-                hidden_identity = _named_identity(parent, owner.name)
-                if final_identity == owner.identity:
-                    owner.present = False
-                    disposition, cleanup_settled = "uncertain", False
-                elif hidden_identity == owner.identity:
-                    owner.present = True
-                    disposition = "unpublished"
-                else:
-                    disposition, cleanup_settled = "uncertain", False
-            if disposition == "unpublished" and parent >= 0 and owner.identity is not None:
-                try:
-                    if _named_identity(parent, owner.name) == owner.identity:
-                        _remove_named_tree(
-                            parent, owner.name, expected_identity=owner.identity,
-                        )
-                        owner.present = False
-                except BaseException:
-                    cleanup_settled = False
-        finally:
-            for fd in (prior, owner.fd, parent, source):
-                if fd >= 0:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        cleanup_settled = False
-            owner.fd = -1
+                            disposition, cleanup_settled = "uncertain", False
+                    if (disposition == "unpublished"
+                            and parent.fd >= 0 and owner.identity is not None):
+                        try:
+                            if _named_identity(parent.fd, owner.name) == owner.identity:
+                                _remove_named_tree(
+                                    parent.fd,
+                                    owner.name,
+                                    expected_identity=owner.identity,
+                                )
+                                owner.present = False
+                        except BaseException:
+                            cleanup_settled = False
+        except BaseException as ownership_fault:
+            cleanup_settled = False
+            fault = store._preferred_settlement_fault(fault, [ownership_fault])
         settlement.record(_PublishResult(disposition, cleanup_settled, fault))
 
     def _cleanup_attempt(self) -> tuple[bool, BaseException | None]:
@@ -2821,55 +2960,56 @@ class NativeOutputTransaction:
         if owner is None:
             settlement.record(_PublishResult("unpublished", True, fault))
             return
-        parent = -1
+        parent = store._OwnedDescriptor()
+        hidden = store._OwnedDescriptor()
         try:
-            with self.run._mutation(store.MutationScope.CONTROL):
-                anchor = store._open_run_fd(self.run.project_dir, self.run.run_id)
-                try:
-                    parent = privfs.open_strict_dir_at(
-                        anchor, policy.components[:-1],
+            with _settled_descriptors(
+                (hidden, parent), "native tree recovery descriptors",
+            ):
+                with self.run._mutation(store.MutationScope.CONTROL):
+                    with _owned_run_anchor(self.run) as anchor:
+                        store._open_strict_directory_into(
+                            parent, anchor, policy.components[:-1],
+                        )
+                    if owner.identity is None and owner.fd >= 0:
+                        owner.identity = _identity(os.fstat(owner.fd))
+                    final_identity = _named_identity(
+                        parent.fd, policy.components[-1],
                     )
-                finally:
-                    os.close(anchor)
-                if owner.identity is None and owner.fd >= 0:
-                    owner.identity = _identity(os.fstat(owner.fd))
-                final_identity = _named_identity(parent, policy.components[-1])
-                hidden_identity = _named_identity(parent, owner.name)
-                if owner.identity is None and hidden_identity is not None:
-                    hidden = os.open(owner.name, _DIR_FLAGS, dir_fd=parent)
-                    try:
-                        observed = os.fstat(hidden)
-                        _validate_private_dir(observed, normalize=True, fd=hidden)
+                    hidden_identity = _named_identity(parent.fd, owner.name)
+                    if owner.identity is None and hidden_identity is not None:
+                        hidden.open(owner.name, _DIR_FLAGS, dir_fd=parent.fd)
+                        observed = os.fstat(hidden.fd)
+                        _validate_private_dir(
+                            observed, normalize=True, fd=hidden.fd,
+                        )
                         owner.identity = _identity(observed)
-                    finally:
-                        os.close(hidden)
-                    hidden_identity = owner.identity
-                if owner.identity is not None and final_identity == owner.identity:
-                    owner.present = False
-                    settlement.record(_PublishResult("uncertain", False, fault))
-                elif owner.identity is not None and hidden_identity == owner.identity:
-                    _remove_named_tree(
-                        parent, owner.name, expected_identity=owner.identity,
-                    )
-                    owner.present = False
-                    settlement.record(_PublishResult("unpublished", True, fault))
-                elif final_identity is None and hidden_identity is None:
-                    owner.present = False
-                    settlement.record(_PublishResult("unpublished", True, fault))
-                else:
-                    settlement.record(_PublishResult("uncertain", False, fault))
-        except BaseException:
+                        hidden_identity = owner.identity
+                    if owner.identity is not None and final_identity == owner.identity:
+                        owner.present = False
+                        settlement.record(_PublishResult("uncertain", False, fault))
+                    elif owner.identity is not None and hidden_identity == owner.identity:
+                        _remove_named_tree(
+                            parent.fd, owner.name, expected_identity=owner.identity,
+                        )
+                        owner.present = False
+                        settlement.record(_PublishResult("unpublished", True, fault))
+                    elif final_identity is None and hidden_identity is None:
+                        owner.present = False
+                        settlement.record(_PublishResult("unpublished", True, fault))
+                    else:
+                        settlement.record(_PublishResult("uncertain", False, fault))
+        except BaseException as recovery_fault:
             settlement.record(_PublishResult("uncertain", False, fault))
-        finally:
-            if parent >= 0:
-                try:
-                    os.close(parent)
-                except BaseException:
-                    result = settlement.result
-                    if result is not None:
-                        settlement.record(_PublishResult(
-                            result.disposition, False, result.fault or fault,
-                        ))
+            result = settlement.result
+            if result is not None and recovery_fault is not fault:
+                settlement.record(_PublishResult(
+                    result.disposition,
+                    False,
+                    store._preferred_settlement_fault(
+                        result.fault or fault, [recovery_fault],
+                    ),
+                ))
 
     def _store_receipt(
         self,
@@ -3093,30 +3233,29 @@ def _seed_tree(
     destination_fd: int,
 ) -> None:
     with run._mutation(store.MutationScope.BASE_EVIDENCE):
-        anchor = store._open_run_fd(run.project_dir, run.run_id)
-        try:
-            try:
-                source = privfs.open_strict_dir_at(anchor, policy.components)
-            except privfs.PrivatePathMissing:
-                return
-        finally:
-            os.close(anchor)
-        try:
-            entries = _snapshot_tree_recursive(source, (), normalize=False)
-            snapshot = _Snapshot(
-                NativeOutputEvidence(
-                    0,
-                    NativeOutputKind.TREE,
-                    policy.components,
-                    True,
-                    sum(entry.size for entry in entries if not entry.directory),
-                    _tree_digest(entries),
-                ),
-                entries,
-            )
-            _copy_tree_snapshot(source, destination_fd, snapshot)
-        finally:
-            os.close(source)
+        with _owned_run_anchor(run) as anchor:
+            with _owned_descriptor("native seed source descriptor") as source:
+                try:
+                    store._open_strict_directory_into(
+                        source, anchor, policy.components,
+                    )
+                except privfs.PrivatePathMissing:
+                    return
+                entries = _snapshot_tree_recursive(
+                    source.fd, (), normalize=False,
+                )
+                snapshot = _Snapshot(
+                    NativeOutputEvidence(
+                        0,
+                        NativeOutputKind.TREE,
+                        policy.components,
+                        True,
+                        sum(entry.size for entry in entries if not entry.directory),
+                        _tree_digest(entries),
+                    ),
+                    entries,
+                )
+                _copy_tree_snapshot(source.fd, destination_fd, snapshot)
 
 
 def _write_stage_claim(

@@ -17,6 +17,7 @@ import os
 import stat
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -31,6 +32,36 @@ from .privfs import (
 from .runner_protocol import NormalizedInvocation, StreamRole
 from .runner_supervisor import ExecutionOutcome, ExecutionReason, supervise_execution
 from .state import ContractError
+
+
+@contextmanager
+def _owned_descriptor(what, *, expected_identity=None):
+    """Activate two settlement passes before one descriptor can be allocated."""
+    owner = store._OwnedDescriptor(expected_identity)
+    settlement = store._SettlementOwner(
+        lambda: store._settle_descriptor_owners(
+            (owner,), what,
+        ),
+    )
+    with store._SettlementFence(settlement):
+        with store._SettlementFence(settlement):
+            yield owner
+
+
+@contextmanager
+def _owned_run_anchor(run: store.Run):
+    """Keep one exact run descriptor owned across repository publication."""
+    with _owned_descriptor(
+        "repository runner descriptor",
+        expected_identity=run._run_directory_identity,
+    ) as owner:
+        store._open_run_fd_into(
+            owner,
+            run.project_dir,
+            run.run_id,
+            expected_identity=run._run_directory_identity,
+        )
+        yield owner.fd
 
 
 class ArtifactDisposition(str, Enum):
@@ -329,15 +360,15 @@ def _prepare_stage_batch(
     with run._mutation(store.MutationScope.BASE_EVIDENCE):
         for output in requested:
             run._ensure_artifact_parent(output.components)
-        anchor_fd = store._open_run_fd(run.project_dir, run.run_id)
         try:
-            for output in requested:
-                stages.append(privfs.create_private_stage(
-                    anchor_fd, output.components,
-                ))
-            return privfs.prepare_private_stage_handoff(
-                tuple(stages), invocation.worker.request_id,
-            )
+            with _owned_run_anchor(run) as anchor_fd:
+                for output in requested:
+                    stages.append(privfs.create_private_stage(
+                        anchor_fd, output.components,
+                    ))
+                return privfs.prepare_private_stage_handoff(
+                    tuple(stages), invocation.worker.request_id,
+                )
         except BaseException as primary:
             settled, cancellation = _abort_created_stages(stages)
             try:
@@ -347,8 +378,6 @@ def _prepare_stage_batch(
             if cancellation is not None and isinstance(primary, Exception):
                 raise cancellation from primary
             raise
-        finally:
-            os.close(anchor_fd)
 
 
 def _batch_ownership_settled(batch: PrivateStageHandoffBatch | None) -> bool:
