@@ -69,6 +69,10 @@ def test_control_wait_consumes_a_finite_short_budget():
     assert consumed is True
 
 
+def test_unbounded_supervisor_wait_slice_is_platform_safe():
+    assert 0 < supervisor._CHILD_WAIT_SLICE_SECONDS < (1 << 31)
+
+
 def _read_exact(fd: int, size: int) -> bytes:
     chunks = []
     remaining = size

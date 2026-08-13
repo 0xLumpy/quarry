@@ -85,6 +85,7 @@ _READ_CHUNK_BYTES = 64 * 1024
 _REAP_RESERVE_SECONDS = 0.10
 _REAL_CLOCK_SAMPLE_ATTEMPTS = 2
 _CONTROL_SELECT_SLICE_SECONDS = 60.0
+_CHILD_WAIT_SLICE_SECONDS = 60.0
 _MAX_SAFE_DEADLINE = (1 << 53) - 1
 _MAX_TRAILING_BYTES = (1 << 53) - 1
 
@@ -489,7 +490,9 @@ def _wait_child(
         return
     owner.wait_attempts += 1
     try:
-        returncode = owner.child.wait(timeout=remaining)
+        returncode = owner.child.wait(
+            timeout=min(remaining, _CHILD_WAIT_SLICE_SECONDS),
+        )
     except subprocess.TimeoutExpired:
         return
     except BaseException as exc:
@@ -568,7 +571,9 @@ def _final_reap_bounded(
             return
         owner.wait_attempts += 1
         try:
-            returncode = owner.child.wait(timeout=remaining)
+            returncode = owner.child.wait(
+                timeout=min(remaining, _CHILD_WAIT_SLICE_SECONDS),
+            )
         except subprocess.TimeoutExpired:
             continue
         except BaseException as exc:
