@@ -1162,45 +1162,45 @@ class _ArtifactMarkerRelease:
                     self.marker.expected_identity = self.expected_identity
                 if self.name is None or self.expected_identity is None:
                     self.released = True
-                    return
-                if self.directory.fd < 0:
-                    self.directory.allocate(
-                        lambda: os.open(
-                            self.run._artifact_claim_dir, _DIR_OPEN_FLAGS,
-                        ),
-                    )
-                try:
-                    named = os.stat(
-                        self.name, dir_fd=self.directory.fd,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    os.fsync(self.directory.fd)
-                    self.released = True
                 else:
-                    if (not stat.S_ISREG(named.st_mode)
-                            or named.st_uid != os.geteuid()
-                            or named.st_nlink != 1
-                            or (named.st_dev, named.st_ino)
-                            != self.expected_identity):
-                        raise ContractError("artifact claim marker identity changed")
-                    if self.marker.fd < 0:
-                        self.marker.allocate(
+                    if self.directory.fd < 0:
+                        self.directory.allocate(
                             lambda: os.open(
-                                self.name, _FILE_OPEN_FLAGS,
-                                dir_fd=self.directory.fd,
+                                self.run._artifact_claim_dir, _DIR_OPEN_FLAGS,
                             ),
                         )
-                    observed = os.fstat(self.marker.fd)
-                    if (not stat.S_ISREG(observed.st_mode)
-                            or observed.st_uid != os.geteuid()
-                            or observed.st_nlink != 1
-                            or (observed.st_dev, observed.st_ino)
-                            != self.expected_identity):
-                        raise ContractError("artifact claim marker identity changed")
-                    os.unlink(self.name, dir_fd=self.directory.fd)
-                    os.fsync(self.directory.fd)
-                    self.released = True
+                    try:
+                        named = os.stat(
+                            self.name, dir_fd=self.directory.fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        os.fsync(self.directory.fd)
+                        self.released = True
+                    else:
+                        if (not stat.S_ISREG(named.st_mode)
+                                or named.st_uid != os.geteuid()
+                                or named.st_nlink != 1
+                                or (named.st_dev, named.st_ino)
+                                != self.expected_identity):
+                            raise ContractError("artifact claim marker identity changed")
+                        if self.marker.fd < 0:
+                            self.marker.allocate(
+                                lambda: os.open(
+                                    self.name, _FILE_OPEN_FLAGS,
+                                    dir_fd=self.directory.fd,
+                                ),
+                            )
+                        observed = os.fstat(self.marker.fd)
+                        if (not stat.S_ISREG(observed.st_mode)
+                                or observed.st_uid != os.geteuid()
+                                or observed.st_nlink != 1
+                                or (observed.st_dev, observed.st_ino)
+                                != self.expected_identity):
+                            raise ContractError("artifact claim marker identity changed")
+                        os.unlink(self.name, dir_fd=self.directory.fd)
+                        os.fsync(self.directory.fd)
+                        self.released = True
         except BaseException as exc:
             primary = exc
         faults = _close_owned_descriptors_twice((self.marker, self.directory))
@@ -1603,6 +1603,133 @@ class _ArtifactClaim:
             raise ContractError("artifact claim marker remains live")
 
 
+class _ArtifactAppendTransaction:
+    """Copy-on-write append owner for one canonical base artifact.
+
+    The prior inode is read through a strict descriptor into a private stage.
+    Only a complete, fsynced ``prior + data`` stage can replace the canonical
+    name.  Stable descriptor and marker owners let the caller install both
+    settlement fences before the first allocation or namespace effect.
+    """
+
+    __slots__ = (
+        "run", "components", "data", "marker", "claim", "anchor", "source",
+        "verification", "source_signature", "source_missing",
+    )
+
+    def __init__(self, run, components: tuple[str, ...], data: bytes) -> None:
+        self.run = run
+        self.components = components
+        self.data = data
+        self.marker = _ArtifactMarkerRelease(run)
+        self.claim = _ArtifactClaim(run, components, self.marker)
+        self.anchor = _OwnedDescriptor(run._run_directory_identity)
+        self.source = _OwnedDescriptor()
+        self.verification = _OwnedDescriptor()
+        self.source_signature = None
+        self.source_missing = False
+
+    @property
+    def descriptor_owners(self) -> tuple[_OwnedDescriptor, ...]:
+        return (self.verification, self.source, self.anchor)
+
+    def _open_prior(self) -> None:
+        from . import privfs
+        self.anchor.allocate(
+            lambda: _open_run_fd(self.run.project_dir, self.run.run_id),
+        )
+        try:
+            self.source.allocate(
+                lambda: privfs.open_strict_file_at(
+                    self.anchor.fd, self.components,
+                ),
+            )
+        except privfs.PrivatePathMissing:
+            self.source_missing = True
+        else:
+            self.source_signature = _identity_stat(self.source.fd)
+
+    @staticmethod
+    def _write_all(fd: int, data: bytes | memoryview) -> None:
+        view = memoryview(data)
+        while view:
+            try:
+                written = os.write(fd, view)
+            except InterruptedError:
+                continue
+            if written <= 0:
+                raise OSError("artifact append made no progress")
+            view = view[written:]
+
+    def _copy_prior(self, writer: int) -> None:
+        if self.source_missing:
+            return
+        while True:
+            try:
+                chunk = os.read(self.source.fd, 1024 * 1024)
+            except InterruptedError:
+                continue
+            if not chunk:
+                return
+            self._write_all(writer, chunk)
+
+    def _verify_prior(self) -> None:
+        """Bind the copied bytes to the same complete canonical generation."""
+        from . import privfs
+        if self.source_missing:
+            try:
+                self.verification.allocate(
+                    lambda: privfs.open_strict_file_at(
+                        self.anchor.fd, self.components,
+                    ),
+                )
+            except privfs.PrivatePathMissing:
+                return
+            raise ContractError("artifact append destination appeared during copy")
+        if _identity_stat(self.source.fd) != self.source_signature:
+            raise ContractError("artifact append source changed during copy")
+        self.verification.allocate(
+            lambda: privfs.open_strict_file_at(
+                self.anchor.fd, self.components,
+            ),
+        )
+        if _identity_stat(self.verification.fd) != self.source_signature:
+            raise ContractError("artifact append source name changed during copy")
+
+    def _close_sources(self) -> None:
+        faults = _close_owned_descriptors_twice(self.descriptor_owners)
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            raise preferred
+        if any(owner.fd >= 0 for owner in self.descriptor_owners):
+            raise ContractError("artifact append source descriptors did not settle")
+
+    def execute(self) -> None:
+        self.marker.allocate()
+        self._open_prior()
+        writer = self.claim.open_writer()
+        self._copy_prior(writer)
+        self._write_all(writer, self.data)
+        os.fsync(writer)
+        self._verify_prior()
+        self._close_sources()
+        self.claim.publish()
+
+    def settle(self) -> None:
+        faults = _close_owned_descriptors_twice(self.descriptor_owners)
+        try:
+            self.claim._settle()
+        except BaseException as exc:
+            faults.append(exc)
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            raise preferred
+        if (any(owner.fd >= 0 for owner in self.descriptor_owners)
+                or self.claim._state not in {"published", "fenced"}
+                or not self.marker.released):
+            raise ContractError("artifact append transaction did not settle")
+
+
 _RUN_CONSTRUCTION_AUTHORITY = object()
 _TOOL_RUNS_UNLOADED = object()
 
@@ -1879,30 +2006,17 @@ class Run:
             privfs.private_dir(self.dir.joinpath(*components[:-1]))
 
     def _append_base_artifact(self, components: tuple[str, ...], data: bytes) -> None:
-        """Durably append exact bytes through BASE_EVIDENCE authority."""
+        """Atomically append exact bytes through BASE_EVIDENCE authority."""
         components = _validated_artifact_components(components)
         if type(data) is not bytes:
             raise TypeError("artifact append data must be exact bytes")
-        from . import privfs
         with self._mutation(MutationScope.BASE_EVIDENCE):
             self._ensure_artifact_parent(components)
-            path = self.dir.joinpath(*components)
-            fd = privfs.open_private(path, append=True)
-            try:
-                view = memoryview(data)
-                while view:
-                    written = os.write(fd, view)
-                    if written <= 0:
-                        raise OSError("artifact append made no progress")
-                    view = view[written:]
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            parent_fd = os.open(path.parent, _DIR_OPEN_FLAGS)
-            try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
+            transaction = _ArtifactAppendTransaction(self, components, data)
+            settlement = _SettlementOwner(transaction.settle)
+            with _SettlementFence(settlement):
+                with _SettlementFence(settlement):
+                    transaction.execute()
 
     def _replace_artifact(
         self, scope: MutationScope, components: tuple[str, ...], data: bytes,
