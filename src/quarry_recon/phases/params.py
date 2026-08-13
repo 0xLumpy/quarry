@@ -285,12 +285,13 @@ def _arjun_exec(repository, url: str, rate: int, threads: int, paths: tuple, tim
         text = std_f.read_text(encoding="utf-8", errors="replace") if std_f.exists() else ""
     except OSError:
         text = ""                          # unreadable stdout -> no signals -> unknown (fails closed)
-    rows, malformed = (_arjun_rows(out_f, url) if native_output_current(r, out_f)
-                       else (None, 0))
+    params_current = native_output_current(r, out_f)
+    rows, malformed = (_arjun_rows(out_f, url) if params_current else (None, 0))
     verdict, detail = _arjun_verdict(r.exit_code == 0, _arjun_signals(text), rows,
                                      target=url, malformed=malformed)
     return {"url": url, "result": r, "verdict": verdict, "detail": detail,
-            "rows": rows, "malformed": malformed, "paths": paths}
+            "rows": rows, "malformed": malformed, "paths": paths,
+            "params_current": params_current}
 
 
 def _arjun_zero_lifecycle(ctx, why: str) -> None:
@@ -384,8 +385,16 @@ def _arjun_lane(ctx, prof, corpus) -> None:
         # every channel is bound as evidence before any completion claim, and the digest is checked here:
         # an unhashable channel must not be named by the manifest and then rejected on the next load.
         channels, channels_ok = {}, True
-        for name, p in (("stdout", std_f), ("stderr", err_f), ("params", out_f)):
-            if not p.exists():
+        meta = getattr(r, "meta", None)
+        stderr_current = (not isinstance(meta, dict)
+                          or meta.get("stderr_published", True) is True)
+        current_channels = (
+            ("stdout", std_f, getattr(r, "raw_path", None) == std_f),
+            ("stderr", err_f, stderr_current),
+            ("params", out_f, res.get("params_current") is True),
+        )
+        for name, p, current in current_channels:
+            if not current or not p.exists():
                 continue
             dig = events.file_digest(p)
             if not dig:
@@ -418,7 +427,10 @@ def _arjun_lane(ctx, prof, corpus) -> None:
                 unpublished.append(u)
         # validated rows are ingested even from a non-completable attempt: a crashed target's exported
         # params are real evidence, and partial corruption must not discard trustworthy siblings
-        nfound += _arjun_ingest(ctx, res["rows"], out_f if out_f.exists() else None)
+        nfound += _arjun_ingest(
+            ctx, res["rows"],
+            out_f if res.get("params_current") is True and out_f.exists() else None,
+        )
 
     def _paths(u: str) -> tuple:
         uid = hashlib.sha256(u.encode()).hexdigest()
@@ -563,6 +575,16 @@ def _apply_nuclei_oob(cmd: list[str]) -> list[str]:
     return cmd
 
 
+def _result_output_current(res, path) -> bool:
+    """Receipt currency with compatibility for result-only test doubles."""
+    if res is None:
+        return False
+    meta = getattr(res, "meta", None)
+    if not isinstance(meta, dict):
+        return True
+    return native_output_current(res, path)
+
+
 def _chunk_terminal(sid, chunk_wu, res, cf, *, status) -> None:
     """Emit a chunk's terminal event from a finally so a chunk never stays 'started'. `status` is the
     chunk outcome, which the caller promotes only after all per-chunk bookkeeping succeeded; it stays
@@ -574,7 +596,8 @@ def _chunk_terminal(sid, chunk_wu, res, cf, *, status) -> None:
         reason = res.note or None
     events.tool_finish(sid, work_unit=chunk_wu, status=status, reason=reason,
                        duration=round(res.duration, 2) if res else None,
-                       raw_ref=str(cf) if cf.exists() else None)
+                       raw_ref=(str(cf) if _result_output_current(res, cf) and cf.exists()
+                                else None))
 
 
 def _nuclei_templates_fp() -> str | None:
@@ -1943,6 +1966,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     cost = {"requests": 0, "deduplicated": 0, "dedup_disagreement": set()}
     tiers = {"xss-verified": 0, "xss-candidate": 0, "dom-xss-static": 0}   # if the loop raises before the aggregate
     status = Status.FAILED                                 # exception mid-loop must NOT emit scan-level success
+    current_attempt_outputs: set[int] = set()              # receipt-authenticated files from this invocation
     try:
       for ci, batch in enumerate(batches):
         chunk_wu = events.work_unit(sid, inputs={"cands": batch}, config=_cfg)
@@ -2012,8 +2036,11 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 continue
             # dalfox v3 exit contract: 0 = clean/no-findings, 1 = clean/with-findings, >=2 = error. Exit code
             # and parsed artifact must agree, or the chunk is PARTIAL/retryable; findings are ingested below.
+            cf_current = _result_output_current(res, cf)
+            if cf_current:
+                current_attempt_outputs.add(ci)
             n_findings, art = (scan_dalfox_jsonl(cf)
-                               if native_output_current(res, cf)
+                               if cf_current
                                else (0, DalfoxArtifact(readable=False)))
             rc = res.exit_code
                         # execution completion decides resume, coverage is reported separately: membership is
@@ -2039,7 +2066,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 membership.pop(str(ci), None)
             clean = (art.execution_done and not _acct["retryable"]
                      and ((rc == 0 and not n_findings) or (rc == 1 and n_findings > 0)))
-            cf_sha = _sha256_file(cf) if cf.exists() else None
+            cf_sha = _sha256_file(cf) if cf_current and cf.exists() else None
             # what the scan cost and what it collapsed, accumulated and reported on the lane's result, so the
             # residual duplicate rate over our own canonicalizer is a measured number, not an assumption
             if type(art.total_requests) is int:
@@ -2092,7 +2119,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                     remainder[str(ci)] = owed_next
                 else:
                     remainder.pop(str(ci), None)
-                if cf.exists() and cf.stat().st_size > 0:    # a degraded chunk WITH output keeps its evidence
+                if cf_current and cf.exists() and cf.stat().st_size > 0:
+                    # a degraded chunk WITH current output keeps its evidence; a preserved prior is invisible
                     _add_evidence(str(ci), rel, cf_sha)
                 _save()
             chunk_status = (Status.SUCCESS if clean and n_findings
@@ -2147,7 +2175,9 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         entries = list(evidence_map.get(str(ci)) or [])       # each already digest-validated on load
         # fall back to THIS run's just-written attempt file (trusted — we wrote it) for a chunk run but not
         # recorded
-        paths = [state_f.parent / e["rel"] for e in entries] or [attempt_dir / f"findings_{ci}.jsonl"]
+        paths = [state_f.parent / e["rel"] for e in entries]
+        if not paths and ci in current_attempt_outputs:
+            paths = [attempt_dir / f"findings_{ci}.jsonl"]
         for p in paths:
             if not (p.exists() and p.stat().st_size > 0):
                 continue

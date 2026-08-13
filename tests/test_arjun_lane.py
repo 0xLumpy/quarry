@@ -7,6 +7,7 @@ Pure/offline — arjun is faked, no subprocess, no network.
 """
 import hashlib
 import json
+import pathlib
 import time
 
 import pytest
@@ -246,6 +247,63 @@ def test_each_verdict_is_recorded_with_an_honest_status(drive):
     assert by["arjun[empty]"] == Status.EMPTY
     assert by["arjun[skipped]"] == Status.PARTIAL
     assert by["arjun[failed]"] == Status.FAILED       # a nonzero exit is never merely PARTIAL
+
+
+def test_noncurrent_params_prior_is_not_hashed_manifested_or_attributed(
+    tmp_path, monkeypatch,
+):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ctx = _Ctx(run_dir)
+    monkeypatch.setattr(params.netguard, "guard_urls", lambda _ctx, urls, phase=None: list(urls))
+    monkeypatch.setattr(params, "have", lambda _binary: True)
+    monkeypatch.setattr(params, "_arjun_engine", lambda: "2.2.7")
+    monkeypatch.setattr(params.settings, "workers", lambda _tool, default: default)
+    real_concurrency = params.settings.concurrency
+    monkeypatch.setattr(
+        params.settings, "concurrency",
+        lambda key, default=None: 1 if key == "ARJUN_TARGETS" else real_concurrency(key, default),
+    )
+    monkeypatch.setattr(budget, "budget_seconds", lambda _key: 0)
+    digested = []
+    real_digest = events.file_digest
+
+    def fake_exec(tool, cmd, **kwargs):
+        stdout = _declared_path(kwargs, "stdout")
+        stderr = _declared_path(kwargs, "stderr")
+        out_f = pathlib.Path(cmd[cmd.index("-oT") + 1])
+        out_f.parent.mkdir(parents=True, exist_ok=True)
+        out_f.write_text(f"{NONE}?stale=1\n")              # preserved final from an earlier attempt
+        stdout.write_text("\n".join([_SCAN.format(u=NONE), _NONE]))
+        stderr.write_text("")
+        return RunResult(
+            tool, cmd, Status.EMPTY, 0, 0.1, stdout, 0,
+            meta={
+                "started": True,
+                "stderr_published": True,
+                "native_outputs": {"current_paths": []},
+                "native_output_ownership_settled": True,
+            },
+        )
+
+    def digest(path):
+        digested.append(pathlib.Path(path))
+        return real_digest(path)
+
+    monkeypatch.setattr(params, "exec_tool", fake_exec)
+    monkeypatch.setattr(events, "file_digest", digest)
+    events.reset()
+    try:
+        events.configure(run_dir)
+        params._arjun_lane(ctx, ctx.profile, [NONE])
+    finally:
+        events.reset()
+
+    stale = next((run_dir / "raw" / "params" / "arjun").glob("**/*.txt"))
+    assert stale.is_file() and stale not in digested
+    manifest = json.loads(next((run_dir / "raw" / "params" / "arjun").glob("**/*.attempt.json")).read_text())
+    assert "params" not in manifest["channels"]
+    assert ctx.run.added == []
 
 
 def test_findings_reach_the_store(drive):

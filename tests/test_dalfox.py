@@ -209,6 +209,51 @@ class TestVerdict:
 
 
 class TestRetryEvidence:
+    def test_noncurrent_preserved_prior_is_never_parsed_hashed_or_reported(
+        self, monkeypatch, tmp_path,
+    ):
+        c = _fresh(monkeypatch, tmp_path)
+        observed = {"cf": None, "parsed": [], "hashed": []}
+        real_scan = params.scan_dalfox_jsonl
+        real_hash = params._sha256_file
+
+        def noncurrent_result(_tool, cmd, **_kwargs):
+            cf = pathlib.Path(cmd[cmd.index("-o") + 1])
+            cf.parent.mkdir(parents=True, exist_ok=True)
+            cf.write_text(META1 + R_ROW)              # preserved PRIOR at the canonical final
+            observed["cf"] = cf
+            return RunResult(
+                "dalfox", cmd, Status.FAILED, 2, 0.1, None, 0,
+                meta={
+                    "started": True,
+                    "native_outputs": {"current_paths": []},
+                    "native_output_ownership_settled": True,
+                },
+            )
+
+        def scan(path, *args, **kwargs):
+            observed["parsed"].append(pathlib.Path(path))
+            return real_scan(path, *args, **kwargs)
+
+        def digest(path):
+            observed["hashed"].append(pathlib.Path(path))
+            return real_hash(path)
+
+        monkeypatch.setattr(params, "exec_tool", noncurrent_result)
+        monkeypatch.setattr(params, "scan_dalfox_jsonl", scan)
+        monkeypatch.setattr(params, "_sha256_file", digest)
+
+        result = params._dalfox_xss_fast(c, ["http://h/p?q="], _Prof())
+
+        cf = observed["cf"]
+        assert cf is not None and cf.is_file(), "the preserved prior must remain on disk"
+        assert cf not in observed["parsed"] and cf not in observed["hashed"]
+        assert result.status is Status.PARTIAL and c.run.added == []
+        state = _state(c)
+        assert state.get("chunks") == {} and state.get("evidence") == {}
+        rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+        assert all(row.get("raw_ref") != str(cf) for row in rows)
+
     def test_retry_preserves_prior_attempt_artifact(self, monkeypatch, tmp_path):
         # review-r9#1: a degraded chunk's raw evidence lives in an IMMUTABLE attempt dir; a retry writes a new
         # attempt dir and never overwrites it (an already-ingested finding's raw_ref stays valid)
