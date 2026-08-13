@@ -1303,20 +1303,27 @@ def _run_with_repository(
 ) -> RunResult:
     """Normalize once, then delegate all execution publication authority."""
     from . import runner_protocol, runner_repository, store
+    from .osint import OsintSession
 
     safe_cmd, argv_error = _preflight_argv(cmd)
     if argv_error is not None:
         return _preflight_failure(tool, safe_cmd, argv_error)
-    if type(repository) is not store.Run:
-        return _preflight_failure(tool, safe_cmd, "repository must be an opened Run authority")
+    if type(repository) not in (store.Run, OsintSession):
+        return _preflight_failure(tool, safe_cmd, "repository authority type is invalid")
     if (type(stdout) is not runner_repository.RepositoryOutput
             or type(stderr) is not runner_repository.RepositoryOutput):
         return _preflight_failure(
             tool, safe_cmd, "stdout and stderr require explicit repository policies",
         )
 
-    raw_path = runner_repository._expected_output_path(repository, stdout)
-    stderr_path = runner_repository._expected_output_path(repository, stderr)
+    if type(repository) is store.Run:
+        raw_path = runner_repository._expected_output_path(repository, stdout)
+        stderr_path = runner_repository._expected_output_path(repository, stderr)
+    else:
+        raw_path = (None if stdout.disposition.value == "discard" else
+                    os.path.abspath(str(repository.dir.joinpath(*stdout.components))))
+        stderr_path = (None if stderr.disposition.value == "discard" else
+                       os.path.abspath(str(repository.dir.joinpath(*stderr.components))))
     try:
         request_id = runner_protocol.new_request_id(os.urandom(16))
         invocation = runner_protocol.normalize_invocation(
@@ -1348,12 +1355,13 @@ def _run_with_repository(
     deadline = ((1 << 53) - 1 if invocation.worker.timeout == 0
                 else started_at + float(invocation.worker.timeout) + 5.0)
     try:
-        outcome = runner_repository.supervise_repository_execution(
-            repository,
-            invocation,
-            stdout=stdout,
-            stderr=stderr,
-            deadline=deadline,
+        supervisor = (
+            runner_repository.supervise_repository_execution
+            if type(repository) is store.Run
+            else runner_repository.supervise_osint_execution
+        )
+        outcome = supervisor(
+            repository, invocation, stdout=stdout, stderr=stderr, deadline=deadline,
         )
     except BaseException as exc:
         if not isinstance(exc, Exception):

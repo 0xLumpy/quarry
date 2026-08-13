@@ -11,7 +11,10 @@ import json
 import os
 import re
 import contextlib
+import fcntl
 import subprocess
+import stat
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -39,6 +42,19 @@ RDAP_LOOKUPS = 20
 
 # Full email (no inner capture group) — findall returns the whole address.
 _EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", re.IGNORECASE)
+
+_OSINT_LOCKS_GUARD = threading.Lock()
+_OSINT_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+_OSINT_LOCK_LOCAL = threading.local()
+
+
+def _shared_osint_lock(key: tuple[str, str]) -> threading.RLock:
+    with _OSINT_LOCKS_GUARD:
+        lock = _OSINT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _OSINT_LOCKS[key] = lock
+        return lock
 
 
 def _email_domain(email: str) -> str:
@@ -91,9 +107,13 @@ class OsintSession:
     """OSINT workspace: candidates + intel + raw evidence under <project>/osint/<ts>/."""
 
     def __init__(self, project_dir: Path, target: str, ts: str | None = None):
+        from .repository_identity import validate_artifact_component
+
         self.project_dir = Path(project_dir)
         self.target = target
-        self.ts = ts or time.strftime("%Y%m%d-%H%M%S")
+        self.ts = validate_artifact_component(
+            ts or time.strftime("%Y%m%d-%H%M%S"), "OSINT session id",
+        )
         self.dir = self.project_dir / "osint" / self.ts
         self.raw = self.dir / "raw"
         privfs.private_dir(self.raw)                         # osint/ session tree is 0700
@@ -103,14 +123,147 @@ class OsintSession:
         self._tool_runs: list[dict] = []
         self._lane_failures: list[dict] = []    # native lanes that only echo (azmap/whois/dmarc/rdap)
         self.notes: list[str] = []
+        self._execution_lock = threading.RLock()
+        self._execution_finalized = False
+        observed = os.stat(self.dir, follow_symlinks=False)
+        self._execution_identity = (observed.st_dev, observed.st_ino)
+        raw_observed = os.stat(self.raw, follow_symlinks=False)
+        self._execution_raw_identity = (raw_observed.st_dev, raw_observed.st_ino)
+
+    @property
+    def _execution_authority_key(self) -> tuple[str, str]:
+        return str(self.project_dir.resolve()), self.ts
+
+    @property
+    def _execution_lock_path(self) -> Path:
+        return self.project_dir / "osint" / ".locks" / f"{self.ts}.lock"
+
+    @property
+    def _execution_sealing_path(self) -> Path:
+        return self.dir / ".execution-sealing"
+
+    @property
+    def _execution_terminal_path(self) -> Path:
+        return self.dir / ".execution-finalized"
+
+    def _materialize_execution_lock_file(self) -> int:
+        lock_dir = privfs.private_dir(self._execution_lock_path.parent)
+        directory_fd = os.open(
+            lock_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            fd = os.open(
+                self._execution_lock_path.name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                privfs.FILE_MODE,
+                dir_fd=directory_fd,
+            )
+        finally:
+            os.close(directory_fd)
+        try:
+            observed = os.fstat(fd)
+            if (not stat.S_ISREG(observed.st_mode)
+                    or observed.st_uid != os.geteuid()
+                    or observed.st_nlink != 1):
+                raise RuntimeError("OSINT execution lock identity is unsafe")
+            if stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE:
+                os.fchmod(fd, privfs.FILE_MODE)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _require_execution_identity(self) -> None:
+        try:
+            observed = os.stat(self.dir, follow_symlinks=False)
+            raw_observed = os.stat(self.raw, follow_symlinks=False)
+        except OSError:
+            raise RuntimeError("OSINT session identity is unavailable") from None
+        if (not stat.S_ISDIR(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or stat.S_IMODE(observed.st_mode) != privfs.DIR_MODE
+                or (observed.st_dev, observed.st_ino) != self._execution_identity
+                or not stat.S_ISDIR(raw_observed.st_mode)
+                or raw_observed.st_uid != os.geteuid()
+                or stat.S_IMODE(raw_observed.st_mode) != privfs.DIR_MODE
+                or (raw_observed.st_dev, raw_observed.st_ino)
+                != self._execution_raw_identity):
+            raise RuntimeError("OSINT session identity changed")
+
+    def _require_execution_open(self) -> None:
+        self._require_execution_identity()
+        if (self._execution_finalized
+                or self._execution_sealing_path.exists()
+                or self._execution_terminal_path.exists()
+                or (self.dir / "manifest.json").exists()):
+            self._execution_finalized = True
+            raise RuntimeError("OSINT session is finalized")
+
+    @contextlib.contextmanager
+    def _execution_mutation(self, *, require_open: bool = True):
+        """Serialize one session mutation through a shared RLock and one flock."""
+        key = self._execution_authority_key
+        lock = _shared_osint_lock(key)
+        with lock:
+            held = getattr(_OSINT_LOCK_LOCAL, "held", None)
+            if held is None:
+                held = {}
+                _OSINT_LOCK_LOCAL.held = held
+            depth, fd = held.get(key, (0, -1))
+            if depth == 0:
+                fd = self._materialize_execution_lock_file()
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except BaseException:
+                    os.close(fd)
+                    raise
+            held[key] = (depth + 1, fd)
+            try:
+                if require_open:
+                    self._require_execution_open()
+                else:
+                    self._require_execution_identity()
+                yield
+            finally:
+                current_depth, current_fd = held[key]
+                if current_depth == 1:
+                    try:
+                        fcntl.flock(current_fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(current_fd)
+                        del held[key]
+                else:
+                    held[key] = (current_depth - 1, current_fd)
 
     def raw_path(self, source: str, name: str) -> Path:
         from .repository_identity import validate_artifact_component
         source = validate_artifact_component(source, "OSINT source")
         name = validate_artifact_component(name, "OSINT raw filename")
-        p = self.raw / source
-        privfs.private_dir(p)                                # 0700 raw evidence dir
-        return p / name
+        with self._execution_mutation():
+            p = self.raw / source
+            privfs.private_dir(p)                            # 0700 raw evidence dir
+            return p / name
+
+    def output(self, path: Path | None = None):
+        """Declare publish or discard under this exact unsealed session."""
+        from .runner_repository import RepositoryOutput
+        if path is None:
+            with self._execution_mutation():
+                return RepositoryOutput.discard()
+        candidate = Path(path)
+        try:
+            components = candidate.relative_to(self.dir).parts
+        except ValueError:
+            raise ValueError("OSINT output belongs to a different session") from None
+        if not components or components[0] != "raw":
+            raise ValueError("OSINT tool output must be session raw evidence")
+        from .repository_identity import validate_artifact_component
+        validated = tuple(
+            validate_artifact_component(component, "OSINT output component")
+            for component in components
+        )
+        with self._execution_mutation():
+            return RepositoryOutput.publish(*validated)
 
     def record(self, result) -> None:
         # redact secret values from the recorded command/note (same choke point as store.Run.record)
@@ -124,7 +277,6 @@ class OsintSession:
             # redacted too: a machinery reason can carry an exception string carrying a key
             entry["outcome"] = secrets.redact_deep(dict(meta))
         self._tool_runs.append(entry)
-
     def candidate(self, value: str, ctype: str, source: str, scope_hint: str, reason: str,
                   raw_ref: str | None = None, manual_followup: str | None = None) -> None:
         value = (value or "").strip().rstrip(".")
@@ -195,6 +347,20 @@ class OsintSession:
                 "operator_limits": operator_limits, "gaps": gaps}
 
     def finalize(self, profile) -> Path:
+        """Seal the session only after every durable execution claim settled."""
+        with self._execution_mutation():
+            claim_dir = self.dir / ".execution-claims"
+            if claim_dir.exists() and any(claim_dir.iterdir()):
+                raise RuntimeError("OSINT session has a live execution claim")
+            # Durable before the first final artifact: a crash cannot reopen a
+            # partly finalized session as writable evidence.
+            privfs.write_private(self._execution_sealing_path, "sealing\n")
+            result = self._finalize(profile)
+            privfs.write_private(self._execution_terminal_path, "finalized\n")
+            self._execution_finalized = True
+            return result
+
+    def _finalize(self, profile) -> Path:
         cands = self.candidates()
         # OSINT evidence is private (0600): candidate/intel values can name a target's private assets
         privfs.write_private(self.dir / "candidates.jsonl",
@@ -785,8 +951,11 @@ def _asn_expand(s: OsintSession, profile, echo, timeout: int) -> None:
     if not profile.asn or not have("asnmap"):
         return
     raw = s.raw_path("asnmap", "ranges.txt")
-    r = exec_tool("asnmap", ["asnmap", "-silent"], stdin_data="\n".join(profile.asn),
-                  raw_path=raw, timeout=min(timeout, 120))
+    r = exec_tool(
+        "asnmap", ["asnmap", "-silent"],
+        repository=s, stdout=s.output(raw), stderr=s.output(),
+        stdin_data="\n".join(profile.asn), timeout=min(timeout, 120),
+    )
     s.record(r)
     if r.raw_path:
         for line in r.raw_path.read_text().splitlines():
@@ -827,8 +996,10 @@ def _porch_pirate(s: OsintSession, apex: str, echo, timeout: int) -> None:
     variables. Both are intel, never scope; a global with an empty value is still recorded.
     """
     pp = s.raw_path("porch-pirate", f"{apex}.txt")
-    r = exec_tool("porch-pirate", ["porch-pirate", "-s", apex, "--urls"],
-                  raw_path=pp, timeout=timeout)
+    r = exec_tool(
+        "porch-pirate", ["porch-pirate", "-s", apex, "--urls"],
+        repository=s, stdout=s.output(pp), stderr=s.output(), timeout=timeout,
+    )
     s.record(r)
     n_urls = 0
     if r.raw_path:
@@ -837,8 +1008,10 @@ def _porch_pirate(s: OsintSession, apex: str, echo, timeout: int) -> None:
             n_urls += 1
 
     gl = s.raw_path("porch-pirate", f"{apex}.globals.txt")
-    rg = exec_tool("porch-pirate", ["porch-pirate", "-s", apex, "--globals"],
-                   raw_path=gl, timeout=timeout)
+    rg = exec_tool(
+        "porch-pirate", ["porch-pirate", "-s", apex, "--globals"],
+        repository=s, stdout=s.output(gl), stderr=s.output(), timeout=timeout,
+    )
     s.record(rg)
     n_globals = 0
     if rg.raw_path:

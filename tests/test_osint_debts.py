@@ -12,6 +12,7 @@ import pathlib
 import pytest
 
 from quarry_recon import notify, osint, policy, settings
+from quarry_recon.runner_repository import ArtifactDisposition, RepositoryOutput
 
 
 class _Sess:
@@ -25,9 +26,14 @@ class _Sess:
         self.failures: list = []
 
     def raw_path(self, source, name):
-        p = self.dir / source
+        p = self.dir / "raw" / source
         p.mkdir(parents=True, exist_ok=True)
         return p / name
+
+    def output(self, path=None):
+        if path is None:
+            return RepositoryOutput.discard()
+        return RepositoryOutput.publish(*path.relative_to(self.dir).parts)
 
     def candidate(self, value, ctype, source, hint, reason, raw_ref=None, manual_followup=None):
         self.cands.append({"value": value, "type": ctype, "source": source, "reason": reason,
@@ -182,6 +188,8 @@ class TestPorchPirateMinesWhatItDocuments:
 
         def fake_exec(tool, cmd, raw_path=None, timeout=None, **kw):
             calls.append(cmd)
+            if raw_path is None and kw["stdout"].disposition is ArtifactDisposition.PUBLISH:
+                raw_path = kw["repository"].dir.joinpath(*kw["stdout"].components)
             raw_path.write_text(self.SAMPLE if "--globals" in cmd else "https://api.acme.com/v1/x\n")
             return type("R", (), {"tool": tool, "raw_path": raw_path, "status": "success"})()
 
@@ -202,6 +210,8 @@ class TestPorchPirateMinesWhatItDocuments:
                "- Author: beta ltd\n- Key: apiKey\n- Value: bbb\n")
 
         def fake_exec(tool, cmd, raw_path=None, timeout=None, **kw):
+            if raw_path is None and kw["stdout"].disposition is ArtifactDisposition.PUBLISH:
+                raw_path = kw["repository"].dir.joinpath(*kw["stdout"].components)
             raw_path.write_text(two if "--globals" in cmd else "")
             return type("R", (), {"tool": tool, "raw_path": raw_path, "status": "success"})()
 
@@ -539,7 +549,7 @@ class TestASRankDiscoversASNs:
         follow = {"organization": {"members": {"numberAsns": 2, "asns": {"edges": [
             {"node": {"asn": "1", "asnName": "a"}}, {"node": {"asn": "2", "asnName": "b"}}]}}}}
         s, _ = self._run(tmp_path, monkeypatch, [first, follow])
-        files = sorted(pathlib.Path(tmp_path / "asrank").glob("*.json"))
+        files = sorted(pathlib.Path(tmp_path / "raw" / "asrank").glob("*.json"))
         assert len(files) == 2, [f.name for f in files]
         assert any("orgs-" in f.name for f in files) and any("members-" in f.name for f in files)
         org_ref = [c for c in s.cands if c["type"] == "org"][0]["raw_ref"]

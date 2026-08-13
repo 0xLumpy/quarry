@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import os
+import stat
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -437,36 +438,25 @@ def _validate_deadline_inputs(deadline, clock) -> None:
     _clock_now(clock)
 
 
-def supervise_repository_execution(
-    run,
+def _supervise_owned_execution(
     invocation,
     *,
-    stdout,
-    stderr,
+    policies,
     deadline,
-    clock=time.monotonic,
-    popen_factory=subprocess.Popen,
+    clock,
+    popen_factory,
+    acquire_claim,
+    prepare_batch,
+    publish_batch,
 ) -> RepositoryExecutionOutcome:
-    """Supervise one invocation and terminally publish or fence its outputs.
-
-    Validation is side-effect free.  Once accepted, a durable run claim spans
-    private stage creation, the killable worker transaction, authenticated parent
-    settlement and the repository-locked publication decision.  Only an exact
-    ``ExecutionReason.COMPLETE`` outcome may publish.  Every other outcome fences
-    all settled bytes and preserves prior authoritative names.
-    """
-    if not callable(clock) or not callable(popen_factory):
-        raise TypeError("execution dependencies must be callable")
-    policies = _validate_output_policies(run, invocation, stdout, stderr)
-    _validate_deadline_inputs(deadline, clock)
+    """One owner-neutral execution, settlement and publish-or-fence transaction."""
     requested_roles, discarded_roles = _role_partition(policies)
-
-    claim = _DurableRunClaim.acquire(run)
+    claim = acquire_claim()
     release_claim = False
     batch = None
     try:
         try:
-            batch = _prepare_stage_batch(run, invocation, policies)
+            batch = prepare_batch()
         except BaseException as preparation_error:
             release_claim = (
                 getattr(
@@ -557,10 +547,7 @@ def supervise_repository_execution(
             )
 
         try:
-            with run._mutation(store.MutationScope.BASE_EVIDENCE):
-                published = privfs.publish_private_stage_handoff(
-                    batch, execution.artifact_proofs,
-                )
+            published = publish_batch(batch, execution.artifact_proofs)
         except PrivateStagePublicationPartial as partial:
             cleanup_fault = _fence_batch(batch)
             ownership_settled = _ownership_settled(execution, batch)
@@ -610,6 +597,11 @@ def supervise_repository_execution(
                 ownership_settled=ownership_settled,
                 fault_operation="fence" if fence_fault is not None else "publish",
             )
+        except BaseException:
+            fence_fault = _fence_batch(batch)
+            release_claim = _ownership_settled(execution, batch)
+            _raise_cancellation(fence_fault)
+            raise
 
         ownership_settled = _ownership_settled(execution, batch)
         release_claim = ownership_settled
@@ -633,3 +625,245 @@ def supervise_repository_execution(
     finally:
         if release_claim:
             claim.release()
+
+
+def supervise_repository_execution(
+    run,
+    invocation,
+    *,
+    stdout,
+    stderr,
+    deadline,
+    clock=time.monotonic,
+    popen_factory=subprocess.Popen,
+) -> RepositoryExecutionOutcome:
+    """Supervise one invocation and terminally publish or fence its outputs.
+
+    Validation is side-effect free.  Once accepted, a durable run claim spans
+    private stage creation, the killable worker transaction, authenticated parent
+    settlement and the repository-locked publication decision.  Only an exact
+    ``ExecutionReason.COMPLETE`` outcome may publish.  Every other outcome fences
+    all settled bytes and preserves prior authoritative names.
+    """
+    if not callable(clock) or not callable(popen_factory):
+        raise TypeError("execution dependencies must be callable")
+    policies = _validate_output_policies(run, invocation, stdout, stderr)
+    _validate_deadline_inputs(deadline, clock)
+
+    def publish_batch(batch, proofs):
+        with run._mutation(store.MutationScope.BASE_EVIDENCE):
+            return privfs.publish_private_stage_handoff(batch, proofs)
+
+    return _supervise_owned_execution(
+        invocation,
+        policies=policies,
+        deadline=deadline,
+        clock=clock,
+        popen_factory=popen_factory,
+        acquire_claim=lambda: _DurableRunClaim.acquire(run),
+        prepare_batch=lambda: _prepare_stage_batch(run, invocation, policies),
+        publish_batch=publish_batch,
+    )
+
+
+@dataclass(slots=True, repr=False)
+class _DurableOsintClaim:
+    """A crash-conservative execution marker for one unsealed OSINT session."""
+
+    session: object = field(repr=False)
+    marker: str = field(repr=False)
+    identity: tuple[int, int] = field(repr=False)
+    released: bool = False
+
+    @classmethod
+    def acquire(cls, session, request_id: str) -> "_DurableOsintClaim":
+        claim_dir = session.dir / ".execution-claims"
+        with session._execution_mutation():
+            privfs.private_dir(claim_dir)
+            directory_fd = os.open(
+                claim_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            fd = -1
+            try:
+                fd = os.open(
+                    request_id,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    privfs.FILE_MODE,
+                    dir_fd=directory_fd,
+                )
+                os.fchmod(fd, privfs.FILE_MODE)
+                view = memoryview(b"active\n")
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("OSINT claim marker write made no progress")
+                    view = view[written:]
+                os.fsync(fd)
+                observed = os.fstat(fd)
+                named = os.stat(
+                    request_id, dir_fd=directory_fd, follow_symlinks=False,
+                )
+                if (not stat.S_ISREG(observed.st_mode)
+                        or not stat.S_ISREG(named.st_mode)
+                        or (observed.st_dev, observed.st_ino)
+                        != (named.st_dev, named.st_ino)
+                        or observed.st_uid != os.geteuid()
+                        or observed.st_nlink != 1
+                        or observed.st_mode & 0o777 != privfs.FILE_MODE):
+                    raise ContractError("OSINT claim marker identity is unsafe")
+                os.fsync(directory_fd)
+            except BaseException:
+                if fd >= 0:
+                    try:
+                        os.unlink(request_id, dir_fd=directory_fd)
+                        os.fsync(directory_fd)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                os.close(directory_fd)
+        return cls(session, request_id, (observed.st_dev, observed.st_ino))
+
+    def release(self) -> None:
+        if self.released:
+            return
+        claim_dir = self.session.dir / ".execution-claims"
+        with self.session._execution_mutation():
+            directory_fd = os.open(
+                claim_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            marker_fd = -1
+            try:
+                marker_fd = os.open(
+                    self.marker,
+                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_fd,
+                )
+                observed = os.fstat(marker_fd)
+                named = os.stat(
+                    self.marker, dir_fd=directory_fd, follow_symlinks=False,
+                )
+                if (not stat.S_ISREG(observed.st_mode)
+                        or not stat.S_ISREG(named.st_mode)
+                        or (observed.st_dev, observed.st_ino) != self.identity
+                        or (named.st_dev, named.st_ino) != self.identity
+                        or observed.st_uid != os.geteuid()
+                        or observed.st_nlink != 1):
+                    raise ContractError("OSINT claim marker identity changed")
+                os.unlink(self.marker, dir_fd=directory_fd)
+                os.fsync(directory_fd)
+            finally:
+                if marker_fd >= 0:
+                    os.close(marker_fd)
+                os.close(directory_fd)
+            try:
+                os.rmdir(claim_dir)
+            except OSError:
+                pass
+            session_fd = os.open(
+                self.session.dir,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                os.fsync(session_fd)
+            finally:
+                os.close(session_fd)
+            self.released = True
+
+
+def _validate_osint_output_policies(session, invocation, stdout, stderr):
+    from .osint import OsintSession
+
+    if type(session) is not OsintSession:
+        raise TypeError("session must be an exact OSINT repository authority")
+    if type(invocation) is not NormalizedInvocation:
+        raise TypeError("invocation must be normalized before OSINT execution")
+    if type(stdout) is not RepositoryOutput or type(stderr) is not RepositoryOutput:
+        raise TypeError("stdout and stderr require explicit repository policies")
+    policies = ((StreamRole.STDOUT, stdout), (StreamRole.STDERR, stderr))
+    with session._execution_mutation():
+        for role, policy in policies:
+            observed = invocation.raw_path if role is StreamRole.STDOUT else invocation.stderr_path
+            expected = (
+                None if policy.disposition is ArtifactDisposition.DISCARD
+                else os.path.abspath(str(session.dir.joinpath(*policy.components)))
+            )
+            requested = policy.disposition is ArtifactDisposition.PUBLISH
+            if (requested != (invocation.worker.claim_for(role) is not None)
+                    or observed != expected
+                    or (requested and policy.components[:1] != ("raw",))):
+                raise ContractError(f"{role.value} policy does not match OSINT session")
+    return policies
+
+
+def _prepare_osint_stage_batch(session, invocation, policies):
+    requested = tuple(
+        policy for _role, policy in policies
+        if policy.disposition is ArtifactDisposition.PUBLISH
+    )
+    if not requested:
+        return None
+    stages = []
+    try:
+        with session._execution_mutation():
+            for output in requested:
+                privfs.private_dir(session.dir.joinpath(*output.components[:-1]))
+            anchor_fd = privfs._walk_dirfd(session.dir)
+            try:
+                for output in requested:
+                    stages.append(privfs.create_private_stage(anchor_fd, output.components))
+                return privfs.prepare_private_stage_handoff(
+                    tuple(stages), invocation.worker.request_id,
+                )
+            finally:
+                os.close(anchor_fd)
+    except BaseException as primary:
+        settled, cancellation = _abort_created_stages(stages)
+        try:
+            primary.repository_ownership_settled = settled
+        except BaseException:
+            pass
+        if cancellation is not None and isinstance(primary, Exception):
+            raise cancellation from primary
+        raise
+
+
+def supervise_osint_execution(
+    session,
+    invocation,
+    *,
+    stdout,
+    stderr,
+    deadline,
+    clock=time.monotonic,
+    popen_factory=subprocess.Popen,
+) -> RepositoryExecutionOutcome:
+    """Execute one OSINT tool under its exact session publication authority."""
+    if not callable(clock) or not callable(popen_factory):
+        raise TypeError("execution dependencies must be callable")
+    policies = _validate_osint_output_policies(
+        session, invocation, stdout, stderr,
+    )
+    _validate_deadline_inputs(deadline, clock)
+
+    def publish_batch(batch, proofs):
+        with session._execution_mutation():
+            return privfs.publish_private_stage_handoff(batch, proofs)
+
+    return _supervise_owned_execution(
+        invocation,
+        policies=policies,
+        deadline=deadline,
+        clock=clock,
+        popen_factory=popen_factory,
+        acquire_claim=lambda: _DurableOsintClaim.acquire(
+            session, invocation.worker.request_id,
+        ),
+        prepare_batch=lambda: _prepare_osint_stage_batch(
+            session, invocation, policies,
+        ),
+        publish_batch=publish_batch,
+    )
