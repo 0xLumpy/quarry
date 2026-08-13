@@ -19,6 +19,7 @@ pytestmark = pytest.mark.offline
 
 @pytest.fixture
 def run(tmp_path):
+    events.reset()
     r = Run.create(tmp_path, "t")
     yield r
     events.reset()
@@ -59,11 +60,19 @@ def test_a_fault_committed_after_the_verdict_is_refused(run):
         run.commit_gap(state.Gap(source_id="late", kind="unknown"))
 
 
-def test_an_unsealed_run_reseals_with_the_late_fault(run):
-    assert run._run_summary()["verdict"] == "complete"
-    run.unseal_verdict()
-    run.commit_fault(state.Fault("publication", where="hotlist", detail="volume read-only"))
-    assert run._run_summary()["verdict"] == "complete_with_gaps"
+def test_a_derived_reopen_reconciles_the_late_publication_fault(run):
+    run.write_state("running")
+    run.begin_finalization()
+    run.write_manifest(profile_summary={}, phases_run=["horizontal"])
+    run.write_state("finished")
+
+    reopened = Run.open(run.project_dir, run.target, run.run_id)
+    reopened.reopen_finalization(detail="fixture report")
+    reopened.mark_stage("hotlist", "failed", detail="volume read-only")
+    summary = reopened.reconcile_finalization()
+
+    assert summary["verdict"] == "complete_with_gaps"
+    assert [fault["where"] for fault in summary["faults"]] == ["hotlist"]
 
 
 def test_only_a_typed_record_may_be_committed(run):
@@ -164,19 +173,28 @@ def test_faults_are_typed_records_on_the_way_out(run):
 
 
 # ── fault injection never produces a clean verdict ───────────────────────────────────────────────
-@pytest.mark.parametrize("inject", [
-    lambda r: r.commit_fault(state.Fault("machinery", where="events.jsonl")),
-    lambda r: r.commit_fault(state.Fault("publication", where="digest")),
-    lambda r: r.commit_fault(state.Fault("phase_exception", where="run")),
-    lambda r: r.commit_gap(state.Gap(source_id="probe.checkpoint", kind="unknown")),
-    lambda r: r.commit_gap(state.Gap(source_id="crawl.katana", kind="cap", omitted=7)),
-    lambda r: r.record("probe", RunResult("httpx", ["x"], Status.FAILED, 1, 1.0, None, 0, note="broke")),
-    lambda r: r.record("params", skipped("oob_probe", "interactsh-client not installed"),
-                       depends_on="interactsh-client"),
+@pytest.mark.parametrize("inject,derived", [
+    (lambda r: r.commit_fault(state.Fault("machinery", where="events.jsonl")), False),
+    (lambda r: r.mark_stage("digest", "failed", detail="fixture publication failure"), True),
+    (lambda r: r.commit_fault(state.Fault("phase_exception", where="run")), False),
+    (lambda r: r.commit_gap(state.Gap(source_id="probe.checkpoint", kind="unknown")), False),
+    (lambda r: r.commit_gap(state.Gap(source_id="crawl.katana", kind="cap", omitted=7)), False),
+    (lambda r: r.record("probe", RunResult(
+        "httpx", ["x"], Status.FAILED, 1, 1.0, None, 0, note="broke",
+    )), False),
+    (lambda r: r.record("params", skipped("oob_probe", "interactsh-client not installed"),
+                        depends_on="interactsh-client"), False),
 ])
-def test_injected_faults_never_finalise_clean(run, inject):
-    inject(run)
-    run.write_manifest(profile_summary={}, phases_run=["probe"])
+def test_injected_faults_never_finalise_clean(run, inject, derived):
+    if derived:
+        run.write_state("running")
+        run.begin_finalization()
+        run.write_manifest(profile_summary={}, phases_run=["probe"])
+        inject(run)
+        run.reconcile_finalization()
+    else:
+        inject(run)
+        run.write_manifest(profile_summary={}, phases_run=["probe"])
     summary = json.loads(run.manifest_path.read_text())["summary"]
     assert summary["verdict"] != "complete", summary
     from quarry_recon.exit_contract import from_summary

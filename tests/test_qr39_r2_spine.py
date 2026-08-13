@@ -321,14 +321,17 @@ def test_the_seal_survives_a_reopen(tmp_path, monkeypatch):
         run.commit_gap(state.Gap(source_id="late", kind="unknown"))
 
 
-def test_the_deliberate_reopen_accepts_records_again(tmp_path, monkeypatch):
-    """Sealing unconditionally would close the hole and break the resume `report` depends on."""
+def test_the_deliberate_reopen_accepts_only_derived_publication_records(tmp_path, monkeypatch):
+    """A report reopen records publication outcome without reopening base evidence."""
     _run(tmp_path, monkeypatch)
     run = Run.open(tmp_path, "t", _run_dir(tmp_path).name)
-    run.write_state("finalizing")                               # exactly what `report` performs
-    run.commit_fault(state.Fault("publication", where="hotlist", detail="volume read-only"))
-    run.commit_gap(state.Gap(source_id="probe.checkpoint", kind="unknown"))
-    assert run._run_summary()["verdict"] == "complete_with_gaps"
+    run.reopen_finalization(detail="fixture report")
+    run.mark_stage("hotlist", "failed", detail="volume read-only")
+    with pytest.raises(state.ContractError):
+        run.commit_gap(state.Gap(source_id="probe.checkpoint", kind="unknown"))
+    summary = run.reconcile_finalization()
+    assert summary["verdict"] == "complete_with_gaps"
+    assert [fault["where"] for fault in summary["faults"]] == ["hotlist"]
 
 
 def test_the_manifest_is_the_authority_a_supervisor_reads(tmp_path, monkeypatch):
