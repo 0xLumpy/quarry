@@ -1135,7 +1135,8 @@ def registered(source_id: str) -> bool:
     return False
 
 
-def run_contract(source_id, cmd, *, input_total=None, env=None, reclassify=None, work_unit=None,
+def run_contract(source_id, cmd, *, repository=None, stdout=None, stderr=None,
+                 input_total=None, env=None, reclassify=None, work_unit=None,
                  parent_id=None, scope_distance=None, discovery_context=None,
                  **run_kwargs):
     """Run a source under its registry contract -> the (reclassified) RunResult.
@@ -1164,7 +1165,10 @@ def run_contract(source_id, cmd, *, input_total=None, env=None, reclassify=None,
 
     res = None
     try:
-        res = _run(tool, cmd, env=env, **run_kwargs)
+        res = _run(
+            tool, cmd, repository=repository, stdout=stdout, stderr=stderr,
+            env=env, **run_kwargs,
+        )
         if reclassify is not None:
             res = reclassify(res)                           # file-output adapter → FINAL status on the terminal event
         return res

@@ -62,6 +62,28 @@ class RepositoryOutput:
         return cls(ArtifactDisposition.PUBLISH, tuple(components))
 
     @classmethod
+    def publish_path(cls, run: store.Run, path) -> "RepositoryOutput":
+        """Bind one caller-held path back to an exact repository authority.
+
+        Production lanes historically asked ``Run.raw_path`` for a ``Path`` and
+        passed that path directly to the runner.  During the compatibility
+        window they may keep the convenient local variable, but publication is
+        authorized only after this method resolves it to validated artifact
+        components and proves that the supplying ``Run`` owns the same opened
+        run identity.  The resulting policy contains no ambient path.
+        """
+        if type(run) is not store.Run:
+            raise TypeError("run must be an opened repository Run")
+        managed = store.managed_run_for_artifact(path)
+        if managed is None:
+            raise ContractError("publication path is not a managed run artifact")
+        owner, components = managed
+        if (owner._authority_key != run._authority_key
+                or owner._run_directory_identity != run._run_directory_identity):
+            raise ContractError("publication path belongs to a different run")
+        return cls.publish(*components)
+
+    @classmethod
     def discard(cls) -> "RepositoryOutput":
         return cls(ArtifactDisposition.DISCARD)
 

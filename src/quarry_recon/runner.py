@@ -808,7 +808,7 @@ def terminate_group(proc, grace: float = _TERM_GRACE) -> None:
         pass
 
 
-def run(
+def _legacy_run(
     tool: str,
     cmd: list[str],
     *,
@@ -1124,6 +1124,328 @@ def run(
         tool=tool, cmd=cmd, status=status, exit_code=proc.returncode, duration=dur,
         raw_path=raw, stdout_lines=out_state["lines"],
         stderr_tail=err_tail, note=note, cpu_s=cpu_s, peak_rss_mb=rss_mb, meta=meta,
+    )
+
+
+_REPOSITORY_POLICY_UNSET = object()
+
+
+def _read_published_diagnostic(path: "Path | None") -> tuple[str, bool, bool, str | None]:
+    """Return the compatibility stderr tail and whole-stream classifiers.
+
+    A repository-published stderr artifact is immutable before this function is
+    called.  Scan it incrementally so classification keeps the legacy
+    whole-stream behavior without loading an unbounded diagnostic into memory.
+    """
+    if path is None:
+        return "", False, False, None
+    carry = b""
+    tail = b""
+    blocked = transport = False
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(_READ_CHUNK), b""):
+                folded = (carry + chunk).lower()
+                blocked = blocked or any(sig in folded for sig in _BLOCK_SIG_B)
+                transport = transport or any(sig in folded for sig in _TRANSPORT_SIG_B)
+                carry = folded[-_SIG_CARRY:]
+                tail = (tail + chunk)[-_STDERR_TAIL_BYTES:]
+    except OSError:
+        return "", False, False, "published stderr could not be read"
+    rendered = "\n".join(tail.decode("utf-8", "replace").strip().splitlines()[-8:])
+    return rendered, blocked, transport, None
+
+
+def _repository_run_result(
+    tool: str,
+    cmd: list[str],
+    outcome,
+    *,
+    request,
+    stdout,
+    stderr,
+    stdout_path: str | None,
+    stderr_path: str | None,
+    duration: float,
+) -> RunResult:
+    """Derive the v0.3 ``RunResult`` view from immutable repository facts."""
+    from .runner_protocol import ExecutionTerminal, StreamRole, StreamTerminal
+    from .runner_repository import ArtifactDisposition, RepositoryPublication
+
+    execution = outcome.execution
+    settlement = execution.settlement
+    stream_by_role = (
+        {stream.role: stream for stream in settlement.streams}
+        if settlement is not None else {}
+    )
+    stdout_stream = stream_by_role.get(StreamRole.STDOUT)
+    published_roles = {proof.role for proof in outcome.published}
+    raw = (
+        Path(stdout_path)
+        if (stdout.disposition is ArtifactDisposition.PUBLISH
+            and "stdout" in published_roles
+            and stdout_path is not None)
+        else None
+    )
+    stderr_final = (
+        Path(stderr_path)
+        if (stderr.disposition is ArtifactDisposition.PUBLISH
+            and "stderr" in published_roles
+            and stderr_path is not None)
+        else None
+    )
+    stderr_tail, blocked, transport, diagnostic_error = (
+        _read_published_diagnostic(stderr_final)
+    )
+
+    faults: list[dict] = []
+    if execution.reason.value != "complete":
+        faults.append(Fault(
+            "machinery", where=tool,
+            detail=f"repository execution ended {execution.reason.value}",
+        ).to_dict())
+    if outcome.publication not in {
+        RepositoryPublication.PUBLISHED,
+        RepositoryPublication.NOT_REQUESTED,
+    }:
+        faults.append(Fault(
+            "publication", where=tool,
+            detail=f"repository publication ended {outcome.publication.value}",
+        ).to_dict())
+    if diagnostic_error is not None:
+        faults.append(Fault("diagnostic", where=tool, detail=diagnostic_error).to_dict())
+
+    started = bool(settlement is not None and settlement.launched)
+    exit_code = settlement.exit_code if settlement is not None else None
+    observed = stdout_stream.observed_bytes if stdout_stream is not None else 0
+    retained = stdout_stream.retained_bytes if raw is not None and stdout_stream is not None else 0
+    lines = stdout_stream.lines if stdout_stream is not None else 0
+    primary_incomplete = (
+        not outcome.clean
+        or stdout_stream is None
+        or stdout_stream.terminal is not StreamTerminal.EOF
+        or (stream_by_role.get(StreamRole.STDIN) is not None
+            and stream_by_role[StreamRole.STDIN].terminal not in {
+                StreamTerminal.COMPLETE,
+                StreamTerminal.PEER_CLOSED,
+                StreamTerminal.NOT_STARTED,
+            })
+    )
+
+    if settlement is not None and settlement.terminal is ExecutionTerminal.TIMED_OUT:
+        status, note = Status.TIMED_OUT, f"timed out after {request.timeout}s"
+    elif not started or exit_code is None:
+        status, note = Status.FAILED, f"execution did not complete ({execution.reason.value})"
+    else:
+        status, note = _classify(
+            exit_code, observed > 0, blocked, transport,
+            request.ok_empty, request.ok_codes,
+        )
+        if status in (Status.SUCCESS, Status.EMPTY) and primary_incomplete:
+            status = Status.PARTIAL
+            note = (note + "; " if note else "") + "primary evidence incomplete"
+
+    meta: dict = {
+        "started": started,
+        "stdout_bytes": observed,
+        "stdout_observed_bytes": observed,
+        "stdout_retained_bytes": retained,
+        "repository_publication": outcome.publication.value,
+        "repository_ownership_settled": outcome.ownership_settled,
+        "execution_reason": execution.reason.value,
+    }
+    if stdout_stream is not None:
+        if stdout_stream.observed_sha256 is not None:
+            meta["stdout_sha256"] = stdout_stream.observed_sha256
+            meta["stdout_observed_sha256"] = stdout_stream.observed_sha256
+        if raw is not None and stdout_stream.retained_sha256 is not None:
+            meta["stdout_retained_sha256"] = stdout_stream.retained_sha256
+        if stdout_stream.terminal is StreamTerminal.CAPPED:
+            meta["output_capped"] = request.max_output_bytes
+            meta["stdout_truncated"] = True
+            meta["stdout_truncated_bytes"] = observed - retained
+    if stderr.disposition is ArtifactDisposition.PUBLISH:
+        meta["stderr_published"] = stderr_final is not None
+    if settlement is not None:
+        meta["streams"] = {
+            stream.role.value: stream.to_dict() for stream in settlement.streams
+        }
+    if faults:
+        meta["faults"] = faults
+    return RunResult(
+        tool=tool,
+        cmd=cmd,
+        status=status,
+        exit_code=exit_code,
+        duration=round(duration, 3),
+        raw_path=raw,
+        stdout_lines=lines,
+        stderr_tail=stderr_tail,
+        note=note,
+        meta=meta,
+    )
+
+
+def _run_with_repository(
+    tool,
+    cmd,
+    *,
+    repository,
+    stdout,
+    stderr,
+    timeout,
+    stdin_data,
+    input_file,
+    ok_empty,
+    ok_codes,
+    env,
+    max_output_bytes,
+) -> RunResult:
+    """Normalize once, then delegate all execution publication authority."""
+    from . import runner_protocol, runner_repository, store
+
+    safe_cmd, argv_error = _preflight_argv(cmd)
+    if argv_error is not None:
+        return _preflight_failure(tool, safe_cmd, argv_error)
+    if type(repository) is not store.Run:
+        return _preflight_failure(tool, safe_cmd, "repository must be an opened Run authority")
+    if (type(stdout) is not runner_repository.RepositoryOutput
+            or type(stderr) is not runner_repository.RepositoryOutput):
+        return _preflight_failure(
+            tool, safe_cmd, "stdout and stderr require explicit repository policies",
+        )
+
+    raw_path = runner_repository._expected_output_path(repository, stdout)
+    stderr_path = runner_repository._expected_output_path(repository, stderr)
+    try:
+        request_id = runner_protocol.new_request_id(os.urandom(16))
+        invocation = runner_protocol.normalize_invocation(
+            request_id=request_id,
+            tool=tool,
+            cmd=safe_cmd,
+            timeout=timeout,
+            stdin_data=stdin_data,
+            input_file=input_file,
+            ok_empty=ok_empty,
+            ok_codes=ok_codes,
+            env=env,
+            base_environment=dict(os.environ),
+            cwd=_TOOL_CWD,
+            raw_path=raw_path,
+            stderr_path=stderr_path,
+            max_output_bytes=max_output_bytes,
+        )
+    except (TypeError, ValueError) as exc:
+        return _preflight_failure(tool, safe_cmd, f"typed invocation rejected ({type(exc).__name__})")
+
+    if not have(safe_cmd[0]):
+        return RunResult(
+            tool, safe_cmd, Status.SKIPPED, None, 0.0, None, 0,
+            note=f"{safe_cmd[0]} not on PATH", meta={"started": False},
+        )
+
+    started_at = time.monotonic()
+    deadline = ((1 << 53) - 1 if invocation.worker.timeout == 0
+                else started_at + float(invocation.worker.timeout) + 5.0)
+    try:
+        outcome = runner_repository.supervise_repository_execution(
+            repository,
+            invocation,
+            stdout=stdout,
+            stderr=stderr,
+            deadline=deadline,
+        )
+    except BaseException as exc:
+        if not isinstance(exc, Exception):
+            raise
+        return RunResult(
+            tool, safe_cmd, Status.FAILED, None,
+            round(time.monotonic() - started_at, 3), None, 0,
+            note=f"repository execution failed ({type(exc).__name__})",
+            meta={
+                "started": False,
+                "faults": [Fault(
+                    "machinery", where=tool,
+                    detail=f"repository execution failed ({type(exc).__name__})",
+                ).to_dict()],
+            },
+        )
+
+    return _repository_run_result(
+        tool,
+        safe_cmd,
+        outcome,
+        request=invocation.worker,
+        stdout=stdout,
+        stderr=stderr,
+        stdout_path=raw_path,
+        stderr_path=stderr_path,
+        duration=time.monotonic() - started_at,
+    )
+
+
+def run(
+    tool: str,
+    cmd: list[str],
+    *,
+    repository=_REPOSITORY_POLICY_UNSET,
+    stdout=_REPOSITORY_POLICY_UNSET,
+    stderr=_REPOSITORY_POLICY_UNSET,
+    raw_path: Path | None = None,
+    timeout: int = 1800,
+    stdin_data: str | None = None,
+    input_file: Path | None = None,
+    ok_empty: bool = True,
+    ok_codes: tuple[int, ...] = (0,),
+    env: dict | None = None,
+    stderr_path: Path | None = None,
+    max_output_bytes: int | None = None,
+) -> RunResult:
+    """Execute with explicit repository ownership and output dispositions.
+
+    Production callers pass ``repository``, ``stdout`` and ``stderr``.  The
+    path-based branch remains temporarily available only for unmanaged callers;
+    a managed run artifact can no longer reach the legacy publisher.
+    """
+    policies = (repository, stdout, stderr)
+    explicit = any(value is not _REPOSITORY_POLICY_UNSET for value in policies)
+    if explicit:
+        safe_cmd, _error = _preflight_argv(cmd)
+        if any(value is _REPOSITORY_POLICY_UNSET for value in policies):
+            return _preflight_failure(
+                tool, safe_cmd, "repository, stdout and stderr must be declared together",
+            )
+        if raw_path is not None or stderr_path is not None:
+            return _preflight_failure(
+                tool, safe_cmd, "repository policies cannot be mixed with ambient output paths",
+            )
+        return _run_with_repository(
+            tool,
+            cmd,
+            repository=repository,
+            stdout=stdout,
+            stderr=stderr,
+            timeout=timeout,
+            stdin_data=stdin_data,
+            input_file=input_file,
+            ok_empty=ok_empty,
+            ok_codes=ok_codes,
+            env=env,
+            max_output_bytes=max_output_bytes,
+        )
+
+    return _legacy_run(
+        tool,
+        cmd,
+        raw_path=raw_path,
+        timeout=timeout,
+        stdin_data=stdin_data,
+        input_file=input_file,
+        ok_empty=ok_empty,
+        ok_codes=ok_codes,
+        env=env,
+        stderr_path=stderr_path,
+        max_output_bytes=max_output_bytes,
     )
 
 
