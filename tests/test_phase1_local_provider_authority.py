@@ -135,9 +135,10 @@ def test_kaeferjaeger_publication_fault_fences_stage_preserves_prior_and_release
     def fail_publish(_stage):
         raise failure
 
-    monkeypatch.setattr(privfs, "replace_private_stage", fail_publish)
-    with pytest.raises(failure_type) as caught:
-        horizontal._kaeferjaeger(ctx)
+    with monkeypatch.context() as publication_fault:
+        publication_fault.setattr(privfs, "replace_private_stage", fail_publish)
+        with pytest.raises(failure_type) as caught:
+            horizontal._kaeferjaeger(ctx)
 
     assert caught.value is failure
     assert final.read_bytes() == b"prior.acme.example\tprior.txt:1\n"
@@ -207,9 +208,14 @@ def test_csp_publication_failure_keeps_prior_and_emits_no_new_entity(tmp_path, m
     )
 
     failure = RuntimeError("durability fault")
-    monkeypatch.setattr(privfs, "replace_private_stage", lambda _stage: (_ for _ in ()).throw(failure))
-    with pytest.raises(RuntimeError) as caught:
-        horizontal.run(ctx)
+    with monkeypatch.context() as publication_fault:
+        publication_fault.setattr(
+            privfs,
+            "replace_private_stage",
+            lambda _stage: (_ for _ in ()).throw(failure),
+        )
+        with pytest.raises(RuntimeError) as caught:
+            horizontal.run(ctx)
 
     assert caught.value is failure
     assert final.read_bytes() == b"prior CSP evidence\n"
@@ -296,9 +302,14 @@ def test_vertical_publication_fault_preserves_prior_and_cannot_cite_it_as_curren
     )
 
     failure = RuntimeError("vertical publication fault")
-    monkeypatch.setattr(privfs, "replace_private_stage", lambda _stage: (_ for _ in ()).throw(failure))
-    with pytest.raises(RuntimeError) as caught:
-        vertical._local_provider_sources(ctx, ctx.profile, ctx.scope)
+    with monkeypatch.context() as publication_fault:
+        publication_fault.setattr(
+            privfs,
+            "replace_private_stage",
+            lambda _stage: (_ for _ in ()).throw(failure),
+        )
+        with pytest.raises(RuntimeError) as caught:
+            vertical._local_provider_sources(ctx, ctx.profile, ctx.scope)
 
     assert caught.value is failure
     assert final.read_bytes() == b"priorct.acme.example\n"
