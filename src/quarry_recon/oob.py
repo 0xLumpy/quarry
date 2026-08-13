@@ -17,10 +17,93 @@ import shutil
 import subprocess
 import threading
 import time
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import privfs, runner
+from .state import ContractError
+
+
+_OOB_SESSION_COMPONENTS = ("raw", "oob", "session", "session.json")
+_OOB_LOG_COMPONENTS = ("raw", "oob", "session", "interactions.jsonl")
+_OOB_CLIENT_SESSION_COMPONENTS = ("raw", "oob", "session", "interactsh.session")
+_SESSION_REFERENCE_FIELDS = frozenset({"log", "session_file"})
+
+
+def _repository_ref(run, path, *, field: str) -> str:
+    """Convert one strict in-run path to its stable repository-relative name."""
+    if field not in _SESSION_REFERENCE_FIELDS:
+        raise ContractError("unknown OOB session reference field")
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = run.dir / candidate
+    try:
+        relative = candidate.relative_to(run.dir)
+    except ValueError:
+        raise ContractError(f"OOB {field} must stay inside run {run.run_id}") from None
+    if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise ContractError(f"OOB {field} is not a safe repository reference")
+    from . import store as _store
+    for index, part in enumerate(relative.parts):
+        _store.validate_artifact_component(part, f"OOB {field} component {index}")
+    return relative.as_posix()
+
+
+def resolve_session_ref(run, value, *, field: str, require_file: bool = True) -> Path:
+    """Resolve a stored OOB reference without accepting absolute/escaping/link paths.
+
+    This function intentionally validates the complete ancestor chain even when
+    the caller will later pass the result to a subprocess.  A path that is safe
+    only at JSON parse time is not a safe client destination.
+    """
+    if field not in _SESSION_REFERENCE_FIELDS or not isinstance(value, str) or not value:
+        raise ContractError(f"OOB {field} is not a repository-relative reference")
+    ref = Path(value)
+    if ref.is_absolute() or not ref.parts or any(part in ("", ".", "..") for part in ref.parts):
+        raise ContractError(f"OOB {field} is not a repository-relative reference")
+    from . import store as _store
+    components = tuple(
+        _store.validate_artifact_component(part, f"OOB {field} component {index}")
+        for index, part in enumerate(ref.parts)
+    )
+    anchor_fd = _store._open_run_fd(run.project_dir, run.run_id)
+    parent_fd = -1
+    fd = -1
+    try:
+        parent_fd = privfs.open_strict_dir_at(anchor_fd, components[:-1])
+        if require_file:
+            try:
+                fd = os.open(
+                    components[-1],
+                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+            except OSError as exc:
+                raise ContractError(f"OOB {field} is not a safe private file") from exc
+            observed = os.fstat(fd)
+            named = os.stat(components[-1], dir_fd=parent_fd, follow_symlinks=False)
+            if ((observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)
+                    or not privfs.is_private(run.dir.joinpath(*components))):
+                raise ContractError(f"OOB {field} is not a safe private file")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        os.close(anchor_fd)
+    return run.dir.joinpath(*components)
+
+
+def _portable_session(run, session: dict) -> dict:
+    """A copy safe to persist: path fields are repository-relative references."""
+    if not isinstance(session, dict):
+        raise ContractError("OOB session must be an object")
+    document = dict(session)
+    for field in _SESSION_REFERENCE_FIELDS:
+        if field in document and document[field]:
+            document[field] = _repository_ref(run, document[field], field=field)
+    return document
 
 
 def _interaction_id(rec: dict) -> str:
@@ -76,23 +159,55 @@ def import_file(run, path, *, scope=None) -> dict:
     # content-hash prefix: two different files sharing a name must not clobber each other's raw
     # evidence, while identical content re-imports to the same file (raw_ref stays stable)
     digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
-    from . import revision as _revision
-    raw = _revision.raw_path(run, "oob", "import", f"{digest}-{src.name}")
-    privfs.write_private(raw, text)             # 0600: imported callback data can carry correlated secrets
     rows = parse_interactsh(text)
     session = load_session(run)                 # None if this run never opened a Quarry-owned session
     if session and session.get("token_map"):
         correlate(rows, session)                # upgrade rows whose token matches; others untouched
-    for row in rows:
-        row["raw_ref"] = str(raw)
-    return {"parsed": len(rows), **_ingest(run, rows, origin="oob.import", scope=scope)}
+    from . import revision as _revision
+    disposition, why = _revision.base_disposition(run.dir)
+    if disposition in (_revision.UNKNOWN, _revision.FINALIZING):
+        raise _revision.RevisionError(
+            f"{run.dir}: {why} — refusing to record late evidence; retry once lifecycle settles",
+            retryable=True,
+        )
+    try:
+        result = _revision.commit_oob_candidate(
+            run,
+            raw_name=f"{digest}-{src.name}",
+            raw_bytes=text.encode("utf-8"),
+            rows=rows,
+            origin="oob.import",
+            scope=scope,
+        )
+    except ContractError as exc:
+        if run.state == "unknown":
+            raise _revision.RevisionError(
+                f"{run.dir}: unknown lifecycle state — refusing OOB mutation; retry after repair",
+                retryable=True,
+            ) from exc
+        raise
+    return {"parsed": len(rows), **result}
 
 
 def import_polled(run, session: dict, rows: list[dict], *, scope=None) -> dict:
     """Persist rows read from the run's owned session. Same revision rules as ``import_file``: a finished
     run is supplemented, never rewritten."""
+    from . import revision as _revision
+    candidate_ref = session.get("log")
+    if session.get("revision_candidate"):
+        log = resolve_session_ref(run, candidate_ref, field="log")
+        raw_bytes = log.read_bytes()
+        result = _revision.commit_oob_candidate(
+            run,
+            raw_name=f"poll-{session['revision_candidate']}.jsonl",
+            raw_bytes=raw_bytes,
+            rows=rows,
+            origin="oob.poll",
+            scope=scope,
+        )
+        return result
     for row in rows:
-        row.setdefault("raw_ref", session.get("log"))
+        row.setdefault("raw_ref", candidate_ref)
     return _ingest(run, rows, origin="oob.poll", scope=scope)
 
 
@@ -184,8 +299,14 @@ def session_path(run, *, create: bool = True) -> Path:
 def save_session(run, session: dict) -> Path:
     """Persist the session to raw/oob/session.json atomically — the token_map must survive a crash
     mid-write. Written 0600, O_NOFOLLOW: the token_map is a private map."""
+    document = _portable_session(run, session)
+    data = json.dumps(document, indent=2).encode("utf-8")
+    replace = getattr(run, "_replace_artifact", None)
+    if callable(replace):
+        from .store import MutationScope
+        return replace(MutationScope.BASE_EVIDENCE, _OOB_SESSION_COMPONENTS, data)
     p = session_path(run)
-    privfs.write_private(p, json.dumps(session, indent=2))
+    privfs.write_private(p, data.decode("utf-8"))
     return p
 
 
@@ -200,7 +321,8 @@ def load_session(run) -> dict | None:
         return None
     if not isinstance(obj, dict):                    # a non-object session (string/list) is not usable
         return None
-    for key in ("unique_id", "log"):                 # string fields used by .lower() / Path(); coerce a bad type
+    for key in ("unique_id", "log", "session_file"):
+        # string fields used by .lower() / Path(); coerce a bad type
         if key in obj and not isinstance(obj[key], str):
             obj[key] = ""
     tm = obj.get("token_map")                        # a token maps to an attribution dict; drop malformed entries
@@ -253,32 +375,50 @@ def open_session(run, server=None, token=None, wait: int = 12):
     """
     if not shutil.which("interactsh-client"):
         return None
-    log = run.raw_path("oob", "session", "interactions.jsonl")
-    sf = run.raw_path("oob", "session", "interactsh.session")
-    # pre-create 0600 so the client appends into private files (its own O_CREAT keeps an existing mode);
-    # the containing dir is already 0700 via raw_path
-    privfs.touch_private(log)
-    privfs.touch_private(sf)
-    # -session-file makes the session resumable: a later client on the same file re-opens the same
-    # correlation id, so closing after a poll does not lose delayed callbacks
-    cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(sf)]
-    # -server wants bare domains, not a URL (nuclei's -iserver takes the full URL)
-    srv = ",".join(_server_hosts(server)) if server else ""
-    if srv:
-        cmd += ["-server", srv]
-    if token:
-        cmd += ["-token", str(token)]           # auth for a protected/self-hosted interactsh
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True)   # own process group -> terminate_group kills the tree
-    parsed = _await_register(proc, server, wait)
-    if parsed is None:
-        close_session(proc)
-        return None
-    domain, uid = parsed
-    session = {"domain": domain, "unique_id": uid, "token_map": {}, "started": _utc(),
-               "log": str(log), "session_file": str(sf), "server": server}
-    save_session(run, session)
-    return session, proc
+    claims = ExitStack()
+    proc = None
+    try:
+        # These lifetime claims exist even though interactsh opens the files by
+        # name.  They keep the base seal from racing a process that can still
+        # append to either canonical artifact.
+        log_claim = claims.enter_context(run.artifact_claim(*_OOB_LOG_COMPONENTS))
+        session_claim = claims.enter_context(run.artifact_claim(*_OOB_CLIENT_SESSION_COMPONENTS))
+        log_writer = log_claim.open_writer()
+        session_writer = session_claim.open_writer()
+        os.close(log_writer)
+        os.close(session_writer)
+        log_claim.publish()
+        session_claim.publish()
+        log = run.dir.joinpath(*_OOB_LOG_COMPONENTS)
+        sf = run.dir.joinpath(*_OOB_CLIENT_SESSION_COMPONENTS)
+        # -session-file makes the session resumable: a later client on the same file re-opens the same
+        # correlation id, so closing after a poll does not lose delayed callbacks
+        cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(sf)]
+        # -server wants bare domains, not a URL (nuclei's -iserver takes the full URL)
+        srv = ",".join(_server_hosts(server)) if server else ""
+        if srv:
+            cmd += ["-server", srv]
+        if token:
+            cmd += ["-token", str(token)]       # auth for a protected/self-hosted interactsh
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                start_new_session=True)
+        setattr(proc, "_quarry_oob_claims", claims)
+        parsed = _await_register(proc, server, wait)
+        if parsed is None:
+            close_session(proc)
+            return None
+        domain, uid = parsed
+        session = {"domain": domain, "unique_id": uid, "token_map": {}, "started": _utc(),
+                   "log": _repository_ref(run, log, field="log"),
+                   "session_file": _repository_ref(run, sf, field="session_file"), "server": server}
+        save_session(run, session)
+        return session, proc
+    except BaseException:
+        if proc is None:
+            claims.close()
+        else:
+            close_session(proc)
+        raise
 
 
 def _resume_token(saved_server, current_server, token):
@@ -301,21 +441,67 @@ def resume_session(run, token=None, server=None, wait: int = 12):
     prev = load_session(run)
     if not prev or not prev.get("session_file") or not shutil.which("interactsh-client"):
         return None
-    log = prev.get("log") or str(run.raw_path("oob", "session", "interactions.jsonl"))
-    cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(prev["session_file"])]
+    from . import revision as _revision
+    repository_run = all(hasattr(run, name) for name in ("dir", "project_dir", "run_id", "artifact_claim"))
+    if repository_run:
+        disposition, why = _revision.base_disposition(run.dir)
+        old_session = resolve_session_ref(run, prev["session_file"], field="session_file")
+        old_log = resolve_session_ref(run, prev.get("log") or "", field="log")
+    else:
+        # Narrow compatibility for lightweight argv-only adapters/tests.  Real
+        # repository callers always take the strict branch above.
+        disposition, why = "live", ""
+        old_session = Path(prev["session_file"])
+        old_log = Path(prev.get("log") or "")
+    if disposition in ("finalizing", "unknown"):
+        from .revision import RevisionError
+        raise RevisionError(
+            f"{run.dir}: {why} — refusing to resume OOB acquisition against it",
+            retryable=True,
+        )
+    claims = None
+    if disposition == "live":
+        # The original session remains the live candidate.  Claims cover the
+        # complete interval in which an external process owns its two names.
+        if repository_run:
+            claims = ExitStack()
+            claims.enter_context(run.artifact_claim())
+            claims.enter_context(run.artifact_claim())
+        log, session_file = old_log, old_session
+        session = dict(prev)
+    else:
+        # A sealed base is never handed back to a mutable client.  Both files
+        # are copied into one unique revision candidate before launch.
+        candidate = _revision.stage_oob_resume_candidate(run, old_log, old_session)
+        log, session_file = candidate.log, candidate.session_file
+        session = dict(prev)
+        session["log"] = _repository_ref(run, log, field="log")
+        session["session_file"] = _repository_ref(run, session_file, field="session_file")
+        session["revision_candidate"] = candidate.name
+    cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(session_file)]
     srv = ",".join(_server_hosts(prev.get("server"))) if prev.get("server") else ""   # bare domains for -server
     if srv:
         cmd += ["-server", srv]
     eff_token = _resume_token(prev.get("server"), server, token)
     if eff_token:
         cmd += ["-token", eff_token]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True)   # own process group -> terminate_group kills the tree
-    parsed = _await_register(proc, prev.get("server"), wait)
-    if parsed is None or parsed[0] != prev.get("domain"):   # must resume the same registered domain
-        close_session(proc)
-        return None
-    return prev, proc
+    proc = None
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                start_new_session=True)
+        if claims is not None:
+            setattr(proc, "_quarry_oob_claims", claims)
+        parsed = _await_register(proc, prev.get("server"), wait)
+        if parsed is None or parsed[0] != prev.get("domain"):
+            close_session(proc)
+            return None
+        return session, proc
+    except BaseException:
+        if proc is None and claims is not None:
+            claims.close()
+        elif proc is not None:
+            close_session(proc)
+        raise
 
 
 def close_session(proc) -> None:
@@ -326,6 +512,13 @@ def close_session(proc) -> None:
             proc.stdout.close()
     except Exception:
         pass
+    claims = getattr(proc, "_quarry_oob_claims", None)
+    if claims is not None:
+        claims.close()
+        try:
+            delattr(proc, "_quarry_oob_claims")
+        except (AttributeError, TypeError):
+            pass
 
 
 def correlate(rows: list[dict], session: dict) -> list[dict]:
@@ -358,10 +551,13 @@ def poll_session(run, session: dict) -> list[dict]:
     lp = session.get("log")
     if not isinstance(lp, str) or not lp:            # no/blank/non-str log path -> nothing to poll
         return []
-    log = Path(lp)
-    if not log.exists():
+    log = resolve_session_ref(run, lp, field="log")
+    try:
+        with os.fdopen(privfs.open_ro_private(log), "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except FileNotFoundError:
         return []
-    return correlate(parse_interactsh(log.read_text(encoding="utf-8", errors="replace")), session)
+    return correlate(parse_interactsh(text), session)
 
 
 # ── token issuance (the source side of correlation) ──────────────────────────────────────────────
@@ -375,15 +571,21 @@ def issue_token(session: dict, source_tool: str, target_url=None, param=None,
     callback never misattributed. With `run` given, the session is persisted before returning, so a
     crash after a probe is injected still leaves the callback correlatable.
     """
-    tmap = session.setdefault("token_map", {})
+    # Build on a copy: a rejected/durability-failed repository commit must not
+    # make a token visible in memory when it never became correlatable on disk.
+    candidate = dict(session)
+    tmap = dict(candidate.get("token_map") or {})
     while True:
         token = "q" + os.urandom(4).hex()        # q + 8 hex chars: DNS-label-safe, ~4e9 space
         if token not in tmap:
             break
     tmap[token] = {"source_tool": source_tool, "target_url": target_url,
                    "param": param, "payload_class": payload_class}
+    candidate["token_map"] = tmap
     if run is not None:
-        save_session(run, session)
+        save_session(run, candidate)
+    session.clear()
+    session.update(candidate)
     return token
 
 

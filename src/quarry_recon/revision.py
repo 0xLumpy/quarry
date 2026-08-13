@@ -2,7 +2,6 @@
 the combined view (docs/design/REVISION-DESIGN.md)."""
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -34,9 +33,19 @@ _REV_RE = re.compile(r"^rev(\d{4,})$")
 class RevisionError(RuntimeError):
     """A revision could not be published, or a published one could not be certified."""
 
-    def __init__(self, message: str, fault: Fault | None = None):
+    def __init__(self, message: str, fault: Fault | None = None, *, retryable: bool = False):
         super().__init__(message)
         self.fault = fault or Fault(kind="publication", where="revision", detail=message)
+        self.retryable = bool(retryable)
+
+
+@dataclass(frozen=True)
+class OOBResumeCandidate:
+    """One sealed-run polling attempt, isolated from canonical base names."""
+
+    name: str
+    log: Path
+    session_file: Path
 
 
 def _sha(data: bytes) -> str:
@@ -97,7 +106,10 @@ def base_finished(run_dir) -> bool:
 def _require_disposition(run_dir) -> str:
     disposition, why = base_disposition(run_dir)
     if disposition in (UNKNOWN, FINALIZING):
-        raise RevisionError(f"{run_dir}: {why} — refusing to record late evidence against it")
+        raise RevisionError(
+            f"{run_dir}: {why} — refusing to record late evidence against it; retry once lifecycle settles",
+            retryable=True,
+        )
     return disposition
 
 
@@ -112,22 +124,132 @@ def raw_path(run, phase: str, tool: str, name: str) -> Path:
     return privfs.private_dir(revisions_dir(run.dir) / "raw" / phase / tool) / name
 
 
+def _oob_counts(rows: list[dict], sink, published) -> dict:
+    added = 0
+    correlated = 0
+    by_protocol: dict[str, int] = {}
+    for row in rows:
+        if sink.add("oob_interaction", row):
+            added += 1
+            protocol = row.get("protocol")
+            if isinstance(protocol, str):
+                by_protocol[protocol] = by_protocol.get(protocol, 0) + 1
+            if row.get("correlation") == "correlated":
+                correlated += 1
+    return {
+        "added": added,
+        "by_protocol": by_protocol,
+        "correlated": correlated,
+        "refused": int(sink.refused),
+        "outstanding": len(published.refused) if published is not None else 0,
+        "revision": published,
+    }
+
+
+def commit_oob_candidate(
+    run, *, raw_name: str, raw_bytes: bytes, rows: list[dict], origin: str, scope=None,
+) -> dict:
+    """Choose and commit one complete live-or-revision OOB candidate.
+
+    Raw proof and normalized rows are named only after the shared per-run lock
+    has selected the lifecycle disposition.  No call to this function can
+    choose a base raw path and later discover that its rows belong to a
+    revision.
+    """
+    raw_name = store.validate_artifact_component(raw_name, "OOB raw filename")
+    if type(raw_bytes) is not bytes or not isinstance(rows, list):
+        raise TypeError("invalid OOB candidate")
+    prior_raw = None
+    raw = None
+    try:
+        with run._mutation(store.MutationScope.CONTROL):
+            disposition = _require_disposition(run.dir)
+            if disposition == LIVE:
+                components = ("raw", "oob", "import", raw_name)
+                raw_ref = "/".join(components)
+                run._replace_artifact(store.MutationScope.BASE_EVIDENCE, components, raw_bytes)
+                for row in rows:
+                    row["raw_ref"] = raw_ref
+                sink = _Live(run)
+                result = _oob_counts(rows, sink, None)
+                sink.commit(scope)
+                return result
+
+            sink = _Supplement(run, origin)
+            # _Supplement.commit normally acquires the same re-entrant repository
+            # authority.  Keeping its public method intact also preserves the
+            # existing concurrent writer adoption behavior.
+            preliminary = _oob_counts(rows, sink, None)
+            if not sink._pending and not sink._refused:
+                # A repeat callback publishes neither a new pointer nor stray
+                # raw evidence.  The previously committed candidate remains
+                # the authoritative proof for the deduplicated row.
+                return preliminary
+            raw = privfs.private_dir(revisions_dir(run.dir) / "raw" / "oob" / "import") / raw_name
+            if raw.exists():
+                prior_raw = raw.read_bytes()
+            privfs.write_private(raw, raw_bytes.decode("utf-8", errors="replace"))
+            raw_ref = str(raw.relative_to(run.dir))
+            for row in rows:
+                row["raw_ref"] = raw_ref
+            for pending in sink._pending:
+                pending["record"]["raw_ref"] = raw_ref
+                pending["fp"] = store.fingerprint(pending["entity"], pending["record"])
+            published = sink.commit(scope)
+            preliminary["outstanding"] = len(published.refused) if published is not None else 0
+            preliminary["revision"] = published
+            return preliminary
+    except Exception as exc:
+        if raw is not None:
+            try:
+                if prior_raw is None:
+                    raw.unlink(missing_ok=True)
+                else:
+                    privfs.write_private(raw, prior_raw.decode("utf-8", errors="replace"))
+            except OSError:
+                pass
+        from .state import ContractError
+        if isinstance(exc, ContractError) and run.state == UNKNOWN:
+            raise RevisionError(
+                f"{run.dir}: unknown lifecycle state — refusing OOB mutation; retry after repair",
+                retryable=True,
+            ) from exc
+        raise
+
+
 @contextmanager
-def _publish_lock(run_dir):
-    """Serialize publication across processes: reading the published pointer, choosing the next revision
-    and swapping the pointer are one critical section, so two writers never pick the same number nor drop
-    each other's segment."""
-    d = revisions_dir(run_dir)
-    try:
-        privfs.private_dir(d)
-    except OSError as e:
-        raise RevisionError(f"{d}: the revisions directory could not be claimed ({type(e).__name__})")
-    fd = privfs.open_private(d / LOCK_NAME)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+def _publish_lock(run):
+    """Use the repository's sole per-run mutation authority for revisions."""
+    if not hasattr(run, "_mutation"):
+        raise RevisionError("revision publication requires a repository Run authority")
+    with run._mutation(store.MutationScope.REVISION):
         yield
-    finally:
-        os.close(fd)                                 # closing the fd releases the lock
+
+
+def stage_oob_resume_candidate(run, base_log: Path, base_session: Path) -> OOBResumeCandidate:
+    """Copy a sealed session into one unique, unpublished revision candidate.
+
+    The existing revision pointer/segment format remains unchanged; this is
+    acquisition staging only, not a new revision publication design.
+    """
+    with run._mutation(store.MutationScope.REVISION):
+        _require_disposition(run.dir)
+        name = f"oob-{os.urandom(16).hex()}"
+        directory = privfs.private_dir(revisions_dir(run.dir) / "candidates" / name)
+        log = directory / "interactions.jsonl"
+        session_file = directory / "interactsh.session"
+        try:
+            privfs.write_private(log, Path(base_log).read_text(encoding="utf-8", errors="replace"))
+            privfs.write_private(
+                session_file,
+                Path(base_session).read_text(encoding="utf-8", errors="surrogateescape"),
+                encoding="utf-8",
+            )
+        except BaseException:
+            # Unique candidate bytes remain non-authoritative if cleanup itself
+            # faults; no canonical base or pointer name was changed.
+            raise
+        return OOBResumeCandidate(name=name, log=log, session_file=session_file)
 
 
 def _evidence_manifest(doc: dict) -> dict:
@@ -561,7 +683,11 @@ def reseal_views(run_dir) -> Revision | None:
     Under the publication lock: this is a read-modify-write of the same pointer, so an unlocked reseal
     would write back a pointer that predates a revision published beside it, dropping its segment.
     """
-    with _publish_lock(run_dir):
+    # Recover the repository identity so view resealing cannot form a competing
+    # authority beside finalization/OOB publication.
+    identity = store.read_run_identity(Path(run_dir).parents[1], Path(run_dir).name)
+    run = store.Run.open(Path(run_dir).parents[1], identity["target"], Path(run_dir).name)
+    with _publish_lock(run):
         rev = read(run_dir)
         if rev.status != "valid":
             return None
@@ -695,7 +821,7 @@ class _Supplement:
         if not self._pending and not self._refused:
             return None
         try:
-            with _publish_lock(self._run.dir):
+            with _publish_lock(self._run):
                 self._resettle()                     # another writer may have published since we opened
                 return self._publish(scope)
         except RevisionError:
