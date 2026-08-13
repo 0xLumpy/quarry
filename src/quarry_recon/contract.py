@@ -329,6 +329,32 @@ class DiskGovernor:
         if self.project_max and self.project_state is None:
             self.project_streamed = self._base_project_streamed + charged
 
+    def _rebase_public_totals(self) -> None:
+        """Adopt supported external counter changes before mutating governor facts.
+
+        ``run_streamed`` and the in-memory ``project_streamed`` counter predate
+        descriptor streaming as public dataclass fields.  Callers may seed or
+        reset either field between operations, so the private bases must follow
+        those writes instead of letting the next synchronization erase them.
+        Caller holds ``_lock``.
+        """
+        settled_charged, active = self._descriptor_state
+        # A public value can lag a just-landed internal state transition when
+        # cancellation interrupts `_sync_descriptor_totals`.  Only a quiescent
+        # governor can distinguish an external write from that transient lag.
+        if active or self._legacy_inflight:
+            return
+        descriptor_charged = settled_charged + sum(
+            facts[1] for facts in active.values()
+        )
+        expected_run = self._base_run_streamed + descriptor_charged
+        if self.run_streamed != expected_run:
+            self._base_run_streamed += self.run_streamed - expected_run
+        if self.project_state is None:
+            expected_project = self._base_project_streamed + descriptor_charged
+            if self.project_streamed != expected_project:
+                self._base_project_streamed += self.project_streamed - expected_project
+
     def _free(self, path):
         # a failed probe is unknown free space, treated as tripped by the caller (fail closed)
         if self.free_fn is not None:
@@ -393,6 +419,7 @@ class DiskGovernor:
         """Pre-contact gate: the binding layer name when there is NO budget to begin, else None. An
         unreadable/held durable project counter fails closed (refuses)."""
         with self._lock:
+            self._rebase_public_totals()
             room, layer = self._inmem_room(path, 0)
             if room is not None and room <= 0:
                 return layer
@@ -411,6 +438,7 @@ class DiskGovernor:
         """Grant up to `want` bytes for a response `written` bytes in, reserving them so a concurrent
         stream sees the reservation. `commit` later charges what actually reaches disk."""
         with self._lock:
+            self._rebase_public_totals()
             room, layer = self._inmem_room(path, written)
             granted = want if room is None else max(0, min(want, room))
             binding = layer if (room is not None and granted < want) else None
@@ -427,6 +455,7 @@ class DiskGovernor:
     def commit(self, n: int) -> None:
         """`n` reserved bytes reached disk: move them from in-flight to the persisted run/project totals."""
         with self._lock:
+            self._rebase_public_totals()
             self._legacy_inflight -= n
             self._base_run_streamed += n
             if self.project_max and self.project_state is None:
@@ -440,6 +469,7 @@ class DiskGovernor:
         if leftover <= 0:
             return
         with self._lock:
+            self._rebase_public_totals()
             self._legacy_inflight -= leftover
             self._sync_descriptor_totals()
         if self.project_max and self.project_state is not None:
@@ -458,13 +488,14 @@ class DiskGovernor:
         if self.project_max and self.project_state is not None:
             raise ValueError("managed descriptor streaming refuses a durable project limit")
         with self._lock:
+            self._rebase_public_totals()
             settled_charged, active = self._descriptor_state
             if reservation.token in active:
                 return
             if reservation.terminal_written is not None:
                 raise RuntimeError("descriptor stream reservation is already terminal")
             next_active = dict(active)
-            next_active[reservation.token] = (0, 0)
+            next_active[reservation.token] = (0, 0, False)
             self._descriptor_state = (settled_charged, next_active)
             self._sync_descriptor_totals()
 
@@ -474,15 +505,21 @@ class DiskGovernor:
         if reservation.governor is not self:
             raise RuntimeError("descriptor stream reservation is not active")
         with self._lock:
+            self._rebase_public_totals()
             settled_charged, active = self._descriptor_state
             facts = active.get(reservation.token)
             if facts is None:
                 raise RuntimeError("descriptor stream reservation is not active")
+            granted_total, charged, terminal = facts
+            if terminal:
+                raise RuntimeError("descriptor stream reservation is already terminal")
             room, layer = self._inmem_room(path, written)
             granted = want if room is None else max(0, min(want, room))
             binding = layer if (room is not None and granted < want) else None
             next_active = dict(active)
-            next_active[reservation.token] = (facts[0] + granted, facts[1])
+            next_active[reservation.token] = (
+                granted_total + granted, charged, False,
+            )
             self._descriptor_state = (settled_charged, next_active)
             self._sync_descriptor_totals()
             return granted, binding
@@ -498,6 +535,7 @@ class DiskGovernor:
         if reservation.governor is not self:
             raise RuntimeError("descriptor stream reservation belongs to another governor")
         with self._lock:
+            self._rebase_public_totals()
             settled_charged, active = self._descriptor_state
             facts = active.get(reservation.token)
             if facts is None:
@@ -506,17 +544,22 @@ class DiskGovernor:
                     self._sync_descriptor_totals()
                     return
                 raise RuntimeError("descriptor stream reservation is not active")
-            granted, charged = facts
+            granted, charged, already_terminal = facts
+            if already_terminal:
+                if not terminal or written != charged:
+                    raise RuntimeError("descriptor stream reservation is already terminal")
+                reservation.terminal_written = charged
+                self._sync_descriptor_totals()
+                return
             if written < charged or written > granted:
                 raise RuntimeError("descriptor stream byte accounting is inconsistent")
             next_active = dict(active)
             if terminal:
                 reservation.terminal_written = written
-                next_active.pop(reservation.token)
-                self._descriptor_state = (settled_charged + written, next_active)
+                next_active[reservation.token] = (written, written, True)
             else:
-                next_active[reservation.token] = (granted, written)
-                self._descriptor_state = (settled_charged, next_active)
+                next_active[reservation.token] = (granted, written, False)
+            self._descriptor_state = (settled_charged, next_active)
             self._sync_descriptor_totals()
 
     def _forfeit_descriptor_stream(
@@ -526,6 +569,7 @@ class DiskGovernor:
         if reservation.governor is not self:
             raise RuntimeError("descriptor stream reservation belongs to another governor")
         with self._lock:
+            self._rebase_public_totals()
             settled_charged, active = self._descriptor_state
             facts = active.get(reservation.token)
             if facts is None:
@@ -533,16 +577,41 @@ class DiskGovernor:
                     self._sync_descriptor_totals()
                     return reservation.terminal_written
                 raise RuntimeError("descriptor stream reservation is not active")
-            granted, charged = facts
+            granted, charged, _terminal = facts
             conservative_charge = max(granted, charged, minimum_charge)
             next_active = dict(active)
-            next_active.pop(reservation.token)
             reservation.terminal_written = conservative_charge
-            self._descriptor_state = (
-                settled_charged + conservative_charge, next_active,
+            next_active[reservation.token] = (
+                conservative_charge, conservative_charge, True,
             )
+            self._descriptor_state = (settled_charged, next_active)
             self._sync_descriptor_totals()
             return conservative_charge
+
+    def _finalize_descriptor_stream(
+        self, reservation: "_DescriptorStreamReservation",
+    ) -> int:
+        """Fold one terminal token into the bounded scalar exactly once."""
+        if reservation.governor is not self:
+            raise RuntimeError("descriptor stream reservation belongs to another governor")
+        with self._lock:
+            self._rebase_public_totals()
+            settled_charged, active = self._descriptor_state
+            facts = active.get(reservation.token)
+            if facts is None:
+                if reservation.terminal_written is not None:
+                    self._sync_descriptor_totals()
+                    return reservation.terminal_written
+                raise RuntimeError("descriptor stream reservation is not terminal")
+            granted, charged, terminal = facts
+            if not terminal or granted != charged:
+                raise RuntimeError("descriptor stream reservation is not terminal")
+            next_active = dict(active)
+            reservation.terminal_written = charged
+            next_active.pop(reservation.token)
+            self._descriptor_state = (settled_charged + charged, next_active)
+            self._sync_descriptor_totals()
+            return charged
 
 
 class _DescriptorStreamReservation:
@@ -563,6 +632,9 @@ class _DescriptorStreamReservation:
 
     def forfeit(self, minimum_charge: int) -> int:
         return self.governor._forfeit_descriptor_stream(self, minimum_charge)
+
+    def finalize(self) -> int:
+        return self.governor._finalize_descriptor_stream(self)
 
 
 def _governor_ceiling(key: str, value: int, source, rejected, rejected_source) -> int:
@@ -862,6 +934,9 @@ class _DescriptorStreamLedger:
         # outer fence retries this whole idempotent sequence after interruption.
         self.reconcile_descriptor(terminal=True)
 
+    def finalize(self) -> None:
+        self.reservation.finalize()
+
     def attach(self, exc) -> None:
         if exc is None:
             return
@@ -884,7 +959,7 @@ class _DescriptorStreamLedger:
 
 
 class _DescriptorStreamSettlement:
-    """Idempotent settlement authority shared by two already-active fences."""
+    """Idempotent settlement authority shared by nested active fences."""
 
     __slots__ = ("ledger", "primary", "faults")
 
@@ -897,27 +972,44 @@ class _DescriptorStreamSettlement:
         if fault is not None:
             self.primary = _preferred_stream_fault(self.primary, [fault])
 
-    def reconcile(self) -> None:
+    def reconcile(self, *, finalize: bool = False) -> None:
         try:
             self.ledger.settle()
         except BaseException as exc:
             self.faults.append(exc)
+        if finalize:
+            # The first attempt may itself be the interrupted cleanup.  Retry
+            # once under the same boundary, then fold the terminal token.  A
+            # repeated finalizer is harmless after its atomic state transition.
+            try:
+                self.ledger.settle()
+            except BaseException as exc:
+                self.faults.append(exc)
+            try:
+                self.ledger.finalize()
+            except BaseException as exc:
+                self.faults.append(exc)
+            try:
+                self.ledger.finalize()
+            except BaseException as exc:
+                self.faults.append(exc)
 
 
 class _DescriptorStreamFence:
     """One cancellation recovery layer over a shared descriptor settlement."""
 
-    __slots__ = ("settlement",)
+    __slots__ = ("settlement", "finalize")
 
-    def __init__(self, settlement: _DescriptorStreamSettlement) -> None:
+    def __init__(self, settlement: _DescriptorStreamSettlement, *, finalize=False) -> None:
         self.settlement = settlement
+        self.finalize = finalize
 
     def __enter__(self):
         return self
 
-    def __exit__(self, _kind, primary, _traceback) -> bool:
+    def _leave(self, primary) -> bool:
         self.settlement.remember(primary)
-        self.settlement.reconcile()
+        self.settlement.reconcile(finalize=self.finalize)
         preferred = _preferred_stream_fault(
             self.settlement.primary, self.settlement.faults,
         )
@@ -932,6 +1024,30 @@ class _DescriptorStreamFence:
                 raise preferred from primary
             raise preferred
         return False
+
+    def __exit__(self, _kind, primary, _traceback) -> bool:
+        try:
+            return self._leave(primary)
+        except (KeyboardInterrupt, SystemExit) as cancellation:
+            # A cancellation may first arrive while this very cleanup is
+            # running.  Recover within the invocation so the next outer fence
+            # receives an already-settled exception with terminal metadata.
+            self.settlement.remember(cancellation)
+            self.settlement.reconcile(finalize=self.finalize)
+            preferred = _preferred_stream_fault(
+                self.settlement.primary, self.settlement.faults,
+            )
+            self.settlement.ledger.attach(preferred)
+            if preferred is not None and self.settlement.faults:
+                try:
+                    preferred.acquisition_cleanup_errors = tuple(
+                        self.settlement.faults
+                    )
+                except BaseException:
+                    pass
+            if preferred is not cancellation:
+                raise preferred from cancellation
+            raise
 
 
 def preflight_stream_to_fd(*, chunk: int = 1024 * 1024,
@@ -1008,11 +1124,14 @@ def stream_to_fd(r, writer_fd: int, *, budget_path, mirror_fd: int | None = None
                  governor: "DiskGovernor | None" = None) -> "tuple[int, str]":
     """Stream once into an empty repository-owned unpublished descriptor.
 
-    The caller owns descriptor lifetime, keeps the borrowed descriptor unaliased
-    for exclusive sequential writes, and owns terminal publication/fencing.  A
-    mutable ledger is active before the first grant, and two settlement fences
-    reconcile physical bytes, SHA-256 and governor accounting before any return
-    or exception escapes.  ``mirror_fd`` is retained only as an explicit
+    The caller owns descriptor lifetime and authenticates every alias: throughout
+    this call no shared-open-file-description alias may write, seek or truncate,
+    and no independently opened descriptor may mutate the inode.  The caller
+    must not close or reuse the borrowed descriptor number, and also owns
+    terminal publication/fencing.  A mutable ledger is active before the first
+    grant, and nested settlement fences reconcile physical bytes, SHA-256 and
+    governor accounting before any return or exception escapes.  ``mirror_fd``
+    is retained only as an explicit
     compatibility refusal: duplicating physical writes while charging one
     logical body violates the disk-reserve contract.
     """
@@ -1038,12 +1157,13 @@ def stream_to_fd(r, writer_fd: int, *, budget_path, mirror_fd: int | None = None
     ledger = _DescriptorStreamLedger(writer_fd, budget_path, gov)
     settlement = _DescriptorStreamSettlement(ledger)
     end = _time.monotonic() + deadline_s if deadline_s else None
-    with _DescriptorStreamFence(settlement):
+    with _DescriptorStreamFence(settlement, finalize=True):
         with _DescriptorStreamFence(settlement):
-            ledger.activate()
-            return _stream_to_fd_body(
-                r, writer_fd, chunk, deadline_s, end, ledger, gov,
-            )
+            with _DescriptorStreamFence(settlement):
+                ledger.activate()
+                return _stream_to_fd_body(
+                    r, writer_fd, chunk, deadline_s, end, ledger, gov,
+                )
 
 
 class ResponseTooLarge(ValueError):

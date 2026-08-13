@@ -44,6 +44,27 @@ def test_stream_to_fd_keeps_exact_binary_body_and_digest(tmp_path):
     assert path.read_bytes() == body
 
 
+def test_stream_to_fd_accepts_an_authenticated_passive_shared_alias(tmp_path):
+    path = tmp_path / "private-stage"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    passive_alias = os.dup(fd)
+    body = b"passive aliases never mutate the shared file description"
+    try:
+        result = contract.stream_to_fd(
+            io.BytesIO(body), fd, budget_path=tmp_path, chunk=7,
+            governor=contract.DiskGovernor(reserve_bytes=0),
+        )
+    finally:
+        os.close(passive_alias)
+        os.close(fd)
+
+    assert result == (len(body), hashlib.sha256(body).hexdigest())
+    assert path.read_bytes() == body
+    assert "no shared-open-file-description alias may write" in (
+        contract.stream_to_fd.__doc__
+    )
+
+
 class _CountingResponse(io.BytesIO):
     def __init__(self, body=b"body"):
         super().__init__(body)
@@ -323,6 +344,38 @@ def _cancel_once(function, target_line, call, cancellation_type):
     return cancellation
 
 
+def _cancel_on_invocation(
+    function, target_line, invocation, call, cancellation_type,
+):
+    cancellation = cancellation_type(
+        f"descriptor stream cancellation at {target_line} invocation {invocation}",
+    )
+    hits = 0
+    fired = False
+
+    def trace(frame, event, _arg):
+        nonlocal fired, hits
+        if (frame.f_code is function.__code__ and event == "line"
+                and frame.f_lineno == target_line):
+            hits += 1
+            if hits == invocation and not fired:
+                fired = True
+                sys.settrace(None)
+                raise cancellation
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        with pytest.raises(cancellation_type) as caught:
+            call()
+    finally:
+        sys.settrace(previous)
+    assert fired
+    assert caught.value is cancellation
+    return cancellation
+
+
 def _stream_case(tmp_path, name):
     path = tmp_path / name / "private-stage"
     path.parent.mkdir(parents=True)
@@ -341,15 +394,19 @@ def _stream_case(tmp_path, name):
         contract._DescriptorStreamLedger.begin_chunk,
         contract._DescriptorStreamLedger.take,
         contract._DescriptorStreamLedger.reconcile_descriptor,
+        contract._DescriptorStreamLedger.finalize,
         contract._DescriptorStreamLedger.attach,
         contract._DescriptorStreamReservation.reconcile,
         contract._DescriptorStreamReservation.take,
+        contract._DescriptorStreamReservation.finalize,
         contract.DiskGovernor._activate_descriptor_stream,
         contract.DiskGovernor._take_descriptor_stream,
         contract.DiskGovernor._reconcile_descriptor_stream,
+        contract.DiskGovernor._finalize_descriptor_stream,
         contract._DescriptorStreamLedger.settle,
         contract._DescriptorStreamSettlement.remember,
         contract._DescriptorStreamSettlement.reconcile,
+        contract._DescriptorStreamFence._leave,
         contract._DescriptorStreamFence.__exit__,
         contract._DescriptorStreamLedger.result,
     ],
@@ -399,6 +456,52 @@ def test_stream_to_fd_source_line_cancellation_is_exact_and_settled(
         assert governor.run_streamed == len(retained), target_line
         assert governor._inflight == 0, target_line
         assert governor._descriptor_state == (len(retained), {}), target_line
+
+
+@pytest.mark.parametrize("kind", [KeyboardInterrupt, SystemExit])
+def test_second_fence_exit_source_line_cancellation_has_terminal_metadata(
+    tmp_path, kind,
+):
+    operation = contract._DescriptorStreamFence.__exit__
+    discovery_path, discovery_fd, discovery_governor = _stream_case(
+        tmp_path, "second-fence-discovery",
+    )
+    try:
+        lines = _executed_lines(
+            operation,
+            lambda: contract.stream_to_fd(
+                io.BytesIO(b"known-body"), discovery_fd,
+                budget_path=discovery_path.parent, chunk=64,
+                governor=discovery_governor,
+            ),
+        )
+    finally:
+        os.close(discovery_fd)
+    assert lines
+
+    for index, target_line in enumerate(sorted(lines)):
+        path, fd, governor = _stream_case(
+            tmp_path, f"second-fence-{kind.__name__}-{index}",
+        )
+        try:
+            cancellation = _cancel_on_invocation(
+                operation, target_line, 2,
+                lambda: contract.stream_to_fd(
+                    io.BytesIO(b"known-body"), fd,
+                    budget_path=path.parent, chunk=64, governor=governor,
+                ),
+                kind,
+            )
+        finally:
+            os.close(fd)
+
+        retained = path.read_bytes()
+        assert retained == b"known-body", target_line
+        assert cancellation.bytes_written == len(retained), target_line
+        assert cancellation.sha256 == hashlib.sha256(retained).hexdigest(), target_line
+        assert governor._descriptor_state == (len(retained), {}), target_line
+        assert governor.run_streamed == len(retained), target_line
+        assert governor._inflight == 0, target_line
 
 
 def _sync_governor_under_stream_fences(ledger, governor):
@@ -454,6 +557,34 @@ def test_governor_reservation_creation_has_no_pre_fence_effect(tmp_path, kind):
         assert governor._descriptor_state == (0, {})
 
 
+@pytest.mark.parametrize(
+    ("counter", "ceiling", "layer"),
+    [
+        ("run_streamed", "run_max", contract.LAYER_RUN),
+        ("project_streamed", "project_max", contract.LAYER_PROJECT),
+    ],
+)
+def test_legacy_governor_preserves_external_counter_mutation(
+    tmp_path, counter, ceiling, layer,
+):
+    governor = contract.DiskGovernor(
+        **{ceiling: 100}, reserve_bytes=0,
+    )
+    setattr(governor, counter, 60)
+
+    granted, binding = governor.take(tmp_path, 0, 50)
+    assert (granted, binding) == (40, layer)
+    assert getattr(governor, counter) == 60
+    assert governor._inflight == 40
+
+    governor.commit(15)
+    governor.settle(granted, 15)
+    assert getattr(governor, counter) == 75
+    expected_run = 15 if counter == "project_streamed" else 75
+    assert governor.run_streamed == expected_run
+    assert governor._inflight == 0
+
+
 def test_terminal_descriptor_reservations_are_folded_and_removed(tmp_path):
     governor = contract.DiskGovernor(run_max=1000, reserve_bytes=0)
     bodies = [f"body-{index}".encode() for index in range(25)]
@@ -472,6 +603,42 @@ def test_terminal_descriptor_reservations_are_folded_and_removed(tmp_path):
     total = sum(map(len, bodies))
     assert governor._descriptor_state == (total, {})
     assert governor.run_streamed == total
+    assert governor._inflight == 0
+
+
+def test_terminal_charge_can_grow_to_a_later_observation_exactly_once(tmp_path):
+    path = tmp_path / "private-stage"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    governor = contract.DiskGovernor(run_max=100, reserve_bytes=0)
+    ledger = contract._DescriptorStreamLedger(fd, tmp_path, governor)
+    try:
+        ledger.activate()
+        ledger.begin_chunk(b"body")
+        ledger.take()
+        os.write(fd, b"body")
+        ledger.reconcile_descriptor(terminal=True)
+        assert governor._descriptor_state == (0, {
+            ledger.reservation.token: (4, 4, True),
+        })
+
+        alias = os.open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(alias, b"later")
+        finally:
+            os.close(alias)
+        with pytest.raises(OSError, match="exclusive sequential ownership"):
+            ledger.settle()
+        assert ledger.accounting_observed == 9
+        assert ledger.accounting_charged == 9
+
+        ledger.finalize()
+        ledger.finalize()
+    finally:
+        os.close(fd)
+
+    assert path.stat().st_size == 9
+    assert governor._descriptor_state == (9, {})
+    assert governor.run_streamed == 9
     assert governor._inflight == 0
 
 
@@ -608,7 +775,7 @@ def test_cancelling_one_stream_does_not_settle_another_active_token(
         with governor._lock:
             settled, active = governor._descriptor_state
             assert settled == 1
-            assert list(active.values()) == [(4, 0)]
+            assert list(active.values()) == [(4, 0, False)]
             assert governor.run_streamed == 1
             assert governor._inflight == 4
         release_write.set()
