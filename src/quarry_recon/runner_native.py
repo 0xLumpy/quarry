@@ -410,6 +410,8 @@ class NativeOutputAdoption:
                 if transaction._receipt is None:
                     raise
                 receipt = transaction._receipt
+                self._receipt = receipt
+                raise
             self._receipt = receipt
             return receipt
 
@@ -421,13 +423,20 @@ class NativeOutputAdoption:
 
         settled = False
         cleanup_fault = None
+        cancellation = None
         for _attempt in range(2):
             try:
-                settled, cleanup_fault = _cleanup_prepare_ownership(
+                attempt_settled, attempt_fault = _cleanup_prepare_ownership(
                     owner.run, owner,
                 )
             except BaseException as exc:
-                settled, cleanup_fault = False, exc
+                attempt_settled, attempt_fault = False, exc
+            settled = attempt_settled
+            if cleanup_fault is None and attempt_fault is not None:
+                cleanup_fault = attempt_fault
+            if (cancellation is None and attempt_fault is not None
+                    and not isinstance(attempt_fault, Exception)):
+                cancellation = attempt_fault
             if settled:
                 break
 
@@ -437,11 +446,17 @@ class NativeOutputAdoption:
             for _attempt in range(2):
                 try:
                     with owner.run._mutation(store.MutationScope.CONTROL):
-                        released, release_fault = _release_known_claim_locked(
+                        attempt_released, attempt_fault = _release_known_claim_locked(
                             owner.run, owner,
                         )
                 except BaseException as exc:
-                    released, release_fault = False, exc
+                    attempt_released, attempt_fault = False, exc
+                released = attempt_released
+                if release_fault is None and attempt_fault is not None:
+                    release_fault = attempt_fault
+                if (cancellation is None and attempt_fault is not None
+                        and not isinstance(attempt_fault, Exception)):
+                    cancellation = attempt_fault
                 if released:
                     break
 
@@ -465,6 +480,8 @@ class NativeOutputAdoption:
         )
         if cleanup_settled:
             self._receipt = receipt
+        if cancellation is not None:
+            raise cancellation
         return receipt
 
 

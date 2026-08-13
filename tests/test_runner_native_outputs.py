@@ -1010,3 +1010,149 @@ def test_adoption_is_exact_and_single_use_before_side_effects(tmp_path):
     assert adoption.fence() == transaction.finish(clean=False)
     assert run._live_artifact_claim_count() == 0
     assert _attempt_directories(run) == []
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_adoption_transaction_fence_preserves_cleanup_cancellation(
+    tmp_path, monkeypatch, interruption,
+):
+    run = _running_run(
+        tmp_path, f"native-adopt-tx-cancel-{interruption.__name__.lower()}",
+    )
+    final = run.dir / "raw" / "probe" / "nuclei.jsonl"
+    policy = RepositoryNativeOutput.file(3, "raw", "probe", "nuclei.jsonl")
+    adoption = NativeOutputAdoption()
+    transaction = prepare_native_outputs(
+        run,
+        _python_command("import sys", final),
+        (policy,),
+        adoption=adoption,
+    )
+    cancellation = interruption("fixture adoption transaction cancellation")
+    real_cleanup = NativeOutputTransaction._cleanup_attempt
+
+    def cleanup_then_interrupt(self):
+        real_cleanup(self)
+        raise cancellation
+
+    monkeypatch.setattr(
+        NativeOutputTransaction, "_cleanup_attempt", cleanup_then_interrupt,
+    )
+    ordinary_primary = RuntimeError("fixture ordinary caller primary")
+    try:
+        raise ordinary_primary
+    except RuntimeError as caught:
+        assert caught is ordinary_primary
+        with pytest.raises(interruption) as interrupted:
+            adoption.fence()
+
+    assert interrupted.value is cancellation
+    receipt = adoption.fence()
+    assert receipt is transaction.finish(clean=False)
+    assert receipt.cleanup_settled and not receipt.claim_retained
+    assert receipt.fault_type == interruption.__name__
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
+
+
+def _raw_adoption_after_ordinary_prepare_failure(
+    tmp_path, monkeypatch, run_id: str,
+):
+    run = _running_run(tmp_path, run_id)
+    final = run.dir / "raw" / "probe" / "nuclei.jsonl"
+    policy = RepositoryNativeOutput.file(3, "raw", "probe", "nuclei.jsonl")
+    adoption = NativeOutputAdoption()
+    primary = RuntimeError("fixture ordinary prepare primary")
+    real_create = runner_native._create_prepare_root
+
+    def create_then_fail(owner):
+        real_create(owner)
+        raise primary
+
+    with monkeypatch.context() as setup:
+        setup.setattr(runner_native, "_create_prepare_root", create_then_fail)
+        setup.setattr(NativeOutputAdoption, "fence", lambda self: None)
+        with pytest.raises(RuntimeError) as caught:
+            prepare_native_outputs(
+                run,
+                _python_command("import sys", final),
+                (policy,),
+                adoption=adoption,
+            )
+
+    assert caught.value is primary
+    assert run._live_artifact_claim_count() == 1
+    assert len(_attempt_directories(run)) == 1
+    return run, adoption
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_raw_adoption_fence_preserves_cleanup_cancellation(
+    tmp_path, monkeypatch, interruption,
+):
+    run, adoption = _raw_adoption_after_ordinary_prepare_failure(
+        tmp_path,
+        monkeypatch,
+        f"native-adopt-raw-cleanup-{interruption.__name__.lower()}",
+    )
+    cancellation = interruption("fixture raw cleanup cancellation")
+    real_cleanup = runner_native._cleanup_prepare_ownership
+    calls = 0
+
+    def cleanup_then_interrupt(*arguments):
+        nonlocal calls
+        result = real_cleanup(*arguments)
+        calls += 1
+        if calls == 1:
+            raise cancellation
+        return result
+
+    monkeypatch.setattr(
+        runner_native, "_cleanup_prepare_ownership", cleanup_then_interrupt,
+    )
+    with pytest.raises(interruption) as interrupted:
+        adoption.fence()
+
+    assert interrupted.value is cancellation
+    receipt = adoption.fence()
+    assert receipt is not None
+    assert receipt.cleanup_settled and not receipt.claim_retained
+    assert receipt.fault_type == interruption.__name__
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_raw_adoption_fence_preserves_release_cancellation(
+    tmp_path, monkeypatch, interruption,
+):
+    run, adoption = _raw_adoption_after_ordinary_prepare_failure(
+        tmp_path,
+        monkeypatch,
+        f"native-adopt-raw-release-{interruption.__name__.lower()}",
+    )
+    cancellation = interruption("fixture raw release cancellation")
+    real_release = runner_native._release_known_claim_locked
+    calls = 0
+
+    def release_then_interrupt(*arguments):
+        nonlocal calls
+        result = real_release(*arguments)
+        calls += 1
+        if calls == 1:
+            raise cancellation
+        return result
+
+    monkeypatch.setattr(
+        runner_native, "_release_known_claim_locked", release_then_interrupt,
+    )
+    with pytest.raises(interruption) as interrupted:
+        adoption.fence()
+
+    assert interrupted.value is cancellation
+    receipt = adoption.fence()
+    assert receipt is not None
+    assert receipt.cleanup_settled and not receipt.claim_retained
+    assert receipt.fault_type == interruption.__name__
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
