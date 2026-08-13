@@ -102,6 +102,9 @@ class TestSubfinderPerApex:
         monkeypatch.setattr(settings, "performance", lambda: {})      # default 60m budget
 
         class _Run:
+            @property
+            def dir(self):
+                return tmp_path
             def raw_path(self, ph, tl, nm):
                 p = tmp_path / "raw" / ph / tl / nm; p.parent.mkdir(parents=True, exist_ok=True); return p
             def record(self, ph, r): recorded.append(r)
