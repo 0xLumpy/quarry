@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
+from types import MappingProxyType
 
 from . import _fd_claims
 
@@ -290,18 +291,46 @@ class PrivateReplaceCommittedWithFault(PrivatePathError):
     """A replacement committed durably, but settlement also observed a fault."""
 
 
-class PrivatePublishIfAbsentUncertain(PrivateReplaceUncertain):
+class _PrivatePublishIfAbsentOutcome:
+    """Keep authoritative CAS outcome fields immune to instance shadowing."""
+
+    _outcome_state = ""
+
+    def __getattribute__(self, name):
+        if name == "operation":
+            return "publish_if_absent"
+        if name == "state":
+            return type(self)._outcome_state
+        if name == "__dict__":
+            values = BaseException.__getattribute__(self, "__dict__")
+            return MappingProxyType(values)
+        return BaseException.__getattribute__(self, name)
+
+    def __setattr__(self, name, value) -> None:
+        if name in {"operation", "state"}:
+            raise AttributeError("private no-replace outcomes are immutable")
+        BaseException.__setattr__(self, name, value)
+
+    def __delattr__(self, name) -> None:
+        if name in {"operation", "state"}:
+            raise AttributeError("private no-replace outcomes are immutable")
+        BaseException.__delattr__(self, name)
+
+
+class PrivatePublishIfAbsentUncertain(
+    _PrivatePublishIfAbsentOutcome, PrivateReplaceUncertain,
+):
     """A no-replace publication may have landed but is not durably settled."""
 
-    operation = "publish_if_absent"
-    state = "uncertain"
+    _outcome_state = "uncertain"
 
 
-class PrivatePublishIfAbsentCommittedWithFault(PrivateReplaceCommittedWithFault):
+class PrivatePublishIfAbsentCommittedWithFault(
+    _PrivatePublishIfAbsentOutcome, PrivateReplaceCommittedWithFault,
+):
     """A no-replace publication committed, but its action or cleanup faulted."""
 
-    operation = "publish_if_absent"
-    state = "committed_with_fault"
+    _outcome_state = "committed_with_fault"
 
 
 _STAGE_OPERATIONS = frozenset({
@@ -1176,6 +1205,7 @@ _PrivateDescriptorClaim = _fd_claims.DescriptorClaim
 _DESCRIPTOR_CLAIM_KINDS = frozenset({
     "writer", "pin", "parent", "anchor",
     "source_writer", "source_parent", "source_anchor",
+    "verifier", "parent_verifier",
 })
 _DESCRIPTOR_CLAIM_TERMINAL = _fd_claims.TERMINAL_DISPOSITIONS
 _MAX_DESCRIPTOR_CLAIM_ERRORS = _fd_claims.MAX_CLAIM_ERRORS
@@ -1494,6 +1524,7 @@ class PrivateFileStage:
         "_lifecycle_lock",
         "_cleanup_ledger",
         "_noreplace_components",
+        "_noreplace_target_claim",
     )
 
     def __init__(
@@ -1531,6 +1562,7 @@ class PrivateFileStage:
         object.__setattr__(self, "_lifecycle_lock", threading.RLock())
         object.__setattr__(self, "_cleanup_ledger", None)
         object.__setattr__(self, "_noreplace_components", None)
+        object.__setattr__(self, "_noreplace_target_claim", None)
 
     def __setattr__(self, name, value) -> None:
         raise AttributeError("private stage claims are read-only")
@@ -1969,7 +2001,10 @@ def _record_descriptor_claim_error(
 def _validate_descriptor_claim_metadata(
     claim: _PrivateDescriptorClaim, observed: os.stat_result, *, allow_unlinked: bool,
 ) -> None:
-    if claim._kind in {"parent", "anchor", "source_parent", "source_anchor"}:
+    if claim._kind in {
+        "parent", "anchor", "source_parent", "source_anchor",
+        "parent_verifier",
+    }:
         _validate_strict_dir_stat(observed, claim._components)
         return
     if allow_unlinked and observed.st_nlink == 0:
@@ -4655,16 +4690,42 @@ def _new_noreplace_cleanup_ledger(
     )
 
 
+def _register_noreplace_claim(
+    stage: PrivateFileStage,
+    *,
+    identity: tuple[int, int] = (0, 0),
+    kind: str,
+    components: tuple[str, ...],
+) -> _PrivateDescriptorClaim:
+    """Attach an empty verifier slot before any descriptor-producing syscall."""
+    ledger = stage._cleanup_ledger
+    if type(ledger) is not _PrivateStageCleanupLedger:
+        raise PrivateStageStateError("publish_if_absent", stage.state)
+    claim = _new_descriptor_claim(-1, identity, kind, components)
+    with ledger._lock:
+        object.__setattr__(ledger, "_extra_claims", ledger._extra_claims + (claim,))
+    return claim
+
+
+def _noreplace_claims_by_kind(
+    stage: PrivateFileStage, kind: str,
+) -> tuple[_PrivateDescriptorClaim, ...]:
+    ledger = stage._cleanup_ledger
+    if type(ledger) is not _PrivateStageCleanupLedger:
+        return ()
+    return tuple(claim for claim in ledger.claims if claim._kind == kind)
+
+
 def _noreplace_cleanup_claims(
     stage: PrivateFileStage,
 ) -> tuple[_PrivateDescriptorClaim, _PrivateDescriptorClaim, _PrivateDescriptorClaim]:
     ledger = stage._cleanup_ledger
     claims = () if type(ledger) is not _PrivateStageCleanupLedger else ledger._extra_claims
     if (type(ledger) is not _PrivateStageCleanupLedger or ledger._stage_claims
-            or len(claims) != 3
-            or tuple(claim._kind for claim in claims) != ("pin", "parent", "anchor")):
+            or len(claims) < 3
+            or tuple(claim._kind for claim in claims[:3]) != ("pin", "parent", "anchor")):
         raise PrivateStageStateError("publish_if_absent", stage.state)
-    return claims
+    return claims[:3]
 
 
 def _noreplace_fds(stage: PrivateFileStage) -> tuple[int, int, int]:
@@ -4688,43 +4749,191 @@ def _noreplace_fds(stage: PrivateFileStage) -> tuple[int, int, int]:
 def _validate_declared_noreplace_parent(
     stage: PrivateFileStage, *, parent_fd: int, anchor_fd: int,
 ) -> None:
+    """Walk the declared parent using only pre-registered retained claims."""
     _validate_stage_directory_claims_at(
         stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
     )
-    declared = open_strict_dir_at(anchor_fd, stage.components[:-1])
-    with _owned_fd(declared):
-        if _identity(os.fstat(declared)) != stage.parent_identity:
-            raise PrivatePathUnsafe(
-                "private stage parent no longer matches its declared path",
-                components=stage.components,
+    current = _register_noreplace_claim(
+        stage,
+        identity=stage.anchor_identity,
+        kind="parent_verifier",
+        components=(),
+    )
+    _duplicate_private_claim(current, anchor_fd)
+    walked: tuple[str, ...] = ()
+    for component in stage.components[:-1]:
+        walked += (component,)
+        child = _register_noreplace_claim(
+            stage,
+            kind="parent_verifier",
+            components=walked,
+        )
+        try:
+            descriptor = _fd_claims.populate_allocation_slot(
+                child,
+                lambda component=component, current=current: os.open(
+                    component, _DIR_OPEN_FLAGS, dir_fd=current.fd,
+                ),
+                invalid_error=lambda: PrivateStageHandoffError("publish"),
             )
+        except OSError as exc:
+            if child.fd < 0:
+                object.__setattr__(child, "_disposition", "unallocated")
+            _classify_open_error(
+                exc, current.fd, component, walked, expect_dir=True,
+            )
+            raise AssertionError("unreachable")
+        observed = os.fstat(descriptor)
+        object.__setattr__(child, "_owned_identity", _identity(observed))
+        object.__setattr__(child, "_identity", _identity(observed))
+        try:
+            _validate_strict_dir_stat(observed, walked)
+        except BaseException as primary:
+            _record_descriptor_claim_error(child, primary)
+            raise
+        current = child
+    declared = _inspect_clean_pending_claim(current, operation="publish")
+    if _identity(declared) != stage.parent_identity:
+        raise PrivatePathUnsafe(
+            "private stage parent no longer matches its declared path",
+            components=stage.components,
+        )
+
+
+def _open_noreplace_file_claim(
+    stage: PrivateFileStage,
+    *,
+    parent_fd: int,
+    component: str,
+    components: tuple[str, ...],
+) -> _PrivateDescriptorClaim | None:
+    claim = _register_noreplace_claim(
+        stage,
+        kind="verifier",
+        components=components,
+    )
+    try:
+        descriptor = _open_strict_file_in(
+            parent_fd, component, components, _claim=claim,
+        )
+    except PrivatePathMissing:
+        return None
+    observed = os.fstat(descriptor)
+    object.__setattr__(claim, "_identity", _identity(observed))
+    return claim
+
+
+def _noreplace_claim_name_stable(
+    claim: _PrivateDescriptorClaim,
+    *,
+    parent_fd: int,
+    component: str,
+    components: tuple[str, ...],
+) -> os.stat_result:
+    before = _inspect_clean_pending_claim(claim, operation="publish")
+    before_signature = _file_signature(before)
+    after = _inspect_clean_pending_claim(claim, operation="publish")
+    try:
+        named = os.stat(
+            component, dir_fd=parent_fd, follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise PrivatePathUnsafe(
+            "no-replace name changed during observation", components=components,
+        ) from exc
+    _validate_strict_file_stat(named, components)
+    if (before_signature != _file_signature(after)
+            or before_signature != _file_signature(named)):
+        raise PrivatePathUnsafe(
+            "no-replace name changed during observation", components=components,
+        )
+    return after
+
+
+def _authenticate_noreplace_target_claim(
+    stage: PrivateFileStage,
+    target: tuple[str, ...],
+    claim: _PrivateDescriptorClaim,
+    *,
+    parent_fd: int,
+    pin_fd: int,
+) -> None:
+    before = _inspect_clean_pending_claim(claim, operation="publish")
+    pin_before = os.fstat(pin_fd)
+    _validate_strict_file_stat(pin_before, stage.components)
+    before_signature = _file_signature(before)
+    pin_signature = _file_signature(pin_before)
+    if (_identity(before) != stage.file_identity
+            or _identity(pin_before) != stage.file_identity
+            or stage.sealed_digest is None):
+        raise PrivatePathUnsafe(
+            "published no-replace target is not the sealed stage",
+            components=target,
+        )
+    target_digest = _digest_fd(claim.fd)
+    pin_digest = _digest_fd(pin_fd)
+    after = _inspect_clean_pending_claim(claim, operation="publish")
+    pin_after = os.fstat(pin_fd)
+    _validate_strict_file_stat(pin_after, stage.components)
+    try:
+        named = os.stat(
+            target[-1], dir_fd=parent_fd, follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise PrivatePathUnsafe(
+            "published no-replace target left its final path",
+            components=target,
+        ) from exc
+    _validate_strict_file_stat(named, target)
+    if (before_signature != _file_signature(after)
+            or before_signature != _file_signature(named)
+            or pin_signature != _file_signature(pin_after)
+            or target_digest != stage.sealed_digest
+            or pin_digest != stage.sealed_digest):
+        raise PrivatePathUnsafe(
+            "published no-replace target bytes or name changed",
+            components=target,
+        )
 
 
 def _noreplace_named_stage_matches(
     stage: PrivateFileStage, *, parent_fd: int, pin_fd: int,
 ) -> bool:
-    try:
-        named_fd = _open_strict_file_in(
-            parent_fd, stage.temporary_name, stage.components,
-        )
-    except PrivatePathMissing:
+    claim = _open_noreplace_file_claim(
+        stage,
+        parent_fd=parent_fd,
+        component=stage.temporary_name,
+        components=stage.components,
+    )
+    if claim is None:
         return False
-    with _owned_fd(named_fd):
-        named = os.fstat(named_fd)
-        retained = os.fstat(pin_fd)
-        if (_identity(named) != stage.file_identity
-                or _identity(retained) != stage.file_identity):
-            raise PrivatePathUnsafe(
-                "private stage name was substituted", components=stage.components,
-            )
-        if (_file_signature(named) != _file_signature(retained)
-                or stage.sealed_digest is None
-                or _digest_fd(named_fd) != stage.sealed_digest
-                or _digest_fd(pin_fd) != stage.sealed_digest):
-            raise PrivatePathUnsafe(
-                "private stage content changed after sealing",
-                components=stage.components,
-            )
+    named = _inspect_clean_pending_claim(claim, operation="publish")
+    retained = os.fstat(pin_fd)
+    _validate_strict_file_stat(retained, stage.components)
+    if (_identity(named) != stage.file_identity
+            or _identity(retained) != stage.file_identity):
+        raise PrivatePathUnsafe(
+            "private stage name was substituted", components=stage.components,
+        )
+    named_digest = _digest_fd(claim.fd)
+    retained_digest = _digest_fd(pin_fd)
+    stable = _noreplace_claim_name_stable(
+        claim,
+        parent_fd=parent_fd,
+        component=stage.temporary_name,
+        components=stage.components,
+    )
+    retained_after = os.fstat(pin_fd)
+    _validate_strict_file_stat(retained_after, stage.components)
+    if (_identity(stable) != stage.file_identity
+            or _file_signature(retained) != _file_signature(retained_after)
+            or stage.sealed_digest is None
+            or named_digest != stage.sealed_digest
+            or retained_digest != stage.sealed_digest):
+        raise PrivatePathUnsafe(
+            "private stage content changed after sealing",
+            components=stage.components,
+        )
     return True
 
 
@@ -4734,28 +4943,32 @@ def _noreplace_destination_matches_stage(
     *,
     parent_fd: int,
     pin_fd: int,
-) -> bool:
-    try:
-        destination_fd = _open_strict_file_in(
-            parent_fd, target[-1], target,
+) -> _PrivateDescriptorClaim | None:
+    claim = _open_noreplace_file_claim(
+        stage,
+        parent_fd=parent_fd,
+        component=target[-1],
+        components=target,
+    )
+    if claim is None:
+        return None
+    landed = _inspect_clean_pending_claim(claim, operation="publish")
+    if _identity(landed) != stage.file_identity:
+        _noreplace_claim_name_stable(
+            claim,
+            parent_fd=parent_fd,
+            component=target[-1],
+            components=target,
         )
-    except PrivatePathMissing:
-        return False
-    with _owned_fd(destination_fd):
-        landed = os.fstat(destination_fd)
-        retained = os.fstat(pin_fd)
-        if _identity(landed) != stage.file_identity:
-            return False
-        if (_identity(retained) != stage.file_identity
-                or landed.st_size != retained.st_size
-                or stage.sealed_digest is None
-                or _digest_fd(destination_fd) != stage.sealed_digest
-                or _digest_fd(pin_fd) != stage.sealed_digest):
-            raise PrivatePathUnsafe(
-                "published no-replace stage bytes changed",
-                components=target,
-            )
-    return True
+        return None
+    _authenticate_noreplace_target_claim(
+        stage,
+        target,
+        claim,
+        parent_fd=parent_fd,
+        pin_fd=pin_fd,
+    )
+    return claim
 
 
 def _noreplace_target_exists_stably(
@@ -4764,26 +4977,42 @@ def _noreplace_target_exists_stably(
     *,
     parent_fd: int,
 ) -> bool:
-    try:
-        target_fd = _open_strict_file_in(parent_fd, target[-1], target)
-    except PrivatePathMissing:
+    claim = _open_noreplace_file_claim(
+        stage,
+        parent_fd=parent_fd,
+        component=target[-1],
+        components=target,
+    )
+    if claim is None:
         return False
-    with _owned_fd(target_fd):
-        before = os.fstat(target_fd)
-        try:
-            named = os.stat(
-                target[-1], dir_fd=parent_fd, follow_symlinks=False,
-            )
-        except FileNotFoundError as exc:
-            raise PrivatePathUnsafe(
-                "no-replace target changed during observation", components=target,
-            ) from exc
-        _validate_strict_file_stat(named, target)
-        if _file_signature(named) != _file_signature(before):
-            raise PrivatePathUnsafe(
-                "no-replace target changed during observation", components=target,
-            )
+    _noreplace_claim_name_stable(
+        claim,
+        parent_fd=parent_fd,
+        component=target[-1],
+        components=target,
+    )
     return True
+
+
+def _noreplace_existing_target_still_matches(
+    stage: PrivateFileStage,
+    target: tuple[str, ...],
+    *,
+    parent_fd: int,
+) -> bool:
+    prior_claims = _noreplace_claims_by_kind(stage, "verifier")
+    if not prior_claims:
+        return False
+    prior = prior_claims[-1]
+    if prior.disposition != "pending" or prior.fd < 0:
+        return False
+    before = _noreplace_claim_name_stable(
+        prior,
+        parent_fd=parent_fd,
+        component=target[-1],
+        components=target,
+    )
+    return _identity(before) != stage.file_identity
 
 
 def _arm_noreplace_stage(
@@ -4791,13 +5020,89 @@ def _arm_noreplace_stage(
 ) -> None:
     ledger = _new_noreplace_cleanup_ledger(stage)
     object.__setattr__(stage, "_noreplace_components", target)
+    object.__setattr__(stage, "_noreplace_target_claim", None)
     object.__setattr__(stage, "_cleanup_ledger", ledger)
     object.__setattr__(stage, "_state", "publishing")
 
 
+def _drain_noreplace_claim_once(
+    claim: _PrivateDescriptorClaim,
+) -> tuple[BaseException, ...]:
+    """Close one CAS claim once; the raw syscall is the tombstone boundary.
+
+    The slot remains retryable if cancellation happens before entering ``os.close``.
+    Once that syscall returns or raises, its effect cannot be distinguished safely
+    from same-inode numeric-FD reuse, so the claim is terminal and never retried.
+    """
+    with claim._lock:
+        if claim._disposition in _DESCRIPTOR_CLAIM_TERMINAL:
+            return ()
+        if claim._fd < 0 and claim._disposition == "allocating":
+            object.__setattr__(claim, "_disposition", "unallocated")
+            return ()
+        before_errors = len(claim._errors)
+        observed = _inspect_descriptor_claim(claim, allow_unlinked=True)
+        if observed is None:
+            return claim._errors[before_errors:]
+        descriptor = claim._fd
+        object.__setattr__(claim, "_disposition", "close_started")
+        object.__setattr__(claim, "_close_attempts", claim._close_attempts + 1)
+        close_fault: BaseException | None = None
+        try:
+            object.__setattr__(claim, "_fd", -1); os.close(descriptor)
+        except BaseException as exc:
+            if claim._fd == descriptor:
+                raise
+            close_fault = exc
+        if close_fault is not None:
+            _record_descriptor_claim_error(claim, close_fault)
+            object.__setattr__(claim, "_disposition", "close_ambiguous")
+        else:
+            object.__setattr__(
+                claim,
+                "_disposition",
+                "closed_clean" if not claim._errors else "closed_after_fault",
+            )
+        return claim._errors[before_errors:]
+
+
+def _drain_noreplace_claims(
+    claims: tuple[_PrivateDescriptorClaim, ...],
+) -> tuple[BaseException, ...]:
+    errors: list[BaseException] = []
+    for claim in claims:
+        if claim.disposition in _DESCRIPTOR_CLAIM_TERMINAL:
+            continue
+        try:
+            errors.extend(_drain_noreplace_claim_once(claim))
+        except BaseException as exc:
+            _record_descriptor_claim_error(claim, exc)
+            if claim._fd < 0 and claim._disposition == "close_started":
+                object.__setattr__(claim, "_disposition", "close_ambiguous")
+            errors.append(exc)
+    return tuple(errors)
+
+
 def _disarm_noreplace_stage(stage: PrivateFileStage) -> None:
-    claims = _noreplace_cleanup_claims(stage)
-    if any(claim.disposition != "pending" for claim in claims):
+    core_claims = _noreplace_cleanup_claims(stage)
+    ledger = stage._cleanup_ledger
+    verifier_claims = ledger._extra_claims[3:]
+    cleanup_errors = _drain_noreplace_claims(verifier_claims)
+    pending = any(
+        claim.disposition not in _DESCRIPTOR_CLAIM_TERMINAL
+        for claim in verifier_claims
+    )
+    cancellation = _noreplace_cancellation(*cleanup_errors)
+    if (any(claim.disposition != "pending" for claim in core_claims)
+            or pending):
+        object.__setattr__(stage, "_state", "replaced_uncertain")
+        if cancellation is not None:
+            _raise_noreplace_cancellation(
+                cancellation,
+                state="uncertain",
+                target=stage._noreplace_components or stage.components,
+                close_errors=cleanup_errors,
+            )
         raise PrivatePublishIfAbsentUncertain(
             "no-replace cleanup ownership cannot be handed back cleanly",
             components=stage._noreplace_components or stage.components,
@@ -4805,6 +5110,23 @@ def _disarm_noreplace_stage(stage: PrivateFileStage) -> None:
     object.__setattr__(stage, "_state", "sealed")
     object.__setattr__(stage, "_cleanup_ledger", None)
     object.__setattr__(stage, "_noreplace_components", None)
+    object.__setattr__(stage, "_noreplace_target_claim", None)
+    if cancellation is not None:
+        _raise_noreplace_cancellation(
+            cancellation,
+            state="unpublished",
+            target=stage.components,
+            close_errors=cleanup_errors,
+        )
+    if cleanup_errors:
+        error = PrivatePathError(
+            "unpublished no-replace verifiers closed with faults",
+            components=stage.components,
+        )
+        error.operation = "publish_if_absent"
+        error.state = "unpublished"
+        error.close_errors = cleanup_errors
+        raise error from cleanup_errors[0]
 
 
 def _noreplace_cancellation(*values) -> BaseException | None:
@@ -4884,12 +5206,47 @@ def _drain_noreplace_cleanup(
     ledger = stage._cleanup_ledger
     if type(ledger) is not _PrivateStageCleanupLedger:
         return (), False
-    errors = tuple(_drain_private_stage_ledger(ledger))
-    claims = _noreplace_cleanup_claims(stage)
-    for field, claim in zip(("file_fd", "parent_fd", "anchor_fd"), claims):
+    all_claims = ledger.claims
+    errors = _drain_noreplace_claims(all_claims)
+    core_claims = _noreplace_cleanup_claims(stage)
+    for field, claim in zip(("file_fd", "parent_fd", "anchor_fd"), core_claims):
         if claim.disposition in _DESCRIPTOR_CLAIM_TERMINAL:
             object.__setattr__(stage, f"_{field}", -1)
     return errors, ledger.pending
+
+
+def _compact_noreplace_replay_claims(stage: PrivateFileStage) -> None:
+    """Drain and discard obsolete verifier graphs before one uncertain replay."""
+    ledger = stage._cleanup_ledger
+    if type(ledger) is not _PrivateStageCleanupLedger:
+        raise PrivateStageStateError("publish_if_absent", stage.state)
+    core_claims = _noreplace_cleanup_claims(stage)
+    stale_claims = ledger._extra_claims[3:]
+    cleanup_errors = _drain_noreplace_claims(stale_claims)
+    pending = any(
+        claim.disposition not in _DESCRIPTOR_CLAIM_TERMINAL
+        for claim in stale_claims
+    )
+    cancellation = _noreplace_cancellation(*cleanup_errors)
+    if cancellation is not None:
+        _raise_noreplace_cancellation(
+            cancellation,
+            state="uncertain",
+            target=stage._noreplace_components or stage.components,
+            close_errors=cleanup_errors,
+        )
+    if pending or cleanup_errors:
+        error = PrivatePublishIfAbsentUncertain(
+            "obsolete no-replace verifier cleanup is uncertain",
+            components=stage._noreplace_components or stage.components,
+        )
+        error.cleanup_errors = cleanup_errors
+        error.close_errors = cleanup_errors
+        error.cleanup_pending = pending
+        raise error from (cleanup_errors[0] if cleanup_errors else error)
+    with ledger._lock:
+        object.__setattr__(ledger, "_extra_claims", core_claims)
+    object.__setattr__(stage, "_noreplace_target_claim", None)
 
 
 def _finish_noreplace_commit(
@@ -4898,6 +5255,31 @@ def _finish_noreplace_commit(
     *,
     primary: BaseException | None,
 ) -> bool:
+    target_claim = stage._noreplace_target_claim
+    try:
+        pin_fd, parent_fd, anchor_fd = _noreplace_fds(stage)
+        if type(target_claim) is not _PrivateDescriptorClaim:
+            raise PrivatePathUnsafe(
+                "no-replace terminal target verifier is missing",
+                components=target,
+            )
+        _validate_declared_noreplace_parent(
+            stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+        )
+        _authenticate_noreplace_target_claim(
+            stage,
+            target,
+            target_claim,
+            parent_fd=parent_fd,
+            pin_fd=pin_fd,
+        )
+    except BaseException as terminal_error:
+        _mark_noreplace_uncertain(
+            stage,
+            target,
+            primary=terminal_error,
+            action_error=primary,
+        )
     object.__setattr__(stage, "_state", "committed")
     cleanup_errors, cleanup_pending = _drain_noreplace_cleanup(stage)
     cancellation = _noreplace_cancellation(primary, *cleanup_errors)
@@ -4941,7 +5323,7 @@ def _reconcile_noreplace_action(
             action_error=action_error,
         )
     try:
-        landed = _noreplace_destination_matches_stage(
+        landed_claim = _noreplace_destination_matches_stage(
             stage, target, parent_fd=parent_fd, pin_fd=pin_fd,
         )
     except BaseException as observation_error:
@@ -4972,7 +5354,7 @@ def _reconcile_noreplace_action(
             action_error=action_error,
         )
 
-    if landed:
+    if landed_claim is not None:
         object.__setattr__(stage, "_state", "replaced_uncertain")
         try:
             _validate_declared_noreplace_parent(
@@ -4982,13 +5364,17 @@ def _reconcile_noreplace_action(
             _validate_declared_noreplace_parent(
                 stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
             )
-            if not _noreplace_destination_matches_stage(
+            final_claim = _noreplace_destination_matches_stage(
                 stage, target, parent_fd=parent_fd, pin_fd=pin_fd,
-            ):
+            )
+            if final_claim is None:
                 raise PrivatePathUnsafe(
                     "durable no-replace stage left its target path",
                     components=target,
                 )
+            object.__setattr__(
+                stage, "_noreplace_target_claim", final_claim,
+            )
         except BaseException as settlement_error:
             _mark_noreplace_uncertain(
                 stage,
@@ -5039,6 +5425,78 @@ def _reconcile_noreplace_action(
                 reconciliation_error=target_error,
             )
         raise target_error
+    if (target_exists and isinstance(action_error, OSError)
+            and action_error.errno == errno.EEXIST):
+        try:
+            prior_claims = _noreplace_claims_by_kind(stage, "verifier")
+            if not prior_claims:
+                raise PrivatePathUnsafe(
+                    "no-replace prior target verifier is missing",
+                    components=target,
+                )
+            prior_claim = prior_claims[-1]
+            prior_before = _noreplace_claim_name_stable(
+                prior_claim,
+                parent_fd=parent_fd,
+                component=target[-1],
+                components=target,
+            )
+            prior_signature = _file_signature(prior_before)
+            prior_digest = _digest_fd(prior_claim.fd)
+            prior_after_hash = _noreplace_claim_name_stable(
+                prior_claim,
+                parent_fd=parent_fd,
+                component=target[-1],
+                components=target,
+            )
+            if _file_signature(prior_after_hash) != prior_signature:
+                raise PrivatePathUnsafe(
+                    "no-replace prior target changed during authentication",
+                    components=target,
+                )
+            _validate_declared_noreplace_parent(
+                stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+            )
+            if not _noreplace_existing_target_still_matches(
+                stage, target, parent_fd=parent_fd,
+            ):
+                raise PrivatePathUnsafe(
+                    "no-replace target changed after the action refused",
+                    components=target,
+                )
+            _validate_declared_noreplace_parent(
+                stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+            )
+            prior_terminal = _noreplace_claim_name_stable(
+                prior_claim,
+                parent_fd=parent_fd,
+                component=target[-1],
+                components=target,
+            )
+            terminal_digest = _digest_fd(prior_claim.fd)
+            prior_final = _noreplace_claim_name_stable(
+                prior_claim,
+                parent_fd=parent_fd,
+                component=target[-1],
+                components=target,
+            )
+            if (_file_signature(prior_terminal) != prior_signature
+                    or _file_signature(prior_final) != prior_signature
+                    or terminal_digest != prior_digest):
+                raise PrivatePathUnsafe(
+                    "no-replace prior target changed before terminal proof",
+                    components=target,
+                )
+            _validate_declared_noreplace_parent(
+                stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+            )
+        except BaseException as prior_error:
+            _mark_noreplace_uncertain(
+                stage,
+                target,
+                primary=prior_error,
+                action_error=action_error,
+            )
     _disarm_noreplace_stage(stage)
 
     cancellation = _noreplace_cancellation(action_error)
@@ -5073,9 +5531,32 @@ def _start_noreplace_action(
             object.__setattr__(stage, "_state", "publishing")
         return _reconcile_noreplace_action(stage, target, arm_error)
 
+    try:
+        pin_fd, parent_fd, anchor_fd = _noreplace_fds(stage)
+        _validate_declared_noreplace_parent(
+            stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
+        )
+        if not _noreplace_named_stage_matches(
+            stage, parent_fd=parent_fd, pin_fd=pin_fd,
+        ):
+            raise PrivatePathUnsafe(
+                "private no-replace stage disappeared before publication",
+                components=stage.components,
+            )
+    except BaseException as pre_action_error:
+        _disarm_noreplace_stage(stage)
+        cancellation = _noreplace_cancellation(pre_action_error)
+        if cancellation is not None:
+            _raise_noreplace_cancellation(
+                cancellation,
+                state="unpublished",
+                target=target,
+                action_error=pre_action_error,
+            )
+        raise
+
     action_error: BaseException | None = None
     try:
-        _, parent_fd, _ = _noreplace_fds(stage)
         _renameat2_noreplace(
             parent_fd,
             stage.temporary_name,
@@ -5090,13 +5571,14 @@ def _start_noreplace_action(
 def _resume_noreplace_action(
     stage: PrivateFileStage, target: tuple[str, ...],
 ) -> bool:
-    landed = False
+    _compact_noreplace_replay_claims(stage)
+    landed_claim: _PrivateDescriptorClaim | None = None
     try:
         pin_fd, parent_fd, anchor_fd = _noreplace_fds(stage)
-        if _noreplace_destination_matches_stage(
+        landed_claim = _noreplace_destination_matches_stage(
             stage, target, parent_fd=parent_fd, pin_fd=pin_fd,
-        ):
-            landed = True
+        )
+        if landed_claim is not None:
             _validate_declared_noreplace_parent(
                 stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
             )
@@ -5104,13 +5586,17 @@ def _resume_noreplace_action(
             _validate_declared_noreplace_parent(
                 stage, parent_fd=parent_fd, anchor_fd=anchor_fd,
             )
-            if not _noreplace_destination_matches_stage(
+            final_claim = _noreplace_destination_matches_stage(
                 stage, target, parent_fd=parent_fd, pin_fd=pin_fd,
-            ):
+            )
+            if final_claim is None:
                 raise PrivatePathUnsafe(
                     "durable no-replace stage left its target path",
                     components=target,
                 )
+            object.__setattr__(
+                stage, "_noreplace_target_claim", final_claim,
+            )
         else:
             source_intact = _noreplace_named_stage_matches(
                 stage, parent_fd=parent_fd, pin_fd=pin_fd,
@@ -5131,7 +5617,7 @@ def _resume_noreplace_action(
             action_error=None,
         )
 
-    if landed:
+    if landed_claim is not None:
         return _finish_noreplace_commit(stage, target, primary=None)
     _disarm_noreplace_stage(stage)
     if target_exists:
@@ -5167,55 +5653,154 @@ def _publish_private_stage_if_absent_locked(
     _validate_live_stage(stage, "publish_if_absent")
     seal_private_stage(stage)
     _validate_live_stage(stage, "publish_if_absent")
-    _validate_declared_stage_parent(stage)
-    _validate_named_stage(stage)
-    if _noreplace_target_exists_stably(
-        stage, target, parent_fd=stage.parent_fd,
-    ):
-        _validate_declared_stage_parent(stage)
-        _validate_named_stage(stage)
-        return False
     return _start_noreplace_action(stage, target)
 
 
-@_serialized_stage_lifecycle
+def _settle_noreplace_public_escape(
+    stage,
+    target_components,
+    primary: BaseException,
+) -> None:
+    if isinstance(primary, Exception) or type(stage) is not PrivateFileStage:
+        raise primary
+    target = stage._noreplace_components
+    if target is None:
+        try:
+            target = _noreplace_target_components(stage, target_components)
+        except BaseException:
+            target = stage.components
+    ledger = stage._cleanup_ledger
+    if ledger is None and stage.state in {"open", "sealed"}:
+        object.__setattr__(stage, "_noreplace_components", None)
+        _raise_noreplace_cancellation(
+            primary,
+            state="unpublished",
+            target=target,
+        )
+    if (type(ledger) is _PrivateStageCleanupLedger
+            and stage.state in {"open", "sealed"}):
+        _disarm_noreplace_stage(stage)
+        _raise_noreplace_cancellation(
+            primary,
+            state="unpublished",
+            target=target,
+        )
+    if type(ledger) is not _PrivateStageCleanupLedger:
+        raise primary
+    if stage.state == "committed":
+        cleanup_errors, cleanup_pending = _drain_noreplace_cleanup(stage)
+        _raise_noreplace_cancellation(
+            primary,
+            state="committed",
+            target=target,
+            action_error=primary,
+            reconciliation_error=(
+                PrivatePathError(
+                    "committed no-replace cleanup remains pending",
+                    components=target,
+                )
+                if cleanup_pending else None
+            ),
+            close_errors=cleanup_errors,
+        )
+    if stage.state in {"publishing", "replaced_uncertain"}:
+        _reconcile_noreplace_action(stage, target, primary)
+    raise primary
+
+
+class _PrivateNoreplacePublicFence:
+    """One public cancellation fence; nested instances guard handler entry."""
+
+    __slots__ = ("stage", "target_components")
+
+    def __init__(self, stage, target_components) -> None:
+        self.stage = stage
+        self.target_components = target_components
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _kind, primary, _traceback) -> bool:
+        if primary is None:
+            return False
+        _settle_noreplace_public_escape(
+            self.stage, self.target_components, primary,
+        )
+        return False
+
+
+def _publish_private_stage_if_absent_fenced(
+    stage: PrivateFileStage, target_components: tuple[str, ...],
+) -> bool:
+    outer = _PrivateNoreplacePublicFence(stage, target_components)
+    inner = _PrivateNoreplacePublicFence(stage, target_components)
+    with outer:
+        with inner:
+            if type(stage) is not PrivateFileStage:
+                return _publish_private_stage_if_absent_locked(
+                    stage, target_components,
+                )
+            with stage._lifecycle_lock:
+                return _publish_private_stage_if_absent_locked(
+                    stage, target_components,
+                )
+
+
+def _publish_private_stage_if_absent_public_middle(
+    stage: PrivateFileStage, target_components: tuple[str, ...],
+) -> bool:
+    try: return _publish_private_stage_if_absent_fenced(stage, target_components)
+    except BaseException as primary:
+        _settle_noreplace_public_escape(
+            stage, target_components, primary,
+        )
+    raise AssertionError("unreachable no-replace publication boundary")
+
+
+def _publish_private_stage_if_absent_public_inner(
+    stage: PrivateFileStage, target_components: tuple[str, ...],
+) -> bool:
+    try: return _publish_private_stage_if_absent_public_middle(stage, target_components)
+    except BaseException as primary:
+        _settle_noreplace_public_escape(
+            stage, target_components, primary,
+        )
+    raise AssertionError("unreachable no-replace publication boundary")
+
+
+def _publish_private_stage_if_absent_public_outer(
+    stage: PrivateFileStage, target_components: tuple[str, ...],
+) -> bool:
+    try: return _publish_private_stage_if_absent_public_inner(stage, target_components)
+    except BaseException as primary:
+        _settle_noreplace_public_escape(
+            stage, target_components, primary,
+        )
+    raise AssertionError("unreachable no-replace publication boundary")
+
+
+def _publish_private_stage_if_absent_public_export(
+    stage: PrivateFileStage, target_components: tuple[str, ...],
+) -> bool:
+    # On CPython 3.10 the trace event for this first suite line precedes its
+    # SETUP_FINALLY.  Like the direct public trampoline, it is still wholly
+    # pre-operation; the next nested boundary is active before any effect.
+    try: return _publish_private_stage_if_absent_public_outer(stage, target_components)
+    except BaseException as primary:
+        _settle_noreplace_public_escape(
+            stage, target_components, primary,
+        )
+    raise AssertionError("unreachable no-replace publication boundary")
+
+
 def publish_private_stage_if_absent(
     stage: PrivateFileStage, target_components: tuple[str, ...],
 ) -> bool:
-    """Cancellation-fenced public boundary for no-replace publication."""
-    try:
-        return _publish_private_stage_if_absent_locked(stage, target_components)
-    except BaseException as primary:
-        if isinstance(primary, Exception) or type(stage) is not PrivateFileStage:
-            raise
-        target = stage._noreplace_components
-        ledger = stage._cleanup_ledger
-        if target is None:
-            raise
-        if ledger is None and stage.state in {"open", "sealed"}:
-            object.__setattr__(stage, "_noreplace_components", None)
-            _raise_noreplace_cancellation(
-                primary,
-                state="unpublished",
-                target=target,
-            )
-        if (type(ledger) is _PrivateStageCleanupLedger
-                and stage.state in {"open", "sealed"}):
-            _disarm_noreplace_stage(stage)
-            _raise_noreplace_cancellation(
-                primary,
-                state="unpublished",
-                target=target,
-            )
-        if type(ledger) is not _PrivateStageCleanupLedger:
-            raise
-        if stage.state == "committed":
-            return _finish_noreplace_commit(
-                stage, target, primary=primary,
-            )
-        if stage.state in {"publishing", "replaced_uncertain"}:
-            return _reconcile_noreplace_action(stage, target, primary)
-        raise
+    """Enter the cancellation-fenced no-replace publication operation."""
+    # This one-line trampoline has one trace event and no action/handler seam.
+    # A cancellation there is wholly pre-operation; once the call begins, the
+    # nested private boundaries own action settlement and cancellation metadata.
+    return _publish_private_stage_if_absent_public_export(stage, target_components)
 
 
 @_serialized_stage_lifecycle
@@ -5490,9 +6075,15 @@ def abort_private_stage(stage: PrivateFileStage) -> None:
             else None
         )
         if ledger is not None:
-            cleanup_errors.extend(
-                _settle_failed_prepare_cleanup((stage,), ledger, None)
-            )
+            if stage._noreplace_components is not None:
+                first_errors, _ = _drain_noreplace_cleanup(stage)
+                second_errors, _ = _drain_noreplace_cleanup(stage)
+                cleanup_errors.extend(first_errors)
+                cleanup_errors.extend(second_errors)
+            else:
+                cleanup_errors.extend(
+                    _settle_failed_prepare_cleanup((stage,), ledger, None)
+                )
             if not ledger.pending:
                 object.__setattr__(stage, "_cleanup_ledger", None)
         error = PrivatePathError(
