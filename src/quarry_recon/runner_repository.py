@@ -63,35 +63,16 @@ class RepositoryOutput:
 
     @classmethod
     def publish_path(cls, run: store.Run, path) -> "RepositoryOutput":
-        """Translate a caller-held path into a non-authoritative output policy.
-
-        An exact ``Run`` receives an eager identity check.  Lightweight phase
-        test doubles receive only lexical component extraction; that never
-        grants authority because ``supervise_repository_execution`` later
-        requires the exact ``Run`` type and revalidates its opened identity.
-        The returned policy contains no ambient path in either case.
-        """
-        if type(run) is store.Run:
-            managed = store.managed_run_for_artifact(path)
-            if managed is None:
-                raise ContractError("publication path is not a managed run artifact")
-            owner, components = managed
-            if (owner._authority_key != run._authority_key
-                    or owner._run_directory_identity != run._run_directory_identity):
-                raise ContractError("publication path belongs to a different run")
-            return cls.publish(*components)
-        try:
-            candidate = os.path.abspath(os.fspath(path))
-            base = getattr(run, "dir", None)
-            if base is not None:
-                components = tuple(
-                    os.path.relpath(candidate, os.path.abspath(os.fspath(base))).split(os.sep)
-                )
-            else:
-                parts = tuple(os.path.normpath(candidate).split(os.sep))
-                components = parts[parts.index("raw"):]
-        except (AttributeError, TypeError, ValueError, OSError):
-            raise TypeError("run path cannot form an output policy") from None
+        """Bind one caller-held path to an exact opened ``Run`` authority."""
+        if type(run) is not store.Run:
+            raise TypeError("publication path requires an exact repository Run")
+        managed = store.managed_run_for_artifact(path)
+        if managed is None:
+            raise ContractError("publication path is not a managed run artifact")
+        owner, components = managed
+        if (owner._authority_key != run._authority_key
+                or owner._run_directory_identity != run._run_directory_identity):
+            raise ContractError("publication path belongs to a different run")
         return cls.publish(*components)
 
     @classmethod

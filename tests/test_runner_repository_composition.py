@@ -42,6 +42,20 @@ def _running_run(tmp_path, run_id="repository-execution"):
     return run
 
 
+def test_publish_path_requires_the_exact_opened_run_authority(tmp_path):
+    run = _running_run(tmp_path, run_id="publish-path-authority")
+    destination = run.raw_path("probe", "fixture", "stdout.bin")
+
+    policy = runner_repository.RepositoryOutput.publish_path(run, destination)
+
+    assert policy == runner_repository.RepositoryOutput.publish(
+        "raw", "probe", "fixture", "stdout.bin",
+    )
+    fake = type("FakeRun", (), {"dir": run.dir})()
+    with pytest.raises(TypeError, match="exact repository Run"):
+        runner_repository.RepositoryOutput.publish_path(fake, destination)
+
+
 def _invocation(run, *, stdout, stderr):
     return protocol.normalize_invocation(
         request_id=REQUEST_ID,
