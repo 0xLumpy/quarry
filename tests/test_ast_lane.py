@@ -626,8 +626,13 @@ class TestNormalisationIsCompleteAndDescriptive:
             TestTheWorkUnitMakesARerunSKIP._fake(monkeypatch, tmp_path, out='[{"analyzerName":"fetch",'
                                                                            '"value":"/api/x"}]')
             monkeypatch.setattr(crawl, "have", lambda b: True)
+            real_read_text = pathlib.Path.read_text
             monkeypatch.setattr(crawl.Path, "read_text",
-                                lambda self, *a, **k: (_ for _ in ()).throw(OSError("gone")))
+                                lambda self, *a, **k: (
+                                    (_ for _ in ()).throw(OSError("gone"))
+                                    if self.parent.name == "ast" and self.suffix == ".json"
+                                    else real_read_text(self, *a, **k)
+                                ))
             ctx = type("C", (), {"run": run, "scope": _Scope(), "echo": lambda *a, **k: None,
                                  "profile": type("P", (), {})()})()
             crawl._ast_bundles(ctx, _ledger([("https://acme.com/b.js", _bundle(tmp_path))]))

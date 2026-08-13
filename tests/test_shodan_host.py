@@ -2264,11 +2264,10 @@ class TestSweepProgressIsDurableAcrossRuns:
         for i in range(3):
             run = store.Run.create(project, "acme.com")           # a REAL new run directory each time
             clock["t"] = 0.0
-            d = run.dir / "attempts"
-            d.mkdir(parents=True, exist_ok=True)
+            d = run.create_artifact_dir("raw", "probe", "shodan-host", "attempt")
             o = sh.run_hosts(targets, fetch=prov.fetch,
                              ingest=lambda t, rec, art, wrote: None,
-                             ledger=_ledger(run.dir), attempt_dir=d, bound=_b.Budget(1),
+                             ledger=_ledger(d.parent), attempt_dir=d, bound=_b.Budget(1),
                              progress=sh.SweepProgress(sh.progress_path(project)))
             assert o.attempted == 1, (i, o.attempted)
             assert o.replayed == 0, "a fresh run replayed evidence it could not have"
@@ -2283,10 +2282,9 @@ class TestSweepProgressIsDurableAcrossRuns:
         progress = sh.SweepProgress(sh.progress_path(project))
         for _ in range(2):
             run = store.Run.create(project, "acme.com")
-            d = run.dir / "attempts"
-            d.mkdir(parents=True, exist_ok=True)
+            d = run.create_artifact_dir("raw", "probe", "shodan-host", "attempt")
             o = sh.run_hosts(targets, fetch=prov.fetch, ingest=lambda t, rec, art, wrote: None,
-                             ledger=_ledger(run.dir), attempt_dir=d, bound=_b.Budget(0),
+                             ledger=_ledger(d.parent), attempt_dir=d, bound=_b.Budget(0),
                              progress=sh.SweepProgress(sh.progress_path(project)))
             assert o.attempted == 3, o.attempted
         assert len(prov.calls) == 6, prov.calls
