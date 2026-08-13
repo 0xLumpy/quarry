@@ -290,7 +290,8 @@ class PrivateReplaceCommittedWithFault(PrivatePathError):
 
 _STAGE_OPERATIONS = frozenset({
     "prepare", "seal", "replace", "abort", "abort_handoff",
-    "abort_spawn", "borrow_spawn", "mark_spawned", "bind_worker", "transfer", "fence",
+    "abort_spawn", "borrow_spawn", "mark_spawned", "bind_worker", "transfer",
+    "settle", "publish", "fence",
 })
 _STAGE_STATES = frozenset({
     "open", "sealed", "handoff_prepared", "publishing", "committed",
@@ -320,7 +321,7 @@ class PrivateStageHandoffError(PrivatePathError):
     def __init__(self, operation: str) -> None:
         if type(operation) is not str or operation not in {
             "prepare", "abort_handoff", "abort_spawn", "mark_spawned",
-            "borrow_spawn", "bind_worker", "transfer", "fence",
+            "borrow_spawn", "bind_worker", "transfer", "settle", "publish", "fence",
         }:
             raise TypeError("invalid private stage handoff operation")
         self.operation = operation
@@ -1147,6 +1148,7 @@ _PRIVATE_STAGE_CONSTRUCTOR = object()
 _PRIVATE_STAGE_BATCH_CONSTRUCTOR = object()
 _PRIVATE_STAGE_TRANSFER_AUTHORITY_CONSTRUCTOR = object()
 _PRIVATE_STAGE_PARENT_CLOSE_RECEIPT_CONSTRUCTOR = object()
+_PRIVATE_STAGE_ARTIFACT_PROOF_CONSTRUCTOR = object()
 _PRIVATE_STAGE_BATCH_CLAIM_CONSTRUCTOR = object()
 _PRIVATE_STAGE_CLEANUP_LEDGER_CONSTRUCTOR = object()
 
@@ -1206,6 +1208,70 @@ class PrivateStageParentCloseReceipt:
         return (
             "PrivateStageParentCloseReceipt("
             f"stages={len(self.file_identities)}, state={self.state!r})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False, init=False)
+class PrivateStageArtifactProof:
+    """Parent-authenticated immutable bytes for one transferred stage."""
+
+    claim_id: str
+    role: str
+    components: tuple[str, ...]
+    dev: int
+    ino: int
+    size: int
+    sha256: str
+    lines: int | None
+
+    def __init__(
+        self,
+        *,
+        claim_id: str,
+        role: str,
+        components: tuple[str, ...],
+        dev: int,
+        ino: int,
+        size: int,
+        sha256: str,
+        lines: int | None,
+        _constructor_token: object,
+    ) -> None:
+        if (_constructor_token is not _PRIVATE_STAGE_ARTIFACT_PROOF_CONSTRUCTOR
+                or type(claim_id) is not str or len(claim_id) != 32
+                or any(char not in "0123456789abcdef" for char in claim_id)
+                or type(role) is not str or role not in {"stdin", "stdout", "stderr"}
+                or type(components) is not tuple or not components
+                or type(dev) is not int or dev < 0
+                or type(ino) is not int or ino < 0
+                or type(size) is not int or size < 0
+                or type(sha256) is not str or len(sha256) != 64
+                or any(char not in "0123456789abcdef" for char in sha256)
+                or (lines is not None and (type(lines) is not int or lines < 0))
+                or (role == "stdin") != (lines is None)
+                or (lines is not None and lines > size)):
+            raise PrivateStageHandoffError("settle")
+        try:
+            validate_relative_components(components, allow_empty=False)
+        except PrivatePathError:
+            raise PrivateStageHandoffError("settle") from None
+        object.__setattr__(self, "claim_id", claim_id)
+        object.__setattr__(self, "role", role)
+        object.__setattr__(self, "components", components)
+        object.__setattr__(self, "dev", dev)
+        object.__setattr__(self, "ino", ino)
+        object.__setattr__(self, "size", size)
+        object.__setattr__(self, "sha256", sha256)
+        object.__setattr__(self, "lines", lines)
+
+    @property
+    def file_identity(self) -> tuple[int, int]:
+        return self.dev, self.ino
+
+    def __repr__(self) -> str:
+        return (
+            "PrivateStageArtifactProof("
+            f"role={self.role!r}, size={self.size}, lines={self.lines!r})"
         )
 
 
@@ -1481,7 +1547,8 @@ class PrivateStageHandoffBatch:
 
     __slots__ = (
         "_stages", "_request_id", "_state",
-        "_transfer_authority", "_transfer_receipt", "_cleanup_ledger",
+        "_transfer_authority", "_transfer_receipt", "_artifact_proofs",
+        "_cleanup_ledger",
     )
 
     def __init__(
@@ -1502,6 +1569,7 @@ class PrivateStageHandoffBatch:
         object.__setattr__(self, "_state", "prepared")
         object.__setattr__(self, "_transfer_authority", None)
         object.__setattr__(self, "_transfer_receipt", None)
+        object.__setattr__(self, "_artifact_proofs", None)
         object.__setattr__(self, "_cleanup_ledger", cleanup_ledger)
 
     def __setattr__(self, name, value) -> None:
@@ -1538,7 +1606,7 @@ class PrivateStageHandoffBatch:
                 operation = self.abort
             elif self.state in {
                 "spawn_prepared", "worker_spawned_unverified", "worker_claim_bound",
-                "parent_writers_closed", "transfer_uncertain",
+                "parent_writers_closed", "transfer_uncertain", "settled",
             }:
                 # This fences evidence authority only; it neither asserts nor waits
                 # for process settlement.
@@ -2942,6 +3010,281 @@ def transfer_private_stage_handoff(
     raise uncertain from cause
 
 
+_ARTIFACT_ROLE_ORDER = {"stdin": 0, "stdout": 1, "stderr": 2}
+
+
+def _validate_transferred_handoff_shape(
+    batch: PrivateStageHandoffBatch, operation: str, *, stage_state: str,
+) -> tuple[
+    tuple[PrivateFileStage, ...],
+    _PrivateStageCleanupLedger,
+    PrivateStageParentCloseReceipt,
+]:
+    """Validate the descriptor graph retained after clean writer transfer."""
+    stages = batch._stages
+    ledger = batch._cleanup_ledger
+    receipt = batch._transfer_receipt
+    if (type(stages) is not tuple or not 1 <= len(stages) <= 3
+            or any(type(stage) is not PrivateFileStage for stage in stages)
+            or len({id(stage) for stage in stages}) != len(stages)
+            or type(ledger) is not _PrivateStageCleanupLedger
+            or len(ledger.stage_claims) != len(stages)
+            or type(receipt) is not PrivateStageParentCloseReceipt
+            or receipt.request_id != batch._request_id
+            or receipt.file_identities != tuple(
+                stage.file_identity for stage in stages
+            )
+            or any(stage.state != stage_state
+                   or (stage.file_fd, stage.parent_fd, stage.anchor_fd)
+                   != (-1, -1, -1)
+                   or stage._cleanup_ledger is not ledger
+                   for stage in stages)
+            or any(stage_claim._stage is not stage
+                   for stage_claim, stage in zip(ledger.stage_claims, stages))
+            or any(
+                stage_claim.writer._identity != stage.file_identity
+                or stage_claim.pin._identity != stage.file_identity
+                or stage_claim.parent._identity != stage.parent_identity
+                or stage_claim.anchor._identity != stage.anchor_identity
+                or stage_claim.writer._disposition != "closed_clean"
+                or stage_claim.writer._errors
+                or any(
+                    claim._disposition != "pending" or claim.fd < 0
+                    for claim in (
+                        stage_claim.pin, stage_claim.parent, stage_claim.anchor,
+                    )
+                )
+                for stage_claim, stage in zip(ledger.stage_claims, stages)
+            )):
+        raise PrivateStageHandoffError(operation)
+    return stages, ledger, receipt
+
+
+def _validate_artifact_claim_specs(
+    claims, *, count: int,
+) -> tuple[tuple[str, str], ...]:
+    if (type(claims) is not tuple or len(claims) != count
+            or any(type(claim) is not tuple or len(claim) != 2
+                   for claim in claims)):
+        raise PrivateStageHandoffError("settle")
+    validated: list[tuple[str, str]] = []
+    for claim_id, role in claims:
+        if (type(claim_id) is not str or len(claim_id) != 32
+                or any(char not in "0123456789abcdef" for char in claim_id)
+                or type(role) is not str or role not in _ARTIFACT_ROLE_ORDER):
+            raise PrivateStageHandoffError("settle")
+        validated.append((claim_id, role))
+    roles = tuple(role for _, role in validated)
+    claim_ids = tuple(claim_id for claim_id, _ in validated)
+    if (len(set(roles)) != len(roles)
+            or len(set(claim_ids)) != len(claim_ids)
+            or tuple(sorted(roles, key=_ARTIFACT_ROLE_ORDER.__getitem__)) != roles):
+        raise PrivateStageHandoffError("settle")
+    return tuple(validated)
+
+
+def _inspect_clean_pending_claim(
+    claim: _PrivateDescriptorClaim, *, operation: str,
+) -> os.stat_result:
+    observed = _inspect_descriptor_claim(claim, allow_unlinked=False)
+    if (observed is None or claim._disposition != "pending"
+            or claim._errors or claim._metadata_fault):
+        raise PrivateStageHandoffError(operation)
+    return observed
+
+
+def _hash_stage_artifact(fd: int, *, count_lines: bool) -> tuple[int, str, int | None]:
+    """Hash and optionally count LF bytes while restoring a retained pin offset."""
+    original = os.lseek(fd, 0, os.SEEK_CUR)
+    digest = hashlib.sha256()
+    size = 0
+    lines = 0
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+            if count_lines:
+                lines += chunk.count(b"\n")
+    finally:
+        os.lseek(fd, original, os.SEEK_SET)
+    return size, digest.hexdigest(), lines if count_lines else None
+
+
+def _validate_transferred_stage_parent(
+    stage: PrivateFileStage, stage_claim: _PrivateStageBatchClaim,
+    *, operation: str,
+) -> None:
+    parent_observed = _inspect_clean_pending_claim(
+        stage_claim.parent, operation=operation,
+    )
+    anchor_observed = _inspect_clean_pending_claim(
+        stage_claim.anchor, operation=operation,
+    )
+    if (_identity(parent_observed) != stage.parent_identity
+            or _identity(anchor_observed) != stage.anchor_identity):
+        raise PrivateStageHandoffError(operation)
+    declared = open_strict_dir_at(
+        stage_claim.anchor.fd, stage.components[:-1],
+    )
+    with _owned_fd(declared):
+        if _identity(os.fstat(declared)) != stage.parent_identity:
+            raise PrivatePathUnsafe(
+                "private stage parent no longer matches its declared path",
+                components=stage.components,
+            )
+
+
+def _authenticate_transferred_stage(
+    stage: PrivateFileStage,
+    stage_claim: _PrivateStageBatchClaim,
+    *,
+    role: str,
+    operation: str,
+) -> tuple[int, str, int | None]:
+    """Synchronize and authenticate an exact named inode retained by its pin."""
+    _validate_transferred_stage_parent(
+        stage, stage_claim, operation=operation,
+    )
+    pin_before_sync = _inspect_clean_pending_claim(
+        stage_claim.pin, operation=operation,
+    )
+    if _identity(pin_before_sync) != stage.file_identity:
+        raise PrivateStageHandoffError(operation)
+
+    try:
+        named_before = os.stat(
+            stage.temporary_name,
+            dir_fd=stage_claim.parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise PrivatePathMissing(
+            "private stage claim disappeared before settlement",
+            components=stage.components,
+        ) from exc
+    _validate_strict_file_stat(named_before, stage.components)
+    if (_identity(named_before) != stage.file_identity
+            or _file_signature(named_before) != _file_signature(pin_before_sync)):
+        raise PrivatePathUnsafe(
+            "private stage name was substituted", components=stage.components,
+        )
+
+    _fsync_managed(stage_claim.pin.fd)
+    pin_before_hash = os.fstat(stage_claim.pin.fd)
+    _validate_strict_file_stat(pin_before_hash, stage.components)
+    if _identity(pin_before_hash) != stage.file_identity:
+        raise PrivatePathUnsafe(
+            "private stage pin identity changed", components=stage.components,
+        )
+    size, digest, lines = _hash_stage_artifact(
+        stage_claim.pin.fd, count_lines=role != "stdin",
+    )
+    pin_after_hash = os.fstat(stage_claim.pin.fd)
+    _validate_strict_file_stat(pin_after_hash, stage.components)
+    try:
+        named_after = os.stat(
+            stage.temporary_name,
+            dir_fd=stage_claim.parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise PrivatePathMissing(
+            "private stage claim disappeared during settlement",
+            components=stage.components,
+        ) from exc
+    _validate_strict_file_stat(named_after, stage.components)
+    signature = _file_signature(pin_before_hash)
+    if (signature != _file_signature(pin_after_hash)
+            or signature != _file_signature(named_after)
+            or size != signature[5]):
+        raise PrivatePathUnsafe(
+            "private stage content changed during settlement",
+            components=stage.components,
+        )
+    return size, digest, lines
+
+
+def _force_settled_handoff_state(
+    batch: PrivateStageHandoffBatch,
+    stages: tuple[PrivateFileStage, ...],
+    proofs: tuple[PrivateStageArtifactProof, ...],
+) -> None:
+    object.__setattr__(batch, "_artifact_proofs", proofs)
+    object.__setattr__(batch, "_state", "settled")
+    for stage in stages:
+        object.__setattr__(stage, "_state", "settled")
+
+
+def _restore_parent_writers_closed_state(
+    batch: PrivateStageHandoffBatch,
+    stages: tuple[PrivateFileStage, ...],
+) -> None:
+    object.__setattr__(batch, "_artifact_proofs", None)
+    object.__setattr__(batch, "_state", "parent_writers_closed")
+    for stage in stages:
+        object.__setattr__(stage, "_state", "parent_writers_closed")
+
+
+@_serialized_batch_lifecycle
+def settle_private_stage_handoff(
+    batch: PrivateStageHandoffBatch,
+    receipt: PrivateStageParentCloseReceipt,
+    *,
+    worker_reaped: bool,
+    claims: tuple[tuple[str, str], ...],
+) -> tuple[PrivateStageArtifactProof, ...]:
+    """Authenticate stable stage bytes after writer transfer and exact reap."""
+    _require_strict_capabilities()
+    if type(batch) is not PrivateStageHandoffBatch:
+        raise PrivateStageHandoffError("settle")
+    if batch.state != "parent_writers_closed":
+        raise PrivateStageStateError("settle", batch.state)
+    stages, _, retained_receipt = _validate_transferred_handoff_shape(
+        batch, "settle", stage_state="parent_writers_closed",
+    )
+    if (type(receipt) is not PrivateStageParentCloseReceipt
+            or receipt is not retained_receipt or worker_reaped is not True):
+        raise PrivateStageHandoffError("settle")
+    specs = _validate_artifact_claim_specs(claims, count=len(stages))
+
+    proofs: list[PrivateStageArtifactProof] = []
+    try:
+        for stage, stage_claim, (claim_id, role) in zip(
+            stages, batch._cleanup_ledger.stage_claims, specs,
+        ):
+            size, digest, lines = _authenticate_transferred_stage(
+                stage, stage_claim, role=role, operation="settle",
+            )
+            proofs.append(PrivateStageArtifactProof(
+                claim_id=claim_id,
+                role=role,
+                components=stage.components,
+                dev=stage.file_identity[0],
+                ino=stage.file_identity[1],
+                size=size,
+                sha256=digest,
+                lines=lines,
+                _constructor_token=_PRIVATE_STAGE_ARTIFACT_PROOF_CONSTRUCTOR,
+            ))
+    except PrivateStageHandoffError:
+        raise
+    except BaseException as primary:
+        raise PrivateStageHandoffError("settle") from primary
+
+    frozen_proofs = tuple(proofs)
+    try:
+        with _defer_stage_transition_signals():
+            _force_settled_handoff_state(batch, stages, frozen_proofs)
+    except BaseException as primary:
+        _restore_parent_writers_closed_state(batch, stages)
+        raise PrivateStageHandoffError("settle") from primary
+    return frozen_proofs
+
+
 def _force_fenced_state(
     batch: PrivateStageHandoffBatch, stages: tuple[PrivateFileStage, ...],
 ) -> None:
@@ -2951,6 +3294,7 @@ def _force_fenced_state(
         object.__setattr__(authority, "_borrowed", False)
     object.__setattr__(batch, "_transfer_authority", None)
     object.__setattr__(batch, "_transfer_receipt", None)
+    object.__setattr__(batch, "_artifact_proofs", None)
     object.__setattr__(batch, "_state", "fenced")
     for stage in stages:
         object.__setattr__(stage, "_file_fd", -1)
@@ -2971,6 +3315,7 @@ def _reconcile_fenced_state_direct(
         object.__setattr__(authority, "_borrowed", False)
     object.__setattr__(batch, "_transfer_authority", None)
     object.__setattr__(batch, "_transfer_receipt", None)
+    object.__setattr__(batch, "_artifact_proofs", None)
     object.__setattr__(batch, "_state", "fenced")
     for stage in stages:
         object.__setattr__(stage, "_file_fd", -1)
@@ -3009,7 +3354,7 @@ def fence_private_stage_handoff(batch: PrivateStageHandoffBatch) -> None:
         "spawn_prepared", "worker_spawned_unverified", "worker_claim_bound",
     }
     if batch.state not in writer_states | {
-        "parent_writers_closed", "transfer_uncertain",
+        "parent_writers_closed", "transfer_uncertain", "settled",
     }:
         raise PrivateStageStateError("fence", batch.state)
 
