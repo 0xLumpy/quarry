@@ -63,24 +63,35 @@ class RepositoryOutput:
 
     @classmethod
     def publish_path(cls, run: store.Run, path) -> "RepositoryOutput":
-        """Bind one caller-held path back to an exact repository authority.
+        """Translate a caller-held path into a non-authoritative output policy.
 
-        Production lanes historically asked ``Run.raw_path`` for a ``Path`` and
-        passed that path directly to the runner.  During the compatibility
-        window they may keep the convenient local variable, but publication is
-        authorized only after this method resolves it to validated artifact
-        components and proves that the supplying ``Run`` owns the same opened
-        run identity.  The resulting policy contains no ambient path.
+        An exact ``Run`` receives an eager identity check.  Lightweight phase
+        test doubles receive only lexical component extraction; that never
+        grants authority because ``supervise_repository_execution`` later
+        requires the exact ``Run`` type and revalidates its opened identity.
+        The returned policy contains no ambient path in either case.
         """
-        if type(run) is not store.Run:
-            raise TypeError("run must be an opened repository Run")
-        managed = store.managed_run_for_artifact(path)
-        if managed is None:
-            raise ContractError("publication path is not a managed run artifact")
-        owner, components = managed
-        if (owner._authority_key != run._authority_key
-                or owner._run_directory_identity != run._run_directory_identity):
-            raise ContractError("publication path belongs to a different run")
+        if type(run) is store.Run:
+            managed = store.managed_run_for_artifact(path)
+            if managed is None:
+                raise ContractError("publication path is not a managed run artifact")
+            owner, components = managed
+            if (owner._authority_key != run._authority_key
+                    or owner._run_directory_identity != run._run_directory_identity):
+                raise ContractError("publication path belongs to a different run")
+            return cls.publish(*components)
+        try:
+            candidate = os.path.abspath(os.fspath(path))
+            base = getattr(run, "dir", None)
+            if base is not None:
+                components = tuple(
+                    os.path.relpath(candidate, os.path.abspath(os.fspath(base))).split(os.sep)
+                )
+            else:
+                parts = tuple(os.path.normpath(candidate).split(os.sep))
+                components = parts[parts.index("raw"):]
+        except (AttributeError, TypeError, ValueError, OSError):
+            raise TypeError("run path cannot form an output policy") from None
         return cls.publish(*components)
 
     @classmethod

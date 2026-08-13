@@ -25,6 +25,7 @@ def _meta_csp(html: str) -> list[str]:
                 out.append(m.group(1))
     return out
 from ..runner import RunResult, Status, have, run as exec_tool, skipped
+from ..runner_repository import RepositoryOutput
 
 
 # hostname matcher for the operator's local kaeferjaeger SNI dataset (never fetched remotely).
@@ -144,8 +145,12 @@ def run(ctx) -> None:
 
     # expand CIDR -> IPs
     ips_path = ctx.run.raw_path("horizontal", "mapcidr", "ips.txt")
-    r = exec_tool("mapcidr", ["mapcidr", "-cidr", ",".join(prof.cidr), "-silent"],
-            raw_path=ips_path, timeout=120)
+    r = exec_tool(
+        "mapcidr", ["mapcidr", "-cidr", ",".join(prof.cidr), "-silent"],
+        repository=ctx.run,
+        stdout=RepositoryOutput.publish_path(ctx.run, ips_path),
+        stderr=RepositoryOutput.discard(), timeout=120,
+    )
     ctx.run.record("horizontal", r)
     ips_file = ips_path if r.ok else cidr_file
 
@@ -154,8 +159,13 @@ def run(ctx) -> None:
         ctx.run.record("horizontal", skipped("tlsx", "passive-only mode"))
     else:
         tls_raw = ctx.run.raw_path("horizontal", "tlsx", "san.txt")
-        r = exec_tool("tlsx", ["tlsx", "-l", str(ips_file), "-san", "-cn", "-silent",
-                         "-p", "443,8443,4443", "-resp-only"], raw_path=tls_raw, timeout=ctx.http_timeout)
+        r = exec_tool(
+            "tlsx", ["tlsx", "-l", str(ips_file), "-san", "-cn", "-silent",
+                     "-p", "443,8443,4443", "-resp-only"],
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish_path(ctx.run, tls_raw),
+            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        )
         ctx.run.record("horizontal", r)
         if r.raw_path:
             added = 0
@@ -167,8 +177,12 @@ def run(ctx) -> None:
     # reverse DNS (PTR) on range IPs
     if not scope.passive_only:
         ptr_raw = ctx.run.raw_path("horizontal", "dnsx", "ptr.txt")
-        r = exec_tool("dnsx", ["dnsx", "-l", str(ips_file), "-ptr", "-resp-only", "-silent"],
-                raw_path=ptr_raw, timeout=ctx.http_timeout)
+        r = exec_tool(
+            "dnsx", ["dnsx", "-l", str(ips_file), "-ptr", "-resp-only", "-silent"],
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish_path(ctx.run, ptr_raw),
+            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        )
         ctx.run.record("horizontal", r)
         if r.raw_path:
             for ent in normalize.hosts(r.raw_path.read_text(), "revdns", str(ptr_raw)):
@@ -179,8 +193,13 @@ def run(ctx) -> None:
     # (surfaces hosts behind Akamai/Cloudflare that DNS enum misses). Needs active mode + CIDR.
     if not scope.passive_only and have("caduceus"):
         cad = ctx.run.raw_path("horizontal", "caduceus", "certs.json")
-        r = exec_tool("caduceus", ["caduceus", "-i", str(cidr_file),
-                                   "-p", "443,8443,4443", "-j"], raw_path=cad, timeout=ctx.http_timeout)
+        r = exec_tool(
+            "caduceus", ["caduceus", "-i", str(cidr_file),
+                         "-p", "443,8443,4443", "-j"],
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish_path(ctx.run, cad),
+            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        )
         ctx.run.record("horizontal", r)
         if r.raw_path:
             import json as _json
@@ -225,6 +244,11 @@ def run(ctx) -> None:
     asn_seeds = prof.asn
     if asn_seeds:
         asn_raw = ctx.run.raw_path("horizontal", "asnmap", "ranges.txt")
-        r = exec_tool("asnmap", ["asnmap", "-silent"], stdin_data="\n".join(asn_seeds),
-                raw_path=asn_raw, timeout=60)
+        r = exec_tool(
+            "asnmap", ["asnmap", "-silent"],
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish_path(ctx.run, asn_raw),
+            stderr=RepositoryOutput.discard(),
+            stdin_data="\n".join(asn_seeds), timeout=60,
+        )
         ctx.run.record("horizontal", r)

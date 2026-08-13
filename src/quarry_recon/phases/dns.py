@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from .. import normalize
 from ..runner import have, run as exec_tool, skipped
+from ..runner_repository import RepositoryOutput
 
 _RECORD_FLAGS = ["-a", "-aaaa", "-cname", "-mx", "-ns", "-txt", "-soa", "-caa", "-asn", "-cdn"]
 # types a `*.apex` wildcard spuriously spreads → filtered against the baseline; zone-level types
@@ -46,7 +47,12 @@ def _wildcard_baseline(ctx, apexes: set, phase: str) -> dict:
     probes = [f"quarry-wc-{uuid4().hex[:10]}.{a}" for a in apexes]
     pf = ctx.write_list(f"{phase}_wildcard_probe.txt", probes)
     out = ctx.run.raw_path(phase, "dnsx", "wildcard.jsonl")
-    r = exec_tool("dnsx", _dnsx_cmd(ctx, pf, _WILDCARD_PROBE_FLAGS), raw_path=out, timeout=600)
+    r = exec_tool(
+        "dnsx", _dnsx_cmd(ctx, pf, _WILDCARD_PROBE_FLAGS),
+        repository=ctx.run,
+        stdout=RepositoryOutput.publish_path(ctx.run, out),
+        stderr=RepositoryOutput.discard(), timeout=600,
+    )
     ctx.run.record(phase, r)
     baseline: dict = {}
     if r.raw_path and r.raw_path.exists():
@@ -67,7 +73,12 @@ def enrich_hosts(ctx, hosts, phase: str) -> int:
     wildcard = _wildcard_baseline(ctx, {_apex_of(h, apexes) for h in hosts}, phase)
     hf = ctx.write_list(f"{phase}_dns_hosts.txt", hosts)
     out = ctx.run.raw_path(phase, "dnsx", "records.jsonl")
-    r = exec_tool("dnsx", _dnsx_cmd(ctx, hf), raw_path=out, timeout=ctx.http_timeout)
+    r = exec_tool(
+        "dnsx", _dnsx_cmd(ctx, hf),
+        repository=ctx.run,
+        stdout=RepositoryOutput.publish_path(ctx.run, out),
+        stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+    )
     ctx.run.record(phase, r)
     n = 0
     if r.raw_path and r.raw_path.exists():

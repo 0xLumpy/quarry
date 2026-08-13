@@ -21,6 +21,7 @@ from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, r
                         run_provider)
 from ..runner import (RunResult, Status, have, reclassify_from_artifact, run as exec_tool,
                        skipped)
+from ..runner_repository import RepositoryOutput
 
 _SUBFINDER_DEFAULT_MIN = 60                  # default -max-time budget (minutes)
 _SUBFINDER_UNBOUNDED_MIN = 1440             # 0 -> 24h ceiling (subfinder cancels on -max-time 0)
@@ -90,7 +91,10 @@ def _run_subfinder(ctx, prof, scope) -> None:
                                  config={"sources": "all", "max_time_min": budget_min, "providers": providers})
         r = run_contract("vertical.subfinder",
                          ["subfinder", "-d", apex, "-all", "-max-time", str(budget_min),
-                          "-stats", "-silent"], work_unit=sf_wu, raw_path=sf_raw,
+                          "-stats", "-silent"],
+                         repository=ctx.run,
+                         stdout=RepositoryOutput.publish_path(ctx.run, sf_raw),
+                         stderr=RepositoryOutput.discard(), work_unit=sf_wu,
                          reclassify=reclassify, timeout=outer)
         ctx.run.record("vertical", r)
         if r.raw_path:
@@ -139,8 +143,12 @@ def _openintel(ctx, cfg: dict, apex: str, timeout: int = 180) -> set:
         ctx.run.record("vertical", skipped("openintel-subs", "configured binary or db not found"))
         return set()
     raw = ctx.run.raw_path("vertical", "openintel", f"{apex}.txt")
-    r = exec_tool("openintel-subs", [exe, "query", "-d", apex, "-s", "-b", db],
-                  raw_path=raw, timeout=timeout)
+    r = exec_tool(
+        "openintel-subs", [exe, "query", "-d", apex, "-s", "-b", db],
+        repository=ctx.run,
+        stdout=RepositoryOutput.publish_path(ctx.run, raw),
+        stderr=RepositoryOutput.discard(), timeout=timeout,
+    )
     ctx.run.record("vertical", r)
     if r.status not in (Status.SUCCESS, Status.EMPTY) or not (r.raw_path and Path(r.raw_path).exists()):
         return set()
@@ -957,7 +965,12 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
                   "-t", str(settings.workers("httpx", 15))]
         if ctx.profile.http_rl:                           # honor a configured HTTP rate
             hx_cmd += ["-rl", str(ctx.profile.http_rl)]
-        r = exec_tool("httpx", hx_cmd, raw_path=hx, timeout=ctx.http_timeout)
+        r = exec_tool(
+            "httpx", hx_cmd,
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish_path(ctx.run, hx),
+            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        )
         # everything observable about this invocation is committed BEFORE the fallible ledger write, so a
         # `record()` that raises does not make the run forget what already happened.
         blob = None
@@ -1174,7 +1187,12 @@ def _github_subs(ctx, prof, scope) -> None:
         for d in prof.apex_domains:
             r = exec_tool("github-subdomains",
                           ["github-subdomains", "-d", d, "-t", str(gh_token)],
-                          raw_path=ctx.run.raw_path("vertical", "github-subdomains", f"{d}.txt"),
+                          repository=ctx.run,
+                          stdout=RepositoryOutput.publish_path(
+                              ctx.run,
+                              ctx.run.raw_path("vertical", "github-subdomains", f"{d}.txt"),
+                          ),
+                          stderr=RepositoryOutput.discard(),
                           timeout=ctx.http_timeout)
             ctx.run.record("vertical", r)
             if r.raw_path:
@@ -1209,8 +1227,12 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
         # -mode both adds default + target-mined patterns. Runs over the FULL known set (word cloud).
         if not scope.passive_only and have("alterx"):
             perms = ctx.run.raw_path("vertical", "alterx", f"perms_{it}.txt")
-            r = exec_tool("alterx", ["alterx", "-l", str(known), "-enrich", "-mode", "both",
-                                     "-silent"], raw_path=perms, timeout=600)
+            r = exec_tool(
+                "alterx", ["alterx", "-l", str(known), "-enrich", "-mode", "both", "-silent"],
+                repository=ctx.run,
+                stdout=RepositoryOutput.publish_path(ctx.run, perms),
+                stderr=RepositoryOutput.discard(), timeout=600,
+            )
             ctx.run.record("vertical", r)
             if perms.exists():
                 cand += perms.read_text().splitlines()
@@ -1240,7 +1262,12 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
             cmd += ["-r", str(resolvers)]
         if prof.dns_rate:
             cmd += ["--rate-limit", str(prof.dns_rate)]
-        r = exec_tool("puredns", cmd, raw_path=res, timeout=ctx.http_timeout)
+        r = exec_tool(
+            "puredns", cmd,
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish_path(ctx.run, res),
+            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        )
         if _n_all != _n_new:                              # dedup SAVINGS is optimization telemetry, NOT a gap
             r.note = (f"frontier: {_n_new} new candidate(s), {_n_all - _n_new} already-settled skipped; "
                       f"{r.note or ''}").strip()
@@ -1430,6 +1457,9 @@ def run(ctx) -> None:
         sho_wu = events.work_unit("vertical.shosubgo", inputs={"roots": sorted(prof.apex_domains)})
         r = run_contract("vertical.shosubgo", ["shosubgo", "-f", str(roots_file),
                                                "-s", sho_key, "-o", str(sho), "-fail"],
+                         repository=ctx.run,
+                         stdout=RepositoryOutput.discard(),
+                         stderr=RepositoryOutput.discard(),
                          work_unit=sho_wu, reclassify=_sho_reclassify, timeout=ctx.http_timeout)
         ctx.run.record("vertical", r)
         hosts, _ = _shosubgo_read(sho)                  # re-read for ingest (392 names were dropped when unread)
@@ -1454,7 +1484,12 @@ def run(ctx) -> None:
             if prof.dns_rate:
                 cmd += ["--rate-limit", str(prof.dns_rate)]
             br = ctx.run.raw_path("vertical", "puredns", f"brute-{d}.txt")
-            r = exec_tool("puredns", cmd, raw_path=br, timeout=ctx.http_timeout)
+            r = exec_tool(
+                "puredns", cmd,
+                repository=ctx.run,
+                stdout=RepositoryOutput.publish_path(ctx.run, br),
+                stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            )
             ctx.run.record("vertical", r)
             if r.raw_path:
                 for e in normalize.hosts(r.raw_path.read_text(), "puredns-brute", str(br)):
@@ -1487,8 +1522,12 @@ def run(ctx) -> None:
         cn = ctx.run.raw_path("vertical", "dnsx", "cnames.jsonl")
         # -a so each result carries the host's A records: dangling = a CNAME but no A here. Not "not in
         # resolved" — a no-A CNAME host can still get a `resolved` entity with a:[]
-        r = exec_tool("dnsx", ["dnsx", "-l", str(res_hosts), "-cname", "-a", "-json", "-silent"],
-                      raw_path=cn, timeout=ctx.http_timeout)
+        r = exec_tool(
+            "dnsx", ["dnsx", "-l", str(res_hosts), "-cname", "-a", "-json", "-silent"],
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish_path(ctx.run, cn),
+            stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        )
         ctx.run.record("vertical", r)
         if r.raw_path:
             n = ntk = 0

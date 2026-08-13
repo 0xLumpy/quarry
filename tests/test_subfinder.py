@@ -88,8 +88,9 @@ class TestSubfinderPerApex:
     def _wire(self, monkeypatch, tmp_path, http_timeout, dur_for):
         calls, recorded, added = [], [], []
 
-        def fake_rc(sid, cmd, *, work_unit=None, raw_path=None, reclassify=None, timeout=None, **k):
+        def fake_rc(sid, cmd, *, work_unit=None, stdout=None, reclassify=None, timeout=None, **k):
             apex = cmd[cmd.index("-d") + 1]
+            raw_path = tmp_path.joinpath(*stdout.components)
             raw_path.parent.mkdir(parents=True, exist_ok=True)
             raw_path.write_text(f"www.{apex}\n")                       # one in-scope host per apex
             res = RunResult("subfinder", cmd, Status.SUCCESS, 0, dur_for(apex), raw_path, 1)
