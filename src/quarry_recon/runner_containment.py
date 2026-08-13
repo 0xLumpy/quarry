@@ -1,7 +1,7 @@
 """Parent-owned process containment for the killable runner boundary.
 
-This module deliberately does not participate in :mod:`quarry_recon.runner` yet.
-It prepares one Linux cgroup-v2 backend whose assurance is *cooperative*: ordinary
+This module provides the parent-owned Linux cgroup-v2 backend used by the runner
+supervisor.  Its assurance is *cooperative*: ordinary
 forks, ``setsid()``, double-forks and concurrent forks remain in the acquired
 subtree, but a deliberately hostile same-UID program may be able to migrate to a
 different writable cgroup.  This is an execution-correctness boundary, not a

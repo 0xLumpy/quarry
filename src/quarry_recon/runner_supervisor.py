@@ -19,12 +19,16 @@ from enum import Enum
 
 from . import runner_ipc
 from .runner_containment import (
+    ContainmentRefused,
+    ContainmentSettlement,
+    ContainmentUnsupported,
+    MembershipVerification,
+    acquire_direct_cgroup_v2,
     capture_parked_process_identity,
     capture_process_identity,
 )
 from .runner_protocol import (
     MAX_FRAME_BYTES,
-    ContainmentKind,
     ControlTranscript,
     ExecutionTerminal,
     PreparedFrame,
@@ -63,6 +67,7 @@ class BootstrapReason(str, Enum):
     READY_FAILED = "ready_failed"
     COMMAND_FAILED = "command_failed"
     CONTROL_FAILED = "control_failed"
+    CONTAINMENT_FAILED = "containment_failed"
     WORKER_FAILED = "worker_failed"
     DEADLINE = "deadline"
     REAP_FAILED = "reap_failed"
@@ -113,6 +118,8 @@ class BootstrapOutcome:
         kill_requested: bool,
         _expected_request_sha256: str | None,
         _authority: object,
+        _containment_bound: bool = False,
+        _containment_settled: bool = False,
     ) -> None:
         if _authority is not _BOOTSTRAP_OUTCOME_AUTHORITY:
             raise TypeError("bootstrap outcomes require supervisor authority")
@@ -135,6 +142,8 @@ class BootstrapOutcome:
                 or type(abort_command_sent) is not bool
                 or type(parent_pipes_closed) is not bool
                 or type(kill_requested) is not bool
+                or type(_containment_bound) is not bool
+                or type(_containment_settled) is not bool
                 or type(observed_trailing_control_bytes) is not int
                 or not 0 <= observed_trailing_control_bytes <= _MAX_TRAILING_BYTES):
             raise TypeError("invalid bootstrap outcome")
@@ -164,7 +173,8 @@ class BootstrapOutcome:
                     or not control_eof
                     or observed_trailing_control_bytes != 0
                     or not abort_command_sent or not parent_pipes_closed
-                    or kill_requested):
+                    or kill_requested or not _containment_bound
+                    or not _containment_settled):
                 raise ValueError("incomplete successful bootstrap outcome")
             if (ready.request_id != request_id or ready.worker_pid != worker_pid
                     or settlement.request_id != request_id
@@ -228,6 +238,15 @@ class _BootstrapOwner:
 
     selector: object | None = None
     selector_close_attempted: bool = False
+    containment: object | None = None
+    containment_bound: bool = False
+    containment_settle_attempts: int = 0
+    containment_settle_retry_allowed: bool = False
+    containment_settlement: ContainmentSettlement | None = None
+    containment_close_attempts: int = 0
+    containment_close_retry_allowed: bool = False
+    containment_terminal: bool = False
+    containment_cleanup_failed: bool = False
     child: object | None = None
     worker_spawned: bool = False
     worker_pid: int | None = None
@@ -360,6 +379,8 @@ def _outcome(
     abort_command_sent: bool = False,
     parent_pipes_closed: bool = True,
     kill_requested: bool = False,
+    _containment_bound: bool = False,
+    _containment_settled: bool = False,
 ) -> BootstrapOutcome:
     expected_digest = request_digest(request) if reason is BootstrapReason.ABORTED else None
     return BootstrapOutcome(
@@ -379,6 +400,8 @@ def _outcome(
         kill_requested=kill_requested,
         _expected_request_sha256=expected_digest,
         _authority=_BOOTSTRAP_OUTCOME_AUTHORITY,
+        _containment_bound=_containment_bound,
+        _containment_settled=_containment_settled,
     )
 
 
@@ -648,10 +671,69 @@ def _owner_close_pipe(owner: _BootstrapOwner, role: str) -> bool:
     return False
 
 
+def _settle_owned_containment(
+    owner: _BootstrapOwner, real_deadline: float,
+) -> None:
+    """Settle one acquired cgroup, then terminalize any residual FD authority."""
+    handle = owner.containment
+    if handle is None or owner.containment_terminal:
+        return
+
+    while (owner.containment_settlement is None
+           and owner.containment_settle_attempts < _REAL_CLOCK_SAMPLE_ATTEMPTS
+           and (owner.containment_settle_attempts == 0
+                or owner.containment_settle_retry_allowed)):
+        owner.containment_settle_retry_allowed = False
+        try:
+            owner.containment_settle_attempts += 1; owner.containment_settlement = handle.kill_settle_remove(real_deadline)
+        except BaseException as exc:
+            owner.remember(exc)
+            if (not isinstance(exc, Exception)
+                    and owner.containment_settle_attempts
+                    < _REAL_CLOCK_SAMPLE_ATTEMPTS):
+                # The public containment transaction stores monotone kill/remove
+                # facts and explicitly supports one same-owner reconciliation
+                # entry after cooperative cancellation.  Ordinary faults and
+                # concrete non-settled results are never replayed.
+                owner.containment_settle_retry_allowed = True
+                continue
+            break
+
+    settlement = owner.containment_settlement
+    if (type(settlement) is ContainmentSettlement
+            and settlement.cooperative_settled):
+        owner.containment_terminal = True
+        return
+
+    owner.containment_cleanup_failed = True
+    owner.failure = BootstrapReason.CONTAINMENT_FAILED
+    while (not owner.containment_terminal
+           and owner.containment_close_attempts < _REAL_CLOCK_SAMPLE_ATTEMPTS
+           and (owner.containment_close_attempts == 0
+                or owner.containment_close_retry_allowed)):
+        owner.containment_close_retry_allowed = False
+        try:
+            owner.containment_close_attempts += 1; handle.close(); owner.containment_terminal = True
+        except BaseException as exc:
+            owner.remember(exc)
+            if (not isinstance(exc, Exception)
+                    and owner.containment_close_attempts
+                    < _REAL_CLOCK_SAMPLE_ATTEMPTS):
+                # The stable DirectCgroupV2 owner reconciles its own monotone
+                # descriptor claims.  A second entry is safe after the one
+                # cooperative cancellation, including a cancellation at the
+                # callee's first line before its fence became active.
+                owner.containment_close_retry_allowed = True
+                continue
+            break
+        else:
+            break
+
+
 def _settle_owned_child(
     owner: _BootstrapOwner, deadline: float, clock, real_deadline: float,
 ) -> None:
-    """Close parent channels and settle the exact child from durable facts."""
+    """Settle both parent-owned authorities from their durable facts."""
     _adopt_child_authority(owner)
     _owner_close_selector(owner)
     input_clean = _owner_close_pipe(owner, "input")
@@ -660,34 +742,52 @@ def _settle_owned_child(
     if not parent_pipes_closed and owner.failure is None:
         owner.failure = BootstrapReason.CONTROL_FAILED
 
+    # Closing the command channel first makes the fixed worker fail closed.
+    # Consume exact child-status authority before cgroup settlement: the latter
+    # may legitimately wait until the absolute deadline, but must never thereby
+    # strand an unreaped supervisor child.  Cgroup kill remains the final
+    # fallback for the already-bound launcher and any cooperative descendants.
+    if owner.worker_spawned:
+        if owner.failure is None:
+            try:
+                graceful_deadline, graceful_real_deadline = (
+                    _graceful_reap_deadlines(deadline, clock, real_deadline)
+                )
+            except BaseException as exc:
+                owner.remember(exc)
+                owner.failure = BootstrapReason.DEADLINE
+            else:
+                _wait_child(
+                    owner, graceful_deadline, clock, graceful_real_deadline,
+                )
+
+        if not owner.worker_reaped and not owner.child_status_fault:
+            _request_kill_bounded(owner, real_deadline)
+        if not owner.worker_reaped and not owner.child_status_fault:
+            _final_reap_bounded(owner, real_deadline)
+
+    _settle_owned_containment(owner, real_deadline)
+
     if not owner.worker_spawned:
         return
-
-    if owner.failure is None:
-        try:
-            graceful_deadline, graceful_real_deadline = _graceful_reap_deadlines(
-                deadline, clock, real_deadline,
-            )
-        except BaseException as exc:
-            owner.remember(exc)
-            owner.failure = BootstrapReason.DEADLINE
-        else:
-            _wait_child(owner, graceful_deadline, clock, graceful_real_deadline)
-
-    if not owner.worker_reaped and not owner.child_status_fault:
-        _request_kill_bounded(owner, real_deadline)
-    if not owner.worker_reaped and not owner.child_status_fault:
-        _final_reap_bounded(owner, real_deadline)
 
     if not owner.worker_reaped:
         owner.failure = BootstrapReason.REAP_FAILED
         owner.worker_returncode = None
+    elif owner.containment_cleanup_failed:
+        owner.failure = BootstrapReason.CONTAINMENT_FAILED
     elif owner.failure is None and (
             owner.worker_returncode != 0 or owner.kill_requested
             or owner.forced_termination_fault):
         owner.failure = BootstrapReason.WORKER_FAILED
     if owner.failure is None:
-        owner.failure = BootstrapReason.ABORTED
+        if (owner.containment_bound
+                and type(owner.containment_settlement) is ContainmentSettlement
+                and owner.containment_settlement.cooperative_settled
+                and owner.containment_terminal):
+            owner.failure = BootstrapReason.ABORTED
+        else:
+            owner.failure = BootstrapReason.CONTAINMENT_FAILED
 
 
 def _drive_abort_protocol(
@@ -832,9 +932,11 @@ def _drive_abort_protocol(
                         if (record.request_id != request.request_id
                                 or record.worker_pid != owner.worker_pid
                                 or record.launcher_pid != record.launcher_pgid
-                                or record.containment_kind is not ContainmentKind.CGROUP_V2
+                                or owner.containment is None
+                                or record.containment_kind
+                                is not owner.containment.kind
                                 or record.containment_id
-                                != f"direct/quarry-{request.request_id}"
+                                != owner.containment.containment_id
                                 or owner.worker_identity is None):
                             owner.failure = BootstrapReason.CONTROL_FAILED
                             break
@@ -851,6 +953,19 @@ def _drive_abort_protocol(
                                 or proof.state not in ("T", "t")):
                             owner.failure = BootstrapReason.IDENTITY_FAILED
                             break
+                        try:
+                            verification = owner.containment.bind_parked_process(
+                                proof,
+                            )
+                        except BaseException as exc:
+                            owner.remember(exc)
+                            owner.failure = BootstrapReason.CONTAINMENT_FAILED
+                            break
+                        if (type(verification) is not MembershipVerification
+                                or not verification.verified):
+                            owner.failure = BootstrapReason.CONTAINMENT_FAILED
+                            break
+                        owner.containment_bound = True
                         owner.prepared = record
                         write_wire = encode_command(WorkerCommand(
                             request_id=request.request_id,
@@ -961,10 +1076,24 @@ def bootstrap_worker(
 
     owner = _BootstrapOwner()
     try:
-        owner.selector = selectors.DefaultSelector()
-        if _remaining(deadline, clock, real_deadline) <= 0:
+        try:
+            owner.containment = acquire_direct_cgroup_v2(request.request_id)
+        except (ContainmentUnsupported, ContainmentRefused):
+            owner.failure = BootstrapReason.UNSUPPORTED
+        except BaseException as exc:
+            owner.remember(exc)
+            owner.failure = BootstrapReason.CONTAINMENT_FAILED
+        if owner.failure is None and _remaining(
+                deadline, clock, real_deadline,
+        ) <= 0:
             owner.failure = BootstrapReason.DEADLINE
-        else:
+        if owner.failure is None:
+            try:
+                owner.selector = selectors.DefaultSelector()
+            except BaseException as exc:
+                owner.remember(exc)
+                owner.failure = BootstrapReason.CONTROL_FAILED
+        if owner.failure is None:
             spawn_kwargs = {
                 "stdin": subprocess.PIPE,
                 "stdout": subprocess.PIPE,
@@ -1056,4 +1185,10 @@ def bootstrap_worker(
             owner.input_closed_clean and owner.output_closed_clean
         ),
         kill_requested=owner.kill_requested,
+        _containment_bound=owner.containment_bound,
+        _containment_settled=(
+            type(owner.containment_settlement) is ContainmentSettlement
+            and owner.containment_settlement.cooperative_settled
+            and owner.containment_terminal
+        ),
     )
