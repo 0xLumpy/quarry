@@ -79,6 +79,21 @@ def test_worker_command_is_frozen_request_digest_and_worker_bound(kind):
     assert str(WORKER_PID) not in rendered
 
 
+def test_ready_only_command_preserves_the_legacy_four_field_wire_schema():
+    command = _command()
+    frame = protocol.encode_command(command)
+    envelope = json.loads(frame[4:])
+
+    assert set(envelope["body"]) == {
+        "request_id", "request_sha256", "worker_pid", "command",
+    }
+    assert protocol.decode_command(_frame("launch_command", command.to_dict())) == command
+
+    explicit_null = command.to_dict()
+    explicit_null["prepared_sha256"] = None
+    assert protocol.decode_command(_frame("launch_command", explicit_null)) == command
+
+
 @pytest.mark.parametrize("field,value", [
     ("request_id", "62" * 16),
     ("request_sha256", "b5" * 32),

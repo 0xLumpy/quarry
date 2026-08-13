@@ -803,20 +803,26 @@ class ReadyFrame:
 class WorkerCommand:
     """One request- and worker-bound parent decision.
 
-    The request digest is private control traffic and is deliberately omitted from
-    rendering.  A command is correlation testimony only; in particular, ``GO`` is
-    not containment, stage-transfer, or publication authority by itself.
+    The request and prepared-frame digests are private control traffic and are
+    deliberately omitted from rendering.  ``prepared_sha256`` is absent for the
+    READY-only abort path and binds every command sent after PREPARED.  The record
+    cannot decide which phase a receiver is in, so workers enforce that presence
+    rule at their command boundary.  A command is correlation testimony only; in
+    particular, ``GO`` is not containment, stage-transfer, or publication authority
+    by itself.
     """
 
     request_id: str
     request_sha256: str = field(repr=False)
     worker_pid: int = field(repr=False)
     command: WorkerCommandKind
+    prepared_sha256: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _request_id(self.request_id)
         if _optional_digest(self.request_sha256, "request_sha256") is None:
             raise ProtocolError("command needs a request digest", "request_sha256")
+        _optional_digest(self.prepared_sha256, "prepared_sha256")
         _positive_int(self.worker_pid, "worker_pid")
         if type(self.command) is not WorkerCommandKind:
             raise ProtocolError("invalid enum", "command")
@@ -825,27 +831,28 @@ class WorkerCommand:
         return f"WorkerCommand(command={self.command.value!r})"
 
     def to_dict(self) -> dict:
-        return {
+        doc = {
             "request_id": self.request_id,
             "request_sha256": self.request_sha256,
             "worker_pid": self.worker_pid,
             "command": self.command.value,
         }
+        if self.prepared_sha256 is not None:
+            doc["prepared_sha256"] = self.prepared_sha256
+        return doc
 
     @classmethod
     def from_dict(cls, doc: dict) -> "WorkerCommand":
-        _exact_keys(
-            doc,
-            frozenset({
-                "request_id", "request_sha256", "worker_pid", "command",
-            }),
-            "command",
-        )
+        legacy = frozenset({"request_id", "request_sha256", "worker_pid", "command"})
+        prepared = legacy | frozenset({"prepared_sha256"})
+        if type(doc) is not dict or frozenset(doc) not in (legacy, prepared):
+            raise ProtocolError("object keys do not match schema", "command")
         return cls(
             request_id=doc["request_id"],
             request_sha256=doc["request_sha256"],
             worker_pid=doc["worker_pid"],
             command=_enum(WorkerCommandKind, doc["command"], "command"),
+            prepared_sha256=doc.get("prepared_sha256"),
         )
 
 
@@ -1576,6 +1583,13 @@ def encode_prepared(prepared: PreparedFrame) -> bytes:
     if type(prepared) is not PreparedFrame:
         raise ProtocolError("invalid prepared frame", "prepared")
     return _encode("prepared", prepared.to_dict())
+
+
+def prepared_digest(prepared: PreparedFrame) -> str:
+    """Authenticate one exact canonical PREPARED claim in its own domain."""
+    return hashlib.sha256(
+        b"quarry-runner-prepared-v1\0" + encode_prepared(prepared)
+    ).hexdigest()
 
 
 def decode_prepared(frame: bytes) -> PreparedFrame:
