@@ -108,3 +108,39 @@ def test_default_popen_constructor_cancellation_reaps_spawned_child(
             except ProcessLookupError:
                 pass
             child.wait(timeout=2)
+
+
+def test_real_execution_timeout_zero_has_no_execution_cutoff(monkeypatch):
+    if sys.platform != "linux":
+        pytest.skip("fixed worker execution is Linux-only")
+    invocation = protocol.normalize_invocation(
+        request_id="93" * 16,
+        tool="fixture",
+        cmd=(
+            sys.executable,
+            "-c",
+            "import os,time; time.sleep(0.15); os.write(1,b'natural-exit')",
+        ),
+        timeout=0,
+        env={},
+        base_environment={"PATH": os.environ.get("PATH", "")},
+    )
+    monkeypatch.setattr(supervisor.sys, "executable", sys.executable)
+
+    outcome = supervisor.supervise_execution(
+        invocation,
+        stage_batch=None,
+        deadline=(1 << 52),
+    )
+
+    assert outcome.reason is supervisor.ExecutionReason.COMPLETE
+    assert outcome.transaction_complete is True
+    assert outcome.worker_reaped and outcome.worker_returncode == 0
+    assert outcome.settlement is not None
+    assert outcome.settlement.terminal is protocol.ExecutionTerminal.COMPLETE
+    stdout = next(
+        stream for stream in outcome.settlement.streams
+        if stream.role is protocol.StreamRole.STDOUT
+    )
+    assert stdout.observed_bytes == len(b"natural-exit")
+    assert stdout.retained_bytes == 0

@@ -27,6 +27,8 @@ class FakeDirectContainment:
     """A parent-owned direct-containment handle for supervisor tests."""
 
     def __init__(self, controller, request_id):
+        from quarry_recon import runner_protocol as protocol
+
         self._controller = controller
         self.request_id = request_id
         self.kind = controller.kind
@@ -39,6 +41,7 @@ class FakeDirectContainment:
         self.settlement_deadlines = []
         self.close_calls = 0
         self.terminal = False
+        self.containment_assurance = protocol.ContainmentAssurance.COOPERATIVE_SCOPE
 
     def bind_parked_process(self, proof):
         from quarry_recon import runner_containment as containment
@@ -53,6 +56,14 @@ class FakeDirectContainment:
                 True, containment.ContainmentReason.VERIFIED,
             )
         return result
+
+    def verify_pid(self, identity):
+        from quarry_recon import runner_containment as containment
+
+        self._controller.events.append(("verify", identity))
+        return containment.MembershipVerification(
+            True, containment.ContainmentReason.VERIFIED,
+        )
 
     def kill_settle_remove(self, deadline):
         from quarry_recon import runner_containment as containment
