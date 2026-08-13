@@ -92,6 +92,14 @@ def fresh_artifact_dir(base) -> "Path":
     is derived by globbing a directory (gowitness): a reused or pre-populated directory would let a prior
     run's artifacts inflate this attempt's count. Prior attempts are preserved as evidence."""
     base = Path(base)
+    # Compatibility callers still use an ambient Path, but a path inside a
+    # Run is immediately rebound to the exact repository authority.  New
+    # production code should prefer ``Run.fresh_artifact_dir`` directly.
+    from . import store as _store
+    managed = _store.managed_run_for_artifact(base / "attempt-probe")
+    if managed is not None:
+        run, components = managed
+        return run.fresh_artifact_dir(*components[:-1])
     base.mkdir(parents=True, exist_ok=True)
     n = 0
     while True:

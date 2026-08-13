@@ -1512,7 +1512,6 @@ def _vhost_enum(ctx) -> None:
                                             **{f"eff:{a}": e["digest"] for a, e in eff.items()}},
                               schema_version=_VHOST_SCHEMA)
     sbase = ctx.run.dir / "raw" / "probe"
-    sbase.mkdir(parents=True, exist_ok=True)
     budget.prune_state(sbase, "probe.ffuf_vhost", cfg_fp)
     ledger = budget.Ledger(budget.state_path(sbase, "probe.ffuf_vhost", cfg_fp), lane="probe.ffuf_vhost")
     vh_budget = budget.Budget(budget.budget_seconds("VHOST_BUDGET_S"))
@@ -2007,7 +2006,6 @@ def shodan_host_lane(ctx) -> None:
         if not targets:
             raise ProviderSkip("no observed in-scope address to look up")
         sbase = ctx.run.dir / "raw" / "probe"
-        sbase.mkdir(parents=True, exist_ok=True)
         cfg_fp = events.work_unit(_SHODAN_HOST_SID, inputs={}, config={},
                                   schema_version=shodan_host.SHODAN_HOST_SCHEMA)
         budget.prune_state(sbase, _SHODAN_HOST_SID, cfg_fp)

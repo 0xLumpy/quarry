@@ -331,7 +331,6 @@ def _arjun_lane(ctx, prof, corpus) -> None:
     cfg_fp = events.work_unit("params.arjun", inputs={}, config={"engine": engine},
                               schema_version=_ARJUN_SCHEMA)
     state_base = ctx.run.dir / "raw" / "params"
-    state_base.mkdir(parents=True, exist_ok=True)
     budget.prune_state(state_base, "params.arjun", cfg_fp)
     ledger = budget.Ledger(budget.state_path(state_base, "params.arjun", cfg_fp), lane="params.arjun")
     aj_budget = budget.Budget(budget.budget_seconds("ARJUN_BUDGET_S"))

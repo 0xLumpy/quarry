@@ -235,7 +235,6 @@ def run(ctx) -> None:
                                                                 "wordlist": wl.name, "tier": tier},
                               file_digests={"wordlist": wl_digest}, schema_version=_CONTENT_SCHEMA)
     state_base = ctx.run.dir / "raw" / "content"
-    state_base.mkdir(parents=True, exist_ok=True)
     budget.prune_state(state_base, "content.ffuf", cfg_fp)
     ledger = budget.Ledger(budget.state_path(state_base, "content.ffuf", cfg_fp), lane="content.ffuf")
     ff_budget = budget.Budget(budget.budget_seconds("CONTENT_FFUF_BUDGET_S"))

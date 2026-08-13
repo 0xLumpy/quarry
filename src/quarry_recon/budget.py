@@ -205,6 +205,32 @@ def store_writable(attempt_dir) -> bool:
     artifact tree whose contract is "every file is validated evidence" must not gain one."""
     probe = Path(attempt_dir) / ".quarry-write-probe"
     body = b'{"probe":1}'
+    managed = _managed_artifact(Path(attempt_dir) / "write-probe")
+    if managed is not None:
+        run, components = managed
+        writer = -1
+        try:
+            # Exercise the same private stage/write/fsync/fence authority used
+            # by a real artifact without ever creating a canonical probe name.
+            with run.artifact_claim(*components) as claim:
+                writer = claim.open_writer()
+                view = memoryview(body)
+                while view:
+                    written = os.write(writer, view)
+                    if written <= 0:
+                        raise OSError("artifact writability probe made no progress")
+                    view = view[written:]
+                os.fsync(writer)
+                os.close(writer)
+                writer = -1
+            return True
+        except (OSError, RuntimeError, ValueError):
+            if writer >= 0:
+                try:
+                    os.close(writer)
+                except OSError:
+                    pass
+            return False
     try:
         Path(attempt_dir).mkdir(parents=True, exist_ok=True)
         ok = publish_bytes(probe, body, digest=hashlib.sha256(body).hexdigest())

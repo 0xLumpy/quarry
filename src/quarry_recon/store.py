@@ -1655,6 +1655,91 @@ class Run:
             privfs.private_dir(p)                            # raw evidence dirs are 0700
             return p / name
 
+    def fresh_artifact_dir(self, *components: str) -> Path:
+        """Atomically allocate one private ``attempt-N`` base-evidence directory.
+
+        Allocation and finalization share the Run authority, so either the
+        directory is committed while base evidence is still open or the seal
+        wins without a filesystem side effect.  Existing attempt names are
+        authenticated rather than blindly skipped: a planted link or wrong
+        object type makes the allocator fail closed.
+        """
+        components = _validated_artifact_components(tuple(components))
+        from . import privfs
+        with self._mutation(MutationScope.BASE_EVIDENCE):
+            base = self.dir.joinpath(*components)
+            privfs.private_dir(base)
+            anchor_fd = _open_run_fd(self.project_dir, self.run_id)
+            base_fd = -1
+            try:
+                base_fd = privfs.open_strict_dir_at(anchor_fd, components)
+                index = 0
+                while True:
+                    name = f"attempt-{index}"
+                    try:
+                        existing = os.stat(
+                            name, dir_fd=base_fd, follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        existing = None
+                    if existing is not None:
+                        self._validate_base_directory_stat(
+                            existing, components + (name,),
+                        )
+                        index += 1
+                        continue
+                    try:
+                        os.mkdir(name, privfs.DIR_MODE, dir_fd=base_fd)
+                    except FileExistsError:
+                        # Cooperative writers cannot race while the Run lock is
+                        # held.  A new name here is untrusted interference.
+                        raise ContractError(
+                            f"artifact attempt name {name!r} changed during allocation",
+                        ) from None
+                    except BaseException:
+                        # If mkdir committed before cancellation was delivered,
+                        # durably reconcile that harmless empty generation.  It
+                        # remains a truthful pre-seal allocation even though the
+                        # interrupted caller receives no Path.
+                        try:
+                            observed = os.stat(
+                                name, dir_fd=base_fd, follow_symlinks=False,
+                            )
+                        except OSError:
+                            pass
+                        else:
+                            self._validate_base_directory_stat(
+                                observed, components + (name,),
+                            )
+                            os.fsync(base_fd)
+                        raise
+                    child_fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=base_fd)
+                    try:
+                        observed = os.fstat(child_fd)
+                        named = os.stat(
+                            name, dir_fd=base_fd, follow_symlinks=False,
+                        )
+                        self._validate_base_directory_stat(
+                            observed, components + (name,),
+                        )
+                        self._validate_base_directory_stat(
+                            named, components + (name,),
+                        )
+                        if ((observed.st_dev, observed.st_ino)
+                                != (named.st_dev, named.st_ino)):
+                            raise ContractError(
+                                f"artifact attempt name {name!r} changed during allocation",
+                            )
+                        os.fsync(child_fd)
+                    finally:
+                        os.close(child_fd)
+                    os.fsync(base_fd)
+                    return base / name
+            finally:
+                if base_fd >= 0:
+                    os.close(base_fd)
+                os.close(anchor_fd)
+
     # ── tool run accounting ──
     def record(self, phase: str, result, *, depends_on: str | None = None) -> None:
         # the single choke point that redacts secrets out of cmd/note/stderr before they reach the manifest
