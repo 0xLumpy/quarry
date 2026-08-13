@@ -18,12 +18,15 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit as _urlsplit, urlunsplit as _urlunsplit
 
-from .. import (ast_obs, budget, cgroup, events, fetch, normalize, policy, registry,
-                remainder, secrets, settings, store)
+from .. import (ast_obs, budget, cgroup, events, fetch, normalize, policy,
+                registry, remainder, secrets, settings, store)
 from ..contract import registered, run_contract
-from ..runner import (Status, have, native_output_current, reclassify_from_artifact,
+from ..runner import (Status, _NativeFacadeFence, _NativeFacadeOwner,
+                      _finish_native_outputs, _preferred_native_fault, have,
+                      native_output_current, reclassify_from_artifact,
                       run as exec_tool, skipped)
-from ..runner_native import RepositoryNativeOutput
+from ..runner_native import (NativeOutputAdoption, RepositoryNativeOutput,
+                             prepare_native_outputs)
 from ..runner_repository import RepositoryOutput
 
 # deep-mine patterns; each findall() yields the value to store (full match or capture group).
@@ -152,12 +155,13 @@ def _jsluice_run(ctx, sub, files, raw, origin):
 JS_BEAUTIFY_TIMEOUT = 60          # per-file cap on a local reformat
 
 
-def _beautify_run(ctx, files):
+def _beautify_run(ctx, files, builder, expected_entries):
     """Beautify JS per file through the runner. Returns (beautified_ok, degraded, overall Status).
 
-    Each file is reformatted as a temp copy and swapped in only after a clean run, so a timeout mid-write
-    leaves the untouched original rather than a truncated one. Per-file telemetry is aggregated into one
-    recorded result.
+    Each clean formatter stdout is a unique retained repository artifact.  The
+    enclosing TREE transaction remains claimed across execution and copies the
+    authenticated artifact into its private generation.  A degraded formatter
+    falls back to the immutable ledger source.
     """
     sid = "crawl.js_beautify"
     events.tool_start(sid, cmd=["js-beautify"], input_total=len(files), discovery_context="js")
@@ -166,26 +170,37 @@ def _beautify_run(ctx, files):
     cpu_total = 0.0
     rss_peak = 0.0
     for i, f in enumerate(files, 1):
-        tmp = f.with_suffix(f.suffix + ".beauty")          # beautify a copy, never the only original
+        output = ctx.run.raw_path(
+            "crawl", "js-beautify",
+            f"{f.stem}-{uuid.uuid4().hex}.beauty.js",
+        )
         try:
             res = exec_tool("js-beautify", ["js-beautify", str(f)],
                             repository=ctx.run,
-                            stdout=RepositoryOutput.publish(*tmp.relative_to(ctx.run.dir).parts),
+                            stdout=RepositoryOutput.publish(
+                                *output.relative_to(ctx.run.dir).parts,
+                            ),
                             stderr=RepositoryOutput.discard(), timeout=JS_BEAUTIFY_TIMEOUT)
         except Exception:
             res = None
         cpu_total += getattr(res, "cpu_s", 0.0) or 0.0
         rss_peak = max(rss_peak, getattr(res, "peak_rss_mb", 0.0) or 0.0)
-        swapped = False
-        if (res is not None and res.status in (Status.SUCCESS, Status.EMPTY)
-                and res.raw_path == tmp and native_output_current(res, tmp) and tmp.exists()):
-            try:
-                tmp.replace(f)                              # atomic swap-in only after a clean run
-                swapped = True
-                ok += 1
-            except Exception:
-                pass                                        # swap failed -> degraded, original kept
-        if not swapped:
+        complete = bool(
+            res is not None
+            and res.status in (Status.SUCCESS, Status.EMPTY)
+            and res.raw_path == output
+            and native_output_current(res, output)
+        )
+        chosen = output if complete else f
+        evidence = builder.copy_repository_file(
+            tuple(chosen.relative_to(ctx.run.dir).parts), f.name,
+        )
+        expected_entries[evidence.components] = (
+            False, evidence.size, evidence.sha256,
+        )
+        if complete:
+            ok += 1
+        else:
             degraded += 1
             reason = res.status.value if res is not None else "exception"
             events.coverage_partial(sid, reason=f"{f.name}: {reason}")
@@ -202,6 +217,89 @@ def _beautify_run(ctx, files):
         "note": f"{ok}/{len(files)} beautified" + (f", {degraded} degraded" if degraded else ""),
         "cpu_s": round(cpu_total, 2), "peak_rss_mb": round(rss_peak, 1)})())
     return ok, degraded, status
+
+
+def _owned_tree(ctx, destination: Path, build) -> bool:
+    """Build and atomically publish one canonical tree under native authority."""
+    if type(ctx.run) is not store.Run:
+        return False
+    components = destination.relative_to(ctx.run.dir).parts
+    command = ("quarry-owned-tree", str(destination))
+    policy = RepositoryNativeOutput.tree(((1, ()),), *components)
+    owner = _NativeFacadeOwner(NativeOutputAdoption())
+    operation_fault = None
+    finish_fault = None
+    built = False
+    try:
+        with _NativeFacadeFence(owner):
+            with _NativeFacadeFence(owner):
+                owner.transaction = prepare_native_outputs(
+                    ctx.run, command, (policy,), adoption=owner.adoption,
+                )
+                builder = owner.transaction.open_tree_builder(0)
+                expectation = build(builder)
+                built = bool(
+                    type(expectation) is tuple
+                    and len(expectation) == 4
+                    and type(expectation[0]) is bool
+                    and type(expectation[1]) is int
+                    and type(expectation[2]) is int
+                    and type(expectation[3]) is str
+                    and expectation[0]
+                    and expectation[1] >= 0
+                    and expectation[2] >= 0
+                )
+                build_receipt = builder.seal() if built else None
+                built = bool(
+                    build_receipt is not None
+                    and build_receipt.sealed
+                    and build_receipt.cleanup_settled
+                    and build_receipt.directories == expectation[1]
+                    and build_receipt.files == expectation[2]
+                    and build_receipt.sha256 == expectation[3]
+                )
+                owner.receipt, finish_fault = _finish_native_outputs(
+                    owner.transaction, owner.adoption, clean=built,
+                )
+    except BaseException as exc:
+        operation_fault = exc
+    fault = _preferred_native_fault(
+        operation_fault, finish_fault, owner.cleanup_fault,
+    )
+    if fault is not None and not isinstance(fault, Exception):
+        raise fault
+    receipt = owner.receipt
+    committed = () if receipt is None else receipt.committed
+    current = bool(
+        built
+        and fault is None
+        and receipt is not None
+        and receipt.clean
+        and len(committed) == 1
+        and committed[0].components == tuple(components)
+        and committed[0].present
+    )
+    if not current and fault is not None:
+        ctx.echo(
+            f"    could not publish {destination.name}: "
+            f"{type(fault).__name__}"
+        )
+    return current
+
+
+def _expected_tree_digest(entries) -> str:
+    """Digest an exact expected TREE manifest using the native tree domain."""
+    digest = hashlib.sha256()
+    digest.update(b"quarry-native-tree-v1\0")
+    for suffix, (directory, size, file_digest) in sorted(entries.items()):
+        path = "/".join(suffix).encode("utf-8")
+        digest.update(len(path).to_bytes(8, "big"))
+        digest.update(path)
+        digest.update(b"d" if directory else b"f")
+        digest.update(size.to_bytes(8, "big"))
+        if file_digest is not None:
+            digest.update(bytes.fromhex(file_digest))
+    return digest.hexdigest()
 
 
 def _katana_scope_flags(scope) -> list[str]:
@@ -319,24 +417,6 @@ def _persistence_gap(ctx, lane: str, ledger, eligible: int) -> None:
                                     + (" — the state path is owned by a different lane"
                                        if getattr(ledger, "foreign", False) else "")
                                     + "; a resume will redo this lane"))
-
-
-def _stage_dir(active):
-    """A fresh, provably-empty staging directory beside `active`, or None.
-
-    The name is unique per attempt and `mkdir()` is exclusive, so a leftover directory makes staging fail
-    rather than be inherited.
-    """
-    for _ in range(8):
-        cand = active.with_name(f"{active.name}.gen-{os.getpid()}-{os.urandom(4).hex()}")
-        try:
-            cand.mkdir(parents=True)
-            return cand
-        except FileExistsError:
-            continue
-        except OSError:
-            return None                       # permission / disk / anything else: no stage, no publication
-    return None
 
 
 #: rounds of chunk discovery per run. A chunk can name another chunk, so this bounds the depth of that
@@ -1068,56 +1148,43 @@ def _jxscout_traverse(ctx, ledger, raw_dir):
 
 
 def _js_publish_derived(ctx, ledger, raw_dir):
-    """Build the derived JS tree the miners and secret scanners read, as a fresh generation, and swap it in.
-    Returns the published directory, or None when it could not be published exactly.
-
-    The tree is exact by construction: staged from validated evidence only, beautified while still
-    staged, and published atomically, so nothing partially built is ever mineable. Beautification
-    therefore re-runs each run rather than being preserved across them.
-    """
+    """Publish the exact derived JS tree through one owned TREE transaction."""
     active = raw_dir.parent / "js_derived"
-    for old in raw_dir.parent.glob("js_derived.gen-*"):           # abandoned staging from a killed run
-        shutil.rmtree(old, ignore_errors=True)
-    (raw_dir.parent / "js_derived.state.json").unlink(missing_ok=True)   # provenance state is obsolete
     wanted = ledger.artifacts()
-    staging = _stage_dir(active)
-    if staging is None:
-        ctx.echo("    js_derived: could not create a clean staging directory — mining skipped")
+    copied = 0
+
+    def build(builder):
+        nonlocal copied
+        expected_entries = {}
+        ordered = sorted(wanted, key=lambda path: path.name)
+        if ordered and have("js-beautify"):
+            ok, degraded, bstatus = _beautify_run(
+                ctx, ordered, builder, expected_entries,
+            )
+            events.ledger(
+                "crawl.js_beautify", beautified=ok, degraded=degraded,
+                input_total=len(ordered), status=bstatus.value,
+            )
+            copied = len(ordered)
+        else:
+            for source in ordered:
+                evidence = builder.copy_repository_file(
+                    tuple(source.relative_to(ctx.run.dir).parts), source.name,
+                )
+                expected_entries[evidence.components] = (
+                    False, evidence.size, evidence.sha256,
+                )
+                copied += 1
+        return (
+            copied == len(wanted), 0, copied,
+            _expected_tree_digest(expected_entries),
+        )
+
+    published = _owned_tree(ctx, active, build)
+    if not published:
         _js_mineable(ctx, eligible=len(wanted), tested=0)
         return None
-    staged, failed = [], 0
-    for src in sorted(wanted, key=lambda q: q.name):
-        dst = staging / src.name
-        try:
-            data = src.read_bytes()
-            dst.write_bytes(data)
-            if dst.stat().st_size != len(data):
-                raise OSError("short write")
-            staged.append(dst)
-        except OSError:
-            failed += 1
-            dst.unlink(missing_ok=True)                            # never leave a partial in the generation
-    if failed:
-        # an incomplete generation must not become the mineable tree: the scanners would silently see less
-        ctx.echo(f"    js_derived: {failed} artifact(s) could not be staged — mining skipped")
-        shutil.rmtree(staging, ignore_errors=True)
-        _js_mineable(ctx, eligible=len(wanted), tested=0)
-        return None
-    if staged and have("js-beautify"):
-        # beautify while staged: the published tree is then already in its final form, so there is no
-        # window in which the mineable tree is mid-mutation and no digest to re-seal afterwards.
-        try:
-            ok, degraded, bstatus = _beautify_run(ctx, staged)
-            events.ledger("crawl.js_beautify", beautified=ok, degraded=degraded,
-                          input_total=len(staged), status=bstatus.value)
-        except Exception as ex:
-            ctx.echo(f"    js-beautify: {ex}")
-    for stray in list(staging.glob("*.beauty")) + list(staging.glob("*.part-*")):
-        stray.unlink(missing_ok=True)                              # tool temps never ship
-    if not _publish_tree(ctx, active, staging):
-        _js_mineable(ctx, eligible=len(wanted), tested=0)
-        return None
-    _js_mineable(ctx, eligible=len(wanted), tested=len(staged))
+    _js_mineable(ctx, eligible=len(wanted), tested=copied)
     return active
 
 
@@ -1131,43 +1198,6 @@ def _js_mineable(ctx, *, eligible: int, tested: int) -> None:
                             reason=(f"{omitted} validated artifact(s) not available for mining"
                                     if omitted else
                                     f"all {tested} validated artifact(s) available for mining"))
-
-
-def _publish_tree(ctx, active, staging) -> bool:
-    """Swap a freshly built generation into place as the active derived tree. Returns True only when the
-    active tree is the new generation.
-
-    `os.replace` cannot overwrite a non-empty directory, so the outgoing tree is moved aside first and
-    removed only once publication or rollback is confirmed.
-    """
-    # never create the stage here: publication requires a stage the caller built exclusively, or a
-    # missing generation would publish as an empty success over a populated active tree.
-    if staging is None or not staging.is_dir():
-        ctx.echo(f"    refusing to publish {active.name}: staging generation is missing")
-        return False
-    retired = active.with_name(active.name + f".retired-{os.getpid()}")
-    moved_aside = False
-    try:
-        if active.exists():
-            os.replace(active, retired)
-            moved_aside = True
-        os.replace(staging, active)
-    except OSError as ex:
-        ctx.echo(f"    could not publish {active.name}: {ex}")
-        shutil.rmtree(staging, ignore_errors=True)
-        if moved_aside and not active.exists():
-            try:
-                os.replace(retired, active)          # put the previous generation back...
-                moved_aside = False
-            except OSError as ex2:
-                # ...and if even that fails, keep it: a stale generation an operator can find beats no
-                # evidence at all, so `retired` survives on disk and the failure is reported.
-                ctx.echo(f"    WARNING: previous {active.name} left at {retired.name}: {ex2}")
-        return False
-    # publication confirmed — only now is the retired copy safe to drop
-    if moved_aside:
-        shutil.rmtree(retired, ignore_errors=True)
-    return True
 
 
 _SOURCEMAP_VERSION = 3          # the only source-map revision whose sourcesContent layout we extract
@@ -1228,14 +1258,8 @@ def _path_fingerprint(rels) -> str:
     return h.hexdigest()
 
 
-def _extract_payload(text, key, staging, tally, workroot=None):
-    """Validate one sourcemap payload and extract its embedded sources into `staging`. Updates `tally` in
-    place and returns the staging subdir name on success, else None.
-
-    A sourcemap is untrusted input, so extraction is isolated here: one hostile map cannot abort the
-    phase and discard its valid siblings. Extraction runs in a work directory outside the publishable
-    generation and is moved in only when the whole payload finished.
-    """
+def _extract_payload(text, key, builder, tally):
+    """Validate one sourcemap and write its complete payload through ``builder``."""
     try:
         obj = json.loads(text)
     except (json.JSONDecodeError, ValueError):
@@ -1255,13 +1279,10 @@ def _extract_payload(text, key, staging, tally, workroot=None):
     if not any(isinstance(c, str) and c for c in contents):
         return None
     tally["with_content"] += 1
-    # extract into a work directory outside the publishable generation and move it in only on success:
-    # a failed extraction whose cleanup also fails must not leave a partial subdir the scanners ingest.
-    sub = staging / key[:32]                                     # keyed by the full payload identity
-    work = (workroot or staging.parent) / f"{staging.name}.work-{key[:32]}"
-    shutil.rmtree(work, ignore_errors=True)
-    local = 0
-    rels: list = []                              # exact relative paths written for this payload
+    sub = key[:32]
+    prepared: list[tuple[tuple[str, ...], bytes]] = []
+    rels: list[str] = []
+    directories: set[tuple[str, ...]] = set()
     try:
         for i, content in enumerate(contents):
             if not isinstance(content, str) or not content:
@@ -1270,48 +1291,50 @@ def _extract_payload(text, key, staging, tally, workroot=None):
             # sanitizing alone collides: `../a.js`, `./a.js`, `/a.js` and `webpack:///./a.js` all reduce
             # to `a.js`, so the source index is what makes every output path unique.
             safe = _safe_srcpath(name if isinstance(name, str) and name else f"src{i}.js")
-            out = work / f"{i:04d}" / safe
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(content)
-            rels.append(f"{i:04d}/{safe}")
-            local += 1
-        # complete: move the finished payload into the generation. Only now can a scanner ever see it.
-        os.replace(work, sub)
-    except (OSError, ValueError, TypeError):
+            suffix = (sub, f"{i:04d}", *Path(safe).parts)
+            prepared.append((suffix, content.encode("utf-8")))
+            rels.append("/".join(suffix[1:]))
+            for depth in range(1, len(suffix)):
+                directories.add(suffix[:depth])
+    except (UnicodeError, ValueError, TypeError):
         # valid_maps is already incremented, so extraction needs its own measure — otherwise the outcome
         # report sees obtained == attempted and drops the class from its reason.
         tally["extract_fail"]["extract_error"] = tally["extract_fail"].get("extract_error", 0) + 1
-        shutil.rmtree(work, ignore_errors=True)
-        shutil.rmtree(sub, ignore_errors=True)
         return None
+    try:
+        for suffix, payload in prepared:
+            builder.write_bytes(payload, *suffix)
+    except Exception:
+        tally["extract_fail"]["extract_error"] = (
+            tally["extract_fail"].get("extract_error", 0) + 1
+        )
+        raise
     # commit the count only once the payload finished: per-file increments would stay on the books
     # when a later error deletes the whole payload directory.
+    local = len(prepared)
     tally["recovered"] += local
     tally["extracted"] += 1
+    tally["directories"].update(directories)
+    for directory in directories:
+        tally["tree_entries"][directory] = (True, 0, None)
+    for suffix, payload in prepared:
+        tally["tree_entries"][suffix] = (
+            False, len(payload), hashlib.sha256(payload).hexdigest(),
+        )
     # a count is not containment — a planted symlink leaves it unchanged — so the manifest is the exact
     # set of relative paths, fingerprinted, and verification refuses any symlink inside a payload.
-    tally["manifest"][key[:32]] = (local, _path_fingerprint(rels))
-    return key[:32]
+    tally["manifest"][sub] = (local, _path_fingerprint(rels))
+    return sub
 
 
-def _sourcemap_recover(ctx, js_ledger):
-    """The crawl sourcemap lane: find .map references in the fetched JS, fetch every in-scope one host-fair
-    under a throughput budget, and recover `sourcesContent` to disk.
-
-    Returns the published recovered-source directory, or None when it could not be published exactly — in
-    which case nothing may be mined from it. Reference resolution is driven by the ledger's url->artifact
-    map, once per original URL, and payload bodies are streamed, so peak memory is roughly one map.
-    """
+def _sourcemap_recover_build(ctx, js_ledger, builder, obtained_js):
+    """Build one recovered-source generation in an owned private tree."""
     recov_dir = ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered"
     MAX_MAP = 20 * 1024 * 1024     # per-item guard
     live_subdirs: set = set()      # map subdirs backed by a payload this run; everything else is pruned
     tally = {"valid_maps": 0, "with_content": 0, "extracted": 0, "recovered": 0,
-             "parse_fail": {}, "extract_fail": {}, "manifest": {}}
-    for _old in list(recov_dir.parent.glob(f"{recov_dir.name}.gen-*")) + \
-                list(recov_dir.parent.glob(f"{recov_dir.name}.gen-*.work-*")):
-        shutil.rmtree(_old, ignore_errors=True)                  # abandoned staging/work from a killed run
-    staging = _stage_dir(recov_dir)                              # unique and provably empty
-    obtained_js = list(js_ledger.items())
+             "parse_fail": {}, "extract_fail": {}, "manifest": {}, "directories": set(),
+             "tree_entries": {}}
     map_urls: set = set()          # in-scope http(s) .map candidates (for the review queue)
     inline_n, inline_fail = 0, {}  # data: URIs are candidates too, and must be accounted for
     payload_n = 0                  # every payload we actually looked at (inline + resumed + fetched)
@@ -1319,11 +1342,7 @@ def _sourcemap_recover(ctx, js_ledger):
     m_fail: dict = {}
     map_budget = budget.Budget(budget.budget_seconds("SOURCEMAP_BUDGET_S"))
     map_persisted = True
-    published = False
-    if staging is None:
-        # the exclusive-stage contract is end-to-end: no stage -> no extraction, no publication.
-        ctx.echo("    sourcemaps: could not create a clean staging directory — extraction skipped")
-    elif obtained_js:
+    if obtained_js:
         import base64
         from urllib.parse import urljoin
         js_read_ok, js_read_fail = 0, 0
@@ -1354,7 +1373,7 @@ def _sourcemap_recover(ctx, js_ledger):
                         continue
                     payload_n += 1                               # extract now; never accumulate the body
                     got = _extract_payload(raw.decode("utf-8", "replace"),
-                                           _payload_key(u, ref_i, raw), staging, tally)
+                                           _payload_key(u, ref_i, raw), builder, tally)
                     if got:
                         live_subdirs.add(got)
                     del raw
@@ -1368,11 +1387,9 @@ def _sourcemap_recover(ctx, js_ledger):
         # membership is uncapped: sorted order clusters by host, so a slice would hand one alphabetically
         # early host the whole budget. Host-fair order, a budget and a ledger bound this instead.
         map_dir = ctx.run.dir / "raw" / "crawl" / "sourcemaps"
-        map_dir.mkdir(parents=True, exist_ok=True)
         # same reasoning as js_fetch: keep state out of any directory a scanner or miner walks
         map_ledger = budget.Ledger(map_dir.parent / "sourcemap_fetch.state.json", lane="crawl.sourcemaps")
         cache_dir = map_dir / "fetched"                          # the raw .map bodies: the ledger's artifacts
-        cache_dir.mkdir(parents=True, exist_ok=True)
         # resumed maps: read one body at a time from its cached artifact, extract, release. An entry whose
         # artifact is gone is requeued for fetching, so it surfaces only if the re-fetch also fails.
         requeue = []
@@ -1390,7 +1407,7 @@ def _sourcemap_recover(ctx, js_ledger):
                 continue
             resumed_ok += 1
             payload_n += 1
-            got = _extract_payload(body.decode("utf-8", "replace"), _payload_key(m, 0, body), staging, tally)
+            got = _extract_payload(body.decode("utf-8", "replace"), _payload_key(m, 0, body), builder, tally)
             if got:
                 live_subdirs.add(got)
             del body
@@ -1425,7 +1442,7 @@ def _sourcemap_recover(ctx, js_ledger):
                     m_got += 1
                     payload_n += 1
                     got = _extract_payload(data.decode("utf-8", "replace"),
-                                           _payload_key(m, 0, data), staging, tally)
+                                           _payload_key(m, 0, data), builder, tally)
                     if got:
                         live_subdirs.add(got)
                     del data
@@ -1441,8 +1458,12 @@ def _sourcemap_recover(ctx, js_ledger):
                                         measure="state_persisted", unit="state_persisted",
                                         eligible=1, tested=1, omitted=0,
                                         reason="completion state persisted")
-        sm_raw = ctx.run.raw_path("crawl", "sourcemaps", "candidates.txt")
-        sm_raw.write_text("\n".join(sorted(map_urls)) + "\n")
+        sm_raw = ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "candidates.txt"
+        sm_payload = ("\n".join(sorted(map_urls)) + "\n").encode()
+        if not budget.publish_bytes(
+            sm_raw, sm_payload, digest=hashlib.sha256(sm_payload).hexdigest(),
+        ):
+            ctx.echo("    sourcemaps: candidate evidence could not be published")
         for smap in sorted(map_urls):
             ctx.run.add("review", {"id": f"sourcemap:{smap}", "klass": "sourcemap", "value": smap,
                                    "sources": ["sourcemap-scan"]})
@@ -1454,7 +1475,7 @@ def _sourcemap_recover(ctx, js_ledger):
                                 attempted=m_att, budget=map_budget, noun="sourcemap", durable=map_persisted)
         budget.report_outcome("crawl.sourcemaps", measure="sourcemaps_fetched", attempted=m_att,
                               obtained=m_got, classes=m_fail, noun="sourcemap")
-    if staging is not None and (obtained_js or True):
+    if obtained_js or True:
         # validity and extraction are separate outcomes, and inline candidates that never became payloads
         # are still counted.
         budget.report_outcome("crawl.sourcemaps", measure="sourcemaps_valid",
@@ -1464,15 +1485,7 @@ def _sourcemap_recover(ctx, js_ledger):
         budget.report_outcome("crawl.sourcemaps", measure="sourcemaps_extracted",
                               attempted=tally["with_content"], obtained=tally["extracted"],
                               classes=tally["extract_fail"], noun="sourcemap with embedded source")
-    else:
-        # with JS present but no staging, candidate discovery never ran: these measures are unmeasured, not
-        # zero, and COVERAGE_UNKNOWN reaches the verdict as a gap while keeping the input count.
-        for _m in ("sourcemaps", "sourcemaps_fetched", "sourcemaps_valid", "sourcemaps_extracted",
-                   "js_inspected"):
-            events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_UNKNOWN, measure=_m, unit=_m,
-                                    reason=f"no staging directory — {len(obtained_js)} JS artifact(s) were "
-                                           f"never inspected for sourcemaps; coverage UNMEASURED")
-    if not obtained_js and staging is not None:
+    if not obtained_js:
         # no JS -> zero eligible sourcemaps. Emit zero observations anyway so the structured auto-reset
         # opens a fresh generation and a prior gap does not linger as stale.
         events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_CAP, measure="sourcemaps",
@@ -1481,41 +1494,68 @@ def _sourcemap_recover(ctx, js_ledger):
                                 eligible=0, tested=0, omitted=0, reason="no JS files this run -> 0 fetches")
         events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_TIMEOUT, measure="js_inspected",
                                 eligible=0, tested=0, omitted=0, reason="no JS files this run -> 0 inspected")
-    # the generation must contain exactly what we counted, checked both ways and down to the file level.
-    # Guarded, or a raising iterdir()/unlink() turns a failure to verify into a failure to report.
-    if staging is not None and staging.is_dir():
-        try:
-            for entry in list(staging.iterdir()):                # drop what no counter claims
-                ok = (entry.name in live_subdirs and entry.is_dir() and not entry.is_symlink())
-                if ok:
-                    continue
-                if entry.is_dir() and not entry.is_symlink():
-                    shutil.rmtree(entry, ignore_errors=True)
-                else:
-                    entry.unlink(missing_ok=True)                # a symlink is unlinked, never followed
-                if entry.exists():
-                    raise OSError(f"uncounted entry {entry.name} could not be removed")
-            manifest = {e.name for e in staging.iterdir() if e.is_dir() and not e.is_symlink()}
-            if manifest != live_subdirs:
-                raise OSError(f"{len(live_subdirs - manifest)} counted payload(s) missing from the generation")
-            for key, (exp_n, exp_fp) in tally["manifest"].items():   # ...and the files inside each payload
-                sub = staging / key
-                seen = []
-                for q in sub.rglob("*"):
-                    if q.is_symlink():
-                        # no symlink may exist anywhere inside a payload: the scanners walk this tree
-                        # themselves and cannot be made to stop following links.
-                        raise OSError(f"payload {key} contains a symlink ({q.name})")
-                    if q.is_file():
-                        seen.append(str(q.relative_to(sub)))
-                if len(seen) != exp_n or _path_fingerprint(seen) != exp_fp:
-                    raise OSError(f"payload {key} has {len(seen)} recovered file(s), counted {exp_n} "
-                                  f"(or the paths differ)")
-        except OSError as ex:
-            ctx.echo(f"    sourcemaps: generation disagrees with its counters ({ex}) — not publishing")
-            shutil.rmtree(staging, ignore_errors=True)
-            staging = None
-    published = _publish_tree(ctx, recov_dir, staging)
+    return {
+        "ready": True,
+        "directories": len(tally["directories"]),
+        "live_subdirs": live_subdirs,
+        "tally": tally,
+        "map_urls": map_urls,
+        "inline_n": inline_n,
+        "payload_n": payload_n,
+        "m_att": m_att,
+        "m_got": m_got,
+        "map_persisted": map_persisted,
+    }
+
+
+def _sourcemap_recover(ctx, js_ledger):
+    """Recover sourcemaps and publish the exact tree through native authority."""
+    recov_dir = ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered"
+    obtained_js = list(js_ledger.items())
+    state = {}
+
+    def build(builder):
+        state.update(_sourcemap_recover_build(ctx, js_ledger, builder, obtained_js))
+        return (
+            state["ready"], state["directories"],
+            state["tally"]["recovered"],
+            _expected_tree_digest(state["tally"]["tree_entries"]),
+        )
+
+    published = _owned_tree(ctx, recov_dir, build)
+    if not state:
+        ctx.echo("    sourcemaps: could not acquire an owned staging generation — extraction skipped")
+        for measure in (
+            "sourcemaps", "sourcemaps_fetched", "sourcemaps_valid",
+            "sourcemaps_extracted", "js_inspected",
+        ):
+            events.coverage_partial(
+                "crawl.sourcemaps", kind=events.COVERAGE_UNKNOWN,
+                measure=measure, unit=measure,
+                reason=(
+                    f"no owned generation — {len(obtained_js)} JS artifact(s) "
+                    "were never inspected for sourcemaps; coverage UNMEASURED"
+                ),
+            )
+        state = {
+            "live_subdirs": set(),
+            "tally": {
+                "valid_maps": 0, "with_content": 0, "extracted": 0,
+                "recovered": 0, "parse_fail": {}, "extract_fail": {},
+                "manifest": {}, "directories": set(), "tree_entries": {},
+            },
+            "directories": 0,
+            "map_urls": set(), "inline_n": 0, "payload_n": 0,
+            "m_att": 0, "m_got": 0, "map_persisted": False,
+        }
+    live_subdirs = state["live_subdirs"]
+    tally = state["tally"]
+    map_urls = state["map_urls"]
+    inline_n = state["inline_n"]
+    payload_n = state["payload_n"]
+    m_att = state["m_att"]
+    m_got = state["m_got"]
+    map_persisted = state["map_persisted"]
     events.coverage_partial("crawl.sourcemaps", kind=events.COVERAGE_TIMEOUT, measure="sourcemaps_published",
                             unit="sourcemaps_published", eligible=1, tested=1 if published else 0,
                             omitted=0 if published else 1,

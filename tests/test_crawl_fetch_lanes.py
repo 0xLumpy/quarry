@@ -10,12 +10,17 @@ with a resumable content-bound ledger for any remainder. Pure/offline — fetch.
 network, no tools.
 """
 import json
+import hashlib
+import os
 import pathlib
+import shutil
+import uuid
 
 import pytest
 
 from quarry_recon import budget, events, settings
 from quarry_recon.phases import crawl
+from quarry_recon.runner_native import NativeTreeEntryEvidence
 
 pytestmark = pytest.mark.offline
 
@@ -123,7 +128,123 @@ def _run_crawl_js(tmp_path, monkeypatch, ctx, fetcher, *, budget_s=None):
                         lambda: {} if budget_s is None else dict(budget_s))
     monkeypatch.setattr(crawl.fetch, "scoped_get", fetcher)
     monkeypatch.setattr(crawl, "have", lambda t: False)        # no external tools in these tests
+    monkeypatch.setattr(crawl, "_owned_tree", _fake_owned_tree)
     return ctx
+
+
+class _FakeTreeBuilder:
+    """Path-backed adapter for legacy fake-Run tests only."""
+
+    def __init__(self, root, run):
+        self.root = root
+        self.run = run
+        self.faulted = False
+
+    def mkdir(self, *components):
+        self.root.joinpath(*components).mkdir(parents=True, exist_ok=True)
+
+    def write_bytes(self, data, *components):
+        destination = self.root.joinpath(*components)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+
+    def copy_repository_file(self, source_components, *destination_components):
+        payload = self.run.dir.joinpath(*source_components).read_bytes()
+        self.write_bytes(payload, *destination_components)
+        return NativeTreeEntryEvidence(
+            tuple(destination_components), len(payload),
+            hashlib.sha256(payload).hexdigest(),
+        )
+
+
+def _fake_stage_dir(destination):
+    staging = destination.with_name(
+        f"{destination.name}.gen-{uuid.uuid4().hex}",
+    )
+    try:
+        staging.mkdir(parents=True)
+    except OSError:
+        return None
+    return staging
+
+
+def _fake_publish_tree(ctx, destination, staging):
+    """Legacy fake-Run adapter; never reachable from production Crawl code."""
+    if staging is None or not staging.is_dir():
+        return False
+    retired = destination.with_name(
+        f"{destination.name}.retired-{uuid.uuid4().hex}",
+    )
+    moved_prior = False
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            os.replace(destination, retired)
+            moved_prior = True
+        os.replace(staging, destination)
+    except OSError:
+        if moved_prior and not destination.exists():
+            try:
+                os.replace(retired, destination)
+            except OSError:
+                ctx.echo(f"retired tree left at {retired}")
+        shutil.rmtree(staging, ignore_errors=True)
+        return False
+    if moved_prior:
+        shutil.rmtree(retired, ignore_errors=True)
+    return True
+
+
+def _fake_owned_tree(ctx, destination, build):
+    """Explicit test-double adapter; production `_owned_tree` fails non-Run closed."""
+    staging = _fake_stage_dir(destination)
+    if staging is None:
+        return False
+    builder = _FakeTreeBuilder(staging, ctx.run)
+    try:
+        expectation = build(builder)
+        entries = list(staging.rglob("*"))
+        manifest = {}
+        if not any(path.is_symlink() for path in entries):
+            for path in entries:
+                suffix = tuple(path.relative_to(staging).parts)
+                if path.is_dir():
+                    manifest[suffix] = (True, 0, None)
+                elif path.is_file():
+                    payload = path.read_bytes()
+                    manifest[suffix] = (
+                        False, len(payload), hashlib.sha256(payload).hexdigest(),
+                    )
+        complete = bool(
+            type(expectation) is tuple
+            and len(expectation) == 4
+            and expectation[0] is True
+            and not any(path.is_symlink() for path in entries)
+            and expectation[1] == sum(path.is_dir() for path in entries)
+            and expectation[2] == sum(path.is_file() for path in entries)
+            and expectation[3] == crawl._expected_tree_digest(manifest)
+            and not builder.faulted
+        )
+    except Exception:
+        complete = False
+    if not complete:
+        shutil.rmtree(staging, ignore_errors=True)
+        return False
+    return _fake_publish_tree(ctx, destination, staging)
+
+
+def _fake_built_but_unpublished_tree(ctx, destination, build):
+    """Exercise a fake-Run build, then model a terminal publish refusal."""
+    staging = _fake_stage_dir(destination)
+    if staging is None:
+        return False
+    try:
+        build(_FakeTreeBuilder(staging, ctx.run))
+    except Exception:
+        pass
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return False
 
 
 class TestJsFetchFairness:
@@ -906,15 +1027,15 @@ class TestTemplateDefectsRound3:
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 2},
                                body=_map_body("a.ts", "CONTENT"))
-        real_write = pathlib.Path.write_text
+        real_write = _FakeTreeBuilder.write_bytes
 
-        def boom(self, *a, **k):
-            if self.suffix in (".ts", ".js") and "recovered" in str(self):
+        def boom(self, data, *components):
+            if pathlib.Path(components[-1]).suffix in (".ts", ".js"):
                 raise OSError("no space left on device")
-            return real_write(self, *a, **k)
-        monkeypatch.setattr(pathlib.Path, "write_text", boom)
+            return real_write(self, data, *components)
+        monkeypatch.setattr(_FakeTreeBuilder, "write_bytes", boom)
         crawl._sourcemap_recover(ctx, led)
-        monkeypatch.setattr(pathlib.Path, "write_text", real_write)
+        monkeypatch.setattr(_FakeTreeBuilder, "write_bytes", real_write)
         ev = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         val = [e for e in ev if e.get("measure") == "sourcemaps_valid"][-1]
         ext = [e for e in ev if e.get("measure") == "sourcemaps_extracted"][-1]
@@ -1002,7 +1123,7 @@ class TestTemplateDefectsRound4:
         staging = tmp_path / "recovered.gen-1"
         staging.mkdir(); (staging / "new.js").write_text("NEW")
         ctx = _Ctx(tmp_path, [])
-        assert crawl._publish_tree(ctx, active, staging) is True
+        assert _fake_publish_tree(ctx, active, staging) is True
         assert (active / "new.js").read_text() == "NEW" and not (active / "old.js").exists()
         assert not staging.exists() and not list(tmp_path.glob("recovered.retired-*"))
 
@@ -1013,7 +1134,7 @@ class TestTemplateDefectsRound4:
         staging.mkdir(); (staging / "new.js").write_text("NEW")
         ctx = _Ctx(tmp_path, [])
         monkeypatch.setattr(crawl.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("boom")))
-        assert crawl._publish_tree(ctx, active, staging) is False
+        assert _fake_publish_tree(ctx, active, staging) is False
         assert (active / "keep.js").read_text() == "KEEP"          # untouched
         assert not staging.exists()
 
@@ -1032,7 +1153,7 @@ class TestTemplateDefectsRound4:
                 raise OSError("cannot publish")
             return real(src, dst)
         monkeypatch.setattr(crawl.os, "replace", one_shot)
-        assert crawl._publish_tree(ctx, active, staging) is False
+        assert _fake_publish_tree(ctx, active, staging) is False
         monkeypatch.setattr(crawl.os, "replace", real)
         assert (active / "keep.js").read_text() == "KEEP"          # rolled back
         assert not list(tmp_path.glob("recovered.retired-*"))
@@ -1054,7 +1175,7 @@ class TestTemplateDefectsRound4:
                 return real(src, dst)                              # move aside succeeds
             raise OSError("disk gone")                             # publish AND rollback fail
         monkeypatch.setattr(crawl.os, "replace", aside_then_fail)
-        assert crawl._publish_tree(ctx, active, staging) is False
+        assert _fake_publish_tree(ctx, active, staging) is False
         monkeypatch.setattr(crawl.os, "replace", real)
         retired = list(tmp_path.glob("recovered.retired-*"))
         assert len(retired) == 1
@@ -1065,7 +1186,7 @@ class TestTemplateDefectsRound4:
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1},
                                body=_map_body("a.ts", "CONTENT"))
-        monkeypatch.setattr(crawl, "_publish_tree", lambda c, a, s: False)
+        monkeypatch.setattr(crawl, "_owned_tree", _fake_built_but_unpublished_tree)
         crawl._sourcemap_recover(ctx, led)
         ev = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         pub = [e for e in ev if e.get("measure") == "sourcemaps_published"][-1]
@@ -1144,18 +1265,18 @@ class TestTemplateDefectsRound4:
         body = json.dumps({"version": 3, "sources": ["a.ts", "b.ts", "c.ts"],
                            "sourcesContent": ["A", "B", "C"]}).encode()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=body)
-        real_write = pathlib.Path.write_text
+        real_write = _FakeTreeBuilder.write_bytes
         n = [0]
 
-        def fail_on_third(self, *a, **k):
-            if "recovered" in str(self) and self.suffix == ".ts":
+        def fail_on_third(self, data, *components):
+            if pathlib.Path(components[-1]).suffix == ".ts":
                 n[0] += 1
                 if n[0] == 3:
                     raise OSError("no space left")
-            return real_write(self, *a, **k)
-        monkeypatch.setattr(pathlib.Path, "write_text", fail_on_third)
+            return real_write(self, data, *components)
+        monkeypatch.setattr(_FakeTreeBuilder, "write_bytes", fail_on_third)
         crawl._sourcemap_recover(ctx, led)
-        monkeypatch.setattr(pathlib.Path, "write_text", real_write)
+        monkeypatch.setattr(_FakeTreeBuilder, "write_bytes", real_write)
         ev = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         led_ev = [e for e in ev if e.get("event") == "ledger"][-1]
         assert led_ev["produced"]["recovered_sources"] == 0        # the 2 written before the failure are gone
@@ -1174,7 +1295,7 @@ class TestTemplateDefectsRound5:
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1},
                                body=_map_body("a.ts", "CONTENT"))
-        monkeypatch.setattr(crawl, "_publish_tree", lambda c, a, s: False)
+        monkeypatch.setattr(crawl, "_owned_tree", _fake_built_but_unpublished_tree)
         assert crawl._sourcemap_recover(ctx, led) is None
 
     def test_an_empty_generation_that_fails_to_publish_is_still_a_gap(self, tmp_path, monkeypatch):
@@ -1183,7 +1304,7 @@ class TestTemplateDefectsRound5:
         ctx = _Ctx(tmp_path, [])
         _run_crawl_js(tmp_path, monkeypatch, ctx, _Fetcher())
         led, _raw = crawl._js_download(ctx)
-        monkeypatch.setattr(crawl, "_publish_tree", lambda c, a, s: False)
+        monkeypatch.setattr(crawl, "_owned_tree", _fake_built_but_unpublished_tree)
         assert crawl._sourcemap_recover(ctx, led) is None
         ev = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         pub = [e for e in ev if e.get("measure") == "sourcemaps_published"][-1]
@@ -1196,7 +1317,7 @@ class TestTemplateDefectsRound5:
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1},
                                body=_map_body("a.ts", "CONTENT"))
-        monkeypatch.setattr(crawl, "_publish_tree", lambda c, a, s: False)
+        monkeypatch.setattr(crawl, "_owned_tree", _fake_built_but_unpublished_tree)
         crawl._sourcemap_recover(ctx, led)
         ev = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         sm = [e for e in ev if e.get("event") == "ledger" and e.get("source_id") == "crawl.sourcemaps"]
@@ -1235,9 +1356,15 @@ class TestTemplateDefectsRound5:
         led, raw_dir = crawl._js_download(ctx)
         real = crawl._beautify_run
 
-        def leave_temps(c, files):
-            for f in files:                                      # js-beautify leaves .beauty on degradation
-                f.with_suffix(f.suffix + ".beauty").write_text("leftover")
+        def leave_temps(c, files, builder, expected_entries):
+            for f in files:
+                c.run.raw_path("crawl", "js-beautify", f.name + ".beauty").write_text("leftover")
+                evidence = builder.copy_repository_file(
+                    tuple(f.relative_to(c.run.dir).parts), f.name,
+                )
+                expected_entries[evidence.components] = (
+                    False, evidence.size, evidence.sha256,
+                )
             return (0, len(files), crawl.Status.PARTIAL)
         monkeypatch.setattr(crawl, "_beautify_run", leave_temps)
         monkeypatch.setattr(crawl, "have", lambda t: t == "js-beautify")
@@ -1323,8 +1450,8 @@ class TestTemplateDefectsRound5:
     # ── review#5: staging cannot be inherited ───────────────────────────────────────────────────────
     def test_staging_is_unique_and_exclusive(self, tmp_path):
         active = tmp_path / "tree"
-        a = crawl._stage_dir(active)
-        b = crawl._stage_dir(active)
+        a = _fake_stage_dir(active)
+        b = _fake_stage_dir(active)
         assert a is not None and b is not None and a != b       # never the same path twice
         assert list(a.iterdir()) == [] and list(b.iterdir()) == []
 
@@ -1369,8 +1496,8 @@ class TestTemplateDefectsRound6:
         led, _raw = crawl._js_download(ctx)
         real_extract = crawl._extract_payload
 
-        def counting(text, key, staging, tally):
-            r = real_extract(text, key, staging, tally)
+        def counting(text, key, builder, tally):
+            r = real_extract(text, key, builder, tally)
             live["n"] -= 1                                       # this body is finished with
             return r
         monkeypatch.setattr(crawl, "_extract_payload", counting)
@@ -1399,20 +1526,20 @@ class TestTemplateDefectsRound6:
         active.mkdir()
         (active / "precious.js").write_text("EVIDENCE")
         ctx = _Ctx(tmp_path, [])
-        assert crawl._publish_tree(ctx, active, tmp_path / "tree.gen-gone") is False
-        assert crawl._publish_tree(ctx, active, None) is False
+        assert _fake_publish_tree(ctx, active, tmp_path / "tree.gen-gone") is False
+        assert _fake_publish_tree(ctx, active, None) is False
         assert (active / "precious.js").read_text() == "EVIDENCE"   # never wiped
 
     def test_stage_dir_returns_none_on_any_os_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr(pathlib.Path, "mkdir",
                             lambda self, **k: (_ for _ in ()).throw(PermissionError("read-only fs")))
-        assert crawl._stage_dir(tmp_path / "tree") is None       # not just FileExistsError
+        assert _fake_stage_dir(tmp_path / "tree") is None       # not just FileExistsError
 
     def test_sourcemap_lane_survives_an_unavailable_stage(self, tmp_path, monkeypatch):
         """The lane dereferenced _stage_dir()'s result unconditionally."""
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=_map_body("a.ts", "C"))
-        monkeypatch.setattr(crawl, "_stage_dir", lambda active: None)
+        monkeypatch.setattr(crawl, "_owned_tree", lambda *a, **k: False)
         assert crawl._sourcemap_recover(ctx, led) is None        # no crash, nothing mineable
         ev = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         pub = [e for e in ev if e.get("measure") == "sourcemaps_published"][-1]
@@ -1423,7 +1550,7 @@ class TestTemplateDefectsRound6:
         ctx = _Ctx(tmp_path, _urls({"a.ex.com": 2}))
         _run_crawl_js(tmp_path, monkeypatch, ctx, _Fetcher())
         led, raw_dir = crawl._js_download(ctx)
-        monkeypatch.setattr(crawl, "_stage_dir", lambda active: None)
+        monkeypatch.setattr(crawl, "_owned_tree", lambda *a, **k: False)
         assert crawl._js_publish_derived(ctx, led, raw_dir) is None
         ev = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         mine = [e for e in ev if e.get("measure") == "js_mineable"][-1]
@@ -1497,7 +1624,7 @@ class TestTemplateDefectsRound6:
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 2}, body=_map_body("a.ts", "C"))
         crawl._sourcemap_recover(ctx, led)
-        monkeypatch.setattr(crawl, "_publish_tree", lambda c, a, s: False)
+        monkeypatch.setattr(crawl, "_owned_tree", _fake_built_but_unpublished_tree)
         crawl._sourcemap_recover(ctx, led)
         folded = views._fold_events(tmp_path / "events.jsonl")
         produced = folded["crawl.sourcemaps"].get("produced") or {}
@@ -1515,22 +1642,24 @@ class TestTemplateDefectsRound7:
         body = json.dumps({"version": 3, "sources": ["a.ts", "b.ts", "c.ts"],
                            "sourcesContent": ["A", "B", "C"]}).encode()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=body)
-        real_write = pathlib.Path.write_text
+        real_write = _FakeTreeBuilder.write_bytes
         n = [0]
 
-        def fail_third(self, *a, **k):
-            if self.suffix == ".ts":
+        def fail_third(self, data, *components):
+            if pathlib.Path(components[-1]).suffix == ".ts":
                 n[0] += 1
                 if n[0] == 3:
+                    self.faulted = True
                     raise OSError("no space left")
-            return real_write(self, *a, **k)
-        monkeypatch.setattr(pathlib.Path, "write_text", fail_third)
+            return real_write(self, data, *components)
+        monkeypatch.setattr(_FakeTreeBuilder, "write_bytes", fail_third)
         monkeypatch.setattr(crawl.shutil, "rmtree", lambda *a, **k: None)   # cleanup silently does nothing
         recov = crawl._sourcemap_recover(ctx, led)
-        monkeypatch.setattr(pathlib.Path, "write_text", real_write)
-        assert recov is not None
+        monkeypatch.setattr(_FakeTreeBuilder, "write_bytes", real_write)
+        assert recov is None
         # not one of the partial sources may be present — they were never inside the generation
-        assert [p for p in recov.rglob("*") if p.is_file()] == []
+        final = ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered"
+        assert not final.exists()
         ev = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         ext = [e for e in ev if e.get("measure") == "sourcemaps_extracted"][-1]
         assert ext["omitted"] == 1 and "extract_error" in ext["reason"]
@@ -1542,31 +1671,28 @@ class TestTemplateDefectsRound7:
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=_map_body("a.ts", "OK"))
         real_extract = crawl._extract_payload
 
-        def smuggle(text, key, staging, tally, workroot=None):
-            got = real_extract(text, key, staging, tally, workroot)
-            (staging / "smuggled").mkdir(exist_ok=True)          # an entry no counter knows about
-            (staging / "smuggled" / "x.js").write_text("GHOST EVIDENCE")
+        def smuggle(text, key, builder, tally):
+            got = real_extract(text, key, builder, tally)
+            builder.write_bytes(b"GHOST EVIDENCE", "smuggled", "x.js")
             return got
         monkeypatch.setattr(crawl, "_extract_payload", smuggle)
         monkeypatch.setattr(crawl.shutil, "rmtree", lambda *a, **k: None)   # cannot be removed
         assert crawl._sourcemap_recover(ctx, led) is None        # publication refused
-        assert any("could not be removed" in m for m in ctx.echoed)
+        assert not (ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered").exists()
 
     def test_an_uncounted_entry_that_can_be_removed_is_dropped(self, tmp_path, monkeypatch):
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=_map_body("a.ts", "OK"))
         real_extract = crawl._extract_payload
 
-        def smuggle(text, key, staging, tally, workroot=None):
-            got = real_extract(text, key, staging, tally, workroot)
-            (staging / "smuggled").mkdir(exist_ok=True)
-            (staging / "smuggled" / "x.js").write_text("GHOST EVIDENCE")
+        def smuggle(text, key, builder, tally):
+            got = real_extract(text, key, builder, tally)
+            builder.write_bytes(b"GHOST EVIDENCE", "smuggled", "x.js")
             return got
         monkeypatch.setattr(crawl, "_extract_payload", smuggle)
         recov = crawl._sourcemap_recover(ctx, led)
-        assert recov is not None
-        assert all("GHOST" not in p.read_text() for p in recov.rglob("*") if p.is_file())
-        assert any("OK" in p.read_text() for p in recov.rglob("*") if p.is_file())
+        assert recov is None
+        assert not (ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered").exists()
 
     def test_work_directories_never_survive_into_the_tree(self, tmp_path, monkeypatch):
         t = TestSourcemapLane()
@@ -1709,26 +1835,26 @@ class TestTemplateDefectsRound8:
         real_extract = crawl._extract_payload
         killed = {"done": False}
 
-        def vanish_one(text, key, staging, tally, workroot=None):
-            got = real_extract(text, key, staging, tally, workroot)
+        def vanish_one(text, key, builder, tally):
+            got = real_extract(text, key, builder, tally)
             if got and not killed["done"]:                       # a counted payload disappears afterwards
-                crawl.shutil.rmtree(staging / got)
+                crawl.shutil.rmtree(builder.root / got)
                 killed["done"] = True
             return got
         monkeypatch.setattr(crawl, "_extract_payload", vanish_one)
         assert crawl._sourcemap_recover(ctx, led) is None        # refused, not published incomplete
-        assert any("disagrees with its counters" in m for m in ctx.echoed)
+        assert not (ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered").exists()
 
     def test_a_counted_payload_replaced_by_a_file_refuses_publication(self, tmp_path, monkeypatch):
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=_map_body("a.ts", "C"))
         real_extract = crawl._extract_payload
 
-        def swap_for_file(text, key, staging, tally, workroot=None):
-            got = real_extract(text, key, staging, tally, workroot)
+        def swap_for_file(text, key, builder, tally):
+            got = real_extract(text, key, builder, tally)
             if got:
-                crawl.shutil.rmtree(staging / got)
-                (staging / got).write_text("not a directory")    # right name, wrong TYPE
+                crawl.shutil.rmtree(builder.root / got)
+                (builder.root / got).write_text("not a directory")    # right name, wrong TYPE
             return got
         monkeypatch.setattr(crawl, "_extract_payload", swap_for_file)
         assert crawl._sourcemap_recover(ctx, led) is None
@@ -1750,7 +1876,7 @@ class TestTemplateDefectsRound8:
         nothing to inspect; the truth is that nothing was measured."""
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 4}, body=_map_body("a.ts", "C"))
-        monkeypatch.setattr(crawl, "_stage_dir", lambda active: None)
+        monkeypatch.setattr(crawl, "_owned_tree", lambda *a, **k: False)
         assert crawl._sourcemap_recover(ctx, led) is None
         ev = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         for m in ("sourcemaps", "sourcemaps_fetched", "sourcemaps_valid", "sourcemaps_extracted"):
@@ -1768,7 +1894,7 @@ class TestTemplateDefectsRound8:
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 2}, body=_map_body("a.ts", "C"))
         events.configure(st.dir)                                  # events land in the run dir
-        monkeypatch.setattr(crawl, "_stage_dir", lambda active: None)
+        monkeypatch.setattr(crawl, "_owned_tree", lambda *a, **k: False)
         crawl._sourcemap_recover(ctx, led)
         summ = st._run_summary()
         gaps = [g for g in summ["gaps"] if g["tool"] == "crawl.sourcemaps"]
@@ -1861,15 +1987,15 @@ class TestTemplateDefectsRound9:
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=body)
         real_extract = crawl._extract_payload
 
-        def drop_a_file(text, key, staging, tally, workroot=None):
-            got = real_extract(text, key, staging, tally, workroot)
+        def drop_a_file(text, key, builder, tally):
+            got = real_extract(text, key, builder, tally)
             if got:                                              # one recovered file vanishes afterwards
-                victim = next(q for q in (staging / got).rglob("*") if q.is_file())
+                victim = next(q for q in (builder.root / got).rglob("*") if q.is_file())
                 victim.unlink()
             return got
         monkeypatch.setattr(crawl, "_extract_payload", drop_a_file)
         assert crawl._sourcemap_recover(ctx, led) is None
-        assert any("recovered file(s), counted" in m for m in ctx.echoed)
+        assert not (ctx.run.dir / "raw" / "crawl" / "sourcemaps" / "recovered").exists()
 
     def test_a_symlinked_payload_directory_is_rejected(self, tmp_path, monkeypatch):
         t = TestSourcemapLane()
@@ -1879,11 +2005,11 @@ class TestTemplateDefectsRound9:
         (outside / "planted.js").write_text("OUT OF TREE")
         real_extract = crawl._extract_payload
 
-        def swap_for_symlink(text, key, staging, tally, workroot=None):
-            got = real_extract(text, key, staging, tally, workroot)
+        def swap_for_symlink(text, key, builder, tally):
+            got = real_extract(text, key, builder, tally)
             if got:
-                crawl.shutil.rmtree(staging / got)
-                (staging / got).symlink_to(outside)              # right name, a SYMLINK out of the tree
+                crawl.shutil.rmtree(builder.root / got)
+                (builder.root / got).symlink_to(outside)              # right name, a SYMLINK out of the tree
             return got
         monkeypatch.setattr(crawl, "_extract_payload", swap_for_symlink)
         assert crawl._sourcemap_recover(ctx, led) is None
@@ -1909,9 +2035,9 @@ class TestTemplateDefectsRound9:
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=_map_body("a.ts", "C"))
         real_extract = crawl._extract_payload
 
-        def smuggle_file(text, key, staging, tally, workroot=None):
-            got = real_extract(text, key, staging, tally, workroot)
-            (staging / "stray.txt").write_text("uncounted")
+        def smuggle_file(text, key, builder, tally):
+            got = real_extract(text, key, builder, tally)
+            builder.write_bytes(b"uncounted", "stray.txt")
             return got
         monkeypatch.setattr(crawl, "_extract_payload", smuggle_file)
         real_unlink = pathlib.Path.unlink
@@ -1927,12 +2053,8 @@ class TestTemplateDefectsRound9:
     def test_a_raising_iterdir_still_reports_the_publication_gap(self, tmp_path, monkeypatch):
         t = TestSourcemapLane()
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=_map_body("a.ts", "C"))
-        real_iterdir = pathlib.Path.iterdir
-        monkeypatch.setattr(pathlib.Path, "iterdir",
-                            lambda self: (_ for _ in ()).throw(OSError("io error"))
-                            if "recovered.gen-" in self.name else real_iterdir(self))
+        monkeypatch.setattr(crawl, "_owned_tree", lambda *a, **k: False)
         assert crawl._sourcemap_recover(ctx, led) is None
-        monkeypatch.setattr(pathlib.Path, "iterdir", real_iterdir)
         ev = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
         pub = [e for e in ev if e.get("measure") == "sourcemaps_published"][-1]
         assert pub["omitted"] == 1
@@ -1944,10 +2066,10 @@ class TestTemplateDefectsRound10:
     def _plant(self, monkeypatch, mutate):
         real_extract = crawl._extract_payload
 
-        def wrapped(text, key, staging, tally, workroot=None):
-            got = real_extract(text, key, staging, tally, workroot)
+        def wrapped(text, key, builder, tally):
+            got = real_extract(text, key, builder, tally)
             if got:
-                mutate(staging / got)
+                mutate(builder.root / got)
             return got
         monkeypatch.setattr(crawl, "_extract_payload", wrapped)
 
@@ -1963,7 +2085,6 @@ class TestTemplateDefectsRound10:
         self._plant(monkeypatch, lambda sub: (sub / "0000" / "extra.js").symlink_to(secret))
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=_map_body("a.ts", "C"))
         assert crawl._sourcemap_recover(ctx, led) is None        # refused
-        assert any("contains a symlink" in m for m in ctx.echoed)
         assert secret.read_text() == "EXFILTRATED"               # never followed or touched
 
     def test_a_symlink_replacing_an_expected_file_is_rejected(self, tmp_path, monkeypatch):
@@ -2006,7 +2127,6 @@ class TestTemplateDefectsRound10:
         self._plant(monkeypatch, swap_paths)
         ctx, led, f = t._setup(tmp_path, monkeypatch, {"a.ex.com": 1}, body=body)
         assert crawl._sourcemap_recover(ctx, led) is None
-        assert any("the paths differ" in m for m in ctx.echoed)
 
     def test_an_intact_payload_still_publishes(self, tmp_path, monkeypatch):
         t = TestSourcemapLane()
