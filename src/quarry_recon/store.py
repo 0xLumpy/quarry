@@ -47,7 +47,13 @@ class MutationScope(str, Enum):
 _RUN_LOCKS_GUARD = threading.Lock()
 _RUN_LOCKS: dict[tuple[str, str], threading.RLock] = {}
 _RUN_LOCK_LOCAL = threading.local()
-_LIVE_ARTIFACT_CLAIMS: dict[tuple[str, str], int] = {}
+
+_BASE_ARTIFACT_ROOTS = frozenset({
+    "raw", "normalized", "metrics", "events.jsonl", "events.degraded.json",
+    "tool-runs.jsonl", "envelope-remainder.json", "envelope-refused.jsonl",
+    "envelope-fold-refused", "envelope-degraded.json",
+})
+_CLAIM_SUFFIX = ".claim"
 
 
 def _run_lock_key(project_dir: Path, run_id: str) -> tuple[str, str]:
@@ -71,6 +77,21 @@ def _scoped_mutation(scope: MutationScope):
                 return function(self, *args, **kwargs)
         return wrapped
     return decorate
+
+
+def _validated_artifact_components(components, *, base_only: bool = True) -> tuple[str, ...]:
+    """Validate one repository-relative artifact identity before path construction."""
+    if type(components) is not tuple or not components:
+        raise ContractError("an artifact claim requires at least one path component")
+    if len(components) > 64:
+        raise ContractError("an artifact identity has too many path components")
+    validated = tuple(
+        validate_artifact_component(component, f"artifact component {index}")
+        for index, component in enumerate(components)
+    )
+    if base_only and validated[0] not in _BASE_ARTIFACT_ROOTS:
+        raise ContractError(f"{validated[0]!r} is not a base-artifact namespace")
+    return validated
 
 
 def _record_bytes(rec) -> int:
@@ -918,7 +939,116 @@ class ToolRunRecord:
     depends_on: str = ""               # registry bin this source needs; the source→tool edge the verdict reads
 
 
+class _ArtifactClaim:
+    """Opaque, single-use authority for one unpublished base artifact.
+
+    A caller may borrow one writable descriptor, but destination naming,
+    settlement, publication and fencing remain repository operations.  The
+    durable marker is retained until the context exits after a terminal
+    publication/fence, so finalization cannot race the owner's return path.
+    """
+
+    __slots__ = (
+        "_run", "_components", "_marker_name", "_marker_identity", "_stage",
+        "_writer_fd", "_state",
+    )
+
+    def __init__(self, run, components, marker_name, marker_identity):
+        self._run = run
+        self._components = components
+        self._marker_name = marker_name
+        self._marker_identity = marker_identity
+        self._stage = None
+        self._writer_fd = -1
+        self._state = "claimed"
+
+    def __repr__(self) -> str:
+        return f"ArtifactClaim(state={self._state!r})"
+
+    def _require_artifact(self) -> tuple[str, ...]:
+        if self._components is None:
+            raise ContractError("this lifecycle claim has no artifact destination")
+        if self._state not in {"claimed", "open"}:
+            raise ContractError(f"artifact claim is already {self._state}")
+        return self._components
+
+    def open_writer(self) -> int:
+        """Return one disposable writer duplicate for the private stage."""
+        components = self._require_artifact()
+        if self._stage is not None or self._writer_fd >= 0:
+            raise ContractError("artifact claim already issued its writer")
+        from . import privfs
+        with self._run._mutation(MutationScope.BASE_EVIDENCE):
+            self._run._ensure_artifact_parent(components)
+            anchor_fd = _open_run_fd(self._run.project_dir, self._run.run_id)
+            try:
+                stage = privfs.create_private_stage(anchor_fd, components)
+            finally:
+                os.close(anchor_fd)
+            self._stage = stage
+            writer = os.dup(stage.file_fd)
+        self._writer_fd = writer
+        self._state = "open"
+        return writer
+
+    def _writer_is_live(self) -> bool:
+        if self._writer_fd < 0 or self._stage is None:
+            return False
+        try:
+            observed = os.fstat(self._writer_fd)
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                return False
+            raise
+        return (observed.st_dev, observed.st_ino) == self._stage.file_identity
+
+    def publish(self) -> None:
+        """Settle and durably publish the exact staged bytes."""
+        self._require_artifact()
+        if self._stage is None:
+            raise ContractError("artifact claim has no opened writer")
+        if self._writer_is_live():
+            raise ContractError("artifact writer is still live")
+        from . import privfs
+        with self._run._mutation(MutationScope.BASE_EVIDENCE):
+            privfs.replace_private_stage(self._stage)
+        self._state = "published"
+
+    def fence(self) -> None:
+        """Settle an unpublished stage without creating an authoritative final."""
+        if self._state in {"published", "fenced"}:
+            return
+        from . import privfs
+        with self._run._mutation(MutationScope.CONTROL):
+            if self._stage is not None:
+                identity = self._stage.file_identity
+                components = self._stage.components
+                privfs.abort_private_stage(self._stage)
+                # Generic privfs fencing retains a randomly named discard because
+                # it cannot assume repository serialization. Here the run lock
+                # supplies that missing authority: locate only our exact inode in
+                # its strict parent, remove it, and durably settle the directory.
+                anchor_fd = _open_run_fd(self._run.project_dir, self._run.run_id)
+                parent_fd = -1
+                try:
+                    parent_fd = privfs.open_strict_dir_at(anchor_fd, components[:-1])
+                    for name in os.listdir(parent_fd):
+                        if not (name.startswith(".quarry-discard-") and name.endswith(".stage")):
+                            continue
+                        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                        if (observed.st_dev, observed.st_ino) == identity:
+                            os.unlink(name, dir_fd=parent_fd)
+                            os.fsync(parent_fd)
+                            break
+                finally:
+                    if parent_fd >= 0:
+                        os.close(parent_fd)
+                    os.close(anchor_fd)
+        self._state = "fenced"
+
+
 _RUN_CONSTRUCTION_AUTHORITY = object()
+_TOOL_RUNS_UNLOADED = object()
 
 
 class Run:
@@ -959,6 +1089,8 @@ class Run:
         self._faults: list = []                           # typed Fault records folded into the verdict
         self._gaps: list = []                             # typed Gap records folded into the verdict
         self._tool_runs: list[ToolRunRecord] = []
+        self._tool_runs_path = self.dir / "tool-runs.jsonl"
+        self._tool_runs_signature: tuple | None | object = _TOOL_RUNS_UNLOADED
         self._counts_cache: dict[str, int] = {}
         self._records: dict[str, dict] = {}       # entity -> {canonical_key: merged record} (instance-local)
         self._folded: dict[str, FoldedLog] = {}   # entity -> the same fold, with its trust status
@@ -1090,23 +1222,180 @@ class Run:
                 f"finalization metadata is unavailable in state {state!r}",
             )
 
-    @contextmanager
-    def artifact_claim(self):
-        """Hold one live base-artifact authority until its writer is terminal."""
-        key = self._authority_key
-        with self._mutation(MutationScope.BASE_EVIDENCE):
-            with _RUN_LOCKS_GUARD:
-                _LIVE_ARTIFACT_CLAIMS[key] = _LIVE_ARTIFACT_CLAIMS.get(key, 0) + 1
+    @property
+    def _artifact_claim_dir(self) -> Path:
+        return self.project_dir / "recon" / "state" / "claims" / self.run_id
+
+    def _create_artifact_claim_marker(self) -> tuple[str, tuple[int, int]]:
+        """Durably register one unique live owner while the run lock is held."""
+        from . import privfs
+        directory = privfs.private_dir(self._artifact_claim_dir)
+        directory_fd = os.open(directory, _DIR_OPEN_FLAGS)
+        name = f"{os.urandom(16).hex()}{_CLAIM_SUFFIX}"
+        fd = -1
         try:
-            yield
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+                privfs.FILE_MODE,
+                dir_fd=directory_fd,
+            )
+            os.fchmod(fd, privfs.FILE_MODE)
+            body = json.dumps({
+                "schema_version": 1,
+                "run_id": self.run_id,
+                "pid": os.getpid(),
+            }, sort_keys=True).encode("utf-8")
+            view = memoryview(body)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("artifact claim marker write made no progress")
+                view = view[written:]
+            os.fsync(fd)
+            observed = os.fstat(fd)
+            if (not stat.S_ISREG(observed.st_mode)
+                    or observed.st_uid != os.geteuid()
+                    or observed.st_nlink != 1
+                    or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE):
+                raise ContractError("artifact claim marker identity is unsafe")
+            os.fsync(directory_fd)
+            return name, (observed.st_dev, observed.st_ino)
+        except BaseException:
+            if fd >= 0:
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                except OSError:
+                    pass
+            raise
         finally:
-            with _shared_run_lock(key):
-                with _RUN_LOCKS_GUARD:
-                    remaining = _LIVE_ARTIFACT_CLAIMS.get(key, 0) - 1
-                    if remaining > 0:
-                        _LIVE_ARTIFACT_CLAIMS[key] = remaining
-                    else:
-                        _LIVE_ARTIFACT_CLAIMS.pop(key, None)
+            if fd >= 0:
+                os.close(fd)
+            os.close(directory_fd)
+
+    def _release_artifact_claim_marker(
+        self, name: str, expected_identity: tuple[int, int],
+    ) -> None:
+        directory_fd = os.open(self._artifact_claim_dir, _DIR_OPEN_FLAGS)
+        fd = -1
+        try:
+            fd = os.open(name, _FILE_OPEN_FLAGS, dir_fd=directory_fd)
+            observed = os.fstat(fd)
+            if (not stat.S_ISREG(observed.st_mode)
+                    or observed.st_uid != os.geteuid()
+                    or observed.st_nlink != 1
+                    or (observed.st_dev, observed.st_ino) != expected_identity):
+                raise ContractError("artifact claim marker identity changed")
+            os.unlink(name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            os.close(directory_fd)
+
+    def _live_artifact_claim_count(self) -> int:
+        try:
+            directory_fd = os.open(self._artifact_claim_dir, _DIR_OPEN_FLAGS)
+        except FileNotFoundError:
+            return 0
+        try:
+            count = 0
+            for name in os.listdir(directory_fd):
+                token = name[:-len(_CLAIM_SUFFIX)] if name.endswith(_CLAIM_SUFFIX) else ""
+                if (len(token) != 32
+                        or any(char not in "0123456789abcdef" for char in token)):
+                    raise ContractError("artifact claim registry contains an unknown entry")
+                fd = os.open(name, _FILE_OPEN_FLAGS, dir_fd=directory_fd)
+                try:
+                    observed = os.fstat(fd)
+                    if (not stat.S_ISREG(observed.st_mode)
+                            or observed.st_uid != os.geteuid()
+                            or observed.st_nlink != 1):
+                        raise ContractError("artifact claim registry contains an unsafe entry")
+                finally:
+                    os.close(fd)
+                count += 1
+            return count
+        finally:
+            os.close(directory_fd)
+
+    def _ensure_artifact_parent(self, components: tuple[str, ...]) -> None:
+        from . import privfs
+        if len(components) > 1:
+            privfs.private_dir(self.dir.joinpath(*components[:-1]))
+
+    def _append_base_artifact(self, components: tuple[str, ...], data: bytes) -> None:
+        """Durably append exact bytes through BASE_EVIDENCE authority."""
+        components = _validated_artifact_components(components)
+        if type(data) is not bytes:
+            raise TypeError("artifact append data must be exact bytes")
+        from . import privfs
+        with self._mutation(MutationScope.BASE_EVIDENCE):
+            self._ensure_artifact_parent(components)
+            path = self.dir.joinpath(*components)
+            fd = privfs.open_private(path, append=True)
+            try:
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("artifact append made no progress")
+                    view = view[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            parent_fd = os.open(path.parent, _DIR_OPEN_FLAGS)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+
+    def _replace_artifact(
+        self, scope: MutationScope, components: tuple[str, ...], data: bytes,
+    ) -> Path:
+        """Durably replace one scoped artifact through the strict stage primitive."""
+        components = _validated_artifact_components(components)
+        if type(data) is not bytes:
+            raise TypeError("artifact replacement data must be exact bytes")
+        from . import privfs
+        stage = None
+        with self._mutation(scope):
+            self._ensure_artifact_parent(components)
+            anchor_fd = _open_run_fd(self.project_dir, self.run_id)
+            try:
+                stage = privfs.stage_private_bytes(anchor_fd, components, data)
+            finally:
+                os.close(anchor_fd)
+            try:
+                privfs.replace_private_stage(stage)
+            except BaseException:
+                try:
+                    privfs.abort_private_stage(stage)
+                except BaseException:
+                    pass
+                raise
+        return self.dir.joinpath(*components)
+
+    @contextmanager
+    def artifact_claim(self, *components):
+        """Hold an opaque durable base-artifact authority until terminal settlement.
+
+        The zero-component form is retained as a lifecycle-only claim for callers
+        that already own a private stage through another strict subsystem.
+        """
+        validated = None if not components else _validated_artifact_components(tuple(components))
+        with self._mutation(MutationScope.BASE_EVIDENCE):
+            marker_name, marker_identity = self._create_artifact_claim_marker()
+        claim = _ArtifactClaim(self, validated, marker_name, marker_identity)
+        try:
+            yield claim
+        finally:
+            if claim._state not in {"published", "fenced"}:
+                claim.fence()
+            with self._mutation(MutationScope.CONTROL):
+                self._release_artifact_claim_marker(marker_name, marker_identity)
 
     def begin_finalization(self) -> None:
         """Irreversibly seal base evidence after every artifact owner settled."""
@@ -1116,8 +1405,7 @@ class Run:
                 raise ContractError(
                     f"run {self.run_id} cannot begin finalization from {state!r}",
                 )
-            with _RUN_LOCKS_GUARD:
-                live = _LIVE_ARTIFACT_CLAIMS.get(self._authority_key, 0)
+            live = self._live_artifact_claim_count()
             if live:
                 raise ContractError(
                     f"run {self.run_id} has {live} live artifact claim(s)",
@@ -1192,16 +1480,90 @@ class Run:
         # the single choke point that redacts secrets out of cmd/note/stderr before they reach the manifest
         with self._mutation(MutationScope.BASE_EVIDENCE):
             from . import secrets
-            self._tool_runs.append(ToolRunRecord(
+            self._refresh_tool_runs()
+            record = ToolRunRecord(
                 phase=phase, tool=result.tool, status=str(result.status.value),
                 exit_code=result.exit_code, duration=round(result.duration, 2),
                 stdout_lines=result.stdout_lines, note=secrets.redact(result.note),
                 cmd=secrets.redact(" ".join(result.cmd)), stderr_tail=secrets.redact(result.stderr_tail),
                 cpu_s=getattr(result, "cpu_s", 0.0), peak_rss_mb=getattr(result, "peak_rss_mb", 0.0),
                 depends_on=depends_on or "",
-            ))
+            )
+            self._append_base_artifact(
+                ("tool-runs.jsonl",),
+                (json.dumps(asdict(record), ensure_ascii=False) + "\n").encode("utf-8"),
+            )
+            self._tool_runs.append(record)
+            self._tool_runs_signature = self._tool_runs_disk_signature()
+
+    def _tool_runs_disk_signature(self) -> tuple | None:
+        try:
+            observed = os.stat(self._tool_runs_path, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return (
+            observed.st_dev, observed.st_ino, observed.st_size,
+            observed.st_mtime_ns, observed.st_ctime_ns,
+        )
+
+    @staticmethod
+    def _tool_run_from_dict(value) -> ToolRunRecord:
+        if not isinstance(value, dict):
+            raise ContractError("tool-run ledger contains a non-object row")
+        required = (
+            "phase", "tool", "status", "exit_code", "duration",
+            "stdout_lines", "note", "cmd",
+        )
+        if any(name not in value for name in required):
+            raise ContractError("tool-run ledger contains an incomplete row")
+        fields = {
+            "stderr_tail": "", "cpu_s": 0.0,
+            "peak_rss_mb": 0.0, "depends_on": "",
+        }
+        fields.update({name: value[name] for name in required})
+        fields.update({name: value[name] for name in fields if name in value})
+        try:
+            return ToolRunRecord(**fields)
+        except (TypeError, ValueError) as exc:
+            raise ContractError("tool-run ledger contains an invalid row") from exc
+
+    def _refresh_tool_runs(self) -> None:
+        signature = self._tool_runs_disk_signature()
+        if self._tool_runs_signature is not _TOOL_RUNS_UNLOADED and signature == self._tool_runs_signature:
+            return
+        if signature is None:
+            # Preserve same-process compatibility for an object whose tests or a
+            # legacy adapter populated the historical in-memory list directly.
+            if self._tool_runs_signature is _TOOL_RUNS_UNLOADED and self._tool_runs:
+                self._tool_runs_signature = None
+                return
+            legacy = _read_json(self.manifest_path)
+            rows = legacy.get("tool_runs") if isinstance(legacy, dict) else None
+            self._tool_runs = (
+                [self._tool_run_from_dict(row) for row in rows]
+                if isinstance(rows, list) else []
+            )
+            self._tool_runs_signature = None
+            return
+        records = []
+        from . import privfs
+        try:
+            with os.fdopen(privfs.open_ro_private(self._tool_runs_path), "r", encoding="utf-8") as fh:
+                for index, line in enumerate(fh, 1):
+                    if not line.endswith("\n"):
+                        raise ContractError(f"tool-run ledger row {index} is torn")
+                    try:
+                        value = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ContractError(f"tool-run ledger row {index} is invalid JSON") from exc
+                    records.append(self._tool_run_from_dict(value))
+        except UnicodeError as exc:
+            raise ContractError("tool-run ledger is not valid UTF-8") from exc
+        self._tool_runs = records
+        self._tool_runs_signature = signature
 
     def tool_runs(self, phase: str | None = None) -> list[ToolRunRecord]:
+        self._refresh_tool_runs()
         if phase is None:
             return list(self._tool_runs)
         return [r for r in self._tool_runs if r.phase == phase]
@@ -1852,7 +2214,8 @@ class Run:
         status_counts: dict[str, int] = {}
         failures = []
         gaps = []
-        for r in self._tool_runs:
+        tool_runs = self.tool_runs()
+        for r in tool_runs:
             status_counts[r.status] = status_counts.get(r.status, 0) + 1
             why = r.note or r.stderr_tail or f"exit {r.exit_code}"
             if r.status == "failed":
@@ -2208,7 +2571,7 @@ class Run:
             "finished": _utc(),
             "profile": profile_summary,
             "phases_run": phases_run,
-            "tool_runs": [asdict(r) for r in self._tool_runs],
+            "tool_runs": [asdict(r) for r in self.tool_runs()],
             "entity_counts": {e: self.count(e) for e in ENTITY_KEYS
                               if self._entity_file(e).exists()},
             "notes": [secrets.redact(n) for n in self.notes],
@@ -2270,3 +2633,39 @@ class Run:
                                 f"not {target!r}")
         return Run(project_dir, identity["target"], run_id=run_id, load_started=True, _identity=identity,
                    _authority=_RUN_CONSTRUCTION_AUTHORITY)
+
+
+def managed_run_for_artifact(path) -> "tuple[Run, tuple[str, ...]] | None":
+    """Return the owning run and relative identity for a lexical managed path.
+
+    This discovery is read-only.  It exists only to fail closed at compatibility
+    surfaces that still receive a ``Path``; new writers should carry an explicit
+    artifact claim instead.
+    """
+    if not isinstance(path, (str, os.PathLike)):
+        return None
+    try:
+        candidate = Path(os.path.abspath(os.fspath(path)))
+    except (TypeError, ValueError, OSError):
+        return None
+    for run_dir in candidate.parents:
+        if run_dir.parent.name != "recon":
+            continue
+        run_id = run_dir.name
+        if not valid_run_id(run_id):
+            continue
+        try:
+            relative = candidate.relative_to(run_dir)
+        except ValueError:
+            continue
+        if not relative.parts:
+            return None
+        components = _validated_artifact_components(tuple(relative.parts))
+        project_dir = run_dir.parent.parent
+        try:
+            identity = read_run_identity(project_dir, run_id)
+        except FileNotFoundError:
+            continue
+        run = Run.open(project_dir, identity["target"], run_id)
+        return run, components
+    return None

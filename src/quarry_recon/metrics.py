@@ -49,8 +49,21 @@ def build(run, phases: list[dict], run_wall: float, run_cpu: float, peak_rss_mb:
 
 
 def write(run, phases, run_wall, run_cpu, peak_rss_mb) -> dict:
+    from .state import ContractError
+    from .store import MutationScope
+    state = run.state
+    if state == "finished":
+        raise ContractError(
+            f"run {run.run_id} is finished — reopen it (`finalizing`) before rewriting metrics",
+        )
+    if state in {"created", "running"}:
+        scope = MutationScope.BASE_EVIDENCE
+    elif state in {"finalizing", "finalization_failed"}:
+        scope = MutationScope.FINALIZATION_METADATA
+    else:
+        raise ContractError(f"metrics are unavailable in run state {state!r}")
     d = build(run, phases, run_wall, run_cpu, peak_rss_mb)
-    out = run.dir / "metrics"
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "summary.json").write_text(json.dumps(d, indent=2))
+    run._replace_artifact(
+        scope, ("metrics", "summary.json"), json.dumps(d, indent=2).encode("utf-8"),
+    )
     return d

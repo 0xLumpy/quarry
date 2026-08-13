@@ -74,6 +74,7 @@ EVENT_TYPES = (TOOL_START, TOOL_PROGRESS, TOOL_FINISH,
                ARTIFACT_WRITTEN, COVERAGE_PARTIAL, TOOL_BLOCKED, COVERAGE_RESET, LEDGER)
 
 _sink: Path | None = None
+_run = None                           # repository authority for a managed run sink
 _coverage_seen: set = set()             # source_ids that emitted a coverage unit THIS session (for the snapshot)
 _provider_seen: set = set()             # source_ids whose provider terminal opened a generation THIS session
 # event-sink write failures this session. Best-effort is preserved, but the loss is not silent: it
@@ -113,8 +114,13 @@ def persist_degraded() -> None:
     if p is None:
         return
     try:
-        privfs.write_private(p, json.dumps(_degraded))      # 0600, O_NOFOLLOW, atomic exclusive temp
-    except OSError:
+        body = json.dumps(_degraded).encode("utf-8")
+        if _run is not None:
+            from .store import MutationScope
+            _run._replace_artifact(MutationScope.BASE_EVIDENCE, ("events.degraded.json",), body)
+        else:
+            privfs.write_private(p, body.decode("utf-8"))  # legacy non-repository sink
+    except Exception:
         pass
 
 
@@ -124,9 +130,17 @@ def configure(run_dir) -> Path:
     Opens a fresh coverage generation for this process, so a resume supersedes the prior run's units
     rather than inheriting a gap from one that has since disappeared. Loads the persisted degradation
     record, which ACCUMULATES: a run whose earlier session lost events can never be recorded clean."""
-    global _sink, _coverage_seen, _provider_seen, _degraded
-    _sink = Path(run_dir) / "events.jsonl"
-    privfs.private_dir(_sink.parent)             # 0700 parent: the sink is untraversable by group/other
+    global _sink, _run, _coverage_seen, _provider_seen, _degraded
+    from . import store
+    if isinstance(run_dir, store.Run):
+        _run = run_dir
+        _sink = run_dir.dir / "events.jsonl"
+    else:
+        _sink = Path(run_dir) / "events.jsonl"
+        managed = store.managed_run_for_artifact(_sink)
+        _run = managed[0] if managed is not None else None
+    if _run is None:
+        privfs.private_dir(_sink.parent)         # compatibility sink outside a managed repository
     _coverage_seen = set()
     _provider_seen = set()
     _degraded = _load_degraded()
@@ -135,8 +149,9 @@ def configure(run_dir) -> Path:
 
 def reset() -> None:
     """Detach the sink (tests / between runs). emit() then returns records without persisting."""
-    global _sink, _coverage_seen, _provider_seen, _degraded
+    global _sink, _run, _coverage_seen, _provider_seen, _degraded
     _sink = None
+    _run = None
     _coverage_seen = set()
     _provider_seen = set()
     _degraded = _fresh_degraded()
@@ -169,8 +184,14 @@ def emit(event: str, source_id: str, **fields) -> dict:
     if _sink is not None:
         try:
             # 0600 sink (privfs), utf-8 (events carry redacted UTF-8 payloads; Windows would else default to cp)
-            with os.fdopen(privfs.open_private(_sink, append=True), "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(rec, default=str, ensure_ascii=False) + "\n")
+            line = (json.dumps(rec, default=str, ensure_ascii=False) + "\n").encode("utf-8")
+            if _run is not None:
+                if _sink != _run.dir / "events.jsonl":
+                    raise RuntimeError("managed event sink identity changed")
+                _run._append_base_artifact(("events.jsonl",), line)
+            else:
+                with os.fdopen(privfs.open_private(_sink, append=True), "a", encoding="utf-8") as fh:
+                    fh.write(line.decode("utf-8"))
         except Exception as e:
             # best-effort — a log write must not break a run — but the loss is recorded, not swallowed
             _degraded["writes_failed"] += 1

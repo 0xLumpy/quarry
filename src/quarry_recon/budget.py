@@ -20,6 +20,20 @@ from . import events
 _MAX_BUDGET_S = 30 * 24 * 3600        # a month; anything larger is a typo, not a policy
 
 
+def _managed_artifact(path):
+    from . import store
+    return store.managed_run_for_artifact(path)
+
+
+def _base_mutation_for(path):
+    managed = _managed_artifact(path)
+    if managed is None:
+        return contextlib.nullcontext()
+    run, _components = managed
+    from .store import MutationScope
+    return run._mutation(MutationScope.BASE_EVIDENCE)
+
+
 def budget_seconds(key: str) -> int:
     """A lane's wall-clock budget in seconds; 0 (the default) is unbounded. Strictly parsed, so a typo
     cannot become a tiny budget."""
@@ -86,6 +100,33 @@ def publish_bytes(dest: Path, data: bytes, *, digest: str) -> bool:
 
     Every step resolves through a directory descriptor we hold open. Same-uid interference is out of
     scope: a process running as us can reach these descriptors directly."""
+    managed = _managed_artifact(dest)
+    if managed is not None:
+        run, components = managed
+        if type(data) is not bytes or hashlib.sha256(data).hexdigest() != digest:
+            return False
+        writer = -1
+        try:
+            with run.artifact_claim(*components) as claim:
+                writer = claim.open_writer()
+                view = memoryview(data)
+                while view:
+                    written = os.write(writer, view)
+                    if written <= 0:
+                        raise OSError("artifact publication made no progress")
+                    view = view[written:]
+                os.close(writer)
+                writer = -1
+                claim.publish()
+            return True
+        except (OSError, RuntimeError, ValueError):
+            if writer >= 0:
+                try:
+                    os.close(writer)
+                except OSError:
+                    pass
+            return False
+
     dfd = sfd = None
     name = None
     created = False
@@ -740,11 +781,12 @@ def state_path(base, lane: str, config_fp: str):
 
 
 def prune_state(base, lane: str, keep_fp: str) -> None:
-    keep = state_path(base, lane, keep_fp).name
-    for old in Path(base).glob(f"{lane.replace('.', '_')}.*.state.json"):
-        if old.name != keep:
-            old.unlink(missing_ok=True)
-            old.with_name(old.name + ".journal").unlink(missing_ok=True)
+    with _base_mutation_for(Path(base) / ".prune-authority"):
+        keep = state_path(base, lane, keep_fp).name
+        for old in Path(base).glob(f"{lane.replace('.', '_')}.*.state.json"):
+            if old.name != keep:
+                old.unlink(missing_ok=True)
+                old.with_name(old.name + ".journal").unlink(missing_ok=True)
 
 
 class Ledger:
@@ -754,6 +796,7 @@ class Ledger:
     def __init__(self, state_file: Path, *, lane: str):
         self.path = Path(state_file)
         self.journal = self.path.with_name(self.path.name + ".journal")
+        self._managed = _managed_artifact(self.path)
         self.lane = lane
         self.done: dict[str, str] = {}        # item -> completion artifact, relative to the state file
         self.evid: dict[str, list] = {}       # item -> every retained artifact, append-only
@@ -765,6 +808,13 @@ class Ledger:
         self.unreadable: str = ""             # why an index that exists cannot be trusted; absent stays ""
         self._raw_evid: dict[str, list] = {}
         self._load()
+
+    def _mutation(self):
+        if self._managed is None:
+            return contextlib.nullcontext()
+        run, _components = self._managed
+        from .store import MutationScope
+        return run._mutation(MutationScope.BASE_EVIDENCE)
 
     def _resolved_base(self) -> Path:
         return self.path.parent.resolve()
@@ -884,9 +934,10 @@ class Ledger:
             self._journal_unsafe = True
         elif damaged:
             try:                                    # truncate to the intact prefix so the next append is clean
-                tmp = self.journal.with_name(self.journal.name + ".repair")
-                tmp.write_text("".join(ln + "\n" for ln in kept))
-                os.replace(tmp, self.journal)
+                with self._mutation():
+                    tmp = self.journal.with_name(self.journal.name + ".repair")
+                    tmp.write_text("".join(ln + "\n" for ln in kept))
+                    os.replace(tmp, self.journal)
             except OSError:
                 # repair failed: appending would land on the fragment. Stop journalling — save() still
                 # compacts in-memory state, so completions are un-journalled, not lost.
@@ -1007,6 +1058,10 @@ class Ledger:
     def _append(self, rec: dict) -> bool:
         """True when the record is durably journaled. Never swallows an error: a caller has to be able to tell
         an appended completion from one that exists only in memory."""
+        with self._mutation():
+            return self._append_locked(rec)
+
+    def _append_locked(self, rec: dict) -> bool:
         if self.foreign or self._journal_unsafe or self.unreadable:
             # appending to a foreign, fragmented or untrusted journal builds a healthy-looking history
             # on top of one we already know is broken
@@ -1027,6 +1082,10 @@ class Ledger:
             return False
 
     def save(self) -> bool:
+        with self._mutation():
+            return self._save_locked()
+
+    def _save_locked(self) -> bool:
         """Compact: write the snapshot atomically, then drop the journal it supersedes. Refuses a foreign path
         or an untrusted store, either of which compaction would overwrite."""
         if self.foreign or self.unreadable:

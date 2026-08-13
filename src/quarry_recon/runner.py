@@ -850,6 +850,28 @@ def run(
     if preflight_errors:
         return _preflight_failure(tool, argv, "; ".join(preflight_errors))
 
+    # Compatibility callers may still hold a repository Path minted while the
+    # run was live. Revalidate that lifecycle before PATH lookup, staging or
+    # launch; new production callers use an opaque artifact claim instead.
+    from . import store as _store
+    for label, destination in (("raw_path", raw_path), ("stderr_path", stderr_path)):
+        if destination is None:
+            continue
+        try:
+            managed = _store.managed_run_for_artifact(destination)
+        except Exception as exc:
+            preflight_errors.append(f"{label} repository identity is unsafe ({type(exc).__name__})")
+            continue
+        if managed is not None:
+            owner, _components = managed
+            state = owner.state
+            if state not in {"created", "running"}:
+                preflight_errors.append(
+                    f"{label} belongs to sealed run {owner.run_id} in state {state!r}",
+                )
+    if preflight_errors:
+        return _preflight_failure(tool, argv, "; ".join(preflight_errors))
+
     cmd = argv                              # normalized concrete list; preflight proved this is not None
     bin_name = cmd[0]
     if not have(bin_name):
