@@ -346,6 +346,8 @@ class _PrepareOwnership:
     reconcile the named effect instead of losing its only cleanup authority.
     """
 
+    run: store.Run
+    policies: tuple[RepositoryNativeOutput, ...]
     base_path: Path
     _root_name: str
     _claim_name: str
@@ -355,6 +357,115 @@ class _PrepareOwnership:
     _root_present: bool = False
     _claim_identity: tuple[int, int] | None = None
     _claim_present: bool = False
+
+
+class NativeOutputAdoption:
+    """Opaque caller-owned slot spanning the prepare return boundary.
+
+    The facade allocates this exact object before calling
+    :func:`prepare_native_outputs`.  Preparation installs its raw ownership
+    ledger before its first filesystem effect, and a completed transaction
+    installs itself before its constructor returns.  ``fence()`` therefore has
+    exact cleanup authority even when an exception lands before the caller can
+    assign the function's return value.
+    """
+
+    __slots__ = ("_owner", "_transaction", "_receipt")
+
+    def __init__(self) -> None:
+        self._owner = None
+        self._transaction = None
+        self._receipt = None
+
+    def __repr__(self) -> str:
+        state = (
+            "settled" if self._receipt is not None
+            else "transaction" if self._transaction is not None
+            else "preparing" if self._owner is not None
+            else "empty"
+        )
+        return f"NativeOutputAdoption(state={state!r})"
+
+    def _adopt_prepare(self, owner: _PrepareOwnership) -> None:
+        if type(owner) is not _PrepareOwnership or self._owner is not None:
+            raise ContractError("native output adoption is invalid or already used")
+        self._owner = owner
+
+    def _adopt_transaction(self, transaction) -> None:
+        if (self._owner is None or self._transaction is not None
+                or type(transaction) is not NativeOutputTransaction):
+            raise ContractError("native output transaction adoption is invalid")
+        self._transaction = transaction
+
+    def fence(self) -> NativeOutputReceipt | None:
+        """Idempotently fence whichever side of preparation was adopted."""
+        transaction = self._transaction
+        if transaction is not None:
+            if transaction._receipt is not None:
+                self._receipt = transaction._receipt
+                return self._receipt
+            try:
+                receipt = transaction.finish(clean=False)
+            except BaseException:
+                if transaction._receipt is None:
+                    raise
+                receipt = transaction._receipt
+            self._receipt = receipt
+            return receipt
+
+        owner = self._owner
+        if owner is None:
+            return None
+        if self._receipt is not None:
+            return self._receipt
+
+        settled = False
+        cleanup_fault = None
+        for _attempt in range(2):
+            try:
+                settled, cleanup_fault = _cleanup_prepare_ownership(
+                    owner.run, owner,
+                )
+            except BaseException as exc:
+                settled, cleanup_fault = False, exc
+            if settled:
+                break
+
+        released = not owner._claim_present
+        release_fault = None
+        if settled and owner._claim_present:
+            for _attempt in range(2):
+                try:
+                    with owner.run._mutation(store.MutationScope.CONTROL):
+                        released, release_fault = _release_known_claim_locked(
+                            owner.run, owner,
+                        )
+                except BaseException as exc:
+                    released, release_fault = False, exc
+                if released:
+                    break
+
+        claim_retained = owner._claim_present or not released
+        cleanup_settled = settled and released and not claim_retained
+        fault = cleanup_fault or release_fault
+        receipt = NativeOutputReceipt(
+            policy_count=len(owner.policies),
+            unpublished=tuple(
+                _default_evidence(index, policy)
+                for index, policy in enumerate(owner.policies)
+            ),
+            cleanup_settled=cleanup_settled,
+            claim_retained=claim_retained,
+            fault_operation=(
+                "cleanup" if not settled
+                else "release" if not released
+                else "execute"
+            ),
+            fault_type=None if fault is None else type(fault).__name__,
+        )
+        if cleanup_settled:
+            self._receipt = receipt
+        return receipt
 
 
 def _identity(observed: os.stat_result) -> tuple[int, int]:
@@ -1228,7 +1339,7 @@ class NativeOutputTransaction:
         "run", "policies", "rewritten_cmd", "_base_fd", "_root_fd",
         "_root_name", "_root_identity", "_root_present", "_claim_name",
         "_claim_identity", "_claim_present", "_receipt", "_finish_ledger",
-        "_stage_names", "_constructor_token",
+        "_stage_names", "_adoption", "_constructor_token",
     )
 
     def __init__(
@@ -1244,6 +1355,7 @@ class NativeOutputTransaction:
         claim_name: str,
         claim_identity: tuple[int, int],
         stage_names: tuple[str, ...],
+        adoption: NativeOutputAdoption,
         _constructor_token,
     ) -> None:
         if _constructor_token is not _CONSTRUCTOR:
@@ -1262,7 +1374,9 @@ class NativeOutputTransaction:
         self._receipt = None
         self._finish_ledger = None
         self._stage_names = stage_names
+        self._adoption = adoption
         self._constructor_token = _constructor_token
+        adoption._adopt_transaction(self)
 
     def __repr__(self) -> str:
         return (
@@ -2023,17 +2137,26 @@ def prepare_native_outputs(
     run,
     cmd,
     policies,
+    *,
+    adoption: NativeOutputAdoption | None = None,
 ) -> NativeOutputTransaction:
     """Claim private argv sinks and return the sole owner of their settlement."""
     argv, policies = _validate_prepare_inputs(run, cmd, policies)
+    if adoption is None:
+        adoption = NativeOutputAdoption()
+    elif type(adoption) is not NativeOutputAdoption:
+        raise TypeError("native output adoption must be an exact owner")
     base = (
         run.project_dir / "recon" / "state" / "native-stages" / run.run_id
     )
     owner = _PrepareOwnership(
+        run=run,
+        policies=policies,
         base_path=base,
         _root_name=f"attempt-{os.urandom(16).hex()}",
         _claim_name=f"{os.urandom(16).hex()}.claim",
     )
+    adoption._adopt_prepare(owner)
     try:
         with run._mutation(store.MutationScope.BASE_EVIDENCE):
             _create_known_claim(run, owner)
@@ -2080,28 +2203,12 @@ def prepare_native_outputs(
             claim_name=owner._claim_name,
             claim_identity=owner._claim_identity,
             stage_names=tuple(stage_names),
+            adoption=adoption,
             _constructor_token=_CONSTRUCTOR,
         )
     except BaseException:
-        settled = False
-        for _attempt in range(2):
-            try:
-                settled, _cleanup_fault = _cleanup_prepare_ownership(run, owner)
-            except BaseException:
-                settled = False
-            if settled:
-                break
-        if settled and owner._claim_present:
-            # A one-shot cancellation at the release boundary is reconciled by
-            # the first attempt and retried while the exact name is still owned.
-            for _attempt in range(2):
-                try:
-                    with run._mutation(store.MutationScope.CONTROL):
-                        released, _release_fault = _release_known_claim_locked(
-                            run, owner,
-                        )
-                except BaseException:
-                    released = False
-                if released:
-                    break
+        try:
+            adoption.fence()
+        except BaseException:
+            pass
         raise

@@ -13,6 +13,7 @@ import pytest
 
 from quarry_recon import runner_native, store
 from quarry_recon.runner_native import (
+    NativeOutputAdoption,
     NativeOutputTransaction,
     NativeOutputUnsupported,
     RepositoryNativeOutput,
@@ -902,3 +903,110 @@ def test_terminal_receipt_boundary_cannot_relabel_committed_output(
     assert not receipt.uncertain and not receipt.unpublished
     assert final.read_text() == "new"
     assert run._live_artifact_claim_count() == 0
+
+
+@pytest.mark.parametrize(
+    "exception_type", [RuntimeError, KeyboardInterrupt, SystemExit],
+)
+def test_preallocated_adoption_fences_prepare_return_boundary(
+    tmp_path, exception_type,
+):
+    run = _running_run(tmp_path, f"native-adopt-{exception_type.__name__.lower()}")
+    final = run.dir / "raw" / "probe" / "nuclei.jsonl"
+    policy = RepositoryNativeOutput.file(3, "raw", "probe", "nuclei.jsonl")
+    adoption = NativeOutputAdoption()
+    transaction = None
+    primary = exception_type("fixture after prepare return")
+
+    def wrapper():
+        prepare_native_outputs(
+            run,
+            _python_command("import sys", final),
+            (policy,),
+            adoption=adoption,
+        )
+        raise primary
+
+    try:
+        transaction = wrapper()
+    except BaseException as caught:
+        receipt = adoption.fence()
+        assert caught is primary
+    else:  # pragma: no cover - the fixture always raises
+        pytest.fail("prepare return boundary did not raise")
+
+    assert transaction is None
+    assert receipt is not None
+    assert not receipt.clean and len(receipt.unpublished) == 1
+    assert receipt.cleanup_settled and not receipt.claim_retained
+    assert adoption.fence() is receipt
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
+
+
+@pytest.mark.parametrize(
+    "exception_type", [RuntimeError, KeyboardInterrupt, SystemExit],
+)
+def test_adoption_idempotently_fences_raw_prepare_owner(
+    tmp_path, monkeypatch, exception_type,
+):
+    run = _running_run(tmp_path, f"native-raw-adopt-{exception_type.__name__.lower()}")
+    final = run.dir / "raw" / "probe" / "nuclei.jsonl"
+    policy = RepositoryNativeOutput.file(3, "raw", "probe", "nuclei.jsonl")
+    adoption = NativeOutputAdoption()
+    primary = exception_type("fixture raw prepare boundary")
+    real_create = runner_native._create_prepare_root
+
+    def create_then_interrupt(*arguments):
+        real_create(*arguments)
+        raise primary
+
+    monkeypatch.setattr(runner_native, "_create_prepare_root", create_then_interrupt)
+    with pytest.raises(exception_type) as caught:
+        prepare_native_outputs(
+            run,
+            _python_command("import sys", final),
+            (policy,),
+            adoption=adoption,
+        )
+
+    assert caught.value is primary
+    receipt = adoption.fence()
+    assert receipt is not None
+    assert not receipt.clean and len(receipt.unpublished) == 1
+    assert receipt.cleanup_settled and not receipt.claim_retained
+    assert adoption.fence() is receipt
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
+
+
+def test_adoption_is_exact_and_single_use_before_side_effects(tmp_path):
+    run = _running_run(tmp_path, "native-adoption-closed")
+    first = run.dir / "raw" / "probe" / "one.jsonl"
+    second = run.dir / "raw" / "probe" / "two.jsonl"
+    adoption = NativeOutputAdoption()
+
+    with pytest.raises(TypeError, match="exact owner"):
+        prepare_native_outputs(
+            run,
+            _python_command("import sys", first),
+            (RepositoryNativeOutput.file(3, "raw", "probe", "one.jsonl"),),
+            adoption=object(),
+        )
+    transaction = prepare_native_outputs(
+        run,
+        _python_command("import sys", first),
+        (RepositoryNativeOutput.file(3, "raw", "probe", "one.jsonl"),),
+        adoption=adoption,
+    )
+    with pytest.raises(ContractError, match="already used"):
+        prepare_native_outputs(
+            run,
+            _python_command("import sys", second),
+            (RepositoryNativeOutput.file(3, "raw", "probe", "two.jsonl"),),
+            adoption=adoption,
+        )
+
+    assert adoption.fence() == transaction.finish(clean=False)
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
