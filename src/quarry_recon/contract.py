@@ -607,6 +607,101 @@ def stream_to_file(r, dest, *, chunk: int = 1024 * 1024, deadline_s: float = 300
     return written, digest.hexdigest()
 
 
+def stream_to_fd(r, writer_fd: int, *, budget_path, chunk: int = 1024 * 1024,
+                 deadline_s: float = 300.0,
+                 governor: "DiskGovernor | None" = None) -> "tuple[int, str]":
+    """Stream into a repository-owned unpublished descriptor.
+
+    This is the managed counterpart to :func:`stream_to_file`: it never creates,
+    renames, publishes or retains an ambient path.  The caller owns terminal
+    publication/fencing and the descriptor lifetime.  Ordinary incompleteness
+    carries exact prefix bytes and digest; cancellation remains a ``BaseException``
+    so the repository transaction can fence before propagating it.
+    """
+    import time as _time
+
+    if type(writer_fd) is not int or writer_fd < 0:
+        raise TypeError("managed acquisition writer must be an open descriptor")
+    gov = governor if governor is not None else default_governor()
+    digest = _hashlib.sha256()
+    written = granted_total = 0
+    active = b""
+    active_offset = 0
+    end = _time.monotonic() + deadline_s if deadline_s and deadline_s > 0 else None
+    primary = None
+    try:
+        while True:
+            if end is not None and _time.monotonic() > end:
+                raise TimeoutError(f"still receiving after {deadline_s:g}s")
+            active = r.read(chunk)
+            active_offset = 0
+            if not active:
+                break
+            granted, layer = gov.take(budget_path, written, len(active))
+            granted_total += granted
+            while active_offset < granted:
+                try:
+                    landed = _os.write(writer_fd, active[active_offset:granted])
+                except InterruptedError:
+                    continue
+                if landed <= 0:
+                    raise OSError("managed acquisition write made no progress")
+                digest.update(active[active_offset:active_offset + landed])
+                active_offset += landed
+                written += landed
+                gov.commit(landed)
+            if granted < len(active):
+                raise AcquisitionTruncated(
+                    f"acquisition stopped at the {layer} policy after {written} byte(s)",
+                    bytes_written=written, partial=None, limit_kind=layer,
+                    limit_bytes=getattr(gov, _LAYER_CAP_ATTR[layer], 0),
+                )
+        _os.fsync(writer_fd)
+    except (KeyboardInterrupt, SystemExit) as exc:
+        primary = exc
+        raise
+    except IncompleteAcquisition as exc:
+        primary = exc
+        raise
+    except Exception as exc:
+        primary = IncompleteAcquisition(
+            f"response incomplete after {written} byte(s): {exc}",
+            bytes_written=written, partial=None,
+        )
+        raise primary from exc
+    finally:
+        # Account for a syscall wrapper that reports an exception after bytes
+        # landed.  The offered prefix is known even though the descriptor is
+        # intentionally write-only.
+        cleanup_errors = []
+        try:
+            on_disk = _os.fstat(writer_fd).st_size
+        except OSError as exc:
+            on_disk = written
+            cleanup_errors.append(exc)
+        extra = max(0, on_disk - written)
+        if extra:
+            digest.update(active[active_offset:active_offset + extra])
+            written += extra
+            try:
+                gov.commit(extra)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        try:
+            gov.settle(granted_total, written)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        current = primary or _sys.exc_info()[1]
+        if isinstance(current, (IncompleteAcquisition, KeyboardInterrupt, SystemExit)):
+            current.bytes_written = written
+            current.sha256 = digest.hexdigest()
+            if cleanup_errors:
+                current.acquisition_cleanup_errors = tuple(cleanup_errors)
+        elif cleanup_errors:
+            raise cleanup_errors[0]
+    return written, digest.hexdigest()
+
+
 class ResponseTooLarge(ValueError):
     """A response longer than the caller's read bound. Its class is OURS, never the provider's."""
 
