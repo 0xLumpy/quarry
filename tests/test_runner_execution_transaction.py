@@ -323,11 +323,12 @@ def test_execution_go_is_exactly_ordered_and_streams_own_stage_descriptors(
     assert events.index("StartedFrame") < events.index("stream_settled")
     assert events.index("stream_settled") < events.index("WorkerSettlement")
 
-    assert launcher.release_calls[0][0] is request
+    assert launcher.release_calls[0][0] == request
     assert launcher.reap_calls == 0
     assert len(stream_calls) == 1
     stream_request, stream_launcher, kwargs = stream_calls[0]
-    assert stream_request is request and stream_launcher is launcher
+    assert stream_request is launcher.release_calls[0][0]
+    assert stream_request == request and stream_launcher is launcher
     assert kwargs["stdin_data"] == DATA
     assert kwargs["stdin_file_fd"] is None
     assert kwargs["stdout_stage_fd"] == 81
