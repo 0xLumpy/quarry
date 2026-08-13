@@ -6,14 +6,16 @@ CNAME/takeover signal, and probes those that resolve — the same treatment vert
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import json as _json
 
 from .. import normalize, policy
 from .. import settings
-from ..runner import (RunResult, Status, fresh_artifact_dir, have, nuclei_timeout, reclassify_from_files,
-                      run as exec_tool, scaled_timeout, skipped)
+from ..runner import (RunResult, Status, have, native_output_current, nuclei_timeout,
+                      reclassify_from_files, run as exec_tool, scaled_timeout, skipped)
+from ..runner_native import RepositoryNativeOutput
 from ..runner_repository import RepositoryOutput
 from .. import budget, events, remainder, sweep
 from ..contract import registered
@@ -462,13 +464,17 @@ def run(ctx) -> None:
                 wcmd = ["nuclei", "-l", str(wi), "-tags", "waf", "-jsonl", "-o", str(wo)]
                 if prof.http_rl:
                     wcmd += ["-rl", str(prof.http_rl)]
-                ctx.run.record("enrich", exec_tool(
+                wr = exec_tool(
                     "nuclei", wcmd,
                     repository=ctx.run,
                     stdout=RepositoryOutput.discard(),
                     stderr=RepositoryOutput.discard(),
-                    timeout=nuclei_timeout(len(new_live), ctx.http_timeout)))
-                if wo.exists():
+                    native_outputs=(RepositoryNativeOutput.file(
+                        7, *wo.relative_to(ctx.run.dir).parts, required=False,
+                    ),),
+                    timeout=nuclei_timeout(len(new_live), ctx.http_timeout))
+                ctx.run.record("enrich", wr)
+                if native_output_current(wr, wo) and wo.exists():
                     for line in wo.read_text().splitlines():
                         try:
                             o = _json.loads(line)
@@ -482,7 +488,9 @@ def run(ctx) -> None:
 
             if prof.screenshots and have("gowitness"):  # screenshots
                 lf = ctx.write_list("enrich_live.txt", new_live)
-                shot_dir = fresh_artifact_dir(ctx.run.dir / "raw" / "enrich" / "gowitness")
+                shot_dir = ctx.run.raw_path(
+                    "enrich", "gowitness", f"attempt-{os.urandom(16).hex()}",
+                )
                 gr = exec_tool("gowitness",
                     ["gowitness", "scan", "file", "-f", str(lf),
                      "--screenshot-path", str(shot_dir), "--write-jsonl",
@@ -490,26 +498,36 @@ def run(ctx) -> None:
                     repository=ctx.run,
                     stdout=RepositoryOutput.discard(),
                     stderr=RepositoryOutput.discard(),
+                    native_outputs=(RepositoryNativeOutput.tree(
+                        ((6, ()), (9, ("gowitness.jsonl",))),
+                        *shot_dir.relative_to(ctx.run.dir).parts,
+                    ),),
                     timeout=ctx.http_timeout)
                 # same reclassification as probe; count this attempt's dir only, so a reused/
                 # pre-populated dir cannot inflate the count (the dir is fresh per invocation)
-                shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
+                current = native_output_current(gr, shot_dir)
+                shots = (len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
+                         if current else 0)
                 reclassify_from_files(gr, shots, "screenshot")
                 ctx.run.record("enrich", gr)
-                for ext in ("*.jpeg", "*.png"):
-                    for img in shot_dir.glob(ext):
-                        ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
+                if current:
+                    for ext in ("*.jpeg", "*.png"):
+                        for img in shot_dir.glob(ext):
+                            ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
 
             if have("smap"):                            # passive (Shodan) ports — parse like probe
                 sm_targets = [normalize.host_of_url(u) for u in new_live]
                 si = ctx.write_list("enrich_smap.txt", sm_targets)
                 sm = ctx.run.raw_path("enrich", "smap", "smap.json")
-                sm.unlink(missing_ok=True)              # -o file: clear stale before the run
                 sr = exec_tool(
                     "smap", ["smap", "-iL", str(si), "-oJ", str(sm)],
                     repository=ctx.run,
                     stdout=RepositoryOutput.discard(),
-                    stderr=RepositoryOutput.discard(), timeout=600,
+                    stderr=RepositoryOutput.discard(),
+                    native_outputs=(RepositoryNativeOutput.file(
+                        4, *sm.relative_to(ctx.run.dir).parts, required=False,
+                    ),),
+                    timeout=600,
                 )
                 # parse + reclassify + ingest via the same shared helper probe uses (-oJ structured;
                 # status reflects yield), so enrich's passive port yield is not lost as raw-only.

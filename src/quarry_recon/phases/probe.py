@@ -8,6 +8,7 @@ optional smap passive (Shodan-backed) port scan.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass as _dataclass
 
 import json as _json
@@ -1685,16 +1686,19 @@ def _cdn_shared_ips(ctx, ips):
         return None                                          # cannot vet -> caller withholds SYN (httpx by name)
     ipf = ctx.write_list("cdncheck_ips.txt", ips)
     out = ctx.run.raw_path("probe", "cdncheck", "classified.jsonl")
-    out.unlink(missing_ok=True)                              # stale artifact must not influence this run's decision
     r = exec_tool(
         "cdncheck", ["cdncheck", "-i", str(ipf), "-jsonl", "-silent", "-duc", "-o", str(out)],
         repository=ctx.run,
         stdout=RepositoryOutput.discard(),
         stderr=RepositoryOutput.discard(),
+        native_outputs=(RepositoryNativeOutput.file(
+            7, *out.relative_to(ctx.run.dir).parts, required=False,
+        ),),
         timeout=scaled_timeout(len(ips), ctx.http_timeout, per_unit=0.02),
     )
     ctx.run.record("probe", r)
-    if r.status not in (Status.SUCCESS, Status.EMPTY) or not out.exists():
+    if (r.status not in (Status.SUCCESS, Status.EMPTY)
+            or not native_output_current(r, out) or not out.exists()):
         return None                                          # errored/truncated -> treat as un-vetted (no SYN)
     want = set(ips)
     try:
@@ -2117,7 +2121,8 @@ def _smap_ingest(ctx, r, sm, phase, targets):
     hostnames. smap is passive and cannot prove per-target completion, so returned/eligible is a visibility
     note, never forced to PARTIAL. Returns the in-scope port count.
     """
-    records, complete = _smap_records(sm)
+    records, complete = (_smap_records(sm) if native_output_current(r, sm)
+                         else (None, False))
     reclassify_from_artifact(r, None if records is None else sum(len(rp) for *_, rp in records), label="smap")
     if records is not None and not complete and r.status in (Status.SUCCESS, Status.EMPTY):
         r.status = Status.PARTIAL                            # malformed rows -> completion uncertain (valid kept)
@@ -2178,7 +2183,6 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
         return None
     ips_file = ctx.write_list(f"{phase}_webports_ips.txt", unique_ips)
     raw = ctx.run.raw_path(phase, "naabu-web", "open.json")
-    raw.unlink(missing_ok=True)                          # clear stale artifact: a prior run must not narrow this one
     cmd = ["naabu", "-list", str(ips_file), "-p", ",".join(str(p) for p in prof.ports),
            "-json", "-scan-type", "s", "-Pn", "-silent", "-o", str(raw)]   # SYN, no host-disco, web ports only
     if prof.portscan_rate:
@@ -2188,7 +2192,11 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
         "naabu", cmd,
         repository=ctx.run,
         stdout=RepositoryOutput.discard(),
-        stderr=RepositoryOutput.discard(), timeout=to,
+        stderr=RepositoryOutput.discard(),
+        native_outputs=(RepositoryNativeOutput.file(
+            11, *raw.relative_to(ctx.run.dir).parts, required=False,
+        ),),
+        timeout=to,
     )
     raw_status = res.status
     # naabu writes findings to the -o file. Parse fail-closed: any malformed row or out-of-profile
@@ -2197,7 +2205,7 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
     want_ports = set(prof.ports)
     open_by_ip: dict[str, set] = {}
     parse_ok = True
-    if raw.exists():
+    if native_output_current(res, raw) and raw.exists():
         try:
             raw_lines = raw.read_text().splitlines()
         except (OSError, UnicodeError):
@@ -2451,9 +2459,12 @@ def run(ctx) -> None:
                       repository=ctx.run,
                       stdout=RepositoryOutput.discard(),
                       stderr=RepositoryOutput.discard(),
+                      native_outputs=(RepositoryNativeOutput.file(
+                          7, *waf_out.relative_to(ctx.run.dir).parts, required=False,
+                      ),),
                       timeout=nuclei_timeout(ctx.run.count("live"), ctx.http_timeout))
         ctx.run.record("probe", r)
-        if waf_out.exists():
+        if native_output_current(r, waf_out) and waf_out.exists():
             n = 0
             for line in waf_out.read_text().splitlines():
                 try:
@@ -2471,11 +2482,14 @@ def run(ctx) -> None:
     # ── screenshots (write structured jsonl too for the asset DB) ──
     if prof.screenshots and ctx.run.count("live"):
         live_file = ctx.write_list("live.txt", ctx.run.values("live"))
-        shot_dir = fresh_artifact_dir(ctx.run.dir / "raw" / "probe" / "gowitness")   # FRESH per invocation
+        shot_dir = ctx.run.raw_path(
+            "probe", "gowitness", f"attempt-{os.urandom(16).hex()}",
+        )
         # gowitness writes to files, so the runner mislabels it BLOCKED on a stderr WAF line; reclassify from
         # shots in this attempt's fresh dir, inside the contract so the terminal event has the final status
         def _gw_reclassify(res):
-            shots = len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
+            shots = (len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
+                     if native_output_current(res, shot_dir) else 0)
             return reclassify_from_files(res, shots, "screenshot")
         # C10b resume: work_unit = the live-host set being screenshotted. A changed live set is a new unit.
         gw_wu = events.work_unit("probe.gowitness", inputs={"live": sorted(ctx.run.values("live"))})
@@ -2486,12 +2500,17 @@ def run(ctx) -> None:
                 repository=ctx.run,
                 stdout=RepositoryOutput.discard(),
                 stderr=RepositoryOutput.discard(),
+                native_outputs=(RepositoryNativeOutput.tree(
+                    ((6, ()), (9, ("gowitness.jsonl",))),
+                    *shot_dir.relative_to(ctx.run.dir).parts,
+                ),),
                 work_unit=gw_wu, reclassify=_gw_reclassify, timeout=ctx.http_timeout)
         ctx.run.record("probe", r)
-        for img in shot_dir.glob("*.jpeg"):
-            ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
-        for img in shot_dir.glob("*.png"):
-            ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
+        if native_output_current(r, shot_dir):
+            for img in shot_dir.glob("*.jpeg"):
+                ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
+            for img in shot_dir.glob("*.png"):
+                ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
 
     # ── ports: naabu (in-scope CIDR) → nmap -sV service detection ──
     if prof.portscan and prof.cidr:
@@ -2526,11 +2545,11 @@ def run(ctx) -> None:
             for gi, (ptup, ips) in enumerate(sorted(groups.items())):
                 g_ips = ctx.write_list(f"nmap_ips_{gi}.txt", sorted(ips))
                 nm = ctx.run.raw_path("probe", "nmap", f"service_{gi}.xml")
-                nm.unlink(missing_ok=True)                   # -oX file: clear stale before the run
                 # reclassify (status-only) inside the contract so the terminal event has the final
                 # nmap status; re-read below for ingest. work_unit = this port-group's ports + its IP set.
                 def _nmap_reclassify(res, xml=nm):
-                    svcs, complete = _nmap_services(xml)
+                    svcs, complete = (_nmap_services(xml) if native_output_current(res, xml)
+                                      else (None, False))
                     reclassify_from_artifact(res, None if svcs is None else len(svcs), label="nmap")
                     if svcs is not None and not complete and res.status in (Status.SUCCESS, Status.EMPTY):
                         res.status = Status.PARTIAL          # malformed rows / no clean finish -> uncertain (valid kept)
@@ -2544,10 +2563,14 @@ def run(ctx) -> None:
                                   repository=ctx.run,
                                   stdout=RepositoryOutput.discard(),
                                   stderr=RepositoryOutput.discard(),
+                                  native_outputs=(RepositoryNativeOutput.file(
+                                      9, *nm.relative_to(ctx.run.dir).parts,
+                                  ),),
                                   work_unit=wu, reclassify=_nmap_reclassify,
                                   timeout=scaled_timeout(len(ips) * len(ptup), ctx.http_timeout, per_unit=30))
                 ctx.run.record("probe", nr)
-                svcs, _ = _nmap_services(nm)                 # re-read for ingest (status already set)
+                svcs, _ = (_nmap_services(nm) if native_output_current(nr, nm)
+                           else (None, False))                # re-read authenticated current output
                 for sip, sport, proto, service, product, version in (svcs or []):
                     # naabu OBSERVED the open port (triggering nmap); nmap ENRICHED it — carry both sources.
                     ctx.run.add("port", {"id": f"{sip}:{sport}", "ip": sip, "port": sport, "proto": proto,
@@ -2567,14 +2590,17 @@ def run(ctx) -> None:
         sm_targets = [normalize.host_of_url(u) for u in ctx.run.values("live")]
         sm_in = ctx.write_list("smap_targets.txt", sm_targets)
         sm = ctx.run.raw_path("probe", "smap", "smap.json")
-        sm.unlink(missing_ok=True)                          # -o file: clear stale before the run
         # -oJ structured output (verified schema) instead of scraping nmap-text; parse + reclassify + ingest
         # via the shared helper (raw-only recording dropped the passive port yield)
         r = exec_tool(
             "smap", ["smap", "-iL", str(sm_in), "-oJ", str(sm)],
             repository=ctx.run,
             stdout=RepositoryOutput.discard(),
-            stderr=RepositoryOutput.discard(), timeout=600,
+            stderr=RepositoryOutput.discard(),
+            native_outputs=(RepositoryNativeOutput.file(
+                4, *sm.relative_to(ctx.run.dir).parts, required=False,
+            ),),
+            timeout=600,
         )
         smn = _smap_ingest(ctx, r, sm, "probe", sm_targets)
         if smn:
