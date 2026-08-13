@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from quarry_recon import runner_ipc
+from quarry_recon import runner_containment as containment
 from quarry_recon import runner_protocol as protocol
 from quarry_recon import runner_supervisor as supervisor
 
@@ -25,6 +26,12 @@ FAKE_PID = 42001
 FAKE_LAUNCHER_PID = 42002
 PREPARED_ABORT_ENV = "QUARRY_RUNNER_PREPARED_ABORT"
 SECRET_VALUES = ("secret-tool", "secret-target", "environment-secret")
+
+
+@pytest.fixture(autouse=True)
+def _acquire_fake_direct_containment(fake_direct_containment):
+    """Keep parent-side protocol tests independent of host cgroup delegation."""
+    return fake_direct_containment
 
 
 @pytest.fixture(autouse=True)
@@ -474,6 +481,216 @@ def test_prelaunch_abort_of_staged_request_transfers_no_stage_authority(
         assert secret not in rendered
 
 
+def test_parent_acquires_binds_then_commands_exact_direct_containment(
+    monkeypatch, fake_direct_containment,
+):
+    request = _request()
+    fake_direct_containment.containment_id = "direct/parent-owned-leaf"
+    proof_box = []
+
+    def authenticate(pid, parent):
+        proof = SimpleNamespace(
+            process=SimpleNamespace(pid=pid), parent=parent, state="T",
+        )
+        proof_box.append(proof)
+        return proof
+
+    def peer(command_fd, control_fd):
+        decoded = protocol.decode_request(runner_ipc.read_frame(
+            command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
+        ))
+        prepared = _prepared(
+            decoded,
+            containment_kind=fake_direct_containment.kind,
+            containment_id=fake_direct_containment.containment_id,
+        )
+        runner_ipc.write_all(
+            control_fd,
+            protocol.encode_ready(_ready(decoded))
+            + protocol.encode_prepared(prepared),
+        )
+        _read_prepared_abort(command_fd, decoded, prepared)
+        fake_direct_containment.events.append(("command_observed", None))
+        runner_ipc.write_all(
+            control_fd, protocol.encode_settlement(_settlement(decoded)),
+        )
+        return 0
+
+    monkeypatch.setattr(
+        supervisor, "capture_parked_process_identity", authenticate,
+    )
+
+    def factory(_argv, **_kwargs):
+        fake_direct_containment.events.append(("spawn", None))
+        return _PipeChild(peer)
+
+    monkeypatch.setattr(
+        supervisor,
+        "capture_process_identity",
+        lambda pid: SimpleNamespace(pid=pid, start_time_ticks=123456),
+    )
+    outcome = supervisor.bootstrap_worker(
+        request, deadline=time.monotonic() + 2, popen_factory=factory,
+    )
+
+    handle = fake_direct_containment.handle
+    assert outcome.reason is supervisor.BootstrapReason.ABORTED
+    assert fake_direct_containment.acquire_calls == [request.request_id]
+    assert [event for event, _value in fake_direct_containment.events] == [
+        "acquire", "spawn", "bind", "command_observed", "settle",
+    ]
+    assert len(proof_box) == 1
+    assert handle.bind_proofs == [proof_box[0]]
+    assert handle.kind is protocol.ContainmentKind.CGROUP_V2
+    assert handle.containment_id == "direct/parent-owned-leaf"
+    assert len(handle.settlement_deadlines) == 1
+    assert handle.terminal is True
+
+
+def test_direct_containment_acquisition_failure_has_zero_spawn_side_effect(
+    fake_direct_containment,
+):
+    fake_direct_containment.acquire_exception = containment.ContainmentUnsupported(
+        containment.ContainmentReason.CGROUP_V2_MOUNT_MISSING,
+    )
+    spawn_calls = []
+    outcome = supervisor.bootstrap_worker(
+        _request(), deadline=time.monotonic() + 1,
+        popen_factory=lambda *args, **kwargs: spawn_calls.append((args, kwargs)),
+    )
+
+    assert fake_direct_containment.acquire_calls == [RID]
+    assert fake_direct_containment.handles == []
+    assert spawn_calls == []
+    assert outcome.reason is not supervisor.BootstrapReason.ABORTED
+    assert not outcome.worker_spawned
+    assert not outcome.transaction_complete
+
+
+@pytest.mark.parametrize("mode", ["unverified", "error"])
+def test_parent_never_commands_when_exact_parked_binding_fails(
+    monkeypatch, fake_direct_containment, mode,
+):
+    if mode == "unverified":
+        fake_direct_containment.bind_result = containment.MembershipVerification(
+            False, containment.ContainmentReason.PROCESS_CGROUP_MISMATCH,
+        )
+    else:
+        fake_direct_containment.bind_exception = containment.ContainmentFailure(
+            containment.ContainmentReason.BINDING_WRITE_FAILED,
+        )
+
+    outcome = _run_unauthorized_peer(
+        monkeypatch,
+        lambda request: (
+            protocol.encode_ready(_ready(request))
+            + protocol.encode_prepared(_prepared(request))
+        ),
+    )
+
+    handle = fake_direct_containment.handle
+    assert len(handle.bind_proofs) == 1
+    assert not outcome.transaction_complete
+    assert outcome.reason is not supervisor.BootstrapReason.ABORTED
+    assert outcome.abort_command_sent is False
+    assert len(handle.settlement_deadlines) == 1
+    assert handle.terminal is True
+
+
+def test_binding_cancellation_sends_no_command_and_settles_containment(
+    monkeypatch, fake_direct_containment,
+):
+    cancellation = KeyboardInterrupt("cancel exact parked binding")
+    fake_direct_containment.bind_exception = cancellation
+    observed = []
+    command_read_finished = threading.Event()
+
+    def peer(command_fd, control_fd):
+        request = protocol.decode_request(runner_ipc.read_frame(
+            command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
+        ))
+        runner_ipc.write_all(
+            control_fd,
+            protocol.encode_ready(_ready(request))
+            + protocol.encode_prepared(_prepared(request)),
+        )
+        os.close(control_fd)
+        try:
+            observed.append(os.read(command_fd, 1))
+        except OSError:
+            observed.append(None)
+        finally:
+            command_read_finished.set()
+        return 0
+
+    monkeypatch.setattr(
+        supervisor,
+        "capture_process_identity",
+        lambda pid: SimpleNamespace(pid=pid, start_time_ticks=123456),
+    )
+
+    def factory(_argv, **_kwargs):
+        return _PipeChild(
+            peer, kill_hook=lambda: command_read_finished.wait(1),
+        )
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        supervisor.bootstrap_worker(
+            _request(), deadline=time.monotonic() + 2, popen_factory=factory,
+        )
+
+    handle = fake_direct_containment.handle
+    assert caught.value is cancellation
+    assert command_read_finished.wait(1)
+    assert observed == [b""]
+    assert len(handle.bind_proofs) == 1
+    assert len(handle.settlement_deadlines) == 1
+    assert handle.terminal is True
+
+
+@pytest.mark.parametrize("mode", ["unsettled", "error"])
+def test_containment_settlement_must_be_exact_before_aborted_outcome(
+    monkeypatch, fake_direct_containment, mode,
+):
+    if mode == "unsettled":
+        fake_direct_containment.settlement_result = containment.ContainmentSettlement(
+            True, False, False, containment.ContainmentReason.DEADLINE_EXPIRED,
+        )
+    else:
+        fake_direct_containment.settlement_exception = (
+            containment.ContainmentFailure(
+                containment.ContainmentReason.KILL_FAILED,
+            )
+        )
+
+    outcome = supervisor.bootstrap_worker(
+        _request(), deadline=time.monotonic() + 2,
+        popen_factory=_factory(monkeypatch, _honest_abort_peer, []),
+    )
+
+    handle = fake_direct_containment.handle
+    assert outcome.abort_command_sent is True
+    assert outcome.worker_reaped
+    assert outcome.reason is not supervisor.BootstrapReason.ABORTED
+    assert not outcome.transaction_complete
+    assert len(handle.settlement_deadlines) == 1
+    assert handle.terminal is False
+
+
+def test_containment_settlement_uses_trusted_real_monotonic_deadline(
+    monkeypatch, fake_direct_containment,
+):
+    monkeypatch.setattr(supervisor, "_REAL_MONOTONIC", lambda: 1000.0)
+    outcome = supervisor.bootstrap_worker(
+        _request(), deadline=150.0, clock=lambda: 100.0,
+        popen_factory=_factory(monkeypatch, _honest_abort_peer, []),
+    )
+
+    assert outcome.reason is supervisor.BootstrapReason.ABORTED
+    assert fake_direct_containment.handle.settlement_deadlines == [1050.0]
+    assert fake_direct_containment.handle.terminal is True
+
+
 def test_ready_without_prepared_never_authorizes_parent_command(monkeypatch):
     outcome = _run_unauthorized_peer(
         monkeypatch,
@@ -496,7 +713,7 @@ def test_ready_without_prepared_never_authorizes_parent_command(monkeypatch):
     ),
 )
 def test_untrusted_prepared_intent_never_authorizes_parent_command(
-    monkeypatch, change,
+    monkeypatch, fake_direct_containment, change,
 ):
     monkeypatch.setattr(
         supervisor,
@@ -513,6 +730,7 @@ def test_untrusted_prepared_intent_never_authorizes_parent_command(
         ),
     )
     assert outcome.reason is supervisor.BootstrapReason.CONTROL_FAILED
+    assert fake_direct_containment.handle.bind_proofs == []
 
 
 @pytest.mark.parametrize("proof_change", [
@@ -907,7 +1125,7 @@ def test_expiry_during_pre_spawn_preparation_has_no_popen_side_effect():
 
 
 def test_cancellation_after_selector_allocation_closes_once_without_spawn(
-    monkeypatch,
+    monkeypatch, fake_direct_containment,
 ):
     original_selector = supervisor.selectors.DefaultSelector
     selector_box = []
@@ -958,13 +1176,17 @@ def test_cancellation_after_selector_allocation_closes_once_without_spawn(
         assert len(injected) == 1
         assert selector_box[0].close_calls == 1
         assert spawn_calls == []
+        assert len(fake_direct_containment.handle.settlement_deadlines) == 1
+        assert fake_direct_containment.handle.terminal is True
     finally:
         sys.settrace(previous_trace)
         if selector_box and selector_box[0].close_calls == 0:
             selector_box[0].inner.close()
 
 
-def test_spawn_failure_is_typed_and_does_not_render_secrets():
+def test_spawn_failure_is_typed_and_settles_direct_containment(
+    fake_direct_containment,
+):
     def refuse(*args, **kwargs):
         raise OSError("environment-secret")
 
@@ -973,6 +1195,8 @@ def test_spawn_failure_is_typed_and_does_not_render_secrets():
     )
     assert outcome.reason is supervisor.BootstrapReason.SPAWN_FAILED
     assert not outcome.transaction_complete
+    assert len(fake_direct_containment.handle.settlement_deadlines) == 1
+    assert fake_direct_containment.handle.terminal is True
     for secret in SECRET_VALUES:
         assert secret not in repr(outcome)
 

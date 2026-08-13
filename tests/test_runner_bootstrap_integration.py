@@ -15,6 +15,12 @@ from quarry_recon import runner_supervisor as supervisor
 pytestmark = pytest.mark.integration
 
 
+@pytest.fixture(autouse=True)
+def _acquire_fake_direct_containment(fake_direct_containment):
+    """Use a fake cgroup handle while retaining the real worker/launcher pair."""
+    return fake_direct_containment
+
+
 def test_real_fixed_worker_completes_authenticated_prelaunch_abort(monkeypatch):
     request = protocol.normalize_invocation(
         request_id="91" * 16,
@@ -52,7 +58,9 @@ def test_real_fixed_worker_completes_authenticated_prelaunch_abort(monkeypatch):
     assert "environment-sentinel" not in rendered
 
 
-def test_default_popen_constructor_cancellation_reaps_spawned_child(monkeypatch):
+def test_default_popen_constructor_cancellation_reaps_spawned_child(
+    monkeypatch, fake_direct_containment,
+):
     if sys.platform != "linux":
         pytest.skip("fixed worker bootstrap is Linux-only")
 
@@ -88,6 +96,8 @@ def test_default_popen_constructor_cancellation_reaps_spawned_child(monkeypatch)
         assert child.stdin is not None and child.stdin.closed
         assert child.stdout is not None and child.stdout.closed
         assert child.returncode is not None
+        assert len(fake_direct_containment.handle.settlement_deadlines) == 1
+        assert fake_direct_containment.handle.terminal is True
         if os.path.isdir("/proc"):
             assert not os.path.exists(f"/proc/{child.pid}")
     finally:

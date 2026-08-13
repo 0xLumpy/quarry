@@ -23,6 +23,87 @@ import subprocess
 import pytest
 
 
+class FakeDirectContainment:
+    """A parent-owned direct-containment handle for supervisor tests."""
+
+    def __init__(self, controller, request_id):
+        self._controller = controller
+        self.request_id = request_id
+        self.kind = controller.kind
+        self.containment_id = (
+            controller.containment_id
+            if controller.containment_id is not None
+            else f"direct/quarry-{request_id}"
+        )
+        self.bind_proofs = []
+        self.settlement_deadlines = []
+        self.terminal = False
+
+    def bind_parked_process(self, proof):
+        from quarry_recon import runner_containment as containment
+
+        self.bind_proofs.append(proof)
+        self._controller.events.append(("bind", proof))
+        if self._controller.bind_exception is not None:
+            raise self._controller.bind_exception
+        result = self._controller.bind_result
+        if result is None:
+            result = containment.MembershipVerification(
+                True, containment.ContainmentReason.VERIFIED,
+            )
+        return result
+
+    def kill_settle_remove(self, deadline):
+        from quarry_recon import runner_containment as containment
+
+        self.settlement_deadlines.append(deadline)
+        self._controller.events.append(("settle", deadline))
+        if self._controller.settlement_exception is not None:
+            raise self._controller.settlement_exception
+        result = self._controller.settlement_result
+        if result is None:
+            result = containment.ContainmentSettlement(
+                True, True, True, containment.ContainmentReason.SETTLED,
+            )
+        self.terminal = (
+            result.reason is containment.ContainmentReason.SETTLED
+            and result.cooperative_settled
+        )
+        return result
+
+
+class FakeDirectContainmentFactory:
+    """Configurable acquisition seam with durable call-order observations."""
+
+    def __init__(self):
+        from quarry_recon import runner_protocol as protocol
+
+        self.kind = protocol.ContainmentKind.CGROUP_V2
+        self.containment_id = None
+        self.acquire_exception = None
+        self.bind_exception = None
+        self.bind_result = None
+        self.settlement_exception = None
+        self.settlement_result = None
+        self.acquire_calls = []
+        self.handles = []
+        self.events = []
+
+    def __call__(self, request_id):
+        self.acquire_calls.append(request_id)
+        self.events.append(("acquire", request_id))
+        if self.acquire_exception is not None:
+            raise self.acquire_exception
+        handle = FakeDirectContainment(self, request_id)
+        self.handles.append(handle)
+        return handle
+
+    @property
+    def handle(self):
+        assert self.handles, "direct containment was not acquired"
+        return self.handles[-1]
+
+
 class NetworkDenied(RuntimeError):
     """Raised when an offline test attempts a real network connection or spawns a subprocess."""
 
@@ -106,6 +187,18 @@ def profile(tmp_path):
         return TargetProfile.load(p)
 
     return _make
+
+
+@pytest.fixture
+def fake_direct_containment(monkeypatch):
+    """Replace supervisor acquisition with a fresh typed direct handle."""
+    from quarry_recon import runner_supervisor as supervisor
+
+    factory = FakeDirectContainmentFactory()
+    monkeypatch.setattr(
+        supervisor, "acquire_direct_cgroup_v2", factory, raising=False,
+    )
+    return factory
 
 
 @pytest.fixture(autouse=True)
