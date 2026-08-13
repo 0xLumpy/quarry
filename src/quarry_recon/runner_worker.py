@@ -21,6 +21,7 @@ from . import runner_ipc
 from .runner_protocol import (
     MAX_FRAME_BYTES,
     MAX_PID,
+    MAX_STDIN_DATA_BYTES,
     ContainmentKind,
     ExecutionTerminal,
     PreparedFrame,
@@ -153,6 +154,32 @@ def _validate_output_fds(
             or any(fd in (request_fd, control_fd, 0, 1, 2) for fd in values)):
         raise _metadata_failure()
     return stdout_fd, stderr_fd
+
+
+def _validate_execution_fds(
+    request,
+    stdout_fd: int | None,
+    stderr_fd: int | None,
+    stdin_file_fd: int | None,
+    *,
+    request_fd: int,
+    control_fd: int,
+) -> tuple[int | None, int | None, int | None]:
+    expected_stdout = request.claim_for(StreamRole.STDOUT) is not None
+    expected_stderr = request.claim_for(StreamRole.STDERR) is not None
+    expected_stdin = request.stdin_mode is StdinMode.FILE
+    if (expected_stdout != (stdout_fd is not None)
+            or expected_stderr != (stderr_fd is not None)
+            or expected_stdin != (stdin_file_fd is not None)):
+        raise _metadata_failure()
+    values = tuple(
+        fd for fd in (stdin_file_fd, stdout_fd, stderr_fd) if fd is not None
+    )
+    if (any(type(fd) is not int or not 3 <= fd <= MAX_PID for fd in values)
+            or len(values) != len(set(values))
+            or any(fd in (request_fd, control_fd, 0, 1, 2) for fd in values)):
+        raise _metadata_failure()
+    return stdout_fd, stderr_fd, stdin_file_fd
 
 
 def _fd_identity(fd: int) -> tuple[int, int]:
@@ -1134,10 +1161,15 @@ def _run_execution_transaction(
         request = decode_request(runner_ipc.read_frame(
             request_fd, max_frame_bytes=MAX_FRAME_BYTES,
         ))
-        _validate_output_fds(
-            request, stdout_fd, stderr_fd,
+        _validate_execution_fds(
+            request, stdout_fd, stderr_fd, stdin_file_fd,
             request_fd=request_fd, control_fd=control_fd,
         )
+        if request.stdin_mode is StdinMode.DATA and stdin_data is None:
+            stdin_data = runner_ipc.read_payload(
+                request_fd, request.stdin_bytes,
+                max_payload_bytes=MAX_STDIN_DATA_BYTES,
+            )
         if not _stdin_payload_valid(request, stdin_data, stdin_file_fd):
             raise _metadata_failure()
     except BaseException as primary:

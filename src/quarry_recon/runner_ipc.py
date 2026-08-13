@@ -78,6 +78,15 @@ def read_frame(fd: int, *, max_frame_bytes: int) -> bytes:
     return header + _read_exact(fd, declared)
 
 
+def read_payload(fd: int, size: int, *, max_payload_bytes: int) -> bytes:
+    """Read one exact bounded raw segment between framed protocol records."""
+    fd = _validate_fd(fd)
+    limit = _validate_limit(max_payload_bytes)
+    if type(size) is not int or not 0 <= size <= limit:
+        raise IpcError("invalid_limit")
+    return _read_exact(fd, size)
+
+
 def require_eof(fd: int) -> None:
     """Require the peer to close without even one trailing channel byte."""
     fd = _validate_fd(fd)
