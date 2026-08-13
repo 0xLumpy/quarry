@@ -1409,6 +1409,61 @@ def _finish_native_outputs(transaction, adoption, *, clean: bool):
         return receipt, _preferred_native_fault(primary, recovery)
 
 
+class _NativeFacadeOwner:
+    """Stable native-output authority shared by nested caller fences.
+
+    Preparation adopts its raw filesystem owner and completed transaction into
+    ``adoption`` before returning.  Keeping that adoption object outside both
+    context layers means a cancellation at a prepare/handler/cleanup call line
+    cannot discard the only cleanup authority.
+    """
+
+    __slots__ = ("adoption", "transaction", "receipt", "cleanup_fault")
+
+    def __init__(self, adoption) -> None:
+        self.adoption = adoption
+        self.transaction = None
+        self.receipt = None
+        self.cleanup_fault = None
+
+    def reconcile(self):
+        receipt, fault = _fence_native_adoption(self.adoption)
+        if self.receipt is None and receipt is not None:
+            self.receipt = receipt
+        self.cleanup_fault = _preferred_native_fault(
+            self.cleanup_fault, fault,
+        )
+        return fault
+
+
+class _NativeFacadeFence:
+    """One recovery layer over a shared native facade owner.
+
+    Two layers are installed before preparation.  If the sole cooperative
+    cancellation interrupts the inner layer's cleanup entry, the already-active
+    outer layer repeats the idempotent adoption fence before propagating it.
+    """
+
+    __slots__ = ("owner",)
+
+    def __init__(self, owner: _NativeFacadeOwner) -> None:
+        self.owner = owner
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _kind, primary, _traceback) -> bool:
+        cleanup = self.owner.reconcile()
+        preferred = _preferred_native_fault(primary, cleanup)
+        if preferred is not None and not isinstance(preferred, Exception):
+            if primary is not None and preferred is not primary:
+                raise preferred from primary
+            raise preferred
+        if primary is None and cleanup is not None:
+            raise cleanup
+        return False
+
+
 def _native_execution_clean(outcome, request) -> bool:
     """Whether process settlement, containment and accepted exit are clean."""
     from .runner_protocol import ExecutionTerminal
@@ -1462,17 +1517,26 @@ def _run_with_repository(
     from .osint import OsintSession
 
     safe_cmd, argv_error = _preflight_argv(cmd)
-    if argv_error is not None:
-        return _preflight_failure(tool, safe_cmd, argv_error)
+    native_declared = type(native_outputs) is not tuple or bool(native_outputs)
 
-    def preflight_failure(detail: str) -> RunResult:
-        failed = _preflight_failure(tool, safe_cmd, detail)
-        if type(native_outputs) is tuple and native_outputs:
+    def mark_native_preflight(failed: RunResult) -> RunResult:
+        if native_declared:
             _mark_native_outputs_unavailable(
-                failed, len(native_outputs), operation="validate",
+                failed,
+                len(native_outputs) if type(native_outputs) is tuple else 0,
+                operation="validate",
                 ownership_settled=True,
             )
         return failed
+
+    if argv_error is not None:
+        return mark_native_preflight(
+            _preflight_failure(tool, safe_cmd, argv_error)
+        )
+
+    def preflight_failure(detail: str) -> RunResult:
+        failed = _preflight_failure(tool, safe_cmd, detail)
+        return mark_native_preflight(failed)
 
     if type(repository) not in (store.Run, OsintSession):
         return preflight_failure("repository authority type is invalid")
@@ -1580,68 +1644,63 @@ def _run_with_repository(
             duration=time.monotonic() - started_at,
         )
 
-    adoption = runner_native.NativeOutputAdoption()
-    try:
-        transaction = runner_native.prepare_native_outputs(
-            repository, safe_cmd, native_outputs, adoption=adoption,
-        )
-    except BaseException as primary:
-        receipt, recovery = _fence_native_adoption(adoption)
-        fault = _preferred_native_fault(primary, recovery)
-        failed = machinery_failure(primary)
-        if receipt is not None:
-            _attach_native_output_receipt(failed, repository, receipt)
-        else:
-            _mark_native_outputs_unavailable(
-                failed, len(native_outputs), operation="cleanup",
-                fault_type=type(fault).__name__, ownership_settled=False,
-            )
-        if fault is not None and not isinstance(fault, Exception):
-            raise fault
-        return failed
-
+    owner = _NativeFacadeOwner(runner_native.NativeOutputAdoption())
     result = None
     operation_fault = None
     finish_fault = None
-    receipt = None
     try:
-        child_invocation = replace(
-            invocation,
-            worker=replace(invocation.worker, argv=transaction.rewritten_cmd),
-        )
-        outcome = supervise(child_invocation)
-        result = _repository_run_result(
-            tool,
-            safe_cmd,
-            outcome,
-            request=invocation.worker,
-            stdout=stdout,
-            stderr=stderr,
-            stdout_path=raw_path,
-            stderr_path=stderr_path,
-            duration=time.monotonic() - started_at,
-        )
-        receipt, finish_fault = _finish_native_outputs(
-            transaction, adoption,
-            clean=_native_execution_clean(outcome, invocation.worker),
-        )
+        with _NativeFacadeFence(owner):
+            with _NativeFacadeFence(owner):
+                owner.transaction = runner_native.prepare_native_outputs(
+                    repository, safe_cmd, native_outputs,
+                    adoption=owner.adoption,
+                )
+                child_invocation = replace(
+                    invocation,
+                    worker=replace(
+                        invocation.worker,
+                        argv=owner.transaction.rewritten_cmd,
+                    ),
+                )
+                outcome = supervise(child_invocation)
+                result = _repository_run_result(
+                    tool,
+                    safe_cmd,
+                    outcome,
+                    request=invocation.worker,
+                    stdout=stdout,
+                    stderr=stderr,
+                    stdout_path=raw_path,
+                    stderr_path=stderr_path,
+                    duration=time.monotonic() - started_at,
+                )
+                before_deadline = time.monotonic() < deadline
+                owner.receipt, finish_fault = _finish_native_outputs(
+                    owner.transaction,
+                    owner.adoption,
+                    clean=(
+                        before_deadline
+                        and _native_execution_clean(outcome, invocation.worker)
+                    ),
+                )
     except BaseException as exc:
         operation_fault = exc
-    finally:
-        recovered_receipt, recovery_fault = _fence_native_adoption(adoption)
-        if receipt is None:
-            receipt = recovered_receipt
 
+    receipt = owner.receipt
     fault = _preferred_native_fault(
-        operation_fault, finish_fault, recovery_fault,
+        operation_fault, finish_fault, owner.cleanup_fault,
     )
     if result is None:
-        failed = machinery_failure(fault or RuntimeError("native execution did not settle"))
+        failed = machinery_failure(
+            fault or RuntimeError("native execution did not settle")
+        )
         if receipt is not None:
             _attach_native_output_receipt(failed, repository, receipt)
         else:
             _mark_native_outputs_unavailable(
-                failed, len(native_outputs), operation="cleanup",
+                failed,
+                len(native_outputs),
+                operation="cleanup",
                 fault_type=None if fault is None else type(fault).__name__,
                 ownership_settled=False,
             )

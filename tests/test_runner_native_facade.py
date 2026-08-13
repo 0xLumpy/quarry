@@ -1,6 +1,7 @@
 """Public runner composition for repository-owned native argv outputs."""
 from __future__ import annotations
 
+import inspect
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,6 +52,13 @@ def _run_native(run, command, policy, **kwargs):
 def _attempt_directories(run: store.Run) -> list[Path]:
     root = run.project_dir / "recon" / "state" / "native-stages" / run.run_id
     return [] if not root.exists() else list(root.iterdir())
+
+
+def _source_line(function, fragment: str) -> int:
+    lines, first = inspect.getsourcelines(function)
+    matches = [first + index for index, line in enumerate(lines) if fragment in line]
+    assert len(matches) == 1
+    return matches[0]
 
 
 def _install_clean_execution(monkeypatch, original_command):
@@ -151,6 +159,24 @@ def test_missing_binary_refuses_before_native_prepare(tmp_path, monkeypatch):
     assert _attempt_directories(run) == []
 
 
+def test_invalid_argv_marks_preserved_native_final_noncurrent(tmp_path):
+    run = _running_run(tmp_path, "facade-invalid-argv")
+    final = run.dir / "raw" / "probe" / "fixture" / "native.txt"
+    final.parent.mkdir(parents=True)
+    final.write_text("prior")
+    policy = RepositoryNativeOutput.file(
+        2, "raw", "probe", "fixture", "native.txt",
+    )
+
+    result = _run_native(run, [sys.executable, "bad\0argv", str(final)], policy)
+
+    assert result.status is Status.FAILED and result.started is False
+    assert final.read_text() == "prior"
+    assert result.meta["native_outputs"]["clean"] is False
+    assert result.meta["native_output_ownership_settled"] is True
+    assert runner.native_output_current(result, final) is False
+
+
 @pytest.mark.parametrize(
     "exception_type", [RuntimeError, KeyboardInterrupt, SystemExit],
 )
@@ -177,6 +203,119 @@ def test_facade_fences_real_prepare_return_boundary(
         assert caught.value is primary
 
     assert not final.exists()
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_facade_fences_cancellation_after_prepare_assignment(
+    tmp_path, monkeypatch, interruption,
+):
+    run = _running_run(
+        tmp_path, f"facade-post-prepare-{interruption.__name__.lower()}",
+    )
+    final, command, policy = _file_invocation(run)
+    cancellation = interruption("fixture after native prepare assignment")
+    target = _source_line(runner._run_with_repository, "child_invocation = replace(")
+    fired = False
+
+    def trace(frame, event, _arg):
+        nonlocal fired
+        if (not fired and event == "line"
+                and frame.f_code is runner._run_with_repository.__code__
+                and frame.f_lineno == target):
+            fired = True
+            raise cancellation
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        with pytest.raises(interruption) as caught:
+            _run_native(run, command, policy)
+    finally:
+        sys.settrace(previous)
+
+    assert fired and caught.value is cancellation
+    assert not final.exists()
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
+
+
+@pytest.mark.parametrize(
+    "primary_site", ["prepare", "supervisor"],
+)
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_outer_facade_fence_recovers_inner_cleanup_entry_interruption(
+    tmp_path, monkeypatch, primary_site, interruption,
+):
+    run = _running_run(
+        tmp_path,
+        f"facade-inner-exit-{primary_site}-{interruption.__name__.lower()}",
+    )
+    final, command, policy = _file_invocation(run)
+    ordinary = RuntimeError(f"fixture ordinary {primary_site} primary")
+    cancellation = interruption("fixture inner facade cleanup entry")
+    if primary_site == "prepare":
+        real_prepare = runner_native.prepare_native_outputs
+
+        def prepare_then_fail(*args, **kwargs):
+            real_prepare(*args, **kwargs)
+            raise ordinary
+
+        monkeypatch.setattr(
+            runner_native, "prepare_native_outputs", prepare_then_fail,
+        )
+    else:
+        monkeypatch.setattr(
+            runner_repository,
+            "supervise_repository_execution",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ordinary),
+        )
+
+    target = _source_line(runner._NativeFacadeFence.__exit__, "cleanup =")
+    fired = False
+
+    def trace(frame, event, _arg):
+        nonlocal fired
+        if (not fired and event == "line"
+                and frame.f_code is runner._NativeFacadeFence.__exit__.__code__
+                and frame.f_lineno == target):
+            fired = True
+            raise cancellation
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        with pytest.raises(interruption) as caught:
+            _run_native(run, command, policy)
+    finally:
+        sys.settrace(previous)
+
+    assert fired and caught.value is cancellation
+    assert not final.exists()
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
+
+
+def test_facade_refuses_native_publication_after_shared_deadline(
+    tmp_path, monkeypatch,
+):
+    run = _running_run(tmp_path, "facade-native-deadline")
+    final, command, policy = _file_invocation(run)
+    _install_clean_execution(monkeypatch, command)
+    samples = iter((100.0, 126.0, 126.0))
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(samples))
+
+    result = _run_native(run, command, policy)
+
+    assert result.status is Status.PARTIAL
+    assert not final.exists()
+    assert result.meta["native_outputs"]["clean"] is False
+    assert result.meta["native_outputs"]["fault_operation"] == "execute"
+    assert result.meta["native_output_ownership_settled"] is True
+    assert runner.native_output_current(result, final) is False
     assert run._live_artifact_claim_count() == 0
     assert _attempt_directories(run) == []
 
