@@ -1069,20 +1069,6 @@ def _close_owned_descriptors_twice(
     return faults
 
 
-def _replay_settlement(operation) -> list[BaseException]:
-    """Run one idempotent settlement twice only when the first pass escaped."""
-    faults: list[BaseException] = []
-    try:
-        operation()
-    except BaseException as exc:
-        faults.append(exc)
-        try:
-            operation()
-        except BaseException as replay_exc:
-            faults.append(replay_exc)
-    return faults
-
-
 class _ArtifactMarkerRelease:
     """Persistent allocation and release ownership for one exact claim marker."""
 
@@ -1209,6 +1195,55 @@ class _ArtifactMarkerRelease:
             raise preferred
         if not self.released or self.marker.fd >= 0 or self.directory.fd >= 0:
             raise ContractError("artifact claim marker release did not settle")
+
+
+class _ArtifactClaimRegistryRead:
+    """Descriptor-owned, side-effect-free scan of one run's claim registry."""
+
+    __slots__ = ("run", "directory", "entry")
+
+    def __init__(self, run) -> None:
+        self.run = run
+        self.directory = _OwnedDescriptor()
+        self.entry = _OwnedDescriptor()
+
+    def read(self) -> int:
+        try:
+            self.directory.allocate(
+                lambda: os.open(self.run._artifact_claim_dir, _DIR_OPEN_FLAGS),
+            )
+        except FileNotFoundError:
+            return 0
+        count = 0
+        for name in os.listdir(self.directory.fd):
+            token = name[:-len(_CLAIM_SUFFIX)] if name.endswith(_CLAIM_SUFFIX) else ""
+            if (len(token) != 32
+                    or any(char not in "0123456789abcdef" for char in token)):
+                raise ContractError("artifact claim registry contains an unknown entry")
+            self.entry.allocate(
+                lambda name=name: os.open(
+                    name, _FILE_OPEN_FLAGS, dir_fd=self.directory.fd,
+                ),
+            )
+            observed = os.fstat(self.entry.fd)
+            if (not stat.S_ISREG(observed.st_mode)
+                    or observed.st_uid != os.geteuid()
+                    or observed.st_nlink != 1):
+                raise ContractError("artifact claim registry contains an unsafe entry")
+            faults = _close_owned_descriptors_twice((self.entry,))
+            preferred = _preferred_settlement_fault(None, faults)
+            if preferred is not None:
+                raise preferred
+            count += 1
+        return count
+
+    def settle(self) -> None:
+        faults = _close_owned_descriptors_twice((self.entry, self.directory))
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            raise preferred
+        if self.entry.fd >= 0 or self.directory.fd >= 0:
+            raise ContractError("artifact claim registry descriptors did not settle")
 
 
 class _SettlementOwner:
@@ -1443,7 +1478,6 @@ class _ArtifactClaim:
         self._settlement_faults: list[BaseException] = []
         self._state = "claimed"
 
-    @classmethod
     def __repr__(self) -> str:
         return f"ArtifactClaim(state={self._state!r})"
 
@@ -1911,94 +1945,32 @@ class Run:
 
     def _create_artifact_claim_marker(self) -> tuple[str, tuple[int, int]]:
         """Durably register one unique live owner while the run lock is held."""
-        from . import privfs
-        directory = privfs.private_dir(self._artifact_claim_dir)
-        directory_fd = os.open(directory, _DIR_OPEN_FLAGS)
-        name = f"{os.urandom(16).hex()}{_CLAIM_SUFFIX}"
-        fd = -1
-        try:
-            fd = os.open(
-                name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                | getattr(os, "O_CLOEXEC", 0),
-                privfs.FILE_MODE,
-                dir_fd=directory_fd,
-            )
-            os.fchmod(fd, privfs.FILE_MODE)
-            body = json.dumps({
-                "schema_version": 1,
-                "run_id": self.run_id,
-                "pid": os.getpid(),
-            }, sort_keys=True).encode("utf-8")
-            view = memoryview(body)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise OSError("artifact claim marker write made no progress")
-                view = view[written:]
-            os.fsync(fd)
-            observed = os.fstat(fd)
-            if (not stat.S_ISREG(observed.st_mode)
-                    or observed.st_uid != os.geteuid()
-                    or observed.st_nlink != 1
-                    or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE):
-                raise ContractError("artifact claim marker identity is unsafe")
-            os.fsync(directory_fd)
-            return name, (observed.st_dev, observed.st_ino)
-        except BaseException:
-            if fd >= 0:
-                try:
-                    os.unlink(name, dir_fd=directory_fd)
-                    os.fsync(directory_fd)
-                except OSError:
-                    pass
-            raise
-        finally:
-            if fd >= 0:
-                os.close(fd)
-            os.close(directory_fd)
+        marker = _ArtifactMarkerRelease(self)
+        settlement = _SettlementOwner(
+            lambda: marker.settle() if settlement.primary is not None else None,
+        )
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                return marker.allocate()
 
     def _release_artifact_claim_marker(
         self, name: str, expected_identity: tuple[int, int],
     ) -> None:
         """Idempotently release one exact marker and settle every owned fd."""
         release = _ArtifactMarkerRelease(self, name, expected_identity)
-        faults = _replay_settlement(release.settle)
-        preferred = _preferred_settlement_fault(None, faults)
-        if preferred is not None:
-            try:
-                preferred.close_errors = tuple(faults)
-            except BaseException:
-                pass
-            raise preferred
-        if not release.released:
-            raise ContractError("artifact claim marker release did not settle")
+        settlement = _SettlementOwner(release.settle)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                release.settle()
+                if not release.released:
+                    raise ContractError("artifact claim marker release did not settle")
 
     def _live_artifact_claim_count(self) -> int:
-        try:
-            directory_fd = os.open(self._artifact_claim_dir, _DIR_OPEN_FLAGS)
-        except FileNotFoundError:
-            return 0
-        try:
-            count = 0
-            for name in os.listdir(directory_fd):
-                token = name[:-len(_CLAIM_SUFFIX)] if name.endswith(_CLAIM_SUFFIX) else ""
-                if (len(token) != 32
-                        or any(char not in "0123456789abcdef" for char in token)):
-                    raise ContractError("artifact claim registry contains an unknown entry")
-                fd = os.open(name, _FILE_OPEN_FLAGS, dir_fd=directory_fd)
-                try:
-                    observed = os.fstat(fd)
-                    if (not stat.S_ISREG(observed.st_mode)
-                            or observed.st_uid != os.geteuid()
-                            or observed.st_nlink != 1):
-                        raise ContractError("artifact claim registry contains an unsafe entry")
-                finally:
-                    os.close(fd)
-                count += 1
-            return count
-        finally:
-            os.close(directory_fd)
+        registry = _ArtifactClaimRegistryRead(self)
+        settlement = _SettlementOwner(registry.settle)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                return registry.read()
 
     def _ensure_artifact_parent(self, components: tuple[str, ...]) -> None:
         from . import privfs

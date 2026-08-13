@@ -257,22 +257,35 @@ class _DurableRunClaim:
     """One durable claim marker whose release requires proven terminal ownership."""
 
     run: store.Run
-    name: str = field(repr=False)
-    identity: tuple[int, int] = field(repr=False)
+    marker: store._ArtifactMarkerRelease = field(repr=False)
     released: bool = False
 
     @classmethod
     def acquire(cls, run: store.Run) -> "_DurableRunClaim":
-        with run._mutation(store.MutationScope.BASE_EVIDENCE):
-            name, identity = run._create_artifact_claim_marker()
-        return cls(run, name, identity)
+        claim = cls(run, store._ArtifactMarkerRelease(run))
+        settlement = store._SettlementOwner(
+            lambda: claim._settle() if settlement.primary is not None else None,
+        )
+        with store._SettlementFence(settlement):
+            with store._SettlementFence(settlement):
+                with run._mutation(store.MutationScope.BASE_EVIDENCE):
+                    claim.marker.allocate()
+                return claim
 
-    def release(self) -> None:
+    def _settle(self) -> None:
         if self.released:
             return
         with self.run._mutation(store.MutationScope.CONTROL):
-            self.run._release_artifact_claim_marker(self.name, self.identity)
+            self.marker.settle()
+        if not self.marker.released:
+            raise ContractError("durable run claim marker remains live")
         self.released = True
+
+    def release(self) -> None:
+        settlement = store._SettlementOwner(self._settle)
+        with store._SettlementFence(settlement):
+            with store._SettlementFence(settlement):
+                self._settle()
 
 
 def _stage_cleanup_settled(stage: privfs.PrivateFileStage) -> bool:
@@ -438,42 +451,94 @@ def _validate_deadline_inputs(deadline, clock) -> None:
     _clock_now(clock)
 
 
-def _supervise_owned_execution(
+class _ExecutionClaimOwner:
+    """Mutable claim and release decision held by two outer settlement fences."""
+
+    __slots__ = (
+        "acquire_claim", "claim", "batch", "execution", "retain",
+        "prepared", "supervisor_started",
+    )
+
+    def __init__(self, acquire_claim) -> None:
+        self.acquire_claim = acquire_claim
+        self.claim = None
+        self.batch = None
+        self.execution = None
+        self.retain = False
+        self.prepared = False
+        self.supervisor_started = False
+
+    def acquire(self) -> None:
+        self.claim = self.acquire_claim()
+
+    def prepare(self, prepare_batch):
+        # Once preparation starts, retain the marker unless an exact terminal
+        # preparation failure or a later authenticated outcome proves ownership
+        # settled.  The batch is assigned directly into this stable owner.
+        try:
+            # Keep arming and the callback on one traced source line: a
+            # cancellation before it starts has no preparation owner, while a
+            # returned batch is adopted together with its phase transition.
+            self.retain = True; self.prepared, self.batch = True, prepare_batch()
+        except BaseException as preparation_error:
+            self.retain = self.retain and (
+                getattr(
+                    preparation_error,
+                    "repository_ownership_settled",
+                    False,
+                ) is not True
+            )
+            raise
+        return self.batch
+
+    def supervise(self, operation):
+        # As above, there is no traced gap between declaring the supervisor
+        # possibly active and entering it, nor after a returned outcome.
+        self.supervisor_started = True; self.execution = operation()
+        return self.execution
+
+    def settle(self) -> None:
+        if self.claim is None:
+            return
+        terminal = not self.retain
+        if self.prepared:
+            fence_fault = _fence_batch(self.batch)
+            if fence_fault is not None:
+                raise fence_fault
+            if not self.supervisor_started:
+                terminal = _batch_ownership_settled(self.batch)
+        if self.execution is not None:
+            terminal = _ownership_settled(self.execution, self.batch)
+        if terminal:
+            self.claim.release()
+
+
+def _supervise_owned_execution_claimed(
     invocation,
     *,
     policies,
     deadline,
     clock,
     popen_factory,
-    acquire_claim,
+    claim_owner,
     prepare_batch,
     publish_batch,
 ) -> RepositoryExecutionOutcome:
-    """One owner-neutral execution, settlement and publish-or-fence transaction."""
+    """Execution body entered only after outer claim fences are active."""
     requested_roles, discarded_roles = _role_partition(policies)
-    claim = acquire_claim()
-    release_claim = False
-    batch = None
+    claim_owner.acquire()
+    batch = claim_owner.prepare(prepare_batch)
+
     try:
         try:
-            batch = prepare_batch()
-        except BaseException as preparation_error:
-            release_claim = (
-                getattr(
-                    preparation_error,
-                    "repository_ownership_settled",
-                    False,
-                ) is True
-            )
-            raise
-
-        try:
-            execution = supervise_execution(
-                invocation,
-                stage_batch=batch,
-                deadline=deadline,
-                clock=clock,
-                popen_factory=popen_factory,
+            execution = claim_owner.supervise(
+                lambda: supervise_execution(
+                    invocation,
+                    stage_batch=batch,
+                    deadline=deadline,
+                    clock=clock,
+                    popen_factory=popen_factory,
+                ),
             )
         except BaseException:
             fence_error = _fence_batch(batch)
@@ -491,7 +556,6 @@ def _supervise_owned_execution(
         if not execution.transaction_complete:
             fence_fault = _fence_batch(batch)
             ownership_settled = _ownership_settled(execution, batch)
-            release_claim = ownership_settled
             _raise_cancellation(fence_fault)
             return RepositoryExecutionOutcome(
                 execution=execution,
@@ -512,7 +576,6 @@ def _supervise_owned_execution(
                 _raise_cancellation(fence_error)
                 raise ContractError("discard-only execution returned artifact authority")
             ownership_settled = _ownership_settled(execution, batch)
-            release_claim = ownership_settled
             return RepositoryExecutionOutcome(
                 execution=execution,
                 publication=RepositoryPublication.NOT_REQUESTED,
@@ -528,13 +591,11 @@ def _supervise_owned_execution(
             publication_expired = _clock_now(clock) >= float(deadline)
         except BaseException:
             fence_error = _fence_batch(batch)
-            release_claim = _ownership_settled(execution, batch)
             _raise_cancellation(fence_error)
             raise
         if publication_expired:
             fence_fault = _fence_batch(batch)
             ownership_settled = _ownership_settled(execution, batch)
-            release_claim = ownership_settled
             _raise_cancellation(fence_fault)
             return RepositoryExecutionOutcome(
                 execution=execution,
@@ -551,7 +612,6 @@ def _supervise_owned_execution(
         except PrivateStagePublicationPartial as partial:
             cleanup_fault = _fence_batch(batch)
             ownership_settled = _ownership_settled(execution, batch)
-            release_claim = ownership_settled
             _raise_cancellation(cleanup_fault)
             _raise_cancellation(partial)
             return RepositoryExecutionOutcome(
@@ -570,7 +630,6 @@ def _supervise_owned_execution(
             # idempotent drain is safe and never retries a rename.
             cleanup_fault = _fence_batch(batch)
             ownership_settled = _ownership_settled(execution, batch)
-            release_claim = ownership_settled
             _raise_cancellation(cleanup_fault)
             _raise_cancellation(committed)
             return RepositoryExecutionOutcome(
@@ -585,7 +644,6 @@ def _supervise_owned_execution(
         except PrivateStageHandoffError as publication_error:
             fence_fault = _fence_batch(batch)
             ownership_settled = _ownership_settled(execution, batch)
-            release_claim = ownership_settled
             _raise_cancellation(fence_fault)
             _raise_cancellation(publication_error)
             return RepositoryExecutionOutcome(
@@ -599,12 +657,10 @@ def _supervise_owned_execution(
             )
         except BaseException:
             fence_fault = _fence_batch(batch)
-            release_claim = _ownership_settled(execution, batch)
             _raise_cancellation(fence_fault)
             raise
 
         ownership_settled = _ownership_settled(execution, batch)
-        release_claim = ownership_settled
         if ownership_settled:
             return RepositoryExecutionOutcome(
                 execution=execution,
@@ -623,8 +679,35 @@ def _supervise_owned_execution(
             fault_operation="cleanup",
         )
     finally:
-        if release_claim:
-            claim.release()
+        claim_owner.settle()
+
+
+def _supervise_owned_execution(
+    invocation,
+    *,
+    policies,
+    deadline,
+    clock,
+    popen_factory,
+    acquire_claim,
+    prepare_batch,
+    publish_batch,
+) -> RepositoryExecutionOutcome:
+    """Run one transaction with claim cleanup active before acquisition."""
+    claim_owner = _ExecutionClaimOwner(acquire_claim)
+    settlement = store._SettlementOwner(claim_owner.settle)
+    with store._SettlementFence(settlement):
+        with store._SettlementFence(settlement):
+            return _supervise_owned_execution_claimed(
+                invocation,
+                policies=policies,
+                deadline=deadline,
+                clock=clock,
+                popen_factory=popen_factory,
+                claim_owner=claim_owner,
+                prepare_batch=prepare_batch,
+                publish_batch=publish_batch,
+            )
 
 
 def supervise_repository_execution(
