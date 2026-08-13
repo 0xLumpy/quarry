@@ -37,7 +37,10 @@ APPROVED_DIRECT = {
 }
 
 # EVERY phase module is scanned (a missed module is a blind spot). Kept in sync with src/quarry_recon/phases/.
-PHASE_MODULES = ["content", "crawl", "dns", "enrich", "horizontal", "origin", "params", "probe", "vertical"]
+PHASE_MODULES = [
+    "_local_raw", "content", "crawl", "dns", "enrich", "horizontal", "origin", "params", "probe",
+    "vertical",
+]
 
 
 def test_phase_module_list_is_complete():

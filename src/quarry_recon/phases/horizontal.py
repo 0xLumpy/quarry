@@ -26,10 +26,15 @@ def _meta_csp(html: str) -> list[str]:
     return out
 from ..runner import RunResult, Status, have, run as exec_tool, skipped
 from ..runner_repository import RepositoryOutput
+from . import _local_raw
 
 
 # hostname matcher for the operator's local kaeferjaeger SNI dataset (never fetched remotely).
 _KJ_HOST_RX = _re.compile(r"[a-z0-9_.-]+\.[a-z]{2,}", _re.I)
+
+
+class _RawWriteError(OSError):
+    """A repository-stage write failed, rather than one local input file."""
 
 
 def _kaeferjaeger_dir():
@@ -43,45 +48,60 @@ def _kaeferjaeger(ctx) -> int:
     provenance. Status distinguishes no file read / some failed / all processed. Returns the match count."""
     import time
     ddir = _kaeferjaeger_dir()
-    files = sorted(ddir.glob("*.txt")) if ddir.is_dir() else []
-    if not files:
-        ctx.run.record("horizontal", skipped(
-            "kaeferjaeger", "no local SNI dataset — optional setup: download provider *_sni.txt to "
-            "~/.config/quarry/kaeferjaeger/"))
-        return 0
     t0 = time.monotonic()
-    raw_path = ctx.run.raw_path("horizontal", "kaeferjaeger", "matches.txt")
     # matched = unique in-scope hosts found (drives status + raw_path; a rerun re-finding existing
     # entities still counts). added = new store entities; provenance is written once per (host, file).
-    matched, added, prov_seen, add_seen, read_files, failed = set(), 0, set(), set(), 0, 0
-    with raw_path.open("w", encoding="utf-8") as out:
-        for f in files:
-            try:
-                with f.open("r", encoding="utf-8", errors="replace") as fh:
-                    for lineno, line in enumerate(fh, 1):        # stream: RAM bounded to a line, whole file read
-                        for m in _KJ_HOST_RX.findall(line):
-                            h = m.lower().rstrip(".")
-                            if not ctx.scope.in_scope(h):
-                                continue
-                            matched.add(h)
-                            if (h, f.name) not in prov_seen:
-                                prov_seen.add((h, f.name))
-                                out.write(f"{h}\t{f.name}:{lineno}\n")   # first occ per (host, file)
-                            if h not in add_seen:
-                                add_seen.add(h)
-                                if ctx.run.add("subdomain", {"host": h, "sources": ["kaeferjaeger"],
-                                                             "raw_ref": str(raw_path)}):
-                                    added += 1
-                read_files += 1
-            except OSError as e:
-                failed += 1
-                ctx.run.notes.append(f"kaeferjaeger: {f.name} unreadable: {e}")
-    status = (Status.FAILED if read_files == 0 else Status.PARTIAL if failed
-              else Status.SUCCESS if matched else Status.EMPTY)
-    ctx.run.record("horizontal", RunResult("kaeferjaeger", ["<local SNI dataset>"], status, 0,
-                   round(time.monotonic() - t0, 2), raw_path if matched else None, len(matched),
-                   note=f"{read_files}/{len(files)} file(s) read, {failed} failed, {len(matched)} matched, +{added} added"))
-    return len(matched)
+    matched, added, prov_seen, read_files, failed = set(), 0, set(), 0, 0
+    with _local_raw.lifecycle(ctx.run):
+        # The lifecycle claim exists before even enumerating the local dataset.
+        # An absent dataset therefore stays an honest skip without publishing a
+        # misleading empty replacement artifact.
+        files = sorted(ddir.glob("*.txt")) if ddir.is_dir() else []
+        if not files:
+            ctx.run.record("horizontal", skipped(
+                "kaeferjaeger", "no local SNI dataset — optional setup: download provider *_sni.txt to "
+                "~/.config/quarry/kaeferjaeger/"))
+            return 0
+        with _local_raw.text_writer(
+            ctx.run, "horizontal", "kaeferjaeger", "matches.txt",
+        ) as (raw_path, out):
+            for f in files:
+                try:
+                    with f.open("r", encoding="utf-8", errors="replace") as fh:
+                        for lineno, line in enumerate(fh, 1):    # stream: RAM bounded to a line
+                            for m in _KJ_HOST_RX.findall(line):
+                                h = m.lower().rstrip(".")
+                                if not ctx.scope.in_scope(h):
+                                    continue
+                                matched.add(h)
+                                if (h, f.name) not in prov_seen:
+                                    prov_seen.add((h, f.name))
+                                    try:
+                                        out.write(f"{h}\t{f.name}:{lineno}\n")
+                                    except OSError as exc:
+                                        # Do not misclassify a failed repository stage as an unreadable input.
+                                        raise _RawWriteError(str(exc)) from exc
+                    read_files += 1
+                except _RawWriteError:
+                    raise
+                except OSError as e:
+                    failed += 1
+                    ctx.run.notes.append(f"kaeferjaeger: {f.name} unreadable: {e}")
+        # The inner claim has published. Keep the outer marker through every
+        # entity append so each raw_ref names this invocation's committed bytes.
+        for h in sorted(matched):
+            if ctx.run.add("subdomain", {"host": h, "sources": ["kaeferjaeger"],
+                                         "raw_ref": str(raw_path)}):
+                added += 1
+        status = (Status.FAILED if read_files == 0 else Status.PARTIAL if failed
+                  else Status.SUCCESS if matched else Status.EMPTY)
+        ctx.run.record("horizontal", RunResult(
+            "kaeferjaeger", ["<local SNI dataset>"], status, 0,
+            round(time.monotonic() - t0, 2), raw_path if matched else None, len(matched),
+            note=(f"{read_files}/{len(files)} file(s) read, {failed} failed, "
+                  f"{len(matched)} matched, +{added} added"),
+        ))
+        return len(matched)
 
 
 def run(ctx) -> None:
@@ -94,37 +114,46 @@ def run(ctx) -> None:
     # CSP siblings: in-scope domains named in the apex's Content-Security-Policy, fetched via
     # fetch.scoped_headers (resolve/scope/IP-guarded, paced to http_rl; not csprecon, which auto-follows).
     if not scope.passive_only:
-        roots = netguard.guard_hosts(ctx, prof.apex_domains, phase="horizontal.csp")
-        raw = ctx.run.raw_path("horizontal", "csp", "csp.txt")
-        added = responses = failed = 0
-        dump = []
-        for apex in roots:
-            for scheme in ("https", "http"):
-                # transport-safe + self-signed OK (insecure): a bad request never aborts the phase.
-                hdrs, body, final, st = fetch.scoped_headers(ctx, f"{scheme}://{apex}/", insecure=True)
-                if hdrs is None:                          # transport failure or off-scope redirect
-                    failed += 1
-                    continue
-                responses += 1
-                csp = " ".join(str(hdrs.get(k) or "") for k in    # all CSP header variants + <meta http-equiv>
-                               ("Content-Security-Policy", "Content-Security-Policy-Report-Only",
-                                "X-Content-Security-Policy", "X-WebKit-CSP"))
-                csp = (csp + " " + " ".join(_meta_csp(body.decode("utf-8", "replace")))).strip()
-                if csp:
-                    dump.append(f"# {final} (status {st})\n{csp}")
-                for m in _CSP_HOST.findall(csp):
-                    h = m.lower().strip(".")
-                    if scope.in_scope(h) and ctx.run.add(
-                            "subdomain", {"host": h, "sources": ["csp"], "raw_ref": str(raw)}):
-                        added += 1
-        raw.write_text("\n".join(dump))
-        # source-level status: failed if nothing answered, partial if some fetches failed, empty if all
-        # answered without CSP, success only when CSP was found.
-        _st = (Status.SKIPPED if not roots else Status.FAILED if responses == 0 else
-               Status.PARTIAL if failed else Status.SUCCESS if (dump or added) else Status.EMPTY)
-        ctx.run.record("horizontal", RunResult("csp", ["<native scoped CSP fetch>"], _st, 0, 0.0,
-                                               raw if dump else None, len(dump),
-                                               note=f"{responses} responded, {failed} failed, +{added} host(s)"))
+        with _local_raw.lifecycle(ctx.run):
+            # Fresh resolution is provider-contact preparation, so even it
+            # starts only after the durable lifecycle claim exists.
+            roots = netguard.guard_hosts(ctx, prof.apex_domains, phase="horizontal.csp")
+            raw = _local_raw.destination(ctx.run, "horizontal", "csp", "csp.txt")
+            added = responses = failed = 0
+            dump = []
+            discovered = set()
+            for apex in roots:
+                for scheme in ("https", "http"):
+                    # transport-safe + self-signed OK (insecure): a bad request never aborts the phase.
+                    hdrs, body, final, st = fetch.scoped_headers(ctx, f"{scheme}://{apex}/", insecure=True)
+                    if hdrs is None:                          # transport failure or off-scope redirect
+                        failed += 1
+                        continue
+                    responses += 1
+                    csp = " ".join(str(hdrs.get(k) or "") for k in  # all CSP variants + <meta http-equiv>
+                                   ("Content-Security-Policy", "Content-Security-Policy-Report-Only",
+                                    "X-Content-Security-Policy", "X-WebKit-CSP"))
+                    csp = (csp + " " + " ".join(_meta_csp(body.decode("utf-8", "replace")))).strip()
+                    if csp:
+                        dump.append(f"# {final} (status {st})\n{csp}")
+                    discovered.update(h for h in (m.lower().strip(".") for m in _CSP_HOST.findall(csp))
+                                      if scope.in_scope(h))
+            raw = _local_raw.replace_text(
+                ctx.run, "horizontal", "csp", "csp.txt", "\n".join(dump),
+            )
+            # No record may cite a prior same-name artifact when this publication did not commit.
+            for h in sorted(discovered):
+                if ctx.run.add("subdomain", {"host": h, "sources": ["csp"], "raw_ref": str(raw)}):
+                    added += 1
+            # Source accounting is part of the same terminal base mutation: the
+            # seal cannot observe raw/entities without their source result.
+            _st = (Status.SKIPPED if not roots else Status.FAILED if responses == 0 else
+                   Status.PARTIAL if failed else Status.SUCCESS if (dump or added) else Status.EMPTY)
+            ctx.run.record("horizontal", RunResult(
+                "csp", ["<native scoped CSP fetch>"], _st, 0, 0.0,
+                raw if dump else None, len(dump),
+                note=f"{responses} responded, {failed} failed, +{added} host(s)",
+            ))
         if added:
             ctx.echo(f"  csp: +{added} in-scope host(s) from apex Content-Security-Policy")
 

@@ -23,6 +23,7 @@ from ..runner import (RunResult, Status, have, native_output_current,
                       reclassify_from_artifact, run as exec_tool, skipped)
 from ..runner_native import RepositoryNativeOutput
 from ..runner_repository import RepositoryOutput
+from . import _local_raw
 
 _SUBFINDER_DEFAULT_MIN = 60                  # default -max-time budget (minutes)
 _SUBFINDER_UNBOUNDED_MIN = 1440             # 0 -> 24h ceiling (subfinder cancels on -max-time 0)
@@ -1354,21 +1355,21 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
                                         f"name, so the {rounds}-round bound cost nothing"))
 
 
-def run(ctx) -> None:
-    prof, scope = ctx.profile, ctx.scope
-    roots_file = ctx.write_list("roots.txt", prof.apex_domains)
+def _local_provider_sources(ctx, prof, scope, *, censys_config=None) -> set[str]:
+    """Run in-process/local providers under one repository lifecycle per source.
 
-    # ── passive: subfinder (per APEX) ──
-    _run_subfinder(ctx, prof, scope)
-
-    # ── passive CT-log sources (crt.sh + certspotter), coverage over subfinder ──
-
+    Provider contact (or OpenIntel's local database scan) begins only after a
+    durable base claim exists.  A source publishes its aggregate raw evidence
+    before any entity can cite it, and the lifecycle marker remains live until
+    every corresponding entity append has settled.
+    """
     # a `*.X.apex` wildcard cert name registers `X.apex` as a wildcard brute-zone candidate (A1), which
     # brutes the zone and HTTP-differentiates instead of letting DNS strip them as noise
     wildcard_zones: set[str] = set()
     cs_token = secrets.certspotter()
     _max_pages = settings.concurrency("PROVIDER_MAX_PAGES", 5)   # bounded cursor pagination (configurable)
     ct_new = 0
+
     def _provider_over_apexes(src_id, per_apex, acct=None):
         """Run each (provider, apex) as its own work unit, so one apex's failure is FAILED for that unit only
         while every other apex's discovery is still unioned. Also gives providers a per-apex resume key.
@@ -1386,59 +1387,88 @@ def run(ctx) -> None:
     _cs_acct = {"cred_fp": secrets.fingerprint(cs_token)} if cs_token else None   # certspotter token identity
     for src, fn, acct in (("crtsh", lambda a: _crtsh(a), None),
                           ("certspotter", lambda a: _certspotter(a, cs_token, max_pages=_max_pages), _cs_acct)):
-        # bracket the in-process CT provider (native HTTP) with a per-apex source lifecycle
-        hosts = _provider_over_apexes(f"vertical.{src}", fn, acct)
-        if not hosts:
-            continue
-        raw = ctx.run.raw_path("vertical", src, "hosts.txt")
-        raw.write_text("\n".join(sorted(hosts)) + "\n")
-        for h in hosts:
-            name = h[2:] if h.startswith("*.") else h        # `*.X.apex` → derived zone `X.apex`
-            if not name or "." not in name or not scope.in_scope(name) or scope.is_oos(name):
+        with _local_raw.lifecycle(ctx.run):
+            hosts = _provider_over_apexes(f"vertical.{src}", fn, acct)
+            if not hosts:
                 continue
-            if h.startswith("*."):
-                wildcard_zones.add(name)
-            if ctx.run.add("subdomain", {"host": name, "sources": [src], "raw_ref": str(raw)}):
-                ct_new += 1
+            raw = _local_raw.replace_text(
+                ctx.run, "vertical", src, "hosts.txt", "\n".join(sorted(hosts)) + "\n",
+            )
+            for h in sorted(hosts):
+                name = h[2:] if h.startswith("*.") else h    # `*.X.apex` → derived zone `X.apex`
+                if not name or "." not in name or not scope.in_scope(name) or scope.is_oos(name):
+                    continue
+                if h.startswith("*."):
+                    wildcard_zones.add(name)
+                if ctx.run.add("subdomain", {"host": name, "sources": [src], "raw_ref": str(raw)}):
+                    ct_new += 1
     if ct_new:
         ctx.echo(f"  CT logs (crt.sh + certspotter): +{ct_new} in-scope")
 
     # ── passive: openintel-subs (ADVANCED — SILENT unless config.yaml `openintel:` set; secrets.yaml legacy) ──
     oi = settings.openintel()   # config.yaml (proper home) with secrets.yaml back-compat
     if oi.get("binary") and oi.get("db"):
-        oi_hosts = set()
-        for apex in prof.apex_domains:
-            oi_hosts |= _openintel(ctx, oi, apex)
-        if oi_hosts:
-            raw = ctx.run.raw_path("vertical", "openintel", "hosts.txt")
-            raw.write_text("\n".join(sorted(oi_hosts)) + "\n")
-            n = sum(ctx.run.add("subdomain", {"host": h, "sources": ["openintel"], "raw_ref": str(raw)})
-                    for h in oi_hosts if scope.in_scope(h) and not scope.is_oos(h))
-            if n:
-                ctx.echo(f"  openintel: +{n} in-scope (local top1M subs DB)")
+        with _local_raw.lifecycle(ctx.run):
+            oi_hosts = set()
+            for apex in prof.apex_domains:
+                oi_hosts |= _openintel(ctx, oi, apex)
+            if oi_hosts:
+                raw = _local_raw.replace_text(
+                    ctx.run, "vertical", "openintel", "hosts.txt",
+                    "\n".join(sorted(oi_hosts)) + "\n",
+                )
+                n = sum(ctx.run.add(
+                    "subdomain", {"host": h, "sources": ["openintel"], "raw_ref": str(raw)},
+                ) for h in sorted(oi_hosts) if scope.in_scope(h) and not scope.is_oos(h))
+                if n:
+                    ctx.echo(f"  openintel: +{n} in-scope (local top1M subs DB)")
 
     # ── passive: Censys Platform cert search (OPTIONAL — SILENT unless secrets.yaml `censys:` set) ──
-    cen = secrets.censys()
-    censys_entitlement_skip(cen, prof.apex_domains)
+    if censys_config is None:
+        censys_config = secrets.censys()
+        censys_entitlement_skip(censys_config, prof.apex_domains)
+    cen = censys_config
     if cen.get("token") and cen.get("org"):
         # org id (non-secret) + a token fingerprint (never the token) — a different account/org
         # sees different data, so the resume identity must change with it.
         cen_acct = {"org": str(cen["org"]), "cred_fp": secrets.fingerprint(cen["token"])}
-        cen_hosts = _provider_over_apexes("vertical.censys", lambda a: _censys(cen, a, max_pages=_max_pages), cen_acct)
-        if cen_hosts:
-            raw = ctx.run.raw_path("vertical", "censys", "hosts.txt")
-            raw.write_text("\n".join(sorted(cen_hosts)) + "\n")
-            n = 0
-            for h in cen_hosts:
-                name = h[2:] if h.startswith("*.") else h
-                if not name or "." not in name or not scope.in_scope(name) or scope.is_oos(name):
-                    continue
-                if h.startswith("*."):
-                    wildcard_zones.add(name)                  # A1: censys wildcard cert → brute-zone
-                if ctx.run.add("subdomain", {"host": name, "sources": ["censys"], "raw_ref": str(raw)}):
-                    n += 1
-            if n:
-                ctx.echo(f"  censys: +{n} in-scope (Platform cert search)")
+        with _local_raw.lifecycle(ctx.run):
+            cen_hosts = _provider_over_apexes(
+                "vertical.censys", lambda a: _censys(cen, a, max_pages=_max_pages), cen_acct,
+            )
+            if cen_hosts:
+                raw = _local_raw.replace_text(
+                    ctx.run, "vertical", "censys", "hosts.txt",
+                    "\n".join(sorted(cen_hosts)) + "\n",
+                )
+                n = 0
+                for h in sorted(cen_hosts):
+                    name = h[2:] if h.startswith("*.") else h
+                    if not name or "." not in name or not scope.in_scope(name) or scope.is_oos(name):
+                        continue
+                    if h.startswith("*."):
+                        wildcard_zones.add(name)              # A1: censys wildcard cert → brute-zone
+                    if ctx.run.add("subdomain", {
+                        "host": name, "sources": ["censys"], "raw_ref": str(raw),
+                    }):
+                        n += 1
+                if n:
+                    ctx.echo(f"  censys: +{n} in-scope (Platform cert search)")
+
+    return wildcard_zones
+
+
+def run(ctx) -> None:
+    prof, scope = ctx.profile, ctx.scope
+    roots_file = ctx.write_list("roots.txt", prof.apex_domains)
+
+    # ── passive: subfinder (per APEX) ──
+    _run_subfinder(ctx, prof, scope)
+
+    # ── passive CT/local/provider sources, coverage over subfinder ──
+    cen = secrets.censys()
+    censys_entitlement_skip(cen, prof.apex_domains)
+    wildcard_zones = _local_provider_sources(ctx, prof, scope, censys_config=cen)
 
     _github_subs(ctx, prof, scope)
 
