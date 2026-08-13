@@ -32,6 +32,7 @@ from ..runner import (Status, ffuf_results, ffuf_usable_rows, fresh_artifact_dir
                       nuclei_timeout, reclassify_ffuf,
                       reclassify_from_artifact, reclassify_from_files, run as exec_tool, scaled_timeout,
                       skipped)
+from ..runner_repository import RepositoryOutput
 
 # Serialized-object / token markers in Set-Cookie + response headers; passive format evidence only.
 # Distinctive markers only — pickle (`gAR`) / Ruby-Marshal (`BAg`) prefixes collide too easily.
@@ -1398,8 +1399,14 @@ def _vhost_scan(ctx, base, apex, out, wl, wl_digest, mc, ffuf_to, prof):
                           config={"mc": mc, "wordlist": wl.name},
                           file_digests={"wordlist": wl_digest}, schema_version=_VHOST_SCHEMA)
     errf = out.with_suffix(".stderr.log")            # FULL stderr: the -maxtime marker must not be evictable
-    r = run_contract("probe.ffuf_vhost", cmd, work_unit=wu, timeout=hard, stderr_path=errf,
-                     reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ffuf_to or None))   # graceful -maxtime; hard backstop
+    r = run_contract(
+        "probe.ffuf_vhost", cmd,
+        repository=ctx.run,
+        stdout=RepositoryOutput.discard(),
+        stderr=RepositoryOutput.publish(*errf.relative_to(ctx.run.dir).parts),
+        work_unit=wu, timeout=hard,
+        reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ffuf_to or None),
+    )   # graceful -maxtime; hard backstop
     return r
 
 
@@ -1628,7 +1635,12 @@ def _run_httpx(ctx, hosts, ports, phase, tag):
     # so a flag/rate change invalidates the unit, not just the host/port set.
     wu = events.work_unit(f"{phase}.httpx", inputs={"hosts": sorted(set(hosts)), "ports": sorted(ports)},
                           config={"flags": "v0.3.4-probe", "rl": ctx.profile.http_rl})
-    r = run_contract(f"{phase}.httpx", cmd, work_unit=wu, raw_path=hx, timeout=to)
+    r = run_contract(
+        f"{phase}.httpx", cmd,
+        repository=ctx.run,
+        stdout=RepositoryOutput.publish(*hx.relative_to(ctx.run.dir).parts),
+        stderr=RepositoryOutput.discard(), work_unit=wu, timeout=to,
+    )
     ctx.run.record(phase, r)
     return str(hx), (r.raw_path.read_text().splitlines() if r.raw_path else [])
 
@@ -1672,8 +1684,13 @@ def _cdn_shared_ips(ctx, ips):
     ipf = ctx.write_list("cdncheck_ips.txt", ips)
     out = ctx.run.raw_path("probe", "cdncheck", "classified.jsonl")
     out.unlink(missing_ok=True)                              # stale artifact must not influence this run's decision
-    r = exec_tool("cdncheck", ["cdncheck", "-i", str(ipf), "-jsonl", "-silent", "-duc", "-o", str(out)],
-                  timeout=scaled_timeout(len(ips), ctx.http_timeout, per_unit=0.02))
+    r = exec_tool(
+        "cdncheck", ["cdncheck", "-i", str(ipf), "-jsonl", "-silent", "-duc", "-o", str(out)],
+        repository=ctx.run,
+        stdout=RepositoryOutput.discard(),
+        stderr=RepositoryOutput.discard(),
+        timeout=scaled_timeout(len(ips), ctx.http_timeout, per_unit=0.02),
+    )
     ctx.run.record("probe", r)
     if r.status not in (Status.SUCCESS, Status.EMPTY) or not out.exists():
         return None                                          # errored/truncated -> treat as un-vetted (no SYN)
@@ -2165,7 +2182,12 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
     if prof.portscan_rate:
         cmd += ["-rate", str(prof.portscan_rate)]
     to = scaled_timeout(len(unique_ips) * len(prof.ports), ctx.http_timeout, per_unit=0.02)
-    res = exec_tool("naabu", cmd, timeout=to)
+    res = exec_tool(
+        "naabu", cmd,
+        repository=ctx.run,
+        stdout=RepositoryOutput.discard(),
+        stderr=RepositoryOutput.discard(), timeout=to,
+    )
     raw_status = res.status
     # naabu writes findings to the -o file. Parse fail-closed: any malformed row or out-of-profile
     # port makes the whole scan unusable (full fallback). A missing/empty file is not malformed.
@@ -2383,7 +2405,11 @@ def run(ctx) -> None:
             tls_wu = events.work_unit("probe.tlsx_certs", inputs={"hosts": thosts},
                                       config={"ports": "443,8443,4443"})
             r = run_contract("probe.tlsx_certs", ["tlsx", "-l", str(tf), "-p", "443,8443,4443",
-                                   "-json", "-silent"], work_unit=tls_wu, raw_path=tr, timeout=ctx.http_timeout)
+                                   "-json", "-silent"],
+                             repository=ctx.run,
+                             stdout=RepositoryOutput.publish(*tr.relative_to(ctx.run.dir).parts),
+                             stderr=RepositoryOutput.discard(),
+                             work_unit=tls_wu, timeout=ctx.http_timeout)
             ctx.run.record("probe", r)
             san_new = 0
             if r.raw_path and r.raw_path.exists():
@@ -2420,6 +2446,9 @@ def run(ctx) -> None:
         if prof.http_rl:                       # else native default (empty = fast)
             waf_cmd += ["-rl", str(prof.http_rl)]
         r = exec_tool("nuclei", waf_cmd,
+                      repository=ctx.run,
+                      stdout=RepositoryOutput.discard(),
+                      stderr=RepositoryOutput.discard(),
                       timeout=nuclei_timeout(ctx.run.count("live"), ctx.http_timeout))
         ctx.run.record("probe", r)
         if waf_out.exists():
@@ -2452,6 +2481,9 @@ def run(ctx) -> None:
                 ["gowitness", "scan", "file", "-f", str(live_file),
                  "--screenshot-path", str(shot_dir), "--write-jsonl",
                  "--write-jsonl-file", str(shot_dir / "gowitness.jsonl")],
+                repository=ctx.run,
+                stdout=RepositoryOutput.discard(),
+                stderr=RepositoryOutput.discard(),
                 work_unit=gw_wu, reclassify=_gw_reclassify, timeout=ctx.http_timeout)
         ctx.run.record("probe", r)
         for img in shot_dir.glob("*.jpeg"):
@@ -2469,7 +2501,12 @@ def run(ctx) -> None:
         # naabu concurrency is RATE-based (portscan_rate), not thread-based — but a big CIDR can still
         # wall the flat timeout, so scale the ceiling by range count.
         naabu_to = scaled_timeout(len(prof.cidr), ctx.http_timeout, per_unit=300)
-        r = exec_tool("naabu", cmd, raw_path=pr, timeout=naabu_to)
+        r = exec_tool(
+            "naabu", cmd,
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish(*pr.relative_to(ctx.run.dir).parts),
+            stderr=RepositoryOutput.discard(), timeout=naabu_to,
+        )
         ctx.run.record("probe", r)
         open_ports = {}
         if r.raw_path:
@@ -2502,6 +2539,9 @@ def run(ctx) -> None:
                 nr = run_contract("probe.nmap_service",
                                   ["nmap", "-sV", "-Pn", "-T4", "-iL", str(g_ips),
                                    "-p", ",".join(ptup), "-oX", str(nm)],
+                                  repository=ctx.run,
+                                  stdout=RepositoryOutput.discard(),
+                                  stderr=RepositoryOutput.discard(),
                                   work_unit=wu, reclassify=_nmap_reclassify,
                                   timeout=scaled_timeout(len(ips) * len(ptup), ctx.http_timeout, per_unit=30))
                 ctx.run.record("probe", nr)
@@ -2528,7 +2568,12 @@ def run(ctx) -> None:
         sm.unlink(missing_ok=True)                          # -o file: clear stale before the run
         # -oJ structured output (verified schema) instead of scraping nmap-text; parse + reclassify + ingest
         # via the shared helper (raw-only recording dropped the passive port yield)
-        r = exec_tool("smap", ["smap", "-iL", str(sm_in), "-oJ", str(sm)], timeout=600)
+        r = exec_tool(
+            "smap", ["smap", "-iL", str(sm_in), "-oJ", str(sm)],
+            repository=ctx.run,
+            stdout=RepositoryOutput.discard(),
+            stderr=RepositoryOutput.discard(), timeout=600,
+        )
         smn = _smap_ingest(ctx, r, sm, "probe", sm_targets)
         if smn:
             ctx.echo(f"  smap: +{smn} passive port(s) (Shodan-backed, no packets to target)")
