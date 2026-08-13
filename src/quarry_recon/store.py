@@ -46,7 +46,21 @@ class MutationScope(str, Enum):
 
 _RUN_LOCKS_GUARD = threading.Lock()
 _RUN_LOCKS: dict[tuple[str, str], threading.RLock] = {}
+_PROJECT_LOCKS: dict[str, threading.RLock] = {}
 _RUN_LOCK_LOCAL = threading.local()
+
+
+def _reset_mutation_locks_after_fork() -> None:
+    """Discard process-local mutexes whose owners do not survive a fork."""
+    global _RUN_LOCKS_GUARD, _RUN_LOCKS, _PROJECT_LOCKS, _RUN_LOCK_LOCAL
+    _RUN_LOCKS_GUARD = threading.Lock()
+    _RUN_LOCKS = {}
+    _PROJECT_LOCKS = {}
+    _RUN_LOCK_LOCAL = threading.local()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_mutation_locks_after_fork)
 
 _BASE_ARTIFACT_DIRECTORY_ROOTS = frozenset({
     "raw", "normalized", "metrics", "envelope-fold-refused",
@@ -71,6 +85,32 @@ def _shared_run_lock(key: tuple[str, str]) -> threading.RLock:
             lock = threading.RLock()
             _RUN_LOCKS[key] = lock
         return lock
+
+
+def _shared_project_lock(project_key: str) -> threading.RLock:
+    with _RUN_LOCKS_GUARD:
+        lock = _PROJECT_LOCKS.get(project_key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROJECT_LOCKS[project_key] = lock
+        return lock
+
+
+def _thread_mutation_ledgers() -> tuple[dict, dict]:
+    """Return fork-safe per-thread Run/project ledgers."""
+    if getattr(_RUN_LOCK_LOCAL, "pid", None) != os.getpid():
+        _RUN_LOCK_LOCAL.projects = {}
+        _RUN_LOCK_LOCAL.held = {}
+        _RUN_LOCK_LOCAL.pid = os.getpid()
+    projects = getattr(_RUN_LOCK_LOCAL, "projects", None)
+    runs = getattr(_RUN_LOCK_LOCAL, "held", None)
+    if projects is None:
+        projects = {}
+        _RUN_LOCK_LOCAL.projects = projects
+    if runs is None:
+        runs = {}
+        _RUN_LOCK_LOCAL.held = runs
+    return projects, runs
 
 
 def _scoped_mutation(scope: MutationScope):
@@ -161,6 +201,38 @@ def _iter_ledger_lines(fh, cap: int):
         yield None
     elif buf:
         yield buf if len(buf) <= cap else None
+
+
+def _iter_descriptor_lines(fd: int):
+    """Yield binary lines from an already-owned descriptor without fd handoff."""
+    pending = bytearray()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        pending.extend(chunk)
+        while True:
+            newline = pending.find(b"\n")
+            if newline < 0:
+                break
+            yield bytes(pending[:newline + 1])
+            del pending[:newline + 1]
+    if pending:
+        yield bytes(pending)
+
+
+class _DescriptorReader:
+    """Minimal bounded-reader adapter over a descriptor owned elsewhere."""
+
+    __slots__ = ("fd",)
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+        os.lseek(fd, 0, os.SEEK_SET)
+
+    def read(self, size: int) -> bytes:
+        return os.read(self.fd, size)
 
 
 class _BoundedKeySet:
@@ -564,14 +636,13 @@ def _manifest_gap_reason(manifest: dict, entity: str) -> str:
     return f"{outstanding} unit(s) of outstanding envelope work" if outstanding else ""
 
 
-def fold_observations(path, *, max_keys: int | None = None, max_bytes_per_key: int | None = None,
-                      max_corpus_bytes: int | None = None, on_refused=None) -> FoldedLog:
-    """Stream one entity's append-only log into its merged view (peak RSS = one line + the materialized set).
-    Enforces the given envelope limits: a new key is refused past `max_keys`/`max_bytes_per_key`/
-    `max_corpus_bytes`, and an existing key may not grow past the byte ceilings; each refusal goes to
-    `on_refused(key, kind)` if given (bounded), else into `refused_keys`. All limits None -> unbounded read.
-    """
-    entity = Path(path).stem
+def _fold_observation_stream(
+    fh, entity: str, *, max_keys: int | None = None,
+    max_bytes_per_key: int | None = None,
+    max_corpus_bytes: int | None = None, on_refused=None,
+    require_newline: bool = False,
+) -> FoldedLog:
+    """Fold an already-authorized binary stream without reopening its name."""
     merged: dict = {}
     dropped = 0
     corpus_bytes = 0
@@ -587,56 +658,76 @@ def fold_observations(path, *, max_keys: int | None = None, max_bytes_per_key: i
         else:
             refused_keys.add(k)
 
-    try:
-        with open(path, "rb") as fh:
-            for line in fh:                          # one line resident at a time; the file is never held whole
-                if not line.strip():
-                    continue
-                try:
-                    rec = json.loads(line.decode("utf-8"))   # per-line decode: one bad byte costs its row alone
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    dropped += 1
-                    continue
-                if not isinstance(rec, dict):
-                    dropped += 1
-                    continue
-                k = canonical_key(entity, rec)
-                if not k:
-                    dropped += 1
-                    continue
-                if k in merged:
-                    cand = _merge_record(merged[k], rec)
-                    if not bytes_active:
-                        merged[k] = cand
-                        continue
-                    delta = _record_bytes(cand) - _record_bytes(merged[k])
-                    if max_bytes_per_key is not None and _record_bytes(cand) > max_bytes_per_key:
-                        _refuse(k, "growth")         # keep base; a key may not grow past the per-key ceiling
-                    elif max_corpus_bytes is not None and delta > 0 and corpus_bytes + delta > max_corpus_bytes:
-                        _refuse(k, "growth")
-                    else:
-                        merged[k] = cand
-                        corpus_bytes += max(0, delta)
-                    continue
-                rb = _record_bytes(rec) if bytes_active else 0
-                if max_bytes_per_key is not None and rb > max_bytes_per_key:
-                    _refuse(k, "bytes")              # one record larger than the per-key ceiling
-                elif max_keys is not None and len(merged) >= max_keys:
-                    _refuse(k, "key")                # the distinct-key ceiling
-                elif max_corpus_bytes is not None and corpus_bytes + rb > max_corpus_bytes:
-                    _refuse(k, "corpus")             # the summed-bytes ceiling
-                else:
-                    merged[k] = rec
-                    corpus_bytes += rb
-    except FileNotFoundError:
-        return FoldedLog(status="absent", reason="no observation log")
-    except OSError as e:
-        return FoldedLog(status="unusable", reason=f"{type(e).__name__}: {e}")
+    for line in fh:                                  # one line resident at a time; the file is never held whole
+        if require_newline and line and not line.endswith(b"\n"):
+            dropped += 1
+            continue
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line.decode("utf-8"))   # per-line decode: one bad byte costs its row alone
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            dropped += 1
+            continue
+        if not isinstance(rec, dict):
+            dropped += 1
+            continue
+        k = canonical_key(entity, rec)
+        if not k:
+            dropped += 1
+            continue
+        if k in merged:
+            cand = _merge_record(merged[k], rec)
+            if not bytes_active:
+                merged[k] = cand
+                continue
+            delta = _record_bytes(cand) - _record_bytes(merged[k])
+            if max_bytes_per_key is not None and _record_bytes(cand) > max_bytes_per_key:
+                _refuse(k, "growth")                 # keep base; a key may not grow past the per-key ceiling
+            elif max_corpus_bytes is not None and delta > 0 and corpus_bytes + delta > max_corpus_bytes:
+                _refuse(k, "growth")
+            else:
+                merged[k] = cand
+                corpus_bytes += max(0, delta)
+            continue
+        rb = _record_bytes(rec) if bytes_active else 0
+        if max_bytes_per_key is not None and rb > max_bytes_per_key:
+            _refuse(k, "bytes")                      # one record larger than the per-key ceiling
+        elif max_keys is not None and len(merged) >= max_keys:
+            _refuse(k, "key")                        # the distinct-key ceiling
+        elif max_corpus_bytes is not None and corpus_bytes + rb > max_corpus_bytes:
+            _refuse(k, "corpus")                     # the summed-bytes ceiling
+        else:
+            merged[k] = rec
+            corpus_bytes += rb
     refused = len(refused_keys) if on_refused is None else refused_count
     if dropped:
         return FoldedLog(records=merged, status="degraded", dropped=dropped, refused=refused,
                          refused_keys=refused_keys, reason=f"{dropped} unusable observation row(s)")
     return FoldedLog(records=merged, refused=refused, refused_keys=refused_keys)
+
+
+def fold_observations(path, *, max_keys: int | None = None, max_bytes_per_key: int | None = None,
+                      max_corpus_bytes: int | None = None, on_refused=None,
+                      require_newline: bool = False) -> FoldedLog:
+    """Stream one entity's append-only log into its merged view (peak RSS = one line + the materialized set).
+    Enforces the given envelope limits: a new key is refused past `max_keys`/`max_bytes_per_key`/
+    `max_corpus_bytes`, and an existing key may not grow past the byte ceilings; each refusal goes to
+    `on_refused(key, kind)` if given (bounded), else into `refused_keys`. All limits None -> unbounded read.
+    """
+    entity = Path(path).stem
+    try:
+        with open(path, "rb") as fh:
+            return _fold_observation_stream(
+                fh, entity, max_keys=max_keys,
+                max_bytes_per_key=max_bytes_per_key,
+                max_corpus_bytes=max_corpus_bytes, on_refused=on_refused,
+                require_newline=require_newline,
+            )
+    except FileNotFoundError:
+        return FoldedLog(status="absent", reason="no observation log")
+    except OSError as e:
+        return FoldedLog(status="unusable", reason=f"{type(e).__name__}: {e}")
 
 
 def _utc() -> str:
@@ -692,40 +783,44 @@ def _read_identity_file(run_fd: int, name: str):
     is valid.  Anything present must still be a stable regular file opened no-follow: an unsafe object is
     repository damage, not a malformed document that another file may mask.
     """
+    owner = _OwnedDescriptor()
+    settlement = _SettlementOwner(
+        lambda: _settle_descriptor_owners((owner,), "run identity descriptor"),
+    )
     try:
-        fd = os.open(name, _FILE_OPEN_FLAGS, dir_fd=run_fd)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                owner.open(name, _FILE_OPEN_FLAGS, dir_fd=run_fd)
+                fd = owner.fd
+                before = _identity_stat(fd)
+                if not stat.S_ISREG(before[2]):
+                    raise _InvalidRunIdentity(f"run identity {name} is not a regular file")
+                chunks: list[bytes] = []
+                size = 0
+                while True:
+                    chunk = os.read(fd, min(65536, _MAX_IDENTITY_BYTES + 1 - size))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > _MAX_IDENTITY_BYTES:
+                        if _identity_stat(fd) != before:
+                            raise _InvalidRunIdentity(f"run identity {name} changed while it was being read")
+                        return _MALFORMED_IDENTITY
+                if _identity_stat(fd) != before:
+                    raise _InvalidRunIdentity(f"run identity {name} changed while it was being read")
+                try:
+                    value = json.loads(b"".join(chunks).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+                    return _MALFORMED_IDENTITY
+                if not isinstance(value, dict):
+                    return _MALFORMED_IDENTITY
+                return value
     except FileNotFoundError:
         return None
     except OSError as e:
         error = _InvalidRunIdentity if e.errno in (errno.ELOOP, errno.ENOTDIR) else ContractError
         raise error(f"run identity {name} cannot be opened safely: {type(e).__name__}: {e}") from e
-    try:
-        before = _identity_stat(fd)
-        if not stat.S_ISREG(before[2]):
-            raise _InvalidRunIdentity(f"run identity {name} is not a regular file")
-        chunks: list[bytes] = []
-        size = 0
-        while True:
-            chunk = os.read(fd, min(65536, _MAX_IDENTITY_BYTES + 1 - size))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-            if size > _MAX_IDENTITY_BYTES:
-                if _identity_stat(fd) != before:
-                    raise _InvalidRunIdentity(f"run identity {name} changed while it was being read")
-                return _MALFORMED_IDENTITY
-        if _identity_stat(fd) != before:
-            raise _InvalidRunIdentity(f"run identity {name} changed while it was being read")
-        try:
-            value = json.loads(b"".join(chunks).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
-            return _MALFORMED_IDENTITY
-        if not isinstance(value, dict):
-            return _MALFORMED_IDENTITY
-        return value
-    finally:
-        os.close(fd)
 
 
 def _validated_identity_record(record: dict, name: str, run_id: str) -> "tuple[dict, datetime] | None":
@@ -761,37 +856,104 @@ def _run_identity_from_fd(run_fd: int, run_id: str) -> "tuple[dict, datetime]":
     return authority, started
 
 
-def _open_run_fd(project_dir: Path, run_id: str) -> int:
-    """Open an existing real run directory relative to a no-follow repository root."""
+def _run_creation_pending(run_fd: int) -> bool:
+    """Whether current-code Run.create has not exposed its completed transaction."""
+    try:
+        observed = os.stat(".creation-pending", dir_fd=run_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != 0o600):
+        raise _InvalidRunIdentity("run creation-pending marker is unsafe")
+    return True
+
+
+def _open_run_fd_into(
+    destination: "_OwnedDescriptor",
+    project_dir: Path,
+    run_id: str,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
+    """Adopt an exact Run descriptor into a caller-owned stable slot.
+
+    The caller allocates ``destination`` and activates its settlement fences
+    before entering this function.  There is consequently no raw descriptor
+    return value that can be interrupted before the caller records ownership.
+    This function independently fences its temporary repository-root anchor and
+    also reconciles ``destination`` until its handoff has committed.
+    """
+    if type(destination) is not _OwnedDescriptor:
+        raise TypeError("run descriptor destination must be an exact owner")
+    if destination.fd >= 0 or destination.terminal:
+        raise ContractError("run descriptor destination is already used")
+    if (expected_identity is not None
+            and destination.expected_identity not in {None, expected_identity}):
+        raise ContractError("run descriptor destination expects a different identity")
+    if expected_identity is not None:
+        destination.expected_identity = expected_identity
     run_id = validate_run_id(run_id)                 # before the id participates in any path/open operation
+    root_owner = _OwnedDescriptor()
+    handed_off = False
+
+    def settle_open() -> None:
+        owners = (root_owner,) if handed_off else (destination, root_owner)
+        _settle_descriptor_owners(owners, "run-open descriptors")
+
+    settlement = _SettlementOwner(settle_open)
+    key = _run_lock_key(Path(project_dir), run_id)
+    _projects, held = _thread_mutation_ledgers()
+    entry = held.get(key)
     root = Path(project_dir) / "recon"
     try:
-        root_fd = os.open(root, _DIR_OPEN_FLAGS)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                if type(entry) is _RunMutationLedgerEntry and entry.depth > 0:
+                    entry.owner.validate_live()
+                    observed_identity = entry.owner.run._run_directory_identity
+                    if (destination.expected_identity is not None
+                            and destination.expected_identity != observed_identity):
+                        raise ContractError(f"run {run_id!r} expected identity changed")
+                    destination.expected_identity = observed_identity
+                    destination.duplicate(entry.owner.run_anchor.fd)
+                else:
+                    root_owner.open(root, _DIR_OPEN_FLAGS)
+                    destination.open(run_id, _DIR_OPEN_FLAGS, dir_fd=root_owner.fd)
+                handed_off = True
     except FileNotFoundError as e:
         raise FileNotFoundError(f"run {run_id!r} not found under {root}") from e
     except OSError as e:
-        raise ContractError(f"repository root {root} cannot be opened safely: {type(e).__name__}: {e}") from e
-    try:
-        try:
-            return os.open(run_id, _DIR_OPEN_FLAGS, dir_fd=root_fd)
-        except FileNotFoundError as e:
-            raise FileNotFoundError(f"run {run_id!r} not found under {root}") from e
-        except OSError as e:
-            raise ContractError(f"run {run_id!r} is not a safe real directory: "
-                                f"{type(e).__name__}: {e}") from e
-    finally:
-        os.close(root_fd)
+        raise ContractError(f"run {run_id!r} cannot be opened safely under {root}: "
+                            f"{type(e).__name__}: {e}") from e
+
+
+def _open_run_fd(
+    project_dir: Path, run_id: str,
+    *, expected_identity: tuple[int, int] | None = None,
+) -> int:
+    """Compatibility shim pending migration to ``_open_run_fd_into``."""
+    owner = _OwnedDescriptor(expected_identity)
+    _open_run_fd_into(
+        owner, project_dir, run_id, expected_identity=expected_identity,
+    )
+    return owner.release()
 
 
 def read_run_identity(project_dir: Path, run_id: str) -> dict:
     """Read one reconciled run identity without creating or repairing repository state."""
     run_id = validate_run_id(run_id)
-    run_fd = _open_run_fd(Path(project_dir), run_id)
-    try:
-        identity, _started = _run_identity_from_fd(run_fd, run_id)
-        return dict(identity)
-    finally:
-        os.close(run_fd)
+    owner = _OwnedDescriptor()
+    settlement = _SettlementOwner(
+        lambda: _settle_descriptor_owners((owner,), "run identity anchor"),
+    )
+    with _SettlementFence(settlement):
+        with _SettlementFence(settlement):
+            _open_run_fd_into(owner, Path(project_dir), run_id)
+            if _run_creation_pending(owner.fd):
+                raise _InvalidRunIdentity(f"run {run_id!r} creation is incomplete")
+            identity, _started = _run_identity_from_fd(owner.fd, run_id)
+            return dict(identity)
 
 
 def read_run_creation_target(project_dir: Path, run_id: str) -> str:
@@ -802,29 +964,85 @@ def read_run_creation_target(project_dir: Path, run_id: str) -> str:
     directory/run ID and target still reconcile with any readable manifest identity.
     """
     run_id = validate_run_id(run_id)
-    run_fd = _open_run_fd(Path(project_dir), run_id)
+    owner = _OwnedDescriptor()
+    settlement = _SettlementOwner(
+        lambda: _settle_descriptor_owners((owner,), "run creation anchor"),
+    )
+    with _SettlementFence(settlement):
+        with _SettlementFence(settlement):
+            _open_run_fd_into(owner, Path(project_dir), run_id)
+            run_fd = owner.fd
+            if _run_creation_pending(run_fd):
+                raise _InvalidRunIdentity(f"run {run_id!r} creation is incomplete")
+            creation = _read_identity_file(run_fd, "run.json")
+            if creation is None or creation is _MALFORMED_IDENTITY or not isinstance(creation, dict):
+                raise _InvalidRunIdentity(f"run {run_id!r} has no readable run.json creation record")
+            if creation.get("run_id") != run_id:
+                raise _InvalidRunIdentity(
+                    f"run.json names {creation.get('run_id')!r}, not directory {run_id!r}",
+                )
+            target = creation.get("target")
+            if type(target) is not str or not target.strip():
+                raise _InvalidRunIdentity(f"run {run_id!r} creation record names no target")
+            manifest = _read_identity_file(run_fd, "manifest.json")
+            if isinstance(manifest, dict):
+                manifest_id, manifest_target = manifest.get("run_id"), manifest.get("target")
+                if type(manifest_id) is str and manifest_id != run_id:
+                    raise _InvalidRunIdentity(
+                        f"manifest.json names {manifest_id!r}, not directory {run_id!r}",
+                    )
+                if type(manifest_target) is str and manifest_target.strip() and manifest_target != target:
+                    raise _InvalidRunIdentity("run.json and manifest.json disagree on target")
+            return target
+
+
+def _snapshot_one_run(
+    root: Path,
+    name: str,
+    root_owner: "_OwnedDescriptor",
+):
+    run_owner = _OwnedDescriptor()
+    settlement = _SettlementOwner(
+        lambda: _settle_descriptor_owners((run_owner,), "run enumeration descriptor"),
+    )
     try:
-        creation = _read_identity_file(run_fd, "run.json")
-        if creation is None or creation is _MALFORMED_IDENTITY or not isinstance(creation, dict):
-            raise _InvalidRunIdentity(f"run {run_id!r} has no readable run.json creation record")
-        if creation.get("run_id") != run_id:
-            raise _InvalidRunIdentity(f"run.json names {creation.get('run_id')!r}, not directory {run_id!r}")
-        target = creation.get("target")
-        if type(target) is not str or not target.strip():
-            raise _InvalidRunIdentity(f"run {run_id!r} creation record names no target")
-        manifest = _read_identity_file(run_fd, "manifest.json")
-        if isinstance(manifest, dict):
-            manifest_id, manifest_target = manifest.get("run_id"), manifest.get("target")
-            if type(manifest_id) is str and manifest_id != run_id:
-                raise _InvalidRunIdentity(f"manifest.json names {manifest_id!r}, not directory {run_id!r}")
-            if type(manifest_target) is str and manifest_target.strip() and manifest_target != target:
-                raise _InvalidRunIdentity("run.json and manifest.json disagree on target")
-        return target
-    finally:
-        os.close(run_fd)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                run_owner.open(name, _DIR_OPEN_FLAGS, dir_fd=root_owner.fd)
+                if _run_creation_pending(run_owner.fd):
+                    return None
+                identity, started = _run_identity_from_fd(run_owner.fd, name)
+                return started, name, root / name, identity, run_owner.identity
+    except _InvalidRunIdentity:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            return None
+        raise ContractError(
+            f"run {name!r} cannot be opened while enumerating {root}: "
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
 
 
-def _run_snapshots(project_dir: Path) -> "list[tuple[datetime, str, Path, dict]]":
+def _enumerate_run_snapshots(
+    root: Path,
+    root_owner: "_OwnedDescriptor",
+) -> "list[tuple[datetime, str, Path, dict, tuple[int, int]]]":
+    """Enumerate under already-active root descriptor settlement fences."""
+    runs = []
+    names = os.listdir(root_owner.fd)
+    for name in names:
+        if not valid_run_id(name):
+            continue
+        snapshot = _snapshot_one_run(root, name, root_owner)
+        if snapshot is not None:
+            runs.append(snapshot)
+    return runs
+
+
+def _run_snapshots(
+    project_dir: Path,
+) -> "list[tuple[datetime, str, Path, dict, tuple[int, int]]]":
     """Validated identity snapshots for selectable runs, oldest first.
 
     Each identity is read exactly once through a no-follow run descriptor.  Consumers carry this snapshot
@@ -832,39 +1050,22 @@ def _run_snapshots(project_dir: Path) -> "list[tuple[datetime, str, Path, dict]]
     lifetime across mutations as well.
     """
     root = Path(project_dir) / "recon"
+    root_owner = _OwnedDescriptor()
+    settlement = _SettlementOwner(
+        lambda: _settle_descriptor_owners(
+            (root_owner,), "run enumeration descriptors",
+        ),
+    )
     try:
-        root_fd = os.open(root, _DIR_OPEN_FLAGS)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                root_owner.open(root, _DIR_OPEN_FLAGS)
+                runs = _enumerate_run_snapshots(root, root_owner)
     except FileNotFoundError:
         return []
     except OSError as e:
         raise ContractError(f"repository root {root} cannot be listed safely: "
                             f"{type(e).__name__}: {e}") from e
-    runs = []
-    try:
-        try:
-            names = os.listdir(root_fd)
-        except OSError as e:
-            raise ContractError(f"repository root {root} cannot be listed: {type(e).__name__}: {e}") from e
-        for name in names:
-            if not valid_run_id(name):
-                continue
-            try:
-                run_fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=root_fd)
-            except OSError as e:
-                if e.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
-                    continue                              # symlink, non-directory, or vanished entry
-                raise ContractError(f"run {name!r} cannot be opened while enumerating {root}: "
-                                    f"{type(e).__name__}: {e}") from e
-            try:
-                try:
-                    identity, started = _run_identity_from_fd(run_fd, name)
-                except _InvalidRunIdentity:
-                    continue                              # damaged identities are not selectable as a run
-            finally:
-                os.close(run_fd)
-            runs.append((started, name, root / name, identity))
-    finally:
-        os.close(root_fd)
     runs.sort(key=lambda item: (item[0], item[1]))
     return runs
 
@@ -882,6 +1083,18 @@ def _atomic_write(path: Path, text: str) -> None:
     never chmod-after-write."""
     from . import privfs
     privfs.write_private(path, text)
+
+
+def _write_all_descriptor(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError("repository descriptor write made no progress")
+        view = view[written:]
 
 
 #: every key `Run._run_summary` emits. A committed summary carries all of them, so a partial object is
@@ -993,11 +1206,14 @@ class _OwnedDescriptor:
         self.expected_identity = expected_identity
         self.terminal = False
 
-    def allocate(self, allocate) -> int:
+    def _prepare_allocation(self) -> None:
         if self.fd >= 0:
             raise ContractError("repository descriptor ownership slot is already used")
         self.terminal = False
-        self.fd = allocate()
+
+    def _finish_allocation(self) -> int:
+        if self.fd < 0:
+            raise ContractError("repository descriptor allocator did not adopt a descriptor")
         observed = os.fstat(self.fd)
         self.identity = (observed.st_dev, observed.st_ino)
         if (self.expected_identity is not None
@@ -1005,6 +1221,35 @@ class _OwnedDescriptor:
             raise ContractError("repository descriptor identity changed during allocation")
         return self.fd
 
+    def open(self, path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        """Open directly into this stable slot; no callback-return adoption gap."""
+        self._prepare_allocation()
+        self.fd = os.open(path, flags, mode, dir_fd=dir_fd)
+        return self._finish_allocation()
+
+    def duplicate(self, source_fd: int) -> int:
+        """Duplicate directly into this stable slot."""
+        self._prepare_allocation()
+        self.fd = os.dup(source_fd)
+        return self._finish_allocation()
+
+    def allocate_into(self, allocate) -> int:
+        """Let a strict helper adopt its result before it can return or raise.
+
+        The callback receives this owner and must call ``adopt``.  Unlike the
+        former callback-return API, a callback that adopts and then raises
+        leaves the descriptor visible to the already-active settlement fence.
+        """
+        self._prepare_allocation()
+        allocate(self)
+        return self._finish_allocation()
+
+    def adopt(self, fd: int) -> int:
+        """Adopt a descriptor from inside an owner-aware allocation callback."""
+        if self.fd >= 0:
+            raise ContractError("repository descriptor ownership slot is already used")
+        self.fd = fd
+        return fd
     def close_once(self) -> BaseException | None:
         """Attempt one authenticated close and monotonically reconcile its result."""
         if self.terminal:
@@ -1051,6 +1296,215 @@ class _OwnedDescriptor:
         self.terminal = True
         return None
 
+    def release(self) -> int:
+        """Transfer an authenticated live descriptor out of this owner."""
+        if self.fd < 0 or self.terminal or self.identity is None:
+            raise ContractError("repository descriptor owner has nothing to release")
+        observed = os.fstat(self.fd)
+        if (observed.st_dev, observed.st_ino) != self.identity:
+            raise ContractError("repository descriptor identity changed before release")
+        result = self.fd
+        self.fd = -1
+        self.terminal = True
+        return result
+
+
+def _open_strict_directory_into(
+    destination: _OwnedDescriptor,
+    anchor_fd: int,
+    components: tuple[str, ...],
+) -> None:
+    """Walk strict directories and adopt the final descriptor before return."""
+    from . import privfs
+    components = privfs.validate_relative_components(components)
+    walkers = [_OwnedDescriptor(), _OwnedDescriptor()]
+    current_index = 0
+    handed_off = False
+
+    def settle_walk() -> None:
+        owned = tuple(walkers) if handed_off else (destination, *walkers)
+        _settle_descriptor_owners(owned, "strict directory walk descriptors")
+
+    settlement = _SettlementOwner(settle_walk)
+    with _SettlementFence(settlement):
+        with _SettlementFence(settlement):
+            walkers[current_index].duplicate(anchor_fd)
+            for index, component in enumerate(components):
+                final = index == len(components) - 1
+                child = destination if final else walkers[1 - current_index]
+                _open_strict_directory_child(
+                    child, walkers[current_index].fd, component,
+                    components[:index + 1],
+                )
+                observed = os.fstat(child.fd)
+                if (not stat.S_ISDIR(observed.st_mode)
+                        or observed.st_uid != os.geteuid()
+                        or stat.S_IMODE(observed.st_mode) != 0o700):
+                    raise ContractError("managed directory identity is unsafe")
+                _settle_descriptor_owners(
+                    (walkers[current_index],), "strict directory walk descriptor",
+                )
+                if not final:
+                    current_index = 1 - current_index
+            if not components:
+                destination.duplicate(walkers[current_index].fd)
+            handed_off = True
+
+
+def _open_strict_directory_child(
+    destination: _OwnedDescriptor,
+    parent_fd: int,
+    component: str,
+    traversed: tuple[str, ...],
+) -> None:
+    """Map a missing strict child outside the descriptor-owning walk frame."""
+    from . import privfs
+    try:
+        destination.open(component, _DIR_OPEN_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError as exc:
+        raise privfs.PrivatePathMissing(
+            "managed path does not exist", components=traversed,
+        ) from exc
+
+
+def _open_strict_file_into(
+    destination: _OwnedDescriptor,
+    anchor_fd: int,
+    components: tuple[str, ...],
+) -> None:
+    """Open one strict private file directly into a stable destination."""
+    from . import privfs
+    components = privfs.validate_relative_components(components, allow_empty=False)
+    parent = _OwnedDescriptor()
+    handed_off = False
+
+    def settle_file_open() -> None:
+        owned = (parent,) if handed_off else (destination, parent)
+        _settle_descriptor_owners(owned, "strict file open descriptors")
+
+    settlement = _SettlementOwner(
+        settle_file_open,
+    )
+    try:
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                _open_strict_directory_into(parent, anchor_fd, components[:-1])
+                destination.open(components[-1], _FILE_OPEN_FLAGS, dir_fd=parent.fd)
+                observed = os.fstat(destination.fd)
+                if (not stat.S_ISREG(observed.st_mode)
+                        or observed.st_uid != os.geteuid()
+                        or observed.st_nlink != 1
+                        or stat.S_IMODE(observed.st_mode) != 0o600):
+                    raise ContractError("managed file identity is unsafe")
+                handed_off = True
+    except FileNotFoundError as exc:
+        raise privfs.PrivatePathMissing(
+            "managed path does not exist", components=components,
+        ) from exc
+
+
+def _publish_private_directory_into(
+    destination: _OwnedDescriptor,
+    parent_fd: int,
+    name: str,
+    mode: int,
+) -> bool:
+    """Create, pin and no-replace-publish one exact private directory."""
+    from . import privfs
+    state = {
+        "temporary": f".quarry-dir-{os.urandom(16).hex()}.stage",
+        "published": False,
+        "kept": False,
+    }
+
+    def settle_stage() -> None:
+        if state["kept"]:
+            return
+        if destination.fd >= 0 and destination.identity is not None:
+            candidate = name if state["published"] else state["temporary"]
+            try:
+                named = os.stat(candidate, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                alternate = name if candidate == state["temporary"] else state["temporary"]
+                named = os.stat(alternate, dir_fd=parent_fd, follow_symlinks=False)
+                candidate = alternate
+            if (named.st_dev, named.st_ino) != destination.identity:
+                raise ContractError("staged private directory was substituted")
+            if candidate == state["temporary"]:
+                if os.listdir(destination.fd):
+                    raise ContractError("staged private directory is not empty")
+                os.rmdir(candidate, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            else:
+                state["published"] = True
+                state["kept"] = True
+                return
+        _settle_descriptor_owners(
+            (destination,), "unpublished private directory descriptor",
+        )
+
+    settlement = _SettlementOwner(settle_stage)
+    with _SettlementFence(settlement):
+        with _SettlementFence(settlement):
+            temporary = state["temporary"]
+            os.mkdir(temporary, mode, dir_fd=parent_fd); destination.open(temporary, _DIR_OPEN_FLAGS, dir_fd=parent_fd)  # noqa: E702 - one traced settlement seam
+            observed = os.fstat(destination.fd)
+            if (not stat.S_ISDIR(observed.st_mode)
+                    or observed.st_uid != os.geteuid()
+                    or stat.S_IMODE(observed.st_mode) != mode):
+                raise ContractError("staged private directory is unsafe")
+            if not _rename_private_directory_if_absent(
+                parent_fd, temporary, name,
+            ):
+                return False
+            state["published"] = True
+            os.fsync(parent_fd)
+            state["kept"] = True
+            return True
+
+
+def _rename_private_directory_if_absent(
+    parent_fd: int, temporary: str, name: str,
+) -> bool:
+    """Isolate the no-replace EEXIST exception-table boundary."""
+    from . import privfs
+    try:
+        privfs._renameat2_noreplace(parent_fd, temporary, parent_fd, name)
+    except FileExistsError:
+        return False
+    return True
+
+
+def _open_or_publish_private_directory(
+    destination: _OwnedDescriptor,
+    parent_fd: int,
+    name: str,
+    mode: int,
+    *, initializing: bool,
+) -> bool:
+    """Open an established namespace or publish one exact bootstrap inode."""
+    created = False
+    if initializing:
+        created = _publish_private_directory_into(destination, parent_fd, name, mode)
+    if destination.fd < 0:
+        destination.open(name, _DIR_OPEN_FLAGS, dir_fd=parent_fd)
+    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (named.st_dev, named.st_ino) != destination.identity:
+        raise ContractError("private directory name changed during bootstrap")
+    return created
+
+
+def _settle_descriptor_owners(
+    owners: tuple[_OwnedDescriptor, ...], what: str,
+) -> None:
+    """Close an exact descriptor set and refuse an indeterminate owner."""
+    faults = _close_owned_descriptors_twice(owners)
+    preferred = _preferred_settlement_fault(None, faults)
+    if preferred is not None:
+        raise preferred
+    if any(owner.fd >= 0 for owner in owners):
+        raise ContractError(f"{what} did not settle")
+
 
 def _close_owned_descriptors_twice(
     owners: tuple[_OwnedDescriptor, ...],
@@ -1067,6 +1521,1235 @@ def _close_owned_descriptors_twice(
                 if fault is not None:
                     faults.append(fault)
     return faults
+
+
+class _RunMutationOwner:
+    """Stable descriptor authority for one outermost Run mutation epoch."""
+
+    __slots__ = (
+        "run", "lock_directory", "state_directory", "lock_file", "lock_record",
+        "project_anchor", "recon_root", "run_anchor", "creation_file",
+        "claims_root", "claim_registry", "history_directory",
+        "history_record", "lock_identity", "initializing",
+        "lock_record_durable", "creation_record", "root_locked", "locked",
+        "acquired", "terminal", "borrowed_project_anchor",
+        "state_created", "locks_created", "history_created",
+        "claims_root_created", "claim_registry_created",
+        "claim_registry_possible", "claim_registry_stage_name",
+        "authority_record_created", "authority_record_durable",
+    )
+
+    def __init__(
+        self, run, *, initializing: bool = False,
+        project_anchor_fd: int | None = None,
+    ) -> None:
+        self.run = run
+        self.lock_directory = _OwnedDescriptor()
+        self.state_directory = _OwnedDescriptor()
+        self.lock_file = _OwnedDescriptor()
+        self.lock_record = _OwnedDescriptor()
+        self.project_anchor = _OwnedDescriptor(run._project_directory_identity)
+        self.recon_root = _OwnedDescriptor()
+        self.run_anchor = _OwnedDescriptor(run._run_directory_identity)
+        self.creation_file = _OwnedDescriptor()
+        self.claims_root = _OwnedDescriptor()
+        self.claim_registry = _OwnedDescriptor()
+        self.history_directory = _OwnedDescriptor()
+        self.history_record = _OwnedDescriptor()
+        self.lock_identity = None
+        self.initializing = initializing
+        self.lock_record_durable = False
+        self.creation_record = None
+        self.root_locked = False
+        self.locked = False
+        self.acquired = False
+        self.terminal = False
+        self.borrowed_project_anchor = project_anchor_fd
+        self.state_created = False
+        self.locks_created = False
+        self.history_created = False
+        self.claims_root_created = False
+        self.claim_registry_created = False
+        self.claim_registry_possible = False
+        self.claim_registry_stage_name = None
+        self.authority_record_created = False
+        self.authority_record_durable = False
+
+    @property
+    def descriptor_owners(self) -> tuple[_OwnedDescriptor, ...]:
+        return (
+            self.creation_file, self.claim_registry, self.claims_root,
+            self.history_directory,
+            self.history_record,
+            self.run_anchor, self.recon_root, self.project_anchor,
+            self.lock_record, self.lock_file,
+            self.lock_directory, self.state_directory,
+        )
+
+    @property
+    def lock_record_name(self) -> str:
+        return f"{self.run.run_id}.lock.identity"
+
+    @staticmethod
+    def _identity(fd: int) -> tuple[int, int]:
+        observed = os.fstat(fd)
+        return observed.st_dev, observed.st_ino
+
+    def _validate_named_identities(self) -> None:
+        """Both public names must still resolve to the exact pinned objects."""
+        project_named = os.stat(self.run.project_dir, follow_symlinks=False)
+        if ((project_named.st_dev, project_named.st_ino) != self.run._project_directory_identity
+                or self._identity(self.project_anchor.fd) != self.run._project_directory_identity):
+            raise ContractError("project directory identity changed")
+        recon_named = os.stat(
+            "recon", dir_fd=self.project_anchor.fd, follow_symlinks=False,
+        )
+        if (recon_named.st_dev, recon_named.st_ino) != self._identity(self.recon_root.fd):
+            raise ContractError("repository root identity changed")
+        state_named = os.stat(
+            "state", dir_fd=self.recon_root.fd, follow_symlinks=False,
+        )
+        if (state_named.st_dev, state_named.st_ino) != self._identity(self.state_directory.fd):
+            raise ContractError("repository state directory identity changed")
+        locks_named = os.stat(
+            "locks", dir_fd=self.state_directory.fd, follow_symlinks=False,
+        )
+        if (locks_named.st_dev, locks_named.st_ino) != self._identity(self.lock_directory.fd):
+            raise ContractError("repository lock directory identity changed")
+        claims_named = os.stat(
+            "claims", dir_fd=self.state_directory.fd, follow_symlinks=False,
+        )
+        if (claims_named.st_dev, claims_named.st_ino) != self.claims_root.identity:
+            raise ContractError("repository claims directory identity changed")
+        registry_named = os.stat(
+            self.run.run_id, dir_fd=self.claims_root.fd, follow_symlinks=False,
+        )
+        if (registry_named.st_dev, registry_named.st_ino) != self.claim_registry.identity:
+            raise ContractError("run artifact-claim registry identity changed")
+        history_named = os.stat(
+            "history", dir_fd=self.state_directory.fd, follow_symlinks=False,
+        )
+        if (history_named.st_dev, history_named.st_ino) != self.history_directory.identity:
+            raise ContractError("repository history directory identity changed")
+        history_record_named = os.stat(
+            "authority.identity", dir_fd=self.state_directory.fd,
+            follow_symlinks=False,
+        )
+        if ((history_record_named.st_dev, history_record_named.st_ino)
+                != self.history_record.identity):
+            raise ContractError("repository history identity record changed")
+        lock_named = os.stat(
+            self.run._lock_path.name, dir_fd=self.lock_directory.fd,
+            follow_symlinks=False,
+        )
+        if (lock_named.st_dev, lock_named.st_ino) != self.lock_identity:
+            raise ContractError("repository lock identity changed")
+        run_named = os.stat(
+            self.run.run_id, dir_fd=self.recon_root.fd, follow_symlinks=False,
+        )
+        if (run_named.st_dev, run_named.st_ino) != self.run._run_directory_identity:
+            raise ContractError(f"run {self.run.run_id!r} directory identity changed")
+        if self._identity(self.run_anchor.fd) != self.run._run_directory_identity:
+            raise ContractError(f"run {self.run.run_id!r} descriptor identity changed")
+        creation_named = os.stat(
+            "run.json", dir_fd=self.run_anchor.fd, follow_symlinks=False,
+        )
+        if ((creation_named.st_dev, creation_named.st_ino) != self.creation_file.identity
+                or self._identity(self.creation_file.fd) != self.creation_file.identity):
+            raise ContractError("run creation record identity changed")
+        record_named = os.stat(
+            self.lock_record_name, dir_fd=self.lock_directory.fd,
+            follow_symlinks=False,
+        )
+        if ((record_named.st_dev, record_named.st_ino) != self.lock_record.identity
+                or self._identity(self.lock_record.fd) != self.lock_record.identity):
+            raise ContractError("repository lock identity record changed")
+        os.lseek(self.creation_file.fd, 0, os.SEEK_SET)
+        raw_creation = os.read(self.creation_file.fd, _MAX_IDENTITY_BYTES + 1)
+        try:
+            creation = json.loads(raw_creation.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise ContractError("run creation record is unreadable") from None
+        if (not isinstance(creation, dict)
+                or creation.get("mutation_lock") != self._lock_witness
+                or creation.get("artifact_claims") != self._claims_witness
+                or creation.get("project_state") != self._project_state_witness):
+            raise ContractError("run creation mutation-lock witness changed")
+        os.lseek(self.lock_record.fd, 0, os.SEEK_SET)
+        raw_record = os.read(self.lock_record.fd, 4097)
+        try:
+            lock_record = json.loads(raw_record.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise ContractError("repository lock identity record is unreadable") from None
+        expected_record = {
+            "schema_version": 1, "run_id": self.run.run_id,
+            "device": self.lock_identity[0], "inode": self.lock_identity[1],
+        }
+        if lock_record != expected_record:
+            raise ContractError("repository lock identity record changed")
+        os.lseek(self.history_record.fd, 0, os.SEEK_SET)
+        raw_history_record = os.read(self.history_record.fd, 4097)
+        try:
+            history_record = json.loads(raw_history_record.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise ContractError("repository history identity record is unreadable") from None
+        expected_history_record = {
+            "schema_version": 1,
+            "state_device": self.state_directory.identity[0],
+            "state_inode": self.state_directory.identity[1],
+            "locks_device": self.lock_directory.identity[0],
+            "locks_inode": self.lock_directory.identity[1],
+            "claims_device": self.claims_root.identity[0],
+            "claims_inode": self.claims_root.identity[1],
+            "history_device": self.history_directory.identity[0],
+            "history_inode": self.history_directory.identity[1],
+        }
+        if history_record != expected_history_record:
+            raise ContractError("repository history identity record changed")
+
+    @property
+    def _shared_authority_payload(self) -> dict:
+        return {
+            "schema_version": 1,
+            "state_device": self.state_directory.identity[0],
+            "state_inode": self.state_directory.identity[1],
+            "locks_device": self.lock_directory.identity[0],
+            "locks_inode": self.lock_directory.identity[1],
+            "claims_device": self.claims_root.identity[0],
+            "claims_inode": self.claims_root.identity[1],
+            "history_device": self.history_directory.identity[0],
+            "history_inode": self.history_directory.identity[1],
+        }
+
+    def _bind_shared_authority(self, *, create: bool) -> None:
+        """Open the bootstrap-only project-state namespace identity record."""
+        from . import privfs
+        flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        if create:
+            self.authority_record_created = True
+            flags |= os.O_CREAT | os.O_EXCL
+        try:
+            self.history_record.open(
+                "authority.identity", flags, privfs.FILE_MODE,
+                dir_fd=self.state_directory.fd,
+            )
+        except FileNotFoundError as exc:
+            raise ContractError("repository shared authority record is missing") from exc
+        except FileExistsError as exc:
+            raise ContractError("repository shared authority record already exists") from exc
+        observed = os.fstat(self.history_record.fd)
+        named = os.stat(
+            "authority.identity", dir_fd=self.state_directory.fd,
+            follow_symlinks=False,
+        )
+        if (not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE
+                or (named.st_dev, named.st_ino) != self.history_record.identity
+                or observed.st_size > 4096):
+            raise ContractError("repository shared authority record is unsafe")
+        if create:
+            payload = json.dumps(
+                self._shared_authority_payload, sort_keys=True,
+            ).encode("utf-8")
+            os.fchmod(self.history_record.fd, privfs.FILE_MODE)
+            _write_all_descriptor(self.history_record.fd, payload)
+            os.fsync(self.history_record.fd)
+            os.fsync(self.state_directory.fd)
+            self.authority_record_durable = True
+        os.lseek(self.history_record.fd, 0, os.SEEK_SET)
+        raw = os.read(self.history_record.fd, 4097)
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise ContractError("repository shared authority record is unreadable") from None
+        if record != self._shared_authority_payload:
+            raise ContractError("repository shared authority identity changed")
+
+    def _shared_authority_exists(self) -> bool:
+        try:
+            os.stat(
+                "authority.identity", dir_fd=self.state_directory.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _shared_namespace_has_run_witness(self) -> bool:
+        for name in os.listdir(self.recon_root.fd):
+            if name == self.run.run_id or not valid_run_id(name):
+                continue
+            candidate = _OwnedDescriptor()
+            settlement = _SettlementOwner(
+                lambda: _settle_descriptor_owners(
+                    (candidate,), "shared authority witness descriptor",
+                ),
+            )
+            with _SettlementFence(settlement):
+                with _SettlementFence(settlement):
+                    try:
+                        candidate.open(name, _DIR_OPEN_FLAGS, dir_fd=self.recon_root.fd)
+                    except FileNotFoundError:
+                        continue
+                    creation = _read_identity_file(candidate.fd, "run.json")
+                    if (isinstance(creation, dict)
+                            and creation.get("run_id") == name
+                            and isinstance(creation.get("project_state"), dict)):
+                        return True
+        return False
+
+    def _validate_shared_consensus(self) -> None:
+        """Require an older Run witness before adopting established shared state."""
+        witnessed = False
+        for name in os.listdir(self.recon_root.fd):
+            if name == self.run.run_id or not valid_run_id(name):
+                continue
+            candidate = _OwnedDescriptor()
+            settlement = _SettlementOwner(
+                lambda: _settle_descriptor_owners(
+                    (candidate,), "shared authority witness descriptor",
+                ),
+            )
+            with _SettlementFence(settlement):
+                with _SettlementFence(settlement):
+                    try:
+                        candidate.open(name, _DIR_OPEN_FLAGS, dir_fd=self.recon_root.fd)
+                    except FileNotFoundError:
+                        continue
+                    creation = _read_identity_file(candidate.fd, "run.json")
+                    if not isinstance(creation, dict):
+                        continue
+                    if creation.get("run_id") != name:
+                        continue
+                    project_state = creation.get("project_state")
+                    if not isinstance(project_state, dict):
+                        raise ContractError(
+                            "legacy repository shared authority requires explicit repair",
+                        )
+                    if project_state != self._project_state_witness:
+                        raise ContractError("repository shared authority witness changed")
+                    claims = creation.get("artifact_claims")
+                    if (not isinstance(claims, dict)
+                            or claims.get("root_device") != self.claims_root.identity[0]
+                            or claims.get("root_inode") != self.claims_root.identity[1]):
+                        raise ContractError("repository claims authority witness changed")
+                    witnessed = True
+        if not witnessed:
+            raise ContractError(
+                "repository shared authority has no creation-bound Run witness",
+            )
+
+    def _bind_durable_lock_identity(self) -> None:
+        """Create-once binding from the public lock name to its exact inode.
+
+        ``O_EXCL`` is the bootstrap arbitration.  If two different lock inodes
+        are flocked during a name-substitution race, only one contender can
+        create this record; the other opens the winner's record and fails the
+        exact identity comparison.  An interrupted creator may leave an
+        incomplete record, which safely terminalizes future acquisition rather
+        than allowing another identity to replace it.
+        """
+        from . import privfs
+        if self.initializing:
+            try:
+                self.lock_record.open(
+                    self.lock_record_name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    privfs.FILE_MODE,
+                    dir_fd=self.lock_directory.fd,
+                )
+            except FileExistsError as exc:
+                raise ContractError("repository lock identity record already exists during creation") from exc
+        else:
+            try:
+                self.lock_record.open(
+                    self.lock_record_name, os.O_RDWR | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=self.lock_directory.fd,
+                )
+            except FileNotFoundError as exc:
+                raise ContractError("repository lock identity record is missing") from exc
+        if self.initializing:
+            payload = json.dumps({
+                "schema_version": 1,
+                "run_id": self.run.run_id,
+                "device": self.lock_identity[0],
+                "inode": self.lock_identity[1],
+            }, sort_keys=True).encode("utf-8")
+            os.fchmod(self.lock_record.fd, privfs.FILE_MODE)
+            _write_all_descriptor(self.lock_record.fd, payload)
+            os.fsync(self.lock_record.fd)
+            os.fsync(self.lock_directory.fd)
+        observed = os.fstat(self.lock_record.fd)
+        named = os.stat(
+            self.lock_record_name, dir_fd=self.lock_directory.fd,
+            follow_symlinks=False,
+        )
+        if (not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE
+                or (named.st_dev, named.st_ino) != (observed.st_dev, observed.st_ino)
+                or observed.st_size > 4096):
+            raise ContractError("repository lock identity record is unsafe")
+        os.lseek(self.lock_record.fd, 0, os.SEEK_SET)
+        raw = os.read(self.lock_record.fd, 4097)
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise ContractError("repository lock identity record is unreadable") from None
+        expected = {
+            "schema_version": 1,
+            "run_id": self.run.run_id,
+            "device": self.lock_identity[0],
+            "inode": self.lock_identity[1],
+        }
+        if record != expected:
+            raise ContractError("repository lock identity changed")
+
+    @property
+    def _lock_witness(self) -> dict:
+        return {
+            "schema_version": 1,
+            "device": self.lock_identity[0],
+            "inode": self.lock_identity[1],
+        }
+
+    @property
+    def _claims_witness(self) -> dict:
+        return {
+            "schema_version": 1,
+            "root_device": self.claims_root.identity[0],
+            "root_inode": self.claims_root.identity[1],
+            "registry_device": self.claim_registry.identity[0],
+            "registry_inode": self.claim_registry.identity[1],
+        }
+
+    @property
+    def _project_state_witness(self) -> dict:
+        return {
+            "schema_version": 1,
+            "state_device": self.state_directory.identity[0],
+            "state_inode": self.state_directory.identity[1],
+            "locks_device": self.lock_directory.identity[0],
+            "locks_inode": self.lock_directory.identity[1],
+            "claims_device": self.claims_root.identity[0],
+            "claims_inode": self.claims_root.identity[1],
+            "history_device": self.history_directory.identity[0],
+            "history_inode": self.history_directory.identity[1],
+            "record_device": self.history_record.identity[0],
+            "record_inode": self.history_record.identity[1],
+        }
+
+    def _bind_run_creation_witness(self) -> None:
+        """Bind the lock to immutable identity inside the pinned Run itself.
+
+        The sibling sidecar is useful for create-once arbitration, but it is not
+        a trust root: an attacker could rename a lock and its self-described
+        sidecar together.  ``run.json`` was claimed with the Run directory and
+        is the creation-bound authority every later acquisition must reconcile.
+        Legacy records without this witness fail closed rather than silently
+        adopting whatever lock name happens to exist.
+        """
+        from . import privfs
+        creation = _read_identity_file(self.run_anchor.fd, "run.json")
+        if not isinstance(creation, dict):
+            raise ContractError("run creation identity is unavailable for mutation locking")
+        if self.initializing:
+            if "mutation_lock" in creation:
+                raise ContractError("run creation identity already has a mutation-lock witness")
+            self.creation_record = dict(creation)
+            creation = dict(creation)
+            creation["mutation_lock"] = self._lock_witness
+            creation["artifact_claims"] = self._claims_witness
+            creation["project_state"] = self._project_state_witness
+            stage = None
+            try:
+                stage = privfs.stage_private_bytes(
+                    self.run_anchor.fd, ("run.json",),
+                    json.dumps(creation).encode("utf-8"),
+                )
+                privfs.replace_private_stage(stage)
+            except BaseException:
+                if stage is not None:
+                    try:
+                        privfs.abort_private_stage(stage)
+                    except BaseException:
+                        pass
+                raise
+            creation = _read_identity_file(self.run_anchor.fd, "run.json")
+        if (not isinstance(creation, dict)
+                or creation.get("mutation_lock") != self._lock_witness
+                or creation.get("artifact_claims") != self._claims_witness
+                or creation.get("project_state") != self._project_state_witness):
+            raise ContractError("run creation mutation-lock witness changed")
+        self.creation_file.open("run.json", _FILE_OPEN_FLAGS, dir_fd=self.run_anchor.fd)
+        creation_stat = os.fstat(self.creation_file.fd)
+        if (not stat.S_ISREG(creation_stat.st_mode)
+                or creation_stat.st_uid != os.geteuid()
+                or creation_stat.st_nlink != 1):
+            raise ContractError("run creation record is unsafe")
+        if self.initializing:
+            self.lock_record_durable = True
+
+    def _fence_incomplete_bootstrap(self) -> None:
+        """Remove only the exact incomplete names created by Run creation."""
+        if not self.initializing or self.lock_record_durable:
+            return
+        if self.creation_record is not None and self.run_anchor.fd >= 0:
+            from . import privfs
+            observed_creation = _read_identity_file(self.run_anchor.fd, "run.json")
+            if (isinstance(observed_creation, dict)
+                    and observed_creation.get("mutation_lock") == self._lock_witness):
+                stage = privfs.stage_private_bytes(
+                    self.run_anchor.fd, ("run.json",),
+                    json.dumps(self.creation_record).encode("utf-8"),
+                )
+                try:
+                    privfs.replace_private_stage(stage)
+                except BaseException:
+                    try:
+                        privfs.abort_private_stage(stage)
+                    except BaseException:
+                        pass
+                    raise
+            elif (not isinstance(observed_creation, dict)
+                  or "mutation_lock" in observed_creation):
+                raise ContractError("incomplete Run lock witness changed")
+        if self.lock_directory.fd >= 0:
+            for name, identity in (
+                (self.lock_record_name, self.lock_record.identity),
+                (self.run._lock_path.name, self.lock_identity or self.lock_file.identity),
+            ):
+                if identity is None:
+                    continue
+                try:
+                    observed = os.stat(name, dir_fd=self.lock_directory.fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if (observed.st_dev, observed.st_ino) != identity:
+                    raise ContractError("incomplete repository lock identity was substituted")
+                os.unlink(name, dir_fd=self.lock_directory.fd)
+            os.fsync(self.lock_directory.fd)
+        if self.claim_registry_possible and self.claims_root.fd >= 0:
+            registry = self.claim_registry
+            public_name = self.run.run_id
+            if registry.fd < 0:
+                raise ContractError("incomplete claim registry lost its descriptor")
+            try:
+                named = os.stat(
+                    public_name, dir_fd=self.claims_root.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                candidates = []
+                for candidate in os.listdir(self.claims_root.fd):
+                    if not (candidate.startswith(".quarry-claim-")
+                            and candidate.endswith(".stage")):
+                        continue
+                    observed = os.stat(
+                        candidate, dir_fd=self.claims_root.fd,
+                        follow_symlinks=False,
+                    )
+                    if (observed.st_dev, observed.st_ino) == registry.identity:
+                        candidates.append(candidate)
+                if len(candidates) != 1:
+                    raise ContractError("incomplete claim registry name is indeterminate")
+                public_name = candidates[0]
+                named = os.stat(
+                    public_name, dir_fd=self.claims_root.fd,
+                    follow_symlinks=False,
+                )
+            if (named.st_dev, named.st_ino) != registry.identity:
+                raise ContractError("incomplete claim registry was substituted")
+            if os.listdir(registry.fd):
+                raise ContractError("incomplete claim registry is not empty")
+            os.rmdir(public_name, dir_fd=self.claims_root.fd)
+            os.fsync(self.claims_root.fd)
+        if self.authority_record_created and self.history_record.identity is not None:
+            named = os.stat(
+                "authority.identity", dir_fd=self.state_directory.fd,
+                follow_symlinks=False,
+            )
+            if (named.st_dev, named.st_ino) != self.history_record.identity:
+                raise ContractError("incomplete shared authority record was substituted")
+            os.unlink("authority.identity", dir_fd=self.state_directory.fd)
+        for name, parent, descriptor, created in (
+            ("history", self.state_directory, self.history_directory, self.history_created),
+            ("claims", self.state_directory, self.claims_root, self.claims_root_created),
+            ("locks", self.state_directory, self.lock_directory, self.locks_created),
+            ("state", self.recon_root, self.state_directory, self.state_created),
+        ):
+            if not created or descriptor.identity is None:
+                continue
+            named = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+            if (named.st_dev, named.st_ino) != descriptor.identity:
+                raise ContractError("incomplete shared authority directory was substituted")
+            if os.listdir(descriptor.fd):
+                raise ContractError("incomplete shared authority directory is not empty")
+            os.rmdir(name, dir_fd=parent.fd)
+            os.fsync(parent.fd)
+
+    def acquire(self) -> None:
+        """Pin lock and Run names, take the flock, then reconcile both names."""
+        if self.acquired or self.terminal:
+            raise ContractError("repository mutation owner is already used")
+        from . import privfs
+        if self.borrowed_project_anchor is None:
+            self.project_anchor.open(self.run.project_dir, _DIR_OPEN_FLAGS)
+            fcntl.flock(self.project_anchor.fd, fcntl.LOCK_EX)
+            self.root_locked = True
+        else:
+            self.project_anchor.duplicate(self.borrowed_project_anchor)
+        self.recon_root.open("recon", _DIR_OPEN_FLAGS, dir_fd=self.project_anchor.fd)
+        self.run_anchor.open(self.run.run_id, _DIR_OPEN_FLAGS, dir_fd=self.recon_root.fd)
+        for name, parent, destination, created_attribute in (
+            ("state", self.recon_root, self.state_directory, "state_created"),
+            ("locks", self.state_directory, self.lock_directory, "locks_created"),
+        ):
+            try:
+                setattr(
+                    self, created_attribute,
+                    _open_or_publish_private_directory(
+                        destination, parent.fd, name, privfs.DIR_MODE,
+                        initializing=self.initializing,
+                    ),
+                )
+            except FileNotFoundError as exc:
+                raise ContractError(f"repository {name} directory is missing") from exc
+            observed_directory = os.fstat(destination.fd)
+            if (not stat.S_ISDIR(observed_directory.st_mode)
+                    or observed_directory.st_uid != os.geteuid()
+                    or stat.S_IMODE(observed_directory.st_mode) != privfs.DIR_MODE):
+                raise ContractError(f"repository {name} directory identity is unsafe")
+        try:
+            self.history_created = _open_or_publish_private_directory(
+                self.history_directory, self.state_directory.fd,
+                "history", privfs.DIR_MODE, initializing=self.initializing,
+            )
+        except FileNotFoundError as exc:
+            raise ContractError("repository history directory is missing") from exc
+        history_stat = os.fstat(self.history_directory.fd)
+        if (not stat.S_ISDIR(history_stat.st_mode)
+                or history_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(history_stat.st_mode) != privfs.DIR_MODE):
+            raise ContractError("repository history directory identity is unsafe")
+        try:
+            self.claims_root_created = _open_or_publish_private_directory(
+                self.claims_root, self.state_directory.fd,
+                "claims", privfs.DIR_MODE, initializing=self.initializing,
+            )
+        except FileNotFoundError as exc:
+            raise ContractError("repository claims directory is missing") from exc
+        claims_stat = os.fstat(self.claims_root.fd)
+        if (not stat.S_ISDIR(claims_stat.st_mode)
+                or claims_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(claims_stat.st_mode) != privfs.DIR_MODE):
+            raise ContractError("repository claims directory is unsafe")
+
+        if self.initializing:
+            authority_exists = self._shared_authority_exists()
+            prior_witness = self._shared_namespace_has_run_witness()
+            if authority_exists:
+                if not prior_witness:
+                    raise ContractError(
+                        "repository shared authority has no creation-bound Run witness",
+                    )
+                self._bind_shared_authority(create=False)
+            elif prior_witness:
+                raise ContractError("repository shared authority record is missing")
+            else:
+                # No creation-bound Run has exposed this namespace.  This is a
+                # retry of a pre-witness bootstrap (possibly after a supported
+                # cancellation), so finish the same project-root-serialized
+                # authority record rather than permanently poisoning creation.
+                if not all((
+                    self.state_created, self.locks_created,
+                    self.history_created, self.claims_root_created,
+                )):
+                    raise ContractError(
+                        "repository shared namespace was planted before bootstrap",
+                    )
+                self._bind_shared_authority(create=True)
+            if authority_exists:
+                self._validate_shared_consensus()
+            _claim_private_directory_into(
+                self, self.claims_root.fd, self.run.run_id, privfs.DIR_MODE,
+            )
+            if not self.claim_registry_possible:
+                if prior_witness:
+                    raise ContractError(
+                        "run artifact-claim registry already exists during creation",
+                    ) from None
+                # A pre-witness bootstrap retry may reclaim only an empty,
+                # private registry.  Any planted marker or unsafe object is a
+                # poisoned namespace and remains a hard refusal.
+                retry_registry = _OwnedDescriptor()
+                retry_settlement = _SettlementOwner(
+                    lambda: _settle_descriptor_owners(
+                        (retry_registry,), "claim registry retry descriptor",
+                    ),
+                )
+                with _SettlementFence(retry_settlement):
+                    with _SettlementFence(retry_settlement):
+                        retry_registry.open(
+                            self.run.run_id, _DIR_OPEN_FLAGS,
+                            dir_fd=self.claims_root.fd,
+                        )
+                        retry_stat = os.fstat(retry_registry.fd)
+                        if (retry_stat.st_uid != os.geteuid()
+                                or stat.S_IMODE(retry_stat.st_mode) != privfs.DIR_MODE
+                                or os.listdir(retry_registry.fd)):
+                            raise ContractError(
+                                "run artifact-claim registry already exists during creation",
+                            )
+            else:
+                self.claim_registry_created = True
+        else:
+            self._bind_shared_authority(create=False)
+        try:
+            if self.claim_registry.fd < 0:
+                self.claim_registry.open(
+                    self.run.run_id, _DIR_OPEN_FLAGS, dir_fd=self.claims_root.fd,
+                )
+            else:
+                named_registry = os.stat(
+                    self.run.run_id, dir_fd=self.claims_root.fd,
+                    follow_symlinks=False,
+                )
+                if ((named_registry.st_dev, named_registry.st_ino)
+                        != self.claim_registry.identity):
+                    raise ContractError("run artifact-claim registry was substituted")
+        except FileNotFoundError as exc:
+            raise ContractError("run artifact-claim registry is missing") from exc
+        registry_stat = os.fstat(self.claim_registry.fd)
+        if (not stat.S_ISDIR(registry_stat.st_mode)
+                or registry_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(registry_stat.st_mode) != privfs.DIR_MODE):
+            raise ContractError("run artifact-claim registry is unsafe")
+        lock_flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        if self.initializing:
+            os.fsync(self.history_directory.fd)
+            lock_flags |= os.O_CREAT | os.O_EXCL
+        try:
+            self.lock_file.open(
+                self.run._lock_path.name, lock_flags,
+                privfs.FILE_MODE, dir_fd=self.lock_directory.fd,
+            )
+        except FileNotFoundError as exc:
+            raise ContractError("repository lock is missing") from exc
+        except FileExistsError as exc:
+            raise ContractError("repository lock already exists during creation") from exc
+        observed_lock = os.fstat(self.lock_file.fd)
+        if (not stat.S_ISREG(observed_lock.st_mode)
+                or observed_lock.st_uid != os.geteuid()
+                or observed_lock.st_nlink != 1
+                or stat.S_IMODE(observed_lock.st_mode) != privfs.FILE_MODE):
+            raise ContractError("repository lock identity is unsafe")
+        self.lock_identity = (observed_lock.st_dev, observed_lock.st_ino)
+        fcntl.flock(self.lock_file.fd, fcntl.LOCK_EX)
+        self.locked = True
+        self._bind_durable_lock_identity()
+        self._bind_run_creation_witness()
+        if self.initializing:
+            os.fsync(self.claim_registry.fd)
+            os.fsync(self.claims_root.fd)
+            os.fsync(self.lock_directory.fd)
+            os.fsync(self.state_directory.fd)
+            os.fsync(self.recon_root.fd)
+        self._validate_named_identities()
+        self.acquired = True
+
+    def validate_live(self) -> None:
+        if (not self.acquired or self.terminal
+                or (self.borrowed_project_anchor is None and not self.root_locked)
+                or not self.locked
+                or any(owner.fd < 0 for owner in self.descriptor_owners)):
+            raise ContractError("repository mutation owner is not live")
+        for descriptor in self.descriptor_owners:
+            if self._identity(descriptor.fd) != descriptor.identity:
+                raise ContractError("repository mutation descriptor identity changed")
+
+    def reauthenticate(self) -> None:
+        """Reconcile every public name and witness at an epoch boundary."""
+        self.validate_live()
+        self._validate_named_identities()
+
+    def settle(self) -> None:
+        """Idempotently release flock then every exact descriptor owner."""
+        primary = None
+        try:
+            self._fence_incomplete_bootstrap()
+            if self.locked and self.lock_file.fd >= 0:
+                try:
+                    fcntl.flock(self.lock_file.fd, fcntl.LOCK_UN)
+                except OSError as exc:
+                    if exc.errno == errno.EBADF:
+                        self.locked = False
+                    else:
+                        raise
+                else:
+                    self.locked = False
+        except BaseException as exc:
+            primary = exc
+        try:
+            if self.root_locked and self.project_anchor.fd >= 0:
+                try:
+                    fcntl.flock(self.project_anchor.fd, fcntl.LOCK_UN)
+                except OSError as exc:
+                    if exc.errno == errno.EBADF:
+                        self.root_locked = False
+                    else:
+                        raise
+                else:
+                    self.root_locked = False
+        except BaseException as exc:
+            primary = _preferred_settlement_fault(primary, [exc])
+        faults = _close_owned_descriptors_twice(self.descriptor_owners)
+        if self.lock_file.fd < 0:
+            self.locked = False
+        if self.project_anchor.fd < 0:
+            self.root_locked = False
+        preferred = _preferred_settlement_fault(primary, faults)
+        if preferred is not None:
+            raise preferred
+        if (self.root_locked or self.locked
+                or any(owner.fd >= 0 for owner in self.descriptor_owners)):
+            raise ContractError("repository mutation authority did not settle")
+        self.terminal = True
+
+
+class _ProjectMutationOwner:
+    """One reentrant process/thread epoch over the caller-supplied project inode."""
+
+    __slots__ = (
+        "project_dir", "expected_identity", "anchor", "locked", "acquired",
+        "terminal", "pid",
+    )
+
+    def __init__(
+        self, project_dir: Path,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> None:
+        self.project_dir = Path(project_dir)
+        self.expected_identity = expected_identity
+        self.anchor = _OwnedDescriptor(expected_identity)
+        self.locked = False
+        self.acquired = False
+        self.terminal = False
+        self.pid = os.getpid()
+
+    def acquire(self) -> None:
+        if self.acquired or self.terminal:
+            raise ContractError("project mutation owner is already used")
+        self.anchor.open(self.project_dir, _DIR_OPEN_FLAGS)
+        observed = os.fstat(self.anchor.fd)
+        if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid()):
+            raise ContractError("project directory identity is unsafe")
+        fcntl.flock(self.anchor.fd, fcntl.LOCK_EX)
+        self.locked = True
+        self.reauthenticate()
+        self.acquired = True
+
+    def validate_live(self) -> None:
+        if (self.pid != os.getpid() or self.terminal or not self.locked or self.anchor.fd < 0
+                or self.anchor.identity is None):
+            raise ContractError("project mutation owner is not live")
+        observed = os.fstat(self.anchor.fd)
+        if (observed.st_dev, observed.st_ino) != self.anchor.identity:
+            raise ContractError("project mutation descriptor identity changed")
+
+    def reauthenticate(self) -> None:
+        if self.acquired:
+            self.validate_live()
+        named = os.stat(self.project_dir, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != self.anchor.identity:
+            raise ContractError("project directory identity changed")
+
+    def settle(self) -> None:
+        primary = None
+        try:
+            if self.locked and self.anchor.fd >= 0:
+                try:
+                    fcntl.flock(self.anchor.fd, fcntl.LOCK_UN)
+                except OSError as exc:
+                    if exc.errno == errno.EBADF:
+                        self.locked = False
+                    else:
+                        raise
+                else:
+                    self.locked = False
+        except BaseException as exc:
+            primary = exc
+        faults = _close_owned_descriptors_twice((self.anchor,))
+        if self.anchor.fd < 0:
+            self.locked = False
+        preferred = _preferred_settlement_fault(primary, faults)
+        if preferred is not None:
+            raise preferred
+        if self.locked or self.anchor.fd >= 0:
+            raise ContractError("project mutation authority did not settle")
+        self.terminal = True
+
+
+@dataclass
+class _ProjectMutationLedgerEntry:
+    owner: _ProjectMutationOwner
+    depth: int = 1
+
+
+class _NestedProjectMutationOwner:
+    __slots__ = ("entry", "prior_depth", "armed")
+
+    def __init__(self, entry: _ProjectMutationLedgerEntry) -> None:
+        self.entry = entry
+        self.prior_depth = entry.depth
+        self.armed = False
+
+    def acquire(self) -> None:
+        if self.armed:
+            raise ContractError("nested project mutation owner is already entered")
+        self.armed = True
+        self.entry.depth = self.prior_depth + 1
+
+    def settle(self) -> None:
+        if self.armed:
+            if self.entry.depth not in {self.prior_depth, self.prior_depth + 1}:
+                raise ContractError("project mutation depth is invalid")
+            self.entry.depth = self.prior_depth
+            self.armed = False
+        if self.entry.depth < 1:
+            raise ContractError("project mutation depth is invalid")
+
+
+@contextmanager
+def _project_mutation(
+    project_dir: Path,
+    expected_identity: tuple[int, int] | None = None,
+):
+    project_dir = Path(project_dir)
+    project_key = str(project_dir.resolve())
+    held, _runs = _thread_mutation_ledgers()
+    other = next((key for key in held if key != project_key), None)
+    if other is not None:
+        raise ContractError("cross-project mutation nesting is unsupported")
+    lock = _shared_project_lock(project_key)
+    with lock:
+        entry = held.get(project_key)
+        if entry is not None:
+            if (type(entry) is not _ProjectMutationLedgerEntry
+                    or (expected_identity is not None
+                        and entry.owner.anchor.identity != expected_identity)):
+                raise ContractError("project mutation ledger is damaged")
+            entry.owner.validate_live()
+            nested = _NestedProjectMutationOwner(entry)
+            settlement = _SettlementOwner(nested.settle)
+            with _SettlementFence(settlement):
+                with _SettlementFence(settlement):
+                    nested.acquire()
+                    yield entry.owner
+            return
+        owner = _ProjectMutationOwner(project_dir, expected_identity)
+
+        def settle_epoch() -> None:
+            held.pop(project_key, None)
+            owner.settle()
+
+        settlement = _SettlementOwner(settle_epoch)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                owner.acquire()
+                held[project_key] = _ProjectMutationLedgerEntry(owner)
+                yield owner
+                owner.reauthenticate()
+
+
+class _RunCreationCleanup:
+    """Quarantine/remove only the exact unexposed Run generation on failure."""
+
+    __slots__ = (
+        "recon", "run_id", "run_anchor", "creation", "identity", "possible",
+        "exposed", "terminal",
+    )
+
+    def __init__(
+        self, recon: _OwnedDescriptor, run_id: str,
+        run_anchor: _OwnedDescriptor, creation: _OwnedDescriptor,
+    ) -> None:
+        self.recon = recon
+        self.run_id = run_id
+        self.run_anchor = run_anchor
+        self.creation = creation
+        self.identity = None
+        self.possible = False
+        self.exposed = False
+        self.terminal = False
+
+    @staticmethod
+    def _remove_tree(fd: int) -> None:
+        for name in os.listdir(fd):
+            observed = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(observed.st_mode):
+                child = _OwnedDescriptor((observed.st_dev, observed.st_ino))
+                settlement = _SettlementOwner(
+                    lambda: _settle_descriptor_owners(
+                        (child,), "Run creation cleanup descriptor",
+                    ),
+                )
+                with _SettlementFence(settlement):
+                    with _SettlementFence(settlement):
+                        child.open(name, _DIR_OPEN_FLAGS, dir_fd=fd)
+                        _RunCreationCleanup._remove_tree(child.fd)
+                        named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                        if (named.st_dev, named.st_ino) != child.identity:
+                            raise ContractError("incomplete Run directory was substituted")
+                        os.rmdir(name, dir_fd=fd)
+            elif stat.S_ISREG(observed.st_mode):
+                regular = _OwnedDescriptor((observed.st_dev, observed.st_ino))
+                settlement = _SettlementOwner(
+                    lambda: _settle_descriptor_owners(
+                        (regular,), "Run creation cleanup file descriptor",
+                    ),
+                )
+                with _SettlementFence(settlement):
+                    with _SettlementFence(settlement):
+                        regular.open(name, _FILE_OPEN_FLAGS, dir_fd=fd)
+                        named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                        if (named.st_dev, named.st_ino) != regular.identity:
+                            raise ContractError("incomplete Run file was substituted")
+                        os.unlink(name, dir_fd=fd)
+            else:
+                raise ContractError("incomplete Run contains an unsafe entry")
+        os.fsync(fd)
+
+    def settle(self) -> None:
+        primary = None
+        try:
+            faults = _close_owned_descriptors_twice((self.creation,))
+            preferred = _preferred_settlement_fault(None, faults)
+            if preferred is not None:
+                raise preferred
+            if not self.exposed and self.possible and self.identity is None:
+                # The name may have been substituted after mkdir but before a
+                # descriptor could be adopted.  Never infer ownership from the
+                # current public name and risk deleting someone else's inode.
+                if self.run_anchor.fd < 0 or self.run_anchor.identity is None:
+                    raise ContractError("incomplete Run generation lost its descriptor identity")
+                self.identity = self.run_anchor.identity
+            if not self.exposed and self.identity is not None:
+                named = os.stat(self.run_id, dir_fd=self.recon.fd, follow_symlinks=False)
+                if (named.st_dev, named.st_ino) != self.identity:
+                    raise ContractError("incomplete Run generation was substituted")
+                if self.run_anchor.fd < 0:
+                    self.run_anchor.expected_identity = self.identity
+                    self.run_anchor.open(self.run_id, _DIR_OPEN_FLAGS, dir_fd=self.recon.fd)
+                creation = _read_identity_file(self.run_anchor.fd, "run.json")
+                # A completed creation witness is the durable point after which
+                # shared lock/claim namespaces intentionally remain coherent.
+                # If cancellation occurs later, `.creation-pending` keeps the
+                # generation forensic and unselectable until an operator acts;
+                # if the marker is already gone, creation was already exposed.
+                if (isinstance(creation, dict)
+                        and isinstance(creation.get("mutation_lock"), dict)
+                        and isinstance(creation.get("artifact_claims"), dict)
+                        and isinstance(creation.get("project_state"), dict)):
+                    self.exposed = not _run_creation_pending(self.run_anchor.fd)
+                else:
+                    self._remove_tree(self.run_anchor.fd)
+                    faults = _close_owned_descriptors_twice((self.run_anchor,))
+                    preferred = _preferred_settlement_fault(None, faults)
+                    if preferred is not None:
+                        raise preferred
+                    os.rmdir(self.run_id, dir_fd=self.recon.fd)
+                    os.fsync(self.recon.fd)
+                    self.identity = None
+        except FileNotFoundError:
+            self.identity = None
+        except BaseException as exc:
+            primary = exc
+        faults = _close_owned_descriptors_twice((self.creation, self.run_anchor))
+        preferred = _preferred_settlement_fault(primary, faults)
+        if preferred is not None:
+            raise preferred
+        if self.creation.fd >= 0 or self.run_anchor.fd >= 0:
+            raise ContractError("Run creation cleanup descriptor did not settle")
+        self.terminal = True
+
+    def expose_if_complete(self) -> None:
+        """Reconcile the marker boundary before returning a public handle."""
+        if self.identity is None or self.run_anchor.fd < 0:
+            raise ContractError("Run creation has no pinned generation to expose")
+        named = os.stat(self.run_id, dir_fd=self.recon.fd, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != self.identity:
+            raise ContractError("Run generation changed before exposure")
+        if _run_creation_pending(self.run_anchor.fd):
+            raise ContractError("Run creation remains pending")
+        identity, _started = _run_identity_from_fd(self.run_anchor.fd, self.run_id)
+        if (not isinstance(identity.get("mutation_lock"), dict)
+                or not isinstance(identity.get("artifact_claims"), dict)
+                or not isinstance(identity.get("project_state"), dict)):
+            raise ContractError("Run creation authority is incomplete")
+        self.exposed = True
+
+
+def _bootstrap_run_tree(run_anchor: _OwnedDescriptor, identity: dict) -> None:
+    """Create initial Run contents only through the exact claimed directory."""
+    from . import privfs
+    child = _OwnedDescriptor()
+    record = _OwnedDescriptor()
+    settlement = _SettlementOwner(
+        lambda: _settle_descriptor_owners(
+            (record, child), "Run bootstrap descriptors",
+        ),
+    )
+    with _SettlementFence(settlement):
+        with _SettlementFence(settlement):
+            for name in ("raw", "normalized", "exports", "reports"):
+                os.mkdir(name, privfs.DIR_MODE, dir_fd=run_anchor.fd)
+                child.open(name, _DIR_OPEN_FLAGS, dir_fd=run_anchor.fd)
+                os.fsync(child.fd)
+                _settle_descriptor_owners((child,), "Run bootstrap directory descriptor")
+            record.open(
+                "run.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+                privfs.FILE_MODE, dir_fd=run_anchor.fd,
+            )
+            _write_all_descriptor(record.fd, json.dumps(identity).encode("utf-8"))
+            os.fsync(record.fd)
+            _settle_descriptor_owners((record,), "Run bootstrap identity descriptor")
+            os.fsync(run_anchor.fd)
+
+
+def _claim_run_directory(recon_fd: int, run_id: str, mode: int) -> bool:
+    """Claim one Run name; isolate the exception boundary from owner frames."""
+    try:
+        os.mkdir(run_id, mode, dir_fd=recon_fd)
+    except FileExistsError:
+        return False
+    return True
+
+
+def _claim_run_directory_into(
+    cleanup: "_RunCreationCleanup", recon_fd: int, run_id: str, mode: int,
+) -> bool:
+    """Claim and pin a Run generation without a source-line adoption gap."""
+    claimed = _publish_private_directory_into(
+        cleanup.run_anchor, recon_fd, run_id, mode,
+    )
+    if not claimed:
+        return False
+    cleanup.identity = cleanup.run_anchor.identity
+    return True
+
+
+def _claim_private_directory_into(
+    owner: "_RunMutationOwner", parent_fd: int, name: str, mode: int,
+) -> None:
+    """Claim one private name through an identity-owned temporary directory."""
+    owner.claim_registry_possible = _publish_private_directory_into(
+        owner.claim_registry, parent_fd, name, mode,
+    )
+
+
+class _ProjectStatePublisher:
+    """Descriptor-owned publication of per-project history/current metadata."""
+
+    __slots__ = ("owner", "state", "history")
+
+    def __init__(self, owner: _RunMutationOwner) -> None:
+        self.owner = owner
+        self.state = _OwnedDescriptor()
+        self.history = _OwnedDescriptor()
+
+    @property
+    def descriptor_owners(self) -> tuple[_OwnedDescriptor, ...]:
+        return self.history, self.state
+
+    def _validate(self) -> None:
+        self.owner.validate_live()
+        named = os.stat("state", dir_fd=self.owner.recon_root.fd, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != self.state.identity:
+            raise ContractError("repository state publication directory changed")
+        history_named = os.stat(
+            "history", dir_fd=self.state.fd, follow_symlinks=False,
+        )
+        if (history_named.st_dev, history_named.st_ino) != self.history.identity:
+            raise ContractError("repository history directory changed")
+
+    def publish(self, history_name: str, history_data: bytes, run_path: str) -> None:
+        from . import privfs
+        self.state.duplicate(self.owner.state_directory.fd)
+        self.history.expected_identity = self.owner.history_directory.identity
+        self.history.duplicate(self.owner.history_directory.fd)
+        observed_history = os.fstat(self.history.fd)
+        if (observed_history.st_uid != os.geteuid()
+                or stat.S_IMODE(observed_history.st_mode) != privfs.DIR_MODE):
+            raise ContractError("repository history directory is unsafe")
+        history_stage = privfs.stage_private_bytes(
+            self.history.fd, (history_name,), history_data,
+        )
+        try:
+            privfs.replace_private_stage(history_stage)
+        except BaseException:
+            try:
+                privfs.abort_private_stage(history_stage)
+            except BaseException:
+                pass
+            raise
+        self._validate()
+        pointer_stage = privfs.stage_private_bytes(
+            self.state.fd, ("current.txt",), run_path.encode("utf-8"),
+        )
+        try:
+            privfs.replace_private_stage(pointer_stage)
+        except BaseException:
+            try:
+                privfs.abort_private_stage(pointer_stage)
+            except BaseException:
+                pass
+            raise
+        self._validate()
+
+    def settle(self) -> None:
+        _settle_descriptor_owners(
+            self.descriptor_owners, "project state publication descriptors",
+        )
+
+
+@dataclass
+class _RunMutationLedgerEntry:
+    owner: _RunMutationOwner
+    depth: int = 1
+
+
+class _NestedMutationOwner:
+    """Cancellation-safe depth accounting for one reused mutation owner."""
+
+    __slots__ = ("entry", "prior_depth", "armed")
+
+    def __init__(self, entry: _RunMutationLedgerEntry) -> None:
+        self.entry = entry
+        self.prior_depth = entry.depth
+        self.armed = False
+
+    def acquire(self) -> None:
+        if self.armed:
+            raise ContractError("nested mutation owner is already entered")
+        self.armed = True
+        self.entry.depth = self.prior_depth + 1
+
+    def settle(self) -> None:
+        if self.armed:
+            if self.entry.depth not in {self.prior_depth, self.prior_depth + 1}:
+                raise ContractError("repository mutation depth is invalid")
+            self.entry.depth = self.prior_depth
+            self.armed = False
+        if self.entry.depth < 1:
+            raise ContractError("repository mutation depth is invalid")
 
 
 class _ArtifactMarkerRelease:
@@ -1094,17 +2777,18 @@ class _ArtifactMarkerRelease:
         if self.name is not None or self.expected_identity is not None:
             raise ContractError("artifact claim marker owner is already used")
         from . import privfs
-        directory = privfs.private_dir(self.run._artifact_claim_dir)
-        self.directory.allocate(lambda: os.open(directory, _DIR_OPEN_FLAGS))
+        active = self.run._active_mutation_owner()
+        if active is None:
+            raise ContractError("artifact claim marker has no mutation authority")
+        self.directory.expected_identity = active.claim_registry.identity
+        self.directory.duplicate(active.claim_registry.fd)
         self.name = f"{os.urandom(16).hex()}{_CLAIM_SUFFIX}"
-        self.marker.allocate(
-            lambda: os.open(
-                self.name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                | getattr(os, "O_CLOEXEC", 0),
-                privfs.FILE_MODE,
-                dir_fd=self.directory.fd,
-            ),
+        self.marker.open(
+            self.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            privfs.FILE_MODE,
+            dir_fd=self.directory.fd,
         )
         self.expected_identity = self.marker.identity
         self.marker.expected_identity = self.expected_identity
@@ -1150,11 +2834,11 @@ class _ArtifactMarkerRelease:
                     self.released = True
                 else:
                     if self.directory.fd < 0:
-                        self.directory.allocate(
-                            lambda: os.open(
-                                self.run._artifact_claim_dir, _DIR_OPEN_FLAGS,
-                            ),
-                        )
+                        active = self.run._active_mutation_owner()
+                        if active is None:
+                            raise ContractError("artifact claim release has no mutation authority")
+                        self.directory.expected_identity = active.claim_registry.identity
+                        self.directory.duplicate(active.claim_registry.fd)
                     try:
                         named = os.stat(
                             self.name, dir_fd=self.directory.fd,
@@ -1171,11 +2855,9 @@ class _ArtifactMarkerRelease:
                                 != self.expected_identity):
                             raise ContractError("artifact claim marker identity changed")
                         if self.marker.fd < 0:
-                            self.marker.allocate(
-                                lambda: os.open(
-                                    self.name, _FILE_OPEN_FLAGS,
-                                    dir_fd=self.directory.fd,
-                                ),
+                            self.marker.open(
+                                self.name, _FILE_OPEN_FLAGS,
+                                dir_fd=self.directory.fd,
                             )
                         observed = os.fstat(self.marker.fd)
                         if (not stat.S_ISREG(observed.st_mode)
@@ -1208,23 +2890,18 @@ class _ArtifactClaimRegistryRead:
         self.entry = _OwnedDescriptor()
 
     def read(self) -> int:
-        try:
-            self.directory.allocate(
-                lambda: os.open(self.run._artifact_claim_dir, _DIR_OPEN_FLAGS),
-            )
-        except FileNotFoundError:
-            return 0
+        active = self.run._active_mutation_owner()
+        if active is None:
+            raise ContractError("artifact claim registry read has no mutation authority")
+        self.directory.expected_identity = active.claim_registry.identity
+        self.directory.duplicate(active.claim_registry.fd)
         count = 0
         for name in os.listdir(self.directory.fd):
             token = name[:-len(_CLAIM_SUFFIX)] if name.endswith(_CLAIM_SUFFIX) else ""
             if (len(token) != 32
                     or any(char not in "0123456789abcdef" for char in token)):
                 raise ContractError("artifact claim registry contains an unknown entry")
-            self.entry.allocate(
-                lambda name=name: os.open(
-                    name, _FILE_OPEN_FLAGS, dir_fd=self.directory.fd,
-                ),
-            )
+            self.entry.open(name, _FILE_OPEN_FLAGS, dir_fd=self.directory.fd)
             observed = os.fstat(self.entry.fd)
             if (not stat.S_ISREG(observed.st_mode)
                     or observed.st_uid != os.geteuid()
@@ -1333,17 +3010,14 @@ class _ArtifactDirectoryAllocation:
     def _ensure_chain(self) -> None:
         from . import privfs
         if self.anchor.fd < 0:
-            self.anchor.allocate(
-                lambda: _open_run_fd(self.run.project_dir, self.run.run_id),
-            )
+            active = self.run._active_mutation_owner()
+            if active is None:
+                raise ContractError("artifact directory has no mutation authority")
+            self.anchor.duplicate(active.run_anchor.fd)
         for index, owner in enumerate(self.prefixes, 1):
             if owner.fd < 0:
                 prefix = self.parent_components[:index]
-                owner.allocate(
-                    lambda prefix=prefix: privfs.open_strict_dir_at(
-                        self.anchor.fd, prefix,
-                    ),
-                )
+                _open_strict_directory_into(owner, self.anchor.fd, prefix)
 
     def reconcile(self) -> None:
         """Prove and durably settle a possibly-landed empty directory."""
@@ -1366,9 +3040,7 @@ class _ArtifactDirectoryAllocation:
         self.identity = named_identity
         self.child.expected_identity = named_identity
         if self.child.fd < 0:
-            self.child.allocate(
-                lambda: os.open(self.name, _DIR_OPEN_FLAGS, dir_fd=self.parent.fd),
-            )
+            self.child.open(self.name, _DIR_OPEN_FLAGS, dir_fd=self.parent.fd)
         observed = os.fstat(self.child.fd)
         self.run._validate_base_directory_stat(
             observed, self.parent_components + (self.name,),
@@ -1499,14 +3171,15 @@ class _ArtifactClaim:
         try:
             with self._run._mutation(MutationScope.BASE_EVIDENCE):
                 self._run._ensure_artifact_parent(components)
-                self._open_anchor.allocate(
-                    lambda: _open_run_fd(self._run.project_dir, self._run.run_id),
-                )
+                active = self._run._active_mutation_owner()
+                if active is None:
+                    raise ContractError("artifact claim has no mutation authority")
+                self._open_anchor.duplicate(active.run_anchor.fd)
                 self._stage = privfs.create_private_stage(
                     self._open_anchor.fd, components,
                 )
                 self._writer_owner.expected_identity = self._stage.file_identity
-                self._writer_owner.allocate(lambda: os.dup(self._stage.file_fd))
+                self._writer_owner.duplicate(self._stage.file_fd)
                 self._writer_fd = self._writer_owner.fd
         except BaseException as exc:
             primary = exc
@@ -1572,16 +3245,14 @@ class _ArtifactClaim:
                         identity = self._stage.file_identity
                         components = self._stage.components
                         if self._cleanup_anchor.fd < 0:
-                            self._cleanup_anchor.allocate(
-                                lambda: _open_run_fd(
-                                    self._run.project_dir, self._run.run_id,
-                                ),
-                            )
+                            active = self._run._active_mutation_owner()
+                            if active is None:
+                                raise ContractError("artifact cleanup has no mutation authority")
+                            self._cleanup_anchor.duplicate(active.run_anchor.fd)
                         if self._cleanup_parent.fd < 0:
-                            self._cleanup_parent.allocate(
-                                lambda: privfs.open_strict_dir_at(
-                                    self._cleanup_anchor.fd, components[:-1],
-                                ),
+                            _open_strict_directory_into(
+                                self._cleanup_parent,
+                                self._cleanup_anchor.fd, components[:-1],
                             )
                         for name in os.listdir(self._cleanup_parent.fd):
                             if not (name.startswith(".quarry-discard-")
@@ -1669,15 +3340,12 @@ class _ArtifactAppendTransaction:
 
     def _open_prior(self) -> None:
         from . import privfs
-        self.anchor.allocate(
-            lambda: _open_run_fd(self.run.project_dir, self.run.run_id),
-        )
+        active = self.run._active_mutation_owner()
+        if active is None:
+            raise ContractError("artifact append has no mutation authority")
+        self.anchor.duplicate(active.run_anchor.fd)
         try:
-            self.source.allocate(
-                lambda: privfs.open_strict_file_at(
-                    self.anchor.fd, self.components,
-                ),
-            )
+            _open_strict_file_into(self.source, self.anchor.fd, self.components)
         except privfs.PrivatePathMissing:
             self.source_missing = True
         else:
@@ -1712,20 +3380,16 @@ class _ArtifactAppendTransaction:
         from . import privfs
         if self.source_missing:
             try:
-                self.verification.allocate(
-                    lambda: privfs.open_strict_file_at(
-                        self.anchor.fd, self.components,
-                    ),
+                _open_strict_file_into(
+                    self.verification, self.anchor.fd, self.components,
                 )
             except privfs.PrivatePathMissing:
                 return
             raise ContractError("artifact append destination appeared during copy")
         if _identity_stat(self.source.fd) != self.source_signature:
             raise ContractError("artifact append source changed during copy")
-        self.verification.allocate(
-            lambda: privfs.open_strict_file_at(
-                self.anchor.fd, self.components,
-            ),
+        _open_strict_file_into(
+            self.verification, self.anchor.fd, self.components,
         )
         if _identity_stat(self.verification.fd) != self.source_signature:
             raise ContractError("artifact append source name changed during copy")
@@ -1764,6 +3428,154 @@ class _ArtifactAppendTransaction:
             raise ContractError("artifact append transaction did not settle")
 
 
+class _CanonicalLogAppendOwner:
+    """Rollback-capable, descriptor-relative append of one framed JSONL row."""
+
+    __slots__ = (
+        "run", "components", "data", "parent", "file", "prior_size",
+        "source_missing", "possible", "synced", "committed", "terminal",
+        "reconcile_failures",
+    )
+
+    def __init__(self, run, components: tuple[str, ...], data: bytes) -> None:
+        if (not isinstance(data, bytes) or not data or not data.endswith(b"\n")
+                or len(data) > _MAX_IDENTITY_BYTES):
+            raise ContractError("canonical append requires one bounded newline-framed row")
+        self.run = run
+        self.components = components
+        self.data = data
+        self.parent = _OwnedDescriptor()
+        self.file = _OwnedDescriptor()
+        self.prior_size = 0
+        self.source_missing = False
+        self.possible = False
+        self.synced = False
+        self.committed = False
+        self.terminal = False
+        self.reconcile_failures = 0
+
+    @property
+    def descriptor_owners(self) -> tuple[_OwnedDescriptor, ...]:
+        return self.file, self.parent
+
+    def _validate_file(self) -> None:
+        from . import privfs
+        observed = os.fstat(self.file.fd)
+        named = os.stat(
+            self.components[-1], dir_fd=self.parent.fd, follow_symlinks=False,
+        )
+        if (not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE
+                or (observed.st_dev, observed.st_ino) != self.file.identity
+                or (named.st_dev, named.st_ino) != self.file.identity):
+            raise ContractError("canonical append destination identity is unsafe")
+
+    def _reconcile(self) -> None:
+        if not self.possible or self.committed:
+            return
+        active = self.run._active_mutation_owner()
+        if active is None:
+            raise ContractError("canonical append reconciliation has no mutation authority")
+        active.reauthenticate()
+        if self.file.fd < 0 and self.source_missing:
+            try:
+                self.file.open(
+                    self.components[-1],
+                    os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=self.parent.fd,
+                )
+            except FileNotFoundError:
+                self.possible = False
+                return
+        self._validate_file()
+        observed_size = os.fstat(self.file.fd).st_size
+        if observed_size < self.prior_size or observed_size > self.prior_size + len(self.data):
+            raise ContractError("canonical append destination changed concurrently")
+        suffix = os.pread(self.file.fd, observed_size - self.prior_size, self.prior_size)
+        if suffix != self.data[:len(suffix)]:
+            raise ContractError("canonical append suffix changed concurrently")
+        if self.synced and observed_size == self.prior_size + len(self.data):
+            if suffix != self.data:
+                raise ContractError("canonical append verification failed")
+            self.committed = True
+            return
+        os.ftruncate(self.file.fd, self.prior_size)
+        os.fsync(self.file.fd)
+        if self.source_missing:
+            named = os.stat(
+                self.components[-1], dir_fd=self.parent.fd, follow_symlinks=False,
+            )
+            if (named.st_dev, named.st_ino) != self.file.identity:
+                raise ContractError("new canonical append destination was substituted")
+            os.unlink(self.components[-1], dir_fd=self.parent.fd)
+        os.fsync(self.parent.fd)
+        self.possible = False
+
+    def execute(self) -> None:
+        from . import privfs
+        active = self.run._active_mutation_owner()
+        if active is None:
+            raise ContractError("canonical append has no mutation authority")
+        self.run._ensure_artifact_parent(self.components)
+        _open_strict_directory_into(
+            self.parent, active.run_anchor.fd, self.components[:-1],
+        )
+        flags = (os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW
+                 | getattr(os, "O_CLOEXEC", 0))
+        try:
+            self.file.open(self.components[-1], flags, dir_fd=self.parent.fd)
+        except FileNotFoundError:
+            self.source_missing = True
+            self.possible = True
+            self.file.open(
+                self.components[-1], flags | os.O_CREAT | os.O_EXCL,
+                privfs.FILE_MODE, dir_fd=self.parent.fd,
+            )
+        self._validate_file()
+        self.prior_size = os.fstat(self.file.fd).st_size
+        if (self.prior_size
+                and os.pread(self.file.fd, 1, self.prior_size - 1) != b"\n"):
+            raise ContractError("canonical append destination has a torn suffix")
+        self.possible = True
+        view = memoryview(self.data)
+        while view:
+            written = os.write(self.file.fd, view)
+            if written <= 0:
+                raise OSError("canonical append made no progress")
+            view = view[written:]
+        os.fsync(self.file.fd)
+        self.synced = True
+        self._reconcile()
+        if not self.committed:
+            raise ContractError("canonical append did not commit")
+
+    def settle(self) -> None:
+        primary = None
+        try:
+            self._reconcile()
+        except BaseException as exc:
+            primary = exc
+            self.reconcile_failures += 1
+            # Preserve the exact descriptors for the already-active outer
+            # settlement fence.  One supported interruption can then retry
+            # rollback instead of closing the only authenticated generation.
+            if (self.possible and not self.committed
+                    and self.reconcile_failures < 2):
+                raise
+        faults = _close_owned_descriptors_twice(self.descriptor_owners)
+        preferred = _preferred_settlement_fault(primary, faults)
+        if preferred is not None:
+            raise preferred
+        if any(owner.fd >= 0 for owner in self.descriptor_owners):
+            raise ContractError("canonical append descriptors did not settle")
+        if self.possible and not self.committed:
+            raise ContractError("canonical append outcome is indeterminate")
+        self.terminal = True
+
+
 _RUN_CONSTRUCTION_AUTHORITY = object()
 _TOOL_RUNS_UNLOADED = object()
 
@@ -1776,10 +3588,19 @@ class Run:
     """
 
     def __init__(self, project_dir: Path, target: str, run_id: str | None = None, *, load_started: bool = False,
-                 _identity: dict | None = None, _authority=None):
+                 _identity: dict | None = None,
+                 _run_directory_identity: tuple[int, int] | None = None,
+                 _authority=None):
         if _authority is not _RUN_CONSTRUCTION_AUTHORITY:
             raise ContractError("construct runs through Run.create(), Run.open() or Run.latest()")
         self.project_dir = Path(project_dir)
+        observed_project = os.stat(self.project_dir, follow_symlinks=False)
+        if (not stat.S_ISDIR(observed_project.st_mode)
+                or observed_project.st_uid != os.geteuid()):
+            raise ContractError("project directory identity is unsafe")
+        self._project_directory_identity = (
+            observed_project.st_dev, observed_project.st_ino,
+        )
         self.target = validate_target(target)
         self.run_id = validate_run_id(run_id if run_id is not None else self._mint_run_id())
         self.dir = self.project_dir / "recon" / self.run_id
@@ -1790,6 +3611,9 @@ class Run:
         self._run_directory_identity = (
             observed_run_dir.st_dev, observed_run_dir.st_ino,
         )
+        if (_run_directory_identity is not None
+                and self._run_directory_identity != _run_directory_identity):
+            raise ContractError(f"run {self.run_id!r} directory identity changed during open")
         self.raw = self.dir / "raw"
         self.normalized = self.dir / "normalized"
         self.exports = self.dir / "exports"
@@ -1849,89 +3673,167 @@ class Run:
     def _lock_path(self) -> Path:
         return self.project_dir / "recon" / "state" / "locks" / f"{self.run_id}.lock"
 
-    def _materialize_lock_file(self) -> int:
-        """Open the sole out-of-band per-run advisory lock with private modes."""
-        from . import privfs
-        lock_dir = privfs.private_dir(self._lock_path.parent)
-        directory_fd = os.open(
-            lock_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-        try:
-            fd = os.open(
-                self._lock_path.name,
-                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-                privfs.FILE_MODE,
-                dir_fd=directory_fd,
-            )
-        finally:
-            os.close(directory_fd)
-        try:
-            observed = os.fstat(fd)
-            if (not stat.S_ISREG(observed.st_mode)
-                    or observed.st_uid != os.geteuid()
-                    or observed.st_nlink != 1):
-                raise ContractError("repository lock identity is unsafe")
-            if stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE:
-                os.fchmod(fd, privfs.FILE_MODE)
-            return fd
-        except BaseException:
-            os.close(fd)
-            raise
-
     @contextmanager
     def _mutation(self, scope: MutationScope):
-        """Serialize one run mutation through the shared RLock and one flock."""
+        """Serialize one mutation through a pinned Run and durable lock owner."""
         if type(scope) is not MutationScope:
             raise TypeError("invalid repository mutation scope")
         key = self._authority_key
+        _projects, held = _thread_mutation_ledgers()
+        different = next((held_key for held_key in held if held_key != key), None)
+        if different is not None:
+            raise ContractError("cross-Run mutation nesting is unsupported")
         lock = _shared_run_lock(key)
-        with lock:
-            held = getattr(_RUN_LOCK_LOCAL, "held", None)
-            if held is None:
-                held = {}
-                _RUN_LOCK_LOCAL.held = held
-            depth, fd = held.get(key, (0, -1))
-            if depth == 0:
-                fd = self._materialize_lock_file()
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                except BaseException:
-                    os.close(fd)
-                    raise
-            held[key] = (depth + 1, fd)
-            try:
-                self._require_scope(scope)
-                yield
-            finally:
-                current_depth, current_fd = held[key]
-                if current_depth == 1:
-                    try:
-                        fcntl.flock(current_fd, fcntl.LOCK_UN)
-                    finally:
-                        os.close(current_fd)
-                        del held[key]
-                else:
-                    held[key] = (current_depth - 1, current_fd)
+        with _project_mutation(
+            self.project_dir, self._project_directory_identity,
+        ) as project_owner:
+            with lock:
+                entry = held.get(key)
+                if entry is not None:
+                    if (type(entry) is not _RunMutationLedgerEntry
+                            or entry.owner.run._run_directory_identity != self._run_directory_identity):
+                        raise ContractError("repository mutation ledger is damaged")
+                    entry.owner.validate_live()
+                    nested = _NestedMutationOwner(entry)
+                    nested_settlement = _SettlementOwner(nested.settle)
+                    with _SettlementFence(nested_settlement):
+                        with _SettlementFence(nested_settlement):
+                            nested.acquire()
+                            self._require_scope(scope, entry.owner)
+                            yield
+                    return
+                owner = _RunMutationOwner(
+                    self, project_anchor_fd=project_owner.anchor.fd,
+                )
+                def settle_epoch() -> None:
+                    held.pop(key, None)
+                    owner.settle()
+                settlement = _SettlementOwner(settle_epoch)
+                with _SettlementFence(settlement):
+                    with _SettlementFence(settlement):
+                        owner.acquire()
+                        entry = _RunMutationLedgerEntry(owner)
+                        held[key] = entry
+                        self._require_scope(scope, owner)
+                        yield
+                        owner.reauthenticate()
 
-    def _require_scope(self, scope: MutationScope) -> None:
+    def _active_mutation_owner(self) -> _RunMutationOwner | None:
+        _projects, held = _thread_mutation_ledgers()
+        entry = held.get(self._authority_key)
+        if type(entry) is _RunMutationLedgerEntry and entry.depth > 0:
+            entry.owner.validate_live()
+            return entry.owner
+        return None
+
+    def _replace_run_bytes_locked(self, components: tuple[str, ...], data: bytes) -> None:
+        """Replace one Run object relative to the current pinned authority."""
+        from . import privfs
+        owner = self._active_mutation_owner()
+        if owner is None:
+            raise ContractError("repository replacement has no mutation authority")
+        stage = privfs.stage_private_bytes(owner.run_anchor.fd, components, data)
         try:
-            observed = os.stat(self.dir, follow_symlinks=False)
-        except OSError:
-            raise ContractError(f"run {self.run_id!r} directory identity is unavailable") from None
-        if (not stat.S_ISDIR(observed.st_mode)
-                or observed.st_uid != os.geteuid()
-                or (observed.st_dev, observed.st_ino) != self._run_directory_identity):
-            raise ContractError(f"run {self.run_id!r} directory identity changed")
-        identity = read_run_identity(self.project_dir, self.run_id)
+            privfs.replace_private_stage(stage)
+        except BaseException:
+            try:
+                privfs.abort_private_stage(stage)
+            except BaseException:
+                pass
+            raise
+
+    def _read_run_json_locked(self, name: str):
+        owner = self._active_mutation_owner()
+        if owner is None:
+            return _read_json(self.dir / name)
+        value = _read_identity_file(owner.run_anchor.fd, name)
+        return None if value is _MALFORMED_IDENTITY else value
+
+    def _run_name_exists_locked(self, name: str) -> bool:
+        owner = self._active_mutation_owner()
+        if owner is None:
+            return os.path.lexists(self.dir / name)
+        try:
+            os.stat(name, dir_fd=owner.run_anchor.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _run_file_stat_locked(self, components: tuple[str, ...]):
+        """Stat one strict regular Run file through the active pinned anchor."""
+        active = self._active_mutation_owner()
+        if active is None:
+            return os.stat(self.dir.joinpath(*components), follow_symlinks=False)
+        from . import privfs
+        slot = _OwnedDescriptor()
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners((slot,), "Run file stat descriptor"),
+        )
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                _open_strict_file_into(slot, active.run_anchor.fd, components)
+                return os.fstat(slot.fd)
+
+    def _unlink_run_file_locked(self, components: tuple[str, ...]) -> None:
+        """Capture then unlink one exact private Run file under pinned authority."""
+        from . import privfs
+        active = self._active_mutation_owner()
+        if active is None:
+            raise ContractError("Run file removal has no mutation authority")
+        parent = _OwnedDescriptor()
+        target = _OwnedDescriptor()
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners(
+                (target, parent), "Run file removal descriptors",
+            ),
+        )
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                try:
+                    _open_strict_directory_into(
+                        parent, active.run_anchor.fd, components[:-1],
+                    )
+                    target.open(components[-1], _FILE_OPEN_FLAGS, dir_fd=parent.fd)
+                except (FileNotFoundError, privfs.PrivatePathMissing):
+                    return
+                quarantine = f".quarry-unlink-{os.urandom(16).hex()}.stage"
+                os.rename(
+                    components[-1], quarantine,
+                    src_dir_fd=parent.fd, dst_dir_fd=parent.fd,
+                )
+                captured = os.stat(quarantine, dir_fd=parent.fd, follow_symlinks=False)
+                if (captured.st_dev, captured.st_ino) != target.identity:
+                    raise ContractError("Run file removal captured a substituted name")
+                os.unlink(quarantine, dir_fd=parent.fd)
+                os.fsync(parent.fd)
+
+    def _require_scope(self, scope: MutationScope, owner: _RunMutationOwner) -> None:
+        owner.validate_live()
+        identity, _started = _run_identity_from_fd(owner.run_anchor.fd, self.run_id)
         if identity["target"] != self.target:
             raise ContractError(f"run {self.run_id!r} identity changed")
-        state = self.state
+        state = self._read_state_from_fd(owner.run_anchor.fd)["state"]
         if state == "unknown":
             raise ContractError(f"run {self.run_id} has unknown lifecycle state")
-        if scope is MutationScope.BASE_EVIDENCE and state not in {"created", "running"}:
-            raise ContractError(
-                f"base evidence is sealed for run {self.run_id} in state {state!r}",
-            )
+        if scope is MutationScope.BASE_EVIDENCE:
+            if state not in {"created", "running"}:
+                raise ContractError(
+                    f"base evidence is sealed for run {self.run_id} in state {state!r}",
+                )
+            try:
+                os.stat(
+                    "manifest.json", dir_fd=owner.run_anchor.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                # Presence is the seal.  A malformed, linked or otherwise
+                # unreadable manifest is damage, never permission to mutate
+                # the base corpus again.
+                raise ContractError(
+                    f"base evidence is sealed for run {self.run_id} by its manifest",
+                )
         if scope is MutationScope.FINALIZATION_METADATA and state not in {
             "finalizing", "finalization_failed", "finished",
         }:
@@ -1966,6 +3868,9 @@ class Run:
                     raise ContractError("artifact claim marker release did not settle")
 
     def _live_artifact_claim_count(self) -> int:
+        if self._active_mutation_owner() is None:
+            with self._mutation(MutationScope.CONTROL):
+                return self._live_artifact_claim_count()
         registry = _ArtifactClaimRegistryRead(self)
         settlement = _SettlementOwner(registry.settle)
         with _SettlementFence(settlement):
@@ -1974,8 +3879,28 @@ class Run:
 
     def _ensure_artifact_parent(self, components: tuple[str, ...]) -> None:
         from . import privfs
-        if len(components) > 1:
-            privfs.private_dir(self.dir.joinpath(*components[:-1]))
+        owner = self._active_mutation_owner()
+        if owner is None:
+            raise ContractError("artifact parent creation has no mutation authority")
+        parent_fd = owner.run_anchor.fd
+        owned = []
+        try:
+            for component in components[:-1]:
+                try:
+                    os.mkdir(component, privfs.DIR_MODE, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                child = _OwnedDescriptor()
+                owned.append(child)
+                child.open(component, _DIR_OPEN_FLAGS, dir_fd=parent_fd)
+                self._validate_base_directory_stat(
+                    os.fstat(child.fd), tuple(components[:len(owned)]),
+                )
+                parent_fd = child.fd
+        finally:
+            _settle_descriptor_owners(
+                tuple(reversed(owned)), "artifact parent descriptors",
+            )
 
     def _append_base_artifact(self, components: tuple[str, ...], data: bytes) -> None:
         """Atomically append exact bytes through BASE_EVIDENCE authority."""
@@ -1998,14 +3923,12 @@ class Run:
         if type(data) is not bytes:
             raise TypeError("artifact replacement data must be exact bytes")
         from . import privfs
-        stage = None
         with self._mutation(scope):
             self._ensure_artifact_parent(components)
-            anchor_fd = _open_run_fd(self.project_dir, self.run_id)
-            try:
-                stage = privfs.stage_private_bytes(anchor_fd, components, data)
-            finally:
-                os.close(anchor_fd)
+            owner = self._active_mutation_owner()
+            if owner is None:
+                raise ContractError("artifact replacement has no mutation authority")
+            stage = privfs.stage_private_bytes(owner.run_anchor.fd, components, data)
             try:
                 privfs.replace_private_stage(stage)
             except BaseException:
@@ -2038,74 +3961,80 @@ class Run:
     def _fsync_base_file_at(
         self, parent_fd: int, name: str, components: tuple[str, ...],
     ) -> None:
-        fd = -1
+        owner = _OwnedDescriptor()
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners((owner,), "base file descriptor"),
+        )
         try:
-            fd = os.open(name, _FILE_OPEN_FLAGS, dir_fd=parent_fd)
-            before = os.fstat(fd)
-            self._validate_base_file_stat(before, components)
-            os.fsync(fd)
-            after = os.fstat(fd)
-            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            self._validate_base_file_stat(after, components)
-            self._validate_base_file_stat(named, components)
-            if ((after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
-                    or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)):
-                raise ContractError(
-                    f"canonical base file {'/'.join(components)!r} changed while sealing",
-                )
+            with _SettlementFence(settlement):
+                with _SettlementFence(settlement):
+                    owner.open(name, _FILE_OPEN_FLAGS, dir_fd=parent_fd)
+                    fd = owner.fd
+                    before = os.fstat(fd)
+                    self._validate_base_file_stat(before, components)
+                    os.fsync(fd)
+                    after = os.fstat(fd)
+                    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    self._validate_base_file_stat(after, components)
+                    self._validate_base_file_stat(named, components)
+                    if ((after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                            or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)):
+                        raise ContractError(
+                            f"canonical base file {'/'.join(components)!r} changed while sealing",
+                        )
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EISDIR}:
                 raise ContractError(
                     f"canonical base file {'/'.join(components)!r} is unsafe",
                 ) from exc
             raise
-        finally:
-            if fd >= 0:
-                os.close(fd)
 
     def _fsync_base_directory_at(
         self, parent_fd: int, name: str, components: tuple[str, ...],
     ) -> None:
-        fd = -1
+        owner = _OwnedDescriptor()
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners((owner,), "base directory descriptor"),
+        )
         try:
-            fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=parent_fd)
-            before = os.fstat(fd)
-            self._validate_base_directory_stat(before, components)
-            for child in sorted(os.listdir(fd)):
-                child_components = components + (child,)
-                try:
-                    observed = os.stat(child, dir_fd=fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    raise ContractError(
-                        f"canonical base entry {'/'.join(child_components)!r} changed while sealing",
-                    ) from None
-                if stat.S_ISREG(observed.st_mode):
-                    self._fsync_base_file_at(fd, child, child_components)
-                elif stat.S_ISDIR(observed.st_mode):
-                    self._fsync_base_directory_at(fd, child, child_components)
-                else:
-                    raise ContractError(
-                        f"canonical base entry {'/'.join(child_components)!r} is unsafe",
-                    )
-            os.fsync(fd)
-            after = os.fstat(fd)
-            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            self._validate_base_directory_stat(after, components)
-            self._validate_base_directory_stat(named, components)
-            if ((after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
-                    or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)):
-                raise ContractError(
-                    f"canonical base directory {'/'.join(components)!r} changed while sealing",
-                )
+            with _SettlementFence(settlement):
+                with _SettlementFence(settlement):
+                    owner.open(name, _DIR_OPEN_FLAGS, dir_fd=parent_fd)
+                    fd = owner.fd
+                    before = os.fstat(fd)
+                    self._validate_base_directory_stat(before, components)
+                    for child in sorted(os.listdir(fd)):
+                        child_components = components + (child,)
+                        try:
+                            observed = os.stat(child, dir_fd=fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            raise ContractError(
+                                f"canonical base entry {'/'.join(child_components)!r} changed while sealing",
+                            ) from None
+                        if stat.S_ISREG(observed.st_mode):
+                            self._fsync_base_file_at(fd, child, child_components)
+                        elif stat.S_ISDIR(observed.st_mode):
+                            self._fsync_base_directory_at(fd, child, child_components)
+                        else:
+                            raise ContractError(
+                                f"canonical base entry {'/'.join(child_components)!r} is unsafe",
+                            )
+                    os.fsync(fd)
+                    after = os.fstat(fd)
+                    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    self._validate_base_directory_stat(after, components)
+                    self._validate_base_directory_stat(named, components)
+                    if ((after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                            or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)):
+                        raise ContractError(
+                            f"canonical base directory {'/'.join(components)!r} changed while sealing",
+                        )
         except OSError as exc:
             if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
                 raise ContractError(
                     f"canonical base directory {'/'.join(components)!r} is unsafe",
                 ) from exc
             raise
-        finally:
-            if fd >= 0:
-                os.close(fd)
 
     def _flush_base_evidence(self) -> None:
         """Flush every canonical base inode and its directory chain before sealing.
@@ -2114,24 +4043,24 @@ class Run:
         refuses links and non-private objects, and deliberately excludes lifecycle,
         manifest, report, export and revision objects.
         """
-        run_fd = _open_run_fd(self.project_dir, self.run_id)
-        try:
-            for name in ("run.json", *sorted(_BASE_ARTIFACT_ROOTS)):
-                try:
-                    observed = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    continue
-                if name == "run.json" or name in _BASE_ARTIFACT_FILE_ROOTS:
-                    if not stat.S_ISREG(observed.st_mode):
-                        raise ContractError(f"canonical base file {name!r} is unsafe")
-                    self._fsync_base_file_at(run_fd, name, (name,))
-                else:
-                    if not stat.S_ISDIR(observed.st_mode):
-                        raise ContractError(f"canonical base directory {name!r} is unsafe")
-                    self._fsync_base_directory_at(run_fd, name, (name,))
-            os.fsync(run_fd)
-        finally:
-            os.close(run_fd)
+        owner = self._active_mutation_owner()
+        if owner is None:
+            raise ContractError("base durability walk has no mutation authority")
+        run_fd = owner.run_anchor.fd
+        for name in ("run.json", *sorted(_BASE_ARTIFACT_ROOTS)):
+            try:
+                observed = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if name == "run.json" or name in _BASE_ARTIFACT_FILE_ROOTS:
+                if not stat.S_ISREG(observed.st_mode):
+                    raise ContractError(f"canonical base file {name!r} is unsafe")
+                self._fsync_base_file_at(run_fd, name, (name,))
+            else:
+                if not stat.S_ISDIR(observed.st_mode):
+                    raise ContractError(f"canonical base directory {name!r} is unsafe")
+                self._fsync_base_directory_at(run_fd, name, (name,))
+        os.fsync(run_fd)
 
     @contextmanager
     def artifact_claim(self, *components):
@@ -2170,6 +4099,10 @@ class Run:
             if state != "running":
                 raise ContractError(
                     f"run {self.run_id} cannot begin finalization from {state!r}",
+                )
+            if self._run_name_exists_locked("manifest.json"):
+                raise ContractError(
+                    f"run {self.run_id} base evidence is already sealed by its manifest",
                 )
             live = self._live_artifact_claim_count()
             if live:
@@ -2234,20 +4167,119 @@ class Run:
         if run_id is not None:
             run_id = validate_run_id(run_id)                    # before recon/ can be created
         project_dir = Path(project_dir)
-        privfs.private_dir(project_dir / "recon")            # 0700 recon root before the run dir is claimed
+        # The caller-supplied project inode is the out-of-band parent guard.
+        # Creating that project directory is deliberately outside repository
+        # mutation authority; all repository effects begin only after it has
+        # been pinned and flocked.
+        privfs.private_dir(project_dir)
+        project_observed = os.stat(project_dir, follow_symlinks=False)
+        if (not stat.S_ISDIR(project_observed.st_mode)
+                or project_observed.st_uid != os.geteuid()
+                or stat.S_IMODE(project_observed.st_mode) != privfs.DIR_MODE):
+            raise ContractError("project directory identity is unsafe")
+        project_identity = project_observed.st_dev, project_observed.st_ino
         attempts = 1 if run_id is not None else 16
-        for _ in range(attempts):
-            rid = run_id if run_id is not None else cls._mint_run_id()
+        with _project_mutation(project_dir, project_identity) as project_owner:
             try:
-                os.mkdir(project_dir / "recon" / rid, privfs.DIR_MODE)   # claim atomically and 0700
+                os.mkdir("recon", privfs.DIR_MODE, dir_fd=project_owner.anchor.fd)
             except FileExistsError:
-                if run_id is not None:
-                    raise
-                continue
-            run = cls(project_dir, target, run_id=rid, _authority=_RUN_CONSTRUCTION_AUTHORITY)
-            run.write_state("created")
-            return run
+                pass
+            recon = _OwnedDescriptor()
+            recon_settlement = _SettlementOwner(
+                lambda: _settle_descriptor_owners((recon,), "Run creation root descriptor"),
+            )
+            with _SettlementFence(recon_settlement):
+                with _SettlementFence(recon_settlement):
+                    recon.open("recon", _DIR_OPEN_FLAGS, dir_fd=project_owner.anchor.fd)
+                    observed_recon = os.fstat(recon.fd)
+                    if (observed_recon.st_uid == os.geteuid()
+                            and stat.S_ISDIR(observed_recon.st_mode)
+                            and stat.S_IMODE(observed_recon.st_mode) != privfs.DIR_MODE):
+                        os.fchmod(recon.fd, privfs.DIR_MODE)
+                        observed_recon = os.fstat(recon.fd)
+                    if (not stat.S_ISDIR(observed_recon.st_mode)
+                            or observed_recon.st_uid != os.geteuid()
+                            or stat.S_IMODE(observed_recon.st_mode) != privfs.DIR_MODE):
+                        raise ContractError("repository root identity is unsafe")
+                    for _ in range(attempts):
+                        rid = run_id if run_id is not None else cls._mint_run_id()
+                        run_anchor = _OwnedDescriptor()
+                        creation = _OwnedDescriptor()
+                        cleanup = _RunCreationCleanup(recon, rid, run_anchor, creation)
+                        outcome = [None]
+                        creation_settlement = _SettlementOwner(cleanup.settle)
+                        with _SettlementFence(creation_settlement):
+                            with _SettlementFence(creation_settlement):
+                                cleanup.possible = True
+                                if not _claim_run_directory_into(
+                                    cleanup, recon.fd, rid, privfs.DIR_MODE,
+                                ):
+                                    cleanup.possible = False
+                                    if run_id is not None:
+                                        raise FileExistsError(rid)
+                                    continue
+                                creation.open(
+                                    ".creation-pending",
+                                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                                    | getattr(os, "O_CLOEXEC", 0),
+                                    privfs.FILE_MODE, dir_fd=run_anchor.fd,
+                                )
+                                os.fsync(creation.fd)
+                                os.fsync(run_anchor.fd)
+                                os.fsync(recon.fd)
+                                _settle_descriptor_owners(
+                                    (creation,), "Run creation marker descriptor",
+                                )
+                                identity = {
+                                    "run_id": rid, "target": target, "started": _utc(),
+                                }
+                                _bootstrap_run_tree(run_anchor, identity)
+                                run = cls(
+                                    project_dir, target, run_id=rid,
+                                    load_started=True, _identity=identity,
+                                    _run_directory_identity=run_anchor.identity,
+                                    _authority=_RUN_CONSTRUCTION_AUTHORITY,
+                                )
+                                run._initialize_mutation_authority(
+                                    project_anchor_fd=project_owner.anchor.fd,
+                                )
+                                with run._mutation(MutationScope.CONTROL):
+                                    run._write_state_locked("created")
+                                    run._unlink_run_file_locked((".creation-pending",))
+                                cleanup.exposed = True
+                                _settle_descriptor_owners(
+                                    (run_anchor,), "Run creation anchor descriptor",
+                                )
+                                outcome[0] = run
+                        if outcome[0] is not None:
+                            # Reconcile exposure from the durable marker/witness,
+                            # not a fragile in-frame boolean assignment.
+                            anchor = _OwnedDescriptor(run._run_directory_identity)
+                            check = _SettlementOwner(
+                                lambda: _settle_descriptor_owners(
+                                    (anchor,), "Run creation exposure descriptor",
+                                ),
+                            )
+                            with _SettlementFence(check):
+                                with _SettlementFence(check):
+                                    _open_run_fd_into(
+                                        anchor, project_dir, run.run_id,
+                                        expected_identity=run._run_directory_identity,
+                                    )
+                                    if _run_creation_pending(anchor.fd):
+                                        raise ContractError("Run creation remains pending")
+                            return outcome[0]
         raise RuntimeError("could not mint a unique run id after 16 attempts")
+
+    def _initialize_mutation_authority(self, *, project_anchor_fd: int | None = None) -> None:
+        """Create one exact lock identity while Run creation is still exclusive."""
+        owner = _RunMutationOwner(
+            self, initializing=True, project_anchor_fd=project_anchor_fd,
+        )
+        settlement = _SettlementOwner(owner.settle)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                owner.acquire()
 
     @classmethod
     def open(cls, project_dir, target, run_id) -> "Run":
@@ -2259,22 +4291,32 @@ class Run:
         """
         target = validate_target(target)
         run_id = validate_run_id(run_id)              # refuse before joining/opening caller-controlled input
-        identity = read_run_identity(Path(project_dir), run_id)
+        anchor = _OwnedDescriptor()
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners((anchor,), "Run.open identity anchor"),
+        )
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                _open_run_fd_into(anchor, Path(project_dir), run_id)
+                if _run_creation_pending(anchor.fd):
+                    raise _InvalidRunIdentity(f"run {run_id!r} creation is incomplete")
+                identity, _started = _run_identity_from_fd(anchor.fd, run_id)
+                run_directory_identity = anchor.identity
         if target != identity["target"]:
             raise ContractError(f"run {run_id!r} belongs to target {identity['target']!r}, not {target!r}")
         return cls(project_dir, identity["target"], run_id=run_id, load_started=True, _identity=identity,
+                   _run_directory_identity=run_directory_identity,
                    _authority=_RUN_CONSTRUCTION_AUTHORITY)
 
     # ── raw evidence ──
     def raw_path(self, phase: str, tool: str, name: str) -> Path:
         with self._mutation(MutationScope.BASE_EVIDENCE):
-            from . import privfs
             phase = validate_artifact_component(phase, "raw phase")
             tool = validate_artifact_component(tool, "raw tool")
             name = validate_artifact_component(name, "raw filename")
-            p = self.raw / phase / tool
-            privfs.private_dir(p)                            # raw evidence dirs are 0700
-            return p / name
+            components = ("raw", phase, tool, name)
+            self._ensure_artifact_parent(components)
+            return self.dir.joinpath(*components)
 
     def fresh_artifact_dir(self, *components: str) -> Path:
         """Atomically allocate one private ``attempt-N`` base-evidence directory.
@@ -2287,9 +4329,7 @@ class Run:
         """
         components = _validated_artifact_components(tuple(components))
         with self._mutation(MutationScope.BASE_EVIDENCE):
-            base = self.dir.joinpath(*components)
-            from . import privfs
-            privfs.private_dir(base)
+            self._ensure_artifact_parent(components + ("attempt-0",))
             allocation = _ArtifactDirectoryAllocation(
                 self, components, "attempt-0",
             )
@@ -2348,9 +4388,10 @@ class Run:
             self._tool_runs_signature = self._tool_runs_disk_signature()
 
     def _tool_runs_disk_signature(self) -> tuple | None:
+        from . import privfs
         try:
-            observed = os.stat(self._tool_runs_path, follow_symlinks=False)
-        except FileNotFoundError:
+            observed = self._run_file_stat_locked(("tool-runs.jsonl",))
+        except (FileNotFoundError, privfs.PrivatePathMissing):
             return None
         return (
             observed.st_dev, observed.st_ino, observed.st_size,
@@ -2388,7 +4429,7 @@ class Run:
             if self._tool_runs_signature is _TOOL_RUNS_UNLOADED and self._tool_runs:
                 self._tool_runs_signature = None
                 return
-            legacy = _read_json(self.manifest_path)
+            legacy = self._read_run_json_locked("manifest.json")
             rows = legacy.get("tool_runs") if isinstance(legacy, dict) else None
             self._tool_runs = (
                 [self._tool_run_from_dict(row) for row in rows]
@@ -2398,18 +4439,33 @@ class Run:
             return
         records = []
         from . import privfs
+        active = self._active_mutation_owner()
+        descriptor = None
         try:
-            with os.fdopen(privfs.open_ro_private(self._tool_runs_path), "r", encoding="utf-8") as fh:
-                for index, line in enumerate(fh, 1):
-                    if not line.endswith("\n"):
-                        raise ContractError(f"tool-run ledger row {index} is torn")
-                    try:
-                        value = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        raise ContractError(f"tool-run ledger row {index} is invalid JSON") from exc
-                    records.append(self._tool_run_from_dict(value))
+            if active is None:
+                iterator = self._tool_runs_path.read_bytes().splitlines(keepends=True)
+            else:
+                descriptor = _OwnedDescriptor()
+                _open_strict_file_into(
+                    descriptor, active.run_anchor.fd, ("tool-runs.jsonl",),
+                )
+                iterator = _iter_descriptor_lines(descriptor.fd)
+            for index, encoded in enumerate(iterator, 1):
+                line = encoded.decode("utf-8")
+                if not line.endswith("\n"):
+                    raise ContractError(f"tool-run ledger row {index} is torn")
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ContractError(f"tool-run ledger row {index} is invalid JSON") from exc
+                records.append(self._tool_run_from_dict(value))
         except UnicodeError as exc:
             raise ContractError("tool-run ledger is not valid UTF-8") from exc
+        finally:
+            if descriptor is not None:
+                _settle_descriptor_owners(
+                    (descriptor,), "tool-run ledger descriptor",
+                )
         self._tool_runs = records
         self._tool_runs_signature = signature
 
@@ -2469,6 +4525,18 @@ class Run:
     # ── finalisation state machine ──
     def manifest_committed(self) -> bool:
         """Whether this run's base manifest is committed. `manifest_committed(path)` is the one rule."""
+        owner = self._active_mutation_owner()
+        if owner is not None:
+            manifest = _read_identity_file(owner.run_anchor.fd, "manifest.json")
+            if not isinstance(manifest, dict):
+                return False
+            counts = manifest.get("entity_counts")
+            return (
+                isinstance(counts, dict)
+                and all(isinstance(k, str) and type(v) is int and v >= 0
+                        for k, v in counts.items())
+                and summary_well_formed(manifest.get("summary"))
+            )
         return manifest_committed(self.manifest_path)
 
     def _read_state(self) -> dict:
@@ -2479,6 +4547,9 @@ class Run:
         fact and fails closed as `unknown` — inferring `finished` from a manifest there would let a
         corrupt lifecycle record read as a completed one.
         """
+        owner = self._active_mutation_owner()
+        if owner is not None:
+            return self._read_state_from_fd(owner.run_anchor.fd)
         from .state import RUN_STATES, STATE_UNKNOWN
         if not self.state_path.exists():
             if self.manifest_path.exists() and not self.manifest_committed():
@@ -2491,6 +4562,32 @@ class Run:
         d = _read_json(self.state_path)
         if self._well_formed_state(d):
             return d
+        return {"schema_version": 1, "run_id": self.run_id, "stages": {},
+                "state": STATE_UNKNOWN, "unreadable": True}
+
+    def _read_state_from_fd(self, run_fd: int) -> dict:
+        """Read lifecycle from the exact Run descriptor held by mutation authority."""
+        from .state import STATE_UNKNOWN
+        state = _read_identity_file(run_fd, "state.json")
+        if state is None:
+            manifest = _read_identity_file(run_fd, "manifest.json")
+            if manifest is not None and manifest is not _MALFORMED_IDENTITY:
+                counts = manifest.get("entity_counts") if isinstance(manifest, dict) else None
+                committed = (
+                    isinstance(counts, dict)
+                    and all(isinstance(k, str) and type(v) is int and v >= 0
+                            for k, v in counts.items())
+                    and summary_well_formed(manifest.get("summary"))
+                )
+                if not committed:
+                    return {"schema_version": 1, "run_id": self.run_id, "stages": {},
+                            "state": STATE_UNKNOWN, "unreadable": True}
+                return {"schema_version": 1, "run_id": self.run_id, "stages": {},
+                        "state": "finished"}
+            return {"schema_version": 1, "run_id": self.run_id, "stages": {},
+                    "state": "created"}
+        if state is not _MALFORMED_IDENTITY and self._well_formed_state(state):
+            return state
         return {"schema_version": 1, "run_id": self.run_id, "stages": {},
                 "state": STATE_UNKNOWN, "unreadable": True}
 
@@ -2527,7 +4624,10 @@ class Run:
         and an unreadable record is never overwritten — it is evidence, and guessing past it is how a
         corrupt run re-finalises as a clean one."""
         from .state import ContractError, run_transition_ok
-        rec = self._read_state()
+        owner = self._active_mutation_owner()
+        if owner is None:
+            raise ContractError("state transition has no mutation authority")
+        rec = self._read_state_from_fd(owner.run_anchor.fd)
         src = rec["state"]
         if rec.get("unreadable"):
             raise ContractError(f"run {self.run_id} has an unreadable {self.state_path.name} — refusing to "
@@ -2536,7 +4636,9 @@ class Run:
             raise ContractError(f"illegal run-state transition {src!r} -> {dst!r}")
         rec.update({"schema_version": 1, "run_id": self.run_id, "state": dst,
                     "generation": self.generation(), "updated": _utc(), "detail": detail})
-        _atomic_write(self.state_path, json.dumps(rec, indent=2))
+        self._replace_run_bytes_locked(
+            ("state.json",), json.dumps(rec, indent=2).encode("utf-8"),
+        )
 
     def write_state(self, dst: str, *, detail: str | None = None) -> None:
         """Compatibility lifecycle API routed through the authoritative seal/reopen operations."""
@@ -2560,7 +4662,7 @@ class Run:
         """
         h = hashlib.sha256(self.run_id.encode("utf-8"))
         for entity in sorted(ENTITY_KEYS):
-            if not self._entity_file(entity).exists():
+            if self._entity_signature(entity) is None:
                 continue
             records = self._records_for(entity)
             h.update(f"\n{entity}:{len(records)}".encode("utf-8"))
@@ -2583,18 +4685,24 @@ class Run:
     @_scoped_mutation(MutationScope.FINALIZATION_METADATA)
     def mark_stage(self, stage: str, status: str, *, detail: str | None = None) -> None:
         from .state import ContractError
-        if self.state != "finalizing":
+        owner = self._active_mutation_owner()
+        if owner is None:
+            raise ContractError("stage transition has no mutation authority")
+        state = self._read_state_from_fd(owner.run_anchor.fd)
+        if state["state"] != "finalizing":
             raise ContractError(
                 f"run {self.run_id} must be in finalizing to record derived stage metadata",
             )
-        rec = self._read_state()
+        rec = state
         if rec.get("unreadable"):
             raise ContractError(f"run {self.run_id} has an unreadable {self.state_path.name} — refusing to "
                                 f"record stage {stage!r} over it")
         rec.setdefault("stages", {})[stage] = {"generation": self.generation(), "status": status,
                                                "detail": detail, "updated": _utc()}
         rec["schema_version"], rec["run_id"] = 1, self.run_id
-        _atomic_write(self.state_path, json.dumps(rec, indent=2))
+        self._replace_run_bytes_locked(
+            ("state.json",), json.dumps(rec, indent=2).encode("utf-8"),
+        )
 
     @_scoped_mutation(MutationScope.FINALIZATION_METADATA)
     def reconcile_finalization(self) -> dict | None:
@@ -2607,12 +4715,13 @@ class Run:
         run with no committed manifest has nothing to reconcile.
         """
         from .state import Fault
-        manifest = _read_json(self.manifest_path)
+        manifest = self._read_run_json_locked("manifest.json")
         # a damaged summary is not reconciled: filling in what it lacks would author the verdict rather
         # than bring one back in step with the stages
         if not isinstance(manifest, dict) or not summary_well_formed(manifest.get("summary")):
             return None
-        if self.state != "finalizing":
+        owner = self._active_mutation_owner()
+        if owner is None or self._read_state_from_fd(owner.run_anchor.fd)["state"] != "finalizing":
             raise ContractError(
                 f"run {self.run_id} must be explicitly reopened before derived reconciliation",
             )
@@ -2636,7 +4745,9 @@ class Run:
         summary["faults"] = kept
         summary["verdict"] = _verdict_for(summary)
         manifest["summary"] = summary
-        _atomic_write(self.manifest_path, json.dumps(manifest, indent=2))
+        self._replace_run_bytes_locked(
+            ("manifest.json",), json.dumps(manifest, indent=2).encode("utf-8"),
+        )
         self._sealed_summary, self._verdict_sealed = summary, True
         return summary
 
@@ -2646,9 +4757,12 @@ class Run:
 
     def _entity_signature(self, entity: str) -> tuple | None:
         """Return a mutation-sensitive identity for one canonical entity log."""
+        from . import privfs
         try:
-            observed = os.stat(self._entity_file(entity), follow_symlinks=False)
-        except FileNotFoundError:
+            observed = self._run_file_stat_locked(
+                ("normalized", f"{validate_entity(entity)}.jsonl"),
+            )
+        except (FileNotFoundError, privfs.PrivatePathMissing):
             return None
         except OSError:
             # Folding below reports the authoritative typed/unusable state.  A
@@ -2701,8 +4815,8 @@ class Run:
             if reason:
                 self._refuse_over_envelope(entity, key, reason)   # bound the corpus; record the refusal durably
                 return False
-            records[key] = record
             self._append_line(entity, line)
+            records[key] = record
             self._corpus_bytes[entity] = self._corpus_bytes_for(entity) + len(line.encode("utf-8"))
             return True
         if not _subsumed(records[key], record):             # novel: new evidence or a conflicting value
@@ -2738,8 +4852,8 @@ class Run:
             if reason:
                 self._refuse_over_envelope(entity, key, reason)   # bound the corpus; record the refusal durably
                 return False
-            records[key] = record
             self._append_line(entity, line)
+            records[key] = record
             self._corpus_bytes[entity] = self._corpus_bytes_for(entity) + len(line.encode("utf-8"))
             return True
         if _subsumed(records[key], record):
@@ -2758,9 +4872,14 @@ class Run:
         self._append_line(entity, json.dumps(record, ensure_ascii=False))
 
     def _append_line(self, entity: str, line: str) -> None:
-        from . import privfs
-        # 0600, O_NOFOLLOW append: the normalized log (incl. secret.jsonl) is never group/other-readable
-        privfs.append_private(self._entity_file(entity), line + "\n")
+        append = _CanonicalLogAppendOwner(
+            self, ("normalized", f"{validate_entity(entity)}.jsonl"),
+            (line + "\n").encode("utf-8"),
+        )
+        settlement = _SettlementOwner(append.settle)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                append.execute()
         self._entity_signatures[entity] = self._entity_signature(entity)
 
     # ── corpus envelope: bound materialized keys and corpus bytes, refuse—never drop—the overflow ──
@@ -2828,8 +4947,25 @@ class Run:
         self._envelope_durability[cause] = msg
         self.notes.append(msg)
         try:
-            _atomic_write(self._degraded_path,
-                          json.dumps({"degraded": dict(self._envelope_durability)}, indent=2))
+            active = self._active_mutation_owner()
+            if active is not None:
+                state = self._read_state_from_fd(active.run_anchor.fd)["state"]
+                if state not in {"created", "running"}:
+                    return
+                self._replace_run_bytes_locked(
+                    ("envelope-degraded.json",),
+                    json.dumps(
+                        {"degraded": dict(self._envelope_durability)}, indent=2,
+                    ).encode("utf-8"),
+                )
+            elif self.state in {"created", "running"}:
+                with self._mutation(MutationScope.BASE_EVIDENCE):
+                    self._replace_run_bytes_locked(
+                        ("envelope-degraded.json",),
+                        json.dumps(
+                            {"degraded": dict(self._envelope_durability)}, indent=2,
+                        ).encode("utf-8"),
+                    )
         except OSError as e:
             if not self._marker_unwritable:                     # surface once: the gap will not survive a crash
                 self._marker_unwritable = True
@@ -2851,9 +4987,15 @@ class Run:
                     self.notes.append(msg)                      # re-surface on reopen, so the gap persists
 
     def _append_refused(self, entity: str, key: str, kind: str) -> None:
-        from . import privfs
-        privfs.append_private(self._refused_path,
-                              json.dumps({"entity": entity, "key": key, "kind": kind}, ensure_ascii=False) + "\n")
+        append = _CanonicalLogAppendOwner(
+            self, ("envelope-refused.jsonl",),
+            (json.dumps({"entity": entity, "key": key, "kind": kind},
+                        ensure_ascii=False) + "\n").encode(),
+        )
+        settlement = _SettlementOwner(append.settle)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                append.execute()
 
     def _fold_refused_path(self, entity: str):
         return self._fold_refused_dir / f"{validate_entity(entity)}.jsonl"
@@ -2870,6 +5012,41 @@ class Run:
                                                f"envelope fold-refusal dir unreadable ({type(e).__name__})")
         return srcs
 
+    def _refusal_components_locked(self) -> list[tuple[str, ...]]:
+        """Enumerate exact refusal files through the pinned Run anchor."""
+        from . import privfs
+        active = self._active_mutation_owner()
+        if active is None:
+            return [tuple(path.relative_to(self.dir).parts) for path in self._refusal_sources()
+                    if path.exists()]
+        components: list[tuple[str, ...]] = []
+        try:
+            self._run_file_stat_locked(("envelope-refused.jsonl",))
+        except (FileNotFoundError, privfs.PrivatePathMissing):
+            pass
+        else:
+            components.append(("envelope-refused.jsonl",))
+        directory = _OwnedDescriptor()
+        settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners((directory,), "refusal directory descriptor"),
+        )
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                try:
+                    _open_strict_directory_into(
+                        directory, active.run_anchor.fd,
+                        ("envelope-fold-refused",),
+                    )
+                except privfs.PrivatePathMissing:
+                    return components
+                for name in sorted(os.listdir(directory.fd)):
+                    validate_artifact_component(name, "fold refusal filename")
+                    observed = os.stat(name, dir_fd=directory.fd, follow_symlinks=False)
+                    if not stat.S_ISREG(observed.st_mode):
+                        raise ContractError("envelope fold-refusal entry is unsafe")
+                    components.append(("envelope-fold-refused", name))
+        return components
+
     def _ledger_distinct_by_kind(self) -> dict:
         """Exact distinct refused identities per (known entity, kind), folded from every refusal file via an
         on-disk sqlite dedup: memory is one insert batch and the group set is bounded to the entity enum, never
@@ -2877,10 +5054,10 @@ class Run:
         counted as damage and surfaced as a durable gap. No refusal files -> recover an old count-only marker."""
         import sqlite3
         import tempfile
-        sources = [p for p in self._refusal_sources() if p.exists()]
+        sources = self._refusal_components_locked()
         if not sources:
             return self._recover_marker_counts()
-        fd, dbpath = tempfile.mkstemp(dir=self.dir, prefix=".envcount-", suffix=".db")
+        fd, dbpath = tempfile.mkstemp(prefix="quarry-envcount-", suffix=".db")
         os.close(fd)
         damaged = 0
         out: dict[str, dict[str, int]] = {}
@@ -2890,41 +5067,53 @@ class Run:
             con.execute("PRAGMA synchronous=OFF")
             con.execute("CREATE TABLE r(entity TEXT, key TEXT, kind TEXT, "
                         "PRIMARY KEY(entity, key)) WITHOUT ROWID")   # PK dedups; first kind wins
-            for src in sources:
+            active = self._active_mutation_owner()
+            for components in sources:
                 batch: list = []
+                source = _OwnedDescriptor()
                 try:
-                    with open(src, "rb") as fh:
-                        for line in _iter_ledger_lines(fh, _MAX_LEDGER_LINE):
-                            if line is None:            # an over-length line, rejected before materialize/parse
-                                damaged += 1
-                                continue
-                            if not line.strip():
-                                continue
-                            try:
-                                rec = json.loads(line.decode("utf-8"))
-                            except (UnicodeDecodeError, json.JSONDecodeError):
-                                damaged += 1
-                                continue
-                            if not isinstance(rec, dict):
-                                damaged += 1                    # valid JSON, wrong shape -> damage, never rec.get crash
-                                continue
-                            e, k, kind = rec.get("entity"), rec.get("key"), rec.get("kind")
-                            # out-of-vocabulary entity/kind, an over-long key, or a key sqlite cannot encode
-                            # (a lone surrogate) is damage: fails closed and bounds finalize RAM to the enum
-                            # and a small batch of length-capped keys
-                            if (not isinstance(e, str) or e not in ENTITY_KEYS or not isinstance(k, str)
-                                    or not isinstance(kind, str) or kind not in _REFUSAL_KINDS
-                                    or len(k) > _MAX_LEDGER_KEY or not _utf8_safe(k)):
-                                damaged += 1
-                                continue
-                            batch.append((e, k, kind))
-                            if len(batch) >= _LEDGER_BATCH:     # bounded: one small batch resident, flushed to disk
-                                con.executemany("INSERT OR IGNORE INTO r VALUES(?,?,?)", batch)
-                                batch.clear()
+                    if active is None:
+                        source.open(self.dir.joinpath(*components), _FILE_OPEN_FLAGS)
+                    else:
+                        _open_strict_file_into(
+                            source, active.run_anchor.fd, components,
+                        )
+                    reader = _DescriptorReader(source.fd)
+                    for line in _iter_ledger_lines(reader, _MAX_LEDGER_LINE):
+                        if line is None:            # an over-length line, rejected before materialize/parse
+                            damaged += 1
+                            continue
+                        if not line.strip():
+                            continue
+                        try:
+                            rec = json.loads(line.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            damaged += 1
+                            continue
+                        if not isinstance(rec, dict):
+                            damaged += 1                    # valid JSON, wrong shape -> damage, never rec.get crash
+                            continue
+                        e, k, kind = rec.get("entity"), rec.get("key"), rec.get("kind")
+                        # out-of-vocabulary entity/kind, an over-long key, or a key sqlite cannot encode
+                        # (a lone surrogate) is damage: fails closed and bounds finalize RAM to the enum
+                        # and a small batch of length-capped keys
+                        if (not isinstance(e, str) or e not in ENTITY_KEYS or not isinstance(k, str)
+                                or not isinstance(kind, str) or kind not in _REFUSAL_KINDS
+                                or len(k) > _MAX_LEDGER_KEY or not _utf8_safe(k)):
+                            damaged += 1
+                            continue
+                        batch.append((e, k, kind))
+                        if len(batch) >= _LEDGER_BATCH:     # bounded: one small batch resident, flushed to disk
+                            con.executemany("INSERT OR IGNORE INTO r VALUES(?,?,?)", batch)
+                            batch.clear()
                     if batch:
                         con.executemany("INSERT OR IGNORE INTO r VALUES(?,?,?)", batch)
                 except OSError:
                     damaged += 1
+                finally:
+                    _settle_descriptor_owners(
+                        (source,), "refusal source descriptor",
+                    )
             for e, kind, n in con.execute("SELECT entity, kind, COUNT(*) FROM r GROUP BY entity, kind"):
                 out.setdefault(e, {})[kind] = n
             con.close()
@@ -2944,7 +5133,7 @@ class Run:
         so its remainder is not silently lost, tallied under `key`."""
         out: dict[str, dict[str, int]] = {}
         try:
-            doc = json.loads(self._envelope_path.read_text())
+            doc = self._read_run_json_locked("envelope-remainder.json")
         except (OSError, json.JSONDecodeError, ValueError):
             return out
         for rem in (doc.get("remainders") or []) if isinstance(doc, dict) else []:
@@ -2959,14 +5148,19 @@ class Run:
         without paying the full ledger fold; the exact count is refreshed into it at finalize."""
         try:
             from . import envelope
-            _atomic_write(self._envelope_path, json.dumps({**envelope.declaration(), "overflow": True}, indent=2))
+            self._replace_run_bytes_locked(
+                ("envelope-remainder.json",),
+                json.dumps({**envelope.declaration(), "overflow": True}, indent=2).encode("utf-8"),
+            )
         except OSError:
             pass
 
     def _persist_envelope_remainder(self) -> None:
         env = self.envelope_remainder()
         if env is not None:
-            _atomic_write(self._envelope_path, json.dumps(env, indent=2))
+            self._replace_run_bytes_locked(
+                ("envelope-remainder.json",), json.dumps(env, indent=2).encode("utf-8"),
+            )
 
     def envelope_remainder(self) -> dict | None:
         """The durable record of identities this run refused past the declared corpus envelope, or None if it
@@ -3003,47 +5197,85 @@ class Run:
         if entity in self._records:
             return self._records[entity]
         from . import envelope, privfs
-        # only a log that exists on disk can fold-refuse; a live-only run never touches the fold ledger
-        if not self._entity_file(entity).exists():
-            self._folded[entity] = fold_observations(self._entity_file(entity))
-            self._records[entity] = self._folded[entity].records
-            return self._records[entity]
-        fd = None
-        if persist_refusals:
-            privfs.private_dir(self._fold_refused_dir)
-            refused_any = [False]
-            try:
-                fd = privfs.open_private(self._fold_refused_path(entity), append=False)   # truncate: idempotent
-            except OSError as e:
-                self._mark_durability_degraded(f"fold:{entity}",
-                                               f"envelope fold-refusal file unwritable for {entity!r} "
-                                               f"({type(e).__name__})")
-                fd = None
-        else:
-            refused_any = [False]
-
-        def _sink(k: str, kind: str) -> None:
-            refused_any[0] = True
-            if fd is None:
-                return
-            os.write(fd, (json.dumps({"entity": entity, "key": k, "kind": kind},
-                                     ensure_ascii=False) + "\n").encode("utf-8"))
-
-        try:
+        active = self._active_mutation_owner()
+        if persist_refusals and active is None:
+            raise ContractError("persisted entity fold has no mutation authority")
+        if active is None:
             folded = fold_observations(
                 self._entity_file(entity), max_keys=self._envelope_cap(),
                 max_bytes_per_key=envelope.MAX_BYTES_PER_KEY,
-                max_corpus_bytes=envelope.MAX_CORPUS_BYTES_PER_ENTITY, on_refused=_sink)
-        finally:
-            if fd is not None:
-                os.close(fd)
-        if persist_refusals:
-            if not refused_any[0]:                # nothing refused now: clear any stale file (e.g. a raised bound)
+                max_corpus_bytes=envelope.MAX_CORPUS_BYTES_PER_ENTITY,
+                require_newline=True,
+            )
+            self._folded[entity] = folded
+            self._records[entity] = folded.records
+            self._entity_signatures[entity] = self._entity_signature(entity)
+            return self._records[entity]
+
+        source = _OwnedDescriptor()
+        source_settlement = _SettlementOwner(
+            lambda: _settle_descriptor_owners((source,), "entity fold source descriptor"),
+        )
+        refused_any = [False]
+        refusal_stage = None
+        components = ("envelope-fold-refused", f"{entity}.jsonl")
+        with _SettlementFence(source_settlement):
+            with _SettlementFence(source_settlement):
                 try:
-                    self._fold_refused_path(entity).unlink()
-                except OSError:
-                    pass
-            elif not self._envelope_marked:
+                    _open_strict_file_into(
+                        source, active.run_anchor.fd,
+                        ("normalized", f"{entity}.jsonl"),
+                    )
+                except privfs.PrivatePathMissing:
+                    folded = FoldedLog(status="absent", reason="no observation log")
+                else:
+                    if persist_refusals:
+                        try:
+                            self._ensure_artifact_parent(components)
+                            refusal_stage = privfs.create_private_stage(
+                                active.run_anchor.fd, components,
+                            )
+                        except OSError as exc:
+                            self._mark_durability_degraded(
+                                f"fold:{entity}",
+                                f"envelope fold-refusal file unwritable for {entity!r} "
+                                f"({type(exc).__name__})",
+                            )
+
+                    def _sink(k: str, kind: str) -> None:
+                        refused_any[0] = True
+                        if refusal_stage is not None:
+                            _write_all_descriptor(
+                                refusal_stage.file_fd,
+                                (json.dumps({"entity": entity, "key": k, "kind": kind},
+                                            ensure_ascii=False) + "\n").encode("utf-8"),
+                            )
+
+                    try:
+                        folded = _fold_observation_stream(
+                            _iter_descriptor_lines(source.fd), entity,
+                            max_keys=self._envelope_cap(),
+                            max_bytes_per_key=envelope.MAX_BYTES_PER_KEY,
+                            max_corpus_bytes=envelope.MAX_CORPUS_BYTES_PER_ENTITY,
+                            on_refused=_sink,
+                            require_newline=True,
+                        )
+                        if refusal_stage is not None:
+                            if refused_any[0]:
+                                privfs.replace_private_stage(refusal_stage)
+                            else:
+                                privfs.abort_private_stage(refusal_stage)
+                                self._unlink_run_file_locked(components)
+                    except BaseException:
+                        if (refusal_stage is not None
+                                and refusal_stage.state not in {"aborted", "committed", "fenced"}):
+                            try:
+                                privfs.abort_private_stage(refusal_stage)
+                            except BaseException:
+                                pass
+                        raise
+        if persist_refusals:
+            if refused_any[0] and not self._envelope_marked:
                 self._envelope_marked = True
                 self._write_marker_stub()
         self._folded[entity] = folded
@@ -3107,6 +5339,15 @@ class Run:
         status_counts: dict[str, int] = {}
         failures = []
         gaps = []
+        for entity in sorted(ENTITY_KEYS):
+            folded = self.read_folded(entity)
+            if folded.status in {"degraded", "unusable", "unknown"}:
+                gaps.append({
+                    "phase": "store", "tool": f"normalized:{entity}",
+                    "status": folded.status, "kind": "unknown",
+                    "why": folded.reason or "canonical observation log is damaged",
+                    "output_lines": len(folded.records),
+                })
         tool_runs = self.tool_runs()
         for r in tool_runs:
             status_counts[r.status] = status_counts.get(r.status, 0) + 1
@@ -3507,40 +5748,31 @@ class Run:
             raise TypeError("publish_manifest requires a prepared manifest")
         if prepared.run_id != self.run_id or prepared.target != self.target:
             raise ContractError("prepared manifest belongs to a different run")
-        state_now = self.state
-        scope = (
-            MutationScope.BASE_EVIDENCE
-            if state_now in {"created", "running"}
-            else MutationScope.FINALIZATION_METADATA
-        )
-        with self._mutation(scope):
+        with self._mutation(MutationScope.FINALIZATION_METADATA):
             current = self.state
             if current == "finalizing":
-                if os.path.lexists(self.manifest_path):
+                if self._run_name_exists_locked("manifest.json"):
                     raise ContractError(
                         "the base manifest is already published; reconcile only derived-publication metadata",
                     )
-            elif current not in {"created", "running"}:
+            else:
                 raise ContractError(
                     f"run {self.run_id} cannot publish a base manifest in state {current!r}",
                 )
-            _atomic_write(self.manifest_path, prepared.manifest_text)
-            # update state pointers (per-project, under recon/)
-            from . import privfs
-            state = self.project_dir / "recon" / "state"
-            privfs.private_dir(state / "history")                # 0700 state root
-            _atomic_write(state / "history" / f"{self.run_id}.json", prepared.history_text)
-            # the `current` pointer is swapped atomically (temp symlink + os.replace), so a concurrent reader
-            # never sees it briefly missing
-            cur = state / "current"
-            try:
-                tmp = state / f".current.{os.getpid()}.tmp"
-                if tmp.is_symlink() or tmp.exists():
-                    tmp.unlink()
-                os.symlink(self.dir.resolve(), tmp)
-                os.replace(tmp, cur)
-            except OSError:
-                _atomic_write(state / "current.txt", str(self.dir.resolve()))
+            self._replace_run_bytes_locked(
+                ("manifest.json",), prepared.manifest_text.encode("utf-8"),
+            )
+            owner = self._active_mutation_owner()
+            if owner is None:
+                raise ContractError("manifest publication has no mutation authority")
+            publisher = _ProjectStatePublisher(owner)
+            settlement = _SettlementOwner(publisher.settle)
+            with _SettlementFence(settlement):
+                with _SettlementFence(settlement):
+                    publisher.publish(
+                        f"{self.run_id}.json", prepared.history_text.encode("utf-8"),
+                        str(self.dir),
+                    )
 
     def write_manifest(self, profile_summary: dict, phases_run: list[str],
                        metrics: dict | None = None, policy: list | None = None) -> None:
@@ -3563,19 +5795,31 @@ class Run:
             raise ContractError(
                 "the base manifest is already published; reconcile only derived-publication metadata",
             )
-        base_mutations = state_now in {"created", "running"}
-        scope = MutationScope.BASE_EVIDENCE if base_mutations else MutationScope.FINALIZATION_METADATA
-        with self._mutation(scope):
+        if state_now == "created":
+            self.write_state("running")
+            state_now = "running"
+        if state_now == "running":
+            prepared = self.begin_finalization(
+                profile_summary=profile_summary,
+                phases_run=phases_run,
+                metrics=metrics,
+                policy=policy,
+            )
+            if prepared is None:
+                raise ContractError("manifest preparation did not complete")
+            self.publish_manifest(prepared)
+            return
+        with self._mutation(MutationScope.FINALIZATION_METADATA):
             prepared = self._prepare_manifest_locked(
                 profile_summary, phases_run, metrics, policy,
-                base_mutations=base_mutations,
+                base_mutations=False,
             )
             self.publish_manifest(prepared)
 
     @staticmethod
     def list_runs(project_dir: Path) -> "list[Path]":
         """Reconciled real run directories, oldest→newest, without following or modifying repository data."""
-        return [path for _started, _name, path, _identity in _run_snapshots(Path(project_dir))]
+        return [path for _started, _name, path, _identity, _inode in _run_snapshots(Path(project_dir))]
 
     @staticmethod
     def latest(project_dir: Path, target: str | None = None) -> "Run | None":
@@ -3584,11 +5828,12 @@ class Run:
         snapshots = _run_snapshots(Path(project_dir))
         if not snapshots:
             return None
-        _started, run_id, _path, identity = snapshots[-1]
+        _started, run_id, _path, identity, run_directory_identity = snapshots[-1]
         if target is not None and identity["target"] != target:
             raise ContractError(f"latest run {run_id!r} belongs to target {identity['target']!r}, "
                                 f"not {target!r}")
         return Run(project_dir, identity["target"], run_id=run_id, load_started=True, _identity=identity,
+                   _run_directory_identity=run_directory_identity,
                    _authority=_RUN_CONSTRUCTION_AUTHORITY)
 
 

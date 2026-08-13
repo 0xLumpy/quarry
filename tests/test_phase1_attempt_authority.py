@@ -266,7 +266,7 @@ def test_directory_allocation_effect_lines_are_owned_by_active_fences(
         store._ArtifactClaim.fence,
         store._ArtifactClaim._settle,
         store._ArtifactMarkerRelease.settle,
-        store._OwnedDescriptor.allocate,
+        store._OwnedDescriptor.open,
         store._OwnedDescriptor.close_once,
         store._close_owned_descriptors_twice,
         store._SettlementOwner.reconcile,
