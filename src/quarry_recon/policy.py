@@ -330,6 +330,129 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.store:_MAX_LEDGER_LINE": ("resource", "a ledger line longer than this is damage, rejected "
                                             "before it is materialized/parsed"),
 
+    # Phase 1 execution/repository infrastructure.  These limits protect identity, bounded control
+    # parsing and ownership recovery; none controls how much eligible reconnaissance `--unbound` runs.
+    "quarry_recon._fd_claims:MAX_CLAIM_ERRORS": (
+        "resource", "the bounded in-memory fault journal for one descriptor claim; the terminal "
+                    "disposition and dropped-fault counter remain explicit"),
+    "quarry_recon._fd_claims:MAX_DROPPED_ERRORS": (
+        "not_a_bound", "the saturation value of a diagnostic dropped-fault counter, not a limit on "
+                       "descriptor fencing attempts or reconnaissance work"),
+    "quarry_recon.privfs:_MAX_COMPONENTS": (
+        "identity", "the structural grammar of one descriptor-relative managed path; overlong path "
+                    "identities are rejected rather than partially traversed"),
+    "quarry_recon.privfs:_MAX_COMPONENT_BYTES": (
+        "identity", "the UTF-8 component grammar of a descriptor-relative managed path, not a volume "
+                    "allowance"),
+    "quarry_recon.privfs:_MAX_RELATIVE_PATH_BYTES": (
+        "identity", "the encoded grammar of one descriptor-relative managed path, never a ceiling on "
+                    "the evidence stored below a valid path"),
+    "quarry_recon.privfs:_MAX_DESCRIPTOR_CLAIM_ERRORS": (
+        "resource", "the private-filesystem alias for the bounded per-descriptor diagnostic journal; "
+                    "ownership settlement is still exact"),
+    "quarry_recon.privfs:_MAX_DESCRIPTOR_CLAIM_DROPPED": (
+        "not_a_bound", "the private-filesystem alias for the diagnostic counter's saturation value, "
+                       "not a work or recovery limit"),
+    "quarry_recon.privfs:_MAX_WORKER_PID": (
+        "identity", "the accepted operating-system PID domain for a stage-handoff correlation identity; "
+                    "it does not bound child execution"),
+    "quarry_recon.runner_containment:DESCENDANT_LIMIT": (
+        "not_a_bound", "a fixed containment failure-reason string naming a limit breach, not the limit "
+                       "itself"),
+    "quarry_recon.runner_containment:_MAX_CGROUP_COMPONENTS": (
+        "identity", "the structural grammar of an authenticated cgroup membership path; an invalid "
+                    "identity is refused"),
+    "quarry_recon.runner_containment:_MAX_CGROUP_PATH_BYTES": (
+        "identity", "the encoded grammar of an authenticated cgroup membership path, not a scan-volume "
+                    "control"),
+    "quarry_recon.runner_containment:_MAX_DESCENDANT_CGROUPS": (
+        "resource", "a safety bound on adversarial descendant-cgroup traversal; crossing it fails "
+                    "containment settlement rather than reporting the process tree clean"),
+    "quarry_recon.runner_containment:_MAX_DESCENDANT_DEPTH": (
+        "resource", "a safety bound on adversarial descendant-cgroup traversal depth; crossing it fails "
+                    "containment settlement rather than omitting work"),
+    "quarry_recon.runner_containment:_MAX_DESCENDANT_ENTRIES": (
+        "resource", "a safety bound on directory entries inspected while settling a cgroup tree; "
+                    "crossing it is a typed containment failure"),
+    "quarry_recon.runner_containment:_MAX_EVENTS_TEXT": (
+        "resource", "the bounded read of one kernel cgroup.events control file; oversize input fails "
+                    "containment validation"),
+    "quarry_recon.runner_containment:_MAX_PROC_TEXT": (
+        "resource", "the bounded read of one procfs/cgroup control file; oversize input fails containment "
+                    "validation"),
+    "quarry_recon.runner_containment:_MAX_SAFE_DEADLINE": (
+        "parser", "the strict numeric range accepted for an absolute monotonic containment deadline, "
+                  "not a deadline chosen by policy"),
+    "quarry_recon.runner_native:_MAX_POLICIES": (
+        "resource", "the descriptor and staging blast-radius bound for one exact native-output policy "
+                    "tuple; excess policies are refused in preflight, never silently dropped"),
+    "quarry_recon.runner_protocol:MAX_ARGV_BYTES": (
+        "resource", "the bounded control-memory footprint of one execution argv; an oversize request is "
+                    "refused before launch"),
+    "quarry_recon.runner_protocol:MAX_ARGV_ITEMS": (
+        "resource", "the bounded item count of one execution argv; an oversize request is refused before "
+                    "launch"),
+    "quarry_recon.runner_protocol:MAX_DETAIL_BYTES": (
+        "not_a_bound", "a compatibility alias of MAX_DIAGNOSTIC_BYTES and therefore no independent "
+                       "execution or evidence ceiling"),
+    "quarry_recon.runner_protocol:MAX_DIAGNOSTIC_BYTES": (
+        "resource", "the bounded credential-safe diagnostic-code field in a control record, not captured "
+                    "target evidence"),
+    "quarry_recon.runner_protocol:MAX_ENV_BYTES": (
+        "resource", "the bounded control-memory footprint of one child environment; an oversize request "
+                    "is refused before launch"),
+    "quarry_recon.runner_protocol:MAX_ENV_ITEMS": (
+        "resource", "the bounded item count of one child environment; an oversize request is refused "
+                    "before launch"),
+    "quarry_recon.runner_protocol:MAX_EXIT_CODE": (
+        "parser", "the upper scalar range accepted for a versioned protocol exit code, not a limit on "
+                  "execution"),
+    "quarry_recon.runner_protocol:MAX_EXIT_CODES": (
+        "resource", "the bounded control-record set of accepted exit codes; excess values are refused "
+                    "before launch"),
+    "quarry_recon.runner_protocol:MAX_FRAME_BYTES": (
+        "resource", "the allocation bound for one versioned runner control frame; oversize control input "
+                    "is rejected and never treated as a clean settlement"),
+    "quarry_recon.runner_protocol:MAX_JSON_DEPTH": (
+        "resource", "the recursion-safety bound for an untrusted runner control document; a deeper frame "
+                    "is rejected"),
+    "quarry_recon.runner_protocol:MAX_JSON_INTEGER_DIGITS": (
+        "parser", "the strict lexical range for an integer in a runner control document, not a work "
+                  "allowance"),
+    "quarry_recon.runner_protocol:MAX_JSON_NODES": (
+        "resource", "the parser-work bound for one untrusted runner control document; a larger tree is "
+                    "rejected"),
+    "quarry_recon.runner_protocol:MAX_PATH_BYTES": (
+        "identity", "the encoded grammar of one normalized path field in the versioned runner protocol; "
+                    "it does not bound bytes stored at that path"),
+    "quarry_recon.runner_protocol:MAX_PID": (
+        "identity", "the accepted operating-system PID domain in the versioned execution identity, not "
+                    "a process-count bound"),
+    "quarry_recon.runner_protocol:MAX_SAFE_INTEGER": (
+        "parser", "the exact numeric range accepted by the runner JSON and timeout parsers, not a policy "
+                  "ceiling"),
+    "quarry_recon.runner_protocol:MAX_STDIN_DATA_BYTES": (
+        "resource", "the bounded in-band allocation for one stdin-data request; larger input must use the "
+                    "out-of-band file-descriptor path or is refused before launch"),
+    "quarry_recon.runner_protocol:MAX_TEXT_BYTES": (
+        "resource", "the default control-field allocation bound in the versioned runner protocol, not a "
+                    "limit on captured target evidence"),
+    "quarry_recon.runner_protocol:MIN_EXIT_CODE": (
+        "parser", "the lower scalar range accepted for a versioned protocol exit code, not a limit on "
+                  "execution"),
+    "quarry_recon.runner_supervisor:_MAX_SAFE_DEADLINE": (
+        "parser", "the strict numeric range accepted for an absolute monotonic supervisor deadline, not "
+                  "a deadline selected by policy"),
+    "quarry_recon.runner_supervisor:_MAX_TRAILING_BYTES": (
+        "not_a_bound", "the saturation value of a control-transcript byte counter after protocol failure, "
+                       "not a read, evidence or execution ceiling"),
+    "quarry_recon.runner_supervisor:_REAP_RESERVE_SECONDS": (
+        "not_a_bound", "a partition of the caller's one existing settlement deadline reserved for forced "
+                       "kill and reap, not an additional timeout"),
+    "quarry_recon.store:_MAX_IDENTITY_BYTES": (
+        "resource", "the bounded read of one untrusted repository identity document; oversize identity "
+                    "data is rejected without materializing or mutating a run"),
+
     # parser ranges for the acquisition byte knobs
     "quarry_recon.contract:_ACQUIRE_BYTES_MAX": ("parser", "the strict parser's ceiling for the ACQUIRE_* "
                                                  "byte knobs (1 PiB)"),
