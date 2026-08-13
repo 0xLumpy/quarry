@@ -240,6 +240,35 @@ def test_tree_builder_repository_copy_revalidates_exact_run_target(tmp_path):
     assert run._live_artifact_claim_count() == 0
 
 
+def test_tree_builder_repository_copy_cannot_rebind_transaction_run(tmp_path):
+    run = _running_run(tmp_path / "owner", "native-builder-original-owner")
+    foreign = _running_run(tmp_path / "foreign", "native-builder-foreign-owner")
+    source_components = ("raw", "crawl", "sources", "app.js")
+    original_body = b"original repository owner"
+    foreign_body = b"foreign repository owner"
+    run._replace_artifact(
+        store.MutationScope.BASE_EVIDENCE, source_components, original_body,
+    )
+    foreign._replace_artifact(
+        store.MutationScope.BASE_EVIDENCE, source_components, foreign_body,
+    )
+    transaction, final = _tree_builder_transaction(run)
+    builder = transaction.open_tree_builder()
+
+    with pytest.raises(ContractError, match="Run authority is immutable"):
+        transaction.run = foreign
+
+    assert transaction.run is run
+    evidence = builder.copy_repository_file(source_components, "app.js")
+    assert evidence.sha256 == hashlib.sha256(original_body).hexdigest()
+    builder.seal()
+    receipt = transaction.finish(clean=True)
+
+    assert receipt.clean and (final / "app.js").read_bytes() == original_body
+    assert run._live_artifact_claim_count() == 0
+    assert foreign._live_artifact_claim_count() == 0
+
+
 @pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize(
     "seam",
@@ -319,6 +348,81 @@ def test_tree_builder_repository_copy_cancellation_seams_are_fenceable(
     assert receipt.cleanup_settled and not final.exists()
     assert run._live_artifact_claim_count() == 0
     assert _attempt_directories(run) == []
+    assert _open_descriptors() == baseline
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    "seam_fragment",
+    [
+        "settled = True  # descriptor close effect is fully recorded",
+        "if settled:  # reconcile the terminal allocation slot",
+    ],
+    ids=["post-close-effect", "post-close-reconcile"],
+)
+def test_tree_builder_post_close_cancellation_never_closes_reused_fd(
+    tmp_path, interruption, seam_fragment,
+):
+    run = _running_run(
+        tmp_path,
+        f"native-builder-post-close-{interruption.__name__.lower()}",
+    )
+    source_components = ("raw", "crawl", "sources", "app.js")
+    run._replace_artifact(
+        store.MutationScope.BASE_EVIDENCE,
+        source_components,
+        b"post-close cancellation fixture",
+    )
+    baseline = _open_descriptors()
+    adoption = NativeOutputAdoption()
+    transaction, final = _tree_builder_transaction(run, adoption=adoption)
+    builder = transaction.open_tree_builder()
+    cancellation = interruption("fixture post-close cancellation")
+    target_line = _source_line(NativeTreeBuilder._close_tracked, seam_fragment)
+    sentinel_fds: list[int] = []
+    reused_fd = -1
+    fired = False
+
+    def trace(frame, event, _arg):
+        nonlocal fired, reused_fd
+        if (fired or event != "line"
+                or frame.f_code is not NativeTreeBuilder._close_tracked.__code__
+                or frame.f_lineno != target_line):
+            return trace
+        slot = frame.f_locals["slot"]
+        if slot.identity != run._run_directory_identity:
+            return trace
+        candidate = frame.f_locals["fd"]
+        assert slot.fd == -1, "the close effect must already be tombstoned"
+        for _attempt in range(128):
+            opened = os.open("/dev/null", os.O_RDONLY)
+            sentinel_fds.append(opened)
+            if opened == candidate:
+                reused_fd = opened
+                break
+        assert reused_fd == candidate
+        fired = True
+        raise cancellation
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        with pytest.raises(interruption) as caught:
+            builder.copy_repository_file(source_components, "app.js")
+    finally:
+        sys.settrace(previous)
+
+    try:
+        assert fired and caught.value is cancellation
+        receipt = _settle_cancelled_tree_adoption(adoption, cancellation)
+        assert not receipt.clean and not receipt.claim_retained
+        assert receipt.cleanup_settled and not final.exists()
+        assert run._live_artifact_claim_count() == 0
+        assert _attempt_directories(run) == []
+        os.fstat(reused_fd)
+    finally:
+        for descriptor in sentinel_fds:
+            os.close(descriptor)
     assert _open_descriptors() == baseline
 
 

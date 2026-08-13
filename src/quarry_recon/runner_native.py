@@ -385,6 +385,21 @@ class _BuilderDescriptorAllocation:
 
     fd: int = -1
     identity: tuple[int, int] | None = None
+    close_attempted: bool = False
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _NativeRunAuthority:
+    """Frozen owner and identity facts captured with one native transaction."""
+
+    owner: store.Run = field(repr=False)
+    project_dir: Path = field(repr=False)
+    repository_root: Path = field(repr=False)
+    run_id: str
+    target: str = field(repr=False)
+    started: str = field(repr=False)
+    directory_identity: tuple[int, int] = field(repr=False)
+    witness: object = field(repr=False)
 
 
 @dataclass(slots=True)
@@ -1453,8 +1468,8 @@ class NativeTreeBuilder:
 
     __slots__ = (
         "_transaction", "_policy_index", "_stage_name", "_fd", "_identity",
-        "_owned_fds", "_allocation_slots", "_blocked_fds", "_effects",
-        "_receipt", "_fault", "_cancellation", "_constructor_token",
+        "_allocation_slots", "_effects", "_receipt", "_fault",
+        "_cancellation", "_constructor_token",
     )
 
     def __init__(
@@ -1475,9 +1490,7 @@ class NativeTreeBuilder:
         self._stage_name = stage_name
         self._fd = -1
         self._identity = None
-        self._owned_fds: dict[int, tuple[int, int] | None] = {}
         self._allocation_slots: list[_BuilderDescriptorAllocation] = []
-        self._blocked_fds: set[int] = set()
         self._effects: set[tuple[str, ...]] = set()
         self._receipt = None
         self._fault = None
@@ -1514,16 +1527,13 @@ class NativeTreeBuilder:
     def _track_fd(
         self,
         fd: int,
-        slot: _BuilderDescriptorAllocation | None = None,
+        slot: _BuilderDescriptorAllocation,
     ) -> int:
         # Publish ownership immediately after open/dup returns, before the
         # first validating syscall can be interrupted.
-        self._owned_fds[fd] = None
         observed = os.fstat(fd)
         identity = _identity(observed)
-        self._owned_fds[fd] = identity
-        if slot is not None:
-            slot.identity = identity
+        slot.identity = identity
         return fd
 
     def _allocate_owned(self, allocator) -> int:
@@ -1555,32 +1565,32 @@ class NativeTreeBuilder:
         return self._allocate_owned(lambda: os.dup(fd))
 
     def _live_descriptor_numbers(self) -> tuple[int, ...]:
-        return tuple(dict.fromkeys((
-            *self._owned_fds,
-            *(slot.fd for slot in self._allocation_slots if slot.fd >= 0),
-        )))
+        return tuple(dict.fromkeys(
+            slot.fd for slot in self._allocation_slots if slot.fd >= 0
+        ))
 
     def _close_tracked(
         self,
         fd: int,
     ) -> tuple[bool, BaseException | None]:
         slots = tuple(slot for slot in self._allocation_slots if slot.fd == fd)
-        if fd not in self._owned_fds and not slots:
+        if not slots:
             return True, None
-        if fd in self._blocked_fds:
-            return False, None
-        expected = self._owned_fds.get(fd)
-        if expected is None:
-            expected = next(
-                (slot.identity for slot in slots if slot.identity is not None),
-                None,
+        if len(slots) != 1:
+            return False, ContractError(
+                "native tree descriptor ownership is ambiguous",
             )
+        slot = slots[0]
+        expected = slot.identity
         faults: list[BaseException] = []
         settled = False
-        try:
-            os.close(fd)
-        except BaseException as exc:
-            faults.append(exc)
+
+        # A prior attempt may have closed the descriptor and then been
+        # cancelled before it could tombstone the numeric slot.  Probe before
+        # every retry: a missing or differently-owned number is settled, while
+        # the same identity is deliberately retained because it is ambiguous
+        # with same-inode descriptor reuse.
+        if slot.close_attempted:
             try:
                 observed = os.fstat(fd)
             except OSError as probe_fault:
@@ -1592,21 +1602,35 @@ class NativeTreeBuilder:
                 faults.append(probe_fault)
             else:
                 if expected is not None and _identity(observed) != expected:
-                    # Our descriptor closed and its number was reused.  Never
-                    # close the new owner's descriptor.
                     settled = True
-                else:
-                    # POSIX does not permit blindly retrying close after an
-                    # ambiguous report: the number could be reused for the
-                    # same inode.  Retain the transaction claim instead.
-                    self._blocked_fds.add(fd)
         else:
-            settled = True
-        if settled:
-            self._owned_fds.pop(fd, None)
-            for slot in slots:
-                slot.fd = -1
-            self._blocked_fds.discard(fd)
+            try:
+                # The syscall, effect marker and numeric tombstone share one
+                # source line.  Cooperative source-line cancellation can occur
+                # before the effect or after the tombstone, never in the unsafe
+                # successful-close/stale-number gap.  The descriptor remains
+                # live before the syscall; an ambiguous reported close is
+                # reconciled below rather than pre-syscall tombstoned.
+                os.close(fd); slot.close_attempted = True; slot.fd = -1
+            except BaseException as exc:
+                faults.append(exc)
+                slot.close_attempted = True
+                try:
+                    observed = os.fstat(fd)
+                except OSError as probe_fault:
+                    if probe_fault.errno == errno.EBADF:
+                        settled = True
+                    else:
+                        faults.append(probe_fault)
+                except BaseException as probe_fault:
+                    faults.append(probe_fault)
+                else:
+                    if expected is not None and _identity(observed) != expected:
+                        settled = True
+            else:
+                settled = True  # descriptor close effect is fully recorded
+        if settled:  # reconcile the terminal allocation slot
+            slot.fd = -1
             if self._fd == fd:
                 self._fd = -1
         return settled, _preferred_builder_fault(tuple(faults))
@@ -1620,7 +1644,14 @@ class NativeTreeBuilder:
         for fd in descriptors:
             if fd < 0:
                 continue
-            closed, fault = self._close_tracked(fd)
+            try:
+                closed, fault = self._close_tracked(fd)
+            except BaseException as exc:
+                faults.append(exc)
+                try:
+                    closed, fault = self._close_tracked(fd)
+                except BaseException as reconcile_fault:
+                    closed, fault = False, reconcile_fault
             settled &= closed
             faults.append(fault)
         return settled, _preferred_builder_fault(tuple(faults))
@@ -1926,10 +1957,8 @@ class NativeTreeBuilder:
 
     def _open_repository_source_root(self) -> int:
         """Pin this transaction's exact Run through builder-owned fds."""
-        run = self._transaction.run
-        if type(run) is not store.Run:
-            raise ContractError("native tree repository source requires exact Run")
-        repository_root = run.project_dir / "recon"
+        authority = self._transaction._require_run_authority()
+        repository_root = authority.repository_root
         root = run_fd = -1
         primary = None
         try:
@@ -1939,11 +1968,11 @@ class NativeTreeBuilder:
             root_observed = os.fstat(root)
             _validate_private_dir(root_observed, normalize=False, fd=root)
             run_fd = self._open_owned(
-                run.run_id, _DIR_FLAGS, dir_fd=root,
+                authority.run_id, _DIR_FLAGS, dir_fd=root,
             )
             observed = os.fstat(run_fd)
             _validate_private_dir(observed, normalize=False, fd=run_fd)
-            if _identity(observed) != run._run_directory_identity:
+            if _identity(observed) != authority.directory_identity:
                 raise ContractError("native tree source Run identity changed")
             creation = self._read_repository_identity_file(
                 run_fd, "run.json", required=True,
@@ -1951,7 +1980,9 @@ class NativeTreeBuilder:
             manifest = self._read_repository_identity_file(
                 run_fd, "manifest.json", required=False,
             )
-            expected = (run.run_id, run.target, run.started)
+            expected = (
+                authority.run_id, authority.target, authority.started,
+            )
             if (creation.get("run_id"), creation.get("target"),
                     creation.get("started")) != expected:
                 raise ContractError("native tree source Run authority changed")
@@ -2163,7 +2194,8 @@ class NativeOutputTransaction:
     """One durable claim spanning private native output staging and publication."""
 
     __slots__ = (
-        "run", "policies", "rewritten_cmd", "_base_fd", "_root_fd",
+        "_run_authority", "_run_witness", "policies", "rewritten_cmd",
+        "_base_fd", "_root_fd",
         "_root_name", "_root_identity", "_root_present", "_claim_name",
         "_claim_identity", "_claim_present", "_receipt", "_finish_ledger",
         "_stage_names", "_builders", "_adoption", "_constructor_token",
@@ -2187,7 +2219,19 @@ class NativeOutputTransaction:
     ) -> None:
         if _constructor_token is not _CONSTRUCTOR:
             raise ContractError("construct native output transactions through prepare_native_outputs")
-        self.run = run
+        witness = object()
+        project_dir = Path(run.project_dir)
+        self._run_witness = witness
+        self._run_authority = _NativeRunAuthority(
+            owner=run,
+            project_dir=project_dir,
+            repository_root=Path(os.path.abspath(project_dir)) / "recon",
+            run_id=run.run_id,
+            target=run.target,
+            started=run.started,
+            directory_identity=run._run_directory_identity,
+            witness=witness,
+        )
         self.policies = policies
         self.rewritten_cmd = rewritten_cmd
         self._base_fd = base_fd
@@ -2205,6 +2249,29 @@ class NativeOutputTransaction:
         self._adoption = adoption
         self._constructor_token = _constructor_token
         adoption._adopt_transaction(self)
+
+    @property
+    def run(self) -> store.Run:
+        """The exact immutable Run owner captured by this transaction."""
+        return self._run_authority.owner
+
+    @run.setter
+    def run(self, _replacement) -> None:
+        raise ContractError("native output Run authority is immutable")
+
+    def _require_run_authority(self) -> _NativeRunAuthority:
+        authority = self._run_authority
+        owner = authority.owner
+        if (type(authority) is not _NativeRunAuthority
+                or authority.witness is not self._run_witness
+                or type(owner) is not store.Run
+                or Path(owner.project_dir) != authority.project_dir
+                or owner.run_id != authority.run_id
+                or owner.target != authority.target
+                or owner.started != authority.started
+                or owner._run_directory_identity != authority.directory_identity):
+            raise ContractError("native output Run authority changed")
+        return authority
 
     def __repr__(self) -> str:
         return (
