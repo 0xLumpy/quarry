@@ -1151,6 +1151,7 @@ _PRIVATE_STAGE_BATCH_CONSTRUCTOR = object()
 _PRIVATE_STAGE_TRANSFER_AUTHORITY_CONSTRUCTOR = object()
 _PRIVATE_STAGE_PARENT_CLOSE_RECEIPT_CONSTRUCTOR = object()
 _PRIVATE_STAGE_ARTIFACT_PROOF_CONSTRUCTOR = object()
+_PRIVATE_STAGE_PUBLICATION_ATTEMPT_CONSTRUCTOR = object()
 _PRIVATE_STAGE_BATCH_CLAIM_CONSTRUCTOR = object()
 _PRIVATE_STAGE_CLEANUP_LEDGER_CONSTRUCTOR = object()
 
@@ -1277,6 +1278,39 @@ class PrivateStageArtifactProof:
         )
 
 
+class _PrivateStagePublicationAttempt:
+    """Durable per-member action facts retained across publication boundaries."""
+
+    __slots__ = (
+        "stage", "proof", "prior_claim", "prior_absent", "prior_signature", "state",
+        "reported_error",
+    )
+
+    def __init__(
+        self,
+        *,
+        stage: PrivateFileStage,
+        proof: PrivateStageArtifactProof,
+        prior_claim: _PrivateDescriptorClaim,
+        _constructor_token: object,
+    ) -> None:
+        if (_constructor_token is not _PRIVATE_STAGE_PUBLICATION_ATTEMPT_CONSTRUCTOR
+                or type(stage) is not PrivateFileStage
+                or type(proof) is not PrivateStageArtifactProof
+                or type(prior_claim) is not _PrivateDescriptorClaim):
+            raise PrivateStageHandoffError("publish")
+        self.stage = stage
+        self.proof = proof
+        self.prior_claim = prior_claim
+        self.prior_absent: bool | None = None
+        self.prior_signature: tuple[int, int, int, int, int, int, int] | None = None
+        self.state = "not_started"
+        self.reported_error: BaseException | None = None
+
+    def __repr__(self) -> str:
+        return f"PrivateStagePublicationAttempt(state={self.state!r})"
+
+
 def _validate_publication_proof_tuple(
     value, *, operation: str = "publish",
 ) -> tuple[PrivateStageArtifactProof, ...]:
@@ -1289,18 +1323,70 @@ def _validate_publication_proof_tuple(
 class PrivateStagePublicationPartial(PrivateStageHandoffError):
     """Terminal, non-clean receipt for an ordered per-artifact publication."""
 
+    __slots__ = (
+        "_publication_initialized", "_state", "_committed", "_uncertain",
+        "_unpublished", "_cleanup_errors",
+    )
+
     def __init__(
         self,
         *,
         committed: tuple[PrivateStageArtifactProof, ...],
         uncertain: tuple[PrivateStageArtifactProof, ...],
         unpublished: tuple[PrivateStageArtifactProof, ...],
+        _cleanup_errors: tuple[BaseException, ...] = (),
     ) -> None:
         super().__init__("publish")
-        self.state = "partial"
-        self.committed = _validate_publication_proof_tuple(committed)
-        self.uncertain = _validate_publication_proof_tuple(uncertain)
-        self.unpublished = _validate_publication_proof_tuple(unpublished)
+        self.cleanup_errors = tuple(_cleanup_errors)
+        self.close_errors = tuple(_cleanup_errors)
+        object.__setattr__(self, "_cleanup_errors", tuple(_cleanup_errors))
+        object.__setattr__(self, "_state", "partial")
+        object.__setattr__(
+            self, "_committed", _validate_publication_proof_tuple(committed),
+        )
+        object.__setattr__(
+            self, "_uncertain", _validate_publication_proof_tuple(uncertain),
+        )
+        object.__setattr__(
+            self, "_unpublished", _validate_publication_proof_tuple(unpublished),
+        )
+        object.__setattr__(self, "_publication_initialized", True)
+
+    def __setattr__(self, name, value) -> None:
+        if name in {
+            "__traceback__", "__cause__", "__context__", "__suppress_context__",
+        }:
+            BaseException.__setattr__(self, name, value)
+            return
+        if getattr(self, "_publication_initialized", False):
+            raise AttributeError("private publication receipts are immutable")
+        object.__setattr__(self, name, value)
+
+    def __getattribute__(self, name):
+        if name == "operation":
+            return "publish"
+        if name in {"cleanup_errors", "close_errors"}:
+            return object.__getattribute__(self, "_cleanup_errors")
+        return BaseException.__getattribute__(self, name)
+
+    def __delattr__(self, name) -> None:
+        raise AttributeError("private publication receipts are immutable")
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def committed(self) -> tuple[PrivateStageArtifactProof, ...]:
+        return self._committed
+
+    @property
+    def uncertain(self) -> tuple[PrivateStageArtifactProof, ...]:
+        return self._uncertain
+
+    @property
+    def unpublished(self) -> tuple[PrivateStageArtifactProof, ...]:
+        return self._unpublished
 
     def __repr__(self) -> str:
         return (
@@ -1313,12 +1399,51 @@ class PrivateStagePublicationPartial(PrivateStageHandoffError):
 class PrivateStagePublicationCommittedWithFault(PrivateStageHandoffError):
     """All artifacts committed durably, but descriptor cleanup also faulted."""
 
+    __slots__ = (
+        "_publication_initialized", "_state", "_committed", "_cleanup_errors",
+    )
+
     def __init__(
         self, *, committed: tuple[PrivateStageArtifactProof, ...],
+        _cleanup_errors: tuple[BaseException, ...] = (),
     ) -> None:
         super().__init__("publish")
-        self.state = "committed_with_fault"
-        self.committed = _validate_publication_proof_tuple(committed)
+        self.cleanup_errors = tuple(_cleanup_errors)
+        self.close_errors = tuple(_cleanup_errors)
+        object.__setattr__(self, "_cleanup_errors", tuple(_cleanup_errors))
+        object.__setattr__(self, "_state", "committed_with_fault")
+        object.__setattr__(
+            self, "_committed", _validate_publication_proof_tuple(committed),
+        )
+        object.__setattr__(self, "_publication_initialized", True)
+
+    def __setattr__(self, name, value) -> None:
+        if name in {
+            "__traceback__", "__cause__", "__context__", "__suppress_context__",
+        }:
+            BaseException.__setattr__(self, name, value)
+            return
+        if getattr(self, "_publication_initialized", False):
+            raise AttributeError("private publication receipts are immutable")
+        object.__setattr__(self, name, value)
+
+    def __getattribute__(self, name):
+        if name == "operation":
+            return "publish"
+        if name in {"cleanup_errors", "close_errors"}:
+            return object.__getattribute__(self, "_cleanup_errors")
+        return BaseException.__getattribute__(self, name)
+
+    def __delattr__(self, name) -> None:
+        raise AttributeError("private publication receipts are immutable")
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def committed(self) -> tuple[PrivateStageArtifactProof, ...]:
+        return self._committed
 
     def __repr__(self) -> str:
         return (
@@ -1600,7 +1725,8 @@ class PrivateStageHandoffBatch:
     __slots__ = (
         "_stages", "_request_id", "_state",
         "_transfer_authority", "_transfer_receipt", "_artifact_proofs",
-        "_publication_outcome", "_cleanup_ledger",
+        "_publication_outcome", "_publication_attempts", "_publication_cursor",
+        "_cleanup_ledger",
     )
 
     def __init__(
@@ -1623,6 +1749,8 @@ class PrivateStageHandoffBatch:
         object.__setattr__(self, "_transfer_receipt", None)
         object.__setattr__(self, "_artifact_proofs", None)
         object.__setattr__(self, "_publication_outcome", None)
+        object.__setattr__(self, "_publication_attempts", None)
+        object.__setattr__(self, "_publication_cursor", None)
         object.__setattr__(self, "_cleanup_ledger", cleanup_ledger)
 
     def __setattr__(self, name, value) -> None:
@@ -3365,58 +3493,156 @@ def _published_stage_matches(
     proof: PrivateStageArtifactProof,
 ) -> bool:
     try:
-        published = _open_strict_file_in(
-            stage_claim.parent.fd,
+        observed = os.stat(
             stage.destination_name,
-            stage.components,
+            dir_fd=stage_claim.parent.fd,
+            follow_symlinks=False,
         )
-    except PrivatePathMissing:
+    except FileNotFoundError:
         return False
+    _validate_strict_file_stat(observed, stage.components)
+    if (_identity(observed) != proof.file_identity
+            or observed.st_size != proof.size):
+        return False
+    # The retained pin is the exact source inode and was already stably hashed.
+    # A strict named inode with that same identity therefore authenticates the
+    # settled proof without allocating an unregistered verifier descriptor.
+    pin_observed = _inspect_clean_pending_claim(
+        stage_claim.pin, operation="publish",
+    )
+    if (_identity(pin_observed) != proof.file_identity
+            or pin_observed.st_size != proof.size):
+        return False
+    size, digest, lines = _hash_stage_artifact(
+        stage_claim.pin.fd, count_lines=proof.role != "stdin",
+    )
+    pin_after = _inspect_clean_pending_claim(
+        stage_claim.pin, operation="publish",
+    )
     try:
-        observed = os.fstat(published)
-        if (_identity(observed) != proof.file_identity
-                or observed.st_size != proof.size):
-            return False
-        size, digest, lines = _hash_stage_artifact(
-            published, count_lines=proof.role != "stdin",
+        named_after = os.stat(
+            stage.destination_name,
+            dir_fd=stage_claim.parent.fd,
+            follow_symlinks=False,
         )
-        return (size, digest, lines) == (proof.size, proof.sha256, proof.lines)
-    finally:
-        close_errors = _close_fds(published)
-        if close_errors:
-            raise close_errors[0]
+    except FileNotFoundError:
+        return False
+    _validate_strict_file_stat(named_after, stage.components)
+    return (
+        _file_signature(pin_observed) == _file_signature(pin_after)
+        and _file_signature(observed) == _file_signature(named_after)
+        and _identity(named_after) == proof.file_identity
+        and named_after.st_size == proof.size
+        and (size, digest, lines) == (proof.size, proof.sha256, proof.lines)
+    )
 
 
-def _observe_prior_destination(
+def _new_publication_prior_claim(
+    stage: PrivateFileStage,
+) -> _PrivateDescriptorClaim:
+    return _new_descriptor_claim(
+        -1, stage.parent_identity, "pin", stage.components,
+    )
+
+
+def _capture_prior_destination(
     stage: PrivateFileStage,
     stage_claim: _PrivateStageBatchClaim,
-) -> tuple[int, int] | None:
+    attempt: _PrivateStagePublicationAttempt,
+) -> None:
     try:
-        destination = _open_strict_file_in(
+        fd = _open_strict_file_in(
             stage_claim.parent.fd,
             stage.destination_name,
             stage.components,
+            _claim=attempt.prior_claim,
         )
     except PrivatePathMissing:
-        return None
-    try:
-        return _identity(os.fstat(destination))
-    finally:
-        close_errors = _close_fds(destination)
-        if close_errors:
-            raise close_errors[0]
+        object.__setattr__(attempt.prior_claim, "_disposition", "unallocated")
+        attempt.prior_absent = True
+        return
+    observed = os.fstat(fd)
+    object.__setattr__(attempt.prior_claim, "_owned_identity", _identity(observed))
+    object.__setattr__(attempt.prior_claim, "_identity", _identity(observed))
+    _validate_strict_file_stat(observed, stage.components)
+    attempt.prior_absent = False
+    attempt.prior_signature = _file_signature(observed)
 
 
-def _destination_still_matches_prior(
+def _destination_matches_held_prior(
     stage: PrivateFileStage,
     stage_claim: _PrivateStageBatchClaim,
-    prior_identity: tuple[int, int] | None,
+    attempt: _PrivateStagePublicationAttempt,
+) -> bool:
+    if attempt.prior_absent is True:
+        try:
+            os.stat(
+                stage.destination_name,
+                dir_fd=stage_claim.parent.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return True
+        return False
+    if attempt.prior_absent is not False:
+        return False
+    held = _inspect_clean_pending_claim(
+        attempt.prior_claim, operation="publish",
+    )
+    try:
+        named = os.stat(
+            stage.destination_name,
+            dir_fd=stage_claim.parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    return (_identity(named) == _identity(held)
+            and attempt.prior_signature is not None
+            and _file_signature(named) == attempt.prior_signature
+            and _file_signature(held) == attempt.prior_signature)
+
+
+def _temporary_stage_matches(
+    stage: PrivateFileStage,
+    stage_claim: _PrivateStageBatchClaim,
+    proof: PrivateStageArtifactProof,
 ) -> bool:
     try:
-        current = _observe_prior_destination(stage, stage_claim)
-    except BaseException:
+        named = os.stat(
+            stage.temporary_name,
+            dir_fd=stage_claim.parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
         return False
-    return current == prior_identity
+    _validate_strict_file_stat(named, stage.components)
+    pin = _inspect_clean_pending_claim(stage_claim.pin, operation="publish")
+    if (_identity(named) != proof.file_identity
+            or _identity(pin) != proof.file_identity
+            or named.st_size != proof.size
+            or pin.st_size != proof.size):
+        return False
+    size, digest, lines = _hash_stage_artifact(
+        stage_claim.pin.fd, count_lines=proof.role != "stdin",
+    )
+    pin_after = _inspect_clean_pending_claim(
+        stage_claim.pin, operation="publish",
+    )
+    try:
+        named_after = os.stat(
+            stage.temporary_name,
+            dir_fd=stage_claim.parent.fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    _validate_strict_file_stat(named_after, stage.components)
+    return (
+        _file_signature(pin) == _file_signature(pin_after)
+        and _file_signature(named) == _file_signature(named_after)
+        and (size, digest, lines) == (proof.size, proof.sha256, proof.lines)
+    )
 
 
 def _set_publication_state(
@@ -3439,10 +3665,406 @@ def _cleanup_publication_ledger(
     ledger = batch._cleanup_ledger
     if type(ledger) is not _PrivateStageCleanupLedger:
         return (PrivateStageHandoffError("cleanup"),)
+    errors: list[BaseException] = []
     try:
-        return _drain_private_stage_ledger(ledger)
+        errors.extend(_drain_private_stage_ledger(ledger))
     except BaseException as exc:
-        return (exc,)
+        errors.append(exc)
+    attempts = batch._publication_attempts
+    if type(attempts) is tuple:
+        for attempt in attempts:
+            if type(attempt) is not _PrivateStagePublicationAttempt:
+                errors.append(PrivateStageHandoffError("cleanup"))
+                continue
+            try:
+                errors.extend(_drain_private_descriptor_claim(
+                    attempt.prior_claim,
+                ))
+            except BaseException as exc:
+                errors.append(exc)
+    return tuple(errors)
+
+
+def _publication_cleanup_pending(batch: PrivateStageHandoffBatch) -> bool:
+    if batch._cleanup_ledger.pending:
+        return True
+    attempts = batch._publication_attempts
+    return type(attempts) is tuple and any(
+        type(attempt) is not _PrivateStagePublicationAttempt
+        or attempt.prior_claim.disposition not in _DESCRIPTOR_CLAIM_TERMINAL
+        for attempt in attempts
+    )
+
+
+class _PrivatePublicationTransaction:
+    """Stable per-batch facts shared by nested cancellation fences."""
+
+    __slots__ = (
+        "batch", "stages", "ledger", "proofs", "attempts", "primary",
+        "publication_started", "success_requested",
+    )
+
+    def __init__(
+        self,
+        batch: PrivateStageHandoffBatch,
+        stages: tuple[PrivateFileStage, ...],
+        ledger: _PrivateStageCleanupLedger,
+        proofs: tuple[PrivateStageArtifactProof, ...],
+    ) -> None:
+        self.batch = batch
+        self.stages = stages
+        self.ledger = ledger
+        self.proofs = proofs
+        self.attempts: list[_PrivateStagePublicationAttempt] = []
+        self.primary: BaseException | None = None
+        self.publication_started = False
+        self.success_requested = False
+
+
+def _remember_publication_primary(
+    transaction: _PrivatePublicationTransaction,
+    primary: BaseException,
+) -> None:
+    pending = [primary]
+    visited: set[int] = set()
+    cancellation: BaseException | None = None
+    while pending and len(visited) < 16:
+        candidate = pending.pop(0)
+        if id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if not isinstance(candidate, Exception):
+            cancellation = candidate
+            break
+        cause = getattr(candidate, "__cause__", None)
+        if isinstance(cause, BaseException):
+            pending.append(cause)
+        errors = getattr(candidate, "cleanup_errors", ())
+        if type(errors) is tuple:
+            pending.extend(
+                error for error in errors if isinstance(error, BaseException)
+            )
+    if cancellation is not None:
+        primary = cancellation
+    current = transaction.primary
+    if current is None or (
+        not isinstance(primary, Exception) and isinstance(current, Exception)
+    ):
+        transaction.primary = primary
+
+
+def _publication_partition(
+    transaction: _PrivatePublicationTransaction,
+) -> tuple[
+    tuple[PrivateStageArtifactProof, ...],
+    tuple[PrivateStageArtifactProof, ...],
+    tuple[PrivateStageArtifactProof, ...],
+]:
+    committed: list[PrivateStageArtifactProof] = []
+    uncertain: list[PrivateStageArtifactProof] = []
+    unpublished: list[PrivateStageArtifactProof] = []
+    for attempt, stage_claim in zip(
+        transaction.attempts, transaction.ledger.stage_claims,
+    ):
+        try:
+            landed = _published_stage_matches(
+                attempt.stage, stage_claim, attempt.proof,
+            )
+        except BaseException as exc:
+            landed = False
+            _remember_publication_primary(transaction, exc)
+            attempt.state = "uncertain"
+            uncertain.append(attempt.proof)
+            continue
+        if landed:
+            if attempt.state in {"durable", "committed"}:
+                attempt.state = "committed"
+                committed.append(attempt.proof)
+            else:
+                attempt.state = "uncertain"
+                uncertain.append(attempt.proof)
+            continue
+        try:
+            source_retained = _temporary_stage_matches(
+                attempt.stage, stage_claim, attempt.proof,
+            )
+            prior_retained = _destination_matches_held_prior(
+                attempt.stage, stage_claim, attempt,
+            )
+        except BaseException as exc:
+            _remember_publication_primary(transaction, exc)
+            source_retained = prior_retained = False
+        if source_retained and prior_retained:
+            attempt.state = "unpublished"
+            unpublished.append(attempt.proof)
+        else:
+            attempt.state = "uncertain"
+            uncertain.append(attempt.proof)
+    return tuple(committed), tuple(uncertain), tuple(unpublished)
+
+
+def _reconcile_publication_terminal_direct(
+    transaction: _PrivatePublicationTransaction,
+    *,
+    batch_state: str,
+    stage_states: tuple[str, ...],
+    outcome: object,
+) -> None:
+    batch = transaction.batch
+    object.__setattr__(batch, "_publication_outcome", outcome)
+    object.__setattr__(batch, "_state", batch_state)
+    for stage, state in zip(transaction.stages, stage_states):
+        object.__setattr__(stage, "_state", state)
+
+
+def _finish_private_publication(
+    transaction: _PrivatePublicationTransaction,
+) -> tuple[PrivateStageArtifactProof, ...]:
+    """Reconcile names, terminal facts, and every retained descriptor claim."""
+    batch = transaction.batch
+    outcome = batch._publication_outcome
+    if isinstance(outcome, PrivateStagePublicationPartial):
+        cleanup_errors = _cleanup_publication_ledger(batch)
+        for cleanup_error in cleanup_errors:
+            _remember_publication_primary(transaction, cleanup_error)
+        states = tuple(
+            "committed" if proof in outcome.committed
+            else "uncertain" if proof in outcome.uncertain
+            else "unpublished"
+            for proof in transaction.proofs
+        )
+        _reconcile_publication_terminal_direct(
+            transaction, batch_state="partial", stage_states=states,
+            outcome=outcome,
+        )
+        raise outcome from transaction.primary
+    if isinstance(outcome, PrivateStagePublicationCommittedWithFault):
+        cleanup_errors = _cleanup_publication_ledger(batch)
+        for cleanup_error in cleanup_errors:
+            _remember_publication_primary(transaction, cleanup_error)
+        _reconcile_publication_terminal_direct(
+            transaction,
+            batch_state="committed_with_fault",
+            stage_states=tuple(
+                "committed_with_fault" for _ in transaction.stages
+            ),
+            outcome=outcome,
+        )
+        raise outcome from transaction.primary
+    if type(outcome) is tuple and outcome is transaction.proofs:
+        cleanup_errors = _cleanup_publication_ledger(batch)
+        if cleanup_errors or _publication_cleanup_pending(batch):
+            fault = PrivateStagePublicationCommittedWithFault(
+                committed=transaction.proofs,
+                _cleanup_errors=cleanup_errors,
+            )
+            object.__setattr__(batch, "_publication_outcome", fault)
+            _reconcile_publication_terminal_direct(
+                transaction,
+                batch_state="committed_with_fault",
+                stage_states=tuple(
+                    "committed_with_fault" for _ in transaction.stages
+                ),
+                outcome=fault,
+            )
+            cause = cleanup_errors[0] if cleanup_errors else None
+            if cause is fault:
+                cause = next(
+                    (item for item in fault.cleanup_errors if item is not fault),
+                    None,
+                )
+            raise fault from cause
+        _reconcile_publication_terminal_direct(
+            transaction,
+            batch_state="committed",
+            stage_states=tuple("committed" for _ in transaction.stages),
+            outcome=transaction.proofs,
+        )
+        if (transaction.primary is not None
+                and not isinstance(transaction.primary, Exception)):
+            raise transaction.primary
+        return transaction.proofs
+    if batch.state in {"partial", "committed_with_fault", "fenced"}:
+        if isinstance(outcome, BaseException):
+            raise outcome
+        raise PrivateStageHandoffError("publish")
+    if batch.state == "committed":
+        return transaction.proofs
+
+    if not transaction.publication_started:
+        authority = batch._transfer_authority
+        transition_errors: list[BaseException] = []
+        try:
+            _force_fenced_state(batch, transaction.stages)
+        except BaseException as exc:
+            transition_errors.append(exc)
+        finally:
+            _reconcile_fenced_state_direct(
+                batch, authority, transaction.stages,
+            )
+            transition_errors.extend(_cleanup_publication_ledger(batch))
+        primary = transaction.primary or PrivateStageHandoffError("publish")
+        if isinstance(primary, PrivateStageHandoffError):
+            error = primary
+        else:
+            error = PrivateStageHandoffError("publish")
+        error.cleanup_errors = tuple(transition_errors)
+        error.close_errors = tuple(transition_errors)
+        object.__setattr__(batch, "_publication_outcome", error)
+        if error is primary:
+            raise error
+        raise error from primary
+
+    committed, uncertain, unpublished = _publication_partition(transaction)
+    if transaction.success_requested and transaction.primary is None:
+        if len(committed) != len(transaction.proofs):
+            transaction.primary = PrivatePathUnsafe(
+                "published private stage set changed before commit",
+            )
+        else:
+            object.__setattr__(batch, "_publication_outcome", transaction.proofs)
+            cleanup_errors = _cleanup_publication_ledger(batch)
+            if cleanup_errors or _publication_cleanup_pending(batch):
+                fault = PrivateStagePublicationCommittedWithFault(
+                    committed=transaction.proofs,
+                    _cleanup_errors=cleanup_errors,
+                )
+                _reconcile_publication_terminal_direct(
+                    transaction,
+                    batch_state="committed_with_fault",
+                    stage_states=tuple(
+                        "committed_with_fault" for _ in transaction.stages
+                    ),
+                    outcome=fault,
+                )
+                cause = cleanup_errors[0] if cleanup_errors else None
+                if cause is fault:
+                    cause = next(
+                        (item for item in fault.cleanup_errors if item is not fault),
+                        None,
+                    )
+                raise fault from cause
+            _reconcile_publication_terminal_direct(
+                transaction,
+                batch_state="committed",
+                stage_states=tuple("committed" for _ in transaction.stages),
+                outcome=transaction.proofs,
+            )
+            if (transaction.primary is not None
+                    and not isinstance(transaction.primary, Exception)):
+                raise transaction.primary
+            return transaction.proofs
+
+    if transaction.primary is None:
+        transaction.primary = PrivatePathUnsafe(
+            "private stage publication outcome is uncertain",
+        )
+    cleanup_errors = _cleanup_publication_ledger(batch)
+    for cleanup_error in cleanup_errors:
+        _remember_publication_primary(transaction, cleanup_error)
+    partial = PrivateStagePublicationPartial(
+        committed=committed,
+        uncertain=uncertain,
+        unpublished=unpublished,
+        _cleanup_errors=cleanup_errors,
+    )
+    object.__setattr__(batch, "_publication_outcome", partial)
+    stage_states = tuple(attempt.state for attempt in transaction.attempts)
+    _reconcile_publication_terminal_direct(
+        transaction,
+        batch_state="partial",
+        stage_states=stage_states,
+        outcome=partial,
+    )
+    raise partial from transaction.primary
+
+
+class _PrivatePublicationFence:
+    """One owner layer; a second layer retries interrupted reconciliation."""
+
+    __slots__ = ("transaction",)
+
+    def __init__(self, transaction: _PrivatePublicationTransaction) -> None:
+        self.transaction = transaction
+
+    def __enter__(self) -> _PrivatePublicationTransaction:
+        return self.transaction
+
+    def __exit__(self, _kind, primary, _traceback) -> bool:
+        if primary is None:
+            return False
+        _remember_publication_primary(self.transaction, primary)
+        _finish_private_publication(self.transaction)
+        return False
+
+
+def _prepare_private_publication(
+    transaction: _PrivatePublicationTransaction,
+    supplied_proofs: tuple[PrivateStageArtifactProof, ...],
+) -> None:
+    batch = transaction.batch
+    retained = _validate_settled_artifact_proofs(
+        batch, transaction.stages, supplied_proofs,
+    )
+    destinations = tuple(
+        (stage.parent_identity, stage.destination_name)
+        for stage in transaction.stages
+    )
+    if len(set(destinations)) != len(destinations):
+        raise PrivateStageHandoffError("publish")
+    for stage, stage_claim, proof in zip(
+        transaction.stages, transaction.ledger.stage_claims, retained,
+    ):
+        size, digest, lines = _authenticate_transferred_stage(
+            stage, stage_claim, role=proof.role, operation="publish",
+        )
+        if (size, digest, lines) != (proof.size, proof.sha256, proof.lines):
+            raise PrivateStageHandoffError("publish")
+        attempt = _PrivateStagePublicationAttempt(
+            stage=stage,
+            proof=proof,
+            prior_claim=_new_publication_prior_claim(stage),
+            _constructor_token=_PRIVATE_STAGE_PUBLICATION_ATTEMPT_CONSTRUCTOR,
+        )
+        transaction.attempts.append(attempt)
+        object.__setattr__(
+            batch, "_publication_attempts", tuple(transaction.attempts),
+        )
+        _capture_prior_destination(stage, stage_claim, attempt)
+
+
+def _drive_private_publication_actions(
+    transaction: _PrivatePublicationTransaction,
+) -> tuple[PrivateStageArtifactProof, ...]:
+    index = -1
+    try:
+        for index, (stage, stage_claim, attempt) in enumerate(zip(
+            transaction.stages,
+            transaction.ledger.stage_claims,
+            transaction.attempts,
+        )):
+            object.__setattr__(transaction.batch, "_publication_cursor", index)
+            attempt.state = "attempting"
+            os.rename(
+                stage.temporary_name,
+                stage.destination_name,
+                src_dir_fd=stage_claim.parent.fd,
+                dst_dir_fd=stage_claim.parent.fd,
+            )
+            attempt.state = "landed"
+            _fsync_managed(stage_claim.parent.fd)
+            if not _published_stage_matches(stage, stage_claim, attempt.proof):
+                raise PrivatePathUnsafe(
+                    "durable private stage no longer occupies its final path",
+                    components=stage.components,
+                )
+            attempt.state = "durable"
+        transaction.success_requested = True
+    except BaseException as exc:
+        if 0 <= index < len(transaction.attempts):
+            transaction.attempts[index].reported_error = exc
+        _remember_publication_primary(transaction, exc)
+    return _finish_private_publication(transaction)
 
 
 @_serialized_batch_lifecycle
@@ -3454,7 +4076,7 @@ def cleanup_private_stage_handoff(batch: PrivateStageHandoffBatch) -> None:
     if batch.state not in {"partial", "committed", "committed_with_fault"}:
         raise PrivateStageStateError("cleanup", batch.state)
     errors = list(_cleanup_publication_ledger(batch))
-    if errors or batch._cleanup_ledger.pending:
+    if errors or _publication_cleanup_pending(batch):
         error = PrivateStageHandoffError("cleanup")
         error.cleanup_errors = tuple(errors)
         error.close_errors = tuple(errors)
@@ -3484,187 +4106,29 @@ def publish_private_stage_handoff(
     retained = batch._artifact_proofs
     if type(retained) is not tuple:
         raise PrivateStageHandoffError("publish")
-    committed: list[PrivateStageArtifactProof] = []
-    uncertain: list[PrivateStageArtifactProof] = []
-    unpublished: list[PrivateStageArtifactProof] = []
-    primary: BaseException | None = None
-    publication_started = False
-
+    transaction = _PrivatePublicationTransaction(
+        batch, stages, ledger, retained,
+    )
     try:
-        retained = _validate_settled_artifact_proofs(batch, stages, proofs)
-        destinations = tuple(
-            (stage.parent_identity, stage.destination_name) for stage in stages
-        )
-        if len(set(destinations)) != len(destinations):
-            raise PrivateStageHandoffError("publish")
-
-        prior_identities: list[tuple[int, int] | None] = []
-        for stage, stage_claim, proof in zip(
-            stages, ledger.stage_claims, retained,
-        ):
-            size, digest, lines = _authenticate_transferred_stage(
-                stage, stage_claim, role=proof.role, operation="publish",
-            )
-            if (size, digest, lines) != (proof.size, proof.sha256, proof.lines):
-                raise PrivateStageHandoffError("publish")
-            prior_identities.append(_observe_prior_destination(stage, stage_claim))
-
-        _set_publication_state(
-            batch,
-            stages,
-            batch_state="publishing",
-            stage_states=tuple("publishing" for _ in stages),
-            outcome=None,
-        )
-        publication_started = True
-        for index, (stage, stage_claim, proof, prior_identity) in enumerate(zip(
-            stages, ledger.stage_claims, retained, prior_identities,
-        )):
-            action_error: BaseException | None = None
-            try:
-                os.rename(
-                    stage.temporary_name,
-                    stage.destination_name,
-                    src_dir_fd=stage_claim.parent.fd,
-                    dst_dir_fd=stage_claim.parent.fd,
+        with _PrivatePublicationFence(transaction):
+            with _PrivatePublicationFence(transaction):
+                _prepare_private_publication(transaction, proofs)
+                _set_publication_state(
+                    batch,
+                    stages,
+                    batch_state="publishing",
+                    stage_states=tuple("publishing" for _ in stages),
+                    outcome=None,
                 )
-            except BaseException as exc:
-                action_error = exc
-
-            try:
-                landed = _published_stage_matches(stage, stage_claim, proof)
-            except BaseException as exc:
-                landed = False
-                if action_error is None:
-                    action_error = exc
-            if landed:
-                try:
-                    _fsync_managed(stage_claim.parent.fd)
-                    if not _published_stage_matches(stage, stage_claim, proof):
-                        raise PrivatePathUnsafe(
-                            "durable private stage no longer occupies its final path",
-                            components=stage.components,
-                        )
-                except BaseException as exc:
-                    uncertain.append(proof)
-                    unpublished.extend(retained[index + 1:])
-                    primary = action_error if action_error is not None else exc
-                    break
-                committed.append(proof)
-                if action_error is not None:
-                    unpublished.extend(retained[index + 1:])
-                    primary = action_error
-                    break
-                continue
-
-            if _destination_still_matches_prior(
-                stage, stage_claim, prior_identity,
-            ):
-                unpublished.extend(retained[index:])
-            else:
-                uncertain.append(proof)
-                unpublished.extend(retained[index + 1:])
-            primary = action_error or PrivatePathUnsafe(
-                "private stage publication outcome is uncertain",
-                components=stage.components,
-            )
-            break
-
-        if primary is None:
-            try:
-                invalid_committed: list[PrivateStageArtifactProof] = []
-                for stage, stage_claim, proof in zip(
-                    stages, ledger.stage_claims, retained,
-                ):
-                    if not _published_stage_matches(stage, stage_claim, proof):
-                        invalid_committed.append(proof)
-                if invalid_committed:
-                    uncertain.extend(invalid_committed)
-                    committed[:] = [
-                        proof for proof in committed
-                        if proof not in invalid_committed
-                    ]
-                    raise PrivatePathUnsafe(
-                        "published private stage set changed before commit",
-                    )
-            except BaseException as exc:
-                primary = exc
-
-        if primary is None:
-            _set_publication_state(
-                batch,
-                stages,
-                batch_state="committed",
-                stage_states=tuple("committed" for _ in stages),
-                outcome=retained,
-            )
-            cleanup_errors = list(_cleanup_publication_ledger(batch))
-            if cleanup_errors or ledger.pending:
-                fault = PrivateStagePublicationCommittedWithFault(
-                    committed=retained,
-                )
-                fault.cleanup_errors = tuple(cleanup_errors)
-                fault.close_errors = tuple(cleanup_errors)
-                object.__setattr__(batch, "_state", "committed_with_fault")
-                object.__setattr__(batch, "_publication_outcome", fault)
-                for stage in stages:
-                    object.__setattr__(stage, "_state", "committed_with_fault")
-                raise fault from (cleanup_errors[0] if cleanup_errors else fault)
-            return retained
-    except PrivateStagePublicationCommittedWithFault:
+                transaction.publication_started = True
+                return _drive_private_publication_actions(transaction)
+    except (PrivateStagePublicationPartial,
+            PrivateStagePublicationCommittedWithFault,
+            PrivateStageHandoffError):
         raise
     except BaseException as exc:
-        if primary is None:
-            primary = exc
-            unpublished = list(retained)
-
-    if not publication_started:
-        # No publication action ran.  This is a rejected evidence authority, not
-        # a partial publication receipt; consume it with the existing fence.
-        fence_errors: list[BaseException] = []
-        authority = batch._transfer_authority
-        try:
-            _force_fenced_state(batch, stages)
-        except BaseException as exc:
-            fence_errors.append(exc)
-        finally:
-            _reconcile_fenced_state_direct(batch, authority, stages)
-            fence_errors.extend(_cleanup_publication_ledger(batch))
-        if isinstance(primary, PrivateStageHandoffError):
-            primary.cleanup_errors = tuple(fence_errors)
-            primary.close_errors = tuple(fence_errors)
-            raise primary
-        error = PrivateStageHandoffError("publish")
-        error.cleanup_errors = tuple(fence_errors)
-        error.close_errors = tuple(fence_errors)
-        raise error from primary
-
-    # A failed attempt consumes every publication action but retains exact outcome
-    # facts and a separately replayable descriptor-cleanup authority.
-    partial = PrivateStagePublicationPartial(
-        committed=tuple(committed),
-        uncertain=tuple(uncertain),
-        unpublished=tuple(unpublished),
-    )
-    stage_states = []
-    for proof in retained:
-        if proof in committed:
-            stage_states.append("committed")
-        elif proof in uncertain:
-            stage_states.append("uncertain")
-        else:
-            stage_states.append("unpublished")
-    _set_publication_state(
-        batch,
-        stages,
-        batch_state="partial",
-        stage_states=tuple(stage_states),
-        outcome=partial,
-    )
-    cleanup_errors = list(_cleanup_publication_ledger(batch))
-    partial.cleanup_errors = tuple(cleanup_errors)
-    partial.close_errors = tuple(cleanup_errors)
-    raise partial from primary
+        _remember_publication_primary(transaction, exc)
+        return _finish_private_publication(transaction)
 
 
 def _force_fenced_state(
