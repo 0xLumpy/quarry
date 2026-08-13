@@ -19,8 +19,9 @@ from .. import budget, campaign, events, netguard, normalize, policy, remainder,
 from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, read_bounded,
                         registered, run_contract,
                         run_provider)
-from ..runner import (RunResult, Status, have, reclassify_from_artifact, run as exec_tool,
-                       skipped)
+from ..runner import (RunResult, Status, have, native_output_current,
+                      reclassify_from_artifact, run as exec_tool, skipped)
+from ..runner_native import RepositoryNativeOutput
 from ..runner_repository import RepositoryOutput
 
 _SUBFINDER_DEFAULT_MIN = 60                  # default -max-time budget (minutes)
@@ -1440,11 +1441,11 @@ def run(ctx) -> None:
     sho_key = secrets.shodan()
     if have("shosubgo") and sho_key:
         sho = ctx.run.raw_path("vertical", "shosubgo", "sho.txt")
-        sho.unlink(missing_ok=True)                    # stale artifact must not fake completion
         # `-fail`: exit 1 on any API error, or an auth error exits 0 and reads as clean-empty. shosubgo
         # writes to the -o file; reclassify inside the contract so the terminal carries the final status.
         def _sho_reclassify(res):
-            hosts, artifact_ok = _shosubgo_read(sho)
+            hosts, artifact_ok = (_shosubgo_read(sho) if native_output_current(res, sho)
+                                  else (None, False))
             reclassify_from_artifact(res, None if hosts is None else len(hosts), label="shosubgo")
             # a clean-EXIT run whose artifact had malformed lines / bad UTF-8 is NOT a trustworthy clean
             # result: downgrade to PARTIAL (completion uncertain) while KEEPING the valid hosts.
@@ -1460,9 +1461,13 @@ def run(ctx) -> None:
                          repository=ctx.run,
                          stdout=RepositoryOutput.discard(),
                          stderr=RepositoryOutput.discard(),
+                         native_outputs=(RepositoryNativeOutput.file(
+                             6, *sho.relative_to(ctx.run.dir).parts,
+                         ),),
                          work_unit=sho_wu, reclassify=_sho_reclassify, timeout=ctx.http_timeout)
         ctx.run.record("vertical", r)
-        hosts, _ = _shosubgo_read(sho)                  # re-read for ingest (392 names were dropped when unread)
+        hosts, _ = (_shosubgo_read(sho) if native_output_current(r, sho)
+                    else (None, False))                  # re-read authenticated output for ingest
         for e in (hosts or []):
             if scope.in_scope(e["host"]):
                 ctx.run.add("subdomain", e)
