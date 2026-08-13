@@ -230,6 +230,7 @@ def _exchange(
     *,
     command_factory=_command,
     stdin_data=DATA,
+    wire_stdin_data=None,
     launcher=None,
     stream_behavior="complete",
 ):
@@ -250,6 +251,8 @@ def _exchange(
             if callable(command_factory) else command_factory
         )
         wire = protocol.encode_request(request)
+        if wire_stdin_data is not None:
+            wire += wire_stdin_data
         if command is not None:
             wire += protocol.encode_command(command)
         runner_ipc.write_all(request_write, wire)
@@ -286,6 +289,41 @@ def _exchange(
             os.close(request_write)
         if control_write >= 0:
             os.close(control_write)
+
+
+def test_execution_reads_exact_data_payload_before_command(monkeypatch):
+    request, returncode, records, _launcher, stream_calls, events = _exchange(
+        monkeypatch,
+        stdin_data=None,
+        wire_stdin_data=DATA,
+    )
+
+    assert returncode == 0
+    assert tuple(type(record) for record in records) == (
+        protocol.ReadyFrame,
+        protocol.PreparedFrame,
+        protocol.StartedFrame,
+        protocol.WorkerSettlement,
+    )
+    assert stream_calls[0][2]["stdin_data"] == DATA
+    assert events.index("request_decoded") < events.index("ReadyFrame")
+    assert events.index("ReadyFrame") < events.index("command_decoded")
+
+
+def test_execution_rejects_truncated_data_payload_before_ready(monkeypatch):
+    request, returncode, records, launcher, stream_calls, events = _exchange(
+        monkeypatch,
+        command_factory=None,
+        stdin_data=None,
+        wire_stdin_data=DATA[:-1],
+    )
+
+    assert request.stdin_bytes == len(DATA)
+    assert returncode == runner_worker._EXIT_BOOTSTRAP_INVALID
+    assert records == ()
+    assert stream_calls == []
+    assert "ReadyFrame" not in events
+    assert launcher.reap_calls == 1
 
 
 def test_execution_go_is_exactly_ordered_and_streams_own_stage_descriptors(
