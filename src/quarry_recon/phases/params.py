@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import budget, events, evidence, fetch, netguard, normalize, oob, secrets, settings
+from .. import budget, events, evidence, fetch, netguard, normalize, oob, secrets, settings, store
 from ..runner import (RunResult, Status, cancel_all as runner_cancel_all, fresh_artifact_dir, have,
                       native_output_current, nuclei_timeout, reset_cancel as runner_reset_cancel,
                       run as exec_tool, scaled_timeout, skipped)
@@ -29,6 +30,65 @@ from ..runner_native import RepositoryNativeOutput
 from ..runner_repository import RepositoryOutput
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
+
+
+def _base_evidence_claimed(function):
+    """Keep the base seal blocked for an in-process acquisition transaction."""
+    @functools.wraps(function)
+    def wrapped(ctx, *args, **kwargs):
+        if type(ctx.run) is store.Run:
+            with ctx.run.artifact_claim():
+                return function(ctx, *args, **kwargs)
+        return function(ctx, *args, **kwargs)
+    return wrapped
+
+
+def _publish_json_state(ctx, path: Path, value) -> None:
+    body = json.dumps(value).encode("utf-8")
+    if type(ctx.run) is store.Run:
+        if not budget.publish_bytes(path, body, digest=hashlib.sha256(body).hexdigest()):
+            raise OSError(f"could not publish state {path.name}")
+    else:
+        path.write_bytes(body)
+
+
+def _append_run_log(ctx, path: Path, text: str) -> None:
+    body = text.encode("utf-8")
+    if type(ctx.run) is store.Run:
+        ctx.run._append_base_artifact(tuple(path.relative_to(ctx.run.dir).parts), body)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as writer:
+            writer.write(text)
+
+
+def _publish_lines(ctx, path: Path, lines) -> None:
+    """Publish a streamed UTF-8 aggregate without materializing it in RAM."""
+    if type(ctx.run) is not store.Run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as writer:
+            for line in lines:
+                writer.write(line + "\n")
+        return
+    components = tuple(path.relative_to(ctx.run.dir).parts)
+    writer_fd = -1
+    with ctx.run.artifact_claim(*components) as claim:
+        try:
+            writer_fd = claim.open_writer()
+            for line in lines:
+                view = memoryview((line + "\n").encode("utf-8"))
+                while view:
+                    written = os.write(writer_fd, view)
+                    if written <= 0:
+                        raise OSError("aggregate publication made no progress")
+                    view = view[written:]
+            os.fsync(writer_fd)
+            os.close(writer_fd)
+            writer_fd = -1
+            claim.publish()
+        finally:
+            if writer_fd >= 0:
+                os.close(writer_fd)
 
 
 def active_review_values(ctx, klass: str) -> list:
@@ -686,6 +746,7 @@ def _nuclei_cmd(targets_file, out_file, prof, mhe: int) -> list[str]:
     return cmd
 
 
+@_base_evidence_claimed
 def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     """Chunked nuclei main scan: split live hosts into NUCLEI_CHUNK_HOSTS batches and scan sequentially (rate
     is target-wide, so parallel batches would blow the budget). Chunking buys resume, progress and per-batch
@@ -832,9 +893,10 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
         _add_evidence(_ci, _rel)
 
     def _save():
-        state_f.write_text(json.dumps(
-            {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": done_map,
-             "evidence": evidence_map, "coverage": cov_map, "digests": digest_map}))
+        _publish_json_state(ctx, state_f, {
+            "work_unit": scan_wu, "chunk_size": chunk_n, "chunks": done_map,
+            "evidence": evidence_map, "coverage": cov_map, "digests": digest_map,
+        })
 
     def _emit_coverage(ci: int, planned, requests, *, why: str) -> None:
         """Per-chunk request coverage as structured counters, one stable unit per chunk so the store's
@@ -865,6 +927,7 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     # the source terminal always fires (try/finally). status starts FAILED so an exception mid-loop cannot
     # emit a scan-level success, and is set to SUCCESS/PARTIAL only after the loop + aggregate complete.
     status = Status.FAILED
+    attempt_created = False
     try:
         for ci, batch in enumerate(batches):
             chunk_wu = events.work_unit(sid, inputs={"hosts": batch}, config=_cfg)
@@ -877,7 +940,14 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                 _emit_coverage(ci, _prior.get("planned"), _prior.get("requests"),
                                why="resumed — coverage as first recorded")
                 continue
-            attempt_dir.mkdir(parents=True, exist_ok=True)   # lazy: only create the attempt dir if a chunk runs
+            if not attempt_created:
+                if type(ctx.run) is store.Run:
+                    ctx.run.create_artifact_dir(
+                        *attempt_dir.relative_to(ctx.run.dir).parts,
+                    )
+                else:
+                    attempt_dir.mkdir(parents=True, exist_ok=True)
+                attempt_created = True
             bf = ctx.write_list(f"nuclei_targets_{ci}.txt", batch)
             cf = attempt_dir / f"findings_{ci}.jsonl"        # this attempt's artifact (never overwrites a prior)
             ef = attempt_dir / f"stderr_{ci}.log"            # per-chunk full stderr: completion/coverage oracle
@@ -895,8 +965,7 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                                 ),),
                                 timeout=nuclei_timeout(len(batch), ctx.http_timeout))
                 if res.stderr_tail:
-                    with log.open("a", encoding="utf-8") as lf:
-                        lf.write(res.stderr_tail + "\n")
+                    _append_run_log(ctx, log, res.stderr_tail + "\n")
                 # ask nuclei whether it finished, from its terminal line in the full stderr (the 8-line tail
                 # can be evicted by a trailing [INF] burst, so prefer the file and fall back only if absent)
                 try:
@@ -965,20 +1034,20 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                 _chunk_terminal(sid, chunk_wu, res, cf, status=chunk_status)   # FAILED if exec or bookkeeping raised
         # rebuild the aggregate into a temp file, then swap atomically, so a crash mid-rebuild leaves the old
         # findings.jsonl intact; read every preserved evidence artifact per chunk and deduplicate lines
-        tmp = findings.with_name(findings.name + ".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
+        def _aggregate_lines():
             for ci in range(len(batches)):
                 rels = list(evidence_map.get(str(ci)) or [])
                 paths = [state_f.parent / r for r in rels] or [attempt_dir / f"findings_{ci}.jsonl"]
-                seen_lines: set[str] = set()                  # dedup per chunk (across its attempts) — never across
-                for p in paths:                               # chunks, whose identical-looking lines are distinct hosts
+                seen_lines: set[str] = set()              # dedup per chunk (across its attempts) — never across
+                for p in paths:                           # chunks, whose identical-looking lines are distinct hosts
                     if not (p.exists() and p.stat().st_size > 0):
                         continue
                     for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
                         if line and line not in seen_lines:
                             seen_lines.add(line)
-                            fh.write(line + "\n")
-        os.replace(tmp, findings)
+                            yield line
+
+        _publish_lines(ctx, findings, _aggregate_lines())
                 # scan status tracks execution only; degraded request coverage rides the structured counters
                 # and reaches the operator through the run verdict
         status = Status.PARTIAL if incomplete else Status.SUCCESS
@@ -1767,6 +1836,7 @@ def _sha256_file(p) -> str:
     return h.hexdigest()
 
 
+@_base_evidence_claimed
 def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     """params.dalfox_xss_fast: reflected-XSS scan over the CANONICALIZED xss candidates with
     the fast flags, in resumable chunks. Mirrors _nuclei_scan: input-hashed chunk state, mark done ONLY
@@ -1943,9 +2013,11 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
         _add_evidence(_ci, _e["rel"], _e["sha256"])
 
     def _save():
-        state_f.write_text(json.dumps(
-            {"work_unit": scan_wu, "chunk_size": chunk_n, "chunks": completion, "evidence": evidence_map,
-             "remainder": remainder, "terminal": terminal, "membership": membership}))
+        _publish_json_state(ctx, state_f, {
+            "work_unit": scan_wu, "chunk_size": chunk_n, "chunks": completion,
+            "evidence": evidence_map, "remainder": remainder,
+            "terminal": terminal, "membership": membership,
+        })
 
     # the decision, recorded before execution (knowable up front) and surviving a run that raises anywhere.
     # `omitted=0` keeps it inert in the verdict: telemetry about a choice, never a coverage claim.
@@ -1966,6 +2038,7 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     tiers = {"xss-verified": 0, "xss-candidate": 0, "dom-xss-static": 0}   # if the loop raises before the aggregate
     status = Status.FAILED                                 # exception mid-loop must NOT emit scan-level success
     current_attempt_outputs: set[int] = set()              # receipt-authenticated files from this invocation
+    attempt_created = False
     try:
       for ci, batch in enumerate(batches):
         chunk_wu = events.work_unit(sid, inputs={"cands": batch}, config=_cfg)
@@ -1991,7 +2064,14 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 reason=(f"chunk {ci + 1}/{len(batches)}: resuming {len(owed)} owed target(s) only — "
                         f"{len(batches[ci]) - len(owed)} already covered are NOT re-requested"))
         bf = ctx.write_list(f"dalfox_xss_{ci}.txt", batch)
-        attempt_dir.mkdir(parents=True, exist_ok=True)     # created lazily, only if a chunk actually runs
+        if not attempt_created:
+            if type(ctx.run) is store.Run:
+                ctx.run.create_artifact_dir(
+                    *attempt_dir.relative_to(ctx.run.dir).parts,
+                )
+            else:
+                attempt_dir.mkdir(parents=True, exist_ok=True)
+            attempt_created = True
         cf = attempt_dir / f"findings_{ci}.jsonl"          # IMMUTABLE per-attempt artifact (never overwritten)
         rel = f"wu_{scan_wu}/attempt_{attempt_id}/findings_{ci}.jsonl"
         events.tool_start(sid, work_unit=chunk_wu, input_total=len(batch))   # this chunk's own lifecycle

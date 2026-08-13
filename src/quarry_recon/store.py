@@ -1740,6 +1740,65 @@ class Run:
                     os.close(base_fd)
                 os.close(anchor_fd)
 
+    def create_artifact_dir(self, *components: str) -> Path:
+        """Create one exact, previously absent private base-evidence directory.
+
+        Unlike :meth:`fresh_artifact_dir`, the caller supplies the complete
+        identity (for example a work-unit/attempt tuple).  The repository lock
+        and descriptor-relative validation make creation indivisible with the
+        base-seal predicate; an existing name is never adopted or reused.
+        """
+        components = _validated_artifact_components(tuple(components))
+        if len(components) < 2:
+            raise ContractError("an artifact directory requires a parent identity")
+        from . import privfs
+        with self._mutation(MutationScope.BASE_EVIDENCE):
+            self._ensure_artifact_parent(components)
+            anchor_fd = _open_run_fd(self.project_dir, self.run_id)
+            parent_fd = child_fd = -1
+            try:
+                parent_fd = privfs.open_strict_dir_at(anchor_fd, components[:-1])
+                name = components[-1]
+                try:
+                    os.mkdir(name, privfs.DIR_MODE, dir_fd=parent_fd)
+                except FileExistsError:
+                    raise ContractError(
+                        f"artifact directory {'/'.join(components)!r} already exists",
+                    ) from None
+                except BaseException:
+                    # Reconcile a mkdir that committed immediately before a
+                    # cooperative cancellation.  The empty attempt is durable
+                    # and never mistaken for completed evidence.
+                    try:
+                        observed = os.stat(
+                            name, dir_fd=parent_fd, follow_symlinks=False,
+                        )
+                    except OSError:
+                        pass
+                    else:
+                        self._validate_base_directory_stat(observed, components)
+                        os.fsync(parent_fd)
+                    raise
+                child_fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=parent_fd)
+                observed = os.fstat(child_fd)
+                named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                self._validate_base_directory_stat(observed, components)
+                self._validate_base_directory_stat(named, components)
+                if ((observed.st_dev, observed.st_ino)
+                        != (named.st_dev, named.st_ino)):
+                    raise ContractError(
+                        f"artifact directory {'/'.join(components)!r} changed during creation",
+                    )
+                os.fsync(child_fd)
+                os.fsync(parent_fd)
+                return self.dir.joinpath(*components)
+            finally:
+                if child_fd >= 0:
+                    os.close(child_fd)
+                if parent_fd >= 0:
+                    os.close(parent_fd)
+                os.close(anchor_fd)
+
     # ── tool run accounting ──
     def record(self, phase: str, result, *, depends_on: str | None = None) -> None:
         # the single choke point that redacts secrets out of cmd/note/stderr before they reach the manifest
