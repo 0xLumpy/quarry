@@ -177,6 +177,32 @@ def test_invalid_argv_marks_preserved_native_final_noncurrent(tmp_path):
     assert runner.native_output_current(result, final) is False
 
 
+@pytest.mark.parametrize("ambient", [False, True])
+def test_public_preflight_marks_native_final_noncurrent(
+    tmp_path, ambient,
+):
+    run = _running_run(tmp_path, f"facade-public-preflight-{ambient}")
+    final, command, policy = _file_invocation(run)
+    final.parent.mkdir(parents=True)
+    final.write_text("prior")
+    kwargs = {
+        "repository": run,
+        "stdout": RepositoryOutput.discard(),
+        "native_outputs": (policy,),
+    }
+    if ambient:
+        kwargs["stderr"] = RepositoryOutput.discard()
+        kwargs["raw_path"] = final
+
+    result = runner.run("native-fixture", command, **kwargs)
+
+    assert result.status is Status.FAILED and result.started is False
+    assert final.read_text() == "prior"
+    assert result.meta["native_outputs"]["clean"] is False
+    assert result.meta["native_output_ownership_settled"] is True
+    assert runner.native_output_current(result, final) is False
+
+
 @pytest.mark.parametrize(
     "exception_type", [RuntimeError, KeyboardInterrupt, SystemExit],
 )

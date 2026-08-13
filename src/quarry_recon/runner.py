@@ -1766,13 +1766,25 @@ def run(
     )
     if explicit:
         safe_cmd, _error = _preflight_argv(cmd)
+
+        def explicit_preflight_failure(detail: str) -> RunResult:
+            failed = _preflight_failure(tool, safe_cmd, detail)
+            if type(native_outputs) is not tuple or native_outputs:
+                _mark_native_outputs_unavailable(
+                    failed,
+                    len(native_outputs) if type(native_outputs) is tuple else 0,
+                    operation="validate",
+                    ownership_settled=True,
+                )
+            return failed
+
         if any(value is _REPOSITORY_POLICY_UNSET for value in policies):
-            return _preflight_failure(
-                tool, safe_cmd, "repository, stdout and stderr must be declared together",
+            return explicit_preflight_failure(
+                "repository, stdout and stderr must be declared together",
             )
         if raw_path is not None or stderr_path is not None:
-            return _preflight_failure(
-                tool, safe_cmd, "repository policies cannot be mixed with ambient output paths",
+            return explicit_preflight_failure(
+                "repository policies cannot be mixed with ambient output paths",
             )
         return _run_with_repository(
             tool,
