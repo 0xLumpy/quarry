@@ -230,7 +230,7 @@ def test_clean_execution_holds_claim_then_publishes_exact_requested_stdout(
         "raw", "probe", "fixture", "stdout.bin",
     ))
     final = run.dir.joinpath(*stdout.components)
-    final.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    privfs.private_dir(final.parent)
     final.write_bytes(b"prior authoritative bytes")
     final.chmod(0o600)
 
@@ -261,6 +261,7 @@ def test_clean_execution_holds_claim_then_publishes_exact_requested_stdout(
 
     assert result.clean is True
     assert result.publication is runner_repository.RepositoryPublication.PUBLISHED
+    assert result.ownership_settled is True
     assert result.requested_roles == (protocol.StreamRole.STDOUT,)
     assert result.discarded_roles == (protocol.StreamRole.STDERR,)
     assert result.published is result.execution.artifact_proofs
@@ -304,6 +305,7 @@ def test_discard_is_explicit_and_creates_no_output_stage_or_artifact(
     assert seen == [None]
     assert result.clean is True
     assert result.publication is runner_repository.RepositoryPublication.NOT_REQUESTED
+    assert result.ownership_settled is True
     assert result.requested_roles == ()
     assert result.discarded_roles == (
         protocol.StreamRole.STDOUT, protocol.StreamRole.STDERR,
@@ -320,7 +322,7 @@ def test_nonclean_execution_fences_settled_bytes_and_preserves_prior_final(
         "raw", "probe", "fixture", "stdout.bin",
     ))
     final = run.dir.joinpath(*stdout.components)
-    final.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    privfs.private_dir(final.parent)
     final.write_bytes(b"old")
     final.chmod(0o600)
     batches = []
@@ -347,6 +349,7 @@ def test_nonclean_execution_fences_settled_bytes_and_preserves_prior_final(
 
     assert result.clean is False
     assert result.publication is runner_repository.RepositoryPublication.FENCED
+    assert result.ownership_settled is True
     assert result.published == result.uncertain == ()
     assert result.unpublished == result.execution.artifact_proofs
     assert batches[0].state == "fenced"
@@ -367,7 +370,7 @@ def test_later_publication_failure_returns_exact_committed_partition(
     )
     stdout_final = run.dir.joinpath(*stdout.components)
     stderr_final = run.dir.joinpath(*stderr.components)
-    stdout_final.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    privfs.private_dir(stdout_final.parent)
     stdout_final.write_bytes(b"old stdout")
     stderr_final.write_bytes(b"old stderr")
     stdout_final.chmod(0o600)
@@ -398,11 +401,94 @@ def test_later_publication_failure_returns_exact_committed_partition(
 
     assert result.clean is False
     assert result.publication is runner_repository.RepositoryPublication.PARTIAL
+    assert result.ownership_settled is True
     assert result.published == result.execution.artifact_proofs[:1]
     assert result.uncertain == ()
     assert result.unpublished == result.execution.artifact_proofs[1:]
     assert stdout_final.read_bytes() == STDOUT
     assert stderr_final.read_bytes() == b"old stderr"
+
+
+def test_unreaped_execution_keeps_durable_claim_and_publishes_nothing(
+    tmp_path, monkeypatch,
+):
+    run = _running_run(tmp_path, run_id="unreaped-owner")
+    stdout, stderr = _policy_pair(stdout=runner_repository.RepositoryOutput.publish(
+        "raw", "probe", "fixture", "stdout.bin",
+    ))
+    final = run.dir.joinpath(*stdout.components)
+    privfs.private_dir(final.parent)
+    final.write_bytes(b"old")
+    final.chmod(0o600)
+
+    def unreaped(invocation, *, stage_batch, deadline, clock, popen_factory):
+        assert stage_batch.state == "prepared"
+        return supervisor.ExecutionOutcome(
+            reason=supervisor.ExecutionReason.REAP_FAILED,
+            request_id=invocation.worker.request_id,
+            worker_pid=WORKER_PID,
+            worker_spawned=True,
+            worker_reaped=False,
+            parent_pipes_closed=True,
+            containment_settled=False,
+            stages_settled=False,
+            _authority=supervisor._EXECUTION_OUTCOME_AUTHORITY,
+        )
+
+    monkeypatch.setattr(runner_repository, "supervise_execution", unreaped)
+    result = runner_repository.supervise_repository_execution(
+        run,
+        _invocation(run, stdout=stdout, stderr=stderr),
+        stdout=stdout,
+        stderr=stderr,
+        deadline=runner_repository.time.monotonic() + 5,
+    )
+
+    assert result.clean is False
+    assert result.publication is runner_repository.RepositoryPublication.FENCED
+    assert result.ownership_settled is False
+    assert result.published == result.uncertain == result.unpublished == ()
+    assert final.read_bytes() == b"old"
+    claim_dir = tmp_path / "recon" / "state" / "claims" / run.run_id
+    assert len(list(claim_dir.iterdir())) == 1
+    with pytest.raises(ContractError, match="live artifact claim"):
+        run.begin_finalization()
+
+
+def test_expired_shared_deadline_fences_settled_stage_before_publication(
+    tmp_path, monkeypatch,
+):
+    run = _running_run(tmp_path, run_id="publication-deadline")
+    stdout, stderr = _policy_pair(stdout=runner_repository.RepositoryOutput.publish(
+        "raw", "probe", "fixture", "stdout.bin",
+    ))
+    final = run.dir.joinpath(*stdout.components)
+    privfs.private_dir(final.parent)
+    final.write_bytes(b"old")
+    final.chmod(0o600)
+    monkeypatch.setattr(
+        runner_repository,
+        "supervise_execution",
+        _fake_supervisor({protocol.StreamRole.STDOUT: STDOUT}),
+    )
+    readings = iter((1.0, 1.0, 5.0))
+
+    result = runner_repository.supervise_repository_execution(
+        run,
+        _invocation(run, stdout=stdout, stderr=stderr),
+        stdout=stdout,
+        stderr=stderr,
+        deadline=5.0,
+        clock=lambda: next(readings),
+    )
+
+    assert result.clean is False
+    assert result.publication is runner_repository.RepositoryPublication.FENCED
+    assert result.ownership_settled is True
+    assert result.unpublished == result.execution.artifact_proofs
+    assert result.fault_operation == "publish"
+    assert final.read_bytes() == b"old"
+    assert not list((tmp_path / "recon" / "state" / "claims" / run.run_id).iterdir())
 
 
 def test_policy_mismatch_is_rejected_before_claim_stage_or_supervisor(
