@@ -57,6 +57,7 @@ _RENAME_EXCHANGE = 2
 _CONSTRUCTOR = object()
 _TREE_BUILDER_CONSTRUCTOR = object()
 _MAX_POLICIES = 64
+_MAX_REPOSITORY_IDENTITY_BYTES = 4 * 1024 * 1024
 
 
 class NativeOutputKind(str, Enum):
@@ -309,6 +310,35 @@ class NativeTreeBuildReceipt:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class NativeTreeEntryEvidence:
+    """Immutable bytes authenticated while one builder copy was pinned."""
+
+    components: tuple[str, ...] = field(repr=False)
+    size: int
+    sha256: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.components) is not tuple or not self.components:
+            raise TypeError("native tree entry evidence requires exact components")
+        components = tuple(
+            validate_artifact_component(component, "native tree evidence")
+            for component in self.components
+        )
+        if type(self.size) is not int or self.size < 0:
+            raise TypeError("invalid native tree entry size")
+        if (type(self.sha256) is not str or len(self.sha256) != 64
+                or any(char not in "0123456789abcdef" for char in self.sha256)):
+            raise TypeError("invalid native tree entry digest")
+        object.__setattr__(self, "components", components)
+
+    def __repr__(self) -> str:
+        return (
+            "NativeTreeEntryEvidence("
+            f"components={len(self.components)}, size={self.size})"
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class _TreeEntry:
     suffix: tuple[str, ...] = field(repr=False)
     directory: bool
@@ -347,6 +377,14 @@ class _TreePublishOwner:
     fd: int = -1
     identity: tuple[int, int] | None = None
     present: bool = False
+
+
+@dataclass(slots=True)
+class _BuilderDescriptorAllocation:
+    """Pre-registered owner for a builder descriptor allocation boundary."""
+
+    fd: int = -1
+    identity: tuple[int, int] | None = None
 
 
 @dataclass(slots=True)
@@ -1415,8 +1453,8 @@ class NativeTreeBuilder:
 
     __slots__ = (
         "_transaction", "_policy_index", "_stage_name", "_fd", "_identity",
-        "_owned_fds", "_blocked_fds", "_effects", "_receipt", "_fault",
-        "_cancellation", "_constructor_token",
+        "_owned_fds", "_allocation_slots", "_blocked_fds", "_effects",
+        "_receipt", "_fault", "_cancellation", "_constructor_token",
     )
 
     def __init__(
@@ -1438,6 +1476,7 @@ class NativeTreeBuilder:
         self._fd = -1
         self._identity = None
         self._owned_fds: dict[int, tuple[int, int] | None] = {}
+        self._allocation_slots: list[_BuilderDescriptorAllocation] = []
         self._blocked_fds: set[int] = set()
         self._effects: set[tuple[str, ...]] = set()
         self._receipt = None
@@ -1472,13 +1511,29 @@ class NativeTreeBuilder:
                 and not isinstance(fault, Exception)):
             self._cancellation = fault
 
-    def _track_fd(self, fd: int) -> int:
+    def _track_fd(
+        self,
+        fd: int,
+        slot: _BuilderDescriptorAllocation | None = None,
+    ) -> int:
         # Publish ownership immediately after open/dup returns, before the
         # first validating syscall can be interrupted.
         self._owned_fds[fd] = None
         observed = os.fstat(fd)
-        self._owned_fds[fd] = _identity(observed)
+        identity = _identity(observed)
+        self._owned_fds[fd] = identity
+        if slot is not None:
+            slot.identity = identity
         return fd
+
+    def _allocate_owned(self, allocator) -> int:
+        """Allocate directly into a pre-registered mutable ownership slot."""
+        slot = _BuilderDescriptorAllocation()
+        self._allocation_slots.append(slot)
+        # Allocation and retained-slot assignment deliberately share one line:
+        # cooperative source-line cancellation cannot observe an unowned fd.
+        slot.fd = allocator()
+        return self._track_fd(slot.fd, slot)
 
     def _open_owned(
         self,
@@ -1489,23 +1544,37 @@ class NativeTreeBuilder:
         mode: int | None = None,
     ) -> int:
         if mode is None:
-            fd = os.open(name, flags, dir_fd=dir_fd)
-        else:
-            fd = os.open(name, flags, mode, dir_fd=dir_fd)
-        return self._track_fd(fd)
+            return self._allocate_owned(
+                lambda: os.open(name, flags, dir_fd=dir_fd),
+            )
+        return self._allocate_owned(
+            lambda: os.open(name, flags, mode, dir_fd=dir_fd),
+        )
 
     def _dup_owned(self, fd: int) -> int:
-        return self._track_fd(os.dup(fd))
+        return self._allocate_owned(lambda: os.dup(fd))
+
+    def _live_descriptor_numbers(self) -> tuple[int, ...]:
+        return tuple(dict.fromkeys((
+            *self._owned_fds,
+            *(slot.fd for slot in self._allocation_slots if slot.fd >= 0),
+        )))
 
     def _close_tracked(
         self,
         fd: int,
     ) -> tuple[bool, BaseException | None]:
-        if fd not in self._owned_fds:
+        slots = tuple(slot for slot in self._allocation_slots if slot.fd == fd)
+        if fd not in self._owned_fds and not slots:
             return True, None
         if fd in self._blocked_fds:
             return False, None
-        expected = self._owned_fds[fd]
+        expected = self._owned_fds.get(fd)
+        if expected is None:
+            expected = next(
+                (slot.identity for slot in slots if slot.identity is not None),
+                None,
+            )
         faults: list[BaseException] = []
         settled = False
         try:
@@ -1535,6 +1604,8 @@ class NativeTreeBuilder:
             settled = True
         if settled:
             self._owned_fds.pop(fd, None)
+            for slot in slots:
+                slot.fd = -1
             self._blocked_fds.discard(fd)
             if self._fd == fd:
                 self._fd = -1
@@ -1761,7 +1832,7 @@ class NativeTreeBuilder:
         source_root_fd: int,
         source_components: tuple[str, ...],
         *destination_components: str,
-    ) -> None:
+    ) -> NativeTreeEntryEvidence:
         """Copy one stable regular file from a pinned external source root."""
         self._assert_active()
         if type(source_root_fd) is not int or source_root_fd < 0:
@@ -1777,6 +1848,7 @@ class NativeTreeBuilder:
         self._effects.add(destination_suffix)
         source_parent = source = destination_parent = destination = -1
         primary = None
+        evidence = None
         try:
             source_parent = self._open_directory_chain(
                 source_root_fd, source_suffix[:-1], create=False,
@@ -1836,8 +1908,9 @@ class NativeTreeBuilder:
                 raise ContractError("native tree destination changed while copying")
             # Keep the content digest live until all identity checks completed;
             # seal independently authenticates the entire resulting tree.
-            if len(digest.hexdigest()) != 64:  # pragma: no cover - hashlib invariant
-                raise ContractError("native tree copy digest failed")
+            evidence = NativeTreeEntryEvidence(
+                destination_suffix, size, digest.hexdigest(),
+            )
             os.fsync(destination_parent)
         except BaseException as exc:
             primary = exc
@@ -1847,6 +1920,169 @@ class NativeTreeBuilder:
         if not settled and cleanup is None:
             cleanup = ContractError("native tree copy descriptor did not close")
         self._raise_operation_fault(primary, cleanup)
+        if evidence is None:  # pragma: no cover - operation faults raise above
+            raise ContractError("native tree copy lacks authenticated evidence")
+        return evidence
+
+    def _open_repository_source_root(self) -> int:
+        """Pin this transaction's exact Run through builder-owned fds."""
+        run = self._transaction.run
+        if type(run) is not store.Run:
+            raise ContractError("native tree repository source requires exact Run")
+        repository_root = run.project_dir / "recon"
+        root = run_fd = -1
+        primary = None
+        try:
+            root = self._allocate_owned(
+                lambda: os.open(repository_root, _DIR_FLAGS),
+            )
+            root_observed = os.fstat(root)
+            _validate_private_dir(root_observed, normalize=False, fd=root)
+            run_fd = self._open_owned(
+                run.run_id, _DIR_FLAGS, dir_fd=root,
+            )
+            observed = os.fstat(run_fd)
+            _validate_private_dir(observed, normalize=False, fd=run_fd)
+            if _identity(observed) != run._run_directory_identity:
+                raise ContractError("native tree source Run identity changed")
+            creation = self._read_repository_identity_file(
+                run_fd, "run.json", required=True,
+            )
+            manifest = self._read_repository_identity_file(
+                run_fd, "manifest.json", required=False,
+            )
+            expected = (run.run_id, run.target, run.started)
+            if (creation.get("run_id"), creation.get("target"),
+                    creation.get("started")) != expected:
+                raise ContractError("native tree source Run authority changed")
+            if (manifest is not None
+                    and (manifest.get("run_id"), manifest.get("target"),
+                         manifest.get("started")) != expected):
+                raise ContractError("native tree source Run identities disagree")
+        except BaseException as exc:
+            primary = exc
+        settled, cleanup = self._close_many((root,))
+        if not settled and cleanup is None:
+            cleanup = ContractError(
+                "native tree repository-root descriptor did not close",
+            )
+        if primary is not None or cleanup is not None:
+            if run_fd >= 0:
+                extra_settled, extra_fault = self._close_many((run_fd,))
+                if not extra_settled and extra_fault is None:
+                    extra_fault = ContractError(
+                        "native tree Run descriptor did not close",
+                    )
+                cleanup = _preferred_builder_fault((cleanup, extra_fault))
+            self._raise_operation_fault(primary, cleanup)
+        return run_fd
+
+    def _read_repository_identity_file(
+        self,
+        run_fd: int,
+        name: str,
+        *,
+        required: bool,
+    ) -> dict | None:
+        """Read one bounded Run identity through builder-owned descriptors."""
+        identity_fd = -1
+        try:
+            identity_fd = self._open_owned(name, _FILE_FLAGS, dir_fd=run_fd)
+        except FileNotFoundError as exc:
+            if required:
+                raise ContractError(
+                    f"native tree source Run lacks {name}",
+                ) from exc
+            return None
+        primary = None
+        record = None
+        try:
+            before = os.fstat(identity_fd)
+            _validate_private_file(before, normalize=False, fd=identity_fd)
+            chunks: list[bytes] = []
+            size = 0
+            while True:
+                chunk = os.read(
+                    identity_fd,
+                    min(
+                        65536,
+                        _MAX_REPOSITORY_IDENTITY_BYTES + 1 - size,
+                    ),
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > _MAX_REPOSITORY_IDENTITY_BYTES:
+                    raise ContractError(
+                        f"native tree source Run {name} is too large",
+                    )
+            after = os.fstat(identity_fd)
+            if _file_signature(after) != _file_signature(before):
+                raise ContractError(
+                    f"native tree source Run {name} changed while reading",
+                )
+            try:
+                candidate = json.loads(b"".join(chunks).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError,
+                    RecursionError) as exc:
+                if required:
+                    raise ContractError(
+                        f"native tree source Run {name} is malformed",
+                    ) from exc
+            else:
+                if type(candidate) is dict:
+                    record = candidate
+                elif required:
+                    raise ContractError(
+                        f"native tree source Run {name} is malformed",
+                    )
+        except BaseException as exc:
+            primary = exc
+        settled, cleanup = self._close_many((identity_fd,))
+        if not settled and cleanup is None:
+            cleanup = ContractError(
+                "native tree Run identity descriptor did not close",
+            )
+        self._raise_operation_fault(primary, cleanup)
+        if required and record is None:
+            raise ContractError(
+                f"native tree source Run {name} is malformed",
+            )
+        return record
+
+    def copy_repository_file(
+        self,
+        source_components: tuple[str, ...],
+        *destination_components: str,
+    ) -> NativeTreeEntryEvidence:
+        """Copy one stable file from this transaction's exact repository Run."""
+        self._assert_active()
+        source_suffix = self._components(
+            source_components, "native tree repository source", allow_empty=False,
+        )
+        destination_suffix = self._components(
+            tuple(destination_components),
+            "native tree destination",
+            allow_empty=False,
+        )
+        source_root = -1
+        evidence = None
+        primary = None
+        try:
+            source_root = self._open_repository_source_root()
+            evidence = self.copy_file(
+                source_root, source_suffix, *destination_suffix,
+            )
+        except BaseException as exc:
+            primary = exc
+        settled, cleanup = self._close_many((source_root,))
+        if not settled and cleanup is None:
+            cleanup = ContractError("native tree Run descriptor did not close")
+        self._raise_operation_fault(primary, cleanup)
+        if evidence is None:  # pragma: no cover - operation faults raise above
+            raise ContractError("repository copy lacks authenticated evidence")
+        return evidence
 
     def _close_pinned(self) -> tuple[bool, BaseException | None]:
         return self._close_many((self._fd,))
@@ -1860,7 +2096,7 @@ class NativeTreeBuilder:
         self._assert_active()
         if self._fault is not None or self._cancellation is not None:
             raise ContractError("faulted native tree builder cannot be sealed")
-        if set(self._owned_fds) != {self._fd}:
+        if set(self._live_descriptor_numbers()) != {self._fd}:
             raise ContractError("native tree builder has unsettled descriptors")
         primary = None
         entries = None
@@ -1902,10 +2138,12 @@ class NativeTreeBuilder:
             return self._receipt
         settled = True
         faults: list[BaseException | None] = []
-        attempt_settled, fault = self._close_many(tuple(self._owned_fds))
+        attempt_settled, fault = self._close_many(
+            self._live_descriptor_numbers(),
+        )
         settled &= attempt_settled
         faults.append(fault)
-        if self._owned_fds:
+        if self._live_descriptor_numbers():
             settled = False
         fault = _preferred_builder_fault(tuple(faults))
         self._remember_fault(fault)

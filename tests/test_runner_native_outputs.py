@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import inspect
 import os
 import select
 import signal
@@ -17,6 +19,7 @@ from quarry_recon.runner_native import (
     NativeOutputTransaction,
     NativeOutputUnsupported,
     NativeTreeBuilder,
+    NativeTreeEntryEvidence,
     RepositoryNativeOutput,
     prepare_native_outputs,
 )
@@ -83,6 +86,33 @@ def _attempt_directories(run: store.Run) -> list[Path]:
     return [] if not root.exists() else list(root.iterdir())
 
 
+def _source_line(function, fragment: str) -> int:
+    lines, first = inspect.getsourcelines(function)
+    matches = [first + index for index, line in enumerate(lines) if fragment in line]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _open_descriptors() -> set[int]:
+    return {int(name) for name in os.listdir("/proc/self/fd")}
+
+
+def _settle_cancelled_tree_adoption(
+    owner: NativeOutputAdoption,
+    cancellation: BaseException,
+):
+    receipt = None
+    for _attempt in range(3):
+        try:
+            receipt = owner.fence()
+        except type(cancellation) as exc:
+            assert exc is cancellation
+            continue
+        break
+    assert receipt is not None
+    return receipt
+
+
 def _reap_child(child: int) -> int:
     waited, status = os.waitpid(child, 0)
     assert waited == child
@@ -92,15 +122,16 @@ def _reap_child(child: int) -> int:
 def _tree_builder_transaction(
     run: store.Run,
     components: tuple[str, ...] = ("raw", "crawl", "derived"),
+    *,
+    adoption: NativeOutputAdoption | None = None,
 ) -> tuple[NativeOutputTransaction, Path]:
     final = run.dir.joinpath(*components)
     policy = RepositoryNativeOutput.tree(
         ((3, ()),), *components,
     )
+    options = {} if adoption is None else {"adoption": adoption}
     transaction = prepare_native_outputs(
-        run,
-        _python_command("import sys", final),
-        (policy,),
+        run, _python_command("import sys", final), (policy,), **options,
     )
     return transaction, final
 
@@ -144,10 +175,15 @@ def test_tree_builder_copies_from_pinned_private_source_root(tmp_path):
     source_fd = os.open(source_root, runner_native._DIR_FLAGS)
     try:
         builder = transaction.open_tree_builder()
-        builder.copy_file(
+        evidence = builder.copy_file(
             source_fd,
             ("nested", "payload.bin"),
             "evidence", "payload.bin",
+        )
+        assert evidence == NativeTreeEntryEvidence(
+            ("evidence", "payload.bin"),
+            len(b"\x00external\xff"),
+            hashlib.sha256(b"\x00external\xff").hexdigest(),
         )
         builder.seal()
     finally:
@@ -159,6 +195,131 @@ def test_tree_builder_copies_from_pinned_private_source_root(tmp_path):
     assert (final / "evidence" / "payload.bin").read_bytes() == b"\x00external\xff"
     assert stat.S_IMODE((final / "evidence").stat().st_mode) == 0o700
     assert stat.S_IMODE((final / "evidence" / "payload.bin").stat().st_mode) == 0o600
+
+
+def test_tree_builder_copies_repository_file_with_exact_entry_evidence(tmp_path):
+    run = _running_run(tmp_path, "native-builder-repository-copy")
+    source_components = ("raw", "crawl", "sources", "app.js")
+    body = b"const repositoryOwned = true;\n"
+    run._replace_artifact(store.MutationScope.BASE_EVIDENCE, source_components, body)
+    transaction, final = _tree_builder_transaction(run)
+
+    builder = transaction.open_tree_builder()
+    evidence = builder.copy_repository_file(
+        source_components, "nested", "app.js",
+    )
+    assert evidence == NativeTreeEntryEvidence(
+        ("nested", "app.js"), len(body), hashlib.sha256(body).hexdigest(),
+    )
+    builder.seal()
+    receipt = transaction.finish(clean=True)
+
+    assert receipt.clean and receipt.committed[0].present
+    assert (final / "nested" / "app.js").read_bytes() == body
+    assert run._live_artifact_claim_count() == 0
+
+
+def test_tree_builder_repository_copy_revalidates_exact_run_target(tmp_path):
+    run = _running_run(tmp_path, "native-builder-repository-target")
+    source_components = ("raw", "crawl", "sources", "app.js")
+    run._replace_artifact(
+        store.MutationScope.BASE_EVIDENCE, source_components, b"source",
+    )
+    transaction, final = _tree_builder_transaction(run)
+    builder = transaction.open_tree_builder()
+    original_target = run.target
+    try:
+        run.target = "substituted.example"
+        with pytest.raises(ContractError, match="Run authority changed"):
+            builder.copy_repository_file(source_components, "app.js")
+    finally:
+        run.target = original_target
+
+    receipt = transaction.finish(clean=False)
+    assert not receipt.clean and not final.exists()
+    assert run._live_artifact_claim_count() == 0
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    "seam",
+    ["run-allocation", "source-allocation", "source-root-close", "return"],
+)
+def test_tree_builder_repository_copy_cancellation_seams_are_fenceable(
+    tmp_path, interruption, seam,
+):
+    run = _running_run(
+        tmp_path,
+        f"native-builder-repository-{seam}-{interruption.__name__.lower()}",
+    )
+    source_components = ("raw", "crawl", "sources", "app.js")
+    body = b"repository cancellation fixture"
+    source = run._replace_artifact(
+        store.MutationScope.BASE_EVIDENCE, source_components, body,
+    )
+    baseline = _open_descriptors()
+    adoption = NativeOutputAdoption()
+    transaction, final = _tree_builder_transaction(run, adoption=adoption)
+    builder = transaction.open_tree_builder()
+    cancellation = interruption(f"fixture repository copy {seam}")
+    allocation_line = _source_line(
+        NativeTreeBuilder._allocate_owned, "return self._track_fd",
+    )
+    close_line = _source_line(
+        NativeTreeBuilder.copy_repository_file,
+        "settled, cleanup = self._close_many((source_root,))",
+    )
+    return_line = _source_line(
+        NativeTreeBuilder.copy_repository_file, "return evidence",
+    )
+    source_identity = (source.stat().st_dev, source.stat().st_ino)
+    fired = False
+
+    def trace(frame, event, _arg):
+        nonlocal fired
+        if fired or event != "line":
+            return trace
+        if (seam in {"run-allocation", "source-allocation"}
+                and frame.f_code is NativeTreeBuilder._allocate_owned.__code__
+                and frame.f_lineno == allocation_line):
+            slot = frame.f_locals["slot"]
+            observed = os.fstat(slot.fd)
+            identity = (observed.st_dev, observed.st_ino)
+            expected = (
+                run._run_directory_identity
+                if seam == "run-allocation"
+                else source_identity
+            )
+            if identity != expected:
+                return trace
+        elif (seam == "source-root-close"
+                and frame.f_code is NativeTreeBuilder.copy_repository_file.__code__
+                and frame.f_lineno == close_line):
+            pass
+        elif (seam == "return"
+                and frame.f_code is NativeTreeBuilder.copy_repository_file.__code__
+                and frame.f_lineno == return_line):
+            pass
+        else:
+            return trace
+        fired = True
+        raise cancellation
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        with pytest.raises(interruption) as caught:
+            builder.copy_repository_file(source_components, "app.js")
+    finally:
+        sys.settrace(previous)
+
+    assert fired and caught.value is cancellation
+    receipt = _settle_cancelled_tree_adoption(adoption, cancellation)
+    assert not receipt.clean and not receipt.claim_retained
+    assert receipt.cleanup_settled and not final.exists()
+    assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
+    assert _open_descriptors() == baseline
 
 
 def test_tree_builder_exact_policy_and_component_validation_precedes_effects(
