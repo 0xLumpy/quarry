@@ -958,6 +958,461 @@ class _PreparedManifest:
     history_text: str
 
 
+def _preferred_settlement_fault(
+    primary: BaseException | None,
+    faults: list[BaseException],
+) -> BaseException | None:
+    """Prefer the operation's cancellation, then any cleanup cancellation.
+
+    Cleanup is allowed to add diagnostic faults, but an operator's exact
+    ``KeyboardInterrupt``/``SystemExit`` object is the control-flow authority.
+    """
+    if primary is not None and not isinstance(primary, Exception):
+        return primary
+    cancellation = next(
+        (fault for fault in faults if not isinstance(fault, Exception)), None,
+    )
+    return cancellation or primary or (faults[0] if faults else None)
+
+
+class _OwnedDescriptor:
+    """Mutable ownership slot spanning a syscall/result-assignment boundary.
+
+    The allocation result is assigned directly into this object on the same
+    source line as the call.  A later one-shot line cancellation can therefore
+    be reconciled by a second close pass instead of losing a raw integer in a
+    dead frame.  ``expected_identity`` is mandatory for exposed descriptors;
+    internal, never-exposed descriptors adopt their identity after allocation.
+    """
+
+    __slots__ = ("fd", "identity", "expected_identity", "terminal")
+
+    def __init__(self, expected_identity: tuple[int, int] | None = None) -> None:
+        self.fd = -1
+        self.identity = None
+        self.expected_identity = expected_identity
+        self.terminal = False
+
+    def allocate(self, allocate) -> int:
+        if self.fd >= 0:
+            raise ContractError("repository descriptor ownership slot is already used")
+        self.terminal = False
+        self.fd = allocate()
+        observed = os.fstat(self.fd)
+        self.identity = (observed.st_dev, observed.st_ino)
+        if (self.expected_identity is not None
+                and self.identity != self.expected_identity):
+            raise ContractError("repository descriptor identity changed during allocation")
+        return self.fd
+
+    def close_once(self) -> BaseException | None:
+        """Attempt one authenticated close and monotonically reconcile its result."""
+        if self.terminal:
+            return None
+        if self.fd < 0:
+            return None
+        try:
+            observed = os.fstat(self.fd)
+        except OSError as exc:
+            if exc.errno == errno.EBADF:
+                self.fd = -1
+                self.terminal = True
+                return None
+            return exc
+        except BaseException as exc:
+            return exc
+        identity = (observed.st_dev, observed.st_ino)
+        # ``identity`` records the object this slot actually adopted.  The
+        # separately declared ``expected_identity`` validates that adoption,
+        # but a mismatch must still close the newly owned (wrong) descriptor.
+        expected = self.identity
+        if expected is not None and identity != expected:
+            # The exact owned descriptor was already closed and its integer was
+            # reused.  Never close the new owner's descriptor.
+            self.fd = -1
+            self.terminal = True
+            return ContractError("repository descriptor number was reused")
+        try:
+            os.close(self.fd)
+        except BaseException as exc:
+            # A real source-line cancellation happens before ``os.close`` and a
+            # second pass may safely retry.  If close committed before reporting
+            # a fault, EBADF proves the owned descriptor is already terminal.
+            try:
+                os.fstat(self.fd)
+            except OSError as observed_error:
+                if observed_error.errno == errno.EBADF:
+                    self.fd = -1
+                    self.terminal = True
+            except BaseException:
+                pass
+            return exc
+        self.fd = -1
+        self.terminal = True
+        return None
+
+
+def _close_owned_descriptors_twice(
+    owners: tuple[_OwnedDescriptor, ...],
+) -> list[BaseException]:
+    """Drain every slot twice so one line interruption cannot strand a suffix."""
+    faults: list[BaseException] = []
+    for _pass in range(2):
+        for owner in owners:
+            try:
+                fault = owner.close_once()
+            except BaseException as exc:
+                faults.append(exc)
+            else:
+                if fault is not None:
+                    faults.append(fault)
+    return faults
+
+
+def _replay_settlement(operation) -> list[BaseException]:
+    """Run one idempotent settlement twice only when the first pass escaped."""
+    faults: list[BaseException] = []
+    try:
+        operation()
+    except BaseException as exc:
+        faults.append(exc)
+        try:
+            operation()
+        except BaseException as replay_exc:
+            faults.append(replay_exc)
+    return faults
+
+
+class _ArtifactMarkerRelease:
+    """Persistent allocation and release ownership for one exact claim marker."""
+
+    __slots__ = (
+        "run", "name", "expected_identity", "directory", "marker", "released",
+        "durable",
+    )
+
+    def __init__(
+        self, run, name: str | None = None,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> None:
+        self.run = run
+        self.name = name
+        self.expected_identity = expected_identity
+        self.directory = _OwnedDescriptor()
+        self.marker = _OwnedDescriptor(expected_identity)
+        self.released = False
+        self.durable = name is not None and expected_identity is not None
+
+    def allocate(self) -> tuple[str, tuple[int, int]]:
+        """Create and durably authenticate the marker into this stable owner."""
+        if self.name is not None or self.expected_identity is not None:
+            raise ContractError("artifact claim marker owner is already used")
+        from . import privfs
+        directory = privfs.private_dir(self.run._artifact_claim_dir)
+        self.directory.allocate(lambda: os.open(directory, _DIR_OPEN_FLAGS))
+        self.name = f"{os.urandom(16).hex()}{_CLAIM_SUFFIX}"
+        self.marker.allocate(
+            lambda: os.open(
+                self.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+                privfs.FILE_MODE,
+                dir_fd=self.directory.fd,
+            ),
+        )
+        self.expected_identity = self.marker.identity
+        self.marker.expected_identity = self.expected_identity
+        os.fchmod(self.marker.fd, privfs.FILE_MODE)
+        body = json.dumps({
+            "schema_version": 1,
+            "run_id": self.run.run_id,
+            "pid": os.getpid(),
+        }, sort_keys=True).encode("utf-8")
+        view = memoryview(body)
+        while view:
+            written = os.write(self.marker.fd, view)
+            if written <= 0:
+                raise OSError("artifact claim marker write made no progress")
+            view = view[written:]
+        os.fsync(self.marker.fd)
+        observed = os.fstat(self.marker.fd)
+        if (not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE
+                or (observed.st_dev, observed.st_ino)
+                != self.expected_identity):
+            raise ContractError("artifact claim marker identity is unsafe")
+        os.fsync(self.directory.fd)
+        self.durable = True
+        faults = _close_owned_descriptors_twice((self.marker, self.directory))
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            raise preferred
+        return self.name, self.expected_identity
+
+    def settle(self) -> None:
+        primary = None
+        try:
+            if not self.released:
+                if self.expected_identity is None and self.marker.fd >= 0:
+                    observed = os.fstat(self.marker.fd)
+                    self.marker.identity = (observed.st_dev, observed.st_ino)
+                    self.expected_identity = self.marker.identity
+                    self.marker.expected_identity = self.expected_identity
+                if self.name is None or self.expected_identity is None:
+                    self.released = True
+                    return
+                if self.directory.fd < 0:
+                    self.directory.allocate(
+                        lambda: os.open(
+                            self.run._artifact_claim_dir, _DIR_OPEN_FLAGS,
+                        ),
+                    )
+                try:
+                    named = os.stat(
+                        self.name, dir_fd=self.directory.fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    os.fsync(self.directory.fd)
+                    self.released = True
+                else:
+                    if (not stat.S_ISREG(named.st_mode)
+                            or named.st_uid != os.geteuid()
+                            or named.st_nlink != 1
+                            or (named.st_dev, named.st_ino)
+                            != self.expected_identity):
+                        raise ContractError("artifact claim marker identity changed")
+                    if self.marker.fd < 0:
+                        self.marker.allocate(
+                            lambda: os.open(
+                                self.name, _FILE_OPEN_FLAGS,
+                                dir_fd=self.directory.fd,
+                            ),
+                        )
+                    observed = os.fstat(self.marker.fd)
+                    if (not stat.S_ISREG(observed.st_mode)
+                            or observed.st_uid != os.geteuid()
+                            or observed.st_nlink != 1
+                            or (observed.st_dev, observed.st_ino)
+                            != self.expected_identity):
+                        raise ContractError("artifact claim marker identity changed")
+                    os.unlink(self.name, dir_fd=self.directory.fd)
+                    os.fsync(self.directory.fd)
+                    self.released = True
+        except BaseException as exc:
+            primary = exc
+        faults = _close_owned_descriptors_twice((self.marker, self.directory))
+        preferred = _preferred_settlement_fault(primary, faults)
+        if preferred is not None:
+            raise preferred
+        if not self.released or self.marker.fd >= 0 or self.directory.fd >= 0:
+            raise ContractError("artifact claim marker release did not settle")
+
+
+class _SettlementOwner:
+    """Stable idempotent cleanup authority shared by two active fences."""
+
+    __slots__ = ("operation", "faults", "primary")
+
+    def __init__(self, operation) -> None:
+        self.operation = operation
+        self.faults: list[BaseException] = []
+        self.primary: BaseException | None = None
+
+    def remember(self, fault: BaseException | None) -> None:
+        if fault is not None:
+            self.primary = _preferred_settlement_fault(self.primary, [fault])
+
+    def reconcile(self) -> BaseException | None:
+        try:
+            self.operation()
+        except BaseException as exc:
+            self.faults.append(exc)
+        return _preferred_settlement_fault(None, self.faults)
+
+
+class _SettlementFence:
+    """One recovery layer over a shared mutable settlement owner.
+
+    Two instances are entered before the first effect.  A one-shot source-line
+    interruption at any entry, handler, reconciliation or return line in the
+    inner ``__exit__`` therefore unwinds through the already-active outer
+    instance, which repeats the idempotent operation before propagating the
+    preferred exact cancellation.
+    """
+
+    __slots__ = ("owner",)
+
+    def __init__(self, owner: _SettlementOwner) -> None:
+        self.owner = owner
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _kind, primary, _traceback) -> bool:
+        self.owner.remember(primary)
+        self.owner.reconcile()
+        preferred = _preferred_settlement_fault(
+            self.owner.primary, self.owner.faults,
+        )
+        if preferred is not None and preferred is not primary:
+            try:
+                preferred.cleanup_errors = tuple(self.owner.faults)
+            except BaseException:
+                pass
+            if primary is not None:
+                raise preferred from primary
+            raise preferred
+        return False
+
+
+class _ArtifactDirectoryAllocation:
+    """Persistent facts for one possibly-created canonical directory."""
+
+    __slots__ = (
+        "run", "parent_components", "name", "possible", "identity", "durable",
+        "anchor", "prefixes", "child",
+    )
+
+    def __init__(self, run, parent_components: tuple[str, ...], name: str) -> None:
+        self.run = run
+        self.parent_components = parent_components
+        self.name = name
+        self.possible = False
+        self.identity = None
+        self.durable = False
+        self.anchor = _OwnedDescriptor(run._run_directory_identity)
+        self.prefixes = tuple(_OwnedDescriptor() for _ in parent_components)
+        self.child = _OwnedDescriptor()
+
+    @property
+    def parent(self) -> _OwnedDescriptor:
+        return self.prefixes[-1]
+
+    @property
+    def descriptor_owners(self) -> tuple[_OwnedDescriptor, ...]:
+        return (self.child, *reversed(self.prefixes), self.anchor)
+
+    def _ensure_chain(self) -> None:
+        from . import privfs
+        if self.anchor.fd < 0:
+            self.anchor.allocate(
+                lambda: _open_run_fd(self.run.project_dir, self.run.run_id),
+            )
+        for index, owner in enumerate(self.prefixes, 1):
+            if owner.fd < 0:
+                prefix = self.parent_components[:index]
+                owner.allocate(
+                    lambda prefix=prefix: privfs.open_strict_dir_at(
+                        self.anchor.fd, prefix,
+                    ),
+                )
+
+    def reconcile(self) -> None:
+        """Prove and durably settle a possibly-landed empty directory."""
+        if not self.possible or self.durable:
+            return
+        self._ensure_chain()
+        try:
+            named = os.stat(
+                self.name, dir_fd=self.parent.fd, follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            self.possible = False
+            return
+        self.run._validate_base_directory_stat(
+            named, self.parent_components + (self.name,),
+        )
+        named_identity = (named.st_dev, named.st_ino)
+        if self.identity is not None and named_identity != self.identity:
+            raise ContractError("artifact directory identity changed during allocation")
+        self.identity = named_identity
+        self.child.expected_identity = named_identity
+        if self.child.fd < 0:
+            self.child.allocate(
+                lambda: os.open(self.name, _DIR_OPEN_FLAGS, dir_fd=self.parent.fd),
+            )
+        observed = os.fstat(self.child.fd)
+        self.run._validate_base_directory_stat(
+            observed, self.parent_components + (self.name,),
+        )
+        if (observed.st_dev, observed.st_ino) != named_identity:
+            raise ContractError("artifact directory name changed during allocation")
+        if os.listdir(self.child.fd):
+            raise ContractError("new artifact directory was populated during allocation")
+        # Child data first, then every name-bearing directory back to the run
+        # anchor.  This also settles parents materialized immediately before the
+        # allocation, rather than fsyncing only the leaf's direct parent.
+        os.fsync(self.child.fd)
+        for owner in reversed(self.prefixes):
+            os.fsync(owner.fd)
+        os.fsync(self.anchor.fd)
+        self.durable = True
+
+    def settle(self) -> None:
+        primary = None
+        try:
+            if self.possible and not self.durable:
+                self.reconcile()
+        except BaseException as exc:
+            primary = exc
+        faults = _close_owned_descriptors_twice(self.descriptor_owners)
+        preferred = _preferred_settlement_fault(primary, faults)
+        if preferred is not None:
+            raise preferred
+        if any(owner.fd >= 0 for owner in self.descriptor_owners):
+            raise ContractError("artifact directory descriptors did not settle")
+        if self.possible and not self.durable:
+            raise ContractError("artifact directory allocation did not settle")
+
+    def allocate_fresh(self) -> Path:
+        """Select, create and reconcile the next authenticated attempt name."""
+        from . import privfs
+        self._ensure_chain()
+        index = 0
+        while True:
+            name = f"attempt-{index}"
+            try:
+                existing = os.stat(
+                    name, dir_fd=self.parent.fd, follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
+                self.run._validate_base_directory_stat(
+                    existing, self.parent_components + (name,),
+                )
+                index += 1
+                continue
+            self.name = name
+            self.possible = True
+            try:
+                os.mkdir(name, privfs.DIR_MODE, dir_fd=self.parent.fd)
+            except FileExistsError:
+                raise ContractError(
+                    f"artifact attempt name {name!r} changed during allocation",
+                ) from None
+            self.reconcile()
+            return self.run.dir.joinpath(*self.parent_components, name)
+
+    def create_exact(self) -> Path:
+        """Create and reconcile the already-declared exact directory name."""
+        from . import privfs
+        self._ensure_chain()
+        self.possible = True
+        try:
+            os.mkdir(self.name, privfs.DIR_MODE, dir_fd=self.parent.fd)
+        except FileExistsError:
+            raise ContractError(
+                "artifact directory "
+                f"{'/'.join(self.parent_components + (self.name,))!r} already exists",
+            ) from None
+        self.reconcile()
+        return self.run.dir.joinpath(*self.parent_components, self.name)
+
+
 class _ArtifactClaim:
     """Opaque, single-use authority for one unpublished base artifact.
 
@@ -968,19 +1423,27 @@ class _ArtifactClaim:
     """
 
     __slots__ = (
-        "_run", "_components", "_marker_name", "_marker_identity", "_stage",
-        "_writer_fd", "_state",
+        "_run", "_components", "_stage",
+        "_writer_fd", "_writer_owner", "_open_anchor", "_cleanup_anchor",
+        "_cleanup_parent", "_discard_settled", "_marker_release",
+        "_settlement_faults", "_state",
     )
 
-    def __init__(self, run, components, marker_name, marker_identity):
+    def __init__(self, run, components, marker_release):
         self._run = run
         self._components = components
-        self._marker_name = marker_name
-        self._marker_identity = marker_identity
         self._stage = None
         self._writer_fd = -1
+        self._writer_owner = _OwnedDescriptor()
+        self._open_anchor = _OwnedDescriptor(run._run_directory_identity)
+        self._cleanup_anchor = _OwnedDescriptor(run._run_directory_identity)
+        self._cleanup_parent = _OwnedDescriptor()
+        self._discard_settled = False
+        self._marker_release = marker_release
+        self._settlement_faults: list[BaseException] = []
         self._state = "claimed"
 
+    @classmethod
     def __repr__(self) -> str:
         return f"ArtifactClaim(state={self._state!r})"
 
@@ -997,24 +1460,38 @@ class _ArtifactClaim:
         if self._stage is not None or self._writer_fd >= 0:
             raise ContractError("artifact claim already issued its writer")
         from . import privfs
-        with self._run._mutation(MutationScope.BASE_EVIDENCE):
-            self._run._ensure_artifact_parent(components)
-            anchor_fd = _open_run_fd(self._run.project_dir, self._run.run_id)
+        primary = None
+        faults: list[BaseException] = []
+        try:
+            with self._run._mutation(MutationScope.BASE_EVIDENCE):
+                self._run._ensure_artifact_parent(components)
+                self._open_anchor.allocate(
+                    lambda: _open_run_fd(self._run.project_dir, self._run.run_id),
+                )
+                self._stage = privfs.create_private_stage(
+                    self._open_anchor.fd, components,
+                )
+                self._writer_owner.expected_identity = self._stage.file_identity
+                self._writer_owner.allocate(lambda: os.dup(self._stage.file_fd))
+                self._writer_fd = self._writer_owner.fd
+        except BaseException as exc:
+            primary = exc
+        faults.extend(_close_owned_descriptors_twice((self._open_anchor,)))
+        preferred = _preferred_settlement_fault(primary, faults)
+        if preferred is not None:
             try:
-                stage = privfs.create_private_stage(anchor_fd, components)
-            finally:
-                os.close(anchor_fd)
-            self._stage = stage
-            writer = os.dup(stage.file_fd)
-        self._writer_fd = writer
+                preferred.close_errors = tuple(faults)
+            except BaseException:
+                pass
+            raise preferred
         self._state = "open"
-        return writer
+        return self._writer_fd
 
     def _writer_is_live(self) -> bool:
-        if self._writer_fd < 0 or self._stage is None:
+        if self._writer_owner.terminal or self._writer_owner.fd < 0 or self._stage is None:
             return False
         try:
-            observed = os.fstat(self._writer_fd)
+            observed = os.fstat(self._writer_owner.fd)
         except OSError as exc:
             if exc.errno == errno.EBADF:
                 return False
@@ -1026,7 +1503,12 @@ class _ArtifactClaim:
         self._require_artifact()
         if self._stage is None:
             raise ContractError("artifact claim has no opened writer")
-        if self._writer_is_live():
+        writer_faults = _close_owned_descriptors_twice((self._writer_owner,))
+        self._writer_fd = self._writer_owner.fd
+        preferred = _preferred_settlement_fault(None, writer_faults)
+        if preferred is not None:
+            raise preferred
+        if not self._writer_owner.terminal or self._writer_is_live():
             raise ContractError("artifact writer is still live")
         from . import privfs
         with self._run._mutation(MutationScope.BASE_EVIDENCE):
@@ -1038,32 +1520,87 @@ class _ArtifactClaim:
         if self._state in {"published", "fenced"}:
             return
         from . import privfs
-        with self._run._mutation(MutationScope.CONTROL):
-            if self._stage is not None:
-                identity = self._stage.file_identity
-                components = self._stage.components
-                privfs.abort_private_stage(self._stage)
-                # Generic privfs fencing retains a randomly named discard because
-                # it cannot assume repository serialization. Here the run lock
-                # supplies that missing authority: locate only our exact inode in
-                # its strict parent, remove it, and durably settle the directory.
-                anchor_fd = _open_run_fd(self._run.project_dir, self._run.run_id)
-                parent_fd = -1
-                try:
-                    parent_fd = privfs.open_strict_dir_at(anchor_fd, components[:-1])
-                    for name in os.listdir(parent_fd):
-                        if not (name.startswith(".quarry-discard-") and name.endswith(".stage")):
-                            continue
-                        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                        if (observed.st_dev, observed.st_ino) == identity:
-                            os.unlink(name, dir_fd=parent_fd)
-                            os.fsync(parent_fd)
-                            break
-                finally:
-                    if parent_fd >= 0:
-                        os.close(parent_fd)
-                    os.close(anchor_fd)
-        self._state = "fenced"
+        faults: list[BaseException] = []
+        for _pass in range(2):
+            try:
+                with self._run._mutation(MutationScope.CONTROL):
+                    faults.extend(_close_owned_descriptors_twice((
+                        self._writer_owner, self._open_anchor,
+                    )))
+                    self._writer_fd = self._writer_owner.fd
+                    if self._stage is not None and self._stage.state not in {
+                        "aborted", "committed", "fenced",
+                    }:
+                        privfs.abort_private_stage(self._stage)
+                    if (self._stage is not None
+                            and self._stage.state == "aborted"
+                            and not self._discard_settled):
+                        identity = self._stage.file_identity
+                        components = self._stage.components
+                        if self._cleanup_anchor.fd < 0:
+                            self._cleanup_anchor.allocate(
+                                lambda: _open_run_fd(
+                                    self._run.project_dir, self._run.run_id,
+                                ),
+                            )
+                        if self._cleanup_parent.fd < 0:
+                            self._cleanup_parent.allocate(
+                                lambda: privfs.open_strict_dir_at(
+                                    self._cleanup_anchor.fd, components[:-1],
+                                ),
+                            )
+                        for name in os.listdir(self._cleanup_parent.fd):
+                            if not (name.startswith(".quarry-discard-")
+                                    and name.endswith(".stage")):
+                                continue
+                            observed = os.stat(
+                                name, dir_fd=self._cleanup_parent.fd,
+                                follow_symlinks=False,
+                            )
+                            if (observed.st_dev, observed.st_ino) == identity:
+                                os.unlink(name, dir_fd=self._cleanup_parent.fd)
+                                os.fsync(self._cleanup_parent.fd)
+                                break
+                        self._discard_settled = True
+            except BaseException as exc:
+                faults.append(exc)
+            faults.extend(_close_owned_descriptors_twice((
+                self._cleanup_parent, self._cleanup_anchor,
+            )))
+            stage_terminal = (
+                self._stage is None
+                or self._stage.state in {"aborted", "committed", "fenced"}
+            )
+            discard_terminal = (
+                self._stage is None
+                or self._stage.state in {"committed", "fenced"}
+                or self._discard_settled
+            )
+            if (self._writer_owner.fd < 0 and stage_terminal and discard_terminal
+                    and self._open_anchor.fd < 0
+                    and self._cleanup_parent.fd < 0
+                    and self._cleanup_anchor.fd < 0):
+                self._state = "fenced"
+                break
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            try:
+                preferred.close_errors = tuple(faults)
+            except BaseException:
+                pass
+            raise preferred
+        if self._state != "fenced":
+            raise ContractError("artifact claim did not reach terminal fencing")
+
+    def _settle(self) -> None:
+        """Idempotently settle content ownership, then its durable marker."""
+        if self._state not in {"published", "fenced"}:
+            self.fence()
+        if self._state in {"published", "fenced"}:
+            with self._run._mutation(MutationScope.CONTROL):
+                self._marker_release.settle()
+        if not self._marker_release.released:
+            raise ContractError("artifact claim marker remains live")
 
 
 _RUN_CONSTRUCTION_AUTHORITY = object()
@@ -1297,22 +1834,18 @@ class Run:
     def _release_artifact_claim_marker(
         self, name: str, expected_identity: tuple[int, int],
     ) -> None:
-        directory_fd = os.open(self._artifact_claim_dir, _DIR_OPEN_FLAGS)
-        fd = -1
-        try:
-            fd = os.open(name, _FILE_OPEN_FLAGS, dir_fd=directory_fd)
-            observed = os.fstat(fd)
-            if (not stat.S_ISREG(observed.st_mode)
-                    or observed.st_uid != os.geteuid()
-                    or observed.st_nlink != 1
-                    or (observed.st_dev, observed.st_ino) != expected_identity):
-                raise ContractError("artifact claim marker identity changed")
-            os.unlink(name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-        finally:
-            if fd >= 0:
-                os.close(fd)
-            os.close(directory_fd)
+        """Idempotently release one exact marker and settle every owned fd."""
+        release = _ArtifactMarkerRelease(self, name, expected_identity)
+        faults = _replay_settlement(release.settle)
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            try:
+                preferred.close_errors = tuple(faults)
+            except BaseException:
+                pass
+            raise preferred
+        if not release.released:
+            raise ContractError("artifact claim marker release did not settle")
 
     def _live_artifact_claim_count(self) -> int:
         try:
@@ -1522,16 +2055,18 @@ class Run:
         that already own a private stage through another strict subsystem.
         """
         validated = None if not components else _validated_artifact_components(tuple(components))
-        with self._mutation(MutationScope.BASE_EVIDENCE):
-            marker_name, marker_identity = self._create_artifact_claim_marker()
-        claim = _ArtifactClaim(self, validated, marker_name, marker_identity)
-        try:
-            yield claim
-        finally:
-            if claim._state not in {"published", "fenced"}:
-                claim.fence()
-            with self._mutation(MutationScope.CONTROL):
-                self._release_artifact_claim_marker(marker_name, marker_identity)
+        marker = _ArtifactMarkerRelease(self)
+        claim = _ArtifactClaim(self, validated, marker)
+        settlement = _SettlementOwner(claim._settle)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                with self._mutation(MutationScope.BASE_EVIDENCE):
+                    marker.allocate()
+                yield claim
+        claim._settlement_faults.extend(settlement.faults)
+        if (claim._state not in {"published", "fenced"}
+                or not claim._marker_release.released):
+            raise ContractError("artifact claim did not reach terminal settlement")
 
     def begin_finalization(
         self, *, profile_summary: dict | None = None,
@@ -1665,80 +2200,21 @@ class Run:
         object type makes the allocator fail closed.
         """
         components = _validated_artifact_components(tuple(components))
-        from . import privfs
         with self._mutation(MutationScope.BASE_EVIDENCE):
             base = self.dir.joinpath(*components)
+            from . import privfs
             privfs.private_dir(base)
-            anchor_fd = _open_run_fd(self.project_dir, self.run_id)
-            base_fd = -1
-            try:
-                base_fd = privfs.open_strict_dir_at(anchor_fd, components)
-                index = 0
-                while True:
-                    name = f"attempt-{index}"
-                    try:
-                        existing = os.stat(
-                            name, dir_fd=base_fd, follow_symlinks=False,
-                        )
-                    except FileNotFoundError:
-                        existing = None
-                    if existing is not None:
-                        self._validate_base_directory_stat(
-                            existing, components + (name,),
-                        )
-                        index += 1
-                        continue
-                    try:
-                        os.mkdir(name, privfs.DIR_MODE, dir_fd=base_fd)
-                    except FileExistsError:
-                        # Cooperative writers cannot race while the Run lock is
-                        # held.  A new name here is untrusted interference.
-                        raise ContractError(
-                            f"artifact attempt name {name!r} changed during allocation",
-                        ) from None
-                    except BaseException:
-                        # If mkdir committed before cancellation was delivered,
-                        # durably reconcile that harmless empty generation.  It
-                        # remains a truthful pre-seal allocation even though the
-                        # interrupted caller receives no Path.
-                        try:
-                            observed = os.stat(
-                                name, dir_fd=base_fd, follow_symlinks=False,
-                            )
-                        except OSError:
-                            pass
-                        else:
-                            self._validate_base_directory_stat(
-                                observed, components + (name,),
-                            )
-                            os.fsync(base_fd)
-                        raise
-                    child_fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=base_fd)
-                    try:
-                        observed = os.fstat(child_fd)
-                        named = os.stat(
-                            name, dir_fd=base_fd, follow_symlinks=False,
-                        )
-                        self._validate_base_directory_stat(
-                            observed, components + (name,),
-                        )
-                        self._validate_base_directory_stat(
-                            named, components + (name,),
-                        )
-                        if ((observed.st_dev, observed.st_ino)
-                                != (named.st_dev, named.st_ino)):
-                            raise ContractError(
-                                f"artifact attempt name {name!r} changed during allocation",
-                            )
-                        os.fsync(child_fd)
-                    finally:
-                        os.close(child_fd)
-                    os.fsync(base_fd)
-                    return base / name
-            finally:
-                if base_fd >= 0:
-                    os.close(base_fd)
-                os.close(anchor_fd)
+            allocation = _ArtifactDirectoryAllocation(
+                self, components, "attempt-0",
+            )
+            settlement = _SettlementOwner(allocation.settle)
+            result = None
+            with _SettlementFence(settlement):
+                with _SettlementFence(settlement):
+                    result = allocation.allocate_fresh()
+            if result is None or allocation is None or not allocation.durable:
+                raise ContractError("artifact attempt allocation did not settle")
+            return result
 
     def create_artifact_dir(self, *components: str) -> Path:
         """Create one exact, previously absent private base-evidence directory.
@@ -1751,53 +2227,18 @@ class Run:
         components = _validated_artifact_components(tuple(components))
         if len(components) < 2:
             raise ContractError("an artifact directory requires a parent identity")
-        from . import privfs
         with self._mutation(MutationScope.BASE_EVIDENCE):
             self._ensure_artifact_parent(components)
-            anchor_fd = _open_run_fd(self.project_dir, self.run_id)
-            parent_fd = child_fd = -1
-            try:
-                parent_fd = privfs.open_strict_dir_at(anchor_fd, components[:-1])
-                name = components[-1]
-                try:
-                    os.mkdir(name, privfs.DIR_MODE, dir_fd=parent_fd)
-                except FileExistsError:
-                    raise ContractError(
-                        f"artifact directory {'/'.join(components)!r} already exists",
-                    ) from None
-                except BaseException:
-                    # Reconcile a mkdir that committed immediately before a
-                    # cooperative cancellation.  The empty attempt is durable
-                    # and never mistaken for completed evidence.
-                    try:
-                        observed = os.stat(
-                            name, dir_fd=parent_fd, follow_symlinks=False,
-                        )
-                    except OSError:
-                        pass
-                    else:
-                        self._validate_base_directory_stat(observed, components)
-                        os.fsync(parent_fd)
-                    raise
-                child_fd = os.open(name, _DIR_OPEN_FLAGS, dir_fd=parent_fd)
-                observed = os.fstat(child_fd)
-                named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                self._validate_base_directory_stat(observed, components)
-                self._validate_base_directory_stat(named, components)
-                if ((observed.st_dev, observed.st_ino)
-                        != (named.st_dev, named.st_ino)):
-                    raise ContractError(
-                        f"artifact directory {'/'.join(components)!r} changed during creation",
-                    )
-                os.fsync(child_fd)
-                os.fsync(parent_fd)
-                return self.dir.joinpath(*components)
-            finally:
-                if child_fd >= 0:
-                    os.close(child_fd)
-                if parent_fd >= 0:
-                    os.close(parent_fd)
-                os.close(anchor_fd)
+            allocation = _ArtifactDirectoryAllocation(
+                self, components[:-1], components[-1],
+            )
+            settlement = _SettlementOwner(allocation.settle)
+            with _SettlementFence(settlement):
+                with _SettlementFence(settlement):
+                    allocation.create_exact()
+            if not allocation.durable:
+                raise ContractError("artifact directory creation did not settle")
+            return self.dir.joinpath(*components)
 
     # ── tool run accounting ──
     def record(self, phase: str, result, *, depends_on: str | None = None) -> None:
