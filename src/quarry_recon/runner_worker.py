@@ -10,6 +10,7 @@ the target.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import select
 import signal
@@ -28,6 +29,7 @@ from .runner_protocol import (
     StreamRole,
     StreamSettlement,
     StreamTerminal,
+    StartedFrame,
     WorkerRequest,
     WorkerCommandKind,
     WorkerSettlement,
@@ -36,6 +38,7 @@ from .runner_protocol import (
     encode_request,
     encode_prepared,
     encode_ready,
+    encode_started,
     encode_settlement,
     prepared_digest,
     request_digest,
@@ -44,12 +47,15 @@ from .runner_containment import (
     capture_parked_process_identity,
     capture_process_identity,
 )
+from .runner_streams import _run_stream_engine
 
 
 EXPECTED_PARENT_PID_ENV = "QUARRY_RUNNER_EXPECTED_PARENT_PID"
 PREPARED_ABORT_ENV = "QUARRY_RUNNER_PREPARED_ABORT"
+EXECUTION_ENV = "QUARRY_RUNNER_EXECUTION"
 STDOUT_FD_ENV = "QUARRY_RUNNER_STDOUT_FD"
 STDERR_FD_ENV = "QUARRY_RUNNER_STDERR_FD"
+STDIN_FD_ENV = "QUARRY_RUNNER_STDIN_FD"
 _PR_SET_PDEATHSIG = 1
 _EXIT_BOOTSTRAP_INVALID = 64
 _EXIT_CONTROL_FAILED = 65
@@ -105,8 +111,21 @@ def _pop_output_fd_metadata() -> tuple[int | None, int | None]:
     return _parse_output_fd(stdout_raw), _parse_output_fd(stderr_raw)
 
 
+def _pop_input_fd_metadata() -> int | None:
+    return _parse_output_fd(os.environ.pop(STDIN_FD_ENV, None))
+
+
 def _pop_prepared_abort_mode() -> bool:
     raw = os.environ.pop(PREPARED_ABORT_ENV, None)
+    if raw is None:
+        return False
+    if raw != "1":
+        raise _metadata_failure()
+    return True
+
+
+def _pop_execution_mode() -> bool:
+    raw = os.environ.pop(EXECUTION_ENV, None)
     if raw is None:
         return False
     if raw != "1":
@@ -1068,6 +1087,206 @@ def _run_prepared_abort_worker(
             )
 
 
+def _stdin_payload_valid(request: WorkerRequest, stdin_data, stdin_file_fd) -> bool:
+    if request.stdin_mode is StdinMode.NULL:
+        return stdin_data is None and stdin_file_fd is None
+    if request.stdin_mode is StdinMode.DATA:
+        return (
+            type(stdin_data) is bytes
+            and stdin_file_fd is None
+            and len(stdin_data) == request.stdin_bytes
+            and hashlib.sha256(stdin_data).hexdigest() == request.stdin_sha256
+        )
+    return (
+        stdin_data is None
+        and type(stdin_file_fd) is int
+        and stdin_file_fd >= 3
+    )
+
+
+def _run_execution_transaction(
+    request_fd: int,
+    control_fd: int,
+    worker_pid: int,
+    owner: _ExecutionLauncherOwner,
+    *,
+    stdout_fd: int | None,
+    stderr_fd: int | None,
+    stdin_data: bytes | None,
+    stdin_file_fd: int | None,
+) -> int:
+    launcher = None
+    request = None
+    try:
+        launcher = _spawn_execution_launcher(
+            inherited_fds=(request_fd, control_fd),
+            _owner=owner,
+        )
+        launcher.close_inherited_before_stop()
+    except BaseException as primary:
+        if launcher is not None:
+            _settle_after_boundary(launcher, primary)
+        if not isinstance(primary, Exception):
+            raise
+        return _EXIT_BOOTSTRAP_INVALID
+
+    try:
+        request = decode_request(runner_ipc.read_frame(
+            request_fd, max_frame_bytes=MAX_FRAME_BYTES,
+        ))
+        _validate_output_fds(
+            request, stdout_fd, stderr_fd,
+            request_fd=request_fd, control_fd=control_fd,
+        )
+        if not _stdin_payload_valid(request, stdin_data, stdin_file_fd):
+            raise _metadata_failure()
+    except BaseException as primary:
+        _settle_after_boundary(launcher, primary)
+        return _EXIT_BOOTSTRAP_INVALID
+
+    digest = request_digest(request)
+    try:
+        runner_ipc.write_all(control_fd, encode_ready(ReadyFrame(
+            request_id=request.request_id,
+            worker_pid=worker_pid,
+            request_sha256=digest,
+        )))
+    except BaseException as primary:
+        _settle_after_boundary(launcher, primary)
+        return _EXIT_CONTROL_FAILED
+
+    try:
+        stopped = launcher.prove_stopped()
+    except BaseException as primary:
+        settled = _settle_after_boundary(launcher, primary)
+        _write_parked_failure(
+            control_fd, request_id=request.request_id, worker_pid=worker_pid,
+            detail="launcher_not_parked", settled=settled,
+        )
+        return _EXIT_CONTROL_FAILED
+    if not stopped:
+        settled = _settle_launcher(launcher)
+        _write_parked_failure(
+            control_fd, request_id=request.request_id, worker_pid=worker_pid,
+            detail="launcher_not_parked", settled=settled,
+        )
+        return _EXIT_CONTROL_FAILED
+
+    prepared = PreparedFrame(
+        request_id=request.request_id,
+        worker_pid=worker_pid,
+        launcher_pid=launcher.pid,
+        launcher_pgid=launcher.pgid,
+        containment_kind=ContainmentKind.CGROUP_V2,
+        containment_id=f"direct/quarry-{request.request_id}",
+    )
+    try:
+        runner_ipc.write_all(control_fd, encode_prepared(prepared))
+    except BaseException as primary:
+        _settle_after_boundary(launcher, primary)
+        return _EXIT_CONTROL_FAILED
+
+    command_error = None
+    try:
+        command = decode_command(runner_ipc.read_frame(
+            request_fd, max_frame_bytes=MAX_FRAME_BYTES,
+        ))
+        runner_ipc.require_eof(request_fd)
+        command_valid = _command_matches_prepared(command, request, prepared)
+    except BaseException as primary:
+        command_error = primary
+        command = None
+        command_valid = False
+
+    if command_error is not None or not command_valid \
+            or command.command is not WorkerCommandKind.GO:
+        settled = (
+            _settle_after_boundary(launcher, command_error)
+            if command_error is not None else _settle_launcher(launcher)
+        )
+        if command_error is not None:
+            terminal = ExecutionTerminal.WORKER_FAILED
+            detail = "command_invalid"
+            returncode = _EXIT_CONTROL_FAILED
+        elif not command_valid:
+            terminal = ExecutionTerminal.WORKER_FAILED
+            detail = "command_mismatch"
+            returncode = 0
+        else:
+            terminal = ExecutionTerminal.CANCELLED
+            detail = "parent_abort"
+            returncode = 0
+        _write_settlement(control_fd, _negative_settlement(
+            request_id=request.request_id,
+            worker_pid=worker_pid,
+            terminal=terminal,
+            detail=detail,
+            process_group_settled=settled,
+        ))
+        return returncode
+
+    started = StartedFrame(
+        request_id=request.request_id,
+        worker_pid=worker_pid,
+        tool_pid=launcher.pid,
+        tool_pgid=launcher.pgid,
+        containment_kind=prepared.containment_kind,
+        containment_id=prepared.containment_id,
+    )
+
+    def _write_started() -> None:
+        runner_ipc.write_all(control_fd, encode_started(started))
+
+    now = time.monotonic()
+    execution_deadline = None if request.timeout == 0 else now + float(request.timeout)
+    # Worker teardown is independently bounded even for timeout=0.  The parent
+    # retains the stronger absolute transaction deadline and can kill this owner.
+    settlement_deadline = (
+        now + 5.0 if execution_deadline is None else execution_deadline + 5.0
+    )
+    try:
+        settlement = _run_stream_engine(
+            request,
+            launcher,
+            stdin_data=stdin_data,
+            stdin_file_fd=stdin_file_fd,
+            stdout_stage_fd=stdout_fd,
+            stderr_stage_fd=stderr_fd,
+            execution_deadline=execution_deadline,
+            settlement_deadline=settlement_deadline,
+            clock=time.monotonic,
+            on_started=_write_started,
+        )
+        _write_settlement(control_fd, settlement)
+    except BaseException as primary:
+        if not _launcher_terminal(launcher):
+            _settle_after_boundary(launcher, primary)
+        if not isinstance(primary, Exception):
+            raise
+        return _EXIT_CONTROL_FAILED
+    return 0
+
+
+def _run_execution_worker(
+    request_fd: int,
+    control_fd: int,
+    worker_pid: int,
+    *,
+    stdout_fd: int | None,
+    stderr_fd: int | None,
+    stdin_data: bytes | None,
+    stdin_file_fd: int | None,
+) -> int:
+    owner = _ExecutionLauncherOwner()
+    with _ExecutionLauncherFence(owner):
+        with _ExecutionLauncherFence(owner):
+            return _run_execution_transaction(
+                request_fd, control_fd, worker_pid, owner,
+                stdout_fd=stdout_fd, stderr_fd=stderr_fd,
+                stdin_data=stdin_data, stdin_file_fd=stdin_file_fd,
+            )
+
+
 def _run_worker(
     request_fd: int,
     control_fd: int,
@@ -1076,12 +1295,22 @@ def _run_worker(
     stdout_fd: int | None = None,
     stderr_fd: int | None = None,
     prepared_abort: bool = False,
+    execution: bool = False,
+    stdin_data: bytes | None = None,
+    stdin_file_fd: int | None = None,
 ) -> int:
     """Run one legacy or parked transaction over blocking descriptors."""
     _arm_parent_death(expected_parent_pid)
     worker_pid = os.getpid()
-    if (type(prepared_abort) is not bool):
+    if (type(prepared_abort) is not bool or type(execution) is not bool
+            or (prepared_abort and execution)):
         raise _metadata_failure()
+    if execution:
+        return _run_execution_worker(
+            request_fd, control_fd, worker_pid,
+            stdout_fd=stdout_fd, stderr_fd=stderr_fd,
+            stdin_data=stdin_data, stdin_file_fd=stdin_file_fd,
+        )
     if prepared_abort or stdout_fd is not None or stderr_fd is not None:
         return _run_prepared_abort_worker(
             request_fd, control_fd, worker_pid,
@@ -1160,7 +1389,9 @@ def main() -> int:
     try:
         expected_parent_pid = _expected_parent_pid()
         prepared_abort = _pop_prepared_abort_mode()
+        execution = _pop_execution_mode()
         stdout_fd, stderr_fd = _pop_output_fd_metadata()
+        stdin_file_fd = _pop_input_fd_metadata()
         # The bootstrap environment contains only fixed numeric metadata.  Remove
         # even that value before accepting the target-effective request over IPC.
         os.environ.clear()
@@ -1168,6 +1399,8 @@ def main() -> int:
             0, 1, expected_parent_pid,
             stdout_fd=stdout_fd, stderr_fd=stderr_fd,
             prepared_abort=prepared_abort,
+            execution=execution,
+            stdin_file_fd=stdin_file_fd,
         )
     except BaseException:
         return _EXIT_BOOTSTRAP_INVALID
