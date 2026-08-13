@@ -112,3 +112,39 @@ def test_nuclei_state_publication_preserves_prior_on_fault(tmp_path, monkeypatch
 
     assert state_path.read_bytes() == original
     assert run._live_artifact_claim_count() == 0
+
+
+@pytest.mark.parametrize("writer", ["state", "log", "lines"])
+def test_fake_context_cannot_mutate_sealed_managed_artifact(tmp_path, writer):
+    run = _running(tmp_path, f"sealed-{writer}")
+    path = run._replace_artifact(
+        store.MutationScope.BASE_EVIDENCE,
+        ("raw", "params", "fixture", f"{writer}.txt"),
+        b"prior\n",
+    )
+    run.begin_finalization()
+    fake = _Context(SimpleNamespace(dir=run.dir))
+
+    with pytest.raises(store.ContractError):
+        if writer == "state":
+            params._publish_json_state(fake, path, {"new": True})
+        elif writer == "log":
+            params._append_run_log(fake, path, "new\n")
+        else:
+            params._publish_lines(fake, path, ["new"])
+
+    assert path.read_bytes() == b"prior\n"
+
+
+def test_fake_context_cannot_enter_managed_scan_transaction(tmp_path):
+    run = _running(tmp_path, "sealed-fake-transaction")
+    fake = _Context(SimpleNamespace(dir=run.dir))
+    entered = []
+
+    @params._base_evidence_claimed
+    def operation(_ctx):
+        entered.append(True)
+
+    with pytest.raises(store.ContractError, match="exact Run owner"):
+        operation(fake)
+    assert entered == []

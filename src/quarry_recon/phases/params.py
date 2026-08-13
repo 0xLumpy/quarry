@@ -32,12 +32,40 @@ from ..runner_repository import RepositoryOutput
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
 
 
+def _managed_owner(ctx, path: Path | None = None):
+    """Rebind compatibility-shaped inputs to their exact repository owner.
+
+    A test double may use ordinary paths only outside a Run.  Once either its
+    declared root or a destination resolves inside a real Run, ambient fallback
+    would bypass the seal, so discovery is deliberately fail-closed.
+    """
+    if type(ctx.run) is store.Run:
+        return ctx.run
+    if path is not None:
+        managed = store.managed_run_for_artifact(path)
+        if managed is not None:
+            return managed[0]
+    root = getattr(ctx.run, "dir", None)
+    if isinstance(root, (str, os.PathLike)):
+        managed = store.managed_run_for_artifact(
+            Path(root) / "raw" / "params" / ".authority-probe",
+        )
+        if managed is not None:
+            return managed[0]
+    return None
+
+
 def _base_evidence_claimed(function):
     """Keep the base seal blocked for an in-process acquisition transaction."""
     @functools.wraps(function)
     def wrapped(ctx, *args, **kwargs):
-        if type(ctx.run) is store.Run:
-            with ctx.run.artifact_claim():
+        owner = _managed_owner(ctx)
+        if owner is not None:
+            if owner is not ctx.run:
+                raise store.ContractError(
+                    "a managed Params transaction requires its exact Run owner",
+                )
+            with owner.artifact_claim():
                 return function(ctx, *args, **kwargs)
         return function(ctx, *args, **kwargs)
     return wrapped
@@ -45,7 +73,12 @@ def _base_evidence_claimed(function):
 
 def _publish_json_state(ctx, path: Path, value) -> None:
     body = json.dumps(value).encode("utf-8")
-    if type(ctx.run) is store.Run:
+    owner = _managed_owner(ctx, path)
+    if owner is not None:
+        if owner is not ctx.run:
+            raise store.ContractError(
+                "a managed Params state write requires its exact Run owner",
+            )
         if not budget.publish_bytes(path, body, digest=hashlib.sha256(body).hexdigest()):
             raise OSError(f"could not publish state {path.name}")
     else:
@@ -54,8 +87,13 @@ def _publish_json_state(ctx, path: Path, value) -> None:
 
 def _append_run_log(ctx, path: Path, text: str) -> None:
     body = text.encode("utf-8")
-    if type(ctx.run) is store.Run:
-        ctx.run._append_base_artifact(tuple(path.relative_to(ctx.run.dir).parts), body)
+    owner = _managed_owner(ctx, path)
+    if owner is not None:
+        if owner is not ctx.run:
+            raise store.ContractError(
+                "a managed Params log write requires its exact Run owner",
+            )
+        owner._append_base_artifact(tuple(path.relative_to(owner.dir).parts), body)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as writer:
@@ -64,15 +102,20 @@ def _append_run_log(ctx, path: Path, text: str) -> None:
 
 def _publish_lines(ctx, path: Path, lines) -> None:
     """Publish a streamed UTF-8 aggregate without materializing it in RAM."""
-    if type(ctx.run) is not store.Run:
+    owner = _managed_owner(ctx, path)
+    if owner is None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as writer:
             for line in lines:
                 writer.write(line + "\n")
         return
-    components = tuple(path.relative_to(ctx.run.dir).parts)
+    if owner is not ctx.run:
+        raise store.ContractError(
+            "a managed Params aggregate requires its exact Run owner",
+        )
+    components = tuple(path.relative_to(owner.dir).parts)
     writer_fd = -1
-    with ctx.run.artifact_claim(*components) as claim:
+    with owner.artifact_claim(*components) as claim:
         try:
             writer_fd = claim.open_writer()
             for line in lines:
