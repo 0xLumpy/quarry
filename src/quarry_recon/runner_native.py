@@ -45,6 +45,13 @@ _CREATE_FILE_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
 )
+_CREATE_STAGE_FLAGS = (
+    os.O_RDWR
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 _RENAME_EXCHANGE = 2
 _CONSTRUCTOR = object()
 _MAX_POLICIES = 64
@@ -277,6 +284,53 @@ class _PublishResult:
     disposition: str
     cleanup_settled: bool = True
     fault: BaseException | None = field(default=None, repr=False)
+
+
+@dataclass(slots=True)
+class _FilePublishOwner:
+    components: tuple[str, ...]
+    temporary_name: str
+    anchor_fd: int = -1
+    parent_fd: int = -1
+    file_fd: int = -1
+    file_identity: tuple[int, int] | None = None
+    present: bool = False
+    stage: object | None = None
+
+
+@dataclass(slots=True)
+class _TreePublishOwner:
+    name: str
+    fd: int = -1
+    identity: tuple[int, int] | None = None
+    present: bool = False
+
+
+@dataclass(slots=True)
+class _PolicySettlement:
+    evidence: NativeOutputEvidence
+    name: str
+    result: _PublishResult | None = None
+    file_owner: _FilePublishOwner | None = None
+    tree_owner: _TreePublishOwner | None = None
+
+    def record(self, result: _PublishResult) -> None:
+        self.result = result
+
+
+@dataclass(slots=True)
+class _FinishLedger:
+    requested_clean: bool
+    validation_done: bool = False
+    snapshots: tuple[_Snapshot, ...] | None = None
+    validation_fault: BaseException | None = None
+    settlements: list[_PolicySettlement] = field(default_factory=list)
+    cleanup_done: bool = False
+    cleanup_settled: bool = True
+    cleanup_fault: BaseException | None = None
+    release_done: bool = False
+    release_fault: BaseException | None = None
+    cancellation: BaseException | None = None
 
 
 class NativeOutputUnsupported(RuntimeError):
@@ -1055,13 +1109,125 @@ def _fence_private_stage(run: store.Run, stage) -> bool:
             os.close(anchor)
 
 
+def _create_owned_file_stage(
+    anchor_fd: int,
+    policy: RepositoryNativeOutput,
+    owner: _FilePublishOwner,
+) -> None:
+    """Create a privfs-compatible stage while publishing every owner transition."""
+    owner.anchor_fd = privfs.open_strict_dir_at(anchor_fd, ())
+    owner.parent_fd = privfs.open_strict_dir_at(
+        owner.anchor_fd, policy.components[:-1],
+    )
+    anchor_identity = _identity(os.fstat(owner.anchor_fd))
+    parent_identity = _identity(os.fstat(owner.parent_fd))
+    owner.present = True
+    owner.file_fd = os.open(
+        owner.temporary_name,
+        _CREATE_STAGE_FLAGS,
+        privfs.FILE_MODE,
+        dir_fd=owner.parent_fd,
+    )
+    os.fchmod(owner.file_fd, privfs.FILE_MODE)
+    observed = os.fstat(owner.file_fd)
+    _validate_private_file(observed, normalize=False, fd=owner.file_fd)
+    owner.file_identity = _identity(observed)
+    os.fsync(owner.parent_fd)
+    owner.stage = privfs.PrivateFileStage(
+        anchor_fd=owner.anchor_fd,
+        parent_fd=owner.parent_fd,
+        file_fd=owner.file_fd,
+        temporary_name=owner.temporary_name,
+        destination_name=policy.components[-1],
+        components=policy.components,
+        anchor_identity=anchor_identity,
+        parent_identity=parent_identity,
+        file_identity=owner.file_identity,
+        _constructor_token=privfs._PRIVATE_STAGE_CONSTRUCTOR,
+    )
+
+
+def _close_untransferred_file_owner(owner: _FilePublishOwner) -> bool:
+    settled = True
+    for attribute in ("file_fd", "parent_fd", "anchor_fd"):
+        fd = getattr(owner, attribute)
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except BaseException:
+                settled = False
+            setattr(owner, attribute, -1)
+    return settled
+
+
+def _fence_owned_file_stage(run: store.Run, owner: _FilePublishOwner) -> bool:
+    """Fence exactly one hidden FILE stage or retain the run claim."""
+    stage = owner.stage
+    if stage is not None:
+        if stage.state in {"publishing", "replaced_uncertain"}:
+            owner.present = True
+            return False
+        if stage.state == "committed":
+            owner.present = False
+            return True
+        settled = _fence_private_stage(run, stage)
+        owner.present = not settled
+        return settled
+
+    settled = True
+    try:
+        with run._mutation(store.MutationScope.CONTROL):
+            if owner.present:
+                if owner.parent_fd < 0:
+                    anchor = store._open_run_fd(run.project_dir, run.run_id)
+                    try:
+                        owner.parent_fd = privfs.open_strict_dir_at(
+                            anchor, owner.components[:-1],
+                        )
+                    finally:
+                        os.close(anchor)
+                try:
+                    observed = os.stat(
+                        owner.temporary_name,
+                        dir_fd=owner.parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    os.fsync(owner.parent_fd)
+                    owner.present = False
+                else:
+                    if (owner.file_identity is not None
+                            and _identity(observed) != owner.file_identity):
+                        raise ContractError("native file stage identity changed")
+                    if not stat.S_ISREG(observed.st_mode):
+                        raise ContractError("native file stage type changed")
+                    os.unlink(owner.temporary_name, dir_fd=owner.parent_fd)
+                    os.fsync(owner.parent_fd)
+                    owner.present = False
+    except BaseException:
+        settled = False
+    return _close_untransferred_file_owner(owner) and settled and not owner.present
+
+
+def _create_owned_tree(parent_fd: int, owner: _TreePublishOwner) -> None:
+    """Create a pre-named tree candidate into its mutable ownership ledger."""
+    owner.present = True
+    os.mkdir(owner.name, privfs.DIR_MODE, dir_fd=parent_fd)
+    owner.fd = os.open(owner.name, _DIR_FLAGS, dir_fd=parent_fd)
+    os.fchmod(owner.fd, privfs.DIR_MODE)
+    observed = os.fstat(owner.fd)
+    _validate_private_dir(observed, normalize=False, fd=owner.fd)
+    owner.identity = _identity(observed)
+    os.fsync(parent_fd)
+
+
 class NativeOutputTransaction:
     """One durable claim spanning private native output staging and publication."""
 
     __slots__ = (
         "run", "policies", "rewritten_cmd", "_base_fd", "_root_fd",
         "_root_name", "_root_identity", "_root_present", "_claim_name",
-        "_claim_identity", "_claim_present", "_receipt",
+        "_claim_identity", "_claim_present", "_receipt", "_finish_ledger",
         "_stage_names", "_constructor_token",
     )
 
@@ -1094,6 +1260,7 @@ class NativeOutputTransaction:
         self._claim_identity = claim_identity
         self._claim_present = True
         self._receipt = None
+        self._finish_ledger = None
         self._stage_names = stage_names
         self._constructor_token = _constructor_token
 
@@ -1146,10 +1313,23 @@ class NativeOutputTransaction:
         self._validate_root()
         return os.open(name, _FILE_FLAGS, dir_fd=self._root_fd)
 
-    def _publish_file(self, policy: RepositoryNativeOutput, snapshot: _Snapshot, name: str) -> _PublishResult:
+    def _publish_file(
+        self,
+        policy: RepositoryNativeOutput,
+        snapshot: _Snapshot,
+        name: str,
+        settlement: _PolicySettlement,
+    ) -> None:
         if not snapshot.evidence.present:
-            return self._publish_file_absence(policy)
-        stage = None
+            settlement.record(self._publish_file_absence(policy))
+            return
+        owner = settlement.file_owner
+        if owner is None:
+            owner = _FilePublishOwner(
+                policy.components,
+                f".quarry-native-file-{os.urandom(16).hex()}.stage",
+            )
+            settlement.file_owner = owner
         source = -1
         fault = None
         disposition = "unpublished"
@@ -1162,9 +1342,12 @@ class NativeOutputTransaction:
                 self.run._ensure_artifact_parent(policy.components)
                 anchor = store._open_run_fd(self.run.project_dir, self.run.run_id)
                 try:
-                    stage = privfs.create_private_stage(anchor, policy.components)
+                    _create_owned_file_stage(anchor, policy, owner)
                 finally:
                     os.close(anchor)
+                stage = owner.stage
+                if type(stage) is not privfs.PrivateFileStage:
+                    raise ContractError("native file stage construction did not settle")
                 digest = hashlib.sha256()
                 size = 0
                 while True:
@@ -1185,23 +1368,32 @@ class NativeOutputTransaction:
                     (snapshot.evidence.size, snapshot.evidence.sha256),
                 )
                 privfs.replace_private_stage(stage)
+                owner.present = False
             disposition = "committed"
         except privfs.PrivateReplaceCommittedWithFault as exc:
+            owner.present = False
             disposition, cleanup_settled, fault = "committed", False, exc
         except privfs.PrivateReplaceUncertain as exc:
             disposition, cleanup_settled, fault = "uncertain", False, exc
         except BaseException as exc:
             fault = exc
+            stage = owner.stage
             if stage is not None and stage.state in {"publishing", "replaced_uncertain"}:
                 disposition, cleanup_settled = "uncertain", False
             elif stage is not None and stage.state == "committed":
+                owner.present = False
                 disposition, cleanup_settled = "committed", False
             else:
-                cleanup_settled = _fence_private_stage(self.run, stage)
+                cleanup_settled = _fence_owned_file_stage(self.run, owner)
         finally:
             if source >= 0:
-                os.close(source)
-        return _PublishResult(disposition, cleanup_settled, fault)
+                try:
+                    os.close(source)
+                except BaseException as exc:
+                    cleanup_settled = False
+                    if fault is None:
+                        fault = exc
+        settlement.record(_PublishResult(disposition, cleanup_settled, fault))
 
     def _publish_file_absence(self, policy: RepositoryNativeOutput) -> _PublishResult:
         fault = None
@@ -1263,15 +1455,25 @@ class NativeOutputTransaction:
                 os.close(parent)
         return _PublishResult(disposition, cleanup_settled, fault)
 
-    def _publish_tree(self, policy: RepositoryNativeOutput, snapshot: _Snapshot, name: str) -> _PublishResult:
+    def _publish_tree(
+        self,
+        policy: RepositoryNativeOutput,
+        snapshot: _Snapshot,
+        name: str,
+        settlement: _PolicySettlement,
+    ) -> None:
         if not snapshot.evidence.present:
-            return _PublishResult("committed")
+            settlement.record(_PublishResult("committed"))
+            return
+        owner = settlement.tree_owner
+        if owner is None:
+            owner = _TreePublishOwner(
+                f".quarry-native-tree-{os.urandom(16).hex()}",
+            )
+            settlement.tree_owner = owner
         source = -1
         parent = -1
-        candidate = -1
         prior = -1
-        candidate_name = f".quarry-native-tree-{os.urandom(16).hex()}"
-        candidate_identity = None
         prior_identity = None
         action_started = False
         exchanged = False
@@ -1288,9 +1490,9 @@ class NativeOutputTransaction:
                     parent = privfs.open_strict_dir_at(anchor, policy.components[:-1])
                 finally:
                     os.close(anchor)
-                candidate, candidate_identity = _mkdir_at(parent, candidate_name)
-                _copy_tree_snapshot(source, candidate, snapshot)
-                os.fsync(candidate)
+                _create_owned_tree(parent, owner)
+                _copy_tree_snapshot(source, owner.fd, snapshot)
+                os.fsync(owner.fd)
                 try:
                     prior = privfs.open_strict_dir_at(parent, (policy.components[-1],))
                 except privfs.PrivatePathMissing:
@@ -1300,17 +1502,17 @@ class NativeOutputTransaction:
                     action_started = True
                     try:
                         _rename_exchange(
-                            parent, candidate_name, parent, policy.components[-1],
+                            parent, owner.name, parent, policy.components[-1],
                         )
                     except BaseException as exchange_error:
                         final_identity = _named_identity(parent, policy.components[-1])
-                        hidden_identity = _named_identity(parent, candidate_name)
-                        if (final_identity == candidate_identity
+                        hidden_identity = _named_identity(parent, owner.name)
+                        if (final_identity == owner.identity
                                 and hidden_identity == prior_identity):
                             exchanged = True
                             fault = exchange_error
                         elif (final_identity == prior_identity
-                                and hidden_identity == candidate_identity):
+                                and hidden_identity == owner.identity):
                             raise
                         else:
                             raise privfs.PrivateReplaceUncertain(
@@ -1319,31 +1521,33 @@ class NativeOutputTransaction:
                             ) from exchange_error
                     else:
                         exchanged = True
+                    owner.present = False
                 else:
                     action_started = True
                     try:
                         os.rename(
-                            candidate_name,
+                            owner.name,
                             policy.components[-1],
                             src_dir_fd=parent,
                             dst_dir_fd=parent,
                         )
                     except BaseException as rename_error:
                         final_identity = _named_identity(parent, policy.components[-1])
-                        hidden_identity = _named_identity(parent, candidate_name)
-                        if final_identity == candidate_identity and hidden_identity is None:
+                        hidden_identity = _named_identity(parent, owner.name)
+                        if final_identity == owner.identity and hidden_identity is None:
                             fault = rename_error
-                        elif final_identity is None and hidden_identity == candidate_identity:
+                        elif final_identity is None and hidden_identity == owner.identity:
                             raise
                         else:
                             raise privfs.PrivateReplaceUncertain(
                                 "native tree rename outcome is uncertain",
                                 components=policy.components,
                             ) from rename_error
+                    owner.present = False
                 os.fsync(parent)
                 final = privfs.open_strict_dir_at(parent, (policy.components[-1],))
                 try:
-                    if _identity(os.fstat(final)) != candidate_identity:
+                    if _identity(os.fstat(final)) != owner.identity:
                         raise ContractError("native tree final identity changed")
                     final_entries = _snapshot_tree_recursive(final, (), normalize=False)
                     if (final_entries != snapshot.entries
@@ -1356,7 +1560,7 @@ class NativeOutputTransaction:
                     try:
                         _remove_named_tree(
                             parent,
-                            candidate_name,
+                            owner.name,
                             expected_identity=prior_identity,
                         )
                     except BaseException as cleanup_error:
@@ -1368,31 +1572,35 @@ class NativeOutputTransaction:
         except BaseException as exc:
             if fault is None:
                 fault = exc
-            if action_started and parent >= 0 and candidate_identity is not None:
+            if action_started and parent >= 0 and owner.identity is not None:
                 final_identity = _named_identity(parent, policy.components[-1])
-                hidden_identity = _named_identity(parent, candidate_name)
-                if final_identity == candidate_identity:
+                hidden_identity = _named_identity(parent, owner.name)
+                if final_identity == owner.identity:
+                    owner.present = False
                     disposition, cleanup_settled = "uncertain", False
-                elif hidden_identity == candidate_identity:
+                elif hidden_identity == owner.identity:
+                    owner.present = True
                     disposition = "unpublished"
                 else:
                     disposition, cleanup_settled = "uncertain", False
-            if disposition == "unpublished" and parent >= 0 and candidate_identity is not None:
+            if disposition == "unpublished" and parent >= 0 and owner.identity is not None:
                 try:
-                    if _named_identity(parent, candidate_name) == candidate_identity:
+                    if _named_identity(parent, owner.name) == owner.identity:
                         _remove_named_tree(
-                            parent, candidate_name, expected_identity=candidate_identity,
+                            parent, owner.name, expected_identity=owner.identity,
                         )
+                        owner.present = False
                 except BaseException:
                     cleanup_settled = False
         finally:
-            for fd in (prior, candidate, parent, source):
+            for fd in (prior, owner.fd, parent, source):
                 if fd >= 0:
                     try:
                         os.close(fd)
                     except OSError:
                         cleanup_settled = False
-        return _PublishResult(disposition, cleanup_settled, fault)
+            owner.fd = -1
+        settlement.record(_PublishResult(disposition, cleanup_settled, fault))
 
     def _cleanup_attempt(self) -> tuple[bool, BaseException | None]:
         fault = None
@@ -1496,111 +1704,257 @@ class NativeOutputTransaction:
         except BaseException as exc:
             return self._reconcile_claim_boundary(), exc
 
+    def _recover_publish_escape(
+        self,
+        policy: RepositoryNativeOutput,
+        settlement: _PolicySettlement,
+        fault: BaseException,
+    ) -> None:
+        """Convert an escaped publisher boundary into one conservative fact."""
+        if settlement.result is not None:
+            return
+        if policy.kind is NativeOutputKind.FILE:
+            owner = settlement.file_owner
+            if owner is None:
+                settlement.record(_PublishResult("unpublished", True, fault))
+                return
+            stage = owner.stage
+            if stage is not None and stage.state == "committed":
+                owner.present = False
+                settlement.record(_PublishResult("committed", False, fault))
+            elif stage is not None and stage.state in {
+                "publishing", "replaced_uncertain",
+            }:
+                settlement.record(_PublishResult("uncertain", False, fault))
+            else:
+                settled = _fence_owned_file_stage(self.run, owner)
+                settlement.record(_PublishResult("unpublished", settled, fault))
+            return
+
+        owner = settlement.tree_owner
+        if owner is None:
+            settlement.record(_PublishResult("unpublished", True, fault))
+            return
+        parent = -1
+        try:
+            with self.run._mutation(store.MutationScope.CONTROL):
+                anchor = store._open_run_fd(self.run.project_dir, self.run.run_id)
+                try:
+                    parent = privfs.open_strict_dir_at(
+                        anchor, policy.components[:-1],
+                    )
+                finally:
+                    os.close(anchor)
+                if owner.identity is None and owner.fd >= 0:
+                    owner.identity = _identity(os.fstat(owner.fd))
+                final_identity = _named_identity(parent, policy.components[-1])
+                hidden_identity = _named_identity(parent, owner.name)
+                if owner.identity is None and hidden_identity is not None:
+                    hidden = os.open(owner.name, _DIR_FLAGS, dir_fd=parent)
+                    try:
+                        observed = os.fstat(hidden)
+                        _validate_private_dir(observed, normalize=True, fd=hidden)
+                        owner.identity = _identity(observed)
+                    finally:
+                        os.close(hidden)
+                    hidden_identity = owner.identity
+                if owner.identity is not None and final_identity == owner.identity:
+                    owner.present = False
+                    settlement.record(_PublishResult("uncertain", False, fault))
+                elif owner.identity is not None and hidden_identity == owner.identity:
+                    _remove_named_tree(
+                        parent, owner.name, expected_identity=owner.identity,
+                    )
+                    owner.present = False
+                    settlement.record(_PublishResult("unpublished", True, fault))
+                elif final_identity is None and hidden_identity is None:
+                    owner.present = False
+                    settlement.record(_PublishResult("unpublished", True, fault))
+                else:
+                    settlement.record(_PublishResult("uncertain", False, fault))
+        except BaseException:
+            settlement.record(_PublishResult("uncertain", False, fault))
+        finally:
+            if parent >= 0:
+                try:
+                    os.close(parent)
+                except BaseException:
+                    result = settlement.result
+                    if result is not None:
+                        settlement.record(_PublishResult(
+                            result.disposition, False, result.fault or fault,
+                        ))
+
+    def _store_receipt(
+        self,
+        receipt: NativeOutputReceipt,
+    ) -> None:
+        self._receipt = receipt
+
     def finish(self, *, clean: bool) -> NativeOutputReceipt:
-        """Fence or publish this attempt and return its exact terminal partition."""
+        """Resume, fence or publish this attempt and return its exact partition."""
         if type(clean) is not bool:
             raise TypeError("native output completion must be an exact boolean")
         if self._receipt is not None:
             return self._receipt
+        ledger = self._finish_ledger
+        if ledger is None:
+            ledger = _FinishLedger(clean)
+            self._finish_ledger = ledger
 
-        committed: list[NativeOutputEvidence] = []
-        uncertain: list[NativeOutputEvidence] = []
-        unpublished: list[NativeOutputEvidence] = []
-        cleanup_settled = True
-        fault_operation = None
-        fault = None
-        cancellation = None
-        snapshots: tuple[_Snapshot, ...] | None = None
-
-        if not clean:
-            unpublished.extend(
-                _default_evidence(index, policy)
-                for index, policy in enumerate(self.policies)
-            )
-            fault_operation = "execute"
-        else:
-            try:
-                snapshots = self._snapshots()
-            except BaseException as exc:
-                fault = exc
-                if not isinstance(exc, Exception):
-                    cancellation = exc
-                fault_operation = "validate"
-                unpublished.extend(
-                    _default_evidence(index, policy)
+        if not ledger.validation_done:
+            if not ledger.requested_clean:
+                ledger.settlements = [
+                    _PolicySettlement(
+                        _default_evidence(index, policy),
+                        self._stage_names[index],
+                        result=_PublishResult("unpublished"),
+                    )
                     for index, policy in enumerate(self.policies)
-                )
-
-        if snapshots is not None:
-            stopped = False
-            for index, (policy, snapshot, name) in enumerate(zip(
-                self.policies, snapshots, self._stage_names,
-            )):
-                if stopped:
-                    unpublished.append(snapshot.evidence)
-                    continue
-                result = (
-                    self._publish_file(policy, snapshot, name)
-                    if policy.kind is NativeOutputKind.FILE
-                    else self._publish_tree(policy, snapshot, name)
-                )
-                if result.disposition == "committed":
-                    committed.append(snapshot.evidence)
-                elif result.disposition == "uncertain":
-                    uncertain.append(snapshot.evidence)
-                    stopped = True
+                ]
+                ledger.validation_done = True
+            else:
+                try:
+                    snapshots = self._snapshots()
+                except BaseException as exc:
+                    ledger.validation_fault = exc
+                    ledger.cancellation = (
+                        exc if not isinstance(exc, Exception) else None
+                    )
+                    ledger.settlements = [
+                        _PolicySettlement(
+                            _default_evidence(index, policy),
+                            self._stage_names[index],
+                            result=_PublishResult("unpublished"),
+                        )
+                        for index, policy in enumerate(self.policies)
+                    ]
                 else:
-                    unpublished.append(snapshot.evidence)
-                    stopped = True
-                if result.fault is not None:
-                    fault = fault or result.fault
-                    fault_operation = "publish"
-                    if not isinstance(result.fault, Exception):
-                        cancellation = cancellation or result.fault
-                cleanup_settled &= result.cleanup_settled
+                    ledger.snapshots = snapshots
+                    ledger.settlements = [
+                        _PolicySettlement(snapshot.evidence, name)
+                        for snapshot, name in zip(snapshots, self._stage_names)
+                    ]
+                ledger.validation_done = True
 
-        try:
-            attempt_settled, cleanup_fault = self._cleanup_attempt()
-        except BaseException as exc:
-            attempt_settled = self._reconcile_attempt_absence()
-            cleanup_fault = exc
-        cleanup_settled &= attempt_settled
-        if cleanup_fault is not None:
-            fault = fault or cleanup_fault
-            fault_operation = fault_operation or "cleanup"
-            if not isinstance(cleanup_fault, Exception):
-                cancellation = cancellation or cleanup_fault
+        stopped = False
+        if ledger.snapshots is not None:
+            for policy, snapshot, settlement in zip(
+                self.policies, ledger.snapshots, ledger.settlements,
+            ):
+                if settlement.result is not None:
+                    stopped |= settlement.result.disposition != "committed"
+                    continue
+                if stopped:
+                    settlement.record(_PublishResult("unpublished"))
+                    continue
+                try:
+                    if policy.kind is NativeOutputKind.FILE:
+                        self._publish_file(
+                            policy, snapshot, settlement.name, settlement,
+                        )
+                    else:
+                        self._publish_tree(
+                            policy, snapshot, settlement.name, settlement,
+                        )
+                except BaseException as exc:
+                    self._recover_publish_escape(policy, settlement, exc)
+                result = settlement.result
+                if result is None:
+                    result = _PublishResult(
+                        "uncertain", False,
+                        ContractError("native publisher did not settle"),
+                    )
+                    settlement.record(result)
+                if result.fault is not None and not isinstance(result.fault, Exception):
+                    ledger.cancellation = ledger.cancellation or result.fault
+                stopped |= result.disposition != "committed"
 
-        claim_retained = bool(uncertain) or not cleanup_settled
-        if not claim_retained:
+        if not ledger.cleanup_done:
+            try:
+                attempt_settled, cleanup_fault = self._cleanup_attempt()
+            except BaseException as exc:
+                attempt_settled = self._reconcile_attempt_absence()
+                cleanup_fault = exc
+            ledger.cleanup_settled = attempt_settled
+            ledger.cleanup_fault = cleanup_fault
+            ledger.cleanup_done = True
+            if cleanup_fault is not None and not isinstance(cleanup_fault, Exception):
+                ledger.cancellation = ledger.cancellation or cleanup_fault
+
+        results = tuple(
+            settlement.result or _PublishResult(
+                "uncertain", False,
+                ContractError("native output lacks a terminal settlement"),
+            )
+            for settlement in ledger.settlements
+        )
+        publications_settled = (
+            all(result.cleanup_settled for result in results)
+            and not any(result.disposition == "uncertain" for result in results)
+        )
+        if ledger.cleanup_settled and publications_settled and not ledger.release_done:
             try:
                 released, release_fault = self._release_claim()
             except BaseException as exc:
                 released = self._reconcile_claim_boundary()
                 release_fault = exc
-            cleanup_settled &= released
-            claim_retained = self._claim_present or not released
-            if release_fault is not None:
-                fault = fault or release_fault
-                fault_operation = fault_operation or "release"
-                if not isinstance(release_fault, Exception):
-                    cancellation = cancellation or release_fault
+            ledger.release_done = released
+            ledger.release_fault = release_fault
+            if release_fault is not None and not isinstance(release_fault, Exception):
+                ledger.cancellation = ledger.cancellation or release_fault
 
-        if not cleanup_settled and fault_operation is None:
-            fault_operation = "cleanup"
+        committed = tuple(
+            settlement.evidence
+            for settlement, result in zip(ledger.settlements, results)
+            if result.disposition == "committed"
+        )
+        uncertain = tuple(
+            settlement.evidence
+            for settlement, result in zip(ledger.settlements, results)
+            if result.disposition == "uncertain"
+        )
+        unpublished = tuple(
+            settlement.evidence
+            for settlement, result in zip(ledger.settlements, results)
+            if result.disposition == "unpublished"
+        )
+        publication_fault = next(
+            (result.fault for result in results if result.fault is not None),
+            None,
+        )
+        if ledger.validation_fault is not None:
+            fault_operation, fault = "validate", ledger.validation_fault
+        elif publication_fault is not None:
+            fault_operation, fault = "publish", publication_fault
+        elif ledger.cleanup_fault is not None:
+            fault_operation, fault = "cleanup", ledger.cleanup_fault
+        elif ledger.release_fault is not None:
+            fault_operation, fault = "release", ledger.release_fault
+        elif not ledger.requested_clean:
+            fault_operation, fault = "execute", None
+        else:
+            fault_operation, fault = None, None
+        claim_retained = self._claim_present or not ledger.release_done
+        cleanup_settled = (
+            ledger.cleanup_settled
+            and all(result.cleanup_settled for result in results)
+            and ledger.release_done
+            and not claim_retained
+        )
         receipt = NativeOutputReceipt(
             policy_count=len(self.policies),
-            committed=tuple(committed),
-            uncertain=tuple(uncertain),
-            unpublished=tuple(unpublished),
+            committed=committed,
+            uncertain=uncertain,
+            unpublished=unpublished,
             cleanup_settled=cleanup_settled,
             claim_retained=claim_retained,
             fault_operation=fault_operation,
             fault_type=None if fault is None else type(fault).__name__,
         )
-        self._receipt = receipt
-        if cancellation is not None:
-            raise cancellation
+        self._store_receipt(receipt)
+        if ledger.cancellation is not None:
+            raise ledger.cancellation
         return receipt
 
 

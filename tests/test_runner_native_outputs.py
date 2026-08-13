@@ -792,3 +792,113 @@ def test_finish_reconciles_interruption_after_claim_release(
     assert receipt.fault_type == interruption.__name__
     assert run._live_artifact_claim_count() == 0
     assert _attempt_directories(run) == []
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_file_publish_create_boundary_leaves_no_unowned_hidden_stage(
+    tmp_path, monkeypatch, interruption,
+):
+    run = _running_run(tmp_path, f"native-file-owner-{interruption.__name__.lower()}")
+    final = run.dir / "raw" / "probe" / "nuclei.jsonl"
+    policy = RepositoryNativeOutput.file(3, "raw", "probe", "nuclei.jsonl")
+    transaction = prepare_native_outputs(
+        run,
+        _python_command(
+            "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('new')",
+            final,
+        ),
+        (policy,),
+    )
+    _run_child(transaction)
+    real_create = runner_native._create_owned_file_stage
+
+    def create_then_interrupt(*arguments):
+        real_create(*arguments)
+        raise interruption("fixture file-stage boundary")
+
+    monkeypatch.setattr(
+        runner_native, "_create_owned_file_stage", create_then_interrupt,
+    )
+    with pytest.raises(interruption, match="fixture file-stage boundary"):
+        transaction.finish(clean=True)
+
+    receipt = transaction.finish(clean=False)
+    assert not receipt.clean and len(receipt.unpublished) == 1
+    assert not receipt.claim_retained and receipt.cleanup_settled
+    assert not final.exists()
+    parent = run.dir / "raw" / "probe"
+    assert not any(path.name.startswith(".quarry-native-file-")
+                   for path in parent.iterdir())
+    assert run._live_artifact_claim_count() == 0
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_tree_publish_create_boundary_leaves_no_unowned_hidden_stage(
+    tmp_path, monkeypatch, interruption,
+):
+    run = _running_run(tmp_path, f"native-tree-owner-{interruption.__name__.lower()}")
+    final = run.dir / "raw" / "crawl" / "gowitness"
+    policy = RepositoryNativeOutput.tree(
+        ((3, ()),), "raw", "crawl", "gowitness",
+    )
+    transaction = prepare_native_outputs(
+        run,
+        _python_command(
+            "from pathlib import Path; import sys; "
+            "(Path(sys.argv[1])/'shot').write_text('new')",
+            final,
+        ),
+        (policy,),
+    )
+    _run_child(transaction)
+    real_create = runner_native._create_owned_tree
+
+    def create_then_interrupt(*arguments):
+        real_create(*arguments)
+        raise interruption("fixture tree-stage boundary")
+
+    monkeypatch.setattr(runner_native, "_create_owned_tree", create_then_interrupt)
+    with pytest.raises(interruption, match="fixture tree-stage boundary"):
+        transaction.finish(clean=True)
+
+    receipt = transaction.finish(clean=False)
+    assert not receipt.clean and len(receipt.unpublished) == 1
+    assert not receipt.claim_retained and receipt.cleanup_settled
+    assert not final.exists()
+    parent = run.dir / "raw" / "crawl"
+    assert not any(path.name.startswith(".quarry-native-tree-")
+                   for path in parent.iterdir())
+    assert run._live_artifact_claim_count() == 0
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_terminal_receipt_boundary_cannot_relabel_committed_output(
+    tmp_path, monkeypatch, interruption,
+):
+    run = _running_run(tmp_path, f"native-receipt-{interruption.__name__.lower()}")
+    final = run.dir / "raw" / "probe" / "nuclei.jsonl"
+    policy = RepositoryNativeOutput.file(3, "raw", "probe", "nuclei.jsonl")
+    transaction = prepare_native_outputs(
+        run,
+        _python_command(
+            "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('new')",
+            final,
+        ),
+        (policy,),
+    )
+    _run_child(transaction)
+    real_store = NativeOutputTransaction._store_receipt
+
+    def store_then_interrupt(*arguments):
+        real_store(*arguments)
+        raise interruption("fixture receipt boundary")
+
+    monkeypatch.setattr(NativeOutputTransaction, "_store_receipt", store_then_interrupt)
+    with pytest.raises(interruption, match="fixture receipt boundary"):
+        transaction.finish(clean=True)
+
+    receipt = transaction.finish(clean=False)
+    assert receipt.clean and len(receipt.committed) == 1
+    assert not receipt.uncertain and not receipt.unpublished
+    assert final.read_text() == "new"
+    assert run._live_artifact_claim_count() == 0
