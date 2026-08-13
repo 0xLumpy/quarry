@@ -37,6 +37,7 @@ class FakeDirectContainment:
         )
         self.bind_proofs = []
         self.settlement_deadlines = []
+        self.close_calls = 0
         self.terminal = False
 
     def bind_parked_process(self, proof):
@@ -71,6 +72,13 @@ class FakeDirectContainment:
         )
         return result
 
+    def close(self):
+        self.close_calls += 1
+        self._controller.events.append(("close", None))
+        if self._controller.close_exception is not None:
+            raise self._controller.close_exception
+        self.terminal = True
+
 
 class FakeDirectContainmentFactory:
     """Configurable acquisition seam with durable call-order observations."""
@@ -85,6 +93,7 @@ class FakeDirectContainmentFactory:
         self.bind_result = None
         self.settlement_exception = None
         self.settlement_result = None
+        self.close_exception = None
         self.acquire_calls = []
         self.handles = []
         self.events = []

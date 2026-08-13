@@ -536,7 +536,10 @@ def test_parent_acquires_binds_then_commands_exact_direct_containment(
     handle = fake_direct_containment.handle
     assert outcome.reason is supervisor.BootstrapReason.ABORTED
     assert fake_direct_containment.acquire_calls == [request.request_id]
-    assert [event for event, _value in fake_direct_containment.events] == [
+    assert [
+        event for event, _value in fake_direct_containment.events
+        if event != "close"
+    ] == [
         "acquire", "spawn", "bind", "command_observed", "settle",
     ]
     assert len(proof_box) == 1
@@ -671,10 +674,14 @@ def test_containment_settlement_must_be_exact_before_aborted_outcome(
     handle = fake_direct_containment.handle
     assert outcome.abort_command_sent is True
     assert outcome.worker_reaped
-    assert outcome.reason is not supervisor.BootstrapReason.ABORTED
+    assert outcome.reason is supervisor.BootstrapReason.CONTROL_FAILED
     assert not outcome.transaction_complete
     assert len(handle.settlement_deadlines) == 1
-    assert handle.terminal is False
+    assert handle.close_calls == 1
+    assert handle.terminal is True
+    assert [event for event, _value in fake_direct_containment.events[-2:]] == [
+        "settle", "close",
+    ]
 
 
 def test_containment_settlement_uses_trusted_real_monotonic_deadline(
