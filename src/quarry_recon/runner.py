@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
@@ -1286,6 +1286,155 @@ def _repository_run_result(
     )
 
 
+def _native_evidence_meta(evidence) -> dict:
+    """Render one authenticated native-output fact without exposing a stage path."""
+    return {
+        "policy_index": evidence.policy_index,
+        "kind": evidence.kind.value,
+        "components": list(evidence.components),
+        "present": evidence.present,
+        "size": evidence.size,
+        "sha256": evidence.sha256,
+    }
+
+
+def _attach_native_output_receipt(
+    result: RunResult,
+    repository,
+    receipt,
+) -> RunResult:
+    """Compose native argv publication into the public compatibility result."""
+    groups = {
+        "committed": receipt.committed,
+        "uncertain": receipt.uncertain,
+        "unpublished": receipt.unpublished,
+    }
+    current_paths = tuple(
+        os.path.abspath(os.path.normpath(str(
+            repository.dir.joinpath(*evidence.components)
+        )))
+        for evidence in receipt.committed
+        if evidence.present
+    )
+    result.meta["native_outputs"] = {
+        "clean": receipt.clean,
+        "policy_count": receipt.policy_count,
+        "committed": [_native_evidence_meta(item) for item in groups["committed"]],
+        "uncertain": [_native_evidence_meta(item) for item in groups["uncertain"]],
+        "unpublished": [_native_evidence_meta(item) for item in groups["unpublished"]],
+        "current_paths": list(current_paths),
+        "cleanup_settled": receipt.cleanup_settled,
+        "claim_retained": receipt.claim_retained,
+        "fault_operation": receipt.fault_operation,
+        "fault_type": receipt.fault_type,
+    }
+    ownership_settled = receipt.cleanup_settled and not receipt.claim_retained
+    result.meta["native_output_ownership_settled"] = ownership_settled
+    result.meta["repository_ownership_settled"] = bool(
+        result.meta.get("repository_ownership_settled") and ownership_settled
+    )
+    if not receipt.clean:
+        detail = (
+            "native output publication did not complete cleanly"
+            + (f" ({receipt.fault_operation})" if receipt.fault_operation else "")
+        )
+        faults = result.meta.setdefault("faults", [])
+        faults.append(Fault("publication", where=result.tool, detail=detail).to_dict())
+        if result.status in (Status.SUCCESS, Status.EMPTY):
+            result.status = Status.PARTIAL
+            result.note = (result.note + "; " if result.note else "") + detail
+    return result
+
+
+def _mark_native_outputs_unavailable(
+    result: RunResult,
+    policy_count: int,
+    *,
+    operation: str,
+    fault_type: str | None = None,
+    ownership_settled: bool,
+) -> RunResult:
+    """Prevent adapters from mistaking preserved finals for this invocation."""
+    result.meta["native_outputs"] = {
+        "clean": False,
+        "policy_count": policy_count,
+        "committed": [],
+        "uncertain": [],
+        "unpublished": [],
+        "current_paths": [],
+        "cleanup_settled": ownership_settled,
+        "claim_retained": not ownership_settled,
+        "fault_operation": operation,
+        "fault_type": fault_type,
+    }
+    result.meta["native_output_ownership_settled"] = ownership_settled
+    if "repository_ownership_settled" in result.meta:
+        result.meta["repository_ownership_settled"] = bool(
+            result.meta["repository_ownership_settled"] and ownership_settled
+        )
+    return result
+
+
+def _preferred_native_fault(*faults):
+    """The first cancellation, else the first ordinary settlement fault."""
+    for fault in faults:
+        if fault is not None and not isinstance(fault, Exception):
+            return fault
+    return next((fault for fault in faults if fault is not None), None)
+
+
+def _fence_native_adoption(adoption):
+    """Reconcile an adopted prepare/transaction without throwing its fault."""
+    try:
+        return adoption.fence(), None
+    except BaseException as primary:
+        try:
+            receipt = adoption.fence()
+            recovery = None
+        except BaseException as recovery:
+            receipt = None
+        return receipt, _preferred_native_fault(primary, recovery)
+
+
+def _finish_native_outputs(transaction, adoption, *, clean: bool):
+    """Publish/fence, recovering terminal truth through the adoption owner."""
+    try:
+        return transaction.finish(clean=clean), None
+    except BaseException as primary:
+        receipt, recovery = _fence_native_adoption(adoption)
+        return receipt, _preferred_native_fault(primary, recovery)
+
+
+def _native_execution_clean(outcome, request) -> bool:
+    """Whether process settlement, containment and accepted exit are clean."""
+    from .runner_protocol import ExecutionTerminal
+
+    settlement = outcome.execution.settlement
+    return bool(
+        outcome.clean
+        and settlement is not None
+        and settlement.terminal is ExecutionTerminal.COMPLETE
+        and settlement.exit_code in request.ok_codes
+    )
+
+
+def native_output_current(result: RunResult, path) -> bool:
+    """Whether ``path`` is authenticated as current by this invocation's receipt.
+
+    Results supplied by legacy test doubles have no native receipt and retain the
+    old adapter behavior.  A real native-output facade result always carries the
+    key, including on fencing and publication faults, so production consumers
+    never infer currency from the ambient final path.
+    """
+    native = result.meta.get("native_outputs")
+    if native is None:
+        return True
+    if type(native) is not dict or type(native.get("current_paths")) is not list:
+        return False
+    candidate = os.path.abspath(os.path.normpath(os.fspath(path)))
+    return candidate in native["current_paths"]
+
+
 def _run_with_repository(
     tool,
     cmd,
@@ -1293,6 +1442,7 @@ def _run_with_repository(
     repository,
     stdout,
     stderr,
+    native_outputs,
     timeout,
     stdin_data,
     input_file,
@@ -1302,19 +1452,31 @@ def _run_with_repository(
     max_output_bytes,
 ) -> RunResult:
     """Normalize once, then delegate all execution publication authority."""
-    from . import runner_protocol, runner_repository, store
+    from . import runner_native, runner_protocol, runner_repository, store
     from .osint import OsintSession
 
     safe_cmd, argv_error = _preflight_argv(cmd)
     if argv_error is not None:
         return _preflight_failure(tool, safe_cmd, argv_error)
+
+    def preflight_failure(detail: str) -> RunResult:
+        failed = _preflight_failure(tool, safe_cmd, detail)
+        if type(native_outputs) is tuple and native_outputs:
+            _mark_native_outputs_unavailable(
+                failed, len(native_outputs), operation="validate",
+                ownership_settled=True,
+            )
+        return failed
+
     if type(repository) not in (store.Run, OsintSession):
-        return _preflight_failure(tool, safe_cmd, "repository authority type is invalid")
+        return preflight_failure("repository authority type is invalid")
     if (type(stdout) is not runner_repository.RepositoryOutput
             or type(stderr) is not runner_repository.RepositoryOutput):
-        return _preflight_failure(
-            tool, safe_cmd, "stdout and stderr require explicit repository policies",
-        )
+        return preflight_failure("stdout and stderr require explicit repository policies")
+    if type(native_outputs) is not tuple:
+        return preflight_failure("native outputs require an exact tuple")
+    if native_outputs and type(repository) is not store.Run:
+        return preflight_failure("native outputs require Run ownership")
 
     if type(repository) is store.Run:
         raw_path = runner_repository._expected_output_path(repository, stdout)
@@ -1343,35 +1505,49 @@ def _run_with_repository(
             max_output_bytes=max_output_bytes,
         )
     except (TypeError, ValueError) as exc:
-        return _preflight_failure(tool, safe_cmd, f"typed invocation rejected ({type(exc).__name__})")
+        return preflight_failure(f"typed invocation rejected ({type(exc).__name__})")
+
+    if native_outputs:
+        try:
+            runner_native._validate_prepare_inputs(repository, safe_cmd, native_outputs)
+        except (TypeError, ValueError) as exc:
+            return preflight_failure(
+                f"native output policy rejected ({type(exc).__name__})"
+            )
 
     if not have(safe_cmd[0]):
-        return RunResult(
+        missing = RunResult(
             tool, safe_cmd, Status.SKIPPED, None, 0.0, None, 0,
             note=f"{safe_cmd[0]} not on PATH", meta={"started": False},
         )
+        if native_outputs:
+            _mark_native_outputs_unavailable(
+                missing, len(native_outputs), operation="execute",
+                ownership_settled=True,
+            )
+        return missing
 
     started_at = time.monotonic()
     deadline = ((1 << 53) - 1 if invocation.worker.timeout == 0
                 else started_at + float(invocation.worker.timeout) + 5.0)
-    try:
+    def supervise(current_invocation):
         supervisor = (
             runner_repository.supervise_repository_execution
             if type(repository) is store.Run
             else runner_repository.supervise_osint_execution
         )
-        outcome = supervisor(
-            repository, invocation, stdout=stdout, stderr=stderr, deadline=deadline,
+        return supervisor(
+            repository, current_invocation,
+            stdout=stdout, stderr=stderr, deadline=deadline,
         )
-    except BaseException as exc:
-        if not isinstance(exc, Exception):
-            raise
+
+    def machinery_failure(exc, *, started=False):
         return RunResult(
             tool, safe_cmd, Status.FAILED, None,
             round(time.monotonic() - started_at, 3), None, 0,
             note=f"repository execution failed ({type(exc).__name__})",
             meta={
-                "started": False,
+                "started": started,
                 "faults": [Fault(
                     "machinery", where=tool,
                     detail=f"repository execution failed ({type(exc).__name__})",
@@ -1379,17 +1555,118 @@ def _run_with_repository(
             },
         )
 
-    return _repository_run_result(
-        tool,
-        safe_cmd,
-        outcome,
-        request=invocation.worker,
-        stdout=stdout,
-        stderr=stderr,
-        stdout_path=raw_path,
-        stderr_path=stderr_path,
-        duration=time.monotonic() - started_at,
+    if not native_outputs:
+        try:
+            outcome = supervise(invocation)
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            return machinery_failure(exc)
+        return _repository_run_result(
+            tool,
+            safe_cmd,
+            outcome,
+            request=invocation.worker,
+            stdout=stdout,
+            stderr=stderr,
+            stdout_path=raw_path,
+            stderr_path=stderr_path,
+            duration=time.monotonic() - started_at,
+        )
+
+    adoption = runner_native.NativeOutputAdoption()
+    try:
+        transaction = runner_native.prepare_native_outputs(
+            repository, safe_cmd, native_outputs, adoption=adoption,
+        )
+    except BaseException as primary:
+        receipt, recovery = _fence_native_adoption(adoption)
+        fault = _preferred_native_fault(primary, recovery)
+        failed = machinery_failure(primary)
+        if receipt is not None:
+            _attach_native_output_receipt(failed, repository, receipt)
+        else:
+            _mark_native_outputs_unavailable(
+                failed, len(native_outputs), operation="cleanup",
+                fault_type=type(fault).__name__, ownership_settled=False,
+            )
+        if fault is not None and not isinstance(fault, Exception):
+            raise fault
+        return failed
+
+    result = None
+    operation_fault = None
+    finish_fault = None
+    receipt = None
+    try:
+        child_invocation = replace(
+            invocation,
+            worker=replace(invocation.worker, argv=transaction.rewritten_cmd),
+        )
+        outcome = supervise(child_invocation)
+        result = _repository_run_result(
+            tool,
+            safe_cmd,
+            outcome,
+            request=invocation.worker,
+            stdout=stdout,
+            stderr=stderr,
+            stdout_path=raw_path,
+            stderr_path=stderr_path,
+            duration=time.monotonic() - started_at,
+        )
+        receipt, finish_fault = _finish_native_outputs(
+            transaction, adoption,
+            clean=_native_execution_clean(outcome, invocation.worker),
+        )
+    except BaseException as exc:
+        operation_fault = exc
+    finally:
+        recovered_receipt, recovery_fault = _fence_native_adoption(adoption)
+        if receipt is None:
+            receipt = recovered_receipt
+
+    fault = _preferred_native_fault(
+        operation_fault, finish_fault, recovery_fault,
     )
+    if result is None:
+        failed = machinery_failure(fault or RuntimeError("native execution did not settle"))
+        if receipt is not None:
+            _attach_native_output_receipt(failed, repository, receipt)
+        else:
+            _mark_native_outputs_unavailable(
+                failed, len(native_outputs), operation="cleanup",
+                fault_type=None if fault is None else type(fault).__name__,
+                ownership_settled=False,
+            )
+        if fault is not None and not isinstance(fault, Exception):
+            raise fault
+        return failed
+
+    if receipt is not None:
+        _attach_native_output_receipt(result, repository, receipt)
+    else:
+        _mark_native_outputs_unavailable(
+            result, len(native_outputs), operation="cleanup",
+            fault_type=None if fault is None else type(fault).__name__,
+            ownership_settled=False,
+        )
+        if result.status in (Status.SUCCESS, Status.EMPTY):
+            result.status = Status.PARTIAL
+            result.note = (
+                result.note + "; " if result.note else ""
+            ) + "native output settlement did not return a receipt"
+    if fault is not None and isinstance(fault, Exception):
+        detail = f"native output settlement raised {type(fault).__name__}"
+        result.meta.setdefault("faults", []).append(
+            Fault("publication", where=tool, detail=detail).to_dict()
+        )
+        if result.status in (Status.SUCCESS, Status.EMPTY):
+            result.status = Status.PARTIAL
+            result.note = (result.note + "; " if result.note else "") + detail
+    if fault is not None and not isinstance(fault, Exception):
+        raise fault
+    return result
 
 
 def run(
@@ -1399,6 +1676,7 @@ def run(
     repository=_REPOSITORY_POLICY_UNSET,
     stdout=_REPOSITORY_POLICY_UNSET,
     stderr=_REPOSITORY_POLICY_UNSET,
+    native_outputs=(),
     raw_path: Path | None = None,
     timeout: int = 1800,
     stdin_data: str | None = None,
@@ -1416,7 +1694,11 @@ def run(
     a managed run artifact can no longer reach the legacy publisher.
     """
     policies = (repository, stdout, stderr)
-    explicit = any(value is not _REPOSITORY_POLICY_UNSET for value in policies)
+    explicit = (
+        any(value is not _REPOSITORY_POLICY_UNSET for value in policies)
+        or type(native_outputs) is not tuple
+        or bool(native_outputs)
+    )
     if explicit:
         safe_cmd, _error = _preflight_argv(cmd)
         if any(value is _REPOSITORY_POLICY_UNSET for value in policies):
@@ -1433,6 +1715,7 @@ def run(
             repository=repository,
             stdout=stdout,
             stderr=stderr,
+            native_outputs=native_outputs,
             timeout=timeout,
             stdin_data=stdin_data,
             input_file=input_file,

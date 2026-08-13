@@ -1136,6 +1136,7 @@ def registered(source_id: str) -> bool:
 
 
 def run_contract(source_id, cmd, *, repository=None, stdout=None, stderr=None,
+                 native_outputs=(),
                  input_total=None, env=None, reclassify=None, work_unit=None,
                  parent_id=None, scope_distance=None, discovery_context=None,
                  **run_kwargs):
@@ -1167,7 +1168,7 @@ def run_contract(source_id, cmd, *, repository=None, stdout=None, stderr=None,
     try:
         res = _run(
             tool, cmd, repository=repository, stdout=stdout, stderr=stderr,
-            env=env, **run_kwargs,
+            native_outputs=native_outputs, env=env, **run_kwargs,
         )
         if reclassify is not None:
             res = reclassify(res)                           # file-output adapter → FINAL status on the terminal event
