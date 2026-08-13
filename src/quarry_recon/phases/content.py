@@ -108,7 +108,7 @@ def _run_one(ctx, url, wl, wl_digest, mc, recurse, ct_to, out, prof):
         "content.ffuf", cmd,
         repository=ctx.run,
         stdout=RepositoryOutput.discard(),
-        stderr=RepositoryOutput.publish_path(ctx.run, errf),
+        stderr=RepositoryOutput.publish(*errf.relative_to(ctx.run.dir).parts),
         work_unit=wu, timeout=hard,
         reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ct_to or None),
     )

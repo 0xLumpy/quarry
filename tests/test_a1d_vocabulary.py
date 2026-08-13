@@ -21,6 +21,16 @@ from test_crawl_fetch_lanes import _Ctx, TestXnLinkFinderHasOneLifecycle
 pytestmark = pytest.mark.offline
 
 
+def _declared_path(kwargs, policy_name="stdout"):
+    """Resolve one typed runner policy inside an explicit test double."""
+    policy = kwargs.get(policy_name)
+    disposition = getattr(getattr(policy, "disposition", None), "value", None)
+    repository = kwargs.get("repository")
+    if repository is None or disposition != "publish":
+        return None
+    return Path(repository.dir).joinpath(*policy.components)
+
+
 class TestA1dVocabularyLossReachesTheVerdict:
     """review-B-audit-11#1: the loss was a REASON-ONLY coverage event, which the reconciler ignores — so a
     run that silently dropped brute vocabulary still read `complete`."""
@@ -1601,6 +1611,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
             seq = list(statuses)
 
             def fake(tool, cmd, raw_path=None, timeout=None, **k):
+                raw_path = raw_path or _declared_path(k)
                 st = getattr(crawl.Status, seq.pop(0).upper()) if seq else crawl.Status.EMPTY
                 if produced_hosts and st is crawl.Status.SUCCESS and raw_path is not None:
                     raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1867,7 +1878,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
             monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
             monkeypatch.setattr(enrich, "exec_tool",
                                 lambda tool, cmd, raw_path=None, timeout=None, **k: (
-                                    cmds.append(cmd), raws.append(raw_path),
+                                    cmds.append(cmd), raws.append(raw_path or _declared_path(k)),
                                     _RR(tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))[2])
             ctx = _Ctx(run.dir, [])
             ctx.run = run
@@ -2157,6 +2168,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
             from quarry_recon.runner import RunResult as _RR
 
             def _tool(tool, cmd, raw_path=None, timeout=None, **k):
+                raw_path = raw_path or _declared_path(k)
                 if found and raw_path is not None:
                     raw_path.write_text("word000.acme.com\n")
                 return _RR(tool, cmd, crawl.Status.SUCCESS if found else crawl.Status.EMPTY,
@@ -2225,6 +2237,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             seq = list(statuses or [])
 
             def _tool(tool, cmd, raw_path=None, timeout=None, **k):
+                raw_path = raw_path or _declared_path(k)
                 st_now = seq.pop(0) if seq else None
                 if st_now is crawl.Status.SKIPPED:
                     return _RR(tool, cmd, st_now, None, 0.0, None, 0)   # no process ran
@@ -2747,6 +2760,7 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
 
             def _tool(tool, cmd, raw_path=None, timeout=None, **k):
+                raw_path = raw_path or _declared_path(k)
                 raw_path.write_text("")                     # the file EXISTS and is empty, as httpx left it
                 return _RR(tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0)   # ...and stdout was empty
 
@@ -3612,6 +3626,7 @@ class TestTheRecursionRoundsPolicy:
 
         def fake_exec(tool, cmd, raw_path=None, timeout=None, **k):
             from quarry_recon.runner import RunResult as _RR
+            raw_path = raw_path or _declared_path(k)
             if tool == "alterx":
                 raw_path.write_text("")                       # no permutations: growth is the resolver's
                 return _RR(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, raw_path, 0)
@@ -3664,6 +3679,7 @@ class TestTheRecursionRoundsPolicy:
 
         def fake_exec(tool, cmd, raw_path=None, timeout=None, **k):
             from quarry_recon.runner import RunResult as _RR
+            raw_path = raw_path or _declared_path(k)
             if tool == "alterx":
                 rounds.append(len(rounds) + 1)
                 assert len(rounds) < 25, "the recursion did not terminate"

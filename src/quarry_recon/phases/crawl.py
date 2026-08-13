@@ -103,7 +103,7 @@ def _jsluice_run(ctx, sub, files, raw, origin):
     events.tool_start(sid, cmd=["jsluice", sub, "-j"], input_total=len(files), discovery_context=origin)
     t0 = time.monotonic()
     degraded = 0
-    aggregate = RepositoryOutput.publish_path(ctx.run, raw)
+    aggregate = RepositoryOutput.publish(*raw.relative_to(ctx.run.dir).parts)
     written = 0
     with ctx.run.artifact_claim(*aggregate.components) as aggregate_claim:
         aggregate_fd = aggregate_claim.open_writer()
@@ -116,7 +116,7 @@ def _jsluice_run(ctx, sub, files, raw, origin):
                 res = exec_tool(
                     "jsluice", ["jsluice", sub, "-j"],
                     repository=ctx.run,
-                    stdout=RepositoryOutput.publish_path(ctx.run, chunk),
+                    stdout=RepositoryOutput.publish(*chunk.relative_to(ctx.run.dir).parts),
                     stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
                     stdin_data=f.read_bytes().decode("utf-8", "replace"),
                 )
@@ -1573,7 +1573,7 @@ def run(ctx) -> None:
         r = run_contract(
             "crawl.katana_standard", cmd,
             repository=ctx.run,
-            stdout=RepositoryOutput.publish_path(ctx.run, kat),
+            stdout=RepositoryOutput.publish(*kat.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), work_unit=kat_wu, timeout=ctx.http_timeout,
         )
         ctx.run.record("crawl", r)
@@ -1607,7 +1607,7 @@ def run(ctx) -> None:
                                         _katana_scope_flags(scope) +   # the same OOS exclusion on the headless pass
                                         (["-rl", str(prof.http_rl)] if prof.http_rl else []),
                               repository=ctx.run,
-                              stdout=RepositoryOutput.publish_path(ctx.run, kh),
+                              stdout=RepositoryOutput.publish(*kh.relative_to(ctx.run.dir).parts),
                               stderr=RepositoryOutput.discard(),
                               work_unit=kh_wu, timeout=ctx.http_timeout)
                 ctx.run.record("crawl", r)
@@ -1623,7 +1623,7 @@ def run(ctx) -> None:
     gau_wu = events.work_unit("crawl.gau", inputs={"apexes": sorted(prof.apex_domains)}, config={"subs": True})
     r = run_contract("crawl.gau", ["gau", "--subs", "--threads", "5"] + prof.apex_domains,
                      repository=ctx.run,
-                     stdout=RepositoryOutput.publish_path(ctx.run, gau_raw),
+                     stdout=RepositoryOutput.publish(*gau_raw.relative_to(ctx.run.dir).parts),
                      stderr=RepositoryOutput.discard(),
                      work_unit=gau_wu, timeout=ctx.http_timeout)
     ctx.run.record("crawl", r)
@@ -1807,7 +1807,7 @@ def run(ctx) -> None:
         r = exec_tool(
             "trufflehog", th_cmd,
             repository=ctx.run,
-            stdout=RepositoryOutput.publish_path(ctx.run, th),
+            stdout=RepositoryOutput.publish(*th.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
         )
         ctx.run.record("crawl", r)

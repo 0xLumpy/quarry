@@ -93,7 +93,7 @@ def _run_subfinder(ctx, prof, scope) -> None:
                          ["subfinder", "-d", apex, "-all", "-max-time", str(budget_min),
                           "-stats", "-silent"],
                          repository=ctx.run,
-                         stdout=RepositoryOutput.publish_path(ctx.run, sf_raw),
+                         stdout=RepositoryOutput.publish(*sf_raw.relative_to(ctx.run.dir).parts),
                          stderr=RepositoryOutput.discard(), work_unit=sf_wu,
                          reclassify=reclassify, timeout=outer)
         ctx.run.record("vertical", r)
@@ -146,7 +146,7 @@ def _openintel(ctx, cfg: dict, apex: str, timeout: int = 180) -> set:
     r = exec_tool(
         "openintel-subs", [exe, "query", "-d", apex, "-s", "-b", db],
         repository=ctx.run,
-        stdout=RepositoryOutput.publish_path(ctx.run, raw),
+        stdout=RepositoryOutput.publish(*raw.relative_to(ctx.run.dir).parts),
         stderr=RepositoryOutput.discard(), timeout=timeout,
     )
     ctx.run.record("vertical", r)
@@ -968,7 +968,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         r = exec_tool(
             "httpx", hx_cmd,
             repository=ctx.run,
-            stdout=RepositoryOutput.publish_path(ctx.run, hx),
+            stdout=RepositoryOutput.publish(*hx.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
         )
         # everything observable about this invocation is committed BEFORE the fallible ledger write, so a
@@ -1185,12 +1185,12 @@ def _github_subs(ctx, prof, scope) -> None:
         return
     try:
         for d in prof.apex_domains:
+            gh_raw = ctx.run.raw_path("vertical", "github-subdomains", f"{d}.txt")
             r = exec_tool("github-subdomains",
                           ["github-subdomains", "-d", d, "-t", str(gh_token)],
                           repository=ctx.run,
-                          stdout=RepositoryOutput.publish_path(
-                              ctx.run,
-                              ctx.run.raw_path("vertical", "github-subdomains", f"{d}.txt"),
+                          stdout=RepositoryOutput.publish(
+                              *gh_raw.relative_to(ctx.run.dir).parts,
                           ),
                           stderr=RepositoryOutput.discard(),
                           timeout=ctx.http_timeout)
@@ -1230,7 +1230,7 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
             r = exec_tool(
                 "alterx", ["alterx", "-l", str(known), "-enrich", "-mode", "both", "-silent"],
                 repository=ctx.run,
-                stdout=RepositoryOutput.publish_path(ctx.run, perms),
+                stdout=RepositoryOutput.publish(*perms.relative_to(ctx.run.dir).parts),
                 stderr=RepositoryOutput.discard(), timeout=600,
             )
             ctx.run.record("vertical", r)
@@ -1265,7 +1265,7 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
         r = exec_tool(
             "puredns", cmd,
             repository=ctx.run,
-            stdout=RepositoryOutput.publish_path(ctx.run, res),
+            stdout=RepositoryOutput.publish(*res.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
         )
         if _n_all != _n_new:                              # dedup SAVINGS is optimization telemetry, NOT a gap
@@ -1487,7 +1487,7 @@ def run(ctx) -> None:
             r = exec_tool(
                 "puredns", cmd,
                 repository=ctx.run,
-                stdout=RepositoryOutput.publish_path(ctx.run, br),
+                stdout=RepositoryOutput.publish(*br.relative_to(ctx.run.dir).parts),
                 stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
             )
             ctx.run.record("vertical", r)
@@ -1525,7 +1525,7 @@ def run(ctx) -> None:
         r = exec_tool(
             "dnsx", ["dnsx", "-l", str(res_hosts), "-cname", "-a", "-json", "-silent"],
             repository=ctx.run,
-            stdout=RepositoryOutput.publish_path(ctx.run, cn),
+            stdout=RepositoryOutput.publish(*cn.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
         )
         ctx.run.record("vertical", r)

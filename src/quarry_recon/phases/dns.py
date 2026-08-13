@@ -50,7 +50,7 @@ def _wildcard_baseline(ctx, apexes: set, phase: str) -> dict:
     r = exec_tool(
         "dnsx", _dnsx_cmd(ctx, pf, _WILDCARD_PROBE_FLAGS),
         repository=ctx.run,
-        stdout=RepositoryOutput.publish_path(ctx.run, out),
+        stdout=RepositoryOutput.publish(*out.relative_to(ctx.run.dir).parts),
         stderr=RepositoryOutput.discard(), timeout=600,
     )
     ctx.run.record(phase, r)
@@ -76,7 +76,7 @@ def enrich_hosts(ctx, hosts, phase: str) -> int:
     r = exec_tool(
         "dnsx", _dnsx_cmd(ctx, hf),
         repository=ctx.run,
-        stdout=RepositoryOutput.publish_path(ctx.run, out),
+        stdout=RepositoryOutput.publish(*out.relative_to(ctx.run.dir).parts),
         stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
     )
     ctx.run.record(phase, r)

@@ -148,7 +148,7 @@ def run(ctx) -> None:
     r = exec_tool(
         "mapcidr", ["mapcidr", "-cidr", ",".join(prof.cidr), "-silent"],
         repository=ctx.run,
-        stdout=RepositoryOutput.publish_path(ctx.run, ips_path),
+        stdout=RepositoryOutput.publish(*ips_path.relative_to(ctx.run.dir).parts),
         stderr=RepositoryOutput.discard(), timeout=120,
     )
     ctx.run.record("horizontal", r)
@@ -163,7 +163,7 @@ def run(ctx) -> None:
             "tlsx", ["tlsx", "-l", str(ips_file), "-san", "-cn", "-silent",
                      "-p", "443,8443,4443", "-resp-only"],
             repository=ctx.run,
-            stdout=RepositoryOutput.publish_path(ctx.run, tls_raw),
+            stdout=RepositoryOutput.publish(*tls_raw.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
         )
         ctx.run.record("horizontal", r)
@@ -180,7 +180,7 @@ def run(ctx) -> None:
         r = exec_tool(
             "dnsx", ["dnsx", "-l", str(ips_file), "-ptr", "-resp-only", "-silent"],
             repository=ctx.run,
-            stdout=RepositoryOutput.publish_path(ctx.run, ptr_raw),
+            stdout=RepositoryOutput.publish(*ptr_raw.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
         )
         ctx.run.record("horizontal", r)
@@ -197,7 +197,7 @@ def run(ctx) -> None:
             "caduceus", ["caduceus", "-i", str(cidr_file),
                          "-p", "443,8443,4443", "-j"],
             repository=ctx.run,
-            stdout=RepositoryOutput.publish_path(ctx.run, cad),
+            stdout=RepositoryOutput.publish(*cad.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
         )
         ctx.run.record("horizontal", r)
@@ -247,7 +247,7 @@ def run(ctx) -> None:
         r = exec_tool(
             "asnmap", ["asnmap", "-silent"],
             repository=ctx.run,
-            stdout=RepositoryOutput.publish_path(ctx.run, asn_raw),
+            stdout=RepositoryOutput.publish(*asn_raw.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(),
             stdin_data="\n".join(asn_seeds), timeout=60,
         )
