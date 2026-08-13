@@ -962,6 +962,7 @@ class Run:
         self._counts_cache: dict[str, int] = {}
         self._records: dict[str, dict] = {}       # entity -> {canonical_key: merged record} (instance-local)
         self._folded: dict[str, FoldedLog] = {}   # entity -> the same fold, with its trust status
+        self._entity_signatures: dict[str, tuple | None] = {}
         # identities refused past the corpus envelope. Durable records, RAM bounded regardless of N:
         # live refusals append to `_refused_path`; reopen-fold refusals are rewritten per entity under
         # `_fold_refused_dir` (idempotent across reopens); the exact distinct count is folded from both by an
@@ -1408,6 +1409,35 @@ class Run:
     def _entity_file(self, entity: str) -> Path:
         return self.normalized / f"{validate_entity(entity)}.jsonl"
 
+    def _entity_signature(self, entity: str) -> tuple | None:
+        """Return a mutation-sensitive identity for one canonical entity log."""
+        try:
+            observed = os.stat(self._entity_file(entity), follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            # Folding below reports the authoritative typed/unusable state.  A
+            # distinct sentinel still invalidates any previously trusted cache.
+            return ("unavailable",)
+        return (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_ctime_ns,
+        )
+
+    def _refresh_entity_cache(self, entity: str) -> None:
+        """Discard an instance cache when another run handle changed the log."""
+        signature = self._entity_signature(entity)
+        if (entity in self._entity_signatures
+                and self._entity_signatures[entity] != signature):
+            self._records.pop(entity, None)
+            self._folded.pop(entity, None)
+            self._corpus_bytes.pop(entity, None)
+            self._counts_cache.pop(entity, None)
+        self._entity_signatures[entity] = signature
+
     @_scoped_mutation(MutationScope.BASE_EVIDENCE)
     def add(self, entity: str, record: dict) -> bool:
         """Record an observation of a normalized entity. Returns True iff its natural key is NEW, so the
@@ -1496,6 +1526,7 @@ class Run:
         from . import privfs
         # 0600, O_NOFOLLOW append: the normalized log (incl. secret.jsonl) is never group/other-readable
         privfs.append_private(self._entity_file(entity), line + "\n")
+        self._entity_signatures[entity] = self._entity_signature(entity)
 
     # ── corpus envelope: bound materialized keys and corpus bytes, refuse—never drop—the overflow ──
     @staticmethod
@@ -1719,6 +1750,7 @@ class Run:
         refusals are REWRITTEN per entity (truncate-then-stream), so repeated reopens yield the same rows,
         never a growing pile, and the fold never holds the refused set resident."""
         entity = validate_entity(entity)
+        self._refresh_entity_cache(entity)
         if entity not in self._records:
             from . import envelope, privfs
             # only a log that exists on disk can fold-refuse; a live-only run never touches the fold ledger
@@ -1761,6 +1793,7 @@ class Run:
                 self._write_marker_stub()
             self._folded[entity] = folded
             self._records[entity] = folded.records
+            self._entity_signatures[entity] = self._entity_signature(entity)
         return self._records[entity]
 
     def _seen_keys(self, entity: str) -> set:
