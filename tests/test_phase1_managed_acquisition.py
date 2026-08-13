@@ -41,6 +41,25 @@ def test_stream_to_fd_keeps_exact_binary_body_and_digest(tmp_path):
     assert path.read_bytes() == body
 
 
+def test_stream_to_fd_mirrors_one_response_into_two_private_stages(tmp_path):
+    primary_path = tmp_path / "partial-stage"
+    mirror_path = tmp_path / "complete-stage"
+    primary = os.open(primary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    mirror = os.open(mirror_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    body = b"one response, two unpublished claims\x00\xff"
+    try:
+        size, digest = contract.stream_to_fd(
+            io.BytesIO(body), primary, mirror_fd=mirror, budget_path=tmp_path,
+            chunk=5, governor=contract.DiskGovernor(reserve_bytes=0),
+        )
+    finally:
+        os.close(mirror)
+        os.close(primary)
+
+    assert (size, digest) == (len(body), hashlib.sha256(body).hexdigest())
+    assert primary_path.read_bytes() == mirror_path.read_bytes() == body
+
+
 @pytest.mark.parametrize("kind", [KeyboardInterrupt, SystemExit])
 def test_stream_to_fd_attaches_exact_prefix_to_cancellation(tmp_path, kind):
     path = tmp_path / "cancelled-stage"

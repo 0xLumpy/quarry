@@ -607,21 +607,28 @@ def stream_to_file(r, dest, *, chunk: int = 1024 * 1024, deadline_s: float = 300
     return written, digest.hexdigest()
 
 
-def stream_to_fd(r, writer_fd: int, *, budget_path, chunk: int = 1024 * 1024,
+def stream_to_fd(r, writer_fd: int, *, budget_path, mirror_fd: int | None = None,
+                 chunk: int = 1024 * 1024,
                  deadline_s: float = 300.0,
                  governor: "DiskGovernor | None" = None) -> "tuple[int, str]":
     """Stream into a repository-owned unpublished descriptor.
 
     This is the managed counterpart to :func:`stream_to_file`: it never creates,
     renames, publishes or retains an ambient path.  The caller owns terminal
-    publication/fencing and the descriptor lifetime.  Ordinary incompleteness
-    carries exact prefix bytes and digest; cancellation remains a ``BaseException``
-    so the repository transaction can fence before propagating it.
+    publication/fencing and the descriptor lifetime.  When ``mirror_fd`` is
+    supplied, every primary byte is also written to that private descriptor;
+    this lets a transaction select final-versus-partial publication after EOF
+    without reading the response twice.  Ordinary incompleteness carries exact
+    primary-prefix bytes and digest; cancellation remains a ``BaseException`` so
+    the repository transaction can settle before propagating it.
     """
     import time as _time
 
     if type(writer_fd) is not int or writer_fd < 0:
         raise TypeError("managed acquisition writer must be an open descriptor")
+    if (mirror_fd is not None
+            and (type(mirror_fd) is not int or mirror_fd < 0 or mirror_fd == writer_fd)):
+        raise TypeError("managed acquisition mirror must be a distinct open descriptor")
     gov = governor if governor is not None else default_governor()
     digest = _hashlib.sha256()
     written = granted_total = 0
@@ -646,7 +653,22 @@ def stream_to_fd(r, writer_fd: int, *, budget_path, chunk: int = 1024 * 1024,
                     continue
                 if landed <= 0:
                     raise OSError("managed acquisition write made no progress")
-                digest.update(active[active_offset:active_offset + landed])
+                landed_bytes = active[active_offset:active_offset + landed]
+                if mirror_fd is not None:
+                    mirror_offset = 0
+                    while mirror_offset < len(landed_bytes):
+                        try:
+                            mirrored = _os.write(
+                                mirror_fd, landed_bytes[mirror_offset:],
+                            )
+                        except InterruptedError:
+                            continue
+                        if mirrored <= 0:
+                            raise OSError(
+                                "managed acquisition mirror write made no progress",
+                            )
+                        mirror_offset += mirrored
+                digest.update(landed_bytes)
                 active_offset += landed
                 written += landed
                 gov.commit(landed)
@@ -657,6 +679,8 @@ def stream_to_fd(r, writer_fd: int, *, budget_path, chunk: int = 1024 * 1024,
                     limit_bytes=getattr(gov, _LAYER_CAP_ATTR[layer], 0),
                 )
         _os.fsync(writer_fd)
+        if mirror_fd is not None:
+            _os.fsync(mirror_fd)
     except (KeyboardInterrupt, SystemExit) as exc:
         primary = exc
         raise
