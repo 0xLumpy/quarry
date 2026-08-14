@@ -231,11 +231,59 @@ def _artifact_id(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:24]
 
 
-def _discard_artifact(dest) -> None:
-    """Remove a probe response we are not keeping, and its acquisition receipt with it."""
-    dest = Path(dest)
-    dest.unlink(missing_ok=True)
-    dest.with_name(dest.name + fetch._RECEIPT_SUFFIX).unlink(missing_ok=True)
+def _discard_artifact(ctx, acquisition, dest, *, source="probe") -> None:
+    """Discard one response through its exact managed acquisition ledger."""
+    if acquisition is None:
+        return
+    try:
+        ledger = fetch.discard_acquisition(ctx, acquisition)
+    except Exception as exc:
+        ledger = getattr(exc, "managed_discard", None)
+        _record_discard_diagnostic(
+            ctx, dest, source, ledger,
+            f"discard failed ({type(exc).__name__}: {exc})",
+        )
+        return
+    if ledger is None:
+        # Legacy paths have no managed snapshots.  This helper is currently
+        # used only for Run-owned SSTI artifacts, but retain the proven legacy
+        # behavior for callers outside the repository namespace.
+        dest = Path(dest)
+        dest.unlink(missing_ok=True)
+        dest.with_name(dest.name + fetch._RECEIPT_SUFFIX).unlink(missing_ok=True)
+        return
+    if any(
+        getattr(ledger.get(name), "state", "uncertain")
+        not in {"removed", "removed-with-fault", "absent"}
+        for name in ("body", "receipt")
+    ):
+        _record_discard_diagnostic(
+            ctx, dest, source, ledger,
+            "discard left an object changed, unremoved, or uncertain",
+        )
+
+
+def _record_discard_diagnostic(ctx, dest, source, ledger, note) -> None:
+    """Persist truthful per-object cleanup facts for operator review."""
+    states = {}
+    for name in ("body", "receipt"):
+        fact = None if ledger is None else (
+            ledger.get(name) if isinstance(ledger, dict)
+            else getattr(ledger, name, None)
+        )
+        states[name] = {
+            "state": getattr(fact, "state", "uncertain"),
+            "error": getattr(fact, "error", ""),
+        }
+    ctx.run.add("review", {
+        "id": f"discard:{secrets.fingerprint(str(dest))}",
+        "klass": "artifact-discard",
+        "value": str(dest),
+        "raw_ref": str(dest),
+        "discard": states,
+        "note": f"{note}; body={states['body']['state']}, receipt={states['receipt']['state']}",
+        "sources": [source],
+    })
 
 
 def _text_of(acq, *, limit: int | None = None) -> str | None:
@@ -1364,7 +1412,7 @@ def probe_ssti(ctx, urls: list[str]) -> int:
                 continue
             if acq is None:
                 unresolved[(i, k)] = (PROBED, "not contacted (off-scope redirect or scan-box guard)")
-                _discard_artifact(dest)
+                _discard_artifact(ctx, acq, dest, source="ssti-probe")
                 continue
             if not acq.contacted and not acq.complete:
                 unresolved[(i, k)] = (PROBED, f"refused before contact ({acq.disposition})")
@@ -1373,7 +1421,7 @@ def probe_ssti(ctx, urls: list[str]) -> int:
                 # a non-200 is an answer: this parameter did not render the probe. Resolved, not a gap.
                 unresolved.pop((i, k), None)
                 resolved.add((i, k))
-                _discard_artifact(dest)
+                _discard_artifact(ctx, acq, dest, source="ssti-probe")
                 continue
             # an incomplete response answers nothing: the deciding literal may be in the suffix that
             # never arrived
@@ -1385,7 +1433,9 @@ def probe_ssti(ctx, urls: list[str]) -> int:
             unresolved.pop((i, k), None)
             resolved.add((i, k))
             if not hit:
-                _discard_artifact(dest)                # a non-hit probe response is not evidence
+                _discard_artifact(
+                    ctx, acq, dest, source="ssti-probe",
+                )                                      # a non-hit probe response is not evidence
                 continue
             # the body with the computed value stays as evidence for manual validation
             ctx.run.add("finding", {
