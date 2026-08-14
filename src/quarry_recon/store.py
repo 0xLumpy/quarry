@@ -5879,6 +5879,83 @@ _RUN_CONSTRUCTION_AUTHORITY = object()
 _TOOL_RUNS_UNLOADED = object()
 
 
+class _RunFileRemoval:
+    """Stable owner for one exact descriptor-relative Run-file removal."""
+
+    __slots__ = (
+        "run", "components", "parent", "target", "possible", "durable",
+    )
+
+    def __init__(self, run, components: tuple[str, ...]) -> None:
+        self.run = run
+        self.components = components
+        self.parent = _OwnedDescriptor()
+        self.target = _OwnedDescriptor()
+        self.possible = False
+        self.durable = False
+
+    def _reconcile_once(self) -> None:
+        if not self.possible or self.durable:
+            return
+        retained = os.fstat(self.target.fd)
+        try:
+            current = os.stat(
+                self.components[-1], dir_fd=self.parent.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            current = None
+        if current is None:
+            if retained.st_nlink != 0:
+                raise ContractError("Run file removal lost its exact name")
+            os.fsync(self.parent.fd)
+            self.durable = True
+        elif (current.st_dev, current.st_ino) == self.target.identity:
+            self.possible = False
+        else:
+            raise ContractError("Run file removal name changed during settlement")
+
+    def execute(self, anchor_fd: int) -> None:
+        from . import privfs
+        try:
+            _open_strict_directory_into(
+                self.parent, anchor_fd, self.components[:-1],
+            )
+            self.target.open(
+                self.components[-1], _FILE_OPEN_FLAGS,
+                dir_fd=self.parent.fd,
+            )
+        except (FileNotFoundError, privfs.PrivatePathMissing):
+            if self.parent.fd >= 0:
+                os.fsync(self.parent.fd)
+            return
+        captured = os.fstat(self.target.fd)
+        self.run._validate_base_file_stat(captured, self.components)
+        named = os.stat(
+            self.components[-1], dir_fd=self.parent.fd,
+            follow_symlinks=False,
+        )
+        if (named.st_dev, named.st_ino) != self.target.identity:
+            raise ContractError("Run file removal found a substituted name")
+        self.possible = True
+        os.unlink(self.components[-1], dir_fd=self.parent.fd)
+        self._reconcile_once()
+
+    def settle(self) -> None:
+        faults: list[BaseException] = []
+        for _pass in range(2):
+            try:
+                self._reconcile_once()
+            except BaseException as exc:
+                faults.append(exc)
+        faults.extend(_close_owned_descriptors_twice((self.target, self.parent)))
+        preferred = _preferred_settlement_fault(None, faults)
+        if preferred is not None:
+            raise preferred
+        if self.target.fd >= 0 or self.parent.fd >= 0:
+            raise ContractError("Run file removal descriptors did not settle")
+
+
 class Run:
     """One reconnaissance run inside a project: owns its tree, manifest, and entity store.
 
@@ -6075,36 +6152,14 @@ class Run:
 
     def _unlink_run_file_locked(self, components: tuple[str, ...]) -> None:
         """Capture then unlink one exact private Run file under pinned authority."""
-        from . import privfs
         active = self._active_mutation_owner()
         if active is None:
             raise ContractError("Run file removal has no mutation authority")
-        parent = _OwnedDescriptor()
-        target = _OwnedDescriptor()
-        settlement = _SettlementOwner(
-            lambda: _settle_descriptor_owners(
-                (target, parent), "Run file removal descriptors",
-            ),
-        )
+        removal = _RunFileRemoval(self, components)
+        settlement = _SettlementOwner(removal.settle)
         with _SettlementFence(settlement):
             with _SettlementFence(settlement):
-                try:
-                    _open_strict_directory_into(
-                        parent, active.run_anchor.fd, components[:-1],
-                    )
-                    target.open(components[-1], _FILE_OPEN_FLAGS, dir_fd=parent.fd)
-                except (FileNotFoundError, privfs.PrivatePathMissing):
-                    return
-                quarantine = f".quarry-unlink-{os.urandom(16).hex()}.stage"
-                os.rename(
-                    components[-1], quarantine,
-                    src_dir_fd=parent.fd, dst_dir_fd=parent.fd,
-                )
-                captured = os.stat(quarantine, dir_fd=parent.fd, follow_symlinks=False)
-                if (captured.st_dev, captured.st_ino) != target.identity:
-                    raise ContractError("Run file removal captured a substituted name")
-                os.unlink(quarantine, dir_fd=parent.fd)
-                os.fsync(parent.fd)
+                removal.execute(active.run_anchor.fd)
 
     def _require_scope(self, scope: MutationScope, owner: _RunMutationOwner) -> None:
         owner.validate_live()

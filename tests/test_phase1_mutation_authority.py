@@ -89,6 +89,56 @@ def _cancel_once(function, target_line, call, cancellation_type):
     assert caught.value is cancellation
 
 
+def _executed_line_occurrences(function, call) -> list[tuple[int, int]]:
+    seen = {}
+    occurrences = []
+
+    def trace(frame, event, _arg):
+        if frame.f_code is function.__code__ and event == "line":
+            occurrence = seen.get(frame.f_lineno, 0)
+            seen[frame.f_lineno] = occurrence + 1
+            occurrences.append((frame.f_lineno, occurrence))
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        call()
+    finally:
+        sys.settrace(previous)
+    return occurrences
+
+
+def _cancel_occurrence(function, target, call, cancellation_type):
+    target_line, target_occurrence = target
+    cancellation = cancellation_type(
+        f"mutation-authority cancellation at {target_line}/{target_occurrence}",
+    )
+    seen = 0
+    fired = False
+
+    def trace(frame, event, _arg):
+        nonlocal fired, seen
+        if (frame.f_code is function.__code__ and event == "line"
+                and frame.f_lineno == target_line):
+            if seen == target_occurrence and not fired:
+                fired = True
+                sys.settrace(None)
+                raise cancellation
+            seen += 1
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        with pytest.raises(cancellation_type) as caught:
+            call()
+    finally:
+        sys.settrace(previous)
+    assert fired
+    assert caught.value is cancellation
+
+
 def _tree_bytes(root: Path) -> tuple:
     return tuple(
         (str(path.relative_to(root)), path.read_bytes())
@@ -1382,3 +1432,288 @@ def test_fork_resets_worker_owned_process_local_locks(tmp_path, kind):
     else:
         lock = store._shared_run_lock(run._authority_key)
     _fork_after_worker_holds_local_lock(tmp_path, lock, run.run_id)
+
+
+_REMOVAL_COMPONENTS = ("raw", "unlink", "victim.bin")
+
+
+def _run_with_removal_parent(project: Path, run_id: str, *, present: bool):
+    run = _running_run(project, run_id)
+    name = _REMOVAL_COMPONENTS if present else ("raw", "unlink", "sibling.bin")
+    run._replace_artifact(
+        store.MutationScope.BASE_EVIDENCE, name, b"exact removal generation",
+    )
+    return run
+
+
+def _remove_run_file(run: store.Run) -> None:
+    with run._mutation(store.MutationScope.BASE_EVIDENCE):
+        run._unlink_run_file_locked(_REMOVAL_COMPONENTS)
+
+
+def test_run_file_removal_is_exact_and_absence_is_idempotent(tmp_path):
+    run = _run_with_removal_parent(tmp_path, "remove-normal", present=True)
+    victim = run.dir.joinpath(*_REMOVAL_COMPONENTS)
+
+    _remove_run_file(run)
+    _remove_run_file(run)
+
+    assert not victim.exists()
+    assert not list(run.dir.rglob(".quarry-unlink-*.stage"))
+    assert _lock_is_available(run)
+
+
+def test_run_file_removal_refuses_a_substituted_name_without_touching_it(
+    tmp_path, monkeypatch,
+):
+    run = _run_with_removal_parent(tmp_path, "remove-substitution", present=True)
+    victim = run.dir.joinpath(*_REMOVAL_COMPONENTS)
+    displaced = victim.with_name("displaced.bin")
+    parent = victim.parent
+    original = victim.read_bytes()
+    foreign = b"foreign substituted generation"
+    real_open = store._OwnedDescriptor.open
+    swapped = False
+
+    def swap_after_open(owner, name, flags, *args, **kwargs):
+        nonlocal swapped
+        result = real_open(owner, name, flags, *args, **kwargs)
+        if name == victim.name and not swapped:
+            swapped = True
+            dir_fd = kwargs["dir_fd"]
+            os.rename(
+                victim.name, displaced.name,
+                src_dir_fd=dir_fd, dst_dir_fd=dir_fd,
+            )
+            fd = os.open(
+                victim.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=dir_fd,
+            )
+            try:
+                os.write(fd, foreign)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.fsync(dir_fd)
+        return result
+
+    before_fds = _open_fds()
+    with monkeypatch.context() as patch:
+        patch.setattr(store._OwnedDescriptor, "open", swap_after_open)
+        with pytest.raises(ContractError, match="substituted name"):
+            _remove_run_file(run)
+
+    assert swapped
+    assert victim.read_bytes() == foreign
+    assert displaced.read_bytes() == original
+    assert not list(parent.glob(".quarry-unlink-*.stage"))
+    assert _open_fds() == before_fds
+    assert _lock_is_available(run)
+
+
+@pytest.mark.parametrize("fault_type", [OSError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("fault_position", ["before", "after"])
+def test_run_file_removal_ordinary_unlink_fault_is_retryable(
+    tmp_path, monkeypatch, fault_position, fault_type,
+):
+    run = _run_with_removal_parent(
+        tmp_path, f"remove-fault-{fault_position}-{fault_type.__name__}",
+        present=True,
+    )
+    victim = run.dir.joinpath(*_REMOVAL_COMPONENTS)
+    identity = (victim.stat().st_dev, victim.stat().st_ino)
+    real_unlink = os.unlink
+    fault = fault_type(f"unlink {fault_position} fault")
+    fired = False
+
+    def fault_unlink(path, *args, **kwargs):
+        nonlocal fired
+        if path == victim.name and kwargs.get("dir_fd") is not None and not fired:
+            fired = True
+            if fault_position == "after":
+                real_unlink(path, *args, **kwargs)
+            raise fault
+        return real_unlink(path, *args, **kwargs)
+
+    before_fds = _open_fds()
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "unlink", fault_unlink)
+        with pytest.raises(fault_type) as caught:
+            _remove_run_file(run)
+    assert caught.value is fault and fired
+    if fault_position == "before":
+        observed = victim.stat()
+        assert (observed.st_dev, observed.st_ino) == identity
+    else:
+        assert not victim.exists()
+    assert not list(run.dir.rglob(".quarry-unlink-*.stage"))
+    assert _open_fds() == before_fds
+    assert _lock_is_available(run)
+
+    _remove_run_file(run)
+    assert not victim.exists()
+    assert not list(run.dir.rglob(".quarry-unlink-*.stage"))
+    assert _open_fds() == before_fds
+    assert _lock_is_available(run)
+
+
+@pytest.mark.parametrize("fault_type", [OSError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("fault_position", ["before", "after"])
+def test_run_file_removal_fsync_fault_is_reconciled_before_escape(
+    tmp_path, monkeypatch, fault_position, fault_type,
+):
+    run = _run_with_removal_parent(
+        tmp_path, f"remove-fsync-{fault_position}-{fault_type.__name__}",
+        present=True,
+    )
+    victim = run.dir.joinpath(*_REMOVAL_COMPONENTS)
+    parent_stat = victim.parent.stat()
+    parent_identity = (parent_stat.st_dev, parent_stat.st_ino)
+    real_fsync = os.fsync
+    fault = fault_type(f"fsync {fault_position} fault")
+    fired = False
+    durable_syncs = 0
+
+    def fault_fsync(fd):
+        nonlocal fired, durable_syncs
+        observed = os.fstat(fd)
+        if (observed.st_dev, observed.st_ino) == parent_identity:
+            if not fired:
+                fired = True
+                if fault_position == "after":
+                    real_fsync(fd)
+                    durable_syncs += 1
+                raise fault
+            real_fsync(fd)
+            durable_syncs += 1
+            return None
+        return real_fsync(fd)
+
+    before_fds = _open_fds()
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", fault_fsync)
+        with pytest.raises(fault_type) as caught:
+            _remove_run_file(run)
+
+    assert caught.value is fault and fired
+    assert durable_syncs >= 1
+    assert not victim.exists()
+    assert not list(run.dir.rglob(".quarry-unlink-*.stage"))
+    assert _open_fds() == before_fds
+    assert _lock_is_available(run)
+
+    _remove_run_file(run)
+    assert not victim.exists()
+    assert not list(run.dir.rglob(".quarry-unlink-*.stage"))
+    assert _open_fds() == before_fds
+    assert _lock_is_available(run)
+
+
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("cancellation_type", [KeyboardInterrupt, SystemExit])
+def test_run_file_removal_source_lines_are_exact_and_retryable(
+    tmp_path, present, cancellation_type,
+):
+    function = store.Run._unlink_run_file_locked
+    probe = _run_with_removal_parent(
+        tmp_path / "probe", f"remove-probe-{present}", present=present,
+    )
+    occurrences = _executed_line_occurrences(
+        function, lambda: _remove_run_file(probe),
+    )
+    assert occurrences
+
+    for target_line, target_occurrence in occurrences:
+        project = tmp_path / (
+            f"case-{present}-{cancellation_type.__name__}-"
+            f"{target_line}-{target_occurrence}"
+        )
+        run = _run_with_removal_parent(
+            project, f"remove-{present}-{target_line}-{target_occurrence}",
+            present=present,
+        )
+        victim = run.dir.joinpath(*_REMOVAL_COMPONENTS)
+        identity = (
+            (victim.stat().st_dev, victim.stat().st_ino)
+            if present else None
+        )
+        before_fds = _open_fds()
+
+        _cancel_occurrence(
+            function, (target_line, target_occurrence),
+            lambda: _remove_run_file(run),
+            cancellation_type,
+        )
+
+        if victim.exists():
+            observed = victim.stat()
+            assert (observed.st_dev, observed.st_ino) == identity, target_line
+            assert victim.read_bytes() == b"exact removal generation", target_line
+        assert not list(run.dir.rglob(".quarry-unlink-*.stage")), target_line
+        assert _open_fds() == before_fds, target_line
+        assert _lock_is_available(run), target_line
+
+        _remove_run_file(run)
+        assert not victim.exists(), target_line
+        assert not list(run.dir.rglob(".quarry-unlink-*.stage")), target_line
+        assert _open_fds() == before_fds, target_line
+        assert _lock_is_available(run), target_line
+
+
+@pytest.mark.parametrize(
+    "function",
+    [
+        store._RunFileRemoval.execute,
+        store._RunFileRemoval._reconcile_once,
+        store._RunFileRemoval.settle,
+    ],
+    ids=["execute", "reconcile", "settle"],
+)
+@pytest.mark.parametrize("cancellation_type", [KeyboardInterrupt, SystemExit])
+def test_run_file_removal_owner_occurrences_are_terminal(
+    tmp_path, function, cancellation_type,
+):
+    probe = _run_with_removal_parent(
+        tmp_path / "owner-probe",
+        f"owner-probe-{function.__name__.replace('_', '-')}",
+        present=True,
+    )
+    occurrences = _executed_line_occurrences(
+        function, lambda: _remove_run_file(probe),
+    )
+    assert occurrences
+
+    for target_line, target_occurrence in occurrences:
+        label = function.__name__.replace("_", "-")
+        project = tmp_path / (
+            f"owner-{label}-{cancellation_type.__name__}-"
+            f"{target_line}-{target_occurrence}"
+        )
+        run = _run_with_removal_parent(
+            project, f"remove-{label}-{target_line}-{target_occurrence}",
+            present=True,
+        )
+        victim = run.dir.joinpath(*_REMOVAL_COMPONENTS)
+        identity = (victim.stat().st_dev, victim.stat().st_ino)
+        before_fds = _open_fds()
+
+        _cancel_occurrence(
+            function, (target_line, target_occurrence),
+            lambda: _remove_run_file(run), cancellation_type,
+        )
+
+        if victim.exists():
+            observed = victim.stat()
+            assert (observed.st_dev, observed.st_ino) == identity, (
+                target_line, target_occurrence,
+            )
+        assert not list(run.dir.rglob(".quarry-unlink-*.stage"))
+        assert _open_fds() == before_fds, (target_line, target_occurrence)
+        assert _lock_is_available(run), (target_line, target_occurrence)
+
+        _remove_run_file(run)
+        assert not victim.exists(), (target_line, target_occurrence)
+        assert _open_fds() == before_fds, (target_line, target_occurrence)
+        assert _lock_is_available(run), (target_line, target_occurrence)
