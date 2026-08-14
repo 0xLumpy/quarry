@@ -215,4 +215,3 @@ def test_forked_stale_handles_append_without_loss_or_corrupt_jsonl(tmp_path):
     }
     reopened = store.Run.open(tmp_path, "acme.example", run.run_id)
     assert reopened.count("subdomain") == 3
-
