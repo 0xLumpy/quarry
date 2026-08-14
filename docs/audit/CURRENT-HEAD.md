@@ -373,7 +373,11 @@ in the release ledger; silence is not closure.
 
 ## Decision
 
-`v0.3.10` remains a **NO-GO**. Do not change either version string, create a tag, publish a package or
-claim high-scale readiness until every in-scope row in the release ledger is closed with post-fix evidence.
+`v0.3.10` remains a **NO-GO**, and both version strings remain `0.3.9` at this audited source. They may
+change together only in a maintainer-authorized `0.3.10` nomination after source, scope, validation inputs,
+supported matrix and candidate release notes are frozen; nomination closes no row and precedes accepted
+candidate evidence. Do not create the signed tag until the accepted aggregate and detached approval close
+the pre-publication requirements, do not publish anything except the exact accepted artifact bytes, and do
+not project the release complete until the publication receipt satisfies the remaining `RG09` postconditions.
 The current architecture may evolve through compatibility boundaries; this decision does not authorize a
 big-bang rewrite or reduce reconnaissance coverage.

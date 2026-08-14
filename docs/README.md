@@ -43,7 +43,8 @@ operator reference, organised by task.
 - [Current-HEAD audit](audit/CURRENT-HEAD.md) — verified closures, reopened invariants, and release blockers.
 - [Market baseline](audit/MARKET-BASELINE-2026-08.md) — sourced comparison with BBOT, reconFTW,
   ProjectDiscovery, and OWASP Amass/OAM.
-- [v0.3.10 ledger](releases/v0.3.10.md) — the sole scope and closure record for the pending release.
+- [v0.3.10 ledger](releases/v0.3.10.md) — the sole in-tree scope ledger and documentation projection for
+  the pending release; accepted external attestations are result authority.
 - [Release gates](releases/RELEASE-GATES.md) — hermetic, integration, corpus, package, fault, and publication evidence.
 - [Roadmap](roadmap.md) — future sequencing and the deferred reporting prototype.
 - [Golden corpus](design/GOLDEN-CORPUS.md) — private attestation and synthetic fixture rules.

@@ -17,7 +17,9 @@ mean the current `v0.3.9` implementation satisfies them.
   and maps it to the stable historical finding IDs.
 - [`../audit/MARKET-BASELINE-2026-08.md`](../audit/MARKET-BASELINE-2026-08.md) records the dated external
   architecture/professionalism benchmark and clearly separated Quarry inferences.
-- [`../releases/v0.3.10.md`](../releases/v0.3.10.md) is the sole scope and evidence ledger for that release.
+- [`../releases/v0.3.10.md`](../releases/v0.3.10.md) is the sole in-tree scope ledger and documentation
+  projection for that release; immutable external attestations and their accepted aggregate are result
+  authority.
 - [`../releases/RELEASE-GATES.md`](../releases/RELEASE-GATES.md) defines the gate taxonomy and proof
   required for promotion.
 - [`../design/GOLDEN-CORPUS.md`](../design/GOLDEN-CORPUS.md) defines private corpus attestation and safe

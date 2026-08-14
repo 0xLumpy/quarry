@@ -16,6 +16,13 @@ not configured, and `verify-quarry.sh` treats unavailable live prerequisites as
 
 - Promotion is based on a machine-readable evidence set bound to one exact
   candidate commit and source-tree digest.
+- The nominated candidate contains the final package version plus the frozen
+  scope and validation inputs. Results produced by evaluating that candidate
+  live outside its tracked tree as immutable, content-addressed attestations.
+- Release evidence is a forward-only object graph: scope and candidate precede
+  identity, gate records and artifacts; those precede aggregation, approval,
+  tagging and publication. A mutable locator or documentation edit is never an
+  evidence identity.
 - A missing, skipped, deselected, uncollected, stale, or unparsable required
   result is not a pass.
 - A release does not become green by rerunning only a failed test. After a fix,
@@ -32,9 +39,14 @@ not configured, and `verify-quarry.sh` treats unavailable live prerequisites as
 
 ## Result vocabulary and aggregation
 
-Every gate has exactly one status:
+The contract universe has 64 obligations. The accepted corpus manifest selects
+`S`, a subset of the seven `C-CORPUS-*` gates, so a candidate scope contains
+`57 + |S|` obligations and `55 + |S|` pre-aggregate record slots. Each
+scope-selected obligation has exactly one status. `E-AGGREGATE` is the
+deterministic aggregation operation and output, and `E-APPROVAL` is the later
+detached approval; neither occupies a gate-record slot:
 
-| Status | Meaning | Promotion effect for a required gate |
+| Status | Meaning | Promotion effect for a required obligation |
 |---|---|---|
 | `pass` | All declared assertions ran and passed against the candidate; required evidence is valid | Eligible |
 | `fail` | At least one assertion ran and failed, or a safety invariant was violated | Blocks |
@@ -54,10 +66,12 @@ runner events, not gate statuses:
 - a waiver cannot turn a failed invariant green. Changing a requirement needs a
   reviewed scope/ADR revision and a new candidate evidence set.
 
-The release aggregate is `pass` only when every required gate is `pass` or
-validly `not_applicable`. Any required `fail`, `open`, `blocked`, missing record,
-invalid signature, candidate-identity mismatch, or stale result blocks
-promotion.
+The aggregate payload's decision is `pass` only when every scope-selected
+pre-aggregate record is `pass` or validly `not_applicable`. Any selected record
+obligation with `fail`, `open`, `blocked`, a missing record, an invalid
+signature, a candidate-identity mismatch or a stale result blocks aggregation
+and promotion. The later detached approval establishes `E-APPROVAL`; it is not
+an aggregate input, but its absence or invalidity still blocks promotion.
 
 ## Exact execution-lane taxonomy
 
@@ -125,13 +139,14 @@ record contains the pre-approved `not_applicable` rationale.
 ### Phase A: contract and prerequisite closure
 
 These gates make subsequent results interpretable. They must close before a
-release candidate can be declared.
+nominated commit can be accepted as the release candidate. Creating a
+nomination commit is not promotion and closes none of these gates.
 
 | Gate | Requirement | Evidence | Phase 0 status |
 |---|---|---|---|
-| `A-IDENTITY` | Candidate is one exact commit; source-tree digest, dirty state, submodule/input identities, package version, and schema versions agree | Candidate identity record; dirty candidates fail | `open` — the v1 collector/schema exist, but an enforced quiescent runner and accepted nominated-candidate record do not |
+| `A-IDENTITY` | Candidate is one exact commit; source-tree digest, dirty state, submodule/input identities and schema versions agree, and both package-version sources equal the nominated release | Candidate identity record; dirty candidates fail collection and a release/package-version mismatch blocks this gate | `open` — the v1 collector/schema exist, but an enforced quiescent runner and accepted nominated-candidate record do not |
 | `A-TAXONOMY` | Every test/job maps to exactly one primary lane; incompatible markers and unmarked tests fail collection | Classification manifest plus collected/selected/deselected counts | `open` — current markers do not cover the complete suite |
-| `A-EVIDENCE-SCHEMA` | Gate records validate against a versioned schema and aggregate deterministically | Schema, validator result, aggregator result, canonical digest | `open` — v1 structural schemas/readers exist; artifact verification, signature trust and the deterministic aggregator remain unimplemented |
+| `A-EVIDENCE-SCHEMA` | Gate records validate against a versioned schema and the aggregator conforms deterministically to committed golden vectors | Schemas plus a hermetic aggregator-conformance/golden-vector result and its canonical digest; this is not the candidate release aggregate | `open` — v1 structural schemas/readers exist; artifact verification, signature trust and the deterministic aggregator remain unimplemented |
 | `A-CORPUS` | Selected private sources have accepted two-pass attestations and alias mappings; committed fixtures contain synthetic data only | Private attestation IDs plus public fixture and disclosure-check digests | `open` — design exists; attestations/fixtures are not claimed |
 | `A-THRESHOLDS` | Versioned correctness, quality, resource, and regression thresholds exist for the release scope | Reviewed threshold manifest | `open` — numeric performance/coverage baselines are not yet accepted |
 | `A-SUPPORT` | Supported OS, architecture, Python, and tool/template matrices are finite and versioned | Support matrix digest | `open` — package metadata alone is not a finite tested matrix |
@@ -260,10 +275,11 @@ domain happened to be configured.
 | `D-LIVE-CONTRACT` | In-scope live scenarios exercise only the release-scope matrix and preserve full private evidence/coverage decisions | Private run manifest, exact tool/template identities, scenario results |
 | `D-CLEANUP` | OOB sessions, temporary credentials, callbacks, leases, and range mutations are closed or explicitly handed off | Cleanup/retention record |
 
-If no approved scope rule requires Phase D for a candidate, these gates are
-`not_applicable` with that rule's digest. If Phase D is required and its range,
-tool, or authorization is unavailable, it is `blocked`. A script-level `SKIP`
-never closes it.
+All four Phase D slots always emit records. If no approved scope rule requires
+live execution, each emits an exact `not_applicable` record bound to that rule's
+digest. If live execution is required, each emits `pass` or `blocked` as
+applicable; a violated assertion remains `fail` under the general result
+vocabulary. A script-level `SKIP` never closes a slot.
 
 ### Phase E: publication gate
 
@@ -271,15 +287,26 @@ The publication decision is a separate, reproducible aggregation step:
 
 | Gate | Requirement |
 |---|---|
-| `E-AGGREGATE` | Every required Phase A-D record is present, authentic, schema-valid, candidate-matched, and `pass`/valid `not_applicable` |
+| `E-AGGREGATE` | Every scope-selected Phase A-C record, all four Phase D outcome/`not_applicable` records, and the `E-DOCS`, `E-PROJECT-HYGIENE`, and pre-publication `E-ARTIFACTS` records are present, authentic, schema-valid, candidate-matched, and `pass`/valid `not_applicable`; deterministic aggregation emits the decision payload |
 | `E-DOCS` | Release notes enumerate behavioral changes, accepted risks, known limitations, migrations, exit/result contract, and supported matrix |
 | `E-PROJECT-HYGIENE` | License file, security policy, contribution guidance, changelog, and vulnerability-reporting route are present and package-consistent |
-| `E-ARTIFACTS` | Published package, SBOM, provenance, signatures, schemas, and checksums match the candidate evidence subjects |
-| `E-APPROVAL` | Named release approver reviews the aggregate and signs the decision; approver cannot overwrite underlying gate results |
+| `E-ARTIFACTS` | Candidate-built package, SBOM, provenance, schemas and checksums are accepted publication subjects; the later publication receipt proves those exact bytes, and no substitutes, were promoted |
+| `E-APPROVAL` | Named release approver reviews the aggregate and signs a detached approval bound to its digest; approver cannot overwrite underlying gate results |
 
-No tag or version bump precedes `E-AGGREGATE`. If an artifact is rebuilt after
-approval, its subject digest changes and the candidate must repeat every gate
-whose inputs include that artifact.
+`E-AGGREGATE` is the operation that creates the aggregate payload, so neither an
+`E-AGGREGATE` result nor `E-APPROVAL` is an input to that payload. Successful
+deterministic validation constitutes `E-AGGREGATE`; a later detached signature
+over its digest constitutes `E-APPROVAL`. This ordering prevents the aggregate
+or approval from depending on itself.
+
+The final package version is part of the nominated candidate, not a post-gate
+edit. After the source, scope, validation inputs and candidate release notes are
+frozen, a maintainer-authorized nomination commit sets both package-version
+sources to the intended release before any accepted gate runs. Nomination is
+not a tag, publication or green decision. After approval, the signed tag targets
+that exact candidate commit and publication promotes the already-attested
+artifact bytes. A rebuild or tracked change creates a new subject and repeats
+every gate whose inputs it changes.
 
 ## Machine-readable evidence
 
@@ -288,14 +315,62 @@ are in [`release/evidence`](../../release/evidence/). Their strict reader and
 clean-Git identity collector are implemented in
 [`release_evidence.py`](../../src/quarry_recon/release_evidence.py). These are a
 prerequisite slice, not accepted gate evidence: they do not verify signatures,
-open and rehash content-addressed artifacts, aggregate a required gate set or
-resolve the nominated-candidate/package-version lifecycle. `A-IDENTITY`,
-`A-EVIDENCE-SCHEMA` and `RG00` therefore remain open.
+open and rehash content-addressed artifacts, aggregate a scope-selected gate-record set or
+implement the nomination, approval, publication or documentation-reconciliation
+lifecycle defined below. `A-IDENTITY`, `A-EVIDENCE-SCHEMA` and `RG00` therefore
+remain open.
 
 The v1 registry is scoped only to release `0.3.10` and binds its corresponding
 scope ledger. The collector and reader refuse any other release label; a later
 release requires its own explicit registry/scope contract rather than reusing
 the v0.3.10 input under a different label.
+
+### Forward-only evidence lifecycle
+
+The candidate commit contains the final source, package version, scope ledger,
+schemas and other validation inputs, but never results produced after
+nomination. For an accepted `v0.3.10` nomination, `release`, the semantic
+`[project].version` and the literal `quarry_recon.__version__` must all equal
+`0.3.10`. A structurally valid identity collected while the package remains
+`0.3.9` is diagnostic only and cannot close `A-IDENTITY`.
+
+Candidate identities, gate records, evidence artifacts, aggregate payloads,
+approvals and publication receipts are immutable objects outside the candidate
+tree. Their declared content digests are authority; a filesystem path, URL, CI
+job or "latest" pointer is only a locator. Every consumer must open and rehash
+the referenced bytes. Private artifacts use the same digest binding while
+exposing only approved opaque references.
+
+References point forward only:
+
+1. the candidate identity binds the frozen commit, tree, source digest, package
+   version, scope-ledger digest, registry and schema versions;
+2. each gate record binds that candidate-identity digest and the digests of its
+   inputs, toolchain and artifacts;
+3. the aggregate payload binds the candidate identity, frozen scope-selected gate
+   manifest, ordered gate-record digests, verified artifact digests, decision,
+   reasons and aggregator identity;
+4. a detached approval binds the aggregate digest and accepted signer-policy
+   digest;
+5. the signed tag targets the candidate commit and binds the candidate,
+   aggregate and approval digests; and
+6. a publication receipt binds the tag and exact promoted artifact digests.
+
+The digest that addresses an aggregate is computed from its payload and is not
+a member of that payload. Its approval is a later detached envelope, never an
+input to the aggregate. Gate reruns create new immutable records and a new
+aggregate; no status or evidence object is edited in place. A source, scope,
+schema, policy or package-version change creates a new candidate identity.
+
+After acceptance, a descendant commit may add a documentation-only projection
+of the external result. That projection cites the candidate commit, tree and
+identity digest; the aggregate and approval digests; the signed-tag object
+identity; and the publication-receipt digest. It is not the release subject,
+does not change the signed tag, cannot alter the candidate's frozen scope and
+cannot close or reopen a gate. Correcting designated projection fields needs no
+gate rerun. A descendant change to normative scope, validation, source, package
+bytes or accepted release-note content is not a projection and is a new
+candidate instead.
 
 Candidate identity hashes the exact committed source independently of checkout
 metadata. `quarry.git-tree-sha256.v1` domain-separates the hash and frames each
@@ -384,8 +459,10 @@ artifact bytes, signature authenticity or promotion eligibility. Its printed
 digest is a content identity, not an acceptance decision; those checks belong
 to the still-missing scope manifest, artifact verifier and aggregator.
 
-Each gate eventually emits one canonical record. The v1 gate schema preserves
-at least the following structure:
+Each record-producing gate eventually emits one canonical record. The
+`E-AGGREGATE` payload and detached `E-APPROVAL` use their own still-open
+contracts rather than pretending to be inputs to themselves. The v1 gate schema
+preserves at least the following structure:
 
 ```json
 {
@@ -447,10 +524,13 @@ artifacts must be content-addressed; the eventual
 aggregate must include their digests and reject an artifact that cannot be
 opened and rehashed.
 
-The aggregator must have hermetic tests for every status, missing record,
-duplicate gate, wrong candidate, malformed schema, invalid signature, expired
-disposition, unexpected skip, and conflicting result. Its output must contain
-the ordered gate set, decision, reasons, and aggregate digest.
+The aggregator must have hermetic conformance tests and committed golden vectors
+for every status, missing record, duplicate gate, wrong candidate, malformed
+schema, invalid signature, expired disposition, unexpected skip, and
+conflicting result. The conformance run emits a result and canonical digest;
+that evidence closes `A-EVIDENCE-SCHEMA` only and is not a candidate release
+aggregate. A candidate aggregate output instead contains the ordered
+scope-selected gate set, decision, reasons, and aggregate digest.
 
 ## Current Phase 0 closure order
 
