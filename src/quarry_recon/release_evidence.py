@@ -86,7 +86,15 @@ PYTEST_TAXONOMY_SCHEMA_PATH = \
 VERIFICATION_JOB_MAP_SCHEMA_PATH = \
     "release/evidence/schemas/verification-job-map-v1.schema.json"
 VERIFICATION_JOB_MAP_PATH = "release/evidence/verification-job-map-v1.json"
+H0_DEVELOPMENT_PROFILE_SCHEMA_PATH = \
+    "release/evidence/schemas/h0-development-profile-v1.schema.json"
+H0_DEVELOPMENT_PROFILE_PATH = "release/evidence/h0-development-profile-v1.json"
 FUTURE_RUNNER_INPUTS = {
+    "h0-development-profile": H0_DEVELOPMENT_PROFILE_PATH,
+    "h0-development-profile-schema": H0_DEVELOPMENT_PROFILE_SCHEMA_PATH,
+    "h0-inner-launcher": "src/quarry_recon/release_h0_inner.py",
+    "h0-private-identity-worker": "src/quarry_recon/release_h0_identity.py",
+    "h0-runner": "src/quarry_recon/release_h0.py",
     "pytest-taxonomy-schema": PYTEST_TAXONOMY_SCHEMA_PATH,
     "verification-job-map": VERIFICATION_JOB_MAP_PATH,
     "verification-job-map-schema": VERIFICATION_JOB_MAP_SCHEMA_PATH,
