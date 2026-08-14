@@ -13,8 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from quarry_recon import store
-from quarry_recon import privfs
+from quarry_recon import privfs, run_manifest, store
 from quarry_recon.state import ContractError
 
 
@@ -1086,17 +1085,22 @@ def test_write_manifest_crosses_finalization_seal(tmp_path):
         run.add("ip", {"ip": "192.0.2.202"})
 
 
-def test_sealed_manifest_rebuild_does_not_create_base_degradation_marker(tmp_path):
+def test_sealed_manifest_rebuild_refuses_malformed_base_without_mutation(tmp_path):
     run = _running_run(tmp_path, "sealed-damaged-ledger")
     refused = run.dir / "envelope-refused.jsonl"
     refused.write_bytes(b"not-json\n")
     os.chmod(refused, 0o600)
     run.begin_finalization()
+    state_before = run.state_path.read_bytes()
+    refused_before = refused.read_bytes()
     assert not run._degraded_path.exists()
-    run.write_manifest({}, ["fixture"])
+    with pytest.raises(run_manifest.ManifestError,
+                       match=r"envelope-refused\.jsonl row 1"):
+        run.write_manifest({}, ["fixture"])
     assert not run._degraded_path.exists()
-    manifest = json.loads(run.manifest_path.read_text())
-    assert manifest["summary"]["verdict"] != "complete"
+    assert not run.manifest_path.exists()
+    assert run.state_path.read_bytes() == state_before
+    assert refused.read_bytes() == refused_before
 
 
 def test_preexisting_claim_registry_poison_refuses_new_run(tmp_path):
