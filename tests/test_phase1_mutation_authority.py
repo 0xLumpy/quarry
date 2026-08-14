@@ -924,14 +924,34 @@ def test_normalized_journal_cross_process_writers_lose_no_rows(tmp_path):
         )
         for prefix in (1, 2)
     ]
-    for process in processes:
-        process.start()
-    assert {ready.get(timeout=10), ready.get(timeout=10)} == {1, 2}
-    release.set()
-    for process in processes:
-        process.join(20)
-        assert process.exitcode == 0
-    assert sorted((output.get(timeout=5), output.get(timeout=5))) == ["", ""]
+    started = []
+    reports = None
+    try:
+        for process in processes:
+            process.start()
+            started.append(process)
+        assert {ready.get(timeout=10), ready.get(timeout=10)} == {1, 2}
+        release.set()
+        for process in processes:
+            process.join(20)
+            assert process.exitcode == 0
+        reports = sorted((output.get(timeout=5), output.get(timeout=5)))
+    finally:
+        release.set()
+        for process in started:
+            if process.is_alive():
+                process.kill()
+                process.join(5)
+            process.close()
+        for queue in (ready, output):
+            queue.close()
+            queue.join_thread()
+            # The parent never puts, so Queue.close() has no feeder finalizer
+            # to close its retained pipe endpoints.  Close them explicitly so
+            # their later GC cannot perturb the next test's exact FD baseline.
+            queue._reader.close()
+            queue._writer.close()
+    assert reports == ["", ""]
 
     reopened = store.Run.open(tmp_path, run.target, run.run_id)
     assert set(reopened.values("ip")) == {
