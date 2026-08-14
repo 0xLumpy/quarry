@@ -2114,6 +2114,7 @@ class DirectCgroupV2:
         self._kill_state = "not_requested"
         self._kill_errno = None
         self._binding_attempted = False
+        self._bound_identity: ProcessIdentity | None = None
         self._closed = False
         self._closing = False
         self._removed = False
@@ -2213,9 +2214,13 @@ class DirectCgroupV2:
                     result = self._verify_open_proc(identity, claim.fd)
             except BaseException as exc:
                 primary = exc
-            return _finish_proc_claim(
+            finished = _finish_proc_claim(
                 claim, primary=primary, result=result,
             )
+            if (type(finished) is MembershipVerification
+                    and finished.verified):
+                self._bound_identity = identity
+            return finished
         except BaseException as boundary:
             claims = () if claim is None else (claim,)
             chosen = (
@@ -2300,6 +2305,8 @@ class DirectCgroupV2:
                 raise ContainmentFailure(
                     ContainmentReason.PROCESS_IDENTITY_INVALID,
                 )
+            if result.verified:
+                self._bound_identity = proof.process
             return result
         except BaseException as boundary:
             claims = tuple(
@@ -2324,6 +2331,98 @@ class DirectCgroupV2:
             try:
                 claim = _open_proc_close_claim(identity.pid, "verify_proc_fd")
                 result = self._verify_open_proc(identity, claim.fd)
+            except ContainmentFailure as exc:
+                if exc.reason is ContainmentReason.DESCRIPTOR_CLOSE_FAILED:
+                    primary = exc
+                else:
+                    result = MembershipVerification(False, exc.reason)
+            except BaseException as exc:
+                primary = exc
+            return _finish_proc_claim(
+                claim, primary=primary, result=result,
+            )
+        except BaseException as boundary:
+            claims = () if claim is None else (claim,)
+            chosen = (
+                primary if primary is not None
+                and not isinstance(primary, Exception) else boundary
+            )
+            _recover_claims_at_boundary(chosen, claims)
+
+    def verify_started_pid(
+        self, identity: ProcessIdentity,
+    ) -> MembershipVerification:
+        """Verify the exact bound STARTED identity, including exit races.
+
+        Linux removes an exited task from ``cgroup.procs`` before its parent
+        reaps it, while the zombie's ``/proc/<pid>`` identity and cgroup record
+        remain readable.  This proof is valid only after this handle performed
+        its one parked binding.  One held proc directory binds two identity,
+        membership and leaf observations around the cgroup.procs sample.  A live
+        process must be listed; only an exact final ``Z`` state may explain its
+        absence.  Reaped, ``X``/``x``, malformed or changed identities refuse.
+        """
+        self._require_open()
+        if type(identity) is not ProcessIdentity:
+            raise ContainmentRefused(ContainmentReason.PROCESS_IDENTITY_INVALID)
+        if self._bound_identity != identity:
+            raise ContainmentRefused(ContainmentReason.PROCESS_IDENTITY_INVALID)
+        claim: _DescriptorCloseClaim | None = None
+        primary: BaseException | None = None
+        result: MembershipVerification | None = None
+        try:
+            try:
+                claim = _open_proc_close_claim(
+                    identity.pid, "verify_started_proc_fd",
+                )
+                before = _proc_stat_identity(claim.fd)
+                membership_before = _proc_cgroup(claim.fd)
+                leaf_before = self._leaf_identity_current()
+                pids = _parse_pid_lines(_read_fd(
+                    self._procs_read_fd,
+                    _MAX_PROC_TEXT,
+                    reason=ContainmentReason.PROCESS_CGROUP_MALFORMED,
+                ))
+                after = _proc_stat_identity(claim.fd)
+                membership_after = _proc_cgroup(claim.fd)
+                leaf_after = self._leaf_identity_current()
+                if (before.pid != identity.pid
+                        or after.pid != identity.pid
+                        or before.start_time_ticks != identity.start_time_ticks
+                        or after.start_time_ticks != identity.start_time_ticks):
+                    result = MembershipVerification(
+                        False, ContainmentReason.PROCESS_IDENTITY_CHANGED,
+                    )
+                elif (before.state in ("X", "x")
+                        or after.state in ("X", "x")
+                        or (before.state == "Z" and after.state != "Z")):
+                    result = MembershipVerification(
+                        False, ContainmentReason.PROCESS_GONE,
+                    )
+                elif (before.process_group != identity.pid
+                        or after.process_group != identity.pid
+                        or before.session != identity.pid
+                        or after.session != identity.pid):
+                    result = MembershipVerification(
+                        False, ContainmentReason.PROCESS_IDENTITY_CHANGED,
+                    )
+                elif (membership_before != self._membership
+                        or membership_after != self._membership):
+                    result = MembershipVerification(
+                        False, ContainmentReason.PROCESS_CGROUP_MISMATCH,
+                    )
+                elif not leaf_before or not leaf_after:
+                    result = MembershipVerification(
+                        False, ContainmentReason.LEAF_IDENTITY_CHANGED,
+                    )
+                elif identity.pid not in pids and after.state != "Z":
+                    result = MembershipVerification(
+                        False, ContainmentReason.LEAF_MEMBERSHIP_MISSING,
+                    )
+                else:
+                    result = MembershipVerification(
+                        True, ContainmentReason.VERIFIED,
+                    )
             except ContainmentFailure as exc:
                 if exc.reason is ContainmentReason.DESCRIPTOR_CLOSE_FAILED:
                     primary = exc

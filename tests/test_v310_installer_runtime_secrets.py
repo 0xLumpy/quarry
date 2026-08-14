@@ -8,12 +8,13 @@ import site
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
 
 from quarry_recon import (contract, events, oob, registry, runner, runner_native,
-                          runtime_identity, secrets, store)
+                          runner_supervisor, runtime_identity, secrets, store)
 from quarry_recon.phases import params, vertical
 from quarry_recon.runner import RunResult, Status
 from quarry_recon.runner_repository import RepositoryOutput
@@ -1273,6 +1274,22 @@ def test_configured_canary_is_removed_from_every_persisted_child_sink(
     monkeypatch.setattr(registry, "tool_for_bin", lambda _name: tool)
     monkeypatch.setattr(secrets, "chaos", lambda: canary)
     monkeypatch.setattr(secrets, "values", lambda: [canary])
+    real_capture = runner_supervisor.capture_process_identity
+    captured_pids = []
+
+    def delay_started_capture(pid):
+        captured_pids.append(pid)
+        if len(captured_pids) == 2:
+            # The credential fixture exits immediately.  Before the STARTED EOF
+            # barrier this delay let the worker reap it and made the parent lose
+            # /proc identity.  The worker must now retain that identity until the
+            # parent finishes this exact capture and containment verification.
+            time.sleep(0.1)
+        return real_capture(pid)
+
+    monkeypatch.setattr(
+        runner_supervisor, "capture_process_identity", delay_started_capture,
+    )
 
     run = store.Run.create(tmp_path, "acme.example", run_id="v310-secret-sinks")
     run.write_state("running")
@@ -1302,12 +1319,16 @@ def test_configured_canary_is_removed_from_every_persisted_child_sink(
 
     assert result.status is Status.FAILED
     assert "framework credential" in result.note
+    assert result.meta["execution_reason"] == "complete"
+    assert result.meta["repository_publication"] == "published"
+    assert len(captured_pids) == 2 and captured_pids[0] != captured_pids[1]
     assert not native_path.exists(), "credential-bearing native output must never publish"
     assert canary.encode() not in stdout_path.read_bytes()
     assert canary.encode() not in stderr_path.read_bytes()
     assert b"QUARRY_RUNNER_PRIVATE_REDACTIONS" not in stdout_path.read_bytes()
     assert b"absent" in stdout_path.read_bytes()
     assert b"*" * len(canary) in stdout_path.read_bytes()
+    assert list(run.dir.rglob(".quarry-*.stage")) == []
     for path in run.dir.rglob("*"):
         if path.is_file():
             assert canary.encode() not in path.read_bytes(), path

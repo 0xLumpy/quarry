@@ -9,6 +9,7 @@ from __future__ import annotations
 import errno
 import inspect
 import os
+import shutil
 import stat
 import sys
 import time
@@ -2363,6 +2364,185 @@ def test_pid_verification_refuses_matching_pid_outside_leaf(monkeypatch, tmp_pat
         result = handle.verify_pid(containment.ProcessIdentity(pid, started))
         assert result.verified is False
         assert result.reason is containment.ContainmentReason.PROCESS_CGROUP_MISMATCH
+    finally:
+        handle.close()
+
+
+def _bind_started_fixture(monkeypatch, tmp_path, *, pid: int, started: int):
+    handle, leaf = _acquire_fixture(monkeypatch, tmp_path / "cgroup-fixture")
+    process = _install_fake_proc(
+        monkeypatch,
+        tmp_path,
+        pid=pid,
+        start_time=started,
+        membership="/delegated",
+    )
+    (process / "stat").write_text(_proc_stat(
+        pid,
+        started,
+        state="T",
+        process_group=pid,
+        session=pid,
+    ))
+    real_write = containment.os.write
+
+    def model_migration(fd: int, payload: bytes) -> int:
+        written = real_write(fd, payload)
+        if fd == handle._procs_write_fd:
+            (leaf / "cgroup.procs").write_bytes(payload)
+            (process / "cgroup").write_text(f"0::{handle.membership}\n")
+        return written
+
+    monkeypatch.setattr(containment.os, "write", model_migration)
+    identity = containment.ProcessIdentity(pid, started)
+    assert handle.bind_pid(identity).verified is True
+    return handle, leaf, process, identity
+
+
+@pytest.mark.parametrize(("state", "listed", "verified", "reason"), [
+    ("S", True, True, containment.ContainmentReason.VERIFIED),
+    ("Z", False, True, containment.ContainmentReason.VERIFIED),
+    ("S", False, False, containment.ContainmentReason.LEAF_MEMBERSHIP_MISSING),
+    ("X", True, False, containment.ContainmentReason.PROCESS_GONE),
+    ("x", False, False, containment.ContainmentReason.PROCESS_GONE),
+])
+def test_started_verification_requires_live_leaf_or_exact_unreaped_zombie(
+        monkeypatch, tmp_path, state, listed, verified, reason):
+    pid, started = 42430, 199_124
+    handle, leaf, process, identity = _bind_started_fixture(
+        monkeypatch, tmp_path, pid=pid, started=started,
+    )
+    (process / "stat").write_text(_proc_stat(
+        pid, started, state=state, process_group=pid, session=pid,
+    ))
+    (leaf / "cgroup.procs").write_text(f"{pid}\n" if listed else "")
+    try:
+        result = handle.verify_started_pid(identity)
+        assert result.verified is verified
+        assert result.reason is reason
+    finally:
+        handle.close()
+
+
+@pytest.mark.parametrize("mutation", ["start", "cgroup", "leaf"])
+def test_started_zombie_verification_rejects_changed_authority(
+        monkeypatch, tmp_path, mutation):
+    pid, started = 42431, 199_125
+    handle, leaf, process, identity = _bind_started_fixture(
+        monkeypatch, tmp_path, pid=pid, started=started,
+    )
+    (process / "stat").write_text(_proc_stat(
+        pid,
+        started + (mutation == "start"),
+        state="Z",
+        process_group=pid,
+        session=pid,
+    ))
+    (leaf / "cgroup.procs").write_text("")
+    if mutation == "cgroup":
+        (process / "cgroup").write_text("0::/delegated/sibling\n")
+    if mutation == "leaf":
+        handle._leaf_identity = (0, 0)
+    try:
+        result = handle.verify_started_pid(identity)
+        assert result.verified is False
+        assert result.reason is {
+            "start": containment.ContainmentReason.PROCESS_IDENTITY_CHANGED,
+            "cgroup": containment.ContainmentReason.PROCESS_CGROUP_MISMATCH,
+            "leaf": containment.ContainmentReason.LEAF_IDENTITY_CHANGED,
+        }[mutation]
+    finally:
+        handle.close()
+
+
+def test_started_verification_accepts_exact_live_to_zombie_transition(
+        monkeypatch, tmp_path):
+    pid, started = 42432, 199_126
+    handle, leaf, process, identity = _bind_started_fixture(
+        monkeypatch, tmp_path, pid=pid, started=started,
+    )
+    (process / "stat").write_text(_proc_stat(
+        pid, started, state="S", process_group=pid, session=pid,
+    ))
+    (leaf / "cgroup.procs").write_text("")
+    real_stat = containment._proc_stat_identity
+    samples = 0
+
+    def transition_to_zombie(fd):
+        nonlocal samples
+        observed = real_stat(fd)
+        samples += 1
+        if samples == 1:
+            (process / "stat").write_text(_proc_stat(
+                pid, started, state="Z", process_group=pid, session=pid,
+            ))
+        return observed
+
+    monkeypatch.setattr(containment, "_proc_stat_identity", transition_to_zombie)
+    try:
+        result = handle.verify_started_pid(identity)
+        assert result == containment.MembershipVerification(
+            True, containment.ContainmentReason.VERIFIED,
+        )
+        assert samples == 2
+    finally:
+        handle.close()
+
+
+def test_started_verification_refuses_a_reaped_zombie(monkeypatch, tmp_path):
+    pid, started = 42433, 199_127
+    handle, leaf, process, identity = _bind_started_fixture(
+        monkeypatch, tmp_path, pid=pid, started=started,
+    )
+    (process / "stat").write_text(_proc_stat(
+        pid, started, state="Z", process_group=pid, session=pid,
+    ))
+    (leaf / "cgroup.procs").write_text("")
+    shutil.rmtree(process)
+    try:
+        result = handle.verify_started_pid(identity)
+        assert result.verified is False
+        assert result.reason is containment.ContainmentReason.PROCESS_GONE
+    finally:
+        handle.close()
+
+
+def test_failed_binding_attempt_cannot_authorize_zombie_continuity(
+        monkeypatch, tmp_path):
+    handle, leaf = _acquire_fixture(monkeypatch, tmp_path / "cgroup-fixture")
+    pid, started = 42434, 199_128
+    process = _install_fake_proc(
+        monkeypatch,
+        tmp_path,
+        pid=pid,
+        start_time=started,
+        membership=handle.membership,
+    )
+    (process / "stat").write_text(_proc_stat(
+        pid, started, state="T", process_group=pid, session=pid,
+    ))
+    identity = containment.ProcessIdentity(pid, started)
+    real_write = containment.os.write
+
+    def refuse_migration(fd: int, payload: bytes) -> int:
+        if fd == handle._procs_write_fd:
+            return len(payload)
+        return real_write(fd, payload)
+
+    monkeypatch.setattr(containment.os, "write", refuse_migration)
+    try:
+        attempted = handle.bind_pid(identity)
+        assert attempted.verified is False
+        assert attempted.reason is containment.ContainmentReason.LEAF_MEMBERSHIP_MISSING
+        assert handle._binding_attempted is True
+        assert handle._bound_identity is None
+        (process / "stat").write_text(_proc_stat(
+            pid, started, state="Z", process_group=pid, session=pid,
+        ))
+        (leaf / "cgroup.procs").write_text("")
+        with pytest.raises(containment.ContainmentRefused) as caught:
+            handle.verify_started_pid(identity)
+        assert caught.value.reason is containment.ContainmentReason.PROCESS_IDENTITY_INVALID
     finally:
         handle.close()
 

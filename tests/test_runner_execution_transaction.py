@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import threading
 from dataclasses import replace
 
 import pytest
@@ -210,7 +211,11 @@ def _install_execution_fakes(
                 detail="exec_release",
                 process_group_settled=True,
             )
-        kwargs["on_started"]()
+        try:
+            kwargs["on_started"]()
+        except BaseException:
+            launcher.abort_and_reap()
+            raise
         events.append("stream_settled")
         return _complete_settlement(request, launcher)
 
@@ -234,6 +239,7 @@ def _exchange(
     launcher=None,
     stream_behavior="complete",
     timeout=30,
+    trailing=b"",
 ):
     invocation = _invocation(timeout=timeout)
     request = invocation.worker
@@ -256,6 +262,7 @@ def _exchange(
             wire += wire_stdin_data
         if command is not None:
             wire += protocol.encode_command(command)
+        wire += trailing
         runner_ipc.write_all(request_write, wire)
         os.close(request_write)
         request_write = -1
@@ -375,6 +382,130 @@ def test_execution_go_is_exactly_ordered_and_streams_own_stage_descriptors(
     assert callable(kwargs["on_started"])
 
 
+def test_execution_keeps_fast_child_unreaped_until_parent_started_eof(
+        monkeypatch):
+    invocation = _invocation()
+    request = invocation.worker
+    events = []
+    launcher = _FakeExecutionLauncher(events=events)
+    stream_calls = []
+    request_read, request_write = os.pipe()
+    control_read, control_write = os.pipe()
+    result = {}
+    try:
+        runner_ipc.write_all(
+            request_write,
+            protocol.encode_request(request)
+            + protocol.encode_command(_command(request)),
+        )
+        monkeypatch.setattr(runner_worker, "_arm_parent_death", lambda _pid: None)
+        monkeypatch.setattr(runner_worker.os, "getpid", lambda: WORKER_PID)
+        _install_execution_fakes(
+            monkeypatch,
+            launcher,
+            events=events,
+            stream_calls=stream_calls,
+        )
+
+        def run_worker():
+            result["returncode"] = runner_worker._run_worker(
+                request_read,
+                control_write,
+                expected_parent_pid=8001,
+                stdout_fd=81,
+                stderr_fd=82,
+                execution=True,
+                stdin_data=DATA,
+                stdin_file_fd=None,
+            )
+
+        thread = threading.Thread(target=run_worker, daemon=True)
+        thread.start()
+        decoder = runner_ipc.IncrementalFrameDecoder(protocol.MAX_FRAME_BYTES)
+        records = []
+        while len(records) < 3:
+            records.extend(
+                protocol.decode_control_frame(frame)
+                for frame in decoder.feed(os.read(control_read, 65536))
+            )
+        assert tuple(type(record) for record in records) == (
+            protocol.ReadyFrame,
+            protocol.PreparedFrame,
+            protocol.StartedFrame,
+        )
+        assert thread.is_alive()
+        assert launcher.reap_calls == 0
+        assert "stream_settled" not in events
+
+        os.close(request_write)
+        request_write = -1
+        thread.join(1)
+        assert not thread.is_alive()
+        assert result == {"returncode": 0}
+        assert "stream_settled" in events
+    finally:
+        for fd in (request_read, request_write, control_read, control_write):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def test_execution_rejects_trailing_bytes_after_go_at_started_barrier(
+        monkeypatch):
+    request = _invocation().worker
+
+    def command_with_trailing_bytes(observed):
+        return _command(observed)
+
+    events = []
+    launcher = _FakeExecutionLauncher(events=events)
+    request_read, request_write = os.pipe()
+    control_read, control_write = os.pipe()
+    try:
+        runner_ipc.write_all(
+            request_write,
+            protocol.encode_request(request)
+            + protocol.encode_command(command_with_trailing_bytes(request))
+            + b"trailing-control-byte",
+        )
+        os.close(request_write)
+        request_write = -1
+        monkeypatch.setattr(runner_worker, "_arm_parent_death", lambda _pid: None)
+        monkeypatch.setattr(runner_worker.os, "getpid", lambda: WORKER_PID)
+        _install_execution_fakes(monkeypatch, launcher, events=events)
+        returncode = runner_worker._run_worker(
+            request_read,
+            control_write,
+            expected_parent_pid=8001,
+            stdout_fd=81,
+            stderr_fd=82,
+            execution=True,
+            stdin_data=DATA,
+            stdin_file_fd=None,
+        )
+        os.close(control_write)
+        control_write = -1
+        records = _frame_records(control_read)
+
+        assert returncode == runner_worker._EXIT_CONTROL_FAILED
+        assert tuple(type(record) for record in records) == (
+            protocol.ReadyFrame,
+            protocol.PreparedFrame,
+            protocol.StartedFrame,
+        )
+        assert launcher.reap_calls == 1
+        assert "stream_settled" not in events
+    finally:
+        for fd in (request_read, request_write, control_read, control_write):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
 def test_timeout_zero_defers_settlement_deadline_until_natural_exit(monkeypatch):
     request, returncode, records, _launcher, stream_calls, _events = _exchange(
         monkeypatch, timeout=0,
@@ -437,6 +568,33 @@ def test_abort_mismatch_and_missing_go_never_release_or_start(
     assert launcher.release_calls == []
     assert launcher.reap_calls == 1
     assert stream_calls == []
+
+
+@pytest.mark.parametrize("kind", [
+    protocol.WorkerCommandKind.ABORT,
+    protocol.WorkerCommandKind.GO,
+])
+def test_negative_or_mismatched_command_rejects_trailing_bytes_before_launch(
+        monkeypatch, kind):
+    def command(request):
+        observed = _command(request, kind)
+        if kind is protocol.WorkerCommandKind.GO:
+            observed = replace(observed, request_sha256="c7" * 32)
+        return observed
+
+    _request, returncode, records, launcher, streams, _events = _exchange(
+        monkeypatch,
+        command_factory=command,
+        trailing=b"unexpected-trailing-command",
+    )
+
+    assert returncode == runner_worker._EXIT_CONTROL_FAILED
+    assert records[-1].terminal is protocol.ExecutionTerminal.WORKER_FAILED
+    assert records[-1].detail == "command_invalid"
+    assert records[-1].launched is False
+    assert launcher.release_calls == []
+    assert launcher.reap_calls == 1
+    assert streams == []
 
 
 def test_exec_failure_emits_no_started_and_returns_typed_launch_failure(monkeypatch):

@@ -1225,7 +1225,6 @@ def _run_execution_transaction(
         command = decode_command(runner_ipc.read_frame(
             request_fd, max_frame_bytes=MAX_FRAME_BYTES,
         ))
-        runner_ipc.require_eof(request_fd)
         command_valid = _command_matches_prepared(command, request, prepared)
     except BaseException as primary:
         command_error = primary
@@ -1234,6 +1233,17 @@ def _run_execution_transaction(
 
     if command_error is not None or not command_valid \
             or command.command is not WorkerCommandKind.GO:
+        try:
+            # Only a fully correlated GO defers EOF until the post-STARTED
+            # parent observation barrier.  Malformed, negative and mismatched
+            # commands remain pre-launch transactions and reject every trailing
+            # byte, including after a frame-decoding refusal.
+            runner_ipc.require_eof(request_fd)
+        except BaseException as eof_error:
+            if (command_error is None
+                    or (isinstance(command_error, Exception)
+                        and not isinstance(eof_error, Exception))):
+                command_error = eof_error
         settled = (
             _settle_after_boundary(launcher, command_error)
             if command_error is not None else _settle_launcher(launcher)
@@ -1270,6 +1280,13 @@ def _run_execution_transaction(
 
     def _write_started() -> None:
         runner_ipc.write_all(control_fd, encode_started(started))
+        # The exact parent keeps this private command channel open after GO while
+        # it independently authenticates STARTED identity and containment.
+        # Waiting for EOF before the stream engine can reap keeps even an already-
+        # exited launcher as an inspectable zombie.  Successful authentication
+        # closes the barrier immediately; failure settlement also closes it before
+        # kill/reap.  In either case trailing bytes are rejected.
+        runner_ipc.require_eof(request_fd)
 
     now = time.monotonic()
     execution_deadline = None if request.timeout == 0 else now + float(request.timeout)

@@ -1627,7 +1627,7 @@ def _authenticate_execution_started(
             or identity != owner.prepared_identity):
         raise _ExecutionProtocolFailure(ExecutionReason.IDENTITY_FAILED)
     try:
-        verification = owner.containment.verify_pid(identity)
+        verification = owner.containment.verify_started_pid(identity)
     except Exception:
         raise _ExecutionProtocolFailure(
             ExecutionReason.CONTAINMENT_FAILED,
@@ -1717,12 +1717,6 @@ def _drive_execution_protocol(
                     if owner.failure is not None:
                         break
                     if write_phase == "command":
-                        if not _owner_close_pipe(owner, "input"):
-                            _set_execution_failure(
-                                owner, ExecutionReason.COMMAND_FAILED,
-                            )
-                            break
-                        owner.input_fd = -1
                         owner.go_command_sent = True
                     write_wire = b""
                     write_offset = 0
@@ -1813,6 +1807,17 @@ def _drive_execution_protocol(
                             _authenticate_execution_started(
                                 owner, request, record,
                             )
+                            # Closing the exact private command pipe releases the
+                            # worker's STARTED observation barrier.  The worker
+                            # cannot enter its reap loop before this close, so a
+                            # fast-exiting tool retains /proc identity through
+                            # parent authentication.  A close fault is a command
+                            # fault; final settlement still closes or kills it.
+                            if not _owner_close_pipe(owner, "input"):
+                                raise _ExecutionProtocolFailure(
+                                    ExecutionReason.COMMAND_FAILED,
+                                )
+                            owner.input_fd = -1
                         else:
                             if type(record) is not WorkerSettlement:
                                 raise ProtocolError(

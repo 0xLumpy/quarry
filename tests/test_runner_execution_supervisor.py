@@ -349,6 +349,9 @@ class _DirectHandle:
             True, containment.ContainmentReason.VERIFIED,
         )
 
+    def verify_started_pid(self, identity):
+        return self.verify_pid(identity)
+
     def kill_settle_remove(self, deadline):
         self.settlement_deadlines.append(deadline)
         self.events.append("containment_settled")
@@ -545,10 +548,13 @@ def test_data_execution_transfers_writers_before_hash_bound_go_and_settles(
         inherited.pop(int(env[runner_worker.STDERR_FD_ENV]))
         runner_ipc.write_all(
             control_fd,
-            protocol.encode_started(_started(decoded, direct.handle.containment_id))
-            + protocol.encode_settlement(
-                _settlement(decoded, stdin_data=DATA),
-            ),
+            protocol.encode_started(_started(decoded, direct.handle.containment_id)),
+        )
+        assert os.read(command_fd, 1) == b""
+        events.append("started_eof_observed")
+        runner_ipc.write_all(
+            control_fd,
+            protocol.encode_settlement(_settlement(decoded, stdin_data=DATA)),
         )
         return 0
 
@@ -578,6 +584,7 @@ def test_data_execution_transfers_writers_before_hash_bound_go_and_settles(
         assert events.index("launcher_authenticated") < events.index("launcher_bound")
         assert events.index("launcher_bound") < events.index("go_received")
         assert events.index("go_received") < events.index("tool_verified")
+        assert events.index("tool_verified") < events.index("started_eof_observed")
         assert events.index("worker_reaped") < events.index("containment_settled")
         assert events.index("containment_settled") < events.index("stages_settled")
         assert direct.calls == [request.request_id]
@@ -596,6 +603,76 @@ def test_data_execution_transfers_writers_before_hash_bound_go_and_settles(
             outcome.reason = supervisor.ExecutionReason.CONTROL_FAILED
     finally:
         _cleanup_batch(batch)
+
+
+@pytest.mark.parametrize("after_effect", [False, True])
+@pytest.mark.parametrize("cancellation_type", [KeyboardInterrupt, SystemExit])
+def test_started_eof_cancellation_unblocks_and_reaps_exact_worker(
+        tmp_path, monkeypatch, after_effect, cancellation_type):
+    invocation = _null_invocation()
+    request = invocation.worker
+    events = []
+    calls = []
+    direct = _install_parent_fakes(monkeypatch, events)
+    cancellation = cancellation_type("cancel STARTED EOF acknowledgement")
+    eof_observed = threading.Event()
+
+    def peer(command_fd, control_fd, _inherited, _env):
+        decoded = protocol.decode_request(runner_ipc.read_frame(
+            command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
+        ))
+        prepared = _prepared(decoded, direct.handle.containment_id)
+        runner_ipc.write_all(
+            control_fd,
+            protocol.encode_ready(_ready(decoded))
+            + protocol.encode_prepared(prepared),
+        )
+        command = protocol.decode_command(runner_ipc.read_frame(
+            command_fd, max_frame_bytes=protocol.MAX_FRAME_BYTES,
+        ))
+        assert command.command is protocol.WorkerCommandKind.GO
+        runner_ipc.write_all(
+            control_fd,
+            protocol.encode_started(_started(decoded, direct.handle.containment_id)),
+        )
+        assert os.read(command_fd, 1) == b""
+        eof_observed.set()
+        runner_ipc.write_all(
+            control_fd,
+            protocol.encode_settlement(
+                _settlement(decoded, stdin_data=b"", stdout=b"", stderr=b""),
+            ),
+        )
+        return 0
+
+    real_close_once = supervisor._close_pipe_once
+    injected = False
+
+    def interrupt_started_close(pipe):
+        nonlocal injected
+        if not injected:
+            injected = True
+            if after_effect:
+                closed, fault = real_close_once(pipe)
+                assert closed is True and fault is None
+            return False, cancellation
+        return real_close_once(pipe)
+
+    monkeypatch.setattr(supervisor, "_close_pipe_once", interrupt_started_close)
+    with pytest.raises(cancellation_type) as caught:
+        supervisor.supervise_execution(
+            invocation,
+            deadline=time.monotonic() + 3,
+            popen_factory=_spawn_factory(peer, events, calls),
+        )
+
+    assert caught.value is cancellation
+    assert injected is True
+    assert eof_observed.wait(1)
+    assert "tool_verified" in events
+    assert "worker_reaped" in events
+    assert "containment_settled" in events
+    assert direct.handle.terminal is True
 
 
 def test_file_input_is_inherited_once_without_path_disclosure(

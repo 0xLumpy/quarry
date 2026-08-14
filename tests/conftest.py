@@ -285,6 +285,9 @@ class FakeDirectContainment:
             True, containment.ContainmentReason.VERIFIED,
         )
 
+    def verify_started_pid(self, identity):
+        return self.verify_pid(identity)
+
     def kill_settle_remove(self, deadline):
         from quarry_recon import runner_containment as containment
 
