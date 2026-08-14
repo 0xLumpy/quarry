@@ -10,6 +10,8 @@ import json
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import events, store
 from quarry_recon.runner import RunResult, Status
 

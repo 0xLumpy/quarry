@@ -11,6 +11,8 @@ import json
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import budget, campaign
 
 

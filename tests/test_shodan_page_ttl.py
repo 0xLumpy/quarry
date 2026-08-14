@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import shodan_sched as S
 from quarry_recon.shodan_sched import Pivot, PivotState
 

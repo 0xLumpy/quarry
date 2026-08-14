@@ -18,7 +18,16 @@ import pytest
 
 from quarry_recon.runner import Status
 
-pytestmark = pytest.mark.integration
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.requires_tool("cat"),
+    pytest.mark.requires_tool("head"),
+    pytest.mark.requires_tool("printf"),
+    pytest.mark.requires_tool("setsid"),
+    pytest.mark.requires_tool("sh"),
+    pytest.mark.requires_tool("sleep"),
+    pytest.mark.requires_tool("true"),
+]
 
 
 def _kinds(r):

@@ -653,7 +653,7 @@ def _proc_has_identity(pid: int, identity: tuple[int, int]) -> bool:
     return False
 
 
-@pytest.mark.integration
+@pytest.mark.synthetic_process
 def test_real_linux_launcher_is_stopped_isolated_release_gated_and_exactly_reaped(
         monkeypatch, tmp_path):
     if sys.platform != "linux" or not os.path.isdir("/proc/self/fd"):

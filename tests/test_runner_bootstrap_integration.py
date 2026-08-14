@@ -12,7 +12,7 @@ from quarry_recon import runner_protocol as protocol
 from quarry_recon import runner_supervisor as supervisor
 
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.offline, pytest.mark.synthetic_process]
 
 
 @pytest.fixture(autouse=True)
@@ -30,8 +30,8 @@ def test_real_fixed_worker_completes_authenticated_prelaunch_abort(monkeypatch):
         env={"TOKEN": "environment-sentinel"},
         base_environment={"PATH": "/usr/bin"},
     ).worker
-    # The integration lane runs under an installed project interpreter; using that
-    # exact executable keeps ``-I`` meaningful and avoids PYTHONPATH-based imports.
+    # H0 runs under an installed project interpreter; using that exact executable
+    # keeps ``-I`` meaningful and avoids PYTHONPATH-based imports.
     monkeypatch.setattr(supervisor.sys, "executable", sys.executable)
     outcome = supervisor.bootstrap_worker(
         request, deadline=time.monotonic() + 5,

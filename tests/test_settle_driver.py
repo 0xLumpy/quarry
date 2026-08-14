@@ -16,6 +16,8 @@ import pathlib
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import budget, campaign, remainder, settle, store
 
 

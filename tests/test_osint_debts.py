@@ -11,6 +11,8 @@ import pathlib
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import notify, osint, policy, settings
 from quarry_recon.runner_repository import ArtifactDisposition, RepositoryOutput
 

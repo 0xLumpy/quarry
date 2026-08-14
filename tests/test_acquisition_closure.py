@@ -12,6 +12,8 @@ import pathlib
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import campaign, contract, events, policy, sources
 from quarry_recon.runner import RunResult, Status
 

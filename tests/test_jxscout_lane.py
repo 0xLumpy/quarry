@@ -15,22 +15,34 @@ import pytest
 from quarry_recon import policy, settings
 from quarry_recon.phases import crawl
 
+pytestmark = pytest.mark.offline
 
-def _stub_shim(monkeypatch, tmp_path):
+
+def _stub_shim(monkeypatch, tmp_path, *, real_bwrap=False):
     """Resolve the SHIM without requiring it to be installed on this host.
 
     The analyzer is an OPTIONAL install, so an offline test that only reaches the sandbox when
     `~/.local/bin` happens to be on PATH is not a test — measured in a clean env (`env -i`, PATH=/usr/bin:
     /bin) every disposition silently became `no-sandbox` and passed nothing it claimed to pin. bwrap
-    itself is NOT stubbed: the argv these tests assert on has to be the one the real builder produces."""
+    itself is represented by a deterministic runner path for H0 argv-builder tests.  The separate H1
+    namespace tests request the real runner-attested executable explicitly."""
     stub = tmp_path / crawl.JXSCOUT_SHIM
     if not stub.exists():
         stub.write_text("#!/bin/sh\nexit 0\n")
         stub.chmod(0o755)
     real = crawl.shutil.which
-    monkeypatch.setattr(crawl.shutil, "which",
-                        lambda name, *a, **k: str(stub) if name == crawl.JXSCOUT_SHIM
-                        else real(name, *a, **k))
+    fake_bwrap = "/runner-attested/bin/bwrap"
+    monkeypatch.setattr(
+        crawl.shutil,
+        "which",
+        lambda name, *a, **k: (
+            str(stub)
+            if name == crawl.JXSCOUT_SHIM
+            else real(name, *a, **k)
+            if real_bwrap or name != "bwrap"
+            else fake_bwrap
+        ),
+    )
     return stub
 
 
@@ -269,21 +281,6 @@ class TestDispositionsAreNotGuesses:
         assert binds == [str(tmp_path)], binds
         assert str(tmp_path / "b.js") in joined
 
-    @pytest.mark.integration          # spawns the REAL sandbox: the claim is about the namespace itself
-    @pytest.mark.skipif(not __import__("shutil").which("bwrap"), reason="bwrap not installed")
-    @pytest.mark.parametrize("path", [".config/quarry/secrets.yaml", ".ssh", "workspace"])
-    def test_the_operators_own_files_are_NOT_in_the_namespace(self, tmp_path, monkeypatch, path):
-        """Measured through the real sandbox: not merely unwritable — absent."""
-        import subprocess
-        _stub_shim(monkeypatch, tmp_path)
-        (tmp_path / "b.js").write_text("x")
-        cmd = crawl._jxscout_sandbox(["jxscout-chunks", str(tmp_path / "b.js"), "0"],
-                                     tmp_path / "out.txt", tmp_path / "err.txt")
-        target = str(pathlib.Path.home() / path)
-        probe = cmd[:cmd.index("sh")] + ["sh", "-c", f"ls -d {target} 2>&1 || true"]
-        got = subprocess.run(probe, capture_output=True, text=True, timeout=60).stdout
-        assert target not in got.split("\n")[0] or "No such file" in got, got[:120]
-
     def test_the_sandbox_carries_EVERY_measured_limit(self, tmp_path, monkeypatch):
         """Isolation is not containment: the probe measured that a counting loop runs to the wall clock,
         that Buffers escape the heap flag, and that output must be bounded in the CHILD."""
@@ -346,10 +343,10 @@ class TestTheWritablePathIsPRIVATEToEachInvocation:
     bundle, inside the evidence trail the sandbox exists to protect."""
 
     @staticmethod
-    def _recorder(monkeypatch, tmp_path, *, out="a.js\n", err="", publish=True):
+    def _recorder(monkeypatch, tmp_path, *, out="a.js\n", err="", publish=True, real_bwrap=False):
         """Runs the REAL analyze path, capturing what the sandbox was actually pointed at."""
         from quarry_recon.runner import RunResult, Status
-        _stub_shim(monkeypatch, tmp_path)
+        _stub_shim(monkeypatch, tmp_path, real_bwrap=real_bwrap)
         seen: list = []
 
         def fake_contract(source_id, cmd, work_unit=None, timeout=None, **kw):
@@ -441,36 +438,6 @@ class TestTheWritablePathIsPRIVATEToEachInvocation:
             assert (cov["tested"], cov["omitted"]) == (0, 1) and "unpublished=1" in cov["reason"], cov
         finally:
             events.reset()
-
-    @pytest.mark.integration          # spawns the REAL sandbox: the claim is about the namespace itself
-    @pytest.mark.skipif(not __import__("shutil").which("bwrap"), reason="bwrap not installed")
-    def test_the_evidence_TREE_is_absent_from_the_real_namespace(self, tmp_path, monkeypatch):
-        import subprocess
-        import tempfile
-        from quarry_recon import store
-        seen = self._recorder(monkeypatch, tmp_path)
-        run = store.Run.create(tmp_path, "acme.com")
-        (tmp_path / "x.js").write_text("x")
-        crawl._jxscout_analyze(type("C", (), {"run": run})(), tmp_path / "x.js", 0)
-        published = run.raw_path("crawl", "jxscout", "x.txt")
-        assert published.exists() and published.read_text(), "it really is there, on the host"
-        dead = seen[0]["binds"][0]
-        assert not pathlib.Path(dead).exists(), "the first scratch does not outlive its invocation"
-        # a LATER bundle, built exactly as the lane builds it, asks for the earlier one's evidence
-        with tempfile.TemporaryDirectory(prefix="quarry-jxscout-") as later:
-            (tmp_path / "y.js").write_text("y")
-            cmd = crawl._jxscout_sandbox(["jxscout-chunks", str(tmp_path / "y.js"), "0"],
-                                         pathlib.Path(later) / "out.txt", pathlib.Path(later) / "err.txt")
-            probe = cmd[:cmd.index("sh")] + [
-                "sh", "-c", f"ls -d {published} {published.parent} {run.dir} {dead}; "
-                            f"echo rc=$?; : > {published} 2>&1 || echo 'write refused'"]
-            done = subprocess.run(probe, capture_output=True, text=True, timeout=60)
-            got = done.stdout + done.stderr
-        assert str(published) not in got.split("rc=")[0], got[:300]
-        assert got.count("No such file") >= 4, got[:300]        # every one of the four, absent
-        assert dead not in got.split("rc=")[0], "a dead scratch must not reappear either"
-        assert published.read_text(), "the earlier artifact is intact after a later bundle ran"
-
 
 class TestGuessingIsEngagementPolicy:
     def test_the_default_NEVER_guesses(self):

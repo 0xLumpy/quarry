@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import gadgets, store, triage
 
 

@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import contract
 from quarry_recon.phases import probe
 

@@ -23,6 +23,9 @@ import pytest
 from quarry_recon.phases import probe
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "measure-shodan-replay.py"
+REPO = SCRIPT.parent.parent
+
+pytestmark = pytest.mark.offline
 
 
 @pytest.fixture
@@ -83,24 +86,26 @@ class TestItRunsAtAllAsAPROGRAM:
     entrypoint was deleted by an edit that rewrote `main()` to end-of-file, and `--preflight` on the VPS
     printed nothing and exited 0. A program is only proven by running it as one."""
 
-    def _run(self, *args, cwd=None):
-        env = dict(os.environ, HOME=str(cwd)) if cwd else dict(os.environ)
+    def _run(self, *args, home: Path):
+        home.mkdir(parents=True, exist_ok=True)
+        env = {"HOME": str(home), "PATH": ""}
         return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True,
-                              env=env, timeout=120)
+                              cwd=str(REPO), env=env, timeout=120)
 
     def test_the_entrypoint_exists(self):
         src = SCRIPT.read_text()
         assert 'if __name__ == "__main__":' in src and "sys.exit(main())" in src
 
-    @pytest.mark.integration
-    def test_help_is_a_real_program_invocation(self):
-        r = self._run("--help")
+    @pytest.mark.synthetic_process
+    def test_help_is_a_real_program_invocation(self, tmp_path):
+        r = self._run("--help", home=tmp_path / "home")
         assert r.returncode == 0 and "--preflight" in r.stdout and "--run" in r.stdout
 
-    @pytest.mark.integration
+    @pytest.mark.synthetic_process
     def test_executing_it_PRODUCES_OUTPUT_and_a_meaningful_exit(self, tmp_path):
         """With no key configured this must ABORT loudly — never exit 0 in silence."""
-        r = self._run("--preflight", "--project", str(tmp_path / "p"), cwd=tmp_path)
+        r = self._run("--preflight", "--project", str(tmp_path / "p"),
+                      home=tmp_path / "home")
         assert (r.stdout + r.stderr).strip(), "a run that says nothing cannot be trusted with money"
         assert r.returncode in (0, 2), f"unexpected exit {r.returncode}: {r.stderr}"
         if r.returncode == 2:

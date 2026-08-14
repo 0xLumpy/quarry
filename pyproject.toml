@@ -30,16 +30,19 @@ where = ["src"]
 quarry_recon = ["data/*.yaml", "data/*.txt"]
 
 [tool.pytest.ini_options]
-# Default selection excludes live/integration/tool tests. The conftest Python-level deny guard is a
-# development tripwire for the remaining tests; it is not the OS isolation boundary required by the
-# release-gate contract. CI currently selects `-m "offline"`.
+# Every collected test is assigned one primary lane by tests/conftest.py before
+# marker selection.  The Python-level deny guard remains a development tripwire,
+# not the OS isolation boundary required by the release-gate contract.
 testpaths = ["tests"]
 markers = [
-    "offline: intended hermetic lane — no network or external binary (current CI selection)",
-    "requires_tool: needs a real external binary on PATH (skips when absent)",
-    "integration: runs a real external binary against fixtures (no live target)",
+    "offline: H0 hermetic lane — no network or undeclared external binary",
+    "integration: H1 tool-integration lane — attested real binary against synthetic fixtures",
+    "corpus: C0 private-corpus lane",
+    "packaging: P0 package-supply lane",
     "live: contacts the live range/network (never in offline CI)",
+    "requires_tool(name): secondary capability annotation naming one real tool",
+    "synthetic_process: secondary H0 annotation permitting a controlled interpreter/synthetic child",
 ]
-# Default run excludes live/integration/requires_tool; explicit marker selection opts into them. Complete
-# lane classification and OS isolation remain open release prerequisites.
-addopts = "--strict-markers -ra -m 'not live and not integration and not requires_tool'"
+# Default development and CI selection is the positively classified H0 lane.
+# OS isolation and canonical machine evidence remain open release prerequisites.
+addopts = "--strict-markers -ra -m offline"

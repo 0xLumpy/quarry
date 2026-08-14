@@ -1,8 +1,8 @@
 name: offline-ci
 
-# Current development CI: positively selects tests marked `offline` and arms the Python-level deny guard.
-# This does not yet classify every non-live test or provide the OS isolation/machine evidence required by
-# docs/releases/RELEASE-GATES.md. Integration/live suites are deliberately excluded here.
+# Current development CI: positively selects the structurally complete H0 lane and arms the Python-level
+# deny guard. This is not yet the OS isolation or canonical machine evidence required by
+# docs/releases/RELEASE-GATES.md. H1/C0/P0/L0 lanes are deliberately separate.
 on:
   push:
     branches: [main]
@@ -10,6 +10,8 @@ on:
 
 jobs:
   offline:
+    env:
+      QUARRY_PRIMARY_LANE: H0-hermetic
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -21,7 +23,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install (package + dev)
         run: pip install -e ".[dev]"
-      - name: Offline-marked tests (deny guard)
+      - name: H0 tests (deny guard)
         env:
           QUARRY_OFFLINE_CI: "1"     # arms the session-wide guard (covers import-time network too)
-        run: pytest -m offline
+        run: pytest -m offline --quarry-taxonomy-manifest "$RUNNER_TEMP/quarry-taxonomy.json"

@@ -491,34 +491,3 @@ def test_probe_keeps_verified_fd_open_for_the_child(monkeypatch):
     assert captured.get("pass_fds") == (7,)
     registry._probe("some-cmd")
     assert "pass_fds" not in captured
-
-
-@pytest.mark.integration
-def test_real_staged_probe_execs_verified_fd(tmp_path, monkeypatch):
-    """NON-mocked _probe: the staged capability probe execs the verified descriptor via /proc/self/fd and
-    verification PASSES. Mocking _probe (as the other tests do) hides the close_fds bug this guards. Also
-    confirms install_one makes a non-executable staged file executable (fchmod)."""
-    import subprocess
-    # this test carries the module `offline` marker too, so under the CI guard subprocess is blocked; restore
-    # the genuine run/Popen (stashed by the guard) so the REAL _probe actually execs
-    try:
-        import conftest as _cf
-        for _obj, _attr, _orig in getattr(_cf, "_saved", []):
-            if _obj is subprocess and _attr in ("run", "Popen"):
-                monkeypatch.setattr(subprocess, _attr, _orig)
-    except Exception:
-        pass
-    monkeypatch.setenv("HOME", str(tmp_path))
-    dest = _bindir(tmp_path) / "qtool"
-
-    def fake_shell(cmd, dry):
-        stage = _bindir(tmp_path) / ".stage" / "qtool"
-        stage.parent.mkdir(parents=True, exist_ok=True)
-        stage.write_text("#!/bin/sh\nexit 0\n")               # real executable; NO chmod — install_one fchmods it
-        return 0, ""
-
-    monkeypatch.setattr(registry, "run_shell", fake_shell)
-    monkeypatch.setattr(registry.shutil, "which", lambda b: str(dest))
-    # _probe is deliberately NOT mocked here
-    assert install_one(_src_tool(), _sink) is True
-    assert dest.read_text() == "#!/bin/sh\nexit 0\n"

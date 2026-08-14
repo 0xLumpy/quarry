@@ -12,6 +12,8 @@ import pathlib
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import campaign, store
 from quarry_recon.state import ContractError
 

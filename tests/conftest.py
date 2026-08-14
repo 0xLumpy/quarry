@@ -1,26 +1,246 @@
-"""Shared pytest fixtures and the current Python-level offline deny guard.
+"""Shared pytest fixtures, exact lane classification, and the Python deny guard.
 
 Two layers make ordinary Python network/subprocess entry points fail loudly:
 
-1. A SESSION guard installed in ``pytest_configure`` when ``QUARRY_OFFLINE_CI`` is set (the CI workflow
-   sets it). Because it is installed BEFORE collection, it also covers IMPORT-TIME network — e.g.
-   ``netguard._own_ips()`` runs a ``getaddrinfo`` + UDP connect at import; both are try/except-swallowed,
-   so the block is safe (the module still imports, ``_OWN_IPS`` is just empty, which no offline test needs).
-2. A per-test AUTOUSE fixture for local dev runs (no env var), so plain ``pytest`` still blocks runtime
-   network for every test not marked ``live``/``integration``.
+1. Stable subprocess guards are installed before collection for every run.  This matters because several
+   production functions capture ``subprocess.Popen`` in a default argument while test modules import.
+   H0 tests may opt into one tightly constrained current-interpreter child with ``synthetic_process``;
+   ordinary H0 tests still fail on every subprocess attempt.
+2. When ``QUARRY_OFFLINE_CI`` is set, socket/resolver guards are also installed before collection.  The
+   per-test autouse fixture provides the same runtime network tripwire for local H0 runs.
 
-Both use the same ``_BLOCKERS`` set, which covers selected socket, resolver, UDP, and subprocess entry
-points—a scanner launched via ``subprocess``/``exec_tool`` would otherwise get normal network despite the socket
-patches (they affect the pytest process, not a child). This is a useful tripwire, not an OS isolation
-boundary or proof that every possible native/network API is denied. Release isolation is specified in
-``docs/releases/RELEASE-GATES.md``.
+These guards are tracked-test tripwires, not child containment: reviewed Python fixture code could still
+use an absolute native executable or its own network API.  The OS-isolated H0 evidence boundary therefore
+remains open and is specified in ``docs/releases/RELEASE-GATES.md``.
 """
+
 from __future__ import annotations
 
+import json
+import os
+import platform
+import re
 import socket
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
+
+_PRIMARY_LANES = (
+    ("offline", "H0-hermetic"),
+    ("integration", "H1-tool-integration"),
+    ("corpus", "C0-private-corpus"),
+    ("packaging", "P0-package-supply"),
+    ("live", "L0-authorized-live"),
+)
+_PRIMARY_LANE_MARKERS = tuple(marker for marker, _lane in _PRIMARY_LANES)
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+_TAXONOMY_SCHEMA = "quarry.pytest-taxonomy.v1"
+_MAX_TAXONOMY_MANIFEST_BYTES = 2 * 1024 * 1024
+TAXONOMY_MANIFEST_KEY = pytest.StashKey()
+
+
+def pytest_addoption(parser):
+    group = parser.getgroup("quarry release diagnostics")
+    group.addoption(
+        "--quarry-taxonomy-manifest",
+        metavar="PATH",
+        help="write a new canonical diagnostic manifest for this collection",
+    )
+
+
+def _classify_test_item(item):
+    """Return one primary lane and secondary capabilities, or raise a typed usage error."""
+    primary = []
+    for name in _PRIMARY_LANE_MARKERS:
+        marks = tuple(item.iter_markers(name))
+        if any(mark.args or mark.kwargs for mark in marks):
+            raise pytest.UsageError(f"{item.nodeid}: primary marker {name!r} takes no arguments")
+        if len(marks) > 1:
+            raise pytest.UsageError(f"{item.nodeid}: duplicate primary marker {name!r}")
+        if marks:
+            primary.append(name)
+    primary = tuple(primary)
+    if len(primary) != 1:
+        detail = "unmarked" if not primary else "multiple primary lanes: " + ", ".join(primary)
+        raise pytest.UsageError(f"{item.nodeid}: {detail}")
+
+    synthetic_marks = tuple(item.iter_markers("synthetic_process"))
+    if any(mark.args or mark.kwargs for mark in synthetic_marks):
+        raise pytest.UsageError(f"{item.nodeid}: synthetic_process takes no arguments")
+    if len(synthetic_marks) > 1:
+        raise pytest.UsageError(f"{item.nodeid}: duplicate synthetic_process annotation")
+    synthetic = bool(synthetic_marks)
+    if synthetic and primary[0] != "offline":
+        raise pytest.UsageError(
+            f"{item.nodeid}: synthetic_process is valid only in the offline/H0 lane"
+        )
+
+    tools = []
+    for mark in item.iter_markers("requires_tool"):
+        if (
+            len(mark.args) != 1
+            or mark.kwargs
+            or type(mark.args[0]) is not str
+            or not _TOOL_NAME_RE.fullmatch(mark.args[0])
+        ):
+            raise pytest.UsageError(
+                f"{item.nodeid}: requires_tool must carry exactly one stable tool name"
+            )
+        tools.append(mark.args[0])
+    if len(set(tools)) != len(tools):
+        raise pytest.UsageError(f"{item.nodeid}: duplicate requires_tool annotation")
+    if tools and primary[0] not in {"integration", "packaging"}:
+        raise pytest.UsageError(
+            f"{item.nodeid}: requires_tool is valid only in a reviewed H1/P0 lane"
+        )
+    if primary[0] == "integration" and not tools:
+        raise pytest.UsageError(f"{item.nodeid}: integration/H1 test does not name its real tool")
+    return primary[0], tuple(sorted(tools)), synthetic
+
+
+def _utf8_key(value):
+    try:
+        return value.encode("utf-8", "strict")
+    except UnicodeEncodeError as exc:
+        raise pytest.UsageError("test taxonomy contains a non-Unicode node id") from exc
+
+
+def _taxonomy_manifest_bytes(rows, selected_nodeids, *, mark_expression, keyword_expression):
+    """Build the compact canonical diagnostic manifest; rows are the pre-deselection collection."""
+    ordered_rows = sorted(rows, key=lambda row: _utf8_key(row[0]))
+    nodeids = [row[0] for row in ordered_rows]
+    if len(set(nodeids)) != len(nodeids):
+        raise pytest.UsageError("test taxonomy contains duplicate node ids")
+    selected = set(selected_nodeids)
+    unknown = selected - set(nodeids)
+    if unknown:
+        raise pytest.UsageError(
+            f"test selection introduced unknown node ids: {sorted(unknown, key=_utf8_key)!r}"
+        )
+
+    lanes = []
+    selected_by_lane = []
+    for marker, lane in _PRIMARY_LANES:
+        members = [nodeid for nodeid, primary, _tools, _synthetic in ordered_rows
+                   if primary == marker]
+        lanes.append({"lane": lane, "marker": marker, "nodes": members})
+        selected_by_lane.append({
+            "lane": lane,
+            "selected": sum(nodeid in selected for nodeid in members),
+        })
+
+    by_tool = {}
+    synthetic_nodes = []
+    for nodeid, _primary, tools, synthetic in ordered_rows:
+        for tool in tools:
+            by_tool.setdefault(tool, []).append(nodeid)
+        if synthetic:
+            synthetic_nodes.append(nodeid)
+    capabilities = [
+        {"name": name, "nodes": by_tool[name]}
+        for name in sorted(by_tool, key=_utf8_key)
+    ]
+    document = {
+        "capabilities": capabilities,
+        "collector": {
+            "name": "pytest",
+            "python_implementation": platform.python_implementation(),
+            "python_version": platform.python_version(),
+            "version": pytest.__version__,
+        },
+        "lanes": lanes,
+        "schema_version": _TAXONOMY_SCHEMA,
+        "selection": {
+            "collected": len(nodeids),
+            "deselected": len(nodeids) - len(selected),
+            "keyword_expression": keyword_expression,
+            "mark_expression": mark_expression,
+            "selected": len(selected),
+            "selected_by_lane": selected_by_lane,
+        },
+        "synthetic_process_nodes": synthetic_nodes,
+    }
+    try:
+        encoded = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8", "strict")
+    except (RecursionError, TypeError, UnicodeEncodeError, ValueError) as exc:
+        raise pytest.UsageError(f"cannot encode test taxonomy manifest: {exc}") from exc
+    if len(encoded) > _MAX_TAXONOMY_MANIFEST_BYTES:
+        raise pytest.UsageError(
+            f"test taxonomy manifest is {len(encoded)} bytes; limit is "
+            f"{_MAX_TAXONOMY_MANIFEST_BYTES}"
+        )
+    return encoded
+
+
+def _write_new_private(path, body):
+    """Create one diagnostic output without following or overwriting its final path."""
+    target = os.fspath(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(target, flags, 0o600)
+    except OSError as exc:
+        raise pytest.UsageError(f"cannot create taxonomy manifest {target!r}: {exc}") from exc
+    created = True
+    try:
+        view = memoryview(body)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short taxonomy manifest write")
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        created = False
+    except BaseException as exc:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if created:
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+        if not isinstance(exc, Exception):
+            raise
+        raise pytest.UsageError(f"cannot write taxonomy manifest {target!r}: {exc}") from exc
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_collection_modifyitems(config, items):
+    """Classify the complete collection before pytest's ``-m`` deselection runs."""
+    errors = []
+    rows = []
+    for item in items:
+        try:
+            lane, tools, synthetic = _classify_test_item(item)
+        except pytest.UsageError as exc:
+            errors.append(str(exc))
+        else:
+            rows.append((item.nodeid, lane, tools, synthetic))
+    if errors:
+        rendered = "\n".join(f"  - {message}" for message in sorted(errors))
+        raise pytest.UsageError(f"test taxonomy violations:\n{rendered}")
+    yield
+    body = _taxonomy_manifest_bytes(
+        rows,
+        [item.nodeid for item in items],
+        mark_expression=config.getoption("markexpr") or "",
+        keyword_expression=config.getoption("keyword") or "",
+    )
+    config.stash[TAXONOMY_MANIFEST_KEY] = body
+    output = config.getoption("quarry_taxonomy_manifest")
+    if output:
+        _write_new_private(output, body)
 
 
 class FakeDirectContainment:
@@ -129,8 +349,176 @@ class NetworkDenied(RuntimeError):
 
 
 def _blocked(*a, **k):
-    raise NetworkDenied("offline test attempted network/subprocess (mark it `live`/`integration` if it "
-                        "genuinely needs one)")
+    raise NetworkDenied("test lane denied a network or subprocess operation")
+
+
+_REAL_SUBPROCESS_POPEN = subprocess.Popen
+_REAL_SUBPROCESS_RUN = subprocess.run
+_SYNTHETIC_INTERPRETER = sys.executable
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if type(_SYNTHETIC_INTERPRETER) is not str or not os.path.isabs(_SYNTHETIC_INTERPRETER):
+    raise RuntimeError("pytest requires an absolute current interpreter for synthetic_process")
+_PROCESS_DENY = "deny"
+_PROCESS_SYNTHETIC = "synthetic"
+_PROCESS_EXTERNAL = "external"
+_process_mode = _PROCESS_DENY
+_synthetic_home_root = None
+_SYNTHETIC_BASE_ENV = frozenset({"HOME", "PATH"})
+_SYNTHETIC_PROTOCOL_ENV = frozenset({
+    "QUARRY_RUNNER_EXECUTION",
+    "QUARRY_RUNNER_EXPECTED_PARENT_PID",
+    "QUARRY_RUNNER_PREPARED_ABORT",
+    "QUARRY_RUNNER_STDERR_FD",
+    "QUARRY_RUNNER_STDIN_FD",
+    "QUARRY_RUNNER_STDOUT_FD",
+})
+
+
+def _validate_synthetic_spawn(argv, positional, kwargs, *, home_root):
+    """Refuse every H0 child shape except the declared current-interpreter fixture."""
+    if positional or type(argv) not in (list, tuple) or not argv:
+        raise NetworkDenied("synthetic_process requires one argv list/tuple")
+    if any(type(part) is not str for part in argv):
+        raise NetworkDenied("synthetic_process argv must contain exact strings")
+    if not os.path.isabs(argv[0]) or argv[0] != _SYNTHETIC_INTERPRETER:
+        raise NetworkDenied("synthetic_process may execute only the absolute current interpreter")
+    if kwargs.get("shell", False) is not False:
+        raise NetworkDenied("synthetic_process forbids shell execution")
+    if kwargs.get("executable") is not None:
+        raise NetworkDenied("synthetic_process forbids an executable override")
+    if kwargs.get("preexec_fn") is not None:
+        raise NetworkDenied("synthetic_process forbids a pre-exec callback")
+    if "close_fds" in kwargs and kwargs["close_fds"] is not True:
+        raise NetworkDenied("synthetic_process forbids ambient descriptor inheritance")
+    for name in ("startupinfo", "user", "group", "extra_groups"):
+        if kwargs.get(name) is not None:
+            raise NetworkDenied(f"synthetic_process forbids non-default {name}")
+    for name, default in (("creationflags", 0), ("umask", -1), ("process_group", -1)):
+        if name in kwargs and (type(kwargs[name]) is not int or kwargs[name] != default):
+            raise NetworkDenied(f"synthetic_process forbids non-default {name}")
+
+    stream_values = {
+        "stdin": (None, subprocess.PIPE, subprocess.DEVNULL),
+        "stdout": (None, subprocess.PIPE, subprocess.DEVNULL),
+        "stderr": (None, subprocess.PIPE, subprocess.DEVNULL, subprocess.STDOUT),
+    }
+    for name, allowed_values in stream_values.items():
+        value = kwargs.get(name)
+        if value is not None and (type(value) is not int or value not in allowed_values):
+            raise NetworkDenied(f"synthetic_process forbids a borrowed {name} descriptor")
+
+    cwd = kwargs.get("cwd")
+    try:
+        cwd_text = os.fspath(cwd)
+    except TypeError as exc:
+        raise NetworkDenied("synthetic_process requires an explicit absolute cwd") from exc
+    if type(cwd_text) is not str or not os.path.isabs(cwd_text):
+        raise NetworkDenied("synthetic_process requires an explicit absolute cwd")
+
+    env = kwargs.get("env")
+    if type(env) is not dict or any(type(key) is not str or type(value) is not str
+                                    for key, value in env.items()):
+        raise NetworkDenied("synthetic_process requires an explicit string-only environment")
+    worker = tuple(argv[1:]) == ("-I", "-m", "quarry_recon.runner_worker")
+    allowed = _SYNTHETIC_PROTOCOL_ENV if worker else _SYNTHETIC_BASE_ENV
+    extra = set(env) - allowed
+    if extra:
+        raise NetworkDenied("synthetic_process environment contains a non-allowlisted key")
+
+    if worker:
+        if cwd_text != "/":
+            raise NetworkDenied("synthetic worker requires cwd='/'")
+        parent = env.get("QUARRY_RUNNER_EXPECTED_PARENT_PID")
+        prepared = env.get("QUARRY_RUNNER_PREPARED_ABORT")
+        execution = env.get("QUARRY_RUNNER_EXECUTION")
+        if not (parent and parent.isascii() and parent.isdigit() and int(parent) > 0):
+            raise NetworkDenied("synthetic worker environment has no valid parent identity")
+        if prepared not in (None, "1") or execution not in (None, "1"):
+            raise NetworkDenied("synthetic worker environment has an invalid execution mode")
+        if (prepared == "1") == (execution == "1"):
+            raise NetworkDenied("synthetic worker environment needs exactly one execution mode")
+        descriptor_names = (
+            "QUARRY_RUNNER_STDOUT_FD",
+            "QUARRY_RUNNER_STDERR_FD",
+            "QUARRY_RUNNER_STDIN_FD",
+        )
+        descriptor_values = []
+        for name in descriptor_names:
+            value = env.get(name)
+            if value is not None:
+                if not (value.isascii() and value.isdigit() and str(int(value)) == value):
+                    raise NetworkDenied("synthetic worker environment contains an invalid descriptor")
+                descriptor = int(value)
+                if descriptor <= 2:
+                    raise NetworkDenied("synthetic worker protocol descriptor is ambient stdio")
+                descriptor_values.append(descriptor)
+        expected_descriptors = set(descriptor_values)
+        if len(expected_descriptors) != len(descriptor_values):
+            raise NetworkDenied("synthetic worker protocol descriptors must be unique")
+        pass_fds = kwargs.get("pass_fds", ())
+        if (
+            type(pass_fds) is not tuple
+            or any(type(fd) is not int or fd < 0 for fd in pass_fds)
+            or len(set(pass_fds)) != len(pass_fds)
+            or set(pass_fds) != expected_descriptors
+        ):
+            raise NetworkDenied("synthetic worker pass_fds do not exactly match protocol descriptors")
+        if prepared == "1" and (expected_descriptors or pass_fds):
+            raise NetworkDenied("synthetic abort worker forbids protocol descriptor handoff")
+    else:
+        pass_fds = kwargs.get("pass_fds", ())
+        if type(pass_fds) is not tuple or pass_fds:
+            raise NetworkDenied("synthetic_process ordinary child forbids descriptor inheritance")
+        home = env.get("HOME")
+        if home_root is None or not home or not os.path.isabs(home):
+            raise NetworkDenied("synthetic_process requires a disposable absolute HOME")
+        try:
+            if not Path(home).resolve().is_relative_to(Path(home_root).resolve()):
+                raise NetworkDenied("synthetic_process HOME is outside the pytest temporary root")
+        except OSError as exc:
+            raise NetworkDenied("synthetic_process HOME cannot be resolved") from exc
+        if env.get("PATH") != "":
+            raise NetworkDenied("synthetic_process PATH must be empty")
+        try:
+            resolved_cwd = Path(cwd_text).resolve()
+            permitted_roots = (_REPOSITORY_ROOT, Path(home_root).resolve())
+            if not any(
+                resolved_cwd == root or resolved_cwd.is_relative_to(root)
+                for root in permitted_roots
+            ):
+                raise NetworkDenied("synthetic_process cwd is outside controlled roots")
+        except OSError as exc:
+            raise NetworkDenied("synthetic_process cwd cannot be resolved") from exc
+
+
+def _authorize_process(argv, positional, kwargs):
+    if _process_mode == _PROCESS_EXTERNAL:
+        return
+    if _process_mode != _PROCESS_SYNTHETIC:
+        raise NetworkDenied("test lane denied subprocess execution")
+    _validate_synthetic_spawn(argv, positional, kwargs, home_root=_synthetic_home_root)
+
+
+class _GuardedPopen(_REAL_SUBPROCESS_POPEN):
+    """Stable pre-collection proxy, including for production defaults captured at import."""
+
+    def __init__(self, args, *positional, **kwargs):
+        _authorize_process(args, positional, kwargs)
+        super().__init__(args, *positional, **kwargs)
+
+
+def _guarded_run(*popenargs, **kwargs):
+    if len(popenargs) != 1:
+        if not popenargs and "args" in kwargs:
+            argv = kwargs["args"]
+            remaining = ()
+        else:
+            raise NetworkDenied("subprocess.run requires one explicit argv")
+    else:
+        argv = popenargs[0]
+        remaining = ()
+    _authorize_process(argv, remaining, kwargs)
+    return _REAL_SUBPROCESS_RUN(*popenargs, **kwargs)
 
 
 def _family_aware_connect(original):
@@ -139,51 +527,68 @@ def _family_aware_connect(original):
     def guard(self, *a, **k):
         if getattr(self, "family", None) == getattr(socket, "AF_UNIX", object()):
             return original(self, *a, **k)
-        raise NetworkDenied("offline test attempted a network connect (mark it `live`/`integration`)")
+        raise NetworkDenied("test lane denied an Internet-family network connect")
     return guard
 
 
-# (target-object, attribute) pairs to patch. Patch the CONNECT/RESOLVE/SEND entry points and subprocess
-# spawn — NOT socket.socket itself (replacing the class breaks `ssl.SSLSocket(socket.socket)` subclassing).
-# connect/connect_ex are family-aware (AF_UNIX IPC allowed); everything else is a hard deny.
-def _blockers():
+# Patch CONNECT/RESOLVE/SEND entry points, not socket.socket itself (replacing the class breaks
+# ``ssl.SSLSocket(socket.socket)`` subclassing). AF_UNIX remains available for internal IPC.
+def _network_blockers():
     return [
         (socket.socket, "connect", _family_aware_connect(socket.socket.connect)),
         (socket.socket, "connect_ex", _family_aware_connect(socket.socket.connect_ex)),
         (socket.socket, "sendto", _blocked),
         (socket, "create_connection", _blocked), (socket, "getaddrinfo", _blocked),
         (socket, "gethostbyname", _blocked), (socket, "gethostbyname_ex", _blocked),
-        (subprocess, "Popen", _blocked), (subprocess, "run", _blocked),
     ]
 
 
-# ── layer 1: session guard (CI), installed before collection so import-time network is covered ──
+# ── layer 1: stable process guard plus CI pre-collection network guard ──
 _saved: list = []
 
 
 def pytest_configure(config):
-    import os
-    if not os.environ.get("QUARRY_OFFLINE_CI"):
-        return
-    for obj, attr, replacement in _blockers():
+    blockers = [
+        (subprocess, "Popen", _GuardedPopen),
+        (subprocess, "run", _guarded_run),
+    ]
+    if os.environ.get("QUARRY_OFFLINE_CI"):
+        blockers.extend(_network_blockers())
+    for obj, attr, replacement in blockers:
         _saved.append((obj, attr, getattr(obj, attr)))
         setattr(obj, attr, replacement)
 
 
 def pytest_unconfigure(config):
-    for obj, attr, original in _saved:
+    for obj, attr, original in reversed(_saved):
         setattr(obj, attr, original)
     _saved.clear()
 
 
 # ── layer 2: per-test autouse guard (local dev) ──
 @pytest.fixture(autouse=True)
-def _network_deny(request, monkeypatch):
-    """Block network+subprocess for every test not marked `live`/`integration`."""
-    if request.node.get_closest_marker("live") or request.node.get_closest_marker("integration"):
-        return
-    for obj, attr, replacement in _blockers():
-        monkeypatch.setattr(obj, attr, replacement)
+def _network_deny(request, monkeypatch, tmp_path_factory):
+    """Select process authority and deny Python network entry points for network-free lanes."""
+    global _process_mode, _synthetic_home_root
+    previous_mode, previous_root = _process_mode, _synthetic_home_root
+    integration = request.node.get_closest_marker("integration") is not None
+    live = request.node.get_closest_marker("live") is not None
+    packaging = request.node.get_closest_marker("packaging") is not None
+    synthetic = request.node.get_closest_marker("synthetic_process") is not None
+    if integration or live or packaging:
+        _process_mode = _PROCESS_EXTERNAL
+    elif synthetic:
+        _process_mode = _PROCESS_SYNTHETIC
+    else:
+        _process_mode = _PROCESS_DENY
+    _synthetic_home_root = tmp_path_factory.getbasetemp()
+    if not integration and not live:
+        for obj, attr, replacement in _network_blockers():
+            monkeypatch.setattr(obj, attr, replacement)
+    try:
+        yield
+    finally:
+        _process_mode, _synthetic_home_root = previous_mode, previous_root
 
 
 # ── shared fixtures ──

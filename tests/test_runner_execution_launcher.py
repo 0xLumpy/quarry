@@ -19,7 +19,7 @@ from quarry_recon import runner_protocol as protocol
 from quarry_recon import runner_worker
 
 
-pytestmark = pytest.mark.integration
+pytestmark = pytest.mark.offline
 
 
 def _require_linux_procfs() -> None:
@@ -93,6 +93,7 @@ def _proc_bytes(pid: int, name: str) -> bytes:
         return source.read()
 
 
+@pytest.mark.synthetic_process
 def test_authenticated_release_execs_exact_request_and_exposes_binary_pipes(
         tmp_path):
     _require_linux_procfs()
@@ -140,6 +141,7 @@ def test_authenticated_release_execs_exact_request_and_exposes_binary_pipes(
         _settle_launcher(launcher)
 
 
+@pytest.mark.synthetic_process
 def test_sigcont_is_scheduling_only_and_cannot_release_exec(tmp_path):
     _require_linux_procfs()
     marker = tmp_path / "stray-sigcont-exec"
@@ -162,6 +164,7 @@ def test_sigcont_is_scheduling_only_and_cannot_release_exec(tmp_path):
         _settle_launcher(launcher)
 
 
+@pytest.mark.synthetic_process
 def test_release_refuses_a_non_request_without_resuming_launcher():
     _require_linux_procfs()
     launcher = _spawn_launcher()
@@ -176,6 +179,7 @@ def test_release_refuses_a_non_request_without_resuming_launcher():
 
 
 @pytest.mark.parametrize("wire", ["eof", "truncated", "trailing"])
+@pytest.mark.synthetic_process
 def test_unauthenticated_release_channel_input_never_execs(tmp_path, wire):
     _require_linux_procfs()
     marker = tmp_path / f"{wire}-exec"

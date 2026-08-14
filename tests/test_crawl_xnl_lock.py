@@ -1,7 +1,7 @@
 """review-B-audit-6#1 — the xnLinkFinder lane's PROJECT state under real concurrency.
 
-Its own module because the offline gate hard-denies subprocess spawning, and two real processes is the only
-way to observe the lock doing its job rather than merely being present: an in-process test can patch
+Its own H0 synthetic-process module because two real interpreter children are the only way to observe the
+lock doing its job rather than merely being present: an in-process test can patch
 `state_lock` to raise, but it cannot show that two runs of the same project do not both prune the state
 directory, mine the same unit, race on the shared `.tmp` and unlink each other's journal.
 
@@ -21,7 +21,7 @@ import pytest
 
 from quarry_recon.phases import crawl
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.offline, pytest.mark.synthetic_process]
 
 #: one child = one full lane over one input, with a fake tool that RECORDS its invocation and then WAITS
 #: for a gate file. The overlap is a handshake, not a sleep: the parent knows the holder is inside the lock
@@ -150,10 +150,17 @@ def _repo() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent
 
 
+def _child_env(project: pathlib.Path) -> dict[str, str]:
+    home = project / ".test-home"
+    home.mkdir(parents=True, exist_ok=True)
+    return {"HOME": str(home), "PATH": ""}
+
+
 def _start(project, indir, marker, name, gate="-"):
     return subprocess.Popen([sys.executable, "-c", _CHILD, str(project), name, str(indir), str(gate),
                              str(marker)],
-                            cwd=str(_repo()), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            cwd=str(_repo()), env=_child_env(project),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
 def _finish(proc):

@@ -19,7 +19,7 @@ from quarry_recon import runner_streams
 from quarry_recon import runner_worker
 
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.offline, pytest.mark.synthetic_process]
 
 
 def _digest(data: bytes) -> str:

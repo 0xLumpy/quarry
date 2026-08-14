@@ -11,13 +11,18 @@ import pytest
 
 from quarry_recon import release_evidence as evidence
 
-pytestmark = [pytest.mark.integration, pytest.mark.requires_tool]
+_GIT = shutil.which("git")
+GIT = os.fspath(Path(_GIT).resolve()) if _GIT else None
 
-
-GIT = os.fspath(Path(shutil.which("git") or pytest.skip("Git is required", allow_module_level=True)).resolve())
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.requires_tool("git"),
+    pytest.mark.skipif(GIT is None, reason="Git is required"),
+]
 
 
 def _git(repository: Path, *arguments: str) -> str:
+    assert GIT is not None
     completed = subprocess.run(
         [GIT, "-C", os.fspath(repository), *arguments],
         capture_output=True,
@@ -44,6 +49,7 @@ def _candidate_repository(tmp_path: Path) -> Path:
 
 
 def test_real_git_candidate_is_repeatable_and_ignored_notes_stay_outside_evidence(tmp_path):
+    assert GIT is not None
     repository = _candidate_repository(tmp_path)
     index = repository / _git(repository, "rev-parse", "--git-path", "index")
     index_before = (index.read_bytes(), index.stat().st_mtime_ns)
@@ -66,6 +72,7 @@ def test_real_git_candidate_is_repeatable_and_ignored_notes_stay_outside_evidenc
 
 
 def test_real_git_nonignored_change_refuses_collection(tmp_path):
+    assert GIT is not None
     repository = _candidate_repository(tmp_path)
     (repository / "unexpected.txt").write_text("not part of the candidate\n", encoding="utf-8")
     with pytest.raises(evidence.EvidenceError, match="dirty"):

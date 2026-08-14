@@ -19,7 +19,11 @@ import pytest
 from quarry_recon import runner
 from quarry_recon.runner import Status
 
-pytestmark = pytest.mark.integration
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.requires_tool("sleep"),
+    pytest.mark.requires_tool("true"),
+]
 
 
 @pytest.fixture(autouse=True)

@@ -17,6 +17,8 @@ import re
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import evidence
 
 

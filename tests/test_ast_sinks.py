@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import ast_obs
 
 
@@ -153,7 +155,7 @@ class TestTheCountersMeanWhatTheySay:
     def test_a_sink_in_two_bundles_counts_once(self, tmp_path, monkeypatch):
         """The store and the report show one observation; a per-artifact sum reported two."""
         import json as _json
-        from tests.test_ast_lane import TestTheWorkUnitMakesARerunSKIP, _bundle, _ctx, _ledger
+        from test_ast_lane import TestTheWorkUnitMakesARerunSKIP, _bundle, _ctx, _ledger
         doc = [{"analyzerName": "eval", "value": "eval(x)", "start": {"line": 1, "column": 0}}]
         TestTheWorkUnitMakesARerunSKIP._fake(monkeypatch, tmp_path, out=_json.dumps(doc))
         from quarry_recon.phases import crawl as _crawl
@@ -168,7 +170,7 @@ class TestTheCountersMeanWhatTheySay:
 
     def test_a_malformed_record_is_one_gap_not_a_crash(self, tmp_path, monkeypatch):
         import json as _json
-        from tests.test_ast_lane import TestTheWorkUnitMakesARerunSKIP, _bundle, _ctx, _ledger
+        from test_ast_lane import TestTheWorkUnitMakesARerunSKIP, _bundle, _ctx, _ledger
         from quarry_recon import ast_obs as _ao
         from quarry_recon.phases import crawl as _crawl
         TestTheWorkUnitMakesARerunSKIP._fake(monkeypatch, tmp_path,

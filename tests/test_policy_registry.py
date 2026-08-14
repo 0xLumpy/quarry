@@ -16,6 +16,8 @@ import pathlib
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import policy
 
 SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "quarry_recon"

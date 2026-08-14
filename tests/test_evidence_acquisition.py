@@ -21,6 +21,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import contract, events, evidence, fetch
 
 

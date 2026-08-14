@@ -13,6 +13,8 @@ import pathlib
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon.phases import crawl
 
 

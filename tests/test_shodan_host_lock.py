@@ -1,7 +1,7 @@
 """B1.7 — the Shodan host lane's SWEEP PROGRESS under real concurrency.
 
-Its own module because the offline gate hard-denies subprocess spawning, and two real processes is the only
-way to observe the project-level lock doing its job rather than merely being present. The single-process
+Its own H0 synthetic-process module because two real interpreter children are the only way to observe the
+project-level lock doing its job rather than merely being present. The single-process
 mechanism assertions (lock taken, temp name private, merge max-wins) live in `test_shodan_host.py`.
 """
 
@@ -17,7 +17,7 @@ import pytest
 
 from quarry_recon import shodan_host as sh
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.offline, pytest.mark.synthetic_process]
 
 #: one child = one run recording one ask and saving. Exactly what two concurrent lanes do.
 _CHILD = ("import sys; sys.path.insert(0, 'src');"
@@ -31,8 +31,14 @@ def _repo() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent
 
 
-def _spawn(path, asks):
-    procs = [subprocess.Popen([sys.executable, "-c", _CHILD, str(path), ip, when], cwd=str(_repo()))
+def _child_env(home: pathlib.Path) -> dict[str, str]:
+    home.mkdir(parents=True, exist_ok=True)
+    return {"HOME": str(home), "PATH": ""}
+
+
+def _spawn(path, asks, home):
+    procs = [subprocess.Popen([sys.executable, "-c", _CHILD, str(path), ip, when],
+                              cwd=str(_repo()), env=_child_env(home))
              for ip, when in asks]
     return [p.wait() for p in procs]
 
@@ -41,7 +47,7 @@ def test_two_REAL_PROCESSES_both_survive_the_merge(tmp_path):
     """review-B1.7r10#1: an unlocked overwrite through one shared temp name let the later save discard the
     earlier run's rotation — so both runs kept asking the same prefix and the tail starved."""
     path = sh.progress_path(tmp_path / "project")
-    assert _spawn(path, (("1.1.1.1", "100"), ("2.2.2.2", "200"))) == [0, 0]
+    assert _spawn(path, (("1.1.1.1", "100"), ("2.2.2.2", "200")), tmp_path / "home") == [0, 0]
     merged = sh.SweepProgress(path)
     assert merged.asked == {"1.1.1.1": 100.0, "2.2.2.2": 200.0}, merged.asked
 
@@ -50,7 +56,7 @@ def test_MANY_concurrent_runs_lose_nothing(tmp_path):
     """Eight at once, each with its own address: every ask has to be in the file afterwards."""
     path = sh.progress_path(tmp_path / "project")
     asks = [(f"10.0.0.{i}", str(100 + i)) for i in range(1, 9)]
-    assert _spawn(path, asks) == [0] * len(asks)
+    assert _spawn(path, asks, tmp_path / "home") == [0] * len(asks)
     merged = sh.SweepProgress(path)
     assert merged.asked == {ip: float(when) for ip, when in asks}, merged.asked
 
@@ -60,7 +66,7 @@ def test_the_file_is_never_left_TORN(tmp_path):
     under the lock is for."""
     path = sh.progress_path(tmp_path / "project")
     asks = [(f"10.0.1.{i}", str(200 + i)) for i in range(1, 7)]
-    assert _spawn(path, asks) == [0] * len(asks)
+    assert _spawn(path, asks, tmp_path / "home") == [0] * len(asks)
     assert sh.SweepProgress(path).asked, "the merged document was unreadable"
     leftovers = [q.name for q in path.parent.iterdir() if q.name.endswith(".tmp")]
     assert leftovers == [], leftovers
@@ -119,7 +125,7 @@ out.write_text(json.dumps(result))
 
 def _spawn_lifecycle(project, out, ready="-", go="-"):
     return subprocess.Popen([sys.executable, "-c", _LIFECYCLE, str(project), str(out), str(ready), str(go)],
-                            cwd=str(_repo()))
+                            cwd=str(_repo()), env=_child_env(project.parent / ".test-home"))
 
 
 def _await(path, what, timeout=20.0):

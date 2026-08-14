@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import pace
 from quarry_recon.phases import probe
 

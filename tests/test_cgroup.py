@@ -11,6 +11,8 @@ import time
 
 import pytest
 
+pytestmark = pytest.mark.offline
+
 from quarry_recon import cgroup
 
 

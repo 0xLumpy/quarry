@@ -15,7 +15,12 @@ import pytest
 
 from quarry_recon.runner import Status
 
-pytestmark = pytest.mark.integration
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.requires_tool("seq"),
+    pytest.mark.requires_tool("sh"),
+    pytest.mark.requires_tool("sleep"),
+]
 
 
 class TestRunnerStderrPath:

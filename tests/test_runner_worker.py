@@ -118,11 +118,15 @@ def test_go_before_prepared_is_a_terminal_worker_failure(monkeypatch):
     assert frames[1].launched is False
 
 
-@pytest.mark.parametrize("field,value", [
-    ("request_id", "72" * 16),
-    ("request_sha256", "b6" * 32),
-    ("worker_pid", os.getpid() + 1),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request_id", "72" * 16),
+        ("request_sha256", "b6" * 32),
+        ("worker_pid", os.getpid() + 1),
+    ],
+    ids=("request_id", "request_sha256", "worker_pid"),
+)
 def test_command_correlation_mismatch_is_terminal_and_nonlaunching(
     monkeypatch, field, value,
 ):

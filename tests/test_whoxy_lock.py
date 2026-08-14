@@ -1,12 +1,12 @@
 """B1.6b — the Whoxy lifecycle lock, proven with genuinely OVERLAPPING PROCESSES.
 
-Marked `integration` rather than `offline`: these spawn a real second process, which the offline guard
-forbids — and a same-process check would only demonstrate flock's per-fd behaviour, not that two
-`quarry osint` runs actually contend.
+The concurrency cases carry the H0 synthetic-process annotation: a same-process check would only
+demonstrate flock's per-fd behaviour, not that two `quarry osint` runs actually contend.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
 import sys
 import textwrap
@@ -16,7 +16,7 @@ import pytest
 
 from quarry_recon import whoxy_page as wp
 
-pytestmark = pytest.mark.integration
+pytestmark = pytest.mark.offline
 
 #: captured at IMPORT, before the autouse redirect below. `importlib.reload` would rebind the module's
 #: CLASSES, so `Anchor` in an already-imported test module would stop comparing equal to the reloaded
@@ -45,14 +45,18 @@ def _holder(project, ready, hold=6.0, schema=None, spend=None, full=False, spend
     else:
         inner = f"wp.lifecycle_lock(pathlib.Path({str(project)!r}))"
     code = textwrap.dedent(f"""
-        import pathlib, time
+        import pathlib, sys, time
+        sys.path.insert(0, "src")
         import quarry_recon.whoxy_page as wp
         {bump}
         with {inner}:
             pathlib.Path({str(ready)!r}).write_text("held")
             time.sleep({hold})
     """)
-    return subprocess.Popen([sys.executable, "-c", code],
+    home = project.parent / ".test-home"
+    home.mkdir(parents=True, exist_ok=True)
+    return subprocess.Popen([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parent.parent),
+                            env={"HOME": str(home), "PATH": ""},
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -66,6 +70,7 @@ def _await(ready, proc):
     pytest.fail("the holder process never acquired the lock")
 
 
+@pytest.mark.synthetic_process
 def test_a_CONCURRENT_lifecycle_is_refused(tmp_path):
     """review-B1.6b#1: two runs could load the same snapshot, buy the same pages, and race while
     compacting the ledger and unlinking the journal it supersedes."""
@@ -81,6 +86,7 @@ def test_a_CONCURRENT_lifecycle_is_refused(tmp_path):
         proc.wait(timeout=10)
 
 
+@pytest.mark.synthetic_process
 def test_a_BLOCKED_lifecycle_issues_NO_paid_request(tmp_path):
     """Contention is refused BEFORE the balance read or any purchase, so a blocked run spends nothing."""
     proj, ready = tmp_path / "proj", tmp_path / "ready"
@@ -99,6 +105,7 @@ def test_a_BLOCKED_lifecycle_issues_NO_paid_request(tmp_path):
     assert calls == []
 
 
+@pytest.mark.synthetic_process
 def test_the_lock_is_released_when_the_HOLDER_DIES(tmp_path):
     """OS-released, not lockfile EXISTENCE: a stale file from a killed run would wedge the project
     forever, while the kernel drops an flock with the process however it dies."""
@@ -120,6 +127,7 @@ def test_the_lock_is_released_when_the_HOLDER_DIES(tmp_path):
     assert (wp.provider_dir(proj) / ".lock").exists(), "the lock FILE must not be removed"
 
 
+@pytest.mark.synthetic_process
 def test_a_DIFFERENT_SCHEMA_still_contends(tmp_path, monkeypatch):
     """review-B1.6b2#1: the lock lived inside the schema directory, so a v1 process and a v2 process took
     DIFFERENT locks and could spend against the same account at once. Two builds share one Whoxy
@@ -140,6 +148,7 @@ def test_a_DIFFERENT_SCHEMA_still_contends(tmp_path, monkeypatch):
         proc.wait(timeout=10)
 
 
+@pytest.mark.synthetic_process
 def test_opening_STATE_takes_the_lock(tmp_path):
     """review-B1.6b2#2: the safe path is the structural one — there is no way to load the ledger, or get
     as far as a balance read, without the provider lock already held."""
@@ -229,6 +238,7 @@ def _lifecycle(project, spend_path, *, total=250, allowance=None, seen=None, cal
     return out, seen, calls
 
 
+@pytest.mark.synthetic_process
 def test_a_FULLY_OWNED_project_replays_while_another_SPENDS(tmp_path, monkeypatch):
     """review-B1.6b4: the account lock was taken before the ledger, so a project that owned everything
     it needed was blocked by another project's purchasing — a gap for access it never wanted."""
@@ -254,6 +264,7 @@ def test_a_FULLY_OWNED_project_replays_while_another_SPENDS(tmp_path, monkeypatc
         proc.wait(timeout=10)
 
 
+@pytest.mark.synthetic_process
 def test_a_project_with_PENDING_pages_is_blocked_without_touching_the_account(tmp_path):
     """Contention on the paid phase keeps what was replayed and reports only the unpaid remainder."""
     spend = tmp_path / "spend.lock"
@@ -274,6 +285,7 @@ def test_a_project_with_PENDING_pages_is_blocked_without_touching_the_account(tm
         proc.wait(timeout=10)
 
 
+@pytest.mark.synthetic_process
 def test_TWO_PROJECTS_cannot_spend_the_same_ACCOUNT_at_once(tmp_path):
     """review-B1.6b3: the project lock protects one project's ledger and nothing else. The Whoxy KEY is
     global, so two runs in DIFFERENT projects take different project locks, read the SAME balance, and
@@ -316,6 +328,7 @@ def test_the_lock_is_released_after_a_BaseException(tmp_path):
         pass                                     # acquirable again -> the finally ran
 
 
+@pytest.mark.synthetic_process
 def test_the_WIRED_LANE_blocked_on_the_account_reads_no_balance_and_fetches_no_page(tmp_path,
                                                                                     monkeypatch):
     """The end-to-end form promised earlier: with another project holding the ACCOUNT lock, the real
