@@ -1,7 +1,7 @@
 # Quarry release gates
 
 Status: Phase 0 gate contract. It defines the evidence required to promote a
-release; it does not assert that the required runners, thresholds, schemas, or
+release; it does not assert that all required runners, thresholds, schemas, or
 evidence collectors already exist.
 
 The current `offline-ci` workflow and historical local test runs are useful
@@ -129,9 +129,9 @@ release candidate can be declared.
 
 | Gate | Requirement | Evidence | Phase 0 status |
 |---|---|---|---|
-| `A-IDENTITY` | Candidate is one exact commit; source-tree digest, dirty state, submodule/input identities, package version, and schema versions agree | Candidate identity record; dirty candidates fail | `open` — collector not defined in code |
+| `A-IDENTITY` | Candidate is one exact commit; source-tree digest, dirty state, submodule/input identities, package version, and schema versions agree | Candidate identity record; dirty candidates fail | `open` — the v1 collector/schema exist, but an enforced quiescent runner and accepted nominated-candidate record do not |
 | `A-TAXONOMY` | Every test/job maps to exactly one primary lane; incompatible markers and unmarked tests fail collection | Classification manifest plus collected/selected/deselected counts | `open` — current markers do not cover the complete suite |
-| `A-EVIDENCE-SCHEMA` | Gate records validate against a versioned schema and aggregate deterministically | Schema, validator result, aggregator result, canonical digest | `open` — schema/collector not implemented |
+| `A-EVIDENCE-SCHEMA` | Gate records validate against a versioned schema and aggregate deterministically | Schema, validator result, aggregator result, canonical digest | `open` — v1 structural schemas/readers exist; artifact verification, signature trust and the deterministic aggregator remain unimplemented |
 | `A-CORPUS` | Selected private sources have accepted two-pass attestations and alias mappings; committed fixtures contain synthetic data only | Private attestation IDs plus public fixture and disclosure-check digests | `open` — design exists; attestations/fixtures are not claimed |
 | `A-THRESHOLDS` | Versioned correctness, quality, resource, and regression thresholds exist for the release scope | Reviewed threshold manifest | `open` — numeric performance/coverage baselines are not yet accepted |
 | `A-SUPPORT` | Supported OS, architecture, Python, and tool/template matrices are finite and versioned | Support matrix digest | `open` — package metadata alone is not a finite tested matrix |
@@ -283,8 +283,109 @@ whose inputs include that artifact.
 
 ## Machine-readable evidence
 
-Each gate emits one canonical record. The eventual schema must preserve at
-least the following structure:
+The committed v1 candidate-identity, schema-registry and gate-record contracts
+are in [`release/evidence`](../../release/evidence/). Their strict reader and
+clean-Git identity collector are implemented in
+[`release_evidence.py`](../../src/quarry_recon/release_evidence.py). These are a
+prerequisite slice, not accepted gate evidence: they do not verify signatures,
+open and rehash content-addressed artifacts, aggregate a required gate set or
+resolve the nominated-candidate/package-version lifecycle. `A-IDENTITY`,
+`A-EVIDENCE-SCHEMA` and `RG00` therefore remain open.
+
+The v1 registry is scoped only to release `0.3.10` and binds its corresponding
+scope ledger. The collector and reader refuse any other release label; a later
+release requires its own explicit registry/scope contract rather than reusing
+the v0.3.10 input under a different label.
+
+Candidate identity hashes the exact committed source independently of checkout
+metadata. `quarry.git-tree-sha256.v1` domain-separates the hash and frames each
+tracked entry's raw Git path, mode and type followed by its exact blob bytes;
+gitlinks contribute their exact commit object ID. Entries are ordered by raw
+path. Only canonical Git blob modes (`100644`, `100755`, `120000`) and gitlink
+mode/type (`160000 commit`) pairs enter the digest; absolute, empty-component,
+`.` and `..` paths are refused. The tree is derived from the captured commit,
+never from a second `HEAD` lookup. Within a runner-supplied quiescent
+candidate-only epoch, collection refuses staged, unstaged,
+non-ignored untracked,
+changed-HEAD, changed-submodule and uninitialized-submodule state before it
+returns. Index entries marked `assume-unchanged`, `skip-worktree` or another
+non-canonical visibility state are refused rather than trusted as clean, both
+in the superproject and in every recorded recursive submodule checkout. Each
+Git-reported worktree root must also equal that expected resolved checkout;
+the top-level root must contain the requested candidate location, and repository
+metadata cannot redirect a cleanliness check elsewhere. The absolute Git
+directory observed at the requested location must be the same directory
+observed from the resolved root, preventing a nested repository from redirecting
+the collector to an ancestor worktree.
+Ignored paths are outside the candidate and cannot be declared as candidate
+inputs; candidate inputs are read from committed blobs, never ambient checkout
+bytes. A dirty checkout is refused before nomination rather than represented by
+a candidate record; the aggregate consequently blocks on a missing valid
+identity instead of treating `dirty: true` as evidence.
+
+The exact tree preimage begins with the NUL-terminated ASCII domain
+`quarry.git-tree-sha256.v1`. For every entry in ascending raw-path byte order it
+then appends four frames—path, ASCII mode, ASCII type and payload—where each
+frame is an unsigned eight-byte big-endian length followed by that many bytes.
+Payload is the exact blob body, or the lowercase ASCII full commit object ID for
+a gitlink. The committed golden vectors in `test_release_evidence.py` freeze
+both blob and gitlink behavior. Canonical release runs must materialize the
+captured committed tree in a candidate-only environment; they may not execute
+the ambient checkout where ignored files could influence imports, config or
+tools. A portable userspace scan cannot itself freeze an arbitrary worktree:
+the collector's repeated comparisons detect changes they observe but do not
+establish the required isolation epoch. Output collected without an enforced
+quiescent runner is structural diagnostic data, not `A-IDENTITY` evidence. The
+collector requires an absolute runner-attested Git executable path;
+the eventual scope manifest must assign `A-IDENTITY` an execution lane and its
+gate record must bind that executable's path-independent digest, version and
+runtime identity. The collector supplies only `PATH`, C locale, UTC and its
+fixed read-only Git controls to the child; it does not forward `HOME`, loader,
+credential or other ambient variables. This minimal environment and absolute
+argv also disable repository fsmonitor, `core.ignoreStat` and the untracked
+cache for collector queries, and restore default ctime/stat checking; POSIX
+collection additionally forces file-mode and symlink checks on. They do not
+replace the future runner's executable/runtime-closure attestation, and an
+ambient `git` lookup is not eligible as release evidence.
+
+For each superproject/submodule checkout, raw index entries must equal the
+captured tree and the non-ignored untracked-name query must be empty. The
+collector then opens the actual worktree without Git filters and compares every
+committed byte, file type, executable mode and symlink target to its committed
+blob. It never invokes a configured clean/smudge filter and never replaces or
+refreshes the candidate's real index.
+
+Evidence JSON is strict UTF-8 with duplicate members and non-finite numbers
+refused. RFC3339 evidence timestamps require offset hours from 00 through 23
+and minutes from 00 through 59, and reject the unknown-local-offset spelling
+`-00:00`. Canonical bytes use sorted object keys, compact separators,
+unescaped Unicode and no trailing newline in the digest preimage; CLI output
+adds one newline as a record delimiter. Arrays retain their contract-defined
+semantic order. `quarry.release-evidence.canonical-json.v1` domain-separates
+canonical record digests. The v1 gate signature member is only a structural
+envelope; until an accepted trust policy and verifier exist, its presence is
+not an authenticity claim.
+
+The canonical-record digest preimage is the NUL-terminated ASCII domain
+`quarry.release-evidence.canonical-json.v1` followed immediately by the JSON
+bytes. Object keys sort by Python Unicode code-point order; strings are not
+Unicode-normalized. Records are limited to 1 MiB, 64 nested levels and exact
+integers in the inclusive range `-(2^63-1)` through `2^63-1`. A committed
+non-ASCII golden vector freezes these v1 choices.
+
+The checked-in JSON Schemas define the portable structural envelopes; the
+Python reader additionally enforces path normalization, exact types, ordering,
+uniqueness, count reconciliation, status semantics and exact identity binding.
+There is not yet an accepted JSON-Schema engine/parity result. Likewise,
+`validate candidate` validates a supplied record but does not recompute it from
+a repository, while `validate gate --identity` proves structure and embedded
+identity agreement only. It does not prove known-gate membership, requiredness,
+artifact bytes, signature authenticity or promotion eligibility. Its printed
+digest is a content identity, not an acceptance decision; those checks belong
+to the still-missing scope manifest, artifact verifier and aggregator.
+
+Each gate eventually emits one canonical record. The v1 gate schema preserves
+at least the following structure:
 
 ```json
 {
@@ -292,9 +393,11 @@ least the following structure:
   "release": "0.3.10",
   "candidate": {
     "git_commit": "<full-object-id>",
+    "git_tree": "<full-object-id>",
     "source_tree_digest": "sha256:<digest>",
     "dirty": false,
-    "package_version": "<version>"
+    "package_version": "<version>",
+    "identity_digest": "sha256:<candidate-identity-record-digest>"
   },
   "gate_id": "C-FAULT-RUNNER",
   "lane": "H0-hermetic",
@@ -313,7 +416,7 @@ least the following structure:
     {"name": "threshold-manifest", "digest": "sha256:<digest>"}
   ],
   "toolchain": [
-    {"name": "pytest", "version": "<version>", "digest": "sha256:<digest>"}
+    {"name": "pytest", "path": "/absolute/attested/pytest", "version": "<version>", "digest": "sha256:<digest>"}
   ],
   "selection": {
     "collected": 0,
@@ -330,20 +433,24 @@ least the following structure:
     {"name": "results", "media_type": "application/json", "digest": "sha256:<digest>"}
   ],
   "reason": "prerequisite not configured",
-  "not_applicable_rule": null
+  "not_applicable_rule": null,
+  "signature": null
 }
 ```
 
 The placeholder values illustrate the contract and are not a real gate result.
-Private evidence records may add opaque corpus references but never source paths
-or target values. Operational logs exclude Quarry-owned credentials by
-construction. Evidence artifacts are content-addressed; the aggregate includes
-their digests and rejects an artifact that cannot be opened and rehashed.
+Private evidence may encode opaque corpus references only through the existing
+named input/artifact digest records; it never records source paths or target
+values. Operational logs must exclude Quarry-owned credentials;
+emitters and the still-open disclosure gates enforce that requirement. Evidence
+artifacts must be content-addressed; the eventual
+aggregate must include their digests and reject an artifact that cannot be
+opened and rehashed.
 
-The aggregator itself has hermetic tests for every status, missing record,
+The aggregator must have hermetic tests for every status, missing record,
 duplicate gate, wrong candidate, malformed schema, invalid signature, expired
-disposition, unexpected skip, and conflicting result. Its output contains the
-ordered gate set, decision, reasons, and aggregate digest.
+disposition, unexpected skip, and conflicting result. Its output must contain
+the ordered gate set, decision, reasons, and aggregate digest.
 
 ## Current Phase 0 closure order
 

@@ -1,0 +1,59 @@
+{
+  "identity_inputs": [
+    {
+      "name": "candidate-identity-schema",
+      "path": "release/evidence/schemas/candidate-identity-v1.schema.json"
+    },
+    {
+      "name": "gate-record-schema",
+      "path": "release/evidence/schemas/gate-record-v1.schema.json"
+    },
+    {
+      "name": "package-metadata",
+      "path": "pyproject.toml"
+    },
+    {
+      "name": "package-version",
+      "path": "src/quarry_recon/__init__.py"
+    },
+    {
+      "name": "release-evidence-validator",
+      "path": "src/quarry_recon/release_evidence.py"
+    },
+    {
+      "name": "release-gate-contract",
+      "path": "docs/releases/RELEASE-GATES.md"
+    },
+    {
+      "name": "release-schema-registry",
+      "path": "release/evidence/registry-v1.json"
+    },
+    {
+      "name": "release-schema-registry-schema",
+      "path": "release/evidence/schemas/schema-registry-v1.schema.json"
+    },
+    {
+      "name": "release-scope-ledger",
+      "path": "docs/releases/v0.3.10.md"
+    }
+  ],
+  "release": "0.3.10",
+  "schema_version": "quarry.release-schema-registry.v1",
+  "schemas": [
+    {
+      "name": "candidate_identity",
+      "path": "release/evidence/schemas/candidate-identity-v1.schema.json",
+      "record_version": "quarry.candidate-identity.v1"
+    },
+    {
+      "name": "gate_record",
+      "path": "release/evidence/schemas/gate-record-v1.schema.json",
+      "record_version": "quarry.release-gate.v1"
+    },
+    {
+      "name": "schema_registry",
+      "path": "release/evidence/schemas/schema-registry-v1.schema.json",
+      "record_version": "quarry.release-schema-registry.v1"
+    }
+  ]
+}

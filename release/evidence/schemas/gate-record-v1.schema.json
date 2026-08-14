@@ -1,0 +1,373 @@
+{
+  "$id": "urn:quarry:schema:release-gate:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "$defs": {
+    "digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "git_object": {
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "pass",
+        "fail",
+        "open",
+        "blocked",
+        "not_applicable"
+      ]
+    },
+    "token": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "type": "string"
+    }
+  },
+  "properties": {
+    "artifacts": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "$ref": "#/$defs/digest"
+          },
+          "media_type": {
+            "pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$",
+            "type": "string"
+          },
+          "name": {
+            "$ref": "#/$defs/token"
+          }
+        },
+        "required": [
+          "digest",
+          "media_type",
+          "name"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "assertions": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/token"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/$defs/status"
+          }
+        },
+        "required": [
+          "id",
+          "reason",
+          "status"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "candidate": {
+      "additionalProperties": false,
+      "properties": {
+        "dirty": {
+          "const": false
+        },
+        "git_commit": {
+          "$ref": "#/$defs/git_object"
+        },
+        "git_tree": {
+          "$ref": "#/$defs/git_object"
+        },
+        "identity_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "package_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_tree_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "required": [
+        "dirty",
+        "git_commit",
+        "git_tree",
+        "identity_digest",
+        "package_version",
+        "source_tree_digest"
+      ],
+      "type": "object"
+    },
+    "environment": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "isolation_profile": {
+          "$ref": "#/$defs/digest"
+        },
+        "os": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "python": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "runner_image": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "required": [
+        "architecture",
+        "isolation_profile",
+        "os",
+        "python",
+        "runner_image"
+      ],
+      "type": "object"
+    },
+    "finished_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "gate_id": {
+      "pattern": "^[A-E]-[A-Z0-9]+(-[A-Z0-9]+)*$",
+      "type": "string"
+    },
+    "inputs": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "$ref": "#/$defs/digest"
+          },
+          "name": {
+            "$ref": "#/$defs/token"
+          }
+        },
+        "required": [
+          "digest",
+          "name"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "lane": {
+      "enum": [
+        "H0-hermetic",
+        "H1-tool-integration",
+        "C0-private-corpus",
+        "P0-package-supply",
+        "L0-authorized-live"
+      ]
+    },
+    "not_applicable_rule": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "approved_at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "expires_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "$ref": "#/$defs/token"
+            }
+          },
+          "required": [
+            "approved_at",
+            "digest",
+            "expires_at",
+            "id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "release": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "required": {
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": "quarry.release-gate.v1"
+    },
+    "selection": {
+      "additionalProperties": false,
+      "properties": {
+        "collected": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deselected": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "passed": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "skipped": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "xfailed": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "xpassed": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "collected",
+        "deselected",
+        "failed",
+        "passed",
+        "selected",
+        "skipped",
+        "xfailed",
+        "xpassed"
+      ],
+      "type": "object"
+    },
+    "signature": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "algorithm": {
+              "$ref": "#/$defs/token"
+            },
+            "key_id": {
+              "$ref": "#/$defs/token"
+            },
+            "value": {
+              "pattern": "^base64:[A-Za-z0-9+/]+={0,2}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "algorithm",
+            "key_id",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "started_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/status"
+    },
+    "toolchain": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "$ref": "#/$defs/digest"
+          },
+          "name": {
+            "$ref": "#/$defs/token"
+          },
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "digest",
+          "name",
+          "path",
+          "version"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "artifacts",
+    "assertions",
+    "candidate",
+    "environment",
+    "finished_at",
+    "gate_id",
+    "inputs",
+    "lane",
+    "not_applicable_rule",
+    "reason",
+    "release",
+    "required",
+    "schema_version",
+    "selection",
+    "signature",
+    "started_at",
+    "status",
+    "toolchain"
+  ],
+  "title": "Quarry release gate record v1",
+  "type": "object"
+}

@@ -356,6 +356,15 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.privfs:_MAX_WORKER_PID": (
         "identity", "the accepted operating-system PID domain for a stage-handoff correlation identity; "
                     "it does not bound child execution"),
+    "quarry_recon.release_evidence:MAX_JSON_DEPTH": (
+        "resource", "the recursion-safety bound for one untrusted release-evidence control record; a "
+                    "deeper record is rejected and never treated as accepted evidence"),
+    "quarry_recon.release_evidence:MAX_JSON_INTEGER": (
+        "parser", "the exact scalar range accepted by the versioned release-evidence JSON contract, "
+                  "not a reconnaissance or evidence-retention allowance"),
+    "quarry_recon.release_evidence:MAX_RECORD_BYTES": (
+        "resource", "the allocation bound for one versioned release-evidence control record; oversize "
+                    "control input is rejected and does not truncate captured target evidence"),
     "quarry_recon.runner_containment:DESCENDANT_LIMIT": (
         "not_a_bound", "a fixed containment failure-reason string naming a limit breach, not the limit "
                        "itself"),
