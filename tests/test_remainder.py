@@ -121,6 +121,40 @@ class TestTheSweepMapsOntoDispositions:
         assert "candidate_pairs" in record["detail"], record
 
 
+class TestObligationDispositionAuthority:
+    @pytest.mark.parametrize("record", [
+        {"disposition": "remainder", "retriable": 0, "terminal": {}},
+        {"disposition": "remainder", "retriable": 1, "terminal": {"machinery": 1}},
+        {"disposition": "terminal", "retriable": 0, "terminal": {}},
+        {"disposition": "terminal", "retriable": 1, "terminal": {"machinery": 1}},
+        {"disposition": "known_zero", "retriable": 1, "terminal": {}},
+        {"disposition": "unknown", "retriable": 0, "terminal": {"dependency": 1}},
+        {"disposition": "not_applicable", "retriable": 1, "terminal": {}},
+    ])
+    def test_a_persisted_disposition_cannot_contradict_its_counts(self, record):
+        payload = {
+            "lane": "enrich.a1d_brute", "unit": "u", "measure": "targets",
+            "why": "", **record,
+        }
+        with pytest.raises(ValueError, match="contradicts"):
+            remainder.Obligation.from_record(payload)
+
+    @pytest.mark.parametrize("disposition,retriable,terminal", [
+        ("remainder", 2, {}),
+        ("terminal", 0, {"machinery": 2}),
+        ("known_zero", 0, {}),
+        ("unknown", 0, {}),
+        ("not_applicable", 0, {}),
+    ])
+    def test_each_disposition_has_one_accepted_count_shape(
+            self, disposition, retriable, terminal):
+        obligation = remainder.Obligation(
+            lane="enrich.a1d_brute", unit="u", measure="targets",
+            disposition=disposition, retriable=retriable, terminal=terminal,
+        )
+        obligation.validate()
+
+
 class TestTheLoopReportsToo:
     """`vertical.alterx_permute` declares a model, so it must REPORT — a lane that never does reads as
     unknown for ever, and the supervisor learns nothing about a loop it was told to expect."""

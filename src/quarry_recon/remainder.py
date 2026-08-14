@@ -161,6 +161,22 @@ class Obligation:
                 raise ValueError(f"{self.lane}: unknown terminal cause {cause!r}")
             if type(value) is not int or value < 0:
                 raise ValueError(f"{self.lane}: terminal {cause} must be an exact non-negative int")
+        # The empty `(unit, measure)` row is a lane label.  Its disposition summarizes concrete rows,
+        # while those rows carry every count exactly once; the campaign reader reconciles that label
+        # against its units.  Concrete obligations must be self-consistent in isolation.
+        if self.unit or self.measure:
+            has_terminal = any(value > 0 for value in self.terminal.values())
+            if self.disposition == "remainder":
+                coherent = self.retriable > 0 and not has_terminal
+            elif self.disposition == "terminal":
+                coherent = self.retriable == 0 and has_terminal
+            else:
+                coherent = self.retriable == 0 and not has_terminal
+            if not coherent:
+                raise ValueError(
+                    f"{self.lane}: disposition {self.disposition!r} contradicts its "
+                    "retriable/terminal counts",
+                )
 
     def as_record(self) -> dict:
         return {"lane": self.lane, "unit": self.unit, "measure": self.measure,

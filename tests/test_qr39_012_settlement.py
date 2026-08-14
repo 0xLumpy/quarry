@@ -69,6 +69,11 @@ class _Launcher:
                 # real lost coverage: the manifest folds it into summary.gaps and the run's verdict
                 events.coverage_partial("probe.httpx", eligible=50, tested=10, omitted=40,
                                         kind="timeout", unit="probe.httpx:hosts", measure="hosts")
+            for source in spec.get("covered", ()):
+                # Explicit source/measure-matching positive evidence; unlike silence, this can discharge
+                # the same source's historical coverage gap.
+                events.coverage_partial(source, eligible=50, tested=50, omitted=0,
+                                        kind="timeout", unit=f"{source}:hosts", measure="hosts")
             for rem in spec.get("remainders", ()):
                 remainder.emit(rem)
             for lane in spec.get("unknown", ()):
@@ -283,6 +288,33 @@ class TestResumeAtEveryBoundary:
         assert resumed.calls == [], "the campaign had already measured its fixed point"
         assert [c.index for c in out.children] == [1, 2]
 
+    def test_a_persisted_max_runs_decision_is_not_reinterpreted_under_a_larger_resume_bound(
+        self, tmp_path,
+    ):
+        """The manifested decision is authority once written; changing the next invocation's bound cannot
+        turn it into a continuation that the ledger itself correctly refuses after a terminal child."""
+        first = _Launcher(tmp_path, [{"hosts": ["a.acme.com"],
+                                      "remainders": [_rem(now=1)]}])
+
+        def killed_before_stop(self, decision):
+            raise RuntimeError("killed after the child decision, before the campaign stop")
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(campaign.Campaign, "finish", killed_before_stop)
+            with pytest.raises(RuntimeError, match="before the campaign stop"):
+                settle.settle(project_dir=tmp_path, target="acme.com", campaign_id="c-max-resume",
+                              max_runs=1, launch=first)
+
+        interrupted = campaign.Campaign(tmp_path, "c-max-resume")
+        assert interrupted.status == "valid" and interrupted.stop is None
+        assert interrupted.children[-1]["decision"]["cause"] == "max_runs"
+
+        resumed = _Launcher(tmp_path, [{"remainders": [_rem()]}])
+        out = settle.settle(project_dir=tmp_path, target="acme.com", campaign_id="c-max-resume",
+                            max_runs=2, launch=resumed)
+        assert (out.stop, out.success) == ("max_runs", False)
+        assert resumed.calls == [], "a persisted terminal child decision launched another child"
+
     def test_an_abandoned_child_is_a_TERMINAL_ledger_state(self, tmp_path):
         _kill(tmp_path, [{"die": "mid_phase"}], "c-12")
         settle.settle(project_dir=tmp_path, target="acme.com", campaign_id="c-12", max_runs=1,
@@ -446,7 +478,8 @@ class TestTerminalCausesAreClassified:
         out, _ = _settle(tmp_path, [{"hosts": ["a.acme.com"], "remainders": [_rem()]},
                                     {"remainders": [_rem()]}])
         assert campaign.Campaign(tmp_path, out.campaign_id).stop == {
-            "cause": "fixed_point", "detail": "no retriable work and nothing new", "success": True}
+            "cause": "fixed_point", "detail": "no retriable work and nothing new", "success": True,
+            "clean": True, "recovered": False}
         assert out.terminal == {}
 
     @pytest.mark.parametrize("terminal", [{}, {"invented": 1}, {"machinery": -1}, {"machinery": True},
@@ -460,8 +493,9 @@ class TestTerminalCausesAreClassified:
         ledger.path.write_text(json.dumps(doc))
         assert campaign.Campaign(tmp_path, out.campaign_id).status == "unusable", terminal
 
-    def test_a_ledger_written_BEFORE_the_breakdown_still_reads(self, tmp_path):
-        """Old campaigns carry no terminal key; they are readable, and say so by its absence."""
+    def test_a_terminal_ledger_without_its_breakdown_is_unusable(self, tmp_path):
+        """The breakdown is the evidence that distinguishes a bound, gap and fault; absence is not a
+        legacy terminal truth the strict v1 ledger can classify."""
         out, _ = _settle(tmp_path, [{"hosts": ["a.acme.com"], "remainders": [_rem(now=1)]},
                                     {"remainders": [_rem(terminal={"entitlement": 3})]}])
         ledger = campaign.Campaign(tmp_path, out.campaign_id)
@@ -469,7 +503,7 @@ class TestTerminalCausesAreClassified:
         del doc["stop"]["terminal"]
         ledger.path.write_text(json.dumps(doc))
         reopened = campaign.Campaign(tmp_path, out.campaign_id)
-        assert reopened.status == "valid" and "terminal" not in reopened.stop
+        assert reopened.status == "unusable" and "terminal breakdown" in reopened.reason
 
 
 # ── which campaign a caller may resume ─────────────────────────────────────────────────────────────
@@ -596,10 +630,10 @@ class TestACampaignIsOneTargetsCorpus:
         """Two targets under one campaign is not a target; adopting either would pick one for the operator."""
         self._kill_for(tmp_path, "c-t6", "other.com")
         ledger = campaign.Campaign(tmp_path, "c-t6")
+        ledger.abandoned(ledger.children[0], "the first supervisor was interrupted")
         strayed = store.Run.create(tmp_path, "acme.com")
-        doc = json.loads(ledger.path.read_text())
-        doc["children"].append({"index": 2, "state": "started", "run_id": strayed.run_id})
-        ledger.path.write_text(json.dumps(doc))
+        second = ledger.reserve()
+        ledger.started(second, strayed.run_id)
         target, why = settle.campaign_target(tmp_path, "c-t6")
         assert target is None and "'acme.com', 'other.com'" in why, why
         for asked in ("acme.com", "other.com"):
@@ -796,7 +830,7 @@ class TestAFixedPointOverGapsIsNotClean:
                                             "gap": True},
                                            {"hosts": ["b.acme.com"], "remainders": [_rem(now=1)],
                                             "gap": True},
-                                           {"remainders": [_rem()]},
+                                           {"remainders": [_rem()], "covered": ["probe.httpx"]},
                                            {"remainders": [_rem()]}])
         assert (out.stop, out.clean) == ("fixed_point", True), out
         assert len(launcher.calls) == 4
@@ -932,6 +966,7 @@ class TestTheBudgetIsCumulativeAcrossResumes:
         ledger = campaign.Campaign(tmp_path, cid)
         doc = json.loads(ledger.path.read_text())
         doc["stop"] = None                                   # as a kill between children would leave it
+        doc["children"][-1]["decision"] = {"cause": None, "detail": "", "success": False}
         ledger.path.write_text(json.dumps(doc))
         return out, launcher
 
@@ -1138,6 +1173,7 @@ class TestAnInterruptedChildIsChargedToTheBudget:
         ledger = campaign.Campaign(tmp_path, "c-i8")
         doc = json.loads(ledger.path.read_text())
         doc["stop"] = None
+        doc["children"][-1]["decision"] = {"cause": None, "detail": "", "success": False}
         ledger.path.write_text(json.dumps(doc))
         out = settle.settle(project_dir=tmp_path, target="acme.com", campaign_id="c-i8", budget_s=10,
                             max_runs=9, launch=_Launcher(tmp_path, [{}, {}, {"remainders": [_rem()]},

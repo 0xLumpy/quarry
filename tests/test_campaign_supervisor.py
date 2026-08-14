@@ -34,6 +34,13 @@ def _absorbed(new=0, enriched=0, unusable=None):
     return out
 
 
+def _ensure_union(ledger):
+    union = campaign.Union(ledger.dir / "union.json", create=True)
+    if union.status == "new":
+        union.save()
+    return union
+
+
 class TestProgressIncludesReducingTheRemainder:
     def test_taking_owed_work_forward_is_PROGRESS(self):
         """A child that discovered no identity but reduced what is owed from 10 to 5 is not idle, and
@@ -184,17 +191,27 @@ class TestTheLedger:
 
     def test_the_states_advance_and_are_DURABLE(self, tmp_path):
         c = campaign.Campaign(tmp_path, "c1")
+        _ensure_union(c)
         child = c.reserve()
         c.started(child, "20260802-abc")
-        c.manifested(child, summary=_summary(spend=[{"lane": "probe.cert", "amount": 2}]),
-                     absorbed=_absorbed(new=3, enriched=1),
-                     decision=campaign.Decision(retriable=4, progressed=True))
-        c.finish(campaign.Decision(stop="fixed_point", detail="done"))
+        first_summary = _summary(spend=[{"lane": "probe.cert", "provider": "dnsx",
+                                         "measure": "queries", "amount": 2, "unknown": 0}])
+        first = campaign.decide(first_summary, _absorbed(new=3, enriched=1), children=1)
+        c.manifested(child, summary=first_summary, absorbed=_absorbed(new=3, enriched=1), decision=first)
+        final_child = c.reserve()
+        c.started(final_child, "20260802-def")
+        final = campaign.decide(_summary(), _absorbed(), children=2,
+                                previous_retriable=first.retriable)
+        final.detail = "done"
+        c.manifested(final_child, summary=_summary(), absorbed=_absorbed(), decision=final)
+        c.finish(final)
         reopened = campaign.Campaign(tmp_path, "c1")
         kid = reopened.children[0]
         assert (kid["state"], kid["run_id"], kid["new_identities"]) == ("manifested", "20260802-abc", 3)
-        assert kid["provider_spend"] == [{"lane": "probe.cert", "amount": 2}], kid
-        assert reopened.stop == {"cause": "fixed_point", "detail": "done", "success": True}
+        assert kid["provider_spend"] == [{"lane": "probe.cert", "provider": "dnsx",
+                                           "measure": "queries", "amount": 2, "unknown": 0}], kid
+        assert reopened.stop == {"cause": "fixed_point", "detail": "done", "success": True,
+                                 "clean": True, "recovered": False}
 
     def test_an_INTERRUPTED_child_is_visible(self, tmp_path):
         """A crash between reserving and manifesting leaves a child in its last known state — never an
@@ -256,7 +273,7 @@ class TestTheLedger:
         broken.recover("ledger was unreadable")
         history = json.loads(c.path.read_text())["recoveries"]
         assert [(r["index"], r["reason"]) for r in history] == [(1, "ledger was unreadable")]
-        assert "not JSON" in history[0]["cause"] and history[0]["at"].endswith("+00:00")
+        assert "strict JSON" in history[0]["cause"] and history[0]["at"].endswith("+00:00")
         assert campaign.Campaign(tmp_path, "c1").status == "valid"
 
     def test_recovery_ADMISSION_survives_every_later_publication(self, tmp_path):
@@ -288,7 +305,8 @@ class TestTheLedger:
         """Recovery erases every child. On a readable ledger that is not repair, it is the laundering
         `require()` exists to stop."""
         c = campaign.Campaign(tmp_path, "c1")
-        c.reserve()
+        first = c.reserve()
+        c.abandoned(first, "fixture child was never launched")
         c.reserve()
         for reopened in (c, campaign.Campaign(tmp_path, "c1")):
             with pytest.raises(ValueError, match="nothing to recover"):
@@ -389,6 +407,7 @@ class TestEveryWriteIsFailClosed:
                                       ("started", "manifested", "manifested")])
     def test_states_advance_in_ORDER_only(self, tmp_path, path):
         c = campaign.Campaign(tmp_path, "c1")
+        _ensure_union(c)
         child = c.reserve()
         with pytest.raises(ValueError, match="not a transition"):
             for step in path:
@@ -408,7 +427,7 @@ class TestEveryWriteIsFailClosed:
         child = c.reserve()
         c.started(child, "run-1")
         with pytest.raises(ValueError, match="provider_spend"):
-            c.manifested(child, summary={"verdict": "success", "provider_spend": {}, "faults": []},
+            c.manifested(child, summary={"verdict": "complete", "provider_spend": {}, "faults": []},
                          absorbed=_absorbed(new=1), decision=campaign.decide(_summary(), _absorbed(new=1)))
         assert campaign.Campaign(tmp_path, "c1").status == "valid"
 
@@ -423,11 +442,14 @@ class TestEveryWriteIsFailClosed:
             c.manifested(child, summary={"verdict": "success", "provider_spend": {}, "faults": []},
                          absorbed=_absorbed(new=1), decision=campaign.decide(_summary(), _absorbed(new=1)))
         assert child == before, "the rejected candidate was written onto the owned record"
-        c.finish(campaign.decide(_summary(), _absorbed(new=1)))
-        assert campaign.Campaign(tmp_path, "c1").status == "valid"
+        with pytest.raises(ValueError, match="interrupted child"):
+            c.finish(campaign.decide(_summary(), _absorbed(new=1)))
+        reopened = campaign.Campaign(tmp_path, "c1")
+        assert reopened.status == "valid" and reopened.stop is None
 
     def test_a_child_rejected_once_can_still_be_manifested_PROPERLY(self, tmp_path):
         c = campaign.Campaign(tmp_path, "c1")
+        _ensure_union(c)
         child = c.reserve()
         c.started(child, "run-1")
         with pytest.raises(ValueError):
@@ -462,7 +484,9 @@ class TestNoWriterCanPublishWhatLoadRefuses:
 
     def test_a_hand_EDITED_child_cannot_ride_along_with_a_TRANSITION(self, tmp_path):
         c = campaign.Campaign(tmp_path, "c1")
-        first, second = c.reserve(), c.reserve()
+        first = c.reserve()
+        c.abandoned(first, "fixture child was never launched")
+        second = c.reserve()
         first["index"] = 9
         with pytest.raises(ValueError, match="child 1"):
             c.started(second, "run-2")
@@ -485,10 +509,10 @@ class TestNoWriterCanPublishWhatLoadRefuses:
 
     def test_an_unreadable_STOP_is_refused(self, tmp_path):
         c = campaign.Campaign(tmp_path, "c1")
-        c.reserve()
+        c.abandoned(c.reserve(), "fixture child was never launched")
         c.stop = "stopped"
         with pytest.raises(ValueError, match="stop record"):
-            c.reserve()
+            c._commit(c.children)
 
 
 class TestAFailedPublicationSettles:
@@ -523,6 +547,7 @@ class TestAFailedPublicationSettles:
             c.reserve()
         restore()
         assert [k["index"] for k in c.children] == [1], "the landed child was thrown away"
+        c.abandoned(c.children[0], "fixture child was never launched")
         assert c.reserve()["index"] == 2
         assert [k["index"] for k in campaign.Campaign(tmp_path, "c1").children] == [1, 2]
 
@@ -539,10 +564,15 @@ class TestAFailedPublicationSettles:
 
     def test_a_failed_FINISH_does_not_claim_a_stop(self, tmp_path, monkeypatch):
         c = campaign.Campaign(tmp_path, "c1")
-        c.reserve()
+        _ensure_union(c)
+        child = c.reserve()
+        c.started(child, "run-1")
+        summary = _summary()
+        decision = campaign.decide(summary, _absorbed(), children=1)
+        c.manifested(child, summary=summary, absorbed=_absorbed(), decision=decision)
         restore = self._breaking(monkeypatch, land=False)
         with pytest.raises(OSError):
-            c.finish(campaign.decide(_summary(), _absorbed(new=1)))
+            c.finish(decision)
         restore()
         assert c.stop is None and campaign.Campaign(tmp_path, "c1").stop is None
 
@@ -560,7 +590,7 @@ class TestAFailedPublicationSettles:
 
     def test_a_ledger_found_CORRUPT_while_settling_is_unusable(self, tmp_path, monkeypatch):
         c = campaign.Campaign(tmp_path, "c1")
-        c.reserve()
+        c.abandoned(c.reserve(), "fixture child was never launched")
         c.path.write_text("{not json")               # what settling will find
         restore = self._breaking(monkeypatch, land=False)
         with pytest.raises(OSError):

@@ -1653,15 +1653,18 @@ def _campaign_result(ledger, campaign_id: str):
                              remediation=stop["detail"] or None)
     if cause == "terminal" and terminal is None:
         return gapped(f"terminal: {stop['detail']}" if stop["detail"] else "terminal work remains")
-    if any(c.get("state") == "abandoned" for c in ledger.children):
+    if ledger.truth.abandoned:
         return gapped("a child run could not be measured and was abandoned")
-    if ledger.recoveries:
-        return gapped("this campaign's ledger was recovered after an evidence loss")
+    if stop["recovered"]:
+        return gapped("this campaign's evidence was recovered after a loss")
+    if ledger.truth.open_gaps:
+        opened = ", ".join(sorted({gap["source_id"] for gap in ledger.truth.open_gaps}))
+        return gapped(f"unresolved historical coverage: {opened}")
     # a child that ran under a declared bound reports the same evidence a standalone run does, so it must
     # reach the same status: converging it to clean would make `--settle` hide what `run` states
     limited = any(c.get("verdict") == "complete_with_limits" for c in ledger.children)
     bounded = cause in _SETTLE_BOUNDED or terminal == "bounded" or limited
-    if stop["success"] and not limited:
+    if stop["clean"] and not limited:
         return CommandResult("status", campaign_id=campaign_id)
     if bounded:
         return CommandResult("status", coverage="intentionally_bounded", campaign_id=campaign_id,

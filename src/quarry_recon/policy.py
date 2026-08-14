@@ -392,6 +392,12 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.run_manifest:MAX_BASE_INVENTORY_BYTES": (
         "resource", "the streamed total-byte authentication bound for one immutable run evidence tree; "
                     "overflow refuses the manifest rather than accepting a prefix"),
+    "quarry_recon.campaign:MAX_CAMPAIGN_LEDGER_BYTES": (
+        "resource", "the fail-closed allocation bound for one versioned campaign control ledger; an "
+                    "oversized ledger is refused rather than parsed or accepted as terminal truth"),
+    "quarry_recon.campaign:MAX_CAMPAIGN_UNION_BYTES": (
+        "resource", "the fail-closed streamed read bound for one immutable campaign-union generation; "
+                    "overflow makes the union unusable rather than accepting a prefix"),
     "quarry_recon.release_h0:_MAX_BWRAP_STATUS_BYTES": (
         "resource", "the bounded parent read of one bubblewrap status control channel; overflow invalidates "
                     "the H0 diagnostic rather than truncating or accepting the status"),

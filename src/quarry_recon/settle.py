@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import campaign as _campaign, store as _store
+from . import campaign as _campaign, remainder as _remainder, store as _store
 from .state import ContractError
 
 #: a campaign id is minted like a run id: second precision alone collides, and a reused id would continue
@@ -193,12 +193,13 @@ class Outcome:
     #: {cause: count} from the decision that ended the campaign, for a caller stating an outcome —
     #: `remainder.terminal_class` says whether that is a bound, a gap or a fault
     terminal: dict = field(default_factory=dict)
+    open_gaps: list = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
         """A fixed point over a union that was never rebuilt and with every child measured — what a
         caller consults before calling anything complete."""
-        return self.success and not self.recovered and not self.abandoned
+        return self.success and not self.recovered and not self.abandoned and not self.open_gaps
 
 
 def settle(*, project_dir, target: str, launch, max_runs: int = _campaign.MAX_CHILDREN,
@@ -235,6 +236,10 @@ def settle(*, project_dir, target: str, launch, max_runs: int = _campaign.MAX_CH
     # why a killed campaign can be resumed while a live one still cannot be joined (§6).
     with ledger.acquire():
         union = _campaign.Union.for_campaign(project_dir, cid, create=True)
+        union.require()
+        # Both recovery ledgers are permanent cleanliness debts.  Set this before any `_finish`, so the
+        # terminal record atomically persists the same answer the live Outcome exposes.
+        out.recovered = bool(ledger.recoveries) or union.was_recovered
         # a child that has a run may already have acquired, so only a campaign whose first child never
         # launched may still open acquisition
         acquired = any(child.get("run_id") for child in ledger.children)
@@ -320,7 +325,6 @@ def settle(*, project_dir, target: str, launch, max_runs: int = _campaign.MAX_CH
 
     out.elapsed_s = round(now() - t0, 1)
     out.spent_s = round(spent_before + out.elapsed_s, 1)
-    out.recovered = union.was_recovered
     return out
 
 
@@ -425,7 +429,7 @@ def _history(ledger, out: Outcome):
             out.abandoned += 1
         if child.get("state") != "manifested":
             continue
-        book.adopt(child.get("obligations") or [])
+        book.adopt(child.get("obligations") or [], open_gaps=child.get("open_gaps") or [])
         previous_retriable = child.get("retriable")
         idle = 0 if child.get("progressed") else idle + 1
         _recall(out, child)
@@ -456,14 +460,26 @@ def _adopt(project_dir, ledger, union, book, out: Outcome, say, *, max_runs, pre
         return None
     index, run_id = child["index"], child["run_id"]
     run_dir = Path(project_dir) / "recon" / run_id
+    if child["state"] == "manifested":
+        # Manifestation is already the durable decision for this child.  In particular, a kill between
+        # this publication and the top-level stop must not reinterpret `max_runs` or another bound from
+        # the new invocation's options and then try to append after a terminal child.
+        obligations = [_remainder.Obligation.from_record(record)
+                       for record in child.get("obligations") or []]
+        book.adopt(child.get("obligations") or [], open_gaps=child.get("open_gaps") or [])
+        _recall(out, child)
+        persisted = child["decision"]
+        return _campaign.Decision(
+            stop=persisted["cause"], detail=persisted["detail"],
+            retriable=child["retriable"], progressed=child["progressed"],
+            obligations=obligations, terminal=dict(child["terminal"]),
+            gaps=[dict(record) for record in child["gaps"]],
+            coverage=[dict(record) for record in child["coverage"]],
+            resolved_gaps=[dict(record) for record in child["resolved_gaps"]],
+            open_gaps=[dict(record) for record in child["open_gaps"]],
+        )
     summary = _committed(run_dir)
     if summary is None:
-        if child["state"] == "manifested":
-            # measured once and its evidence is gone since: the ledger's own record of it is what is left
-            book.adopt(child.get("obligations") or [])
-            _recall(out, child)
-            return _campaign.Decision(retriable=child.get("retriable", 0),
-                                      progressed=bool(child.get("progressed")))
         # its coverage is unmeasurable, but the time it burned is not: the campaign is charged what it
         # can establish, and records nothing when it can establish nothing
         ledger.abandoned(child, "interrupted before its manifest: nothing about it can be measured",
@@ -500,9 +516,14 @@ def _finish(ledger, out: Outcome, decision) -> None:
         if child.get("state") == "reserved":
             ledger.abandoned(child, "the campaign stopped before this child was launched")
             out.abandoned += 1
-    ledger.finish(decision)
+    ledger._finish_recovered = out.recovered
+    try:
+        ledger.finish(decision)
+    finally:
+        ledger.__dict__.pop("_finish_recovered", None)
     out.stop, out.detail, out.success = decision.stop or "fixed_point", decision.detail, decision.success
     out.terminal = dict(decision.terminal)
+    out.open_gaps = [dict(record) for record in ledger.open_gaps]
 
 
 # ── reading a campaign back ────────────────────
@@ -526,6 +547,9 @@ def report_lines(ledger) -> list[str]:
                          + ("" if child.get("progressed") else " · no progress")
                          + (f" · faults: {', '.join(sorted(set(child.get('faults') or [])))}"
                             if child.get("faults") else ""))
+            if child.get("resolved_gaps"):
+                lines.append(f"     resolved {len(child['resolved_gaps'])} earlier gap(s) by matching "
+                             "coverage/obligation evidence")
         elif state == "abandoned":
             lines.append(f"  {child['index']}. {child.get('run_id') or '(not launched)'} · "
                          f"ABANDONED: {child.get('reason')}")
@@ -536,7 +560,11 @@ def report_lines(ledger) -> list[str]:
     if stop:
         lines.append(f"  stopped: {stop['cause']}"
                      + (f" — {stop['detail']}" if stop["detail"] else "")
-                     + ("  ✔ success" if stop["success"] else ""))
+                     + ("  ✔ success" if stop["success"] else "")
+                     + ("" if stop["clean"] else "  ⚠ not clean"))
     else:
         lines.append("  no stop recorded — the campaign did not finish")
+    if ledger.open_gaps:
+        lines.append("  open gaps: " + ", ".join(
+            f"{gap['source_id']}[{gap['kind']}]" for gap in ledger.open_gaps))
     return lines

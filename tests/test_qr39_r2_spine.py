@@ -185,17 +185,82 @@ def test_an_unreadable_record_is_evidence_and_is_not_overwritten(tmp_path, monke
 
 
 # ── 4. a campaign's own outcome reaches the exit status ───────────────────────────────────────────
+def _campaign_summary(*, verdict="complete", remainders=(), faults=(), gaps=()):
+    return {"verdict": verdict, "remainders": list(remainders), "faults": list(faults),
+            "gaps": list(gaps), "coverage": [], "provider_spend": []}
+
+
+def _campaign_absorbed(*, new=0, unusable=None):
+    from quarry_recon import campaign as C
+    absorbed = C.AbsorbResult(new=new, unusable=dict(unusable or {}))
+    absorbed.absorbed = True
+    return absorbed
+
+
+def _campaign_remainder(*, now=0, terminal=None):
+    from quarry_recon import remainder
+    lane = "enrich.a1d_brute"
+    return remainder.Remainder(
+        lane=lane, unit=f"{lane}:targets", measure="targets", model="project_progress",
+        now=now, terminal=dict(terminal or {}),
+    ).as_record()
+
+
 def _ledger(tmp_path, cid, *, stop, detail="", success=False, terminal=None):
     from quarry_recon import campaign as C
     led = C.Campaign(tmp_path, cid)
     led.require()
-    child = led.reserve()
-    led.started(child, "r1")
-    decision = C.Decision(stop=stop, detail=detail)
-    decision.terminal = terminal or {}
-    object.__setattr__(decision, "stop", stop)
-    if success:
-        decision.stop = "fixed_point"
+    union = C.Union(led.dir / "union.json", create=True)
+    if union.status == "new":
+        union.save()
+
+    book = C.Settlement()
+
+    def manifested(summary, absorbed, *, index, previous=None, idle=0, max_children=10,
+                   decision_detail=None):
+        child = led.reserve()
+        led.started(child, f"r{index}")
+        decision = C.decide(summary, absorbed, settlement=book, children=index,
+                            previous_retriable=previous, idle_children=idle,
+                            max_children=max_children)
+        if decision_detail is not None:
+            decision.detail = decision_detail
+        led.manifested(child, summary=summary, absorbed=absorbed, decision=decision)
+        return decision
+
+    if stop == "no_progress":
+        summary = _campaign_summary(remainders=[_campaign_remainder(now=1)])
+        first = manifested(summary, _campaign_absorbed(), index=1)
+        decision = manifested(summary, _campaign_absorbed(), index=2,
+                              previous=first.retriable, idle=1, decision_detail=detail)
+    elif stop == "terminal":
+        summary = _campaign_summary(remainders=[_campaign_remainder(terminal=terminal)])
+        decision = manifested(summary, _campaign_absorbed(), index=1, decision_detail=detail)
+    elif stop == "child_fault":
+        summary = _campaign_summary(
+            verdict="complete_with_gaps",
+            faults=[{"kind": "machinery", "where": "fixture"}],
+        )
+        decision = manifested(summary, _campaign_absorbed(), index=1, decision_detail=detail)
+    elif stop == "unknown":
+        summary = _campaign_summary()
+        decision = manifested(summary, _campaign_absorbed(unusable={"host": "unreadable"}), index=1,
+                              decision_detail=detail)
+    elif stop == "max_runs":
+        summary = _campaign_summary(remainders=[_campaign_remainder(now=1)])
+        decision = manifested(summary, _campaign_absorbed(new=1), index=1, max_children=1,
+                              decision_detail=detail)
+    elif stop == "budget":
+        summary = _campaign_summary(remainders=[_campaign_remainder(now=1)])
+        continuing = manifested(summary, _campaign_absorbed(new=1), index=1)
+        assert continuing.stop is None
+        decision = C.Decision(stop="budget", detail=detail)
+    else:
+        decision = manifested(_campaign_summary(), _campaign_absorbed(), index=1,
+                              decision_detail=detail)
+
+    assert decision.stop == stop
+    assert decision.success is bool(success or stop == "fixed_point")
     led.finish(decision)
     return led
 
@@ -229,6 +294,17 @@ def test_a_campaign_that_never_finished_is_gapped_and_names_the_resume(tmp_path)
     res = _invoke(tmp_path, "status", "--campaign", "c-open", "--json")
     doc = json.loads(res.stdout)
     assert res.exit_code == 4 and "--settle-resume c-open" in doc["remediation"]
+
+
+def test_status_cannot_report_a_finished_campaign_clean_after_its_union_is_lost(tmp_path):
+    led = _ledger(tmp_path, "c-union-lost", stop="fixed_point", success=True)
+    for artifact in led.dir.glob("union*"):
+        artifact.unlink()
+
+    res = _invoke(tmp_path, "status", "--campaign", led.campaign_id, "--json")
+    doc = json.loads(res.stdout)
+    assert res.exit_code == 4 and doc["gaps"]
+    assert "union is unusable" in json.dumps(doc)
 
 
 # ── 6/7. every exit leaves through the contract, Click's own included ─────────────────────────────
@@ -673,11 +749,16 @@ def _limited_ledger(tmp_path, cid="c-lim", *, verdict="complete_with_limits"):
     from quarry_recon import campaign as C
     led = C.Campaign(tmp_path, cid)
     led.require()
+    union = C.Union(led.dir / "union.json", create=True)
+    if union.status == "new":
+        union.save()
     child = led.reserve()
     led.started(child, "r1")
-    led.manifested(child, summary={"verdict": verdict, "remainders": []},
-                   absorbed=C.AbsorbResult(), decision=C.Decision(stop="fixed_point"))
-    led.finish(C.Decision(stop="fixed_point"))
+    summary = _campaign_summary(verdict=verdict)
+    absorbed = _campaign_absorbed()
+    decision = C.decide(summary, absorbed, settlement=C.Settlement(), children=1)
+    led.manifested(child, summary=summary, absorbed=absorbed, decision=decision)
+    led.finish(decision)
     return led
 
 
