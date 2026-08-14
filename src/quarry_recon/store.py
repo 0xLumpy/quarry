@@ -54,6 +54,16 @@ _LIVE_MANAGED_ACQUISITIONS: dict[int, object] = {}
 _RUN_LOCK_LOCAL = threading.local()
 
 
+def _register_live_managed_acquisition(transaction) -> None:
+    """Adopt one live transaction without a traced acquire/effect/exit gap."""
+    with _RUN_LOCKS_GUARD: _LIVE_MANAGED_ACQUISITIONS[id(transaction)] = transaction
+
+
+def _unregister_live_managed_acquisition(transaction) -> None:
+    """Drop one settled transaction without a traced effect/exit gap."""
+    with _RUN_LOCKS_GUARD: _LIVE_MANAGED_ACQUISITIONS.pop(id(transaction), None)
+
+
 def _reset_mutation_locks_after_fork() -> None:
     """Discard process-local mutexes whose owners do not survive a fork."""
     global _RUN_LOCKS_GUARD, _RUN_LOCKS, _PROJECT_LOCKS
@@ -5452,6 +5462,7 @@ class _ManagedAcquisitionTransaction:
                 "managed acquisition context cannot settle in a forked child",
             )
         if self.settlement_state == "released":
+            _unregister_live_managed_acquisition(self)
             self.settled = True
             return
         faults: list[BaseException] = []
@@ -5535,8 +5546,7 @@ class _ManagedAcquisitionTransaction:
             and not self.marker.locked
         )
         if graph_terminal:
-            with _RUN_LOCKS_GUARD:
-                _LIVE_MANAGED_ACQUISITIONS.pop(id(self), None)
+            _unregister_live_managed_acquisition(self)
         self.settled = content_graph_terminal and self.settlement_state == "released"
         if self.settlement_state == "retained-uncertain":
             faults.append(ManagedAcquisitionRefused(
@@ -6338,8 +6348,7 @@ class Run:
         settlement = _SettlementOwner(transaction.settle)
         with _SettlementFence(settlement):
             with _SettlementFence(settlement):
-                with _RUN_LOCKS_GUARD:
-                    _LIVE_MANAGED_ACQUISITIONS[id(transaction)] = transaction
+                _register_live_managed_acquisition(transaction)
                 marker.acquire()
                 transaction.activate()
                 yield transaction
@@ -6348,6 +6357,34 @@ class Run:
                 or transaction.settlement_state == "live"):
             raise ContractError(
                 "managed acquisition claim did not reach terminal settlement",
+            )
+
+    @contextmanager
+    def managed_acquisition_discard_claim(self, *components):
+        """Hold a destination lease pre-armed for a no-contact pair discard.
+
+        The discard lifecycle facts are installed before the first marker or
+        namespace effect.  Therefore an exact cancellation after context entry
+        but before the caller invokes ``discard_pair`` releases the marker as a
+        proven precontact operation instead of manufacturing crash-stale state.
+        """
+        validated = _validated_artifact_components(tuple(components))
+        marker = _ManagedAcquisitionMarker(self, validated)
+        transaction = _ManagedAcquisitionTransaction(self, validated, marker)
+        transaction.clean_precontact = True
+        transaction.discard_started = True
+        settlement = _SettlementOwner(transaction.settle)
+        with _SettlementFence(settlement):
+            with _SettlementFence(settlement):
+                _register_live_managed_acquisition(transaction)
+                marker.acquire()
+                transaction.activate()
+                yield transaction
+        transaction.artifact._settlement_faults.extend(settlement.faults)
+        if (transaction.artifact._state not in {"published", "fenced"}
+                or transaction.settlement_state == "live"):
+            raise ContractError(
+                "managed acquisition discard claim did not reach terminal settlement",
             )
 
     def begin_finalization(

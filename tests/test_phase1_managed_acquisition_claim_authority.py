@@ -1875,6 +1875,164 @@ def test_composite_discard_finishes_receipt_and_preserves_exact_primary(
     run.begin_finalization()
 
 
+def _prearmed_discard_claim_events(run, components):
+    operation = store.Run.managed_acquisition_discard_claim.__wrapped__
+    events = []
+
+    def trace(frame, event, _arg):
+        if frame.f_code is operation.__code__ and event == "line":
+            events.append(frame.f_lineno)
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        with run.managed_acquisition_discard_claim(*components) as transaction:
+            assert transaction.clean_precontact
+            assert transaction.discard_started
+    finally:
+        sys.settrace(previous)
+    return events
+
+
+@pytest.mark.parametrize("cancellation_type", [KeyboardInterrupt, SystemExit])
+def test_each_prearmed_discard_claim_line_drains_without_stale_marker(
+    tmp_path, cancellation_type,
+):
+    probe_run, _probe_dest, probe_components = _run(
+        tmp_path / "probe", "discard-claim-line-probe",
+    )
+    events = _prearmed_discard_claim_events(probe_run, probe_components)
+    assert events
+    assert _claim_markers(probe_run) == []
+
+    operation = store.Run.managed_acquisition_discard_claim.__wrapped__
+    for target in range(1, len(events) + 1):
+        run, _dest, components = _run(
+            tmp_path / f"{cancellation_type.__name__}-{target}",
+            f"discard-claim-line-{target}",
+        )
+        cancellation = cancellation_type(
+            f"prearmed discard claim occurrence {target}",
+        )
+        occurrence = 0
+        fired = False
+        live_before = frozenset(store._LIVE_MANAGED_ACQUISITIONS)
+
+        def trace(frame, event, _arg):
+            nonlocal occurrence, fired
+            if frame.f_code is operation.__code__ and event == "line":
+                occurrence += 1
+                if occurrence == target and not fired:
+                    fired = True
+                    sys.settrace(None)
+                    raise cancellation
+            return trace
+
+        previous = sys.gettrace()
+        try:
+            sys.settrace(trace)
+            with pytest.raises(cancellation_type) as caught:
+                with run.managed_acquisition_discard_claim(*components):
+                    pass
+        finally:
+            sys.settrace(previous)
+
+        assert fired and caught.value is cancellation, (target, events[target - 1])
+        assert _claim_markers(run) == [], (target, events[target - 1])
+        assert frozenset(store._LIVE_MANAGED_ACQUISITIONS) == live_before
+        run.begin_finalization()
+
+
+@pytest.mark.parametrize("cancellation_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(("operation", "at_unregister"), [
+    (store._register_live_managed_acquisition, False),
+    (store._unregister_live_managed_acquisition, True),
+])
+def test_prearmed_discard_registry_transition_preserves_exact_and_drains(
+    tmp_path, cancellation_type, operation, at_unregister,
+):
+    run, _dest, components = _run(
+        tmp_path,
+        f"discard-registry-{'out' if at_unregister else 'in'}-"
+        f"{cancellation_type.__name__}",
+    )
+    line = _line_containing(operation, "with _RUN_LOCKS_GUARD")
+    cancellation = cancellation_type(
+        f"exact {operation.__name__} cancellation",
+    )
+    fired = False
+    live_before = frozenset(store._LIVE_MANAGED_ACQUISITIONS)
+
+    def trace(frame, event, _arg):
+        nonlocal fired
+        if (frame.f_code is operation.__code__ and event == "line"
+                and frame.f_lineno == line and not fired):
+            fired = True
+            sys.settrace(None)
+            raise cancellation
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        with pytest.raises(cancellation_type) as caught:
+            with run.managed_acquisition_discard_claim(*components):
+                assert at_unregister
+    finally:
+        sys.settrace(previous)
+
+    assert fired and caught.value is cancellation
+    assert _claim_markers(run) == []
+    assert frozenset(store._LIVE_MANAGED_ACQUISITIONS) == live_before
+    run.begin_finalization()
+
+
+@pytest.mark.parametrize("cancellation_type", [KeyboardInterrupt, SystemExit])
+def test_prearmed_discard_yield_gap_preserves_pair_and_exact_primary(
+    tmp_path, cancellation_type,
+):
+    run, dest, components = _run(
+        tmp_path, f"discard-yield-gap-{cancellation_type.__name__}",
+    )
+    receipt_components, body_snapshot, receipt_snapshot = _publish_managed_pair(
+        run, dest, components,
+    )
+    cancellation = cancellation_type("exact cancellation before discard_pair")
+
+    with pytest.raises(cancellation_type) as caught:
+        with run.managed_acquisition_discard_claim(*components) as transaction:
+            assert transaction.clean_precontact and transaction.discard_started
+            raise cancellation
+
+    assert caught.value is cancellation
+    assert dest.read_bytes() == b"managed pair body"
+    assert run.dir.joinpath(*receipt_components).read_bytes() == b'{"managed":"pair"}'
+    assert body_snapshot is not None and receipt_snapshot is not None
+    assert _claim_markers(run) == []
+    run.begin_finalization()
+
+
+def test_prearmed_discard_claim_returns_terminal_pair_ledger(tmp_path):
+    run, dest, components = _run(tmp_path, "discard-prearmed-terminal")
+    receipt_components, body_snapshot, receipt_snapshot = _publish_managed_pair(
+        run, dest, components,
+    )
+
+    with run.managed_acquisition_discard_claim(*components) as transaction:
+        ledger = transaction.discard_pair(
+            components, body_snapshot,
+            receipt_components, receipt_snapshot,
+        )
+
+    assert type(ledger) is store.ManagedDiscardLedger
+    assert ledger.body.state.startswith("removed")
+    assert ledger.receipt.state.startswith("removed")
+    assert not dest.exists() and not run.dir.joinpath(*receipt_components).exists()
+    assert _claim_markers(run) == []
+    run.begin_finalization()
+
+
 _DISCARD_CANCELLATION_BOUNDARIES = (
     store._ManagedDiscardComposite._remove,
     store._ManagedDiscardComposite.reconcile,
