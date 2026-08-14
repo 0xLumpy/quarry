@@ -1,0 +1,404 @@
+{
+  "$id": "https://quarry.invalid/schemas/run-manifest-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Structural envelope only. Quarry's strict reader additionally authenticates repository bytes and enforces arithmetic, lane-model, lifecycle, generation, verdict, and status semantics.",
+  "additionalProperties": false,
+  "properties": {
+    "base_files": {
+      "items": { "$ref": "#/$defs/base_file" },
+      "maxItems": 100000,
+      "type": "array"
+    },
+    "entity_counts": {
+      "additionalProperties": { "$ref": "#/$defs/count" },
+      "propertyNames": {
+        "enum": [
+          "certificate", "dns_record", "endpoint", "finding", "gadget_candidate",
+          "ip", "js_url", "live", "oob_interaction", "ownership_transition",
+          "parameter", "path_observation", "port", "resolved", "review", "screenshot",
+          "secret", "sink_observation", "subdomain", "tech", "url", "web_port", "wildcard_zone"
+        ]
+      },
+      "type": "object"
+    },
+    "envelope": {
+      "additionalProperties": false,
+      "properties": {
+        "max_bytes_per_key": { "const": 65536 },
+        "max_corpus_bytes_per_entity": { "const": 33554432 },
+        "max_keys_per_entity": { "const": 100000 },
+        "rss_budget_mb": { "const": 160 },
+        "version": { "const": 3 }
+      },
+      "required": [
+        "max_bytes_per_key", "max_corpus_bytes_per_entity", "max_keys_per_entity",
+        "rss_budget_mb", "version"
+      ],
+      "type": "object"
+    },
+    "envelope_degraded": {
+      "additionalProperties": {
+        "minLength": 1,
+        "pattern": "^EXCEPTION:.*\\S.*",
+        "type": "string"
+      },
+      "minProperties": 1,
+      "propertyNames": { "minLength": 1, "pattern": ".*\\S.*" },
+      "type": "object"
+    },
+    "envelope_remainder": {
+      "additionalProperties": { "$ref": "#/$defs/json_value" },
+      "type": "object"
+    },
+    "finished": { "$ref": "#/$defs/timestamp" },
+    "lifecycle": {
+      "additionalProperties": false,
+      "properties": {
+        "generation": { "pattern": "^[0-9a-f]{16}$", "type": "string" },
+        "state_at_commit": { "const": "finalizing" }
+      },
+      "required": ["generation", "state_at_commit"],
+      "type": "object"
+    },
+    "metrics": {
+      "additionalProperties": { "$ref": "#/$defs/json_value" },
+      "type": "object"
+    },
+    "notes": { "items": { "type": "string" }, "type": "array" },
+    "observability_degraded": {
+      "additionalProperties": false,
+      "properties": {
+        "first_error": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "writes_failed": { "maximum": 9223372036854775807, "minimum": 1, "type": "integer" }
+      },
+      "required": ["first_error", "writes_failed"],
+      "type": "object"
+    },
+    "phases_run": { "items": { "minLength": 1, "type": "string" }, "type": "array", "uniqueItems": true },
+    "policy": { "items": { "$ref": "#/$defs/json_value" }, "type": "array" },
+    "profile": {
+      "additionalProperties": { "$ref": "#/$defs/json_value" },
+      "type": "object"
+    },
+    "run_id": {
+      "pattern": "^(?!state$|campaigns$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "type": "string"
+    },
+    "schema_version": { "const": "quarry.run-manifest.v1" },
+    "started": { "$ref": "#/$defs/timestamp" },
+    "summary": { "$ref": "#/$defs/summary" },
+    "target": { "pattern": ".*\\S.*", "type": "string" },
+    "tool_runs": { "items": { "$ref": "#/$defs/tool_run" }, "type": "array" }
+  },
+  "required": [
+    "base_files", "entity_counts", "envelope", "finished", "lifecycle", "notes",
+    "phases_run", "profile", "run_id", "schema_version", "started", "summary", "target",
+    "tool_runs"
+  ],
+  "title": "Quarry strict committed run manifest v1",
+  "type": "object",
+  "$defs": {
+    "base_file": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": { "$ref": "#/$defs/count" },
+        "digest": { "pattern": "^sha256:[0-9a-f]{64}$", "type": "string" },
+        "media_type": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "path": {
+          "allOf": [
+            { "not": { "pattern": "(^/|\\\\|(^|/)\\.{1,2}(/|$))" } },
+            { "pattern": "^[^/]+(?:/[^/]+)*$" },
+            { "pattern": ".*\\S.*" }
+          ],
+          "type": "string"
+        },
+        "rows": { "oneOf": [{ "$ref": "#/$defs/count" }, { "type": "null" }] }
+      },
+      "required": ["bytes", "digest", "media_type", "path", "rows"],
+      "type": "object"
+    },
+    "count": { "maximum": 9223372036854775807, "minimum": 0, "type": "integer" },
+    "json_value": {
+      "anyOf": [
+        { "type": ["boolean", "null", "string"] },
+        {
+          "maximum": 9223372036854775807,
+          "minimum": -9223372036854775807,
+          "type": "number"
+        },
+        { "items": { "$ref": "#/$defs/json_value" }, "type": "array" },
+        {
+          "additionalProperties": { "$ref": "#/$defs/json_value" },
+          "type": "object"
+        }
+      ]
+    },
+    "coverage_counters": {
+      "additionalProperties": false,
+      "properties": {
+        "eligible": { "$ref": "#/$defs/count" },
+        "omitted": { "$ref": "#/$defs/count" },
+        "tested": { "$ref": "#/$defs/count" }
+      },
+      "required": ["eligible", "omitted", "tested"],
+      "type": "object"
+    },
+    "coverage_unit": {
+      "additionalProperties": false,
+      "properties": {
+        "eligible": { "$ref": "#/$defs/count" },
+        "kind": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "omitted": { "$ref": "#/$defs/count" },
+        "reason": { "type": ["string", "null"] },
+        "tested": { "$ref": "#/$defs/count" },
+        "unit": { "type": "string" }
+      },
+      "required": ["eligible", "kind", "omitted", "reason", "tested", "unit"],
+      "type": "object"
+    },
+    "coverage_unknown": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "reason": { "type": ["string", "null"] },
+        "unit": { "type": "string" }
+      },
+      "required": ["kind", "reason", "unit"],
+      "type": "object"
+    },
+    "coverage": {
+      "additionalProperties": false,
+      "properties": {
+        "by_kind": {
+          "additionalProperties": { "$ref": "#/$defs/coverage_counters" },
+          "type": "object"
+        },
+        "eligible": { "$ref": "#/$defs/count" },
+        "measure": { "type": "string" },
+        "omitted": { "$ref": "#/$defs/count" },
+        "reason": { "type": ["string", "null"] },
+        "source_id": { "type": "string" },
+        "tested": { "$ref": "#/$defs/count" },
+        "units": { "items": { "$ref": "#/$defs/coverage_unit" }, "type": "array" },
+        "unknown": { "items": { "$ref": "#/$defs/coverage_unknown" }, "type": "array" },
+        "valid": { "type": "boolean" }
+      },
+      "required": [
+        "by_kind", "eligible", "measure", "omitted", "reason", "source_id", "tested",
+        "units", "unknown", "valid"
+      ],
+      "type": "object"
+    },
+    "fault": {
+      "additionalProperties": false,
+      "properties": {
+        "challenges_completeness": { "type": "boolean" },
+        "detail": { "type": ["string", "null"] },
+        "kind": {
+          "enum": [
+            "phase_exception", "machinery", "publication", "optional_tool_failed",
+            "required_tool_missing", "diagnostic"
+          ]
+        },
+        "where": { "type": ["string", "null"] }
+      },
+      "required": ["challenges_completeness", "kind"],
+      "type": "object"
+    },
+    "outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "eligible": { "$ref": "#/$defs/count" },
+        "error_class": { "type": "string" },
+        "kind": { "type": "string" },
+        "measure": { "type": ["string", "null"] },
+        "missing_tool": { "type": "string" },
+        "omitted": { "$ref": "#/$defs/count" },
+        "omitted_fraction": { "maximum": 1, "minimum": 0, "type": "number" },
+        "origin": { "enum": ["operator", "provider"] },
+        "output_lines": { "$ref": "#/$defs/count" },
+        "phase": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "priority": { "enum": ["major", "minor"] },
+        "status": { "type": "string" },
+        "tool": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "why": { "type": ["string", "null"] }
+      },
+      "required": ["phase", "tool", "why"],
+      "type": "object"
+    },
+    "remainder": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "lane": { "const": "store.envelope" } }, "required": ["lane"] },
+          "then": { "properties": { "model": { "const": "project_progress" } } }
+        },
+        {
+          "if": { "properties": { "lane": { "const": "enrich.a1d_brute" } }, "required": ["lane"] },
+          "then": { "properties": { "model": { "const": "project_progress" } } }
+        },
+        {
+          "if": { "properties": { "lane": { "const": "enrich.wildcard_a1d" } }, "required": ["lane"] },
+          "then": { "properties": { "model": { "const": "project_progress" } } }
+        },
+        {
+          "if": { "properties": { "lane": { "const": "vertical.wildcard_http" } }, "required": ["lane"] },
+          "then": { "properties": { "model": { "const": "project_progress" } } }
+        },
+        {
+          "if": { "properties": { "lane": { "const": "vertical.alterx_permute" } }, "required": ["lane"] },
+          "then": { "properties": { "model": { "const": "rerun_same_work" } } }
+        },
+        {
+          "if": { "properties": { "lane": { "const": "crawl.jxscout_chunks" } }, "required": ["lane"] },
+          "then": {
+            "oneOf": [
+              {
+                "properties": {
+                  "model": { "const": "project_progress" },
+                  "unit": { "const": "crawl.jxscout_chunks:bundles" }
+                }
+              },
+              {
+                "properties": {
+                  "model": { "const": "rerun_same_work" },
+                  "unit": { "not": { "const": "crawl.jxscout_chunks:bundles" } }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "detail": {
+          "additionalProperties": { "$ref": "#/$defs/json_value" },
+          "type": "object"
+        },
+        "lane": {
+          "enum": [
+            "crawl.jxscout_chunks", "enrich.a1d_brute", "enrich.wildcard_a1d",
+            "store.envelope", "vertical.alterx_permute", "vertical.wildcard_http"
+          ]
+        },
+        "measure": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "model": { "enum": ["project_progress", "rerun_same_work"] },
+        "retriable": {
+          "additionalProperties": false,
+          "properties": {
+            "cooldown": { "$ref": "#/$defs/count" },
+            "now": { "$ref": "#/$defs/count" }
+          },
+          "required": ["cooldown", "now"],
+          "type": "object"
+        },
+        "terminal": {
+          "additionalProperties": false,
+          "properties": {
+            "dependency": { "$ref": "#/$defs/count" },
+            "entitlement": { "$ref": "#/$defs/count" },
+            "machinery": { "$ref": "#/$defs/count" },
+            "unschedulable": { "$ref": "#/$defs/count" }
+          },
+          "required": ["dependency", "entitlement", "machinery", "unschedulable"],
+          "type": "object"
+        },
+        "unit": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" }
+      },
+      "required": ["detail", "lane", "measure", "model", "retriable", "terminal", "unit"],
+      "type": "object"
+    },
+    "spend": {
+      "additionalProperties": false,
+      "properties": {
+        "amount": { "$ref": "#/$defs/count" },
+        "lane": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "measure": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "provider": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "unknown": { "$ref": "#/$defs/count" }
+      },
+      "required": ["amount", "lane", "measure", "provider", "unknown"],
+      "type": "object"
+    },
+    "summary": {
+      "additionalProperties": false,
+      "properties": {
+        "coverage": { "items": { "$ref": "#/$defs/coverage" }, "type": "array" },
+        "coverage_limits": { "items": { "$ref": "#/$defs/outcome" }, "type": "array" },
+        "failures": { "items": { "$ref": "#/$defs/outcome" }, "type": "array" },
+        "faults": { "items": { "$ref": "#/$defs/fault" }, "type": "array" },
+        "gaps": { "items": { "$ref": "#/$defs/outcome" }, "type": "array" },
+        "operator_limits": { "items": { "$ref": "#/$defs/outcome" }, "type": "array" },
+        "phase_exceptions": {
+          "items": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+          "type": "array"
+        },
+        "provider_limits": { "items": { "$ref": "#/$defs/outcome" }, "type": "array" },
+        "provider_spend": { "items": { "$ref": "#/$defs/spend" }, "type": "array" },
+        "remainders": {
+          "items": {
+            "oneOf": [
+              { "$ref": "#/$defs/remainder" },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "invalid": { "minLength": 1, "type": "string" },
+                  "lane": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+                  "unit": { "type": "string" }
+                },
+                "required": ["invalid", "lane", "unit"],
+                "type": "object"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "tool_status": {
+          "additionalProperties": { "$ref": "#/$defs/count" },
+          "propertyNames": { "minLength": 1 },
+          "type": "object"
+        },
+        "tools_failed": { "$ref": "#/$defs/count" },
+        "verdict": { "enum": ["complete", "complete_with_limits", "complete_with_gaps"] }
+      },
+      "required": [
+        "coverage", "coverage_limits", "failures", "faults", "gaps", "operator_limits",
+        "phase_exceptions", "provider_limits", "provider_spend", "remainders", "tool_status",
+        "tools_failed", "verdict"
+      ],
+      "type": "object"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$",
+      "type": "string"
+    },
+    "tool_run": {
+      "additionalProperties": false,
+      "properties": {
+        "cmd": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "cpu_s": { "maximum": 9223372036854775807, "minimum": 0, "type": "number" },
+        "depends_on": { "type": "string" },
+        "duration": { "maximum": 9223372036854775807, "minimum": 0, "type": "number" },
+        "exit_code": {
+          "maximum": 9223372036854775807,
+          "minimum": -9223372036854775807,
+          "type": ["integer", "null"]
+        },
+        "note": { "type": "string" },
+        "peak_rss_mb": { "maximum": 9223372036854775807, "minimum": 0, "type": "number" },
+        "phase": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" },
+        "status": {
+          "enum": ["blocked", "empty", "failed", "limited", "partial", "skipped", "success", "timed_out"]
+        },
+        "stderr_tail": { "type": "string" },
+        "stdout_lines": { "$ref": "#/$defs/count" },
+        "tool": { "minLength": 1, "pattern": ".*\\S.*", "type": "string" }
+      },
+      "required": [
+        "cmd", "cpu_s", "depends_on", "duration", "exit_code", "note", "peak_rss_mb",
+        "phase", "status", "stderr_tail", "stdout_lines", "tool"
+      ],
+      "type": "object"
+    }
+  }
+}

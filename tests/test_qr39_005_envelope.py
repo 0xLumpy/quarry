@@ -148,12 +148,16 @@ def test_existing_key_merge_is_not_refused_at_the_cap(tmp_path: Path, monkeypatc
 
 
 def test_overflow_remainder_survives_reopen(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 20)
     run = Run.create(tmp_path, "audit")
-    _fill(run, "subdomain", 75)
+    # The cheap bound is an ingest fault fixture, not a supported manifest
+    # declaration.  Restore production policy before the strict writer binds
+    # the resulting admitted/refused bytes.
+    with monkeypatch.context() as bounded:
+        bounded.setattr(envelope, "MAX_KEYS_PER_ENTITY", 20)
+        _fill(run, "subdomain", 75)
     run.write_manifest({}, [], metrics=None, policy=None)
     manifest = json.loads(run.manifest_path.read_text())
-    assert manifest["envelope"]["max_keys_per_entity"] == 20
+    assert manifest["envelope"]["max_keys_per_entity"] == envelope.MAX_KEYS_PER_ENTITY
     assert manifest["envelope_remainder"]["remainders"][0]["terminal"]["unschedulable"] == 55
 
     reopened = Run.open(tmp_path, "audit", run.run_id)
@@ -347,14 +351,15 @@ def test_a_ledger_write_failure_is_surfaced_not_false_clean(tmp_path: Path, monk
 
 # ── round-3: the envelope holds on the finished/campaign fold, durably, fail-closed, bounded, dedup'd ──
 
-def test_finished_and_campaign_fold_refuse_an_oversized_record(tmp_path: Path, monkeypatch):
+def test_finished_and_campaign_fold_refuse_an_oversized_record(tmp_path: Path):
     # the finished-run reconciliation a campaign absorbs must not present an over-envelope record as clean
     from quarry_recon.store import fold_run_entity
-    monkeypatch.setattr(envelope, "MAX_BYTES_PER_KEY", 100)
     run = Run.create(tmp_path, "audit")
     path = run.normalized / "subdomain.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"host": "h.example.com", "blob": "x" * 2000}) + "\n")   # ~2 KiB, one key
+    path.write_text(json.dumps({
+        "host": "h.example.com", "blob": "x" * (envelope.MAX_BYTES_PER_KEY + 1024),
+    }) + "\n")
     _make_private(path)
     run.write_manifest({}, [], metrics=None, policy=None)
     folded = fold_run_entity(run.dir, "subdomain")
@@ -364,13 +369,14 @@ def test_finished_and_campaign_fold_refuse_an_oversized_record(tmp_path: Path, m
 
 def test_a_prior_durability_failure_keeps_a_reopen_gapped(tmp_path: Path, monkeypatch):
     # a ledger-write failure persists a durable marker, so a fresh reopen stays gapped, never a false fixed_point
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
     run = Run.create(tmp_path, "audit")
-    run.add("subdomain", {"host": "kept.example.com"})
-    monkeypatch.setattr(run, "_append_refused",
+    with monkeypatch.context() as bounded:
+        bounded.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
+        run.add("subdomain", {"host": "kept.example.com"})
+        bounded.setattr(run, "_append_refused",
                         lambda e, k, ki: (_ for _ in ()).throw(OSError("disk full")))
-    for i in range(3):
-        run.add("subdomain", {"host": f"lost{i}.example.com"})
+        for i in range(3):
+            run.add("subdomain", {"host": f"lost{i}.example.com"})
     assert run._degraded_path.exists()                          # durable, not just an in-memory note
     run.write_manifest({}, [], metrics=None, policy=None)
     reopened = Run.open(tmp_path, "audit", run.run_id)          # a fresh instance with no in-memory notes
@@ -421,17 +427,18 @@ def test_no_unenforced_disk_budget_is_published():
 
 # ── round-4: growth-only overflow degrades the fold; ledger validation; durability marker failure ─────
 
-def test_finished_fold_degrades_on_a_growth_refusal_with_unchanged_count(tmp_path: Path, monkeypatch):
+def test_finished_fold_degrades_on_a_growth_refusal_with_unchanged_count(tmp_path: Path):
     # an on-disk log carrying an over-byte ENRICHMENT of an existing key: the distinct-key count is unchanged,
     # so a count-only check reads `valid`; the refused growth must still degrade the fold (no clean fixed_point)
     from quarry_recon.store import fold_run_entity
-    monkeypatch.setattr(envelope, "MAX_BYTES_PER_KEY", 200)
     run = Run.create(tmp_path, "audit")
     path = run.normalized / "subdomain.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:
         fh.write(json.dumps({"host": "h.example.com"}) + "\n")
-        fh.write(json.dumps({"host": "h.example.com", "blob": "x" * 500}) + "\n")   # growth past the ceiling
+        fh.write(json.dumps({
+            "host": "h.example.com", "blob": "x" * (envelope.MAX_BYTES_PER_KEY + 1024),
+        }) + "\n")   # growth past the production ceiling
     _make_private(path)
     run.write_manifest({}, [], metrics=None, policy=None)
     folded = fold_run_entity(run.dir, "subdomain")
@@ -520,10 +527,11 @@ def test_a_live_refusal_makes_a_reopened_run_untrustworthy(tmp_path: Path, monke
     # live refusals never reach the normalized log; folding rows alone would read the run as clean, but its
     # finalized manifest records the refusal, so the finished/campaign fold must stay degraded (not trustworthy)
     from quarry_recon.store import fold_run_entity
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
     run = Run.create(tmp_path, "audit")
-    run.add("subdomain", {"host": "a.example.com"})           # admitted -> on the log
-    run.add("subdomain", {"host": "b.example.com"})           # LIVE refused -> only in the ledger
+    with monkeypatch.context() as bounded:
+        bounded.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
+        run.add("subdomain", {"host": "a.example.com"})       # admitted -> on the log
+        run.add("subdomain", {"host": "b.example.com"})       # LIVE refused -> only in the ledger
     run.write_manifest({}, [], metrics=None, policy=None)
     folded = fold_run_entity(run.dir, "subdomain")
     assert folded.status == "degraded" and not folded.trustworthy
@@ -532,6 +540,7 @@ def test_a_live_refusal_makes_a_reopened_run_untrustworthy(tmp_path: Path, monke
 
 def test_marker_unwritable_gap_survives_reopen_via_the_manifest(tmp_path: Path, monkeypatch):
     import quarry_recon.store as store_mod
+    production_max = envelope.MAX_KEYS_PER_ENTITY
     monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
     run = Run.create(tmp_path, "audit")
     run.add("subdomain", {"host": "kept.example.com"})
@@ -547,6 +556,7 @@ def test_marker_unwritable_gap_survives_reopen_via_the_manifest(tmp_path: Path, 
                         lambda e, k, ki: (_ for _ in ()).throw(OSError("disk full")))
     for i in range(3):
         run.add("subdomain", {"host": f"lost{i}.example.com"})
+    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", production_max)
     run.write_manifest({}, [], metrics=None, policy=None)     # the manifest IS writable and records the gap
     assert "envelope_degraded" in json.loads(run.manifest_path.read_text())
     monkeypatch.setattr(store_mod, "_atomic_write", orig)     # marker still missing on disk
@@ -605,9 +615,8 @@ def test_an_oversized_ledger_line_is_rejected_without_materializing(tmp_path: Pa
     assert any("unreadable" in e for e in run._run_summary()["phase_exceptions"])
 
 
-def test_a_persisted_durability_gap_keeps_a_finished_fold_untrustworthy(tmp_path: Path, monkeypatch):
+def test_a_persisted_durability_gap_keeps_a_finished_fold_untrustworthy(tmp_path: Path):
     from quarry_recon.store import fold_run_entity
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
     run = Run.create(tmp_path, "audit")
     run.add("subdomain", {"host": "a.example.com"})
     run.write_manifest({}, [], metrics=None, policy=None)
@@ -618,9 +627,8 @@ def test_a_persisted_durability_gap_keeps_a_finished_fold_untrustworthy(tmp_path
     assert folded.status == "degraded" and not folded.trustworthy   # a persisted durability gap fails closed
 
 
-def test_a_malformed_envelope_remainder_fails_closed_but_clean_stays_trustworthy(tmp_path: Path, monkeypatch):
+def test_a_malformed_envelope_remainder_fails_closed_but_clean_stays_trustworthy(tmp_path: Path):
     from quarry_recon.store import fold_run_entity
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
     run = Run.create(tmp_path, "audit")
     run.add("subdomain", {"host": "a.example.com"})
     run.write_manifest({}, [], metrics=None, policy=None)
@@ -635,10 +643,9 @@ def test_a_malformed_envelope_remainder_fails_closed_but_clean_stays_trustworthy
     assert fold_run_entity(clean.dir, "subdomain").trustworthy
 
 
-def test_a_non_int_remainder_counter_fails_closed(tmp_path: Path, monkeypatch):
+def test_a_non_int_remainder_counter_fails_closed(tmp_path: Path):
     # a well-formed record whose counter is the wrong type is an UNREADABLE refusal claim: coercing it to 0
     # would let a gapped run be absorbed, so the contract rejects it and the fold fails closed
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
     for bad in ("1", 1.0, True, -1, None):                     # wrong-type / negative terminal counter
         rec = {**_env_record(), "terminal": {"unschedulable": bad}}
         assert not _fold_with_remainder(tmp_path, f"t-{bad!r}", [rec]).trustworthy
@@ -646,9 +653,8 @@ def test_a_non_int_remainder_counter_fails_closed(tmp_path: Path, monkeypatch):
     assert not _fold_with_remainder(tmp_path, "retriable", [rec]).trustworthy
 
 
-def test_any_outstanding_remainder_work_degrades_not_just_unschedulable(tmp_path: Path, monkeypatch):
+def test_any_outstanding_remainder_work_degrades_not_just_unschedulable(tmp_path: Path):
     # retriable.now, retriable.cooldown, and ANY terminal cause are all outstanding work — not only unschedulable
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
     for rec in (_env_record(now=3),
                 _env_record(cooldown=2),
                 _env_record(terminal={"machinery": 1}),
@@ -662,10 +668,9 @@ def test_any_outstanding_remainder_work_degrades_not_just_unschedulable(tmp_path
     assert _fold_with_remainder(tmp_path, "other", [_env_record(entity="url", terminal={"unschedulable": 3})]).trustworthy
 
 
-def test_a_structurally_invalid_remainder_fails_closed_via_the_contract(tmp_path: Path, monkeypatch):
+def test_a_structurally_invalid_remainder_fails_closed_via_the_contract(tmp_path: Path):
     # parsed through the AUTHORITATIVE remainder contract: a missing required field, an unknown key, a
     # bad model/measure, or a missing entity all fail closed — the partial value never reads as clean
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
     good = _env_record(terminal={"unschedulable": 2})
     bad_records = [
         {k: v for k, v in good.items() if k != "model"},          # missing required field
@@ -682,10 +687,9 @@ def test_a_structurally_invalid_remainder_fails_closed_via_the_contract(tmp_path
     assert not _fold_with_remainder(tmp_path, "good", [good]).trustworthy
 
 
-def test_an_invalid_envelope_identity_keeps_work_outstanding(tmp_path: Path, monkeypatch):
+def test_an_invalid_envelope_identity_keeps_work_outstanding(tmp_path: Path):
     # a record owes 3 units under the unit `store.envelope:subdomain`; a detail.entity that is bogus, empty,
     # or mismatched (or an unknown nested retriable key) is never a clean signal -> the work stays OUTSTANDING
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
 
     def _under_subdomain(detail_entity=..., extra_retriable=None):
         rec = _env_record(entity="subdomain", terminal={"unschedulable": 3})   # unit == store.envelope:subdomain

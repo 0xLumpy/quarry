@@ -1131,28 +1131,28 @@ SUMMARY_KEYS = frozenset({"verdict", "tool_status", "tools_failed", "failures", 
 
 
 def summary_well_formed(summary) -> bool:
-    """Whether a stored summary is the shape the writer emits. A dict missing required keys is damage: an
-    empty one reconciles to `verdict: complete` because it carries nothing to contradict it."""
-    return isinstance(summary, dict) and SUMMARY_KEYS.issubset(summary)
+    """Whether a stored summary is the exact, reconciled shape the writer emits."""
+    from . import run_manifest
+    try:
+        run_manifest.validate_summary(summary)
+    except run_manifest.ManifestError:
+        return False
+    return True
 
 
 def manifest_committed(manifest_path) -> bool:
-    """Whether a base manifest is committed — the one rule, so every reader agrees on what a commitment is.
+    """Whether exact base bytes form a committed v1 manifest.
 
-    Readable, carrying exact non-negative entity counters and a well-formed summary. A manifest whose
-    shape cannot be trusted is a damaged file: reading a commitment out of it would let a run that never
-    sealed, or one whose record was mangled, report a verdict it never reached.
+    Lifecycle state is a separate authority and may be absent for an imported
+    legacy repository.  The manifest's own immutable content and claimed
+    ``finalizing`` generation are nevertheless always checked here.
     """
-    manifest = _read_json(manifest_path)
-    if not isinstance(manifest, dict):
-        return False
-    counts = manifest.get("entity_counts")
-    if not isinstance(counts, dict):
-        return False
-    # `type is int` rejects a bool counter, and a negative one is not a count of anything
-    if not all(isinstance(k, str) and type(v) is int and v >= 0 for k, v in counts.items()):
-        return False
-    return summary_well_formed(manifest.get("summary"))
+    from . import run_manifest
+    path = Path(manifest_path)
+    has_state = os.path.lexists(path.parent / "state.json")
+    if run_manifest.committed(path, verify_lifecycle=has_state):
+        return True
+    return not has_state and run_manifest.legacy_committed(path)
 
 
 def _verdict_for(summary: dict) -> str:
@@ -1180,6 +1180,14 @@ class ToolRunRecord:
     cpu_s: float = 0.0                 # per-tool child CPU seconds
     peak_rss_mb: float = 0.0           # per-tool peak RSS (MB) of the process tree
     depends_on: str = ""               # registry bin this source needs; the source→tool edge the verdict reads
+
+    def __post_init__(self) -> None:
+        from .runner import Status
+        known = {status.value for status in Status}
+        if type(self.status) is not str or self.status not in known:
+            raise ContractError(f"unknown tool-run status {self.status!r}")
+        if self.exit_code is not None and type(self.exit_code) is not int:
+            raise ContractError("tool-run exit_code must be an integer or null")
 
 
 @dataclass(frozen=True)
@@ -6934,18 +6942,6 @@ class Run:
     # ── finalisation state machine ──
     def manifest_committed(self) -> bool:
         """Whether this run's base manifest is committed. `manifest_committed(path)` is the one rule."""
-        owner = self._active_mutation_owner()
-        if owner is not None:
-            manifest = _read_identity_file(owner.run_anchor.fd, "manifest.json")
-            if not isinstance(manifest, dict):
-                return False
-            counts = manifest.get("entity_counts")
-            return (
-                isinstance(counts, dict)
-                and all(isinstance(k, str) and type(v) is int and v >= 0
-                        for k, v in counts.items())
-                and summary_well_formed(manifest.get("summary"))
-            )
         return manifest_committed(self.manifest_path)
 
     def _read_state(self) -> dict:
@@ -6959,9 +6955,9 @@ class Run:
         owner = self._active_mutation_owner()
         if owner is not None:
             return self._read_state_from_fd(owner.run_anchor.fd)
-        from .state import RUN_STATES, STATE_UNKNOWN
-        if not self.state_path.exists():
-            if self.manifest_path.exists() and not self.manifest_committed():
+        from .state import STATE_UNKNOWN
+        if not os.path.lexists(self.state_path):
+            if os.path.lexists(self.manifest_path) and not self.manifest_committed():
                 # a damaged manifest is not a commitment, and with no lifecycle record to read there is
                 # nothing left that could say how this run ended
                 return {"schema_version": 1, "run_id": self.run_id, "stages": {},
@@ -6981,14 +6977,7 @@ class Run:
         if state is None:
             manifest = _read_identity_file(run_fd, "manifest.json")
             if manifest is not None and manifest is not _MALFORMED_IDENTITY:
-                counts = manifest.get("entity_counts") if isinstance(manifest, dict) else None
-                committed = (
-                    isinstance(counts, dict)
-                    and all(isinstance(k, str) and type(v) is int and v >= 0
-                            for k, v in counts.items())
-                    and summary_well_formed(manifest.get("summary"))
-                )
-                if not committed:
+                if not self.manifest_committed():
                     return {"schema_version": 1, "run_id": self.run_id, "stages": {},
                             "state": STATE_UNKNOWN, "unreadable": True}
                 return {"schema_version": 1, "run_id": self.run_id, "stages": {},
@@ -7007,18 +6996,12 @@ class Run:
         version this reader does not know, or holding malformed stages would otherwise read as `finished`
         here and then crash the finalisation that trusted it.
         """
-        from .state import RUN_STATES, SUPPORTED_SCHEMA
-        if not isinstance(d, dict) or d.get("state") not in RUN_STATES:
+        from . import run_manifest
+        try:
+            run_manifest.validate_state_document(d, self.run_id)
+        except run_manifest.ManifestError:
             return False
-        sv = d.get("schema_version")
-        if type(sv) is not int or sv not in SUPPORTED_SCHEMA:      # `type is int` rejects a bool
-            return False
-        if d.get("run_id") != self.run_id:      # a record from another run answers for nothing here
-            return False
-        stages = d.get("stages")
-        if not isinstance(stages, dict):
-            return False
-        return all(isinstance(name, str) and isinstance(rec, dict) for name, rec in stages.items())
+        return True
 
     @property
     def state(self) -> str:
@@ -7043,6 +7026,10 @@ class Run:
                                 f"advance it to {dst!r}; inspect or remove the file deliberately")
         if src != dst and not run_transition_ok(src, dst):
             raise ContractError(f"illegal run-state transition {src!r} -> {dst!r}")
+        if (dst == "finalization_failed" and detail is None
+                and not any(stage.get("status") == "failed"
+                            for stage in rec.get("stages", {}).values())):
+            detail = "finalization failed without a recorded stage"
         rec.update({"schema_version": 1, "run_id": self.run_id, "state": dst,
                     "generation": self.generation(), "updated": _utc(), "detail": detail})
         self._replace_run_bytes_locked(
@@ -7154,8 +7141,10 @@ class Run:
         summary["faults"] = kept
         summary["verdict"] = _verdict_for(summary)
         manifest["summary"] = summary
+        from . import run_manifest
+        run_manifest.validate_document(manifest)
         self._replace_run_bytes_locked(
-            ("manifest.json",), json.dumps(manifest, indent=2).encode("utf-8"),
+            ("manifest.json",), run_manifest.canonical_json_bytes(manifest),
         )
         self._sealed_summary, self._verdict_sealed = summary, True
         return summary
@@ -7748,6 +7737,7 @@ class Run:
         status_counts: dict[str, int] = {}
         failures = []
         gaps = []
+        operator_limits: list = []                            # our own explicit tool/provider bounds
         for entity in sorted(ENTITY_KEYS):
             folded = self.read_folded(entity)
             if folded.status in {"degraded", "unusable", "unknown"}:
@@ -7772,17 +7762,32 @@ class Run:
                 gaps.append({"phase": r.phase, "tool": r.tool, "status": "missing", "kind": "required_tool_missing",
                              "why": why, "output_lines": 0,
                              "missing_tool": r.depends_on or r.tool})   # required tool absent -> coverage gap
+            elif r.status == "limited":
+                # A RunResult has no durable provider-limit classification;
+                # without one, LIMITED is truthfully an operator boundary.
+                operator_limits.append({
+                    "phase": r.phase, "tool": r.tool, "why": why,
+                    "status": "limited", "output_lines": r.stdout_lines,
+                    "origin": "operator",
+                })
         # in-process provider terminals are folded in below, so a failed or partial provider feeds the
         # verdict and every terminal — clean ones included — increments tool_status
         provider_limits: list = []                            # external limits (quota/entitlement)
         # an operator boundary is a limit too, but it is ours; a separate bucket and an `origin` field keep
         # it from reading as a provider refusing us
-        operator_limits: list = []                            # our own bounds (reserve, withheld budget)
+        # tool-level limits above and provider-level limits below share the same
+        # operator bucket; neither may fall through to a complete verdict.
+        provider_gaps = {
+            "partial": "tool_omission",
+            "incomplete": "tool_omission",
+            "timed_out": "timeout",
+            "blocked": "unknown",
+        }
         for term in self._read_provider_terminals():
             sid = term.get("source_id", "?")
             st = term.get("status")
             status_counts[st] = status_counts.get(st, 0) + 1     # providers count toward tool_status too
-            if st not in ("failed", "partial", "incomplete", "limited"):
+            if st in ("success", "empty", "skipped"):
                 continue
             why = term.get("reason") or term.get("error_class") or st
             entry = {"phase": sid.split(".", 1)[0], "tool": sid, "why": why}
@@ -7797,8 +7802,12 @@ class Run:
                                "origin": "provider" if ec else "operator"})
             elif st == "failed":
                 failures.append(entry)
-            else:                                                 # partial / incomplete -> a coverage gap
-                gaps.append({**entry, "status": st, "kind": "tool_omission", "output_lines": 0})
+            else:
+                # Exhaust the closed provider status vocabulary.  A status the
+                # validator knows but this projector forgets must never become
+                # a clean terminal by falling through.
+                gaps.append({**entry, "status": st, "kind": provider_gaps.get(st, "unknown"),
+                             "output_lines": 0})
         phase_exceptions = [secrets.redact(n) for n in self.notes if "EXCEPTION" in n]
         # ── coverage counters: reconcile event-level input omissions into the verdict ──────────────
         # cap/timeout omitted>0 is a gap; sample/limit omitted>0 is a soft limit; inconsistent is unknown
@@ -7847,6 +7856,14 @@ class Run:
         # refused identities are lost coverage this run, so they gate the verdict as a gap and ride the
         # remainders a supervisor reads; without this an overflowed run finalises as clean/complete
         remainders = self._read_remainders()
+        for rec in remainders:
+            if set(rec) == {"lane", "unit", "invalid"}:
+                lane = rec["lane"]
+                gaps.append({
+                    "phase": lane.split(".", 1)[0], "tool": lane,
+                    "status": "remainder:unknown", "kind": "unknown",
+                    "why": rec["invalid"], "output_lines": 0,
+                })
         env = env_remainder
         if env is not None:
             for rec in env["remainders"]:
@@ -7882,11 +7899,21 @@ class Run:
         from .state import ContractError
         if self._sealed_summary is not None:
             return self._sealed_summary
-        if self.manifest_path.exists():
+        if os.path.lexists(self.manifest_path):
             # a committed manifest is the verdict; a damaged one has none, and recomputing here would
             # answer from an empty in-process ledger — a clean verdict invented for a broken record
-            stored = (_read_json(self.manifest_path) or {}).get("summary")
-            if not summary_well_formed(stored):
+            from . import run_manifest
+            try:
+                has_state = os.path.lexists(self.state_path)
+                try:
+                    stored = run_manifest.read(
+                        self.manifest_path, verify_lifecycle=has_state,
+                    ).summary
+                except run_manifest.ManifestError:
+                    if has_state:
+                        raise
+                    stored = run_manifest.read_legacy(self.manifest_path).summary
+            except run_manifest.ManifestError:
                 raise ContractError(f"run {self.run_id} has a manifest whose summary is unreadable or "
                                     f"incomplete — refusing to recompute a verdict over it")
             return stored
@@ -7982,10 +8009,9 @@ class Run:
         from . import events
 
         def _int(x):
-            try:
-                return int(x)
-            except (TypeError, ValueError):
-                return None
+            # Persisted coverage counters are authority inputs.  In particular,
+            # bools and numeric strings must not be laundered into integers.
+            return x if type(x) is int and 0 <= x <= (1 << 63) - 1 else None
 
         ev = self.dir / "events.jsonl"
         if not ev.exists():
@@ -8001,13 +8027,18 @@ class Run:
                     continue
                 et = rec.get("event")
                 sid = rec.get("source_id", "?")
+                if not isinstance(sid, str):
+                    sid = "<invalid-coverage-source>"
                 if et == events.COVERAGE_RESET:
                     live.pop(sid, None)                            # new generation: prior units gone
                 elif et == events.COVERAGE_PARTIAL and (rec.get("eligible") is not None
                                                         or rec.get("kind") == events.COVERAGE_UNKNOWN):
                     # COVERAGE_UNKNOWN is structured but uncounted; admitted so "ran, unmeasurable" reaches
                     # the verdict as a gap rather than reading as fully covered
-                    live.setdefault(sid, {})[rec.get("unit", sid)] = rec   # latest per unit, this generation
+                    unit = rec.get("unit", sid)
+                    if not isinstance(unit, str):
+                        unit = "<invalid-coverage-unit>"
+                    live.setdefault(sid, {})[unit] = rec   # latest per unit, this generation
         except Exception:
             pass
         # aggregated per (source_id, measure) so each rollup has one homogeneous denominator; by_kind and
@@ -8071,12 +8102,26 @@ class Run:
                 except Exception:
                     continue
                 et = rec.get("event")
-                if not rec.get("provider") or et not in (events.TOOL_START, events.TOOL_FINISH):
+                if rec.get("provider") is not True or et not in (events.TOOL_START, events.TOOL_FINISH):
                     continue
-                sid = rec.get("source_id", "?")
-                key = (sid, rec.get("work_unit"))
+                sid = rec.get("source_id")
+                work_unit = rec.get("work_unit")
+                if (not isinstance(sid, str) or not sid.strip()
+                        or (work_unit is not None and not isinstance(work_unit, str))):
+                    # Direct diagnostic summaries remain conservative.  The
+                    # strict manifest validator independently rejects the raw
+                    # malformed row before publication.
+                    key = ("<invalid-provider-record>", len(latest))
+                    latest[key] = {
+                        "source_id": "<invalid-provider-record>",
+                        "work_unit": None,
+                        "status": "incomplete",
+                        "reason": "provider lifecycle record is malformed",
+                    }
+                    continue
+                key = (sid, work_unit)
                 if et == events.TOOL_START:
-                    if rec.get("reset_generation"):              # the reset is persisted before execution
+                    if rec.get("reset_generation") is True:      # exact persisted generation marker
                         for k in [k for k in latest if k[0] == sid]:   # drop this source's prior units
                             del latest[k]
                     # the start is recorded as incomplete and replaced by its terminal; a start with no
@@ -8105,7 +8150,9 @@ class Run:
             from .state import Fault
             self.commit_fault(Fault("machinery", where="events.jsonl",
                                     detail=f"{od['writes_failed']} event write(s) failed: {od['first_error']}"))
+        from . import run_manifest
         manifest = {
+            "schema_version": run_manifest.SCHEMA_VERSION,
             "run_id": self.run_id,
             "target": self.target,
             "started": self.started,
@@ -8138,6 +8185,14 @@ class Run:
             manifest["observability_degraded"] = od
         if base_mutations:
             _events.persist_degraded()              # survives the base seal and the next process
+        manifest["lifecycle"] = {
+            "state_at_commit": "finalizing",
+            "generation": self.generation(),
+        }
+        manifest["base_files"] = run_manifest.build_file_inventory(self.dir)
+        run_manifest.validate_document(manifest)
+        manifest_bytes = run_manifest.canonical_json_bytes(manifest)
+        run_manifest.validate_prepared_document(self.dir, manifest)
         history = {
             "run_id": self.run_id,
             "target": self.target,
@@ -8147,7 +8202,7 @@ class Run:
         return _PreparedManifest(
             run_id=self.run_id,
             target=self.target,
-            manifest_text=json.dumps(manifest, indent=2),
+            manifest_text=manifest_bytes.decode("utf-8"),
             history_text=json.dumps(history, indent=2),
         )
 

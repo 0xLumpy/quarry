@@ -9,6 +9,7 @@ owns the ledger, the union and the rules. It never edits a child's evidence and 
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -342,9 +343,20 @@ def _read(path: Path):
 
 
 def _committed(run_dir) -> dict | None:
-    """The verdict a child committed to its manifest, or None when it never committed a readable one."""
-    doc = _read(Path(run_dir) / "manifest.json")
-    return doc["summary"] if isinstance(doc, dict) and isinstance(doc.get("summary"), dict) else None
+    """The one strictly validated verdict a child committed, or no commitment."""
+    from . import run_manifest
+    run_dir = Path(run_dir)
+    try:
+        return run_manifest.read(
+            run_dir / "manifest.json", verify_lifecycle=os.path.lexists(run_dir / "state.json"),
+        ).summary
+    except run_manifest.ManifestError:
+        if os.path.lexists(run_dir / "state.json"):
+            return None
+        try:
+            return run_manifest.read_legacy(run_dir / "manifest.json").summary
+        except run_manifest.ManifestError:
+            return None
 
 
 def _when(value):

@@ -368,6 +368,30 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.release_evidence:MAX_TAXONOMY_RECORD_BYTES": (
         "resource", "the allocation bound for one versioned pytest-taxonomy artifact; oversize input is "
                     "rejected rather than truncated or accepted as complete release evidence"),
+    "quarry_recon.run_manifest:MAX_JSONL_LINE_BYTES": (
+        "resource", "the allocation bound for validating one immutable manifest-bound JSONL record; an "
+                    "oversized row invalidates the manifest rather than being truncated or accepted"),
+    "quarry_recon.run_manifest:MAX_JSON_DEPTH": (
+        "resource", "the recursion-safety bound for one untrusted run-manifest document; deeper input is "
+                    "rejected rather than partially interpreted"),
+    "quarry_recon.run_manifest:MAX_JSON_INTEGER": (
+        "parser", "the portable scalar range of the versioned run-manifest JSON contract, not a work or "
+                  "evidence-volume allowance"),
+    "quarry_recon.run_manifest:MAX_MANIFEST_BYTES": (
+        "resource", "the allocation bound for one committed run-manifest control document; an oversized "
+                    "manifest is rejected rather than truncated"),
+    "quarry_recon.run_manifest:MAX_STRUCTURED_FILE_BYTES": (
+        "resource", "the allocation bound for one manifest-bound structured control file; raw evidence "
+                    "continues to be hashed as a stream"),
+    "quarry_recon.run_manifest:MAX_BASE_FILES": (
+        "resource", "the fail-closed file-count bound for authenticating one immutable run evidence tree; "
+                    "overflow invalidates the manifest"),
+    "quarry_recon.run_manifest:MAX_BASE_TREE_DEPTH": (
+        "resource", "the fail-closed directory-recursion bound for one immutable run evidence tree; it "
+                    "does not truncate an accepted inventory"),
+    "quarry_recon.run_manifest:MAX_BASE_INVENTORY_BYTES": (
+        "resource", "the streamed total-byte authentication bound for one immutable run evidence tree; "
+                    "overflow refuses the manifest rather than accepting a prefix"),
     "quarry_recon.release_h0:_MAX_BWRAP_STATUS_BYTES": (
         "resource", "the bounded parent read of one bubblewrap status control channel; overflow invalidates "
                     "the H0 diagnostic rather than truncating or accepting the status"),
