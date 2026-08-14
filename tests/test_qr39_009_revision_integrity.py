@@ -41,11 +41,6 @@ def _import(run, tmp_path, name: str, full_id: str):
     return oob.import_file(run, src)
 
 
-@pytest.fixture
-def one_key(monkeypatch):
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
-
-
 # ── the evidence itself is certified, not only its count ──────────────────────────────────────────
 def test_a_same_count_content_swap_uncertifies_the_revision(tmp_path):
     run = _sealed(tmp_path)
@@ -106,8 +101,12 @@ def test_an_escaping_view_directory_is_never_created(tmp_path):
 
 
 # ── the corpus envelope holds across concurrent writers ───────────────────────────────────────────
-def test_concurrent_writers_do_not_publish_past_the_envelope(tmp_path, one_key):
+def test_concurrent_writers_do_not_publish_past_the_envelope(tmp_path, monkeypatch):
     run = _sealed(tmp_path)
+    # A committed base records the production v3 declaration.  Narrow only the
+    # later supplemental writer; mutating the declaration before publication
+    # would correctly make the base manifest non-canonical.
+    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 1)
     ready = threading.Barrier(2)
     faults: list = []
 
@@ -137,8 +136,8 @@ def test_concurrent_writers_do_not_publish_past_the_envelope(tmp_path, one_key):
 
 # ── a refused ingest says so to its caller ────────────────────────────────────────────────────────
 def test_a_refused_import_reports_its_refusals(tmp_path, monkeypatch):
-    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 0)
     run = _sealed(tmp_path)
+    monkeypatch.setattr(envelope, "MAX_KEYS_PER_ENTITY", 0)
 
     res = _import(run, tmp_path, "cb.jsonl", "q1.csession01")
 

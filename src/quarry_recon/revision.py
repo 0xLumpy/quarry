@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,7 +14,7 @@ from pathlib import Path
 from . import envelope, privfs, store
 from .state import RUN_STATES, STATE_UNKNOWN, Fault
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REVISIONS_DIR = "revisions"
 POINTER_NAME = "revision.json"
 SEGMENT_NAME = "observations.jsonl"
@@ -37,6 +38,30 @@ class RevisionError(RuntimeError):
         super().__init__(message)
         self.fault = fault or Fault(kind="publication", where="revision", detail=message)
         self.retryable = bool(retryable)
+
+
+class RevisionPublicationError(RevisionError):
+    """Pointer publication could not be reduced to a safe retry decision."""
+
+    def __init__(self, message: str, *, outcome: str):
+        super().__init__(message, retryable=outcome == "not_landed")
+        self.outcome = outcome
+
+
+class _PointerPostCommitFault(BaseException):
+    """A primitive fault after the new pointer's parent fsync completed."""
+
+    def __init__(self, primary: BaseException):
+        super().__init__(str(primary))
+        self.primary = primary
+
+
+@dataclass(frozen=True)
+class _PointerSettlement:
+    """Settled authority after a fallible pointer publication attempt."""
+
+    outcome: str
+    revision: Revision | None = None
 
 
 @dataclass(frozen=True)
@@ -200,7 +225,8 @@ def commit_oob_candidate(
             preliminary["revision"] = published
             return preliminary
     except Exception as exc:
-        if raw is not None:
+        rollback_safe = not isinstance(exc, RevisionPublicationError) or exc.outcome == "not_landed"
+        if raw is not None and rollback_safe:
             try:
                 if prior_raw is None:
                     raw.unlink(missing_ok=True)
@@ -287,17 +313,18 @@ def _entity_content_digests(run_dir) -> dict:
     """
     out = {}
     d = Path(run_dir) / "normalized"
-    if not d.is_dir():
+    try:
+        mode = d.lstat().st_mode
+    except FileNotFoundError:
         return out
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise RevisionError(f"{d}: base evidence directory is unsafe")
     for p in sorted(d.glob("*.jsonl")):
-        h = hashlib.sha256()
         try:
-            with open(p, "rb") as fh:                 # streamed: a corpus is bounded, not small
-                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                    h.update(chunk)
+            body = _read_regular(p, root=Path(run_dir))  # the declared corpus envelope bounds this file
         except OSError as e:
             raise RevisionError(f"{p}: base evidence is unreadable ({type(e).__name__})")
-        out[p.stem] = h.hexdigest()
+        out[p.stem] = _sha(body)
     return out
 
 
@@ -317,9 +344,12 @@ class Revision:
     supplement_digest: str = ""
     entity_counts: dict = field(default_factory=dict)
     entity_digests: dict = field(default_factory=dict)
+    raw_files: dict = field(default_factory=dict)
     views: dict = field(default_factory=dict)
+    stale_views: list = field(default_factory=list)
     refused: list = field(default_factory=list)
     digest: str = ""
+    pointer_digest: str = ""
     orphans: list = field(default_factory=list)      # revision dirs above the pointer: written, never published
 
     @property
@@ -352,6 +382,148 @@ def _orphans(run_dir, published: int) -> list[str]:
     return sorted(out)
 
 
+def _canonical_bytes(value) -> bytes:
+    """One stable JSON encoding for identities recorded inside a revision pointer."""
+    return json.dumps(
+        value, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _pointer_digest(doc: dict) -> str:
+    """Digest every pointer claim except the digest field itself."""
+    body = dict(doc)
+    body.pop("pointer_digest", None)
+    return _sha(_canonical_bytes(body))
+
+
+def _evidence_digest(*, base: str, supplement: str, counts: dict,
+                     entity_digests: dict, raw_files: dict) -> str:
+    """Identity of the effective evidence view (derived views deliberately excluded)."""
+    return _sha(_canonical_bytes({
+        "base": base,
+        "supplement": supplement,
+        "entity_counts": counts,
+        "entity_digests": entity_digests,
+        "raw_files": raw_files,
+    }))
+
+
+def _read_regular(path: Path, *, root: Path | None = None) -> bytes:
+    """Read one stable regular file without following a symlink."""
+    path = Path(path)
+    if root is not None:
+        root = Path(root)
+        root_mode = root.lstat().st_mode
+        if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+            raise OSError(f"unsafe managed root: {root}")
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise OSError(f"file escapes managed root: {path}") from exc
+        cursor = root
+        for component in relative.parts[:-1]:
+            cursor = cursor / component
+            mode = cursor.lstat().st_mode
+            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                raise OSError(f"unsafe file ancestry: {cursor}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError(f"not a regular file: {path}")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != \
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise OSError(f"file changed while it was read: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _revision_raw_path(run_dir, ref: str) -> Path:
+    """Resolve a late-evidence raw reference, confined below ``revisions/raw``."""
+    if not isinstance(ref, str):
+        raise ValueError("raw reference is not a string")
+    parts = Path(ref).parts
+    if (Path(ref).is_absolute() or len(parts) < 4 or parts[:2] != (REVISIONS_DIR, "raw")
+            or any(part in ("", ".", "..") for part in parts)):
+        raise ValueError(f"raw reference {ref!r} is not a revision raw file")
+    return Path(run_dir).joinpath(*parts)
+
+
+def _late_raw_refs(rows: list[dict]) -> set[str]:
+    refs: set[str] = set()
+    for row in rows:
+        record = row.get("record") if isinstance(row, dict) else None
+        if not isinstance(record, dict):
+            continue
+        for ref in store._all_refs(record):
+            if isinstance(ref, str) and Path(ref).parts[:2] == (REVISIONS_DIR, "raw"):
+                refs.add(ref)
+    return refs
+
+
+def _raw_file_claims(run_dir, rows: list[dict]) -> dict:
+    claims = {}
+    for ref in sorted(_late_raw_refs(rows)):
+        path = _revision_raw_path(run_dir, ref)
+        body = _read_regular(path, root=revisions_dir(run_dir))
+        claims[ref] = {"bytes": len(body), "digest": _sha(body)}
+    return claims
+
+
+def _records_digest(entity: str, records: dict) -> str:
+    return _sha(_canonical_bytes(
+        [[key, store.fingerprint(entity, record)] for key, record in sorted(records.items())]
+    ))
+
+
+def _effective_records(run_dir, base_counts: dict, rows: list[dict]) -> tuple[dict, str]:
+    """Fold the base plus every published supplement segment for every effective entity."""
+    manifest = store._read_json(Path(run_dir) / "manifest.json")
+    declared = manifest.get("envelope") if isinstance(manifest, dict) else None
+    if not isinstance(declared, dict):
+        return {}, "the base manifest carries no corpus envelope"
+    limits = {
+        "max_keys": declared.get("max_keys_per_entity"),
+        "max_bytes_per_key": declared.get("max_bytes_per_key"),
+        "max_corpus_bytes": declared.get("max_corpus_bytes_per_entity"),
+    }
+    if any(type(value) is not int or value < 0 for value in limits.values()):
+        return {}, "the base manifest carries an invalid corpus envelope"
+    entities = set(base_counts)
+    entities.update(row["entity"] for row in rows)
+    records_by_entity: dict[str, dict] = {}
+    for entity in sorted(entities):
+        if entity not in store.ENTITY_KEYS:
+            return {}, f"the base manifest names an unknown entity {entity!r}"
+        base = store.fold_observations(
+            Path(run_dir) / "normalized" / f"{entity}.jsonl",
+            **limits,
+            require_newline=True,
+        )
+        expected = base_counts.get(entity, 0)
+        if base.status == "absent" and expected == 0:
+            base = store.FoldedLog()
+        if not base.trustworthy or base.refused or len(base.records) != expected:
+            return {}, f"{entity} cannot be read whole: {base.reason}"
+        records = dict(base.records)
+        for row in rows:
+            if row["entity"] != entity:
+                continue
+            key, record = row["id"], row["record"]
+            records[key] = store.merge(entity, records[key], record) if key in records else record
+        records_by_entity[entity] = records
+    return records_by_entity, ""
+
+
 def read(run_dir) -> Revision:
     """The combined view published for `run_dir`, or an `absent` Revision when none was.
 
@@ -360,20 +532,53 @@ def read(run_dir) -> Revision:
     """
     run_dir = Path(run_dir)
     p = pointer_path(run_dir)
-    if not p.exists():
+    try:
+        p.lstat()
+    except FileNotFoundError:
         return Revision()
-    doc = store._read_json(p)
+    try:
+        doc = json.loads(_read_regular(p, root=revisions_dir(run_dir)).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        doc = None
     if not isinstance(doc, dict):
         return Revision(status="unusable", reason="the revision pointer is unreadable")
+    return _certify_document(run_dir, doc)
+
+
+def _unusable(n: int, reason: str, run_dir) -> Revision:
+    return Revision(revision=n, status="unusable", reason=reason,
+                    orphans=_orphans(run_dir, n))
+
+
+def _certify_document(run_dir, doc: dict) -> Revision:
+    """Certify one pointer document against the bytes on disk.
+
+    Publication calls this before exposing the document; ``read`` calls the same
+    function afterwards.  There is consequently no weaker pre-publication rule.
+    """
+    run_dir = Path(run_dir)
     if doc.get("schema_version") != SCHEMA_VERSION:
         return Revision(status="unusable", reason=f"unknown revision schema {doc.get('schema_version')!r}")
     n = doc.get("revision")
     if type(n) is not int or n < 1:
         return Revision(status="unusable", reason="the revision pointer carries no exact revision number")
+    expected_fields = {
+        "schema_version", "revision", "created", "base", "supplement", "entity_counts",
+        "entity_digests", "raw_files", "views", "refused", "digest", "pointer_digest",
+    }
+    if set(doc) != expected_fields:
+        return _unusable(n, f"revision {n} pointer fields do not match schema", run_dir)
+    base = doc.get("base")
+    if not isinstance(base, dict) or set(base) != {
+        "run_id", "target", "manifest_digest", "entity_counts", "entity_contents",
+    }:
+        return _unusable(n, f"revision {n} base claim is malformed", run_dir)
     supplement = doc.get("supplement")
+    if not isinstance(supplement, dict) or set(supplement) != {"segments", "lines", "digest"}:
+        return _unusable(n, f"revision {n} supplement claim is malformed", run_dir)
     segments = supplement.get("segments") if isinstance(supplement, dict) else None
     if not isinstance(segments, list) or not segments:
-        return Revision(status="unusable", reason=f"revision {n} lists no supplement segment")
+        return _unusable(n, f"revision {n} lists no supplement segment", run_dir)
     rev = Revision(revision=n, status="valid", created=str(doc.get("created", "")),
                    base=doc.get("base") if isinstance(doc.get("base"), dict) else {},
                    segments=segments,
@@ -381,53 +586,128 @@ def read(run_dir) -> Revision:
                    supplement_digest=str(supplement.get("digest", "")),
                    entity_counts=doc.get("entity_counts") if isinstance(doc.get("entity_counts"), dict) else {},
                    entity_digests=doc.get("entity_digests") if isinstance(doc.get("entity_digests"), dict) else {},
+                   raw_files=doc.get("raw_files") if isinstance(doc.get("raw_files"), dict) else {},
                    views=doc.get("views") if isinstance(doc.get("views"), dict) else {},
                    refused=doc.get("refused") if isinstance(doc.get("refused"), list) else [],
                    digest=str(doc.get("digest", "")),
+                   pointer_digest=str(doc.get("pointer_digest", "")),
                    orphans=_orphans(run_dir, n))
+    if not rev.created or not isinstance(doc.get("created"), str):
+        return _unusable(n, f"revision {n} carries no creation time", run_dir)
+    if not isinstance(doc.get("entity_counts"), dict) or not isinstance(doc.get("entity_digests"), dict):
+        return _unusable(n, f"revision {n} entity claims are malformed", run_dir)
+    if not isinstance(doc.get("raw_files"), dict) or not isinstance(doc.get("refused"), list):
+        return _unusable(n, f"revision {n} raw/refusal claims are malformed", run_dir)
+    if not isinstance(doc.get("views"), dict) or set(doc["views"]) != {"dir", "files"}:
+        return _unusable(n, f"revision {n} view claims are malformed", run_dir)
+    for entry in rev.refused:
+        if (not isinstance(entry, dict) or set(entry) != {"entity", "key", "kind"}
+                or entry.get("entity") not in store.ENTITY_KEYS
+                or not isinstance(entry.get("key"), str) or not entry["key"]
+                or not isinstance(entry.get("kind"), str) or not entry["kind"]):
+            return _unusable(n, f"revision {n} carries a malformed refusal", run_dir)
     bad = _view_dir_fault(rev)
     if bad:
-        return Revision(revision=n, status="unusable", reason=bad, orphans=rev.orphans)
+        return _unusable(n, bad, run_dir)
     held = doc.get("base", {}).get("manifest_digest") if isinstance(doc.get("base"), dict) else None
     try:
-        current, _ = _base_manifest(run_dir)
+        current, base_counts = _base_manifest(run_dir)
         contents = _entity_content_digests(run_dir)
     except RevisionError as e:
-        return Revision(revision=n, status="unusable", reason=str(e), orphans=rev.orphans)
+        return _unusable(n, str(e), run_dir)
     if held != current:
-        return Revision(revision=n, status="unusable", orphans=rev.orphans,
-                        reason=f"the base run changed after revision {n} was published")
+        return _unusable(n, f"the base run changed after revision {n} was published", run_dir)
+    manifest_doc = store._read_json(run_dir / "manifest.json")
+    if (not isinstance(manifest_doc, dict)
+            or rev.base.get("run_id") != manifest_doc.get("run_id")
+            or rev.base.get("target") != manifest_doc.get("target")):
+        return _unusable(n, f"revision {n} does not name the sealed base identity", run_dir)
+    if rev.base.get("entity_counts") != base_counts:
+        return _unusable(n, f"revision {n} does not carry the base manifest's entity counts", run_dir)
     # the manifest counts the evidence; these digest it, so a same-count content swap is still a change
     recorded = rev.base.get("entity_contents")
     if not isinstance(recorded, dict) or recorded != contents:
         moved = sorted(set(contents) ^ set(recorded or {})
                        | {e for e in contents if isinstance(recorded, dict) and e in recorded
                           and recorded[e] != contents[e]})
-        return Revision(revision=n, status="unusable", orphans=rev.orphans,
-                        reason=f"the base evidence changed after revision {n} was published "
-                               f"({', '.join(moved[:4]) or 'no recorded content digests'})")
+        return _unusable(n, f"the base evidence changed after revision {n} was published "
+                          f"({', '.join(moved[:4]) or 'no recorded content digests'})", run_dir)
+    previous_number = 0
     for seg in segments:
-        if not isinstance(seg, dict):
-            return Revision(revision=n, status="unusable", reason="a supplement segment is malformed",
-                            orphans=rev.orphans)
+        if not isinstance(seg, dict) or set(seg) != {"revision", "file", "lines", "bytes", "digest"}:
+            return _unusable(n, "a supplement segment is malformed", run_dir)
+        number = seg.get("revision")
+        if type(number) is not int or number <= previous_number:
+            return _unusable(n, f"revision {n} has a non-monotonic segment chain", run_dir)
         try:
-            body = _segment_path(run_dir, seg.get("file")).read_bytes()
+            segment_path = _segment_path(run_dir, seg.get("file"))
+            body = _read_regular(segment_path, root=revisions_dir(run_dir))
         except (OSError, ValueError) as e:
-            return Revision(revision=n, status="unusable", orphans=rev.orphans,
-                            reason=f"supplement segment {seg.get('file')!r} is unusable: {e}")
-        if len(body) != seg.get("bytes") or _sha(body) != seg.get("digest"):
-            return Revision(revision=n, status="unusable", orphans=rev.orphans,
-                            reason=f"supplement segment {seg.get('file')!r} is not the one revision {n} published")
+            return _unusable(n, f"supplement segment {seg.get('file')!r} is unusable: {e}", run_dir)
+        path_number = int(Path(seg["file"]).parts[0][3:])
+        if number != path_number:
+            return _unusable(n, f"supplement segment {seg.get('file')!r} has the wrong revision", run_dir)
+        if (type(seg.get("lines")) is not int or seg["lines"] < 0
+                or type(seg.get("bytes")) is not int or seg["bytes"] < 0
+                or not isinstance(seg.get("digest"), str)):
+            return _unusable(n, "a supplement segment claim is malformed", run_dir)
+        if (len(body) != seg["bytes"] or _sha(body) != seg["digest"]
+                or len(body.splitlines()) != seg["lines"]):
+            return _unusable(
+                n, f"supplement segment {seg.get('file')!r} is not the one revision {n} published", run_dir,
+            )
+        previous_number = number
+    if previous_number != n:
+        return _unusable(n, f"revision {n} does not end at its own supplement segment", run_dir)
     if _chain_digest(segments) != rev.supplement_digest:
-        return Revision(revision=n, status="unusable", orphans=rev.orphans,
-                        reason=f"revision {n} does not certify its own segment chain")
+        return _unusable(n, f"revision {n} does not certify its own segment chain", run_dir)
+    expected_lines = sum(seg["lines"] for seg in segments)
+    if rev.supplement_lines != expected_lines:
+        return _unusable(n, f"revision {n} records the wrong supplement line count", run_dir)
     rows, dropped = _committed_rows(run_dir, rev)
     if dropped:
-        return Revision(revision=n, status="unusable", orphans=rev.orphans,
-                        reason=f"{dropped} unusable supplement row(s) in revision {n}")
-    counts_bad = _count_fault(run_dir, rev, _base_manifest(run_dir)[1], rows)
-    if counts_bad:
-        return Revision(revision=n, status="unusable", orphans=rev.orphans, reason=counts_bad)
+        return _unusable(n, f"{dropped} unusable supplement row(s) in revision {n}", run_dir)
+    if len(rows) != expected_lines:
+        return _unusable(n, f"revision {n} does not yield every segment row", run_dir)
+
+    records_by_entity, effective_fault = _effective_records(run_dir, base_counts, rows)
+    if effective_fault:
+        return _unusable(n, effective_fault, run_dir)
+    counts = {entity: len(records) for entity, records in records_by_entity.items()}
+    digests = {entity: _records_digest(entity, records)
+               for entity, records in records_by_entity.items()}
+    if (any(type(value) is not int or value < 0 for value in rev.entity_counts.values())
+            or rev.entity_counts != counts):
+        moved = sorted(set(rev.entity_counts) ^ set(counts)
+                       | {entity for entity in counts if rev.entity_counts.get(entity) != counts[entity]})
+        entity = moved[0] if moved else "evidence"
+        return _unusable(n, f"revision {n} entity counts do not match {entity}", run_dir)
+    if rev.entity_digests != digests:
+        return _unusable(n, f"revision {n} entity digests do not match the effective evidence", run_dir)
+
+    try:
+        raw_files = _raw_file_claims(run_dir, rows)
+    except (OSError, ValueError) as exc:
+        return _unusable(n, f"revision {n} late raw evidence is unusable: {exc}", run_dir)
+    if rev.raw_files != raw_files:
+        return _unusable(n, f"revision {n} late raw evidence claims do not match disk", run_dir)
+
+    expected_digest = _evidence_digest(
+        base=current,
+        supplement=rev.supplement_digest,
+        counts=counts,
+        entity_digests=digests,
+        raw_files=raw_files,
+    )
+    if rev.digest != expected_digest:
+        return _unusable(n, f"revision {n} does not certify its effective evidence", run_dir)
+    if rev.pointer_digest != _pointer_digest(doc):
+        return _unusable(n, f"revision {n} pointer document digest does not match", run_dir)
+
+    try:
+        rev.stale_views = _stale_view_files(run_dir, rev)
+    except RevisionError as exc:
+        return _unusable(n, str(exc), run_dir)
     return rev
 
 
@@ -500,7 +780,9 @@ def _committed_rows(run_dir, rev: Revision) -> tuple[list[dict], int]:
     dropped = 0
     for seg in rev.segments:
         try:
-            text = _segment_path(run_dir, seg.get("file")).read_text(encoding="utf-8")
+            text = _read_regular(
+                _segment_path(run_dir, seg.get("file")), root=revisions_dir(run_dir),
+            ).decode("utf-8")
         except (OSError, ValueError, UnicodeDecodeError):
             dropped += 1
             continue
@@ -572,11 +854,7 @@ def missing_views(run_dir) -> list[str]:
     rev = read(run_dir)
     if rev.status != "valid":
         return []
-    d = _view_dir(run_dir, rev)
-    files = rev.views.get("files")
-    if not isinstance(files, dict):
-        return []
-    return sorted(name for name in files if not (d / name).is_file())
+    return list(rev.stale_views)
 
 
 def view_identity(run_dir) -> tuple[int, str]:
@@ -589,30 +867,27 @@ def view_identity(run_dir) -> tuple[int, str]:
 def combined_fold(run_dir, entity: str) -> store.FoldedLog:
     """The base run's fold for `entity` with every committed supplement row merged in — what a consumer
     must read once a revision exists. An uncertified revision folds in nothing and says so."""
+    entity = store.validate_entity(entity)
     base = store.fold_run_entity(run_dir, entity)
     rev = read(run_dir)
     if rev.status == "absent":
         return base
     if rev.status != "valid":
         return store.FoldedLog(records=base.records, status="unknown", dropped=base.dropped, reason=rev.reason)
-    if not base.trustworthy:
-        return base
     rows, dropped = _committed_rows(run_dir, rev)
-    records = dict(base.records)
-    for row in rows:
-        if row["entity"] != entity:
-            continue
-        key, rec = row["id"], row["record"]
-        records[key] = store.merge(entity, records[key], rec) if key in records else rec
+    records_by_entity, fault = _effective_records(run_dir, rev.base.get("entity_counts", {}), rows)
+    if fault:
+        return store.FoldedLog(status="unknown", reason=fault)
+    records = records_by_entity.get(entity, {})
     expected = rev.entity_counts.get(entity, 0)
     if type(expected) is not int or len(records) != expected:
-        return store.FoldedLog(records=records, status="degraded", dropped=base.dropped + dropped,
+        return store.FoldedLog(records=records, status="degraded", dropped=dropped,
                                reason=f"revision {rev.revision} records {expected} {entity}, "
                                       f"the combined view yields {len(records)}")
     if dropped:
-        return store.FoldedLog(records=records, status="degraded", dropped=base.dropped + dropped,
+        return store.FoldedLog(records=records, status="degraded", dropped=dropped,
                                reason=f"{dropped} unusable supplement row(s)")
-    return store.FoldedLog(records=records, dropped=base.dropped)
+    return store.FoldedLog(records=records)
 
 
 class CombinedRun:
@@ -670,10 +945,282 @@ def _view_files(rev_dir: Path) -> dict:
     """`{path relative to the revision dir: digest}` for every derived view it holds — the segment is
     evidence, not a view, so it is never listed."""
     out = {}
-    for p in sorted(rev_dir.rglob("*")):
-        if p.is_file() and p.name != SEGMENT_NAME:
-            out[str(p.relative_to(rev_dir))] = _sha(p.read_bytes())
+    try:
+        paths = sorted(rev_dir.rglob("*"))
+    except OSError as exc:
+        raise RevisionError(f"{rev_dir}: revision view tree is unreadable: {exc}") from exc
+    for p in paths:
+        try:
+            mode = p.lstat().st_mode
+        except OSError as exc:
+            raise RevisionError(f"{p}: revision view is unreadable: {exc}") from exc
+        if stat.S_ISLNK(mode):
+            raise RevisionError(f"{p}: revision view may not be a symlink")
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise RevisionError(f"{p}: revision view is not a regular file")
+        if p.name != SEGMENT_NAME:
+            out[str(p.relative_to(rev_dir))] = _sha(_read_regular(p, root=rev_dir))
     return out
+
+
+def _stale_view_files(run_dir, rev: Revision) -> list[str]:
+    """Recompute every derived-view claim; stale bytes are rebuildable, unsafe paths are not."""
+    files = rev.views.get("files")
+    if not isinstance(files, dict):
+        raise RevisionError(f"revision {rev.revision} carries no view-file claims")
+    for name, digest in files.items():
+        parts = Path(name).parts if isinstance(name, str) else ()
+        if (not parts or Path(name).is_absolute() or any(part in ("", ".", "..") for part in parts)
+                or parts[-1] == SEGMENT_NAME or not isinstance(digest, str)):
+            raise RevisionError(f"revision {rev.revision} carries an unsafe view-file claim {name!r}")
+    directory = _view_dir(run_dir, rev)
+    if not directory.exists():
+        return sorted(files)
+    mode = directory.lstat().st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise RevisionError(f"revision {rev.revision} view directory is unsafe")
+    try:
+        actual = _view_files(directory)
+    except RevisionError:
+        raise
+    return sorted(set(files) ^ set(actual)
+                  | {name for name in files if name in actual and files[name] != actual[name]})
+
+
+def _fsync_file(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_tree(root: Path) -> None:
+    """Durably seal every regular file and directory in a staged revision tree."""
+    paths = sorted(root.rglob("*"))
+    for path in paths:
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode) or not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+            raise OSError(f"unsafe staged revision object: {path}")
+        if stat.S_ISREG(mode):
+            _fsync_file(path)
+    directories = [path for path in paths if stat.S_ISDIR(path.lstat().st_mode)]
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        _fsync_directory(directory)
+    _fsync_directory(root)
+
+
+def _fsync_raw_claims(run_dir, claims: dict) -> None:
+    directories: set[Path] = set()
+    root = revisions_dir(run_dir)
+    for ref in claims:
+        path = _revision_raw_path(run_dir, ref)
+        _fsync_file(path)
+        parent = path.parent
+        while parent != root:
+            directories.add(parent)
+            parent = parent.parent
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        _fsync_directory(directory)
+
+
+def _write_all(fd: int, body: bytes) -> None:
+    view = memoryview(body)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("revision pointer write made no progress")
+        view = view[written:]
+
+
+def _write_fsync_and_relinquish(fd: int, body: bytes) -> None:
+    """Write/fsync one owned descriptor and never mask its primary fault on close."""
+    primary: BaseException | None = None
+    try:
+        _write_all(fd, body)
+        os.fsync(fd)
+    except BaseException as exc:
+        primary = exc
+    try:
+        os.close(fd)
+    except BaseException as exc:
+        if primary is None:
+            primary = exc
+    if primary is not None:
+        raise primary
+
+
+def _pointer_bytes(document: dict) -> bytes:
+    return (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _private_directory_identity(path: Path) -> tuple[int, int]:
+    """Authenticate one canonical private directory and return its stable name identity."""
+    info = Path(path).lstat()
+    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != privfs.DIR_MODE):
+        raise OSError(f"unsafe private directory authority: {path}")
+    return info.st_dev, info.st_ino
+
+
+def _same_private_directory(path: Path, expected: tuple[int, int]) -> bool:
+    try:
+        return _private_directory_identity(path) == expected
+    except OSError:
+        return False
+
+
+def _settle_pointer_fault(
+    run_dir: Path,
+    document: dict,
+    candidate: Revision,
+    previous: bytes | None,
+    directory_identity: tuple[int, int],
+    *, already_durable: bool = False,
+) -> _PointerSettlement:
+    """Classify a failed publication without guessing whether the pointer landed.
+
+    A second directory fsync turns a byte-valid intended or restored pointer into
+    a durable result before it is reported.  Anything else is ambiguous and may
+    not be retried blindly (in particular, OOB raw proof must be retained).
+    """
+    root = revisions_dir(run_dir)
+    if not _same_private_directory(root, directory_identity):
+        return _PointerSettlement("ambiguous")
+    try:
+        current = _read_regular(pointer_path(run_dir), root=root)
+    except FileNotFoundError:
+        current = None
+    except OSError:
+        return _PointerSettlement("ambiguous")
+
+    intended = _pointer_bytes(document)
+    if current == intended:
+        settled = read(run_dir)
+        if (settled.status != "valid" or settled.revision != candidate.revision
+                or settled.pointer_digest != candidate.pointer_digest):
+            return _PointerSettlement("ambiguous")
+        if not already_durable:
+            try:
+                _fsync_directory(root)
+                _fsync_directory(Path(run_dir))
+            except Exception:
+                return _PointerSettlement("ambiguous")
+        if not _same_private_directory(root, directory_identity):
+            return _PointerSettlement("ambiguous")
+        return _PointerSettlement("landed", settled)
+
+    if current == previous:
+        try:
+            _fsync_directory(root)
+            _fsync_directory(Path(run_dir))
+        except Exception:
+            return _PointerSettlement("ambiguous")
+        if _same_private_directory(root, directory_identity):
+            return _PointerSettlement("not_landed")
+    return _PointerSettlement("ambiguous")
+
+
+def _publish_pointer(
+    path: Path, document: dict, *, directory_identity: tuple[int, int] | None = None,
+) -> None:
+    """Durably atomically replace the pointer after every candidate byte is sealed."""
+    body = _pointer_bytes(document)
+    parent_flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0))
+    dfd = os.open(path.parent, parent_flags)
+    opened = os.fstat(dfd)
+    if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != privfs.DIR_MODE
+            or (directory_identity is not None
+                and (opened.st_dev, opened.st_ino) != directory_identity)):
+        os.close(dfd)
+        raise OSError(f"revision directory authority changed before pointer publication: {path.parent}")
+    temporary = f".{path.name}.{os.urandom(16).hex()}.tmp"
+    fd = -1
+    replaced = False
+    previous = None
+    primary: BaseException | None = None
+    published_durable = False
+    try:
+        try:
+            previous = _read_regular(path)
+        except FileNotFoundError:
+            previous = None
+        fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            privfs.FILE_MODE,
+            dir_fd=dfd,
+        )
+        closing_fd, fd = fd, -1
+        _write_fsync_and_relinquish(closing_fd, body)
+        fd = -1
+        os.replace(temporary, path.name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        replaced = True
+        try:
+            os.fsync(dfd)
+        except BaseException:
+            # A reported publication fault must not knowingly leave the new
+            # pointer exposed.  Restore the exact previous bytes when possible.
+            if previous is None:
+                os.unlink(path.name, dir_fd=dfd)
+            else:
+                rollback = f".{path.name}.{os.urandom(16).hex()}.rollback"
+                rfd = os.open(
+                    rollback,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    privfs.FILE_MODE,
+                    dir_fd=dfd,
+                )
+                _write_fsync_and_relinquish(rfd, previous)
+                os.replace(rollback, path.name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            os.fsync(dfd)
+            raise
+        else:
+            published_durable = True
+    except BaseException as exc:
+        primary = exc
+        if fd >= 0:
+            closing_fd, fd = fd, -1
+            try:
+                os.close(closing_fd)
+            except BaseException:
+                pass
+        if not replaced:
+            try:
+                os.unlink(temporary, dir_fd=dfd)
+            except BaseException:
+                pass
+    finally:
+        closing_dfd, dfd = dfd, -1
+        try:
+            os.close(closing_dfd)
+        except BaseException as exc:
+            if primary is None:
+                primary = exc
+    if primary is not None:
+        if published_durable:
+            raise _PointerPostCommitFault(primary)
+        raise primary
 
 
 def reseal_views(run_dir) -> Revision | None:
@@ -691,13 +1238,58 @@ def reseal_views(run_dir) -> Revision | None:
         rev = read(run_dir)
         if rev.status != "valid":
             return None
+        revision_root = revisions_dir(run_dir)
+        directory_identity = _private_directory_identity(revision_root)
+        try:
+            previous_pointer = _read_regular(pointer_path(run_dir), root=revision_root)
+        except OSError as exc:
+            raise RevisionError(f"{run_dir}: prior revision pointer is unreadable: {exc}") from exc
         doc = store._read_json(pointer_path(run_dir))
         if not isinstance(doc, dict):
             return None
         d = _view_dir(run_dir, rev)
         doc["views"] = {"dir": d.name, "files": _view_files(d)}
-        store._atomic_write(pointer_path(run_dir), json.dumps(doc, indent=2))
-        return read(run_dir)
+        doc["pointer_digest"] = _pointer_digest(doc)
+        candidate = _certify_document(run_dir, doc)
+        if candidate.status != "valid":
+            raise RevisionError(
+                f"{run_dir}: regenerated revision views did not certify: {candidate.reason}",
+            )
+        _fsync_tree(d)
+        _fsync_directory(revision_root)
+        _fsync_directory(Path(run_dir))
+        candidate = _certify_document(run_dir, doc)
+        if candidate.status != "valid":
+            raise RevisionError(
+                f"{run_dir}: regenerated revision views changed during durability settlement: "
+                f"{candidate.reason}",
+            )
+        publication_fault: BaseException | None = None
+        publication_completed = False
+        try:
+            _publish_pointer(
+                pointer_path(run_dir), doc, directory_identity=directory_identity,
+            )
+            publication_completed = True
+        except _PointerPostCommitFault as exc:
+            publication_fault = exc.primary
+            publication_completed = True
+        except BaseException as exc:
+            publication_fault = exc
+        settlement = _settle_pointer_fault(
+            Path(run_dir), doc, candidate, previous_pointer, directory_identity,
+            already_durable=publication_completed,
+        )
+        if settlement.outcome == "landed" and settlement.revision is not None:
+            if isinstance(publication_fault, (KeyboardInterrupt, SystemExit)):
+                raise publication_fault
+            return settlement.revision
+        if settlement.outcome == "not_landed" and publication_fault is not None:
+            raise publication_fault
+        raise RevisionPublicationError(
+            f"{run_dir}: revision view pointer publication outcome is ambiguous; inspect it before retrying",
+            outcome="ambiguous",
+        ) from publication_fault
 
 
 # ── ingesting a late observation ──────────────────────────────────────────────────────────────────
@@ -824,6 +1416,8 @@ class _Supplement:
             with _publish_lock(self._run):
                 self._resettle()                     # another writer may have published since we opened
                 return self._publish(scope)
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except RevisionError:
             raise
         except BaseException as e:
@@ -856,10 +1450,12 @@ class _Supplement:
 
     def _publish(self, scope) -> Revision:
         nxt = self._next_revision()
-        rev_dir = revisions_dir(self._run.dir) / _rev_name(nxt)
+        revision_root = revisions_dir(self._run.dir)
+        rev_dir = revision_root / _rev_name(nxt)
         if rev_dir.exists():
             raise RevisionError(f"{rev_dir}: revision {nxt} already exists")
         privfs.private_dir(rev_dir)
+        directory_identity = _private_directory_identity(revision_root)
         body = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in self._pending)
         # discovered callback evidence: 0600 from creation, written whole, never rewritten
         privfs.write_private(rev_dir / SEGMENT_NAME, body)
@@ -867,16 +1463,24 @@ class _Supplement:
         segments = list(self._published.segments) + [
             {"revision": nxt, "file": f"{_rev_name(nxt)}/{SEGMENT_NAME}", "lines": len(self._pending),
              "bytes": len(raw), "digest": _sha(raw)}]
-        counts = dict(self._base_counts)
-        digests = {}
-        for entity, records in self._records.items():
-            counts[entity] = len(records)
-            digests[entity] = _sha(json.dumps(
-                [[k, store.fingerprint(entity, r)] for k, r in sorted(records.items())],
-                ensure_ascii=False).encode("utf-8"))
+        staged = Revision(revision=nxt, status="valid", segments=segments)
+        rows, dropped = _committed_rows(self._run.dir, staged)
+        if dropped or len(rows) != sum(segment["lines"] for segment in segments):
+            raise RevisionError(f"{rev_dir}: staged supplement segment cannot be read whole")
+        records_by_entity, effective_fault = _effective_records(self._run.dir, self._base_counts, rows)
+        if effective_fault:
+            raise RevisionError(f"{self._run.dir}: {effective_fault}")
+        self._records = records_by_entity
+        counts = {entity: len(records) for entity, records in records_by_entity.items()}
+        digests = {entity: _records_digest(entity, records)
+                   for entity, records in records_by_entity.items()}
         views = self._render_views(rev_dir, scope)
         supplement = {"segments": segments, "lines": sum(int(s.get("lines") or 0) for s in segments),
                       "digest": _chain_digest(segments)}
+        try:
+            raw_files = _raw_file_claims(self._run.dir, rows)
+        except (OSError, ValueError) as exc:
+            raise RevisionError(f"{self._run.dir}: late raw evidence cannot be certified: {exc}") from exc
         pointer = {
             "schema_version": SCHEMA_VERSION,
             "revision": nxt,
@@ -887,19 +1491,81 @@ class _Supplement:
             "supplement": supplement,
             "entity_counts": counts,
             "entity_digests": digests,
+            "raw_files": raw_files,
             "views": views,
             "refused": self._outstanding_refusals(),
         }
-        pointer["digest"] = _sha(json.dumps(
-            {"base": self._base_digest, "supplement": supplement["digest"], "entity_counts": counts},
-            sort_keys=True, ensure_ascii=False).encode("utf-8"))
-        store._atomic_write(pointer_path(self._run.dir), json.dumps(pointer, indent=2))
-        self.revised = True
-        published = read(self._run.dir)
-        if published.status != "valid":
-            raise RevisionError(f"{self._run.dir}: revision {nxt} did not certify after publication: "
-                                f"{published.reason}")
-        return published
+        pointer["digest"] = _evidence_digest(
+            base=self._base_digest,
+            supplement=supplement["digest"],
+            counts=counts,
+            entity_digests=digests,
+            raw_files=raw_files,
+        )
+        pointer["pointer_digest"] = _pointer_digest(pointer)
+        candidate = _certify_document(self._run.dir, pointer)
+        if candidate.status != "valid":
+            raise RevisionError(
+                f"{self._run.dir}: revision {nxt} refused before publication: {candidate.reason}",
+            )
+
+        # All evidence and derived bytes reach stable storage before the one
+        # authoritative name changes.  Any earlier fault leaves this directory
+        # as a named orphan and the prior pointer byte-identical.
+        _fsync_tree(rev_dir)
+        _fsync_raw_claims(self._run.dir, raw_files)
+        _fsync_directory(revision_root)
+        # The revisions directory may itself have been created for this
+        # publication.  Its canonical name is durable only after its parent is
+        # synced; doing this unconditionally also settles pre-existing raw-tree
+        # creation from OOB acquisition.
+        _fsync_directory(self._run.dir)
+
+        # Certification must follow the durability callbacks: a short write or
+        # mutation during a barrier may not publish a pointer to bytes that no
+        # longer match its claims.
+        candidate = _certify_document(self._run.dir, pointer)
+        if candidate.status != "valid":
+            raise RevisionError(
+                f"{self._run.dir}: revision {nxt} changed during durability settlement: {candidate.reason}",
+            )
+
+        try:
+            previous_pointer = _read_regular(pointer_path(self._run.dir), root=revision_root)
+        except FileNotFoundError:
+            previous_pointer = None
+        except OSError as exc:
+            raise RevisionError(f"{self._run.dir}: prior revision pointer is unreadable: {exc}") from exc
+
+        publication_fault: BaseException | None = None
+        publication_completed = False
+        try:
+            _publish_pointer(
+                pointer_path(self._run.dir), pointer, directory_identity=directory_identity,
+            )
+            publication_completed = True
+        except _PointerPostCommitFault as exc:
+            publication_fault = exc.primary
+            publication_completed = True
+        except BaseException as exc:
+            publication_fault = exc
+
+        settlement = _settle_pointer_fault(
+            self._run.dir, pointer, candidate, previous_pointer, directory_identity,
+            already_durable=publication_completed,
+        )
+        if settlement.outcome == "landed" and settlement.revision is not None:
+            self.revised = True
+            if isinstance(publication_fault, (KeyboardInterrupt, SystemExit)):
+                raise publication_fault
+            return settlement.revision
+        if settlement.outcome == "not_landed" and publication_fault is not None:
+            raise publication_fault
+        message = (
+            f"{self._run.dir}: revision {nxt} pointer publication outcome is ambiguous; "
+            "do not retry until the canonical revision pointer is inspected"
+        )
+        raise RevisionPublicationError(message, outcome="ambiguous") from publication_fault
 
     def _outstanding_refusals(self) -> list:
         """Every refusal still owed: the ones earlier revisions recorded plus this writer's, minus any

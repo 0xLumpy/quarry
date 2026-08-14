@@ -876,6 +876,7 @@ def _persist_refusal(run_dir: Path, n: int = 2) -> None:
     from quarry_recon import revision
     ptr = json.loads(revision.pointer_path(run_dir).read_text())
     ptr["refused"] = [{"entity": "oob_interaction", "key": f"k{i}", "kind": "keys"} for i in range(n)]
+    ptr["pointer_digest"] = revision._pointer_digest(ptr)
     revision.pointer_path(run_dir).write_text(json.dumps(ptr, indent=2))
 
 
