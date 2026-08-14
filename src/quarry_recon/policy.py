@@ -365,6 +365,21 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.release_evidence:MAX_RECORD_BYTES": (
         "resource", "the allocation bound for one versioned release-evidence control record; oversize "
                     "control input is rejected and does not truncate captured target evidence"),
+    "quarry_recon.release_evidence:MAX_TAXONOMY_RECORD_BYTES": (
+        "resource", "the allocation bound for one versioned pytest-taxonomy artifact; oversize input is "
+                    "rejected rather than truncated or accepted as complete release evidence"),
+    "quarry_recon.release_h0:_MAX_BWRAP_STATUS_BYTES": (
+        "resource", "the bounded parent read of one bubblewrap status control channel; overflow invalidates "
+                    "the H0 diagnostic rather than truncating or accepting the status"),
+    "quarry_recon.release_h0:_MAX_COMMAND_OUTPUT": (
+        "resource", "the bounded output of one H0 prerequisite or tool query; overflow refuses the "
+                    "diagnostic rather than treating partial output as authoritative"),
+    "quarry_recon.release_h0:_MAX_ISOLATION_REPORT_BYTES": (
+        "resource", "the bounded parent read of one H0 isolation control report; overflow invalidates the "
+                    "diagnostic rather than truncating or accepting the report"),
+    "quarry_recon.release_h0:_MAX_LOG_BYTES": (
+        "resource", "the per-stream parent-memory and log-artifact guard for one H0 diagnostic; overflow "
+                    "fails the diagnostic rather than publishing partial logs as complete"),
     "quarry_recon.runner_containment:DESCENDANT_LIMIT": (
         "not_a_bound", "a fixed containment failure-reason string naming a limit breach, not the limit "
                        "itself"),
