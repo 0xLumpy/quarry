@@ -27,7 +27,7 @@ pytestmark = pytest.mark.integration
 #: for a gate file. The overlap is a handshake, not a sleep: the parent knows the holder is inside the lock
 #: because the marker exists, and the holder cannot finish until the parent opens the gate.
 _CHILD = r"""
-import json, pathlib, sys, time
+import contextlib, json, os, pathlib, sys, time, uuid
 sys.path.insert(0, "src")
 from types import SimpleNamespace
 from quarry_recon import events, budget
@@ -39,6 +39,57 @@ project, gate = pathlib.Path(project), pathlib.Path(gate)
 run_dir = project / run_name
 run_dir.mkdir(parents=True, exist_ok=True)
 events.reset(); events.configure(run_dir)
+
+
+class FakeArtifactClaim:
+    # Explicit repository adapter for this process-only fake Run.
+
+    def __init__(self, final):
+        self.final = final
+        self.stage = final.with_name(f"{final.name}.claim-{uuid.uuid4().hex}")
+        self.writer = -1
+        self.published = False
+
+    def open_writer(self):
+        self.final.parent.mkdir(parents=True, exist_ok=True)
+        self.writer = os.open(self.stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        return self.writer
+
+    def publish(self):
+        if self.writer >= 0:
+            os.close(self.writer)
+            self.writer = -1
+        os.replace(self.stage, self.final)
+        self.published = True
+
+    def fence(self):
+        if self.writer >= 0:
+            os.close(self.writer)
+            self.writer = -1
+        self.stage.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def fake_artifact_claim(final):
+    claim = FakeArtifactClaim(final)
+    try:
+        yield claim
+    finally:
+        if not claim.published:
+            claim.fence()
+
+
+def publish_bytes(run, components, data):
+    destination = run.dir.joinpath(*components)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(data)
+    destination.chmod(0o600)
+    return True
+
+
+def publish_absence(run, components):
+    run.dir.joinpath(*components).unlink(missing_ok=True)
+    return True
 
 
 def fake_exec(tool, cmd, timeout=None, input_file=None, **k):
@@ -77,6 +128,11 @@ class Run:
 crawl.exec_tool = fake_exec
 crawl.have = lambda t: True
 crawl._xnl_engine = lambda: "8.2"
+crawl._xnl_artifact_claim = (
+    lambda run, components: fake_artifact_claim(run.dir.joinpath(*components))
+)
+crawl._xnl_publish_run_bytes = publish_bytes
+crawl._xnl_publish_run_absence = publish_absence
 ctx = SimpleNamespace(run=Run(), http_timeout=60,
                       profile=SimpleNamespace(apex_domains=["acme.com"], http_rl=0),
                       scope=SimpleNamespace(in_scope=lambda h: h == "acme.com" or h.endswith(".acme.com"),

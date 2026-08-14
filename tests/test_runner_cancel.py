@@ -30,6 +30,15 @@ def _clean_cancel_latch():
     runner._CPU_INFLIGHT.clear()
 
 
+def _declared_path(kwargs, policy_name):
+    policy = kwargs.get(policy_name)
+    disposition = getattr(getattr(policy, "disposition", None), "value", None)
+    repository = kwargs.get("repository")
+    if repository is None or disposition != "publish":
+        return None
+    return repository.dir.joinpath(*policy.components)
+
+
 def test_cancel_all_terminates_a_running_child_within_a_bound():
     """The core guarantee: a tool with NO timeout still dies promptly when the operator cancels."""
     started = threading.Event()
@@ -473,6 +482,8 @@ def test_completed_work_is_harvested_before_the_kill(tmp_path, monkeypatch):
     quick_done = threading.Event()
 
     def mixed(tool, cmd, *, raw_path=None, stderr_path=None, timeout=None, **kw):
+        raw_path = raw_path or _declared_path(kw, "stdout")
+        stderr_path = stderr_path or _declared_path(kw, "stderr")
         u = cmd[cmd.index("-u") + 1]
         if u == QUICK:
             raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -506,6 +517,8 @@ def test_completed_work_is_harvested_before_the_kill(tmp_path, monkeypatch):
     launched = []
 
     def all_quick(tool, cmd, *, raw_path=None, stderr_path=None, timeout=None, **kw):
+        raw_path = raw_path or _declared_path(kw, "stdout")
+        stderr_path = stderr_path or _declared_path(kw, "stderr")
         u = cmd[cmd.index("-u") + 1]
         launched.append(u)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -606,6 +619,8 @@ def test_work_finishing_during_the_kill_race_is_still_harvested(tmp_path, monkey
     kill_called = threading.Event()
 
     def racy(tool, cmd, *, raw_path=None, stderr_path=None, timeout=None, **kw):
+        raw_path = raw_path or _declared_path(kw, "stdout")
+        stderr_path = stderr_path or _declared_path(kw, "stderr")
         u = cmd[cmd.index("-u") + 1]
         both_started.wait()
         if u == RACER:
@@ -647,6 +662,8 @@ def test_work_finishing_during_the_kill_race_is_still_harvested(tmp_path, monkey
     launched = []
 
     def all_quick(tool, cmd, *, raw_path=None, stderr_path=None, timeout=None, **kw):
+        raw_path = raw_path or _declared_path(kw, "stdout")
+        stderr_path = stderr_path or _declared_path(kw, "stderr")
         u = cmd[cmd.index("-u") + 1]
         launched.append(u)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
