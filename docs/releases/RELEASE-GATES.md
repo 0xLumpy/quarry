@@ -5,12 +5,13 @@ release; it does not assert that all required runners, thresholds, schemas, or
 evidence collectors already exist.
 
 The current `offline-ci` workflow and historical local test runs are useful
-observations, but they do not yet satisfy this contract. In particular, the CI
-workflow positively selects only tests marked `offline`, the repository still
-contains unclassified non-live tests, several professional toolchain gates are
-not configured, and `verify-quarry.sh` treats unavailable live prerequisites as
-`SKIP`. Quarry therefore begins Phase 0 with the aggregate release status
-**open**, not green.
+observations, but they do not yet satisfy this contract. Pytest now rejects any
+node without exactly one primary lane and the CI job positively selects the
+complete structural `H0` classification, but its manifest is diagnostic, its
+deny guard is not OS containment, and no accepted candidate-bound test/job map
+exists. Several professional toolchain gates are also not configured, and
+`verify-quarry.sh` treats unavailable live prerequisites as `SKIP`. Quarry
+therefore begins Phase 0 with the aggregate release status **open**, not green.
 
 ## Principles
 
@@ -76,8 +77,9 @@ an aggregate input, but its absence or invalidity still blocks promotion.
 ## Exact execution-lane taxonomy
 
 Every collected test and verification job belongs to one primary lane. An
-unmarked test is a classification error. Lane enforcement must occur at the OS
-boundary as well as inside Python.
+unmarked test is a classification error. Classification fails closed in the
+collector and accepted job map; each lane's I/O boundary must additionally be
+enforced by the OS, not only inside Python.
 
 | Lane | Permitted dependencies and I/O | Forbidden behavior | Where it runs |
 |---|---|---|---|
@@ -91,7 +93,7 @@ boundary as well as inside Python.
 `H1-tool-integration` or another reviewed lane and name an attested tool
 identity. It must never cause a required check to disappear silently.
 
-The intended pytest marker correspondence is:
+The pytest marker correspondence is now structurally enforced:
 
 | Marker | Lane rule |
 |---|---|
@@ -100,18 +102,33 @@ The intended pytest marker correspondence is:
 | `corpus` | `C0-private-corpus`; private runner only |
 | `packaging` | `P0-package-supply` |
 | `live` | `L0-authorized-live` only |
-| `requires_tool` | Secondary annotation; never selected as a standalone lane |
+| `requires_tool("name")` | Secondary named capability; H1/P0 only and never selected as a standalone lane |
+| `synthetic_process` | Secondary H0-only annotation for the constrained current-interpreter child shape |
 
-The `corpus` and `packaging` classifications and a complete classification
-manifest are not yet configured. Until they exist and every test maps to one
-lane, the taxonomy gate is `open`.
+At source `14298c1dfb51ffcb8afd5a39c83c598015a15781` (Git tree
+`2ed4a821d3d3a13c98c44193f7d2585c049f0efc`), collection-time validation accounts for all 7,787 pytest
+nodes before deselection: 7,716 H0 and 71 H1, with zero C0/P0/L0 nodes and 40 H0 synthetic-process
+nodes. Every H1 node carries stable `requires_tool("name")` capabilities. Of those 71 H1 nodes, 53 are
+shell/coreutils-backed migration debt; the remaining 18 are Git or bwrap integrations.
+
+The canonical default-selection `quarry.pytest-taxonomy.v1` diagnostic, produced by CPython 3.13.12 and
+pytest 9.0.3, has SHA-256
+`98faf27745eab7168b6456056ba75762d7b63622fa1104c3839fb6e21cd8d1aa`. This exact provenance binding is
+a structural observation, not a release record. The manifest is not bound to an accepted `0.3.10`
+candidate identity or OS-isolation profile, and the complete verification-job map has not been accepted.
+No evidence slot is populated; `A-TAXONOMY` remains `open`, and `RG00` remains
+`OPEN`.
 
 ### Isolation requirements
 
-`H0` denies network namespace access and subprocess network escape before test
-collection. Python monkeypatches are useful tripwires but are not the boundary.
-Synthetic child processes may execute only from the controlled test environment
-and inherit a minimal environment.
+For release evidence, `H0` denies network namespace access and subprocess
+network escape before test collection. Python monkeypatches are useful
+tripwires but are not the boundary. The current development guard blocks
+ordinary Python network/subprocess entry points, and `synthetic_process`
+permits only a constrained absolute current-interpreter child with a minimal
+environment. It does not contain that child's own network APIs. An OS-isolated
+runner must provide the release boundary and bind its isolation profile to the
+gate record.
 
 `H1` runs in a network namespace with no default route or external resolver. If
 a tool needs TCP/UDP, the only reachable endpoint is the fixture service inside
@@ -145,7 +162,7 @@ nomination commit is not promotion and closes none of these gates.
 | Gate | Requirement | Evidence | Phase 0 status |
 |---|---|---|---|
 | `A-IDENTITY` | Candidate is one exact commit; source-tree digest, dirty state, submodule/input identities and schema versions agree, and both package-version sources equal the nominated release | Candidate identity record; dirty candidates fail collection and a release/package-version mismatch blocks this gate | `open` — the v1 collector/schema exist, but an enforced quiescent runner and accepted nominated-candidate record do not |
-| `A-TAXONOMY` | Every test/job maps to exactly one primary lane; incompatible markers and unmarked tests fail collection | Classification manifest plus collected/selected/deselected counts | `open` — current markers do not cover the complete suite |
+| `A-TAXONOMY` | Every test/job maps to exactly one primary lane; incompatible markers and unmarked tests fail collection | Classification manifest plus collected/selected/deselected counts | `open` — pytest has exact-one structural enforcement and a diagnostic manifest, but no accepted candidate-bound classification record or complete verification-job map exists |
 | `A-EVIDENCE-SCHEMA` | Gate records validate against a versioned schema and the aggregator conforms deterministically to committed golden vectors | Schemas plus a hermetic aggregator-conformance/golden-vector result and its canonical digest; this is not the candidate release aggregate | `open` — v1 structural schemas/readers exist; artifact verification, signature trust and the deterministic aggregator remain unimplemented |
 | `A-CORPUS` | Selected private sources have accepted two-pass attestations and alias mappings; committed fixtures contain synthetic data only | Private attestation IDs plus public fixture and disclosure-check digests | `open` — design exists; attestations/fixtures are not claimed |
 | `A-THRESHOLDS` | Versioned correctness, quality, resource, and regression thresholds exist for the release scope | Reviewed threshold manifest | `open` — numeric performance/coverage baselines are not yet accepted |
@@ -538,9 +555,10 @@ The immediate work is prerequisite closure, not running aspirational commands:
 
 1. accept the candidate identity, gate-evidence, lane-classification, support,
    and threshold schemas;
-2. classify the complete existing test collection and remove documentation/
-   marker contradictions;
-3. implement OS-enforced `H0` isolation and the machine evidence collector;
+2. accept the candidate-bound test/job classification manifest and counts for
+   the now structurally classified pytest collection;
+3. implement OS-enforced `H0` isolation and the candidate-bound gate-record
+   collector;
 4. attest the selected private corpora and create only the necessary synthetic
    committed fixtures;
 5. establish numeric quality and resource baselines without marking them pass;

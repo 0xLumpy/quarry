@@ -5829,10 +5829,10 @@ behav = (rc(Status.EMPTY, MT, 3) == Status.PARTIAL            # native maxtime +
 sys.exit(0 if (struct and behav) else 1)
 PYEOF
 
-echo "[142] offline pytest CI gate (T4/C18) — hermetic pytest suite (tests/) + .github offline-ci workflow. TWO-LAYER network deny: a per-test autouse fixture (local dev) + a session guard armed by QUARRY_OFFLINE_CI=1 installed BEFORE collection (covers import-time network too). Both block sockets/resolvers/UDP/subprocess-spawn, so the gate can neither connect nor launch a scanner. Default run excludes live/integration/requires_tool (opt-in). This shell suite RUNS the pytest gate (with QUARRY_OFFLINE_CI=1) during the dual-run transition. Skips only if pytest is unavailable."
+echo "[142] structurally classified H0 pytest development gate (T4/C18) — collection rejects zero/multiple primary lanes before deselection; the default and .github offline-ci positively select H0, and CI writes the canonical diagnostic taxonomy manifest. QUARRY_OFFLINE_CI=1 installs the Python network tripwire before collection; the autouse fixture supplies the local runtime layer. Ordinary H0 blocks socket/resolver/UDP/subprocess entry points, while reviewed synthetic_process nodes permit only a constrained current-interpreter child. These are Python tripwires, NOT OS containment or candidate evidence. This shell suite RUNS the H0 selection during the dual-run transition and skips only if pytest is unavailable."
 if PYTHONPATH="$QUARRY_SRC" $PY -c 'import pytest' 2>/dev/null; then
   if PYTHONPATH="$QUARRY_SRC" QUARRY_OFFLINE_CI=1 $PY -m pytest "$(dirname "$QUARRY_SRC")/tests" -m offline -q >/tmp/quarry_pytest.out 2>&1; then
-    ok "pytest -m offline green ($(grep -oE '[0-9]+ passed' /tmp/quarry_pytest.out | head -1)); network-deny fixture enforced"
+    ok "pytest -m offline green ($(grep -oE '[0-9]+ passed' /tmp/quarry_pytest.out | head -1)); Python deny tripwire exercised (not OS-contained evidence)"
   else
     no "pytest offline suite FAILED: $(tail -3 /tmp/quarry_pytest.out | tr '\n' ' ')"
   fi

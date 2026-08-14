@@ -328,15 +328,18 @@ uncorrelated unless they carry a Quarry-issued token.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate   # Debian/Ubuntu/Kali enforce PEP 668
 pip install -e '.[dev]'
-pytest -m offline             # current offline-CI selection
-pytest                        # default opt-in exclusions; see tests/README.md
+pytest                        # positive H0 default (`-m offline`)
+pytest -m integration         # H1 named-tool diagnostics; no live target
 bash scripts/verify-quarry.sh # mixed development diagnostics; SKIP is not a release pass
 ```
 
-The default selection excludes the opt-in markers: `-m integration` runs real binaries against
-fixtures, `-m live` contacts the network, `-m requires_tool` needs a binary on PATH. The current workflow
-does not yet satisfy every [release gate](docs/releases/RELEASE-GATES.md); see
-[tests/README.md](tests/README.md) for the exact distinction.
+Every collected pytest node must carry exactly one primary marker: `offline`, `integration`, `corpus`,
+`packaging`, or `live`. `requires_tool("name")` is a named H1/P0 capability, not a selectable safety lane;
+`synthetic_process` is a constrained H0-only exception for a controlled current-interpreter child. The
+default and current CI select H0 positively. Their Python deny hooks are development tripwires, not the
+OS containment or candidate-bound evidence required by the still-open
+[release gates](docs/releases/RELEASE-GATES.md). See [tests/README.md](tests/README.md) for exact counts,
+commands, and limitations.
 
 ## Status
 
