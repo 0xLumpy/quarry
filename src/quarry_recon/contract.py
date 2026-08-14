@@ -1733,9 +1733,16 @@ def run_contract(source_id, cmd, *, repository=None, stdout=None, stderr=None,
 
     res = None
     try:
+        repository_policies = {}
+        if any(value is not None for value in (repository, stdout, stderr)):
+            repository_policies = {
+                "repository": repository,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
         res = _run(
-            tool, cmd, repository=repository, stdout=stdout, stderr=stderr,
-            native_outputs=native_outputs, env=env, **run_kwargs,
+            tool, cmd, native_outputs=native_outputs, env=env,
+            **repository_policies, **run_kwargs,
         )
         if reclassify is not None:
             res = reclassify(res)                           # file-output adapter → FINAL status on the terminal event

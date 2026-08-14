@@ -72,6 +72,37 @@ class TestTerminalEventGuarantee:
         assert evs[1]["faults"][0]["kind"] == "machinery"
 
 
+class TestRunnerPolicyCompatibility:
+    def test_unmanaged_call_omits_repository_policy_keywords(self, monkeypatch):
+        seen = {}
+
+        def capture(tool, cmd, **kwargs):
+            seen.update(kwargs)
+            return RunResult(tool, cmd, Status.EMPTY, 0, 0.1, None, 0)
+
+        _patch_run(monkeypatch, capture)
+        contract.run_contract("vertical.subfinder", ["subfinder"], raw_path="legacy.out")
+        assert not ({"repository", "stdout", "stderr"} & seen.keys())
+        assert seen["raw_path"] == "legacy.out"
+
+    @pytest.mark.parametrize("provided", ["repository", "stdout", "stderr"])
+    def test_any_repository_policy_passes_the_full_triad(self, monkeypatch, provided):
+        seen = {}
+        supplied = object()
+
+        def capture(tool, cmd, **kwargs):
+            seen.update(kwargs)
+            return RunResult(tool, cmd, Status.EMPTY, 0, 0.1, None, 0)
+
+        _patch_run(monkeypatch, capture)
+        contract.run_contract("vertical.subfinder", ["subfinder"], **{provided: supplied})
+        assert {name: seen[name] for name in ("repository", "stdout", "stderr")} == {
+            "repository": supplied if provided == "repository" else None,
+            "stdout": supplied if provided == "stdout" else None,
+            "stderr": supplied if provided == "stderr" else None,
+        }
+
+
 class TestUnknownSourceFailsLoud:
     def test_unknown_source_not_executed(self, tmp_path, monkeypatch):
         called = []
