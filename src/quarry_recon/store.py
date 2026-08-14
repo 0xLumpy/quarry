@@ -4043,10 +4043,11 @@ class ManagedRemoval:
 
 @dataclass(frozen=True)
 class ManagedAcquisitionCertificate:
-    """Opaque terminal proof for one exact body/receipt pair."""
+    """Opaque terminal proof for one exact pair and optional absent sibling."""
 
     body: ManagedAcquisitionSnapshot
     receipt: ManagedAcquisitionSnapshot
+    absent_components: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -4496,8 +4497,16 @@ class _ManagedPairRelease:
         self.restored = True
         self.marker.abandoned = True
 
-    def _unlink_exact_name_locked(self, name: str, *, expected_after: int) -> None:
-        """Authenticate and unlink on one traced authority line, then reconcile."""
+    def _unlink_exact_name_locked(
+        self, name: str, *, expected_after: int,
+        validate_before=None, validate_after=None,
+    ) -> None:
+        """Authenticate and unlink on one traced authority line, then reconcile.
+
+        A terminal pair validator may be coupled to the namespace effect.  The
+        first unlink retains the other exact marker name while its postcheck
+        runs; the last unlink follows a validator on the same traced line.
+        """
         identity = self.marker.marker.identity
         named = os.stat(
             name, dir_fd=self.marker.directory.fd, follow_symlinks=False,
@@ -4510,7 +4519,10 @@ class _ManagedPairRelease:
         # Keep the final authority check and namespace effect on one physical
         # traced line.  A wrapper can run only after the effect and is handled
         # by the descriptor/name reconciliation below.
-        named = os.stat(name, dir_fd=self.marker.directory.fd, follow_symlinks=False); os.unlink(name, dir_fd=self.marker.directory.fd)  # noqa: E702 - one traced authority boundary
+        if validate_before is None:
+            named = os.stat(name, dir_fd=self.marker.directory.fd, follow_symlinks=False); os.unlink(name, dir_fd=self.marker.directory.fd)  # noqa: E702 - one traced authority boundary
+        else:
+            validate_before(); named = os.stat(name, dir_fd=self.marker.directory.fd, follow_symlinks=False); os.unlink(name, dir_fd=self.marker.directory.fd)  # noqa: E702 - one traced authority boundary
         if (named.st_dev, named.st_ino) != identity:
             raise ManagedAcquisitionRefused(
                 "managed acquisition marker release name changed at unlink",
@@ -4520,6 +4532,8 @@ class _ManagedPairRelease:
             raise ManagedAcquisitionRefused(
                 "managed acquisition marker unlink changed the wrong inode",
             )
+        if validate_after is not None:
+            validate_after()
 
     def _delete_quarantine_locked(self) -> None:
         deterministic, quarantine = self._positions_locked(allow_both=True)
@@ -4528,11 +4542,18 @@ class _ManagedPairRelease:
                 "managed acquisition marker overlap is incomplete",
             )
         self.delete_possible = True
-        self._unlink_exact_name_locked(self.marker.name, expected_after=1)
+        self._unlink_exact_name_locked(
+            self.marker.name, expected_after=1,
+            validate_before=self.validate_pair,
+            validate_after=self.validate_pair,
+        )
         # The random exact name still blocks every contender while the
         # deterministic name is absent.  Remove it only after reconciling the
         # first unlink through the pinned marker descriptor.
-        self._unlink_exact_name_locked(self.quarantine, expected_after=0)
+        self._unlink_exact_name_locked(
+            self.quarantine, expected_after=0,
+            validate_before=self.validate_pair,
+        )
         if os.fstat(self.marker.marker.fd).st_nlink != 0:
             raise ManagedAcquisitionRefused(
                 "managed acquisition marker terminal unlink did not commit",
@@ -4782,14 +4803,24 @@ class _ManagedAcquisitionTransaction:
         self,
         body: ManagedAcquisitionSnapshot,
         receipt: ManagedAcquisitionSnapshot,
+        *, absent_components: tuple[str, ...] | None = None,
     ) -> ManagedAcquisitionCertificate:
-        """Certify exact current body+receipt names in one mutation epoch."""
+        """Certify an exact pair and mutually-exclusive absent sibling."""
         self._require_origin_process()
         if (type(body) is not ManagedAcquisitionSnapshot
                 or type(receipt) is not ManagedAcquisitionSnapshot):
             raise TypeError("managed acquisition pair snapshots are invalid")
         body_components = self._target(body.components)
         receipt_components = self._target(receipt.components)
+        absent_components = (
+            None if absent_components is None
+            else self._target(absent_components)
+        )
+        if (absent_components is not None
+                and absent_components in {body_components, receipt_components}):
+            raise ValueError(
+                "managed acquisition absent sibling duplicates a certified name",
+            )
         if self.retain_reason is not None:
             raise ManagedAcquisitionRefused(
                 "managed acquisition was already retained as uncertain",
@@ -4798,6 +4829,7 @@ class _ManagedAcquisitionTransaction:
             self._reauthenticate_locked()
             current_body, current_receipt = self._snapshot_pair_locked(
                 body_components, receipt_components,
+                absent_components=absent_components,
             )
             if (not self._snapshot_matches(body, current_body)
                     or not self._snapshot_matches(receipt, current_receipt)):
@@ -4808,7 +4840,7 @@ class _ManagedAcquisitionTransaction:
                     "managed acquisition terminal pair is no longer current",
                 )
             certificate = ManagedAcquisitionCertificate(
-                current_body, current_receipt,
+                current_body, current_receipt, absent_components,
             )
             if (self.terminal_certificate is not None
                     and self.terminal_certificate != certificate):
@@ -4864,7 +4896,8 @@ class _ManagedAcquisitionTransaction:
         self,
         body_components: tuple[str, ...],
         receipt_components: tuple[str, ...],
-        *, release_certificate: ManagedAcquisitionCertificate | None = None,
+        *, absent_components: tuple[str, ...] | None = None,
+        release_certificate: ManagedAcquisitionCertificate | None = None,
     ) -> tuple[ManagedAcquisitionSnapshot | None,
                ManagedAcquisitionSnapshot | None]:
         """Pin and authenticate both terminal names through one epoch."""
@@ -4905,6 +4938,20 @@ class _ManagedAcquisitionTransaction:
                 b"".join(chunks) if capture else None
             )
 
+        def validate_absent_sibling():
+            if absent_components is None:
+                return
+            try:
+                os.stat(
+                    absent_components[-1], dir_fd=self.parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            raise ManagedAcquisitionRefused(
+                "managed acquisition mutually exclusive sibling is present",
+            )
+
         with _SettlementFence(settlement):
             with _SettlementFence(settlement):
                 missing = []
@@ -4941,6 +4988,7 @@ class _ManagedAcquisitionTransaction:
                     raise ManagedAcquisitionRefused(
                         "managed acquisition pair names changed while certified",
                     )
+                validate_absent_sibling()
                 pair = (
                     ManagedAcquisitionSnapshot(
                         body_components,
@@ -4991,6 +5039,7 @@ class _ManagedAcquisitionTransaction:
                                 raise ManagedAcquisitionRefused(
                                     "managed acquisition terminal pair changed at release",
                                 )
+                        validate_absent_sibling()
 
                     # Both exact inodes remain pinned through a provisional
                     # marker unlink and its postcheck.  Any mismatch, fault or
@@ -5435,6 +5484,7 @@ class _ManagedAcquisitionTransaction:
             return False
         current_body, current_receipt = self._snapshot_pair_locked(
             certificate.body.components, certificate.receipt.components,
+            absent_components=certificate.absent_components,
             release_certificate=certificate,
         )
         return (

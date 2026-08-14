@@ -1041,6 +1041,200 @@ def test_certified_current_pair_releases_marker_after_contact(tmp_path):
     run.begin_finalization()
 
 
+@pytest.mark.parametrize("sibling_kind", ["foreign", "body-hardlink"])
+def test_terminal_certificate_refuses_a_present_mutually_exclusive_sibling(
+    tmp_path, sibling_kind,
+):
+    run, dest, components = _run(
+        tmp_path, f"pair-sibling-present-{sibling_kind}",
+    )
+    receipt_components = components[:-1] + (components[-1] + ".acq.json",)
+    absent_components = components[:-1] + (components[-1] + ".part",)
+    sibling = run.dir.joinpath(*absent_components)
+    transaction = None
+
+    expected = (
+        store.ContractError
+        if sibling_kind == "body-hardlink"
+        else store.ManagedAcquisitionRefused
+    )
+    expected_match = (
+        "canonical base file"
+        if sibling_kind == "body-hardlink"
+        else "mutually exclusive sibling"
+    )
+    with pytest.raises(expected, match=expected_match):
+        with run.managed_acquisition_claim(*components) as transaction:
+            transaction.mark_contact_attempted()
+            writer = transaction.open_writer()
+            contract.stream_to_fd(
+                io.BytesIO(b"certified body"), writer,
+                budget_path=dest.parent,
+                governor=contract.DiskGovernor(reserve_bytes=0),
+            )
+            assert transaction.publish_body_if_absent()
+            assert transaction.publish_companion_if_absent(
+                receipt_components, b'{"receipt":true}',
+            )
+            body = transaction.snapshot(components)
+            receipt = transaction.snapshot(
+                receipt_components, content_limit=1024 * 1024,
+            )
+            if sibling_kind == "body-hardlink":
+                os.link(dest, sibling)
+            else:
+                sibling.write_bytes(b"foreign mutually exclusive sibling")
+                sibling.chmod(0o600)
+            transaction.certify_pair(
+                body, receipt, absent_components=absent_components,
+            )
+
+    assert transaction is not None
+    assert transaction.settlement_state == "retained-uncertain"
+    assert len(_claim_markers(run)) == 1
+    assert sibling.exists()
+
+
+@pytest.mark.parametrize("boundary", ["after-certificate", "inside-release"])
+def test_terminal_certificate_revalidates_absent_sibling_at_marker_release(
+    tmp_path, monkeypatch, boundary,
+):
+    run, dest, components = _run(
+        tmp_path, f"pair-sibling-release-{boundary}",
+    )
+    receipt_components = components[:-1] + (components[-1] + ".acq.json",)
+    absent_components = components[:-1] + (components[-1] + ".part",)
+    sibling = run.dir.joinpath(*absent_components)
+    real_provisional = store._ManagedPairRelease._provisional_unlink_locked
+    fired = False
+
+    def plant_inside_release(release):
+        nonlocal fired
+        result = real_provisional(release)
+        if not fired:
+            fired = True
+            sibling.write_bytes(b"sibling planted after release precheck")
+            sibling.chmod(0o600)
+        return result
+
+    transaction = None
+    with monkeypatch.context() as patch:
+        if boundary == "inside-release":
+            patch.setattr(
+                store._ManagedPairRelease, "_provisional_unlink_locked",
+                plant_inside_release,
+            )
+        with pytest.raises(store.ManagedAcquisitionRefused):
+            with run.managed_acquisition_claim(*components) as transaction:
+                transaction.mark_contact_attempted()
+                writer = transaction.open_writer()
+                contract.stream_to_fd(
+                    io.BytesIO(b"release exclusion body"), writer,
+                    budget_path=dest.parent,
+                    governor=contract.DiskGovernor(reserve_bytes=0),
+                )
+                assert transaction.publish_body_if_absent()
+                assert transaction.publish_companion_if_absent(
+                    receipt_components, b'{"receipt":"release"}',
+                )
+                body = transaction.snapshot(components)
+                receipt = transaction.snapshot(
+                    receipt_components, content_limit=1024 * 1024,
+                )
+                transaction.certify_pair(
+                    body, receipt, absent_components=absent_components,
+                )
+                if boundary == "after-certificate":
+                    sibling.write_bytes(b"sibling planted after certificate")
+                    sibling.chmod(0o600)
+
+    assert transaction is not None
+    assert transaction.settlement_state == "retained-uncertain"
+    assert len(_claim_markers(run)) == 1
+    assert sibling.exists()
+
+
+@pytest.mark.parametrize("selected", ["complete", "partial"])
+@pytest.mark.parametrize("sibling_kind", ["foreign", "body-hardlink"])
+@pytest.mark.parametrize("boundary", ["delete-helper", "final-exact-unlink"])
+def test_terminal_marker_delete_revalidates_the_full_acquisition_triad(
+    tmp_path, monkeypatch, selected, sibling_kind, boundary,
+):
+    run, dest, components = _run(
+        tmp_path,
+        f"triad-terminal-delete-{selected}-{sibling_kind}-{boundary}",
+    )
+    part_components = components[:-1] + (components[-1] + ".part",)
+    body_components, absent_components = (
+        (components, part_components)
+        if selected == "complete"
+        else (part_components, components)
+    )
+    receipt_components = components[:-1] + (components[-1] + ".acq.json",)
+    body_path = run.dir.joinpath(*body_components)
+    sibling = run.dir.joinpath(*absent_components)
+    real_delete = store._ManagedPairRelease._delete_quarantine_locked
+    real_unlink = store._ManagedPairRelease._unlink_exact_name_locked
+    fired = False
+
+    def plant_sibling():
+        nonlocal fired
+        if not fired:
+            fired = True
+            if sibling_kind == "body-hardlink":
+                os.link(body_path, sibling)
+            else:
+                sibling.write_bytes(b"foreign sibling at terminal delete")
+                sibling.chmod(0o600)
+
+    def plant_at_terminal_delete(release):
+        plant_sibling()
+        return real_delete(release)
+
+    def plant_at_final_exact_unlink(release, name, **kwargs):
+        if name == release.quarantine:
+            plant_sibling()
+        return real_unlink(release, name, **kwargs)
+
+    transaction = None
+    with monkeypatch.context() as patch:
+        if boundary == "delete-helper":
+            patch.setattr(
+                store._ManagedPairRelease, "_delete_quarantine_locked",
+                plant_at_terminal_delete,
+            )
+        else:
+            patch.setattr(
+                store._ManagedPairRelease, "_unlink_exact_name_locked",
+                plant_at_final_exact_unlink,
+            )
+        with pytest.raises((store.ManagedAcquisitionRefused, store.ContractError)):
+            with run.managed_acquisition_claim(*components) as transaction:
+                transaction.mark_contact_attempted()
+                writer = transaction.open_writer()
+                contract.stream_to_fd(
+                    io.BytesIO(b"terminal acquisition triad body"), writer,
+                    budget_path=dest.parent,
+                    governor=contract.DiskGovernor(reserve_bytes=0),
+                )
+                assert transaction.publish_body_if_absent(body_components)
+                assert transaction.publish_companion_if_absent(
+                    receipt_components, b'{"receipt":"triad"}',
+                )
+                body = transaction.snapshot(body_components)
+                receipt = transaction.snapshot(
+                    receipt_components, content_limit=1024 * 1024,
+                )
+                transaction.certify_pair(
+                    body, receipt, absent_components=absent_components,
+                )
+
+    assert fired and transaction is not None
+    assert transaction.settlement_state == "retained-uncertain"
+    assert len(_claim_markers(run)) == 1
+    assert sibling.exists()
+
+
 def _exercise_settlement_control(run, dest, components, operation_name):
     """Exercise one public settlement control and drain its expected outcome."""
     transaction = None
@@ -1056,6 +1250,9 @@ def _exercise_settlement_control(run, dest, components, operation_name):
                 receipt_components = components[:-1] + (
                     components[-1] + ".acq.json",
                 )
+                absent_components = components[:-1] + (
+                    components[-1] + ".part",
+                )
                 writer = transaction.open_writer()
                 contract.stream_to_fd(
                     io.BytesIO(b"source-line certified body"), writer,
@@ -1070,7 +1267,9 @@ def _exercise_settlement_control(run, dest, components, operation_name):
                 receipt = transaction.snapshot(
                     receipt_components, content_limit=1024 * 1024,
                 )
-                transaction.certify_pair(body, receipt)
+                transaction.certify_pair(
+                    body, receipt, absent_components=absent_components,
+                )
             else:  # pragma: no cover - test helper misuse
                 raise AssertionError(operation_name)
     except store.ManagedAcquisitionRefused:
@@ -1131,6 +1330,9 @@ def test_each_settlement_control_line_is_fail_closed_unless_proof_was_adopted(
                         receipt_components = components[:-1] + (
                             components[-1] + ".acq.json",
                         )
+                        absent_components = components[:-1] + (
+                            components[-1] + ".part",
+                        )
                         writer = transaction.open_writer()
                         contract.stream_to_fd(
                             io.BytesIO(b"source-line certified body"), writer,
@@ -1146,7 +1348,10 @@ def test_each_settlement_control_line_is_fail_closed_unless_proof_was_adopted(
                         receipt = transaction.snapshot(
                             receipt_components, content_limit=1024 * 1024,
                         )
-                        operation(transaction, body, receipt)
+                        operation(
+                            transaction, body, receipt,
+                            absent_components=absent_components,
+                        )
                     elif operation_name == "retain_uncertain":
                         operation(transaction, "source-line uncertainty")
                     else:
