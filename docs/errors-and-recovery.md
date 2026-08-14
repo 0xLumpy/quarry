@@ -85,14 +85,18 @@ Late OOB evidence for a committed run is written as an append-only supplement un
 The last-published `revision.json` pointer identifies the certified segment chain and combined entity
 counts. Its combined reports and exports live under the pointed-to `revNNNN/` directory; the base run's
 `reports/` and `exports/` remain the base generation. `quarry report` prints the path it actually
-republished. The pointer is published last, so an interrupted publication leaves the preceding revision
-active rather than exposing a half-written generation.
+republished. An interruption before pointer replacement leaves the preceding revision active. A failure
+after the pointer swap, including post-publication certification failure, can leave the candidate pointer
+active but unusable; restoring the preceding pointer remains open `HEAD-03` recovery work.
 
-This describes the supported command path. In `v0.3.9`, complete repository-boundary sealing and
-multi-revision composition are still open release blockers; callers must not mutate a run directory or
-use internal `Run` writers as an alternative to the revision publisher. See
-[`HEAD-02`](audit/CURRENT-HEAD.md#head-02-repository-boundary-object-identity-and-sealed-run-immutability) and
-[`HEAD-03`](audit/CURRENT-HEAD.md#head-03-revision-composition-certification-and-pointer-last-publication).
+This describes the supported command path. At the Phase 1 audited source (`474d848`), the `v0.3.9` code
+now routes production base writers, runner publications and managed HTTP acquisitions through the Run
+mutation/claim boundary, and focused regressions cover its irreversible seal. That is narrow
+implementation evidence, not release closure: the canonical `V310-01`/`V310-02` gate records do not yet
+exist, and multi-revision composition remains an open release blocker. Callers must not mutate a run
+directory or use internal `Run` writers as an alternative to the revision publisher. See
+[`HEAD-02`](audit/CURRENT-HEAD.md#head-02--repository-boundary-object-identity-and-sealed-run-immutability) and
+[`HEAD-03`](audit/CURRENT-HEAD.md#head-03--revision-composition-certification-and-pointer-last-publication).
 
 `<run>/state.json` fails closed. An absent file is a run written before this contract (a committed
 manifest means it finished); a file that is present but unreadable reads as `unknown`, never `finished`,
@@ -127,6 +131,38 @@ Two different shortfalls both exit 4, and they report different reasons. Evidenc
 cannot be certified — is a `revision` gap. Evidence **incomplete** — rows the corpus envelope is still
 refusing — is an `oob` cap gap; the revision stays certified, and the count is what stands across every
 revision, not just what the last import turned away.
+
+## Execution and managed-acquisition settlement
+
+Phase 1 makes a current attempt distinct from a preserved prior artifact. A successful tool exit is not
+enough: every requested primary stream must settle and its publication must be authenticated. If a
+stream is capped, cancelled, blocked, lost or cannot be published, the attempt is non-clean. A returned
+status may be partial, timed out or failed; exact `KeyboardInterrupt`/`SystemExit` cancellation is
+re-raised after settlement. The terminal stream record retains the count and digest of any stable prefix,
+and a private prefix may exist, but production Run callers are not guaranteed a public partial path. An
+older final may remain on disk, but is not reported as the current attempt's output.
+
+Run-owned HTTP evidence uses one deterministic destination lease across reconciliation, contact, body
+publication and receipt publication. Replay authority is a triad: the selected complete-or-partial body,
+its receipt, and certified absence of the mutually exclusive opposite body sibling. A repeat authenticates
+that triad before contact, so `replayed-complete` and `replayed-incomplete` mean no new request was sent.
+If the opposite sibling appears, replay refuses. Unknown, damaged, substituted, crash-stale or
+publication-uncertain ownership likewise refuses a new request and retains enough durable state for
+deliberate diagnosis rather than guessing that contact did not happen.
+
+| Symptom or disposition | What Quarry knows | Safe recovery |
+|---|---|---|
+| Primary stream partial, capped or unsettled | The invocation did not produce an authoritative current artifact; its terminal record retains the stable count/digest, and a private prefix may exist without a public path. | Inspect the stream fault and retained count/digest. Fix the sink/bound and rerun; do not treat a preserved final as this attempt's output. |
+| `replayed-complete` | The exact complete body and receipt still authenticate an earlier acquisition, and the partial-body sibling is certifiably absent. No request was sent this time. | Reuse the evidence. Discard the body/receipt only through exact conditional ownership of those snapshots. Discard does not remove a newly present partial sibling; subsequent acquisition/replay refuses while it exists. |
+| `replayed-incomplete` | The exact retained partial body and receipt authenticate an earlier incomplete acquisition, and the complete-body sibling is certifiably absent. No request was sent this time. | Preserve it as gap evidence. After deciding a retry is authorized, discard the body/receipt only through exact conditional ownership of those snapshots. Discard does not remove a newly present complete sibling; subsequent acquisition/replay refuses while it exists. |
+| `managed-authority-refused`, crash-stale lease or ownership damage | Prior contact or publication cannot be ruled out, so automatic retry would risk duplicate work or overwrite evidence. | Inspect the ownership-transition record and named body/receipt/claim objects. Repair or remove only the object whose identity you have verified. |
+| Complete or partial body without an owned receipt | Bytes may be intact, but Quarry cannot prove which request owns them. Future acquisition refuses rather than overwriting. | Preserve and inspect both names; either reconstruct ownership outside Quarry or deliberately remove the unowned state before retrying. |
+| Discard reports `changed`, `unremoved` or `uncertain` | Conditional cleanup did not prove that the exact acquired object was removed. A changed object is preserved. | Follow the per-object discard facts; never retry cleanup by blindly unlinking the path. |
+| `KeyboardInterrupt` or `SystemExit` during publication/cleanup | The exact cancellation is re-raised after the transaction records the strongest body, receipt and cleanup truth it could establish. | Treat the command as interrupted, then inspect the recorded ownership state before retrying. |
+
+This serialization protects cooperating Quarry Run operations. It is not an authorization sandbox against
+an arbitrary same-UID process changing raw filesystem objects after the final authenticated check; that
+actor is outside the Phase 1 and `privfs` trust boundary.
 
 ## Symptoms → action
 

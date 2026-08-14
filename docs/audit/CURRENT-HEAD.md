@@ -1,23 +1,25 @@
 # Quarry current-HEAD closure ledger
 
-**Audited revision:** `4e4825c6f2a6f2bd81d81da0f231f56845ffd6aa`
+**Audited source revision:** `474d848656a01cd484dd62d817eb21d527202a78`
+
+**Audited Git tree:** `d42640ef23b9ae44c2ec09d18ac5a704e4373d05`
 
 **Package version:** `0.3.9`
 
-**Audit date:** 2026-08-11
+**Audit date:** 2026-08-14
 
 **Release decision:** **NO-GO** for `v0.3.10`, production-grade, or market-leading claims
 
-This is a closure ledger for the implementation at the audited base revision. It does not repeat the
+This is a closure ledger for the implementation at the audited source revision. It does not repeat the
 original audit report. The
 historical finding definitions, evidence taxonomy, accepted decisions and `QR39-*` identifiers remain in
 the [archived v0.3.9 register](../archive/audit-v0.3.9/AUDIT_REGISTER_RECONCILED.md). This document
 supersedes that register only for **current status and release disposition**.
 
-Phase 0 governance/documentation edits made after the audited revision do not close a code finding. If
-this ledger is committed on top of `4e4825c`, that commit remains the audited implementation base until a
-subsequent source change is verified and recorded here. Every release candidate requires a fresh evidence
-set against its own exact identity.
+The documentation commit carrying this ledger is deliberately not treated as a self-audited source
+revision. `474d848` remains the implementation identity until a subsequent source change is verified and
+recorded here. Every release candidate requires a fresh machine-readable evidence set against its own
+exact identity.
 
 ## Authority and status rules
 
@@ -59,27 +61,71 @@ These behaviors are not defects and must not be silently weakened during remedia
 
 ## Evidence baseline
 
-The fresh audit established the following without contacting a target:
+The Phase 1 source audit established the following without contacting a target:
 
-- `main` and `origin/main` both resolved to the audited revision when inspected.
-- The tree contained 54 source modules, 84 `test_*.py` files, 38 tools, 66 registered sources,
-  23 entity kinds and 9 phases.
-- The default non-live suite produced 5,444 passes plus 14 environment/sandbox failures. The exact
-  failed subset subsequently produced 235 passes in the expected host environment, including all 14
-  former failures. This is an **effective diagnostic baseline of 5,458**, not a single clean release-gate
-  transcript.
-- The integration selection produced 74 passes and 5,458 deselections.
-- CI currently selects only `-m offline`: approximately 1,302 default non-live tests are outside that
-  positive-selection gate.
-- `scripts/verify-quarry.sh` was not accepted as fresh closure evidence because its check 2 can contact a
+- The exact source identity is `474d848656a01cd484dd62d817eb21d527202a78`, with Git tree
+  `d42640ef23b9ae44c2ec09d18ac5a704e4373d05`. At final source inspection the index and source/test diff
+  were empty; tracked worktree changes were confined to the four documents carrying this reconciliation.
+  The operator's untracked `notes/` directory was not read as source or release evidence and is not part
+  of the tree.
+- The tree contains 65 Python source modules, 127 `test_*.py` files, 7,631 collected tests, 38 tools,
+  66 registered sources, 23 entity kinds and 9 phases. `pyproject.toml` and
+  `quarry_recon.__version__` both remain `0.3.9`.
+- The final AST writer classifier found 284 terminal-name candidates and excluded 39 value transforms.
+  Semantic and call-graph review of the remaining 245 concrete writer/mutation candidates found zero
+  ambient canonical Run-base writers.
+- All 38 runner policy sites carry the triad: 37 `exec_tool` facade sites plus one internal repository
+  delegation. Independently, all 15 production `run_contract` callers supply the triad. All 21 native
+  sinks are authorized: 13 through `exec_tool` and 8 through `run_contract`. The all-`None` contract
+  compatibility path is non-Run; a partial triad is forwarded whole and fails runner preflight closed.
+- The only production `scoped_get_file` call is the evidence acquisition entry point. Authenticated Run
+  destinations use the managed acquisition transaction; lexical or resolved aliases into the reserved
+  `recon` namespace cannot fall through to legacy I/O. Its three production discard sites use the exact
+  managed discard transaction. The remaining legacy path streamer calls serve unmanaged destinations or
+  project-state Shodan pages, not Run-base evidence.
+- The frozen managed-acquisition integration produced 562 passing transaction/legacy tests, an
+  independent 8-case replay matrix and 119 passing transaction tests on Python 3.13. A final
+  static/currentness selection produced 11 passes on Python 3.13.12; the independent
+  authority/currentness selection produced 71 passes. Earlier focused descriptor, no-replace and
+  exported-descriptor selections ran across Python 3.10, 3.12 and 3.13.
+- The final writer audit produced 32 focused passes and 2 static passes. Test-hygiene commit `474d848`
+  deterministically closes multiprocessing fixture descriptors before exact-HEAD matrix execution; its
+  independent Python 3.13 audit repeated the affected sequence 50/50 successfully and preserved exact
+  descriptor-set equality on the failure probe.
+- The previous 5,458-test effective diagnostic baseline and 74-test integration selection belong to the
+  older `4e4825c` audit. They are historical context, not evidence for this source identity.
+- The private case named `quarry-interrupted-events` remains the primary reporting/scale regression
+  corpus. Its source mapping is sensitive and is not part of the tree; its historical aggregate counts
+  are diagnostic only because no accepted immutable corpus attestation binds it to this source identity.
+- The repository still lacks the accepted candidate-identity collector, complete lane taxonomy,
+  OS-enforced isolation, evidence schema/aggregator, finite support/threshold manifests, package/SBOM/
+  provenance gates and accepted corpus attestations. Focused passing tests therefore remain diagnostic
+  evidence and do not close `RG00`–`RG09`.
+- `scripts/verify-quarry.sh` remains unsuitable as release evidence because its check 2 can contact a
   configured/live target. It must be separated into a proven-offline gate and an explicitly authorized
   range gate before release use.
-- The private case now named `quarry-interrupted-events` is the primary reporting/scale regression corpus.
-  Its source mapping is sensitive, is not committed here, and has not yet been bound to an immutable
-  inventory. Only aggregate counts were used in this audit.
 
-The suite proves substantial behavior, but it does not override the directly reproduced invariant
-failures below.
+Fresh sequential clean-archive matrices used the editable package with exact dependencies at the audited
+source. Every lane had the same 7,631-test collection:
+
+| Lane | Python | Result | Warnings | Pytest time | Log SHA-256 |
+|---|---|---|---:|---:|---|
+| Default | 3.10 | 7,528 passed, 103 deselected | 0 | 924.82 s | `ffb51ab88f30724b4c1b82891df4b8dcfd28255743d6bb7433cb2c747b8dc068` |
+| Default | 3.12 | 7,528 passed, 103 deselected | 4 | 829.18 s | `ec5a56a08391570fbb96ff93f9f1ddf7c0288091a40dabcef0f0b625898b2c51` |
+| Default | 3.13 | 7,528 passed, 103 deselected | 4 | 784.61 s | `d45cb5aceae920d32bb6d272be7c4b93a27c2261e48b20550ba4b47ca40f9b8b` |
+| Offline (`QUARRY_OFFLINE_CI=1`) | 3.10 | 6,224 passed, 1,407 deselected | 0 | 805.69 s | `c79effd344ab2b84b01e290acdf8a11d035b6fc63dce729cac20259abba57976` |
+| Offline (`QUARRY_OFFLINE_CI=1`) | 3.12 | 6,224 passed, 1,407 deselected | 4 | 755.10 s | `62e63c9baf35adf859e84f0cec3c50ba6912cd01c573b570ea6ac031e0539407` |
+| Offline (`QUARRY_OFFLINE_CI=1`) | 3.13 | 6,224 passed, 1,407 deselected | 4 | 707.63 s | `e25fb754615f9f4d52bed7485e71ac0a1f5b15db3b1b2d709927d29d0f94703a` |
+| Integration | 3.10 | 103 passed, 7,528 deselected | 0 | 35.97 s | `5146209dbf8f6b745fc19a43bcc579afe1a12b0dd0d0cb5809ff4a2253316e28` |
+| Integration | 3.12 | 103 passed, 7,528 deselected | 0 | 35.71 s | `69f94614ab848c2c5076e0a1294d46619cb4d4ed4a43141f38d672fa08e0f017` |
+| Integration | 3.13 | 103 passed, 7,528 deselected | 0 | 32.41 s | `aa2e41e94bce98839e075290b508528bb84caccd449a903736ddb4ec9226c19f` |
+
+The four Python 3.12/3.13 default/offline warnings are the known two multithreaded-fork and two tar-filter
+deprecations; integration emitted none. These logs are reproducible diagnostic evidence, not
+schema-valid canonical gate records, and do not populate a release evidence slot.
+
+The Phase 1 suite proves substantial repaired behavior, but does not override the open canonical gate and
+non-Phase-1 findings below.
 
 ## Verified closures and verified foundations
 
@@ -90,55 +136,70 @@ failures below.
 | `VERIFIED-NARROW` | `QR39-010` | Unknown, empty and duplicate selectors are rejected before run/install side effects; selected phases return in canonical order. | `8263b73`; `src/quarry_recon/cli.py::_select_phases`; `tests/test_qr39_010_selector_validation.py` | A future plugin/dependency graph still needs explicit prerequisite metadata; this does not reopen the present static selector fix. |
 | `VERIFIED-NARROW` | `QR39-003`, `QR39-016` | Typed fault/gap records, verdict-after-fault plumbing and a persisted finalization state machine exist. | `45f83e8`, `32ad450`; `src/quarry_recon/state.py`; `tests/test_qr39_003_verdict_after_faults.py`; `tests/test_qr39_016_finalization.py` | Manifest semantics and consumers remain open in `HEAD-04`. |
 | `VERIFIED-NARROW` | `QR39-006` | Newly created run/evidence artifacts use private creation primitives rather than depending on umask. | `7e44385`; `src/quarry_recon/privfs.py`; `tests/test_qr39_006_permissions.py` | Existing files, symlinks, ownership and migration remain open in `HEAD-02`/`HEAD-05`. |
-| `VERIFIED-NARROW` | `QR39-009` | Normal delayed-OOB ingestion routes through revision supplements rather than appending normalized evidence to a sealed base. | `d598dd7`; `src/quarry_recon/revision.py::ingest`; `tests/test_qr39_009_oob_revision.py`; `tests/test_qr39_009_revision_sealing.py` | Repository sealing and revision publication/certification remain open in `HEAD-02`/`HEAD-03`. |
+| `VERIFIED-NARROW` | `QR39-009` | Normal delayed-OOB ingestion routes through revision supplements rather than appending normalized evidence to a sealed base. | `d598dd7`; `src/quarry_recon/revision.py::ingest`; `tests/test_qr39_009_oob_revision.py`; `tests/test_qr39_009_revision_sealing.py` | Base sealing has narrow Phase 1 evidence in `HEAD-02`; revision publication/certification remains open in `HEAD-03`. |
 | `VERIFIED-NARROW` | `QR39-015` | A timed-out individual resolver worker is killable and reclaimed. | `901e093`; `src/quarry_recon/netguard.py::_resolve_batch`; `tests/test_qr39_015_resolver_reclaim.py` | Corpus-wide duration and portable worker-start behavior remain open in `HEAD-06`. |
+| `VERIFIED-NARROW` | `QR39-001`, `QR39-030` | The runner supervises a killable execution owner, authenticates typed stream settlement and publishes requested outputs only through explicit repository policies. Preserved prior finals are not current output. | `579631e`, `246ad1e`, `e27a492`, `00c1095`, `4d1d736`, `5d1b828`; worker, supervisor, repository-composition, contract and stdout-currentness regressions | Candidate-wide `B-HERMETIC-ALL`, `C-OUTPUT-CONTRACT`, `C-FAULT-RUNNER` and `C-PERF-RUNNER` evidence remains open. |
+| `VERIFIED-NARROW` | `QR39-005`, `QR39-006`, `QR39-009`, `QR39-016`, `QR39-032` | Production Run-base writers share mutation/artifact authority; managed HTTP body/receipt acquisition and conditional discard are one serialized transaction; budget-ledger persistence and canonical removal use the same authority; the base seal is irreversible. | `2448b07`, `8b084bf`, `e092fcb`, `53af5f7`, `d11637b`, `117f21e`, `b4a5a13`, `b036a86`, `1f8981b`, `eee5d64`; Phase 1 mutation, claim, finalization, OOB, budget and managed-acquisition regressions | Strict manifest semantics, revision certification and all canonical `V310-02` evidence slots remain open. |
 
-The remaining recent commits are valuable foundations, but their full QR39 rows are not closed by the
-fresh audit.
+These repaired foundations remain narrow: their full QR39 rows are not release-closed without the
+candidate-wide canonical evidence named in their residual dispositions.
 
-## Open stop-ship clusters
+## Stop-ship clusters and narrow repairs
 
 ### `HEAD-01` — subprocess evidence completion
 
-**Status:** `REOPENED`
+**Status:** `VERIFIED-NARROW`
 
 **Maps to:** `QR39-001`, with resource interaction from `QR39-004` and `QR39-030`
 
-**Evidence.** `src/quarry_recon/runner.py:901-934` rejoins drain threads, but tests only
-`stop_reason`; it does not classify a still-alive stdout reader itself as primary incompleteness. A
-disposable harness that blocked `_write_all` returned a successful child result with no published raw
-artifact and no fault while the drain thread remained alive. `runner.run([])` also reaches `cmd[0]` at
-`src/quarry_recon/runner.py:796`, and a configured stdout cap is recorded at
-`src/quarry_recon/runner.py:987` without necessarily changing a successful status.
+**Evidence.** The old in-process drain path is no longer the production Run publication authority. A
+supervised worker owns the process group, pipes and private stages; the parent authenticates a versioned
+settlement record and publishes only after the primary owner is terminal. Invalid argv/input/cap shapes
+fail in preflight, a capped or lost primary stream cannot be clean, and retained prefixes carry their own
+count/digest rather than authenticating a different final. All 38 runner policy sites at the audited
+source carry the triad (37 `exec_tool` facade sites plus one internal repository delegation); all 15
+production `run_contract` callers independently supply that triad, while its all-`None` unmanaged
+compatibility path remains outside a Run base. Worker/protocol/supervisor, repository-composition,
+native-output, blocked/escaped stream, cap, cancellation and currentness
+regressions cover the former reproduced failures.
 
-**Preconditions.** A sink write blocks, an escaped process retains a pipe, the caller supplies an empty
-argv, or stdout exceeds an enabled retention ceiling.
+**Narrow result.** A live/unsettled primary owner, invalid invocation, cap, sink failure or uncommitted
+publication no longer returns an authoritative current artifact. Prior committed evidence is preserved
+without being reported as this attempt's output.
 
-**Acceptance.** Every started reader/feed thread has one terminal state. A live thread, lost/capped
-primary stream, publication failure or invalid argv yields a typed incomplete/failed result; no writer
-owns a sink after it is closed or published. Tests inject blocked writes, escaped holders, non-UTF-8,
-empty argv, truncation and publication failure and prove bounded return plus exact retained bytes.
+**Residual release work.** `V310-01` remains `OPEN`: the accepted candidate-wide hermetic selection,
+output-contract matrix, fault record, performance thresholds and machine evidence for
+`B-HERMETIC-ALL`, `C-OUTPUT-CONTRACT`, `C-FAULT-RUNNER` and `C-PERF-RUNNER` do not exist. Resource
+envelope interactions remain in `HEAD-06`.
 
 ### `HEAD-02` — repository boundary, object identity and sealed-run immutability
 
-**Status:** `REOPENED`
+**Status:** `VERIFIED-NARROW`
 
 **Maps to:** `QR39-005`, `QR39-006`, `QR39-009`, `QR39-016`, `QR39-032`, `QR39-041`
 
-**Evidence.** `Run._refuse_if_sealed()` protects selected verdict methods, but `Run.add()`
-(`src/quarry_recon/store.py:992`), `Run.inherit()` (`:1034`), `Run.raw_path()` (`:772`) and `record()`
-do not enforce the lifecycle. A disposable harness appended an entity to a finished run while its
-manifest count stayed unchanged. `Run.open()` (`:757`) concatenates caller-provided `run_id`, and raw
-phase/tool/name components are not containment-validated; disposable paths traversed outside the run.
-`Run.add()` also accepts an entity absent from `ENTITY_KEYS`, producing an unmanifested log.
+**Evidence.** Run/project identities and artifact/entity components are validated before construction;
+`Run.open()` is descriptor-relative and read-only. Creation, append, `add`, `inherit`, tool/event records,
+attempt directories, budget-ledger persistence, exact canonical removal, native/runner publication, OOB
+mutation and finalization use the scoped Run mutation/artifact boundary. `running -> finalizing` performs
+a strict durability walk and irreversibly seals base evidence; manifest presence seals conservatively.
+Managed HTTP acquisition now holds a deterministic destination lease across reconciliation, contact,
+body/receipt publication, replay and
+conditional discard. The final object-level writer inventory found zero unmanaged production Run-base
+writers, including the former fetch/discard residuals. Traversal, substitution, stale-cache,
+append-versus-seal, artifact-claim-versus-seal, OOB-versus-seal, cancellation, cross-thread/process and
+managed-acquisition fault regressions cover these boundaries.
 
-**Preconditions.** A future plugin/API, a malformed internal caller, a delayed observation path, or a
-local caller supplies an unexpected entity/path after finalization.
+**Narrow result.** The old post-finish append, unknown-entity and path-traversal reproductions now refuse.
+Authorized delayed OOB work cannot append to sealed base evidence. Same-destination managed contact is
+serialized and a damaged/uncertain prior acquisition refuses retry rather than overwriting or duplicating
+contact.
 
-**Acceptance.** All mutation reaches one repository transaction boundary. It validates opaque object
-IDs, entity kind and resolved containment; refuses every base mutation after sealing; and directs
-authorized late evidence to a staged revision. A matrix covers every public mutation method, traversal,
-absolute paths, symlinks, unknown entities and concurrent finalize/append races.
+**Residual release work.** `V310-02` remains `OPEN`: strict manifest semantics are still `HEAD-04`, full
+revision composition/certification is `HEAD-03`, and the canonical `B-MANIFEST`, `C-PRIVATE-FILES`,
+`C-PATH-IDENTITY` and `C-FAULT-STORE` artifacts are absent. The authority is a cooperative boundary; an
+arbitrary same-UID process can still change raw objects after the last authenticated check, which is
+outside the Phase 1/`privfs` trust model.
 
 ### `HEAD-03` — revision composition, certification and pointer-last publication
 
@@ -146,11 +207,12 @@ absolute paths, symlinks, unknown entities and concurrent finalize/append races.
 
 **Maps to:** `QR39-009`, `QR39-024`
 
-**Evidence.** `src/quarry_recon/revision.py:728-772` starts each revision's counts from base counts and
-updates only entity kinds materialized by that writer; a later revision can omit an entity introduced by
-an earlier revision while publishing `status=valid`. The reader rechecks base and segment evidence, but
-does not independently recompute every pointer/view/entity digest. The pointer is written before the
-post-publication `read()` certification; a failed certification therefore leaves the bad pointer active.
+**Evidence.** `revision._Supplement._publish()` starts each revision's counts from base counts and updates
+only entity kinds materialized by that writer. A later revision can therefore omit an entity introduced
+by an earlier revision from its candidate counts. `revision.read()` now recomputes combined counts and
+refuses that pointer as unusable, but the pointer is written before the post-publication certification;
+the correct refusal therefore occurs only after the previous valid pointer has already been replaced.
+The pointer's derived-view and entity-digest claims are not all independently certified before publish.
 
 **Preconditions.** At least two revisions touch different entity kinds, a publication is interrupted or
 a pointer/view field is corrupted.
@@ -167,13 +229,12 @@ must make `combined_fold`, counts, certification and reports agree.
 
 **Maps to:** `QR39-003`, `QR39-012`, `QR39-016`
 
-**Evidence.** `summary_well_formed()` at `src/quarry_recon/store.py:620` checks required-key presence,
-not value types, schema identity, digest or reconciliation to entity logs. A manifest whose required
-summary fields all contain semantically invalid values can satisfy `manifest_committed()`. Settlement's
-`_committed()` at `src/quarry_recon/settle.py:345` accepts any dictionary summary rather than using the
-store's committed-manifest predicate. Fresh campaign harnesses showed an earlier gapped child can be
-followed by a clean/no-progress child and end `fixed_point`, and a ledger can accept contradictory
-stop-cause/success combinations.
+**Evidence.** `store.summary_well_formed()` checks required-key presence, not summary value types, schema
+identity, digest or reconciliation to entity logs. A manifest whose required summary fields all contain
+semantically invalid values can satisfy `store.manifest_committed()`. Settlement's `_committed()` accepts
+any dictionary summary rather than using the store's committed-manifest predicate. Fresh campaign
+harnesses showed an earlier gapped child can be followed by a clean/no-progress child and end
+`fixed_point`, and a ledger can accept contradictory stop-cause/success combinations.
 
 **Preconditions.** A child manifest is truncated/crafted, a prior child has gaps, a resume observes a
 damaged ledger, or terminal fields disagree.
@@ -189,14 +250,13 @@ Kill/restart and corruption tests cover every transition.
 
 **Maps to:** `QR39-007`, `QR39-008`, `QR39-017`, `QR39-027`, `QR39-028`, `QR39-042`
 
-**Evidence.** Binary/source installation has staged activation, but `install_one()` explicitly installs
-Go/pipx runtimes in place before final identity/capability verification
-(`src/quarry_recon/registry.py:651-678`). A failed verification can therefore leave the new active
-payload. The Go non-`renameat2` fallback uses sequential moves and has an absent-active interval
-(`src/quarry_recon/bootstrap.py:282-290`). Runtime launch still resolves ordinary commands through
-`PATH`, and `runner.py:816` inherits the ambient environment. `secrets.py:214-219` exports
-`PDCP_API_KEY` globally, allowing unrelated children to inherit it. Mutable helper/template/runtime
-closures are not comprehensively attested.
+**Evidence.** Binary/source installation has staged activation, but `registry.install_one()` explicitly
+installs Go/pipx runtimes in place before final identity/capability verification. A failed verification
+can therefore leave the new active payload. The Go non-`renameat2` fallback uses sequential moves and has
+an absent-active interval. Runtime launch still resolves ordinary commands through `PATH`, and the runner
+inherits the ambient environment. `secrets.apply_env()` exports `PDCP_API_KEY` globally, allowing
+unrelated children to inherit it. Mutable helper/template/runtime closures are not comprehensively
+attested.
 
 **Preconditions.** Verification fails after in-place installation, activation falls back during a crash,
 `PATH` is shadowed, or any third-party child is launched after secrets were loaded.
@@ -215,13 +275,16 @@ Fault injection preserves the previous healthy install at every step.
 **Evidence.** The store caps each entity independently while `Run._records` retains every materialized
 entity; the private large-corpus case exceeds the 100,000-key per-entity envelope. Refusal entries retain only
 `entity/key/kind`, not the refused payload/provenance, so they cannot replay the promised work. The free
-space reservation in `DiskGovernor` is process-local when no project maximum is active, and
-`stream_to_file()` uses a shared `<dest>.part` name (`src/quarry_recon/contract.py:527`).
-`resolve_many()` has bounded concurrency but no corpus deadline; 100,000 hung names at 16 workers and a
-five-second timeout require about 8.7 hours before overhead.
+space reservation in `DiskGovernor` is process-local when no project maximum is active. Phase 1 repairs
+the Run-owned destination collision: managed HTTP acquisition holds a deterministic cross-process lease
+and uses private stages. The legacy `stream_to_file()` path still uses a shared `<dest>.part` name only
+for destinations proven outside a Run base; the two Shodan callers are project-state sinks. This does not
+make aggregate reservation or arbitrary unmanaged destinations cross-process safe. `resolve_many()` has
+bounded concurrency but no corpus deadline; 100,000 hung names at 16 workers and a five-second timeout
+require about 8.7 hours before overhead.
 
 **Preconditions.** A large corpus crosses an entity envelope, concurrent processes consume one
-filesystem reserve/write one destination, or resolution repeatedly times out.
+filesystem reserve or an unmanaged helper destination, or resolution repeatedly times out.
 
 **Acceptance.** Publish an exact supported v0.3.x envelope. Crossing it either persists complete replayable
 work or truthfully records terminal evidence loss; it never calls key-only metadata resumable. Resource
@@ -260,8 +323,8 @@ private rich-corpus case contained 24,068 review rows, but `digest.json` omitted
 screenshot target, Nuclei request/response/extraction, Dalfox proof and secret-occurrence relationships
 are reduced or lost in normalized/report paths. `_item()` applies configured-secret redaction to local
 digest values, contrary to the maintainer's full-fidelity private-report rule. Target-controlled Markdown
-is not renderer-escaped. `params.run()` returns at `src/quarry_recon/phases/params.py:2372-2374` when
-the Nuclei live set is empty, skipping independent downstream lanes.
+is not renderer-escaped. `params.run()` returns when the Nuclei live set is empty, skipping independent
+downstream lanes.
 
 **Preconditions.** CDN attribution is absent, evidence contains a configured credential string or Markdown
 control text, a finding needs raw proof/relationships, or Nuclei has no live target while other params
@@ -282,9 +345,11 @@ every included/omitted row with a typed reason.
 
 **Evidence.** Literal-source inspection found `actuator-probe`, `evidence.ownership`, `openapi` and
 `ssti-probe` used outside `data/sources.yaml`; `osint.whoxy` is a documented exception. The existing
-boundary test does not scan these native evidence/OSINT modules. Thirty-seven direct runner/contract
-calls remain frozen behind an allowlist rather than one adapter interface. CI runs only `pytest -m
-offline`; it has no full default-suite, lint, type, coverage, security or dependency-integrity gate.
+boundary test does not scan these native evidence/OSINT modules. The 38 runner policy sites (37
+`exec_tool` facade sites plus one internal repository delegation), 15 `run_contract` callers and 21
+native sinks are statically inventoried and authorized. They remain distributed call sites behind several
+static inventories rather than one adapter interface. CI runs only
+`pytest -m offline`; it has no full default-suite, lint, type, coverage, security or dependency-integrity gate.
 The repository declares MIT in `pyproject.toml` but has no tracked `LICENSE`, and lacks tracked
 `SECURITY.md`, `CONTRIBUTING.md` and a changelog/release process.
 

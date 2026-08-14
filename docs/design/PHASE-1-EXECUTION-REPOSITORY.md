@@ -1,8 +1,11 @@
 # Phase 1: execution and repository authority
 
-**Status:** implementation plan; no release gate is closed by this document
+**Status:** implemented and verified narrowly; no release gate is closed by this document
 
 **Planning base:** `f014f6c`
+
+**Audited Phase 1 source:** `474d848656a01cd484dd62d817eb21d527202a78`
+(`d42640ef23b9ae44c2ec09d18ac5a704e4373d05` Git tree), 2026-08-14
 
 **Release work packages:** `V310-01` and `V310-02`
 
@@ -15,9 +18,10 @@ Phase 1 establishes two invariants on which the rest of `v0.3.10` depends:
 
 This phase does not redesign reports, change accepted scanning policy, reduce
 Nuclei coverage, deny private targets, disable public Interactsh, migrate to
-SQLite, or add a universal scan-duration cap. Canonical target evidence remains
-lossless and private. The reporting prototype remains a later rebuildable
-projection.
+SQLite, or add a universal scan-duration cap. It does not intentionally weaken
+privacy or losslessness: lossless private canonical evidence remains a product
+requirement, while the existing `HEAD-06`/`HEAD-08` evidence-loss and provenance
+gaps remain open. The reporting prototype remains a later rebuildable projection.
 
 ## Why these two changes are one phase
 
@@ -130,7 +134,7 @@ Each stream records at least:
 | `role` | `stdin`, `stdout` or `stderr` |
 | `terminal` | One of `complete`, `eof`, `peer_closed`, `cancelled`, `deadline`, `source_error`, `sink_error`, `capped`, `worker_crash` |
 | `observed_bytes` | Bytes read from or offered to the channel |
-| `retained_bytes` | Bytes in the referenced stable artifact |
+| `retained_bytes` | Exact retained bytes in the private stage or published generation |
 | `observed_sha256` | Digest of the observed stream when fully known |
 | `retained_sha256` | Digest of the exact retained artifact |
 | `lines` | Binary-safe line count where applicable |
@@ -141,8 +145,10 @@ fields remain during `v0.3.x`, but are derived from this record rather than
 maintained independently.
 
 An explicit output cap is evidence loss, not a clean operator sample. The exact
-prefix is retained under a unique partial reference; the result is degraded and
-carries a completeness-challenging fault. The uncapped default is unchanged.
+prefix may remain in a private unpublished stage, and the stream terminal record
+retains its count and digest; the result is degraded and carries a
+completeness-challenging fault. No public partial path is guaranteed. The
+uncapped default is unchanged.
 
 ### Deadline model
 
@@ -276,6 +282,63 @@ Every commit is independently green and is committed locally without pushing.
 8. `docs: record narrow Phase 1 evidence`
    - update recovery/design documentation and current-head dispositions;
    - leave `V310-01`/`V310-02` open until canonical release gates run.
+
+### Implementation record at the audited source
+
+This is an implementation ledger, not a release-gate record. The commits and
+focused tests below establish the repaired seams at the audited source, while
+the version remains `0.3.9` and every `V310-*` and `RG00`–`RG09` row remains
+open in the release ledger.
+
+| Step | Narrow outcome | Representative source evidence | Disposition |
+|---|---|---|---|
+| 1–3 | Invocation preflight, repository identity and strict descriptor-relative private-filesystem primitives are present. | `d99d1d2`, `9bf6c99`, `cd227e2`; `tests/test_runner_preflight.py`, `tests/test_repository_identity.py`, `tests/test_phase1_privfs_core.py` | `VERIFIED-NARROW`; canonical release evidence is absent. |
+| 4 | A supervised worker owns process-tree and binary stream settlement; the parent authenticates the prepared transaction and rejects an unsettled primary stream as clean. Unmanaged compatibility cannot silently accept a partial repository-policy triad. | `579631e`, `246ad1e`, `fef18c8`, `e27a492`, `5d1b828`; worker/protocol/supervisor, execution-transaction and contract regressions | `VERIFIED-NARROW`; `C-FAULT-RUNNER` and `C-PERF-RUNNER` remain open. |
+| 5 | Requested stdout, stderr and native argv outputs publish through repository output policies, private stages and exact artifact claims; preserved prior finals are never treated as current output. | `8281636`, `00c1095`, `d052897`, `b5ea9b1`, `5430c4d`, `4d1d736`; publication, native-output, exported-descriptor and stdout-currentness regressions | `VERIFIED-NARROW`; no package, isolation or machine-evidence gate is closed. |
+| 6 | Run creation, append, entity/tool records, attempt directories, budget-ledger persistence, exact canonical removal, finalization and managed HTTP acquisition share the repository mutation/claim boundary. The base seal is irreversible. | `2448b07`, `69f2bce`, `8b084bf`, `e092fcb`, `9bfbe13`, `53af5f7`, `d11637b`, `117f21e`, `b4a5a13`, `b036a86`, `1f8981b`, `eee5d64` | `VERIFIED-NARROW`; full manifest semantics, revision composition and canonical `V310-02` gates remain open. |
+| 7 | Live OOB mutation and sealed-run disposition are serialized through the Run authority; late evidence cannot append to a sealed base. | `c2db405`, `e092fcb`; `tests/test_phase1_oob_authority.py` and finalization race regressions | `VERIFIED-NARROW`; revision certification remains `HEAD-03`/`V310-03` work. |
+| 8 | This design, recovery guidance, current-HEAD ledger and release ledger distinguish the narrow implementation from release closure. | the documentation change following the audited source | Complete as Phase 1 documentation only; release remains **NO-GO**. |
+
+The final committed-source inventory found 65 Python source modules, 127
+`test_*.py` modules and 7,631 collected tests, 38 tools, 66 registered sources,
+23 entity kinds and 9 phases. The final AST classifier found 284 terminal-name
+candidates, excluded 39 value transforms and semantically reviewed the remaining
+245 concrete writer/mutation candidates; call-graph review found zero ambient
+canonical Run-base writers. All 38 runner policy sites carry the triad (37
+`exec_tool` facade sites plus one internal repository delegation); independently,
+all 15 production `run_contract` callers supply it. All 21 native sinks are
+authorized (13 through `exec_tool`, 8 through `run_contract`). The all-`None`
+contract compatibility path is non-Run; any partial triad is forwarded whole and
+fails runner preflight closed. The sole production `scoped_get_file` caller
+routes authenticated Run destinations through `managed_acquisition_claim`; its
+three production discard sites use the exact managed discard transaction. The
+remaining path-based streamer calls are legacy/unmanaged or project-state
+Shodan sinks, not Run-base writers.
+
+Focused diagnostic evidence at the frozen managed-acquisition integration was
+562 passing transaction/legacy tests, an independent 8-case replay matrix and
+119 passing transaction tests on Python 3.13. A final static/currentness
+selection passed 11 tests on Python 3.13.12, and the final independent
+authority/currentness selection passed 71 tests. Earlier focused descriptor,
+no-replace and exported-descriptor selections were also run across Python 3.10,
+3.12 and 3.13. At the exact audited source, fresh sequential clean-archive
+matrices with the editable package and exact dependencies produced, per
+interpreter: 7,528 default passes with 103 deselections, 6,224 offline passes
+with 1,407 deselections, and 103 integration passes with 7,528 deselections.
+Integration had zero warnings; default/offline had zero on Python 3.10 and four
+known deprecation warnings on 3.12/3.13. The final writer audit also produced 32
+focused passes and 2 static passes. Test-hygiene commit `474d848`
+deterministically closes multiprocessing fixture descriptors before these
+matrices. Exact transcript hashes and timings are recorded in the current-HEAD
+ledger. These transcripts are useful implementation evidence, but they are not schema-valid
+`RELEASE-GATES.md` artifacts and therefore do not populate a release evidence
+slot.
+
+The authority is a cooperative repository boundary: Run operations and
+participating processes serialize and reauthenticate exact descriptors and
+names. An arbitrary process with the same UID can still mutate raw filesystem
+objects after the last authenticated check; defending against that actor is
+outside Phase 1, consistent with the `privfs` trust boundary.
 
 ## Acceptance matrix
 
