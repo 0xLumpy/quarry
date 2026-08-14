@@ -184,6 +184,7 @@ class TestStoreDedupAndReplay:
         f = run._entity_file("url")
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text('{"url": "https://h/z", "status": 200, "_alt": {"status": 500}}\n')   # 500 is NOT a list
+        f.chmod(0o600)
         r2 = self._run(tmp_path)
         assert r2.count("url") == 1                                # replay tolerated the corrupt _alt
         # a further conflicting observation must merge without raising
@@ -196,6 +197,7 @@ class TestStoreDedupAndReplay:
         f = run._entity_file("endpoint")
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text('null\n[]\n"scalar"\n{"nokey": 1}\n{"value": "/real"}\n')
+        f.chmod(0o600)
         r2 = self._run(tmp_path)
         assert r2.count("endpoint") == 1                            # only the one real keyed row
         assert r2.add("endpoint", {"value": "/real"}) is False      # and it dedups

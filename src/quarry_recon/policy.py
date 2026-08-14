@@ -386,6 +386,9 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.runner_native:_MAX_POLICIES": (
         "resource", "the descriptor and staging blast-radius bound for one exact native-output policy "
                     "tuple; excess policies are refused in preflight, never silently dropped"),
+    "quarry_recon.runner_native:_MAX_REPOSITORY_IDENTITY_BYTES": (
+        "resource", "the bounded control-memory read for one authenticated repository identity; an "
+                    "oversize identity is refused rather than treated as runnable output"),
     "quarry_recon.runner_protocol:MAX_ARGV_BYTES": (
         "resource", "the bounded control-memory footprint of one execution argv; an oversize request is "
                     "refused before launch"),

@@ -418,10 +418,12 @@ class TestVerdictFoldsProviderTerminals:
         from quarry_recon.store import Run
         run = Run.create(tmp_path, "t"); events.reset(); events.configure(run.dir)
         try:
-            (run.dir / "events.jsonl").write_text(json.dumps({
+            event_log = run.dir / "events.jsonl"
+            event_log.write_text(json.dumps({
                 "event": "tool_finish", "source_id": "vertical.crtsh", "status": "failed",
                 "provider": True, "error_class": "quota", "reason": "hand-built contradiction",
                 "work_unit": "wu-a"}) + "\n")
+            event_log.chmod(0o600)
             s = self._summary(tmp_path, run)
         finally:
             events.reset()

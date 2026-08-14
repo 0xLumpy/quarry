@@ -291,7 +291,7 @@ class TestTheUnionCarriesItsOwnTrust:
         monkeypatch.setattr(campaign._revision, "view_identity",
                             lambda _path: pytest.fail("symlinked child view was read"))
 
-        with pytest.raises(ContractError, match="not a safe real directory"):
+        with pytest.raises(ContractError, match="cannot be opened safely"):
             union.absorb(child)
 
     def test_a_union_with_NO_POINTER_is_unusable(self, tmp_path):

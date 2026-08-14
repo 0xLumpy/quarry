@@ -31,6 +31,34 @@ def _declared_path(kwargs, policy_name="stdout"):
     return Path(repository.dir).joinpath(*policy.components)
 
 
+def _write_private(path: Path, data: str | bytes) -> Path:
+    """Materialize one fake tool artifact with production's private-file mode."""
+    if isinstance(data, str):
+        path.write_text(data)
+    else:
+        path.write_bytes(data)
+    path.chmod(0o600)
+    return path
+
+
+def _write_raw(run, phase: str, tool: str, name: str, data: str | bytes) -> Path:
+    """Seed prior canonical evidence through Run's private parent allocator."""
+    return _write_private(run.raw_path(phase, tool, name), data)
+
+
+def _private_schedule_tree(root: Path) -> Path:
+    """Bootstrap repository authority before seeding a held scheduler lock."""
+    from quarry_recon import store
+
+    store.Run.create(root, "bootstrap")
+    current = root
+    for component in ("recon", "state", "sched", f"v{sweep.SCHEMA}"):
+        current = current / component
+        current.mkdir(mode=0o700, exist_ok=True)
+        current.chmod(0o700)
+    return current
+
+
 class TestA1dVocabularyLossReachesTheVerdict:
     """review-B-audit-11#1: the loss was a REASON-ONLY coverage event, which the reconciler ignores — so a
     run that silently dropped brute vocabulary still read `complete`."""
@@ -43,12 +71,13 @@ class TestA1dVocabularyLossReachesTheVerdict:
         events.reset(); events.configure(run.dir)
         try:
             def fake_exec(tool, cmd, **k):
-                pathlib.Path(cmd[cmd.index("-o") + 1]).write_text("https://api.acme.com/x\n")
-                pathlib.Path(cmd[cmd.index("-op") + 1]).write_text("")
+                _write_private(pathlib.Path(cmd[cmd.index("-o") + 1]),
+                               "https://api.acme.com/x\n")
+                _write_private(pathlib.Path(cmd[cmd.index("-op") + 1]), "")
                 if "-os" in cmd:
-                    pathlib.Path(cmd[cmd.index("-os") + 1]).write_text("[]")
+                    _write_private(pathlib.Path(cmd[cmd.index("-os") + 1]), "[]")
                 if "-owl" in cmd:
-                    pathlib.Path(cmd[cmd.index("-owl") + 1]).write_bytes(wordlist_bytes)
+                    _write_private(pathlib.Path(cmd[cmd.index("-owl") + 1]), wordlist_bytes)
                 from quarry_recon.runner import RunResult
                 return RunResult(tool, cmd, crawl.Status.SUCCESS, 0, 0.1, None, 1)
 
@@ -88,9 +117,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         run = store.Run.create(tmp_path, "t")
         events.reset(); events.configure(run.dir)
         try:
-            wl_dir = run.dir / "raw" / "crawl" / "xnLinkFinder"
-            wl_dir.mkdir(parents=True, exist_ok=True)
-            (wl_dir / "js_wordlist.txt").write_bytes(b"internal\napi\n")
+            _write_raw(run, "crawl", "xnLinkFinder", "js_wordlist.txt", b"internal\napi\n")
             real = pathlib.Path.read_bytes
 
             def denied(self, *a, **k):
@@ -129,9 +156,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
         run = store.Run.create(tmp_path, "t")
         events.reset(); events.configure(run.dir)
         try:
-            wl_dir = run.dir / "raw" / "crawl" / "xnLinkFinder"
-            wl_dir.mkdir(parents=True, exist_ok=True)
-            (wl_dir / "js_wordlist.txt").write_bytes(b"internal\nbad\xffword\n")
+            _write_raw(run, "crawl", "xnLinkFinder", "js_wordlist.txt",
+                       b"internal\nbad\xffword\n")
             from quarry_recon.runner import RunResult as _RR
             monkeypatch.setattr(enrich, "have", lambda t: True)
             monkeypatch.setattr(enrich, "exec_tool",
@@ -163,10 +189,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
         run = store.Run.create(tmp_path, "t")
         events.reset(); events.configure(run.dir)
         try:
-            wl_dir = run.dir / "raw" / "crawl" / "xnLinkFinder"
-            wl_dir.mkdir(parents=True, exist_ok=True)
             for name, body in files.items():
-                (wl_dir / name).write_bytes(body)
+                _write_raw(run, "crawl", "xnLinkFinder", name, body)
             base_path = None
             if base is not None:
                 base_path = tmp_path / "base.txt"
@@ -1147,9 +1171,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
         run = store.Run.create(tmp_path, "t")
         events.reset(); events.configure(run.dir)
         try:
-            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
-            wl.mkdir(parents=True, exist_ok=True)
-            (wl / "a_wordlist.txt").write_text("\n".join(f"word{i:04d}" for i in range(words)))
+            _write_raw(run, "crawl", "xnLinkFinder", "a_wordlist.txt",
+                       "\n".join(f"word{i:04d}" for i in range(words)))
             from quarry_recon.runner import RunResult as _RR
             monkeypatch.setattr(enrich, "A1D_WORD_CAP", words)         # the DNS lane takes everything
             monkeypatch.setattr(enrich, "A1D_WILDCARD_WORD_CAP", 2)    # ...the wildcard lane would not
@@ -1211,9 +1234,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         run = store.Run.create(tmp_path, run_name)
         events.reset(); events.configure(run.dir)
         try:
-            wl = run.dir / "raw" / "crawl" / "xnLinkFinder"
-            wl.mkdir(parents=True, exist_ok=True)
-            (wl / "js_wordlist.txt").write_text("\n".join(words))
+            _write_raw(run, "crawl", "xnLinkFinder", "js_wordlist.txt", "\n".join(words))
             from quarry_recon.runner import RunResult as _RR
             cmds = []
             monkeypatch.setattr(enrich, "have", lambda t: True)
@@ -1267,8 +1288,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
     def test_a_SECOND_LIFECYCLE_on_one_project_submits_nothing(self, tmp_path, monkeypatch):
         """One sweeper per lane: the contender reports a zero-evidence gap instead of duplicate traffic."""
         from quarry_recon import budget as _b
-        sched = tmp_path / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}"
-        sched.mkdir(parents=True, exist_ok=True)
+        sched = _private_schedule_tree(tmp_path)
         with _b.state_lock(sched / "a1d_brute.lock"):
             submitted, run = self._scheduled(tmp_path, monkeypatch, words=[f"w{i:03d}" for i in range(10)])
         assert submitted == [], submitted
@@ -1377,8 +1397,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
     def test_a_CONTENDED_sweep_is_not_blamed_on_a_missing_tool(self, tmp_path, monkeypatch):
         """v17#3: every unattempted apex used to be reported as "puredns is not installed"."""
         from quarry_recon import budget as _b
-        sched = tmp_path / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}"
-        sched.mkdir(parents=True, exist_ok=True)
+        sched = _private_schedule_tree(tmp_path)
         with _b.state_lock(sched / "a1d_brute.lock"):
             submitted, run = self._scheduled(tmp_path, monkeypatch, words=["one", "two"])
         assert submitted == []
@@ -1713,8 +1732,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
         """v19#2: contention, dependency, machinery and the clock all leave a remainder — none of them is
         the cap withholding work."""
         from quarry_recon import budget as _b
-        sched = tmp_path / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}"
-        sched.mkdir(parents=True, exist_ok=True)
+        sched = _private_schedule_tree(tmp_path)
         with _b.state_lock(sched / "a1d_brute.lock"):
             _submitted, run = self._scheduled(tmp_path, monkeypatch,
                                               words=[f"w{i:03d}" for i in range(10)])
