@@ -43,9 +43,12 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the Python 3.10 l
 CANDIDATE_SCHEMA = "quarry.candidate-identity.v1"
 GATE_SCHEMA = "quarry.release-gate.v1"
 REGISTRY_SCHEMA = "quarry.release-schema-registry.v1"
+PYTEST_TAXONOMY_SCHEMA = "quarry.pytest-taxonomy.v1"
+VERIFICATION_JOB_MAP_SCHEMA = "quarry.verification-job-map.v1"
 SOURCE_TREE_ALGORITHM = "quarry.git-tree-sha256.v1"
 RELEASE_SCOPE = "0.3.10"
 MAX_RECORD_BYTES = 1024 * 1024
+MAX_TAXONOMY_RECORD_BYTES = 2 * 1024 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_INTEGER = (1 << 63) - 1
 
@@ -74,6 +77,22 @@ DEFAULT_IDENTITY_INPUTS = {
     "release-scope-ledger": "docs/releases/v0.3.10.md",
 }
 
+# These are standalone contracts intended to become runner inputs in a later
+# candidate-evidence version.  They are deliberately not part of the v1 schema
+# registry or DEFAULT_IDENTITY_INPUTS: adding them there would silently change
+# the already-frozen candidate-identity.v1 contract.
+PYTEST_TAXONOMY_SCHEMA_PATH = \
+    "release/evidence/schemas/pytest-taxonomy-v1.schema.json"
+VERIFICATION_JOB_MAP_SCHEMA_PATH = \
+    "release/evidence/schemas/verification-job-map-v1.schema.json"
+VERIFICATION_JOB_MAP_PATH = "release/evidence/verification-job-map-v1.json"
+FUTURE_RUNNER_INPUTS = {
+    "pytest-taxonomy-schema": PYTEST_TAXONOMY_SCHEMA_PATH,
+    "verification-job-map": VERIFICATION_JOB_MAP_PATH,
+    "verification-job-map-schema": VERIFICATION_JOB_MAP_SCHEMA_PATH,
+    "verification-workflow-offline-ci": ".github/workflows/ci.yml",
+}
+
 GATE_STATUSES = frozenset({"pass", "fail", "open", "blocked", "not_applicable"})
 LANES = frozenset({
     "H0-hermetic",
@@ -82,10 +101,18 @@ LANES = frozenset({
     "P0-package-supply",
     "L0-authorized-live",
 })
+PYTEST_PRIMARY_LANES = (
+    ("offline", "H0-hermetic"),
+    ("integration", "H1-tool-integration"),
+    ("corpus", "C0-private-corpus"),
+    ("packaging", "P0-package-supply"),
+    ("live", "L0-authorized-live"),
+)
 
 _HEX_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_CAPABILITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 _GATE_ID_RE = re.compile(r"^[A-E]-[A-Z0-9]+(?:-[A-Z0-9]+)*$")
 _MEDIA_TYPE_RE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$")
 _RFC3339_RE = re.compile(
@@ -175,10 +202,14 @@ def _json_object_no_duplicates(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-def load_json_bytes(data: bytes) -> object:
+def load_json_bytes(data: bytes, *, maximum: int = MAX_RECORD_BYTES) -> object:
     """Decode strict UTF-8 JSON, rejecting duplicate members and NaN values."""
-    if len(data) > MAX_RECORD_BYTES:
-        raise EvidenceError(f"evidence record exceeds {MAX_RECORD_BYTES} bytes")
+    if type(data) is not bytes:
+        raise EvidenceError("evidence JSON input must be exact bytes")
+    if type(maximum) is not int or maximum <= 0:
+        raise EvidenceError("evidence JSON byte limit must be an exact positive integer")
+    if len(data) > maximum:
+        raise EvidenceError(f"evidence record exceeds {maximum} bytes")
     try:
         text = data.decode("utf-8", "strict")
         document = json.loads(
@@ -1067,9 +1098,413 @@ def _ordered_unique(records: list[dict], key: str, name: str) -> None:
         raise EvidenceError(f"{name} contains duplicate {key} values")
 
 
-def _bounded_record(document: object, name: str) -> None:
-    if len(canonical_json_bytes(document)) > MAX_RECORD_BYTES:
-        raise EvidenceError(f"{name} exceeds {MAX_RECORD_BYTES} canonical bytes")
+def _bounded_record(
+    document: object,
+    name: str,
+    *,
+    maximum: int = MAX_RECORD_BYTES,
+) -> None:
+    if len(canonical_json_bytes(document)) > maximum:
+        raise EvidenceError(f"{name} exceeds {maximum} canonical bytes")
+
+
+def _canonical_document_from_bytes(
+    data: bytes,
+    name: str,
+    *,
+    maximum: int = MAX_RECORD_BYTES,
+) -> object:
+    document = load_json_bytes(data, maximum=maximum)
+    if data != canonical_json_bytes(document):
+        raise EvidenceError(f"{name} is not the exact canonical JSON byte representation")
+    return document
+
+
+def _canonical_json_line_document_from_bytes(data: bytes, name: str) -> object:
+    """Decode the one canonical representation used by tracked JSON records."""
+    if type(data) is not bytes:
+        raise EvidenceError(f"{name} input must be exact bytes")
+    if len(data) > MAX_RECORD_BYTES:
+        raise EvidenceError(f"{name} exceeds {MAX_RECORD_BYTES} bytes")
+    if not data.endswith(b"\n") or data.endswith(b"\n\n"):
+        raise EvidenceError(f"{name} must end in exactly one LF")
+    document = load_json_bytes(data[:-1])
+    if data != canonical_json_bytes(document) + b"\n":
+        raise EvidenceError(f"{name} is not the exact canonical JSON line representation")
+    return document
+
+
+def _control_free_string(value: object, name: str) -> str:
+    if type(value) is not str or any(ord(char) < 0x20 for char in value):
+        raise EvidenceError(f"{name} must be a control-free string")
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeEncodeError as exc:
+        raise EvidenceError(f"{name} must be valid Unicode") from exc
+    return value
+
+
+def _utf8_key(value: str, name: str) -> bytes:
+    try:
+        return value.encode("utf-8", "strict")
+    except UnicodeEncodeError as exc:
+        raise EvidenceError(f"{name} must be valid Unicode") from exc
+
+
+def _utf8_ordered_unique_strings(value: object, name: str) -> list[str]:
+    records = _array(value, name)
+    normalized = []
+    ordering = []
+    for index, member in enumerate(records):
+        member_name = f"{name}[{index}]"
+        text = _nonempty_string(member, member_name)
+        normalized.append(text)
+        ordering.append(_utf8_key(text, member_name))
+    if ordering != sorted(ordering):
+        raise EvidenceError(f"{name} must be sorted by UTF-8 bytes")
+    if len(set(normalized)) != len(normalized):
+        raise EvidenceError(f"{name} contains duplicate values")
+    return normalized
+
+
+def _capability_names(value: object, name: str) -> list[str]:
+    capabilities = _array(value, name)
+    normalized = []
+    for index, capability in enumerate(capabilities):
+        text = _nonempty_string(capability, f"{name}[{index}]")
+        if not _CAPABILITY_RE.fullmatch(text):
+            raise EvidenceError(f"{name}[{index}] must be a stable capability name")
+        normalized.append(text)
+    if normalized != sorted(normalized, key=lambda member: member.encode("utf-8")):
+        raise EvidenceError(f"{name} must be sorted by capability name")
+    if len(set(normalized)) != len(normalized):
+        raise EvidenceError(f"{name} contains duplicate capability names")
+    return normalized
+
+
+def validate_pytest_taxonomy(document: object) -> dict:
+    """Validate one ``quarry.pytest-taxonomy.v1`` document.
+
+    The manifest records a complete pre-deselection collection and aggregate
+    post-selection counts.  It intentionally does not claim OS isolation or
+    release acceptance.
+    """
+    doc = _object(document, "pytest taxonomy", {
+        "capabilities",
+        "collector",
+        "lanes",
+        "schema_version",
+        "selection",
+        "synthetic_process_nodes",
+    })
+    if doc["schema_version"] != PYTEST_TAXONOMY_SCHEMA:
+        raise EvidenceError(f"unsupported pytest taxonomy schema {doc['schema_version']!r}")
+
+    collector = _object(doc["collector"], "pytest taxonomy.collector", {
+        "name", "python_implementation", "python_version", "version",
+    })
+    if collector["name"] != "pytest":
+        raise EvidenceError("pytest taxonomy.collector.name must be exactly 'pytest'")
+    _token(collector["python_implementation"], "pytest taxonomy.collector.python_implementation")
+    _nonempty_string(collector["python_version"], "pytest taxonomy.collector.python_version")
+    _nonempty_string(collector["version"], "pytest taxonomy.collector.version")
+
+    lanes = _array(doc["lanes"], "pytest taxonomy.lanes")
+    if len(lanes) != len(PYTEST_PRIMARY_LANES):
+        raise EvidenceError("pytest taxonomy.lanes must contain every primary lane exactly once")
+    nodes_by_lane: dict[str, list[str]] = {}
+    all_nodes: set[str] = set()
+    for index, ((expected_marker, expected_lane), record) in enumerate(
+        zip(PYTEST_PRIMARY_LANES, lanes)
+    ):
+        item = _object(record, f"pytest taxonomy.lanes[{index}]", {"lane", "marker", "nodes"})
+        if item["marker"] != expected_marker or item["lane"] != expected_lane:
+            raise EvidenceError("pytest taxonomy.lanes must use the canonical marker/lane order")
+        nodes = _utf8_ordered_unique_strings(
+            item["nodes"], f"pytest taxonomy.lanes[{index}].nodes"
+        )
+        overlap = all_nodes.intersection(nodes)
+        if overlap:
+            raise EvidenceError("pytest taxonomy primary lane node sets must be disjoint")
+        nodes_by_lane[expected_lane] = nodes
+        all_nodes.update(nodes)
+
+    capabilities = _array(doc["capabilities"], "pytest taxonomy.capabilities")
+    capability_names = []
+    capable_nodes: set[str] = set()
+    permitted_capability_nodes = set(nodes_by_lane["H1-tool-integration"])
+    permitted_capability_nodes.update(nodes_by_lane["P0-package-supply"])
+    for index, record in enumerate(capabilities):
+        item = _object(record, f"pytest taxonomy.capabilities[{index}]", {"name", "nodes"})
+        name = _nonempty_string(item["name"], f"pytest taxonomy.capabilities[{index}].name")
+        if not _CAPABILITY_RE.fullmatch(name):
+            raise EvidenceError(
+                f"pytest taxonomy.capabilities[{index}].name must be a stable capability name"
+            )
+        capability_names.append(name)
+        nodes = _utf8_ordered_unique_strings(
+            item["nodes"], f"pytest taxonomy.capabilities[{index}].nodes"
+        )
+        if not nodes:
+            raise EvidenceError("pytest taxonomy capabilities must name at least one node")
+        if not set(nodes).issubset(permitted_capability_nodes):
+            raise EvidenceError("pytest taxonomy capabilities are valid only for H1/P0 nodes")
+        capable_nodes.update(nodes)
+    if capability_names != sorted(capability_names, key=lambda member: member.encode("utf-8")):
+        raise EvidenceError("pytest taxonomy.capabilities must be sorted by name")
+    if len(set(capability_names)) != len(capability_names):
+        raise EvidenceError("pytest taxonomy.capabilities contains duplicate names")
+    if not set(nodes_by_lane["H1-tool-integration"]).issubset(capable_nodes):
+        raise EvidenceError("every H1 taxonomy node must name at least one tool capability")
+
+    synthetic_nodes = _utf8_ordered_unique_strings(
+        doc["synthetic_process_nodes"], "pytest taxonomy.synthetic_process_nodes"
+    )
+    if not set(synthetic_nodes).issubset(nodes_by_lane["H0-hermetic"]):
+        raise EvidenceError("synthetic-process annotations are valid only for H0 nodes")
+
+    selection = _object(doc["selection"], "pytest taxonomy.selection", {
+        "collected",
+        "deselected",
+        "keyword_expression",
+        "mark_expression",
+        "selected",
+        "selected_by_lane",
+    })
+    collected = _exact_nonnegative_int(selection["collected"], "pytest taxonomy.selection.collected")
+    selected = _exact_nonnegative_int(selection["selected"], "pytest taxonomy.selection.selected")
+    deselected = _exact_nonnegative_int(
+        selection["deselected"], "pytest taxonomy.selection.deselected"
+    )
+    _control_free_string(
+        selection["keyword_expression"], "pytest taxonomy.selection.keyword_expression"
+    )
+    _control_free_string(selection["mark_expression"], "pytest taxonomy.selection.mark_expression")
+    if collected != len(all_nodes):
+        raise EvidenceError("pytest taxonomy collected count does not match the lane-node union")
+    if collected != selected + deselected:
+        raise EvidenceError("pytest taxonomy selection does not reconcile collected=selected+deselected")
+
+    selected_by_lane = _array(
+        selection["selected_by_lane"], "pytest taxonomy.selection.selected_by_lane"
+    )
+    if len(selected_by_lane) != len(PYTEST_PRIMARY_LANES):
+        raise EvidenceError("pytest taxonomy selected_by_lane must contain every lane exactly once")
+    lane_selected_total = 0
+    for index, ((_marker, expected_lane), record) in enumerate(
+        zip(PYTEST_PRIMARY_LANES, selected_by_lane)
+    ):
+        item = _object(
+            record,
+            f"pytest taxonomy.selection.selected_by_lane[{index}]",
+            {"lane", "selected"},
+        )
+        if item["lane"] != expected_lane:
+            raise EvidenceError("pytest taxonomy selected_by_lane must use canonical lane order")
+        count = _exact_nonnegative_int(
+            item["selected"],
+            f"pytest taxonomy.selection.selected_by_lane[{index}].selected",
+        )
+        if count > len(nodes_by_lane[expected_lane]):
+            raise EvidenceError("pytest taxonomy selected lane count exceeds its collected node count")
+        lane_selected_total += count
+    if selected != lane_selected_total:
+        raise EvidenceError("pytest taxonomy selected count does not match selected_by_lane")
+
+    _bounded_record(doc, "pytest taxonomy", maximum=MAX_TAXONOMY_RECORD_BYTES)
+    return doc
+
+
+def read_pytest_taxonomy(data: bytes) -> dict:
+    """Read a taxonomy artifact only when its bytes are exactly canonical JSON."""
+    document = _canonical_document_from_bytes(
+        data,
+        "pytest taxonomy",
+        maximum=MAX_TAXONOMY_RECORD_BYTES,
+    )
+    return validate_pytest_taxonomy(document)
+
+
+def _verification_job_map_shape(document: object) -> tuple[dict, list[dict]]:
+    doc = _object(document, "verification job map", {"jobs", "schema_version", "workflows"})
+    if doc["schema_version"] != VERIFICATION_JOB_MAP_SCHEMA:
+        raise EvidenceError(f"unsupported verification job-map schema {doc['schema_version']!r}")
+
+    workflows = _array(doc["workflows"], "verification job map.workflows")
+    if not workflows:
+        raise EvidenceError("verification job map must declare at least one workflow")
+    normalized_workflows = []
+    for index, record in enumerate(workflows):
+        item = _object(record, f"verification job map.workflows[{index}]", {"digest", "path"})
+        path = _safe_relative_path(item["path"], f"verification job map.workflows[{index}].path")
+        parts = PurePosixPath(path).parts
+        basename = parts[2] if len(parts) == 3 else ""
+        if (
+            len(parts) != 3
+            or parts[:2] != (".github", "workflows")
+            or basename in {".yml", ".yaml"}
+            or not basename.endswith((".yml", ".yaml"))
+        ):
+            raise EvidenceError("verification workflow paths must directly name .github/workflows YAML")
+        digest = _digest(item["digest"], f"verification job map.workflows[{index}].digest")
+        normalized_workflows.append({"digest": digest, "path": path})
+    _ordered_unique(normalized_workflows, "path", "verification job map.workflows")
+    workflow_paths = {record["path"] for record in normalized_workflows}
+
+    marker_by_lane = {lane: marker for marker, lane in PYTEST_PRIMARY_LANES}
+    jobs = _array(doc["jobs"], "verification job map.jobs")
+    if not jobs:
+        raise EvidenceError("verification job map must classify at least one job")
+    normalized_jobs = []
+    all_instance_ids: set[str] = set()
+    referenced_workflows: set[str] = set()
+    for index, record in enumerate(jobs):
+        item = _object(record, f"verification job map.jobs[{index}]", {
+            "capabilities", "instances", "lane", "ref", "selection",
+        })
+        ref = _nonempty_string(item["ref"], f"verification job map.jobs[{index}].ref")
+        workflow_path, separator, job_id = ref.partition("#jobs.")
+        if not separator or "#" in job_id:
+            raise EvidenceError("verification job refs must be WORKFLOW#jobs.JOB_ID")
+        workflow_path = _safe_relative_path(
+            workflow_path, f"verification job map.jobs[{index}].ref workflow"
+        )
+        _token(job_id, f"verification job map.jobs[{index}].ref job id")
+        if workflow_path not in workflow_paths:
+            raise EvidenceError("verification job ref names an undeclared workflow")
+        referenced_workflows.add(workflow_path)
+
+        lane = item["lane"]
+        if lane not in LANES:
+            raise EvidenceError(f"verification job map.jobs[{index}].lane is unsupported")
+        capabilities = _capability_names(
+            item["capabilities"], f"verification job map.jobs[{index}].capabilities"
+        )
+        if capabilities and lane not in {"H1-tool-integration", "P0-package-supply"}:
+            raise EvidenceError("verification job capabilities are valid only for H1/P0 jobs")
+        if lane == "H1-tool-integration" and not capabilities:
+            raise EvidenceError("every H1 verification job must name at least one tool capability")
+
+        selection = _object(
+            item["selection"],
+            f"verification job map.jobs[{index}].selection",
+            {"keyword_expression", "mark_expression"},
+        )
+        keyword_expression = _control_free_string(
+            selection["keyword_expression"],
+            f"verification job map.jobs[{index}].selection.keyword_expression",
+        )
+        mark_expression = _control_free_string(
+            selection["mark_expression"],
+            f"verification job map.jobs[{index}].selection.mark_expression",
+        )
+        if mark_expression != marker_by_lane[lane]:
+            raise EvidenceError("verification job selection must exactly name its primary lane marker")
+
+        instances = _array(item["instances"], f"verification job map.jobs[{index}].instances")
+        if not instances:
+            raise EvidenceError("every verification job must declare at least one concrete instance")
+        normalized_instances = []
+        for instance_index, instance_record in enumerate(instances):
+            instance = _object(
+                instance_record,
+                f"verification job map.jobs[{index}].instances[{instance_index}]",
+                {"id", "matrix"},
+            )
+            matrix = _array(
+                instance["matrix"],
+                f"verification job map.jobs[{index}].instances[{instance_index}].matrix",
+            )
+            normalized_matrix = []
+            for matrix_index, matrix_record in enumerate(matrix):
+                parameter = _object(
+                    matrix_record,
+                    f"verification job map.jobs[{index}].instances[{instance_index}].matrix[{matrix_index}]",
+                    {"name", "value"},
+                )
+                name = _token(
+                    parameter["name"],
+                    f"verification job map.jobs[{index}].instances[{instance_index}].matrix[{matrix_index}].name",
+                )
+                value = _token(
+                    parameter["value"],
+                    f"verification job map.jobs[{index}].instances[{instance_index}].matrix[{matrix_index}].value",
+                )
+                normalized_matrix.append({"name": name, "value": value})
+            _ordered_unique(
+                normalized_matrix,
+                "name",
+                f"verification job map.jobs[{index}].instances[{instance_index}].matrix",
+            )
+            suffix = ",".join(
+                f"{parameter['name']}={parameter['value']}" for parameter in normalized_matrix
+            )
+            expected_id = ref if not suffix else f"{ref}[{suffix}]"
+            if instance["id"] != expected_id:
+                raise EvidenceError("verification job instance id does not match its job ref and matrix")
+            if expected_id in all_instance_ids:
+                raise EvidenceError("verification job map contains a duplicate concrete instance id")
+            all_instance_ids.add(expected_id)
+            normalized_instances.append({"id": expected_id, "matrix": normalized_matrix})
+        _ordered_unique(
+            normalized_instances, "id", f"verification job map.jobs[{index}].instances"
+        )
+        normalized_jobs.append({
+            "capabilities": capabilities,
+            "instances": normalized_instances,
+            "lane": lane,
+            "ref": ref,
+            "selection": {
+                "keyword_expression": keyword_expression,
+                "mark_expression": mark_expression,
+            },
+        })
+    _ordered_unique(normalized_jobs, "ref", "verification job map.jobs")
+    if referenced_workflows != workflow_paths:
+        raise EvidenceError("verification job map contains an unreferenced workflow")
+    _bounded_record(doc, "verification job map")
+    return doc, normalized_workflows
+
+
+def validate_verification_job_map(
+    document: object,
+    *,
+    workflow_bodies: Mapping[str, bytes],
+) -> dict:
+    """Validate a job map and its exact raw workflow inputs.
+
+    YAML interpretation is intentionally outside this reader.  The map binds
+    raw bytes so any workflow edit, including comments or quoting, is drift.
+    Static parity tests separately prove that the committed mapping describes
+    the bound GitHub Actions workflow.
+    """
+    doc, workflows = _verification_job_map_shape(document)
+    if not isinstance(workflow_bodies, Mapping):
+        raise EvidenceError("verification workflow bodies must be a path-to-bytes mapping")
+    supplied = dict(workflow_bodies)
+    expected_paths = {record["path"] for record in workflows}
+    if any(type(path) is not str for path in supplied):
+        raise EvidenceError("verification workflow body paths must be exact strings")
+    if set(supplied) != expected_paths:
+        raise EvidenceError("verification workflow bodies do not exactly match the declared paths")
+    for record in workflows:
+        body = supplied[record["path"]]
+        if type(body) is not bytes:
+            raise EvidenceError("verification workflow bodies must be exact bytes")
+        observed = "sha256:" + hashlib.sha256(body).hexdigest()
+        if observed != record["digest"]:
+            raise EvidenceError(f"verification workflow raw bytes drifted: {record['path']!r}")
+    return doc
+
+
+def read_verification_job_map(
+    data: bytes,
+    *,
+    workflow_bodies: Mapping[str, bytes],
+) -> dict:
+    """Read an exact canonical JSON-line job map and reject bound workflow drift."""
+    document = _canonical_json_line_document_from_bytes(data, "verification job map")
+    return validate_verification_job_map(document, workflow_bodies=workflow_bodies)
 
 
 def validate_candidate_identity(document: object) -> dict:
@@ -1356,16 +1791,118 @@ def _parse_input_options(values: Sequence[str]) -> dict[str, str]:
     return result
 
 
-def _load_path(path: str) -> object:
+def _read_path_bytes(path: str, *, maximum: int = MAX_RECORD_BYTES) -> bytes:
     try:
         if path == "-":
-            body = sys.stdin.buffer.read(MAX_RECORD_BYTES + 1)
+            body = sys.stdin.buffer.read(maximum + 1)
         else:
             with Path(path).open("rb") as stream:
-                body = stream.read(MAX_RECORD_BYTES + 1)
+                body = stream.read(maximum + 1)
     except OSError as exc:
         raise EvidenceError(f"cannot read evidence {path!r}: {exc}") from exc
-    return load_json_bytes(body)
+    if len(body) > maximum:
+        raise EvidenceError(f"evidence record exceeds {maximum} bytes")
+    return body
+
+
+def _load_path(path: str) -> object:
+    return load_json_bytes(_read_path_bytes(path))
+
+
+def _read_repository_regular_nofollow(
+    repository: str | os.PathLike[str],
+    relative: str,
+) -> bytes:
+    """Read one bounded regular file through no-follow directory descriptors."""
+    required_flags = ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+    if any(not hasattr(os, name) for name in required_flags) or os.open not in os.supports_dir_fd:
+        raise EvidenceError("verification workflow reads require no-follow descriptor traversal")
+    try:
+        repository_path = os.fspath(repository)
+    except TypeError as exc:
+        raise EvidenceError("verification repository must be a filesystem path") from exc
+
+    parts = PurePosixPath(_safe_relative_path(relative, "verification workflow path")).parts
+    directory_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    )
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptors: list[int] = []
+    primary: BaseException | None = None
+    try:
+        descriptors.append(os.open(repository_path, directory_flags))
+        for part in parts[:-1]:
+            descriptors.append(os.open(part, directory_flags, dir_fd=descriptors[-1]))
+        descriptors.append(os.open(parts[-1], file_flags, dir_fd=descriptors[-1]))
+        workflow_descriptor = descriptors[-1]
+        before = os.fstat(workflow_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise EvidenceError(f"verification workflow {relative!r} must be a regular file")
+        if before.st_size > MAX_RECORD_BYTES:
+            raise EvidenceError(
+                f"verification workflow {relative!r} exceeds {MAX_RECORD_BYTES} bytes"
+            )
+
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(
+                workflow_descriptor,
+                min(1024 * 1024, MAX_RECORD_BYTES - total + 1),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_RECORD_BYTES:
+                raise EvidenceError(
+                    f"verification workflow {relative!r} exceeds {MAX_RECORD_BYTES} bytes"
+                )
+        after = os.fstat(workflow_descriptor)
+        if _stat_signature(before) != _stat_signature(after) or total != after.st_size:
+            raise EvidenceError(f"verification workflow {relative!r} changed while being read")
+        return b"".join(chunks)
+    except OSError as exc:
+        primary = exc
+        raise EvidenceError(
+            f"cannot read verification workflow {relative!r} without following links: {exc}"
+        ) from exc
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        close_fault: BaseException | None = None
+        close_cancellation: BaseException | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except (OSError, KeyboardInterrupt, SystemExit) as exc:
+                if close_fault is None:
+                    close_fault = exc
+                if type(exc) in {KeyboardInterrupt, SystemExit} and close_cancellation is None:
+                    close_cancellation = exc
+        if primary is not None:
+            if type(primary) not in {KeyboardInterrupt, SystemExit} and close_cancellation is not None:
+                raise close_cancellation
+        elif close_cancellation is not None:
+            raise close_cancellation
+        elif close_fault is not None:
+            if isinstance(close_fault, OSError):
+                raise EvidenceError(
+                    f"cannot close verification workflow {relative!r} exactly: {close_fault}"
+                ) from close_fault
+            raise close_fault
+
+
+def _repository_workflow_bodies(
+    repository: str | os.PathLike[str],
+    workflows: Sequence[Mapping[str, object]],
+) -> dict[str, bytes]:
+    bodies = {}
+    for record in workflows:
+        relative = _safe_relative_path(record["path"], "verification workflow path")
+        bodies[relative] = _read_repository_regular_nofollow(repository, relative)
+    return bodies
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1388,9 +1925,14 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     validate = commands.add_parser("validate", help="strictly validate and canonically digest a record")
-    validate.add_argument("kind", choices=("candidate", "gate"))
+    validate.add_argument("kind", choices=("candidate", "gate", "taxonomy", "job-map"))
     validate.add_argument("path", help="JSON file, or - for stdin")
     validate.add_argument("--identity", help="candidate JSON required for an exact gate binding check")
+    validate.add_argument(
+        "--repository",
+        default=".",
+        help="repository containing raw workflows bound by a job map (default: .)",
+    )
     return parser
 
 
@@ -1407,10 +1949,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             sys.stdout.buffer.write(canonical_json_bytes(document) + b"\n")
             return 0
-        document = _load_path(options.path)
+        if options.kind == "taxonomy":
+            document = read_pytest_taxonomy(
+                _read_path_bytes(options.path, maximum=MAX_TAXONOMY_RECORD_BYTES)
+            )
+        elif options.kind == "job-map":
+            body = _read_path_bytes(options.path)
+            provisional = _canonical_json_line_document_from_bytes(body, "verification job map")
+            _provisional_doc, workflows = _verification_job_map_shape(provisional)
+            document = read_verification_job_map(
+                body,
+                workflow_bodies=_repository_workflow_bodies(options.repository, workflows),
+            )
+        else:
+            document = _load_path(options.path)
         if options.kind == "candidate":
             validate_candidate_identity(document)
-        else:
+        elif options.kind == "gate":
             if not options.identity:
                 raise EvidenceError("gate validation requires --identity for exact candidate binding")
             validate_gate_record(document, identity=_load_path(options.identity))

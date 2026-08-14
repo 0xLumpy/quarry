@@ -1,0 +1,203 @@
+{
+  "$defs": {
+    "capability": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$",
+          "type": "string"
+        },
+        "nodes": {
+          "items": {
+            "$ref": "#/$defs/node_id"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "name",
+        "nodes"
+      ],
+      "type": "object"
+    },
+    "lane": {
+      "additionalProperties": false,
+      "properties": {
+        "lane": {
+          "enum": [
+            "H0-hermetic",
+            "H1-tool-integration",
+            "C0-private-corpus",
+            "P0-package-supply",
+            "L0-authorized-live"
+          ]
+        },
+        "marker": {
+          "enum": [
+            "offline",
+            "integration",
+            "corpus",
+            "packaging",
+            "live"
+          ]
+        },
+        "nodes": {
+          "items": {
+            "$ref": "#/$defs/node_id"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "lane",
+        "marker",
+        "nodes"
+      ],
+      "type": "object"
+    },
+    "node_id": {
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001f]+$",
+      "type": "string"
+    },
+    "selected_lane": {
+      "additionalProperties": false,
+      "properties": {
+        "lane": {
+          "enum": [
+            "H0-hermetic",
+            "H1-tool-integration",
+            "C0-private-corpus",
+            "P0-package-supply",
+            "L0-authorized-live"
+          ]
+        },
+        "selected": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "lane",
+        "selected"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:quarry:schema:pytest-taxonomy:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "capabilities": {
+      "items": {
+        "$ref": "#/$defs/capability"
+      },
+      "type": "array"
+    },
+    "collector": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "const": "pytest"
+        },
+        "python_implementation": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        },
+        "python_version": {
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f]+$",
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "pattern": "^[^\\u0000-\\u001f]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "python_implementation",
+        "python_version",
+        "version"
+      ],
+      "type": "object"
+    },
+    "lanes": {
+      "items": {
+        "$ref": "#/$defs/lane"
+      },
+      "maxItems": 5,
+      "minItems": 5,
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "quarry.pytest-taxonomy.v1"
+    },
+    "selection": {
+      "additionalProperties": false,
+      "properties": {
+        "collected": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deselected": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "keyword_expression": {
+          "pattern": "^[^\\u0000-\\u001f]*$",
+          "type": "string"
+        },
+        "mark_expression": {
+          "pattern": "^[^\\u0000-\\u001f]*$",
+          "type": "string"
+        },
+        "selected": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "selected_by_lane": {
+          "items": {
+            "$ref": "#/$defs/selected_lane"
+          },
+          "maxItems": 5,
+          "minItems": 5,
+          "type": "array"
+        }
+      },
+      "required": [
+        "collected",
+        "deselected",
+        "keyword_expression",
+        "mark_expression",
+        "selected",
+        "selected_by_lane"
+      ],
+      "type": "object"
+    },
+    "synthetic_process_nodes": {
+      "items": {
+        "$ref": "#/$defs/node_id"
+      },
+      "type": "array",
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "capabilities",
+    "collector",
+    "lanes",
+    "schema_version",
+    "selection",
+    "synthetic_process_nodes"
+  ],
+  "title": "Quarry pytest taxonomy v1",
+  "type": "object"
+}

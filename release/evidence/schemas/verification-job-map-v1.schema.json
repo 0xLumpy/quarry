@@ -1,0 +1,152 @@
+{
+  "$defs": {
+    "capability": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$",
+      "type": "string"
+    },
+    "matrix_parameter": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        },
+        "value": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
+    "selection": {
+      "additionalProperties": false,
+      "properties": {
+        "keyword_expression": {
+          "pattern": "^[^\\u0000-\\u001f]*$",
+          "type": "string"
+        },
+        "mark_expression": {
+          "enum": [
+            "offline",
+            "integration",
+            "corpus",
+            "packaging",
+            "live"
+          ]
+        }
+      },
+      "required": [
+        "keyword_expression",
+        "mark_expression"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:quarry:schema:verification-job-map:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "jobs": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "capabilities": {
+            "items": {
+              "$ref": "#/$defs/capability"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "instances": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "minLength": 1,
+                  "pattern": "^[^\\u0000-\\u001f]+$",
+                  "type": "string"
+                },
+                "matrix": {
+                  "items": {
+                    "$ref": "#/$defs/matrix_parameter"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "id",
+                "matrix"
+              ],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "lane": {
+            "enum": [
+              "H0-hermetic",
+              "H1-tool-integration",
+              "C0-private-corpus",
+              "P0-package-supply",
+              "L0-authorized-live"
+            ]
+          },
+          "ref": {
+            "minLength": 1,
+            "pattern": "^[^\\u0000-\\u001f]+#jobs\\.[A-Za-z0-9][A-Za-z0-9._-]*$",
+            "type": "string"
+          },
+          "selection": {
+            "$ref": "#/$defs/selection"
+          }
+        },
+        "required": [
+          "capabilities",
+          "instances",
+          "lane",
+          "ref",
+          "selection"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "quarry.verification-job-map.v1"
+    },
+    "workflows": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "path": {
+            "pattern": "^\\.github/workflows/[^/]+\\.ya?ml$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "digest",
+          "path"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "jobs",
+    "schema_version",
+    "workflows"
+  ],
+  "title": "Quarry verification job map v1",
+  "type": "object"
+}
