@@ -1,8 +1,8 @@
 # Quarry current-HEAD closure ledger
 
-**Audited source revision:** `14298c1dfb51ffcb8afd5a39c83c598015a15781`
+**Audited source revision:** `19ab50cbdc2415c78e9bb5651dec2e072bb3a71b`
 
-**Audited Git tree:** `2ed4a821d3d3a13c98c44193f7d2585c049f0efc`
+**Audited Git tree:** `8311829d62be4b7099979e2c0e2f476c2f94fc34`
 
 **Package version:** `0.3.9`
 
@@ -18,7 +18,7 @@ definitions, evidence taxonomy, accepted decisions and `QR39-*` identifiers rema
 that register only for **current status and release disposition**.
 
 The documentation commit carrying this ledger is deliberately not treated as a self-audited source
-revision. `14298c1dfb51ffcb8afd5a39c83c598015a15781` remains the implementation identity for this
+revision. `19ab50cbdc2415c78e9bb5651dec2e072bb3a71b` remains the implementation identity for this
 reconciliation. Every release candidate requires a fresh machine-readable evidence set against its own
 exact identity.
 
@@ -65,20 +65,33 @@ These behaviors are not defects and must not be silently weakened during remedia
 The Phase 1 source audit and current taxonomy reconciliation established the following without contacting
 a target:
 
-- The exact current source identity is `14298c1dfb51ffcb8afd5a39c83c598015a15781`, with Git tree
-  `2ed4a821d3d3a13c98c44193f7d2585c049f0efc`. The tracked worktree was clean before this documentation
-  reconciliation. `pyproject.toml` and `quarry_recon.__version__` both remain `0.3.9`.
-- On CPython 3.13.12 with pytest 9.0.3, collection at that identity emitted canonical
-  `quarry.pytest-taxonomy.v1` bytes with SHA-256
-  `98faf27745eab7168b6456056ba75762d7b63622fa1104c3839fb6e21cd8d1aa`. The default positive H0
-  selection accounts for all 7,787 nodes before deselection: 7,716 H0 selected and 71 H1 deselected;
-  C0/P0/L0 each contain zero nodes, and 40 H0 nodes carry `synthetic_process`.
+- The exact current source identity is `19ab50cbdc2415c78e9bb5651dec2e072bb3a71b`, with Git tree
+  `8311829d62be4b7099979e2c0e2f476c2f94fc34` and domain-separated source-tree digest
+  `sha256:53e5c9d77e9e234873b44cabbb219652abdf69dc6a0b2b12977d37a108ba8209`. The tracked worktree was
+  clean before the diagnostic and this documentation reconciliation. `pyproject.toml` and
+  `quarry_recon.__version__` both remain `0.3.9`.
+- On CPython 3.13.12 with pytest 9.0.3, collect-only execution at that identity emitted canonical
+  `quarry.pytest-taxonomy.v1` bytes with raw-file SHA-256
+  `732f26bfb49c48ad2bce556d782d43b3952b9dd1b661e5312a30705994c0938b`. The positive H0 selection
+  accounts for all 7,867 nodes before deselection: 7,796 H0 selected and 71 H1 deselected; C0/P0/L0 each
+  contain zero nodes, and 40 H0 nodes carry `synthetic_process`.
 - All H1 nodes name real-tool capabilities. The manifest indexes `bwrap`, `cat`, `git`, `head`, `ls`,
   `printf`, `seq`, `setsid`, `sh`, `sleep`, and `true`; capability counts may overlap. The 71 H1 nodes
   comprise 14 Git nodes, 4 bwrap nodes, and 53 shell/coreutils-backed migration-debt nodes.
-- The taxonomy manifest is provenance-bound here as a development diagnostic only. It is not bound to an
-  accepted `0.3.10` candidate record or OS-isolation profile, the complete verification-job map is not
-  accepted, no `A-TAXONOMY` evidence slot is populated, and `RG00` remains `OPEN`.
+- The committed Linux development runner privately cloned and exported that exact committed tree, bound
+  its candidate identity, development isolation profile, schemas, verification-job map and workflow,
+  and collected H0 behind a bubblewrap blank-root boundary. All 14 inner boolean checks were true; outer
+  validation also bound the isolated namespace identities to bubblewrap's status. The candidate and
+  runtime mounts were read-only, work was read-write, `/dev` was isolated, `/proc` was read-only,
+  capabilities were empty, the environment and descriptor inventory were exact, forbidden host roots and
+  `.git` were absent, and the candidate source/cwd/hostname matched.
+- That run is deliberately non-authoritative. It used an untrusted development-host `/usr` runtime with
+  an incomplete executable dependency closure and no seccomp profile; it collected tests but did not
+  execute them. Its summary has raw-file SHA-256
+  `9e52b4761325961ca7bbed8d60f2d1c4163163100cee3be61ec06b5c887ad97f`, declares `authority: none` and
+  `promotion_eligible: false`, and leaves `A-TAXONOMY` `open` for reason
+  `non-nominated 0.3.9/development host runtime`. It is not a gate record, occupies no release evidence
+  slot, and leaves `RG00` `OPEN`.
 - The Phase 1 production-authority audit remains bound to the earlier exact source
   `474d848656a01cd484dd62d817eb21d527202a78` and Git tree
   `d42640ef23b9ae44c2ec09d18ac5a704e4373d05`. Its 65-source-module, 127-test-module and 7,631-node
@@ -110,11 +123,13 @@ a target:
 - The private case named `quarry-interrupted-events` remains the primary reporting/scale regression
   corpus. Its source mapping is sensitive and is not part of the tree; its historical aggregate counts
   are diagnostic only because no accepted immutable corpus attestation binds it to this source identity.
-- The repository now contains the v1 candidate-identity collector/readers, structural gate schemas, and
-  exact pytest lane enforcement. It still lacks an accepted nominated-candidate record, an accepted
-  test/job classification record, OS-enforced isolation, the artifact verifier and deterministic
-  aggregator, finite support/threshold manifests, package/SBOM/provenance gates, and accepted corpus
-  attestations. Focused passing tests therefore remain diagnostic and do not close `RG00`–`RG09`.
+- The repository now contains the v1 candidate-identity collector/readers, structural gate schemas,
+  exact pytest lane enforcement, formal taxonomy/job-map artifacts, and a bounded OS-isolated H0
+  collect-only development runner. It still lacks an accepted nominated-candidate record, an accepted
+  test/job classification gate record, a trusted and complete release runtime image, test execution in
+  that runner, the artifact verifier and deterministic aggregator, finite support/threshold manifests,
+  package/SBOM/provenance gates, and accepted corpus attestations. Focused passing tests and the successful
+  collection diagnostic therefore do not close `RG00`–`RG09`.
 - `scripts/verify-quarry.sh` remains unsuitable as release evidence because its check 2 can contact a
   configured/live target. It must be separated into a proven-offline gate and an explicitly authorized
   range gate before release use.
@@ -137,8 +152,8 @@ the earlier `474d848` Phase 1 source. Every lane had the same 7,631-test collect
 The four Python 3.12/3.13 default/offline warnings are the known two multithreaded-fork and two tar-filter
 deprecations; integration emitted none. These logs are reproducible historical diagnostics, not
 schema-valid canonical gate records, and do not populate a release evidence slot. This ledger makes no
-whole-suite pass claim for `14298c1`; its current observation is the collection-only structural diagnostic
-above.
+whole-suite pass claim for `19ab50c`; its current observation is the OS-isolated, collection-only
+development diagnostic above.
 
 The historical Phase 1 suite proves substantial repaired behavior at its recorded source, but does not
 override the open canonical gate and non-Phase-1 findings below. In the Phase 1 narrative below, “audited

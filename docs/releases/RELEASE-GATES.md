@@ -5,13 +5,16 @@ release; it does not assert that all required runners, thresholds, schemas, or
 evidence collectors already exist.
 
 The current `offline-ci` workflow and historical local test runs are useful
-observations, but they do not yet satisfy this contract. Pytest now rejects any
-node without exactly one primary lane and the CI job positively selects the
-complete structural `H0` classification, but its manifest is diagnostic, its
-deny guard is not OS containment, and no accepted candidate-bound test/job map
-exists. Several professional toolchain gates are also not configured, and
-`verify-quarry.sh` treats unavailable live prerequisites as `SKIP`. Quarry
-therefore begins Phase 0 with the aggregate release status **open**, not green.
+observations, but they do not yet satisfy this contract. Pytest rejects any node
+without exactly one primary lane and the CI job positively selects the complete
+structural `H0` classification, but the CI deny guard is not OS containment.
+The separate Linux development runner can now bind an exact candidate, job map
+and isolation profile while collecting H0 behind bubblewrap, but it is
+deliberately non-authoritative and uses an untrusted host runtime. No accepted
+candidate-bound gate record exists. Several professional toolchain gates are
+also not configured, and `verify-quarry.sh` treats unavailable live
+prerequisites as `SKIP`. Quarry therefore begins Phase 0 with the aggregate
+release status **open**, not green.
 
 ## Principles
 
@@ -105,30 +108,45 @@ The pytest marker correspondence is now structurally enforced:
 | `requires_tool("name")` | Secondary named capability; H1/P0 only and never selected as a standalone lane |
 | `synthetic_process` | Secondary H0-only annotation for the constrained current-interpreter child shape |
 
-At source `14298c1dfb51ffcb8afd5a39c83c598015a15781` (Git tree
-`2ed4a821d3d3a13c98c44193f7d2585c049f0efc`), collection-time validation accounts for all 7,787 pytest
-nodes before deselection: 7,716 H0 and 71 H1, with zero C0/P0/L0 nodes and 40 H0 synthetic-process
+At source `19ab50cbdc2415c78e9bb5651dec2e072bb3a71b` (Git tree
+`8311829d62be4b7099979e2c0e2f476c2f94fc34`), collection-time validation accounts for all 7,867 pytest
+nodes before deselection: 7,796 H0 and 71 H1, with zero C0/P0/L0 nodes and 40 H0 synthetic-process
 nodes. Every H1 node carries stable `requires_tool("name")` capabilities. Of those 71 H1 nodes, 53 are
 shell/coreutils-backed migration debt; the remaining 18 are Git or bwrap integrations.
 
-The canonical default-selection `quarry.pytest-taxonomy.v1` diagnostic, produced by CPython 3.13.12 and
-pytest 9.0.3, has SHA-256
-`98faf27745eab7168b6456056ba75762d7b63622fa1104c3839fb6e21cd8d1aa`. This exact provenance binding is
-a structural observation, not a release record. The manifest is not bound to an accepted `0.3.10`
-candidate identity or OS-isolation profile, and the complete verification-job map has not been accepted.
-No evidence slot is populated; `A-TAXONOMY` remains `open`, and `RG00` remains
-`OPEN`.
+The canonical H0-selection `quarry.pytest-taxonomy.v1` diagnostic, produced by CPython 3.13.12 and pytest
+9.0.3, has raw-file SHA-256
+`732f26bfb49c48ad2bce556d782d43b3952b9dd1b661e5312a30705994c0938b`. The committed development runner
+privately exported the exact committed candidate with source-tree digest
+`sha256:53e5c9d77e9e234873b44cabbb219652abdf69dc6a0b2b12977d37a108ba8209`, bound the formal job map and
+development profile, and performed this collect-only selection behind its bubblewrap boundary. Its
+summary has raw-file SHA-256 `9e52b4761325961ca7bbed8d60f2d1c4163163100cee3be61ec06b5c887ad97f`.
+
+This is an exact structural and isolation observation, not a release record. The package is non-nominated
+`0.3.9`; the mounted development-host `/usr` runtime is untrusted, its executable dependency closure is
+incomplete, and the runner executes no tests. The summary declares `authority: none`,
+`promotion_eligible: false`, and `A-TAXONOMY` `open`. No evidence slot is populated; `A-TAXONOMY` remains
+`open`, and `RG00` remains `OPEN`.
 
 ### Isolation requirements
 
 For release evidence, `H0` denies network namespace access and subprocess
 network escape before test collection. Python monkeypatches are useful
-tripwires but are not the boundary. The current development guard blocks
-ordinary Python network/subprocess entry points, and `synthetic_process`
-permits only a constrained absolute current-interpreter child with a minimal
-environment. It does not contain that child's own network APIs. An OS-isolated
-runner must provide the release boundary and bind its isolation profile to the
-gate record.
+tripwires but are not the boundary. The current CI guard blocks ordinary Python
+network/subprocess entry points, and `synthetic_process` permits only a
+constrained absolute current-interpreter child with a minimal environment. It
+does not contain that child's own network APIs.
+
+The committed Linux development runner adds a blank-root bubblewrap boundary,
+unshared namespaces, empty capabilities, an exact cleared environment, a
+read-only candidate export and read-only `/usr`, isolated `/dev`, read-only
+`/proc`, and a private read-write work mount. Its successful diagnostic reported
+every inner isolation check true. This is a collection-only development
+boundary: it has no seccomp profile, trusts no complete runtime image or
+dependency closure, emits no gate record, and cannot promote a candidate. An
+accepted release runner must retain the isolation properties, execute the
+required selection in an attested runtime, and bind its profile and results to
+the gate record.
 
 `H1` runs in a network namespace with no default route or external resolver. If
 a tool needs TCP/UDP, the only reachable endpoint is the fixture service inside
@@ -161,8 +179,8 @@ nomination commit is not promotion and closes none of these gates.
 
 | Gate | Requirement | Evidence | Phase 0 status |
 |---|---|---|---|
-| `A-IDENTITY` | Candidate is one exact commit; source-tree digest, dirty state, submodule/input identities and schema versions agree, and both package-version sources equal the nominated release | Candidate identity record; dirty candidates fail collection and a release/package-version mismatch blocks this gate | `open` — the v1 collector/schema exist, but an enforced quiescent runner and accepted nominated-candidate record do not |
-| `A-TAXONOMY` | Every test/job maps to exactly one primary lane; incompatible markers and unmarked tests fail collection | Classification manifest plus collected/selected/deselected counts | `open` — pytest has exact-one structural enforcement and a diagnostic manifest, but no accepted candidate-bound classification record or complete verification-job map exists |
+| `A-IDENTITY` | Candidate is one exact commit; source-tree digest, dirty state, submodule/input identities and schema versions agree, and both package-version sources equal the nominated release | Candidate identity record; dirty candidates fail collection and a release/package-version mismatch blocks this gate | `open` — the v1 collector/schema and private exact-commit development runner exist, but no trusted release runtime or accepted nominated-candidate record exists |
+| `A-TAXONOMY` | Every test/job maps to exactly one primary lane; incompatible markers and unmarked tests fail collection | Classification manifest plus collected/selected/deselected counts | `open` — exact-one enforcement, the formal job map and a candidate-bound collect-only diagnostic exist, but no accepted nominated-candidate classification gate record exists |
 | `A-EVIDENCE-SCHEMA` | Gate records validate against a versioned schema and the aggregator conforms deterministically to committed golden vectors | Schemas plus a hermetic aggregator-conformance/golden-vector result and its canonical digest; this is not the candidate release aggregate | `open` — v1 structural schemas/readers exist; artifact verification, signature trust and the deterministic aggregator remain unimplemented |
 | `A-CORPUS` | Selected private sources have accepted two-pass attestations and alias mappings; committed fixtures contain synthetic data only | Private attestation IDs plus public fixture and disclosure-check digests | `open` — design exists; attestations/fixtures are not claimed |
 | `A-THRESHOLDS` | Versioned correctness, quality, resource, and regression thresholds exist for the release scope | Reviewed threshold manifest | `open` — numeric performance/coverage baselines are not yet accepted |
@@ -184,8 +202,8 @@ These are mandatory on every change and run only in `H0-hermetic`.
 | `B-DOCS-POLICY` | Professionalism | CLI/help/config/schema/source registry and policy labels agree; broad Nuclei, private reach, and public Interactsh choices are stated accurately | Generated parity report and policy/config digest |
 
 At Phase 0 these gates are `open` as release gates even when constituent tests
-already pass locally, because the complete selection, isolation, threshold, and
-machine-evidence contracts have not been configured.
+already pass locally, because accepted full-suite execution, release-runtime,
+threshold, and machine-evidence contracts have not been configured.
 
 ### Phase C: release-candidate gates
 
@@ -337,6 +355,15 @@ implement the nomination, approval, publication or documentation-reconciliation
 lifecycle defined below. `A-IDENTITY`, `A-EVIDENCE-SCHEMA` and `RG00` therefore
 remain open.
 
+The separate committed development profile, exact job-map contracts and Linux
+H0 runner are also prerequisite machinery. The runner privately materializes
+one captured commit, collects H0 behind a bounded bubblewrap isolation profile,
+and publishes a create-only external bundle whose final file is unmistakably
+named `NOT-RELEASE-EVIDENCE.json`. It intentionally emits no
+`quarry.release-gate.v1` record. Its host `/usr` runtime and incomplete
+dependency closure are untrusted, so a successful development run cannot be
+used as candidate evidence or populate a registry slot.
+
 The v1 registry is scoped only to release `0.3.10` and binds its corresponding
 scope ledger. The collector and reader refuse any other release label; a later
 release requires its own explicit registry/scope contract rather than reusing
@@ -437,8 +464,8 @@ credential or other ambient variables. This minimal environment and absolute
 argv also disable repository fsmonitor, `core.ignoreStat` and the untracked
 cache for collector queries, and restore default ctime/stat checking; POSIX
 collection additionally forces file-mode and symlink checks on. They do not
-replace the future runner's executable/runtime-closure attestation, and an
-ambient `git` lookup is not eligible as release evidence.
+replace the accepted release runner's executable/runtime-closure attestation,
+and an ambient `git` lookup is not eligible as release evidence.
 
 For each superproject/submodule checkout, raw index entries must equal the
 captured tree and the non-ignored untracked-name query must be empty. The
@@ -557,8 +584,8 @@ The immediate work is prerequisite closure, not running aspirational commands:
    and threshold schemas;
 2. accept the candidate-bound test/job classification manifest and counts for
    the now structurally classified pytest collection;
-3. implement OS-enforced `H0` isolation and the candidate-bound gate-record
-   collector;
+3. promote the collect-only development boundary into an attested release-image
+   runner that executes H0 and emits accepted candidate-bound gate records;
 4. attest the selected private corpora and create only the necessary synthetic
    committed fixtures;
 5. establish numeric quality and resource baselines without marking them pass;

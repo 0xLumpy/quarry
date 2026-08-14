@@ -1,9 +1,9 @@
 # Quarry tests
 
 Pytest development workflow for Quarry. Collection now enforces exactly one primary execution lane for
-every test before marker deselection. This closes the structural marker gap, but the current Python guard
-and diagnostic manifest are not release evidence. The authoritative isolation, evidence, and promotion
-requirements are in the [release-gate contract](../docs/releases/RELEASE-GATES.md).
+every test before marker deselection. This closes the structural marker gap, but the current CI Python
+guard and development diagnostics are not release evidence. The authoritative isolation, evidence, and
+promotion requirements are in the [release-gate contract](../docs/releases/RELEASE-GATES.md).
 
 ## Run
 
@@ -46,21 +46,24 @@ the post-selection counts, named capabilities, collector identity, and synthetic
 
 ## Exact structural diagnostic
 
-At audited source `14298c1dfb51ffcb8afd5a39c83c598015a15781` (Git tree
-`2ed4a821d3d3a13c98c44193f7d2585c049f0efc`), CPython 3.13.12 with pytest 9.0.3 collected **7,787**
-nodes: **7,716 H0 + 71 H1**, with zero C0/P0/L0 nodes. Forty H0 nodes carry `synthetic_process`. The
-canonical default-selection manifest has SHA-256
-`98faf27745eab7168b6456056ba75762d7b63622fa1104c3839fb6e21cd8d1aa`.
+At audited source `19ab50cbdc2415c78e9bb5651dec2e072bb3a71b` (Git tree
+`8311829d62be4b7099979e2c0e2f476c2f94fc34`), CPython 3.13.12 with pytest 9.0.3 collected **7,867**
+nodes: **7,796 H0 + 71 H1**, with zero C0/P0/L0 nodes. Forty H0 nodes carry `synthetic_process`. The
+canonical H0-selection manifest has raw-file SHA-256
+`732f26bfb49c48ad2bce556d782d43b3952b9dd1b661e5312a30705994c0938b`.
 
 The H1 capability index names `bwrap`, `cat`, `git`, `head`, `ls`, `printf`, `seq`, `setsid`, `sh`,
 `sleep`, and `true`; counts overlap when one node requires multiple tools. The 71 H1 nodes comprise 14
 Git nodes, 4 bwrap nodes, and 53 shell/coreutils-backed migration-debt nodes. That debt must move to
 constrained H0 fixtures where semantics permit; it is not erased by assigning those nodes to H1.
 
-This manifest is a provenance-bound development diagnostic, not an accepted candidate artifact. It does
-not bind an accepted `0.3.10` candidate identity, an OS-isolation profile, or the complete verification-job
-map, and it occupies no release evidence slot. `A-TAXONOMY` therefore remains `open`, and `RG00` remains
-`OPEN`.
+The committed Linux development runner produced this manifest from a private export of the exact commit,
+inside its frozen bubblewrap profile, and bound it to the formal verification-job map and a candidate
+identity. The result is still a collect-only development diagnostic, not an accepted candidate artifact:
+the package is non-nominated `0.3.9`, the mounted host `/usr` runtime is untrusted and has no complete
+dependency-closure attestation, and the summary explicitly declares `authority: none` and
+`promotion_eligible: false`. It occupies no release evidence slot. `A-TAXONOMY` therefore remains `open`,
+and `RG00` remains `OPEN`.
 
 ## Guard boundary
 
@@ -71,9 +74,11 @@ validated current-interpreter child with constrained argv, environment, working 
 inheritance.
 
 These controls are tripwires for tracked tests, not OS containment. A reviewed child can use its own
-network API, and Python monkeypatches cannot prove that an escaped/native process has no route. Release
-evidence still requires an OS-isolated H0 runner plus candidate-bound collection and job-map records. The
-current limitations are recorded in the
+network API, and Python monkeypatches cannot prove that an escaped/native process has no route. The
+separate development runner now provides a candidate-bound OS-isolated collection diagnostic, but it does
+not execute the H0 suite or provide a trusted release-image/runtime closure. Release evidence still
+requires those properties plus an accepted candidate-bound gate record. The current limitations are
+recorded in the
 [current audit](../docs/audit/CURRENT-HEAD.md#evidence-baseline).
 
 ## Other verification

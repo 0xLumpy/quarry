@@ -338,8 +338,9 @@ Every collected pytest node must carry exactly one primary marker: `offline`, `i
 `synthetic_process` is a constrained H0-only exception for a controlled current-interpreter child. The
 default and current CI select H0 positively. Their Python deny hooks are development tripwires, not the
 OS containment or candidate-bound evidence required by the still-open
-[release gates](docs/releases/RELEASE-GATES.md). See [tests/README.md](tests/README.md) for exact counts,
-commands, and limitations.
+[release gates](docs/releases/RELEASE-GATES.md). A separate Linux runner now produces an exact-candidate,
+bubblewrap-isolated collect-only development diagnostic; its host runtime is untrusted and it emits no
+release-gate record. See [tests/README.md](tests/README.md) for exact counts, commands, and limitations.
 
 ## Status
 
