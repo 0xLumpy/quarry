@@ -476,7 +476,12 @@ def _with_revision(tmp_path, monkeypatch):
 
 # ── an unusable revision is a gap, never a silent base render ─────────────────────────────────────
 def _damage_revision(run_dir: Path) -> None:
-    next(iter((run_dir / "revisions").rglob("*.jsonl"))).write_text("{ corrupt\n")
+    from quarry_recon import revision
+
+    published = revision.read(run_dir)
+    assert published.status == "valid" and published.segments
+    segment = published.segments[0]["file"]
+    revision._segment_path(run_dir, segment).write_text("{ corrupt\n")
 
 
 @pytest.mark.parametrize("cmd", ["report", "status"])
