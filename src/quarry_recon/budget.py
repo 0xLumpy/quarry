@@ -15,7 +15,7 @@ import stat
 import time
 from pathlib import Path
 
-from . import events
+from . import events, privfs
 
 _MAX_BUDGET_S = 30 * 24 * 3600        # a month; anything larger is a typo, not a policy
 
@@ -842,6 +842,14 @@ class Ledger:
         from .store import MutationScope
         return run._mutation(MutationScope.BASE_EVIDENCE)
 
+    def _observation(self):
+        """Serialize one managed snapshot+journal view without requiring write authority."""
+        if self._managed is None:
+            return contextlib.nullcontext()
+        run, _components = self._managed
+        from .store import MutationScope
+        return run._mutation(MutationScope.CONTROL)
+
     def _resolved_base(self) -> Path:
         return self.path.parent.resolve()
 
@@ -955,21 +963,50 @@ class Ledger:
         for item, rel, dig in pending:
             done[item] = rel
             digests[rel] = dig
+            if self._managed is not None:
+                # Managed compaction refreshes from the durable generation.
+                # Every completion record is retained evidence even when a
+                # later record for the same item becomes its current result.
+                history = self._raw_evid.setdefault(item, [])
+                if rel not in history:
+                    history.append(rel)
         if damaged and self.unreadable:
             # untrusted history is evidence: rewriting it deletes the record that the store is broken
             self._journal_unsafe = True
         elif damaged:
             try:                                    # truncate to the intact prefix so the next append is clean
                 with self._mutation():
-                    tmp = self.journal.with_name(self.journal.name + ".repair")
-                    tmp.write_text("".join(ln + "\n" for ln in kept))
-                    os.replace(tmp, self.journal)
-            except OSError:
+                    repaired = "".join(ln + "\n" for ln in kept)
+                    if self._managed is None:
+                        tmp = self.journal.with_name(self.journal.name + ".repair")
+                        tmp.write_text(repaired)
+                        os.replace(tmp, self.journal)
+                    else:
+                        run, components = self._managed
+                        from .store import MutationScope
+                        journal_components = components[:-1] + (
+                            components[-1] + ".journal",
+                        )
+                        run._replace_artifact(
+                            MutationScope.BASE_EVIDENCE,
+                            journal_components,
+                            repaired.encode("utf-8"),
+                        )
+            except (OSError, privfs.PrivatePathError):
                 # repair failed: appending would land on the fragment. Stop journalling — save() still
                 # compacts in-memory state, so completions are un-journalled, not lost.
                 self._journal_unsafe = True
 
     def _load(self) -> None:
+        # A snapshot and its journal are one logical generation.  Managed
+        # compaction writes the snapshot and supersedes the journal under the
+        # same Run lock, so observe both under one read-capable epoch too.  CONTROL
+        # keeps clean replay available after BASE_EVIDENCE has been sealed;
+        # damaged-tail repair still has to acquire BASE authority below.
+        with self._observation():
+            self._load_locked()
+
+    def _load_locked(self) -> None:
         done, digests = self._read_snapshot()
         self._replay_journal(done, digests)
         verified: dict[str, bool] = {}         # rel -> ok, one hash per artifact rather than per item
@@ -1093,11 +1130,22 @@ class Ledger:
             # on top of one we already know is broken
             return False
         try:
-            self.journal.parent.mkdir(parents=True, exist_ok=True)
-            with self.journal.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"v": self.JOURNAL_SCHEMA, "l": self.lane, **rec}) + "\n")
+            line = (
+                json.dumps({"v": self.JOURNAL_SCHEMA, "l": self.lane, **rec})
+                + "\n"
+            )
+            if self._managed is None:
+                self.journal.parent.mkdir(parents=True, exist_ok=True)
+                with self.journal.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+            else:
+                run, components = self._managed
+                journal_components = components[:-1] + (
+                    components[-1] + ".journal",
+                )
+                run._append_base_artifact(journal_components, line.encode("utf-8"))
             return True
-        except OSError:
+        except (OSError, privfs.PrivatePathError):
             self._journal_unsafe = True        # in-memory state is correct but not appendable
             # appendability and replayability differ here too: a torn tail is repaired to its intact prefix
             # on load, so only an unreadable journal loses records
@@ -1111,27 +1159,115 @@ class Ledger:
         with self._mutation():
             return self._save_locked()
 
+    def _refresh_managed_locked(self) -> bool:
+        """Fold the current on-disk generation before managed compaction.
+
+        Separate Ledger instances may append cooperatively.  The Run epoch
+        serializes those calls, but an older in-memory Ledger must still
+        refresh before replacing the snapshot and superseding the journal.
+        """
+        memory_dirty = self._journal_unsafe or self._journal_lost
+        memory_done = dict(self.done)
+        memory_evid = {item: list(rels) for item, rels in self.evid.items()}
+        memory_digests = dict(self.digests)
+        memory_lost = dict(self.lost)
+        observed = type(self)(self.path, lane=self.lane)
+        if observed.foreign:
+            self.foreign = True
+            return False
+        if observed.unreadable:
+            self.unreadable = observed.unreadable
+            return False
+        if observed._journal_unsafe:
+            self._journal_unsafe = True
+            return False
+
+        self.done = dict(observed.done)
+        self.evid = {
+            item: list(rels) for item, rels in observed.evid.items()
+        }
+        self.digests = dict(observed.digests)
+        self.lost = dict(observed.lost)
+        if memory_dirty:
+            # A failed append leaves the caller's completion only in memory.
+            # After folding every durable concurrent record, keep that newer
+            # local truth so save() can make it durable in the snapshot.
+            self.done.update(memory_done)
+            self.digests.update(memory_digests)
+            self.lost.update(memory_lost)
+            for item, rels in memory_evid.items():
+                merged = self.evid.setdefault(item, [])
+                merged.extend(rel for rel in rels if rel not in merged)
+            for item in self.done:
+                self.lost.pop(item, None)
+        self._raw_evid = {
+            item: list(rels) for item, rels in self.evid.items()
+        }
+        return True
+
     def _save_locked(self) -> bool:
-        """Compact: write the snapshot atomically, then drop the journal it supersedes. Refuses a foreign path
-        or an untrusted store, either of which compaction would overwrite."""
+        """Compact the snapshot and supersede its journal generation.
+
+        Refuses a foreign path or an untrusted store, either of which
+        compaction would overwrite.
+        """
         if self.foreign or self.unreadable:
+            return False
+        if self._managed is not None and not self._refresh_managed_locked():
             return False
         # returns success, never raises: an IO error here must reach the caller as False
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps({"lane": self.lane, "done": self.done,
-                                       "evidence": self.evid, "digests": self.digests}))
-            os.replace(tmp, self.path)
-        except OSError:
+            snapshot = json.dumps({"lane": self.lane, "done": self.done,
+                                   "evidence": self.evid,
+                                   "digests": self.digests})
+            if self._managed is None:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.path.with_name(self.path.name + ".tmp")
+                tmp.write_text(snapshot)
+                os.replace(tmp, self.path)
+            else:
+                run, components = self._managed
+                from .store import MutationScope
+                run._replace_artifact(
+                    MutationScope.BASE_EVIDENCE,
+                    components,
+                    snapshot.encode("utf-8"),
+                )
+        except (OSError, privfs.PrivatePathError):
             self._journal_unsafe = True       # the snapshot is not authoritative; keep the journal
             return False
-        # append safety returns only with the damaged journal actually gone; on one we failed to
-        # remove, the next record lands on the fragment
+        # Unmanaged Ledgers retain the legacy unlink behavior.  A managed
+        # journal is instead atomically compacted to one valid checkpoint: the
+        # generic Run unlink helper cannot reconcile every cancellation seam,
+        # while replace is already exact, fenced, private, and replay-safe.
         try:
-            self.journal.unlink(missing_ok=True)
-            self._journal_unsafe = self.journal.exists()
-        except OSError:
+            if self._managed is None:
+                self.journal.unlink(missing_ok=True)
+                retained = self.journal.exists()
+            else:
+                run, components = self._managed
+                journal_components = components[:-1] + (
+                    components[-1] + ".journal",
+                )
+                checkpoint = (
+                    json.dumps({
+                        "v": self.JOURNAL_SCHEMA,
+                        "l": self.lane,
+                        "k": "ckpt",
+                    })
+                    + "\n"
+                ).encode("utf-8")
+                from .store import MutationScope
+                run._replace_artifact(
+                    MutationScope.BASE_EVIDENCE,
+                    journal_components,
+                    checkpoint,
+                )
+                retained = False
+            self._journal_unsafe = retained
+            if not retained:
+                self._journal_lost = False
+        except (OSError, privfs.PrivatePathError):
             self._journal_unsafe = True
         return True
 
