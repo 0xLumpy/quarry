@@ -93,6 +93,7 @@ _EXPECTED_PROFILE = {
         {"name": "LANG", "value": "C.UTF-8"},
         {"name": "LC_ALL", "value": "C.UTF-8"},
         {"name": "PATH", "value": ""},
+        {"name": "PWD", "value": "/candidate"},
         {"name": "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "value": "1"},
         {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
         {"name": "PYTHONHASHSEED", "value": "0"},
