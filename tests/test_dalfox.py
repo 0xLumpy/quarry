@@ -1261,8 +1261,7 @@ class TestPolicyIsNotExecution:
         assert "did not:" in chan[-1]["reason"] and "dalfox did not start" in chan[-1]["reason"]
 
     def test_the_runner_only_claims_started_without_a_pid(self):
-        """The contract behind the counter. The paths that need no subprocess are asserted here; the
-        real-launch half is `integration` because spawning is blocked offline."""
+        """The contract behind the counter; this unit exercises only child-free paths."""
         from quarry_recon import runner
         assert runner.skipped("x", "no key").started is False
         assert runner.RunResult("t", [], Status.SUCCESS, 0, 0.0, None, 0).started is False, \
@@ -1279,7 +1278,7 @@ class TestPolicyIsNotExecution:
 
     def test_started_is_set_ONLY_once_Popen_returns(self, monkeypatch, tmp_path):
         """Drives the REAL `runner.run` with a faked `Popen`, so the contract is exercised without
-        spawning anything — the offline gate blocks subprocess outright, marker or not."""
+        spawning anything; ordinary, non-synthetic H0 nodes reject a real spawn."""
         import io
         import subprocess as _sp
         from quarry_recon import runner
