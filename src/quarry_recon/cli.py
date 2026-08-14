@@ -1214,6 +1214,17 @@ def _report_view(run_obj):
 
 
 def _run_phases(profile_path, phases, passive, timeout, prepare=None, finished=None):
+    """Run one pipeline inside one private managed-payload snapshot lifetime."""
+    from . import runtime_identity
+    with runtime_identity.managed_payload_snapshot_scope() as payload_scope:
+        return _run_phases_scoped(
+            profile_path, phases, passive, timeout, prepare=prepare, finished=finished,
+            _payload_scope=payload_scope,
+        )
+
+
+def _run_phases_scoped(profile_path, phases, passive, timeout, prepare=None, finished=None,
+                       *, _payload_scope):
     """The run itself, inside whatever policy overrides the flags established. `finished` collects the run
     id as soon as it exists, so a fault mid-run still names the run it happened in."""
     from .phases import REGISTRY, PhaseContext
@@ -1247,6 +1258,7 @@ def _run_phases(profile_path, phases, passive, timeout, prepare=None, finished=N
     secrets.apply_env()   # export PDCP_API_KEY for PD tools, if set
     from .runner import set_tool_cwd
     run_obj = Run.create(project, profile.target)   # collision-resistant id, atomically-claimed dir
+    _payload_scope.bind(run_obj)
     if finished is not None:
         finished["run_id"] = run_obj.run_id
     events.configure(run_obj.dir)   # persist runtime events to <run>/events.jsonl

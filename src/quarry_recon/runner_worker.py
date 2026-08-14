@@ -57,6 +57,7 @@ EXECUTION_ENV = "QUARRY_RUNNER_EXECUTION"
 STDOUT_FD_ENV = "QUARRY_RUNNER_STDOUT_FD"
 STDERR_FD_ENV = "QUARRY_RUNNER_STDERR_FD"
 STDIN_FD_ENV = "QUARRY_RUNNER_STDIN_FD"
+PRIVATE_REDACTIONS_ENV = "QUARRY_RUNNER_PRIVATE_REDACTIONS"
 _PR_SET_PDEATHSIG = 1
 _EXIT_BOOTSTRAP_INVALID = 64
 _EXIT_CONTROL_FAILED = 65
@@ -355,6 +356,7 @@ def _execution_launcher_child(
         if request.cwd is not None:
             os.chdir(request.cwd)
         environment = {key: value for key, value in request.environment}
+        environment.pop(PRIVATE_REDACTIONS_ENV, None)
         os.execvpe(request.argv[0], list(request.argv), environment)
     except BaseException:
         try:

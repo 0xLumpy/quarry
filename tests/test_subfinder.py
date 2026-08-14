@@ -146,13 +146,14 @@ class TestSubfinderProviderFP:
     # Full sha256 (no entropy discarded), never a raw secret.
     def _clean(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(vertical.secrets, "chaos", lambda: None)
         for v in ("XDG_CONFIG_HOME", "SUBFINDER_PROVIDER_CONFIG", "SUBFINDER_CONFIG", "PDCP_API_KEY"):
             monkeypatch.delenv(v, raising=False)
 
     def test_changes_with_pdcp_key(self, monkeypatch, tmp_path):
         self._clean(monkeypatch, tmp_path)
         a = vertical._subfinder_provider_fp()
-        monkeypatch.setenv("PDCP_API_KEY", "k1")
+        monkeypatch.setattr(vertical.secrets, "chaos", lambda: "k1")
         assert vertical._subfinder_provider_fp() != a
 
     def test_changes_with_provider_config(self, monkeypatch, tmp_path):
@@ -196,7 +197,7 @@ class TestSubfinderProviderFP:
 
     def test_is_not_raw_secret_and_retains_128_bits(self, monkeypatch, tmp_path):
         self._clean(monkeypatch, tmp_path)
-        monkeypatch.setenv("PDCP_API_KEY", "SUPER-SECRET-KEY")
+        monkeypatch.setattr(vertical.secrets, "chaos", lambda: "SUPER-SECRET-KEY")
         fp = vertical._subfinder_provider_fp()
         assert "SUPER-SECRET-KEY" not in fp and len(fp) >= 32   # >= 128 bit, raw key never present
 

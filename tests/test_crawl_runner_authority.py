@@ -39,7 +39,6 @@ EXPECTED_NATIVE_SINKS = {
     ("probe", "run", "probe.nmap_service", (9,)),
     ("probe", "run", "smap", (4,)),
     ("vertical", "_recursive_permute", "puredns", (6,)),
-    ("vertical", "run", "vertical.shosubgo", (6,)),
 }
 
 

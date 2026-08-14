@@ -6,10 +6,12 @@ genuine "nothing found" (design §3).
 """
 from __future__ import annotations
 
+import json
 import os
 import select
 import signal
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -368,6 +370,27 @@ def _preflight_argv(cmd) -> "tuple[list[str] | None, str | None]":
     if not cmd[0]:
         return None, "argv[0] must be a non-empty executable"
     return list(cmd), None
+
+
+def _preflight_environment(env) -> "tuple[dict[str, str] | None, str | None]":
+    """Validate caller environment overrides without dispatching to caller-defined methods.
+
+    Only an exact builtin ``dict`` containing exact builtin ``str`` keys and values is authority.  The
+    base descriptor is used deliberately: even an apparently harmless ``dict``/``str`` subclass can run
+    user code during telemetry, sorting, merging, or IPC normalization.
+    """
+    if env is None:
+        return None, None
+    if type(env) is not dict:
+        return None, "environment must be an exact dict of strings"
+    normalized: dict[str, str] = {}
+    for key, value in dict.items(env):
+        if type(key) is not str or type(value) is not str:
+            return None, "environment keys and values must be exact strings"
+        if not key or "=" in key or "\x00" in key or "\x00" in value:
+            return None, "environment contains an invalid key or value"
+        normalized[key] = value
+    return normalized, None
 
 
 def _preflight_failure(tool: str, safe_cmd: "list[str] | None", detail: str) -> RunResult:
@@ -847,9 +870,12 @@ def _legacy_run(
     # staging, source reads, or subprocess launch. The remaining arguments are migrated to the typed worker
     # request in the next Phase 1 slice; do not describe this preparatory check as the complete boundary.
     argv, argv_error = _preflight_argv(cmd)
+    safe_env, env_error = _preflight_environment(env)
     preflight_errors = []
     if argv_error:
         preflight_errors.append(argv_error)
+    if env_error:
+        preflight_errors.append(env_error)
     if stdin_data is not None and input_file is not None:
         preflight_errors.append("stdin_data and input_file are mutually exclusive")
     if stdin_data is not None and not isinstance(stdin_data, str):
@@ -905,7 +931,7 @@ def _legacy_run(
 
     # env is merged over the inherited environment, not a replacement: callers pass only overrides
     # (e.g. {"PYTHONHASHSEED": "0"}) without dropping PATH.
-    proc_env = {**os.environ, **env} if env else None
+    proc_env = {**os.environ, **safe_env} if safe_env else None
 
     faults: list[dict] = []
     out_state = {"bytes": 0, "lines": 0, "nonspace": False, "sha256": "", "capped": False,
@@ -1504,6 +1530,56 @@ def native_output_current(result: RunResult, path) -> bool:
     return candidate in native["current_paths"]
 
 
+def _native_output_contains_private_value(transaction, policies, values: tuple[str, ...]) -> bool:
+    """Scan transaction-private native sinks before publication; a match makes the whole batch unpublished."""
+    tokens = tuple(sorted(
+        {value.encode("utf-8", "strict") for value in values if len(value) >= 6},
+        key=lambda value: (-len(value), value),
+    ))
+    if not tokens:
+        return False
+    paths = set()
+    for policy in policies:
+        for binding in policy.bindings:
+            paths.add(Path(transaction.rewritten_cmd[binding.argv_index]))
+
+    def file_contains(path: Path) -> bool:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        try:
+            carry = b""
+            overlap = max(len(token) for token in tokens) - 1
+            while True:
+                chunk = os.read(fd, 64 * 1024)
+                if not chunk:
+                    return False
+                block = carry + chunk
+                if any(token in block for token in tokens):
+                    return True
+                carry = block[-overlap:] if overlap else b""
+        finally:
+            os.close(fd)
+
+    for path in sorted(paths, key=lambda item: str(item)):
+        if not os.path.lexists(path):
+            continue
+        observed = path.lstat()
+        if stat.S_ISREG(observed.st_mode):
+            if file_contains(path):
+                return True
+        elif stat.S_ISDIR(observed.st_mode):
+            for child in sorted(path.rglob("*"), key=lambda item: str(item)):
+                child_observed = child.lstat()
+                if stat.S_ISDIR(child_observed.st_mode):
+                    continue
+                if not stat.S_ISREG(child_observed.st_mode):
+                    raise RuntimeError("native privacy scan encountered an unsupported object")
+                if file_contains(child):
+                    return True
+        else:
+            raise RuntimeError("native privacy scan encountered an unsupported root object")
+    return False
+
+
 def _run_with_repository(
     tool,
     cmd,
@@ -1546,6 +1622,10 @@ def _run_with_repository(
         failed = _preflight_failure(tool, safe_cmd, detail)
         return mark_native_preflight(failed)
 
+    safe_env, env_error = _preflight_environment(env)
+    if env_error is not None:
+        return preflight_failure(env_error)
+
     if type(repository) not in (store.Run, OsintSession):
         return preflight_failure("repository authority type is invalid")
     if (type(stdout) is not runner_repository.RepositoryOutput
@@ -1564,27 +1644,6 @@ def _run_with_repository(
                     os.path.abspath(str(repository.dir.joinpath(*stdout.components))))
         stderr_path = (None if stderr.disposition.value == "discard" else
                        os.path.abspath(str(repository.dir.joinpath(*stderr.components))))
-    try:
-        request_id = runner_protocol.new_request_id(os.urandom(16))
-        invocation = runner_protocol.normalize_invocation(
-            request_id=request_id,
-            tool=tool,
-            cmd=safe_cmd,
-            timeout=timeout,
-            stdin_data=stdin_data,
-            input_file=input_file,
-            ok_empty=ok_empty,
-            ok_codes=ok_codes,
-            env=env,
-            base_environment=dict(os.environ),
-            cwd=_TOOL_CWD,
-            raw_path=raw_path,
-            stderr_path=stderr_path,
-            max_output_bytes=max_output_bytes,
-        )
-    except (TypeError, ValueError) as exc:
-        return preflight_failure(f"typed invocation rejected ({type(exc).__name__})")
-
     if native_outputs:
         try:
             runner_native._validate_prepare_inputs(repository, safe_cmd, native_outputs)
@@ -1605,6 +1664,55 @@ def _run_with_repository(
             )
         return missing
 
+    prepared = None
+    try:
+        from . import runtime_identity
+        request_id = runner_protocol.new_request_id(os.urandom(16))
+        prepared = runtime_identity.prepare_launch(
+            tool, safe_cmd, caller_env=safe_env,
+            payload_scope=getattr(repository, "_runtime_payload_scope", None),
+        )
+        runtime_identity.revalidate_launch(prepared)
+        identity_ref = (
+            runtime_identity.publish_launch_identity(repository, request_id, prepared.record)
+            if type(repository) is store.Run else None
+        )
+        worker_environment = dict(prepared.environment)
+        if prepared.redactions:
+            worker_environment["QUARRY_RUNNER_PRIVATE_REDACTIONS"] = json.dumps(
+                list(prepared.redactions), ensure_ascii=False, separators=(",", ":"),
+            )
+        invocation = runner_protocol.normalize_invocation(
+            request_id=request_id,
+            tool=tool,
+            cmd=list(prepared.argv),
+            timeout=timeout,
+            stdin_data=stdin_data,
+            input_file=input_file,
+            ok_empty=ok_empty,
+            ok_codes=ok_codes,
+            env=worker_environment,
+            base_environment={},
+            cwd=_TOOL_CWD,
+            raw_path=raw_path,
+            stderr_path=stderr_path,
+            max_output_bytes=max_output_bytes,
+        )
+    except BaseException as exc:
+        if prepared is not None:
+            try:
+                prepared.close()
+            except BaseException as cleanup_fault:
+                exc = _preferred_native_fault(exc, cleanup_fault)
+        if not isinstance(exc, Exception):
+            raise exc.with_traceback(exc.__traceback__)
+        return preflight_failure(f"runtime admission rejected ({type(exc).__name__})")
+
+    runtime_meta = {
+        "runtime_identity": prepared.record,
+        "runtime_identity_ref": identity_ref,
+    }
+
     started_at = time.monotonic()
     deadline = ((1 << 53) - 1 if invocation.worker.timeout == 0
                 else started_at + float(invocation.worker.timeout) + 5.0)
@@ -1620,7 +1728,7 @@ def _run_with_repository(
         )
 
     def machinery_failure(exc, *, started=False):
-        return RunResult(
+        failed = RunResult(
             tool, safe_cmd, Status.FAILED, None,
             round(time.monotonic() - started_at, 3), None, 0,
             note=f"repository execution failed ({type(exc).__name__})",
@@ -1632,15 +1740,26 @@ def _run_with_repository(
                 ).to_dict()],
             },
         )
+        failed.meta.update(runtime_meta)
+        return failed
 
     if not native_outputs:
+        outcome = None
+        operation_fault = None
         try:
+            runtime_identity.revalidate_launch(prepared)
             outcome = supervise(invocation)
         except BaseException as exc:
-            if not isinstance(exc, Exception):
-                raise
-            return machinery_failure(exc)
-        return _repository_run_result(
+            operation_fault = exc
+        try:
+            prepared.close()
+        except BaseException as exc:
+            operation_fault = _preferred_native_fault(operation_fault, exc)
+        if operation_fault is not None:
+            if not isinstance(operation_fault, Exception):
+                raise operation_fault.with_traceback(operation_fault.__traceback__)
+            return machinery_failure(operation_fault, started=outcome is not None)
+        result = _repository_run_result(
             tool,
             safe_cmd,
             outcome,
@@ -1651,11 +1770,14 @@ def _run_with_repository(
             stderr_path=stderr_path,
             duration=time.monotonic() - started_at,
         )
+        result.meta.update(runtime_meta)
+        return result
 
     owner = _NativeFacadeOwner(runner_native.NativeOutputAdoption())
     result = None
     operation_fault = None
     finish_fault = None
+    private_output_refused = False
     try:
         with _NativeFacadeFence(owner):
             with _NativeFacadeFence(owner):
@@ -1663,13 +1785,19 @@ def _run_with_repository(
                     repository, safe_cmd, native_outputs,
                     adoption=owner.adoption,
                 )
+                if len(owner.transaction.rewritten_cmd) != len(prepared.source_argv_indexes):
+                    raise RuntimeError("native output rewrite does not match admitted source argv")
+                rewritten_argv = list(invocation.worker.argv)
+                for source_index, runtime_index in enumerate(prepared.source_argv_indexes[1:], start=1):
+                    rewritten_argv[runtime_index] = owner.transaction.rewritten_cmd[source_index]
                 child_invocation = replace(
                     invocation,
                     worker=replace(
                         invocation.worker,
-                        argv=owner.transaction.rewritten_cmd,
+                        argv=tuple(rewritten_argv),
                     ),
                 )
+                runtime_identity.revalidate_launch(prepared)
                 outcome = supervise(child_invocation)
                 result = _repository_run_result(
                     tool,
@@ -1682,17 +1810,26 @@ def _run_with_repository(
                     stderr_path=stderr_path,
                     duration=time.monotonic() - started_at,
                 )
+                result.meta.update(runtime_meta)
                 before_deadline = time.monotonic() < deadline
+                private_output_refused = _native_output_contains_private_value(
+                    owner.transaction, native_outputs, prepared.redactions,
+                )
                 owner.receipt, finish_fault = _finish_native_outputs(
                     owner.transaction,
                     owner.adoption,
                     clean=(
                         before_deadline
                         and _native_execution_clean(outcome, invocation.worker)
+                        and not private_output_refused
                     ),
                 )
     except BaseException as exc:
         operation_fault = exc
+    try:
+        prepared.close()
+    except BaseException as exc:
+        operation_fault = _preferred_native_fault(operation_fault, exc)
 
     receipt = owner.receipt
     fault = _preferred_native_fault(
@@ -1729,6 +1866,17 @@ def _run_with_repository(
             result.note = (
                 result.note + "; " if result.note else ""
             ) + "native output settlement did not return a receipt"
+    if private_output_refused:
+        result.status = Status.FAILED
+        result.note = (
+            result.note + "; " if result.note else ""
+        ) + "native output contained a framework credential and was refused"
+        result.meta.setdefault("faults", []).append(
+            Fault(
+                "publication", where=tool,
+                detail="native output contained a framework credential and was refused",
+            ).to_dict()
+        )
     if fault is not None and isinstance(fault, Exception):
         detail = f"native output settlement raised {type(fault).__name__}"
         result.meta.setdefault("faults", []).append(

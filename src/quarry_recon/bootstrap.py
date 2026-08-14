@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import platform
 import re
@@ -13,6 +14,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 from dataclasses import dataclass
@@ -48,6 +50,10 @@ def _failed(name: str, detail: str, *, required: bool = True,
 
 class _ArchiveError(Exception):
     """A downloaded archive failed verification or carries an unsafe member — never extracted."""
+
+
+_GO_RECEIPT = ".quarry-go-runtime-receipt.json"
+_GO_RECEIPT_SCHEMA = "quarry.go-runtime-receipt.v1"
 
 
 def load_bootstrap() -> dict:
@@ -257,8 +263,199 @@ def _renameat2_exchange_cmd(sudo: str, a: str, b: str) -> str:
     return f"{sudo}python3 -c {shlex.quote(py)} {shlex.quote(a)} {shlex.quote(b)}"
 
 
-def _swap_in_golang(cand: Path) -> tuple[bool, str]:
-    """Activate the verified go tree via atomic RENAME_EXCHANGE (move/fallback otherwise), keeping .last-good for rollback."""
+def _go_tree_digest(root: Path) -> str:
+    """Digest every path, mode, link target and regular-file byte in one extracted Go tree."""
+    rows = []
+    resolved = root.resolve(strict=True)
+    for path in sorted(resolved.rglob("*"), key=lambda p: p.relative_to(resolved).as_posix().encode()):
+        relative = path.relative_to(resolved).as_posix()
+        if relative == _GO_RECEIPT:
+            continue
+        observed = path.lstat()
+        mode = stat.S_IMODE(observed.st_mode)
+        if stat.S_ISDIR(observed.st_mode):
+            rows.append([relative, "directory", mode])
+        elif stat.S_ISREG(observed.st_mode):
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1 << 20), b""):
+                    digest.update(chunk)
+            rows.append([relative, "file", mode, observed.st_size, digest.hexdigest()])
+        elif stat.S_ISLNK(observed.st_mode):
+            rows.append([relative, "symlink", mode, os.readlink(path)])
+        else:
+            raise _ArchiveError(f"Go tree contains an unsupported object: {relative}")
+    body = json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "strict")
+    return hashlib.sha256(body).hexdigest()
+
+
+def _fsync_tree(root: Path) -> None:
+    """Flush every regular inode and directory in a staged tree before its name can be published."""
+    directories = [root]
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).parts):
+        observed = path.lstat()
+        if stat.S_ISDIR(observed.st_mode):
+            directories.append(path)
+        elif stat.S_ISREG(observed.st_mode):
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        elif not stat.S_ISLNK(observed.st_mode):
+            raise _ArchiveError(f"Go tree contains an unsupported durable object: {path}")
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def _settle_go_operation(root: Path) -> None:
+    """Remove the private installer operation tree and never claim cleanup while a name remains."""
+    if not os.path.lexists(root):
+        return
+    errors = []
+    try:
+        os.chmod(root, 0o700)
+        for path in sorted(root.rglob("*"), key=lambda item: len(item.parts)):
+            observed = path.lstat()
+            if observed.st_uid != os.geteuid():
+                raise _ArchiveError(f"Go operation contains a foreign-owned object: {path}")
+            if stat.S_ISDIR(observed.st_mode):
+                os.chmod(path, 0o700)
+            elif not (stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode)):
+                raise _ArchiveError(f"Go operation contains an unsupported object: {path}")
+    except BaseException as exc:
+        errors.append(exc)
+    try:
+        shutil.rmtree(root)
+    except FileNotFoundError:
+        pass
+    except BaseException as exc:
+        errors.append(exc)
+    cancellation = next((fault for fault in errors if not isinstance(fault, Exception)), None)
+    if os.path.lexists(root):
+        residue = _ArchiveError(
+            f"private Go installer operation remains after cleanup "
+            f"({type(errors[0]).__name__ if errors else 'unknown fault'}): {root}"
+        )
+        if cancellation is not None:
+            cancellation.add_note(f"Go installer residue also remains: {residue}")
+            raise cancellation.with_traceback(cancellation.__traceback__)
+        raise residue
+    if cancellation is not None:
+        raise cancellation.with_traceback(cancellation.__traceback__)
+
+
+def _write_go_receipt(root: Path, *, release: str, archive_sha256: str,
+                      payload_identity: str) -> None:
+    body = (json.dumps({
+        "schema_version": _GO_RECEIPT_SCHEMA,
+        "release": release,
+        "archive_sha256": archive_sha256,
+        "payload_identity": "sha256:" + payload_identity,
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8", "strict")
+    path = root / _GO_RECEIPT
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        view = memoryview(body)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("Go runtime receipt write made no progress")
+            view = view[written:]
+        os.fsync(fd)
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+
+
+def _validate_go_receipt(root: Path, *, release: str, archive_sha256: str,
+                         payload_identity: str) -> None:
+    try:
+        path = root / _GO_RECEIPT
+        observed = path.lstat()
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise _ArchiveError("Go runtime receipt is unreadable") from exc
+    expected = {
+        "schema_version": _GO_RECEIPT_SCHEMA,
+        "release": release,
+        "archive_sha256": archive_sha256,
+        "payload_identity": "sha256:" + payload_identity,
+    }
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1
+            or stat.S_IMODE(observed.st_mode) != 0o600 or document != expected
+            or _go_tree_digest(root) != payload_identity):
+        raise _ArchiveError("Go runtime receipt does not describe the staged payload")
+
+
+def _fsync_go_tree_cmd(sudo: str, root: str) -> str:
+    program = (
+        "import os,stat,sys\n"
+        "r=sys.argv[1]; ds=[r]\n"
+        "for b,d,fs in os.walk(r):\n"
+        " ds.extend(os.path.join(b,x) for x in d)\n"
+        " for n in fs:\n"
+        "  p=os.path.join(b,n); s=os.lstat(p)\n"
+        "  if stat.S_ISREG(s.st_mode):\n"
+        "   f=os.open(p,os.O_RDONLY|os.O_NOFOLLOW); os.fsync(f); os.close(f)\n"
+        "for p in sorted(ds,key=lambda x:x.count(os.sep),reverse=True):\n"
+        " f=os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); os.fsync(f); os.close(f)"
+    )
+    return f"{sudo}python3 -c {shlex.quote(program)} {shlex.quote(root)}"
+
+
+def _fsync_go_names_cmd(sudo: str, *directories: str) -> str:
+    program = (
+        "import os,sys\n"
+        "for p in sys.argv[1:]:\n"
+        " f=os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); os.fsync(f); os.close(f)"
+    )
+    return f"{sudo}python3 -c {shlex.quote(program)} " + " ".join(
+        shlex.quote(path) for path in directories
+    )
+
+
+def _atomic_go_launcher_cmd(sudo: str) -> str:
+    """Snapshot the prior launcher, then publish the stable Go name with one rename."""
+    tmp = f"/usr/local/bin/.go.quarry-{os.getpid()}"
+    backup = f"/usr/local/bin/.go.quarry-last-good-{os.getpid()}"
+    absent = backup + ".absent"
+    script = (
+        f"set -eu; t={shlex.quote(tmp)}; b={shlex.quote(backup)}; a={shlex.quote(absent)}; "
+        "rm -f \"$t\" \"$b\" \"$a\"; "
+        "if [ -e /usr/local/bin/go ] || [ -L /usr/local/bin/go ]; then "
+        "cp -aP /usr/local/bin/go \"$b\"; else : >\"$a\"; fi; "
+        "trap 'rm -f \"$t\"' EXIT; "
+        "ln -s /usr/local/go/bin/go \"$t\"; "
+        "mv -Tf \"$t\" /usr/local/bin/go; trap - EXIT"
+    )
+    return f"{sudo}sh -c {shlex.quote(script)}"
+
+
+def _restore_go_launcher_cmd(sudo: str) -> str:
+    backup = f"/usr/local/bin/.go.quarry-last-good-{os.getpid()}"
+    absent = backup + ".absent"
+    script = (
+        f"set -eu; b={shlex.quote(backup)}; a={shlex.quote(absent)}; "
+        "if [ -e \"$b\" ] || [ -L \"$b\" ]; then mv -Tf \"$b\" /usr/local/bin/go; "
+        "elif [ -e \"$a\" ]; then rm -f /usr/local/bin/go; fi; rm -f \"$a\""
+    )
+    return f"{sudo}sh -c {shlex.quote(script)}"
+
+
+def _drop_go_launcher_backup_cmd(sudo: str) -> str:
+    backup = f"/usr/local/bin/.go.quarry-last-good-{os.getpid()}"
+    return f"{sudo}rm -f {shlex.quote(backup)} {shlex.quote(backup + '.absent')}"
+
+
+def _swap_in_golang(cand: Path, expected_tree_digest: str | None = None, *,
+                    expected_release: str | None = None,
+                    archive_sha256: str | None = None) -> tuple[bool, str]:
+    """Activate a reverified Go tree via atomic rename/exchange, keeping last-good for rollback."""
     sudo = _sudo()
     new = f"/usr/local/go.new.{os.getpid()}"
     lastgood = "/usr/local/go.last-good"
@@ -267,42 +464,75 @@ def _swap_in_golang(cand: Path) -> tuple[bool, str]:
     if _sh(f"{sudo}cp -a {shlex.quote(str(cand))} {new}", False, 300)[0] != 0:
         _sh(f"{sudo}rm -rf {new}", False, 60)                 # live tree untouched — only staging is cleared
         return False, "staging copy failed"
+    if expected_tree_digest is not None:
+        try:
+            copied_digest = _go_tree_digest(Path(new))
+        except (OSError, _ArchiveError) as exc:
+            _sh(f"{sudo}rm -rf {new}", False, 60)
+            return False, f"staged Go payload could not be verified: {type(exc).__name__}"
+        if copied_digest != expected_tree_digest:
+            _sh(f"{sudo}rm -rf {new}", False, 60)
+            return False, "staged Go payload differs from the verified archive"
+        if expected_release is not None and archive_sha256 is not None:
+            try:
+                _validate_go_receipt(
+                    Path(new), release=expected_release, archive_sha256=archive_sha256,
+                    payload_identity=expected_tree_digest,
+                )
+            except (OSError, _ArchiveError) as exc:
+                _sh(f"{sudo}rm -rf {new}", False, 60)
+                return False, f"staged Go receipt could not be verified: {type(exc).__name__}"
+    if _sh(_fsync_go_tree_cmd(sudo, new), False, 300)[0] != 0:
+        _sh(f"{sudo}rm -rf {new}", False, 60)
+        return False, "staged Go payload could not be made durable"
+
+    # The stable launcher is published before the tree. On a first install it is briefly dangling, never
+    # active against unreceipted bytes; on an update it continues to execute the old tree until exchange.
+    if _sh(_atomic_go_launcher_cmd(sudo), False, 60)[0] != 0:
+        _sh(f"{sudo}rm -rf {new}", False, 60)
+        return False, "Go launcher could not be prepared before activation"
+    if _sh(_fsync_go_names_cmd(sudo, "/usr/local/bin"), False, 60)[0] != 0:
+        _sh(_restore_go_launcher_cmd(sudo), False, 60)
+        _sh(f"{sudo}rm -rf {new}", False, 60)
+        return False, "Go launcher publication could not be made durable"
 
     live_exists = _sh(f"{sudo}sh -c 'test -e /usr/local/go'", False, 30)[0] == 0
     have_lastgood = False
     if not live_exists:
         if _sh(f"{sudo}mv {new} /usr/local/go", False, 120)[0] != 0:
+            _sh(_restore_go_launcher_cmd(sudo), False, 60)
             _sh(f"{sudo}rm -rf {new}", False, 60)
             return False, "activation move failed"
     elif _sh(_renameat2_exchange_cmd(sudo, new, "/usr/local/go"), False, 60)[0] == 0:
         # exchanged (go=new, new=old); preserve old as last-good, else exchange back and drop the new tree
         if _sh(f"{sudo}mv {new} {lastgood}", False, 120)[0] != 0:
             if _sh(_renameat2_exchange_cmd(sudo, new, "/usr/local/go"), False, 60)[0] != 0:
+                _sh(_restore_go_launcher_cmd(sudo), False, 60)
                 return False, ("could NOT preserve the previous tree AND could not restore it — /usr/local/go "
                                "may be inconsistent")
             _sh(f"{sudo}rm -rf {new}", False, 60)             # `new` now holds the rejected new tree
+            _sh(_restore_go_launcher_cmd(sudo), False, 60)
             return False, "could NOT preserve the previous tree — restored the original, live install unchanged"
         have_lastgood = True
     else:
-        # no renameat2: displace the live tree only now that the replacement is proven staged
-        if _sh(f"{sudo}sh -c 'mv /usr/local/go {lastgood} && mv {new} /usr/local/go'", False, 120)[0] != 0:
-            _sh(f"{sudo}sh -c 'rm -rf {new}; if [ ! -e /usr/local/go ] && [ -e {lastgood} ]; then "
-                f"mv {lastgood} /usr/local/go; fi'", False, 60)
-            return False, "activation swap failed"
-        have_lastgood = _sh(f"{sudo}sh -c 'test -e {lastgood}'", False, 30)[0] == 0
-
-    if _sh(f"{sudo}ln -sf /usr/local/go/bin/go /usr/local/bin/go", False, 60)[0] != 0:
-        # post-activation failure: restore last-good only if we truly have it, and report honestly either way
+        # A two-move fallback has an observable absent/mixed window and cannot satisfy the release atomicity
+        # contract.  Keep the live tree byte-for-byte and require an atomic exchange-capable host.
+        _sh(f"{sudo}rm -rf {new}", False, 60)
+        _sh(_restore_go_launcher_cmd(sudo), False, 60)
+        return False, "atomic rename exchange unavailable — live Go tree kept"
+    if _sh(_fsync_go_names_cmd(sudo, "/usr/local", "/usr/local/bin"), False, 60)[0] != 0:
+        restored = (have_lastgood and
+                    _sh(_renameat2_exchange_cmd(sudo, lastgood, "/usr/local/go"), False, 60)[0] == 0)
         if not have_lastgood:
-            return False, "symlink step failed after activation and there is no last-good — /usr/local/go may be inconsistent"
-        restored = _sh(_renameat2_exchange_cmd(sudo, lastgood, "/usr/local/go"), False, 60)[0] == 0
-        if not restored:
-            restored = _sh(f"{sudo}sh -c 'rm -rf /usr/local/go && mv {lastgood} /usr/local/go'", False, 120)[0] == 0
-        _sh(f"{sudo}sh -c 'rm -rf {lastgood}; ln -sf /usr/local/go/bin/go /usr/local/bin/go'", False, 60)
+            restored = _sh(f"{sudo}rm -rf /usr/local/go", False, 120)[0] == 0
+        _sh(_restore_go_launcher_cmd(sudo), False, 60)
+        _sh(f"{sudo}rm -rf {lastgood}", False, 60)
         if restored:
-            return False, "symlink step failed after activation — restored last-good"
-        return False, "symlink step failed AND last-good could NOT be restored — /usr/local/go may be inconsistent"
+            return False, "Go activation durability failed — restored last-good"
+        return False, "Go activation durability failed and last-good could NOT be restored"
+    _sh(_drop_go_launcher_backup_cmd(sudo), False, 60)
     _sh(f"{sudo}rm -rf {lastgood}", False, 60)                # activation confirmed; drop the rollback copy
+    _sh(_fsync_go_names_cmd(sudo, "/usr/local", "/usr/local/bin"), False, 60)
     return True, ""
 
 
@@ -322,9 +552,52 @@ def _install_golang_safe(echo, url: str, sha: str) -> tuple[bool, str]:
         cand = stage / "go"
         if not (cand / "bin" / "go").is_file():
             return False, "archive did not contain go/bin/go"
-        return _swap_in_golang(cand)
+        try:
+            probe = subprocess.run([str(cand / "bin" / "go"), "version"], capture_output=True,
+                                   text=True, timeout=30,
+                                   env={"HOME": str(op), "PATH": "/usr/bin:/bin", "LANG": "C"})
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f"candidate runtime probe failed: {type(exc).__name__}"
+        release = re.search(r"/go([0-9]+(?:\.[0-9]+)+)\.", url)
+        wanted = f"go{release.group(1)}" if release else ""
+        if probe.returncode != 0 or not wanted or wanted not in probe.stdout.split():
+            return False, "candidate runtime identity does not match the pinned Go release"
+        try:
+            tree_digest = _go_tree_digest(cand)
+        except (OSError, _ArchiveError) as exc:
+            return False, f"candidate payload identity failed: {type(exc).__name__}"
+        try:
+            _write_go_receipt(
+                cand, release=wanted, archive_sha256=sha, payload_identity=tree_digest,
+            )
+            _fsync_tree(cand)
+            _validate_go_receipt(
+                cand, release=wanted, archive_sha256=sha, payload_identity=tree_digest,
+            )
+        except (OSError, _ArchiveError) as exc:
+            return False, f"candidate receipt/durability failed: {type(exc).__name__}"
+        return _swap_in_golang(
+            cand, tree_digest, expected_release=wanted, archive_sha256=sha,
+        )
     finally:
-        shutil.rmtree(op, ignore_errors=True)
+        primary = sys.exc_info()[1]
+        try:
+            _settle_go_operation(op)
+        except BaseException as cleanup_fault:
+            if primary is None:
+                raise
+            if not isinstance(primary, Exception):
+                primary.add_note(
+                    f"Go installer cleanup also failed: {type(cleanup_fault).__name__}: "
+                    f"{cleanup_fault}"
+                )
+            elif not isinstance(cleanup_fault, Exception):
+                raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
+            else:
+                primary.add_note(
+                    f"Go installer cleanup also failed: {type(cleanup_fault).__name__}: "
+                    f"{cleanup_fault}"
+                )
 
 
 def ensure_golang(echo, dry: bool) -> InstallResult:
@@ -400,14 +673,32 @@ def install_data_files(echo, dry: bool, update: bool = False) -> InstallResult:
 
     # framework secrets store — created once, chmod 600, never overwritten
     sp = Path.home() / ".config" / "quarry" / "secrets.yaml"
-    if sp.exists():
-        echo("  secrets.yaml: present")
+    if os.path.lexists(sp):
+        from . import secrets as _secrets
+        try:
+            _secrets.validate_store_path(sp)
+        except _secrets.SecretStoreError as exc:
+            echo(f"  secrets.yaml: UNSAFE ({exc}) — existing file kept, credentials disabled")
+            failures.append("secrets.yaml")
+        else:
+            echo("  secrets.yaml: present")
     else:
         sp.parent.mkdir(parents=True, exist_ok=True)
         if not dry:
             tpl = resources.files("quarry_recon.data").joinpath("secrets.template.yaml").read_text()
-            sp.write_text(tpl)
-            sp.chmod(0o600)
+            fd = os.open(sp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                data = tpl.encode("utf-8", "strict")
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("secrets template write made no progress")
+                    view = view[written:]
+                os.fchmod(fd, 0o600)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         echo("  secrets.yaml: created")
 
     # non-secret runtime config (performance / local paths) — created once, never overwritten

@@ -13,6 +13,7 @@ import json
 import os
 import queue
 import re
+import signal
 import shutil
 import subprocess
 import threading
@@ -21,7 +22,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import privfs, runner
+from . import privfs, runner, runtime_identity, secrets
 from .state import ContractError
 
 
@@ -29,6 +30,7 @@ _OOB_SESSION_COMPONENTS = ("raw", "oob", "session", "session.json")
 _OOB_LOG_COMPONENTS = ("raw", "oob", "session", "interactions.jsonl")
 _OOB_CLIENT_SESSION_COMPONENTS = ("raw", "oob", "session", "interactsh.session")
 _SESSION_REFERENCE_FIELDS = frozenset({"log", "session_file"})
+_POPEN_TYPE = subprocess.Popen
 
 
 @contextmanager
@@ -395,6 +397,129 @@ def _await_register(proc, server, wait):
     return parsed
 
 
+def _prepare_client_launch(run, command: list[str], *, lifetime: ExitStack,
+                           record_directory: Path | None = None):
+    """Admit one Interactsh process and bind its exact runtime without serializing argv.
+
+    A live base can publish through its artifact authority.  A sealed-base resume instead places the
+    identity beside the already-isolated revision candidate, so it never re-opens a canonical base name.
+    Lightweight compatibility callers still receive the same fail-closed executable admission, but have no
+    repository in which an evidence record could honestly be published.
+    """
+    prepared = runtime_identity.prepare_launch(
+        "interactsh-client", command,
+        payload_scope=getattr(run, "_runtime_payload_scope", None),
+    )
+    request_id = os.urandom(16).hex()
+    try:
+        runtime_identity.revalidate_launch(prepared)
+        if record_directory is not None:
+            body = (json.dumps(prepared.record, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False) + "\n")
+            privfs.write_private(Path(record_directory) / f"runtime-identity-{request_id}.json", body)
+        else:
+            from . import store as _store
+            if type(run) is _store.Run:
+                runtime_identity.publish_launch_identity(run, request_id, prepared.record)
+    except BaseException as primary:
+        cleanup_fault = None
+        try:
+            prepared.close()
+        except BaseException as exc:
+            cleanup_fault = exc
+        if not isinstance(primary, Exception):
+            if cleanup_fault is not None:
+                primary.add_note(
+                    f"runtime identity cleanup also failed: {type(cleanup_fault).__name__}: "
+                    f"{cleanup_fault}"
+                )
+            raise primary.with_traceback(primary.__traceback__)
+        if cleanup_fault is not None and not isinstance(cleanup_fault, Exception):
+            raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
+        if cleanup_fault is not None:
+            primary.add_note(
+                f"runtime identity cleanup also failed: {type(cleanup_fault).__name__}: "
+                f"{cleanup_fault}"
+            )
+        raise primary.with_traceback(primary.__traceback__)
+    lifetime.callback(prepared.close)
+    return list(prepared.argv), dict(prepared.environment)
+
+
+def _settle_partial_popen(proc) -> None:
+    """Kill, exactly reap, and close a Popen whose constructor raised after creating a child."""
+    faults: list[BaseException] = []
+    try:
+        pid = getattr(proc, "pid", None)
+    except BaseException as exc:
+        pid = None
+        faults.append(exc)
+    if type(pid) is int and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except BaseException as exc:
+            faults.append(exc)
+        try:
+            waited, status = os.waitpid(pid, 0)
+            if waited == pid:
+                proc.returncode = os.waitstatus_to_exitcode(status)
+        except ChildProcessError:
+            try:
+                proc.poll()
+            except BaseException as exc:
+                faults.append(exc)
+        except BaseException as exc:
+            faults.append(exc)
+    for name in ("stdin", "stdout", "stderr"):
+        try:
+            stream = getattr(proc, name, None)
+            if stream is not None:
+                stream.close()
+        except BaseException as exc:
+            faults.append(exc)
+    cancellation = next((fault for fault in faults if not isinstance(fault, Exception)), None)
+    if cancellation is not None:
+        raise cancellation.with_traceback(cancellation.__traceback__)
+    if faults:
+        raise faults[0].with_traceback(faults[0].__traceback__)
+
+
+def _spawn_client(owner: dict, claims: ExitStack, argv: list[str], environment: dict[str, str],
+                  *, cwd: Path):
+    """Publish child authority before fork so constructor cancellation cannot orphan a credential user."""
+    kwargs = {
+        "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True,
+        "start_new_session": True, "env": environment, "cwd": str(cwd),
+    }
+    factory = subprocess.Popen
+    if factory is _POPEN_TYPE:
+        proc = _POPEN_TYPE.__new__(_POPEN_TYPE)
+        owner["proc"] = proc
+        setattr(proc, "_quarry_oob_claims", claims)
+        try:
+            _POPEN_TYPE.__init__(proc, argv, **kwargs)
+        except BaseException as primary:
+            try:
+                _settle_partial_popen(proc)
+                owner["constructor_settled"] = True
+            except BaseException as cleanup_fault:
+                if isinstance(primary, Exception) and not isinstance(cleanup_fault, Exception):
+                    raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
+                primary.add_note(
+                    f"OOB constructor cleanup also failed: {type(cleanup_fault).__name__}: "
+                    f"{cleanup_fault}"
+                )
+            raise primary.with_traceback(primary.__traceback__)
+    else:
+        # Test doubles retain Popen's documented postcondition that a raise creates no child authority.
+        proc = factory(argv, **kwargs)
+        owner["proc"] = proc
+        setattr(proc, "_quarry_oob_claims", claims)
+    return proc
+
+
 def open_session(run, server=None, token=None, wait: int = 12):
     """Start a Quarry-owned interactsh-client session and return (session_dict, proc), persisting
     raw/oob/session.json with an empty token_map.
@@ -408,6 +533,7 @@ def open_session(run, server=None, token=None, wait: int = 12):
         return None
     claims = ExitStack()
     proc = None
+    spawn_owner: dict = {}
     try:
         # These lifetime claims exist even though interactsh opens the files by
         # name.  They keep the base seal from racing a process that can still
@@ -424,16 +550,21 @@ def open_session(run, server=None, token=None, wait: int = 12):
         sf = run.dir.joinpath(*_OOB_CLIENT_SESSION_COMPONENTS)
         # -session-file makes the session resumable: a later client on the same file re-opens the same
         # correlation id, so closing after a poll does not lose delayed callbacks
-        cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(sf)]
+        cmd = ["interactsh-client", "-duc", "-json", "-o", str(log),
+               "-session-file", str(sf)]
         # -server wants bare domains, not a URL (nuclei's -iserver takes the full URL)
         srv = ",".join(_server_hosts(server)) if server else ""
         if srv:
             cmd += ["-server", srv]
         if token:
-            cmd += ["-token", str(token)]       # auth for a protected/self-hosted interactsh
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                start_new_session=True)
-        setattr(proc, "_quarry_oob_claims", claims)
+            # The config remains private for exactly the process lifetime.  Authentication material is
+            # never exposed through argv, process listings, telemetry, or runtime-identity evidence.
+            config = claims.enter_context(
+                secrets.private_tool_config("interactsh", {"token": str(token)}),
+            )
+            cmd += ["-config", str(config)]
+        admitted_cmd, admitted_env = _prepare_client_launch(run, cmd, lifetime=claims)
+        proc = _spawn_client(spawn_owner, claims, admitted_cmd, admitted_env, cwd=run.dir)
         parsed = _await_register(proc, server, wait)
         if parsed is None:
             close_session(proc)
@@ -445,7 +576,8 @@ def open_session(run, server=None, token=None, wait: int = 12):
         save_session(run, session)
         return session, proc
     except BaseException:
-        if proc is None:
+        proc = proc or spawn_owner.get("proc")
+        if proc is None or spawn_owner.get("constructor_settled"):
             claims.close()
         else:
             close_session(proc)
@@ -490,12 +622,12 @@ def resume_session(run, token=None, server=None, wait: int = 12):
             f"{run.dir}: {why} — refusing to resume OOB acquisition against it",
             retryable=True,
         )
-    claims = None
+    claims = ExitStack()
+    spawn_owner: dict = {}
     if disposition == "live":
         # The original session remains the live candidate.  Claims cover the
         # complete interval in which an external process owns its two names.
         if repository_run:
-            claims = ExitStack()
             claims.enter_context(run.artifact_claim())
             claims.enter_context(run.artifact_claim())
         log, session_file = old_log, old_session
@@ -509,26 +641,33 @@ def resume_session(run, token=None, server=None, wait: int = 12):
         session["log"] = _repository_ref(run, log, field="log")
         session["session_file"] = _repository_ref(run, session_file, field="session_file")
         session["revision_candidate"] = candidate.name
-    cmd = ["interactsh-client", "-json", "-o", str(log), "-session-file", str(session_file)]
+    cmd = ["interactsh-client", "-duc", "-json", "-o", str(log),
+           "-session-file", str(session_file)]
     srv = ",".join(_server_hosts(prev.get("server"))) if prev.get("server") else ""   # bare domains for -server
     if srv:
         cmd += ["-server", srv]
     eff_token = _resume_token(prev.get("server"), server, token)
     if eff_token:
-        cmd += ["-token", eff_token]
+        config = claims.enter_context(
+            secrets.private_tool_config("interactsh", {"token": eff_token}),
+        )
+        cmd += ["-config", str(config)]
     proc = None
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                start_new_session=True)
-        if claims is not None:
-            setattr(proc, "_quarry_oob_claims", claims)
+        identity_directory = log.parent if disposition == "sealed" else None
+        admitted_cmd, admitted_env = _prepare_client_launch(
+            run, cmd, lifetime=claims, record_directory=identity_directory,
+        )
+        spawn_cwd = run.dir if repository_run else log.parent
+        proc = _spawn_client(spawn_owner, claims, admitted_cmd, admitted_env, cwd=spawn_cwd)
         parsed = _await_register(proc, prev.get("server"), wait)
         if parsed is None or parsed[0] != prev.get("domain"):
             close_session(proc)
             return None
         return session, proc
     except BaseException:
-        if proc is None and claims is not None:
+        proc = proc or spawn_owner.get("proc")
+        if proc is None or spawn_owner.get("constructor_settled"):
             claims.close()
         elif proc is not None:
             close_session(proc)
@@ -536,20 +675,33 @@ def resume_session(run, token=None, server=None, wait: int = 12):
 
 
 def close_session(proc) -> None:
-    """Stop the session's whole process group (best-effort, reaped) and close its stdout pipe."""
-    runner.terminate_group(proc)
+    """Settle process, streams, and private claims while preserving cleanup-time cancellation."""
+    faults: list[BaseException] = []
     try:
-        if proc.stdout:
+        runner.terminate_group(proc)
+    except BaseException as exc:
+        faults.append(exc)
+    try:
+        if getattr(proc, "stdout", None):
             proc.stdout.close()
-    except Exception:
-        pass
+    except BaseException as exc:
+        faults.append(exc)
     claims = getattr(proc, "_quarry_oob_claims", None)
     if claims is not None:
-        claims.close()
         try:
-            delattr(proc, "_quarry_oob_claims")
-        except (AttributeError, TypeError):
-            pass
+            claims.close()
+        except BaseException as exc:
+            faults.append(exc)
+        finally:
+            try:
+                delattr(proc, "_quarry_oob_claims")
+            except (AttributeError, TypeError):
+                pass
+    cancellation = next((fault for fault in faults if not isinstance(fault, Exception)), None)
+    if cancellation is not None:
+        raise cancellation.with_traceback(cancellation.__traceback__)
+    if faults:
+        raise faults[0].with_traceback(faults[0].__traceback__)
 
 
 def correlate(rows: list[dict], session: dict) -> list[dict]:

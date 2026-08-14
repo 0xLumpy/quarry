@@ -961,26 +961,38 @@ class TestNativeLaneOutcomes:
         from quarry_recon.osint import OsintSession
         return OsintSession(tmp_path, "t")
 
+    @staticmethod
+    def _tool_result(exit_code: int):
+        from quarry_recon.runner import RunResult
+        status = Status.SUCCESS if exit_code == 0 else Status.FAILED
+
+        def run(tool, cmd, *, repository, stdout, stderr, **_kwargs):
+            raw = repository.dir.joinpath(*stdout.components)
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw.write_text("")
+            diagnostic = repository.dir.joinpath(*stderr.components)
+            diagnostic.parent.mkdir(parents=True, exist_ok=True)
+            diagnostic.write_text("no whois" if tool == "whois" else "")
+            return RunResult(
+                tool, cmd, status, exit_code, 0.0, raw, 0,
+                stderr_tail=("no whois" if tool == "whois" else ""),
+            )
+        return run
+
     def test_whois_nonzero_exit_is_a_gap(self, tmp_path, monkeypatch):
-        import subprocess as sp
-        monkeypatch.setattr(sp, "run",
-                            lambda *a, **k: sp.CompletedProcess(a[0], 2, stdout="", stderr="no whois"))
+        monkeypatch.setattr(osint, "exec_tool", self._tool_result(2))
         s = self._sess(tmp_path)
         osint._whois(s, "acme.com", lambda m: None, 30)
         assert s.outcome()["verdict"] == "complete_with_gaps"
 
     def test_dig_nonzero_exit_is_a_gap(self, tmp_path, monkeypatch):
-        import subprocess as sp
-        monkeypatch.setattr(sp, "run",
-                            lambda *a, **k: sp.CompletedProcess(a[0], 9, stdout="", stderr=""))
+        monkeypatch.setattr(osint, "exec_tool", self._tool_result(9))
         s = self._sess(tmp_path)
         osint._dmarc(s, "acme.com", lambda m: None, 30)
         assert s.outcome()["verdict"] == "complete_with_gaps"
 
     def test_a_clean_subprocess_is_not_a_gap(self, tmp_path, monkeypatch):
-        import subprocess as sp
-        monkeypatch.setattr(sp, "run",
-                            lambda *a, **k: sp.CompletedProcess(a[0], 0, stdout="", stderr=""))
+        monkeypatch.setattr(osint, "exec_tool", self._tool_result(0))
         s = self._sess(tmp_path)
         osint._dmarc(s, "acme.com", lambda m: None, 30)
         assert s.outcome()["verdict"] == "complete"

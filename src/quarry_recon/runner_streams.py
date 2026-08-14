@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import math
 import os
 import selectors
@@ -31,6 +32,26 @@ from .runner_protocol import (
 _CHUNK_BYTES = 64 * 1024
 _SELECT_SLICE = 0.05
 _SETTLEMENT_GRACE_SECONDS = 5.0
+_PRIVATE_REDACTIONS_ENV = "QUARRY_RUNNER_PRIVATE_REDACTIONS"
+
+
+def _request_redactions(request: WorkerRequest) -> tuple[bytes, ...]:
+    raw = dict(request.environment).get(_PRIVATE_REDACTIONS_ENV)
+    if raw is None:
+        return ()
+    try:
+        values = json.loads(raw)
+    except (TypeError, ValueError):
+        raise RuntimeError("stream_redactions_invalid") from None
+    if (not isinstance(values, list) or not values
+            or not all(isinstance(value, str) and len(value) >= 6 for value in values)
+            or len(values) != len(set(values))):
+        raise RuntimeError("stream_redactions_invalid")
+    try:
+        encoded = tuple(value.encode("utf-8", "strict") for value in values)
+    except UnicodeError:
+        raise RuntimeError("stream_redactions_invalid") from None
+    return tuple(sorted(encoded, key=lambda value: (-len(value), value)))
 
 
 def _valid_deadline(value, name: str, *, optional: bool) -> float | None:
@@ -87,6 +108,8 @@ class _OutputState:
     lines: int = 0
     terminal: StreamTerminal | None = None
     detail: str | None = None
+    redactions: tuple[bytes, ...] = ()
+    redaction_carry: bytes = b""
 
     @property
     def open(self) -> bool:
@@ -124,6 +147,56 @@ class _OutputState:
             self.lines += committed.count(b"\n")
             view = view[written:]
 
+    def _sanitize(self, data: bytes, *, final: bool) -> bytes:
+        if not self.redactions:
+            return data
+        combined = self.redaction_carry + data
+        if final:
+            emit_at = len(combined)
+        else:
+            emit_at = max(0, len(combined) - max(len(value) for value in self.redactions) + 1)
+            # Do not split a complete match: keeping the whole raw value lets the next chunk replace every
+            # byte, rather than leaking a prefix/suffix around an arbitrary read boundary.
+            for value in self.redactions:
+                start = combined.find(value)
+                while start >= 0:
+                    end = start + len(value)
+                    if start < emit_at < end:
+                        emit_at = start
+                    start = combined.find(value, start + 1)
+        sanitized = combined
+        for value in self.redactions:
+            sanitized = sanitized.replace(value, b"*" * len(value))
+        emitted = sanitized[:emit_at]
+        self.redaction_carry = b"" if final else combined[emit_at:]
+        return emitted
+
+    def _consume_bytes(self, chunk: bytes) -> None:
+        chunk = self._sanitize(chunk, final=False)
+        if not chunk:
+            return
+        self.observed_hash.update(chunk)
+        self.observed_bytes += len(chunk)
+        if self.stage_fd is None:
+            return
+        if self.cap is None:
+            retained = chunk
+        else:
+            remaining = max(0, self.cap - self.retained_bytes)
+            retained = chunk[:remaining]
+        self._retain(retained)
+
+    def flush_redaction(self) -> None:
+        chunk = self._sanitize(b"", final=True)
+        if not chunk:
+            return
+        self.observed_hash.update(chunk)
+        self.observed_bytes += len(chunk)
+        if self.stage_fd is None:
+            return
+        retained = chunk if self.cap is None else chunk[:max(0, self.cap - self.retained_bytes)]
+        self._retain(retained)
+
     def consume_ready(self, selector: selectors.BaseSelector) -> None:
         while self.pipe_fd >= 0:
             try:
@@ -136,18 +209,10 @@ class _OutputState:
                 self.close_pipe(selector)
                 return
             if not chunk:
+                self.flush_redaction()
                 self.close_pipe(selector)
                 return
-            self.observed_hash.update(chunk)
-            self.observed_bytes += len(chunk)
-            if self.stage_fd is None:
-                continue
-            if self.cap is None:
-                retained = chunk
-            else:
-                remaining = max(0, self.cap - self.retained_bytes)
-                retained = chunk[:remaining]
-            self._retain(retained)
+            self._consume_bytes(chunk)
 
     def fsync_stage(self) -> None:
         if self.stage_fd is None:
@@ -498,6 +563,7 @@ def _run_stream_engine(
         stdout_stage_fd=stdout_stage_fd,
         stderr_stage_fd=stderr_stage_fd,
     )
+    redactions = _request_redactions(request)
 
     now = float(clock())
     if execution_deadline is None:
@@ -579,6 +645,7 @@ def _run_stream_engine(
                 stage_fd=stdout_stage_fd,
                 claim_id=_claim_id(request, StreamRole.STDOUT),
                 cap=request.max_output_bytes,
+                redactions=redactions,
             ),
             _OutputState(
                 role=StreamRole.STDERR,
@@ -586,6 +653,7 @@ def _run_stream_engine(
                 stage_fd=stderr_stage_fd,
                 claim_id=_claim_id(request, StreamRole.STDERR),
                 cap=None,
+                redactions=redactions,
             ),
         )
         # From this point every detached descriptor has a stable stream owner.
@@ -657,6 +725,7 @@ def _run_stream_engine(
             if output.open:
                 output.close_pipe(selector)
         for output in outputs:
+            output.flush_redaction()
             output.fsync_stage()
 
         forced_output_deadline = execution_cutoff or settlement_cutoff

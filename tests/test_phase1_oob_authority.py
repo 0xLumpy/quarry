@@ -86,6 +86,10 @@ class _FakeProc:
 
 def _fake_interactsh(monkeypatch, captured):
     monkeypatch.setattr(oob.shutil, "which", lambda _name: "/usr/bin/interactsh-client")
+    monkeypatch.setattr(
+        oob, "_prepare_client_launch",
+        lambda _run, command, **_kwargs: (list(command), {}),
+    )
     monkeypatch.setattr(oob, "_await_register", lambda _proc, _server, _wait: ("csession01.oast.pro",
                                                                                "csession01"))
     monkeypatch.setattr(oob.runner, "terminate_group", lambda _proc: None)

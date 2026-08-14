@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from bisect import insort
 from dataclasses import dataclass, field
@@ -22,7 +23,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import budget, events, evidence, fetch, netguard, normalize, oob, secrets, settings, store
+from .. import (budget, events, evidence, fetch, netguard, normalize, oob, runtime_identity,
+                secrets, settings, store)
 from ..runner import (RunResult, Status, cancel_all as runner_cancel_all, fresh_artifact_dir, have,
                       native_output_current, nuclei_timeout, reset_cancel as runner_reset_cancel,
                       run as exec_tool, scaled_timeout, skipped)
@@ -665,16 +667,22 @@ def _arjun_lane(ctx, prof, corpus) -> None:
         raise KeyboardInterrupt
 
 
-def _apply_nuclei_oob(cmd: list[str]) -> list[str]:
-    """Append self-hosted interactsh flags to a nuclei command (else nuclei's built-in public server).
-    Shared by every nuclei invocation so they all use the same OOB endpoint. `secrets.oob()` is the
-    single source of truth for OOB config."""
+@contextlib.contextmanager
+def _nuclei_oob_flags():
+    """Yield self-hosted Nuclei flags without ever placing its authentication token on argv."""
     oob = secrets.oob()
-    if oob.get("callback_server"):
-        cmd += ["-iserver", str(oob["callback_server"])]
-        if oob.get("auth_token"):
-            cmd += ["-itoken", str(oob["auth_token"])]
-    return cmd
+    server, token = oob.get("callback_server"), oob.get("auth_token")
+    if not server:
+        yield ()
+        return
+    base = ("-iserver", str(server))
+    if not token:
+        yield base
+        return
+    # Nuclei's goflags config key is the long option name. The path is non-secret; the 0600 contents
+    # exist only around the child and are never passed through events or runtime-identity records.
+    with secrets.private_tool_config("nuclei-oob", {"interactsh-token": str(token)}) as config:
+        yield (*base, "-config", str(config))
 
 
 def _result_output_current(res, path) -> bool:
@@ -773,11 +781,12 @@ def _nuclei_progress(text: str) -> dict:
     return {"completed": completed, "planned": planned, "requests": requests, "errors": errors}
 
 
-def _nuclei_cmd(targets_file, out_file, prof, mhe: int) -> list[str]:
+def _nuclei_cmd(targets_file, out_file, prof, mhe: int, *, oob_flags=()) -> list[str]:
     """The nuclei main-scan command for one target file; identical flags for every chunk, only -l/-o
     differ (broad active, severity-scoped, governor-scaled -c/-bs, explicit host-error policy, shared
     OOB endpoint)."""
     cmd = ["nuclei", "-l", str(targets_file), "-jsonl", "-o", str(out_file),
+           "-duc",                         # installed template identity is fixed for this invocation
            "-etags", "intrusive,fuzz,dos,brute-force",
            "-s", "critical,high,medium", "-stats", "-si", "30",
            "-c", str(settings.workers("nuclei", 25)),      # core-scaled concurrency (rate stays separate)
@@ -785,7 +794,7 @@ def _nuclei_cmd(targets_file, out_file, prof, mhe: int) -> list[str]:
     cmd += ["-nmhe"] if mhe == 0 else ["-mhe", str(mhe)]   # 0 = full depth: never drop an erroring host
     if prof.http_rl:
         cmd += ["-rl", str(prof.http_rl)]
-    _apply_nuclei_oob(cmd)                                 # self-hosted interactsh (else public default)
+    cmd.extend(oob_flags)                                  # self-hosted interactsh (else public default)
     return cmd
 
 
@@ -971,7 +980,15 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     # emit a scan-level success, and is set to SUCCESS/PARTIAL only after the loop + aggregate complete.
     status = Status.FAILED
     attempt_created = False
+    template_snapshot = None
+    snapshot_entered = False
     try:
+        template_source = Path(os.environ.get("HOME") or Path.home()) / "nuclei-templates"
+        template_snapshot = runtime_identity.reusable_tree_snapshot(
+            template_source, role="nuclei-templates",
+        )
+        template_snapshot.__enter__()
+        snapshot_entered = True
         for ci, batch in enumerate(batches):
             chunk_wu = events.work_unit(sid, inputs={"hosts": batch}, config=_cfg)
             # progress before the chunk, counting cleanly-completed hosts; the per-chunk work_unit is the
@@ -999,14 +1016,16 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             res = None
             chunk_status = Status.FAILED.value               # promoted only after all bookkeeping below
             try:                                             # chunk terminal always fires (finally)
-                res = exec_tool("nuclei", _nuclei_cmd(bf, cf, prof, mhe),
-                                repository=ctx.run,
-                                stdout=RepositoryOutput.discard(),
-                                stderr=RepositoryOutput.publish(*ef.relative_to(ctx.run.dir).parts),
-                                native_outputs=(RepositoryNativeOutput.file(
-                                    5, *cf.relative_to(ctx.run.dir).parts, required=False,
-                                ),),
-                                timeout=nuclei_timeout(len(batch), ctx.http_timeout))
+                with _nuclei_oob_flags() as oob_flags:
+                    res = exec_tool("nuclei", _nuclei_cmd(
+                                        bf, cf, prof, mhe, oob_flags=oob_flags),
+                                    repository=ctx.run,
+                                    stdout=RepositoryOutput.discard(),
+                                    stderr=RepositoryOutput.publish(*ef.relative_to(ctx.run.dir).parts),
+                                    native_outputs=(RepositoryNativeOutput.file(
+                                        5, *cf.relative_to(ctx.run.dir).parts, required=False,
+                                    ),),
+                                    timeout=nuclei_timeout(len(batch), ctx.http_timeout))
                 if res.stderr_tail:
                     _append_run_log(ctx, log, res.stderr_tail + "\n")
                 # ask nuclei whether it finished, from its terminal line in the full stderr (the 8-line tail
@@ -1095,17 +1114,21 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                 # and reaches the operator through the run verdict
         status = Status.PARTIAL if incomplete else Status.SUCCESS
     finally:
-        events.tool_progress(sid, chunk_index=len(batches), chunk_total=len(batches),
-                             current_index=_completed_hosts(), work_unit=scan_wu)   # final: execution-complete
         try:                                                 # a stat() raise must not defeat the scan terminal
-            size = findings.stat().st_size
-        except OSError:
-            size = None
-        events.tool_finish(sid, status=status.value, work_unit=scan_wu,
-                           reason=(f"{incomplete}/{len(batches)} chunk(s) execution-incomplete (retryable)"
-                                   if incomplete else None),
-                           duration=round(time.monotonic() - t0, 2),
-                           raw_ref=str(findings), artifact_size=size, discovery_context="params")
+            events.tool_progress(sid, chunk_index=len(batches), chunk_total=len(batches),
+                                 current_index=_completed_hosts(), work_unit=scan_wu)
+            try:
+                size = findings.stat().st_size
+            except OSError:
+                size = None
+            events.tool_finish(sid, status=status.value, work_unit=scan_wu,
+                               reason=(f"{incomplete}/{len(batches)} chunk(s) execution-incomplete (retryable)"
+                                       if incomplete else None),
+                               duration=round(time.monotonic() - t0, 2),
+                               raw_ref=str(findings), artifact_size=size, discovery_context="params")
+        finally:
+            if snapshot_entered:
+                template_snapshot.__exit__(*sys.exc_info())
     lines = len(findings.read_text().splitlines()) if findings.exists() else 0
     _planned = sum(v["planned"] for v in cov_map.values())
     _sent = sum(v["requests"] for v in cov_map.values())
@@ -1468,28 +1491,58 @@ def _make_oob_credential(secret: str):
             # dalfox reads TOML or JSON, so a serializer escapes the value rather than interpolation
             json.dump({"scan": {"blind_oob_secret": secret}}, fh)
         return d, path
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except Exception as e:
+    except BaseException as primary:
         # `path` is passed so a refused symlink is unlinked too, else it and its directory survive forever
-        _drop_oob_credential(d, path)
-        raise OobCredentialError(f"the OOB credential could not be written: {e}") from e
+        cleanup_fault = None
+        try:
+            _drop_oob_credential(d, path)
+        except BaseException as exc:
+            cleanup_fault = exc
+        if not isinstance(primary, Exception):
+            if cleanup_fault is not None:
+                primary.add_note(
+                    f"OOB credential cleanup also failed: {type(cleanup_fault).__name__}: "
+                    f"{cleanup_fault}"
+                )
+            raise primary.with_traceback(primary.__traceback__)
+        if cleanup_fault is not None and not isinstance(cleanup_fault, Exception):
+            raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
+        if cleanup_fault is not None:
+            raise cleanup_fault
+        raise OobCredentialError(
+            f"the OOB credential could not be written: {primary}"
+        ) from primary
 
 
 def _drop_oob_credential(d, path) -> None:
-    """Destroy exactly what one invocation created. Never raises."""
+    """Destroy exactly what one invocation created and prove its credential bytes are absent."""
+    errors = []
     try:
                                 # `unlink` on a symlink removes the link, not its target, so a refused path is
                                 # still cleaned up
-        if path is not None and (Path(path).is_symlink() or Path(path).is_file()):
+        if path is not None and os.path.lexists(path):
             Path(path).unlink()
-    except OSError:
-        pass
+    except BaseException as exc:
+        errors.append(exc)
     try:
         if d is not None:
             Path(d).rmdir()
-    except OSError:
+    except FileNotFoundError:
         pass
+    except BaseException as exc:
+        errors.append(exc)
+    cancellation = next((exc for exc in errors if not isinstance(exc, Exception)), None)
+    if d is not None and os.path.lexists(d):
+        detail = type(errors[0]).__name__ if errors else "unknown cleanup fault"
+        residue = OobCredentialError(
+            f"the OOB credential remains after cleanup ({detail}): {d}"
+        )
+        if cancellation is not None:
+            cancellation.add_note(f"OOB credential residue also remains: {residue}")
+            raise cancellation.with_traceback(cancellation.__traceback__)
+        raise residue
+    if cancellation is not None:
+        raise cancellation.with_traceback(cancellation.__traceback__)
 
 
 @contextlib.contextmanager
@@ -1502,10 +1555,35 @@ def blind_oob_credential(secret: str):
         yield None
         return
     d, path = _make_oob_credential(secret)     # settled BEFORE the protected body — see `_make_…`
+    primary = None
     try:
         yield path
+    except BaseException as exc:
+        primary = exc
     finally:
-        _drop_oob_credential(d, path)
+        cleanup_fault = None
+        try:
+            _drop_oob_credential(d, path)
+        except BaseException as exc:
+            cleanup_fault = exc
+        if primary is not None:
+            if not isinstance(primary, Exception):
+                if cleanup_fault is not None:
+                    primary.add_note(
+                        f"OOB credential cleanup also failed: {type(cleanup_fault).__name__}: "
+                        f"{cleanup_fault}"
+                    )
+                raise primary.with_traceback(primary.__traceback__)
+            if cleanup_fault is not None and not isinstance(cleanup_fault, Exception):
+                raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
+            if cleanup_fault is not None:
+                primary.add_note(
+                    f"OOB credential cleanup also failed: {type(cleanup_fault).__name__}: "
+                    f"{cleanup_fault}"
+                )
+            raise primary.with_traceback(primary.__traceback__)
+        if cleanup_fault is not None:
+            raise cleanup_fault
 
 
 def _blind_oob_plan(prof) -> dict:
@@ -2546,22 +2624,24 @@ def run(ctx) -> None:
         if subs:
             tk_in = ctx.write_list("takeover_targets.txt", subs)
             tk_out = ctx.run.raw_path("params", "nuclei", "takeover.jsonl")
-            tk_cmd = ["nuclei", "-l", str(tk_in), "-tags", "takeover", "-jsonl", "-o", str(tk_out)]
+            tk_cmd = ["nuclei", "-l", str(tk_in), "-tags", "takeover", "-jsonl",
+                      "-duc", "-o", str(tk_out)]
             # NB: nuclei has no connect-time IP deny (-eh excludes INPUT entries, not resolved IPs); the
             # scan-box/metadata protection for these subs is netguard.guard_hosts' fresh-resolve above.
             if prof.http_rl:                       # else native default (empty = fast)
                 tk_cmd += ["-rl", str(prof.http_rl)]
-            _apply_nuclei_oob(tk_cmd)              # same OOB endpoint as the main scan (no drift)
-            r = exec_tool(
-                "nuclei", tk_cmd,
-                repository=ctx.run,
-                stdout=RepositoryOutput.discard(),
-                stderr=RepositoryOutput.discard(),
-                native_outputs=(RepositoryNativeOutput.file(
-                    7, *tk_out.relative_to(ctx.run.dir).parts, required=False,
-                ),),
-                timeout=nuclei_timeout(len(subs), ctx.http_timeout),
-            )
+            with _nuclei_oob_flags() as oob_flags:
+                tk_cmd.extend(oob_flags)            # same OOB endpoint as the main scan (no drift)
+                r = exec_tool(
+                    "nuclei", tk_cmd,
+                    repository=ctx.run,
+                    stdout=RepositoryOutput.discard(),
+                    stderr=RepositoryOutput.discard(),
+                    native_outputs=(RepositoryNativeOutput.file(
+                        7, *tk_out.relative_to(ctx.run.dir).parts, required=False,
+                    ),),
+                    timeout=nuclei_timeout(len(subs), ctx.http_timeout),
+                )
             ctx.run.record("params", r)
             if native_output_current(r, tk_out) and tk_out.exists():
                 import json as _json

@@ -71,6 +71,43 @@ class TestTerminalEventGuarantee:
         assert evs[1]["status"] == "failed"
         assert evs[1]["faults"][0]["kind"] == "machinery"
 
+    @pytest.mark.parametrize("shape", ["mixed-key", "nonstr-value", "dict-subclass",
+                                        "key-subclass", "value-subclass"])
+    def test_invalid_environment_has_no_telemetry_and_reaches_typed_failure(self, tmp_path, shape):
+        class HostileDict(dict):
+            def _explode(self, *_args, **_kwargs):
+                raise AssertionError("dict subclass method was invoked")
+
+            __iter__ = items = keys = values = __len__ = __bool__ = __str__ = __repr__ = _explode
+
+        class HostileStr(str):
+            def __str__(self):
+                raise AssertionError("str subclass method was invoked")
+
+            def __repr__(self):
+                raise AssertionError("str subclass method was invoked")
+
+        class HostileValue:
+            def __repr__(self):
+                raise AssertionError("invalid value was rendered")
+
+        environments = {
+            "mixed-key": {"GOOD": "value", 1: "value"},
+            "nonstr-value": {"GOOD": HostileValue()},
+            "dict-subclass": HostileDict({"GOOD": "value"}),
+            "key-subclass": {HostileStr("GOOD"): "value"},
+            "value-subclass": {"GOOD": HostileStr("value")},
+        }
+        result = contract.run_contract(
+            "vertical.subfinder", ["/bin/true"], env=environments[shape],
+        )
+        assert result.status == Status.FAILED and result.started is False
+        rows = _events(tmp_path)
+        assert [row["event"] for row in rows] == ["tool_start", "tool_finish"]
+        assert "env" not in rows[0]
+        assert rows[1]["status"] == "failed"
+        assert rows[1]["faults"][0]["kind"] == "machinery"
+
 
 class TestRunnerPolicyCompatibility:
     def test_unmanaged_call_omits_repository_policy_keywords(self, monkeypatch):
@@ -218,7 +255,6 @@ class TestLanesMigrated:
     # increment 1+2 (single-shot) + increment 3 (work-unit'd looped/grouped lanes)
     MIGRATED = [
         ("quarry_recon.phases.vertical", "vertical.subfinder"),
-        ("quarry_recon.phases.vertical", "vertical.shosubgo"),
         ("quarry_recon.phases.crawl", "crawl.gitleaks"),
         ("quarry_recon.phases.probe", "probe.tlsx_certs"),
         ("quarry_recon.phases.probe", "probe.gowitness"),
@@ -254,7 +290,7 @@ class TestLanesMigrated:
     # review#4: single-shot lanes were migrated to run_contract but passed NO work_unit — C10b could not
     # resume them. Each now computes a work_unit and passes it (source_id -> a distinguishing suffix in code).
     SINGLE_SHOT_WU = [
-        ("quarry_recon.phases.vertical", "sf_wu"), ("quarry_recon.phases.vertical", "sho_wu"),
+        ("quarry_recon.phases.vertical", "sf_wu"),
         ("quarry_recon.phases.crawl", "kat_wu"), ("quarry_recon.phases.crawl", "kh_wu"),
         ("quarry_recon.phases.crawl", "gau_wu"), ("quarry_recon.phases.crawl", "gl_wu"),
         ("quarry_recon.phases.probe", "tls_wu"), ("quarry_recon.phases.probe", "gw_wu"),

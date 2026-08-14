@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import inspect
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from quarry_recon import (contract, events, runner, runner_native,
-                          runner_protocol, runner_repository, store)
+                          runner_protocol, runner_repository, runtime_identity, store)
 from quarry_recon.runner import RunResult, Status
 from quarry_recon.runner_native import RepositoryNativeOutput
 from quarry_recon.runner_repository import RepositoryOutput
@@ -104,12 +105,59 @@ def test_facade_rewrites_only_child_argv_and_returns_original_command(
     child_path = final.read_text()
     assert child_path != str(final) and "native-stages" in child_path
     assert seen["child"] != command
-    assert seen["child"][:3] == command[:3]
+    assert Path(seen["child"][0]).is_absolute()
+    assert seen["child"][0] != command[0]                    # private verified launch authority
+    assert seen["child"][1:3] == command[1:3]
     assert result.meta["native_outputs"]["clean"] is True
     assert result.meta["native_outputs"]["policy_count"] == 1
     assert result.meta["native_output_ownership_settled"] is True
     assert runner.native_output_current(result, final) is True
     assert run._live_artifact_claim_count() == 0
+    assert _attempt_directories(run) == []
+
+
+def test_framework_credential_in_native_stage_is_refused_before_publication(
+    tmp_path, monkeypatch,
+):
+    canary = "V310-NATIVE-OUTPUT-CANARY-4933ee"
+    run = _running_run(tmp_path, "facade-private-native")
+    final, command, policy = _file_invocation(run)
+    final.parent.mkdir(parents=True)
+    final.write_text("prior-authoritative")
+
+    real_prepare = runtime_identity.prepare_launch
+
+    def prepare(*args, **kwargs):
+        admitted = real_prepare(*args, **kwargs)
+        return replace(admitted, redactions=(canary,))
+
+    def supervise(_run, invocation, **_kwargs):
+        Path(invocation.worker.argv[3]).write_text("prefix:" + canary)
+        return SimpleNamespace(
+            clean=True,
+            execution=SimpleNamespace(settlement=SimpleNamespace(
+                terminal=runner_protocol.ExecutionTerminal.COMPLETE,
+                exit_code=0,
+            )),
+        )
+
+    def result(tool, cmd, _outcome, **_kwargs):
+        return RunResult(
+            tool, cmd, Status.EMPTY, 0, 0.0, None, 0,
+            meta={"started": True, "repository_ownership_settled": True},
+        )
+
+    monkeypatch.setattr(runtime_identity, "prepare_launch", prepare)
+    monkeypatch.setattr(runner_repository, "supervise_repository_execution", supervise)
+    monkeypatch.setattr(runner, "_repository_run_result", result)
+
+    observed = _run_native(run, command, policy)
+
+    assert observed.status is Status.FAILED
+    assert "framework credential" in observed.note
+    assert final.read_text() == "prior-authoritative"
+    assert runner.native_output_current(observed, final) is False
+    assert canary not in repr(observed.meta)
     assert _attempt_directories(run) == []
 
 

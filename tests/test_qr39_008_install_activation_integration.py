@@ -17,7 +17,7 @@ def test_real_staged_probe_execs_verified_fd(tmp_path, monkeypatch):
     dest = activation_tests._bindir(tmp_path) / "qtool"
 
     def fake_shell(cmd, dry):
-        stage = activation_tests._bindir(tmp_path) / ".stage" / "qtool"
+        stage = activation_tests._candidate_stage()
         stage.parent.mkdir(parents=True, exist_ok=True)
         stage.write_text("#!/bin/sh\nexit 0\n")
         return 0, ""

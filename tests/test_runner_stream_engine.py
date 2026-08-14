@@ -8,6 +8,7 @@ step.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
 import time
@@ -71,6 +72,7 @@ def _execute(
     timeout: int | float = 5,
     execution_window: float | None = None,
     settlement_window: float = 8,
+    environment: dict[str, str] | None = None,
 ):
     invocation = protocol.normalize_invocation(
         request_id=os.urandom(16).hex(),
@@ -78,7 +80,7 @@ def _execute(
         cmd=(sys.executable, "-c", script),
         timeout=timeout,
         stdin_data=stdin_text,
-        env={},
+        env=environment or {},
         base_environment={},
         raw_path=tmp_path / f"{os.urandom(8).hex()}.stdout",
         stderr_path=tmp_path / f"{os.urandom(8).hex()}.stderr",
@@ -158,6 +160,32 @@ def test_binary_non_utf8_and_empty_streams_settle_exactly(
         assert stream.observed_sha256 == _digest(expected)
         assert stream.retained_sha256 == _digest(expected)
         assert stream.lines == expected.count(b"\n")
+
+
+def test_private_redaction_marker_sanitizes_cross_chunk_child_outputs_and_is_not_exported(tmp_path):
+    canary = "V310-CREDENTIAL-SINK-CANARY-607c83f1"
+    marker = "QUARRY_RUNNER_PRIVATE_REDACTIONS"
+    prefix = b"x" * (runner_streams._CHUNK_BYTES - 3)
+    script = (
+        "import os;"
+        f"v=os.environ['PDCP_API_KEY'].encode();p=b'x'*{len(prefix)};"
+        "os.write(1,p+v[:3]);os.write(1,v[3:]+b'\\n');"
+        "os.write(2,b'err:'+v+b'\\n');"
+        f"os.write(1,os.environ.get({marker!r},'absent').encode()+b'\\n')"
+    )
+    settlement, staged_stdout, staged_stderr = _execute(
+        tmp_path, script,
+        environment={
+            "PDCP_API_KEY": canary,
+            marker: json.dumps([canary], separators=(",", ":")),
+        },
+    )
+
+    assert settlement.terminal is protocol.ExecutionTerminal.COMPLETE
+    assert canary.encode() not in staged_stdout
+    assert canary.encode() not in staged_stderr
+    assert staged_stdout == prefix + b"*" * len(canary) + b"\nabsent\n"
+    assert staged_stderr == b"err:" + b"*" * len(canary) + b"\n"
 
 
 @pytest.mark.parametrize(

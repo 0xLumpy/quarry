@@ -116,7 +116,7 @@ class TestNucleiMaxHostError:
 
     def test_cmd_passes_nmhe_for_full_depth(self):
         cmd = _nuclei_cmd("t.txt", "o.jsonl", type("P", (), {"http_rl": 0})(), 0)
-        assert "-nmhe" in cmd and "-mhe" not in cmd
+        assert "-nmhe" in cmd and "-mhe" not in cmd and "-duc" in cmd
 
     def test_mhe_is_in_the_resume_fingerprint(self):
         # a coverage policy change must INVALIDATE resume, not silently continue a shallower generation

@@ -117,7 +117,7 @@ def test_safe_members_returns_all_when_clean(tmp_path):
     assert {m.name for m in members} == {"go", "go/x"}
 
 
-def _go_calls(monkeypatch, fail_on):
+def _go_calls(monkeypatch, fail_on, *, expected_tree_digest=None):
     """Drive _swap_in_golang with sudo disabled and _sh stubbed; `fail_on(cmd)->bool` chooses which shell
     command returns nonzero. Returns (ok, detail, recorded_calls)."""
     calls = []
@@ -128,7 +128,9 @@ def _go_calls(monkeypatch, fail_on):
 
     monkeypatch.setattr(bootstrap, "_sudo", lambda: "")
     monkeypatch.setattr(bootstrap, "_sh", fake_sh)
-    ok, detail = bootstrap._swap_in_golang(Path("/tmp/cand"))
+    ok, detail = bootstrap._swap_in_golang(
+        Path("/tmp/cand"), expected_tree_digest=expected_tree_digest,
+    )
     return ok, detail, calls
 
 
@@ -146,12 +148,13 @@ def test_go_swap_builds_replacement_before_touching_live_and_exchanges_atomicall
                    for c in calls[:exch_at])
 
 
-def test_go_swap_rolls_back_last_good_after_symlink_step_fails(monkeypatch):
-    """A post-activation /usr/local/bin/go symlink failure swaps the rejected tree back out for last-good."""
-    ok, detail, calls = _go_calls(monkeypatch, fail_on=lambda c: c.startswith("ln -sf"))
-    assert ok is False and "symlink step failed" in detail
-    # the exchange-back restores last-good into /usr/local/go
-    assert any("renameat2" in c and "last-good" in c for c in calls)
+def test_go_launcher_failure_precedes_tree_activation(monkeypatch):
+    """A launcher failure leaves both the live tree and its last-good relation untouched."""
+    ok, detail, calls = _go_calls(
+        monkeypatch, fail_on=lambda c: "ln -s /usr/local/go/bin/go" in c,
+    )
+    assert ok is False and "launcher could not be prepared" in detail
+    assert not any("renameat2" in c for c in calls)
 
 
 def test_go_swap_staging_copy_failure_leaves_live_untouched(monkeypatch):
@@ -162,12 +165,114 @@ def test_go_swap_staging_copy_failure_leaves_live_untouched(monkeypatch):
     assert not any("/usr/local/go/bin/go" in c for c in calls)   # never re-pointed the launcher
 
 
+def test_go_swap_rehashes_the_privileged_staging_copy_before_activation(monkeypatch):
+    monkeypatch.setattr(bootstrap, "_go_tree_digest", lambda _path: "b" * 64)
+    ok, detail, calls = _go_calls(
+        monkeypatch, fail_on=lambda _c: False, expected_tree_digest="a" * 64,
+    )
+    assert ok is False and "differs from the verified archive" in detail
+    assert not any("renameat2" in call for call in calls)
+
+
+def test_go_launcher_is_published_by_one_rename_not_an_in_place_symlink_update(monkeypatch):
+    monkeypatch.setattr(bootstrap.os, "getpid", lambda: 1234)
+    command = bootstrap._atomic_go_launcher_cmd("")
+    assert "ln -sf" not in command
+    assert "ln -s /usr/local/go/bin/go" in command
+    assert "mv -Tf" in command and "/usr/local/bin/.go.quarry-1234" in command
+
+
+def test_go_receipt_and_payload_durability_precede_activation(tmp_path, monkeypatch):
+    op = tmp_path / "operation"
+    calls = []
+
+    monkeypatch.setattr(bootstrap.tempfile, "mkdtemp", lambda **_kwargs: str(op))
+
+    def download(_url, destination, _dry):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"archive")
+        return 0, ""
+
+    def extract(_archive, _sha, destination):
+        executable = destination / "go" / "bin" / "go"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"go")
+
+    class Probe:
+        returncode = 0
+        stdout = "go version go1.25.1 linux/amd64\n"
+
+    monkeypatch.setattr(bootstrap, "_curl_to", download)
+    monkeypatch.setattr(bootstrap, "_verify_and_extract", extract)
+    monkeypatch.setattr(bootstrap.subprocess, "run", lambda *_args, **_kwargs: Probe())
+    monkeypatch.setattr(bootstrap, "_go_tree_digest", lambda _root: "a" * 64)
+    monkeypatch.setattr(bootstrap, "_write_go_receipt",
+                        lambda *_args, **_kwargs: calls.append("receipt"))
+    monkeypatch.setattr(bootstrap, "_fsync_tree", lambda _root: calls.append("fsync"))
+    monkeypatch.setattr(bootstrap, "_validate_go_receipt",
+                        lambda *_args, **_kwargs: calls.append("validate"))
+    monkeypatch.setattr(
+        bootstrap, "_swap_in_golang",
+        lambda *_args, **_kwargs: (calls.append("activate") or (True, "")),
+    )
+
+    assert bootstrap._install_golang_safe(
+        lambda _message: None,
+        "https://go.dev/dl/go1.25.1.linux-amd64.tar.gz",
+        "b" * 64,
+    ) == (True, "")
+    assert calls == ["receipt", "fsync", "validate", "activate"]
+    assert not op.exists()
+
+
+def test_go_operation_cleanup_is_loud_until_absence_is_proven(tmp_path, monkeypatch):
+    operation = tmp_path / "operation"
+    payload = operation / "root" / "go" / "bin" / "go"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"go")
+    real_rmtree = bootstrap.shutil.rmtree
+    monkeypatch.setattr(
+        bootstrap.shutil, "rmtree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cleanup fault")),
+    )
+    with pytest.raises(bootstrap._ArchiveError, match="remains after cleanup"):
+        bootstrap._settle_go_operation(operation)
+    assert operation.exists()
+    monkeypatch.setattr(bootstrap.shutil, "rmtree", real_rmtree)
+    bootstrap._settle_go_operation(operation)
+    assert not operation.exists()
+
+
+def test_go_cleanup_cancellation_preempts_an_ordinary_installer_failure(tmp_path, monkeypatch):
+    operation = tmp_path / "operation"
+
+    def create_operation(**_kwargs):
+        operation.mkdir()
+        return str(operation)
+
+    monkeypatch.setattr(bootstrap.tempfile, "mkdtemp", create_operation)
+    monkeypatch.setattr(
+        bootstrap, "_curl_to",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("ordinary body fault")),
+    )
+    real_rmtree = bootstrap.shutil.rmtree
+
+    def remove_then_cancel(path, *args, **kwargs):
+        real_rmtree(path, *args, **kwargs)
+        raise KeyboardInterrupt("cleanup cancellation")
+
+    monkeypatch.setattr(bootstrap.shutil, "rmtree", remove_then_cancel)
+    with pytest.raises(KeyboardInterrupt, match="cleanup cancellation"):
+        bootstrap._install_golang_safe(lambda _message: None, "https://invalid", "a" * 64)
+    assert not operation.exists()
+
+
 def test_go_swap_falls_back_when_renameat2_unavailable(monkeypatch):
-    """With no renameat2, activation falls back to a move-in that still displaces the live tree only AFTER the
-    replacement is staged, and keeps last-good."""
-    ok, _detail, calls = _go_calls(monkeypatch, fail_on=lambda c: "renameat2" in c)
-    assert ok is True
-    assert any("mv /usr/local/go /usr/local/go.last-good && mv /usr/local/go.new" in c for c in calls)
+    """Without atomic exchange support an existing live tree is kept; a two-move gap is not accepted."""
+    ok, detail, calls = _go_calls(monkeypatch, fail_on=lambda c: "renameat2" in c)
+    assert ok is False and "atomic rename exchange unavailable" in detail
+    assert not any("mv /usr/local/go /usr/local/go.last-good && mv /usr/local/go.new" in c
+                   for c in calls)
 
 
 def test_jxscout_swaps_only_after_verification_and_is_transactional():
@@ -222,16 +327,16 @@ def test_go_preservation_failure_is_loud_no_false_restore(monkeypatch):
     assert "could NOT preserve" in detail and "restored last-good" not in detail
 
 
-def test_go_symlink_and_restore_failure_reports_inconsistent(monkeypatch):
-    """When the symlink step fails AND last-good cannot be restored, the result says so — it does not falsely
-    claim last-good was restored."""
+def test_go_launcher_failure_does_not_claim_tree_rollback(monkeypatch):
+    """A pre-activation launcher fault never claims that a live-tree rollback was necessary."""
     def fail_on(c):
-        return (c.startswith("ln -sf")
+        return ("ln -s /usr/local/go/bin/go" in c
                 or ("renameat2" in c and "last-good" in c)              # exchange-back fails
                 or "rm -rf /usr/local/go && mv /usr/local/go.last-good" in c)   # mv fallback fails
     ok, detail, _calls = _go_calls(monkeypatch, fail_on=fail_on)
     assert ok is False
-    assert "could NOT be restored" in detail and "may be inconsistent" in detail
+    assert "launcher could not be prepared" in detail
+    assert "restored" not in detail
 
 
 def test_failed_data_update_keeps_existing_valid_file_and_reports_failure(tmp_path, monkeypatch):

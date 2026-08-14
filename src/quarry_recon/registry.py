@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
+import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from importlib import resources
@@ -19,6 +22,12 @@ _VER_RE = re.compile(r"(?<![\w.])v?\d+\.\d+(?:\.\d+)?(?![\w.])")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _SENTINEL_PINS = {"installed", "latest", "main", "master", "head"}   # floating refs — never a valid pin
 _MAINTENANCE_STATES = {"active", "monitor", "frozen", "distro"}      # refresh cadence (planning only)
+_RUNTIME_RECEIPT_SCHEMA = "quarry.runtime-receipt.v1"
+_RUNTIME_RECEIPT_NAME = ".quarry-runtime-receipt.json"
+_RUNTIME_ROOT_NAME = "toolchains"
+_max_closure_files = 200_000
+_max_closure_bytes = 2 * 1024 * 1024 * 1024
+_install_context = threading.local()
 
 
 class LockError(ValueError):
@@ -29,12 +38,34 @@ class _ActivationError(Exception):
     """A staged binary was swapped in but failed a post-swap identity/receipt check — triggers rollback."""
 
 
+class _RollbackError(_ActivationError):
+    """Activation faulted and rollback could not be proven; recovery bytes were deliberately retained."""
+
+    def __init__(self, message: str, recovery: Path):
+        super().__init__(message)
+        self.recovery = recovery
+
+
 @contextlib.contextmanager
 def _install_lock(bin_: str):
     """Serialize concurrent installs/updates of one binary (non-blocking flock); yields False if held."""
     lock_dir = Path.home() / ".local" / "bin" / ".stage"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_dir / f".{bin_}.installing.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    _private_directory(lock_dir)
+    lock_name = f".{_safe_lock_key(bin_)}.installing.lock"
+    directory_fd = os.open(lock_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fd = os.open(lock_name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600,
+                     dir_fd=directory_fd)
+    except BaseException:
+        os.close(directory_fd)
+        raise
+    observed = os.fstat(fd)
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.geteuid()
+            or observed.st_nlink != 1):
+        os.close(fd)
+        os.close(directory_fd)
+        raise _ActivationError("install lock is not an owner-controlled regular file")
+    os.fchmod(fd, 0o600)
     acquired = False
     try:
         try:
@@ -47,6 +78,7 @@ def _install_lock(bin_: str):
         if acquired:
             fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+        os.close(directory_fd)
 
 
 def _validate_lock(bin_: str, t: dict) -> None:
@@ -107,6 +139,46 @@ def _validate_lock(bin_: str, t: dict) -> None:
                 _bad(f"artifact {plat}: needs a non-empty url")
             if not (isinstance(a.get("sha256"), str) and _SHA256_RE.match(a["sha256"])):
                 _bad(f"artifact {plat}: sha256 must be 64 hex chars, got {a.get('sha256')!r}")
+    for key in ("env_allow", "credential_env", "runtime_bins", "runtime_argv_prefix"):
+        values = t.get(key)
+        if values is not None and (
+            not isinstance(values, list)
+            or len(values) != len(set(values))
+            or not all(isinstance(value, str) and value for value in values)
+        ):
+            _bad(f"{key} must be a unique list of non-empty strings")
+    if set(t.get("env_allow") or ()) & set(t.get("credential_env") or ()):
+        _bad("env_allow and credential_env must be disjoint")
+    for key in ("runtime_exec", "runtime_entry"):
+        value = t.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            _bad(f"{key} must be a non-empty string")
+    runtime_env = t.get("runtime_entry_env")
+    if runtime_env is not None and (
+        not isinstance(runtime_env, dict)
+        or not all(isinstance(k, str) and k and isinstance(v, str) and v
+                   for k, v in runtime_env.items())
+    ):
+        _bad("runtime_entry_env must map non-empty environment names to non-empty relative paths")
+    payloads = t.get("runtime_payloads")
+    if payloads is not None:
+        if not isinstance(payloads, list) or not payloads:
+            _bad("runtime_payloads must be a non-empty list")
+        seen_payloads = set()
+        for payload in payloads:
+            if not isinstance(payload, dict) or set(payload) != {"path", "sha256"}:
+                _bad("runtime_payloads entries need exactly path + sha256")
+            path, digest = payload["path"], payload["sha256"]
+            if (not isinstance(path, str) or not path or path.startswith("/")
+                    or ".." in Path(path).parts or path in seen_payloads):
+                _bad(f"runtime payload path is unsafe or duplicate: {path!r}")
+            if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+                _bad(f"runtime payload {path!r} has an invalid sha256")
+            seen_payloads.add(path)
+    if (t.get("runtime_entry") is None) != (t.get("runtime_exec") is None):
+        _bad("runtime_entry and runtime_exec must be declared together")
+    if t.get("runtime_entry_env") and not t.get("runtime_entry"):
+        _bad("runtime_entry_env requires runtime_entry")
 
 import yaml
 
@@ -144,6 +216,16 @@ class Tool:
     release: str | None = None
     # install lock key for tools sharing one on-disk asset; defaults to the bin (each tool locks only itself)
     lock_key: str | None = None
+    # Runtime admission. Environment names are allowlists, never values. A wrapper can be bypassed by
+    # naming its exact payload entry and interpreter; runtime_payloads pins mutable files outside the shim.
+    env_allow: list[str] | None = None
+    credential_env: list[str] | None = None
+    runtime_bins: list[str] | None = None
+    runtime_exec: str | None = None
+    runtime_entry: str | None = None
+    runtime_argv_prefix: list[str] | None = None
+    runtime_entry_env: dict[str, str] | None = None
+    runtime_payloads: list[dict] | None = None
 
     @property
     def installed(self) -> bool:
@@ -164,9 +246,12 @@ class Tool:
 _PROBE_NOT_RUN = -1     # "not executed / timed out" — distinct from any exit code a tool could accept
 
 
-def _probe(cmd: str, timeout: int = 15, pass_fd: int | None = None) -> tuple[int, str]:
+def _probe(cmd: str, timeout: int = 15, pass_fd: int | None = None,
+           env: "dict[str, str] | None" = None) -> tuple[int, str]:
     """Run a shell probe -> (rc, ANSI-stripped output); _PROBE_NOT_RUN on timeout/launch failure. `pass_fd` is inherited by the child via pass_fds."""
     kwargs = {"pass_fds": (pass_fd,)} if pass_fd is not None else {}
+    if env is not None:
+        kwargs["env"] = dict(env)
     try:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, **kwargs)
         return p.returncode, _ANSI_RE.sub("", p.stdout + p.stderr)
@@ -202,8 +287,21 @@ def load_tools() -> list[Tool]:
             policy=t.get("policy"), capability=t.get("capability"), cap_codes=t.get("cap_codes"),
             repo=t.get("repo"), maintenance_state=t.get("maintenance_state"), release=t.get("release"),
             version_codes=t.get("version_codes"), lock_key=t.get("lock_key"),
+            env_allow=t.get("env_allow") or [], credential_env=t.get("credential_env") or [],
+            runtime_bins=t.get("runtime_bins") or [], runtime_exec=t.get("runtime_exec"),
+            runtime_entry=t.get("runtime_entry"), runtime_argv_prefix=t.get("runtime_argv_prefix") or [],
+            runtime_entry_env=t.get("runtime_entry_env") or {},
+            runtime_payloads=t.get("runtime_payloads") or [],
         ))
     return tools
+
+
+def tool_for_bin(bin_: str) -> "Tool | None":
+    """Return the one declared tool for ``bin_``; duplicate registry identities fail closed."""
+    matches = [tool for tool in load_tools() if tool.bin == bin_]
+    if len(matches) > 1:
+        raise LockError(f"duplicate tool identity {bin_!r}")
+    return matches[0] if matches else None
 
 
 def tools_by_phase(phase: str) -> list[Tool]:
@@ -228,7 +326,11 @@ def _go_mod_and_version(path: str) -> tuple[str, str]:
     if not path:
         return "", ""
     try:
-        p = subprocess.run(["go", "version", "-m", path], capture_output=True, text=True, timeout=15)
+        environment = getattr(_install_context, "environment", None)
+        p = subprocess.run(
+            ["go", "version", "-m", path], capture_output=True, text=True, timeout=15,
+            env=(dict(environment) if environment is not None else None),
+        )
     except (OSError, subprocess.SubprocessError):
         return "", ""
     for line in p.stdout.splitlines():
@@ -254,11 +356,12 @@ def _norm_pkg(name: str) -> str:
     return re.sub(r"[-_.]+", "-", (name or "").strip().lower())
 
 
-def _pipx_meta(pkg: str) -> tuple[str, list]:
+def _pipx_meta(pkg: str, *, env: "dict[str, str] | None" = None) -> tuple[str, list]:
     """(version, app_paths) for the installed pipx package from `pipx list --json`; ('', []) if unreadable."""
     try:
         import json
-        p = subprocess.run(["pipx", "list", "--json"], capture_output=True, text=True, timeout=25)
+        p = subprocess.run(["pipx", "list", "--json"], capture_output=True, text=True, timeout=25,
+                           env=(dict(env) if env is not None else None))
         root = json.loads(p.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
         return "", []
@@ -354,7 +457,19 @@ def _read_receipt(bin_: str) -> dict:
         rec = json.loads(rp.read_text()) if rp.exists() else {}
     except (OSError, ValueError):
         return {}
-    return rec if isinstance(rec, dict) else {}            # a list/scalar receipt is not usable
+    if not isinstance(rec, dict):
+        return {}
+    if rec.get("schema_version") == _RUNTIME_RECEIPT_SCHEMA:
+        tool = rec.get("tools", {}).get(bin_) if isinstance(rec.get("tools"), dict) else None
+        rows = rec.get("files") if isinstance(rec.get("files"), list) else []
+        if isinstance(tool, dict):
+            row = next((item for item in rows if isinstance(item, dict)
+                        and item.get("path") == tool.get("executable")), None)
+            if row is not None:
+                return {"ident": tool.get("identity"), "sha256": row.get("sha256"),
+                        "schema_version": _RUNTIME_RECEIPT_SCHEMA}
+        return {}
+    return rec
 
 
 def _write_receipt(bin_: str, ident: str, sha: str) -> None:
@@ -366,12 +481,363 @@ def _write_receipt(bin_: str, ident: str, sha: str) -> None:
     os.replace(str(tmp), str(rp))
 
 
+def _safe_lock_key(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", value):
+        raise _ActivationError("install lock identity is unsafe")
+    return value
+
+
+def _managed_root(t: "Tool") -> Path:
+    key = _safe_lock_key(t.lock_key or t.bin)
+    return Path.home() / ".local" / "share" / "quarry" / _RUNTIME_ROOT_NAME / key
+
+
+def _private_directory(path: Path) -> None:
+    """Create one owner-private directory and refuse an existing alias/non-directory."""
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        observed = path.lstat()
+    except OSError as exc:
+        raise _ActivationError(f"private install directory is unavailable: {exc}") from exc
+    if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid()
+            or path.is_symlink()):
+        raise _ActivationError(f"private install directory is unsafe: {path}")
+    os.chmod(path, 0o700)
+
+
+def _active_version(root: Path) -> "Path | None":
+    current = root / "current"
+    try:
+        observed = current.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISLNK(observed.st_mode):
+        raise _ActivationError("managed current pointer is not a symlink")
+    target = os.readlink(current)
+    parts = Path(target).parts
+    if (len(parts) != 2 or parts[0] != "versions"
+            or not re.fullmatch(r"[a-f0-9]{32}", parts[1])):
+        raise _ActivationError("managed current pointer target is unsafe")
+    version = root.joinpath(*parts)
+    resolved_root, resolved_version = root.resolve(), version.resolve(strict=True)
+    if resolved_version.parent != (resolved_root / "versions"):
+        raise _ActivationError("managed current pointer escapes its versions directory")
+    observed_version = resolved_version.stat()
+    if (not stat.S_ISDIR(observed_version.st_mode)
+            or observed_version.st_uid != os.geteuid()
+            or stat.S_IMODE(observed_version.st_mode) != 0o500):
+        raise _ActivationError("managed current version is unsafe")
+    return resolved_version
+
+
+def _tree_rows(root: Path) -> list[dict]:
+    """Describe every payload object below a candidate, excluding the self-describing receipt.
+
+    Directories are identity-bearing objects too. A pipx venv's external interpreter symlink is accepted
+    only as an explicit, revalidated external regular-file dependency; it is never mistaken for contained
+    payload.
+    """
+    rows, total = [], 0
+    root = root.resolve(strict=True)
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix().encode("utf-8")):
+        relative = path.relative_to(root).as_posix()
+        if relative == _RUNTIME_RECEIPT_NAME:
+            continue
+        observed = path.lstat()
+        if observed.st_uid != os.geteuid():
+            raise _ActivationError(f"runtime closure object is not owner-controlled: {relative}")
+        mode = stat.S_IMODE(observed.st_mode)
+        if len(rows) >= _max_closure_files:
+            raise _ActivationError("runtime closure exceeds its object-count bound")
+        if stat.S_ISDIR(observed.st_mode):
+            if mode & 0o022:
+                raise _ActivationError(f"runtime closure directory is group/world writable: {relative}")
+            rows.append({"bytes": 0, "kind": "directory", "mode": mode,
+                         "path": relative, "sha256": hashlib.sha256(b"").hexdigest()})
+            continue
+        if stat.S_ISREG(observed.st_mode):
+            if mode & 0o022:
+                raise _ActivationError(f"runtime closure file is group/world writable: {relative}")
+            size = observed.st_size
+            total += size
+            if total > _max_closure_bytes:
+                raise _ActivationError("runtime closure exceeds its byte bound")
+            digest = _file_sha256(path)
+            if not _SHA256_RE.fullmatch(digest):
+                raise _ActivationError(f"runtime closure file could not be hashed: {relative}")
+            rows.append({"bytes": size, "kind": "file", "mode": mode,
+                         "path": relative, "sha256": digest})
+            continue
+        if stat.S_ISLNK(observed.st_mode):
+            target = os.readlink(path)
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(root)
+                external = None
+            except ValueError:
+                try:
+                    target_stat = resolved.stat()
+                except OSError as exc:
+                    raise _ActivationError(
+                        f"runtime closure external link is unavailable: {relative}"
+                    ) from exc
+                if not stat.S_ISREG(target_stat.st_mode):
+                    raise _ActivationError(
+                        f"runtime closure external link is not a regular file: {relative}"
+                    )
+                digest = _file_sha256(resolved)
+                if not _SHA256_RE.fullmatch(digest):
+                    raise _ActivationError(
+                        f"runtime closure external link could not be hashed: {relative}"
+                    )
+                external = {
+                    "bytes": target_stat.st_size,
+                    "mode": stat.S_IMODE(target_stat.st_mode),
+                    "path": str(resolved),
+                    "sha256": digest,
+                }
+            except OSError as exc:
+                raise _ActivationError(f"runtime closure link dangles: {relative}") from exc
+            encoded = target.encode("utf-8", "strict")
+            total += len(encoded)
+            if external is not None:
+                total += external["bytes"]
+            if total > _max_closure_bytes:
+                raise _ActivationError("runtime closure exceeds its byte bound")
+            row = {"bytes": len(encoded), "kind": "symlink", "mode": mode,
+                   "path": relative, "sha256": hashlib.sha256(encoded).hexdigest(),
+                   "target": target}
+            if external is not None:
+                row["external"] = external
+            rows.append(row)
+            continue
+        raise _ActivationError(f"runtime closure contains an unsupported object: {relative}")
+    return rows
+
+
+def _strict_json(path: Path) -> dict:
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate JSON member")
+            result[key] = value
+        return result
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=pairs)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise _ActivationError(f"runtime receipt is unreadable: {type(exc).__name__}") from exc
+    if not isinstance(value, dict):
+        raise _ActivationError("runtime receipt is not an object")
+    return value
+
+
+def _closure_identity(rows: list[dict]) -> str:
+    body = json.dumps(rows, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8", "strict",
+    )
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def _validate_runtime_receipt(root: Path, receipt: dict, *, tool: "Tool | None" = None) -> dict:
+    if set(receipt) != {"schema_version", "lock_key", "generation", "tools", "files"}:
+        raise _ActivationError("runtime receipt has an unknown shape")
+    if receipt.get("schema_version") != _RUNTIME_RECEIPT_SCHEMA:
+        raise _ActivationError("runtime receipt schema is unsupported")
+    _safe_lock_key(receipt.get("lock_key"))
+    if not isinstance(receipt.get("generation"), str) or not re.fullmatch(
+            r"[a-f0-9]{32}", receipt["generation"]):
+        raise _ActivationError("runtime receipt generation is invalid")
+    if receipt["generation"] != root.resolve(strict=True).name:
+        raise _ActivationError("runtime receipt generation does not name its version root")
+    tools = receipt.get("tools")
+    if not isinstance(tools, dict) or not tools:
+        raise _ActivationError("runtime receipt has no tool identities")
+    for name, record in tools.items():
+        if (not isinstance(name, str) or not name
+                or not isinstance(record, dict)
+                or set(record) != {"executable", "identity", "runtime", "content_identity"}
+                or not all(isinstance(record.get(key), str) and record[key]
+                           for key in ("executable", "identity", "runtime", "content_identity"))
+                or not record["content_identity"].startswith("sha256:")
+                or not _SHA256_RE.fullmatch(record["content_identity"][7:])):
+            raise _ActivationError("runtime receipt tool identity is invalid")
+        rel = Path(record["executable"])
+        if rel.is_absolute() or ".." in rel.parts:
+            raise _ActivationError("runtime receipt executable path is unsafe")
+    rows = receipt.get("files")
+    if not isinstance(rows, list) or len(rows) > _max_closure_files:
+        raise _ActivationError("runtime receipt file inventory is invalid")
+    if rows != _tree_rows(root):
+        raise _ActivationError("runtime closure bytes no longer match their receipt")
+    paths = {row.get("path") for row in rows if isinstance(row, dict)}
+    if len(paths) != len(rows):
+        raise _ActivationError("runtime receipt contains duplicate file identities")
+    if any(record["executable"] not in paths for record in tools.values()):
+        raise _ActivationError("runtime receipt executable is absent from its closure")
+    content_identity = _closure_identity(rows)
+    if any(record["content_identity"] != content_identity for record in tools.values()):
+        raise _ActivationError("runtime receipt content identity does not match its closure")
+    if tool is not None:
+        expected_identity = tool.pin or tool.ref
+        record = tools.get(tool.bin)
+        if receipt["lock_key"] != _safe_lock_key(tool.lock_key or tool.bin):
+            raise _ActivationError("runtime receipt belongs to another install lock")
+        if not isinstance(record, dict):
+            raise _ActivationError(f"runtime receipt does not name requested tool {tool.bin}")
+        if record["runtime"] != tool.runtime:
+            raise _ActivationError("runtime receipt changes the requested tool runtime")
+        if expected_identity is None or record["identity"] != str(expected_identity):
+            raise _ActivationError("runtime receipt changes the requested declared identity")
+    return receipt
+
+
+def managed_runtime_receipt(t: "Tool") -> "tuple[Path, dict] | None":
+    """Return and revalidate the active version root plus its complete receipt."""
+    root = _managed_root(t)
+    try:
+        active = _active_version(root)
+    except FileNotFoundError:
+        return None
+    if active is None:
+        return None
+    receipt_path = active / _RUNTIME_RECEIPT_NAME
+    observed = receipt_path.lstat()
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != 0o600 or observed.st_nlink != 1):
+        raise _ActivationError("runtime receipt file identity is unsafe")
+    return active, _validate_runtime_receipt(active, _strict_json(receipt_path), tool=t)
+
+
+def _canonical_receipt_bytes(value: dict) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            + "\n").encode("utf-8", "strict")
+
+
+def _write_runtime_receipt(candidate: Path, value: dict) -> None:
+    path = candidate / _RUNTIME_RECEIPT_NAME
+    data = _canonical_receipt_bytes(value)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("runtime receipt write made no progress")
+            view = view[written:]
+        os.fsync(fd)
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _install_environment(environment: dict[str, str], tool: "Tool | None" = None):
+    previous = getattr(_install_context, "environment", None)
+    previous_tool = getattr(_install_context, "tool", None)
+    _install_context.environment = dict(environment)
+    _install_context.tool = tool
+    try:
+        yield
+    finally:
+        if previous is None:
+            with contextlib.suppress(AttributeError):
+                del _install_context.environment
+        else:
+            _install_context.environment = previous
+        if previous_tool is None:
+            with contextlib.suppress(AttributeError):
+                del _install_context.tool
+        else:
+            _install_context.tool = previous_tool
+
+
+def _installer_environment(candidate: Path, t: "Tool") -> dict[str, str]:
+    ambient = os.environ
+    environment = {
+        key: ambient[key]
+        for key in ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR")
+        if key in ambient
+    }
+    home = candidate / "home"
+    bindir = home / ".local" / "bin"
+    cache = candidate / "cache"
+    for directory in (home, bindir, bindir / ".stage", cache):
+        _private_directory(directory)
+    environment.update({
+        "HOME": str(home),
+        # Never give a caller-controlled PATH precedence during provenance construction. The final owner
+        # bin directory remains last only for a separately registry-managed dependency such as bun.
+        "PATH": os.pathsep.join((
+            "/usr/local/go/bin", "/usr/local/sbin", "/usr/local/bin", "/usr/sbin",
+            "/usr/bin", "/sbin", "/bin", str(Path.home() / ".local" / "bin"),
+        )),
+        "XDG_CACHE_HOME": str(cache),
+        "GOBIN": str(bindir),
+        "GOMODCACHE": str(cache / "gomod"),
+        "GOCACHE": str(cache / "gobuild"),
+        "PIPX_HOME": str(candidate / "pipx"),
+        "PIPX_BIN_DIR": str(bindir),
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    })
+    return environment
+
+
+def _probe_candidate(t: "Tool", executable: Path, environment: dict[str, str]) -> bool:
+    accepted = set(t.cap_codes) if t.cap_codes else None
+    probe = t.capability or t.version_cmd
+    if probe:
+        command = probe.replace(t.bin, shlex_quote(str(executable)), 1)
+        if not _capability_ok(_probe(command, env=environment)[0], accepted):
+            return False
+    if t.pin and t.runtime == "binary" and t.version_cmd:
+        command = t.version_cmd.replace(t.bin, shlex_quote(str(executable)), 1)
+        rc, output = _probe(command, env=environment)
+        version = _parse_version(output) if _version_ok(rc, t.version_codes) else ""
+        if not version_eq(version, t.pin):
+            return False
+    if t.runtime == "go":
+        module, version = _go_mod_and_version(str(executable))
+        if module != _expected_go_module(t) or not version_eq(version, t.pin):
+            return False
+    if t.runtime == "pipx":
+        version, app_paths = _pipx_meta(_pipx_pkg(t), env=environment)
+        admitted = {Path(path).resolve() for path in app_paths}
+        if not version_eq(version, t.pin) or executable.resolve() not in admitted:
+            return False
+    return True
+
+
+def shlex_quote(value: str) -> str:
+    import shlex
+    return shlex.quote(value)
+
+
+def _install_output_detail(output: str) -> str:
+    from . import secrets
+    cleaned = (secrets.redact(output or "") or "").strip()
+    return cleaned[:500] if cleaned else "produced no output"
+
+
 def installed_identity(t: "Tool") -> str:
     """Installed version by runtime identity (go: `go version -m`; pipx: `pipx list`; binary/source: the receipt `ident` with sha rechecked; distro: 'distro'); "" when unprovable."""
     if not t.installed:
         return ""
     if t.policy == "distro":
         return "distro"
+    try:
+        managed = managed_runtime_receipt(t)
+    except (OSError, _ActivationError):
+        return ""
+    if managed is not None:
+        root, receipt = managed
+        record = receipt["tools"].get(t.bin)
+        resolved = Path(shutil.which(t.bin) or "").resolve()
+        expected = root / record["executable"] if isinstance(record, dict) else None
+        if record is None or expected is None or resolved != expected.resolve():
+            return ""
+        return record["identity"]
     # identity is of the executable that resolves on PATH (binary/source shadowing is caught in install_one)
     which = shutil.which(t.bin)
     if t.runtime in ("go", "pipx") and not which:
@@ -478,16 +944,28 @@ def _go_bin_dir() -> "Path | None":
     return d if d.exists() else None
 
 
-def _reclaim_go_shadow(bin_: str, shadow: "Path") -> "Path | None":
-    """Relocate a shadowing legacy `go install` binary to `<bin>.quarry-replaced-<ts>` within the go-bin dir; path, or None if untouchable."""
+def _reclaim_go_shadow(bin_: str, shadow: "Path", *, settlement: "dict | None" = None) -> "Path | None":
+    """Relocate a legacy Go shadow and reconcile a rename that reports failure after landing."""
     gb = _go_bin_dir()
+    bak = None
     try:
         if not gb or shadow.resolve().parent != gb.resolve():
             return None                                     # shadow isn't the go-install dir -> hands off
         bak = shadow.with_name(f"{bin_}.quarry-replaced-{int(time.time())}")
         os.replace(str(shadow), str(bak))
+        _fsync_directory(gb)
         return bak
-    except OSError:
+    except BaseException as primary:
+        if bak is not None and not os.path.lexists(shadow) and os.path.lexists(bak):
+            # The authoritative names prove replace landed even though the syscall reported an error.
+            if settlement is not None:
+                settlement["pair"] = (shadow, bak)
+            _fsync_directory(gb)
+            if isinstance(primary, Exception):
+                return bak
+            raise primary.with_traceback(primary.__traceback__)
+        if not isinstance(primary, Exception):
+            raise primary.with_traceback(primary.__traceback__)
         return None
 
 
@@ -520,161 +998,570 @@ def verify_installed(t: Tool) -> bool:
     return health(t)["ok"]
 
 
+def _copy_active_version(active: "Path | None", candidate: Path) -> dict:
+    if active is None:
+        return {}
+    receipt = _validate_runtime_receipt(active, _strict_json(active / _RUNTIME_RECEIPT_NAME))
+    for child in active.iterdir():
+        if child.name == _RUNTIME_RECEIPT_NAME:
+            continue
+        destination = candidate / child.name
+        if child.is_dir() and not child.is_symlink():
+            shutil.copytree(child, destination, symlinks=True)
+        elif child.is_symlink():
+            os.symlink(os.readlink(child), destination)
+        else:
+            shutil.copy2(child, destination, follow_symlinks=False)
+    return dict(receipt["tools"])
+
+
+def _set_candidate_writable(candidate: Path) -> None:
+    """Give the private builder write access to a copied last-known-good candidate."""
+    paths = (candidate, *sorted(candidate.rglob("*"), key=lambda item: len(item.parts)))
+    for path in paths:
+        observed = path.lstat()
+        if observed.st_uid != os.geteuid():
+            raise _ActivationError(f"candidate contains an object owned by another uid: {path}")
+        if stat.S_ISDIR(observed.st_mode):
+            os.chmod(path, stat.S_IMODE(observed.st_mode) | 0o700)
+        elif stat.S_ISREG(observed.st_mode):
+            os.chmod(path, stat.S_IMODE(observed.st_mode) | 0o600)
+        elif not stat.S_ISLNK(observed.st_mode):
+            raise _ActivationError(f"candidate contains an unsupported object: {path}")
+
+
+def _freeze_candidate_payload(candidate: Path) -> None:
+    """Remove write bits from candidate descendants before their closure is receipted."""
+    for path in sorted(candidate.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.name == _RUNTIME_RECEIPT_NAME:
+            continue
+        observed = path.lstat()
+        if observed.st_uid != os.geteuid():
+            raise _ActivationError(f"candidate contains an object owned by another uid: {path}")
+        if stat.S_ISDIR(observed.st_mode):
+            os.chmod(path, (stat.S_IMODE(observed.st_mode) | 0o500) & ~0o222)
+        elif stat.S_ISREG(observed.st_mode):
+            os.chmod(path, (stat.S_IMODE(observed.st_mode) | 0o400) & ~0o222)
+        elif not stat.S_ISLNK(observed.st_mode):
+            raise _ActivationError(f"candidate contains an unsupported object: {path}")
+
+
+def _durably_settle_candidate_payload(candidate: Path) -> None:
+    """Flush every payload inode and directory after bytes and modes reach their final form."""
+    directories = [candidate]
+    for path in sorted(candidate.rglob("*"), key=lambda item: item.relative_to(candidate).parts):
+        if path.name == _RUNTIME_RECEIPT_NAME:
+            continue
+        observed = path.lstat()
+        if stat.S_ISDIR(observed.st_mode):
+            directories.append(path)
+        elif stat.S_ISREG(observed.st_mode):
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        elif not stat.S_ISLNK(observed.st_mode):
+            raise _ActivationError(f"candidate contains an unsupported object: {path}")
+    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        _fsync_directory(directory)
+
+
+def _seal_candidate_root(candidate: Path) -> None:
+    """Remove mutation authority from the version root after its receipt is durably written."""
+    observed = candidate.lstat()
+    if not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid():
+        raise _ActivationError("candidate version root is not owner-controlled")
+    os.chmod(candidate, 0o500)
+    if stat.S_IMODE(candidate.lstat().st_mode) != 0o500:
+        raise _ActivationError("candidate version root could not be sealed")
+
+
+def _set_candidate_removable(candidate: Path) -> None:
+    """Restore directory traversal/removal authority without mutating retained file inode modes."""
+    paths = (candidate, *sorted(candidate.rglob("*"), key=lambda item: len(item.parts)))
+    for path in paths:
+        observed = path.lstat()
+        if observed.st_uid != os.geteuid():
+            raise _ActivationError(f"candidate contains an object owned by another uid: {path}")
+        if stat.S_ISDIR(observed.st_mode):
+            os.chmod(path, stat.S_IMODE(observed.st_mode) | 0o700)
+        elif not (stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode)):
+            raise _ActivationError(f"candidate contains an unsupported object: {path}")
+
+
+def _discard_candidate(candidate: Path) -> None:
+    """Remove a rejected candidate and return only after proving its version name absent."""
+    errors = []
+    try:
+        _set_candidate_removable(candidate)
+    except BaseException as exc:
+        errors.append(exc)
+    try:
+        shutil.rmtree(candidate)
+    except FileNotFoundError:
+        pass
+    except BaseException as exc:
+        errors.append(exc)
+    cancellation = next((exc for exc in errors if not isinstance(exc, Exception)), None)
+    if os.path.lexists(candidate):
+        residue = _RollbackError(
+            "rejected install candidate could not be settled",
+            candidate,
+        )
+        if cancellation is not None:
+            cancellation.add_note(f"install candidate residue also remains: {candidate}")
+            raise cancellation.with_traceback(cancellation.__traceback__)
+        raise residue
+    try:
+        _fsync_directory(candidate.parent)
+    except FileNotFoundError:
+        pass
+    if cancellation is not None:
+        raise cancellation.with_traceback(cancellation.__traceback__)
+
+
+def _candidate_executable(candidate: Path, t: Tool) -> Path:
+    bindir = candidate / "home" / ".local" / "bin"
+    staged, final = bindir / ".stage" / t.bin, bindir / t.bin
+    if staged.is_symlink() or staged.exists():
+        if final.is_symlink() or final.exists():
+            final.unlink()
+        os.replace(staged, final)
+    try:
+        resolved = final.resolve(strict=True)
+        resolved.relative_to(candidate.resolve(strict=True))
+        observed = resolved.stat()
+    except (OSError, ValueError) as exc:
+        raise _ActivationError(f"{t.bin}: install produced no contained executable") from exc
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.geteuid()
+            or observed.st_size == 0):
+        raise _ActivationError(f"{t.bin}: candidate executable identity is unsafe")
+    os.chmod(resolved, stat.S_IMODE(observed.st_mode) | stat.S_IXUSR)
+    return final
+
+
+def _validate_declared_payloads(candidate: Path, t: Tool) -> None:
+    home = candidate / "home"
+    for declaration in t.runtime_payloads or []:
+        path = home / declaration["path"]
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(candidate.resolve(strict=True))
+        except (OSError, ValueError) as exc:
+            raise _ActivationError(f"{t.bin}: declared runtime payload is absent or escapes") from exc
+        if _file_sha256(resolved) != declaration["sha256"]:
+            raise _ActivationError(f"{t.bin}: declared runtime payload digest does not match")
+
+
+def _validate_retained_tools(candidate: Path, records: dict[str, dict], current: Tool,
+                             environment: dict[str, str]) -> None:
+    """Re-prove every companion copied under a shared install lock before publication."""
+    declarations = {tool.bin: tool for tool in load_tools()}
+    lock_key = _safe_lock_key(current.lock_key or current.bin)
+    for name, record in sorted(records.items()):
+        if name == current.bin:
+            continue
+        declared = declarations.get(name)
+        if (declared is None
+                or _safe_lock_key(declared.lock_key or declared.bin) != lock_key
+                or record.get("runtime") != declared.runtime
+                or record.get("identity") != str(declared.pin or declared.ref or "")):
+            raise _ActivationError(f"retained shared tool {name!r} has no exact registry identity")
+        executable = _candidate_executable(candidate, declared)
+        if executable.relative_to(candidate).as_posix() != record.get("executable"):
+            raise _ActivationError(f"retained shared tool {name!r} changed executable identity")
+        _validate_declared_payloads(candidate, declared)
+        with _install_environment(environment, declared):
+            if not _probe_candidate(declared, executable.resolve(), environment):
+                raise _ActivationError(f"retained shared tool {name!r} failed revalidation")
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _link_snapshot(path: Path, backup_dir: Path) -> tuple[str, str | None]:
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return "absent", None
+    if stat.S_ISLNK(observed.st_mode):
+        return "symlink", os.readlink(path)
+    if not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.geteuid():
+        raise _ActivationError(f"activation destination is unsafe: {path}")
+    backup = backup_dir / f"{path.name}.{os.urandom(8).hex()}.backup"
+    os.link(path, backup, follow_symlinks=False)
+    return "file", str(backup)
+
+
+def _restore_link(path: Path, snapshot: tuple[str, str | None]) -> None:
+    kind, value = snapshot
+    tmp = path.with_name(f".{path.name}.{os.urandom(8).hex()}.rollback")
+    if kind == "absent":
+        path.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
+        return
+    if kind == "symlink":
+        os.symlink(value, tmp)
+    else:
+        os.link(value, tmp, follow_symlinks=False)
+    os.replace(tmp, path)
+    _fsync_directory(path.parent)
+
+
+def _snapshot_matches(path: Path, snapshot: tuple[str, str | None]) -> bool:
+    """Whether an alias already reached its requested snapshot despite a syscall raising after effect."""
+    kind, value = snapshot
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return kind == "absent"
+    if kind == "symlink":
+        return stat.S_ISLNK(observed.st_mode) and os.readlink(path) == value
+    if kind == "file" and stat.S_ISREG(observed.st_mode):
+        try:
+            backup = Path(value).lstat()
+        except OSError:
+            return False
+        return (observed.st_dev, observed.st_ino) == (backup.st_dev, backup.st_ino)
+    return False
+
+
+def _pointer_target(root: Path) -> "str | None":
+    current = root / "current"
+    try:
+        observed = current.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISLNK(observed.st_mode):
+        raise _ActivationError("managed current pointer became a non-symlink")
+    return os.readlink(current)
+
+
+def _candidate_is_current(root: Path, candidate: "Path | None") -> bool:
+    """Reconcile the authoritative pointer before any exception path removes candidate bytes."""
+    if candidate is None:
+        return False
+    try:
+        target = _pointer_target(root)
+        return target is not None and (root / target).resolve(strict=True) == candidate.resolve(strict=True)
+    except (OSError, ValueError, _ActivationError):
+        return False
+
+
+def _replace_symlink(path: Path, target: str) -> None:
+    tmp = path.with_name(f".{path.name}.{os.urandom(8).hex()}.link")
+    os.symlink(target, tmp)
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _activate_candidate(root: Path, candidate: Path, receipt: dict,
+                        t: Tool) -> "tuple[Path | None, Path]":
+    """Publish stable aliases first, then make the complete candidate visible with one pointer rename."""
+    bindir = Path.home() / ".local" / "bin"
+    _private_directory(bindir / ".stage")
+    old_active = _active_version(root)
+    old_target = None if old_active is None else os.path.relpath(old_active, root)
+    backups = root / f".rollback-{os.urandom(8).hex()}"
+    _private_directory(backups)
+    _fsync_directory(root)
+    snapshots: dict[Path, tuple[str, str | None]] = {}
+    reclaimed_shadow: tuple[Path, Path] | None = None
+    shadow_settlement: dict = {}
+    pointer_tmp: Path | None = None
+    try:
+        for bin_name, record in sorted(receipt["tools"].items()):
+            for path, destination in (
+                (bindir / bin_name, root / "current" / record["executable"]),
+                (_receipt_path(bin_name), root / "current" / _RUNTIME_RECEIPT_NAME),
+            ):
+                snapshots[path] = _link_snapshot(path, backups)
+                target = os.path.relpath(destination, path.parent)
+                _replace_symlink(path, target)
+        _fsync_directory(backups)
+        _fsync_directory(bindir)
+        pointer_tmp = root / f".current-{os.urandom(8).hex()}"
+        os.symlink(os.path.relpath(candidate, root), pointer_tmp)
+        os.replace(pointer_tmp, root / "current")
+        _fsync_directory(root)
+        managed = managed_runtime_receipt(t)
+        if managed is None or managed[0] != candidate.resolve():
+            raise _ActivationError(f"{t.bin}: activated receipt does not name the candidate")
+        expected = candidate / receipt["tools"][t.bin]["executable"]
+        if (bindir / t.bin).resolve(strict=True) != expected.resolve(strict=True):
+            raise _ActivationError(f"{t.bin}: activated alias does not resolve to the verified executable")
+        selected = shutil.which(t.bin)
+        if selected and Path(selected).resolve() != expected.resolve(strict=True):
+            shadow = Path(selected)
+            backup = _reclaim_go_shadow(t.bin, shadow, settlement=shadow_settlement)
+            if backup is None:
+                raise _ActivationError(f"{t.bin}: PATH still selects an unmanaged executable")
+            reclaimed_shadow = (shadow, backup)
+            selected = shutil.which(t.bin)
+        if not selected or Path(selected).resolve() != expected.resolve(strict=True):
+            raise _ActivationError(f"{t.bin}: verified executable is not the admitted PATH identity")
+        confirmed = managed_runtime_receipt(t)
+        if confirmed is None or confirmed[0] != candidate.resolve():
+            raise _ActivationError(f"{t.bin}: activated closure changed during final reconciliation")
+        result = reclaimed_shadow[1] if reclaimed_shadow is not None else None
+    except BaseException as primary:
+        rollback_errors = []
+        if reclaimed_shadow is None:
+            reclaimed_shadow = shadow_settlement.get("pair")
+        if pointer_tmp is not None and os.path.lexists(pointer_tmp):
+            try:
+                pointer_tmp.unlink()
+            except BaseException as exc:
+                rollback_errors.append(exc)
+        try:
+            observed_target = _pointer_target(root)
+        except BaseException as exc:
+            observed_target = "<unverifiable>"
+            rollback_errors.append(exc)
+        if observed_target != old_target:
+            try:
+                if old_target is None:
+                    (root / "current").unlink(missing_ok=True)
+                else:
+                    _replace_symlink(root / "current", old_target)
+                _fsync_directory(root)
+            except BaseException as exc:
+                # A syscall may report failure after landing. Reconcile the authoritative name before
+                # declaring rollback uncertain.
+                try:
+                    settled = _pointer_target(root) == old_target
+                except BaseException:
+                    settled = False
+                if not settled:
+                    rollback_errors.append(exc)
+        for path, snapshot in reversed(tuple(snapshots.items())):
+            try:
+                _restore_link(path, snapshot)
+            except BaseException as exc:
+                try:
+                    settled = _snapshot_matches(path, snapshot)
+                except BaseException:
+                    settled = False
+                if settled:
+                    if not isinstance(exc, Exception):
+                        rollback_errors.append(exc)
+                    continue
+                # A name whose restoration is unproven must not keep pointing at the rejected candidate.
+                # Its recoverable prior inode/link is retained under ``backups`` for manual settlement.
+                with contextlib.suppress(OSError):
+                    path.unlink(missing_ok=True)
+                rollback_errors.append(exc)
+        try:
+            _fsync_directory(bindir)
+        except BaseException as exc:
+            rollback_errors.append(exc)
+        if reclaimed_shadow is not None:
+            shadow, backup = reclaimed_shadow
+            try:
+                os.replace(backup, shadow)
+                _fsync_directory(shadow.parent)
+            except BaseException as exc:
+                if not os.path.lexists(backup) and os.path.lexists(shadow):
+                    try:
+                        _fsync_directory(shadow.parent)
+                    except BaseException as durability_fault:
+                        rollback_errors.append(durability_fault)
+                    if not isinstance(exc, Exception):
+                        rollback_errors.append(exc)
+                else:
+                    rollback_errors.append(exc)
+        if rollback_errors:
+            residue = _RollbackError(
+                "activation failed and last-known-good rollback did not settle",
+                backups,
+            )
+            cancellation = (primary if not isinstance(primary, Exception) else next(
+                (fault for fault in rollback_errors if not isinstance(fault, Exception)), None,
+            ))
+            if cancellation is not None:
+                cancellation.add_note(f"installer rollback also failed: {residue}")
+                raise cancellation.with_traceback(cancellation.__traceback__)
+            raise residue from primary
+        try:
+            _discard_candidate(backups)
+        except BaseException as cleanup_fault:
+            if not isinstance(primary, Exception):
+                primary.add_note(
+                    f"installer rollback cleanup also failed: {type(cleanup_fault).__name__}: "
+                    f"{cleanup_fault}"
+                )
+                raise primary.with_traceback(primary.__traceback__)
+            if not isinstance(cleanup_fault, Exception):
+                raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
+            raise cleanup_fault from primary
+        raise primary.with_traceback(primary.__traceback__)
+    # ``current`` now names and revalidates the candidate. Backup cleanup is deliberately caller-owned so
+    # install_one can cross an explicit committed boundary before any later fault or cancellation.
+    return result, backups
+
+
 def install_one(t: Tool, echo, dry_run: bool = False) -> bool:
-    """One version-locked install/update path: binary/source stage+verify+atomic-activate, go/pipx install-in-place+verify. True on success."""
+    """Build, verify and receipt one complete version before an atomic current-pointer publication."""
     cmd = pinned_install(t)
-    if cmd is None:                                        # binary with no artifact for this platform
+    if cmd is None:
         echo(f"unsupported platform ({current_platform()}) — no {t.bin} artifact")
         return False
-    if not cmd:                                           # no install command (manual)
+    if not cmd:
         echo(f"{t.bin}: manual install — {t.doc}")
         return False
     if dry_run:
         echo(f"{t.bin} @ {t.pin or t.ref or t.policy or 'installed'}")
         return True
+    if t.policy == "distro":
+        if verify_installed(t):
+            echo(f"{t.bin}: ok (distro-managed; Quarry performed no in-place mutation)")
+            return True
+        echo(f"{t.bin}: distro-managed tool is absent or unhealthy — NOT modified")
+        return False
+    identity = t.pin or t.ref
+    if not identity:
+        echo(f"{t.bin}: no exact install identity — NOT activated")
+        return False
 
-    accepted = set(t.cap_codes) if t.cap_codes else None
-
-    if t.runtime in ("binary", "source"):
-        stage_dir = Path.home() / ".local" / "bin" / ".stage"
-        stage_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(stage_dir, 0o700)                            # 0700: no other user can plant in the stage dir
-        stage = stage_dir / t.bin
-        with _install_lock(t.lock_key or t.bin) as locked:   # lock the shared resource, not the bin
-            if not locked:
-                echo(f"{t.bin}: another install/update is in progress — skipped")
-                return False
-            # clear any pre-planted name (a dangling symlink too) and stage a fresh regular file to overwrite
-            if stage.is_symlink() or stage.exists():
-                stage.unlink()
-            os.close(os.open(str(stage), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600))
-            code, out = run_shell(cmd, False)
-            staged_ok = stage.is_file() and not stage.is_symlink() and stage.stat().st_size > 0
-            if code != 0 or not staged_ok:
-                # surface the command's own output, not a guessed cause
-                why = (f"exit {code}" if code != 0 else "exited 0 but staged no binary")
-                detail = (out or "").strip()
-                stage.unlink(missing_ok=True)
-                echo(f"{t.bin}: install FAILED ({why})"
-                     + (f" — {detail}" if detail else " — the command produced no output"))
-                return False
-            # one no-follow descriptor drives probe, hash and publish
-            try:
-                sfd = os.open(str(stage), os.O_RDONLY | os.O_NOFOLLOW)
-            except OSError as e:
-                stage.unlink(missing_ok=True)
-                echo(f"{t.bin}: staged artifact is not a regular file ({e}) — NOT activated")
-                return False
-            try:
-                if not stat.S_ISREG(os.fstat(sfd).st_mode):
-                    stage.unlink(missing_ok=True)
-                    echo(f"{t.bin}: staged artifact is not a regular file — NOT activated")
-                    return False
-                os.fchmod(sfd, 0o755)                          # active binary must be executable
-                # probe the fd via /proc, inherited by the child (pass_fd)
-                proc_fd = f"/proc/self/fd/{sfd}"
-                use_proc = os.path.exists(proc_fd)
-                probe_path = proc_fd if use_proc else str(stage)
-                probe_fd = sfd if use_proc else None
-                # verify the staged binary before replacing the working one
-                if t.capability or t.version_cmd:
-                    capcmd = (t.capability or t.version_cmd).replace(t.bin, probe_path, 1)
-                    if not _capability_ok(_probe(capcmd, pass_fd=probe_fd)[0], accepted):
-                        stage.unlink(missing_ok=True)
-                        echo(f"{t.bin}: CAPABILITY FAILED on staged binary — existing binary kept")
-                        return False
-                # reject a wrong-release binary (source is covered by the receipt)
-                if t.pin and t.runtime == "binary" and t.version_cmd:
-                    # independent version probe — a capability pass says nothing about the pin
-                    _rc, _out = _probe(t.version_cmd.replace(t.bin, probe_path, 1), pass_fd=probe_fd)
-                    sv = _parse_version(_out) if _version_ok(_rc, t.version_codes) else ""
-                    if not version_eq(sv, t.pin):
-                        stage.unlink(missing_ok=True)
-                        echo(f"{t.bin}: staged version {sv!r} != pin {t.pin} — wrong release, NOT activated")
-                        return False
-                staged_sha = _fd_sha256(sfd)
-                if not _SHA256_RE.fullmatch(staged_sha):
-                    stage.unlink(missing_ok=True)
-                    echo(f"{t.bin}: could not hash the staged binary for its receipt — NOT activated")
-                    return False
-                dest = Path.home() / ".local" / "bin" / t.bin
-                backup = stage_dir / f".{t.bin}.last-good"
-                receipt = _receipt_path(t.bin)
-                receipt_backup = stage_dir / f".{t.bin}.last-good.receipt"
-                work = stage_dir / f".{t.bin}.{os.urandom(8).hex()}.activating"
-                had_prev = dest.exists()
-                # hardlink the working binary + its receipt as a last-good pair, rolled back together
-                if had_prev:
-                    _relink(dest, backup)
-                    if receipt.exists():
-                        _relink(receipt, receipt_backup)
-                    else:
-                        receipt_backup.unlink(missing_ok=True)
-                try:
-                    _publish_verified(sfd, stage, work, dest)   # activate the exact verified inode
-                    stage.unlink(missing_ok=True)               # drop the writable staging name; only dest holds the inode
-                    _write_receipt(t.bin, t.ref or t.pin, staged_sha)
-                    # the active binary must resolve on PATH, unshadowed
-                    which = shutil.which(t.bin)
-                    if not which:
-                        raise _ActivationError(
-                            f"{t.bin}: activated but does NOT resolve on PATH (~/.local/bin not on PATH?)")
-                    if Path(which).resolve() != dest.resolve():
-                        # reclaim a legacy go-install copy earlier in PATH (runtime migration); a shadow elsewhere fails loud
-                        shadow_orig = Path(which)
-                        relocated = _reclaim_go_shadow(t.bin, shadow_orig)
-                        if relocated:
-                            echo(f"{t.bin}: relocated legacy go binary {which} -> {relocated} (runtime migration)")
-                            which = shutil.which(t.bin)
-                        if not which or Path(which).resolve() != dest.resolve():
-                            if relocated:                    # migration failed -> restore the legacy binary
-                                try:
-                                    os.replace(str(relocated), str(shadow_orig))
-                                except OSError:
-                                    pass
-                            raise _ActivationError(
-                                f"{t.bin}: SHADOWED — {which} resolves before the managed {dest}")
-                    # active bytes must still equal the receipt digest (nothing rewrote them post-verify)
-                    if _file_sha256(dest) != staged_sha:
-                        raise _ActivationError(f"{t.bin}: active bytes changed after verification — NOT activated")
-                except (OSError, _ActivationError) as e:
-                    # restore the last-good binary+receipt pair; delete an unrestorable receipt, report a failed binary restore loudly
-                    try:
-                        _restore_last_good(had_prev, dest, backup, receipt, receipt_backup)
-                    except OSError as re:
-                        echo(f"{t.bin}: CRITICAL — activation failed ({e}) AND rollback failed ({re}); "
-                             f"binary may be inconsistent — reinstall with `quarry install --only {t.bin}`")
-                        return False
-                    echo(str(e) if isinstance(e, _ActivationError)
-                         else f"{t.bin}: activation failed ({e}) — rolled back to last-good")
-                    return False
-                if had_prev:
-                    backup.unlink(missing_ok=True)           # activation confirmed; drop the rollback pair
-                    receipt_backup.unlink(missing_ok=True)
-                echo(f"{t.bin}: ok ({t.pin or t.ref})")
-            finally:
-                os.close(sfd)
-        return True
-
-    # go / pipx — install in place under the shared-resource lock, then verify identity + capability
+    candidate = None
+    root = None
     with _install_lock(t.lock_key or t.bin) as locked:
         if not locked:
             echo(f"{t.bin}: another install/update is in progress — skipped")
             return False
-        code, _ = run_shell(cmd, False)
-        if code != 0 or not t.installed:
-            echo(f"{t.bin}: install FAILED")
+        try:
+            root = _managed_root(t)
+            versions = root / "versions"
+            for directory in (root, versions):
+                _private_directory(directory)
+            active = _active_version(root)
+            generation = os.urandom(16).hex()
+            candidate = versions / generation
+            candidate.mkdir(mode=0o700)
+            previous_tools = _copy_active_version(active, candidate)
+            _set_candidate_writable(candidate)
+            environment = _installer_environment(candidate, t)
+            bindir = candidate / "home" / ".local" / "bin"
+            for obsolete in (bindir / t.bin, bindir / ".stage" / t.bin):
+                if obsolete.is_symlink() or obsolete.exists():
+                    obsolete.unlink()
+            with _install_environment(environment, t):
+                code, command_output = run_shell(cmd, False)
+            if code != 0:
+                raise _ActivationError(
+                    f"{t.bin}: install command failed with exit {code}: "
+                    f"{_install_output_detail(command_output)}"
+                )
+            try:
+                executable = _candidate_executable(candidate, t)
+            except _ActivationError as exc:
+                raise _ActivationError(
+                    f"{t.bin}: install command exited 0 but staged no binary: "
+                    f"{_install_output_detail(command_output)}"
+                ) from exc
+            _validate_declared_payloads(candidate, t)
+            cache = candidate / "cache"
+            if os.path.lexists(cache):
+                _discard_candidate(cache)
+            _validate_retained_tools(candidate, previous_tools, t, environment)
+            _freeze_candidate_payload(candidate)
+            _durably_settle_candidate_payload(candidate)
+            with _install_environment(environment, t):
+                if not _probe_candidate(t, executable.resolve(), environment):
+                    raise _ActivationError(
+                        f"{t.bin}: candidate identity/capability verification failed"
+                    )
+            closure = _tree_rows(candidate)
+            if closure != _tree_rows(candidate):
+                raise _ActivationError(f"{t.bin}: candidate changed during final verification")
+            executable_relative = executable.relative_to(candidate).as_posix()
+            content_identity = _closure_identity(closure)
+            previous_tools[t.bin] = {
+                "executable": executable_relative,
+                "identity": str(identity),
+                "runtime": t.runtime,
+                "content_identity": content_identity,
+            }
+            # A copied shared-lock generation has a new complete closure identity. Every retained tool record
+            # must describe those exact candidate bytes, never the prior generation's aggregate.
+            for record in previous_tools.values():
+                record["content_identity"] = content_identity
+            receipt = {
+                "schema_version": _RUNTIME_RECEIPT_SCHEMA,
+                "lock_key": _safe_lock_key(t.lock_key or t.bin),
+                "generation": generation,
+                "tools": previous_tools,
+                "files": closure,
+            }
+            _write_runtime_receipt(candidate, receipt)
+            _fsync_directory(candidate)
+            _seal_candidate_root(candidate)
+            _validate_runtime_receipt(
+                candidate, _strict_json(candidate / _RUNTIME_RECEIPT_NAME), tool=t,
+            )
+            _fsync_directory(candidate)
+            _fsync_directory(versions)
+            relocated, rollback_backups = _activate_candidate(root, candidate, receipt, t)
+            # Explicit commit boundary: from this assignment onward ``current`` names the verified candidate.
+            # No cleanup, logging, or cancellation path may treat it as rejected or remove it.
+            candidate = None
+            try:
+                _discard_candidate(rollback_backups)
+            except _RollbackError as exc:
+                echo(
+                    f"{t.bin}: install CRITICAL (activation committed; rollback backup cleanup "
+                    f"did not settle) — active candidate kept; recovery retained at {exc.recovery}"
+                )
+                return False
+            echo(f"{t.bin}: ok ({identity})")
+            if relocated is not None:
+                echo(f"{t.bin}: relocated legacy PATH shadow to {relocated}")
+            return True
+        except _RollbackError as exc:
+            echo(f"{t.bin}: install CRITICAL ({exc}) — recovery retained at {exc.recovery}")
             return False
-        if (t.pin or t.ref) and drift(t) != "ok":         # drift or an unknown identity is a failure
-            echo(f"{t.bin}: identity NOT VERIFIED ({drift(t)}) "
-                 f"installed={installed_identity(t)!r} != pin {t.pin or t.ref!r}")
+        except (OSError, ValueError, _ActivationError) as exc:
+            if root is not None and _candidate_is_current(root, candidate):
+                candidate = None
+                echo(
+                    f"{t.bin}: install CRITICAL ({type(exc).__name__}: {exc}) — activation "
+                    "committed; active candidate kept"
+                )
+                return False
+            echo(f"{t.bin}: install FAILED ({type(exc).__name__}: {exc}) — last-known-good kept")
+            if candidate is not None:
+                try:
+                    _discard_candidate(candidate)
+                except _RollbackError as cleanup_fault:
+                    echo(
+                        f"{t.bin}: install CRITICAL ({cleanup_fault}) — recovery retained at "
+                        f"{cleanup_fault.recovery}"
+                    )
             return False
-        probe = t.capability or t.version_cmd
-        if probe and not _capability_ok(_probe(probe)[0], accepted):
-            echo(f"{t.bin}: CAPABILITY FAILED")
-            return False
-        echo(f"{t.bin}: ok ({installed_identity(t) or t.pin})")
-        return True
+        except BaseException as primary:
+            if root is not None and _candidate_is_current(root, candidate):
+                candidate = None
+            if candidate is not None:
+                try:
+                    _discard_candidate(candidate)
+                except BaseException as cleanup_fault:
+                    if (isinstance(primary, Exception)
+                            and not isinstance(cleanup_fault, Exception)):
+                        raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
+                    primary.add_note(
+                        f"install candidate cleanup also failed: {type(cleanup_fault).__name__}: "
+                        f"{cleanup_fault}"
+                    )
+            raise primary.with_traceback(primary.__traceback__)
 
 
 def run_shell(cmd: str, dry_run: bool) -> tuple[int, str]:
@@ -682,7 +1569,9 @@ def run_shell(cmd: str, dry_run: bool) -> tuple[int, str]:
     if dry_run:
         return 0, "(dry-run)"
     try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=1800)
+        environment = getattr(_install_context, "environment", None)
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=1800,
+                           env=(dict(environment) if environment is not None else None))
         tail = "\n".join((p.stdout + p.stderr).strip().splitlines()[-4:])
         return p.returncode, tail
     except subprocess.SubprocessError as e:

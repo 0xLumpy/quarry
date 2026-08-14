@@ -7,6 +7,7 @@ flags an installed version that no longer matches the pin (a reproducibility bre
 import pathlib
 import re
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -214,10 +215,11 @@ class TestPinnedInstall:
 
 class TestRealPins:
     def test_version_pinned_tools_have_no_sentinels(self):
-        # 31 go/pipx + gitleaks + trufflehog + dalfox + bun = 34 carry an exact `version:` pin
-        # (massdns uses ref; nmap is distro-managed)
+        # 29 go/pipx + gitleaks + trufflehog + dalfox + bun = 33 exact `version:` pins.
+        # massdns uses ref, nmap is distro-managed, and shosubgo is now an internal adapter.
         pinned = [t for t in registry.load_tools() if t.pin]
-        assert len(pinned) == 34
+        assert len(pinned) == 33
+        assert all(tool.bin != "shosubgo" for tool in registry.load_tools())
         assert all(t.pin.lower() not in registry._SENTINEL_PINS for t in pinned)
 
     def test_nmap_is_distro_policy_not_pinned(self):
@@ -353,6 +355,11 @@ class TestInstalledIdentity:
 
 
 class TestInstallOne:
+    @pytest.fixture(autouse=True)
+    def _private_home(self, tmp_path, monkeypatch):
+        """Installer tests may publish stable user aliases, so every case needs an isolated HOME."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+
     def _go(self, **kw):
         base = dict(bin="subfinder", runtime="go", pin="v2.14.0",
                     install="go install x/cmd/x@latest", version_cmd="subfinder -version")
@@ -360,8 +367,22 @@ class TestInstallOne:
         return _tool(**base)
 
     def _patch_go(self, monkeypatch, *, drift="ok", cap=(0, "v2.14.0"), cmds=None):
-        monkeypatch.setattr(registry, "run_shell", lambda c, d: (cmds.append(c) if cmds is not None else None, (0, ""))[1])
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: cap)
+        def install(c, d):
+            if cmds is not None:
+                cmds.append(c)
+            home = Path(registry._install_context.environment["HOME"])
+            binary = home / ".local" / "bin" / "subfinder"
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text("GO-BINARY")
+            return 0, ""
+        monkeypatch.setattr(registry, "run_shell", install)
+        monkeypatch.setattr(registry, "_probe", lambda *a, **k: cap)
+        embedded = {"ok": ("x", "v2.14.0"), "DRIFT": ("x", "v1.0.0")}.get(drift, ("", ""))
+        monkeypatch.setattr(registry, "_go_mod_and_version", lambda _path: embedded)
+        monkeypatch.setattr(
+            registry.shutil, "which",
+            lambda b: str(Path.home() / ".local" / "bin" / b),
+        )
         monkeypatch.setattr(Tool, "installed", property(lambda self: True))
         monkeypatch.setattr(registry, "installed_identity", lambda t: "v2.14.0")
         monkeypatch.setattr(registry, "drift", lambda t: drift)
@@ -418,7 +439,9 @@ class TestInstallOne:
 
         def rs(c, d):
             if "curl" in c:
-                stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text(stage_content)
+                candidate = Path(registry._install_context.environment["HOME"])
+                target = candidate / ".local" / "bin" / ".stage" / "gitleaks"
+                target.parent.mkdir(parents=True, exist_ok=True); target.write_text(stage_content)
             return (0, "")
         monkeypatch.setattr(registry, "run_shell", rs)
         # a LIST of results is consumed one per call, so a test can make the capability probe succeed and
@@ -426,9 +449,9 @@ class TestInstallOne:
         if isinstance(probe, list):
             seq = list(probe)
             monkeypatch.setattr(registry, "_probe",
-                                lambda c, timeout=15, pass_fd=None: seq.pop(0) if seq else (127, ""))
+                                lambda *a, **k: seq.pop(0) if seq else (127, ""))
         else:
-            monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: probe)
+            monkeypatch.setattr(registry, "_probe", lambda *a, **k: probe)
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(dest))     # managed dest resolves (no shadow)
         t = _tool(bin="gitleaks", runtime="binary", pin="v8.30.1", version_cmd="gitleaks version",
                   artifacts={"linux/amd64": {"url": "https://x/g.tgz", "sha256": _VALID_SHA}},
@@ -508,13 +531,15 @@ class TestInstallOne:
 
         def rs(c, d):
             if "git" in c:
-                stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text("NEW")
+                candidate = Path(registry._install_context.environment["HOME"])
+                target = candidate / ".local" / "bin" / ".stage" / "massdns"
+                target.parent.mkdir(parents=True, exist_ok=True); target.write_text("NEW")
             return (0, "")
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, ""))
+        monkeypatch.setattr(registry, "_probe", lambda *a, **k: (0, ""))
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(dest))    # resolves to managed dest (no shadow)
-        monkeypatch.setattr(registry, "_write_receipt",
-                            lambda b, ref, sha: (_ for _ in ()).throw(OSError("receipt unwritable")))
+        monkeypatch.setattr(registry, "_write_runtime_receipt",
+                            lambda *_a: (_ for _ in ()).throw(OSError("receipt unwritable")))
         t = _tool(bin="massdns", runtime="source", ref="deadbeef", version_cmd="massdns --help", cap_codes=[0, 1],
                   install="git clone x && git checkout {ref} && cp bin/{bin} ~/.local/bin/.stage/{bin}")
         assert registry.install_one(t, lambda m: None) is False              # activation failed
@@ -532,13 +557,18 @@ class TestCliNoFloat:
 
         def rs(c, d):
             cmds.append(c)
-            m = _re.search(r"\.stage/(\S+)", c)                            # a binary/source STAGE command
-            if m:
-                sp = tmp_path / ".local" / "bin" / ".stage" / m.group(1)
-                sp.parent.mkdir(parents=True, exist_ok=True); sp.write_text("bin")
             return (0, "")
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, ""))   # capability rc 0; version via version_eq
+        def candidate_executable(candidate, tool):
+            path = Path(candidate) / "home" / ".local" / "bin" / tool.bin
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("bin")
+            path.chmod(0o700)
+            return path
+        monkeypatch.setattr(registry, "_candidate_executable", candidate_executable)
+        monkeypatch.setattr(registry, "_validate_declared_payloads", lambda *_a: None)
+        monkeypatch.setattr(registry, "_probe_candidate", lambda *_a: True)
+        monkeypatch.setattr(registry, "_probe", lambda *a, **k: (0, ""))
         monkeypatch.setattr(registry, "version_eq", lambda a, b: True)           # staged version matches (not the focus)
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(tmp_path / ".local" / "bin" / b))  # no shadow
         monkeypatch.setattr(Tool, "installed", property(lambda self: True))
@@ -834,12 +864,18 @@ class TestIdentityR6:
 
         def rs(c, d):
             if "curl" in c:
-                stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text("NEW")
+                candidate = Path(registry._install_context.environment["HOME"])
+                target = candidate / ".local" / "bin" / ".stage" / "gitleaks"
+                target.parent.mkdir(parents=True, exist_ok=True); target.write_text("NEW")
             return (0, "")
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, "v8.30.1"))
+        monkeypatch.setattr(registry, "_probe", lambda *a, **k: (0, "v8.30.1"))
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(dest))
-        monkeypatch.setattr(registry, "_fd_sha256", lambda fd: "")             # staged descriptor unhashable
+        real_sha = registry._file_sha256
+        monkeypatch.setattr(
+            registry, "_file_sha256",
+            lambda path: "" if Path(path).name == "gitleaks" else real_sha(path),
+        )
         t = _tool(bin="gitleaks", runtime="binary", pin="v8.30.1", version_cmd="gitleaks version",
                   artifacts={"linux/amd64": {"url": "https://x/g.tgz", "sha256": _VALID_SHA}},
                   install="curl {url} ... ~/.local/bin/.stage {bin}")
@@ -962,10 +998,12 @@ class TestGoBinaryMigration:
 
         def rs(c, d):
             if "curl" in c and stage_ok:
-                stage.parent.mkdir(parents=True, exist_ok=True); stage.write_text("V3-NEW")
+                candidate = Path(registry._install_context.environment["HOME"])
+                target = candidate / ".local" / "bin" / ".stage" / "dalfox"
+                target.parent.mkdir(parents=True, exist_ok=True); target.write_text("V3-NEW")
             return (0, "") if stage_ok else (1, "")
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, "v3.1.2"))
+        monkeypatch.setattr(registry, "_probe", lambda *a, **k: (0, "v3.1.2"))
         monkeypatch.setattr(registry, "_go_bin_dir", lambda: gobin)
         # PATH resolves the legacy go copy FIRST while it exists; only after relocation does dest win
         monkeypatch.setattr(registry.shutil, "which",
@@ -1205,11 +1243,13 @@ class TestAnInstallFailureSAYSWhatHappened:
 
         def rs(c, d):
             if stage:
-                stage_p.parent.mkdir(parents=True, exist_ok=True)
-                stage_p.write_text("NEW")
+                candidate = Path(registry._install_context.environment["HOME"])
+                target = candidate / ".local" / "bin" / ".stage" / "gitleaks"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("NEW")
             return (code, out)
         monkeypatch.setattr(registry, "run_shell", rs)
-        monkeypatch.setattr(registry, "_probe", lambda c, timeout=15, pass_fd=None: (0, "v8.30.1"))
+        monkeypatch.setattr(registry, "_probe", lambda *a, **k: (0, "v8.30.1"))
         monkeypatch.setattr(registry.shutil, "which", lambda b: str(tmp_path / ".local/bin/gitleaks"))
         t = _tool(bin="gitleaks", runtime="binary", pin="v8.30.1", version_cmd="gitleaks version",
                   artifacts={"linux/amd64": {"url": "https://x/g.tgz", "sha256": _VALID_SHA}},

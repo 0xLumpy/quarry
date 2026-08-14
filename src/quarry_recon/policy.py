@@ -58,7 +58,7 @@ PROVIDER_DOORS: dict[str, str] = {
     "vertical.censys": "run_provider",
     "vertical.certspotter": "run_provider",
     "vertical.crtsh": "run_provider",
-    "vertical.shosubgo": "run_contract",       # an external binary we hand a key to
+    "vertical.shosubgo": "run_provider",       # Quarry's in-process Shodan DNS API adapter
     # runs the tool directly (`exec_tool`), so neither registry gate covers it — it gates itself
     "vertical.github_subs": "direct_tool",
     "osint.whoxy": "direct_http",              # plain HTTP in `osint.py`, outside the source registry
@@ -356,6 +356,9 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.privfs:_MAX_WORKER_PID": (
         "identity", "the accepted operating-system PID domain for a stage-handoff correlation identity; "
                     "it does not bound child execution"),
+    "quarry_recon.phases.vertical:SHODAN_DOMAIN_READ_LIMIT": (
+        "resource", "the bounded acquisition-response allocation for one Shodan domain payload; an "
+                    "oversized response is rejected rather than truncated or accepted as complete"),
     "quarry_recon.release_evidence:MAX_JSON_DEPTH": (
         "resource", "the recursion-safety bound for one untrusted release-evidence control record; a "
                     "deeper record is rejected and never treated as accepted evidence"),

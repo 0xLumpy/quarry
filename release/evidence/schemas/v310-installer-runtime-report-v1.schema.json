@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quarry.local/schemas/v310-installer-runtime-report-v1.schema.json",
+  "title": "Quarry v0.3.10 installer, runtime identity, and secret-isolation gate report",
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,6})?Z$"
+    },
+    "artifacts": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"$ref": "#/$defs/digest"}
+    },
+    "trial-identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["case", "outcome", "assertions", "before_identity", "after_identity", "artifact_digests"],
+      "properties": {
+        "case": {"type": "string"},
+        "outcome": {"const": "pass"},
+        "assertions": {"type": "object"},
+        "before_identity": {"$ref": "#/$defs/digest"},
+        "after_identity": {"$ref": "#/$defs/digest"},
+        "artifact_digests": {"$ref": "#/$defs/artifacts"}
+      }
+    },
+    "trial-secret": {
+      "type": "object", "additionalProperties": false,
+      "required": ["case", "outcome", "assertions", "before_identity", "after_identity", "artifact_digests"],
+      "properties": {
+        "case": {"type": "string"},
+        "outcome": {"const": "pass"},
+        "assertions": {"type": "object"},
+        "before_identity": {"type": "null"},
+        "after_identity": {"type": "null"},
+        "artifact_digests": {"$ref": "#/$defs/artifacts"}
+      }
+    },
+    "a-install-fault": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fault_injected", "identity_unchanged", "last_known_good_preserved", "partial_not_active"],
+      "properties": {
+        "fault_injected": {"const": true}, "identity_unchanged": {"const": true},
+        "last_known_good_preserved": {"const": true}, "partial_not_active": {"const": true}
+      }
+    },
+    "a-filesystem": {
+      "type": "object", "additionalProperties": false,
+      "required": ["aliases_reconciled", "candidate_private", "new_identity_activated", "pointer_atomic", "receipt_complete"],
+      "properties": {
+        "aliases_reconciled": {"const": true}, "candidate_private": {"const": true},
+        "new_identity_activated": {"const": true}, "pointer_atomic": {"const": true},
+        "receipt_complete": {"const": true}
+      }
+    },
+    "a-fault-install": {
+      "type": "object", "additionalProperties": false,
+      "required": ["failure_reported", "fault_observed", "last_known_good_preserved", "residue_settled", "unverified_launches_zero"],
+      "properties": {
+        "failure_reported": {"const": true}, "fault_observed": {"const": true},
+        "last_known_good_preserved": {"const": true}, "residue_settled": {"const": true},
+        "unverified_launches_zero": {"const": true}
+      }
+    },
+    "a-environment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["argv_clean", "declared_consumer_only", "record_values_absent"],
+      "properties": {
+        "argv_clean": {"const": true}, "declared_consumer_only": {"const": true},
+        "record_values_absent": {"const": true}
+      }
+    },
+    "a-private-config": {
+      "type": "object", "additionalProperties": false,
+      "required": ["argv_clean", "cleanup_proven", "owner_only"],
+      "properties": {
+        "argv_clean": {"const": true}, "cleanup_proven": {"const": true},
+        "owner_only": {"const": true}
+      }
+    },
+    "a-shodan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["argv_clean", "child_processes_zero", "record_values_absent"],
+      "properties": {
+        "argv_clean": {"const": true}, "child_processes_zero": {"const": true},
+        "record_values_absent": {"const": true}
+      }
+    },
+    "a-unrelated": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ambient_credential_ignored", "credential_absent"],
+      "properties": {
+        "ambient_credential_ignored": {"const": true}, "credential_absent": {"const": true}
+      }
+    },
+    "a-sink": {
+      "type": "object", "additionalProperties": false,
+      "required": ["binary_safe_scan", "matches_zero", "synthetic_canaries_scanned"],
+      "properties": {
+        "binary_safe_scan": {"const": true}, "matches_zero": {"const": true},
+        "synthetic_canaries_scanned": {"const": true}
+      }
+    },
+    "a-managed": {
+      "type": "object", "additionalProperties": false,
+      "required": ["absolute_anchor", "executed_digest_matches", "receipt_revalidated"],
+      "properties": {
+        "absolute_anchor": {"const": true}, "executed_digest_matches": {"const": true},
+        "receipt_revalidated": {"const": true}
+      }
+    },
+    "a-distro": {
+      "type": "object", "additionalProperties": false,
+      "required": ["absolute_anchor", "executed_digest_matches", "host_digest_recorded"],
+      "properties": {
+        "absolute_anchor": {"const": true}, "executed_digest_matches": {"const": true},
+        "host_digest_recorded": {"const": true}
+      }
+    },
+    "a-wrapper": {
+      "type": "object", "additionalProperties": false,
+      "required": ["interpreter_anchored", "payload_digest_matches", "wrapper_bypassed"],
+      "properties": {
+        "interpreter_anchored": {"const": true}, "payload_digest_matches": {"const": true},
+        "wrapper_bypassed": {"const": true}
+      }
+    },
+    "a-dependency": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dependency_anchored", "dependency_digest_matches", "path_minimal"],
+      "properties": {
+        "dependency_anchored": {"const": true}, "dependency_digest_matches": {"const": true},
+        "path_minimal": {"const": true}
+      }
+    },
+    "a-substitution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["anchored_identity_executed", "substitution_attempted", "unverified_launches_zero"],
+      "properties": {
+        "anchored_identity_executed": {"const": true}, "substitution_attempted": {"const": true},
+        "unverified_launches_zero": {"const": true}
+      }
+    },
+    "a-receipt-item": {
+      "type": "object", "additionalProperties": false,
+      "required": ["declared", "digest_matches", "present"],
+      "properties": {
+        "declared": {"const": true}, "digest_matches": {"const": true}, "present": {"const": true}
+      }
+    },
+    "a-env-keys": {
+      "type": "object", "additionalProperties": false,
+      "required": ["allowlist_exact", "credential_names_only", "values_absent"],
+      "properties": {
+        "allowlist_exact": {"const": true}, "credential_names_only": {"const": true},
+        "values_absent": {"const": true}
+      }
+    },
+    "report": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "candidate_identity_digest", "gate_id", "artifact_kind", "started_at", "finished_at", "trials", "verdict"],
+      "properties": {
+        "schema_version": {"const": "quarry.v310-installer-runtime-report.v1"},
+        "candidate_identity_digest": {"$ref": "#/$defs/digest"},
+        "gate_id": {"type": "string"}, "artifact_kind": {"type": "string"},
+        "started_at": {"$ref": "#/$defs/timestamp"},
+        "finished_at": {"$ref": "#/$defs/timestamp"},
+        "trials": {"type": "array"}, "verdict": {"const": "pass"}
+      }
+    }
+  },
+  "allOf": [
+    {"$ref": "#/$defs/report"},
+    {"oneOf": [
+      {
+        "properties": {
+          "gate_id": {"const": "C-INSTALL-ROLLBACK"}, "artifact_kind": {"const": "fault-matrix"},
+          "trials": {
+            "prefixItems": [
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "activation"}, "assertions": {"$ref": "#/$defs/a-install-fault"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "download"}, "assertions": {"$ref": "#/$defs/a-install-fault"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "extract"}, "assertions": {"$ref": "#/$defs/a-install-fault"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "lock"}, "assertions": {"$ref": "#/$defs/a-install-fault"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "payload"}, "assertions": {"$ref": "#/$defs/a-install-fault"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "privilege"}, "assertions": {"$ref": "#/$defs/a-install-fault"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "receipt"}, "assertions": {"$ref": "#/$defs/a-install-fault"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "verify"}, "assertions": {"$ref": "#/$defs/a-install-fault"}}}
+            ], "items": false, "minItems": 8, "maxItems": 8
+          }
+        }
+      },
+      {
+        "properties": {
+          "gate_id": {"const": "C-INSTALL-ROLLBACK"}, "artifact_kind": {"const": "filesystem-trace"},
+          "trials": {
+            "prefixItems": [
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "binary"}, "assertions": {"$ref": "#/$defs/a-filesystem"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "go"}, "assertions": {"$ref": "#/$defs/a-filesystem"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "pipx"}, "assertions": {"$ref": "#/$defs/a-filesystem"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "source"}, "assertions": {"$ref": "#/$defs/a-filesystem"}}}
+            ], "items": false, "minItems": 4, "maxItems": 4
+          }
+        }
+      },
+      {
+        "properties": {
+          "gate_id": {"const": "C-FAULT-INSTALL"}, "artifact_kind": {"const": "fault-matrix"},
+          "trials": {
+            "prefixItems": [
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "activation"}, "assertions": {"$ref": "#/$defs/a-fault-install"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "download"}, "assertions": {"$ref": "#/$defs/a-fault-install"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "extract"}, "assertions": {"$ref": "#/$defs/a-fault-install"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "lock"}, "assertions": {"$ref": "#/$defs/a-fault-install"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "payload"}, "assertions": {"$ref": "#/$defs/a-fault-install"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "privilege"}, "assertions": {"$ref": "#/$defs/a-fault-install"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "receipt"}, "assertions": {"$ref": "#/$defs/a-fault-install"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "verify"}, "assertions": {"$ref": "#/$defs/a-fault-install"}}}
+            ], "items": false, "minItems": 8, "maxItems": 8
+          }
+        }
+      },
+      {
+        "properties": {
+          "gate_id": {"const": "C-SECRETS"}, "artifact_kind": {"const": "canary-matrix"},
+          "trials": {
+            "prefixItems": [
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "asnmap-environment"}, "assertions": {"$ref": "#/$defs/a-environment"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "dalfox-private-config"}, "assertions": {"$ref": "#/$defs/a-private-config"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "github-token-file"}, "assertions": {"$ref": "#/$defs/a-private-config"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "interactsh-private-config"}, "assertions": {"$ref": "#/$defs/a-private-config"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "nuclei-private-config"}, "assertions": {"$ref": "#/$defs/a-private-config"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "shodan-in-process"}, "assertions": {"$ref": "#/$defs/a-shodan"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "subfinder-environment"}, "assertions": {"$ref": "#/$defs/a-environment"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "unrelated-adapter"}, "assertions": {"$ref": "#/$defs/a-unrelated"}}}
+            ], "items": false, "minItems": 8, "maxItems": 8
+          }
+        }
+      },
+      {
+        "properties": {
+          "gate_id": {"const": "C-SECRETS"}, "artifact_kind": {"const": "sink-scan"},
+          "trials": {
+            "prefixItems": [
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "ambient-environment"}, "assertions": {"$ref": "#/$defs/a-sink"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "argv"}, "assertions": {"$ref": "#/$defs/a-sink"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "crash-data"}, "assertions": {"$ref": "#/$defs/a-sink"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "native-output"}, "assertions": {"$ref": "#/$defs/a-sink"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "process-metadata"}, "assertions": {"$ref": "#/$defs/a-sink"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "release-evidence"}, "assertions": {"$ref": "#/$defs/a-sink"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "reports"}, "assertions": {"$ref": "#/$defs/a-sink"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "runtime-receipts"}, "assertions": {"$ref": "#/$defs/a-sink"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "stderr"}, "assertions": {"$ref": "#/$defs/a-sink"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "stdout"}, "assertions": {"$ref": "#/$defs/a-sink"}}},
+              {"$ref": "#/$defs/trial-secret", "properties": {"case": {"const": "telemetry"}, "assertions": {"$ref": "#/$defs/a-sink"}}}
+            ], "items": false, "minItems": 11, "maxItems": 11
+          }
+        }
+      },
+      {
+        "properties": {
+          "gate_id": {"const": "C-EXEC-IDENTITY"}, "artifact_kind": {"const": "launch-trace"},
+          "trials": {
+            "prefixItems": [
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "distro"}, "assertions": {"$ref": "#/$defs/a-distro"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "managed-binary"}, "assertions": {"$ref": "#/$defs/a-managed"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "managed-go"}, "assertions": {"$ref": "#/$defs/a-managed"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "managed-pipx"}, "assertions": {"$ref": "#/$defs/a-managed"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "managed-source"}, "assertions": {"$ref": "#/$defs/a-managed"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "path-substitution"}, "assertions": {"$ref": "#/$defs/a-substitution"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "runtime-dependency"}, "assertions": {"$ref": "#/$defs/a-dependency"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "wrapper-payload"}, "assertions": {"$ref": "#/$defs/a-wrapper"}}}
+            ], "items": false, "minItems": 8, "maxItems": 8
+          }
+        }
+      },
+      {
+        "properties": {
+          "gate_id": {"const": "C-EXEC-IDENTITY"}, "artifact_kind": {"const": "receipt-reconciliation"},
+          "trials": {
+            "prefixItems": [
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "environment-keys"}, "assertions": {"$ref": "#/$defs/a-env-keys"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "executable"}, "assertions": {"$ref": "#/$defs/a-receipt-item"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "helper"}, "assertions": {"$ref": "#/$defs/a-receipt-item"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "payload"}, "assertions": {"$ref": "#/$defs/a-receipt-item"}}},
+              {"$ref": "#/$defs/trial-identity", "properties": {"case": {"const": "template"}, "assertions": {"$ref": "#/$defs/a-receipt-item"}}}
+            ], "items": false, "minItems": 5, "maxItems": 5
+          }
+        }
+      }
+    ]}
+  ]
+}

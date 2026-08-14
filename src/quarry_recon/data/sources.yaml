@@ -79,8 +79,8 @@ sources:
   vertical.github_subs:      {tool: github-subdomains, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (GitHub PAT)",
     input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: http, failure: silent-skip, fallback: skip, parser: normalize.hosts, log: one-line,
     notes: "needs GitHub PAT; silent if absent"}
-  vertical.shosubgo:         {tool: shosubgo, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (Shodan)",
-    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: http, failure: "no key → skip; configured → -fail exits 1 on API error (FAILED, not clean-empty)", fallback: skip, parser: "fail-closed (malformed/bad-utf8 → PARTIAL, valid hosts kept)", log: one-line, notes: "needs Shodan key; -fail so auth/quota error can't look empty"}
+  vertical.shosubgo:         {tool: internal, phase: vertical, tier: optional, class: passive, default: key, reason: "keyed (Shodan DNS API; credential stays in process)",
+    input: apex, output: subdomain, workers: n/a, rate: n/a, timeout: http, failure: "no key → skip; configured HTTP/schema/parse error → FAILED (never clean-empty)", fallback: skip, parser: "strict UTF-8 JSON object with string subdomains[] and boolean more; bounded pagination", log: one-line, notes: "Quarry-owned in-process adapter; key is never argv, environment, telemetry, or raw evidence"}
   vertical.crtsh:            {tool: crt.sh, phase: vertical, tier: core, class: passive, default: on,
     input: apex, output: subdomain+cert-wildcard, workers: n/a, rate: n/a, timeout: fixed, failure: quiet-warn, fallback: skip, parser: internal, log: delta}
   vertical.certspotter:      {tool: certspotter, phase: vertical, tier: core, class: passive, default: on,

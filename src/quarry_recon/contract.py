@@ -27,7 +27,7 @@ from dataclasses import dataclass as _dataclass
 from pathlib import Path as _Path
 
 from . import events, normalize, sources
-from .runner import Status, _preflight_argv, run as _run, skipped
+from .runner import Status, _preflight_argv, _preflight_environment, run as _run, skipped
 
 # Non-clean terminal statuses that warrant a dedicated event before the normal tool_finish.
 _PARTIAL = (Status.PARTIAL, Status.TIMED_OUT)
@@ -1725,7 +1725,16 @@ def run_contract(source_id, cmd, *, repository=None, stdout=None, stderr=None,
     # Event serialization must not run caller-defined container methods before runner preflight. Invalid argv
     # still receives a start/finish lifecycle, but its start carries the only safe representation: an empty argv.
     event_cmd, _argv_error = _preflight_argv(cmd)
-    events.tool_start(source_id, cmd=event_cmd or [], env=env, input_total=input_total, work_unit=work_unit,
+    # Telemetry records only caller-requested environment names. Runtime admission constructs the exact
+    # allowlisted environment and its private identity record; values (especially credentials) never enter
+    # events.jsonl even transiently.
+    safe_event_env, _env_error = _preflight_environment(env)
+    event_env = (
+        {key: "<provided>" for key in sorted(safe_event_env)}
+        if safe_event_env is not None else None
+    )
+    events.tool_start(source_id, cmd=event_cmd or [], env=event_env,
+                      input_total=input_total, work_unit=work_unit,
                       workers=src.get("workers"), rate=src.get("rate"),
                       timeout=run_kwargs.get("timeout", src.get("timeout")),
                       parent_id=parent_id, scope_distance=scope_distance,

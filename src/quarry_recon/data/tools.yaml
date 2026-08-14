@@ -16,9 +16,27 @@ go_env: &go "GOBIN ok; needs Go toolchain on PATH"
 
 tools:
   # ── Phase 0: OSINT (apex/org/leak discovery) ────────────────────────────
-  # Most OSINT sources are in-process HTTP/whois/dig calls needing NO tool install:
-  #   azmap.dev M365 tenant, whois/RDAP registrant, DMARC pivot (dig), whoxy reverse-whois.
-  # Key-gated in-process: whoxy (secrets.yaml -> whoxy:). The one installed tool:
+  # Most OSINT sources are in-process HTTP calls. External whois/dig are explicit distro runtimes so
+  # every child launch takes the same absolute identity/environment admission boundary.
+  - bin: whois
+    maintenance_state: distro
+    policy: distro
+    phase: osint
+    role: registrant organization/e-mail evidence
+    install: sudo apt-get install -y whois
+    version_cmd: whois --version
+    doc: https://github.com/rfc1036/whois
+
+  - bin: dig
+    maintenance_state: distro
+    policy: distro
+    phase: osint
+    role: DMARC TXT evidence
+    install: sudo apt-get install -y dnsutils
+    version_cmd: dig -v
+    doc: https://bind9.readthedocs.io/
+
+  # Key-gated in-process: whoxy (secrets.yaml -> whoxy:).
   - bin: porch-pirate
     maintenance_state: frozen
     version: "0.0.1"
@@ -43,6 +61,7 @@ tools:
     role: ASN -> CIDR ranges (context); echo AS123 | asnmap -silent
     install: go install github.com/projectdiscovery/asnmap/cmd/asnmap@latest
     version_cmd: asnmap -version
+    credential_env: [PDCP_API_KEY]
     doc: https://github.com/projectdiscovery/asnmap
     notes: Can hang on its data source — runner enforces hard timeout.
 
@@ -78,19 +97,6 @@ tools:
     notes: Active cert scan. Run only on owned IP space. Full cloud sweep = 2-5 days.
 
   # ── Phase 3: Vertical subdomain discovery ───────────────────────────────
-  - bin: shosubgo
-    maintenance_state: monitor
-    release: "5.0"
-    version: "v0.0.0-20250901210855-ccb6dc7bf0ef"
-    phase: vertical
-    role: Shodan-only subdomain discovery (narrow focus = unique hits)
-    install: go install github.com/incogbyte/shosubgo@latest
-    version_cmd: shosubgo -h
-    cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
-    doc: https://github.com/incogbyte/shosubgo
-    keys: Shodan key -> secrets.yaml (shodan:)
-    optional: true
-
   - bin: subfinder
     maintenance_state: active
     version: "v2.14.0"
@@ -98,6 +104,8 @@ tools:
     role: passive subdomain enum (primary); subfinder -all (no -recursive — it RESTRICTS sources)
     install: go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
     version_cmd: subfinder -version
+    env_allow: [SUBFINDER_PROVIDER_CONFIG, SUBFINDER_CONFIG]
+    credential_env: [PDCP_API_KEY]
     doc: https://github.com/projectdiscovery/subfinder
     keys: ~/.config/subfinder/provider-config.yaml (chaos, github, shodan, securitytrails, netlas, c99, dnsdumpster, fofa, ...)
     notes: -all enables all sources (+20 results in testing); -recursive would RESTRICT to the recursive-capable
@@ -123,6 +131,7 @@ tools:
     role: massdns wrapper — DNS brute + validate
     install: go install github.com/d3mondev/puredns/v2@latest
     version_cmd: puredns --help
+    runtime_bins: [massdns]
     cap_codes: [0, 1]   # help/-h probe: 0 or 1 is a working tool
     doc: https://github.com/d3mondev/puredns
     notes: Requires massdns on host. Needs resolvers + trusted-resolvers lists.
@@ -164,6 +173,10 @@ tools:
     ref: 3a1018a694fd630137b1c19525abcb47315404d4
     repo: francisconeves97/jxscout
     runtime: source
+    runtime_exec: node
+    runtime_entry: .local/share/quarry/jxscout-chunk-discoverer.cjs
+    runtime_payloads:
+      - {path: .local/share/quarry/jxscout-chunk-discoverer.cjs, sha256: "157118f58497a8f1208e80bb24f58aa1b25e3847898d07a414cd473a6d0f6f81"}
     # verify sha256 + a live node run in the temp dir first, then swap tree+cjs in under a trap that restores
     # last-good as one unit on any failure; the GPL file is never modified (the shim is ours).
     install: 'set -e; D="$(mktemp -d)"; Q="$HOME/.local/share/quarry"; git clone -q https://github.com/francisconeves97/jxscout "$D/jxscout"; git -C "$D/jxscout" checkout -q {ref}; echo "157118f58497a8f1208e80bb24f58aa1b25e3847898d07a414cd473a6d0f6f81  $D/jxscout/internal/modules/chunk-discoverer/chunk-discoverer.js" | sha256sum -c - >/dev/null; cp "$D/jxscout/internal/modules/chunk-discoverer/chunk-discoverer.js" "$D/cjs"; node "$D/cjs" "$D/jxscout/pkg/chunk-discoverer/tests/files/2.js" 0 >/dev/null; rm -rf "$D/jxscout/.git"; mkdir -p "$Q"; rm -rf "$Q/jxscout.new" "$Q/.cjs.new" "$Q/jxscout.last-good" "$Q/.cjs.last-good"; mv "$D/jxscout" "$Q/jxscout.new"; cp "$D/cjs" "$Q/.cjs.new"; trap ''if [ -e "$Q/jxscout.last-good" ]; then rm -rf "$Q/jxscout"; mv "$Q/jxscout.last-good" "$Q/jxscout"; if [ -e "$Q/.cjs.last-good" ]; then mv "$Q/.cjs.last-good" "$Q/jxscout-chunk-discoverer.cjs"; fi; else rm -rf "$Q/jxscout" "$Q/jxscout-chunk-discoverer.cjs"; fi; rm -rf "$Q/jxscout.new" "$Q/.cjs.new"'' EXIT; if [ -e "$Q/jxscout" ]; then mv "$Q/jxscout" "$Q/jxscout.last-good"; fi; if [ -e "$Q/jxscout-chunk-discoverer.cjs" ]; then cp -p "$Q/jxscout-chunk-discoverer.cjs" "$Q/.cjs.last-good"; fi; mv "$Q/jxscout.new" "$Q/jxscout"; mv "$Q/.cjs.new" "$Q/jxscout-chunk-discoverer.cjs"; trap - EXIT; rm -rf "$Q/jxscout.last-good" "$Q/.cjs.last-good"; mkdir -p ~/.local/bin/.stage; printf ''#!/bin/sh\nexec node "$HOME/.local/share/quarry/jxscout-chunk-discoverer.cjs" "$@"\n'' > ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin}'
@@ -244,6 +257,14 @@ tools:
     ref: 3a1018a694fd630137b1c19525abcb47315404d4
     repo: francisconeves97/jxscout
     runtime: source
+    runtime_exec: bun
+    runtime_argv_prefix: [run]
+    runtime_entry: .local/share/quarry/jxscout/internal/modules/ast-analyzer/ast-analyzer.js
+    runtime_entry_env:
+      NAPI_RS_NATIVE_LIBRARY_PATH: .local/share/quarry/jxscout/internal/modules/ast-analyzer/parser.linux-x64-gnu.node
+    runtime_payloads:
+      - {path: .local/share/quarry/jxscout/internal/modules/ast-analyzer/ast-analyzer.js, sha256: "d1531754a223b21f4c49c2eaed2d16dbef552fac4ebbd69b62739c7c6c48ab65"}
+      - {path: .local/share/quarry/jxscout/internal/modules/ast-analyzer/parser.linux-x64-gnu.node, sha256: "8a8a0259a16112e633ecd54013ac15c00d24a9d54ec566404ce7d5e66e1d3d54"}
     install: 'set -e; if ! command -v bun >/dev/null; then echo "jxscout-ast needs bun (the analyzer fails under node): install bun first" >&2; exit 1; fi; Q="$HOME/.local/share/quarry"; if [ ! -d "$Q/jxscout" ]; then D="$(mktemp -d)"; trap ''rm -rf "$D"'' EXIT; git clone -q https://github.com/francisconeves97/jxscout "$D/jxscout_ast"; git -C "$D/jxscout_ast" checkout -q {ref}; printf ''d1531754a223b21f4c49c2eaed2d16dbef552fac4ebbd69b62739c7c6c48ab65  %s/jxscout_ast/internal/modules/ast-analyzer/ast-analyzer.js\n8a8a0259a16112e633ecd54013ac15c00d24a9d54ec566404ce7d5e66e1d3d54  %s/jxscout_ast/internal/modules/ast-analyzer/parser.linux-x64-gnu.node\n'' "$D" "$D" | sha256sum -c - >/dev/null; rm -rf "$D/jxscout_ast/.git"; mkdir -p "$Q"; mv "$D/jxscout_ast" "$Q/jxscout"; fi; printf ''d1531754a223b21f4c49c2eaed2d16dbef552fac4ebbd69b62739c7c6c48ab65  %s/.local/share/quarry/jxscout/internal/modules/ast-analyzer/ast-analyzer.js\n8a8a0259a16112e633ecd54013ac15c00d24a9d54ec566404ce7d5e66e1d3d54  %s/.local/share/quarry/jxscout/internal/modules/ast-analyzer/parser.linux-x64-gnu.node\n'' "$HOME" "$HOME" | sha256sum -c - >/dev/null; mkdir -p ~/.local/bin/.stage; printf ''#!/bin/sh\nA="$HOME/.local/share/quarry/jxscout/internal/modules/ast-analyzer"\nNAPI_RS_NATIVE_LIBRARY_PATH="$A/parser.linux-x64-gnu.node" exec bun run "$A/ast-analyzer.js" "$@"\n'' > ~/.local/bin/.stage/{bin} && chmod +x ~/.local/bin/.stage/{bin}'
     # RUNS the analyzer on upstream's own example file: proof that bun executed it and that the native
     # parser loaded, not merely that a shim exists on PATH.
@@ -530,6 +551,7 @@ tools:
     install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
     update: nuclei -update; nuclei -update-templates
     version_cmd: nuclei -version
+    env_allow: [NUCLEI_CONFIG]
     doc: https://github.com/projectdiscovery/nuclei
     needs_chromium: true     # only for -headless / screenshot templates
     notes: >

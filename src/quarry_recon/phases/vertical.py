@@ -6,6 +6,7 @@ passive (subfinder -all) + github-subdomains -> brute (puredns) -> permutations
 from __future__ import annotations
 
 import ipaddress as _ipaddress
+import http.client as _http_client
 import json as _json
 import os
 import re as _re
@@ -73,7 +74,9 @@ def _subfinder_provider_fp() -> str:
         except OSError:
             data = b"\x00<absent>"
         h.update(label.encode() + b"\x00" + len(data).to_bytes(8, "big") + data)   # length-framed
-    key = (os.environ.get("PDCP_API_KEY") or "").encode()
+    # The key is no longer exported into Quarry's ambient process. Runtime admission injects it only into
+    # registry-declared consumers; resume identity reads the same source directly and records only a digest.
+    key = (secrets.chaos() or "").encode()
     h.update(b"pdcp-key\x00" + hashlib.sha256(key).digest())  # key fingerprint, never the raw key
     return h.hexdigest()
 
@@ -104,34 +107,6 @@ def _run_subfinder(ctx, prof, scope) -> None:
                     normalize.hosts(r.raw_path.read_text(), "subfinder", str(sf_raw))
                     if scope.in_scope(e["host"]))
             ctx.echo(f"  subfinder [{apex}]: +{n} in-scope ({r.stdout_lines} raw, {r.status.value})")
-
-
-def _shosubgo_read(path):
-    """Fail-closed read of shosubgo's -o host file. Returns (hosts, artifact_ok): hosts = validated host
-    dicts to ingest; artifact_ok = True only when clean UTF-8 and every non-blank line was a valid host.
-    Returns (None, False) when the file is missing or unreadable."""
-    if not path.exists():
-        return None, False
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return None, False
-    try:
-        text = raw.decode("utf-8")
-        artifact_ok = True
-    except UnicodeDecodeError:
-        text, artifact_ok = raw.decode("utf-8", "replace"), False
-    hosts = []
-    for line in text.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        parsed = list(normalize.hosts(s, "shosubgo", str(path)))
-        if parsed:
-            hosts.extend(parsed)
-        else:
-            artifact_ok = False                                     # a non-blank non-host line -> malformed
-    return hosts, artifact_ok
 
 
 def _openintel(ctx, cfg: dict, apex: str, timeout: int = 180) -> set:
@@ -266,6 +241,57 @@ def _censys(cfg: dict, apex: str, timeout: int = 30, max_pages: int = 5) -> set:
 CENSYS_READ_LIMIT = 64 * 1024 * 1024
 CRTSH_READ_LIMIT = 64 * 1024 * 1024
 CERTSPOTTER_READ_LIMIT = 64 * 1024 * 1024
+SHODAN_DOMAIN_READ_LIMIT = 16 * 1024 * 1024
+
+
+def _shodan_domain(apex: str, key: str, timeout: int = 30, max_pages: int = 5) -> ProviderResult:
+    """Shodan DNS domain lookup without exporting Quarry's API key to argv or a child environment."""
+    hosts: set[str] = set()
+    pages = 0
+    more = False
+    for page in range(1, max(1, max_pages) + 1):
+        connection = _http_client.HTTPSConnection("api.shodan.io", timeout=timeout)
+        try:
+            query = urllib.parse.urlencode({"key": key, "page": page})
+            path = f"/dns/domain/{urllib.parse.quote(apex, safe='')}?{query}"
+            connection.request("GET", path, headers={"Accept": "application/json"})
+            response = connection.getresponse()
+            if response.status != 200:
+                raise RuntimeError(f"Shodan DNS API returned HTTP {response.status}")
+            body = read_bounded(
+                response, SHODAN_DOMAIN_READ_LIMIT, provider="shodan-domain",
+                bound="SHODAN_DOMAIN_READ_LIMIT",
+            )
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            # HTTP/client exceptions can retain the request path. Re-raise a value-free typed failure so
+            # provider telemetry and crash data can never serialize the query credential.
+            raise RuntimeError(f"Shodan DNS request failed ({type(exc).__name__})") from None
+        finally:
+            connection.close()
+        try:
+            document = _json.loads(body.decode("utf-8", "strict"))
+        except (UnicodeError, ValueError) as exc:
+            raise RuntimeError(f"Shodan DNS response was invalid ({type(exc).__name__})") from None
+        if (not isinstance(document, dict)
+                or not isinstance(document.get("subdomains"), list)
+                or not all(isinstance(item, str) for item in document["subdomains"])
+                or type(document.get("more", False)) is not bool):
+            raise RuntimeError("Shodan DNS response changed schema")
+        pages = page
+        for subdomain in document["subdomains"]:
+            label = subdomain.strip().lower().strip(".")
+            if not label:
+                hosts.add(apex.lower().strip("."))
+            else:
+                hosts.add(f"{label}.{apex.lower().strip('.')}")
+        more = document.get("more", False)
+        if not more:
+            break
+    return ProviderResult(
+        hosts, partial=more, cursor=(str(pages + 1) if more else None), pages=pages,
+    )
 
 
 def _crtsh(apex: str, timeout: int = 30) -> set:
@@ -1181,11 +1207,10 @@ def _github_subs(ctx, prof, scope) -> None:
         events.tool_blocked("vertical.github_subs", reason=why)
         ctx.run.record("vertical", skipped("github-subdomains", why))   # ONE skip, with the real cause
         return
-    gh_token = secrets.github_tokens_file()   # 0600 temp file from secrets.yaml; None if unset
-    if not gh_token:
-        ctx.run.record("vertical", skipped("github-subdomains", "no GitHub token in secrets.yaml"))
-        return
-    try:
+    with secrets.github_tokens_lifetime() as gh_token:
+        if not gh_token:
+            ctx.run.record("vertical", skipped("github-subdomains", "no GitHub token in secrets.yaml"))
+            return
         for d in prof.apex_domains:
             gh_raw = ctx.run.raw_path("vertical", "github-subdomains", f"{d}.txt")
             r = exec_tool("github-subdomains",
@@ -1201,8 +1226,6 @@ def _github_subs(ctx, prof, scope) -> None:
                 for e in normalize.hosts(r.raw_path.read_text(), "github-subdomains", str(r.raw_path)):
                     if scope.in_scope(e["host"]):
                         ctx.run.add("subdomain", e)
-    finally:
-        gh_token.unlink(missing_ok=True)
 
 
 def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> None:
@@ -1408,6 +1431,32 @@ def _local_provider_sources(ctx, prof, scope, *, censys_config=None) -> set[str]
     if ct_new:
         ctx.echo(f"  CT logs (crt.sh + certspotter): +{ct_new} in-scope")
 
+    # Shodan's maintained DNS API lane is in-process because the former shosubgo interface accepted its
+    # credential only as `-s KEY`, exposing it through argv and process listings.
+    sho_key = secrets.shodan()
+    if sho_key:
+        with _local_raw.lifecycle(ctx.run):
+            sho_hosts = _provider_over_apexes(
+                "vertical.shosubgo",
+                lambda a: _shodan_domain(a, sho_key, max_pages=_max_pages),
+                {"cred_fp": secrets.fingerprint(sho_key)},
+            )
+            if sho_hosts:
+                raw = _local_raw.replace_text(
+                    ctx.run, "vertical", "shodan-domain", "hosts.txt",
+                    "\n".join(sorted(sho_hosts)) + "\n",
+                )
+                added = 0
+                for host in sorted(sho_hosts):
+                    host = host[2:] if host.startswith("*.") else host
+                    if (host and "." in host and scope.in_scope(host) and not scope.is_oos(host)
+                            and ctx.run.add("subdomain", {
+                                "host": host, "sources": ["shodan-domain"], "raw_ref": str(raw),
+                            })):
+                        added += 1
+                if added:
+                    ctx.echo(f"  Shodan DNS: +{added} in-scope")
+
     # ── passive: openintel-subs (ADVANCED — SILENT unless config.yaml `openintel:` set; secrets.yaml legacy) ──
     oi = settings.openintel()   # config.yaml (proper home) with secrets.yaml back-compat
     if oi.get("binary") and oi.get("db"):
@@ -1474,41 +1523,6 @@ def run(ctx) -> None:
     wildcard_zones = _local_provider_sources(ctx, prof, scope, censys_config=cen)
 
     _github_subs(ctx, prof, scope)
-
-    # ── shosubgo (Shodan subs, optional, needs key) ──
-    sho_key = secrets.shodan()
-    if have("shosubgo") and sho_key:
-        sho = ctx.run.raw_path("vertical", "shosubgo", "sho.txt")
-        # `-fail`: exit 1 on any API error, or an auth error exits 0 and reads as clean-empty. shosubgo
-        # writes to the -o file; reclassify inside the contract so the terminal carries the final status.
-        def _sho_reclassify(res):
-            hosts, artifact_ok = (_shosubgo_read(sho) if native_output_current(res, sho)
-                                  else (None, False))
-            reclassify_from_artifact(res, None if hosts is None else len(hosts), label="shosubgo")
-            # a clean-EXIT run whose artifact had malformed lines / bad UTF-8 is NOT a trustworthy clean
-            # result: downgrade to PARTIAL (completion uncertain) while KEEPING the valid hosts.
-            if not artifact_ok and res.status in (Status.SUCCESS, Status.EMPTY):
-                res.status = Status.PARTIAL
-                res.note = f"shosubgo: {len(hosts or [])} host(s) — artifact had malformed lines, completion uncertain"
-            return res
-        # C10b resume: work_unit = the apex-root set (the shosubgo query surface). API key is not folded (a
-        # rotated key is the same coverage intent), but a changed root set is a new unit.
-        sho_wu = events.work_unit("vertical.shosubgo", inputs={"roots": sorted(prof.apex_domains)})
-        r = run_contract("vertical.shosubgo", ["shosubgo", "-f", str(roots_file),
-                                               "-s", sho_key, "-o", str(sho), "-fail"],
-                         repository=ctx.run,
-                         stdout=RepositoryOutput.discard(),
-                         stderr=RepositoryOutput.discard(),
-                         native_outputs=(RepositoryNativeOutput.file(
-                             6, *sho.relative_to(ctx.run.dir).parts,
-                         ),),
-                         work_unit=sho_wu, reclassify=_sho_reclassify, timeout=ctx.http_timeout)
-        ctx.run.record("vertical", r)
-        hosts, _ = (_shosubgo_read(sho) if native_output_current(r, sho)
-                    else (None, False))                  # re-read authenticated output for ingest
-        for e in (hosts or []):
-            if scope.in_scope(e["host"]):
-                ctx.run.add("subdomain", e)
 
     # ── brute force (puredns) ──
     resolvers, trusted = _resolvers(ctx)

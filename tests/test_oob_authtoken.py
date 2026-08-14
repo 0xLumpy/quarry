@@ -56,12 +56,18 @@ def _resume_argv(monkeypatch, saved_server, current_server, token):
         return _FakeProc()
 
     monkeypatch.setattr(oob.shutil, "which", lambda _b: "/usr/bin/interactsh-client")
+    monkeypatch.setattr(
+        oob, "_prepare_client_launch",
+        lambda _run, command, **_kwargs: (list(command), {}),
+    )
     monkeypatch.setattr(oob, "load_session", lambda _run: {
         "session_file": "/tmp/s.session", "log": "/tmp/i.jsonl", "server": saved_server, "domain": "D.oast.pro"})
     monkeypatch.setattr(oob.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(oob, "_await_register", lambda _p, _s, _w: ("D.oast.pro", "uid"))
-    monkeypatch.setattr(oob, "close_session", lambda _p: None)
-    oob.resume_session(object(), token=token, server=current_server, wait=0)
+    monkeypatch.setattr(oob.runner, "terminate_group", lambda _p: None)
+    resumed = oob.resume_session(object(), token=token, server=current_server, wait=0)
+    assert resumed is not None
+    oob.close_session(resumed[1])
     return captured["cmd"]
 
 
@@ -72,7 +78,8 @@ def test_resume_session_argv_public_saved_sends_no_token(monkeypatch):
 
 def test_resume_session_argv_matching_server_sends_both(monkeypatch):
     cmd = _resume_argv(monkeypatch, "oob.example.com", "https://oob.example.com/x", "T")
-    assert "-server" in cmd and "oob.example.com" in cmd and "-token" in cmd and "T" in cmd
+    assert "-server" in cmd and "oob.example.com" in cmd and "-config" in cmd
+    assert "-token" not in cmd and "T" not in cmd
 
 
 def test_resume_session_argv_changed_server_keeps_server_drops_token(monkeypatch):

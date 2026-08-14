@@ -12,7 +12,6 @@ import os
 import re
 import contextlib
 import fcntl
-import subprocess
 import stat
 import threading
 import time
@@ -753,22 +752,26 @@ def _whois(s: OsintSession, apex: str, echo, timeout: int) -> set[str]:
     """Returns registrant emails for whoxy reverse-whois."""
     emails: set[str] = set()
     try:
-        p = subprocess.run(["whois", apex], capture_output=True, text=True,
-                           timeout=min(timeout, 30), stdin=subprocess.DEVNULL)
         raw = s.raw_path("whois", f"{apex}.txt")
-        privfs.write_private(raw, p.stdout)
+        diagnostic = s.raw_path("whois", f"{apex}.stderr.txt")
+        result = exec_tool(
+            "whois", ["whois", apex], repository=s, stdout=s.output(raw),
+            stderr=s.output(diagnostic), timeout=min(timeout, 30), ok_empty=True,
+        )
+        s.record(result)
+        output = result.raw_path.read_text(errors="replace") if result.raw_path is not None else ""
         # `whois` can exit nonzero without raising, so the exit code is checked separately
-        if p.returncode != 0:
-            s.note_failure("whois", f"{apex}: exit {p.returncode} "
-                                    f"{(p.stderr or '').strip().splitlines()[:1]}")
-        for line in p.stdout.splitlines():
+        if result.exit_code != 0:
+            s.note_failure("whois", f"{apex}: exit {result.exit_code} "
+                                    f"{(result.stderr_tail or '').strip().splitlines()[:1]}")
+        for line in output.splitlines():
             low = line.lower()
             if "registrant organization" in low or "registrant org" in low:
                 org = line.split(":", 1)[-1].strip()
                 if org:
                     s.candidate(org, "org", "whois", "related",
                                 f"registrant org of {apex}", raw_ref=str(raw))
-        for email in _EMAIL_RE.findall(p.stdout):       # full emails now
+        for email in _EMAIL_RE.findall(output):       # full emails now
             email = email.lower()
             if "abuse" not in email and "registrar" not in email:
                 emails.add(email)
@@ -780,14 +783,18 @@ def _whois(s: OsintSession, apex: str, echo, timeout: int) -> set[str]:
 
 def _dmarc(s: OsintSession, apex: str, echo, timeout: int) -> None:
     try:
-        p = subprocess.run(["dig", "+short", "TXT", f"_dmarc.{apex}"],
-                           capture_output=True, text=True, timeout=min(timeout, 15),
-                           stdin=subprocess.DEVNULL)
         raw = s.raw_path("dmarc", f"{apex}.txt")
-        privfs.write_private(raw, p.stdout)
-        if p.returncode != 0:                          # dig exits nonzero without raising
-            s.note_failure("dmarc", f"{apex}: dig exit {p.returncode}")
-        for email in _EMAIL_RE.findall(p.stdout):       # rua/ruf mailto addresses
+        diagnostic = s.raw_path("dmarc", f"{apex}.stderr.txt")
+        result = exec_tool(
+            "dig", ["dig", "+short", "TXT", f"_dmarc.{apex}"], repository=s,
+            stdout=s.output(raw), stderr=s.output(diagnostic), timeout=min(timeout, 15),
+            ok_empty=True,
+        )
+        s.record(result)
+        output = result.raw_path.read_text(errors="replace") if result.raw_path is not None else ""
+        if result.exit_code != 0:                       # dig exits nonzero without raising
+            s.note_failure("dmarc", f"{apex}: dig exit {result.exit_code}")
+        for email in _EMAIL_RE.findall(output):          # rua/ruf mailto addresses
             dom = _email_domain(email)                  # the reporting domain is the candidate
             if not dom or dom == apex:
                 continue
