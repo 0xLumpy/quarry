@@ -1,0 +1,61 @@
+{
+  "$id": "urn:quarry:schema:release-scope:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval": {"oneOf": [{"$ref": "#/$defs/review"}, {"type": "null"}]},
+    "input_bindings": {"items": {"$ref": "#/$defs/binding"}, "maxItems": 28, "minItems": 28, "type": "array", "uniqueItems": true},
+    "obligations": {"items": {"$ref": "#/$defs/obligation"}, "maxItems": 64, "minItems": 64, "type": "array", "uniqueItems": true},
+    "production_trust_policy": {
+      "additionalProperties": false,
+      "properties": {"digest": {"type": "null"}, "name": {"const": "production-trust-policy"}, "path": {"const": "release/evidence/trust-policy-v1.json"}, "required_before_nomination": {"const": true}},
+      "required": ["digest", "name", "path", "required_before_nomination"],
+      "type": "object"
+    },
+    "record_inputs": {"items": {"$ref": "#/$defs/token"}, "maxItems": 31, "minItems": 31, "type": "array", "uniqueItems": true},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.release-scope.v1"},
+    "selected_record_slots": {"items": {"$ref": "#/$defs/gate"}, "maxItems": 56, "minItems": 56, "type": "array", "uniqueItems": true},
+    "stages": {"items": {"$ref": "#/$defs/stage"}, "maxItems": 3, "minItems": 3, "type": "array", "uniqueItems": true}
+  },
+  "$defs": {
+    "binding": {
+      "additionalProperties": false,
+      "properties": {"digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"}, "name": {"type": "string"}, "path": {"type": "string"}},
+      "required": ["digest", "name", "path"],
+      "type": "object"
+    },
+    "gate": {"pattern": "^[A-E]-[A-Z0-9]+(-[A-Z0-9]+)*$", "type": "string"},
+    "lane": {"enum": ["H0-hermetic", "H1-tool-integration", "C0-private-corpus", "P0-package-supply", "L0-authorized-live"]},
+    "obligation": {
+      "additionalProperties": false,
+      "properties": {
+        "collector_lane": {"oneOf": [{"$ref": "#/$defs/lane"}, {"type": "null"}]},
+        "disposition": {"enum": ["operation", "required_not_applicable", "required_pass", "unselected"]},
+        "id": {"$ref": "#/$defs/gate"},
+        "phase": {"enum": ["A", "B", "C", "D", "E"]},
+        "record_producing": {"type": "boolean"},
+        "required_evidence_lanes": {"items": {"$ref": "#/$defs/lane"}, "type": "array", "uniqueItems": true},
+        "selected": {"type": "boolean"}
+      },
+      "required": ["collector_lane", "disposition", "id", "phase", "record_producing", "required_evidence_lanes", "selected"],
+      "type": "object"
+    },
+    "review": {
+      "additionalProperties": false,
+      "properties": {"approved_at": {"format": "date-time", "type": "string"}, "review_id": {"$ref": "#/$defs/token"}, "reviewer": {"$ref": "#/$defs/token"}, "signature": {"oneOf": [{"additionalProperties": false, "properties": {"algorithm": {"const": "ed25519"}, "key_id": {"$ref": "#/$defs/token"}, "value": {"pattern": "^base64:[A-Za-z0-9+/]{86}==$", "type": "string"}}, "required": ["algorithm", "key_id", "value"], "type": "object"}, {"type": "null"}]}},
+      "required": ["approved_at", "review_id", "reviewer", "signature"],
+      "type": "object"
+    },
+    "stage": {
+      "additionalProperties": false,
+      "properties": {"depends_on": {"items": {"$ref": "#/$defs/token"}, "type": "array", "uniqueItems": true}, "id": {"$ref": "#/$defs/token"}, "inputs": {"items": {"type": "string"}, "type": "array", "uniqueItems": true}, "output": {"type": "string"}},
+      "required": ["depends_on", "id", "inputs", "output"],
+      "type": "object"
+    },
+    "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}
+  },
+  "required": ["approval", "input_bindings", "obligations", "production_trust_policy", "record_inputs", "release", "schema_version", "selected_record_slots", "stages"],
+  "title": "Quarry release scope v1",
+  "type": "object"
+}

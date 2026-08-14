@@ -1,0 +1,1 @@
+{"approval":null,"expires_at":null,"gates":["D-AUTHORIZATION","D-RANGE-IDENTITY","D-LIVE-CONTRACT","D-CLEANUP"],"live_required":false,"rationale":"v0.3.10 uses reproducible non-live release gates; no authorized live range is selected.","release":"0.3.10","rule_id":"v310-no-live","schema_version":"quarry.no-live-rule.v1"}

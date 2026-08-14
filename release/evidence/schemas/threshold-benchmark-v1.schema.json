@@ -1,0 +1,74 @@
+{
+  "$id": "urn:quarry:schema:threshold-benchmark-manifest:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval": {"oneOf": [{"$ref": "#/$defs/review"}, {"type": "null"}]},
+    "benchmarks": {"items": {"$ref": "#/$defs/benchmark"}, "maxItems": 7, "minItems": 7, "type": "array", "uniqueItems": true},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.threshold-benchmark-manifest.v1"},
+    "thresholds": {"items": {"$ref": "#/$defs/threshold"}, "maxItems": 46, "minItems": 46, "type": "array", "uniqueItems": true}
+  },
+  "$defs": {
+    "benchmark": {
+      "additionalProperties": false,
+      "properties": {
+        "concurrency": {"oneOf": [{"$ref": "#/$defs/count"}, {"type": "null"}]},
+        "fixture_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]},
+        "gate_id": {"enum": ["C-PERF-RUNNER", "C-PERF-INGEST", "C-PERF-REPORT", "C-PERF-CAMPAIGN", "C-PERF-DISK", "C-PERF-RESOLVER", "C-PERF-PHASE-FAIRNESS"]},
+        "invalidation_policy": {"const": "record-and-rerun-complete-trial-set"},
+        "operation": {"enum": ["streaming-runner", "observation-ingest", "report-projection", "campaign-settlement", "concurrent-disk-governor", "mixed-resolution-corpus", "phase-fairness"]},
+        "repetitions": {"oneOf": [{"maximum": 1000, "minimum": 0, "type": "integer"}, {"type": "null"}]},
+        "resource_limits": {"$ref": "#/$defs/resources"},
+        "runner_class": {"oneOf": [{"$ref": "#/$defs/token"}, {"type": "null"}]},
+        "tool_digests": {"items": {"$ref": "#/$defs/digest"}, "type": "array", "uniqueItems": true},
+        "trial_retention": {"const": "all-raw-trials"},
+        "warmup_runs": {"oneOf": [{"$ref": "#/$defs/count"}, {"type": "null"}]}
+      },
+      "required": ["concurrency", "fixture_digest", "gate_id", "invalidation_policy", "operation", "repetitions", "resource_limits", "runner_class", "tool_digests", "trial_retention", "warmup_runs"],
+      "type": "object"
+    },
+    "count": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+    "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "resources": {
+      "additionalProperties": false,
+      "properties": {
+        "cpu_millicores": {"oneOf": [{"$ref": "#/$defs/count"}, {"type": "null"}]},
+        "disk_bytes": {"oneOf": [{"$ref": "#/$defs/count"}, {"type": "null"}]},
+        "memory_bytes": {"oneOf": [{"$ref": "#/$defs/count"}, {"type": "null"}]}
+      },
+      "required": ["cpu_millicores", "disk_bytes", "memory_bytes"],
+      "type": "object"
+    },
+    "review": {
+      "additionalProperties": false,
+      "properties": {
+        "approved_at": {"format": "date-time", "type": "string"},
+        "review_id": {"$ref": "#/$defs/token"},
+        "reviewer": {"$ref": "#/$defs/token"},
+        "signature": {"oneOf": [{"additionalProperties": false, "properties": {"algorithm": {"const": "ed25519"}, "key_id": {"$ref": "#/$defs/token"}, "value": {"pattern": "^base64:[A-Za-z0-9+/]{86}==$", "type": "string"}}, "required": ["algorithm", "key_id", "value"], "type": "object"}, {"type": "null"}]}
+      },
+      "required": ["approved_at", "review_id", "reviewer", "signature"],
+      "type": "object"
+    },
+    "threshold": {
+      "additionalProperties": false,
+      "properties": {
+        "baseline_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]},
+        "class": {"enum": ["absolute", "regression"]},
+        "gate_id": {"type": "string"},
+        "limit": {"oneOf": [{"$ref": "#/$defs/count"}, {"type": "null"}]},
+        "metric": {"$ref": "#/$defs/token"},
+        "operator": {"enum": ["at_least", "at_most"]},
+        "statistic": {"enum": ["maximum", "median", "minimum", "p95"]},
+        "unit": {"$ref": "#/$defs/token"}
+      },
+      "required": ["baseline_digest", "class", "gate_id", "limit", "metric", "operator", "statistic", "unit"],
+      "type": "object"
+    },
+    "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}
+  },
+  "required": ["approval", "benchmarks", "release", "schema_version", "thresholds"],
+  "title": "Quarry threshold and benchmark manifest v1",
+  "type": "object"
+}

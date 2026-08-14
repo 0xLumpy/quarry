@@ -1,0 +1,36 @@
+{
+  "$id": "urn:quarry:schema:release-trust-policy:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "expires_at": {"format": "date-time", "type": "string"},
+    "keys": {"items": {"$ref": "#/$defs/key"}, "minItems": 1, "type": "array", "uniqueItems": true},
+    "policy_id": {"$ref": "#/$defs/token"},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.release-trust-policy.v1"},
+    "thresholds": {"items": {"$ref": "#/$defs/threshold"}, "maxItems": 2, "minItems": 2, "type": "array", "uniqueItems": true},
+    "valid_from": {"type": "string"}
+  },
+  "$defs": {
+    "key": {
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {"const": "ed25519"},
+        "expires_at": {"format": "date-time", "type": "string"},
+        "gate_ids": {"items": {"pattern": "^[A-E]-[A-Z0-9]+(-[A-Z0-9]+)*$", "type": "string"}, "type": "array", "uniqueItems": true},
+        "key_id": {"$ref": "#/$defs/token"},
+        "public_key": {"pattern": "^base64:[A-Za-z0-9+/]{43}=$", "type": "string"},
+        "revoked_at": {"oneOf": [{"format": "date-time", "type": "string"}, {"type": "null"}]},
+        "roles": {"items": {"enum": ["approval", "gate"]}, "maxItems": 1, "minItems": 1, "type": "array", "uniqueItems": true},
+        "valid_from": {"format": "date-time", "type": "string"}
+      },
+      "required": ["algorithm", "expires_at", "gate_ids", "key_id", "public_key", "revoked_at", "roles", "valid_from"],
+      "type": "object"
+    },
+    "threshold": {"additionalProperties": false, "properties": {"minimum_signatures": {"const": 1}, "role": {"enum": ["approval", "gate"]}}, "required": ["minimum_signatures", "role"], "type": "object"},
+    "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}
+  },
+  "required": ["expires_at", "keys", "policy_id", "release", "schema_version", "thresholds", "valid_from"],
+  "title": "Quarry release signature trust policy v1",
+  "type": "object"
+}

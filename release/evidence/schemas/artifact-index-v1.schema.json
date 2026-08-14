@@ -1,0 +1,23 @@
+{
+  "$id": "urn:quarry:schema:release-artifact-index:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {"digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"}, "gate_id": {"pattern": "^[A-E]-[A-Z0-9]+(-[A-Z0-9]+)*$", "type": "string"}, "media_type": {"pattern": "^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$", "type": "string"}, "name": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}, "path": {"minLength": 1, "type": "string"}, "size": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"}},
+        "required": ["digest", "gate_id", "media_type", "name", "path", "size"],
+        "type": "object"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "candidate_identity_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.release-artifact-index.v1"}
+  },
+  "required": ["artifacts", "candidate_identity_digest", "release", "schema_version"],
+  "title": "Quarry release artifact index v1",
+  "type": "object"
+}

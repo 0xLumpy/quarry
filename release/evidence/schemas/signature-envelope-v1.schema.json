@@ -1,0 +1,18 @@
+{
+  "$id": "urn:quarry:schema:release-signature-envelope:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "algorithm": {"const": "ed25519"},
+    "candidate_identity_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "key_id": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"},
+    "payload_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "role": {"enum": ["approval", "gate"]},
+    "schema_version": {"const": "quarry.release-signature-envelope.v1"},
+    "signature": {"pattern": "^base64:[A-Za-z0-9+/]{86}==$", "type": "string"},
+    "trust_policy_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"}
+  },
+  "required": ["algorithm", "candidate_identity_digest", "key_id", "payload_digest", "role", "schema_version", "signature", "trust_policy_digest"],
+  "title": "Quarry release signature envelope v1",
+  "type": "object"
+}

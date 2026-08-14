@@ -1,0 +1,27 @@
+{
+  "$id": "urn:quarry:schema:release-aggregate:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "aggregator": {"$ref": "#/$defs/aggregator"},
+    "candidate": {"$ref": "#/$defs/candidate"},
+    "decision": {"const": "pass"},
+    "generated_at": {"format": "date-time", "type": "string"},
+    "records": {"items": {"$ref": "#/$defs/record"}, "maxItems": 56, "minItems": 56, "type": "array", "uniqueItems": true},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.release-aggregate.v1"},
+    "scope_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "trust_policy_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"}
+  },
+  "$defs": {
+    "aggregator": {"additionalProperties": false, "properties": {"architecture": {"minLength": 1, "type": "string"}, "executable_digest": {"$ref": "#/$defs/digest"}, "implementation": {"minLength": 1, "type": "string"}, "isolation_profile": {"$ref": "#/$defs/digest"}, "os": {"minLength": 1, "type": "string"}, "python": {"minLength": 1, "type": "string"}, "runner_image": {"$ref": "#/$defs/digest"}}, "required": ["architecture", "executable_digest", "implementation", "isolation_profile", "os", "python", "runner_image"], "type": "object"},
+    "artifact": {"additionalProperties": false, "properties": {"digest": {"$ref": "#/$defs/digest"}, "media_type": {"type": "string"}, "name": {"$ref": "#/$defs/token"}}, "required": ["digest", "media_type", "name"], "type": "object"},
+    "candidate": {"additionalProperties": false, "properties": {"dirty": {"const": false}, "git_commit": {"pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$", "type": "string"}, "git_tree": {"pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$", "type": "string"}, "identity_digest": {"$ref": "#/$defs/digest"}, "package_version": {"minLength": 1, "type": "string"}, "source_tree_digest": {"$ref": "#/$defs/digest"}}, "required": ["dirty", "git_commit", "git_tree", "identity_digest", "package_version", "source_tree_digest"], "type": "object"},
+    "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "record": {"additionalProperties": false, "properties": {"artifacts": {"items": {"$ref": "#/$defs/artifact"}, "type": "array", "uniqueItems": true}, "gate_id": {"pattern": "^[A-E]-[A-Z0-9]+(-[A-Z0-9]+)*$", "type": "string"}, "reason": {"type": ["string", "null"]}, "record_digest": {"$ref": "#/$defs/digest"}, "status": {"enum": ["pass", "not_applicable"]}}, "required": ["artifacts", "gate_id", "reason", "record_digest", "status"], "type": "object"},
+    "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}
+  },
+  "required": ["aggregator", "candidate", "decision", "generated_at", "records", "release", "schema_version", "scope_digest", "trust_policy_digest"],
+  "title": "Quarry deterministic release aggregate v1",
+  "type": "object"
+}

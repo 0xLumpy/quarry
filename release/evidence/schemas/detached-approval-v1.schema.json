@@ -1,0 +1,28 @@
+{
+  "$id": "urn:quarry:schema:detached-release-approval:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "aggregate_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "approved_at": {"format": "date-time", "type": "string"},
+    "candidate_identity_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "decision": {"const": "approve"},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.detached-release-approval.v1"},
+    "scope_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "signature": {
+      "additionalProperties": false,
+      "properties": {"algorithm": {"const": "ed25519"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "key_id": {"$ref": "#/$defs/token"}, "payload_digest": {"$ref": "#/$defs/digest"}, "role": {"const": "approval"}, "schema_version": {"const": "quarry.release-signature-envelope.v1"}, "signature": {"pattern": "^base64:[A-Za-z0-9+/]{86}==$", "type": "string"}, "trust_policy_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["algorithm", "candidate_identity_digest", "key_id", "payload_digest", "role", "schema_version", "signature", "trust_policy_digest"],
+      "type": "object"
+    },
+    "trust_policy_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"}
+  },
+  "$defs": {
+    "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}
+  },
+  "required": ["aggregate_digest", "approved_at", "candidate_identity_digest", "decision", "release", "schema_version", "scope_digest", "signature", "trust_policy_digest"],
+  "title": "Quarry detached release approval v1",
+  "type": "object"
+}

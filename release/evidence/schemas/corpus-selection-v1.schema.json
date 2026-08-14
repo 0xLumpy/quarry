@@ -1,0 +1,28 @@
+{
+  "$id": "urn:quarry:schema:corpus-selection:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval": {"oneOf": [{"$ref": "#/$defs/review"}, {"type": "null"}]},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.corpus-selection.v1"},
+    "sources": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {"attestation_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}, "fixture_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}, "gate_id": {"pattern": "^C-CORPUS-[A-Z]+$", "type": "string"}, "kind": {"enum": ["private", "synthetic"]}, "selected": {"type": "boolean"}},
+        "required": ["attestation_digest", "fixture_digest", "gate_id", "kind", "selected"],
+        "type": "object"
+      },
+      "maxItems": 7,
+      "minItems": 7,
+      "type": "array"
+    }
+  },
+  "$defs": {
+    "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "review": {"additionalProperties": false, "properties": {"approved_at": {"format": "date-time", "type": "string"}, "review_id": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}, "reviewer": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}, "signature": {"oneOf": [{"additionalProperties": false, "properties": {"algorithm": {"const": "ed25519"}, "key_id": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}, "value": {"pattern": "^base64:[A-Za-z0-9+/]{86}==$", "type": "string"}}, "required": ["algorithm", "key_id", "value"], "type": "object"}, {"type": "null"}]}}, "required": ["approved_at", "review_id", "reviewer", "signature"], "type": "object"}
+  },
+  "required": ["approval", "release", "schema_version", "sources"],
+  "title": "Quarry corpus selection and attestation manifest v1",
+  "type": "object"
+}

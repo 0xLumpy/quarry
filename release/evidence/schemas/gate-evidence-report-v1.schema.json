@@ -1,0 +1,65 @@
+{
+  "$id": "urn:quarry:schema:gate-evidence-report:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "benchmark": {"oneOf": [{"$ref": "#/$defs/benchmark"}, {"type": "null"}]},
+    "candidate_identity_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "gate_id": {"type": "string"},
+    "instances": {"items": {"$ref": "#/$defs/instance"}, "minItems": 1, "type": "array", "uniqueItems": true},
+    "materials": {"items": {"$ref": "#/$defs/material"}, "type": "array", "uniqueItems": true},
+    "measurements": {"items": {"$ref": "#/$defs/measurement"}, "type": "array", "uniqueItems": true},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.gate-evidence-report.v1"}
+  },
+  "$defs": {
+    "artifact": {"additionalProperties": false, "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"$ref": "#/$defs/token"}}, "required": ["digest", "name"], "type": "object"},
+    "assertion": {"additionalProperties": false, "properties": {"id": {"$ref": "#/$defs/token"}, "reason": {"type": ["string", "null"]}, "status": {"enum": ["pass", "fail", "open", "blocked", "not_applicable"]}}, "required": ["id", "reason", "status"], "type": "object"},
+    "benchmark": {
+      "additionalProperties": false,
+      "properties": {
+        "concurrency": {"$ref": "#/$defs/count"},
+        "fixture_digest": {"$ref": "#/$defs/digest"},
+        "gate_id": {"type": "string"},
+        "invalidation_policy": {"const": "record-and-rerun-complete-trial-set"},
+        "operation": {"type": "string"},
+        "repetitions": {"maximum": 1000, "minimum": 0, "type": "integer"},
+        "resource_limits": {"$ref": "#/$defs/resources"},
+        "runner_class": {"$ref": "#/$defs/token"},
+        "tool_digests": {"items": {"$ref": "#/$defs/digest"}, "minItems": 1, "type": "array", "uniqueItems": true},
+        "trial_retention": {"const": "all-raw-trials"},
+        "warmup_runs": {"$ref": "#/$defs/count"}
+      },
+      "required": ["concurrency", "fixture_digest", "gate_id", "invalidation_policy", "operation", "repetitions", "resource_limits", "runner_class", "tool_digests", "trial_retention", "warmup_runs"],
+      "type": "object"
+    },
+    "count": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+    "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "environment": {"additionalProperties": false, "properties": {"architecture": {"minLength": 1, "type": "string"}, "isolation_profile": {"$ref": "#/$defs/digest"}, "os": {"minLength": 1, "type": "string"}, "python": {"minLength": 1, "type": "string"}, "runner_image": {"$ref": "#/$defs/digest"}}, "required": ["architecture", "isolation_profile", "os", "python", "runner_image"], "type": "object"},
+    "instance": {
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {"items": {"$ref": "#/$defs/artifact"}, "type": "array", "uniqueItems": true},
+        "assertions": {"items": {"$ref": "#/$defs/assertion"}, "type": "array", "uniqueItems": true},
+        "environment": {"$ref": "#/$defs/environment"},
+        "finished_at": {"format": "date-time", "type": "string"},
+        "id": {"$ref": "#/$defs/token"},
+        "lane": {"enum": ["H0-hermetic", "H1-tool-integration", "C0-private-corpus", "P0-package-supply", "L0-authorized-live"]},
+        "selection": {"$ref": "#/$defs/selection"},
+        "started_at": {"format": "date-time", "type": "string"},
+        "toolchain": {"items": {"$ref": "#/$defs/tool"}, "type": "array", "uniqueItems": true}
+      },
+      "required": ["artifacts", "assertions", "environment", "finished_at", "id", "lane", "selection", "started_at", "toolchain"],
+      "type": "object"
+    },
+    "material": {"additionalProperties": false, "properties": {"digest": {"$ref": "#/$defs/digest"}, "kind": {"enum": ["corpus_attestation", "corpus_fixture", "template_set"]}, "name": {"$ref": "#/$defs/token"}}, "required": ["digest", "kind", "name"], "type": "object"},
+    "measurement": {"additionalProperties": false, "properties": {"baseline_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}, "class": {"enum": ["absolute", "regression"]}, "invalidated_trials": {"$ref": "#/$defs/count"}, "metric": {"$ref": "#/$defs/token"}, "observed_trials": {"$ref": "#/$defs/count"}, "statistic": {"enum": ["maximum", "median", "minimum", "p95"]}, "unit": {"$ref": "#/$defs/token"}, "value": {"$ref": "#/$defs/count"}}, "required": ["baseline_digest", "class", "invalidated_trials", "metric", "observed_trials", "statistic", "unit", "value"], "type": "object"},
+    "resources": {"additionalProperties": false, "properties": {"cpu_millicores": {"$ref": "#/$defs/count"}, "disk_bytes": {"$ref": "#/$defs/count"}, "memory_bytes": {"$ref": "#/$defs/count"}}, "required": ["cpu_millicores", "disk_bytes", "memory_bytes"], "type": "object"},
+    "selection": {"additionalProperties": false, "properties": {"collected": {"$ref": "#/$defs/count"}, "deselected": {"$ref": "#/$defs/count"}, "failed": {"$ref": "#/$defs/count"}, "passed": {"$ref": "#/$defs/count"}, "selected": {"$ref": "#/$defs/count"}, "skipped": {"$ref": "#/$defs/count"}, "xfailed": {"$ref": "#/$defs/count"}, "xpassed": {"$ref": "#/$defs/count"}}, "required": ["collected", "deselected", "failed", "passed", "selected", "skipped", "xfailed", "xpassed"], "type": "object"},
+    "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"},
+    "tool": {"additionalProperties": false, "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"$ref": "#/$defs/token"}, "path": {"minLength": 1, "type": "string"}, "version": {"minLength": 1, "type": "string"}}, "required": ["digest", "name", "path", "version"], "type": "object"}
+  },
+  "required": ["benchmark", "candidate_identity_digest", "gate_id", "instances", "materials", "measurements", "release", "schema_version"],
+  "title": "Quarry gate evidence report v1",
+  "type": "object"
+}

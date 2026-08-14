@@ -1,0 +1,50 @@
+{
+  "$id": "urn:quarry:schema:support-matrix:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "aggregators": {"items": {"$ref": "#/$defs/aggregator"}, "minItems": 1, "type": "array", "uniqueItems": true},
+    "approval": {"oneOf": [{"$ref": "#/$defs/review"}, {"type": "null"}]},
+    "environments": {"items": {"$ref": "#/$defs/environment"}, "minItems": 1, "type": "array", "uniqueItems": true},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.support-matrix.v1"},
+    "template_sets": {"items": {"$ref": "#/$defs/versioned"}, "type": "array", "uniqueItems": true},
+    "tools": {"items": {"$ref": "#/$defs/versioned"}, "type": "array", "uniqueItems": true}
+  },
+  "$defs": {
+    "aggregator": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {"$ref": "#/$defs/token"},
+        "executable_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]},
+        "implementation": {"$ref": "#/$defs/token"},
+        "isolation_profile": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]},
+        "os": {"$ref": "#/$defs/token"},
+        "python": {"$ref": "#/$defs/token"},
+        "runner_image": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}
+      },
+      "required": ["architecture", "executable_digest", "implementation", "isolation_profile", "os", "python", "runner_image"],
+      "type": "object"
+    },
+    "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "environment": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {"$ref": "#/$defs/token"},
+        "isolation_profile": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]},
+        "lane": {"enum": ["H0-hermetic", "H1-tool-integration", "C0-private-corpus", "P0-package-supply"]},
+        "os": {"$ref": "#/$defs/token"},
+        "python": {"$ref": "#/$defs/token"},
+        "runner_image": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}
+      },
+      "required": ["architecture", "isolation_profile", "lane", "os", "python", "runner_image"],
+      "type": "object"
+    },
+    "review": {"additionalProperties": false, "properties": {"approved_at": {"format": "date-time", "type": "string"}, "review_id": {"$ref": "#/$defs/token"}, "reviewer": {"$ref": "#/$defs/token"}, "signature": {"oneOf": [{"additionalProperties": false, "properties": {"algorithm": {"const": "ed25519"}, "key_id": {"$ref": "#/$defs/token"}, "value": {"pattern": "^base64:[A-Za-z0-9+/]{86}==$", "type": "string"}}, "required": ["algorithm", "key_id", "value"], "type": "object"}, {"type": "null"}]}}, "required": ["approved_at", "review_id", "reviewer", "signature"], "type": "object"},
+    "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"},
+    "versioned": {"additionalProperties": false, "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"$ref": "#/$defs/token"}, "version": {"minLength": 1, "type": "string"}}, "required": ["digest", "name", "version"], "type": "object"}
+  },
+  "required": ["aggregators", "approval", "environments", "release", "schema_version", "template_sets", "tools"],
+  "title": "Quarry exact release runtime and support matrix v1",
+  "type": "object"
+}

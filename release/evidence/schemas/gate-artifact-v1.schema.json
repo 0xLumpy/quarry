@@ -1,0 +1,208 @@
+{
+  "$id": "urn:quarry:schema:gate-artifact:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "oneOf": [
+    {"$ref": "#/$defs/machine_report"},
+    {"$ref": "#/$defs/package_inventory"},
+    {"$ref": "#/$defs/benchmark_baseline"},
+    {"$ref": "#/$defs/benchmark_trials"},
+    {"$ref": "#/$defs/benchmark_invalidations"},
+    {"$ref": "#/$defs/benchmark_report"},
+    {"$ref": "#/$defs/sbom"},
+    {"$ref": "#/$defs/provenance"},
+    {"$ref": "#/$defs/publication_subjects"}
+  ],
+  "properties": {
+    "artifact_type": {"$ref": "#/$defs/token"},
+    "assertion": {"$ref": "#/$defs/assertion"},
+    "baseline_digest": {"$ref": "#/$defs/digest"},
+    "benchmark_digest": {"$ref": "#/$defs/digest"},
+    "builder": {"$ref": "#/$defs/builder"},
+    "candidate_identity_digest": {"$ref": "#/$defs/digest"},
+    "components": {"items": {"$ref": "#/$defs/component"}, "type": "array"},
+    "dependency_graph_digest": {"$ref": "#/$defs/digest"},
+    "gate_id": {"$ref": "#/$defs/gate"},
+    "invalidations": {"items": {"$ref": "#/$defs/invalidation"}, "type": "array"},
+    "materials": {"items": {"$ref": "#/$defs/named_digest"}, "type": "array"},
+    "measurements": {"items": {"$ref": "#/$defs/measurement"}, "type": "array"},
+    "metrics": {"items": {"$ref": "#/$defs/baseline_metric"}, "type": "array"},
+    "name": {"$ref": "#/$defs/token"},
+    "package": {"$ref": "#/$defs/package"},
+    "raw_trials_digest": {"$ref": "#/$defs/digest"},
+    "records": {"items": {"$ref": "#/$defs/machine_record"}, "minItems": 1, "type": "array"},
+    "release": {"const": "0.3.10"},
+    "resource_limits_observed": {"$ref": "#/$defs/resources"},
+    "schema_version": {"const": "quarry.gate-artifact.v1"},
+    "subjects": {"items": {"type": "object"}, "type": "array"},
+    "trial_invalidations_digest": {"$ref": "#/$defs/digest"},
+    "trials": {"items": {"$ref": "#/$defs/trial"}, "maxItems": 1000, "minItems": 1, "type": "array"},
+    "warmup_runs": {"$ref": "#/$defs/count"}
+  },
+  "$defs": {
+    "assertion": {
+      "additionalProperties": false,
+      "properties": {"id": {"$ref": "#/$defs/token"}, "reason": {"type": "null"}, "status": {"const": "pass"}},
+      "required": ["id", "reason", "status"],
+      "type": "object"
+    },
+    "baseline_metric": {
+      "additionalProperties": false,
+      "properties": {"metric": {"$ref": "#/$defs/token"}, "unit": {"$ref": "#/$defs/token"}, "value": {"minimum": 1, "type": "integer"}},
+      "required": ["metric", "unit", "value"],
+      "type": "object"
+    },
+    "benchmark_baseline": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "benchmark-baseline"}, "gate_id": {"$ref": "#/$defs/gate"}, "metrics": {"items": {"$ref": "#/$defs/baseline_metric"}, "minItems": 1, "type": "array"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
+      "required": ["artifact_type", "gate_id", "metrics", "release", "schema_version"],
+      "type": "object"
+    },
+    "benchmark_invalidations": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "benchmark-invalidations"}, "benchmark_digest": {"$ref": "#/$defs/digest"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"$ref": "#/$defs/gate"}, "invalidations": {"items": {"$ref": "#/$defs/invalidation"}, "type": "array"}, "raw_trials_digest": {"$ref": "#/$defs/digest"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
+      "required": ["artifact_type", "benchmark_digest", "candidate_identity_digest", "gate_id", "invalidations", "raw_trials_digest", "release", "schema_version"],
+      "type": "object"
+    },
+    "benchmark_report": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "benchmark-report"}, "baseline_digest": {"$ref": "#/$defs/digest"}, "benchmark_digest": {"$ref": "#/$defs/digest"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"$ref": "#/$defs/gate"}, "measurements": {"items": {"$ref": "#/$defs/measurement"}, "minItems": 1, "type": "array"}, "raw_trials_digest": {"$ref": "#/$defs/digest"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "trial_invalidations_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["artifact_type", "baseline_digest", "benchmark_digest", "candidate_identity_digest", "gate_id", "measurements", "raw_trials_digest", "release", "schema_version", "trial_invalidations_digest"],
+      "type": "object"
+    },
+    "benchmark_trials": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "benchmark-trials"}, "benchmark_digest": {"$ref": "#/$defs/digest"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"$ref": "#/$defs/gate"}, "release": {"const": "0.3.10"}, "resource_limits_observed": {"$ref": "#/$defs/resources"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "trials": {"items": {"$ref": "#/$defs/trial"}, "maxItems": 1000, "minItems": 1, "type": "array"}, "warmup_runs": {"$ref": "#/$defs/count"}},
+      "required": ["artifact_type", "benchmark_digest", "candidate_identity_digest", "gate_id", "release", "resource_limits_observed", "schema_version", "trials", "warmup_runs"],
+      "type": "object"
+    },
+    "builder": {
+      "additionalProperties": false,
+      "properties": {"environment": {"$ref": "#/$defs/environment"}, "toolchain": {"items": {"$ref": "#/$defs/tool"}, "minItems": 1, "type": "array", "uniqueItems": true}},
+      "required": ["environment", "toolchain"],
+      "type": "object"
+    },
+    "component": {
+      "additionalProperties": false,
+      "properties": {"content_digest": {"$ref": "#/$defs/digest"}, "declared_requirement": {"oneOf": [{"$ref": "#/$defs/text"}, {"type": "null"}]}, "license": {"$ref": "#/$defs/text"}, "name": {"$ref": "#/$defs/token"}, "relationship": {"enum": ["dependency", "project", "template", "tool"]}, "version": {"$ref": "#/$defs/text"}},
+      "required": ["content_digest", "declared_requirement", "license", "name", "relationship", "version"],
+      "type": "object"
+    },
+    "count": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+    "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "environment": {
+      "additionalProperties": false,
+      "properties": {"architecture": {"$ref": "#/$defs/text"}, "isolation_profile": {"$ref": "#/$defs/digest"}, "os": {"$ref": "#/$defs/text"}, "python": {"$ref": "#/$defs/text"}, "runner_image": {"$ref": "#/$defs/digest"}},
+      "required": ["architecture", "isolation_profile", "os", "python", "runner_image"],
+      "type": "object"
+    },
+    "gate": {"pattern": "^[A-E]-[A-Z0-9]+(-[A-Z0-9]+)*$", "type": "string"},
+    "invalidation": {
+      "additionalProperties": false,
+      "properties": {"id": {"$ref": "#/$defs/token"}, "reason": {"$ref": "#/$defs/text"}, "superseded_trials": {"$ref": "#/$defs/benchmark_trials"}, "superseded_trials_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["id", "reason", "superseded_trials", "superseded_trials_digest"],
+      "type": "object"
+    },
+    "machine_record": {
+      "additionalProperties": false,
+      "properties": {"id": {"$ref": "#/$defs/token"}, "result": {"$ref": "#/$defs/result"}, "result_digest": {"$ref": "#/$defs/digest"}, "status": {"const": "pass"}},
+      "required": ["id", "result", "result_digest", "status"],
+      "type": "object"
+    },
+    "machine_report": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "machine-report"}, "assertion": {"$ref": "#/$defs/assertion"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"$ref": "#/$defs/gate"}, "name": {"$ref": "#/$defs/token"}, "records": {"items": {"$ref": "#/$defs/machine_record"}, "minItems": 1, "type": "array"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
+      "required": ["artifact_type", "assertion", "candidate_identity_digest", "gate_id", "name", "records", "release", "schema_version"],
+      "type": "object"
+    },
+    "measurement": {
+      "additionalProperties": false,
+      "properties": {"baseline_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}, "class": {"enum": ["absolute", "regression"]}, "invalidated_trials": {"$ref": "#/$defs/count"}, "metric": {"$ref": "#/$defs/token"}, "observed_trials": {"$ref": "#/$defs/count"}, "statistic": {"enum": ["maximum", "median", "minimum", "p95"]}, "unit": {"$ref": "#/$defs/token"}, "value": {"$ref": "#/$defs/count"}},
+      "required": ["baseline_digest", "class", "invalidated_trials", "metric", "observed_trials", "statistic", "unit", "value"],
+      "type": "object"
+    },
+    "named_digest": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"$ref": "#/$defs/text"}},
+      "required": ["digest", "name"],
+      "type": "object"
+    },
+    "package": {
+      "additionalProperties": false,
+      "properties": {"name": {"const": "quarry-recon"}, "version": {"const": "0.3.10"}},
+      "required": ["name", "version"],
+      "type": "object"
+    },
+    "package_inventory": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "package-inventory"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "C-PACKAGE-BUILD"}, "package": {"$ref": "#/$defs/package"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "subjects": {"items": {"$ref": "#/$defs/package_subject"}, "maxItems": 2, "minItems": 2, "type": "array", "uniqueItems": true}},
+      "required": ["artifact_type", "candidate_identity_digest", "gate_id", "package", "release", "schema_version", "subjects"],
+      "type": "object"
+    },
+    "package_subject": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "media_type": {"enum": ["application/gzip", "application/zip"]}, "name": {"enum": ["sdist", "wheel"]}, "size": {"$ref": "#/$defs/count"}},
+      "required": ["digest", "media_type", "name", "size"],
+      "type": "object"
+    },
+    "provenance": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "provenance"}, "builder": {"$ref": "#/$defs/builder"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "C-PROVENANCE"}, "materials": {"items": {"$ref": "#/$defs/named_digest"}, "minItems": 1, "type": "array", "uniqueItems": true}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "subjects": {"items": {"$ref": "#/$defs/named_digest"}, "maxItems": 2, "minItems": 2, "type": "array", "uniqueItems": true}},
+      "required": ["artifact_type", "builder", "candidate_identity_digest", "gate_id", "materials", "release", "schema_version", "subjects"],
+      "type": "object"
+    },
+    "publication_subject": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "media_type": {"enum": ["application/gzip", "application/json", "application/schema+json", "application/zip"]}, "name": {"$ref": "#/$defs/text"}},
+      "required": ["digest", "media_type", "name"],
+      "type": "object"
+    },
+    "publication_subjects": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "publication-subjects"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "E-ARTIFACTS"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "subjects": {"items": {"$ref": "#/$defs/publication_subject"}, "minItems": 5, "type": "array", "uniqueItems": true}},
+      "required": ["artifact_type", "candidate_identity_digest", "gate_id", "release", "schema_version", "subjects"],
+      "type": "object"
+    },
+    "resources": {
+      "additionalProperties": false,
+      "properties": {"cpu_millicores": {"$ref": "#/$defs/count"}, "disk_bytes": {"$ref": "#/$defs/count"}, "memory_bytes": {"$ref": "#/$defs/count"}},
+      "required": ["cpu_millicores", "disk_bytes", "memory_bytes"],
+      "type": "object"
+    },
+    "result": {
+      "additionalProperties": false,
+      "properties": {"outcome": {"const": "pass"}, "subject": {"$ref": "#/$defs/text"}},
+      "required": ["outcome", "subject"],
+      "type": "object"
+    },
+    "sbom": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "sbom"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "components": {"items": {"$ref": "#/$defs/component"}, "minItems": 1, "type": "array", "uniqueItems": true}, "dependency_graph_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "C-SBOM"}, "package": {"$ref": "#/$defs/package"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
+      "required": ["artifact_type", "candidate_identity_digest", "components", "dependency_graph_digest", "gate_id", "package", "release", "schema_version"],
+      "type": "object"
+    },
+    "text": {"minLength": 1, "pattern": "^[^\\u0000-\\u001f]+$", "type": "string"},
+    "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"},
+    "tool": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"$ref": "#/$defs/token"}, "path": {"pattern": "^/[^\\u0000-\\u001f]*$", "type": "string"}, "version": {"$ref": "#/$defs/text"}},
+      "required": ["digest", "name", "path", "version"],
+      "type": "object"
+    },
+    "trial": {
+      "additionalProperties": false,
+      "properties": {"id": {"pattern": "^trial-[0-9]{3}$", "type": "string"}, "metrics": {"items": {"$ref": "#/$defs/trial_metric"}, "minItems": 1, "type": "array"}},
+      "required": ["id", "metrics"],
+      "type": "object"
+    },
+    "trial_metric": {
+      "additionalProperties": false,
+      "properties": {"baseline_value": {"oneOf": [{"$ref": "#/$defs/count"}, {"type": "null"}]}, "class": {"enum": ["absolute", "regression"]}, "current_value": {"$ref": "#/$defs/count"}, "metric": {"$ref": "#/$defs/token"}, "unit": {"$ref": "#/$defs/token"}, "value": {"$ref": "#/$defs/count"}},
+      "required": ["baseline_value", "class", "current_value", "metric", "unit", "value"],
+      "type": "object"
+    }
+  },
+  "required": ["artifact_type", "schema_version"],
+  "title": "Quarry gate supporting artifact family v1",
+  "type": "object"
+}

@@ -1,0 +1,21 @@
+{
+  "$id": "urn:quarry:schema:no-live-rule:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval": {"oneOf": [{"$ref": "#/$defs/review"}, {"type": "null"}]},
+    "expires_at": {"oneOf": [{"format": "date-time", "type": "string"}, {"type": "null"}]},
+    "gates": {"items": {"type": "string"}, "maxItems": 4, "minItems": 4, "type": "array"},
+    "live_required": {"const": false},
+    "rationale": {"minLength": 1, "type": "string"},
+    "release": {"const": "0.3.10"},
+    "rule_id": {"const": "v310-no-live"},
+    "schema_version": {"const": "quarry.no-live-rule.v1"}
+  },
+  "$defs": {
+    "review": {"additionalProperties": false, "properties": {"approved_at": {"format": "date-time", "type": "string"}, "review_id": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}, "reviewer": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}, "signature": {"oneOf": [{"additionalProperties": false, "properties": {"algorithm": {"const": "ed25519"}, "key_id": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}, "value": {"pattern": "^base64:[A-Za-z0-9+/]{86}==$", "type": "string"}}, "required": ["algorithm", "key_id", "value"], "type": "object"}, {"type": "null"}]}}, "required": ["approved_at", "review_id", "reviewer", "signature"], "type": "object"}
+  },
+  "required": ["approval", "expires_at", "gates", "live_required", "rationale", "release", "rule_id", "schema_version"],
+  "title": "Quarry v0.3.10 no-live scope rule v1",
+  "type": "object"
+}
