@@ -14,7 +14,7 @@ import json
 import pytest
 from click.testing import CliRunner
 
-from quarry_recon import revision, triage
+from quarry_recon import report_truth, revision, run_manifest, triage
 from quarry_recon.cli import cli
 from quarry_recon.state import ContractError
 from quarry_recon.store import Run
@@ -84,9 +84,12 @@ def test_a_fault_clearing_resume_keeps_the_revision_certified(tmp_path, monkeypa
     assert certified.status == "valid" and certified.revision == 1
     view = revision.combined_view(Run.open(tmp_path, "t", run_dir.name))
     assert view is not None and view.count("oob_interaction") == 1
+    assert report_truth.published_private_report_current(view)
     revised = json.loads((run_dir / "revisions" / certified.views["dir"] / "digest.json").read_text())
     assert [q["type"] for q in revised["queues"]["oob"]] == ["oob_interaction"]
-    assert "qlate.csession01" in (run_dir / "revisions" / certified.views["dir"] / "HOTLIST.md").read_text()
+    assert triage.markdown_value("qlate.csession01") in (
+        run_dir / "revisions" / certified.views["dir"] / "HOTLIST.md"
+    ).read_text()
 
 
 @pytest.mark.parametrize("mutate,identity_conflict", [
@@ -114,7 +117,7 @@ def test_a_change_to_evidence_still_uncertifies_the_revision(tmp_path, monkeypat
 
     manifest = json.loads((run_dir / "manifest.json").read_text())
     mutate(manifest)
-    (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (run_dir / "manifest.json").write_bytes(run_manifest.canonical_json_bytes(manifest))
 
     stale = revision.read(run_dir)
     assert stale.status == "unusable" and "changed after revision 1" in stale.reason

@@ -368,6 +368,24 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.release_evidence:MAX_RECORD_BYTES": (
         "resource", "the allocation bound for one versioned release-evidence control record; oversize "
                     "control input is rejected and does not truncate captured target evidence"),
+    "quarry_recon.report_truth:MAX_PRIVATE_REPORT_INTEGER": (
+        "parser", "the portable signed-integer range of the private-report v2 control fields, not a "
+                  "reconnaissance volume allowance"),
+    "quarry_recon.report_truth:MAX_PRIVATE_REPORT_BYTES": (
+        "resource", "the allocation/publication envelope for one deterministic private report; "
+                    "overflow fails finalization and never truncates the current evidence projection"),
+    "quarry_recon.report_truth:MAX_REFERENCE_DEPTH": (
+        "identity", "the structural grammar for a nested provenance/path reference; deeper identities "
+                    "are rejected rather than partially traversed"),
+    "quarry_recon.report_truth:MAX_REFERENCES_PER_OBSERVATION": (
+        "resource", "the allocation bound for one observation's explicit artifact-reference roster; "
+                    "overflow fails report finalization and is never silently omitted"),
+    "quarry_recon.release_v310_08:MAX_V31008_GATE_REPORT_BYTES": (
+        "resource", "the allocation bound for one descriptive report-performance evidence record; "
+                    "oversize input is rejected and can never close the still-open performance gate"),
+    "quarry_recon.release_v310_08:MAX_V31008_GATE_REPORT_TRIALS": (
+        "resource", "the retained raw-trial count bound for one descriptive report-performance record; "
+                    "overflow is rejected rather than summarized away"),
     "quarry_recon.release_evidence:MAX_TAXONOMY_RECORD_BYTES": (
         "resource", "the allocation bound for one versioned pytest-taxonomy artifact; oversize input is "
                     "rejected rather than truncated or accepted as complete release evidence"),
@@ -413,6 +431,38 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.run_manifest:MAX_BASE_INVENTORY_BYTES": (
         "resource", "the streamed total-byte authentication bound for one immutable run evidence tree; "
                     "overflow refuses the manifest rather than accepting a prefix"),
+    "quarry_recon.revision:MAX_REVISION_POINTER_BYTES": (
+        "resource", "the pre-allocation bound for one strict revision control pointer; oversized pointer "
+                    "bytes are rejected before JSON decoding"),
+    "quarry_recon.revision:MAX_REVISION_SEGMENT_BYTES": (
+        "resource", "the per-segment allocation/publication bound for late JSONL evidence; overflow makes "
+                    "the revision unusable and is never accepted as a prefix"),
+    "quarry_recon.revision:MAX_REVISION_SUPPLEMENT_BYTES": (
+        "resource", "the aggregate byte envelope for all segments in one published revision chain; the "
+                    "next revision is refused when it would exceed the complete supported chain"),
+    "quarry_recon.revision:MAX_REVISION_RAW_FILE_BYTES": (
+        "resource", "the per-file allocation bound for one revision-owned raw proof artifact; oversized "
+                    "proof cannot be claimed by a valid revision"),
+    "quarry_recon.revision:MAX_REVISION_RAW_TOTAL_BYTES": (
+        "resource", "the aggregate byte envelope for all revision-owned raw proof artifacts referenced by "
+                    "the effective late-evidence view"),
+    "quarry_recon.revision:MAX_REVISION_RAW_FILES": (
+        "resource", "the finite raw-proof reference count for one revision; overflow refuses the whole "
+                    "claim set rather than retaining a prefix"),
+    "quarry_recon.revision:MAX_REVISION_VIEW_FILE_BYTES": (
+        "resource", "the per-file allocation bound while hashing a rebuildable private revision view"),
+    "quarry_recon.revision:MAX_REVISION_VIEW_TOTAL_BYTES": (
+        "resource", "the aggregate byte envelope while reconciling rebuildable private revision views"),
+    "quarry_recon.revision:MAX_REVISION_VIEW_FILES": (
+        "resource", "the finite object-count envelope while enumerating one private revision view tree"),
+    "quarry_recon.revision:MAX_REVISION_TREE_DEPTH": (
+        "resource", "the recursion/work bound for private revision raw and derived-view path trees"),
+    "quarry_recon.revision:MAX_REVISION_ROOT_ENTRIES": (
+        "resource", "the bounded no-follow inventory size of one revision authority directory; overflow "
+                    "makes reads and further publication fail closed"),
+    "quarry_recon.revision:MAX_REVISION_SEGMENTS": (
+        "resource", "the finite segment-count envelope for one exact late-evidence chain; overflow is "
+                    "refused rather than partially certified"),
     "quarry_recon.campaign:MAX_CAMPAIGN_LEDGER_BYTES": (
         "resource", "the fail-closed allocation bound for one versioned campaign control ledger; an "
                     "oversized ledger is refused rather than parsed or accepted as terminal truth"),

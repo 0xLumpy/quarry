@@ -79,7 +79,7 @@ def test_a_view_directory_outside_the_revision_is_refused(tmp_path, planted):
     _import(run, tmp_path, "cb.jsonl", "q1.csession01")
     doc = json.loads(revision.pointer_path(run.dir).read_text())
     doc["views"]["dir"] = planted
-    revision.pointer_path(run.dir).write_text(json.dumps(doc))
+    revision.pointer_path(run.dir).write_bytes(revision._pointer_bytes(doc))
 
     broken = revision.read(run.dir)
     assert broken.status == "unusable" and "view directory" in broken.reason
@@ -94,7 +94,7 @@ def test_an_escaping_view_directory_is_never_created(tmp_path):
     outside = tmp_path / "OUTSIDE"
     doc = json.loads(revision.pointer_path(run.dir).read_text())
     doc["views"]["dir"] = str(outside)
-    revision.pointer_path(run.dir).write_text(json.dumps(doc))
+    revision.pointer_path(run.dir).write_bytes(revision._pointer_bytes(doc))
 
     assert revision.combined_view(run) is None
     assert not outside.exists(), "a pointer-supplied path created a directory outside the run"

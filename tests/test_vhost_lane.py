@@ -91,7 +91,11 @@ class _Ctx:
 
 
 def _svc(url, addrs=("1.2.3.4",), cdn=False):
-    return {"url": url, "cdn": cdn, "a": list(addrs)}
+    return {
+        "url": url, "cdn": cdn,
+        "cdn_state": "detected" if cdn else "not_detected",
+        "a": list(addrs),
+    }
 
 
 def _drive(tmp_path, monkeypatch, live, *, body=None, status=Status.SUCCESS, words="admin\nstaging\n",
@@ -174,6 +178,20 @@ class TestScopeBeforeContact:
         submitted = __import__("pathlib").Path(seen[0]["wl"]).read_text().split()
         assert sorted(submitted) == ["admin", "staging"]
         assert "jobs" not in submitted and "dev" not in submitted
+
+    def test_unknown_cdn_rows_are_gaps_without_starving_detector_negative_rows(
+            self, tmp_path, monkeypatch):
+        negative = _svc("https://direct.ex.com")
+        negative["cdn_state"] = "not_detected"
+        unknown = _svc("https://unknown.ex.com", cdn=None)
+        unknown["cdn_state"] = "unknown"
+
+        _ctx, seen = _drive(tmp_path, monkeypatch, [negative, unknown], body=_res())
+
+        assert len(seen) == 1
+        assert seen[0]["u"] == "https://direct.ex.com/"
+        gaps = _cov(tmp_path, "cdn_classification")
+        assert gaps and gaps[-1]["kind"] == events.COVERAGE_UNKNOWN
 
     @pytest.mark.parametrize("bad", ["../admin", "a/b", "-bad", "bad-", "a..b", "x" * 70])
     def test_malformed_candidates_never_enter_the_wordlist(self, tmp_path, monkeypatch, bad):

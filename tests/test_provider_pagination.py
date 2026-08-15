@@ -1060,7 +1060,8 @@ class TestShodanPivot:
         head = [l for l in out.splitlines() if l.startswith("## Review queues")]
         assert head and "gf buckets" not in head[0], out
         for klass in ("DNS-OWNER-NAME", "RELATED-HOST"):
-            line = [l for l in out.splitlines() if l.startswith(f"### {klass}")]
+            encoded = triage.markdown_value(klass)
+            line = [l for l in out.splitlines() if l.startswith(f"### {encoded}")]
             assert line, out
             assert "PASSIVE" in line[0] and "never actively expanded" in line[0], line[0]
             assert "gf match" not in line[0], line[0]

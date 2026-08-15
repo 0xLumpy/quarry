@@ -130,7 +130,8 @@ class TestCorroborationIsCurrentNotFrozen:
         run.add("path_observation", _obs("/api/late", ["api-shaped"]))     # written with no corroboration
         run.add("url", {"url": "https://acme.com/api/late", "sources": ["xnLinkFinder"]})   # …found later
         md = triage.build(run, ScopeMatcher([], [], [], False))
-        assert "/api/late  ·  x1  ·  xnLinkFinder" in md, "the report must not say 'ast only' any more"
+        expected = triage.markdown_value("/api/late  ·  x1  ·  xnLinkFinder")
+        assert expected in md, "the report must not say 'ast only' any more"
         q = triage.digest_json(run, ScopeMatcher([], [], [], False))["queues"]["path_observations"]
         assert "corroborated:xnLinkFinder" in q[0]["tags"]
 

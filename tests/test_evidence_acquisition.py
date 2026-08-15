@@ -558,12 +558,16 @@ class TestTheReportShowsTheInterestingOnesFirst:
         return rows
 
     def test_a_high_interest_row_is_shown_even_behind_30_boring_ones(self):
+        from quarry_recon import triage
         out = self._report(self._rows())
-        assert "MAILER_DSN = smtp://svc:S3cr3tPass@mail.example" in out, out[-2000:]
+        expected = triage.markdown_value("MAILER_DSN = smtp://svc:S3cr3tPass@mail.example"
+                                         "   [high: key is not secret-shaped]")
+        assert expected in out, out[-2000:]
 
     def test_the_value_is_shown_COMPLETE_with_why_it_was_not_promoted(self):
+        from quarry_recon import triage
         out = self._report(self._rows())
-        assert "[high: key is not secret-shaped]" in out
+        assert triage.markdown_value("[high: key is not secret-shaped]") in out
         assert "S3cr3tPass" in out, "the operator reads the finding, not a mask"
 
     def test_the_held_back_rows_are_ANNOUNCED_not_silently_cut(self):
@@ -2158,8 +2162,9 @@ class TestOwnershipHasALIFECYCLE:
         scope = SimpleNamespace(in_scope=lambda h: True, is_oos=lambda h: False,
                                 active_allowed=lambda h: True, roots=[], oos=[])
         out = triage.build(run, scope)
-        assert "[RESOLVED] /raw/a.bin" in out, out[-1500:]
-        assert "https://t/.env" not in out, "the superseded transition is history, not current state"
+        assert triage.markdown_value("[RESOLVED] /raw/a.bin") in out, out[-1500:]
+        assert triage.markdown_value("https://t/.env") not in out, \
+            "the superseded transition is history, not current state"
 
     def test_and_a_REOPENED_one_is_shown_as_a_live_problem_again(self):
         from quarry_recon import triage
@@ -2176,7 +2181,8 @@ class TestOwnershipHasALIFECYCLE:
         scope = SimpleNamespace(in_scope=lambda h: True, is_oos=lambda h: False,
                                 active_allowed=lambda h: True, roots=[], oos=[])
         out = triage.build(run, scope)
-        assert "https://t/again" in out and "[RESOLVED]" not in out, out[-1500:]
+        assert triage.markdown_value("https://t/again") in out
+        assert triage.markdown_value("[RESOLVED]") not in out, out[-1500:]
 
     def test_an_ordinary_replay_does_NOT_invent_a_resolution(self, tmp_path, monkeypatch):
         """A resolution for a path that was never refused is a history that did not happen."""
@@ -2550,8 +2556,9 @@ class TestThroughTheREALStore:
         scope = SimpleNamespace(in_scope=lambda h: True, is_oos=lambda h: False,
                                 active_allowed=lambda h: True, roots=[], oos=[])
         out = triage.build(run, scope)
-        assert "[STATE UNKNOWN] /raw/a.bin" in out, out[-1500:]
-        assert "[RESOLVED]" not in out, "the lane refuses to act on this log; the report must not"
+        assert triage.markdown_value("[STATE UNKNOWN] /raw/a.bin") in out, out[-1500:]
+        assert triage.markdown_value("[RESOLVED]") not in out, \
+            "the lane refuses to act on this log; the report must not"
         events.reset()
 
     def test_the_lane_and_the_report_agree_on_a_healthy_log(self, tmp_path, monkeypatch):
@@ -2566,7 +2573,8 @@ class TestThroughTheREALStore:
         scope = SimpleNamespace(in_scope=lambda h: True, is_oos=lambda h: False,
                                 active_allowed=lambda h: True, roots=[], oos=[])
         out = triage.build(run, scope)
-        assert "[RESOLVED] /raw/x" in out and "https://t/x" not in out, out[-1500:]
+        assert triage.markdown_value("[RESOLVED] /raw/x") in out
+        assert triage.markdown_value("https://t/x") not in out, out[-1500:]
         events.reset()
 
 
@@ -2726,6 +2734,7 @@ class TestTheOwnershipLogIsISOLATED:
                                 active_allowed=lambda h: True, roots=[], oos=[])
         out = triage.build(run, scope)
         assert "NOT AUTHORITATIVE" in out
-        assert "MAILER_DSN" in out, "the review evidence really is unaffected — as the warning says"
+        assert triage.markdown_value("MAILER_DSN") in out, \
+            "the review evidence really is unaffected — as the warning says"
         assert "ownership_transition.jsonl" in out, "and the warning names the log that is damaged"
         events.reset()

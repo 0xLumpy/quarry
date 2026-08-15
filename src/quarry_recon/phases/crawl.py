@@ -1848,6 +1848,12 @@ def run(ctx) -> None:
                                        "kind": item.get("RuleID"), "value": sec,
                                        "preview": secrets.mask(sec),
                                        "file": item.get("File"), "line": item.get("StartLine"),
+                                       "raw_ref": str(rep),
+                                       "occurrences": [{"file": item.get("File"),
+                                                        "line": item.get("StartLine"),
+                                                        "end_line": item.get("EndLine"),
+                                                        "raw_ref": str(rep)}],
+                                       "provider_record": item,
                                        "sources": ["gitleaks"]})
             ctx.run.record("crawl", r)
 
@@ -1890,6 +1896,10 @@ def run(ctx) -> None:
                                        "kind": det, "value": raw_s,
                                        "preview": red or secrets.mask(raw_s),
                                        "verified": verified, "verification": verification,
+                                       "raw_ref": str(r.raw_path),
+                                       "occurrences": [{"raw_ref": str(r.raw_path),
+                                                        "source_metadata": o.get("SourceMetadata")}],
+                                       "provider_record": o,
                                        "sources": ["trufflehog"]})
 
     # ── xnLinkFinder: one lifecycle over every collected input, last so each input is complete ──
@@ -2038,7 +2048,8 @@ def _xnl_secret_row(item) -> bool:
                 and item["count"] >= 1)
 
 
-def _xnl_secrets(ctx, tag: str, shot: tuple, *, requested: bool, carrier: dict | None = None) -> tuple:
+def _xnl_secrets(ctx, tag: str, shot: tuple, *, requested: bool,
+                 artifact_ref: str | None = None, carrier: dict | None = None) -> tuple:
     """Ingest xnLinkFinder's `-os` output. Returns (stored, unusable, parse_gap).
 
     The schema is a JSON array of `{"type": str, "value": str, "sources": [str], "count": int}`, and a
@@ -2080,7 +2091,12 @@ def _xnl_secrets(ctx, tag: str, shot: tuple, *, requested: bool, carrier: dict |
         ctx.run.add("secret", {"id": f"xnLinkFinder:{kind}:{secrets.fingerprint(value)}",
                                "kind": kind, "value": value, "preview": value,
                                "verified": None, "verification": "not_checked",
-                               "sources": ["xnLinkFinder"], "context": f"xnLinkFinder-{tag}"})
+                               "sources": ["xnLinkFinder"], "context": f"xnLinkFinder-{tag}",
+                               "raw_ref": artifact_ref,
+                               "occurrences": [{"source": f"xnLinkFinder-{tag}",
+                                                **({"raw_ref": artifact_ref}
+                                                   if artifact_ref else {}),
+                                                "reported_count": item["count"]}]})
         # counted into the carrier the moment the write returns, so a sink dying on the second secret
         # cannot report zero while the first one sits in the store.
         stored += 1
@@ -2915,8 +2931,10 @@ def _xnl_ingest(ctx, tag: str, snap: dict, *, blob=None, written: int = 0, repla
                             reason=(f"{tag}: {n_words} wordlist line(s) usable, {wl_undecodable} not valid "
                                     f"UTF-8 and DROPPED (this vocabulary drives the A1d brute)"
                                     + ("; WORDLIST OUTPUT UNREADABLE" if wl_unreadable else "")))
-    n_secrets, n_secret_bad, secret_gap = _xnl_secrets(ctx, tag, snap["secrets"],
-                                                       requested=_xnl_wants_secrets(written), carrier=res)
+    n_secrets, n_secret_bad, secret_gap = _xnl_secrets(
+        ctx, tag, snap["secrets"], requested=_xnl_wants_secrets(written),
+        artifact_ref=str(_xnl_outputs(ctx, tag)["secrets"]), carrier=res,
+    )
     # `-o`/`-op`/`-owl` are requested explicitly, and their no-find shape is an empty file, not an absent
     # one; a requested artifact that is missing is our blind spot, and the unit stays retryable
     missing = tool_missing

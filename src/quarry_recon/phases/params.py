@@ -12,9 +12,11 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
+import io
 import json
 import os
 import re
+import stat
 import sys
 import time
 from bisect import insort
@@ -23,15 +25,93 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import (budget, events, evidence, fetch, netguard, normalize, nuclei_policy, oob, runtime_identity,
-                secrets, settings, store)
+from .. import (budget, events, evidence, fetch, netguard, normalize, nuclei_policy, oob,
+                resource_contract, run_manifest, runtime_identity, secrets, settings, store)
 from ..runner import (RunResult, Status, cancel_all as runner_cancel_all, fresh_artifact_dir, have,
                       native_output_current, nuclei_timeout, reset_cancel as runner_reset_cancel,
                       run as exec_tool, scaled_timeout, skipped)
 from ..runner_native import RepositoryNativeOutput
 from ..runner_repository import RepositoryOutput
+from . import _local_raw
 
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
+
+
+def _provider_jsonl_records(ctx, path: Path) -> list[dict]:
+    """Read a bounded stable provider JSONL artifact without following its name.
+
+    Managed evidence uses the repository's strict owner-private reader.  Small
+    compatibility fakes do not have a private-file publisher, but still get a
+    no-follow, regular-file, stable, explicitly bounded read.  A malformed row
+    fails the provider lane: dropping it would make partial evidence appear
+    complete.
+    """
+    maximum = run_manifest.MAX_STRUCTURED_FILE_BYTES
+    if _managed_owner(ctx, path) is not None:
+        raw = resource_contract.read_private_file(path, maximum=maximum)
+    else:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            initial = os.fstat(fd)
+            if (not stat.S_ISREG(initial.st_mode) or initial.st_uid != os.geteuid()
+                    or stat.S_IMODE(initial.st_mode) != 0o600 or initial.st_nlink != 1
+                    or initial.st_size > maximum):
+                raise ValueError("provider JSONL is not a bounded owner-private single-link regular file")
+            chunks = []
+            remaining = initial.st_size
+            while remaining:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError("provider JSONL ended before its initial size")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(fd, 1):
+                raise ValueError("provider JSONL grew while it was read")
+            final = os.fstat(fd)
+            identity = lambda observed: (
+                observed.st_dev, observed.st_ino, observed.st_mode, observed.st_size,
+                observed.st_mtime_ns, observed.st_ctime_ns,
+            )
+            if identity(final) != identity(initial):
+                raise ValueError("provider JSONL changed while it was read")
+            raw = b"".join(chunks)
+        finally:
+            os.close(fd)
+    if raw and not raw.endswith(b"\n"):
+        raise ValueError("provider JSONL has a torn final row")
+    def strict_object(pairs):
+        record = {}
+        for key, value in pairs:
+            if key in record:
+                raise ValueError(f"provider JSONL row repeats member {key!r}")
+            record[key] = value
+        return record
+
+    def reject_constant(value):
+        raise ValueError(f"provider JSONL row contains non-finite number {value}")
+
+    records = []
+    for row_number, encoded in enumerate(io.BytesIO(raw), 1):
+        if len(encoded) > run_manifest.MAX_JSONL_LINE_BYTES:
+            raise ValueError("provider JSONL row exceeds the supported bound")
+        try:
+            record = json.loads(
+                encoded.decode("utf-8", "strict"),
+                object_pairs_hook=strict_object,
+                parse_constant=reject_constant,
+            )
+        except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            raise ValueError(
+                f"provider JSONL row {row_number} is invalid: {type(exc).__name__}: {exc}",
+            ) from exc
+        if type(record) is not dict:
+            raise ValueError(f"provider JSONL row {row_number} is not an object")
+        try:
+            run_manifest._validate_json_value(record, f"provider JSONL row {row_number}")
+        except run_manifest.ManifestError as exc:
+            raise ValueError(f"provider JSONL row {row_number} is not portable: {exc}") from exc
+        records.append(record)
+    return records
 
 
 def _managed_owner(ctx, path: Path | None = None):
@@ -2543,33 +2623,62 @@ def _redirect_confirm(ctx, cands, prof) -> RunResult:
     events.tool_start(sid, cmd=["<native redirect probe>", "--no-follow"], input_total=len(cands))
     t0 = time.monotonic()
     confirmed = probed = degraded = 0
-    for i, u in enumerate(cands, 1):
-        host = normalize.host_of_url(u)
-        if not ctx.scope.active_allowed(host):        # scoped: in-scope, not passive, not OOS
-            continue
-        s = urlsplit(u)
-        pairs = parse_qsl(s.query, keep_blank_values=True)
-        if not any(k.lower() in _REDIR_PARAMS for k, _ in pairs):
-            continue
-        newq = [(k, canary_url if k.lower() in _REDIR_PARAMS else v) for k, v in pairs]
-        probe = urlunsplit((s.scheme, s.netloc, s.path, urlencode(newq), ""))
-        probed += 1
-        try:
-            loc, status_code = fetch.redirect_location(ctx, probe, host)
-        except Exception:
-            degraded += 1
-            continue
-        # a Location header only redirects on a 3xx; urljoin resolves it against the origin, so a same-host
-        # redirect stays on-host (not a finding). Only a 3xx whose Location host is our canary confirms.
-        if loc and 300 <= int(status_code or 0) < 400 \
-                and normalize.host_of_url(urljoin(probe, loc)) == _REDIR_CANARY:
-            confirmed += 1
+    pending = []
+    with _local_raw.lifecycle(ctx.run):
+        with _local_raw.text_writer(
+            ctx.run, "params", "redirect-confirm", "probes.jsonl",
+        ) as (raw_path, writer):
+            for i, u in enumerate(cands, 1):
+                host = normalize.host_of_url(u)
+                if not ctx.scope.active_allowed(host):        # scoped: in-scope, not passive, not OOS
+                    continue
+                s = urlsplit(u)
+                pairs = parse_qsl(s.query, keep_blank_values=True)
+                if not any(k.lower() in _REDIR_PARAMS for k, _ in pairs):
+                    continue
+                newq = [(k, canary_url if k.lower() in _REDIR_PARAMS else v) for k, v in pairs]
+                probe = urlunsplit((s.scheme, s.netloc, s.path, urlencode(newq), ""))
+                probed += 1
+                provider_record = {
+                    "candidate": u,
+                    "request": {"method": "GET", "url": probe, "follow_redirects": False},
+                }
+                try:
+                    loc, status_code = fetch.redirect_location(ctx, probe, host)
+                except Exception as exc:
+                    degraded += 1
+                    provider_record["outcome"] = "probe-error"
+                    provider_record["error_type"] = type(exc).__name__
+                    writer.write(json.dumps(provider_record, sort_keys=True, separators=(",", ":")) + "\n")
+                    events.tool_progress(sid, current_index=i, input_total=len(cands))
+                    continue
+                response = {"status": int(status_code or 0), "location": loc}
+                provider_record["response"] = response
+                provider_record["outcome"] = "response"
+                writer.write(json.dumps(provider_record, sort_keys=True, separators=(",", ":")) + "\n")
+                # a Location header only redirects on a 3xx; urljoin resolves it against the origin, so a
+                # same-host redirect stays on-host (not a finding). Only a 3xx whose Location host is our
+                # canary confirms.
+                if loc and 300 <= int(status_code or 0) < 400 \
+                        and normalize.host_of_url(urljoin(probe, loc)) == _REDIR_CANARY:
+                    confirmed += 1
+                    pending.append((u, probe, loc, provider_record))
+                events.tool_progress(sid, current_index=i, input_total=len(cands))
+        for u, probe, loc, provider_record in pending:
+            finding_identity = hashlib.sha256(
+                json.dumps(
+                    {"candidate": u, "probe": probe, "location": loc},
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
             ctx.run.add("finding", {
-                "id": f"open-redirect:{u[:90]}", "template": "open-redirect-candidate",
+                "id": f"open-redirect:sha256:{finding_identity}",
+                "template": "open-redirect-candidate",
                 "name": "open-redirect candidate — param redirects off-host (manual validation required)",
                 "severity": "medium", "matched": f"{probe} -> Location: {loc}",
+                "request": provider_record["request"], "response": provider_record["response"],
+                "provider_record": provider_record, "raw_ref": str(raw_path),
                 "sources": ["redirect_confirm"], "confirmed": False})
-        events.tool_progress(sid, current_index=i, input_total=len(cands))
     status = Status.PARTIAL if degraded else Status.SUCCESS
     events.tool_finish(sid, status=status.value,
                        reason=(f"{degraded} probe error(s)" if degraded else None),
@@ -2691,6 +2800,195 @@ def _oob_probe(ctx, scope, prof):
                      None, added, note=f"{issued} probe(s), {added} interaction(s), {correlated} correlated")
 
 
+def _main_nuclei_lane(ctx, live: list[str], prof) -> None:
+    """Run or terminally account for only the main Nuclei obligation.
+
+    An empty eligible Nuclei corpus is a trustworthy zero for this lane.  It is
+    never a phase-wide stop: the high-signal native and specialist lanes below
+    have independent inputs and obligations.
+    """
+    sid = "params.nuclei_scan"
+    if not live:
+        events.coverage_partial(
+            sid, kind=events.COVERAGE_CAP, measure="requests", unit="requests",
+            eligible=0, tested=0, omitted=0,
+            reason="no active-allowed live hosts; the Nuclei request corpus is exactly empty",
+        )
+        events.ledger(sid, produced={"finding": 0}, consumed={"target": 0})
+        ctx.run.record("params", skipped("nuclei", "no active-allowed live hosts"))
+        return
+
+    # The long-pole. Work is rate-bound, so templates are not gated and batches are not parallelized (that
+    # would blow the RoE); hosts are chunked for resume, progress and per-batch isolation. See _nuclei_scan.
+    findings = ctx.run.raw_path("params", "nuclei", "findings.jsonl")
+    log = ctx.run.raw_path("params", "nuclei", "nuclei.run.log")
+    ck = max(1, settings.concurrency("NUCLEI_CHUNK_HOSTS", 50))
+    nchunks = (len(live) + ck - 1) // ck
+    chunk_budget = nuclei_timeout(min(ck, len(live)), ctx.http_timeout)
+    if not chunk_budget:
+        budget_text = "unbounded"
+    elif chunk_budget < 60:
+        budget_text = f"{chunk_budget}s"
+    elif chunk_budget % 60:
+        budget_text = f"{chunk_budget // 60}m{chunk_budget % 60}s"
+    else:
+        budget_text = f"{chunk_budget // 60}m"
+    final = len(live) - (nchunks - 1) * ck if nchunks else 0
+    ctx.echo(f"  nuclei: {len(live)} host(s) · {nchunks} sequential chunk(s) of {ck}"
+             + (f" (final {final})" if nchunks > 1 and final != ck else "")
+             + f" · per-chunk budget {budget_text} · checkpointed")
+    result = _nuclei_scan(ctx, live, findings, log, prof)
+    ctx.run.record("params", result)
+    count = 0
+    severity_counts = {"critical": 0, "high": 0, "medium": 0}
+    if findings.exists():
+        for obj in _provider_jsonl_records(ctx, findings):
+            tid = obj.get("template-id", "?")
+            severity = (obj.get("info") or {}).get("severity", "unknown")
+            ctx.run.add("finding", {
+                "id": f"{tid}|{obj.get('matched-at', obj.get('host', ''))}",
+                "template": tid, "severity": severity,
+                "name": (obj.get("info") or {}).get("name"),
+                "matched": obj.get("matched-at", obj.get("host", "")),
+                "request": obj.get("request"), "response": obj.get("response"),
+                "extracted_results": obj.get("extracted-results"),
+                "provider_record": obj, "raw_ref": str(findings),
+                "sources": ["nuclei"], "confirmed": False,
+            })
+            if severity in severity_counts:
+                severity_counts[severity] += 1
+            count += 1
+        ctx.echo(f"  nuclei: {count} candidate findings · "
+                 f"crit:{severity_counts['critical']} high:{severity_counts['high']} "
+                 f"med:{severity_counts['medium']}")
+    events.ledger(
+        sid, produced={"finding": count, **severity_counts}, consumed={"target": len(live)},
+    )
+
+
+def _takeover_nuclei_lane(ctx, prof, scope) -> None:
+    """Run and reconcile the independent Nuclei takeover owner."""
+    if not prof.takeover or not have("nuclei"):
+        return
+    nuclei_authority = nuclei_policy.policy_for(ctx)
+    # Union, not "resolved or subdomain": dangling-CNAME hosts (the takeover signal)
+    # have no A record and live only in `subdomain` — they must still be checked.
+    subs = scope.filter_hosts(sorted(set(ctx.run.values("resolved"))
+                                     | set(ctx.run.values("subdomain"))))
+    subs = netguard.guard_hosts(ctx, subs, phase="params.takeover", allow_dangling=True)
+    if not subs:
+        return
+    tk_in = ctx.write_list("takeover_targets.txt", subs)
+    tk_out = ctx.run.raw_path("params", "nuclei", "takeover.jsonl")
+    tk_cmd = ["nuclei", "-l", str(tk_in), "-ept", "javascript",
+              "-tags", "takeover", "-jsonl", "-duc", "-o", str(tk_out)]
+    if prof.http_rl:
+        tk_cmd += ["-rl", str(prof.http_rl)]
+    with _nuclei_oob_flags(prof, nuclei_authority) as oob_flags:
+        tk_cmd.extend(oob_flags)
+        tk_cfg = ({"tags": "takeover", "rate": prof.http_rl,
+                   **nuclei_authority.work_config("params.nuclei_takeover")}
+                  if nuclei_authority is not None
+                  else {"tags": "takeover", "rate": prof.http_rl})
+        tk_wu = events.work_unit(
+            "params.nuclei_takeover", inputs={"hosts": subs}, config=tk_cfg,
+        )
+        if nuclei_authority is not None:
+            nuclei_authority.prepare(
+                "params.nuclei_takeover", tk_cmd, input_total=len(subs), work_unit=tk_wu,
+            )
+        result = exec_tool(
+            "nuclei", tk_cmd,
+            repository=ctx.run,
+            stdout=RepositoryOutput.discard(),
+            stderr=RepositoryOutput.discard(),
+            native_outputs=(RepositoryNativeOutput.file(
+                7, *tk_out.relative_to(ctx.run.dir).parts, required=False,
+            ),),
+            timeout=nuclei_timeout(len(subs), ctx.http_timeout),
+            work_unit=tk_wu,
+        )
+        if nuclei_authority is not None:
+            nuclei_authority.settle(
+                "params.nuclei_takeover", result, input_total=len(subs), work_unit=tk_wu,
+            )
+    ctx.run.record("params", result)
+    produced = 0
+    if native_output_current(result, tk_out) and tk_out.exists():
+        for record in _provider_jsonl_records(ctx, tk_out):
+            produced += int(ctx.run.add("finding", {
+                "id": f"takeover:{record.get('matched-at', record.get('host'))}",
+                "template": record.get("template-id", "takeover"),
+                "severity": "high", "name": "possible subdomain takeover",
+                "matched": record.get("matched-at", record.get("host", "")),
+                "request": record.get("request"), "response": record.get("response"),
+                "extracted_results": record.get("extracted-results"),
+                "provider_record": record, "raw_ref": str(tk_out),
+                "sources": ["nuclei-takeover"], "confirmed": False,
+            }))
+    events.ledger(
+        "params.nuclei_takeover", produced={"finding": produced}, consumed={"target": len(subs)},
+    )
+
+
+def _takeover_nuclei_lane_isolated(ctx, prof, scope) -> None:
+    """A broken takeover provider must not starve unrelated Params owners."""
+    before = ctx.run.count("finding")
+    try:
+        _takeover_nuclei_lane(ctx, prof, scope)
+        return
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        detail = secrets.redact(f"{type(exc).__name__}: {exc}") or type(exc).__name__
+        produced = max(0, ctx.run.count("finding") - before)
+        ctx.run.record("params", RunResult(
+            "nuclei-takeover", ["<nuclei takeover provider settlement>"], Status.FAILED,
+            None, 0.0, None, produced,
+            note=f"Nuclei takeover provider evidence unusable: {detail}",
+        ))
+        events.coverage_partial(
+            "params.nuclei_takeover", kind=events.COVERAGE_UNKNOWN,
+            measure="provider_findings", unit="provider_findings",
+            reason=f"Nuclei takeover provider evidence could not be reconciled: {detail}",
+        )
+        events.ledger(
+            "params.nuclei_takeover", produced={"finding": produced}, consumed={"target": 0},
+        )
+        ctx.echo(
+            f"  nuclei takeover: provider evidence unusable — {detail}; "
+            "continuing independent lanes",
+        )
+
+
+def _main_nuclei_lane_isolated(ctx, live: list[str], prof) -> None:
+    """Settle a broken Nuclei lane without starving independent Params work."""
+    before = ctx.run.count("finding")
+    try:
+        _main_nuclei_lane(ctx, live, prof)
+        return
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        detail = secrets.redact(f"{type(exc).__name__}: {exc}") or type(exc).__name__
+        produced = max(0, ctx.run.count("finding") - before)
+        ctx.run.record("params", RunResult(
+            "nuclei", ["<nuclei provider settlement>"], Status.FAILED,
+            None, 0.0, None, produced,
+            note=f"Nuclei provider evidence unusable: {detail}",
+        ))
+        events.coverage_partial(
+            "params.nuclei_scan", kind=events.COVERAGE_UNKNOWN,
+            measure="provider_findings", unit="provider_findings",
+            reason=f"Nuclei provider evidence could not be reconciled: {detail}",
+        )
+        events.ledger(
+            "params.nuclei_scan", produced={"finding": produced},
+            consumed={"target": len(live)},
+        )
+        ctx.echo(f"  nuclei: provider evidence unusable — {detail}; continuing independent lanes")
+
+
 def run(ctx) -> None:
     prof, scope = ctx.profile, ctx.scope
 
@@ -2733,122 +3031,14 @@ def run(ctx) -> None:
         return
 
     # ── subdomain takeover (nuclei takeover templates over known subs) ──
-    if prof.takeover and have("nuclei"):
-        nuclei_authority = nuclei_policy.policy_for(ctx)
-        # Union, not "resolved or subdomain": dangling-CNAME hosts (the takeover signal)
-        # have no A record and live only in `subdomain` — they must still be checked.
-        subs = scope.filter_hosts(sorted(set(ctx.run.values("resolved"))
-                                         | set(ctx.run.values("subdomain"))))
-        # netguard fresh-resolves these: records private/self leads, withholds only scan-box/metadata self-
-        # hits, and keeps authoritative-NXDOMAIN dangling hosts (the takeover signal)
-        subs = netguard.guard_hosts(ctx, subs, phase="params.takeover", allow_dangling=True)
-        if subs:
-            tk_in = ctx.write_list("takeover_targets.txt", subs)
-            tk_out = ctx.run.raw_path("params", "nuclei", "takeover.jsonl")
-            tk_cmd = ["nuclei", "-l", str(tk_in), "-ept", "javascript",
-                      "-tags", "takeover", "-jsonl",
-                      "-duc", "-o", str(tk_out)]
-            # NB: nuclei has no connect-time IP deny (-eh excludes INPUT entries, not resolved IPs); the
-            # scan-box/metadata protection for these subs is netguard.guard_hosts' fresh-resolve above.
-            if prof.http_rl:                       # else native default (empty = fast)
-                tk_cmd += ["-rl", str(prof.http_rl)]
-            with _nuclei_oob_flags(prof, nuclei_authority) as oob_flags:
-                tk_cmd.extend(oob_flags)            # same OOB endpoint as the main scan (no drift)
-                tk_cfg = ({"tags": "takeover", "rate": prof.http_rl,
-                           **nuclei_authority.work_config("params.nuclei_takeover")}
-                          if nuclei_authority is not None
-                          else {"tags": "takeover", "rate": prof.http_rl})
-                tk_wu = events.work_unit("params.nuclei_takeover", inputs={"hosts": subs}, config=tk_cfg)
-                if nuclei_authority is not None:
-                    nuclei_authority.prepare(
-                        "params.nuclei_takeover", tk_cmd, input_total=len(subs), work_unit=tk_wu,
-                    )
-                r = exec_tool(
-                    "nuclei", tk_cmd,
-                    repository=ctx.run,
-                    stdout=RepositoryOutput.discard(),
-                    stderr=RepositoryOutput.discard(),
-                    native_outputs=(RepositoryNativeOutput.file(
-                        7, *tk_out.relative_to(ctx.run.dir).parts, required=False,
-                    ),),
-                    timeout=nuclei_timeout(len(subs), ctx.http_timeout),
-                    work_unit=tk_wu,
-                )
-                if nuclei_authority is not None:
-                    nuclei_authority.settle(
-                        "params.nuclei_takeover", r, input_total=len(subs), work_unit=tk_wu,
-                    )
-            ctx.run.record("params", r)
-            if native_output_current(r, tk_out) and tk_out.exists():
-                import json as _json
-                for line in tk_out.read_text().splitlines():
-                    try:
-                        o = _json.loads(line)
-                    except _json.JSONDecodeError:
-                        continue
-                    ctx.run.add("finding", {"id": f"takeover:{o.get('matched-at', o.get('host'))}",
-                                            "template": o.get("template-id", "takeover"),
-                                            "severity": "high", "name": "possible subdomain takeover",
-                                            "matched": o.get("matched-at", o.get("host", "")),
-                                            "sources": ["nuclei-takeover"], "confirmed": False})
+    _takeover_nuclei_lane_isolated(ctx, prof, scope)
 
     live = [u for u in ctx.run.values("live") if scope.active_allowed(normalize.host_of_url(u))]
     # fresh self-attack guard right before the scan: `live` was resolved hours ago, so re-check current
     # resolution — a host now pointing at the scan box / metadata never reaches a nuclei chunk
     live = netguard.guard_urls(ctx, live, phase="params.nuclei_scan")
-    if not live:
-        ctx.run.record("params", skipped("nuclei", "no active-allowed live hosts"))
-        return
     # ── nuclei (broad active, OOB interactsh, severity-scoped) — chunked + resumable ──
-
-    # the long-pole. Work is rate-bound, so templates are not gated and batches are not parallelized (that
-    # would blow the RoE); hosts are chunked for resume, progress and per-batch isolation. See _nuclei_scan.
-    findings = ctx.run.raw_path("params", "nuclei", "findings.jsonl")
-    log = ctx.run.raw_path("params", "nuclei", "nuclei.run.log")
-    ck = max(1, settings.concurrency("NUCLEI_CHUNK_HOSTS", 50))
-    _nchunks = (len(live) + ck - 1) // ck
-    _budget = nuclei_timeout(min(ck, len(live)), ctx.http_timeout)
-    # UX #1: 0 means unbounded (not "0m"). A sub-minute / non-round budget must not truncate to "0m"/whole
-    # minutes — render exact m/s so a 45s or 90s ceiling reads honestly.
-    if not _budget:
-        _budget_txt = "unbounded"
-    elif _budget < 60:
-        _budget_txt = f"{_budget}s"
-    elif _budget % 60:
-        _budget_txt = f"{_budget // 60}m{_budget % 60}s"
-    else:
-        _budget_txt = f"{_budget // 60}m"
-    _final = len(live) - (_nchunks - 1) * ck if _nchunks else 0
-    ctx.echo(f"  nuclei: {len(live)} host(s) · {_nchunks} sequential chunk(s) of {ck}"
-             + (f" (final {_final})" if _nchunks > 1 and _final != ck else "")
-             + f" · per-chunk budget {_budget_txt} · checkpointed")   # UX #5: 'checkpointed' (no operator --resume yet)
-    r = _nuclei_scan(ctx, live, findings, log, prof)
-    ctx.run.record("params", r)
-    if findings.exists():
-        n = 0
-        sev = {"critical": 0, "high": 0, "medium": 0}
-        for line in findings.read_text().splitlines():
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            tid = obj.get("template-id", "?")
-            severity = (obj.get("info") or {}).get("severity", "unknown")
-            ctx.run.add("finding", {
-                "id": f"{tid}|{obj.get('matched-at', obj.get('host',''))}",
-                "template": tid, "severity": severity,
-                "name": (obj.get("info") or {}).get("name"),
-                "matched": obj.get("matched-at", obj.get("host", "")),
-                "sources": ["nuclei"], "confirmed": False})
-            if severity in sev:
-                sev[severity] += 1
-            n += 1
-        # terser than the old unconfirmed-validation note — the HOTLIST/digest already carry that
-        # framing; here a severity breakdown is more useful at a glance.
-        ctx.echo(f"  nuclei: {n} candidate findings · "
-                 f"crit:{sev['critical']} high:{sev['high']} med:{sev['medium']}")
-        events.ledger("params.nuclei_scan",
-                      produced={"finding": n, **sev}, consumed={"target": len(live)})
+    _main_nuclei_lane_isolated(ctx, live, prof)
 
     # ── exposed-resource fetch + secret extraction (recon evidence: unauth, in-scope, GET-only) ──
 

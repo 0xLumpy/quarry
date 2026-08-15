@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quarry.invalid/schemas/private-report-v2.schema.json",
+  "title": "Quarry lossless private report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "target", "run_id", "source_view", "counts", "observations", "omissions"],
+  "properties": {
+    "schema_version": {"const": "quarry.private-report.v2"},
+    "target": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+    "run_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+    "source_view": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "manifest_digest", "revision", "revision_digest", "generated_at"],
+      "properties": {
+        "kind": {"enum": ["base", "revision"]},
+        "manifest_digest": {"$ref": "#/$defs/digest"},
+        "revision": {"$ref": "#/$defs/count"},
+        "revision_digest": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]},
+        "generated_at": {
+          "type": "string", "format": "date-time",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "base"}}},
+          "then": {
+            "properties": {
+              "revision": {"const": 0},
+              "revision_digest": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"kind": {"const": "revision"}}},
+          "then": {
+            "properties": {
+              "revision": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
+              "revision_digest": {"$ref": "#/$defs/digest"}
+            }
+          }
+        }
+      ]
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input", "included", "omitted", "by_entity"],
+      "properties": {
+        "input": {"$ref": "#/$defs/count"},
+        "included": {"$ref": "#/$defs/count"},
+        "omitted": {"const": 0},
+        "by_entity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "certificate", "dns_record", "endpoint", "finding", "gadget_candidate", "ip", "js_url",
+            "live", "oob_interaction", "ownership_transition", "parameter", "path_observation", "port",
+            "resolved", "review", "screenshot", "secret", "sink_observation", "subdomain", "tech", "url",
+            "web_port", "wildcard_zone"
+          ],
+          "properties": {
+            "certificate": {"$ref": "#/$defs/count"},
+            "dns_record": {"$ref": "#/$defs/count"},
+            "endpoint": {"$ref": "#/$defs/count"},
+            "finding": {"$ref": "#/$defs/count"},
+            "gadget_candidate": {"$ref": "#/$defs/count"},
+            "ip": {"$ref": "#/$defs/count"},
+            "js_url": {"$ref": "#/$defs/count"},
+            "live": {"$ref": "#/$defs/count"},
+            "oob_interaction": {"$ref": "#/$defs/count"},
+            "ownership_transition": {"$ref": "#/$defs/count"},
+            "parameter": {"$ref": "#/$defs/count"},
+            "path_observation": {"$ref": "#/$defs/count"},
+            "port": {"$ref": "#/$defs/count"},
+            "resolved": {"$ref": "#/$defs/count"},
+            "review": {"$ref": "#/$defs/count"},
+            "screenshot": {"$ref": "#/$defs/count"},
+            "secret": {"$ref": "#/$defs/count"},
+            "sink_observation": {"$ref": "#/$defs/count"},
+            "subdomain": {"$ref": "#/$defs/count"},
+            "tech": {"$ref": "#/$defs/count"},
+            "url": {"$ref": "#/$defs/count"},
+            "web_port": {"$ref": "#/$defs/count"},
+            "wildcard_zone": {"$ref": "#/$defs/count"}
+          }
+        }
+      }
+    },
+    "observations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/observation"}
+    },
+    "omissions": {"type": "array", "maxItems": 0}
+  },
+  "$defs": {
+    "count": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*\\\\)(?!\\s)(?!.*\\s$)(?!.*[\\u0000-\\u001f\\u007f]).+$"
+    },
+    "sourcePath": {
+      "type": "string",
+      "pattern": "^(normalized/(certificate|dns_record|endpoint|finding|gadget_candidate|ip|js_url|live|oob_interaction|ownership_transition|parameter|path_observation|port|resolved|review|screenshot|secret|sink_observation|subdomain|tech|url|web_port|wildcard_zone)\\.jsonl|revisions/rev(?:0{3}[1-9]|0{2}[1-9][0-9]|0[1-9][0-9]{2}|[1-9][0-9]{3,})/observations\\.jsonl)$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "bytes", "rows", "digest", "media_type"],
+      "properties": {
+        "path": {"$ref": "#/$defs/path"},
+        "bytes": {"$ref": "#/$defs/count"},
+        "rows": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/count"}]},
+        "digest": {"$ref": "#/$defs/digest"},
+        "media_type": {"enum": ["application/json", "application/octet-stream", "application/x-ndjson"]}
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observation_id", "entity", "key", "material_digest", "record", "source_ref", "source_refs", "record_refs", "artifact_refs"],
+      "properties": {
+        "observation_id": {"$ref": "#/$defs/digest"},
+        "entity": {
+          "enum": [
+            "certificate", "dns_record", "endpoint", "finding", "gadget_candidate", "ip", "js_url",
+            "live", "oob_interaction", "ownership_transition", "parameter", "path_observation", "port",
+            "resolved", "review", "screenshot", "secret", "sink_observation", "subdomain", "tech", "url",
+            "web_port", "wildcard_zone"
+          ]
+        },
+        "key": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+        "material_digest": {"$ref": "#/$defs/digest"},
+        "record": {"type": "object"},
+        "source_ref": {"$ref": "#/$defs/sourcePath"},
+        "source_refs": {
+          "type": "array", "minItems": 1, "maxItems": 4096, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/sourcePath"}
+        },
+        "record_refs": {
+          "type": "array", "maxItems": 4096, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/path"}
+        },
+        "artifact_refs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {"$ref": "#/$defs/artifact"}
+        }
+      }
+    }
+  }
+}

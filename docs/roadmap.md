@@ -13,10 +13,11 @@ breadth belongs in this release. Exact scope and gates are maintained in
 
 ## v0.3.11 — operator evidence and reporting
 
-- Preserve exact occurrence-level provenance for findings, screenshots,
-  secrets, technologies, services and provider intelligence.
-- Publish a full-fidelity private operator view and a separately requested
-  share view.
+- Extend the v0.3.10 private-report provenance baseline with richer typed
+  occurrence/relationship models for findings, technologies, services and
+  provider intelligence.
+- Add a separately requested, policy-labelled share view; it must remain a
+  derived transform and never replace the full-fidelity private report.
 - Make every acquisition lane conform to one source lifecycle contract.
 - Replace display-derived and truncated identifiers with stable typed IDs.
 - Add relationship-aware, source-aware ranking without turning absence into a

@@ -1081,7 +1081,7 @@ class TestCommittedContracts:
             "sha256:7cb5de860130fabef5660f47105f453cfc1f42e5458e6f854432e874cfd94fb7"
         by_name = {row["name"]: row["digest"] for row in scope["input_bindings"]}
         assert by_name["run-manifest-validator"] == \
-            "sha256:55f64d2870c0a44527409d2e0df8b065c729c2da77e9513e14e0cf537453f58b"
+            "sha256:7d286ef3196269c75a240cfc8e7f26705b96dc90b343bc533ba5247ac7cee587"
         assert by_name["run-manifest-schema"] == \
             "sha256:cb18bd7a504e1870c04bc292b6534a6a1c24762d8a2a5343282320e1675c01ba"
 

@@ -85,7 +85,10 @@ class _Ctx:
 
 
 def _live(*urls, cdn=False):
-    return [{"url": u, "cdn": cdn} for u in urls]
+    return [{
+        "url": u, "cdn": cdn,
+        "cdn_state": "detected" if cdn else "not_detected",
+    } for u in urls]
 
 
 def _drive(tmp_path, monkeypatch, live, *, body=None, status=Status.SUCCESS, budget_s=None,

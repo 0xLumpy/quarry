@@ -738,12 +738,20 @@ def publish_finding(ctx, kind: str, val: str, line, *, url: str, dest, source: s
                     f"proves the credential store leaked.",
             "sources": [source]})
         return "hash" if ok else ""
+    provenance = _provenance(line)
+    occurrence = {
+        "location": url, "host": where,
+        **({"file": str(dest), "raw_ref": str(dest)} if dest else {}),
+        **provenance,
+        **({"final": final_url} if final_url and final_url != url else {}),
+    }
     ok = ctx.run.add("secret", {
         "id": f"exposed:{kind}:{secrets.fingerprint(val or f'{kind}|{url}|{line}')}",
         "kind": kind, "value": val, "preview": secrets.mask(val), "host": where,
         "file": str(dest) if dest else None, "location": url,
+        "raw_ref": str(dest) if dest else None, "occurrences": [occurrence],
         **({"final": final_url} if final_url and final_url != url else {}),
-        **_provenance(line), "sources": [source]})
+        **provenance, "sources": [source]})
     return "secret" if ok else ""
 
 

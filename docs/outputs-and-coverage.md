@@ -131,11 +131,18 @@ operational inputs, not evidence. They must be excluded by construction from rec
 diagnostics, manifests, metrics, notifications and ordinary logs; masking is defense in depth, not a
 license to persist them first. See [secrets.md](secrets.md).
 
-A normal Quarry report is therefore **not share-safe by default**. Any future share export must be an
+A private Quarry report is therefore **not share-safe by default**. `private-report.json` is the
+deterministic full-fidelity machine projection: every effective observation appears exactly once and
+carries stable observation, canonical-source and attested-artifact references. `HOTLIST.md` and
+`digest.json` remain ranked operator projections rather than lossless inventories. Any future share export must be an
 explicit, separately generated derived view that names its policy and records every removed, minimized or
 transformed field. An AI input is another separate typed, access-controlled derived view; it never replaces
 canonical evidence or the private report. Quarry does not currently claim that its ordinary reports are
 safe to upload to a third party or model.
+
+The synthetic 24,068-observation replay is a public shape/determinism check, not a substitute for the
+unselected private corpus. Report timing/RSS/size records are descriptive while the reviewed benchmark
+manifest and numeric `C-PERF-REPORT` thresholds remain unset; measurements alone cannot close that gate.
 
 This is the required boundary, not a claim that every `v0.3.9` path already satisfies it. The current-HEAD
 audit records open lossless-normalization/reporting and typed credential-isolation defects under

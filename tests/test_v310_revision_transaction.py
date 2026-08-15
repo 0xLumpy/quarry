@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -534,6 +535,61 @@ def test_raw_mutation_during_barrier_is_refused_and_never_published(tmp_path, mo
     with pytest.raises(revision.RevisionError, match="changed during durability"):
         _oob_revision(run, tmp_path)
     assert revision.read(run.dir).status == "absent"
+
+
+def test_tree_durability_never_follows_a_swapped_ancestor(tmp_path, monkeypatch):
+    root = privfs.private_dir(tmp_path / "tree")
+    nested = privfs.private_dir(root / "nested")
+    privfs.write_private(nested / "proof.json", "{}\n")
+    outside = privfs.private_dir(tmp_path / "outside")
+    privfs.write_private(outside / "outside.json", "outside\n")
+    outside_inode = (outside / "outside.json").stat().st_ino
+    real_open = revision.os.open
+    real_fsync = revision.os.fsync
+    state = {"swapped": False, "outside_synced": False}
+
+    def swap(component, flags, *args, dir_fd=None, **kwargs):
+        if (component == "nested" and dir_fd is not None
+                and flags & getattr(os, "O_DIRECTORY", 0) and not state["swapped"]):
+            state["swapped"] = True
+            nested.rename(root / "held")
+            (root / "nested").symlink_to(outside, target_is_directory=True)
+        return real_open(component, flags, *args, dir_fd=dir_fd, **kwargs)
+
+    def observe(fd):
+        try:
+            if os.fstat(fd).st_ino == outside_inode:
+                state["outside_synced"] = True
+        except OSError:
+            pass
+        return real_fsync(fd)
+
+    monkeypatch.setattr(revision.os, "open", swap)
+    monkeypatch.setattr(revision.os, "fsync", observe)
+    with pytest.raises(OSError):
+        revision._fsync_tree(root)
+    assert state == {"swapped": True, "outside_synced": False}
+
+
+def test_durability_opens_a_raced_leaf_nonblocking_before_type_check(tmp_path, monkeypatch):
+    root = privfs.private_dir(tmp_path / "tree")
+    proof = root / "proof.json"
+    privfs.write_private(proof, "{}\n")
+    real_open = revision.os.open
+    state = {"swapped": False, "nonblocking": False}
+
+    def swap(component, flags, *args, dir_fd=None, **kwargs):
+        if component == proof.name and dir_fd is not None and not state["swapped"]:
+            state["swapped"] = True
+            proof.unlink()
+            os.mkfifo(proof, privfs.FILE_MODE)
+            state["nonblocking"] = bool(flags & getattr(os, "O_NONBLOCK", 0))
+        return real_open(component, flags, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(revision.os, "open", swap)
+    with pytest.raises(OSError, match="unsafe owner-private single-link file"):
+        revision._fsync_file(proof)
+    assert state == {"swapped": True, "nonblocking": True}
 
 
 def test_oob_close_after_effect_keeps_the_landed_raw_proof(tmp_path, monkeypatch):

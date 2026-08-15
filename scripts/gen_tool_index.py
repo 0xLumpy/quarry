@@ -42,6 +42,8 @@ _PHASES = [
 #: documentation-grade one-line roles, authored here (present tense, no shorthand).
 _ROLE = {
     "porch-pirate": "Searches public Postman workspaces for the target's exposed API endpoints and secrets.",
+    "whois": "Queries domain registration records for passive ownership and contact context.",
+    "dig": "Queries DNS records used by passive OSINT and scope corroboration.",
     "asnmap": "Maps an ASN to its announced CIDR ranges (scope context).",
     "mapcidr": "Expands and condenses CIDR ranges to individual IPs.",
     "tlsx": "Harvests TLS SAN/CN hostnames from IP ranges.",
@@ -53,7 +55,8 @@ _ROLE = {
     "alterx": "Generates subdomain permutations for resolution.",
     "dnsgen": "Generates subdomain permutations (classic alternative to alterx).",
     "dnsx": "Fast DNS resolver, PTR lookups, and record enrichment.",
-    "httpx": "Probes and fingerprints HTTP services and tags CDN vs origin.",
+    "httpx": ("Probes and fingerprints HTTP services and records CDN detector state; a negative is only "
+              "a direct-service candidate, not origin proof."),
     "cdncheck": "Classifies IPs as CDN / WAF / cloud, offline.",
     "gowitness": "Captures screenshots of live web hosts.",
     "naabu": "Fast SYN/CONNECT port scanner.",

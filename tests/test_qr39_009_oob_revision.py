@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from quarry_recon import oob, revision
+from quarry_recon import oob, revision, triage
 from quarry_recon.store import Run, fold_run_entity
 
 pytestmark = pytest.mark.offline
@@ -75,7 +75,8 @@ def test_late_import_revises_the_manifested_view(tmp_path):
     assert combined.status == "valid" and len(combined.records) == 1
 
     revised = (run.dir / "revisions" / rev.views["dir"] / "HOTLIST.md").read_text()
-    assert "qdeadbeef.csession01" in revised and "203.0.113.9" in revised
+    assert triage.markdown_value("qdeadbeef.csession01") in revised
+    assert triage.markdown_value("203.0.113.9") in revised
     assert "qdeadbeef" not in (run.reports / "HOTLIST.md").read_text()
     queues = json.loads((run.dir / "revisions" / rev.views["dir"] / "digest.json").read_text())["queues"]
     assert [q["type"] for q in queues["oob"]] == ["oob_interaction"]
@@ -106,11 +107,20 @@ def test_a_repeat_of_the_same_callback_publishes_nothing(tmp_path):
     assert revision.read(run.dir).revision == 1
 
 
-def test_polled_rows_take_the_same_path(tmp_path):
+def test_polled_rows_with_an_unattested_legacy_log_refuse_revision_publication(tmp_path):
     run = _finished_run(tmp_path)
     rows = oob.parse_interactsh(_callback("q9.csession01", "203.0.113.9", "2026-08-10T14:00:00Z"))
-    res = oob.import_polled(run, {"log": str(run.dir / "raw" / "oob" / "session" / "interactions.jsonl")}, rows)
-    assert res["added"] == 1 and res["revision"].entity_counts["oob_interaction"] == 1
+    # This shape predates sealed-session candidates and names bytes that were
+    # never created or certified.  Publishing the row would leave a dangling
+    # provenance reference in the combined view.  Real sealed resumes use the
+    # revision_candidate path exercised by the authority tests.
+    with pytest.raises(revision.RevisionError, match="unattested artifact"):
+        oob.import_polled(
+            run,
+            {"log": str(run.dir / "raw" / "oob" / "session" / "interactions.jsonl")},
+            rows,
+        )
+    assert revision.read(run.dir).status == "absent"
     assert not (run.dir / "normalized" / "oob_interaction.jsonl").exists()
 
 

@@ -3397,6 +3397,11 @@ class TestXnLinkFinderLifecycleBoundary:
         assert secs[0]["value"] == '"AKIAIOSFODNN7EXAMPLE"', secs        # not masked, not truncated
         assert secs[0]["preview"] == secs[0]["value"] and "*" not in secs[0]["preview"], secs
         assert secs[0]["kind"] == "AWS Access Key" and secs[0]["sources"] == ["xnLinkFinder"], secs
+        raw_ref = str(ctx.run.raw_path("crawl", "xnLinkFinder", "js_secrets.json"))
+        assert secs[0]["raw_ref"] == raw_ref
+        assert secs[0]["occurrences"] == [{
+            "source": "xnLinkFinder-js", "raw_ref": raw_ref, "reported_count": 1,
+        }]
         fin = [e for e in evs if e.get("event") == events.TOOL_FINISH][0]
         assert fin["produced"]["secrets"] == 1 and fin["status"] == "success", fin
 

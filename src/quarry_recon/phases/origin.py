@@ -3,8 +3,8 @@ packets — correlates already-collected evidence (httpx `-cdn`/`-favicon`, tlsx
 items tagged verify-ownership. Map-only: candidates are never added to scope or any scan target.
 
 Two channels:
-  - favicon twin: a non-CDN live host serving the same favicon hash as a CDN-fronted host.
-  - cert twin / SAN: a non-CDN host presenting the same TLS cert (sha1) as the CDN host, or a host
+  - favicon twin: a CDN-detector-negative live host serving the same favicon hash as a CDN-fronted host.
+  - cert twin / SAN: a detector-negative host presenting the same TLS cert (sha1) as the CDN host, or a host
     named in the CDN host's cert SANs that we already see direct.
 
 A CDN usually terminates TLS with its own cert, so the cert-sha1 twin mostly fires off-CDN; the
@@ -12,16 +12,18 @@ favicon-hash twin is the range-validatable channel.
 """
 from __future__ import annotations
 
+from .. import events, normalize
 from ..runner import skipped
 
 
 def _emit(ctx, cdn_host: str, ip: str, channel: str, matched_host: str, sources) -> bool:
-    # matched_host = the non-CDN host that produced this IP — the evidence trail for manual verification.
+    # matched_host = the detector-negative host that produced this IP — evidence for manual verification.
     return ctx.run.add("review", {
         "id": f"origin-ip:{cdn_host}->{ip}:{channel}",
         "klass": "origin-ip", "value": f"{cdn_host} -> {ip} (matches {matched_host})",
         "host": cdn_host, "origin_ip": ip, "channel": channel, "matched_host": matched_host,
-        "note": f"candidate origin IP for CDN-fronted {cdn_host} (via {channel}, matches non-CDN "
+        "note": f"candidate origin IP for CDN-fronted {cdn_host} (via {channel}, matches "
+                f"CDN-detector-negative "
                 f"{matched_host}) — verify ownership before use",
         "sources": sources or ["origin-correlation"]})
 
@@ -31,13 +33,20 @@ def run(ctx) -> None:
         ctx.run.record("origin", skipped("origin", "passive-only mode"))
         return
     live = ctx.run.read("live")
-    cdn_hosts = [l for l in live if l.get("cdn")]
+    cdn_hosts = [l for l in live if normalize.cdn_state(l) == "detected"]
+    unknown = [l for l in live if normalize.cdn_state(l) == "unknown"]
+    if unknown:
+        events.coverage_partial(
+            "origin.correlation", kind=events.COVERAGE_UNKNOWN, measure="cdn_classification",
+            unit="cdn_classification",
+            reason=f"{len(unknown)} live service(s) have unknown CDN classification; no origin inference",
+        )
     if not cdn_hosts:
         ctx.run.record("origin", skipped("origin", "no CDN-fronted hosts — nothing to de-front"))
         return
 
-    # non-CDN live hosts with real IPs = potential origins ("grey twins")
-    origins = [l for l in live if not l.get("cdn") and l.get("a")]
+    # Detector-negative live hosts with real IPs are only correlation candidates ("grey twins").
+    origins = [l for l in live if normalize.cdn_state(l) == "not_detected" and l.get("a")]
     live_ips = {l.get("host"): (l.get("a") or []) for l in origins}
 
     # favicon channel: favicon-hash -> [(host, ips)]
@@ -47,7 +56,7 @@ def run(ctx) -> None:
         if f not in (None, ""):
             fav_map.setdefault(str(f), []).append((l.get("host"), l.get("a") or []))
 
-    # cert channel: sha1 -> [(non-CDN host, ips)], joined cert-store -> live IPs; + per-host cert lookup
+    # cert channel: sha1 -> [(detector-negative host, ips)], joined cert-store -> live IPs
     certs = ctx.run.read("certificate")
     sha1_map: dict = {}
     cert_by_host: dict = {}
@@ -74,7 +83,7 @@ def run(ctx) -> None:
         ch = cdn.get("host")
         src = cdn.get("sources")
 
-        # favicon twin — a non-CDN host with the identical favicon hash
+        # favicon twin — a detector-negative host with the identical favicon hash
         f = cdn.get("favicon")
         if f not in (None, ""):
             for oh, ips in fav_map.get(str(f), []):
@@ -83,12 +92,12 @@ def run(ctx) -> None:
 
         cc = cert_by_host.get(ch)
         if cc:
-            # cert twin — same TLS cert (sha1) served on a non-CDN host
+            # cert twin — same TLS cert (sha1) served on a detector-negative host
             if cc.get("sha1"):
                 for oh, ips in sha1_map.get(cc["sha1"], []):
                     if oh != ch:
                         _add(ch, oh, ips, "cert-sha1", src)
-            # cert SAN names a host we already see direct (non-CDN)
+            # cert SAN names a host the CDN detector marked negative
             for san in (cc.get("san") or []):
                 if san != ch and san in live_ips:
                     _add(ch, san, live_ips[san], "cert-san", src)

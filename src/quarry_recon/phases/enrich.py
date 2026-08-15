@@ -15,7 +15,8 @@ import json as _json
 from .. import normalize, nuclei_policy, policy
 from .. import settings
 from ..runner import (RunResult, Status, have, native_output_current, nuclei_timeout,
-                      reclassify_from_files, run as exec_tool, scaled_timeout, skipped)
+                      reclassify_from_artifact, reclassify_from_files, run as exec_tool,
+                      scaled_timeout, skipped)
 from ..runner_native import RepositoryNativeOutput
 from ..runner_repository import RepositoryOutput
 from .. import budget, events, remainder, sweep
@@ -463,6 +464,7 @@ def run(ctx) -> None:
                 nuclei_authority = nuclei_policy.policy_for(ctx)
                 wi = ctx.write_list("enrich_waf.txt", new_live)
                 wo = ctx.run.raw_path("enrich", "nuclei", "waf.jsonl")
+                waf_rows = None
                 oob_context = (nuclei_authority.oob_flags() if nuclei_authority is not None else
                                contextlib.nullcontext(("-ni",) if not getattr(
                                    prof, "oob_enabled", True) else ()))
@@ -497,18 +499,18 @@ def run(ctx) -> None:
                         nuclei_authority.settle(
                             "enrich.nuclei_waf", wr, input_total=len(new_live), work_unit=wwu,
                         )
-                ctx.run.record("enrich", wr)
                 if native_output_current(wr, wo) and wo.exists():
-                    for line in wo.read_text().splitlines():
-                        try:
-                            o = _json.loads(line)
-                        except _json.JSONDecodeError:
-                            continue
-                        ex = o.get("extracted-results") or []
-                        name = (ex[0] if ex else None) or o.get("matcher-name") or "unknown"
-                        host = o.get("matched-at", o.get("host", ""))
-                        ctx.run.add("tech", {"id": f"{host}|waf:{name}", "tech": f"WAF:{name}",
-                                             "url": host, "sources": ["nuclei-waf"]})
+                    try:
+                        from .probe import _waf_records
+                        waf_rows = _waf_records(ctx, wo)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception:
+                        reclassify_from_artifact(wr, None, label="nuclei-waf")
+                ctx.run.record("enrich", wr)
+                if waf_rows is not None:
+                    for record in waf_rows:
+                        ctx.run.add("tech", record)
 
             if prof.screenshots and have("gowitness"):  # screenshots
                 lf = ctx.write_list("enrich_live.txt", new_live)
@@ -533,11 +535,19 @@ def run(ctx) -> None:
                 shots = (len(list(shot_dir.glob("*.jpeg"))) + len(list(shot_dir.glob("*.png")))
                          if current else 0)
                 reclassify_from_files(gr, shots, "screenshot")
-                ctx.run.record("enrich", gr)
+                screenshot_rows = None
                 if current:
-                    for ext in ("*.jpeg", "*.png"):
-                        for img in shot_dir.glob(ext):
-                            ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
+                    try:
+                        from .probe import _gowitness_records
+                        screenshot_rows = _gowitness_records(ctx, shot_dir)
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception:
+                        reclassify_from_artifact(gr, None, label="gowitness")
+                ctx.run.record("enrich", gr)
+                if screenshot_rows is not None:
+                    for record in screenshot_rows:
+                        ctx.run.add("screenshot", record)
 
             if have("smap"):                            # passive (Shodan) ports — parse like probe
                 sm_targets = [normalize.host_of_url(u) for u in new_live]

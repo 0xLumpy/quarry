@@ -2,13 +2,58 @@
 from __future__ import annotations
 
 import hashlib
+import html
+import json
 import re
-from datetime import datetime, timezone
+import unicodedata
 
-from . import secrets
+from . import normalize
 from .normalize import host_of_url
 
-DIGEST_SCHEMA = "1.0"
+DIGEST_SCHEMA = "2.0"
+
+
+_MARKDOWN_PUNCTUATION = frozenset(r'''!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~''')
+
+
+def markdown_value(value) -> str:
+    """Encode untrusted evidence as inert, visible Markdown text.
+
+    Newlines, terminal controls and bidi controls are rendered as explicit
+    Unicode escapes.  HTML and context-relevant CommonMark introducers are
+    escaped, so a value cannot create headings, links, images, code fences or
+    remote loads at any report insertion point.
+    """
+    text = str(value)
+    out = []
+    for char in text:
+        code = ord(char)
+        if unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"}:
+            out.append(f"\\u{code:04X}")
+            continue
+        if char in "&<>":
+            out.append(html.escape(char, quote=True))
+            continue
+        if char == "\\" or char in _MARKDOWN_PUNCTUATION:
+            out.append("\\" + char)
+            continue
+        out.append(char)
+    return "".join(out)
+
+
+def _source_time(run) -> str:
+    """A deterministic evidence timestamp, never report-generation wall time."""
+    try:
+        from . import run_manifest
+        manifest = run_manifest.read(run.dir / "manifest.json")
+        # Derived revision views are rendered before their pointer becomes the
+        # canonical name, then may be rebuilt after publication.  The base
+        # manifest's finished time is present in both linearization states and
+        # is therefore the stable presentation timestamp.  The machine report
+        # separately carries the exact revision number/digest/created time.
+        return manifest.document["finished"]
+    except Exception:
+        return str(getattr(run, "started", "source-time-unknown"))
 
 
 def _corroboration_now(run) -> dict:
@@ -149,25 +194,6 @@ OAUTH_RX = re.compile(r"(/oauth2?\b|/authorize\b|/token\b|/connect/token\b|"
 OAUTH_PARAMS = {"code", "state", "id_token", "access_token", "redirect_uri",
                 "response_type", "client_id", "scope", "nonce"}
 
-# Query-param names whose values are masked in the digest (full value stays in normalized/url.jsonl).
-SENSITIVE_PARAMS = {"access_token", "id_token", "code", "state", "redirect_uri",
-                    "client_secret", "token", "jwt", "assertion", "refresh_token"}
-
-
-def _sanitize_url(u: str) -> str:
-    if "?" not in u:
-        return u
-    base, qs = u.split("?", 1)
-    out = []
-    for kv in qs.split("&"):
-        if "=" in kv:
-            k, v = kv.split("=", 1)
-            if v and k.lower() in SENSITIVE_PARAMS:
-                v = "***"
-            out.append(f"{k}={v}")
-        else:
-            out.append(kv)
-    return base + "?" + "&".join(out)
 CLOUD_RX = re.compile(r"([a-z0-9.-]+\.s3[.-][a-z0-9-]*\.amazonaws\.com|s3\.amazonaws\.com/|"
                       r"storage\.googleapis\.com/|[a-z0-9-]+\.blob\.core\.windows\.net|"
                       r"[a-z0-9-]+\.r2\.cloudflarestorage\.com|gcr\.io/|[a-z0-9-]+\.azurecr\.io)", re.I)
@@ -196,7 +222,8 @@ def build(run, scope) -> str:
     resolved = run.count("resolved")
     secrets = run.read("secret")
 
-    origins = [l for l in live if not l.get("cdn")]   # non-CDN hosts: no WAF
+    origins = [l for l in live if normalize.cdn_state(l) == "not_detected"]
+    unknown_cdn = [l for l in live if normalize.cdn_state(l) == "unknown"]
     buckets = {k: sorted({u for u in urls if rx.search(u)}) for k, rx in INTEREST.items()}
     vuln_urls = {k: [] for k in VULN_PARAMS}
     for u in urls:
@@ -207,34 +234,39 @@ def build(run, scope) -> str:
             if any(p in names for p in ps):
                 vuln_urls[cls].append(u)
 
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    ts = _source_time(run)
     out = []
     A = out.append
-    A(f"# {run.target} — Recon HOTLIST")
-    A(f"_run {run.run_id} · {ts}_\n")
+    A(f"# {markdown_value(run.target)} — Recon HOTLIST")
+    A(f"_run {markdown_value(run.run_id)} · {markdown_value(ts)}_\n")
     A("## Inventory")
     A(f"- subdomains: {subs}  resolved: {resolved}  live: {len(live)}  urls: {len(urls)}")
-    A(f"- origin (non-CDN) live hosts: {len(origins)}  secrets: {len(secrets)}\n")
+    A(f"- CDN detector-negative live services: {len(origins)}  "
+      f"CDN state unknown: {len(unknown_cdn)}  secrets: {len(secrets)}\n")
 
     findings = run.read("finding")
     if findings:
         sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
-        findings.sort(key=lambda f: sev_rank.get(f.get("severity", "unknown"), 5))
+        findings.sort(key=lambda f: sev_rank.get(str(f.get("severity", "unknown")).lower(), 5))
         _conf = sum(1 for f in findings if f.get("confirmed"))
         _hdr = (f"## Scanner findings — {_conf} confirmed · {len(findings) - _conf} candidate (UNCONFIRMED, "
                 f"manual validation required)" if _conf else
                 f"## Scanner candidates ({len(findings)}) — UNCONFIRMED, manual validation required")
         A(_hdr)
         for f in findings[:30]:
-            A(f"- [{f.get('severity')}] {f.get('template')} @ {f.get('matched')}  (src: {','.join(f.get('sources', []))})")
+            A(f"- [{markdown_value(f.get('severity'))}] {markdown_value(f.get('template'))} @ "
+              f"{markdown_value(f.get('matched'))}  "
+              f"(src: {markdown_value(','.join(str(x) for x in (f.get('sources') or [])))})")
         _more(A, 30, len(findings))
         A("")
 
     if origins:
-        A("## Likely-origin hosts (no CDN → no WAF, test first)")
+        A("## CDN detector-negative services "
+          "(direct-service candidates; WAF is not inferred from this detector)")
         for l in origins[:40]:
-            A(f"- {l['url']}  [{l.get('status_code')}] {l.get('title') or ''} "
-              f"{','.join(l.get('tech') or [])}")
+            A(f"- {markdown_value(l['url'])}  [{markdown_value(l.get('status_code'))}] "
+              f"{markdown_value(l.get('title') or '')} "
+              f"{markdown_value(','.join(str(x) for x in (l.get('tech') or [])))}")
         _more(A, 40, len(origins))
         A("")
 
@@ -246,7 +278,7 @@ def build(run, scope) -> str:
         if items:
             A(f"## {label}  ({len(items)})")
             for u in items[:25]:
-                A(f"- {u}")
+                A(f"- {markdown_value(u)}")
             _more(A, 25, len(items))
             A("")
 
@@ -255,7 +287,7 @@ def build(run, scope) -> str:
         if items:
             A(f"## {cls.upper()} candidate params  ({len(items)}) — common-vuln params present")
             for u in items[:20]:
-                A(f"- {u}")
+                A(f"- {markdown_value(u)}")
             _more(A, 20, len(items))
             A("")
 
@@ -263,34 +295,39 @@ def build(run, scope) -> str:
         A(f"## Secret candidates ({len(secrets)}) — review before any validation")
         for s in secrets:                          # no cap: secrets are the point of the run
             verified = " VERIFIED" if s.get("verified") else ""
-            loc = f"  @ {s.get('file')}" if s.get("file") else ""
-            where = f":{s.get('line')}" if s.get("line") else ""
+            loc = f"  @ {markdown_value(s.get('file'))}" if s.get("file") else ""
+            where = f":{markdown_value(s.get('line'))}" if s.get("line") else ""
             # the readable value: local evidence for the operator; `preview` only if no value stored.
             shown = s.get("value") or s.get("data") or s.get("preview", "")
-            A(f"- [{s.get('kind')}{verified}] {shown}{loc}{where}  "
-              f"(src: {','.join(s.get('sources', []))})")
+            A(f"- [{markdown_value(s.get('kind'))}{verified}] {markdown_value(shown)}{loc}{where}  "
+              f"(src: {markdown_value(','.join(str(x) for x in (s.get('sources') or [])))})")
         A("")
 
     oob_rows = run.read("oob_interaction")
     if oob_rows:
         by_proto: dict[str, int] = {}
         for o in oob_rows:
-            by_proto[o.get("protocol", "?")] = by_proto.get(o.get("protocol", "?"), 0) + 1
+            protocol = str(o.get("protocol", "?"))
+            by_proto[protocol] = by_proto.get(protocol, 0) + 1
         proto = ", ".join(f"{k}:{v}" for k, v in sorted(by_proto.items()))
         ncorr = sum(1 for o in oob_rows if o.get("correlation") == "correlated")
-        A(f"## OOB interactions ({len(oob_rows)}) — {ncorr} correlated, {len(oob_rows) - ncorr} uncorrelated  [{proto}]")
+        A(f"## OOB interactions ({len(oob_rows)}) — {ncorr} correlated, "
+          f"{len(oob_rows) - ncorr} uncorrelated  [{markdown_value(proto)}]")
         A("> correlated = a Quarry-issued callback named its source/param; uncorrelated = imported/stray evidence (no attribution)")
         for o in oob_rows[:25]:
             if o.get("correlation") == "correlated":
-                A(f"- [{o.get('protocol')}] CORRELATED {o.get('payload_class')} <- {o.get('source_tool')} "
-                  f"(param {o.get('param')} on {o.get('target_url')})")
+                A(f"- [{markdown_value(o.get('protocol'))}] CORRELATED "
+                  f"{markdown_value(o.get('payload_class'))} <- {markdown_value(o.get('source_tool'))} "
+                  f"(param {markdown_value(o.get('param'))} on {markdown_value(o.get('target_url'))})")
             else:
                 dom = o.get("interaction_domain") or o.get("correlation_id") or o.get("id")
-                A(f"- [{o.get('protocol')}] {dom}  from {o.get('remote_address', '?')}  (uncorrelated)")
+                A(f"- [{markdown_value(o.get('protocol'))}] {markdown_value(dom)}  from "
+                  f"{markdown_value(o.get('remote_address', '?'))}  (uncorrelated)")
         _more(A, 25, len(oob_rows))
         A("")
 
-    dns_recs = [d for d in run.read("dns_record") if d.get("type") in NOTABLE_DNS_TYPES]
+    dns_recs = [d for d in run.read("dns_record")
+                if type(d.get("type")) is str and d.get("type") in NOTABLE_DNS_TYPES]
     if dns_recs:
         A(f"## DNS context ({len(dns_recs)} notable records — MX/NS/TXT/CAA/ASN/CDN)")
         by_t: dict[str, list] = {}
@@ -301,7 +338,7 @@ def build(run, scope) -> str:
             if items:
                 A(f"### {t.upper()}  ({len(items)})")
                 for d in items[:12]:
-                    A(f"- {d.get('host')} → {str(d.get('value', ''))}")
+                    A(f"- {markdown_value(d.get('host'))} → {markdown_value(d.get('value', ''))}")
                 _more(A, 12, len(items))
                 A("")
 
@@ -332,7 +369,7 @@ def build(run, scope) -> str:
             v = f"[RESOLVED] {v} — {r.get('note', 'no longer applies')}"
         if r.get("klass") == "unclassified" and r.get("key"):
             v = f"{r['key']} = {v}   [{r.get('interest', 'low')}: {r.get('reason', '')}]"
-        by_klass.setdefault(r.get("klass", "other"), []).append(v)
+        by_klass.setdefault(str(r.get("klass", "other")), []).append(v)
     if reviews:
         A(f"## Review queues ({len(reviews)}) — candidates and passive evidence")
         for klass in sorted(by_klass):
@@ -340,9 +377,9 @@ def build(run, scope) -> str:
             items = list(dict.fromkeys(by_klass[klass])) if klass == "unclassified" \
                 else sorted(set(by_klass[klass]))
             label = _REVIEW_LABELS.get(klass, "gf match")
-            A(f"### {klass.upper()}  ({len(items)}) — {label}")
+            A(f"### {markdown_value(str(klass).upper())}  ({len(items)}) — {markdown_value(label)}")
             for v in items[:15]:
-                A(f"- {v}")
+                A(f"- {markdown_value(v)}")
             if len(items) > 15:                    # display bounded; stored evidence is not
                 A(f"- … {len(items) - 15} more — full list in normalized/review.jsonl")
             A("")
@@ -355,13 +392,16 @@ def build(run, scope) -> str:
           "impact. Nothing here was probed; every row is evidence another lane already collected.\n")
         by_klass: dict[str, list] = {}
         for g in gadgets:
-            by_klass.setdefault(g.get("klass") or "other", []).append(g)
+            by_klass.setdefault(str(g.get("klass") or "other"), []).append(g)
         for klass in sorted(by_klass):
             rows = by_klass[klass]
-            A(f"### {klass.upper()}  ({len(rows)})")
+            A(f"### {markdown_value(str(klass).upper())}  ({len(rows)})")
             for g in rows[:10]:
-                chains = ", ".join(g.get("chain_potential") or []) or "unclassified"
-                A(f"- {g.get('value')} — {g.get('observed_behavior')}  ·  chains: {chains}")
+                raw_chains = g.get("chain_potential") or []
+                chains = (", ".join(str(item) for item in raw_chains)
+                          if type(raw_chains) is list else str(raw_chains)) or "unclassified"
+                A(f"- {markdown_value(g.get('value'))} — "
+                  f"{markdown_value(g.get('observed_behavior'))}  ·  chains: {markdown_value(chains)}")
             if len(rows) > 10:
                 A(f"- … {len(rows) - 10} more — full list in normalized/gadget_candidate.jsonl")
             A("")
@@ -379,7 +419,7 @@ def build(run, scope) -> str:
         for o in top[:15]:
             seen = sum(s.get("n", 0) for s in (o.get("sightings") or []) if isinstance(s, dict))
             who = ", ".join(ast_obs.corroborators(o, fresh)) or "ast only"
-            A(f"- {o.get('id')}  ·  x{seen}  ·  {who}")
+            A(f"- {markdown_value(o.get('id'))}  ·  x{seen}  ·  {markdown_value(who)}")
         if len(top) > 15:                          # display bounded; stored evidence is not
             A(f"- … {len(top) - 15} more prioritised — full list in normalized/path_observation.jsonl")
         if len(obs) > len(top):
@@ -398,13 +438,14 @@ def build(run, scope) -> str:
           "and stay complete in the raw artifact.\n")
         by_role: dict[str, list] = {}
         for s in flow:
-            by_role.setdefault(s.get("role") or "other", []).append(s)
+            by_role.setdefault(str(s.get("role") or "other"), []).append(s)
         for role in sorted(by_role):
             rows = by_role[role]
-            A(f"### {role.upper()}  ({len(rows)})")
+            A(f"### {markdown_value(str(role).upper())}  ({len(rows)})")
             for s in rows[:8]:
                 seen = sum(x.get("n", 0) for x in (s.get("sightings") or []) if isinstance(x, dict))
-                A(f"- `{(s.get('value') or '')[:110]}`  ·  {s.get('analyzer')}  ·  x{seen}")
+                A(f"- {markdown_value((s.get('value') or '')[:110])}  ·  "
+                  f"{markdown_value(s.get('analyzer'))}  ·  x{seen}")
             if len(rows) > 8:
                 A(f"- … {len(rows) - 8} more — full list in normalized/sink_observation.jsonl")
             A("")
@@ -413,7 +454,8 @@ def build(run, scope) -> str:
 
     A("## Review order")
     A("1. secrets — exports/secrets.jsonl")
-    A("2. origin hosts above (no WAF)")
+    A("2. detector-negative direct-service candidates above "
+      "(WAF is not inferred from the CDN detector)")
     A("3. auth + api + admin buckets")
     A("4. IDOR/SSRF/SQLi/XSS param candidates")
     A("5. screenshots (gowitness) for visual anomalies")
@@ -422,9 +464,9 @@ def build(run, scope) -> str:
     return "\n".join(out) + "\n"
 
 
-# Structured digest contract (digest.json schema 1.0): every queue item carries provenance
-# (sources + raw_ref + why + confidence). Discovered values are shown whole with a short preview
-# alongside; only Quarry's own configured keys are redacted.
+# Structured private digest contract (digest.json schema 2.0): target evidence
+# remains exact. Quarry credentials are excluded by the typed execution/sink
+# boundary before a report is built, never by heuristic value replacement here.
 
 def _store_ref(run, entity: str, record: dict) -> str:
     """The run-relative file holding this observation. A combined view answers per row, so a callback that
@@ -435,11 +477,21 @@ def _store_ref(run, entity: str, record: dict) -> str:
 
 def _item(type_: str, value, why: str, confidence: str, sources, raw_ref: str, tags,
           location: str | None = None, identity: str | None = None) -> dict:
-    val = _sanitize_url(secrets.redact(value)) if isinstance(value, str) else value
-    # id hashes the sanitized value (raw tokens out of the id, dedups one-time code/state variants);
-    # `identity` overrides it when the display is truncated, since a prefix hash would collide.
-    iid = (f"{type_}:{identity}" if identity else
-           f"{type_}:{hashlib.sha1(str(val).encode('utf-8', 'replace')).hexdigest()[:10]}")
+    # This is the private operator projection: target evidence remains exact.
+    # Operational Quarry credentials are excluded at their typed transport/sink
+    # boundary, not heuristically erased from target observations here.
+    val = value
+    # Identity hashes the complete canonical stored value.  `identity`
+    # overrides the display value only when the latter is deliberately
+    # abbreviated; it is still hashed so target bytes cannot become syntax in
+    # the identifier.  Full SHA-256 avoids a feasible chosen collision silently
+    # collapsing two queue items in the id-dedup below.
+    identity_value = identity if identity is not None else val
+    identity_bytes = json.dumps(
+        identity_value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    iid = f"{type_}:sha256:{hashlib.sha256(identity_bytes).hexdigest()}"
     item = {"id": iid, "type": type_, "value": val, "why": why,
             "confidence": confidence, "sources": list(sources or []),
             "raw_ref": raw_ref, "tags": [t for t in (tags or []) if t]}
@@ -460,16 +512,28 @@ def collect(run, scope) -> dict:
     def add(q, item):
         queues.setdefault(q, []).append(item)
 
-    for l in live:                                  # origin (non-CDN) live hosts
-        if not l.get("cdn"):
-            tags = ["origin", "no-waf"] + ([str(l["status_code"])] if l.get("status_code") else [])
-            add("origin", _item("origin", l["url"], "origin host (no CDN → likely no WAF)",
-                                "high", l.get("sources"), "normalized/live.jsonl", tags))
-        else:                                        # CDN/WAF-fronted host — tag it as such
+    for l in live:
+        cdn_state = normalize.cdn_state(l)
+        if cdn_state == "not_detected":
+            tags = ["direct-service-candidate", "cdn:not_detected"] \
+                + ([str(l["status_code"])] if l.get("status_code") else [])
+            add("origin", _item(
+                "origin", l["url"],
+                "CDN detector-negative service; direct-service candidate only "
+                "(WAF state not inferred from the CDN detector)",
+                "low", l.get("sources"), "normalized/live.jsonl", tags,
+            ))
+        elif cdn_state == "detected":
             cn = l.get("cdn_name") or "cdn"
-            add("origin", _item("origin", l["url"], f"CDN/WAF-fronted host ({cn}) — origin hidden",
+            add("origin", _item("origin", l["url"], f"CDN detected ({cn}); WAF state not inferred",
                                 "low", l.get("sources"), "normalized/live.jsonl",
-                                [t for t in ("cdn-fronted", cn, "waf") if t]))
+                                [t for t in ("cdn:detected", cn) if t]))
+        else:
+            add("origin", _item(
+                "origin", l["url"],
+                "CDN classification unknown; no direct-origin or WAF inference",
+                "unknown", l.get("sources"), "normalized/live.jsonl", ["cdn:unknown"],
+            ))
 
     for row in url_rows:                             # interest buckets + vuln-class params
         u = row.get("url", "")
@@ -578,8 +642,8 @@ def collect(run, scope) -> dict:
             "low", d.get("sources"), "normalized/dns_record.jsonl", tags))
 
     for s in secrets_e:
-        # the readable value: digest.json is the local recon→attack contract. Our own configured
-        # credentials are still redacted inside `_item`; `preview` only if no value stored.
+        # The readable value: digest.json is a private local projection. Quarry
+        # credentials are absent by typed construction; target evidence remains exact.
         shown = s.get("value") or s.get("data") or s.get("preview") or ""
         add("secrets", _item("secret", shown,
             f"{s.get('kind')} secret candidate", "high" if s.get("verified") else "medium",
@@ -675,7 +739,7 @@ def collect(run, scope) -> dict:
 
 
 def digest_json(run, scope) -> dict:
-    """The versioned, redacted recon↔attack contract (digest.json schema 1.0)."""
+    """The deterministic private recon↔attack presentation contract."""
     return {"digest_schema": DIGEST_SCHEMA, "target": run.target, "run_id": run.run_id,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": _source_time(run),
             **collect(run, scope)}

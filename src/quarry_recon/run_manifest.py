@@ -8,7 +8,7 @@ there is no partially trusted dictionary result.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 import json
@@ -104,6 +104,12 @@ class RunManifest:
 
     document: dict[str, Any]
     raw: bytes
+    # The semantic fold is made while the manifest's run-directory descriptor
+    # authority is held.  Keeping that exact snapshot lets strict downstream
+    # projectors consume the bytes that were authenticated instead of reopening
+    # mutable pathnames after verification (an ABA swap/restore would otherwise
+    # be invisible to a final rehash).
+    folded_by_entity: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def summary(self) -> dict[str, Any]:
@@ -1409,11 +1415,13 @@ def read(path: Path, *, verify_lifecycle: bool = True) -> RunManifest:
             if document["base_files"] != _build_file_inventory_at(root_fd):
                 _fail("manifest.base_files does not match the immutable base evidence")
             state_raw = _read_file_at(root_fd, "state.json") if verify_lifecycle else None
+            folded_by_entity = _fold_entities_at(root_fd, document)
             _reconcile_repository(
                 document,
                 root_fd,
                 verify_lifecycle=verify_lifecycle,
                 state_raw=state_raw,
+                folded_by_entity=folded_by_entity,
             )
             if document["base_files"] != _build_file_inventory_at(root_fd):
                 _fail("base evidence changed during manifest verification")
@@ -1422,7 +1430,11 @@ def read(path: Path, *, verify_lifecycle: bool = True) -> RunManifest:
             if state_raw is not None and _read_file_at(root_fd, "state.json") != state_raw:
                 _fail("state.json changed during verification")
             _assert_anchor_name(run_dir, identity)
-            return RunManifest(document=document, raw=raw)
+            return RunManifest(
+                document=document,
+                raw=raw,
+                folded_by_entity=folded_by_entity,
+            )
     except ManifestError:
         raise
     except OSError as exc:

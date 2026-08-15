@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import envelope, privfs, store
+from . import envelope, privfs, run_manifest, store
 from .state import RUN_STATES, STATE_UNKNOWN, Fault
 
 SCHEMA_VERSION = 2
@@ -29,6 +29,23 @@ SEALED, LIVE, UNKNOWN, FINALIZING = "sealed", "live", STATE_UNKNOWN, "finalizing
 #: bookkeeping about the derived views rather than evidence the run discovered.
 VOLATILE_SUMMARY_FIELDS = frozenset({"faults", "verdict"})
 _REV_RE = re.compile(r"^rev(\d{4,})$")
+
+# Revision files are private control/evidence records, not an unbounded byte
+# store.  Every pathname read below names one of these envelopes explicitly;
+# no caller may allocate a file first and decide whether it was supported
+# afterwards.
+MAX_REVISION_POINTER_BYTES = run_manifest.MAX_MANIFEST_BYTES
+MAX_REVISION_SEGMENT_BYTES = run_manifest.MAX_STRUCTURED_FILE_BYTES
+MAX_REVISION_SUPPLEMENT_BYTES = 256 * 1024 * 1024
+MAX_REVISION_RAW_FILE_BYTES = run_manifest.MAX_STRUCTURED_FILE_BYTES
+MAX_REVISION_RAW_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_REVISION_RAW_FILES = 10_000
+MAX_REVISION_VIEW_FILE_BYTES = run_manifest.MAX_STRUCTURED_FILE_BYTES
+MAX_REVISION_VIEW_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_REVISION_VIEW_FILES = 10_000
+MAX_REVISION_TREE_DEPTH = 64
+MAX_REVISION_SEGMENTS = 10_000
+MAX_REVISION_ROOT_ENTRIES = 20_000
 
 
 class RevisionError(RuntimeError):
@@ -321,18 +338,53 @@ def _entity_content_digests(run_dir) -> dict:
         raise RevisionError(f"{d}: base evidence directory is unsafe")
     for p in sorted(d.glob("*.jsonl")):
         try:
-            body = _read_regular(p, root=Path(run_dir))  # the declared corpus envelope bounds this file
+            body = _read_regular(
+                p, root=Path(run_dir), maximum=run_manifest.MAX_STRUCTURED_FILE_BYTES,
+            )
         except OSError as e:
             raise RevisionError(f"{p}: base evidence is unreadable ({type(e).__name__})")
         out[p.stem] = _sha(body)
     return out
 
 
+def _certified_base_snapshot(run_dir):
+    """One strict manifest identity, claim set, and semantic base fold.
+
+    Revision certification must not validate ``manifest.json`` and then reopen
+    it (or its normalized files) through mutable pathnames.  ``run_manifest``
+    captures all of these facts under one held run-directory descriptor.
+    """
+    try:
+        manifest = run_manifest.read(
+            Path(run_dir) / "manifest.json", verify_lifecycle=False,
+        )
+    except run_manifest.ManifestError as exc:
+        raise RevisionError(f"the base manifest cannot be certified: {exc}") from exc
+    document = manifest.document
+    counts = dict(document["entity_counts"])
+    body = json.dumps(_evidence_manifest(document), sort_keys=True, ensure_ascii=False)
+    digest = _sha(body.encode("utf-8"))
+    contents = {}
+    for claim in document["base_files"]:
+        match = re.fullmatch(r"normalized/([a-z][a-z0-9_]*)\.jsonl", claim["path"])
+        if match is None or match.group(1) not in store.ENTITY_KEYS:
+            continue
+        value = claim["digest"]
+        if not isinstance(value, str) or not value.startswith("sha256:"):
+            raise RevisionError("the base manifest carries an invalid normalized-file digest")
+        contents[match.group(1)] = value[len("sha256:"):]
+    records = {
+        entity: dict(folded.records)
+        for entity, folded in manifest.folded_by_entity.items()
+    }
+    return manifest, digest, counts, contents, records
+
+
 # ── the published pointer ─────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Revision:
-    """The manifest of one published combined view; it holds counts and digests, never records."""
+    """One certified combined view plus private in-memory authenticated folds."""
 
     revision: int = 0
     status: str = "absent"                  # absent | valid | unusable
@@ -351,6 +403,10 @@ class Revision:
     digest: str = ""
     pointer_digest: str = ""
     orphans: list = field(default_factory=list)      # revision dirs above the pointer: written, never published
+    base_records: dict = field(default_factory=dict, repr=False, compare=False)
+    effective_records: dict = field(default_factory=dict, repr=False, compare=False)
+    provenance: dict = field(default_factory=dict, repr=False, compare=False)
+    snapshot_bound: bool = field(default=False, repr=False, compare=False)
 
     @property
     def trustworthy(self) -> bool:
@@ -363,30 +419,126 @@ def _segment_path(run_dir, name) -> Path:
     if not isinstance(name, str):
         raise ValueError("segment file is not a string")
     parts = Path(name).parts
-    if len(parts) != 2 or not _REV_RE.match(parts[0]) or parts[1] != SEGMENT_NAME:
+    match = _REV_RE.fullmatch(parts[0]) if len(parts) == 2 else None
+    if (match is None or parts[0] != _rev_name(int(match.group(1)))
+            or parts[1] != SEGMENT_NAME):
         raise ValueError(f"segment file {name!r} is not a revision segment")
     return revisions_dir(run_dir) / parts[0] / parts[1]
+
+
+def _revision_root_entries(run_dir) -> tuple[list[tuple[str, int]], str]:
+    """Bounded no-follow inventory of the revision authority directory."""
+    root = revisions_dir(run_dir)
+    try:
+        iterator = os.scandir(root)
+    except FileNotFoundError:
+        return [], ""
+    except OSError as exc:
+        return [], f"revision directory is unreadable: {exc}"
+    entries: list[tuple[str, int]] = []
+    try:
+        with iterator:
+            for entry in iterator:
+                if len(entries) >= MAX_REVISION_ROOT_ENTRIES:
+                    return [], "revision directory exceeds its object-count bound"
+                try:
+                    mode = entry.stat(follow_symlinks=False).st_mode
+                except OSError as exc:
+                    return [], f"revision directory entry {entry.name!r} is unreadable: {exc}"
+                entries.append((entry.name, mode))
+    except OSError as exc:
+        return [], f"revision directory enumeration failed: {exc}"
+    return entries, ""
 
 
 def _orphans(run_dir, published: int) -> list[str]:
     """Revision directories numbered above the pointer — bytes an interrupted publication left, kept and
     named rather than reused."""
-    d = revisions_dir(run_dir)
-    if not d.is_dir():
-        return []
+    entries, fault = _revision_root_entries(run_dir)
+    if fault:
+        return [f"<unavailable: {fault}>"]
     out = []
-    for child in d.iterdir():
-        m = _REV_RE.match(child.name)
-        if m and child.is_dir() and int(m.group(1)) > published:
-            out.append(child.name)
+    for name, mode in entries:
+        m = _REV_RE.match(name)
+        if m and stat.S_ISDIR(mode) and int(m.group(1)) > published:
+            out.append(name)
     return sorted(out)
 
 
 def _canonical_bytes(value) -> bytes:
     """One stable JSON encoding for identities recorded inside a revision pointer."""
-    return json.dumps(
-        value, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
-    ).encode("utf-8")
+    try:
+        run_manifest._validate_json_value(value, "revision value")
+        return json.dumps(
+            value, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+        ).encode("utf-8")
+    except (run_manifest.ManifestError, TypeError, ValueError, UnicodeEncodeError,
+            RecursionError) as exc:
+        raise RevisionError(f"revision value is not portable JSON: {exc}") from exc
+
+
+def _strict_json(raw: bytes, where: str):
+    """Decode one bounded revision record with the manifest's portable JSON rules."""
+    try:
+        value = run_manifest._parse_json(raw, where)
+        run_manifest._validate_json_value(value, where)
+        return value
+    except run_manifest.ManifestError as exc:
+        raise RevisionError(str(exc)) from exc
+
+
+_DIR_READ_FLAGS = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                   | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+_FILE_READ_FLAGS = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+
+
+def _private_directory_claim(observed, where) -> tuple[int, ...]:
+    if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != privfs.DIR_MODE):
+        raise OSError(f"unsafe private directory: {where}")
+    return observed.st_dev, observed.st_ino, observed.st_mode, observed.st_uid
+
+
+def _private_file_claim(observed, where) -> tuple[int, ...]:
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE
+            or observed.st_nlink != 1):
+        raise OSError(f"unsafe owner-private single-link file: {where}")
+    return (observed.st_dev, observed.st_ino, observed.st_mode, observed.st_uid,
+            observed.st_nlink, observed.st_size, observed.st_mtime_ns, observed.st_ctime_ns)
+
+
+def _open_private_directory_path(path: Path) -> int:
+    """Open a private directory one no-follow component at a time.
+
+    ``O_NOFOLLOW`` on an absolute multi-component pathname protects only its
+    leaf.  Beginning at a held filesystem/cwd descriptor and opening every
+    component relative to the prior descriptor prevents an ancestor rename to
+    a symlink from redirecting revision authority outside its tree.
+    """
+    path = Path(path)
+    components = path.parts[1:] if path.is_absolute() else path.parts
+    if any(component in ("", ".", "..") for component in components):
+        raise OSError(f"unsafe private directory path: {path}")
+    current = os.open(os.sep if path.is_absolute() else ".", _DIR_READ_FLAGS)
+    transient = -1
+    try:
+        for component in components:
+            transient = os.open(component, _DIR_READ_FLAGS, dir_fd=current)
+            os.close(current)
+            current = transient
+            transient = -1
+        _private_directory_claim(os.fstat(current), path)
+        owned, current = current, -1
+        return owned
+    finally:
+        for fd in (transient, current):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def _pointer_digest(doc: dict) -> str:
@@ -408,43 +560,88 @@ def _evidence_digest(*, base: str, supplement: str, counts: dict,
     }))
 
 
-def _read_regular(path: Path, *, root: Path | None = None) -> bytes:
-    """Read one stable regular file without following a symlink."""
+def _read_regular(path: Path, *, root: Path | None = None, maximum: int) -> bytes:
+    """Read one stable owner-private file through pinned directory descriptors."""
+    if type(maximum) is not int or maximum < 0:
+        raise ValueError("managed file byte bound is invalid")
     path = Path(path)
-    if root is not None:
-        root = Path(root)
-        root_mode = root.lstat().st_mode
-        if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
-            raise OSError(f"unsafe managed root: {root}")
-        try:
-            relative = path.relative_to(root)
-        except ValueError as exc:
-            raise OSError(f"file escapes managed root: {path}") from exc
-        cursor = root
-        for component in relative.parts[:-1]:
-            cursor = cursor / component
-            mode = cursor.lstat().st_mode
-            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-                raise OSError(f"unsafe file ancestry: {cursor}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+    root = Path(root) if root is not None else path.parent
     try:
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise OSError(f"not a regular file: {path}")
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise OSError(f"file escapes managed root: {path}") from exc
+    if not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise OSError(f"unsafe managed file path: {path}")
+
+    root_fd = parent_fd = file_fd = check_fd = current_fd = transient_fd = named_root_fd = -1
+    try:
+        root_fd = _open_private_directory_path(root)
+        root_identity = _private_directory_claim(os.fstat(root_fd), root)
+        directory_identities: list[tuple[int, ...]] = []
+        parent_fd = os.dup(root_fd)
+        os.set_inheritable(parent_fd, False)
+        for component in relative.parts[:-1]:
+            transient_fd = os.open(component, _DIR_READ_FLAGS, dir_fd=parent_fd)
+            directory_identities.append(_private_directory_claim(os.fstat(transient_fd), component))
+            os.close(parent_fd)
+            parent_fd = transient_fd
+            transient_fd = -1
+        file_fd = os.open(relative.parts[-1], _FILE_READ_FLAGS, dir_fd=parent_fd)
+        os.close(parent_fd)
+        parent_fd = -1
+
+        file_identity = _private_file_claim(os.fstat(file_fd), path)
+        if file_identity[5] > maximum:
+            raise OSError(f"managed file exceeds its {maximum}-byte bound: {path}")
         chunks = []
+        total = 0
         while True:
-            chunk = os.read(fd, 1024 * 1024)
+            chunk = os.read(file_fd, 1024 * 1024)
             if not chunk:
                 break
+            total += len(chunk)
+            if total > maximum:
+                raise OSError(f"managed file exceeds its {maximum}-byte bound: {path}")
             chunks.append(chunk)
-        after = os.fstat(fd)
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != \
-                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        if _private_file_claim(os.fstat(file_fd), path) != file_identity:
             raise OSError(f"file changed while it was read: {path}")
+        os.close(file_fd)
+        file_fd = -1
+
+        # Rewalk every lexical name from the still-pinned root.  A renamed or
+        # substituted ancestor/final component may not certify the old inode.
+        check_fd = os.dup(root_fd)
+        os.set_inheritable(check_fd, False)
+        for index, component in enumerate(relative.parts[:-1]):
+            transient_fd = os.open(component, _DIR_READ_FLAGS, dir_fd=check_fd)
+            if (_private_directory_claim(os.fstat(transient_fd), component)
+                    != directory_identities[index]):
+                raise OSError(f"file ancestry changed while it was read: {path}")
+            os.close(check_fd)
+            check_fd = transient_fd
+            transient_fd = -1
+        current_fd = os.open(relative.parts[-1], _FILE_READ_FLAGS, dir_fd=check_fd)
+        if _private_file_claim(os.fstat(current_fd), path) != file_identity:
+            raise OSError(f"file name changed while it was read: {path}")
+        os.close(current_fd)
+        current_fd = -1
+        os.close(check_fd)
+        check_fd = -1
+
+        named_root_fd = _open_private_directory_path(root)
+        if _private_directory_claim(os.fstat(named_root_fd), root) != root_identity:
+            raise OSError(f"managed root changed while file was read: {root}")
+        os.close(named_root_fd)
+        named_root_fd = -1
         return b"".join(chunks)
     finally:
-        os.close(fd)
+        for owned in (transient_fd, current_fd, file_fd, parent_fd, check_fd,
+                      named_root_fd, root_fd):
+            if owned >= 0:
+                try:
+                    os.close(owned)
+                except OSError:
+                    pass
 
 
 def _revision_raw_path(run_dir, ref: str) -> Path:
@@ -452,7 +649,8 @@ def _revision_raw_path(run_dir, ref: str) -> Path:
     if not isinstance(ref, str):
         raise ValueError("raw reference is not a string")
     parts = Path(ref).parts
-    if (Path(ref).is_absolute() or len(parts) < 4 or parts[:2] != (REVISIONS_DIR, "raw")
+    if (Path(ref).is_absolute() or len(parts) < 4 or len(parts) > MAX_REVISION_TREE_DEPTH
+            or parts[:2] != (REVISIONS_DIR, "raw")
             or any(part in ("", ".", "..") for part in parts)):
         raise ValueError(f"raw reference {ref!r} is not a revision raw file")
     return Path(run_dir).joinpath(*parts)
@@ -467,14 +665,22 @@ def _late_raw_refs(rows: list[dict]) -> set[str]:
         for ref in store._all_refs(record):
             if isinstance(ref, str) and Path(ref).parts[:2] == (REVISIONS_DIR, "raw"):
                 refs.add(ref)
+                if len(refs) > MAX_REVISION_RAW_FILES:
+                    raise ValueError("revision raw evidence exceeds its file-count bound")
     return refs
 
 
 def _raw_file_claims(run_dir, rows: list[dict]) -> dict:
     claims = {}
+    total = 0
     for ref in sorted(_late_raw_refs(rows)):
         path = _revision_raw_path(run_dir, ref)
-        body = _read_regular(path, root=revisions_dir(run_dir))
+        body = _read_regular(
+            path, root=revisions_dir(run_dir), maximum=MAX_REVISION_RAW_FILE_BYTES,
+        )
+        total += len(body)
+        if total > MAX_REVISION_RAW_TOTAL_BYTES:
+            raise OSError("revision raw evidence exceeds its aggregate byte bound")
         claims[ref] = {"bytes": len(body), "digest": _sha(body)}
     return claims
 
@@ -485,10 +691,11 @@ def _records_digest(entity: str, records: dict) -> str:
     ))
 
 
-def _effective_records(run_dir, base_counts: dict, rows: list[dict]) -> tuple[dict, str]:
-    """Fold the base plus every published supplement segment for every effective entity."""
-    manifest = store._read_json(Path(run_dir) / "manifest.json")
-    declared = manifest.get("envelope") if isinstance(manifest, dict) else None
+def _effective_records_from_snapshot(
+        manifest: run_manifest.RunManifest, base_counts: dict, rows: list[dict],
+) -> tuple[dict, str]:
+    """Fold supplements onto the exact base bytes held by manifest authority."""
+    declared = manifest.document.get("envelope")
     if not isinstance(declared, dict):
         return {}, "the base manifest carries no corpus envelope"
     limits = {
@@ -504,24 +711,54 @@ def _effective_records(run_dir, base_counts: dict, rows: list[dict]) -> tuple[di
     for entity in sorted(entities):
         if entity not in store.ENTITY_KEYS:
             return {}, f"the base manifest names an unknown entity {entity!r}"
-        base = store.fold_observations(
-            Path(run_dir) / "normalized" / f"{entity}.jsonl",
-            **limits,
-            require_newline=True,
-        )
         expected = base_counts.get(entity, 0)
-        if base.status == "absent" and expected == 0:
-            base = store.FoldedLog()
-        if not base.trustworthy or base.refused or len(base.records) != expected:
-            return {}, f"{entity} cannot be read whole: {base.reason}"
-        records = dict(base.records)
+        base = manifest.folded_by_entity.get(entity)
+        if base is None:
+            if expected != 0:
+                return {}, f"{entity} cannot be read whole: authenticated log is absent"
+            records = {}
+        else:
+            if not base.trustworthy or base.refused or len(base.records) != expected:
+                return {}, f"{entity} cannot be read whole: {base.reason}"
+            records = dict(base.records)
+        corpus_bytes = sum(store._record_bytes(record) for record in records.values())
+        if len(records) > limits["max_keys"]:
+            return {}, f"{entity} exceeds the declared key envelope"
+        if any(store._record_bytes(record) > limits["max_bytes_per_key"]
+               for record in records.values()):
+            return {}, f"{entity} exceeds the declared per-key byte envelope"
+        if corpus_bytes > limits["max_corpus_bytes"]:
+            return {}, f"{entity} exceeds the declared corpus byte envelope"
         for row in rows:
             if row["entity"] != entity:
                 continue
             key, record = row["id"], row["record"]
-            records[key] = store.merge(entity, records[key], record) if key in records else record
+            previous = records.get(key)
+            candidate = store.merge(entity, previous, record) if previous is not None else record
+            candidate_bytes = store._record_bytes(candidate)
+            previous_bytes = store._record_bytes(previous) if previous is not None else 0
+            if candidate_bytes > limits["max_bytes_per_key"]:
+                return {}, f"{entity} late evidence exceeds the declared per-key byte envelope"
+            if previous is None and len(records) >= limits["max_keys"]:
+                return {}, f"{entity} late evidence exceeds the declared key envelope"
+            next_corpus_bytes = corpus_bytes - previous_bytes + candidate_bytes
+            if next_corpus_bytes > limits["max_corpus_bytes"]:
+                return {}, f"{entity} late evidence exceeds the declared corpus byte envelope"
+            records[key] = candidate
+            corpus_bytes = next_corpus_bytes
         records_by_entity[entity] = records
     return records_by_entity, ""
+
+
+def _effective_records(run_dir, base_counts: dict, rows: list[dict]) -> tuple[dict, str]:
+    """Compatibility wrapper using one strict authenticated base snapshot."""
+    try:
+        manifest, _digest, current_counts, _contents, _records = _certified_base_snapshot(run_dir)
+    except RevisionError as exc:
+        return {}, str(exc)
+    if current_counts != base_counts:
+        return {}, "the base manifest entity counts changed"
+    return _effective_records_from_snapshot(manifest, base_counts, rows)
 
 
 def read(run_dir) -> Revision:
@@ -537,8 +774,13 @@ def read(run_dir) -> Revision:
     except FileNotFoundError:
         return Revision()
     try:
-        doc = json.loads(_read_regular(p, root=revisions_dir(run_dir)).decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        body = _read_regular(
+            p, root=revisions_dir(run_dir), maximum=MAX_REVISION_POINTER_BYTES,
+        )
+        doc = _strict_json(body, "revision pointer")
+        if type(doc) is not dict or body != _pointer_bytes(doc):
+            raise RevisionError("revision pointer is not in canonical form")
+    except (OSError, RevisionError, ValueError):
         doc = None
     if not isinstance(doc, dict):
         return Revision(status="unusable", reason="the revision pointer is unreadable")
@@ -562,12 +804,19 @@ def _certify_document(run_dir, doc: dict) -> Revision:
     n = doc.get("revision")
     if type(n) is not int or n < 1:
         return Revision(status="unusable", reason="the revision pointer carries no exact revision number")
+    _entries, root_fault = _revision_root_entries(run_dir)
+    if root_fault:
+        return _unusable(n, root_fault, run_dir)
     expected_fields = {
         "schema_version", "revision", "created", "base", "supplement", "entity_counts",
         "entity_digests", "raw_files", "views", "refused", "digest", "pointer_digest",
     }
     if set(doc) != expected_fields:
         return _unusable(n, f"revision {n} pointer fields do not match schema", run_dir)
+    try:
+        run_manifest._timestamp(doc.get("created"), f"revision {n} created")
+    except run_manifest.ManifestError as exc:
+        return _unusable(n, str(exc), run_dir)
     base = doc.get("base")
     if not isinstance(base, dict) or set(base) != {
         "run_id", "target", "manifest_digest", "entity_counts", "entity_contents",
@@ -579,6 +828,8 @@ def _certify_document(run_dir, doc: dict) -> Revision:
     segments = supplement.get("segments") if isinstance(supplement, dict) else None
     if not isinstance(segments, list) or not segments:
         return _unusable(n, f"revision {n} lists no supplement segment", run_dir)
+    if len(segments) > MAX_REVISION_SEGMENTS:
+        return _unusable(n, f"revision {n} exceeds the supplement segment bound", run_dir)
     rev = Revision(revision=n, status="valid", created=str(doc.get("created", "")),
                    base=doc.get("base") if isinstance(doc.get("base"), dict) else {},
                    segments=segments,
@@ -601,25 +852,30 @@ def _certify_document(run_dir, doc: dict) -> Revision:
     if not isinstance(doc.get("views"), dict) or set(doc["views"]) != {"dir", "files"}:
         return _unusable(n, f"revision {n} view claims are malformed", run_dir)
     for entry in rev.refused:
-        if (not isinstance(entry, dict) or set(entry) != {"entity", "key", "kind"}
+        if (not isinstance(entry, dict) or set(entry) not in (
+                    {"entity", "key", "kind"}, {"entity", "key", "kind", "fp"},
+                )
                 or entry.get("entity") not in store.ENTITY_KEYS
                 or not isinstance(entry.get("key"), str) or not entry["key"]
-                or not isinstance(entry.get("kind"), str) or not entry["kind"]):
+                or not isinstance(entry.get("kind"), str) or not entry["kind"]
+                or ("fp" in entry and (
+                    type(entry["fp"]) is not str
+                    or re.fullmatch(r"[0-9a-f]{32}", entry["fp"]) is None
+                ))):
             return _unusable(n, f"revision {n} carries a malformed refusal", run_dir)
     bad = _view_dir_fault(rev)
     if bad:
         return _unusable(n, bad, run_dir)
     held = doc.get("base", {}).get("manifest_digest") if isinstance(doc.get("base"), dict) else None
     try:
-        current, base_counts = _base_manifest(run_dir)
-        contents = _entity_content_digests(run_dir)
+        manifest, current, base_counts, contents, base_records = _certified_base_snapshot(run_dir)
     except RevisionError as e:
-        return _unusable(n, str(e), run_dir)
+        return _unusable(n, f"the base evidence changed after revision {n} was published or became "
+                            f"uncertifiable ({e})", run_dir)
     if held != current:
         return _unusable(n, f"the base run changed after revision {n} was published", run_dir)
-    manifest_doc = store._read_json(run_dir / "manifest.json")
-    if (not isinstance(manifest_doc, dict)
-            or rev.base.get("run_id") != manifest_doc.get("run_id")
+    manifest_doc = manifest.document
+    if (rev.base.get("run_id") != manifest_doc.get("run_id")
             or rev.base.get("target") != manifest_doc.get("target")):
         return _unusable(n, f"revision {n} does not name the sealed base identity", run_dir)
     if rev.base.get("entity_counts") != base_counts:
@@ -633,29 +889,41 @@ def _certify_document(run_dir, doc: dict) -> Revision:
         return _unusable(n, f"the base evidence changed after revision {n} was published "
                           f"({', '.join(moved[:4]) or 'no recorded content digests'})", run_dir)
     previous_number = 0
+    total_segment_bytes = 0
+    certified_rows: list[dict] = []
+    dropped_rows = 0
     for seg in segments:
         if not isinstance(seg, dict) or set(seg) != {"revision", "file", "lines", "bytes", "digest"}:
             return _unusable(n, "a supplement segment is malformed", run_dir)
         number = seg.get("revision")
         if type(number) is not int or number <= previous_number:
             return _unusable(n, f"revision {n} has a non-monotonic segment chain", run_dir)
+        if (type(seg.get("lines")) is not int or seg["lines"] < 0
+                or type(seg.get("bytes")) is not int or not 0 <= seg["bytes"] <= MAX_REVISION_SEGMENT_BYTES
+                or not isinstance(seg.get("digest"), str)):
+            return _unusable(n, "a supplement segment claim is malformed", run_dir)
+        total_segment_bytes += seg["bytes"]
+        if total_segment_bytes > MAX_REVISION_SUPPLEMENT_BYTES:
+            return _unusable(n, f"revision {n} exceeds the supplement byte bound", run_dir)
         try:
             segment_path = _segment_path(run_dir, seg.get("file"))
-            body = _read_regular(segment_path, root=revisions_dir(run_dir))
+            body = _read_regular(
+                segment_path, root=revisions_dir(run_dir), maximum=MAX_REVISION_SEGMENT_BYTES,
+            )
         except (OSError, ValueError) as e:
             return _unusable(n, f"supplement segment {seg.get('file')!r} is unusable: {e}", run_dir)
         path_number = int(Path(seg["file"]).parts[0][3:])
         if number != path_number:
             return _unusable(n, f"supplement segment {seg.get('file')!r} has the wrong revision", run_dir)
-        if (type(seg.get("lines")) is not int or seg["lines"] < 0
-                or type(seg.get("bytes")) is not int or seg["bytes"] < 0
-                or not isinstance(seg.get("digest"), str)):
-            return _unusable(n, "a supplement segment claim is malformed", run_dir)
         if (len(body) != seg["bytes"] or _sha(body) != seg["digest"]
+                or (body and not body.endswith(b"\n"))
                 or len(body.splitlines()) != seg["lines"]):
             return _unusable(
                 n, f"supplement segment {seg.get('file')!r} is not the one revision {n} published", run_dir,
             )
+        parsed, lost = _segment_rows(body, seg["file"])
+        certified_rows.extend(parsed)
+        dropped_rows += lost
         previous_number = number
     if previous_number != n:
         return _unusable(n, f"revision {n} does not end at its own supplement segment", run_dir)
@@ -664,13 +932,15 @@ def _certify_document(run_dir, doc: dict) -> Revision:
     expected_lines = sum(seg["lines"] for seg in segments)
     if rev.supplement_lines != expected_lines:
         return _unusable(n, f"revision {n} records the wrong supplement line count", run_dir)
-    rows, dropped = _committed_rows(run_dir, rev)
-    if dropped:
-        return _unusable(n, f"{dropped} unusable supplement row(s) in revision {n}", run_dir)
+    rows = certified_rows
+    if dropped_rows:
+        return _unusable(n, f"{dropped_rows} unusable supplement row(s) in revision {n}", run_dir)
     if len(rows) != expected_lines:
         return _unusable(n, f"revision {n} does not yield every segment row", run_dir)
 
-    records_by_entity, effective_fault = _effective_records(run_dir, base_counts, rows)
+    records_by_entity, effective_fault = _effective_records_from_snapshot(
+        manifest, base_counts, rows,
+    )
     if effective_fault:
         return _unusable(n, effective_fault, run_dir)
     counts = {entity: len(records) for entity, records in records_by_entity.items()}
@@ -703,6 +973,17 @@ def _certify_document(run_dir, doc: dict) -> Revision:
         return _unusable(n, f"revision {n} does not certify its effective evidence", run_dir)
     if rev.pointer_digest != _pointer_digest(doc):
         return _unusable(n, f"revision {n} pointer document digest does not match", run_dir)
+
+    rev.base_records = base_records
+    rev.effective_records = records_by_entity
+    provenance: dict[tuple[str, str], list[str]] = {}
+    for row in rows:
+        key = (row["entity"], row["id"])
+        segment = row["segment"]
+        if segment not in provenance.setdefault(key, []):
+            provenance[key].append(segment)
+    rev.provenance = {key: tuple(value) for key, value in provenance.items()}
+    rev.snapshot_bound = True
 
     try:
         rev.stale_views = _stale_view_files(run_dir, rev)
@@ -773,45 +1054,85 @@ def _chain_digest(segments: list) -> str:
     return _sha("\n".join(str(s.get("digest", "")) for s in segments if isinstance(s, dict)).encode("utf-8"))
 
 
+def _segment_rows(body: bytes, segment: str) -> tuple[list[dict], int]:
+    """Strict rows from one already-authenticated segment body."""
+    rows: list[dict] = []
+    dropped = 0
+    if body and not body.endswith(b"\n"):
+        return rows, 1
+    for index, line in enumerate(body.splitlines(), 1):
+        if not line or len(line) > run_manifest.MAX_JSONL_LINE_BYTES:
+            dropped += 1
+            continue
+        try:
+            row = _strict_json(line, f"revision segment {segment!r} row {index}")
+        except RevisionError:
+            dropped += 1
+            continue
+        entity = row.get("entity") if type(row) is dict else None
+        rec = row.get("record") if type(row) is dict else None
+        if type(entity) is not str or entity not in store.ENTITY_KEYS or type(rec) is not dict:
+            dropped += 1
+            continue
+        key = store.canonical_key(entity, rec)
+        try:
+            fingerprint = store.fingerprint(entity, rec)
+        except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+            dropped += 1
+            continue
+        if not key or row.get("id") != key or row.get("fp") != fingerprint:
+            dropped += 1
+            continue
+        row["segment"] = segment
+        rows.append(row)
+    return rows, dropped
+
+
 def _committed_rows(run_dir, rev: Revision) -> tuple[list[dict], int]:
     """`(rows, dropped)` from every committed segment, in publication order. A row whose recorded identity
     or fingerprint does not match its record is dropped and counted, never folded in."""
     rows: list[dict] = []
     dropped = 0
+    total = 0
     for seg in rev.segments:
         try:
-            text = _read_regular(
+            claimed = seg.get("bytes")
+            if type(claimed) is not int or claimed < 0 or claimed > MAX_REVISION_SEGMENT_BYTES:
+                raise ValueError("invalid segment byte claim")
+            total += claimed
+            if total > MAX_REVISION_SUPPLEMENT_BYTES:
+                raise ValueError("revision supplement exceeds its aggregate byte bound")
+            body = _read_regular(
                 _segment_path(run_dir, seg.get("file")), root=revisions_dir(run_dir),
-            ).decode("utf-8")
-        except (OSError, ValueError, UnicodeDecodeError):
+                maximum=MAX_REVISION_SEGMENT_BYTES,
+            )
+        except (OSError, ValueError):
             dropped += 1
             continue
-        for line in text.splitlines():
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                dropped += 1
-                continue
-            entity = row.get("entity") if isinstance(row, dict) else None
-            rec = row.get("record") if isinstance(row, dict) else None
-            if not isinstance(entity, str) or entity not in store.ENTITY_KEYS or not isinstance(rec, dict):
-                dropped += 1
-                continue
-            key = store.canonical_key(entity, rec)
-            if not key or row.get("id") != key or row.get("fp") != store.fingerprint(entity, rec):
-                dropped += 1
-                continue
-            row["segment"] = str(seg.get("file"))     # set after validation: a planted value never survives
-            rows.append(row)
+        parsed, lost = _segment_rows(body, str(seg.get("file")))
+        rows.extend(parsed)
+        dropped += lost
     return rows, dropped
 
 
 def _provenance(run_dir, rev: Revision) -> dict:
-    """`{(entity, key): segment file}` for every committed supplement row — which file actually holds it."""
+    """`{(entity, key): (segment files...)}` for every committed supplement row.
+
+    A later row may merge with the base and more than one prior supplement.
+    Keeping the complete ordered source roster lets strict derived views bind
+    every contributing artifact while ``store_ref`` retains its historic
+    latest-segment compatibility result.
+    """
+    if rev.snapshot_bound:
+        return dict(rev.provenance)
     rows, _ = _committed_rows(run_dir, rev)
-    return {(row["entity"], row["id"]): row["segment"] for row in rows}
+    refs: dict[tuple[str, str], list[str]] = {}
+    for row in rows:
+        key = (row["entity"], row["id"])
+        segment = row["segment"]
+        if segment not in refs.setdefault(key, []):
+            refs[key].append(segment)
+    return {key: tuple(value) for key, value in refs.items()}
 
 
 # ── reading the combined view ─────────────────────────────────────────────────────────────────────
@@ -824,9 +1145,11 @@ def combined_counts(run_dir) -> dict:
         return dict(rev.entity_counts)
     if rev.status == "unusable":
         return {}
-    manifest = store._read_json(Path(run_dir) / "manifest.json")
-    counts = manifest.get("entity_counts") if isinstance(manifest, dict) else None
-    return dict(counts) if isinstance(counts, dict) else {}
+    try:
+        manifest, _digest, counts, _contents, _records = _certified_base_snapshot(run_dir)
+    except RevisionError:
+        return {}
+    return dict(counts)
 
 
 def certification(run_dir) -> tuple[str, str]:
@@ -868,25 +1191,22 @@ def combined_fold(run_dir, entity: str) -> store.FoldedLog:
     """The base run's fold for `entity` with every committed supplement row merged in — what a consumer
     must read once a revision exists. An uncertified revision folds in nothing and says so."""
     entity = store.validate_entity(entity)
-    base = store.fold_run_entity(run_dir, entity)
     rev = read(run_dir)
     if rev.status == "absent":
-        return base
+        try:
+            manifest, _digest, _counts, _contents, _records = _certified_base_snapshot(run_dir)
+        except RevisionError as exc:
+            return store.FoldedLog(status="unknown", reason=str(exc))
+        base = manifest.folded_by_entity.get(entity)
+        return base if base is not None else store.FoldedLog()
     if rev.status != "valid":
-        return store.FoldedLog(records=base.records, status="unknown", dropped=base.dropped, reason=rev.reason)
-    rows, dropped = _committed_rows(run_dir, rev)
-    records_by_entity, fault = _effective_records(run_dir, rev.base.get("entity_counts", {}), rows)
-    if fault:
-        return store.FoldedLog(status="unknown", reason=fault)
-    records = records_by_entity.get(entity, {})
+        return store.FoldedLog(status="unknown", reason=rev.reason)
+    records = rev.effective_records.get(entity, {})
     expected = rev.entity_counts.get(entity, 0)
     if type(expected) is not int or len(records) != expected:
-        return store.FoldedLog(records=records, status="degraded", dropped=dropped,
+        return store.FoldedLog(records=records, status="degraded",
                                reason=f"revision {rev.revision} records {expected} {entity}, "
                                       f"the combined view yields {len(records)}")
-    if dropped:
-        return store.FoldedLog(records=records, status="degraded", dropped=dropped,
-                               reason=f"{dropped} unusable supplement row(s)")
     return store.FoldedLog(records=records)
 
 
@@ -897,17 +1217,26 @@ class CombinedRun:
     renderers need to know nothing about revisions.
     """
 
-    def __init__(self, run, overlay: dict, reports: Path, exports: Path, refs: dict | None = None):
+    def __init__(self, run, overlay: dict, reports: Path, exports: Path, refs: dict | None = None,
+                 base_records: dict | None = None):
         self._run = run
         self._overlay = overlay                   # entity -> {canonical key: combined record}
-        self._refs = refs or {}                   # (entity, key) -> the segment file that holds the row
+        self._refs = refs or {}                   # (entity, key) -> ordered contributing segment files
+        self._base_snapshot_bound = base_records is not None
+        self._base_keys: dict[str, set[str]] = {
+            entity: set(records) for entity, records in (base_records or {}).items()
+        }
         self.reports = privfs.private_dir(reports)
         self.exports = privfs.private_dir(exports)
 
     def read(self, entity: str) -> list[dict]:
+        if self._base_snapshot_bound and entity in store.ENTITY_KEYS:
+            return list(self._overlay.get(entity, {}).values())
         return list(self._overlay[entity].values()) if entity in self._overlay else self._run.read(entity)
 
     def count(self, entity: str) -> int:
+        if self._base_snapshot_bound and entity in store.ENTITY_KEYS:
+            return len(self._overlay.get(entity, {}))
         return len(self._overlay[entity]) if entity in self._overlay else self._run.count(entity)
 
     def values(self, entity: str) -> list[str]:
@@ -917,8 +1246,19 @@ class CombinedRun:
     def store_ref(self, entity: str, record: dict) -> str:
         """The run-relative file holding this observation: its supplement segment when it arrived after the
         run finished, else the run's own entity log."""
-        seg = self._refs.get((entity, store.canonical_key(entity, record)))
-        return f"{REVISIONS_DIR}/{seg}" if seg else f"normalized/{entity}.jsonl"
+        segments = self._refs.get((entity, store.canonical_key(entity, record)), ())
+        return f"{REVISIONS_DIR}/{segments[-1]}" if segments else f"normalized/{entity}.jsonl"
+
+    def store_refs(self, entity: str, record: dict) -> list[str]:
+        """Every canonical artifact whose row contributes to this effective record."""
+        key = store.canonical_key(entity, record)
+        if entity not in self._base_keys:
+            self._base_keys[entity] = (set() if self._base_snapshot_bound else {
+                store.canonical_key(entity, row) for row in self._run.read(entity)
+            })
+        out = [f"normalized/{entity}.jsonl"] if key in self._base_keys[entity] else []
+        out.extend(f"{REVISIONS_DIR}/{segment}" for segment in self._refs.get((entity, key), ()))
+        return out
 
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "_run"), name)
@@ -931,24 +1271,71 @@ def combined_view(run, rev: Revision | None = None) -> CombinedRun | None:
     if rev.status != "valid":
         return None
     refs = _provenance(run.dir, rev)
-    overlay = {}
-    for entity in sorted({e for e, _ in refs}):
-        folded = combined_fold(run.dir, entity)
-        if not folded.trustworthy:
-            return None                       # an entity we cannot read whole may not be rendered as a view
-        overlay[entity] = dict(folded.records)
+    overlay = {
+        entity: dict(records) for entity, records in rev.effective_records.items()
+    }
     d = _view_dir(run.dir, rev)
-    return CombinedRun(run, overlay, d, d / "exports", refs)
+    return CombinedRun(run, overlay, d, d / "exports", refs, rev.base_records)
+
+
+def _bounded_tree_paths(root: Path) -> list[Path]:
+    """Enumerate one private tree through held, no-follow directory descriptors."""
+    root = Path(root)
+    paths: list[Path] = []
+    root_fd = _open_private_directory_path(root)
+
+    def walk(directory_fd: int, relative: Path, depth: int) -> None:
+        if depth > MAX_REVISION_TREE_DEPTH:
+            raise RevisionError(f"{root}: revision tree exceeds its depth bound")
+        try:
+            iterator = os.scandir(directory_fd)
+        except OSError as exc:
+            raise RevisionError(f"{root / relative}: revision tree is unreadable: {exc}") from exc
+        with iterator:
+            for entry in iterator:
+                path = root / relative / entry.name
+                try:
+                    observed = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise RevisionError(f"{path}: revision object is unreadable: {exc}") from exc
+                if stat.S_ISLNK(observed.st_mode) or not (
+                        stat.S_ISREG(observed.st_mode) or stat.S_ISDIR(observed.st_mode)):
+                    raise RevisionError(f"{path}: revision tree contains an unsafe object")
+                paths.append(path)
+                if len(paths) > MAX_REVISION_VIEW_FILES:
+                    raise RevisionError(f"{root}: revision tree exceeds its file-count bound")
+                child_fd = -1
+                try:
+                    if stat.S_ISDIR(observed.st_mode):
+                        child_fd = os.open(entry.name, _DIR_READ_FLAGS, dir_fd=directory_fd)
+                        if (_private_directory_claim(os.fstat(child_fd), path)
+                                != _private_directory_claim(observed, path)):
+                            raise RevisionError(f"{path}: revision directory changed during enumeration")
+                        walk(child_fd, relative / entry.name, depth + 1)
+                    else:
+                        child_fd = os.open(entry.name, _FILE_READ_FLAGS, dir_fd=directory_fd)
+                        if (_private_file_claim(os.fstat(child_fd), path)
+                                != _private_file_claim(observed, path)):
+                            raise RevisionError(f"{path}: revision file changed during enumeration")
+                except OSError as exc:
+                    raise RevisionError(f"{path}: revision object is unsafe: {exc}") from exc
+                finally:
+                    if child_fd >= 0:
+                        os.close(child_fd)
+
+    try:
+        walk(root_fd, Path(), 0)
+        return sorted(paths)
+    finally:
+        os.close(root_fd)
 
 
 def _view_files(rev_dir: Path) -> dict:
     """`{path relative to the revision dir: digest}` for every derived view it holds — the segment is
     evidence, not a view, so it is never listed."""
     out = {}
-    try:
-        paths = sorted(rev_dir.rglob("*"))
-    except OSError as exc:
-        raise RevisionError(f"{rev_dir}: revision view tree is unreadable: {exc}") from exc
+    total = 0
+    paths = _bounded_tree_paths(rev_dir)
     for p in paths:
         try:
             mode = p.lstat().st_mode
@@ -961,7 +1348,11 @@ def _view_files(rev_dir: Path) -> dict:
         if not stat.S_ISREG(mode):
             raise RevisionError(f"{p}: revision view is not a regular file")
         if p.name != SEGMENT_NAME:
-            out[str(p.relative_to(rev_dir))] = _sha(_read_regular(p, root=rev_dir))
+            body = _read_regular(p, root=rev_dir, maximum=MAX_REVISION_VIEW_FILE_BYTES)
+            total += len(body)
+            if total > MAX_REVISION_VIEW_TOTAL_BYTES:
+                raise RevisionError(f"{rev_dir}: revision views exceed their aggregate byte bound")
+            out[str(p.relative_to(rev_dir))] = _sha(body)
     return out
 
 
@@ -990,21 +1381,21 @@ def _stale_view_files(run_dir, rev: Revision) -> list[str]:
 
 
 def _fsync_file(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    path = Path(path)
+    parent_fd = _open_private_directory_path(path.parent)
+    fd = -1
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError(f"not a regular file: {path}")
+        fd = os.open(path.name, _FILE_READ_FLAGS, dir_fd=parent_fd)
+        _private_file_claim(os.fstat(fd), path)
         os.fsync(fd)
     finally:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
 
 
 def _fsync_directory(path: Path) -> None:
-    fd = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
-    )
+    fd = _open_private_directory_path(Path(path))
     try:
         os.fsync(fd)
     finally:
@@ -1012,32 +1403,85 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _fsync_tree(root: Path) -> None:
-    """Durably seal every regular file and directory in a staged revision tree."""
-    paths = sorted(root.rglob("*"))
-    for path in paths:
-        mode = path.lstat().st_mode
-        if stat.S_ISLNK(mode) or not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-            raise OSError(f"unsafe staged revision object: {path}")
-        if stat.S_ISREG(mode):
-            _fsync_file(path)
-    directories = [path for path in paths if stat.S_ISDIR(path.lstat().st_mode)]
-    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
-        _fsync_directory(directory)
-    _fsync_directory(root)
+    """Durably seal a staged tree without reopening any absolute descendant path."""
+    root = Path(root)
+    root_fd = _open_private_directory_path(root)
+    count = 0
+
+    def sync(directory_fd: int, relative: Path, depth: int) -> None:
+        nonlocal count
+        if depth > MAX_REVISION_TREE_DEPTH:
+            raise RevisionError(f"{root}: revision tree exceeds its depth bound")
+        try:
+            iterator = os.scandir(directory_fd)
+        except OSError as exc:
+            raise RevisionError(f"{root / relative}: revision tree is unreadable: {exc}") from exc
+        with iterator:
+            for entry in iterator:
+                count += 1
+                if count > MAX_REVISION_VIEW_FILES:
+                    raise RevisionError(f"{root}: revision tree exceeds its file-count bound")
+                path = root / relative / entry.name
+                try:
+                    observed = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise RevisionError(f"{path}: revision object is unreadable: {exc}") from exc
+                child_fd = -1
+                try:
+                    if stat.S_ISREG(observed.st_mode):
+                        child_fd = os.open(entry.name, _FILE_READ_FLAGS, dir_fd=directory_fd)
+                        if (_private_file_claim(os.fstat(child_fd), path)
+                                != _private_file_claim(observed, path)):
+                            raise OSError(f"staged revision file changed during durability: {path}")
+                        os.fsync(child_fd)
+                    elif stat.S_ISDIR(observed.st_mode):
+                        child_fd = os.open(entry.name, _DIR_READ_FLAGS, dir_fd=directory_fd)
+                        if (_private_directory_claim(os.fstat(child_fd), path)
+                                != _private_directory_claim(observed, path)):
+                            raise OSError(f"staged revision directory changed during durability: {path}")
+                        sync(child_fd, relative / entry.name, depth + 1)
+                        os.fsync(child_fd)
+                    else:
+                        raise OSError(f"unsafe staged revision object: {path}")
+                finally:
+                    if child_fd >= 0:
+                        os.close(child_fd)
+
+    try:
+        sync(root_fd, Path(), 0)
+        os.fsync(root_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _fsync_raw_claims(run_dir, claims: dict) -> None:
-    directories: set[Path] = set()
     root = revisions_dir(run_dir)
-    for ref in claims:
-        path = _revision_raw_path(run_dir, ref)
-        _fsync_file(path)
-        parent = path.parent
-        while parent != root:
-            directories.add(parent)
-            parent = parent.parent
-    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
-        _fsync_directory(directory)
+    root_fd = _open_private_directory_path(root)
+    try:
+        for ref in claims:
+            path = _revision_raw_path(run_dir, ref)
+            relative = path.relative_to(root)
+            held = [os.dup(root_fd)]
+            file_fd = -1
+            try:
+                for component in relative.parts[:-1]:
+                    child = os.open(component, _DIR_READ_FLAGS, dir_fd=held[-1])
+                    _private_directory_claim(os.fstat(child), path.parent)
+                    held.append(child)
+                file_fd = os.open(relative.parts[-1], _FILE_READ_FLAGS, dir_fd=held[-1])
+                _private_file_claim(os.fstat(file_fd), path)
+                os.fsync(file_fd)
+                os.close(file_fd)
+                file_fd = -1
+                for directory_fd in reversed(held[1:]):
+                    os.fsync(directory_fd)
+            finally:
+                if file_fd >= 0:
+                    os.close(file_fd)
+                for directory_fd in reversed(held):
+                    os.close(directory_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _write_all(fd: int, body: bytes) -> None:
@@ -1067,16 +1511,27 @@ def _write_fsync_and_relinquish(fd: int, body: bytes) -> None:
 
 
 def _pointer_bytes(document: dict) -> bytes:
-    return (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    try:
+        run_manifest._validate_json_value(document, "revision pointer")
+        body = (json.dumps(
+            document, indent=2, ensure_ascii=False, allow_nan=False,
+        ) + "\n").encode("utf-8")
+    except (run_manifest.ManifestError, TypeError, ValueError, UnicodeEncodeError,
+            RecursionError) as exc:
+        raise RevisionError(f"revision pointer is not portable JSON: {exc}") from exc
+    if len(body) > MAX_REVISION_POINTER_BYTES:
+        raise RevisionError("revision pointer exceeds its byte bound")
+    return body
 
 
 def _private_directory_identity(path: Path) -> tuple[int, int]:
     """Authenticate one canonical private directory and return its stable name identity."""
-    info = Path(path).lstat()
-    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-            or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != privfs.DIR_MODE):
-        raise OSError(f"unsafe private directory authority: {path}")
-    return info.st_dev, info.st_ino
+    fd = _open_private_directory_path(Path(path))
+    try:
+        info = os.fstat(fd)
+        return info.st_dev, info.st_ino
+    finally:
+        os.close(fd)
 
 
 def _same_private_directory(path: Path, expected: tuple[int, int]) -> bool:
@@ -1104,7 +1559,9 @@ def _settle_pointer_fault(
     if not _same_private_directory(root, directory_identity):
         return _PointerSettlement("ambiguous")
     try:
-        current = _read_regular(pointer_path(run_dir), root=root)
+        current = _read_regular(
+            pointer_path(run_dir), root=root, maximum=MAX_REVISION_POINTER_BYTES,
+        )
     except FileNotFoundError:
         current = None
     except OSError:
@@ -1142,9 +1599,7 @@ def _publish_pointer(
 ) -> None:
     """Durably atomically replace the pointer after every candidate byte is sealed."""
     body = _pointer_bytes(document)
-    parent_flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
-                    | getattr(os, "O_NOFOLLOW", 0))
-    dfd = os.open(path.parent, parent_flags)
+    dfd = _open_private_directory_path(path.parent)
     opened = os.fstat(dfd)
     if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.getuid()
             or stat.S_IMODE(opened.st_mode) != privfs.DIR_MODE
@@ -1160,7 +1615,7 @@ def _publish_pointer(
     published_durable = False
     try:
         try:
-            previous = _read_regular(path)
+            previous = _read_regular(path, maximum=MAX_REVISION_POINTER_BYTES)
         except FileNotFoundError:
             previous = None
         fd = os.open(
@@ -1241,10 +1696,15 @@ def reseal_views(run_dir) -> Revision | None:
         revision_root = revisions_dir(run_dir)
         directory_identity = _private_directory_identity(revision_root)
         try:
-            previous_pointer = _read_regular(pointer_path(run_dir), root=revision_root)
+            previous_pointer = _read_regular(
+                pointer_path(run_dir), root=revision_root, maximum=MAX_REVISION_POINTER_BYTES,
+            )
         except OSError as exc:
             raise RevisionError(f"{run_dir}: prior revision pointer is unreadable: {exc}") from exc
-        doc = store._read_json(pointer_path(run_dir))
+        try:
+            doc = _strict_json(previous_pointer, "revision pointer")
+        except RevisionError:
+            doc = None
         if not isinstance(doc, dict):
             return None
         d = _view_dir(run_dir, rev)
@@ -1326,9 +1786,18 @@ class _Supplement:
         self._published = read(run.dir)
         if not self._published.trustworthy:
             raise RevisionError(f"{run.dir}: {self._published.reason} — refusing to revise an uncertified view")
-        self._base_digest, self._base_counts = _base_manifest(run.dir)
-        self._base_contents = _entity_content_digests(run.dir)
+        (manifest, self._base_digest, self._base_counts,
+         self._base_contents, _base_records) = _certified_base_snapshot(run.dir)
+        declared = manifest.document["envelope"]
+        self._limits = {
+            "max_keys": min(declared["max_keys_per_entity"], envelope.MAX_KEYS_PER_ENTITY),
+            "max_bytes_per_key": min(declared["max_bytes_per_key"], envelope.MAX_BYTES_PER_KEY),
+            "max_corpus_bytes": min(
+                declared["max_corpus_bytes_per_entity"], envelope.MAX_CORPUS_BYTES_PER_ENTITY,
+            ),
+        }
         self._records: dict[str, dict] = {}       # entity -> combined {key: record}, materialized on demand
+        self._corpus_bytes: dict[str, int] = {}
         self._pending: list[dict] = []
         self._refused: list[dict] = []
         self.revised = False
@@ -1340,6 +1809,9 @@ class _Supplement:
                 raise RevisionError(f"{self._run.dir}: {entity} is {folded.status} ({folded.reason}) — "
                                     "refusing to supplement evidence that cannot be read whole")
             self._records[entity] = dict(folded.records)
+            self._corpus_bytes[entity] = sum(
+                store._record_bytes(record) for record in self._records[entity].values()
+            )
         return self._records[entity]
 
     @property
@@ -1348,8 +1820,9 @@ class _Supplement:
         without reading the pointer, or a fully-refused import reads as clean success."""
         return len(self._refused)
 
-    def _refuse(self, entity: str, key: str, kind: str) -> None:
-        entry = {"entity": entity, "key": key, "kind": kind}
+    def _refuse(self, entity: str, key: str, kind: str, record: dict) -> None:
+        entry = {"entity": entity, "key": key, "kind": kind,
+                 "fp": store.fingerprint(entity, record)}
         if entry not in self._refused:           # re-admission may retest a row; it is one refusal
             self._refused.append(entry)
 
@@ -1373,10 +1846,13 @@ class _Supplement:
         held = self._combined(entity)
         if key not in held:
             held[key] = record
+            self._corpus_bytes[entity] += store._record_bytes(record)
             self._record(entity, key, record)
             return True
         if not store._subsumed(held[key], record):
+            previous_bytes = store._record_bytes(held[key])
             held[key] = store.merge(entity, held[key], record)
+            self._corpus_bytes[entity] += store._record_bytes(held[key]) - previous_bytes
             self._record(entity, key, record)
         return False
 
@@ -1387,11 +1863,19 @@ class _Supplement:
         corpus a row was measured against may have grown since.
         """
         held = self._combined(entity)
-        if len(json.dumps(record, ensure_ascii=False).encode("utf-8")) > envelope.MAX_BYTES_PER_KEY:
-            self._refuse(entity, key, "bytes")
+        previous = held.get(key)
+        candidate = store.merge(entity, previous, record) if previous is not None else record
+        candidate_bytes = store._record_bytes(candidate)
+        previous_bytes = store._record_bytes(previous) if previous is not None else 0
+        if candidate_bytes > self._limits["max_bytes_per_key"]:
+            self._refuse(entity, key, "growth" if previous is not None else "bytes", record)
             return False
-        if key not in held and len(held) >= envelope.MAX_KEYS_PER_ENTITY:
-            self._refuse(entity, key, "key")
+        if previous is None and len(held) >= self._limits["max_keys"]:
+            self._refuse(entity, key, "key", record)
+            return False
+        if (self._corpus_bytes[entity] - previous_bytes + candidate_bytes
+                > self._limits["max_corpus_bytes"]):
+            self._refuse(entity, key, "growth" if previous is not None else "corpus", record)
             return False
         return True
 
@@ -1399,12 +1883,13 @@ class _Supplement:
         """A revision strictly above every directory that survives here, so an interrupted publication's
         bytes are never overwritten."""
         highest = int(self._published.revision)
-        d = revisions_dir(self._run.dir)
-        if d.is_dir():
-            for child in d.iterdir():
-                m = _REV_RE.match(child.name)
-                if m:
-                    highest = max(highest, int(m.group(1)))
+        entries, fault = _revision_root_entries(self._run.dir)
+        if fault:
+            raise RevisionError(f"{self._run.dir}: {fault}")
+        for name, mode in entries:
+            m = _REV_RE.match(name)
+            if m and stat.S_ISDIR(mode):
+                highest = max(highest, int(m.group(1)))
         return highest + 1
 
     def commit(self, scope=None) -> Revision | None:
@@ -1433,9 +1918,18 @@ class _Supplement:
         if published.digest == self._published.digest and published.revision == self._published.revision:
             return
         self._published = published
-        self._base_digest, self._base_counts = _base_manifest(self._run.dir)
-        self._base_contents = _entity_content_digests(self._run.dir)
+        (manifest, self._base_digest, self._base_counts,
+         self._base_contents, _base_records) = _certified_base_snapshot(self._run.dir)
+        declared = manifest.document["envelope"]
+        self._limits = {
+            "max_keys": min(declared["max_keys_per_entity"], envelope.MAX_KEYS_PER_ENTITY),
+            "max_bytes_per_key": min(declared["max_bytes_per_key"], envelope.MAX_BYTES_PER_KEY),
+            "max_corpus_bytes": min(
+                declared["max_corpus_bytes_per_entity"], envelope.MAX_CORPUS_BYTES_PER_ENTITY,
+            ),
+        }
         self._records = {}
+        self._corpus_bytes = {}
         # re-run envelope admission: the corpus these rows were admitted against has grown, so a row that
         # fitted then may not fit now, and a bound only two writers each honoured alone is not a bound
         kept = []
@@ -1444,7 +1938,10 @@ class _Supplement:
             if not self._admit(entity, key, rec):
                 continue
             held = self._combined(entity)          # admitted rows rejoin the corpus the next row is measured against
-            held[key] = store.merge(entity, held[key], rec) if key in held else rec
+            previous = held.get(key)
+            previous_bytes = store._record_bytes(previous) if previous is not None else 0
+            held[key] = store.merge(entity, previous, rec) if previous is not None else rec
+            self._corpus_bytes[entity] += store._record_bytes(held[key]) - previous_bytes
             kept.append(row)
         self._pending = [{**row, "seq": i + 1} for i, row in enumerate(kept)]
 
@@ -1456,13 +1953,32 @@ class _Supplement:
             raise RevisionError(f"{rev_dir}: revision {nxt} already exists")
         privfs.private_dir(rev_dir)
         directory_identity = _private_directory_identity(revision_root)
-        body = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in self._pending)
+        encoded_rows: list[str] = []
+        body_bytes = 0
+        for index, row in enumerate(self._pending, 1):
+            try:
+                run_manifest._validate_json_value(row, f"revision row {index}")
+                line = json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+                encoded = line.encode("utf-8")
+            except (run_manifest.ManifestError, TypeError, ValueError, UnicodeEncodeError,
+                    RecursionError) as exc:
+                raise RevisionError(f"revision row {index} is not portable JSON: {exc}") from exc
+            if len(encoded) > run_manifest.MAX_JSONL_LINE_BYTES:
+                raise RevisionError(f"revision row {index} exceeds the JSONL record byte bound")
+            body_bytes += len(encoded)
+            if body_bytes > MAX_REVISION_SEGMENT_BYTES:
+                raise RevisionError("revision supplement segment exceeds its byte bound")
+            encoded_rows.append(line)
+        body = "".join(encoded_rows)
         # discovered callback evidence: 0600 from creation, written whole, never rewritten
         privfs.write_private(rev_dir / SEGMENT_NAME, body)
         raw = body.encode("utf-8")
         segments = list(self._published.segments) + [
             {"revision": nxt, "file": f"{_rev_name(nxt)}/{SEGMENT_NAME}", "lines": len(self._pending),
              "bytes": len(raw), "digest": _sha(raw)}]
+        if (len(segments) > MAX_REVISION_SEGMENTS
+                or sum(segment["bytes"] for segment in segments) > MAX_REVISION_SUPPLEMENT_BYTES):
+            raise RevisionError("revision supplement exceeds its supported envelope")
         staged = Revision(revision=nxt, status="valid", segments=segments)
         rows, dropped = _committed_rows(self._run.dir, staged)
         if dropped or len(rows) != sum(segment["lines"] for segment in segments):
@@ -1474,17 +1990,30 @@ class _Supplement:
         counts = {entity: len(records) for entity, records in records_by_entity.items()}
         digests = {entity: _records_digest(entity, records)
                    for entity, records in records_by_entity.items()}
-        views = self._render_views(rev_dir, scope)
         supplement = {"segments": segments, "lines": sum(int(s.get("lines") or 0) for s in segments),
                       "digest": _chain_digest(segments)}
         try:
             raw_files = _raw_file_claims(self._run.dir, rows)
         except (OSError, ValueError) as exc:
             raise RevisionError(f"{self._run.dir}: late raw evidence cannot be certified: {exc}") from exc
+        created = store._utc()
+        evidence_digest = _evidence_digest(
+            base=self._base_digest,
+            supplement=supplement["digest"],
+            counts=counts,
+            entity_digests=digests,
+            raw_files=raw_files,
+        )
+        staged_view = Revision(
+            revision=nxt, status="valid", created=created, digest=evidence_digest,
+            segments=segments, entity_counts=counts, entity_digests=digests,
+            raw_files=raw_files,
+        )
+        views = self._render_views(rev_dir, scope, staged_view)
         pointer = {
             "schema_version": SCHEMA_VERSION,
             "revision": nxt,
-            "created": store._utc(),
+            "created": created,
             "base": {"run_id": self._run.run_id, "target": self._run.target,
                      "manifest_digest": self._base_digest, "entity_counts": self._base_counts,
                      "entity_contents": self._base_contents},
@@ -1495,13 +2024,7 @@ class _Supplement:
             "views": views,
             "refused": self._outstanding_refusals(),
         }
-        pointer["digest"] = _evidence_digest(
-            base=self._base_digest,
-            supplement=supplement["digest"],
-            counts=counts,
-            entity_digests=digests,
-            raw_files=raw_files,
-        )
+        pointer["digest"] = evidence_digest
         pointer["pointer_digest"] = _pointer_digest(pointer)
         candidate = _certify_document(self._run.dir, pointer)
         if candidate.status != "valid":
@@ -1531,7 +2054,10 @@ class _Supplement:
             )
 
         try:
-            previous_pointer = _read_regular(pointer_path(self._run.dir), root=revision_root)
+            previous_pointer = _read_regular(
+                pointer_path(self._run.dir), root=revision_root,
+                maximum=MAX_REVISION_POINTER_BYTES,
+            )
         except FileNotFoundError:
             previous_pointer = None
         except OSError as exc:
@@ -1574,29 +2100,42 @@ class _Supplement:
         A refusal that a later revision erased would let an ingest report a gap and the next `status` call
         report none — the evidence would still be missing, and nothing would say so.
         """
+        admitted = {
+            (row["entity"], row["id"], row["fp"])
+            for row in _committed_rows(self._run.dir, self._published)[0]
+        }
+        admitted.update(
+            (row["entity"], row["id"], row["fp"])
+            for row in self._pending
+        )
         out = []
         for entry in list(self._published.refused) + self._refused:
             if not isinstance(entry, dict):
                 continue
             entity, key = entry.get("entity"), entry.get("key")
-            if entity in self._records and key in self._records[entity]:
-                continue                             # admitted since; it is no longer owed
+            fingerprint = entry.get("fp")
+            if type(fingerprint) is str:
+                if (entity, key, fingerprint) in admitted:
+                    continue                         # this exact refused material was admitted later
+            elif entity in self._records and key in self._records[entity]:
+                continue                             # legacy v2 refusal had no material identity
             if entry not in out:
                 out.append(entry)
         return out
 
     def _pending_refs(self, segment: str) -> dict:
-        """`{(entity, key): segment file}` across the already-committed segments and the one being published,
-        so a view names the file that actually holds each row."""
+        """Complete per-identity segment provenance through the candidate being published."""
         refs = _provenance(self._run.dir, self._published)
         for row in self._pending:
-            refs[(row["entity"], row["id"])] = segment
+            key = (row["entity"], row["id"])
+            held = refs.get(key, ())
+            refs[key] = held if segment in held else tuple((*held, segment))
         return refs
 
-    def _render_views(self, rev_dir: Path, scope) -> dict:
+    def _render_views(self, rev_dir: Path, scope, staged_revision: Revision) -> dict:
         """Regenerate the run's reports and exports from the combined view into this revision's directory;
         the base run's own views stay exactly as it finished them."""
-        from . import exports as _exports, triage
+        from . import exports as _exports, report_truth, triage
         view = CombinedRun(self._run, self._records, rev_dir, rev_dir / "exports",
                            self._pending_refs(f"{rev_dir.name}/{SEGMENT_NAME}"))
         if scope is None:
@@ -1605,6 +2144,13 @@ class _Supplement:
         privfs.write_private(rev_dir / "HOTLIST.md", triage.build(view, scope))
         privfs.write_private(rev_dir / "digest.json",
                              json.dumps(triage.digest_json(view, scope), indent=2, ensure_ascii=False))
+        private_report = report_truth.build_private_report(
+            view, staged_revision=staged_revision,
+        )
+        privfs.write_private(
+            rev_dir / "private-report.json",
+            report_truth.canonical_json_bytes(private_report).decode("utf-8"),
+        )
         _exports.write_all(view)
         _exports.write_delta(view)
         return {"dir": rev_dir.name, "files": _view_files(rev_dir)}

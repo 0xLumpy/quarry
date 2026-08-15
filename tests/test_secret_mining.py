@@ -238,6 +238,12 @@ class TestAHashIsNotARecoveredCredential:
         got = evidence.publish_finding(ctx, "aws-access-key", "AKIAIOSFODNN7EXAMPLE", 1,
                                        url="https://t/.env", dest="/raw/y", source="exposed-fetch")
         assert got == "secret" and added[0][0] == "secret"
+        rec = added[0][1]
+        assert rec["raw_ref"] == "/raw/y"
+        assert rec["occurrences"] == [{
+            "location": "https://t/.env", "host": "t", "file": "/raw/y",
+            "raw_ref": "/raw/y", "line": 1,
+        }]
 
     def test_EVERY_call_site_routes_through_the_same_decision(self):
         """One place decides what a kind IS. Five call sites deciding separately is the defect."""
@@ -408,13 +414,19 @@ class TestTheFindingItselfIsRetained:
         assert rec["value"] == raw, "the finding is the value"
         assert rec["preview"] != raw and "…" in rec["preview"], "…and the PREVIEW is what travels"
 
-    def test_report_prose_still_shows_only_the_preview(self):
-        """The masked preview is what report lines and digests read; nothing in prose gets the value."""
-        import inspect
-        from quarry_recon import triage
-        src = inspect.getsource(triage)
-        assert "s.get('preview', '')" in src or 's.get("preview"' in src
-        assert 's.get("value")' not in src.split("secrets")[-1][:400]
+    def test_private_report_prose_keeps_target_evidence_exact(self, tmp_path):
+        """Private operator output is lossless; share/AI redaction is a separate derived view."""
+        from quarry_recon import store, triage
+        from quarry_recon.config import ScopeMatcher
+
+        run = store.Run.create(tmp_path, "target.example")
+        run.add("secret", {
+            "id": "s1", "kind": "fixture", "value": "TARGET-SECRET-EXACT",
+            "preview": "TARG…XACT", "sources": ["fixture"],
+        })
+        markdown = triage.build(run, ScopeMatcher([], [], [], False))
+        assert triage.markdown_value("TARGET-SECRET-EXACT") in markdown
+        assert "TARG…XACT" not in markdown
 
 
 class TestTheBareKeyRuleNeedsContextToo:
@@ -615,7 +627,8 @@ class TestLocalEvidenceIsREADABLE:
         run = self._run(tmp_path, [{"id": "s2", "kind": "old", "preview": sec.mask(self.RAW),
                                     "sources": ["legacy"]}])
         md = triage.build(run, ScopeMatcher([], [], [], False))
-        assert sec.mask(self.RAW) in md, "a pre-value run still reports what it has"
+        assert triage.markdown_value(sec.mask(self.RAW)) in md, \
+            "a pre-value run still reports what it has"
 
     def test_no_producer_throws_the_value_away(self):
         """Every secret producer stores the complete value on the entity. `pop("data")` deleted it."""

@@ -30,7 +30,7 @@ EXPECTED_NATIVE_SINKS = {
     ("params", "_arjun_exec", "arjun", (4,)),
     ("params", "_nuclei_scan", "nuclei", (5,)),
     ("params", "_dalfox_xss_fast", "dalfox", (6,)),
-    ("params", "run", "nuclei", (7,)),
+    ("params", "_takeover_nuclei_lane", "nuclei", (7,)),
     ("probe", "_vhost_scan", "probe.ffuf_vhost", (17,)),
     ("probe", "_cdn_shared_ips", "cdncheck", (7,)),
     ("probe", "_web_port_prefilter", "naabu", (11,)),

@@ -7,6 +7,7 @@ the registry entirely, so a gate in any single one of them is not a gate.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import pathlib
 
@@ -122,15 +123,20 @@ class TestEveryDoorIsGated:
         minted: list = []
         ran: list = []
 
-        def _mint():
+        @contextlib.contextmanager
+        def _mint_lifetime():
             if not token:
-                return None
+                yield None
+                return
             path = tmp_path / "gh-token"
             path.write_text("ghp_x")
             minted.append(path)
-            return path
+            try:
+                yield path
+            finally:
+                path.unlink(missing_ok=True)
 
-        monkeypatch.setattr(vertical.secrets, "github_tokens_file", _mint)
+        monkeypatch.setattr(vertical.secrets, "github_tokens_lifetime", _mint_lifetime)
         monkeypatch.setattr(vertical, "exec_tool", lambda *a, **k: ran.append(a) or (_ for _ in ()).throw(
             AssertionError("a closed campaign must not run github-subdomains")))
         prof = type("P", (), {"apex_domains": ["acme.com"]})()
@@ -206,7 +212,7 @@ class TestTheClosureIsComplete:
     #: spec's attribute), so no literal ties them to their door. They are pinned behaviourally instead —
     #: the refusal lifecycle tests drive `probe.favicon` / `probe.cert` through `run_providers` directly.
     _CONSTRUCTED = {"probe.favicon", "probe.cert", "vertical.crtsh", "vertical.certspotter",
-                    "probe.shodan_host"}
+                    "vertical.shosubgo", "probe.shodan_host"}
 
     def _door_calls(self):
         """Every `run_provider` / `run_providers` / `run_contract` call whose source id can be resolved —

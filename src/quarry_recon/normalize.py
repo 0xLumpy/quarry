@@ -138,6 +138,9 @@ def httpx_json(raw: str, source: str, raw_ref: str | None = None) -> Iterator[di
         url = obj.get("url")
         if not url:
             continue
+        raw_cdn = obj.get("cdn") if "cdn" in obj else None
+        cdn = raw_cdn if type(raw_cdn) is bool else None
+        state = "detected" if cdn is True else "not_detected" if cdn is False else "unknown"
         yield {
             "url": url,
             "host": (obj.get("input") or obj.get("host") or "").lower().rstrip("."),
@@ -145,7 +148,10 @@ def httpx_json(raw: str, source: str, raw_ref: str | None = None) -> Iterator[di
             "title": obj.get("title"),
             "tech": obj.get("tech", []) or [],
             "webserver": obj.get("webserver"),
-            "cdn": obj.get("cdn", False),
+            # Absence is not a negative detector result.  Keep the nullable
+            # compatibility field and make the three-state contract explicit.
+            "cdn": cdn,
+            "cdn_state": state,
             "cdn_name": obj.get("cdn_name"),
             "ip": obj.get("host") if obj.get("a") is None else None,
             "a": obj.get("a", []) or [],
@@ -158,6 +164,47 @@ def httpx_json(raw: str, source: str, raw_ref: str | None = None) -> Iterator[di
             "asn_org": (obj.get("asn") or {}).get("as_name") if isinstance(obj.get("asn"), dict) else None,
             **_prov(source, raw_ref),
         }
+
+
+def cdn_state(record: dict) -> str:
+    """Return the conservative merged CDN state with positive evidence precedence.
+
+    Store merges preserve conflicting later scalars under ``_alt``.  Ignoring
+    those values made a detector-positive observation look negative/unknown
+    solely because a weaker row arrived first.  Any positive marker wins;
+    unknown wins over negative; an unqualified legacy false remains unknown.
+    """
+    if type(record) is not dict:
+        return "unknown"
+    alt = record.get("_alt") if type(record.get("_alt")) is dict else {}
+
+    def values(field):
+        out = [record[field]] if field in record else []
+        held = alt.get(field)
+        out.extend(held if type(held) is list else ([held] if held is not None else []))
+        return out
+
+    raw_states = values("cdn_state")
+    valid_states = ("detected", "not_detected", "unknown")
+    states = [value for value in raw_states
+              if type(value) is str and value in valid_states]
+    markers = values("cdn")
+    # Reject malformed evidence before applying positive precedence.  Otherwise
+    # a valid positive marker could launder a conflicting non-contract value.
+    if (any(type(value) is not str or value not in valid_states
+            for value in raw_states)
+            or any(value is not None and type(value) is not bool
+                   for value in markers)):
+        return "unknown"
+    if "detected" in states or any(value is True for value in markers):
+        return "detected"
+    if "unknown" in states:
+        return "unknown"
+    if states and all(value == "not_detected" for value in states):
+        return "not_detected"
+    # A false marker without the explicit state is ambiguous: older httpx
+    # normalization inserted false when the provider omitted the field.
+    return "unknown"
 
 
 def urls(raw: str, source: str, raw_ref: str | None = None) -> Iterator[dict]:
@@ -203,8 +250,14 @@ def jsluice_secrets(raw: str, source: str, raw_ref: str | None = None) -> Iterat
         kind = obj.get("kind") or obj.get("type") or "secret"
         data = obj.get("data") or obj.get("match") or obj
         sid = f"{kind}:{json.dumps(data, sort_keys=True)[:120]}"
+        occurrence = {"source": source, **({"raw_ref": raw_ref} if raw_ref else {})}
+        for field in ("url", "file", "line", "column", "start", "end"):
+            if field in obj:
+                occurrence[field] = obj[field]
         yield {"id": sid, "kind": kind, "data": data,
-               "severity": obj.get("severity", "unknown"), **_prov(source, raw_ref)}
+               "severity": obj.get("severity", "unknown"),
+               "occurrences": [occurrence], "provider_record": obj,
+               **_prov(source, raw_ref)}
 
 
 def host_of_url(url: str) -> str:
@@ -214,9 +267,11 @@ def host_of_url(url: str) -> str:
     check refuse. It is "" for any scheme other than `http`/`https`, for a netloc carrying userinfo
     (`user:pass@host`, which no recon input needs), and for an invalid port or IPv6 literal.
     """
+    if type(url) is not str:
+        return ""
     try:
         parts = _urlsplit(url.strip())
-    except ValueError:
+    except (TypeError, ValueError):
         return ""
     if parts.scheme.lower() not in ("http", "https"):
         return ""
@@ -227,7 +282,17 @@ def host_of_url(url: str) -> str:
         parts.port
     except ValueError:
         return ""
-    return host.lower()
+    if not host:
+        return ""
+    # URL parsing returns Unicode host spelling unchanged.  Scope roots use
+    # Quarry's IDNA2008/UTS-46 A-label policy, so returning that Unicode value
+    # would make one authority compare as two different destinations.  IP
+    # literals remain addresses rather than being sent through IDNA.
+    import ipaddress
+    try:
+        return ipaddress.ip_address(host).compressed.lower()
+    except ValueError:
+        return canon_host_strict(host) or ""
 
 def idna_ascii(s: str):
     """The single IDNA encode in the repo: IDNA2008 / UTS-46, non-transitional. Returns the A-label form,

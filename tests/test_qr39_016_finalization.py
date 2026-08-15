@@ -128,6 +128,24 @@ def test_report_resumes_a_failed_finalisation_without_rescanning(tmp_path, monke
     assert (_run_dir(tmp_path) / "reports" / "HOTLIST.md").exists()
 
 
+def test_resumed_report_is_built_after_the_fault_clearing_manifest_rewrite(tmp_path, monkeypatch):
+    from quarry_recon import exports, report_truth
+
+    def boom(*_args, **_kwargs):
+        raise OSError("exports volume is read-only")
+
+    monkeypatch.setattr(exports, "write_all", boom)
+    assert _run(tmp_path, monkeypatch).exit_code == 5
+    monkeypatch.undo()
+    _one_phase(monkeypatch)
+
+    result = _invoke(tmp_path, "report")
+    assert result.exit_code == 0, result.stderr
+    run = Run.open(tmp_path, "t", _run_dir(tmp_path).name)
+    assert run.state == "finished"
+    assert report_truth.published_private_report_current(run)
+
+
 def test_a_resume_that_fails_again_stays_resumable(tmp_path, monkeypatch):
     _break_stage(monkeypatch)
     assert _run(tmp_path, monkeypatch).exit_code == 5

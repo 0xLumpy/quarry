@@ -26,7 +26,8 @@ Quarry is under active development. Commands, schemas, and report formats may st
   with provenance back to raw evidence
 - **Coverage accounting** — instrumented bounded lanes report eligible / tested / omitted with a reason
 - **OSINT pre-flight** — a separate command that proposes scope candidates for human review
-- **Ranked output** — HOTLIST for humans, `digest.json` for tooling
+- **Ranked output** — inertly encoded HOTLIST for humans, `digest.json` queues, and a lossless
+  `private-report.json` projection with stable observation/artifact references
 - **Version-managed installs** — registry tools declare a version, ref or digest (`nmap` is
   distro-managed by policy); complete activation rollback and runtime-identity enforcement remain
   release gates
@@ -200,7 +201,8 @@ it never edits scope.
     normalized/*.jsonl   append-only canonical observation rows with provenance
     exports/*.txt        flat lists (subdomains, live, urls, js)
     reports/HOTLIST.md   ranked queues for manual testing
-    reports/digest.json  the same content, structured
+    reports/digest.json  ranked queue projection, structured
+    reports/private-report.json  every effective private observation with certified provenance
     reports/delta.md     what is new since the previous run
     revisions/
       revision.json      pointer to the certified late-evidence combined view

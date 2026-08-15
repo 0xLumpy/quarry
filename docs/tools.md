@@ -12,6 +12,8 @@ Credential ownership and setup live in [secrets.md](secrets.md) and [external-in
 
 | Tool | Quarry role | Class | Upstream |
 |------|------|------|------|
+| `whois` | Queries domain registration records for passive ownership and contact context. | standard | [rfc1036/whois](https://github.com/rfc1036/whois) |
+| `dig` | Queries DNS records used by passive OSINT and scope corroboration. | standard | [bind9.readthedocs.io](https://bind9.readthedocs.io/) |
 | `porch-pirate` | Searches public Postman workspaces for the target's exposed API endpoints and secrets. | optional | [WatchDogSecurity/porch-pirate](https://github.com/WatchDogSecurity/porch-pirate) |
 
 ## Horizontal — ASN / CIDR / cert / SAN
@@ -27,7 +29,6 @@ Credential ownership and setup live in [secrets.md](secrets.md) and [external-in
 
 | Tool | Quarry role | Class | Upstream |
 |------|------|------|------|
-| `shosubgo` | Discovers subdomains from Shodan. | optional | [incogbyte/shosubgo](https://github.com/incogbyte/shosubgo) |
 | `subfinder` | Passive subdomain enumeration across many sources. | standard | [projectdiscovery/subfinder](https://github.com/projectdiscovery/subfinder) |
 | `github-subdomains` | Finds subdomains referenced in public GitHub code. | optional | [gwen001/github-subdomains](https://github.com/gwen001/github-subdomains) |
 | `puredns` | Brute-forces and validates DNS names (via the massdns backend). | standard | [d3mondev/puredns](https://github.com/d3mondev/puredns) |
@@ -39,7 +40,7 @@ Credential ownership and setup live in [secrets.md](secrets.md) and [external-in
 
 | Tool | Quarry role | Class | Upstream |
 |------|------|------|------|
-| `httpx` | Probes and fingerprints HTTP services and tags CDN vs origin. | standard | [projectdiscovery/httpx](https://github.com/projectdiscovery/httpx) |
+| `httpx` | Probes and fingerprints HTTP services and records CDN detector state; a negative is only a direct-service candidate, not origin proof. | standard | [projectdiscovery/httpx](https://github.com/projectdiscovery/httpx) |
 | `cdncheck` | Classifies IPs as CDN / WAF / cloud, offline. | standard | [projectdiscovery/cdncheck](https://github.com/projectdiscovery/cdncheck) |
 | `gowitness` | Captures screenshots of live web hosts. | standard | [sensepost/gowitness](https://github.com/sensepost/gowitness) |
 | `naabu` | Fast SYN/CONNECT port scanner. | standard | [projectdiscovery/naabu](https://github.com/projectdiscovery/naabu) |

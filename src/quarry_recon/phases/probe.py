@@ -8,6 +8,7 @@ optional smap passive (Shodan-backed) port scan.
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import contextlib
 from dataclasses import dataclass as _dataclass
@@ -22,7 +23,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .. import (budget, contract, events, netguard, normalize, nuclei_policy, pace, secrets, settings, shodan_host,
+from .. import (budget, contract, events, netguard, normalize, nuclei_policy, pace,
+                resource_contract, run_manifest, secrets, settings, shodan_host,
                 shodan_sched, store)
 from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PACE_BUSY, PROVIDER_PARSE,
                         PROVIDER_RATE_LIMIT,
@@ -49,6 +51,79 @@ _JWT_RX = _re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
 
 
 _SHODAN_PAGE = 100                              # Shodan host/search returns up to 100 matches/page
+
+
+def _gowitness_records(ctx, shot_dir: Path | None = None) -> list[dict]:
+    """Return screenshot rows joined to Gowitness' exact target/result evidence.
+
+    Gowitness names the image in ``file_name`` and records the requested and
+    final URLs in its JSONL result.  The image pathname is an artifact
+    reference, never the screenshot's URL identity.  Unsafe/missing image
+    names cannot become normalized screenshot rows; the complete JSONL remains
+    preserved as the provider artifact for diagnostics.
+    """
+    if shot_dir is None:  # narrow compatibility seam for parser unit tests
+        shot_dir = Path(ctx)
+        class _CompatibilityContext:
+            run = None
+        ctx = _CompatibilityContext()
+    report = Path(shot_dir) / "gowitness.jsonl"
+    from .params import _provider_jsonl_records
+
+    rows: list[dict] = []
+    for row_number, result in enumerate(_provider_jsonl_records(ctx, report), 1):
+        url = result.get("url")
+        filename = result.get("file_name")
+        if type(url) is not str or not url.strip() or type(filename) is not str \
+                or not filename or Path(filename).name != filename \
+                or filename in (".", "..") or "\x00" in filename:
+            raise ValueError(f"gowitness row {row_number} has no safe target/image identity")
+        image = shot_dir / filename
+        try:
+            if not image.is_file() or image.is_symlink():
+                raise ValueError(f"gowitness row {row_number} names no private image")
+        except OSError as exc:
+            raise ValueError(f"gowitness row {row_number} image cannot be authenticated") from exc
+        record = {
+            "url": url,
+            "file": str(image),
+            "provider_record": result,
+            "sources": ["gowitness"],
+            "raw_refs": [str(report), str(image)],
+        }
+        final_url = result.get("final_url")
+        if type(final_url) is str and final_url:
+            record["final_url"] = final_url
+        rows.append(record)
+    return rows
+
+
+def _ingest_gowitness(ctx, shot_dir: Path) -> int:
+    rows = _gowitness_records(ctx, shot_dir)
+    return sum(1 for row in rows if ctx.run.add("screenshot", row))
+
+
+def _waf_records(ctx, path: Path) -> list[dict]:
+    """Strict provider rows for Nuclei WAF attribution."""
+    from .params import _provider_jsonl_records
+
+    out = []
+    for row_number, record in enumerate(_provider_jsonl_records(ctx, path), 1):
+        extracted = record.get("extracted-results") or []
+        if type(extracted) is not list or any(type(value) is not str for value in extracted):
+            raise ValueError(f"Nuclei WAF row {row_number} has invalid extracted results")
+        matcher = record.get("matcher-name")
+        if matcher is not None and type(matcher) is not str:
+            raise ValueError(f"Nuclei WAF row {row_number} has an invalid matcher name")
+        host = record.get("matched-at", record.get("host", ""))
+        if type(host) is not str or not host:
+            raise ValueError(f"Nuclei WAF row {row_number} has no matched target")
+        name = (extracted[0] if extracted else None) or matcher or "unknown"
+        out.append({
+            "id": f"{host}|waf:{name}", "tech": f"WAF:{name}", "url": host,
+            "provider_record": record, "sources": ["nuclei-waf"], "raw_ref": str(path),
+        })
+    return out
 
 
 class ShodanPageError(Exception):
@@ -1416,7 +1491,7 @@ def _vhost_scan(ctx, base, apex, out, wl, wl_digest, mc, ffuf_to, prof):
 
 
 def _vhost_enum(ctx) -> None:
-    """Virtual-host enumeration (ffuf `-H 'Host: FUZZ.<apex>'`) over every non-CDN active-allowed live
+    """Virtual-host enumeration (ffuf `-H 'Host: FUZZ.<apex>'`) over every detector-negative active-allowed live
     BASE SERVICE. Active; needs ffuf + a vhost wordlist.
 
     The Host header is fuzzed against a real live host, not `http://<ip>/`: a bare-IP request fails SNI
@@ -1436,14 +1511,20 @@ def _vhost_enum(ctx) -> None:
                                       "— vhost coverage UNMEASURED")
         return
     scope, prof = ctx.scope, ctx.profile
-    # every non-CDN active-allowed base service is a unit; the score only ranks them, preferring HTTPS
+    # every explicitly CDN-detector-negative active-allowed base service is a unit; the score only ranks
+    # them, preferring HTTPS
     # and a subdomain host (the bare apex is often a separate static site, not the vhost-routing app)
     apexset = {a.lower() for a in prof.apex_domains}
     # membership is what we actually scan: base services (ffuf connects to a hostname and has no
     # address-pinning flag). The address set survives as a rank only, so nothing is excluded.
     bases: list = []
+    unknown_cdn = 0
     for l in ctx.run.read("live"):
-        if l.get("cdn"):
+        state = normalize.cdn_state(l)
+        if state == "detected":
+            continue
+        if state == "unknown":
+            unknown_cdn += 1
             continue
         url = (l.get("url") or "").strip()
         m = _re.match(r"(?i)(https?://[^/]+)", url)
@@ -1463,8 +1544,20 @@ def _vhost_enum(ctx) -> None:
     for b in bases:
         b["tier"] = 0 if id(b) in reps else 1
     if not bases:
-        _vhost_zero_lifecycle(ctx, "no non-CDN active-allowed live service to fuzz")
+        if unknown_cdn:
+            _vhost_unknown_lifecycle(
+                ctx, f"{unknown_cdn} live service(s) have unknown CDN classification; "
+                     "refusing to treat absence as a direct-origin service",
+            )
+        else:
+            _vhost_zero_lifecycle(ctx, "no detector-negative active-allowed live service to fuzz")
         return
+    if unknown_cdn:
+        events.coverage_partial(
+            "probe.ffuf_vhost", kind=events.COVERAGE_UNKNOWN,
+            measure="cdn_classification", unit="cdn_classification",
+            reason=f"{unknown_cdn} live service(s) omitted because CDN classification is unknown",
+        )
     # a vhost that's ALREADY a known subdomain isn't the signal — vhost enum's value is the
     # DNS-INVISIBLE hosts. Filter results against everything we already discovered.
     known = set(ctx.run.values("subdomain")) | set(ctx.run.values("resolved"))
@@ -1845,6 +1938,7 @@ def _shodan_host_ingest(ctx, target, rec, art, wrote) -> None:
         wrote(shodan_host.WROTE_HOSTNAME)
     for cve in rec.vulns:
         ctx.run.add("review", {"id": f"shodan-vuln:{rec.ip}:{cve}", "klass": "shodan-vuln", "value": cve,
+                               "ip": rec.ip, "cve": cve,
                                "note": (f"{cve} inferred by Shodan from a banner on {rec.ip} — UNVERIFIED "
                                         f"version inference, not a confirmed finding"),
                                "sources": ["shodan-host"], "raw_ref": ref})
@@ -2296,7 +2390,7 @@ def fingerprint_hosts(ctx, hosts, phase):
             ctx.run.notes.append(f"{phase} cdn-aware SYN gate: {len(cls)}/{len(all_ips)} contactable IPs are "
                                  f"CDN/WAF edge — excluded from SYN, hosts probed by name")
     # a host is SYN-eligible only when all its contactable IPs are non-shared: httpx probes by name, so
-    # ports found on a non-CDN sibling IP would not match what httpx-by-name hits
+    # ports found on a CDN-detector-negative sibling IP would not match what httpx-by-name hits
     syn_map = {h: ([] if any(ip in shared for ip in ips) else ips) for h, ips in pubmap.items()}
     public_hosts = [h for h in hosts if syn_map[h]]                      # ALL contactable IPs non-shared -> SYN-eligible
     no_ip = [h for h in hosts if not syn_map[h]]                         # any shared IP / no IP -> httpx by name
@@ -2452,6 +2546,7 @@ def run(ctx) -> None:
         nuclei_authority = nuclei_policy.policy_for(ctx)
         waf_in = ctx.write_list("waf_targets.txt", ctx.run.values("live"))
         waf_out = ctx.run.raw_path("probe", "nuclei", "waf.jsonl")
+        waf_rows = None
         oob_context = (nuclei_authority.oob_flags() if nuclei_authority is not None else
                        contextlib.nullcontext(("-ni",) if not getattr(
                            prof, "oob_enabled", True) else ()))
@@ -2485,21 +2580,18 @@ def run(ctx) -> None:
                 nuclei_authority.settle(
                     "probe.nuclei_waf", r, input_total=ctx.run.count("live"), work_unit=waf_wu,
                 )
-        ctx.run.record("probe", r)
         if native_output_current(r, waf_out) and waf_out.exists():
-            n = 0
-            for line in waf_out.read_text().splitlines():
-                try:
-                    o = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                ex = o.get("extracted-results") or []
-                name = (ex[0] if ex else None) or o.get("matcher-name") or "unknown"
-                host = o.get("matched-at", o.get("host", ""))
-                ctx.run.add("tech", {"id": f"{host}|waf:{name}", "tech": f"WAF:{name}",
-                                     "url": host, "sources": ["nuclei-waf"]})
-                n += 1
-            ctx.echo(f"  waf: {n} hosts fingerprinted")
+            try:
+                waf_rows = _waf_records(ctx, waf_out)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                reclassify_from_artifact(r, None, label="nuclei-waf")
+        ctx.run.record("probe", r)
+        if waf_rows is not None:
+            for record in waf_rows:
+                ctx.run.add("tech", record)
+            ctx.echo(f"  waf: {len(waf_rows)} hosts fingerprinted")
 
     # ── screenshots (write structured jsonl too for the asset DB) ──
     if prof.screenshots and ctx.run.count("live"):
@@ -2527,12 +2619,18 @@ def run(ctx) -> None:
                     *shot_dir.relative_to(ctx.run.dir).parts,
                 ),),
                 work_unit=gw_wu, reclassify=_gw_reclassify, timeout=ctx.http_timeout)
-        ctx.run.record("probe", r)
+        screenshot_rows = None
         if native_output_current(r, shot_dir):
-            for img in shot_dir.glob("*.jpeg"):
-                ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
-            for img in shot_dir.glob("*.png"):
-                ctx.run.add("screenshot", {"url": str(img), "sources": ["gowitness"]})
+            try:
+                screenshot_rows = _gowitness_records(ctx, shot_dir)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                reclassify_from_artifact(r, None, label="gowitness")
+        ctx.run.record("probe", r)
+        if screenshot_rows is not None:
+            for record in screenshot_rows:
+                ctx.run.add("screenshot", record)
 
     # ── ports: naabu (in-scope CIDR) → nmap -sV service detection ──
     if prof.portscan and prof.cidr:

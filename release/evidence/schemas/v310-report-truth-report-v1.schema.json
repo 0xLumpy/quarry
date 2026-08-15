@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quarry.local/schemas/v310-report-truth-report-v1.schema.json",
+  "title": "Quarry V310-08 descriptive private-report measurement",
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "count": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807},
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,6})?Z$"
+    },
+    "trial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trial_id", "report_digest", "input_observations", "included_observations",
+        "omitted_observations", "artifact_bytes", "wall_time_ms",
+        "peak_aggregate_rss_bytes", "artifact_differences",
+        "observation_coverage_basis_points"
+      ],
+      "properties": {
+        "trial_id": {"type": "string", "pattern": "^trial-[0-9]{4}$"},
+        "report_digest": {"$ref": "#/$defs/digest"},
+        "input_observations": {"$ref": "#/$defs/count"},
+        "included_observations": {"$ref": "#/$defs/count"},
+        "omitted_observations": {"$ref": "#/$defs/count"},
+        "artifact_bytes": {"$ref": "#/$defs/count"},
+        "wall_time_ms": {"$ref": "#/$defs/count"},
+        "peak_aggregate_rss_bytes": {"$ref": "#/$defs/count"},
+        "artifact_differences": {"type": "integer", "minimum": 0, "maximum": 1},
+        "observation_coverage_basis_points": {"type": "integer", "minimum": 0, "maximum": 10000}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repetitions", "report_digest", "peak_aggregate_rss_p95_bytes",
+        "artifact_size_max_bytes", "wall_time_p95_ms", "artifact_differences_max",
+        "observation_coverage_min_basis_points"
+      ],
+      "properties": {
+        "repetitions": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "report_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]},
+        "peak_aggregate_rss_p95_bytes": {"$ref": "#/$defs/count"},
+        "artifact_size_max_bytes": {"$ref": "#/$defs/count"},
+        "wall_time_p95_ms": {"$ref": "#/$defs/count"},
+        "artifact_differences_max": {"type": "integer", "minimum": 0, "maximum": 1},
+        "observation_coverage_min_basis_points": {"type": "integer", "minimum": 0, "maximum": 10000}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "candidate_identity_digest", "evidence_instance_id", "gate_id",
+    "artifact_kind", "fixture_digest", "source_manifest_digest", "source_revision_digest",
+    "started_at", "finished_at", "trials", "summary", "disposition", "open_reasons"
+  ],
+  "properties": {
+    "schema_version": {"const": "quarry.v310-report-truth-report.v1"},
+    "candidate_identity_digest": {"$ref": "#/$defs/digest"},
+    "evidence_instance_id": {"type": "string", "pattern": "^instance-[0-9]{2}$"},
+    "gate_id": {"const": "C-PERF-REPORT"},
+    "artifact_kind": {"const": "report-truth-measurement"},
+    "fixture_digest": {"$ref": "#/$defs/digest"},
+    "source_manifest_digest": {"$ref": "#/$defs/digest"},
+    "source_revision_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]},
+    "started_at": {"$ref": "#/$defs/timestamp"},
+    "finished_at": {"$ref": "#/$defs/timestamp"},
+    "trials": {
+      "type": "array", "minItems": 1, "maxItems": 1000,
+      "items": {"$ref": "#/$defs/trial"}
+    },
+    "summary": {"$ref": "#/$defs/summary"},
+    "disposition": {"const": "descriptive_only"},
+    "open_reasons": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "prefixItems": [
+        {"const": "benchmark_manifest_unreviewed"},
+        {"const": "thresholds_unreviewed"}
+      ],
+      "items": false
+    }
+  }
+}

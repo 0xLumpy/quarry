@@ -40,7 +40,7 @@ def _import(run, tmp_path, name: str, full_id: str):
 def _repoint(run, mutate):
     doc = json.loads(revision.pointer_path(run.dir).read_text())
     mutate(doc)
-    revision.pointer_path(run.dir).write_text(json.dumps(doc))
+    revision.pointer_path(run.dir).write_bytes(revision._pointer_bytes(doc))
 
 
 # ── certification and the view never disagree ─────────────────────────────────────────────────────

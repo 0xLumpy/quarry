@@ -315,7 +315,8 @@ follows only same-host 30x; cross-host `Location` is recorded, not followed.
 ```bash
 nuclei -l <work>/waf_targets.txt -tags waf -jsonl -o raw/probe/nuclei/waf.jsonl
 ```
-→ `tech` (`WAF:<name>`). `httpx -cdn` already tags CDN vs origin; this names the WAF.
+→ `tech` (`WAF:<name>`). `httpx -cdn` records detected / detector-negative / unknown CDN state;
+none of those states alone asserts that a WAF is absent or that a service is an origin.
 
 **gowitness** screenshots (`SCREENSHOTS: true`):
 ```bash
@@ -455,7 +456,8 @@ to manual/attack work.
 ## 11. Phase 8 — content
 
 **Content discovery — default off** (`MODES.CONTENT_DISCOVERY: off|light|balanced|deep`). When on,
-candidate-driven `ffuf` against live, in-scope, active-allowed hosts (origin-first, never capped), with a
+candidate-driven `ffuf` against live, in-scope, active-allowed hosts (CDN-detector-negative-first,
+never capped), with a
 curated config/secret/VCS/dangerous-endpoint wordlist:
 ```bash
 ffuf -u <live-url>/FUZZ -w <curated-wordlist> -ac -timeout 7 -t 40 -noninteractive …
@@ -635,6 +637,7 @@ setsid nohup quarry run -t 0xlumpy > run.log 2>&1 & disown
 - Scanner output (`nuclei`/`dalfox`/takeover) is stored as `finding` with `confirmed:false` —
   candidates for manual validation, never asserted as bugs. Shodan pivots, origin correlation, and
   content discovery are **map-only**.
-- WAF handling is recon-side: `httpx -cdn` tags CDN/origin, the `-tags waf` pass names the WAF,
-  and the checkpoint flags a WAF-*blocked* nuclei. Bypass (nomore403/nowafpls/NewTowner) is
+- WAF handling is recon-side: `httpx -cdn` records a CDN detector state, the `-tags waf` pass can
+  positively name a WAF, and the checkpoint flags a WAF-*blocked* nuclei. Detector-negative and
+  unknown results never become "no WAF" or proven-origin claims. Bypass (nomore403/nowafpls/NewTowner) is
   intentionally human/Burp work.

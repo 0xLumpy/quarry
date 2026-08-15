@@ -2,7 +2,7 @@
 
 Intensity via MODES.CONTENT_DISCOVERY: off | light | balanced | deep; recursion via
 MODES.CONTENT_RECURSION. Guardrails: skipped in passive mode and when off; only live, in-scope,
-active-allowed hosts (origin-first order, never capped); ffuf -ac autocalibration always (kills
+active-allowed hosts (CDN-detector-negative-first order, never capped); ffuf -ac autocalibration always (kills
 wildcard/catch-all floods); http_rl → ffuf -rate. Map-don't-exploit: results are url + review
 candidates, never actions.
 """
@@ -242,9 +242,11 @@ def run(ctx) -> None:
     # artifact the ledger recorded, never a recomputed path.
     cfg_dir = state_base / "ffuf" / cfg_fp[:16]
     attempt_dir = runner_fresh(cfg_dir)
-    # rank decides order, never membership: origin (non-CDN) services first, then round-robin by host so
-    # one host's services cannot drain a bounded run before another host is reached.
-    ordered = budget.order_ranked_fair(eligible, rank=lambda l: 1 if l.get("cdn") else 0,
+    # Rank decides order, never membership: CDN-detector-negative services first, then round-robin by
+    # host so one host's services cannot drain a bounded run before another host is reached.  This is a
+    # scheduling hint only; detector-negative does not assert origin or no-WAF truth.
+    ordered = budget.order_ranked_fair(
+        eligible, rank=lambda l: 0 if normalize.cdn_state(l) == "not_detected" else 1,
                                        group=lambda l: normalize.host_of_url(l.get("url", "")))
     n_resumed = sum(1 for l in ordered if ledger.has(l["url"]))
     ctx.echo(f"  content discovery [{tier}]: {len(eligible)} service(s) eligible"

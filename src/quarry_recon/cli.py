@@ -1169,6 +1169,46 @@ def _publish_views(run_obj, scope, *, checkpoints=(), force: bool = False,
     return exp
 
 
+def _publish_private_report_after_reconcile(
+        run_obj, report_obj, *, force: bool = False, republished: list | None = None,
+) -> str:
+    """Publish the private projection against the final reconciled manifest.
+
+    A prior implementation rendered first and then cleared/added publication
+    faults in ``manifest.json``.  The freshly written report was immediately
+    stale.  Marking this stage provisionally done lets reconciliation establish
+    the exact manifest identity; a subsequent publication fault is recorded and
+    reconciled once more, leaving no false-current report.
+    """
+    from . import privfs, report_truth
+
+    current_before = (
+        not force and run_obj.stage_current("private_report")
+        and report_truth.published_private_report_current(report_obj)
+    )
+    if not current_before:
+        run_obj.mark_stage("private_report", "done")
+    _contained(run_obj, "reconcile", lambda: _reconcile_base(run_obj))
+    if (not force and run_obj.stage_current("private_report")
+            and report_truth.published_private_report_current(report_obj)):
+        return "skipped"
+    try:
+        document = report_truth.build_private_report(report_obj)
+        privfs.write_private(
+            report_obj.reports / "private-report.json",
+            report_truth.canonical_json_bytes(document).decode("utf-8"),
+        )
+    except Exception as exc:                                  # noqa: BLE001
+        detail = secrets.redact(str(exc)) or type(exc).__name__
+        run_obj.mark_stage("private_report", "failed", detail=detail)
+        _contained(run_obj, "reconcile", lambda: _reconcile_base(run_obj))
+        click.echo(_c(f"   ! finalisation stage private_report failed — {detail}", "red"))
+        return "failed"
+    if republished is not None:
+        republished.append("private_report")
+    return "done"
+
+
 def _reconcile_base(run_obj) -> None:
     """Reconcile the committed manifest with what finalisation just did."""
     run_obj.reconcile_finalization()
@@ -1455,8 +1495,8 @@ def _run_phases_scoped(profile_path, phases, passive, timeout, prepare=None, fin
 
     # Derived views and publication bookkeeping are the only mutable surface now.
     exp = _publish_views(run_obj, scope, checkpoints=all_cps) or {}
+    _publish_private_report_after_reconcile(run_obj, run_obj)
     failed = run_obj.finalization_failed()
-    _contained(run_obj, "reconcile", lambda: _reconcile_base(run_obj))
     run_obj.write_state("finalization_failed" if failed else "finished",
                         detail="a derived view could not be published" if failed else None)
 
@@ -1556,6 +1596,17 @@ def report(profile_path, run_id, force, as_json):
                 f"run {run_obj.run_id} has no committed manifest — its base evidence was never sealed or "
                 f"the manifest is unreadable, so there is nothing to finalise; re-run it",
                 where="finalization")
+        # An unusable late-evidence pointer is a coverage gap, not a
+        # publication task.  Reopening finalisation and attempting to render
+        # through it would turn the honest exit-4 gap into a new exit-5
+        # private-report failure while still being unable to recover a view.
+        revision_gap = _revision_gap(run_obj)
+        if revision_gap is not None:
+            click.echo(_c(f"   ⚠ {revision_gap.reason}", "yellow"))
+            from .state import CommandResult
+            return _with_gap(
+                CommandResult("report", run_id=run_obj.run_id), revision_gap,
+            )
         # minimal scope (report doesn't re-filter)
         from .config import ScopeMatcher
         scope = ScopeMatcher([], [], [], False)
@@ -1565,6 +1616,9 @@ def report(profile_path, run_id, force, as_json):
         view = _report_view(run_obj)
         republished: list = []
         exp = _publish_views(view, scope, force=force, republished=republished)
+        _publish_private_report_after_reconcile(
+            run_obj, view, force=force, republished=republished,
+        )
         if view is not run_obj:
             from . import revision as _revision
             # re-hashing the regenerated views and reconciling the manifest are both machinery: uncontained,
@@ -1574,9 +1628,6 @@ def report(profile_path, run_id, force, as_json):
                    f" — {view.reports / 'HOTLIST.md'}")
         click.echo(f"exports: {', '.join(f'{k}={v}' for k, v in exp.items() if v)}")
         failed = run_obj.finalization_failed()
-        # a stage answered by this pass must not leave its old fault standing in the manifest, and one that
-        # failed now must appear there: either way the committed verdict matches what just happened
-        _contained(run_obj, "reconcile", lambda: _reconcile_base(run_obj))
         run_obj.write_state("finalization_failed" if failed else "finished")
         if failed:
             raise _ec.MachineryFailure("a derived view could not be published — see the stage detail in "

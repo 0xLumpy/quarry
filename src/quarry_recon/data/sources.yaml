@@ -111,7 +111,7 @@ sources:
     input: syn_eligible_ips×ports, output: web_port, workers: rate, rate: portscan_rate, timeout: "scaled(ips×ports)", failure: "clean-only-trusted → else direct-httpx", fallback: direct-httpx, parser: internal, log: matrix-line,
     notes: "SYN web-port prefilter (bbot-style); NOT infra portscan. CDN/WAF edge excluded via offline cdncheck (T0.3, no contact); any-CDN host + zero-open host → direct-httpx (never dropped)"}
   probe.ffuf_vhost:          {tool: ffuf, phase: probe, tier: core, class: active, default: on, bounded: planned,
-    input: "base services x apex (live, non-CDN, active-allowed)", output: review(vhost),
+    input: "base services x apex (live, CDN-detector-negative, active-allowed)", output: review(vhost),
     workers: "settings.workers(ffuf)", rate: http_rl,
     timeout: "per-unit scaled(effective wordlist) -maxtime + hard backstop; lane budget PERFORMANCE.VHOST_BUDGET_S seconds (default 0 = unbounded)",
     failure: "per-unit isolate (not phase BLOCKED)", fallback: skip, parser: internal, log: delta,
@@ -247,7 +247,8 @@ sources:
     timeout: "per-service scaled(wordlist x recursion) -maxtime + hard backstop; lane budget PERFORMANCE.CONTENT_FFUF_BUDGET_S seconds (default 0 = unbounded)",
     failure: quiet-warn, fallback: skip, parser: internal, log: delta,
     notes: "off|light|balanced|deep; MATCHES 3xx (ISC-16), no -r. NO host cap (was 25 of 498 on OTC) and NO
-      row cap (was 500 — it discarded discovered URLs). Full eligible set, origin-first RANK then host
+      row cap (was 500 — it discarded discovered URLs). Full eligible set,
+      CDN-detector-negative-first RANK then host
       round-robin, resumable per-service ledger keyed by a full-sha256 service id and namespaced by the
       coverage-config fingerprint. Completion needs a clean EXECUTION and a usable artifact; any trustworthy
       artifact is retained as digest-bound evidence and replayed. Coverage comes from the CURRENT artifact

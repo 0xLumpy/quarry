@@ -74,7 +74,7 @@ class TestAbsorbingAChild:
         (run.normalized / "subdomain.jsonl").unlink()               # the manifest still says 1
         union = campaign.Union.for_campaign(tmp_path, "c1", create=True)
         result = union.absorb(run.dir, kinds=["subdomain"])
-        assert result.unusable and "unusable" in result.unusable["subdomain"], result
+        assert result.unusable and "cannot be certified" in result.unusable["subdomain"], result
         assert not result.progressed and union.records == {}, result
 
     def test_an_OSCILLATION_is_absorbed_once(self, tmp_path):
