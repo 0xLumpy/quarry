@@ -158,17 +158,17 @@ def test_durability_barriers_precede_pointer_publication(tmp_path, monkeypatch):
     real_directory = revision._fsync_directory
     real_publish = revision._publish_pointer
 
-    def tree(path):
+    def tree(path, **kwargs):
         events.append("tree")
-        return real_tree(path)
+        return real_tree(path, **kwargs)
 
-    def raw(run_dir, claims):
+    def raw(run_dir, claims, **kwargs):
         events.append("raw")
-        return real_raw(run_dir, claims)
+        return real_raw(run_dir, claims, **kwargs)
 
-    def directory(path):
+    def directory(path, **kwargs):
         events.append(f"directory:{path}")
-        return real_directory(path)
+        return real_directory(path, **kwargs)
 
     def publish(path, document, **kwargs):
         events.append("pointer")
@@ -410,11 +410,11 @@ def test_restored_pointer_settlement_preserves_control_flow(
             raise OSError("injected first directory fsync fault")
         return real_fsync(fd)
 
-    def fsync_directory(path):
+    def fsync_directory(path, **kwargs):
         if state["rollback_replaced"] and not state["cancelled"]:
             state["cancelled"] = True
             raise sentinel
-        return real_fsync_directory(path)
+        return real_fsync_directory(path, **kwargs)
 
     monkeypatch.setattr(revision.os, "replace", replace)
     monkeypatch.setattr(revision.os, "fsync", fsync)
@@ -509,8 +509,8 @@ def test_segment_mutation_during_barrier_is_refused_before_pointer(tmp_path, mon
     assert sink.add("url", {"url": "https://base.example.com/late"})
     real_fsync_tree = revision._fsync_tree
 
-    def mutate(path):
-        real_fsync_tree(path)
+    def mutate(path, **kwargs):
+        real_fsync_tree(path, **kwargs)
         path.joinpath(revision.SEGMENT_NAME).write_bytes(
             path.joinpath(revision.SEGMENT_NAME).read_bytes() + b"{}\n",
         )
@@ -525,8 +525,8 @@ def test_raw_mutation_during_barrier_is_refused_and_never_published(tmp_path, mo
     run = _sealed(tmp_path)
     real_fsync_raw = revision._fsync_raw_claims
 
-    def mutate(run_dir, claims):
-        real_fsync_raw(run_dir, claims)
+    def mutate(run_dir, claims, **kwargs):
+        real_fsync_raw(run_dir, claims, **kwargs)
         ref = next(iter(claims))
         path = Path(run_dir) / ref
         path.write_bytes(path.read_bytes() + b"changed\n")
@@ -546,6 +546,7 @@ def test_tree_durability_never_follows_a_swapped_ancestor(tmp_path, monkeypatch)
     outside_inode = (outside / "outside.json").stat().st_ino
     real_open = revision.os.open
     real_fsync = revision.os.fsync
+    root_identity = revision._private_directory_identity(root)
     state = {"swapped": False, "outside_synced": False}
 
     def swap(component, flags, *args, dir_fd=None, **kwargs):
@@ -567,8 +568,45 @@ def test_tree_durability_never_follows_a_swapped_ancestor(tmp_path, monkeypatch)
     monkeypatch.setattr(revision.os, "open", swap)
     monkeypatch.setattr(revision.os, "fsync", observe)
     with pytest.raises(OSError):
-        revision._fsync_tree(root)
+        revision._fsync_tree(root, root_identity=root_identity)
     assert state == {"swapped": True, "outside_synced": False}
+
+
+@pytest.mark.parametrize("operation", ["tree", "directory"])
+def test_durability_rejects_a_swapped_and_restored_root_name(
+    tmp_path, monkeypatch, operation,
+):
+    root = privfs.private_dir(tmp_path / "tree")
+    privfs.write_private(root / "actual.json", "actual\n")
+    decoy = privfs.private_dir(tmp_path / "decoy")
+    privfs.write_private(decoy / "decoy.json", "decoy\n")
+    held = tmp_path / "held"
+    expected = revision._private_directory_identity(root)
+    real_open = revision.os.open
+    state = {"swapped": False}
+
+    def swap(component, flags, *args, dir_fd=None, **kwargs):
+        if (component == root.name and dir_fd is not None
+                and flags & getattr(os, "O_DIRECTORY", 0) and not state["swapped"]):
+            state["swapped"] = True
+            root.rename(held)
+            decoy.rename(root)
+            try:
+                return real_open(component, flags, *args, dir_fd=dir_fd, **kwargs)
+            finally:
+                root.rename(decoy)
+                held.rename(root)
+        return real_open(component, flags, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(revision.os, "open", swap)
+    with pytest.raises(OSError, match="authority changed before open"):
+        if operation == "tree":
+            revision._fsync_tree(root, root_identity=expected)
+        else:
+            revision._fsync_directory(root, directory_identity=expected)
+    assert state["swapped"] is True
+    assert (root / "actual.json").read_text() == "actual\n"
+    assert (decoy / "decoy.json").read_text() == "decoy\n"
 
 
 def test_durability_opens_a_raced_leaf_nonblocking_before_type_check(tmp_path, monkeypatch):
@@ -576,6 +614,7 @@ def test_durability_opens_a_raced_leaf_nonblocking_before_type_check(tmp_path, m
     proof = root / "proof.json"
     privfs.write_private(proof, "{}\n")
     real_open = revision.os.open
+    parent_identity = revision._private_directory_identity(root)
     state = {"swapped": False, "nonblocking": False}
 
     def swap(component, flags, *args, dir_fd=None, **kwargs):
@@ -588,7 +627,7 @@ def test_durability_opens_a_raced_leaf_nonblocking_before_type_check(tmp_path, m
 
     monkeypatch.setattr(revision.os, "open", swap)
     with pytest.raises(OSError, match="unsafe owner-private single-link file"):
-        revision._fsync_file(proof)
+        revision._fsync_file(proof, parent_identity=parent_identity)
     assert state == {"swapped": True, "nonblocking": True}
 
 

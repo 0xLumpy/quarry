@@ -509,7 +509,9 @@ def _private_file_claim(observed, where) -> tuple[int, ...]:
             observed.st_nlink, observed.st_size, observed.st_mtime_ns, observed.st_ctime_ns)
 
 
-def _open_private_directory_path(path: Path) -> int:
+def _open_private_directory_path(
+    path: Path, *, expected_identity: tuple[int, int] | None = None,
+) -> int:
     """Open a private directory one no-follow component at a time.
 
     ``O_NOFOLLOW`` on an absolute multi-component pathname protects only its
@@ -529,7 +531,9 @@ def _open_private_directory_path(path: Path) -> int:
             os.close(current)
             current = transient
             transient = -1
-        _private_directory_claim(os.fstat(current), path)
+        claim = _private_directory_claim(os.fstat(current), path)
+        if expected_identity is not None and claim[:2] != expected_identity:
+            raise OSError(f"private directory authority changed before open: {path}")
         owned, current = current, -1
         return owned
     finally:
@@ -1380,9 +1384,11 @@ def _stale_view_files(run_dir, rev: Revision) -> list[str]:
                   | {name for name in files if name in actual and files[name] != actual[name]})
 
 
-def _fsync_file(path: Path) -> None:
+def _fsync_file(path: Path, *, parent_identity: tuple[int, int]) -> None:
     path = Path(path)
-    parent_fd = _open_private_directory_path(path.parent)
+    parent_fd = _open_private_directory_path(
+        path.parent, expected_identity=parent_identity,
+    )
     fd = -1
     try:
         fd = os.open(path.name, _FILE_READ_FLAGS, dir_fd=parent_fd)
@@ -1394,18 +1400,20 @@ def _fsync_file(path: Path) -> None:
         os.close(parent_fd)
 
 
-def _fsync_directory(path: Path) -> None:
-    fd = _open_private_directory_path(Path(path))
+def _fsync_directory(path: Path, *, directory_identity: tuple[int, int]) -> None:
+    fd = _open_private_directory_path(
+        Path(path), expected_identity=directory_identity,
+    )
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
 
 
-def _fsync_tree(root: Path) -> None:
+def _fsync_tree(root: Path, *, root_identity: tuple[int, int]) -> None:
     """Durably seal a staged tree without reopening any absolute descendant path."""
     root = Path(root)
-    root_fd = _open_private_directory_path(root)
+    root_fd = _open_private_directory_path(root, expected_identity=root_identity)
     count = 0
 
     def sync(directory_fd: int, relative: Path, depth: int) -> None:
@@ -1454,9 +1462,11 @@ def _fsync_tree(root: Path) -> None:
         os.close(root_fd)
 
 
-def _fsync_raw_claims(run_dir, claims: dict) -> None:
+def _fsync_raw_claims(
+    run_dir, claims: dict, *, root_identity: tuple[int, int],
+) -> None:
     root = revisions_dir(run_dir)
-    root_fd = _open_private_directory_path(root)
+    root_fd = _open_private_directory_path(root, expected_identity=root_identity)
     try:
         for ref in claims:
             path = _revision_raw_path(run_dir, ref)
@@ -1547,6 +1557,7 @@ def _settle_pointer_fault(
     candidate: Revision,
     previous: bytes | None,
     directory_identity: tuple[int, int],
+    run_directory_identity: tuple[int, int],
     *, already_durable: bool = False,
 ) -> _PointerSettlement:
     """Classify a failed publication without guessing whether the pointer landed.
@@ -1575,8 +1586,10 @@ def _settle_pointer_fault(
             return _PointerSettlement("ambiguous")
         if not already_durable:
             try:
-                _fsync_directory(root)
-                _fsync_directory(Path(run_dir))
+                _fsync_directory(root, directory_identity=directory_identity)
+                _fsync_directory(
+                    Path(run_dir), directory_identity=run_directory_identity,
+                )
             except Exception:
                 return _PointerSettlement("ambiguous")
         if not _same_private_directory(root, directory_identity):
@@ -1585,8 +1598,10 @@ def _settle_pointer_fault(
 
     if current == previous:
         try:
-            _fsync_directory(root)
-            _fsync_directory(Path(run_dir))
+            _fsync_directory(root, directory_identity=directory_identity)
+            _fsync_directory(
+                Path(run_dir), directory_identity=run_directory_identity,
+            )
         except Exception:
             return _PointerSettlement("ambiguous")
         if _same_private_directory(root, directory_identity):
@@ -1693,6 +1708,7 @@ def reseal_views(run_dir) -> Revision | None:
         rev = read(run_dir)
         if rev.status != "valid":
             return None
+        run_directory_identity = _private_directory_identity(Path(run_dir))
         revision_root = revisions_dir(run_dir)
         directory_identity = _private_directory_identity(revision_root)
         try:
@@ -1708,6 +1724,7 @@ def reseal_views(run_dir) -> Revision | None:
         if not isinstance(doc, dict):
             return None
         d = _view_dir(run_dir, rev)
+        view_directory_identity = _private_directory_identity(d)
         doc["views"] = {"dir": d.name, "files": _view_files(d)}
         doc["pointer_digest"] = _pointer_digest(doc)
         candidate = _certify_document(run_dir, doc)
@@ -1715,9 +1732,11 @@ def reseal_views(run_dir) -> Revision | None:
             raise RevisionError(
                 f"{run_dir}: regenerated revision views did not certify: {candidate.reason}",
             )
-        _fsync_tree(d)
-        _fsync_directory(revision_root)
-        _fsync_directory(Path(run_dir))
+        _fsync_tree(d, root_identity=view_directory_identity)
+        _fsync_directory(revision_root, directory_identity=directory_identity)
+        _fsync_directory(
+            Path(run_dir), directory_identity=run_directory_identity,
+        )
         candidate = _certify_document(run_dir, doc)
         if candidate.status != "valid":
             raise RevisionError(
@@ -1738,6 +1757,7 @@ def reseal_views(run_dir) -> Revision | None:
             publication_fault = exc
         settlement = _settle_pointer_fault(
             Path(run_dir), doc, candidate, previous_pointer, directory_identity,
+            run_directory_identity,
             already_durable=publication_completed,
         )
         if settlement.outcome == "landed" and settlement.revision is not None:
@@ -1947,12 +1967,14 @@ class _Supplement:
 
     def _publish(self, scope) -> Revision:
         nxt = self._next_revision()
+        run_directory_identity = _private_directory_identity(Path(self._run.dir))
         revision_root = revisions_dir(self._run.dir)
         rev_dir = revision_root / _rev_name(nxt)
         if rev_dir.exists():
             raise RevisionError(f"{rev_dir}: revision {nxt} already exists")
         privfs.private_dir(rev_dir)
         directory_identity = _private_directory_identity(revision_root)
+        revision_view_identity = _private_directory_identity(rev_dir)
         encoded_rows: list[str] = []
         body_bytes = 0
         for index, row in enumerate(self._pending, 1):
@@ -2035,14 +2057,18 @@ class _Supplement:
         # All evidence and derived bytes reach stable storage before the one
         # authoritative name changes.  Any earlier fault leaves this directory
         # as a named orphan and the prior pointer byte-identical.
-        _fsync_tree(rev_dir)
-        _fsync_raw_claims(self._run.dir, raw_files)
-        _fsync_directory(revision_root)
+        _fsync_tree(rev_dir, root_identity=revision_view_identity)
+        _fsync_raw_claims(
+            self._run.dir, raw_files, root_identity=directory_identity,
+        )
+        _fsync_directory(revision_root, directory_identity=directory_identity)
         # The revisions directory may itself have been created for this
         # publication.  Its canonical name is durable only after its parent is
         # synced; doing this unconditionally also settles pre-existing raw-tree
         # creation from OOB acquisition.
-        _fsync_directory(self._run.dir)
+        _fsync_directory(
+            self._run.dir, directory_identity=run_directory_identity,
+        )
 
         # Certification must follow the durability callbacks: a short write or
         # mutation during a barrier may not publish a pointer to bytes that no
@@ -2078,6 +2104,7 @@ class _Supplement:
 
         settlement = _settle_pointer_fault(
             self._run.dir, pointer, candidate, previous_pointer, directory_identity,
+            run_directory_identity,
             already_durable=publication_completed,
         )
         if settlement.outcome == "landed" and settlement.revision is not None:
