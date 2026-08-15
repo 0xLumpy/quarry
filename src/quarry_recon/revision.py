@@ -564,7 +564,11 @@ def _evidence_digest(*, base: str, supplement: str, counts: dict,
     }))
 
 
-def _read_regular(path: Path, *, root: Path | None = None, maximum: int) -> bytes:
+def _read_regular(
+    path: Path, *, root: Path | None = None, maximum: int,
+    expected_root_identity: tuple[int, int] | None = None,
+    identity_out: dict | None = None,
+) -> bytes:
     """Read one stable owner-private file through pinned directory descriptors."""
     if type(maximum) is not int or maximum < 0:
         raise ValueError("managed file byte bound is invalid")
@@ -579,8 +583,10 @@ def _read_regular(path: Path, *, root: Path | None = None, maximum: int) -> byte
 
     root_fd = parent_fd = file_fd = check_fd = current_fd = transient_fd = named_root_fd = -1
     try:
-        root_fd = _open_private_directory_path(root)
-        root_identity = _private_directory_claim(os.fstat(root_fd), root)
+        root_fd = _open_private_directory_path(
+            root, expected_identity=expected_root_identity,
+        )
+        root_claim = _private_directory_claim(os.fstat(root_fd), root)
         directory_identities: list[tuple[int, ...]] = []
         parent_fd = os.dup(root_fd)
         os.set_inheritable(parent_fd, False)
@@ -632,11 +638,20 @@ def _read_regular(path: Path, *, root: Path | None = None, maximum: int) -> byte
         os.close(check_fd)
         check_fd = -1
 
-        named_root_fd = _open_private_directory_path(root)
-        if _private_directory_claim(os.fstat(named_root_fd), root) != root_identity:
+        named_root_fd = _open_private_directory_path(
+            root, expected_identity=expected_root_identity,
+        )
+        if _private_directory_claim(os.fstat(named_root_fd), root) != root_claim:
             raise OSError(f"managed root changed while file was read: {root}")
         os.close(named_root_fd)
         named_root_fd = -1
+        if identity_out is not None:
+            identity_out.clear()
+            identity_out.update({
+                "root": root_claim,
+                "directories": tuple(directory_identities),
+                "file": file_identity,
+            })
         return b"".join(chunks)
     finally:
         for owned in (transient_fd, current_fd, file_fd, parent_fd, check_fd,
@@ -674,18 +689,27 @@ def _late_raw_refs(rows: list[dict]) -> set[str]:
     return refs
 
 
-def _raw_file_claims(run_dir, rows: list[dict]) -> dict:
+def _raw_file_claims(
+    run_dir, rows: list[dict], *, root_identity: tuple[int, int] | None = None,
+    identity_claims: dict | None = None,
+) -> dict:
     claims = {}
+    if identity_claims is not None:
+        identity_claims.clear()
     total = 0
     for ref in sorted(_late_raw_refs(rows)):
         path = _revision_raw_path(run_dir, ref)
+        identity = {}
         body = _read_regular(
             path, root=revisions_dir(run_dir), maximum=MAX_REVISION_RAW_FILE_BYTES,
+            expected_root_identity=root_identity, identity_out=identity,
         )
         total += len(body)
         if total > MAX_REVISION_RAW_TOTAL_BYTES:
             raise OSError("revision raw evidence exceeds its aggregate byte bound")
         claims[ref] = {"bytes": len(body), "digest": _sha(body)}
+        if identity_claims is not None:
+            identity_claims[ref] = identity
     return claims
 
 
@@ -1384,22 +1408,6 @@ def _stale_view_files(run_dir, rev: Revision) -> list[str]:
                   | {name for name in files if name in actual and files[name] != actual[name]})
 
 
-def _fsync_file(path: Path, *, parent_identity: tuple[int, int]) -> None:
-    path = Path(path)
-    parent_fd = _open_private_directory_path(
-        path.parent, expected_identity=parent_identity,
-    )
-    fd = -1
-    try:
-        fd = os.open(path.name, _FILE_READ_FLAGS, dir_fd=parent_fd)
-        _private_file_claim(os.fstat(fd), path)
-        os.fsync(fd)
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        os.close(parent_fd)
-
-
 def _fsync_directory(path: Path, *, directory_identity: tuple[int, int]) -> None:
     fd = _open_private_directory_path(
         Path(path), expected_identity=directory_identity,
@@ -1463,27 +1471,47 @@ def _fsync_tree(root: Path, *, root_identity: tuple[int, int]) -> None:
 
 
 def _fsync_raw_claims(
-    run_dir, claims: dict, *, root_identity: tuple[int, int],
+    run_dir, claims: dict, *, root_identity: tuple[int, int], identity_claims: dict,
 ) -> None:
     root = revisions_dir(run_dir)
+    if set(identity_claims) != set(claims):
+        raise OSError("revision raw durability identities do not match its claims")
     root_fd = _open_private_directory_path(root, expected_identity=root_identity)
     try:
         for ref in claims:
             path = _revision_raw_path(run_dir, ref)
             relative = path.relative_to(root)
+            expected = identity_claims[ref]
+            if (type(expected) is not dict or set(expected) != {"root", "directories", "file"}
+                    or tuple(expected["root"][:2]) != root_identity
+                    or len(expected["directories"]) != len(relative.parts) - 1
+                    or expected["file"][5] != claims[ref].get("bytes")):
+                raise OSError(f"invalid revision raw durability identity: {ref}")
             held = [os.dup(root_fd)]
             file_fd = -1
             try:
-                for component in relative.parts[:-1]:
+                for index, component in enumerate(relative.parts[:-1]):
                     child = os.open(component, _DIR_READ_FLAGS, dir_fd=held[-1])
-                    _private_directory_claim(os.fstat(child), path.parent)
+                    observed = _private_directory_claim(
+                        os.fstat(child), root.joinpath(*relative.parts[:index + 1]),
+                    )
+                    if observed != expected["directories"][index]:
+                        os.close(child)
+                        raise OSError(f"revision raw directory authority changed: {ref}")
                     held.append(child)
                 file_fd = os.open(relative.parts[-1], _FILE_READ_FLAGS, dir_fd=held[-1])
-                _private_file_claim(os.fstat(file_fd), path)
+                if _private_file_claim(os.fstat(file_fd), path) != expected["file"]:
+                    raise OSError(f"revision raw file authority changed: {ref}")
                 os.fsync(file_fd)
+                if _private_file_claim(os.fstat(file_fd), path) != expected["file"]:
+                    raise OSError(f"revision raw file changed during durability: {ref}")
                 os.close(file_fd)
                 file_fd = -1
-                for directory_fd in reversed(held[1:]):
+                for reverse_index, directory_fd in enumerate(reversed(held[1:])):
+                    index = len(held) - reverse_index - 2
+                    if (_private_directory_claim(os.fstat(directory_fd), path.parent)
+                            != expected["directories"][index]):
+                        raise OSError(f"revision raw directory changed during durability: {ref}")
                     os.fsync(directory_fd)
             finally:
                 if file_fd >= 0:
@@ -2014,8 +2042,12 @@ class _Supplement:
                    for entity, records in records_by_entity.items()}
         supplement = {"segments": segments, "lines": sum(int(s.get("lines") or 0) for s in segments),
                       "digest": _chain_digest(segments)}
+        raw_file_identities = {}
         try:
-            raw_files = _raw_file_claims(self._run.dir, rows)
+            raw_files = _raw_file_claims(
+                self._run.dir, rows, root_identity=directory_identity,
+                identity_claims=raw_file_identities,
+            )
         except (OSError, ValueError) as exc:
             raise RevisionError(f"{self._run.dir}: late raw evidence cannot be certified: {exc}") from exc
         created = store._utc()
@@ -2060,6 +2092,7 @@ class _Supplement:
         _fsync_tree(rev_dir, root_identity=revision_view_identity)
         _fsync_raw_claims(
             self._run.dir, raw_files, root_identity=directory_identity,
+            identity_claims=raw_file_identities,
         )
         _fsync_directory(revision_root, directory_identity=directory_identity)
         # The revisions directory may itself have been created for this

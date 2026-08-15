@@ -609,26 +609,58 @@ def test_durability_rejects_a_swapped_and_restored_root_name(
     assert (decoy / "decoy.json").read_text() == "decoy\n"
 
 
-def test_durability_opens_a_raced_leaf_nonblocking_before_type_check(tmp_path, monkeypatch):
-    root = privfs.private_dir(tmp_path / "tree")
-    proof = root / "proof.json"
-    privfs.write_private(proof, "{}\n")
+@pytest.mark.parametrize("level", ["directory", "file"])
+def test_raw_durability_rejects_descendant_aba_substitution(tmp_path, monkeypatch, level):
+    run_dir = privfs.private_dir(tmp_path / "run")
+    revisions = privfs.private_dir(run_dir / "revisions")
+    raw = privfs.private_dir(revisions / "raw")
+    actual_dir = privfs.private_dir(raw / "a")
+    decoy_dir = privfs.private_dir(raw / "decoy")
+    actual = actual_dir / "proof.bin"
+    decoy = decoy_dir / "proof.bin"
+    privfs.write_private(actual, "same bytes\n")
+    privfs.write_private(decoy, "same bytes\n")
+    ref = "revisions/raw/a/proof.bin"
+    root_identity = revision._private_directory_identity(revisions)
+    identities = {}
+    claims = revision._raw_file_claims(
+        run_dir, [{"record": {"raw_ref": ref}}], root_identity=root_identity,
+        identity_claims=identities,
+    )
     real_open = revision.os.open
-    parent_identity = revision._private_directory_identity(root)
-    state = {"swapped": False, "nonblocking": False}
+    state = {"swapped": False}
 
     def swap(component, flags, *args, dir_fd=None, **kwargs):
-        if component == proof.name and dir_fd is not None and not state["swapped"]:
+        target = "a" if level == "directory" else actual.name
+        if component == target and dir_fd is not None and not state["swapped"]:
             state["swapped"] = True
-            proof.unlink()
-            os.mkfifo(proof, privfs.FILE_MODE)
-            state["nonblocking"] = bool(flags & getattr(os, "O_NONBLOCK", 0))
+            if level == "directory":
+                held = raw / "held"
+                actual_dir.rename(held)
+                decoy_dir.rename(actual_dir)
+                try:
+                    return real_open(component, flags, *args, dir_fd=dir_fd, **kwargs)
+                finally:
+                    actual_dir.rename(decoy_dir)
+                    held.rename(actual_dir)
+            held = actual_dir / "held.bin"
+            actual.rename(held)
+            decoy.rename(actual)
+            try:
+                return real_open(component, flags, *args, dir_fd=dir_fd, **kwargs)
+            finally:
+                actual.rename(decoy)
+                held.rename(actual)
         return real_open(component, flags, *args, dir_fd=dir_fd, **kwargs)
 
     monkeypatch.setattr(revision.os, "open", swap)
-    with pytest.raises(OSError, match="unsafe owner-private single-link file"):
-        revision._fsync_file(proof, parent_identity=parent_identity)
-    assert state == {"swapped": True, "nonblocking": True}
+    with pytest.raises(OSError, match="revision raw .* authority changed"):
+        revision._fsync_raw_claims(
+            run_dir, claims, root_identity=root_identity,
+            identity_claims=identities,
+        )
+    assert state["swapped"] is True
+    assert actual.read_text() == decoy.read_text() == "same bytes\n"
 
 
 def test_oob_close_after_effect_keeps_the_landed_raw_proof(tmp_path, monkeypatch):
