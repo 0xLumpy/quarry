@@ -869,6 +869,40 @@ def test_settlement_fsyncs_an_identical_pointer_substituted_during_publication(
     assert revision.read(run.dir).status == "valid"
 
 
+def test_pointer_substitution_during_final_run_fsync_is_ambiguous(
+    tmp_path, monkeypatch,
+):
+    run = _sealed(tmp_path)
+    sink = revision.ingest(run, "v310.fixture")
+    assert sink.add("url", {"url": "https://base.example.com/late"})
+    real_fsync = revision.os.fsync
+    state = {"swapped": False}
+
+    def fsync(fd):
+        try:
+            target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            target = Path()
+        pointer = revision.pointer_path(run.dir)
+        if target == run.dir and pointer.exists() and not state["swapped"]:
+            held = pointer.parent / "held-pointer.json"
+            decoy = pointer.parent / "decoy-pointer.json"
+            decoy.write_bytes(pointer.read_bytes())
+            decoy.chmod(0o600)
+            pointer.rename(held)
+            decoy.rename(pointer)
+            state["swapped"] = True
+        return real_fsync(fd)
+
+    monkeypatch.setattr(revision.os, "fsync", fsync)
+    with pytest.raises(revision.RevisionPublicationError, match="ambiguous") as caught:
+        sink.commit()
+
+    assert caught.value.outcome == "ambiguous"
+    assert state["swapped"] is True
+    assert sink.revised is False
+
+
 @pytest.mark.parametrize("prior", [False, True])
 def test_post_durability_segment_substitution_never_settles_landed(
     tmp_path, monkeypatch, prior,

@@ -1830,7 +1830,7 @@ def _read_fd_bounded(fd: int, maximum: int, where: Path) -> tuple[bytes, tuple[i
 
 def _read_pointer_authority(
     run_dir: Path, *, run_identity: tuple[int, int],
-    revisions_identity: tuple[int, int],
+    revisions_identity: tuple[int, int], expected_identity: tuple[int, ...] | None = None,
 ) -> bytes | None:
     run_fd, revisions_fd = _open_revision_authority(
         run_dir, run_identity=run_identity, revisions_identity=revisions_identity,
@@ -1841,9 +1841,11 @@ def _read_pointer_authority(
             pointer_fd = os.open(POINTER_NAME, _FILE_READ_FLAGS, dir_fd=revisions_fd)
         except FileNotFoundError:
             return None
-        body, _identity = _read_fd_bounded(
+        body, identity = _read_fd_bounded(
             pointer_fd, MAX_REVISION_POINTER_BYTES, pointer_path(run_dir),
         )
+        if expected_identity is not None and identity != expected_identity:
+            raise OSError("canonical revision pointer identity changed during settlement")
         return body
     finally:
         for fd in (pointer_fd, revisions_fd, run_fd):
@@ -1879,6 +1881,13 @@ def _durably_settle_pointer_authority(
         if checked != expected or checked_identity != identity:
             raise OSError("canonical revision pointer name changed during durability")
         os.fsync(run_fd)
+        os.close(check_fd)
+        check_fd = os.open(POINTER_NAME, _FILE_READ_FLAGS, dir_fd=revisions_fd)
+        checked, checked_identity = _read_fd_bounded(
+            check_fd, MAX_REVISION_POINTER_BYTES, pointer_path(run_dir),
+        )
+        if checked != expected or checked_identity != identity:
+            raise OSError("canonical revision pointer changed during run durability")
     finally:
         for fd in (check_fd, pointer_fd, revisions_fd, run_fd):
             if fd >= 0:
@@ -1887,6 +1896,7 @@ def _durably_settle_pointer_authority(
     # descriptor alone does not prove that its inode still owns the name.
     if _read_pointer_authority(
         run_dir, run_identity=run_identity, revisions_identity=revisions_identity,
+        expected_identity=identity,
     ) != expected:
         raise OSError("canonical revision pointer changed after durability")
 
