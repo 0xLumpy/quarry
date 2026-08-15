@@ -7,7 +7,7 @@
     "benchmarks": {"items": {"$ref": "#/$defs/benchmark"}, "maxItems": 7, "minItems": 7, "type": "array", "uniqueItems": true},
     "release": {"const": "0.3.10"},
     "schema_version": {"const": "quarry.threshold-benchmark-manifest.v1"},
-    "thresholds": {"items": {"$ref": "#/$defs/threshold"}, "maxItems": 46, "minItems": 46, "type": "array", "uniqueItems": true}
+    "thresholds": {"items": {"$ref": "#/$defs/threshold"}, "maxItems": 56, "minItems": 56, "type": "array", "uniqueItems": true}
   },
   "$defs": {
     "benchmark": {

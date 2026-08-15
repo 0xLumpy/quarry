@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 
 from . import release_evidence as evidence
+from . import resource_contract
 
 
 RELEASE_SCOPE_SCHEMA = "quarry.release-scope.v1"
@@ -43,6 +44,7 @@ BENCHMARK_TRIALS_SCHEMA = GATE_ARTIFACT_SCHEMA
 BENCHMARK_INVALIDATIONS_SCHEMA = GATE_ARTIFACT_SCHEMA
 BENCHMARK_BASELINE_SCHEMA = GATE_ARTIFACT_SCHEMA
 BENCHMARK_REPORT_SCHEMA = GATE_ARTIFACT_SCHEMA
+RESOURCE_GATE_REPORT_SCHEMA = resource_contract.SCHEMA_VERSION
 PUBLICATION_SUBJECTS_SCHEMA = GATE_ARTIFACT_SCHEMA
 AGGREGATE_SCHEMA = "quarry.release-aggregate.v1"
 APPROVAL_SCHEMA = "quarry.detached-release-approval.v1"
@@ -157,6 +159,18 @@ QUALITY_THRESHOLD_CONTRACTS = (
     ("B-DETERMINISM", "absolute", "artifact_differences", "at_most", "maximum", "count"),
     ("C-VULNERABILITY", "absolute", "unaccepted_findings", "at_most", "maximum", "count"),
 )
+RESOURCE_FAULT_THRESHOLD_CONTRACTS = (
+    ("C-FAULT-DISK", "absolute", "reserve_overshoot", "at_most", "maximum", "bytes"),
+    ("C-FAULT-DISK", "absolute", "destination_corruptions", "at_most", "maximum", "count"),
+    ("C-FAULT-DISK", "absolute", "lost_reservations", "at_most", "maximum", "count"),
+    ("C-FAULT-DISK", "absolute", "untruthful_remainders", "at_most", "maximum", "count"),
+    ("C-FAULT-DISK", "absolute", "lease_leaks", "at_most", "maximum", "count"),
+    ("C-FAULT-RESOLVER", "absolute", "worker_leaks", "at_most", "maximum", "count"),
+    ("C-FAULT-RESOLVER", "absolute", "late_mutations", "at_most", "maximum", "count"),
+    ("C-FAULT-RESOLVER", "absolute", "lost_remainders", "at_most", "maximum", "count"),
+    ("C-FAULT-RESOLVER", "absolute", "deadline_overshoot", "at_most", "maximum", "milliseconds"),
+    ("C-FAULT-RESOLVER", "absolute", "unbounded_queue_observations", "at_most", "maximum", "count"),
+)
 PERFORMANCE_OPERATIONS = {
     "C-PERF-RUNNER": "streaming-runner",
     "C-PERF-INGEST": "observation-ingest",
@@ -166,6 +180,21 @@ PERFORMANCE_OPERATIONS = {
     "C-PERF-RESOLVER": "mixed-resolution-corpus",
     "C-PERF-PHASE-FAIRNESS": "phase-fairness",
 }
+RESOURCE_REPORT_GATES = (
+    "C-FAULT-DISK",
+    "C-FAULT-RESOLVER",
+    "C-PERF-INGEST",
+    "C-PERF-DISK",
+    "C-PERF-RESOLVER",
+    "C-PERF-PHASE-FAIRNESS",
+)
+# Phase-fairness aggregate counts cannot prove the required per-obligation
+# disposition roster.  Its report remains a supported diagnostic artifact, but
+# cannot close the gate until C-POLICY-TRACE has a typed, cross-reconciled body.
+RESOURCE_SEMANTIC_GATES = tuple(
+    gate_id for gate_id in RESOURCE_REPORT_GATES
+    if gate_id != "C-PERF-PHASE-FAIRNESS"
+)
 PERFORMANCE_THRESHOLD_CONTRACTS = (
     ("C-PERF-RUNNER", "absolute", "peak_aggregate_rss", "at_most", "p95", "bytes"),
     ("C-PERF-RUNNER", "absolute", "wall_deadline", "at_most", "maximum", "milliseconds"),
@@ -207,7 +236,11 @@ PERFORMANCE_THRESHOLD_CONTRACTS = (
     ("C-PERF-PHASE-FAIRNESS", "absolute", "unstarted_obligations", "at_most", "maximum", "count"),
     ("C-PERF-PHASE-FAIRNESS", "regression", "completion_time_delta", "at_most", "median", "basis_points"),
 )
-THRESHOLD_CONTRACTS = QUALITY_THRESHOLD_CONTRACTS + PERFORMANCE_THRESHOLD_CONTRACTS
+THRESHOLD_CONTRACTS = (
+    QUALITY_THRESHOLD_CONTRACTS
+    + RESOURCE_FAULT_THRESHOLD_CONTRACTS
+    + PERFORMANCE_THRESHOLD_CONTRACTS
+)
 THRESHOLD_GATES = (
     "B-HERMETIC-ALL",
     "B-QUALITY",
@@ -215,6 +248,8 @@ THRESHOLD_GATES = (
     "B-STATIC-SECURITY",
     "B-DETERMINISM",
     "C-VULNERABILITY",
+    "C-FAULT-DISK",
+    "C-FAULT-RESOLVER",
     "C-PERF-RUNNER",
     "C-PERF-INGEST",
     "C-PERF-REPORT",
@@ -306,14 +341,25 @@ REQUIRED_ARTIFACTS = {
     "C-FAULT-FINALIZE": (("fault-matrix", "application/json"),),
     "C-FAULT-CAMPAIGN": (("fault-matrix", "application/json"),),
     "C-FAULT-INSTALL": (("fault-matrix", "application/json"),),
-    "C-FAULT-DISK": (("fault-matrix", "application/json"),),
-    "C-FAULT-RESOLVER": (("fault-matrix", "application/json"),),
+    "C-FAULT-DISK": (
+        ("fault-matrix", "application/json"),
+        ("resource-gate-report", "application/json"),
+    ),
+    "C-FAULT-RESOLVER": (
+        ("fault-matrix", "application/json"),
+        ("resource-gate-report", "application/json"),
+    ),
     "C-FAULT-INTERRUPT": (("fault-matrix", "application/json"),),
     **{
         gate_id: (
             ("benchmark-baseline", "application/json"),
             ("benchmark-report", "application/json"),
             ("raw-trials", "application/json"),
+            *(
+                (("resource-gate-report", "application/json"),)
+                if gate_id in RESOURCE_REPORT_GATES
+                else ()
+            ),
             ("trial-invalidations", "application/json"),
         )
         for gate_id in PERFORMANCE_OPERATIONS
@@ -332,6 +378,7 @@ SCHEMA_PATHS = {
     "gate-evidence-report-schema": "release/evidence/schemas/gate-evidence-report-v1.schema.json",
     "no-live-rule-schema": "release/evidence/schemas/no-live-rule-v1.schema.json",
     "release-scope-schema": "release/evidence/schemas/release-scope-v1.schema.json",
+    "resource-gate-report-schema": "release/evidence/schemas/resource-gate-report-v1.schema.json",
     "signature-envelope-schema": "release/evidence/schemas/signature-envelope-v1.schema.json",
     "support-matrix-schema": "release/evidence/schemas/support-matrix-v1.schema.json",
     "threshold-benchmark-schema": "release/evidence/schemas/threshold-benchmark-v1.schema.json",
@@ -346,6 +393,7 @@ SCHEMA_VERSIONS = {
     "gate-evidence-report-schema": EVIDENCE_REPORT_SCHEMA,
     "no-live-rule-schema": NO_LIVE_RULE_SCHEMA,
     "release-scope-schema": RELEASE_SCOPE_SCHEMA,
+    "resource-gate-report-schema": RESOURCE_GATE_REPORT_SCHEMA,
     "signature-envelope-schema": SIGNATURE_ENVELOPE_SCHEMA,
     "support-matrix-schema": SUPPORT_MATRIX_SCHEMA,
     "threshold-benchmark-schema": THRESHOLD_MANIFEST_SCHEMA,
@@ -368,6 +416,7 @@ SCOPE_INPUT_PATHS = {
     **RUN_MANIFEST_INPUT_PATHS,
     **RUNNER_INPUT_PATHS,
     "release-contracts-validator": "src/quarry_recon/release_contracts.py",
+    "resource-gate-report-validator": "src/quarry_recon/resource_contract.py",
 }
 PRODUCTION_TRUST_POLICY_PATH = "release/evidence/trust-policy-v1.json"
 
@@ -2550,6 +2599,207 @@ def _semantic_benchmark(
     )
 
 
+def _resource_threshold_policy(thresholds: dict, gate_id: str) -> dict[str, dict]:
+    """Resolve the resource parser policy from the reviewed threshold manifest.
+
+    The resource report carries a copy of these values for audit readability,
+    but that copy is never authority.  Aggregation has already strict-validated
+    and signature-checked ``thresholds`` before an obligation verifier runs.
+    """
+    required = resource_contract._GATE_METRICS.get(gate_id)
+    if required is None:
+        raise evidence.EvidenceError("resource threshold policy requested for an unsupported gate")
+    rows = [row for row in thresholds["thresholds"] if row["gate_id"] == gate_id]
+    if [row["metric"] for row in rows] != list(required):
+        raise evidence.EvidenceError(
+            "reviewed threshold manifest does not exactly cover the resource gate metrics"
+        )
+    policy = {}
+    for row in rows:
+        metric = row["metric"]
+        if row["limit"] is None:
+            raise evidence.EvidenceError("resource gate has an unresolved reviewed threshold")
+        expected_class = "regression" if metric.endswith("_delta") else "absolute"
+        if row["class"] != expected_class:
+            raise evidence.EvidenceError("resource threshold changes its frozen threshold class")
+        policy[metric] = {
+            "operator": row["operator"],
+            "statistic": row["statistic"],
+            "unit": row["unit"],
+            "limit": row["limit"],
+            "baseline_digest": row["baseline_digest"],
+        }
+    return policy
+
+
+def _resource_trace_digests(
+    gate_id: str, bodies: Mapping[str, bytes], resolver: ArtifactResolver,
+) -> list[str]:
+    """Return the exact signed/indexed artifacts every resource trial must cite."""
+    names = [
+        name for name, _media_type in required_artifact_contract(gate_id)
+        if name != "resource-gate-report"
+    ]
+    digests = []
+    for name in names:
+        if name not in bodies:
+            raise evidence.EvidenceError(
+                f"resource report has no retained supporting body for {gate_id}/{name}"
+            )
+        record = resolver.record(gate_id, name)
+        observed = raw_sha256(bodies[name])
+        if record["digest"] != observed:
+            raise evidence.EvidenceError(
+                f"resource report trace body does not match indexed {gate_id}/{name}"
+            )
+        digests.append(observed)
+    if len(digests) != len(set(digests)):
+        raise evidence.EvidenceError(
+            "resource trial artifacts do not have unique signed content identities"
+        )
+    return sorted(digests)
+
+
+def _reconcile_resource_measurements(
+    resource_report: dict, *, report: dict, thresholds: dict,
+) -> None:
+    gate_id = resource_report["gate_id"]
+    threshold_rows = [
+        row for row in thresholds["thresholds"] if row["gate_id"] == gate_id
+    ]
+    resource_rows = resource_report["measurements"]
+    summary_rows = report["measurements"]
+    expected_metrics = [row["metric"] for row in threshold_rows]
+    if ([row["metric"] for row in resource_rows] != expected_metrics or
+            [row["metric"] for row in summary_rows] != expected_metrics):
+        raise evidence.EvidenceError(
+            "resource measurements do not preserve reviewed threshold order and coverage"
+        )
+    for threshold, resource_row, summary in zip(
+        threshold_rows, resource_rows, summary_rows, strict=True,
+    ):
+        if resource_row["value"] != summary["value"]:
+            raise evidence.EvidenceError(
+                "resource measurement does not reconcile the gate evidence/raw trials"
+            )
+        expected_summary = {
+            "baseline_digest": threshold["baseline_digest"],
+            "class": threshold["class"],
+            "metric": threshold["metric"],
+            "statistic": threshold["statistic"],
+            "unit": threshold["unit"],
+        }
+        observed_summary = {
+            key: summary[key] for key in expected_summary
+        }
+        if observed_summary != expected_summary:
+            raise evidence.EvidenceError(
+                "resource measurement is bound to a different reviewed threshold"
+            )
+
+
+def _validate_resource_gate_report(
+    gate: dict, bodies: Mapping[str, bytes], *, identity: dict, report: dict,
+    resolver: ArtifactResolver, thresholds: dict,
+) -> None:
+    gate_id = gate["gate_id"]
+    if gate_id not in RESOURCE_SEMANTIC_GATES:
+        raise evidence.EvidenceError("resource semantic adapter does not close this gate")
+    body = bodies.get("resource-gate-report")
+    if body is None:
+        raise evidence.EvidenceError("resource gate has no resource-gate-report artifact")
+    resource_digest = raw_sha256(body)
+    owning_instances = [
+        instance for instance in report["instances"]
+        if {"digest": resource_digest, "name": "resource-gate-report"}
+        in instance["artifacts"]
+    ]
+    if len(owning_instances) != 1:
+        raise evidence.EvidenceError(
+            "resource gate report is not attributed to one exact evidence instance"
+        )
+    owner = owning_instances[0]
+    accepted_policy = _resource_threshold_policy(thresholds, gate_id)
+    threshold_digest = raw_sha256(canonical_json_line(thresholds))
+    benchmark = report["benchmark"]
+    benchmark_digest = (
+        evidence.canonical_digest(benchmark) if gate_id.startswith("C-PERF-")
+        else None
+    )
+    try:
+        parsed = resource_contract.read_gate_report(
+            body,
+            gate_id=gate_id,
+            candidate_identity_digest=evidence.canonical_digest(identity),
+            evidence_instance_id=owner["id"],
+            threshold_manifest_digest=threshold_digest,
+            benchmark_manifest_digest=benchmark_digest,
+            accepted_thresholds=accepted_policy,
+        )
+    except resource_contract.ResourceContractError as exc:
+        raise evidence.EvidenceError(f"resource gate report is not accepted: {exc}") from exc
+
+    if parsed["evidence_instance_id"] != owner["id"]:
+        raise evidence.EvidenceError(
+            "resource gate report does not bind its exact signed evidence instance"
+        )
+    if owner["environment"] != gate["environment"]:
+        raise evidence.EvidenceError(
+            "resource gate report is attributed to different signed hardware/runtime identity"
+        )
+    if not (
+        _timestamp(owner["started_at"], "resource owner.started_at")
+        <= _timestamp(parsed["started_at"], "resource report.started_at")
+        <= _timestamp(parsed["finished_at"], "resource report.finished_at")
+        <= _timestamp(owner["finished_at"], "resource owner.finished_at")
+    ):
+        raise evidence.EvidenceError(
+            "resource gate report lies outside its signed evidence instance"
+        )
+
+    expected_trace_digests = _resource_trace_digests(gate_id, bodies, resolver)
+    for trial in parsed["trials"]:
+        if trial["artifact_digests"] != expected_trace_digests:
+            raise evidence.EvidenceError(
+                "resource trial does not reconcile every signed indexed supporting artifact"
+            )
+    _reconcile_resource_measurements(parsed, report=report, thresholds=thresholds)
+
+
+def _semantic_resource_fault(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    _validate_generic_supporting_artifact(
+        bodies["fault-matrix"], gate_id=gate["gate_id"], name="fault-matrix",
+        identity=context["identity"],
+    )
+    _validate_resource_gate_report(
+        gate,
+        bodies,
+        identity=context["identity"],
+        report=context["report"],
+        resolver=context["resolver"],
+        thresholds=context["thresholds"],
+    )
+
+
+def _semantic_resource_benchmark(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    # Baseline identity, retained raw repetitions, invalidations and summary
+    # arithmetic remain the canonical performance authority.  The resource
+    # report is an additional obligation-specific matrix, never a substitute.
+    _semantic_benchmark(gate, bodies, **context)
+    _validate_resource_gate_report(
+        gate,
+        bodies,
+        identity=context["identity"],
+        report=context["report"],
+        resolver=context["resolver"],
+        thresholds=context["thresholds"],
+    )
+
+
 def _semantic_sbom(
     _gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -2596,10 +2846,16 @@ PROVISIONAL_SEMANTIC_VERIFIERS = MappingProxyType({
     "E-ARTIFACTS": _semantic_publication_subjects,
 })
 
-# Production aggregation is deliberately impossible in this substrate commit.
-# Later obligation-owned commits promote a parser into this registry only after
-# its complete machine-evidence contract is frozen and adversarially verified.
-SEMANTIC_VERIFIERS = MappingProxyType({})
+# Only obligation-owned parsers whose complete supporting graph is recomputed
+# are promoted.  In particular C-PERF-PHASE-FAIRNESS stays fail-closed until a
+# typed per-obligation roster can be reconciled with C-POLICY-TRACE.
+SEMANTIC_VERIFIERS = MappingProxyType({
+    "C-FAULT-DISK": _semantic_resource_fault,
+    "C-FAULT-RESOLVER": _semantic_resource_fault,
+    "C-PERF-INGEST": _semantic_resource_benchmark,
+    "C-PERF-DISK": _semantic_resource_benchmark,
+    "C-PERF-RESOLVER": _semantic_resource_benchmark,
+})
 
 
 def _validate_supporting_artifacts(

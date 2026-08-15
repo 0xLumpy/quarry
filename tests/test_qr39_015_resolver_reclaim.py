@@ -100,19 +100,18 @@ def test_late_completion_is_discarded(monkeypatch):
 
 
 def test_a_recv_failure_still_reclaims_the_worker(monkeypatch):
-    import multiprocessing.connection as _mpc_mod
     monkeypatch.setattr(netguard, "_STUB", _OK)
     base = netguard.active_worker_count()
-    real_recv = _mpc_mod.Connection.recv
+    real_drain = netguard._drain_resolution_result
     state = {"boom": True}
 
-    def recv(self):
+    def drain(reader, buffer):
         if state["boom"]:
             state["boom"] = False
-            raise RuntimeError("pipe boom")      # the parent's first recv fails mid-batch
-        return real_recv(self)
+            raise RuntimeError("pipe boom")      # the parent's first drain fails mid-batch
+        return real_drain(reader, buffer)
 
-    monkeypatch.setattr(_mpc_mod.Connection, "recv", recv)
+    monkeypatch.setattr(netguard, "_drain_resolution_result", drain)
     res = netguard.resolve_many(["a.invalid"], timeout=5.0)
     assert res["a.invalid"] == ([], "indeterminate")   # a recv failure is not a crash
     deadline = time.monotonic() + 3

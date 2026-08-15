@@ -1,0 +1,253 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quarry.local/schemas/resource-gate-report-v1.schema.json",
+  "title": "Quarry v0.3.10 V310-06 resource gate report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "candidate_identity_digest",
+    "gate_id",
+    "evidence_instance_id",
+    "started_at",
+    "finished_at",
+    "support_envelope",
+    "support_envelope_digest",
+    "trials",
+    "measurements",
+    "threshold_manifest_digest",
+    "benchmark_manifest_digest",
+    "verdict"
+  ],
+  "properties": {
+    "schema_version": {"const": "quarry.resource-gate-report.v1"},
+    "candidate_identity_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "evidence_instance_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "gate_id": {
+      "enum": [
+        "C-FAULT-DISK",
+        "C-FAULT-RESOLVER",
+        "C-PERF-INGEST",
+        "C-PERF-DISK",
+        "C-PERF-RESOLVER",
+        "C-PERF-PHASE-FAIRNESS"
+      ]
+    },
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "support_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "release_line",
+        "store",
+        "acquisition",
+        "resolver",
+        "resource_metrics",
+        "deferred"
+      ],
+      "properties": {
+        "schema_version": {"const": "quarry.resource-support-envelope.v1"},
+        "release_line": {"const": "0.3.x"},
+        "store": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "max_keys_per_entity",
+            "rss_budget_mb",
+            "max_bytes_per_key",
+            "max_corpus_bytes_per_entity",
+            "whole_corpus_materialized",
+            "overflow_payload_retained",
+            "overflow_disposition"
+          ],
+          "properties": {
+            "version": {"const": 3},
+            "max_keys_per_entity": {"type": "integer", "minimum": 1},
+            "rss_budget_mb": {"type": "integer", "minimum": 1},
+            "max_bytes_per_key": {"type": "integer", "minimum": 1},
+            "max_corpus_bytes_per_entity": {"type": "integer", "minimum": 1},
+            "whole_corpus_materialized": {"const": true},
+            "overflow_payload_retained": {"const": false},
+            "overflow_disposition": {"const": "terminal-unschedulable-gap"}
+          }
+        },
+        "acquisition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cross_process_run_reservations",
+            "cross_process_project_reservations",
+            "cross_process_filesystem_reserve",
+            "cross_process_destination_lease",
+            "cross_process_writers_per_filesystem",
+            "distinct_governor_groups_per_filesystem",
+            "same_governor_threads_share_reservations",
+            "managed_durable_project_limit",
+            "lease_wait_milliseconds"
+          ],
+          "properties": {
+            "cross_process_run_reservations": {"const": true},
+            "cross_process_project_reservations": {"const": true},
+            "cross_process_filesystem_reserve": {"const": true},
+            "cross_process_destination_lease": {"const": true},
+            "cross_process_writers_per_filesystem": {"const": 1},
+            "distinct_governor_groups_per_filesystem": {"const": 1},
+            "same_governor_threads_share_reservations": {"const": true},
+            "managed_durable_project_limit": {"const": "refused-before-contact"},
+            "lease_wait_milliseconds": {"type": "integer", "minimum": 1}
+          }
+        },
+        "resolver": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "hosts_per_batch",
+            "host_utf8_bytes",
+            "worker_result_bytes",
+            "remainder_record_bytes",
+            "corpus_deadline_milliseconds",
+            "worker_processes",
+            "outstanding_queue",
+            "terminate_grace_milliseconds",
+            "hard_kill_fallback_milliseconds",
+            "late_results_mutate_sealed_state"
+          ],
+          "properties": {
+            "hosts_per_batch": {"type": "integer", "minimum": 1},
+            "host_utf8_bytes": {"const": 253},
+            "worker_result_bytes": {"type": "integer", "minimum": 1},
+            "remainder_record_bytes": {"type": "integer", "minimum": 1},
+            "corpus_deadline_milliseconds": {"type": "integer", "minimum": 1},
+            "worker_processes": {"type": "integer", "minimum": 1},
+            "outstanding_queue": {"type": "integer", "minimum": 1},
+            "terminate_grace_milliseconds": {"type": "integer", "minimum": 1},
+            "hard_kill_fallback_milliseconds": {"type": "integer", "minimum": 1},
+            "late_results_mutate_sealed_state": {"const": false}
+          }
+        },
+        "resource_metrics": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "prefixItems": [
+            {"const": "peak_aggregate_rss_bytes"},
+            {"const": "peak_disk_bytes"},
+            {"const": "peak_fd_count"},
+            {"const": "peak_process_count"}
+          ],
+          "items": false
+        },
+        "deferred": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "prefixItems": [
+            {"const": "disk-backed-indexed-repository"},
+            {"const": "unbounded-corpus-claims"},
+            {"const": "cross-lane-distributed-rate-governor"}
+          ],
+          "items": false
+        }
+      }
+    },
+    "support_envelope_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "trials": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["case", "outcome", "resource", "metric_facts", "assertions", "artifact_digests"],
+        "properties": {
+          "case": {"type": "string", "minLength": 1},
+          "outcome": {"enum": ["pass", "fail"]},
+          "resource": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "peak_aggregate_rss_bytes",
+              "peak_disk_bytes",
+              "peak_fd_count",
+              "peak_process_count",
+              "complete"
+            ],
+            "properties": {
+              "peak_aggregate_rss_bytes": {"type": "integer", "minimum": 0},
+              "peak_disk_bytes": {"type": "integer", "minimum": 0},
+              "peak_fd_count": {"type": "integer", "minimum": 0},
+              "peak_process_count": {"type": "integer", "minimum": 0},
+              "complete": {"type": "boolean"}
+            }
+          },
+          "metric_facts": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": {"type": "integer", "minimum": 0}
+          },
+          "assertions": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": {"type": "boolean"}
+          },
+          "artifact_digests": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          }
+        }
+      }
+    },
+    "measurements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "metric",
+          "operator",
+          "statistic",
+          "unit",
+          "value",
+          "limit",
+          "passed",
+          "baseline_digest"
+        ],
+        "properties": {
+          "metric": {"type": "string", "minLength": 1},
+          "operator": {"enum": ["at_most", "at_least"]},
+          "statistic": {"enum": ["maximum", "minimum", "median", "p95"]},
+          "unit": {"enum": ["bytes", "count", "milliseconds", "basis_points"]},
+          "value": {"type": "integer", "minimum": 0},
+          "limit": {"type": "integer", "minimum": 0},
+          "passed": {"type": "boolean"},
+          "baseline_digest": {
+            "oneOf": [
+              {"type": "null"},
+              {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+            ]
+          }
+        }
+      }
+    },
+    "threshold_manifest_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "benchmark_manifest_digest": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      ]
+    },
+    "verdict": {"enum": ["pass", "fail"]}
+  }
+}

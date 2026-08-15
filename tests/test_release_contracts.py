@@ -16,6 +16,7 @@ import pytest
 
 from quarry_recon import release_contracts as contracts
 from quarry_recon import release_evidence as evidence
+from quarry_recon import resource_contract
 
 pytestmark = pytest.mark.offline
 
@@ -186,7 +187,7 @@ def _generic_supporting_body(gate_id: str, name: str, identity: dict) -> bytes:
 def _supporting_bodies(
     gate_id: str, *, identity: dict, scope: dict, support: dict, thresholds: dict,
     benchmark: dict | None, measurements: list[dict], environment: dict,
-    toolchain: list[dict], indexed: list[dict], policy: dict,
+    evidence_instance_id: str, toolchain: list[dict], indexed: list[dict], policy: dict,
 ) -> dict[str, bytes]:
     names = [name for name, _media_type in contracts.required_artifact_contract(gate_id)]
     bodies: dict[str, bytes] = {}
@@ -389,7 +390,76 @@ def _supporting_bodies(
             "subjects": subjects,
         })
     for name in names:
+        if name == "resource-gate-report":
+            continue
         bodies.setdefault(name, _generic_supporting_body(gate_id, name, identity))
+    if "resource-gate-report" in names:
+        threshold_rows = [
+            row for row in thresholds["thresholds"] if row["gate_id"] == gate_id
+        ]
+        measured_by_metric = {row["metric"]: row for row in measurements}
+        accepted = {
+            row["metric"]: {
+                "operator": row["operator"],
+                "statistic": row["statistic"],
+                "unit": row["unit"],
+                "limit": row["limit"],
+                "baseline_digest": row["baseline_digest"],
+            }
+            for row in threshold_rows
+        }
+        values = {
+            row["metric"]: measured_by_metric[row["metric"]]["value"]
+            for row in threshold_rows
+        }
+        trace_digests = sorted(
+            contracts.raw_sha256(bodies[name])
+            for name in names if name != "resource-gate-report"
+        )
+        trials = [{
+            "case": case,
+            "outcome": "pass",
+            "resource": {
+                "peak_aggregate_rss_bytes": values.get("peak_aggregate_rss", 1),
+                "peak_disk_bytes": 1,
+                "peak_fd_count": 1,
+                "peak_process_count": max(1, values.get("worker_processes", 1)),
+                "complete": True,
+            },
+            "metric_facts": copy.deepcopy(values),
+            "assertions": {
+                assertion: True
+                for assertion in sorted(resource_contract._GATE_ASSERTIONS[gate_id][case])
+            },
+            "artifact_digests": trace_digests,
+        } for case in sorted(resource_contract._GATE_CASES[gate_id])]
+        resource_measurements = [{
+            "metric": row["metric"],
+            "operator": row["operator"],
+            "statistic": row["statistic"],
+            "unit": row["unit"],
+            "value": values[row["metric"]],
+            "limit": row["limit"],
+            "baseline_digest": row["baseline_digest"],
+        } for row in threshold_rows]
+        resource_report = resource_contract.build_gate_report(
+            candidate_identity_digest=evidence.canonical_digest(identity),
+            gate_id=gate_id,
+            evidence_instance_id=evidence_instance_id,
+            started_at="2026-08-14T10:20:00Z",
+            finished_at="2026-08-14T10:20:01Z",
+            trials=trials,
+            measurements=resource_measurements,
+            threshold_manifest_digest=contracts.raw_sha256(
+                contracts.canonical_json_line(thresholds)
+            ),
+            accepted_thresholds=accepted,
+            benchmark_manifest_digest=(
+                evidence.canonical_digest(benchmark) if benchmark is not None else None
+            ),
+        )
+        assert resource_report["verdict"] == "pass"
+        bodies["resource-gate-report"] = resource_contract.canonical_bytes(resource_report)
     return bodies
 
 
@@ -418,7 +488,9 @@ def _ready_contracts(
         "runner_image": _digest("5"),
     })
     for row in thresholds["thresholds"]:
-        row["limit"] = 1
+        row["limit"] = (
+            0 if row["metric"] in resource_contract._ZERO_INVARIANTS else 1
+        )
         if row["class"] == "regression":
             row["baseline_digest"] = _digest("c")
     corpus["sources"][-1]["attestation_digest"] = _digest("e")
@@ -616,6 +688,15 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
             measurements = []
             for threshold in thresholds["thresholds"]:
                 if threshold["gate_id"] == gate_id:
+                    if threshold["class"] == "regression":
+                        observed_value = 0
+                    elif threshold["operator"] == "at_least":
+                        observed_value = threshold["limit"]
+                    elif (gate_id in contracts.RESOURCE_REPORT_GATES and
+                          threshold["metric"] not in resource_contract._ZERO_INVARIANTS):
+                        observed_value = min(1, threshold["limit"])
+                    else:
+                        observed_value = 0
                     measurements.append({
                         "baseline_digest": threshold["baseline_digest"],
                         "class": threshold["class"],
@@ -624,7 +705,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "observed_trials": benchmark["repetitions"] if benchmark else 1,
                         "statistic": threshold["statistic"],
                         "unit": threshold["unit"],
-                        "value": 0 if threshold["operator"] == "at_most" else threshold["limit"],
+                        "value": observed_value,
                     })
             materials = []
             if gate_id == "C-TOOLS":
@@ -655,6 +736,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 benchmark=benchmark,
                 measurements=measurements,
                 environment=instances[0]["environment"],
+                evidence_instance_id=instances[0]["id"],
                 toolchain=supported_toolchain,
                 indexed=indexed,
                 policy=policy,
@@ -836,6 +918,22 @@ def _rewrite_supporting_artifact(
     _resign_gate(gate, arguments["identity"], arguments["trust_policy"])
 
 
+def _rewrite_resource_report(arguments: dict, gate_id: str, mutate) -> None:
+    indexed = next(
+        record for record in arguments["artifact_index"]["artifacts"]
+        if record["gate_id"] == gate_id and record["name"] == "resource-gate-report"
+    )
+    path = arguments["artifact_root"] / indexed["path"]
+    report = json.loads(path.read_bytes())
+    mutate(report)
+    _rewrite_supporting_artifact(
+        arguments,
+        gate_id,
+        "resource-gate-report",
+        resource_contract.canonical_bytes(report),
+    )
+
+
 def _rebind_scenario(arguments: dict) -> None:
     """Cascade changed accepted manifest bytes without changing substantive reports."""
     manifest_documents = {
@@ -886,6 +984,7 @@ def _rebind_scenario(arguments: dict) -> None:
                 benchmark=report["benchmark"],
                 measurements=report["measurements"],
                 environment=gate["environment"],
+                evidence_instance_id=report["instances"][0]["id"],
                 toolchain=gate["toolchain"],
                 indexed=arguments["artifact_index"]["artifacts"],
                 policy=arguments["trust_policy"],
@@ -1051,7 +1150,7 @@ class TestCommittedContracts:
         thresholds = _read(
             "release/evidence/threshold-benchmark-v1.json", contracts.read_threshold_manifest,
         )
-        assert len(thresholds["thresholds"]) == len(contracts.THRESHOLD_CONTRACTS) == 46
+        assert len(thresholds["thresholds"]) == len(contracts.THRESHOLD_CONTRACTS) == 56
         for gate_id in contracts.PERFORMANCE_OPERATIONS:
             classes = {
                 row["class"] for row in thresholds["thresholds"] if row["gate_id"] == gate_id
@@ -1193,7 +1292,8 @@ class TestSignatures:
 
 class TestIncompleteSemanticRegistry:
     def test_production_aggregation_refuses_unimplemented_obligation_semantics(self, tmp_path):
-        assert not contracts.SEMANTIC_VERIFIERS
+        assert set(contracts.SEMANTIC_VERIFIERS) == set(contracts.RESOURCE_SEMANTIC_GATES)
+        assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
@@ -1213,6 +1313,7 @@ class TestArtifactsAndAggregation:
                 )
 
         registry = dict(contracts.PROVISIONAL_SEMANTIC_VERIFIERS)
+        registry.update(contracts.SEMANTIC_VERIFIERS)
         for gate_id in set(contracts.SELECTED_RECORD_SLOTS) - set(contracts.LIVE_GATES):
             registry.setdefault(gate_id, verify_structural_fixture)
         monkeypatch.setattr(contracts, "SEMANTIC_VERIFIERS", registry)
@@ -1777,6 +1878,156 @@ class TestArtifactsAndAggregation:
 
         _rewrite_report(arguments, "C-PERF-RUNNER", mutate)
         with pytest.raises(evidence.EvidenceError, match="rerun a complete trial set"):
+            contracts.aggregate_records(**arguments)
+
+    @pytest.mark.parametrize("gate_id", contracts.RESOURCE_SEMANTIC_GATES)
+    def test_every_promoted_resource_gate_requires_its_semantic_report(
+        self, tmp_path, gate_id,
+    ):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, gate_id)
+
+        def omit_from_report(report, _gate):
+            for instance in report["instances"]:
+                instance["artifacts"] = [
+                    row for row in instance["artifacts"]
+                    if row["name"] != "resource-gate-report"
+                ]
+
+        _rewrite_report(arguments, gate_id, omit_from_report)
+        gate["artifacts"] = [
+            row for row in gate["artifacts"] if row["name"] != "resource-gate-report"
+        ]
+        arguments["artifact_index"]["artifacts"] = [
+            row for row in arguments["artifact_index"]["artifacts"]
+            if not (row["gate_id"] == gate_id and row["name"] == "resource-gate-report")
+        ]
+        _resign_gate(gate, arguments["identity"], arguments["trust_policy"])
+        with pytest.raises(evidence.EvidenceError, match="frozen obligation evidence contract"):
+            contracts.aggregate_records(**arguments)
+
+    def test_resource_report_cannot_self_select_threshold_policy(self, tmp_path):
+        arguments = _scenario(tmp_path)
+
+        def mutate(report):
+            measurement = next(
+                row for row in report["measurements"] if row["metric"] == "wall_time"
+            )
+            measurement["limit"] += 1
+
+        _rewrite_resource_report(arguments, "C-PERF-INGEST", mutate)
+        with pytest.raises(evidence.EvidenceError, match="accepted threshold policy"):
+            contracts.aggregate_records(**arguments)
+
+    def test_resource_report_cannot_swap_threshold_or_benchmark_identity(self, tmp_path):
+        threshold_swap = _scenario(tmp_path / "threshold")
+        _rewrite_resource_report(
+            threshold_swap,
+            "C-FAULT-DISK",
+            lambda report: report.__setitem__("threshold_manifest_digest", _digest("9")),
+        )
+        with pytest.raises(evidence.EvidenceError, match="committed threshold manifest"):
+            contracts.aggregate_records(**threshold_swap)
+
+        benchmark_swap = _scenario(tmp_path / "benchmark")
+        _rewrite_resource_report(
+            benchmark_swap,
+            "C-PERF-DISK",
+            lambda report: report.__setitem__("benchmark_manifest_digest", _digest("8")),
+        )
+        with pytest.raises(evidence.EvidenceError, match="benchmark identity"):
+            contracts.aggregate_records(**benchmark_swap)
+
+    def test_resource_report_body_cannot_be_relabelled_for_another_gate(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        source = next(
+            row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-FAULT-DISK" and row["name"] == "resource-gate-report"
+        )
+        body = (arguments["artifact_root"] / source["path"]).read_bytes()
+        _rewrite_supporting_artifact(
+            arguments, "C-FAULT-RESOLVER", "resource-gate-report", body,
+        )
+        with pytest.raises(evidence.EvidenceError, match="gate identity"):
+            contracts.aggregate_records(**arguments)
+
+    def test_resource_trial_digests_must_resolve_to_the_exact_signed_support_graph(
+        self, tmp_path,
+    ):
+        arguments = _scenario(tmp_path)
+        unrelated = next(
+            row["digest"] for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-FAULT-STORE" and row["name"] == "fault-matrix"
+        )
+
+        def mutate(report):
+            for trial in report["trials"]:
+                trial["artifact_digests"] = [unrelated]
+
+        _rewrite_resource_report(arguments, "C-FAULT-DISK", mutate)
+        with pytest.raises(evidence.EvidenceError, match="signed indexed supporting artifact"):
+            contracts.aggregate_records(**arguments)
+
+    def test_resource_measurements_must_reconcile_canonical_raw_trials(self, tmp_path):
+        arguments = _scenario(tmp_path)
+
+        def mutate(report):
+            for trial in report["trials"]:
+                trial["metric_facts"]["wall_time"] = 0
+            measurement = next(
+                row for row in report["measurements"] if row["metric"] == "wall_time"
+            )
+            measurement["value"] = 0
+            measurement["passed"] = True
+
+        _rewrite_resource_report(arguments, "C-PERF-INGEST", mutate)
+        with pytest.raises(evidence.EvidenceError, match="raw trials"):
+            contracts.aggregate_records(**arguments)
+
+    def test_resource_report_candidate_and_signed_instance_are_not_swappable(self, tmp_path):
+        candidate_swap = _scenario(tmp_path / "candidate")
+        _rewrite_resource_report(
+            candidate_swap,
+            "C-FAULT-DISK",
+            lambda report: report.__setitem__("candidate_identity_digest", _digest("7")),
+        )
+        with pytest.raises(evidence.EvidenceError, match="another candidate"):
+            contracts.aggregate_records(**candidate_swap)
+
+        interval_swap = _scenario(tmp_path / "interval")
+        _rewrite_resource_report(
+            interval_swap,
+            "C-FAULT-DISK",
+            lambda report: report.__setitem__("started_at", "2026-08-14T10:19:59Z"),
+        )
+        with pytest.raises(evidence.EvidenceError, match="outside its signed evidence instance"):
+            contracts.aggregate_records(**interval_swap)
+
+    def test_resource_report_cannot_move_to_an_identical_second_signed_instance(
+        self, tmp_path,
+    ):
+        arguments = _scenario(tmp_path)
+
+        def move_artifact(report, gate):
+            original = report["instances"][0]
+            resource_artifact = next(
+                row for row in original["artifacts"]
+                if row["name"] == "resource-gate-report"
+            )
+            original["artifacts"] = [
+                row for row in original["artifacts"]
+                if row["name"] != "resource-gate-report"
+            ]
+            second = copy.deepcopy(original)
+            second["id"] = "instance-01"
+            second["artifacts"] = [resource_artifact]
+            report["instances"].append(second)
+            gate["selection"] = {
+                name: value * 2 for name, value in gate["selection"].items()
+            }
+
+        _rewrite_report(arguments, "C-FAULT-DISK", move_artifact)
+        with pytest.raises(evidence.EvidenceError, match="another evidence instance"):
             contracts.aggregate_records(**arguments)
 
     @pytest.mark.parametrize(

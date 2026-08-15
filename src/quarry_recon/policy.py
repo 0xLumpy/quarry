@@ -371,6 +371,24 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.release_evidence:MAX_TAXONOMY_RECORD_BYTES": (
         "resource", "the allocation bound for one versioned pytest-taxonomy artifact; oversize input is "
                     "rejected rather than truncated or accepted as complete release evidence"),
+    "quarry_recon.resource_contract:MAX_RESOLVER_HOST_BYTES": (
+        "resource", "the encoded per-host allocation bound in one accepted resolver corpus; an oversized "
+                    "identity is rejected before resolution rather than truncated"),
+    "quarry_recon.resource_contract:MAX_RESOLVER_HOSTS": (
+        "resource", "the finite host-count support boundary for one resolver corpus; an overflow is "
+                    "refused before contact and retained exactly only when the bounded payload fits"),
+    "quarry_recon.resource_contract:MAX_RESOLVER_CORPUS_DEADLINE_SECONDS": (
+        "resource", "the finite default wall-clock authority for one resolver corpus; late workers are "
+                    "killed and cannot mutate the sealed result"),
+    "quarry_recon.resource_contract:MAX_ACQUISITION_LEASE_WAIT_SECONDS": (
+        "resource", "the finite default wait for cross-process filesystem and destination ownership; "
+                    "expiry refuses the acquisition rather than writing without authority"),
+    "quarry_recon.resource_contract:MAX_RESOLVER_RESULT_BYTES": (
+        "resource", "the nonblocking per-worker resolver result frame allocation bound; an oversized "
+                    "frame is rejected as invalid work output rather than partially decoded"),
+    "quarry_recon.resource_contract:MAX_RESOLVER_REMAINDER_BYTES": (
+        "resource", "the allocation bound for one exact durable resolver work record; an oversized "
+                    "corpus is terminally refused rather than partially persisted as replayable"),
     "quarry_recon.run_manifest:MAX_JSONL_LINE_BYTES": (
         "resource", "the allocation bound for validating one immutable manifest-bound JSONL record; an "
                     "oversized row invalidates the manifest rather than being truncated or accepted"),

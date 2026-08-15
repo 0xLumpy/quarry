@@ -18,14 +18,17 @@ from . import events
 MODELS = ("project_progress", "rerun_same_work")
 
 #: internal (non-scanner) lanes: they declare a model but are not registered sources, so they are exempt
-#: from the registered-source check. Their remainder is attributed to the store, not a provider.
-SYNTHETIC_LANES = frozenset({"store.envelope"})
+#: from the registered-source check. Their remainder is attributed to internal machinery, not a provider.
+SYNTHETIC_LANES = frozenset({"store.envelope", "netguard.resolve"})
 
 #: every lane that can report a remainder, and its model. Declared, never inferred from a number, and
 #: test-enforced: a lane that reports without declaring is one whose remainder nobody can interpret.
 LANE_MODEL: dict[str, str] = {
     # corpus-envelope overflow: a raised bound advances the refused keys
     "store.envelope": "project_progress",
+    # a resolver batch may continue only when its exact unresolved host payload was durably retained.
+    # Without that payload the producer emits a terminal machinery count instead of a fake retry queue.
+    "netguard.resolve": "project_progress",
     # sweep lanes: the rotation ledger is project-scoped, so a later child continues where this one
     # stopped (`budget.rotation_session`'s per-lane ledger, per-slot content-bound completion)
     "enrich.a1d_brute": "project_progress",

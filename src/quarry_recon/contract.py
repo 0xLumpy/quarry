@@ -26,7 +26,7 @@ import urllib.error as _urlerr
 from dataclasses import dataclass as _dataclass
 from pathlib import Path as _Path
 
-from . import events, normalize, sources
+from . import events, normalize, resource_contract as _resource_contract, sources
 from .runner import Status, _preflight_argv, _preflight_environment, run as _run, skipped
 
 # Non-clean terminal statuses that warrant a dedicated event before the normal tool_finish.
@@ -169,6 +169,12 @@ class IncompleteAcquisition(RuntimeError):
         self.partial = partial
 
 
+class AcquisitionLeaseBusy(IncompleteAcquisition):
+    """Another process owns the filesystem reservation or exact destination."""
+
+    error_class = "disk_busy"
+
+
 class AcquisitionTruncated(IncompleteAcquisition):
     """A stream stopped at our disk/byte policy — an incomplete acquisition whose cause is ours."""
 
@@ -307,17 +313,23 @@ class DiskGovernor:
     project_streamed: int = 0
     free_fn: object = None                          # injectable free-space probe; else shutil.disk_usage
     project_state: object = None                    # durable project-counter file (locked); None = in-memory only
+    run_state: object = None                        # durable per-run counter shared by every run worker process
     run_key: str = ""                               # identity of the run this governor scopes; a change rebuilds it
 
     def __post_init__(self):
         self._lock = _threading.RLock()             # serializes admit/take/commit/settle across threads
         self._inflight = 0                          # bytes granted this instant but not yet on disk
         self._legacy_inflight = 0
-        self._base_run_streamed = self.run_streamed
-        self._base_project_streamed = self.project_streamed
         self._descriptor_state = (0, {})
         if self.project_state is not None:
             self.project_streamed = _load_project_bytes(self.project_state)
+        if self.run_state is not None:
+            if (_Path(self.run_state) == _Path(self.project_state)
+                    if self.project_state is not None else False):
+                raise ValueError("run and project byte counters require distinct state files")
+            self.run_streamed = _load_project_bytes(self.run_state)
+        self._base_run_streamed = self.run_streamed
+        self._base_project_streamed = self.project_streamed
 
     def _sync_descriptor_totals(self) -> None:
         """Rebuild public totals from stable per-stream facts; safe to repeat."""
@@ -368,6 +380,50 @@ class DiskGovernor:
         s = _Path(self.project_state)
         return s.with_name(s.name + ".lock")
 
+    @staticmethod
+    def _counter_lockpath(path):
+        state = _Path(path)
+        return state.with_name(state.name + ".lock")
+
+    @classmethod
+    def _reserve_counter(cls, path, maximum: int, want: int) -> "int | None":
+        """One durable cross-process counter reservation, or None on unsafe state."""
+        from . import budget
+        try:
+            with budget.state_lock(cls._counter_lockpath(path)):
+                current = _load_project_bytes_strict(path)
+                take = max(0, min(want, maximum - current))
+                _store_project_bytes(path, current + take)
+                return take
+        except (budget.StateBusy, _UnreadableProjectState, OSError):
+            return None
+
+    @classmethod
+    def _refund_counter(cls, path, amount: int) -> "int | None":
+        """Return an unused reservation. Failure conservatively leaves it charged."""
+        from . import budget
+        try:
+            with budget.state_lock(cls._counter_lockpath(path)):
+                current = _load_project_bytes_strict(path)
+                total = max(0, current - amount)
+                _store_project_bytes(path, total)
+                return total
+        except (budget.StateBusy, _UnreadableProjectState, OSError):
+            return None
+
+    @classmethod
+    def _charge_counter(cls, path, amount: int) -> "int | None":
+        """Conservatively charge bytes observed outside a prior reservation."""
+        from . import budget
+        try:
+            with budget.state_lock(cls._counter_lockpath(path)):
+                current = _load_project_bytes_strict(path)
+                total = current + amount
+                _store_project_bytes(path, total)
+                return total
+        except (budget.StateBusy, _UnreadableProjectState, OSError):
+            return None
+
     def _inmem_room(self, path, written: int) -> "tuple[int | None, str | None]":
         """(room, binding layer) from the in-memory layers (response/run/reserve, and project when it has
         no durable file), charging persisted + in-flight. Caller holds `_lock`."""
@@ -391,29 +447,76 @@ class DiskGovernor:
     def _reserve_project(self, want: int) -> "int | None":
         """Reserve up to `want` durable project bytes under the file lock (read-modify-write). Granted
         bytes, or None to fail closed when the counter is unreadable, the lock is held, or the write fails."""
-        from . import budget
-        try:
-            with budget.state_lock(self._lockpath()):
-                current = _load_project_bytes_strict(self.project_state)
-                take = max(0, min(want, self.project_max - current))
-                _store_project_bytes(self.project_state, current + take)
-                self.project_streamed = current + take
-                return take
-        except (budget.StateBusy, _UnreadableProjectState, OSError):
-            return None
+        take = self._reserve_counter(self.project_state, self.project_max, want)
+        if take is not None:
+            self.project_streamed = _load_project_bytes(self.project_state)
+        return take
+
+    def _reserve_run(self, want: int) -> "int | None":
+        take = self._reserve_counter(self.run_state, self.run_max, want)
+        if take is not None:
+            total = _load_project_bytes(self.run_state)
+            # The durable total includes this grant and every older live grant.
+            # Rebase the charged scalar to the aggregate prior spend so a
+            # governor constructed before another process ran cannot report a
+            # process-local total after enforcing a global cap.
+            prior_spend = max(0, total - self._inflight - take)
+            self._base_run_streamed = max(self._base_run_streamed, prior_spend)
+        return take
 
     def _refund_project(self, amount: int) -> None:
         """Return `amount` over-reserved durable project bytes (a short/failed write). A refund we cannot
         persist over-counts usage — the fail-closed direction — so it is not surfaced as an error."""
-        from . import budget
-        try:
-            with budget.state_lock(self._lockpath()):
-                current = _load_project_bytes_strict(self.project_state)
-                total = max(0, current - amount)
-                _store_project_bytes(self.project_state, total)
+        total = self._refund_counter(self.project_state, amount)
+        if total is not None:
+            self.project_streamed = total
+
+    def _refund_run(self, amount: int) -> None:
+        self._refund_counter(self.run_state, amount)
+
+    def _reserve_durable(self, want: int) -> "tuple[int, str | None]":
+        """Reserve run+project caps without leaking one side when the other binds."""
+        granted = want
+        run_reserved = 0
+        binding = None
+        if self.run_max and self.run_state is not None:
+            reserved = self._reserve_run(granted)
+            if reserved is None:
+                return 0, LAYER_RUN
+            run_reserved = reserved
+            granted = reserved
+            if granted < want:
+                binding = LAYER_RUN
+        if self.project_max and self.project_state is not None:
+            reserved = self._reserve_project(granted)
+            if reserved is None:
+                if run_reserved:
+                    self._refund_run(run_reserved)
+                return 0, LAYER_PROJECT
+            if reserved < granted:
+                if run_reserved > reserved:
+                    self._refund_run(run_reserved - reserved)
+                return reserved, LAYER_PROJECT
+            granted = reserved
+        return granted, binding
+
+    def _refund_durable(self, amount: int) -> None:
+        if amount <= 0:
+            return
+        if self.run_max and self.run_state is not None:
+            self._refund_run(amount)
+        if self.project_max and self.project_state is not None:
+            self._refund_project(amount)
+
+    def _charge_unreserved_durable(self, amount: int) -> None:
+        if amount <= 0:
+            return
+        if self.run_max and self.run_state is not None:
+            self._charge_counter(self.run_state, amount)
+        if self.project_max and self.project_state is not None:
+            total = self._charge_counter(self.project_state, amount)
+            if total is not None:
                 self.project_streamed = total
-        except (budget.StateBusy, _UnreadableProjectState, OSError):
-            pass
 
     def admit(self, path) -> "str | None":
         """Pre-contact gate: the binding layer name when there is NO budget to begin, else None. An
@@ -423,6 +526,16 @@ class DiskGovernor:
             room, layer = self._inmem_room(path, 0)
             if room is not None and room <= 0:
                 return layer
+            if self.run_max and self.run_state is not None:
+                try:
+                    current = _load_project_bytes_strict(self.run_state)
+                except _UnreadableProjectState:
+                    return LAYER_RUN
+                if not self._inflight:
+                    self._base_run_streamed = max(self._base_run_streamed, current)
+                    self._sync_descriptor_totals()
+                if self.run_max - current <= 0:
+                    return LAYER_RUN
             if self.project_max and self.project_state is not None:
                 from . import budget
                 try:
@@ -442,12 +555,10 @@ class DiskGovernor:
             room, layer = self._inmem_room(path, written)
             granted = want if room is None else max(0, min(want, room))
             binding = layer if (room is not None and granted < want) else None
-            if self.project_max and self.project_state is not None:
-                pg = self._reserve_project(granted)
-                if pg is None:
-                    return 0, LAYER_PROJECT          # durable project state unreadable/held: refuse
-                if pg < granted:
-                    granted, binding = pg, LAYER_PROJECT
+            durable_grant, durable_binding = self._reserve_durable(granted)
+            if durable_grant < granted or durable_binding is not None:
+                granted = durable_grant
+                binding = durable_binding
             self._legacy_inflight += granted
             self._sync_descriptor_totals()
             return granted, binding
@@ -472,8 +583,7 @@ class DiskGovernor:
             self._rebase_public_totals()
             self._legacy_inflight -= leftover
             self._sync_descriptor_totals()
-        if self.project_max and self.project_state is not None:
-            self._refund_project(leftover)
+        self._refund_durable(leftover)
 
     def _begin_descriptor_stream(self) -> "_DescriptorStreamReservation":
         """Create an inert token; activation happens only under both stream fences."""
@@ -485,8 +595,6 @@ class DiskGovernor:
         """Install a token before its first grant; safe to repeat during unwind."""
         if reservation.governor is not self:
             raise RuntimeError("descriptor stream reservation belongs to another governor")
-        if self.project_max and self.project_state is not None:
-            raise ValueError("managed descriptor streaming refuses a durable project limit")
         with self._lock:
             self._rebase_public_totals()
             settled_charged, active = self._descriptor_state
@@ -516,6 +624,10 @@ class DiskGovernor:
             room, layer = self._inmem_room(path, written)
             granted = want if room is None else max(0, min(want, room))
             binding = layer if (room is not None and granted < want) else None
+            durable_grant, durable_binding = self._reserve_durable(granted)
+            if durable_grant < granted or durable_binding is not None:
+                granted = durable_grant
+                binding = durable_binding
             next_active = dict(active)
             next_active[reservation.token] = (
                 granted_total + granted, charged, False,
@@ -555,6 +667,7 @@ class DiskGovernor:
                 raise RuntimeError("descriptor stream byte accounting is inconsistent")
             next_active = dict(active)
             if terminal:
+                self._refund_durable(granted - written)
                 reservation.terminal_written = written
                 next_active[reservation.token] = (written, written, True)
             else:
@@ -579,6 +692,8 @@ class DiskGovernor:
                 raise RuntimeError("descriptor stream reservation is not active")
             granted, charged, _terminal = facts
             conservative_charge = max(granted, charged, minimum_charge)
+            if conservative_charge > granted:
+                self._charge_unreserved_durable(conservative_charge - granted)
             next_active = dict(active)
             reservation.terminal_written = conservative_charge
             next_active[reservation.token] = (
@@ -661,6 +776,11 @@ def _current_scope() -> "tuple[str, object]":
 def _build_governor(*, run_key: str = "", project_state=None) -> DiskGovernor:
     from . import settings
     m = _ACQUIRE_BYTES_MAX
+    run_state = None
+    if run_key and project_state is not None:
+        run_identity = _hashlib.sha256(run_key.encode("utf-8")).hexdigest()
+        project = _Path(project_state)
+        run_state = project.with_name(f"acquire-run-{run_identity}-bytes.json")
     return DiskGovernor(
         response_max=_governor_ceiling("ACQUIRE_RESPONSE_MAX_BYTES",
             *settings.strict_int_with_source("ACQUIRE_RESPONSE_MAX_BYTES", default=0, maximum=m)),
@@ -671,7 +791,7 @@ def _build_governor(*, run_key: str = "", project_state=None) -> DiskGovernor:
         reserve_bytes=_governor_ceiling("ACQUIRE_FREE_RESERVE_BYTES",
             *settings.strict_int_with_source("ACQUIRE_FREE_RESERVE_BYTES",
                                              default=_FREE_RESERVE_DEFAULT, maximum=m)),
-        run_key=run_key, project_state=project_state)
+        run_key=run_key, project_state=project_state, run_state=run_state)
 
 
 _shared_governor: "DiskGovernor | None" = None
@@ -704,12 +824,12 @@ def _ondisk_size(fh) -> "int | None":
         return None
 
 
-def _path_size(path) -> int:
-    """The file's size on disk, or 0 when it is absent/unstattable."""
+def _path_size(path) -> "int | None":
+    """The file's size on disk, or ``None`` when it cannot be established."""
     try:
         return _os.stat(path).st_size
     except OSError:
-        return 0
+        return None
 
 
 def _open_part_wb(part):
@@ -730,19 +850,50 @@ def _fsync_quiet(fh) -> None:
 def stream_to_file(r, dest, *, chunk: int = 1024 * 1024, deadline_s: float = 300.0,
                    governor: "DiskGovernor | None" = None) -> "tuple[int, str]":
     """Stream a response to `dest` atomically -> (bytes, sha256), bounded by `governor` (bytes/free-space/
-    time); a policy stop raises AcquisitionTruncated, a broken transport raises IncompleteAcquisition."""
-    import time as _time
+    time); a policy stop raises AcquisitionTruncated, a broken transport raises IncompleteAcquisition.
+
+    The filesystem reservation and exact destination lease span staging, every
+    free-space decision, fsync and publication.  They are process-wide kernel
+    locks, so separate processes cannot probe/spend one reserve concurrently or
+    share ``<dest>.part``. Threads using one governor retain its aggregate
+    in-flight accounting. Distinct governors serialize at the filesystem fence
+    so their free-space observations cannot spend the same reserve.
+    """
     gov = governor if governor is not None else default_governor()
     dest = _Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    outcome = None
+    progress = [0]
+    try:
+        with _resource_contract.acquisition_lease(dest, local_group=gov) as lease:
+            outcome = _stream_to_file_owned(
+                r, dest, chunk=chunk, deadline_s=deadline_s, governor=gov,
+                lease=lease, progress=progress,
+            )
+            return outcome
+    except _resource_contract.ResourceLeaseUnavailable as exc:
+        raise AcquisitionLeaseBusy(
+            f"acquisition destination/resource lease unavailable: {exc}",
+            bytes_written=outcome[0] if outcome is not None else progress[0], partial=None,
+        ) from exc
+
+
+def _stream_to_file_owned(r, dest, *, chunk: int, deadline_s: float,
+                          governor: DiskGovernor,
+                          lease: _resource_contract.AcquisitionLease,
+                          progress: list[int]) -> "tuple[int, str]":
+    """The legacy stream body; caller holds filesystem+destination ownership."""
+    import time as _time
+    gov = governor
+    dest = _Path(dest)
     part = dest.with_name(dest.name + ".part")
+    anchored_part = lease.child_path(lease.name + ".part")
     digest = _hashlib.sha256()
     written = 0
     granted_total = 0
     opened = False                                      # only a `.part` this call opened may be measured/charged
     end = _time.monotonic() + deadline_s if deadline_s and deadline_s > 0 else None
     try:
-        with _open_part_wb(part) as fh:                 # O_NOFOLLOW: a symlinked/failed open never gets here
+        with _open_part_wb(anchored_part) as fh:        # pinned parent + O_NOFOLLOW final component
             opened = True
             while True:
                 if end is not None and _time.monotonic() > end:
@@ -750,47 +901,60 @@ def stream_to_file(r, dest, *, chunk: int = 1024 * 1024, deadline_s: float = 300
                 buf = r.read(chunk)
                 if not buf:
                     break
-                # take reserves; commit charges only the bytes measured on disk. A short landing or a short
-                # grant is the policy boundary
-                granted, layer = gov.take(dest.parent, written, len(buf))
-                granted_total += granted
-                write_error = None
-                if granted:
-                    try:
-                        fh.write(buf[:granted]); fh.flush()
-                    except (KeyboardInterrupt, SystemExit):
-                        raise
-                    except Exception as we:
-                        write_error = we             # bytes may have partly landed: charge them below, then raise
-                    # charge exactly what reached disk (measured), whether the write/flush succeeded or failed,
-                    # so a flush failure never refunds bytes retained on disk
-                    size = _ondisk_size(fh)
-                    landed = min(max(0, size - written), granted) if size is not None else 0
-                    if landed:
-                        digest.update(buf[:landed]); written += landed; gov.commit(landed)
-                else:
-                    landed = 0
-                if write_error is not None:
-                    _fsync_quiet(fh)
-                    raise IncompleteAcquisition(
-                        f"write failed after {written} byte(s) reached disk: {write_error}",
-                        bytes_written=written, partial=part) from write_error
-                if landed < granted:
-                    # fewer bytes reached disk than we handed the sink: what is on disk is all there is
-                    _fsync_quiet(fh)
-                    raise IncompleteAcquisition(
-                        f"short write: {landed} of {granted} granted byte(s) reached disk after {written} total",
-                        bytes_written=written, partial=part)
-                if granted < len(buf):
-                    _fsync_quiet(fh)
-                    raise AcquisitionTruncated(
-                        f"acquisition stopped at the {layer} policy after {written} byte(s)",
-                        bytes_written=written, partial=part, limit_kind=layer,
-                        limit_bytes=getattr(gov, _LAYER_CAP_ATTR[layer], 0))
+                # The kernel filesystem lease spans the operation for
+                # cross-process exclusion.  Within this process, distinct
+                # governors share that lease, so serialize only the reserve
+                # observation and its bounded write.  Provider reads remain
+                # concurrent and the next governor cannot observe the old free
+                # space until this one's landing/accounting is reconciled.
+                with _resource_contract.reservation_fence(lease, gov):
+                    # take reserves; commit charges only the bytes measured on disk. A short landing or a short
+                    # grant is the policy boundary
+                    granted, layer = gov.take(lease.budget_path, written, len(buf))
+                    granted_total += granted
+                    write_error = None
+                    if granted:
+                        try:
+                            fh.write(buf[:granted]); fh.flush()
+                        except (KeyboardInterrupt, SystemExit):
+                            raise
+                        except Exception as we:
+                            write_error = we         # bytes may have partly landed: charge them below, then raise
+                        # charge exactly what reached disk (measured), whether the write/flush succeeded or failed,
+                        # so a flush failure never refunds bytes retained on disk
+                        size = _ondisk_size(fh)
+                        landed = min(max(0, size - written), granted) if size is not None else 0
+                        if landed:
+                            digest.update(buf[:landed]); written += landed; gov.commit(landed)
+                            progress[0] = written
+                    else:
+                        landed = 0
+                    if write_error is not None:
+                        _fsync_quiet(fh)
+                        raise IncompleteAcquisition(
+                            f"write failed after {written} byte(s) reached disk: {write_error}",
+                            bytes_written=written, partial=part) from write_error
+                    if landed < granted:
+                        # fewer bytes reached disk than we handed the sink: what is on disk is all there is
+                        _fsync_quiet(fh)
+                        raise IncompleteAcquisition(
+                            f"short write: {landed} of {granted} granted byte(s) reached disk after {written} total",
+                            bytes_written=written, partial=part)
+                    if granted < len(buf):
+                        _fsync_quiet(fh)
+                        raise AcquisitionTruncated(
+                            f"acquisition stopped at the {layer} policy after {written} byte(s)",
+                            bytes_written=written, partial=part, limit_kind=layer,
+                            limit_bytes=getattr(gov, _LAYER_CAP_ATTR[layer], 0))
             fh.flush()
             _os.fsync(fh.fileno())
     except (KeyboardInterrupt, SystemExit):
         raise
+    except _resource_contract.ResourceLeaseUnavailable as e:
+        raise IncompleteAcquisition(
+            f"response retained under a destination whose parent identity changed: {e}",
+            bytes_written=written, partial=None,
+        ) from e
     except IncompleteAcquisition:
         raise                                           # our own truncation/short-write already carries partial+cause
     except Exception as e:
@@ -801,20 +965,58 @@ def stream_to_file(r, dest, *, chunk: int = 1024 * 1024, deadline_s: float = 300
         # only a `.part` this call opened; post-close: charge the close-flush delta, release the rest, and
         # sync the in-flight exception's count to what was charged
         if opened:
-            extra = _path_size(part) - written
-            if extra > 0:
-                gov.commit(extra); written += extra
-            gov.settle(granted_total, written)
+            post_close_size = _path_size(anchored_part)
             exc = _sys.exc_info()[1]
-            if isinstance(exc, IncompleteAcquisition):
+            if post_close_size is None and granted_total > written:
+                # A write was handed to the descriptor, but neither the live
+                # descriptor nor its durable name can establish the landed byte
+                # count. Releasing any grant could overspend the reserve, so the
+                # full grant stays charged and the partial is explicitly
+                # uncertain rather than rendered as an observed zero.
+                uncharged = max(0, granted_total - written)
+                if uncharged:
+                    gov.commit(uncharged)
+                gov.settle(granted_total, granted_total)
+                if exc is None:
+                    exc = IncompleteAcquisition(
+                        "response bytes landed but their durable size cannot be reconciled",
+                        bytes_written=0, partial=part,
+                    )
+                    raise_after_settlement = True
+                else:
+                    raise_after_settlement = False
+                try:
+                    exc.bytes_written = None
+                    exc.partial = part
+                    exc.content_uncertain = True
+                    exc.acquisition_accounting_uncertainty = (
+                        "both descriptor and durable-name size probes were unavailable"
+                    )
+                    exc.acquisition_accounting_charged_bytes = granted_total
+                    exc.acquisition_observed_bytes = None
+                except BaseException:
+                    pass
+                if raise_after_settlement:
+                    raise exc
+            else:
+                extra = max(0, (post_close_size or 0) - written)
+                if extra > 0:
+                    gov.commit(extra); written += extra
+                    progress[0] = written
+                gov.settle(granted_total, written)
+            if isinstance(exc, IncompleteAcquisition) and not getattr(
+                    exc, "content_uncertain", False):
                 exc.bytes_written = written
     # publish is part of the acquisition: a failed replace leaves the body in `.part`, so raise a typed
     # incomplete carrying its path + count (probe/fetch recompute the digest) rather than a bare OSError
     try:
-        _os.replace(part, dest)
-    except OSError as e:
+        lease.assert_named_parent()
+        _os.replace(anchored_part, lease.child_path(lease.name))
+        lease.assert_named_parent()
+    except (OSError, _resource_contract.ResourceLeaseUnavailable) as e:
         raise IncompleteAcquisition(f"acquired {written} byte(s) but publication failed: {e}",
-                                    bytes_written=written, partial=part) from e
+                                    bytes_written=written,
+                                    partial=(part if isinstance(e, OSError) else None)) from e
     return written, digest.hexdigest()
 
 
@@ -830,14 +1032,16 @@ class _DescriptorStreamLedger:
     """One mutable truth for descriptor bytes, digest and governor reservation."""
 
     __slots__ = (
-        "fd", "budget_path", "governor", "reservation", "state", "identity",
+        "fd", "budget_path", "governor", "lease", "reservation", "state", "identity",
         "accounting_uncertainty", "accounting_charged", "accounting_observed",
     )
 
-    def __init__(self, fd: int, budget_path, governor: DiskGovernor) -> None:
+    def __init__(self, fd: int, budget_path, governor: DiskGovernor,
+                 lease: "_resource_contract.AcquisitionLease | None" = None) -> None:
         self.fd = fd
         self.budget_path = budget_path
         self.governor = governor
+        self.lease = lease
         self.reservation = governor._begin_descriptor_stream()
         self.state = (_hashlib.sha256(), 0, b"", 0, 0, None)
         observed = _os.fstat(fd)
@@ -932,7 +1136,14 @@ class _DescriptorStreamLedger:
     def settle(self) -> None:
         # Never release a grant while the descriptor's size is unknown.  An
         # outer fence retries this whole idempotent sequence after interruption.
-        self.reconcile_descriptor(terminal=True)
+        if self.lease is None:
+            # Private unit tests exercise ledger state transitions without a
+            # publication path. Production construction always supplies the
+            # pinned filesystem lease above.
+            self.reconcile_descriptor(terminal=True)
+        else:
+            with _resource_contract.reservation_fence(self.lease, self.governor):
+                self.reconcile_descriptor(terminal=True)
 
     def finalize(self) -> None:
         self.reservation.finalize()
@@ -1074,7 +1285,8 @@ def preflight_stream_to_fd(*, chunk: int = 1024 * 1024,
 
 def _stream_to_fd_body(r, writer_fd: int, chunk: int, deadline_s: float,
                        end, ledger: _DescriptorStreamLedger,
-                       governor: DiskGovernor) -> "tuple[int, str]":
+                       governor: DiskGovernor,
+                       lease: _resource_contract.AcquisitionLease) -> "tuple[int, str]":
     """The response loop; its caller holds both settlement fences."""
     import time as _time
 
@@ -1086,27 +1298,28 @@ def _stream_to_fd_body(r, writer_fd: int, chunk: int, deadline_s: float,
             ledger.begin_chunk(incoming)
             if not ledger.active:
                 break
-            ledger.take()
-            while ledger.active_offset < ledger.active_granted:
-                before = ledger.written
-                try:
-                    _os.write(
-                        writer_fd,
-                        ledger.active[ledger.active_offset:ledger.active_granted],
+            with _resource_contract.reservation_fence(lease, governor):
+                ledger.take()
+                while ledger.active_offset < ledger.active_granted:
+                    before = ledger.written
+                    try:
+                        _os.write(
+                            writer_fd,
+                            ledger.active[ledger.active_offset:ledger.active_granted],
+                        )
+                    except InterruptedError:
+                        continue
+                    ledger.reconcile_descriptor()
+                    if ledger.written <= before:
+                        raise OSError("managed acquisition write made no progress")
+                if ledger.active_granted < len(ledger.active):
+                    raise AcquisitionTruncated(
+                        f"acquisition stopped at the {ledger.binding} policy after "
+                        f"{ledger.written} byte(s)",
+                        bytes_written=ledger.written, partial=None,
+                        limit_kind=ledger.binding,
+                        limit_bytes=getattr(governor, _LAYER_CAP_ATTR[ledger.binding], 0),
                     )
-                except InterruptedError:
-                    continue
-                ledger.reconcile_descriptor()
-                if ledger.written <= before:
-                    raise OSError("managed acquisition write made no progress")
-            if ledger.active_granted < len(ledger.active):
-                raise AcquisitionTruncated(
-                    f"acquisition stopped at the {ledger.binding} policy after "
-                    f"{ledger.written} byte(s)",
-                    bytes_written=ledger.written, partial=None,
-                    limit_kind=ledger.binding,
-                    limit_bytes=getattr(governor, _LAYER_CAP_ATTR[ledger.binding], 0),
-                )
         _os.fsync(writer_fd)
     except (KeyboardInterrupt, SystemExit, IncompleteAcquisition):
         raise
@@ -1154,24 +1367,39 @@ def stream_to_fd(r, writer_fd: int, *, budget_path, mirror_fd: int | None = None
         raise ValueError(
             "managed acquisition writer must be an empty private regular descriptor at offset zero",
         )
-    ledger = _DescriptorStreamLedger(writer_fd, budget_path, gov)
-    settlement = _DescriptorStreamSettlement(ledger)
-    end = _time.monotonic() + deadline_s if deadline_s else None
-    finalizer = _DescriptorStreamFence(settlement, finalize=True)
-    # This handler is active before any fence starts unwinding.  In particular,
-    # cancellation at the first traced line of the outermost ``__exit__`` has
-    # not yet entered that method's own try block, so recover it here.
     try:
-        with finalizer:
-            with _DescriptorStreamFence(settlement):
-                with _DescriptorStreamFence(settlement):
-                    ledger.activate()
-                    return _stream_to_fd_body(
-                        r, writer_fd, chunk, deadline_s, end, ledger, gov,
-                    )
-    except BaseException as primary:
-        finalizer._leave(primary)
-        raise
+        reservation_name = _Path(budget_path) / ".quarry-filesystem-reservation"
+        with _resource_contract.acquisition_lease(
+            reservation_name, filesystem_only=True, local_group=gov,
+        ) as lease:
+            ledger = _DescriptorStreamLedger(writer_fd, budget_path, gov, lease)
+            settlement = _DescriptorStreamSettlement(ledger)
+            end = _time.monotonic() + deadline_s if deadline_s else None
+            finalizer = _DescriptorStreamFence(settlement, finalize=True)
+            # This handler is active before any fence starts unwinding.  In particular,
+            # cancellation at the first traced line of the outermost ``__exit__`` has
+            # not yet entered that method's own try block, so recover it here.
+            try:
+                with finalizer:
+                    with _DescriptorStreamFence(settlement):
+                        with _DescriptorStreamFence(settlement):
+                            ledger.activate()
+                            return _stream_to_fd_body(
+                                r, writer_fd, chunk, deadline_s, end, ledger, gov,
+                                lease,
+                            )
+            except BaseException as primary:
+                finalizer._leave(primary)
+                raise
+    except _resource_contract.ResourceLeaseUnavailable as exc:
+        try:
+            observed = max(0, _os.fstat(writer_fd).st_size - initial.st_size)
+        except OSError:
+            observed = 0
+        raise AcquisitionLeaseBusy(
+            f"managed acquisition filesystem reservation unavailable: {exc}",
+            bytes_written=observed, partial=None,
+        ) from exc
 
 
 class ResponseTooLarge(ValueError):
