@@ -903,6 +903,45 @@ def test_pointer_substitution_during_final_run_fsync_is_ambiguous(
     assert sink.revised is False
 
 
+def test_pointer_substitution_during_semantic_settlement_is_ambiguous(
+    tmp_path, monkeypatch,
+):
+    run = _sealed(tmp_path)
+    sink = revision.ingest(run, "v310.fixture")
+    assert sink.add("url", {"url": "https://base.example.com/late"})
+    real_replace = revision.os.replace
+    real_read = revision.read
+    state = {"published": False, "swapped": False}
+
+    def replace(source, destination, *args, **kwargs):
+        result = real_replace(source, destination, *args, **kwargs)
+        if destination == revision.POINTER_NAME:
+            state["published"] = True
+        return result
+
+    def read(run_dir):
+        result = real_read(run_dir)
+        pointer = revision.pointer_path(run.dir)
+        if state["published"] and pointer.exists() and not state["swapped"]:
+            held = pointer.parent / "held-pointer.json"
+            decoy = pointer.parent / "decoy-pointer.json"
+            decoy.write_bytes(pointer.read_bytes())
+            decoy.chmod(0o600)
+            pointer.rename(held)
+            decoy.rename(pointer)
+            state["swapped"] = True
+        return result
+
+    monkeypatch.setattr(revision.os, "replace", replace)
+    monkeypatch.setattr(revision, "read", read)
+    with pytest.raises(revision.RevisionPublicationError, match="ambiguous") as caught:
+        sink.commit()
+
+    assert caught.value.outcome == "ambiguous"
+    assert state == {"published": True, "swapped": True}
+    assert sink.revised is False
+
+
 @pytest.mark.parametrize("prior", [False, True])
 def test_post_durability_segment_substitution_never_settles_landed(
     tmp_path, monkeypatch, prior,

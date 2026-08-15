@@ -1856,7 +1856,7 @@ def _read_pointer_authority(
 def _durably_settle_pointer_authority(
     run_dir: Path, expected: bytes, *, run_identity: tuple[int, int],
     revisions_identity: tuple[int, int],
-) -> None:
+) -> tuple[int, ...]:
     """Fsync the current canonical pointer, then prove its name and hierarchy."""
     run_fd, revisions_fd = _open_revision_authority(
         run_dir, run_identity=run_identity, revisions_identity=revisions_identity,
@@ -1899,6 +1899,7 @@ def _durably_settle_pointer_authority(
         expected_identity=identity,
     ) != expected:
         raise OSError("canonical revision pointer changed after durability")
+    return identity
 
 
 def _write_all(fd: int, body: bytes) -> None:
@@ -2044,7 +2045,7 @@ def _settle_pointer_fault(
             # Even a publisher that observed its own directory fsync may have
             # had the canonical pointer inode substituted inside that callback.
             # Seal the exact current bytes and rebind their name before trust.
-            _durably_settle_pointer_authority(
+            pointer_identity = _durably_settle_pointer_authority(
                 run_dir, intended, run_identity=run_directory_identity,
                 revisions_identity=directory_identity,
             )
@@ -2062,6 +2063,7 @@ def _settle_pointer_fault(
             if _read_pointer_authority(
                 run_dir, run_identity=run_directory_identity,
                 revisions_identity=directory_identity,
+                expected_identity=pointer_identity,
             ) != intended:
                 return _PointerSettlement("ambiguous")
         except Exception:
