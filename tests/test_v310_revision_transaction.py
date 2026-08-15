@@ -456,6 +456,32 @@ def test_canonical_revision_directory_substitution_never_returns_success(tmp_pat
     assert revision.read(run.dir).status == "absent"
 
 
+def test_pointer_settlement_requires_the_original_run_directory_even_after_durability(tmp_path):
+    run = _sealed(tmp_path)
+    published = _generic_revision(run, "url", {"url": "https://base.example.com/late"})
+    pointer = revision.pointer_path(run.dir)
+    document = revision._strict_json(pointer.read_bytes(), "revision pointer")
+    candidate = revision._certify_document(run.dir, document)
+    assert (candidate.status, candidate.revision) == ("valid", published.revision)
+    run_identity = revision._private_directory_identity(run.dir)
+    revisions_identity = revision._private_directory_identity(revision.revisions_dir(run.dir))
+    canonical = run.dir
+    held = canonical.parent / f"{canonical.name}-held"
+    canonical.rename(held)
+    privfs.private_dir(canonical)
+    for child in list(held.iterdir()):
+        child.rename(canonical / child.name)
+
+    settlement = revision._settle_pointer_fault(
+        canonical, document, candidate, None, revisions_identity, run_identity,
+        already_durable=True,
+    )
+
+    assert settlement.outcome == "ambiguous"
+    assert revision._private_directory_identity(canonical) != run_identity
+    assert revision._private_directory_identity(revision.revisions_dir(canonical)) == revisions_identity
+
+
 @pytest.mark.parametrize("sentinel", [KeyboardInterrupt("cancel"), SystemExit("exit")])
 def test_prepublication_control_flow_is_preserved_exactly(tmp_path, monkeypatch, sentinel):
     run = _sealed(tmp_path)
@@ -661,6 +687,101 @@ def test_raw_durability_rejects_descendant_aba_substitution(tmp_path, monkeypatc
         )
     assert state["swapped"] is True
     assert actual.read_text() == decoy.read_text() == "same bytes\n"
+
+
+def test_tree_durability_rewalks_canonical_names_after_fsync(tmp_path, monkeypatch):
+    root = privfs.private_dir(tmp_path / "tree")
+    actual = root / "proof.bin"
+    privfs.write_private(actual, "same bytes\n")
+    decoy = tmp_path / "decoy.bin"
+    privfs.write_private(decoy, "same bytes\n")
+    held = root / "held.bin"
+    actual_inode = actual.stat().st_ino
+    root_identity = revision._private_directory_identity(root)
+    real_fsync = revision.os.fsync
+    state = {"swapped": False, "actual_synced": False, "decoy_synced": False}
+
+    def swap(fd):
+        inode = os.fstat(fd).st_ino
+        if inode == actual_inode and not state["swapped"]:
+            state["swapped"] = True
+            actual.rename(held)
+            decoy.rename(actual)
+        if inode == actual_inode:
+            state["actual_synced"] = True
+        elif state["swapped"] and inode == actual.stat().st_ino:
+            state["decoy_synced"] = True
+        return real_fsync(fd)
+
+    monkeypatch.setattr(revision.os, "fsync", swap)
+    with pytest.raises(OSError, match="changed during durability"):
+        revision._fsync_tree(root, root_identity=root_identity)
+    assert state == {"swapped": True, "actual_synced": True, "decoy_synced": False}
+
+
+def test_raw_durability_rewalks_descendant_names_after_fsync(tmp_path, monkeypatch):
+    run_dir = privfs.private_dir(tmp_path / "run")
+    revisions = privfs.private_dir(run_dir / "revisions")
+    raw = privfs.private_dir(revisions / "raw")
+    actual_dir = privfs.private_dir(raw / "a")
+    decoy_dir = privfs.private_dir(raw / "decoy")
+    actual = actual_dir / "proof.bin"
+    decoy = decoy_dir / "proof.bin"
+    privfs.write_private(actual, "same bytes\n")
+    privfs.write_private(decoy, "same bytes\n")
+    ref = "revisions/raw/a/proof.bin"
+    root_identity = revision._private_directory_identity(revisions)
+    identities = {}
+    claims = revision._raw_file_claims(
+        run_dir, [{"record": {"raw_ref": ref}}], root_identity=root_identity,
+        identity_claims=identities,
+    )
+    actual_inode = actual.stat().st_ino
+    held = raw / "held"
+    real_fsync = revision.os.fsync
+    state = {"swapped": False}
+
+    def swap(fd):
+        if os.fstat(fd).st_ino == actual_inode and not state["swapped"]:
+            state["swapped"] = True
+            actual_dir.rename(held)
+            decoy_dir.rename(actual_dir)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(revision.os, "fsync", swap)
+    with pytest.raises(OSError, match="directory name changed during durability"):
+        revision._fsync_raw_claims(
+            run_dir, claims, root_identity=root_identity,
+            identity_claims=identities,
+        )
+    assert state["swapped"] is True
+
+
+def test_raw_durability_closes_an_unsafe_descendant_on_every_refusal(tmp_path):
+    run_dir = privfs.private_dir(tmp_path / "run")
+    revisions = privfs.private_dir(run_dir / "revisions")
+    raw = privfs.private_dir(revisions / "raw")
+    actual_dir = privfs.private_dir(raw / "a")
+    actual = actual_dir / "proof.bin"
+    privfs.write_private(actual, "proof\n")
+    ref = "revisions/raw/a/proof.bin"
+    root_identity = revision._private_directory_identity(revisions)
+    identities = {}
+    claims = revision._raw_file_claims(
+        run_dir, [{"record": {"raw_ref": ref}}], root_identity=root_identity,
+        identity_claims=identities,
+    )
+    actual_dir.chmod(0o755)
+    before = len(os.listdir("/proc/self/fd"))
+
+    for _ in range(32):
+        with pytest.raises(OSError, match="unsafe private directory"):
+            revision._fsync_raw_claims(
+                run_dir, claims, root_identity=root_identity,
+                identity_claims=identities,
+            )
+
+    assert len(os.listdir("/proc/self/fd")) == before
 
 
 def test_oob_close_after_effect_keeps_the_landed_raw_proof(tmp_path, monkeypatch):

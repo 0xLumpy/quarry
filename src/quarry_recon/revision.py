@@ -1409,12 +1409,19 @@ def _stale_view_files(run_dir, rev: Revision) -> list[str]:
 
 
 def _fsync_directory(path: Path, *, directory_identity: tuple[int, int]) -> None:
+    path = Path(path)
     fd = _open_private_directory_path(
-        Path(path), expected_identity=directory_identity,
+        path, expected_identity=directory_identity,
     )
+    check_fd = -1
     try:
         os.fsync(fd)
+        check_fd = _open_private_directory_path(
+            path, expected_identity=directory_identity,
+        )
     finally:
+        if check_fd >= 0:
+            os.close(check_fd)
         os.close(fd)
 
 
@@ -1423,6 +1430,7 @@ def _fsync_tree(root: Path, *, root_identity: tuple[int, int]) -> None:
     root = Path(root)
     root_fd = _open_private_directory_path(root, expected_identity=root_identity)
     count = 0
+    expected_tree: dict[tuple[str, ...], tuple[str, tuple[int, ...]]] = {}
 
     def sync(directory_fd: int, relative: Path, depth: int) -> None:
         nonlocal count
@@ -1445,15 +1453,19 @@ def _fsync_tree(root: Path, *, root_identity: tuple[int, int]) -> None:
                 child_fd = -1
                 try:
                     if stat.S_ISREG(observed.st_mode):
+                        claim = _private_file_claim(observed, path)
+                        expected_tree[tuple((relative / entry.name).parts)] = ("file", claim)
                         child_fd = os.open(entry.name, _FILE_READ_FLAGS, dir_fd=directory_fd)
                         if (_private_file_claim(os.fstat(child_fd), path)
-                                != _private_file_claim(observed, path)):
+                                != claim):
                             raise OSError(f"staged revision file changed during durability: {path}")
                         os.fsync(child_fd)
                     elif stat.S_ISDIR(observed.st_mode):
+                        claim = _private_directory_claim(observed, path)
+                        expected_tree[tuple((relative / entry.name).parts)] = ("directory", claim)
                         child_fd = os.open(entry.name, _DIR_READ_FLAGS, dir_fd=directory_fd)
                         if (_private_directory_claim(os.fstat(child_fd), path)
-                                != _private_directory_claim(observed, path)):
+                                != claim):
                             raise OSError(f"staged revision directory changed during durability: {path}")
                         sync(child_fd, relative / entry.name, depth + 1)
                         os.fsync(child_fd)
@@ -1463,10 +1475,73 @@ def _fsync_tree(root: Path, *, root_identity: tuple[int, int]) -> None:
                     if child_fd >= 0:
                         os.close(child_fd)
 
+    def validate(directory_fd: int, relative: Path) -> None:
+        direct = {
+            parts[-1]
+            for parts in expected_tree
+            if parts[:-1] == tuple(relative.parts)
+        }
+        seen: set[str] = set()
+        with os.scandir(directory_fd) as iterator:
+            for entry in iterator:
+                key = tuple((relative / entry.name).parts)
+                expected = expected_tree.get(key)
+                if expected is None or entry.name in seen:
+                    raise OSError(f"staged revision tree changed during durability: {root}")
+                seen.add(entry.name)
+                kind, identity = expected
+                opened = -1
+                try:
+                    if kind == "directory":
+                        observed = _private_directory_claim(
+                            entry.stat(follow_symlinks=False), root.joinpath(*key),
+                        )
+                        if observed != identity:
+                            raise OSError(
+                                f"staged revision directory name changed during durability: "
+                                f"{root.joinpath(*key)}",
+                            )
+                        opened = os.open(entry.name, _DIR_READ_FLAGS, dir_fd=directory_fd)
+                        if (_private_directory_claim(os.fstat(opened), root.joinpath(*key))
+                                != identity):
+                            raise OSError(
+                                f"staged revision directory name changed during durability: "
+                                f"{root.joinpath(*key)}",
+                            )
+                        validate(opened, relative / entry.name)
+                    else:
+                        observed = _private_file_claim(
+                            entry.stat(follow_symlinks=False), root.joinpath(*key),
+                        )
+                        if observed != identity:
+                            raise OSError(
+                                f"staged revision file name changed during durability: "
+                                f"{root.joinpath(*key)}",
+                            )
+                        opened = os.open(entry.name, _FILE_READ_FLAGS, dir_fd=directory_fd)
+                        if (_private_file_claim(os.fstat(opened), root.joinpath(*key))
+                                != identity):
+                            raise OSError(
+                                f"staged revision file name changed during durability: "
+                                f"{root.joinpath(*key)}",
+                            )
+                finally:
+                    if opened >= 0:
+                        os.close(opened)
+        if seen != direct:
+            raise OSError(f"staged revision tree names changed during durability: {root}")
+
+    named_root_fd = -1
     try:
         sync(root_fd, Path(), 0)
         os.fsync(root_fd)
+        validate(root_fd, Path())
+        named_root_fd = _open_private_directory_path(
+            root, expected_identity=root_identity,
+        )
     finally:
+        if named_root_fd >= 0:
+            os.close(named_root_fd)
         os.close(root_fd)
 
 
@@ -1477,6 +1552,30 @@ def _fsync_raw_claims(
     if set(identity_claims) != set(claims):
         raise OSError("revision raw durability identities do not match its claims")
     root_fd = _open_private_directory_path(root, expected_identity=root_identity)
+    named_root_fd = -1
+
+    def validate_name(relative: Path, expected: dict, ref: str) -> None:
+        current = os.dup(root_fd)
+        transient = file_fd = -1
+        try:
+            for index, component in enumerate(relative.parts[:-1]):
+                transient = os.open(component, _DIR_READ_FLAGS, dir_fd=current)
+                observed = _private_directory_claim(
+                    os.fstat(transient), root.joinpath(*relative.parts[:index + 1]),
+                )
+                if observed != expected["directories"][index]:
+                    raise OSError(f"revision raw directory name changed during durability: {ref}")
+                os.close(current)
+                current = transient
+                transient = -1
+            file_fd = os.open(relative.parts[-1], _FILE_READ_FLAGS, dir_fd=current)
+            if _private_file_claim(os.fstat(file_fd), root / relative) != expected["file"]:
+                raise OSError(f"revision raw file name changed during durability: {ref}")
+        finally:
+            for owned in (file_fd, transient, current):
+                if owned >= 0:
+                    os.close(owned)
+
     try:
         for ref in claims:
             path = _revision_raw_path(run_dir, ref)
@@ -1491,14 +1590,19 @@ def _fsync_raw_claims(
             file_fd = -1
             try:
                 for index, component in enumerate(relative.parts[:-1]):
-                    child = os.open(component, _DIR_READ_FLAGS, dir_fd=held[-1])
-                    observed = _private_directory_claim(
-                        os.fstat(child), root.joinpath(*relative.parts[:index + 1]),
-                    )
-                    if observed != expected["directories"][index]:
-                        os.close(child)
-                        raise OSError(f"revision raw directory authority changed: {ref}")
-                    held.append(child)
+                    child = -1
+                    try:
+                        child = os.open(component, _DIR_READ_FLAGS, dir_fd=held[-1])
+                        observed = _private_directory_claim(
+                            os.fstat(child), root.joinpath(*relative.parts[:index + 1]),
+                        )
+                        if observed != expected["directories"][index]:
+                            raise OSError(f"revision raw directory authority changed: {ref}")
+                        held.append(child)
+                        child = -1
+                    finally:
+                        if child >= 0:
+                            os.close(child)
                 file_fd = os.open(relative.parts[-1], _FILE_READ_FLAGS, dir_fd=held[-1])
                 if _private_file_claim(os.fstat(file_fd), path) != expected["file"]:
                     raise OSError(f"revision raw file authority changed: {ref}")
@@ -1513,12 +1617,18 @@ def _fsync_raw_claims(
                             != expected["directories"][index]):
                         raise OSError(f"revision raw directory changed during durability: {ref}")
                     os.fsync(directory_fd)
+                validate_name(relative, expected, ref)
             finally:
                 if file_fd >= 0:
                     os.close(file_fd)
                 for directory_fd in reversed(held):
                     os.close(directory_fd)
+        named_root_fd = _open_private_directory_path(
+            root, expected_identity=root_identity,
+        )
     finally:
+        if named_root_fd >= 0:
+            os.close(named_root_fd)
         os.close(root_fd)
 
 
@@ -1595,7 +1705,13 @@ def _settle_pointer_fault(
     not be retried blindly (in particular, OOB raw proof must be retained).
     """
     root = revisions_dir(run_dir)
-    if not _same_private_directory(root, directory_identity):
+    run_dir = Path(run_dir)
+
+    def authorities_current() -> bool:
+        return (_same_private_directory(run_dir, run_directory_identity)
+                and _same_private_directory(root, directory_identity))
+
+    if not authorities_current():
         return _PointerSettlement("ambiguous")
     try:
         current = _read_regular(
@@ -1620,7 +1736,7 @@ def _settle_pointer_fault(
                 )
             except Exception:
                 return _PointerSettlement("ambiguous")
-        if not _same_private_directory(root, directory_identity):
+        if not authorities_current():
             return _PointerSettlement("ambiguous")
         return _PointerSettlement("landed", settled)
 
@@ -1632,7 +1748,7 @@ def _settle_pointer_fault(
             )
         except Exception:
             return _PointerSettlement("ambiguous")
-        if _same_private_directory(root, directory_identity):
+        if authorities_current():
             return _PointerSettlement("not_landed")
     return _PointerSettlement("ambiguous")
 
