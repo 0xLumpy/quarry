@@ -593,7 +593,11 @@ def _resume_token(saved_server, current_server, token):
     return str(token) if set(_server_hosts(current_server)) == set(saved) else None
 
 
-def resume_session(run, token=None, server=None, wait: int = 12):
+_EXPECTED_SERVER_UNSET = object()
+
+
+def resume_session(run, token=None, server=None, wait: int = 12, *,
+                   expected_server=_EXPECTED_SERVER_UNSET):
     """Re-open the run's owned session to poll delayed callbacks, returning (session, proc) with the
     saved token_map intact — this path never rebuilds it (open_session mints a fresh session instead).
 
@@ -602,7 +606,13 @@ def resume_session(run, token=None, server=None, wait: int = 12):
     domain does not match the saved one.
     """
     prev = load_session(run)
-    if not prev or not prev.get("session_file") or not shutil.which("interactsh-client"):
+    if not prev or not prev.get("session_file"):
+        return None
+    # A run-scoped caller may bind the resume to its already-published channel origin.  Compare the exact
+    # persisted value before staging files, creating a private config, or launching/contacting a client.
+    if expected_server is not _EXPECTED_SERVER_UNSET and prev.get("server") != expected_server:
+        return None
+    if not shutil.which("interactsh-client"):
         return None
     from . import revision as _revision
     repository_run = all(hasattr(run, name) for name in ("dir", "project_dir", "run_id", "artifact_claim"))

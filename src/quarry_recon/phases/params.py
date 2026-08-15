@@ -23,7 +23,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .. import (budget, events, evidence, fetch, netguard, normalize, oob, runtime_identity,
+from .. import (budget, events, evidence, fetch, netguard, normalize, nuclei_policy, oob, runtime_identity,
                 secrets, settings, store)
 from ..runner import (RunResult, Status, cancel_all as runner_cancel_all, fresh_artifact_dir, have,
                       native_output_current, nuclei_timeout, reset_cancel as runner_reset_cancel,
@@ -668,10 +668,19 @@ def _arjun_lane(ctx, prof, corpus) -> None:
 
 
 @contextlib.contextmanager
-def _nuclei_oob_flags():
-    """Yield self-hosted Nuclei flags without ever placing its authentication token on argv."""
-    oob = secrets.oob()
-    server, token = oob.get("callback_server"), oob.get("auth_token")
+def _nuclei_oob_flags(prof=None, authority=None):
+    """Yield the exact Nuclei OOB posture without ever placing its authentication token on argv."""
+    if authority is not None:
+        with authority.oob_flags() as flags:
+            yield flags
+        return
+    if not getattr(prof, "oob_enabled", True):
+        # Independent opt-out: Nuclei's own Interactsh client is disabled even when a callback server or
+        # token exists.  No secret is read and no private config is created on this branch.
+        yield ("-ni",)
+        return
+    frozen = nuclei_policy._freeze_oob_config(secrets.oob())
+    server, token = frozen.get("callback_server"), frozen.get("auth_token")
     if not server:
         yield ()
         return
@@ -787,6 +796,7 @@ def _nuclei_cmd(targets_file, out_file, prof, mhe: int, *, oob_flags=()) -> list
     OOB endpoint)."""
     cmd = ["nuclei", "-l", str(targets_file), "-jsonl", "-o", str(out_file),
            "-duc",                         # installed template identity is fixed for this invocation
+           "-ept", "javascript",          # signatures are inventoried, never cryptographically trusted
            "-etags", "intrusive,fuzz,dos,brute-force",
            "-s", "critical,high,medium", "-stats", "-si", "30",
            "-c", str(settings.workers("nuclei", 25)),      # core-scaled concurrency (rate stays separate)
@@ -810,15 +820,21 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     degraded chunk's findings are never discarded and a re-scan cannot duplicate.
     """
     sid = "params.nuclei_scan"
+    authority = nuclei_policy.policy_for(ctx)
+    if authority is not None:
+        authority.assert_ready()                 # a resumed all-done scan must still authenticate policy
     chunk_n = max(1, settings.concurrency("NUCLEI_CHUNK_HOSTS", 50))
     batches = [live[i:i + chunk_n] for i in range(0, len(live), chunk_n)]
     state_f = ctx.run.raw_path("params", "nuclei", "chunks.state.json")
     # resume validity is a work_unit that folds the coverage-affecting config (severity + excluded tags +
     # chunk size), not just the host list, so any coverage-affecting change invalidates the state
-    _tpl = _nuclei_templates_fp()                           # template set is coverage-affecting
+    _tpl = (authority.document["corpus"]["digest"] if authority is not None
+            else _nuclei_templates_fp())                    # exact run snapshot, legacy fallback for test doubles
     mhe = _nuclei_mhe()                                     # host-error policy = which hosts get scanned
     _cfg = {"severity": "critical,high,medium", "etags": "intrusive,fuzz,dos,brute-force", "chunk": chunk_n,
             "templates": _tpl if _tpl is not None else "unknown", "mhe": mhe}
+    if authority is not None:
+        _cfg.update(authority.work_config(sid))              # policy/corpus/config/engine -> resume identity
     if _tpl is None:
         # template state unknown -> non-resumable: a per-run nonce makes resume never skip a chunk we
         # cannot prove ran against the same templates
@@ -872,7 +888,11 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             return None
         if not isinstance(prev, dict):                       # [], null, or a scalar -> reject (rerun all)
             return None
-        return prev if prev.get("work_unit") == scan_wu else None   # config-inclusive key: mismatch → fresh
+        if prev.get("work_unit") != scan_wu:
+            return None                                     # config-inclusive key: mismatch → fresh
+        if authority is not None and prev.get("policy_digest") != authority.digest:
+            return None                                     # explicit defense against copied/crafted state
+        return prev
 
     def _load_digests(prev) -> dict:                          # {rel: sha256} — content binding per artifact
         m = (prev or {}).get("digests")
@@ -948,6 +968,7 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
         _publish_json_state(ctx, state_f, {
             "work_unit": scan_wu, "chunk_size": chunk_n, "chunks": done_map,
             "evidence": evidence_map, "coverage": cov_map, "digests": digest_map,
+            "policy_digest": authority.digest if authority is not None else None,
         })
 
     def _emit_coverage(ci: int, planned, requests, *, why: str) -> None:
@@ -983,12 +1004,15 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     template_snapshot = None
     snapshot_entered = False
     try:
-        template_source = Path(os.environ.get("HOME") or Path.home()) / "nuclei-templates"
-        template_snapshot = runtime_identity.reusable_tree_snapshot(
-            template_source, role="nuclei-templates",
-        )
-        template_snapshot.__enter__()
-        snapshot_entered = True
+        if authority is None:
+            # Compatibility/test-double path. Production owns one wider snapshot context spanning all four
+            # owners, so entering another one here would fragment identity (and is deliberately refused).
+            template_source = Path(os.environ.get("HOME") or Path.home()) / "nuclei-templates"
+            template_snapshot = runtime_identity.reusable_tree_snapshot(
+                template_source, role="nuclei-templates",
+            )
+            template_snapshot.__enter__()
+            snapshot_entered = True
         for ci, batch in enumerate(batches):
             chunk_wu = events.work_unit(sid, inputs={"hosts": batch}, config=_cfg)
             # progress before the chunk, counting cleanly-completed hosts; the per-chunk work_unit is the
@@ -1016,16 +1040,21 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             res = None
             chunk_status = Status.FAILED.value               # promoted only after all bookkeeping below
             try:                                             # chunk terminal always fires (finally)
-                with _nuclei_oob_flags() as oob_flags:
-                    res = exec_tool("nuclei", _nuclei_cmd(
-                                        bf, cf, prof, mhe, oob_flags=oob_flags),
+                with _nuclei_oob_flags(prof, authority) as oob_flags:
+                    command = _nuclei_cmd(bf, cf, prof, mhe, oob_flags=oob_flags)
+                    if authority is not None:
+                        authority.prepare(sid, command, input_total=len(batch), work_unit=chunk_wu)
+                    res = exec_tool("nuclei", command,
                                     repository=ctx.run,
                                     stdout=RepositoryOutput.discard(),
                                     stderr=RepositoryOutput.publish(*ef.relative_to(ctx.run.dir).parts),
                                     native_outputs=(RepositoryNativeOutput.file(
                                         5, *cf.relative_to(ctx.run.dir).parts, required=False,
                                     ),),
-                                    timeout=nuclei_timeout(len(batch), ctx.http_timeout))
+                                    timeout=nuclei_timeout(len(batch), ctx.http_timeout),
+                                    work_unit=chunk_wu)
+                    if authority is not None:
+                        authority.settle(sid, res, input_total=len(batch), work_unit=chunk_wu)
                 if res.stderr_tail:
                     _append_run_log(ctx, log, res.stderr_tail + "\n")
                 # ask nuclei whether it finished, from its terminal line in the full stderr (the 8-line tail
@@ -1586,32 +1615,71 @@ def blind_oob_credential(secret: str):
             raise cleanup_fault
 
 
-def _blind_oob_plan(prof) -> dict:
+def _blind_oob_plan(prof, authority=None) -> dict:
     """Decide the blind/stored-XSS OOB channel: {armed, channel, backend, server, secret, reason}.
 
     Off unless `MODES.BLIND_XSS` arms it; a self-hosted `oob.callback_server` is used when present, else
     the public interactsh pool. Correlation is dalfox's either way; `backend` says who owns the server, so
     `armed` is not "we own the channel". See docs/design/DALFOX-XSS-DESIGN.md.
     """
-    o = secrets.oob() or {}
-    if not getattr(prof, "blind_xss", False):
+    channel = authority.channel("params.dalfox_blind_oob") if authority is not None else None
+    if channel is not None and not channel["enabled"]:
+        global_enabled = authority.document["modes"]["oob_enabled"]
+        return {"armed": False, "enabled": False, "channel": "off", "backend": "",
+                "policy_backend": "off", "server": "", "origin": "", "secret": "",
+                "policy_digest": authority.digest, "channel_digest": channel["channel_digest"],
+                "config_identity": None,
+                "reason": ("MODES.BLIND_XSS is off — the blind/stored-XSS channel was not armed"
+                           if global_enabled else
+                           "MODES.OOB_ENABLED is off — all network OOB transports are disabled")}
+    if authority is None and not getattr(prof, "oob_enabled", True):
+        return {"armed": False, "channel": "off", "backend": "", "server": "", "secret": "",
+                "reason": "MODES.OOB_ENABLED is off — all network OOB transports are disabled"}
+    if authority is not None:
+        o = authority.channel_oob_config("params.dalfox_blind_oob")
+    else:
+        # Compatibility-only adapter for lightweight/non-run callers predating the canonical-origin
+        # requirement. Every managed run takes the authority branch and can never normalize ambient input.
+        legacy = dict(secrets.oob() or {})
+        legacy_server = legacy.get("callback_server")
+        legacy_schemeless = (isinstance(legacy_server, str) and bool(legacy_server)
+                             and "://" not in legacy_server)
+        if legacy_schemeless:
+            legacy["callback_server"] = "https://" + legacy_server
+        o = nuclei_policy._freeze_oob_config(legacy)
+        if legacy_schemeless:
+            o["callback_server"] = str(legacy_server).strip()
+    if authority is None and not getattr(prof, "blind_xss", False):
         return {"armed": False, "channel": "off", "backend": "", "server": "", "secret": "",
                 "reason": "MODES.BLIND_XSS is off — the blind/stored-XSS channel was not armed"}
+    binding = ({"enabled": True, "policy_backend": channel["oob_backend"],
+                "policy_digest": authority.digest, "channel_digest": channel["channel_digest"],
+                "config_identity": channel["config_identity"]}
+               if authority is not None else {"enabled": True, "policy_backend": None,
+                                              "policy_digest": None, "channel_digest": None,
+                                              "config_identity": None})
     server = str(o.get("callback_server") or "").strip()
     if server:
-        return {"armed": True, "channel": "native", "backend": "self-hosted", "server": server,
+        origin = server
+        command_server = (urlsplit(origin).netloc if authority is not None else server)
+        return {"armed": True, "channel": "native", "backend": "self-hosted",
+                # ``server`` remains the canonical policy identity.  Dalfox's optional argv value is a
+                # domain list rather than an origin, so keep that transport spelling separate.
+                "server": origin, "origin": origin, "command_server": command_server,
                 "secret": str(o.get("auth_token") or "").strip(),
-                "reason": f"blind XSS armed on the configured callback server ({server}); "
-                          f"correlation is owned by DALFOX and imported"}
+                "reason": f"blind XSS armed on the configured callback server ({origin}); "
+                          f"correlation is owned by DALFOX and imported", **binding}
     # no self-hosted server: dalfox's own default, the public interactsh pool — the same channel nuclei's
     # OAST and Quarry's SSRF probes already use
-    return {"armed": True, "channel": "native", "backend": "public", "server": "", "secret": "",
+    return {"armed": True, "channel": "native", "backend": "public", "server": "", "origin": "",
+            "secret": "",
             "reason": "blind XSS armed on ProjectDiscovery's PUBLIC interactsh pool (set "
                       "`oob.callback_server` to use your own) — its operator sees the raw callbacks; "
-                      "correlation is owned by DALFOX and imported"}
+                      "correlation is owned by DALFOX and imported", **binding}
 
 
-def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0, cred_path=None) -> list[str]:
+def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0, cred_path=None,
+                *, oob_plan: dict | None = None) -> list[str]:
     """dalfox v3 (Rust) reflected-XSS scan: static AST DOM analysis, no headless browser, `--skip-mining`
     (params are pre-discovered), JSONL to -o, status from the exit code. Concurrency is `--workers` per
     target and `--max-concurrent-targets` across targets; `--rate-limit` caps aggregate rps when RoE is set."""
@@ -1633,11 +1701,12 @@ def _dalfox_cmd(batch_file, out_file, prof, batch_len: int = 0, cred_path=None) 
            "--max-concurrent-targets", str(max(1, settings.concurrency("DALFOX_TARGETS", 4)))]  # tunable
     # blind / stored XSS: `--blind-oob` mints a fresh callback per payload and correlates each interaction
     # back to target/param/location/method/payload, so a beacon names the injection that produced it
-    plan = _blind_oob_plan(prof)
+    plan = oob_plan if oob_plan is not None else _blind_oob_plan(prof)
     if plan["armed"]:
         # ONE argv token when a server is given: the flag is `--blind-oob[=<domains>]`, so a separate
         # `=host` argument would be parsed as a TARGET, not as the backend.
-        cmd += [f"--blind-oob={plan['server']}" if plan["server"] else "--blind-oob"]
+        command_server = plan.get("command_server", plan["server"])
+        cmd += [f"--blind-oob={command_server}" if command_server else "--blind-oob"]
         if plan["secret"] and cred_path is not None:
             # never `--blind-oob-secret <token>` (argv is world-readable): dalfox reads it from a `--config`
             # file, an ephemeral 0600 file the caller owns.
@@ -1969,7 +2038,10 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
     # a SIGKILLed run skips every `finally`, so a credential-transport file can outlive the process;
     # sweep before we make another.
     sweep_stale_oob_creds()
-    _plan_for_run = _blind_oob_plan(prof)     # resolved ONCE: the command, the identity and the report
+    _nuclei_authority = nuclei_policy.policy_for(ctx)
+    _plan_for_run = _blind_oob_plan(
+        prof, _nuclei_authority,
+    )     # resolved ONCE: the command, the identity and the report
     # execution facts about the OOB channel, distinct from the policy above: how many invocations this
     # lifecycle tried to launch the armed channel, and how many actually did.
     _oob = {"attempted": 0, "launched": 0, "why": ""}
@@ -1985,11 +2057,14 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
             # the OOB policy is part of the work's identity, so arming blind XSS or switching backend must not
             # reuse old chunks; the server is fingerprinted, never named, and never the token
             "oob_channel": _plan_for_run["channel"],
+            "oob_enabled": bool(_plan_for_run["armed"]),
             "oob_backend": _plan_for_run["backend"],
             "oob_server": (secrets.fingerprint(_plan_for_run["server"])
                            if _plan_for_run["server"] else None),
             "oob_authenticated": bool(_plan_for_run["secret"]),
             "chunk": chunk_n}
+    if _nuclei_authority is not None:
+        _cfg.update(_nuclei_authority.channel_work_config("params.dalfox_blind_oob"))
     scan_wu = events.work_unit(sid, inputs={"cands": cands}, config=_cfg)
     # nuclei's proven resume contract: a completion map (controls skip) kept separate from an append-only
     # evidence map (controls aggregation), so a finding in a degraded attempt survives a later empty retry
@@ -2149,6 +2224,13 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 + (f" backend={_plan_for_run['backend']} owner=dalfox"
                    if _plan_for_run["armed"] else "")
                 + f": {_plan_for_run['reason']}"))
+    events.emit(
+        "oob_policy", sid, enabled=bool(_plan_for_run["armed"]),
+        oob_backend=(_plan_for_run.get("policy_backend") or _plan_for_run["backend"] or "off"),
+        policy_digest=_plan_for_run.get("policy_digest"),
+        channel_digest=_plan_for_run.get("channel_digest"),
+        oob_config_identity=_plan_for_run.get("config_identity"), work_unit=scan_wu,
+    )
     events.tool_start(sid, cmd=["dalfox", "scan", "-i", "file", "<chunk>", "-f", "jsonl", "--skip-mining"],
                       input_total=len(cands), work_unit=scan_wu)
     t0 = time.monotonic()
@@ -2205,7 +2287,10 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 _oob["attempted"] += 1
             try:
                 with blind_oob_credential(_plan_for_run["secret"]) as _cred:
-                    res = exec_tool("dalfox", _dalfox_cmd(bf, cf, prof, len(batch), _cred),
+                    res = exec_tool(
+                        "dalfox", _dalfox_cmd(
+                            bf, cf, prof, len(batch), _cred, oob_plan=_plan_for_run,
+                        ),
                                     repository=ctx.run,
                                     stdout=RepositoryOutput.discard(),
                                     stderr=RepositoryOutput.discard(),
@@ -2512,6 +2597,9 @@ def _oob_probe(ctx, scope, prof):
     if scope.passive_only:                          # record honest skips — the source is wired/default-on
         ctx.run.record("params", skipped("oob_probe", "passive-only mode"))
         return None
+    if not getattr(prof, "oob_enabled", True):
+        ctx.run.record("params", skipped("oob_probe", "MODES.OOB_ENABLED is off"))
+        return None
     if not have("interactsh-client"):
         # the source keeps its own identity; `depends_on` names the required binary the verdict must miss
         ctx.run.record("params", skipped("oob_probe", "interactsh-client not installed"),
@@ -2529,14 +2617,41 @@ def _oob_probe(ctx, scope, prof):
     if not probes:
         ctx.run.record("params", skipped("oob_probe", "no SSRF-param candidates"))
         return None
-    opened = oob.open_session(ctx.run, server=secrets.oob().get("callback_server"),
-                              token=secrets.oob().get("auth_token"))
+    nuclei_authority = nuclei_policy.policy_for(ctx)
+    frozen_channel = (nuclei_authority.channel("params.oob_probe")
+                      if nuclei_authority is not None else None)
+    if frozen_channel is not None and not frozen_channel["enabled"]:
+        ctx.run.record("params", skipped("oob_probe", "frozen run OOB channel is off"))
+        return None
+    frozen_oob = (nuclei_authority.channel_oob_config("params.oob_probe")
+                  if nuclei_authority is not None else
+                  nuclei_policy._freeze_oob_config(secrets.oob()))
+    sid = "params.oob_probe"
+    channel_cfg = (nuclei_authority.channel_work_config(sid)
+                   if nuclei_authority is not None else {
+                       "oob_enabled": True,
+                       "oob_backend": ("self-hosted" if frozen_oob.get("callback_server")
+                                       else "public-interactsh"),
+                   })
+    probe_wu = events.work_unit(
+        sid, inputs={"probes": [[url, param] for url, _split, _pairs, param in probes]},
+        config=channel_cfg,
+    )
+    events.emit(
+        "oob_policy", sid, enabled=channel_cfg["oob_enabled"],
+        oob_backend=channel_cfg["oob_backend"],
+        policy_digest=channel_cfg.get("policy_digest"),
+        channel_digest=channel_cfg.get("channel_digest"),
+        oob_config_identity=channel_cfg.get("oob_config_identity"), work_unit=probe_wu,
+    )
+    opened = oob.open_session(ctx.run, server=frozen_oob.get("callback_server"),
+                              token=frozen_oob.get("auth_token"))
     if opened is None:
         ctx.run.record("params", skipped("oob_probe", "interactsh session did not open"))
         return None
     session, proc = opened
-    sid = "params.oob_probe"
-    events.tool_start(sid, cmd=["<oob probe>", "interactsh"], input_total=len(probes))
+    events.tool_start(sid, cmd=["<oob probe>", "interactsh"], input_total=len(probes),
+                      work_unit=probe_wu)
     t0 = time.monotonic()
     issued = added = correlated = 0
     try:
@@ -2553,7 +2668,8 @@ def _oob_probe(ctx, scope, prof):
                 fetch.redirect_location(ctx, probe_url, normalize.host_of_url(probe_url), timeout=10)
             except Exception:
                 pass                               # a target that doesn't SSRF-fetch is the common case
-            events.tool_progress(sid, current_index=i, input_total=len(probes))
+            events.tool_progress(sid, current_index=i, input_total=len(probes),
+                                 work_unit=probe_wu)
         time.sleep(3)                              # brief window for a server-side callback to arrive
         for row in oob.poll_session(ctx.run, session):
             row.setdefault("raw_ref", session.get("log"))
@@ -2563,9 +2679,13 @@ def _oob_probe(ctx, scope, prof):
     finally:
         oob.close_session(proc)
     events.tool_finish(sid, status=Status.SUCCESS.value, duration=round(time.monotonic() - t0, 2),
-                       discovery_context="params")
+                       discovery_context="params", work_unit=probe_wu)
     events.ledger(sid, produced={"oob_interaction": added, "correlated": correlated},
-                  consumed={"probe": issued})
+                  consumed={"probe": issued}, work_unit=probe_wu,
+                  oob_enabled=channel_cfg["oob_enabled"],
+                  oob_backend=channel_cfg["oob_backend"],
+                  policy_digest=channel_cfg.get("policy_digest"),
+                  channel_digest=channel_cfg.get("channel_digest"))
     ctx.echo(f"  oob_probe: {issued} callback probe(s) -> {added} interaction(s) ({correlated} correlated)")
     return RunResult("oob_probe", ["<oob probe>"], Status.SUCCESS, 0, round(time.monotonic() - t0, 2),
                      None, added, note=f"{issued} probe(s), {added} interaction(s), {correlated} correlated")
@@ -2614,6 +2734,7 @@ def run(ctx) -> None:
 
     # ── subdomain takeover (nuclei takeover templates over known subs) ──
     if prof.takeover and have("nuclei"):
+        nuclei_authority = nuclei_policy.policy_for(ctx)
         # Union, not "resolved or subdomain": dangling-CNAME hosts (the takeover signal)
         # have no A record and live only in `subdomain` — they must still be checked.
         subs = scope.filter_hosts(sorted(set(ctx.run.values("resolved"))
@@ -2624,14 +2745,24 @@ def run(ctx) -> None:
         if subs:
             tk_in = ctx.write_list("takeover_targets.txt", subs)
             tk_out = ctx.run.raw_path("params", "nuclei", "takeover.jsonl")
-            tk_cmd = ["nuclei", "-l", str(tk_in), "-tags", "takeover", "-jsonl",
+            tk_cmd = ["nuclei", "-l", str(tk_in), "-ept", "javascript",
+                      "-tags", "takeover", "-jsonl",
                       "-duc", "-o", str(tk_out)]
             # NB: nuclei has no connect-time IP deny (-eh excludes INPUT entries, not resolved IPs); the
             # scan-box/metadata protection for these subs is netguard.guard_hosts' fresh-resolve above.
             if prof.http_rl:                       # else native default (empty = fast)
                 tk_cmd += ["-rl", str(prof.http_rl)]
-            with _nuclei_oob_flags() as oob_flags:
+            with _nuclei_oob_flags(prof, nuclei_authority) as oob_flags:
                 tk_cmd.extend(oob_flags)            # same OOB endpoint as the main scan (no drift)
+                tk_cfg = ({"tags": "takeover", "rate": prof.http_rl,
+                           **nuclei_authority.work_config("params.nuclei_takeover")}
+                          if nuclei_authority is not None
+                          else {"tags": "takeover", "rate": prof.http_rl})
+                tk_wu = events.work_unit("params.nuclei_takeover", inputs={"hosts": subs}, config=tk_cfg)
+                if nuclei_authority is not None:
+                    nuclei_authority.prepare(
+                        "params.nuclei_takeover", tk_cmd, input_total=len(subs), work_unit=tk_wu,
+                    )
                 r = exec_tool(
                     "nuclei", tk_cmd,
                     repository=ctx.run,
@@ -2641,7 +2772,12 @@ def run(ctx) -> None:
                         7, *tk_out.relative_to(ctx.run.dir).parts, required=False,
                     ),),
                     timeout=nuclei_timeout(len(subs), ctx.http_timeout),
+                    work_unit=tk_wu,
                 )
+                if nuclei_authority is not None:
+                    nuclei_authority.settle(
+                        "params.nuclei_takeover", r, input_total=len(subs), work_unit=tk_wu,
+                    )
             ctx.run.record("params", r)
             if native_output_current(r, tk_out) and tk_out.exists():
                 import json as _json

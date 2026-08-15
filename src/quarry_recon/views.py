@@ -22,7 +22,7 @@ def _phase_rank(p: str) -> int:
     return _PHASE_ORDER.index(p) if p in _PHASE_ORDER else len(_PHASE_ORDER)
 
 
-def plan_lines() -> list[str]:
+def plan_lines(nuclei_plan: dict | None = None) -> list[str]:
     """Static dry-run: what would run, derived from the registry plus machine settings. No execution.
     ``workers`` prefers the source's contract value, else the machine-scaled ``settings.workers``;
     ``rate`` (per-target RoE) and ``timeout`` come from the contract when declared."""
@@ -72,6 +72,38 @@ def plan_lines() -> list[str]:
     dbt_txt = f" · {dbt} control-debt" if dbt else ""
     lines.append(f"summary: {run} will run · {pend} pending (not wired) · {ret} retired · {off} off · "
                  f"{key} need key{dbt_txt}   (default-on includes bounded long-poles; off = setup/lane/intent)")
+    if nuclei_plan is not None:
+        lines.extend(["", "[accepted Nuclei / OOB policy]"])
+        modes = nuclei_plan["modes"]
+        lines.append(
+            f"  snapshot={nuclei_plan['snapshot']} · corpus-trust={nuclei_plan['corpus_trust']} · "
+            f"oob={modes['oob_backend']} · private-target-block="
+            f"{str(modes['block_private_targets']).lower()}"
+        )
+        for owner in nuclei_plan["owners"]:
+            selected = owner["selected_count"]
+            selected_text = "snapshot-required" if selected is None else str(selected)
+            counts = owner["semantic_counts"]
+            semantic_text = ("snapshot-required" if counts is None else
+                             ",".join(f"{name}={counts[name]}" for name in sorted(counts)))
+            lines.append(
+                f"  {owner['owner']}: oob-enabled={str(owner.get('oob_enabled', owner['oob_backend'] != 'off')).lower()} "
+                f"· oob={owner['oob_backend']} · selected={selected_text} · "
+                f"semantic={semantic_text}"
+            )
+            for label in ("potentially_state_changing", "unknown"):
+                refs = owner[label]
+                if refs:
+                    lines.append(
+                        f"    {label}: "
+                        + ", ".join(f"{row['id']}@{row['path']}" for row in refs)
+                    )
+        for channel in nuclei_plan["channels"]:
+            channel_enabled = channel.get("enabled", channel["oob_backend"] not in {"off"})
+            lines.append(
+                f"  {channel['owner']}: oob-enabled={str(channel_enabled).lower()} "
+                f"· oob={channel['oob_backend']}"
+            )
     return lines
 
 

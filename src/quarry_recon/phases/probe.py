@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import contextlib
 from dataclasses import dataclass as _dataclass
 
 import json as _json
@@ -21,7 +22,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .. import (budget, contract, events, netguard, normalize, pace, secrets, settings, shodan_host,
+from .. import (budget, contract, events, netguard, normalize, nuclei_policy, pace, secrets, settings, shodan_host,
                 shodan_sched, store)
 from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PACE_BUSY, PROVIDER_PARSE,
                         PROVIDER_RATE_LIMIT,
@@ -2448,19 +2449,42 @@ def run(ctx) -> None:
 
     # recon-side only: identify which WAF fronts each host. Bypass tooling stays human/Burp work.
     if have("nuclei") and ctx.run.count("live"):
+        nuclei_authority = nuclei_policy.policy_for(ctx)
         waf_in = ctx.write_list("waf_targets.txt", ctx.run.values("live"))
         waf_out = ctx.run.raw_path("probe", "nuclei", "waf.jsonl")
-        waf_cmd = ["nuclei", "-l", str(waf_in), "-tags", "waf", "-jsonl", "-o", str(waf_out)]
-        if prof.http_rl:                       # else native default (empty = fast)
-            waf_cmd += ["-rl", str(prof.http_rl)]
-        r = exec_tool("nuclei", waf_cmd,
-                      repository=ctx.run,
-                      stdout=RepositoryOutput.discard(),
-                      stderr=RepositoryOutput.discard(),
-                      native_outputs=(RepositoryNativeOutput.file(
-                          7, *waf_out.relative_to(ctx.run.dir).parts, required=False,
-                      ),),
-                      timeout=nuclei_timeout(ctx.run.count("live"), ctx.http_timeout))
+        oob_context = (nuclei_authority.oob_flags() if nuclei_authority is not None else
+                       contextlib.nullcontext(("-ni",) if not getattr(
+                           prof, "oob_enabled", True) else ()))
+        with oob_context as oob_flags:
+            waf_cmd = ["nuclei", "-l", str(waf_in), "-ept", "javascript",
+                       "-tags", "waf", "-jsonl", "-duc",
+                       "-o", str(waf_out)]
+            if prof.http_rl:                       # else native default (empty = fast)
+                waf_cmd += ["-rl", str(prof.http_rl)]
+            waf_cmd.extend(oob_flags)
+            waf_cfg = ({"tags": "waf", "rate": prof.http_rl,
+                        **nuclei_authority.work_config("probe.nuclei_waf")}
+                       if nuclei_authority is not None else {"tags": "waf", "rate": prof.http_rl,
+                                                             "oob_enabled": getattr(prof, "oob_enabled", True)})
+            waf_wu = events.work_unit("probe.nuclei_waf", inputs={"urls": ctx.run.values("live")},
+                                      config=waf_cfg)
+            if nuclei_authority is not None:
+                nuclei_authority.prepare(
+                    "probe.nuclei_waf", waf_cmd, input_total=ctx.run.count("live"), work_unit=waf_wu,
+                )
+            r = exec_tool("nuclei", waf_cmd,
+                          repository=ctx.run,
+                          stdout=RepositoryOutput.discard(),
+                          stderr=RepositoryOutput.discard(),
+                          native_outputs=(RepositoryNativeOutput.file(
+                              7, *waf_out.relative_to(ctx.run.dir).parts, required=False,
+                          ),),
+                          timeout=nuclei_timeout(ctx.run.count("live"), ctx.http_timeout),
+                          work_unit=waf_wu)
+            if nuclei_authority is not None:
+                nuclei_authority.settle(
+                    "probe.nuclei_waf", r, input_total=ctx.run.count("live"), work_unit=waf_wu,
+                )
         ctx.run.record("probe", r)
         if native_output_current(r, waf_out) and waf_out.exists():
             n = 0

@@ -416,10 +416,23 @@ def _doctor(phase):
     click.echo(_c("\n[oob]", "magenta"))
     for _l in oob_lines:
         click.echo(_l)
-    srv = str(ob.get("callback_server") or "").strip()
+    from . import nuclei_policy as _nuclei_policy
+    try:
+        srv = str(_nuclei_policy._freeze_oob_config(ob).get("callback_server") or "")
+    except _nuclei_policy.NucleiPolicyError:
+        srv = ""
+        legacy_srv = ob.get("callback_server")
+        if (isinstance(legacy_srv, str)
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]*", legacy_srv)):
+            click.echo(
+                f"  {_c('✗', 'red')} {'callback server:':<20} {legacy_srv} "
+                "(rejected: an explicit http(s) origin is required)"
+            )
+        else:
+            click.echo(f"  {_c('✗', 'red')} {'callback server:':<20} malformed/unsafe (value withheld)")
     if srv:
         click.echo(f"  {_c('✓', 'green')} {'callback server:':<20} {srv}")
-    else:
+    elif not ob.get("callback_server"):
         click.echo(f"  {_c('·', 'yellow')} {'callback server:':<20} not set")
 
     # readiness verdict — the one-line rollup (required tools are the only blocker; keys are optional)
@@ -1307,40 +1320,58 @@ def _run_phases_scoped(profile_path, phases, passive, timeout, prepare=None, fin
     phase_metrics: list[dict] = []
 
     all_cps = []
-    for name in selected:
-        fn, label, needs_active = REGISTRY[name]
-        if needs_active and profile.passive_only:
-            click.echo(_c(f"▸ {label} — skipped (passive-only)", "yellow"))
-            continue
-        click.echo(_c(f"▸ {label}", "magenta"))
-        p_t0 = _time.perf_counter()
-        p_cpu0 = metrics.rusage()[0]
-        try:
-            fn(ctx)
-        except Exception as e:  # never let one phase kill the run
-            # redact once: an exception message can carry a URL with a key/token
-            err = secrets.redact(str(e)) or ""
-            run_obj.notes.append(f"{name}: EXCEPTION {err}")
-            click.echo(_c(f"   ! {name} raised {err}", "red"))
-            from . import notify
-            notify.send("error", f"Quarry {run_obj.run_id} · {profile.target}: {name} phase raised", err)
-        p_wall = round(_time.perf_counter() - p_t0, 1)
-        phase_metrics.append({"phase": name, "wall_s": p_wall,
-                              "cpu_s": round(metrics.rusage()[0] - p_cpu0, 2),
-                              "size": {e: run_obj.count(e) for e in _INV}})
-        # incremental flush so a killed run keeps its telemetry; a flush failure must never break the run
-        try:
-            _rc, _rss = metrics.rusage()
-            metrics.write(run_obj, phase_metrics, _time.perf_counter() - run_t0,
-                          _rc - run_cpu0, _rss / 1024)
-        except Exception:
-            pass
-        # log-safe per-phase elapsed footer: no control chars, so tmux and runtime.log stay clean
-        click.echo(_c(f"   ⏱ {name} · {p_wall}s", "cyan"))
-        cps = checkpoint.evaluate(run_obj, name)
-        all_cps += cps
-        for cp in cps:
-            click.echo("   " + _c(cp.line(), "yellow" if cp.level == "warn" else "white"))
+    import contextlib as _contextlib
+    from .runner import have as _have
+    from . import nuclei_policy as _nuclei_policy
+    _nuclei_selected = bool(set(selected) & {"probe", "enrich", "params"})
+    _nuclei_context = (
+        _nuclei_policy.run_authority(ctx)
+        if _nuclei_selected and not profile.passive_only and _have("nuclei")
+        else _contextlib.nullcontext(None)
+    )
+    with _nuclei_context as _nuclei_authority:
+        ctx.nuclei_policy = _nuclei_authority
+        for name in selected:
+            fn, label, needs_active = REGISTRY[name]
+            if needs_active and profile.passive_only:
+                click.echo(_c(f"▸ {label} — skipped (passive-only)", "yellow"))
+                continue
+            click.echo(_c(f"▸ {label}", "magenta"))
+            p_t0 = _time.perf_counter()
+            p_cpu0 = metrics.rusage()[0]
+            try:
+                fn(ctx)
+            except Exception as e:  # never let one phase kill the run
+                if isinstance(e, _nuclei_policy.NucleiPolicyError):
+                    # Accepted-policy identity is a run boundary, not a best-effort lane failure.  A
+                    # missing/mutated policy, corpus, config, or engine must never reach a sealed manifest.
+                    raise
+                # redact once: an exception message can carry a URL with a key/token
+                err = secrets.redact(str(e)) or ""
+                run_obj.notes.append(f"{name}: EXCEPTION {err}")
+                click.echo(_c(f"   ! {name} raised {err}", "red"))
+                from . import notify
+                notify.send("error", f"Quarry {run_obj.run_id} · {profile.target}: {name} phase raised", err)
+            p_wall = round(_time.perf_counter() - p_t0, 1)
+            phase_metrics.append({"phase": name, "wall_s": p_wall,
+                                  "cpu_s": round(metrics.rusage()[0] - p_cpu0, 2),
+                                  "size": {e: run_obj.count(e) for e in _INV}})
+            # incremental flush so a killed run keeps its telemetry; a flush failure must never break the run
+            try:
+                _rc, _rss = metrics.rusage()
+                metrics.write(run_obj, phase_metrics, _time.perf_counter() - run_t0,
+                              _rc - run_cpu0, _rss / 1024)
+            except Exception:
+                pass
+            # log-safe per-phase elapsed footer: no control chars, so tmux and runtime.log stay clean
+            click.echo(_c(f"   ⏱ {name} · {p_wall}s", "cyan"))
+            cps = checkpoint.evaluate(run_obj, name)
+            all_cps += cps
+            for cp in cps:
+                click.echo("   " + _c(cp.line(), "yellow" if cp.level == "warn" else "white"))
+        if _nuclei_authority is not None:
+            _nuclei_authority.assert_ready()
+        ctx.nuclei_policy = None
 
     # every checkpoint that challenges what the tool statuses already account for reaches the verdict as a
     # typed gap; committed before the base manifest, so it is in when the verdict is computed
@@ -1385,9 +1416,31 @@ def _run_phases_scoped(profile_path, phases, passive, timeout, prepare=None, fin
     except Exception as e:                                    # noqa: BLE001
         metrics_error = secrets.redact(str(e)) or type(e).__name__
 
+    if _nuclei_authority is not None:
+        # The launch snapshots have been settled, but the immutable policy must still be the exact bytes
+        # whose digest enters the manifest. Missing/mutated policy refuses finalization rather than sealing
+        # a run whose resume/events name different accepted inputs.
+        _nuclei_authority.assert_artifact()
+
+    _manifest_oob_backend = (
+        _nuclei_authority.document["modes"]["oob_backend"]
+        if _nuclei_authority is not None else None
+    )
+    _manifest_oob_channels = (
+        [dict(row) for row in _nuclei_authority.document["channels"]]
+        if _nuclei_authority is not None else
+        _nuclei_policy.channel_summary(profile, _manifest_oob_backend)
+    )
     prepared_manifest = run_obj.begin_finalization(
         profile_summary={"apex_domains": profile.apex_domains, "cidr": profile.cidr,
-                         "passive_only": profile.passive_only, "ports": profile.ports},
+                         "passive_only": profile.passive_only, "ports": profile.ports,
+                         "oob_enabled": profile.oob_enabled,
+                         "oob_channels": _manifest_oob_channels,
+                         "block_private_targets": profile.block_private_targets,
+                         "nuclei_policy_digest": (getattr(_nuclei_authority, "digest", None)
+                                                  if _nuclei_selected else None),
+                         "nuclei_policy": (_nuclei_authority.manifest_summary()
+                                           if _nuclei_authority is not None else None)},
         phases_run=selected, metrics=metrics_summary or None, policy=policy_rows,
     )
     if metrics_error is None:
@@ -1540,10 +1593,19 @@ def report(profile_path, run_id, force, as_json):
 
 
 @cli.command()
-def plan():
-    """Static dry-run: explain what would run (registry + machine settings). No scanning."""
-    from . import views
-    for line in views.plan_lines():
+@click.option("-t", "--target", "profile_path",
+              help="profile/project used for an exact detached Nuclei/OOB policy plan")
+def plan(profile_path):
+    """Dry-run registry work plus accepted Nuclei/OOB policy. No target requests are made."""
+    from . import nuclei_policy as _nuclei_policy, views
+    summary = _nuclei_policy.default_plan_summary()
+    if profile_path is not None:
+        try:
+            profile = TargetProfile.load(_resolve_profile(profile_path))
+            summary = _nuclei_policy.planning_summary(profile)
+        except (ProfileError, _nuclei_policy.NucleiPolicyError) as exc:
+            raise click.ClickException(str(exc)) from exc
+    for line in views.plan_lines(summary):
         click.echo(line)
 
 
@@ -1756,20 +1818,64 @@ def oob_poll(profile_path, run_id, wait, as_json):
 def _oob_poll(profile_path, run_id, wait, got):
     import time as _time
     from . import oob as oobmod
+    from . import exit_contract as _ec
 
     try:
         profile = TargetProfile.load(_resolve_profile(profile_path))
     except ProfileError as e:
         raise click.ClickException(str(e))
+    if not profile.oob_enabled:
+        raise _ec.Refused(
+            "OOB network polling is disabled by MODES.OOB_ENABLED=false; local `quarry oob import` "
+            "remains available"
+        )
     project = _project_dir(profile)
     run_obj = _existing_run(project, profile.target, run_id)
     if run_obj is None:
         raise click.ClickException(f"no runs found under {project}/recon/")
     got["run_id"] = run_obj.run_id
-    # current oob config; resume_session couples the token to the saved session's server (not persisted)
-    _cfg = secrets.oob()
+    from . import nuclei_policy as _nuclei_policy
+    if not run_obj.manifest_committed():
+        raise _ec.Refused(
+            f"run {run_obj.run_id} has no committed manifest/frozen OOB channel; network polling "
+            "is refused, but local `quarry oob import` remains available"
+        )
+    from . import run_manifest as _run_manifest
+    try:
+        _manifest_profile = _run_manifest.read(run_obj.manifest_path).document["profile"]
+    except _run_manifest.ManifestError as exc:
+        raise _ec.MachineryFailure(
+            f"run {run_obj.run_id} OOB policy cannot be authenticated: {exc}", where="oob policy",
+        ) from exc
+    if _manifest_profile.get("oob_enabled") is False:
+        raise _ec.Refused(
+            f"run {run_obj.run_id} was created with MODES.OOB_ENABLED=false; network polling "
+            "cannot be enabled after the fact, but local `quarry oob import` remains available"
+        )
+    try:
+        _policy_document = _nuclei_policy.published_document(
+            run_obj, _manifest_profile.get("nuclei_policy"),
+        )
+        _poll_channel = next(
+            row for row in _policy_document["channels"] if row["owner"] == "quarry.oob_poll"
+        )
+        if not _poll_channel["enabled"]:
+            raise _ec.Refused(
+                f"run {run_obj.run_id} froze quarry.oob_poll disabled; local `quarry oob import` "
+                "remains available"
+            )
+        _modes = _policy_document["modes"]
+        _current_private = (secrets.oob()
+                            if _modes["oob_backend"] == "self-hosted"
+                            and _modes["oob_auth"] == "private-config" else None)
+        _cfg = _nuclei_policy.authenticate_frozen_oob(_policy_document, _current_private)
+    except _nuclei_policy.NucleiPolicyError as exc:
+        raise _ec.Refused(str(exc)) from exc
     resumed = oobmod.resume_session(run_obj, token=_cfg.get("auth_token"),
-                                    server=_cfg.get("callback_server"))
+                                    server=_modes["oob_server"]
+                                    if _modes["oob_backend"] == "self-hosted" else None,
+                                    expected_server=_modes["oob_server"]
+                                    if _modes["oob_backend"] == "self-hosted" else None)
     if resumed is None:
         raise click.ClickException("no resumable OOB session for this run "
                                    "(session.json missing, interactsh-client absent, or domain mismatch)")

@@ -21,7 +21,7 @@ dependencies = [
 quarry = "quarry_recon.cli:cli"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "jsonschema>=4.23"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

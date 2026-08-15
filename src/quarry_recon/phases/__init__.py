@@ -16,6 +16,7 @@ class PhaseContext:
     workdir: Path                 # scratch dir for inter-phase input files
     echo: callable = print
     http_timeout: int = 1800
+    nuclei_policy: object | None = None
 
     def tmp(self, name: str) -> Path:
         self.workdir.mkdir(parents=True, exist_ok=True)

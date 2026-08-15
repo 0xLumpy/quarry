@@ -65,6 +65,7 @@ _identity_schema = "quarry.runtime-launch.v1"
 _max_dynamic_files = 200_000
 _max_dynamic_bytes = 2 * 1024 * 1024 * 1024
 _reusable_snapshots = threading.local()
+_expected_identities = threading.local()
 
 
 def _settle_launch_root(root: Path, *, expected_identity: "tuple[int, int] | None" = None) -> None:
@@ -410,7 +411,11 @@ def _copy_input_tree(source: Path, destination: Path, *, allow_absent: bool) -> 
         elif stat.S_ISREG(observed.st_mode):
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             record = _file_record("private-tree-file", path)
-            _copy_regular(Path(record["path"]), target, record, mode=record["mode"])
+            # Launch snapshots are inputs, never tool-owned state.  Preserve bytes and identity while
+            # removing the ordinary write bit so an adapter cannot accidentally change the corpus seen
+            # by a later owner in the same run.  Every launch still re-hashes the tree immediately before
+            # spawn; the mode is a first barrier, not the identity proof by itself.
+            _copy_regular(Path(record["path"]), target, record, mode=0o400)
         else:
             raise RuntimeIdentityError(f"runtime tree contains an unsupported alias/object: {path}")
     after = _dynamic_tree(source, "private-tree")
@@ -437,21 +442,35 @@ def _active_tree_snapshot(source: Path) -> "dict | None":
     root_stat = root.lstat()
     entry["identity"] = (root_stat.st_dev, root_stat.st_ino)
     try:
-        check = _copy_input_tree(source, root / "tree", allow_absent=False)
+        # Nuclei's platform config discovery happens before it applies NUCLEI_CONFIG_DIR.  Give that
+        # adapter an XDG-shaped root so both reads resolve to the same detached config, never the
+        # operator's ambient ~/.config.  Its cache/home siblings are private ephemeral state and are not
+        # part of the authenticated config tree.
+        state_root = root / "xdg" if entry.get("role") == "nuclei-config" else root
+        anchor_name = "nuclei" if entry.get("role") == "nuclei-config" else "tree"
+        check = _copy_input_tree(
+            source, state_root / anchor_name, allow_absent=bool(entry.get("allow_absent", False)),
+        )
+        if entry.get("role") == "nuclei-config":
+            (state_root / "cache").mkdir(mode=0o700)
+            (state_root / "home").mkdir(mode=0o500)
+            os.chmod(state_root, 0o500)
+        anchor = Path(check["anchor"])
         for directory in sorted(
-                (path for path in (root / "tree").rglob("*") if path.is_dir()),
+                (path for path in anchor.rglob("*") if path.is_dir()),
                 key=lambda path: len(path.parts), reverse=True):
             os.chmod(directory, 0o500)
-        os.chmod(root / "tree", 0o500)
+        os.chmod(anchor, 0o500)
         directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
         os.chmod(root, 0o500)
+        check["source_origin_kind"] = check["source_kind"]
         check["source_kind"] = "detached-tree"
         check["role"] = entry["role"]
-        check["private"] = False
+        check["private"] = bool(entry.get("private", False))
         entry["path"] = Path(check["anchor"])
         entry["check"] = check
         return entry
@@ -476,7 +495,8 @@ def _active_tree_snapshot(source: Path) -> "dict | None":
 
 
 @contextmanager
-def reusable_tree_snapshot(source: Path, *, role: str):
+def reusable_tree_snapshot(source: Path, *, role: str, allow_absent: bool = False,
+                           private: bool = False):
     """Register one lazily-created detached tree authority reusable by sequential lane launches."""
     source = Path(source).absolute()
     trees = getattr(_reusable_snapshots, "trees", None)
@@ -488,7 +508,8 @@ def reusable_tree_snapshot(source: Path, *, role: str):
         raise RuntimeIdentityError(f"runtime tree already has an active snapshot: {source}")
     entry = {
         "source": source, "role": role, "root": None, "path": None,
-        "check": None, "identity": None,
+        "check": None, "identity": None, "allow_absent": bool(allow_absent),
+        "private": bool(private),
     }
     trees[key] = entry
     primary = None
@@ -531,6 +552,50 @@ def reusable_tree_snapshot(source: Path, *, role: str):
             raise primary.with_traceback(primary.__traceback__)
         if cleanup_fault is not None:
             raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
+
+
+def materialize_reusable_tree_snapshot(source: Path, *, role: str) -> dict:
+    """Force and describe an already-registered reusable tree snapshot.
+
+    Policy code uses this before the first child launch so the content identity it records is the exact
+    detached tree every later launch consumes, rather than a best-effort hash of a mutable source name.
+    The returned check is a copy; callers cannot replace the live authority entry.
+    """
+    source = Path(source).absolute()
+    entry = _active_tree_snapshot(source)
+    if entry is None or entry.get("role") != role:
+        raise RuntimeIdentityError(f"no reusable {role} authority is registered for {source}")
+    if entry.get("path") is None or entry.get("check") is None:
+        raise RuntimeIdentityError(f"the reusable {role} authority could not be materialized")
+    return {"path": Path(entry["path"]), "check": dict(entry["check"])}
+
+
+@contextmanager
+def expected_tool_identity(tool_name: str, record: dict):
+    """Require one exact pre-recorded executable identity for every launch of ``tool_name`` in scope."""
+    if type(tool_name) is not str or not tool_name or type(record) is not dict:
+        raise RuntimeIdentityError("expected runtime identity registration is malformed")
+    identities = getattr(_expected_identities, "records", None)
+    if identities is None:
+        identities = {}
+        _expected_identities.records = identities
+    if tool_name in identities:
+        raise RuntimeIdentityError(f"runtime identity already has an active policy: {tool_name}")
+    # A JSON round trip both detaches nested mutable objects and proves this is evidence-safe data.
+    try:
+        expected = json.loads(json.dumps(record, sort_keys=True, separators=(",", ":")))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeIdentityError("expected runtime identity is not canonical JSON") from exc
+    identities[tool_name] = expected
+    try:
+        yield expected
+    finally:
+        identities.pop(tool_name, None)
+        if not identities:
+            try:
+                del _expected_identities.records
+            except AttributeError:
+                pass
 
 
 def _private_snapshot_signature(root: Path) -> tuple[tuple, ...]:
@@ -824,7 +889,8 @@ def _launch_anchors(identities: list[dict], payloads=(), input_specs=(), *,
         input_paths, private_checks = {}, []
         for index, spec in enumerate(input_specs):
             source = Path(spec["source"]).absolute()
-            destination = root / f"input-{index}"
+            destination = (root / "xdg" / "nuclei" if spec.get("role") == "nuclei-config"
+                           else root / f"input-{index}")
             if spec["kind"] == "file":
                 check = _copy_input_file(source, destination, allow_absent=spec["allow_absent"])
             elif spec["kind"] == "tree":
@@ -842,6 +908,11 @@ def _launch_anchors(identities: list[dict], payloads=(), input_specs=(), *,
             check["private"] = bool(spec.get("private", False))
             input_paths[spec["key"]] = destination
             private_checks.append(check)
+        if "nuclei-config" in input_paths and input_paths["nuclei-config"].is_relative_to(root):
+            xdg_root = input_paths["nuclei-config"].parent
+            (xdg_root / "cache").mkdir(mode=0o700)
+            (xdg_root / "home").mkdir(mode=0o500)
+            os.chmod(xdg_root, 0o500)
         directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.fsync(directory_fd)
@@ -970,9 +1041,39 @@ def _dynamic_tree(root: Path, role: str) -> dict:
 
 
 def _nuclei_closure(environment: dict[str, str]) -> list[dict]:
-    home = Path(environment.get("HOME") or Path.home())
-    template_root = home / "nuclei-templates"
+    _config_root, template_root = nuclei_runtime_sources(environment)
     return [_dynamic_tree(template_root, "nuclei-templates")]
+
+
+def nuclei_runtime_sources(environment: "dict[str, str] | None" = None) -> tuple[Path, Path]:
+    """Resolve Quarry's Nuclei config/corpus inputs without confusing source and child names.
+
+    ``NUCLEI_CONFIG`` is Quarry's historical input selector.  Upstream Nuclei consumes
+    ``NUCLEI_CONFIG_DIR`` and ``NUCLEI_TEMPLATES_DIR``; callers may use those selectors too, but a
+    launch always replaces them with the detached run snapshots.  Conflicting old/new config selectors
+    are refused instead of silently attesting one directory and executing another.
+    """
+    values = dict(os.environ if environment is None else environment)
+    home = Path(values.get("HOME") or Path.home())
+    legacy_config = values.get("NUCLEI_CONFIG")
+    upstream_config = values.get("NUCLEI_CONFIG_DIR")
+    for name, value in (
+        ("NUCLEI_CONFIG", legacy_config),
+        ("NUCLEI_CONFIG_DIR", upstream_config),
+        ("NUCLEI_TEMPLATES_DIR", values.get("NUCLEI_TEMPLATES_DIR")),
+    ):
+        if value and not Path(value).is_absolute():
+            raise RuntimeIdentityError(f"{name} must be absolute")
+    if (legacy_config and upstream_config
+            and Path(legacy_config).absolute() != Path(upstream_config).absolute()):
+        raise RuntimeIdentityError("NUCLEI_CONFIG and NUCLEI_CONFIG_DIR select different authorities")
+    config_root = Path(
+        upstream_config
+        or legacy_config
+        or Path(values.get("XDG_CONFIG_HOME") or home / ".config") / "nuclei"
+    )
+    template_root = Path(values.get("NUCLEI_TEMPLATES_DIR") or home / "nuclei-templates")
+    return config_root.absolute(), template_root.absolute()
 
 
 def _subfinder_closure(environment: dict[str, str]) -> list[dict]:
@@ -1119,6 +1220,10 @@ def prepare_launch(tool_name: str, argv: list[str], *, caller_env: "dict | None"
         raise RuntimeIdentityError("runtime argv must be a non-empty string list")
     caller_env = _exact_caller_environment(caller_env)
     main, executable, tool, root, receipt = _tool_identity(argv[0])
+    expected_records = getattr(_expected_identities, "records", None)
+    expected = None if expected_records is None else expected_records.get(tool_name)
+    if expected is not None and main != expected:
+        raise RuntimeIdentityError(f"runtime identity differs from the active policy for {tool_name}")
     if tool is not None and tool.bin != tool_name:
         raise RuntimeIdentityError(
             f"runtime adapter {tool_name!r} attempted executable {tool.bin!r}"
@@ -1195,22 +1300,20 @@ def prepare_launch(tool_name: str, argv: list[str], *, caller_env: "dict | None"
                 input_arg_indexes[len(command_args) - 1] = key
 
     if tool_name == "nuclei":
-        home = Path(ambient_plus_caller.get("HOME") or Path.home())
-        config_value = ambient_plus_caller.get("NUCLEI_CONFIG")
-        if config_value and not Path(config_value).is_absolute():
-            raise RuntimeIdentityError("NUCLEI_CONFIG must be absolute")
-        config_source = Path(
-            config_value
-            or Path(ambient_plus_caller.get("XDG_CONFIG_HOME") or home / ".config") / "nuclei"
-        )
-        template_source = home / "nuclei-templates"
+        config_source, template_source = nuclei_runtime_sources(ambient_plus_caller)
         input_specs.extend((
             {"key": "nuclei-config", "role": "nuclei-config", "kind": "tree",
+             # Generic capability/smoke preparation remains possible before Nuclei has initialized its
+             # config. Managed scan runs are stricter: nuclei_policy.run_authority requires the exact
+             # config/ignore authority before any owner can launch.
              "source": str(config_source), "allow_absent": True, "private": True},
             {"key": "nuclei-templates", "role": "nuclei-templates", "kind": "tree",
              "source": str(template_source), "allow_absent": False, "private": False},
         ))
-        environment_inputs["NUCLEI_CONFIG"] = "nuclei-config"
+        # These are the names upstream actually reads.  The legacy NUCLEI_CONFIG source selector is
+        # intentionally absent from the child environment.
+        environment_inputs["NUCLEI_CONFIG_DIR"] = "nuclei-config"
+        environment_inputs["NUCLEI_TEMPLATES_DIR"] = "nuclei-templates"
         if not any(item in {"-t", "-templates"} for item in command_args):
             command_args.extend(("-t", "@input:nuclei-templates"))
             input_arg_indexes[len(command_args) - 1] = "nuclei-templates"
@@ -1352,11 +1455,33 @@ def prepare_launch(tool_name: str, argv: list[str], *, caller_env: "dict | None"
         environment.update(entry_environment)
         for name, key in environment_inputs.items():
             environment[name] = str(input_paths[key])
+        if tool_name == "nuclei":
+            config_parent = input_paths["nuclei-config"].parent
+            environment.update({
+                "HOME": str(config_parent / "home"),
+                "XDG_CONFIG_HOME": str(config_parent),
+                "XDG_CACHE_HOME": str(config_parent / "cache"),
+            })
         dynamic = [
             _dynamic_tree(Path(check["anchor"]), check["role"])
             for check in private_checks
             if not check["private"] and check["anchor_kind"] == "tree"
         ]
+        private_inputs = []
+        for check in private_checks:
+            if not check["private"]:
+                continue
+            row = {"kind": check["anchor_kind"], "role": check["role"],
+                   "source_state": check["source_kind"]}
+            if tool_name == "nuclei" and check["role"] == "nuclei-config":
+                # The private config bytes and paths remain private.  This credential-free closure is
+                # persisted so the Nuclei policy can authenticate the exact config tree that executed.
+                expected = check["expected"]
+                row["closure"] = {
+                    "bytes": expected["bytes"], "files": expected["files"],
+                    "sha256": expected["sha256"],
+                }
+            private_inputs.append(row)
         record = {
             "schema_version": _identity_schema,
             "tool": tool_name,
@@ -1369,11 +1494,7 @@ def prepare_launch(tool_name: str, argv: list[str], *, caller_env: "dict | None"
             "selected_executable": _file_record("selected-executable", Path(actual[0])),
             "launch_anchors": anchor_records,
             "payload_anchors": payload_records,
-            "private_inputs": [
-                {"kind": check["anchor_kind"], "role": check["role"],
-                 "source_state": check["source_kind"]}
-                for check in private_checks if check["private"]
-            ],
+            "private_inputs": private_inputs,
             "dynamic_closure": dynamic,
         }
         from . import secrets

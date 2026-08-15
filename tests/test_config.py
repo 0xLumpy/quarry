@@ -175,6 +175,7 @@ class TestEveryModeIsDiscoverable:
         "TAKEOVER": True,
         "PORTSCAN": False,
         "BLOCK_PRIVATE_TARGETS": False,
+        "OOB_ENABLED": True,
         "CONTENT_DISCOVERY": "off",
         "CONTENT_RECURSION": 0,
         "JS_AST": False,
@@ -206,7 +207,8 @@ class TestEveryModeIsDiscoverable:
         p = TargetProfile.load(str(prof_file))
         for attr, expect in (("passive_only", False), ("headless", False), ("screenshots", True),
                              ("takeover", True), ("portscan", False),
-                             ("block_private_targets", False), ("content_discovery", "off"),
+                             ("block_private_targets", False), ("oob_enabled", True),
+                             ("content_discovery", "off"),
                              ("content_recursion", 0), ("js_ast", False),
                              ("verify_secrets", False), ("blind_xss", False),
                              ("deep_evidence", False),

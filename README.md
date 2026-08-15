@@ -305,6 +305,18 @@ point at one you host. Setting a server replaces the backend everywhere; it is n
 channel. Quarry's own probes, nuclei and dalfox keep separate sessions and correlation even on the
 same backend.
 
+Set `MODES.OOB_ENABLED: false` for one global network-OOB opt-out. It adds Nuclei's no-Interactsh
+control, prevents Quarry callback issue/poll, and disables Dalfox blind OOB; local `quarry oob import`
+remains available and `BLOCK_PRIVATE_TARGETS` is unchanged. `quarry plan -t <target>` reports the
+resolved off/public/self-hosted backend for every owner from a detached planning snapshot.
+
+The run-scoped Nuclei policy hashes the exact engine, configuration, ignore file, corpus, selected
+templates, and referenced helpers. Template digest markers are inventoried but are **not** verified as
+publisher signatures: the artifact reports `unverified-inventory-only-not-an-authorship-claim` and must
+not be read as an official-signer assertion. Because the pinned engine applies signature-dependent load
+behavior to JavaScript templates, every owner forces `-ept javascript`; those templates remain inventoried
+as `load-excluded` but are never claimed as executed coverage.
+
 `quarry oob import` exists for compatibility only: it ingests external callback logs (Burp
 Collaborator, XSSHunter, a manual interactsh session). Imported rows are evidence but stay
 uncorrelated unless they carry a Quarry-issued token.

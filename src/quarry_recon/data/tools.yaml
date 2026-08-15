@@ -551,7 +551,7 @@ tools:
     install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
     update: nuclei -update; nuclei -update-templates
     version_cmd: nuclei -version
-    env_allow: [NUCLEI_CONFIG]
+    env_allow: [NUCLEI_CONFIG_DIR, NUCLEI_TEMPLATES_DIR]
     doc: https://github.com/projectdiscovery/nuclei
     needs_chromium: true     # only for -headless / screenshot templates
     notes: >

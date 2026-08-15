@@ -195,6 +195,13 @@ class TargetProfile:
         return _flag(self.modes.get("BLOCK_PRIVATE_TARGETS"), False)
 
     @property
+    def oob_enabled(self) -> bool:
+        """Independent OOB transport switch.  Public/self-hosted OOB stays enabled by default; setting
+        this false disables Nuclei Interactsh, Quarry callback issue/poll, and Dalfox blind OOB without
+        disabling local callback-log import or changing the private-target posture."""
+        return _flag(self.modes.get("OOB_ENABLED"), True)
+
+    @property
     def verify_secrets(self) -> bool:
         """Opt-in authorized lane: actively verify discovered secrets. Default False — trufflehog's
         default verification sends discovered target credentials to their third-party provider APIs,
@@ -389,7 +396,8 @@ class TargetProfile:
                 raise ProfileError(f"RATELIMIT.{k} must be > 0, got {v!r}")
         # boolean MODES: validate the known flags parse now, before side effects.
         modes = raw.get("MODES") or {}
-        for k in ("PASSIVE_ONLY", "BLOCK_PRIVATE_TARGETS", "HEADLESS", "SCREENSHOTS", "PORTSCAN", "TAKEOVER"):
+        for k in ("PASSIVE_ONLY", "BLOCK_PRIVATE_TARGETS", "OOB_ENABLED", "HEADLESS", "SCREENSHOTS",
+                  "PORTSCAN", "TAKEOVER"):
             if k in modes:
                 _flag(modes[k], False)          # raises ProfileError on an ambiguous value
         # arming flags: a present value must be a bare boolean — a quoted string must fail loud.

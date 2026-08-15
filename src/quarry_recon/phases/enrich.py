@@ -6,12 +6,13 @@ CNAME/takeover signal, and probes those that resolve — the same treatment vert
 """
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
 import json as _json
 
-from .. import normalize, policy
+from .. import normalize, nuclei_policy, policy
 from .. import settings
 from ..runner import (RunResult, Status, have, native_output_current, nuclei_timeout,
                       reclassify_from_files, run as exec_tool, scaled_timeout, skipped)
@@ -459,20 +460,43 @@ def run(ctx) -> None:
         # ── fingerprint the late hosts the same way probe does (probe ran before they existed) ──
         if new_live:
             if have("nuclei"):                          # WAF fingerprint
+                nuclei_authority = nuclei_policy.policy_for(ctx)
                 wi = ctx.write_list("enrich_waf.txt", new_live)
                 wo = ctx.run.raw_path("enrich", "nuclei", "waf.jsonl")
-                wcmd = ["nuclei", "-l", str(wi), "-tags", "waf", "-jsonl", "-o", str(wo)]
-                if prof.http_rl:
-                    wcmd += ["-rl", str(prof.http_rl)]
-                wr = exec_tool(
-                    "nuclei", wcmd,
-                    repository=ctx.run,
-                    stdout=RepositoryOutput.discard(),
-                    stderr=RepositoryOutput.discard(),
-                    native_outputs=(RepositoryNativeOutput.file(
-                        7, *wo.relative_to(ctx.run.dir).parts, required=False,
-                    ),),
-                    timeout=nuclei_timeout(len(new_live), ctx.http_timeout))
+                oob_context = (nuclei_authority.oob_flags() if nuclei_authority is not None else
+                               contextlib.nullcontext(("-ni",) if not getattr(
+                                   prof, "oob_enabled", True) else ()))
+                with oob_context as oob_flags:
+                    wcmd = ["nuclei", "-l", str(wi), "-ept", "javascript",
+                            "-tags", "waf", "-jsonl", "-duc",
+                            "-o", str(wo)]
+                    if prof.http_rl:
+                        wcmd += ["-rl", str(prof.http_rl)]
+                    wcmd.extend(oob_flags)
+                    wcfg = ({"tags": "waf", "rate": prof.http_rl,
+                             **nuclei_authority.work_config("enrich.nuclei_waf")}
+                            if nuclei_authority is not None else
+                            {"tags": "waf", "rate": prof.http_rl,
+                             "oob_enabled": getattr(prof, "oob_enabled", True)})
+                    wwu = events.work_unit("enrich.nuclei_waf", inputs={"urls": new_live}, config=wcfg)
+                    if nuclei_authority is not None:
+                        nuclei_authority.prepare(
+                            "enrich.nuclei_waf", wcmd, input_total=len(new_live), work_unit=wwu,
+                        )
+                    wr = exec_tool(
+                        "nuclei", wcmd,
+                        repository=ctx.run,
+                        stdout=RepositoryOutput.discard(),
+                        stderr=RepositoryOutput.discard(),
+                        native_outputs=(RepositoryNativeOutput.file(
+                            7, *wo.relative_to(ctx.run.dir).parts, required=False,
+                        ),),
+                        timeout=nuclei_timeout(len(new_live), ctx.http_timeout),
+                        work_unit=wwu)
+                    if nuclei_authority is not None:
+                        nuclei_authority.settle(
+                            "enrich.nuclei_waf", wr, input_total=len(new_live), work_unit=wwu,
+                        )
                 ctx.run.record("enrich", wr)
                 if native_output_current(wr, wo) and wo.exists():
                     for line in wo.read_text().splitlines():

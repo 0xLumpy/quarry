@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quarry.invalid/schemas/nuclei-policy-v1.schema.json",
+  "title": "Quarry run-scoped Nuclei policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "policy_id", "run_id", "policy_digest", "authorization", "engine", "corpus", "config", "ignore", "flags_config", "helpers", "template_inventory", "semantic_classifier", "modes", "owners", "channels"],
+  "properties": {
+    "schema_version": {"const": "quarry.nuclei-policy.v1"},
+    "policy_id": {"const": "quarry.broad-active-verification.v1"},
+    "run_id": {"type": "string", "minLength": 1},
+    "policy_digest": {"$ref": "#/$defs/contentDigest"},
+    "authorization": {
+      "type": "object", "additionalProperties": false,
+      "required": ["consent_basis", "scope_revision", "verification_claim"],
+      "properties": {
+        "consent_basis": {"const": "active-profile"},
+        "scope_revision": {"$ref": "#/$defs/contentDigest"},
+        "verification_claim": {"const": "operator-asserted-not-legally-verified"}
+      }
+    },
+    "engine": {
+      "type": "object", "additionalProperties": false,
+      "required": ["identity", "declared_pin"],
+      "properties": {
+        "identity": {"$ref": "#/$defs/engineIdentity"},
+        "declared_pin": {"type": ["string", "null"]}
+      }
+    },
+    "corpus": {"$ref": "#/$defs/corpusTree"},
+    "config": {"$ref": "#/$defs/configTree"},
+    "ignore": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "tags", "files", "resolved_files"],
+      "properties": {
+        "path": {"const": ".nuclei-ignore"}, "sha256": {"$ref": "#/$defs/contentDigest"},
+        "tags": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "files": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "resolved_files": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      }
+    },
+    "flags_config": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "active_settings"],
+      "properties": {
+        "path": {"const": "config.yaml"}, "sha256": {"$ref": "#/$defs/contentDigest"},
+        "active_settings": {"const": false}
+      }
+    },
+    "helpers": {"type": "array", "items": {"$ref": "#/$defs/fileRow"}},
+    "template_inventory": {"type": "array", "items": {"$ref": "#/$defs/templateInventoryRow"}},
+    "semantic_classifier": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "effect", "classes"],
+      "properties": {
+        "id": {"const": "quarry.nuclei-semantic-risk.v1"},
+        "effect": {"const": "telemetry-only-never-filters-selection"},
+        "classes": {"const": ["not_detected", "potentially_state_changing", "unknown"]}
+      }
+    },
+    "modes": {
+      "type": "object", "additionalProperties": false,
+      "required": ["oob_enabled", "oob_backend", "oob_server", "oob_auth", "oob_auth_identity", "oob_config_identity", "block_private_targets"],
+      "properties": {
+        "oob_enabled": {"type": "boolean"},
+        "oob_backend": {"enum": ["off", "public-interactsh", "self-hosted"]},
+        "oob_server": {"type": ["string", "null"]},
+        "oob_auth": {"enum": ["none", "private-config"]},
+        "oob_auth_identity": {"anyOf": [{"$ref": "#/$defs/contentDigest"}, {"type": "null"}]},
+        "oob_config_identity": {"$ref": "#/$defs/contentDigest"},
+        "block_private_targets": {"type": "boolean"}
+      },
+      "allOf": [
+        {"if": {"properties": {"oob_enabled": {"const": false}}}, "then": {"properties": {"oob_backend": {"const": "off"}, "oob_server": {"const": null}, "oob_auth": {"const": "none"}, "oob_auth_identity": {"const": null}}}},
+        {"if": {"properties": {"oob_enabled": {"const": true}}}, "then": {"properties": {"oob_backend": {"enum": ["public-interactsh", "self-hosted"]}}}},
+        {"if": {"properties": {"oob_backend": {"const": "public-interactsh"}}}, "then": {"properties": {"oob_server": {"const": "projectdiscovery-public-default"}, "oob_auth": {"const": "none"}, "oob_auth_identity": {"const": null}}}},
+        {"if": {"properties": {"oob_backend": {"const": "self-hosted"}}}, "then": {"properties": {"oob_server": {"type": "string", "pattern": "^https?://[^/?#@\\s]+$"}}}},
+        {"if": {"properties": {"oob_auth": {"const": "none"}}}, "then": {"properties": {"oob_auth_identity": {"const": null}}}},
+        {"if": {"properties": {"oob_auth": {"const": "private-config"}}}, "then": {"properties": {"oob_auth_identity": {"$ref": "#/$defs/contentDigest"}}}}
+      ]
+    },
+    "owners": {
+      "type": "array", "minItems": 4, "maxItems": 4,
+      "prefixItems": [
+        {"allOf": [{"$ref": "#/$defs/owner"}, {"properties": {"owner": {"const": "probe.nuclei_waf"}}}]},
+        {"allOf": [{"$ref": "#/$defs/owner"}, {"properties": {"owner": {"const": "enrich.nuclei_waf"}}}]},
+        {"allOf": [{"$ref": "#/$defs/owner"}, {"properties": {"owner": {"const": "params.nuclei_takeover"}}}]},
+        {"allOf": [{"$ref": "#/$defs/owner"}, {"properties": {"owner": {"const": "params.nuclei_scan"}}}]}
+      ],
+      "items": false
+    },
+    "channels": {
+      "type": "array", "minItems": 4, "maxItems": 4,
+      "prefixItems": [
+        {"allOf": [{"$ref": "#/$defs/channel"}, {"properties": {"owner": {"const": "params.oob_probe"}}}]},
+        {"allOf": [{"$ref": "#/$defs/channel"}, {"properties": {"owner": {"const": "quarry.oob_poll"}}}]},
+        {"allOf": [{"$ref": "#/$defs/channel"}, {"properties": {"owner": {"const": "params.dalfox_blind_oob"}}}]},
+        {"allOf": [{"$ref": "#/$defs/channel"}, {"properties": {"owner": {"const": "quarry.oob_import"}}}]}
+      ],
+      "items": false
+    }
+  },
+  "$defs": {
+    "hexDigest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "contentDigest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "fileIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bytes", "path", "role", "sha256", "mode"],
+      "properties": {
+        "bytes": {"type": "integer", "minimum": 0}, "path": {"type": "string", "minLength": 1},
+        "role": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/hexDigest"},
+        "mode": {"type": "integer", "minimum": 0, "maximum": 4095}
+      }
+    },
+    "closure": {
+      "type": ["object", "null"],
+      "oneOf": [
+        {"type": "null"},
+        {"type": "object", "additionalProperties": false, "required": ["bytes", "objects", "sha256"],
+         "properties": {"bytes": {"type": "integer", "minimum": 0}, "objects": {"type": "integer", "minimum": 0}, "sha256": {"$ref": "#/$defs/hexDigest"}}}
+      ]
+    },
+    "receipt": {
+      "type": "object", "additionalProperties": false, "required": ["bytes", "path", "sha256"],
+      "properties": {"bytes": {"type": "integer", "minimum": 0}, "path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/hexDigest"}}
+    },
+    "engineIdentity": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false,
+         "required": ["attestation", "executable", "identity", "runtime", "runtime_root", "closure"],
+         "properties": {"attestation": {"enum": ["host-digest", "immutable-system-name"]}, "executable": {"$ref": "#/$defs/fileIdentity"}, "identity": {"type": "string", "minLength": 1}, "runtime": {"type": "string", "minLength": 1}, "runtime_root": {"type": "string", "minLength": 1}, "closure": {"$ref": "#/$defs/closure"}}},
+        {"type": "object", "additionalProperties": false,
+         "required": ["attestation", "executable", "identity", "declared_identity", "receipt", "runtime", "runtime_root", "closure"],
+         "properties": {"attestation": {"const": "managed-receipt"}, "executable": {"$ref": "#/$defs/fileIdentity"}, "identity": {"type": "string", "minLength": 1}, "declared_identity": {"type": "string", "minLength": 1}, "receipt": {"$ref": "#/$defs/receipt"}, "runtime": {"type": "string", "minLength": 1}, "runtime_root": {"type": "string", "minLength": 1}, "closure": {"$ref": "#/$defs/closure"}}}
+      ]
+    },
+    "fileRow": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bytes", "kind", "path", "sha256"],
+      "properties": {"bytes": {"type": "integer", "minimum": 0}, "kind": {"enum": ["file", "symlink"]}, "path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/contentDigest"}}
+    },
+    "corpusTree": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_state", "source_origin_kind", "digest", "bytes", "file_count", "inventory", "signature_verification", "trust"],
+      "properties": {
+        "source_state": {"enum": ["detached-tree", "tree", "absent"]}, "digest": {"$ref": "#/$defs/contentDigest"},
+        "source_origin_kind": {"enum": ["tree", "absent"]},
+        "bytes": {"type": "integer", "minimum": 0}, "file_count": {"type": "integer", "minimum": 0},
+        "inventory": {"type": "array", "items": {"$ref": "#/$defs/fileRow"}},
+        "signature_verification": {"const": "inventory-only-not-cryptographically-verified"},
+        "trust": {"const": "unverified-inventory-only-not-an-authorship-claim"}
+      },
+      "allOf": [
+        {"if": {"properties": {"source_state": {"const": "absent"}}}, "then": {"properties": {"source_origin_kind": {"const": "absent"}, "bytes": {"const": 0}, "file_count": {"const": 0}, "inventory": {"maxItems": 0}}}},
+        {"if": {"properties": {"source_state": {"const": "tree"}}}, "then": {"properties": {"source_origin_kind": {"const": "tree"}}}},
+        {"if": {"properties": {"source_origin_kind": {"const": "absent"}}}, "then": {"properties": {"bytes": {"const": 0}, "file_count": {"const": 0}, "inventory": {"maxItems": 0}}}}
+      ]
+    },
+    "configTree": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_state", "source_origin_kind", "digest", "bytes", "file_count", "inventory", "private"],
+      "properties": {
+        "source_state": {"enum": ["detached-tree", "tree", "absent"]}, "digest": {"$ref": "#/$defs/contentDigest"},
+        "source_origin_kind": {"enum": ["tree", "absent"]},
+        "bytes": {"type": "integer", "minimum": 0}, "file_count": {"type": "integer", "minimum": 0},
+        "inventory": {"type": "array", "items": {"$ref": "#/$defs/fileRow"}},
+        "private": {"const": true}
+      },
+      "allOf": [
+        {"if": {"properties": {"source_state": {"const": "absent"}}}, "then": {"properties": {"source_origin_kind": {"const": "absent"}, "bytes": {"const": 0}, "file_count": {"const": 0}, "inventory": {"maxItems": 0}}}},
+        {"if": {"properties": {"source_state": {"const": "tree"}}}, "then": {"properties": {"source_origin_kind": {"const": "tree"}}}},
+        {"if": {"properties": {"source_origin_kind": {"const": "absent"}}}, "then": {"properties": {"bytes": {"const": 0}, "file_count": {"const": 0}, "inventory": {"maxItems": 0}}}}
+      ]
+    },
+    "selectedTemplate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "path", "sha256", "severity", "tags", "signature_state", "signature_marker_digest", "semantic_class", "semantic_reasons"],
+      "properties": {"id": {"type": "string", "minLength": 1}, "path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/contentDigest"}, "severity": {"type": "string", "minLength": 1}, "tags": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}, "signature_state": {"enum": ["digest-marker-present-unverified", "unsigned"]}, "signature_marker_digest": {"anyOf": [{"$ref": "#/$defs/contentDigest"}, {"type": "null"}]}, "semantic_class": {"enum": ["not_detected", "potentially_state_changing", "unknown"]}, "semantic_reasons": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}}
+    },
+    "templateInventoryRow": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "path", "bytes", "sha256", "severity", "tags", "signature_state", "signature_marker_digest", "load_state", "required_capabilities", "semantic_class", "semantic_reasons", "helper_paths"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1}, "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 0}, "sha256": {"$ref": "#/$defs/contentDigest"},
+        "severity": {"type": "string", "minLength": 1},
+        "tags": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "signature_state": {"enum": ["digest-marker-present-unverified", "unsigned"]},
+        "signature_marker_digest": {"anyOf": [{"$ref": "#/$defs/contentDigest"}, {"type": "null"}]},
+        "load_state": {"enum": ["loaded", "load-excluded", "metadata-rejected"]},
+        "required_capabilities": {"type": "array", "items": {"enum": ["headless", "code", "javascript", "dast", "self-contained", "file"]}, "uniqueItems": true},
+        "semantic_class": {"enum": ["not_detected", "potentially_state_changing", "unknown"]},
+        "semantic_reasons": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "helper_paths": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      },
+      "allOf": [
+        {"if": {"properties": {"load_state": {"const": "load-excluded"}}, "required": ["load_state"]}, "then": {"properties": {"required_capabilities": {"minItems": 1}}}},
+        {"if": {"properties": {"required_capabilities": {"minItems": 1}}, "required": ["required_capabilities"]}, "then": {"properties": {"load_state": {"const": "load-excluded"}}}},
+        {"if": {"properties": {"load_state": {"enum": ["loaded", "metadata-rejected"]}}, "required": ["load_state"]}, "then": {"properties": {"required_capabilities": {"maxItems": 0}}}}
+      ]
+    },
+    "semanticRef": {
+      "type": "object", "additionalProperties": false, "required": ["id", "path"],
+      "properties": {"id": {"type": "string", "minLength": 1}, "path": {"type": "string", "minLength": 1}}
+    },
+    "semanticInventory": {
+      "type": "object", "additionalProperties": false,
+      "required": ["classifier", "counts", "potentially_state_changing", "unknown"],
+      "properties": {
+        "classifier": {"const": "quarry.nuclei-semantic-risk.v1"},
+        "counts": {"type": "object", "additionalProperties": false, "required": ["not_detected", "potentially_state_changing", "unknown"], "properties": {"not_detected": {"type": "integer", "minimum": 0}, "potentially_state_changing": {"type": "integer", "minimum": 0}, "unknown": {"type": "integer", "minimum": 0}}},
+        "potentially_state_changing": {"type": "array", "items": {"$ref": "#/$defs/semanticRef"}},
+        "unknown": {"type": "array", "items": {"$ref": "#/$defs/semanticRef"}}
+      }
+    },
+    "owner": {
+      "type": "object", "additionalProperties": false,
+      "required": ["owner", "description", "flags", "private_config", "oob_enabled", "oob_backend", "oob_config_identity", "channel_digest", "flags_digest", "selected_count", "selected_templates", "selection_digest", "semantic_inventory"],
+      "properties": {"owner": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1}, "flags": {"type": "array", "items": {"type": "string", "minLength": 1}}, "private_config": {"enum": [null, "interactsh-token"]}, "oob_enabled": {"type": "boolean"}, "oob_backend": {"enum": ["off", "public-interactsh", "self-hosted"]}, "oob_config_identity": {"anyOf": [{"$ref": "#/$defs/contentDigest"}, {"type": "null"}]}, "channel_digest": {"$ref": "#/$defs/contentDigest"}, "flags_digest": {"$ref": "#/$defs/contentDigest"}, "selected_count": {"type": "integer", "minimum": 0}, "selected_templates": {"type": "array", "items": {"$ref": "#/$defs/selectedTemplate"}}, "selection_digest": {"$ref": "#/$defs/contentDigest"}, "semantic_inventory": {"$ref": "#/$defs/semanticInventory"}}
+    },
+    "channel": {
+      "type": "object", "additionalProperties": false,
+      "required": ["owner", "enabled", "oob_backend", "config_identity", "channel_digest"],
+      "properties": {
+        "owner": {"type": "string", "minLength": 1}, "enabled": {"type": "boolean"},
+        "oob_backend": {"enum": ["off", "public-interactsh", "self-hosted", "local-only"]},
+        "config_identity": {"anyOf": [{"$ref": "#/$defs/contentDigest"}, {"type": "null"}]},
+        "channel_digest": {"$ref": "#/$defs/contentDigest"}
+      }
+    }
+  }
+}

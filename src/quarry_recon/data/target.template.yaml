@@ -52,6 +52,9 @@ MODES:
   BLOCK_PRIVATE_TARGETS: false  # false: in-scope names resolving to private, CGNAT or ULA
                               # addresses are contacted and recorded as leads. The scan host
                               # itself and cloud metadata are always withheld.
+  OOB_ENABLED: true           # independent OOB transport switch. false adds nuclei -ni, disables
+                              # Quarry callback issue/poll and Dalfox blind OOB; local `oob import`
+                              # remains available. Does not change BLOCK_PRIVATE_TARGETS.
   CONTENT_DISCOVERY: "off"    # off | light | balanced | deep
   CONTENT_RECURSION: 0        # depth for balanced/deep
   JS_AST: false               # AST analysis of downloaded JS bundles (local, memory-hungry)

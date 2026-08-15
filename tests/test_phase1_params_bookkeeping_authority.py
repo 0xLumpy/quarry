@@ -37,6 +37,9 @@ def _silence_events(monkeypatch):
         "ledger",
     ):
         monkeypatch.setattr(events, name, lambda *args, **kwargs: None)
+    # These fixtures isolate the repository claim itself and invoke the internal lane without the CLI's
+    # run-scoped V310-09 authority. Production managed runs remain fail-closed in policy_for().
+    monkeypatch.setattr(params.nuclei_policy, "policy_for", lambda _ctx: None)
 
 
 def test_nuclei_claim_blocks_seal_through_postprocessing(tmp_path, monkeypatch):
