@@ -1425,56 +1425,11 @@ def _fsync_directory(path: Path, *, directory_identity: tuple[int, int]) -> None
         os.close(fd)
 
 
-def _fsync_tree(root: Path, *, root_identity: tuple[int, int]) -> None:
-    """Durably seal a staged tree without reopening any absolute descendant path."""
+def _validate_tree_identity_claims_fd(
+    root_fd: int, root: Path,
+    expected_tree: dict[tuple[str, ...], tuple[str, tuple[int, ...]]],
+) -> None:
     root = Path(root)
-    root_fd = _open_private_directory_path(root, expected_identity=root_identity)
-    count = 0
-    expected_tree: dict[tuple[str, ...], tuple[str, tuple[int, ...]]] = {}
-
-    def sync(directory_fd: int, relative: Path, depth: int) -> None:
-        nonlocal count
-        if depth > MAX_REVISION_TREE_DEPTH:
-            raise RevisionError(f"{root}: revision tree exceeds its depth bound")
-        try:
-            iterator = os.scandir(directory_fd)
-        except OSError as exc:
-            raise RevisionError(f"{root / relative}: revision tree is unreadable: {exc}") from exc
-        with iterator:
-            for entry in iterator:
-                count += 1
-                if count > MAX_REVISION_VIEW_FILES:
-                    raise RevisionError(f"{root}: revision tree exceeds its file-count bound")
-                path = root / relative / entry.name
-                try:
-                    observed = entry.stat(follow_symlinks=False)
-                except OSError as exc:
-                    raise RevisionError(f"{path}: revision object is unreadable: {exc}") from exc
-                child_fd = -1
-                try:
-                    if stat.S_ISREG(observed.st_mode):
-                        claim = _private_file_claim(observed, path)
-                        expected_tree[tuple((relative / entry.name).parts)] = ("file", claim)
-                        child_fd = os.open(entry.name, _FILE_READ_FLAGS, dir_fd=directory_fd)
-                        if (_private_file_claim(os.fstat(child_fd), path)
-                                != claim):
-                            raise OSError(f"staged revision file changed during durability: {path}")
-                        os.fsync(child_fd)
-                    elif stat.S_ISDIR(observed.st_mode):
-                        claim = _private_directory_claim(observed, path)
-                        expected_tree[tuple((relative / entry.name).parts)] = ("directory", claim)
-                        child_fd = os.open(entry.name, _DIR_READ_FLAGS, dir_fd=directory_fd)
-                        if (_private_directory_claim(os.fstat(child_fd), path)
-                                != claim):
-                            raise OSError(f"staged revision directory changed during durability: {path}")
-                        sync(child_fd, relative / entry.name, depth + 1)
-                        os.fsync(child_fd)
-                    else:
-                        raise OSError(f"unsafe staged revision object: {path}")
-                finally:
-                    if child_fd >= 0:
-                        os.close(child_fd)
-
     def validate(directory_fd: int, relative: Path) -> None:
         direct = {
             parts[-1]
@@ -1531,30 +1486,105 @@ def _fsync_tree(root: Path, *, root_identity: tuple[int, int]) -> None:
         if seen != direct:
             raise OSError(f"staged revision tree names changed during durability: {root}")
 
-    named_root_fd = -1
+    validate(root_fd, Path())
+
+
+def _validate_tree_identity_claims(
+    root: Path, root_identity: tuple[int, int],
+    expected_tree: dict[tuple[str, ...], tuple[str, tuple[int, ...]]],
+) -> None:
+    root = Path(root)
+    root_fd = _open_private_directory_path(root, expected_identity=root_identity)
     try:
-        sync(root_fd, Path(), 0)
-        os.fsync(root_fd)
-        validate(root_fd, Path())
-        named_root_fd = _open_private_directory_path(
-            root, expected_identity=root_identity,
-        )
+        _validate_tree_identity_claims_fd(root_fd, root, expected_tree)
     finally:
-        if named_root_fd >= 0:
-            os.close(named_root_fd)
         os.close(root_fd)
 
 
-def _fsync_raw_claims(
-    run_dir, claims: dict, *, root_identity: tuple[int, int], identity_claims: dict,
-) -> None:
-    root = revisions_dir(run_dir)
-    if set(identity_claims) != set(claims):
-        raise OSError("revision raw durability identities do not match its claims")
+def _fsync_tree(
+    root: Path, *, root_identity: tuple[int, int],
+) -> dict[tuple[str, ...], tuple[str, tuple[int, ...]]]:
+    """Durably seal a staged tree without reopening any absolute descendant path."""
+    root = Path(root)
     root_fd = _open_private_directory_path(root, expected_identity=root_identity)
-    named_root_fd = -1
+    count = 0
+    expected_tree: dict[tuple[str, ...], tuple[str, tuple[int, ...]]] = {}
 
-    def validate_name(relative: Path, expected: dict, ref: str) -> None:
+    def sync(directory_fd: int, relative: Path, depth: int) -> None:
+        nonlocal count
+        if depth > MAX_REVISION_TREE_DEPTH:
+            raise RevisionError(f"{root}: revision tree exceeds its depth bound")
+        try:
+            iterator = os.scandir(directory_fd)
+        except OSError as exc:
+            raise RevisionError(f"{root / relative}: revision tree is unreadable: {exc}") from exc
+        with iterator:
+            for entry in iterator:
+                count += 1
+                if count > MAX_REVISION_VIEW_FILES:
+                    raise RevisionError(f"{root}: revision tree exceeds its file-count bound")
+                path = root / relative / entry.name
+                try:
+                    observed = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise RevisionError(f"{path}: revision object is unreadable: {exc}") from exc
+                child_fd = -1
+                try:
+                    if stat.S_ISREG(observed.st_mode):
+                        claim = _private_file_claim(observed, path)
+                        expected_tree[tuple((relative / entry.name).parts)] = ("file", claim)
+                        child_fd = os.open(entry.name, _FILE_READ_FLAGS, dir_fd=directory_fd)
+                        if (_private_file_claim(os.fstat(child_fd), path)
+                                != claim):
+                            raise OSError(f"staged revision file changed during durability: {path}")
+                        os.fsync(child_fd)
+                    elif stat.S_ISDIR(observed.st_mode):
+                        claim = _private_directory_claim(observed, path)
+                        expected_tree[tuple((relative / entry.name).parts)] = ("directory", claim)
+                        child_fd = os.open(entry.name, _DIR_READ_FLAGS, dir_fd=directory_fd)
+                        if (_private_directory_claim(os.fstat(child_fd), path)
+                                != claim):
+                            raise OSError(f"staged revision directory changed during durability: {path}")
+                        sync(child_fd, relative / entry.name, depth + 1)
+                        os.fsync(child_fd)
+                    else:
+                        raise OSError(f"unsafe staged revision object: {path}")
+                finally:
+                    if child_fd >= 0:
+                        os.close(child_fd)
+
+    try:
+        sync(root_fd, Path(), 0)
+        os.fsync(root_fd)
+    finally:
+        os.close(root_fd)
+    _validate_tree_identity_claims(root, root_identity, expected_tree)
+    return expected_tree
+
+
+def _validate_file_identity_claims_fd(
+    root_fd: int, root: Path, relative_paths: dict, identity_claims: dict,
+    byte_counts: dict, *, noun: str,
+) -> None:
+    """Rewalk a complete named file roster below one held authority root."""
+    root = Path(root)
+    if not (set(relative_paths) == set(identity_claims) == set(byte_counts)):
+        raise OSError(f"{noun} durability identities do not match its claims")
+    root_identity = _private_directory_claim(os.fstat(root_fd), root)[:2]
+    for key in sorted(relative_paths):
+        relative = Path(relative_paths[key])
+        expected = identity_claims[key]
+        if (relative.is_absolute() or not relative.parts
+                or any(part in ("", ".", "..") for part in relative.parts)
+                or type(expected) is not dict
+                or set(expected) != {"root", "directories", "file"}
+                or type(expected.get("directories")) not in (tuple, list)
+                or type(expected.get("file")) not in (tuple, list)
+                or len(expected["root"]) < 2 or tuple(expected["root"][:2]) != root_identity
+                or len(expected["directories"]) != len(relative.parts) - 1
+                or len(expected["file"]) < 6
+                or expected["file"][5] != byte_counts[key]):
+            raise OSError(f"invalid {noun} durability identity: {key}")
         current = os.dup(root_fd)
         transient = file_fd = -1
         try:
@@ -1563,29 +1593,52 @@ def _fsync_raw_claims(
                 observed = _private_directory_claim(
                     os.fstat(transient), root.joinpath(*relative.parts[:index + 1]),
                 )
-                if observed != expected["directories"][index]:
-                    raise OSError(f"revision raw directory name changed during durability: {ref}")
+                if observed != tuple(expected["directories"][index]):
+                    raise OSError(
+                        f"{noun} directory name changed during durability; authority changed: {key}",
+                    )
                 os.close(current)
                 current = transient
                 transient = -1
             file_fd = os.open(relative.parts[-1], _FILE_READ_FLAGS, dir_fd=current)
-            if _private_file_claim(os.fstat(file_fd), root / relative) != expected["file"]:
-                raise OSError(f"revision raw file name changed during durability: {ref}")
+            if (_private_file_claim(os.fstat(file_fd), root / relative)
+                    != tuple(expected["file"])):
+                raise OSError(
+                    f"{noun} file name changed during durability; authority changed: {key}",
+                )
         finally:
             for owned in (file_fd, transient, current):
                 if owned >= 0:
                     os.close(owned)
 
+
+def _validate_file_identity_claims(
+    root: Path, root_identity: tuple[int, int], relative_paths: dict,
+    identity_claims: dict, byte_counts: dict, *, noun: str,
+) -> None:
+    root_fd = _open_private_directory_path(Path(root), expected_identity=root_identity)
     try:
-        for ref in claims:
-            path = _revision_raw_path(run_dir, ref)
-            relative = path.relative_to(root)
-            expected = identity_claims[ref]
-            if (type(expected) is not dict or set(expected) != {"root", "directories", "file"}
-                    or tuple(expected["root"][:2]) != root_identity
-                    or len(expected["directories"]) != len(relative.parts) - 1
-                    or expected["file"][5] != claims[ref].get("bytes")):
-                raise OSError(f"invalid revision raw durability identity: {ref}")
+        _validate_file_identity_claims_fd(
+            root_fd, Path(root), relative_paths, identity_claims, byte_counts, noun=noun,
+        )
+    finally:
+        os.close(root_fd)
+
+
+def _fsync_file_identity_claims(
+    root: Path, root_identity: tuple[int, int], relative_paths: dict,
+    identity_claims: dict, byte_counts: dict, *, noun: str,
+) -> None:
+    """Fsync and finally revalidate every member of one complete file roster."""
+    root = Path(root)
+    root_fd = _open_private_directory_path(root, expected_identity=root_identity)
+    try:
+        _validate_file_identity_claims_fd(
+            root_fd, root, relative_paths, identity_claims, byte_counts, noun=noun,
+        )
+        for key in sorted(relative_paths):
+            relative = Path(relative_paths[key])
+            expected = identity_claims[key]
             held = [os.dup(root_fd)]
             file_fd = -1
             try:
@@ -1593,43 +1646,249 @@ def _fsync_raw_claims(
                     child = -1
                     try:
                         child = os.open(component, _DIR_READ_FLAGS, dir_fd=held[-1])
-                        observed = _private_directory_claim(
-                            os.fstat(child), root.joinpath(*relative.parts[:index + 1]),
-                        )
-                        if observed != expected["directories"][index]:
-                            raise OSError(f"revision raw directory authority changed: {ref}")
+                        if (_private_directory_claim(
+                                os.fstat(child), root.joinpath(*relative.parts[:index + 1]),
+                            ) != tuple(expected["directories"][index])):
+                            raise OSError(f"{noun} directory authority changed: {key}")
                         held.append(child)
                         child = -1
                     finally:
                         if child >= 0:
                             os.close(child)
                 file_fd = os.open(relative.parts[-1], _FILE_READ_FLAGS, dir_fd=held[-1])
-                if _private_file_claim(os.fstat(file_fd), path) != expected["file"]:
-                    raise OSError(f"revision raw file authority changed: {ref}")
+                if (_private_file_claim(os.fstat(file_fd), root / relative)
+                        != tuple(expected["file"])):
+                    raise OSError(f"{noun} file authority changed: {key}")
                 os.fsync(file_fd)
-                if _private_file_claim(os.fstat(file_fd), path) != expected["file"]:
-                    raise OSError(f"revision raw file changed during durability: {ref}")
-                os.close(file_fd)
-                file_fd = -1
-                for reverse_index, directory_fd in enumerate(reversed(held[1:])):
-                    index = len(held) - reverse_index - 2
-                    if (_private_directory_claim(os.fstat(directory_fd), path.parent)
-                            != expected["directories"][index]):
-                        raise OSError(f"revision raw directory changed during durability: {ref}")
+                if (_private_file_claim(os.fstat(file_fd), root / relative)
+                        != tuple(expected["file"])):
+                    raise OSError(f"{noun} file changed during durability: {key}")
+                for index in range(len(held) - 1, 0, -1):
+                    directory_fd = held[index]
+                    if (_private_directory_claim(os.fstat(directory_fd), root / relative.parent)
+                            != tuple(expected["directories"][index - 1])):
+                        raise OSError(f"{noun} directory changed during durability: {key}")
                     os.fsync(directory_fd)
-                validate_name(relative, expected, ref)
             finally:
                 if file_fd >= 0:
                     os.close(file_fd)
                 for directory_fd in reversed(held):
                     os.close(directory_fd)
-        named_root_fd = _open_private_directory_path(
-            root, expected_identity=root_identity,
+        os.fsync(root_fd)
+        _validate_file_identity_claims_fd(
+            root_fd, root, relative_paths, identity_claims, byte_counts, noun=noun,
         )
     finally:
-        if named_root_fd >= 0:
-            os.close(named_root_fd)
         os.close(root_fd)
+    _validate_file_identity_claims(
+        root, root_identity, relative_paths, identity_claims, byte_counts, noun=noun,
+    )
+
+
+def _raw_identity_paths(run_dir, claims: dict) -> tuple[dict, dict]:
+    root = revisions_dir(run_dir)
+    relative_paths = {
+        ref: _revision_raw_path(run_dir, ref).relative_to(root) for ref in claims
+    }
+    byte_counts = {ref: claims[ref].get("bytes") for ref in claims}
+    return relative_paths, byte_counts
+
+
+def _capture_raw_identity_claims(
+    run_dir, claims: dict, *, root_identity: tuple[int, int],
+) -> dict:
+    root = revisions_dir(run_dir)
+    identities: dict = {}
+    for ref, claim in sorted(claims.items()):
+        identity = {}
+        body = _read_regular(
+            _revision_raw_path(run_dir, ref), root=root,
+            maximum=MAX_REVISION_RAW_FILE_BYTES,
+            expected_root_identity=root_identity, identity_out=identity,
+        )
+        if (type(claim) is not dict or set(claim) != {"bytes", "digest"}
+                or len(body) != claim.get("bytes") or _sha(body) != claim.get("digest")):
+            raise OSError(f"revision raw evidence changed during durability: {ref}")
+        identities[ref] = identity
+    return identities
+
+
+def _validate_raw_identity_claims(
+    run_dir, claims: dict, *, root_identity: tuple[int, int], identity_claims: dict,
+) -> None:
+    relative_paths, byte_counts = _raw_identity_paths(run_dir, claims)
+    _validate_file_identity_claims(
+        revisions_dir(run_dir), root_identity, relative_paths, identity_claims,
+        byte_counts, noun="revision raw",
+    )
+
+
+def _fsync_raw_claims(
+    run_dir, claims: dict, *, root_identity: tuple[int, int], identity_claims: dict,
+) -> None:
+    relative_paths, byte_counts = _raw_identity_paths(run_dir, claims)
+    _fsync_file_identity_claims(
+        revisions_dir(run_dir), root_identity, relative_paths, identity_claims,
+        byte_counts, noun="revision raw",
+    )
+
+
+def _capture_segment_identity_claims(
+    run_dir, segments: list, *, root_identity: tuple[int, int],
+) -> dict:
+    root = revisions_dir(run_dir)
+    identities: dict = {}
+    for segment in segments:
+        name = segment.get("file") if isinstance(segment, dict) else None
+        path = _segment_path(run_dir, name)
+        identity = {}
+        body = _read_regular(
+            path, root=root, maximum=MAX_REVISION_SEGMENT_BYTES,
+            expected_root_identity=root_identity, identity_out=identity,
+        )
+        if (len(body) != segment.get("bytes") or _sha(body) != segment.get("digest")
+                or (body and not body.endswith(b"\n"))):
+            raise OSError(f"revision segment changed during durability: {name}")
+        identities[name] = identity
+    return identities
+
+
+def _segment_identity_paths(segments: list) -> tuple[dict, dict]:
+    relative_paths = {segment["file"]: Path(segment["file"]) for segment in segments}
+    byte_counts = {segment["file"]: segment["bytes"] for segment in segments}
+    return relative_paths, byte_counts
+
+
+def _fsync_segment_identity_claims(
+    run_dir, segments: list, *, root_identity: tuple[int, int], identity_claims: dict,
+) -> None:
+    relative_paths, byte_counts = _segment_identity_paths(segments)
+    _fsync_file_identity_claims(
+        revisions_dir(run_dir), root_identity, relative_paths, identity_claims,
+        byte_counts, noun="revision segment",
+    )
+
+
+def _validate_publication_identity_snapshot(
+    run_dir: Path, candidate: Revision, *, run_identity: tuple[int, int],
+    revisions_identity: tuple[int, int], revision_identity: tuple[int, int],
+    revision_tree: dict, segment_identities: dict, raw_identities: dict,
+) -> None:
+    """Bind every revision artifact to one coherent canonical hierarchy."""
+    run_dir = Path(run_dir)
+    run_fd, revisions_fd = _open_revision_authority(
+        run_dir, run_identity=run_identity, revisions_identity=revisions_identity,
+    )
+    revision_fd = -1
+    try:
+        segment_paths, segment_bytes = _segment_identity_paths(candidate.segments)
+        _validate_file_identity_claims_fd(
+            revisions_fd, revisions_dir(run_dir), segment_paths, segment_identities,
+            segment_bytes, noun="revision segment",
+        )
+        raw_paths, raw_bytes = _raw_identity_paths(run_dir, candidate.raw_files)
+        _validate_file_identity_claims_fd(
+            revisions_fd, revisions_dir(run_dir), raw_paths, raw_identities,
+            raw_bytes, noun="revision raw",
+        )
+        revision_name = candidate.views.get("dir")
+        if revision_name != _rev_name(candidate.revision):
+            raise OSError("revision view authority does not name the published revision")
+        revision_fd = os.open(revision_name, _DIR_READ_FLAGS, dir_fd=revisions_fd)
+        if (_private_directory_claim(
+                os.fstat(revision_fd), revisions_dir(run_dir) / revision_name,
+            )[:2] != revision_identity):
+            raise OSError("staged revision directory authority changed during publication")
+        _validate_tree_identity_claims_fd(
+            revision_fd, revisions_dir(run_dir) / revision_name, revision_tree,
+        )
+    finally:
+        for fd in (revision_fd, revisions_fd, run_fd):
+            if fd >= 0:
+                os.close(fd)
+
+
+def _read_fd_bounded(fd: int, maximum: int, where: Path) -> tuple[bytes, tuple[int, ...]]:
+    identity = _private_file_claim(os.fstat(fd), where)
+    if identity[5] > maximum:
+        raise OSError(f"managed file exceeds its {maximum}-byte bound: {where}")
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(fd, min(1024 * 1024, maximum - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > maximum:
+            raise OSError(f"managed file exceeds its {maximum}-byte bound: {where}")
+        chunks.append(chunk)
+    if _private_file_claim(os.fstat(fd), where) != identity:
+        raise OSError(f"managed file changed while it was read: {where}")
+    return b"".join(chunks), identity
+
+
+def _read_pointer_authority(
+    run_dir: Path, *, run_identity: tuple[int, int],
+    revisions_identity: tuple[int, int],
+) -> bytes | None:
+    run_fd, revisions_fd = _open_revision_authority(
+        run_dir, run_identity=run_identity, revisions_identity=revisions_identity,
+    )
+    pointer_fd = -1
+    try:
+        try:
+            pointer_fd = os.open(POINTER_NAME, _FILE_READ_FLAGS, dir_fd=revisions_fd)
+        except FileNotFoundError:
+            return None
+        body, _identity = _read_fd_bounded(
+            pointer_fd, MAX_REVISION_POINTER_BYTES, pointer_path(run_dir),
+        )
+        return body
+    finally:
+        for fd in (pointer_fd, revisions_fd, run_fd):
+            if fd >= 0:
+                os.close(fd)
+
+
+def _durably_settle_pointer_authority(
+    run_dir: Path, expected: bytes, *, run_identity: tuple[int, int],
+    revisions_identity: tuple[int, int],
+) -> None:
+    """Fsync the current canonical pointer, then prove its name and hierarchy."""
+    run_fd, revisions_fd = _open_revision_authority(
+        run_dir, run_identity=run_identity, revisions_identity=revisions_identity,
+    )
+    pointer_fd = check_fd = -1
+    try:
+        pointer_fd = os.open(POINTER_NAME, _FILE_READ_FLAGS, dir_fd=revisions_fd)
+        body, identity = _read_fd_bounded(
+            pointer_fd, MAX_REVISION_POINTER_BYTES, pointer_path(run_dir),
+        )
+        if body != expected:
+            raise OSError("canonical revision pointer bytes changed during settlement")
+        os.fsync(pointer_fd)
+        if (_private_file_claim(os.fstat(pointer_fd), pointer_path(run_dir))
+                != identity):
+            raise OSError("canonical revision pointer changed during durability")
+        os.fsync(revisions_fd)
+        check_fd = os.open(POINTER_NAME, _FILE_READ_FLAGS, dir_fd=revisions_fd)
+        checked, checked_identity = _read_fd_bounded(
+            check_fd, MAX_REVISION_POINTER_BYTES, pointer_path(run_dir),
+        )
+        if checked != expected or checked_identity != identity:
+            raise OSError("canonical revision pointer name changed during durability")
+        os.fsync(run_fd)
+    finally:
+        for fd in (check_fd, pointer_fd, revisions_fd, run_fd):
+            if fd >= 0:
+                os.close(fd)
+    # Reopen the canonical hierarchy after every effectful barrier.  A held
+    # descriptor alone does not prove that its inode still owns the name.
+    if _read_pointer_authority(
+        run_dir, run_identity=run_identity, revisions_identity=revisions_identity,
+    ) != expected:
+        raise OSError("canonical revision pointer changed after durability")
 
 
 def _write_all(fd: int, body: bytes) -> None:
@@ -1682,6 +1941,62 @@ def _private_directory_identity(path: Path) -> tuple[int, int]:
         os.close(fd)
 
 
+def _open_revision_authority(
+    run_dir: Path, *, run_identity: tuple[int, int] | None = None,
+    revisions_identity: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    """Open the canonical run -> revisions hierarchy as one descriptor chain."""
+    run_dir = Path(run_dir)
+    run_fd = revisions_fd = -1
+    try:
+        run_fd = _open_private_directory_path(run_dir, expected_identity=run_identity)
+        observed_run = _private_directory_claim(os.fstat(run_fd), run_dir)
+        if run_identity is not None and observed_run[:2] != run_identity:
+            raise OSError(f"run directory authority changed before open: {run_dir}")
+        revisions_fd = os.open(REVISIONS_DIR, _DIR_READ_FLAGS, dir_fd=run_fd)
+        observed_revisions = _private_directory_claim(
+            os.fstat(revisions_fd), revisions_dir(run_dir),
+        )
+        if (revisions_identity is not None
+                and observed_revisions[:2] != revisions_identity):
+            raise OSError(
+                f"revision directory authority changed before open: {revisions_dir(run_dir)}",
+            )
+        owned_run, run_fd = run_fd, -1
+        owned_revisions, revisions_fd = revisions_fd, -1
+        return owned_run, owned_revisions
+    finally:
+        for fd in (revisions_fd, run_fd):
+            if fd >= 0:
+                os.close(fd)
+
+
+def _revision_hierarchy_identities(
+    run_dir: Path, revision_name: str | None = None,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int] | None]:
+    """Capture run, revisions, and optional revision-dir identities coherently."""
+    run_fd, revisions_fd = _open_revision_authority(Path(run_dir))
+    revision_fd = -1
+    try:
+        run_identity = _private_directory_claim(os.fstat(run_fd), run_dir)[:2]
+        revisions_identity = _private_directory_claim(
+            os.fstat(revisions_fd), revisions_dir(run_dir),
+        )[:2]
+        revision_identity = None
+        if revision_name is not None:
+            if _REV_RE.fullmatch(revision_name) is None:
+                raise OSError(f"invalid revision directory name: {revision_name!r}")
+            revision_fd = os.open(revision_name, _DIR_READ_FLAGS, dir_fd=revisions_fd)
+            revision_identity = _private_directory_claim(
+                os.fstat(revision_fd), revisions_dir(run_dir) / revision_name,
+            )[:2]
+        return run_identity, revisions_identity, revision_identity
+    finally:
+        for fd in (revision_fd, revisions_fd, run_fd):
+            if fd >= 0:
+                os.close(fd)
+
+
 def _same_private_directory(path: Path, expected: tuple[int, int]) -> bool:
     try:
         return _private_directory_identity(path) == expected
@@ -1696,7 +2011,7 @@ def _settle_pointer_fault(
     previous: bytes | None,
     directory_identity: tuple[int, int],
     run_directory_identity: tuple[int, int],
-    *, already_durable: bool = False,
+    *, already_durable: bool = False, identity_validator=None,
 ) -> _PointerSettlement:
     """Classify a failed publication without guessing whether the pointer landed.
 
@@ -1704,52 +2019,79 @@ def _settle_pointer_fault(
     a durable result before it is reported.  Anything else is ambiguous and may
     not be retried blindly (in particular, OOB raw proof must be retained).
     """
-    root = revisions_dir(run_dir)
     run_dir = Path(run_dir)
-
-    def authorities_current() -> bool:
-        return (_same_private_directory(run_dir, run_directory_identity)
-                and _same_private_directory(root, directory_identity))
-
-    if not authorities_current():
-        return _PointerSettlement("ambiguous")
     try:
-        current = _read_regular(
-            pointer_path(run_dir), root=root, maximum=MAX_REVISION_POINTER_BYTES,
+        current = _read_pointer_authority(
+            run_dir, run_identity=run_directory_identity,
+            revisions_identity=directory_identity,
         )
-    except FileNotFoundError:
-        current = None
     except OSError:
         return _PointerSettlement("ambiguous")
 
     intended = _pointer_bytes(document)
     if current == intended:
+        try:
+            # Even a publisher that observed its own directory fsync may have
+            # had the canonical pointer inode substituted inside that callback.
+            # Seal the exact current bytes and rebind their name before trust.
+            _durably_settle_pointer_authority(
+                run_dir, intended, run_identity=run_directory_identity,
+                revisions_identity=directory_identity,
+            )
+            if identity_validator is not None:
+                identity_validator()
+        except Exception:
+            return _PointerSettlement("ambiguous")
         settled = read(run_dir)
         if (settled.status != "valid" or settled.revision != candidate.revision
                 or settled.pointer_digest != candidate.pointer_digest):
             return _PointerSettlement("ambiguous")
-        if not already_durable:
-            try:
-                _fsync_directory(root, directory_identity=directory_identity)
-                _fsync_directory(
-                    Path(run_dir), directory_identity=run_directory_identity,
-                )
-            except Exception:
+        try:
+            if identity_validator is not None:
+                identity_validator()
+            if _read_pointer_authority(
+                run_dir, run_identity=run_directory_identity,
+                revisions_identity=directory_identity,
+            ) != intended:
                 return _PointerSettlement("ambiguous")
-        if not authorities_current():
+        except Exception:
             return _PointerSettlement("ambiguous")
         return _PointerSettlement("landed", settled)
 
     if current == previous:
         try:
-            _fsync_directory(root, directory_identity=directory_identity)
+            # Preserve the established cancellation/control-flow boundary for
+            # a rollback that restored the prior pointer before settlement.
             _fsync_directory(
-                Path(run_dir), directory_identity=run_directory_identity,
+                revisions_dir(run_dir), directory_identity=directory_identity,
             )
+            _fsync_directory(
+                run_dir, directory_identity=run_directory_identity,
+            )
+            if previous is not None:
+                _durably_settle_pointer_authority(
+                    run_dir, previous, run_identity=run_directory_identity,
+                    revisions_identity=directory_identity,
+                )
+            else:
+                run_fd, revisions_fd = _open_revision_authority(
+                    run_dir, run_identity=run_directory_identity,
+                    revisions_identity=directory_identity,
+                )
+                try:
+                    os.fsync(revisions_fd)
+                    os.fsync(run_fd)
+                finally:
+                    os.close(revisions_fd)
+                    os.close(run_fd)
+                if _read_pointer_authority(
+                    run_dir, run_identity=run_directory_identity,
+                    revisions_identity=directory_identity,
+                ) is not None:
+                    return _PointerSettlement("ambiguous")
         except Exception:
             return _PointerSettlement("ambiguous")
-        if authorities_current():
-            return _PointerSettlement("not_landed")
+        return _PointerSettlement("not_landed")
     return _PointerSettlement("ambiguous")
 
 
@@ -1852,9 +2194,7 @@ def reseal_views(run_dir) -> Revision | None:
         rev = read(run_dir)
         if rev.status != "valid":
             return None
-        run_directory_identity = _private_directory_identity(Path(run_dir))
         revision_root = revisions_dir(run_dir)
-        directory_identity = _private_directory_identity(revision_root)
         try:
             previous_pointer = _read_regular(
                 pointer_path(run_dir), root=revision_root, maximum=MAX_REVISION_POINTER_BYTES,
@@ -1868,7 +2208,11 @@ def reseal_views(run_dir) -> Revision | None:
         if not isinstance(doc, dict):
             return None
         d = _view_dir(run_dir, rev)
-        view_directory_identity = _private_directory_identity(d)
+        (run_directory_identity, directory_identity,
+         view_directory_identity) = _revision_hierarchy_identities(
+            Path(run_dir), d.name,
+        )
+        assert view_directory_identity is not None
         doc["views"] = {"dir": d.name, "files": _view_files(d)}
         doc["pointer_digest"] = _pointer_digest(doc)
         candidate = _certify_document(run_dir, doc)
@@ -1876,7 +2220,21 @@ def reseal_views(run_dir) -> Revision | None:
             raise RevisionError(
                 f"{run_dir}: regenerated revision views did not certify: {candidate.reason}",
             )
-        _fsync_tree(d, root_identity=view_directory_identity)
+        revision_tree = _fsync_tree(d, root_identity=view_directory_identity)
+        segment_identities = _capture_segment_identity_claims(
+            run_dir, candidate.segments, root_identity=directory_identity,
+        )
+        raw_identities = _capture_raw_identity_claims(
+            run_dir, candidate.raw_files, root_identity=directory_identity,
+        )
+        _fsync_segment_identity_claims(
+            run_dir, candidate.segments, root_identity=directory_identity,
+            identity_claims=segment_identities,
+        )
+        _fsync_raw_claims(
+            run_dir, candidate.raw_files, root_identity=directory_identity,
+            identity_claims=raw_identities,
+        )
         _fsync_directory(revision_root, directory_identity=directory_identity)
         _fsync_directory(
             Path(run_dir), directory_identity=run_directory_identity,
@@ -1887,6 +2245,19 @@ def reseal_views(run_dir) -> Revision | None:
                 f"{run_dir}: regenerated revision views changed during durability settlement: "
                 f"{candidate.reason}",
             )
+
+        def validate_identity_snapshot() -> None:
+            _validate_publication_identity_snapshot(
+                Path(run_dir), candidate,
+                run_identity=run_directory_identity,
+                revisions_identity=directory_identity,
+                revision_identity=view_directory_identity,
+                revision_tree=revision_tree,
+                segment_identities=segment_identities,
+                raw_identities=raw_identities,
+            )
+
+        validate_identity_snapshot()
         publication_fault: BaseException | None = None
         publication_completed = False
         try:
@@ -1903,6 +2274,7 @@ def reseal_views(run_dir) -> Revision | None:
             Path(run_dir), doc, candidate, previous_pointer, directory_identity,
             run_directory_identity,
             already_durable=publication_completed,
+            identity_validator=validate_identity_snapshot,
         )
         if settlement.outcome == "landed" and settlement.revision is not None:
             if isinstance(publication_fault, (KeyboardInterrupt, SystemExit)):
@@ -2111,14 +2483,16 @@ class _Supplement:
 
     def _publish(self, scope) -> Revision:
         nxt = self._next_revision()
-        run_directory_identity = _private_directory_identity(Path(self._run.dir))
         revision_root = revisions_dir(self._run.dir)
         rev_dir = revision_root / _rev_name(nxt)
         if rev_dir.exists():
             raise RevisionError(f"{rev_dir}: revision {nxt} already exists")
         privfs.private_dir(rev_dir)
-        directory_identity = _private_directory_identity(revision_root)
-        revision_view_identity = _private_directory_identity(rev_dir)
+        (run_directory_identity, directory_identity,
+         revision_view_identity) = _revision_hierarchy_identities(
+            Path(self._run.dir), _rev_name(nxt),
+        )
+        assert revision_view_identity is not None
         encoded_rows: list[str] = []
         body_bytes = 0
         for index, row in enumerate(self._pending, 1):
@@ -2205,7 +2579,14 @@ class _Supplement:
         # All evidence and derived bytes reach stable storage before the one
         # authoritative name changes.  Any earlier fault leaves this directory
         # as a named orphan and the prior pointer byte-identical.
-        _fsync_tree(rev_dir, root_identity=revision_view_identity)
+        revision_tree = _fsync_tree(rev_dir, root_identity=revision_view_identity)
+        segment_identities = _capture_segment_identity_claims(
+            self._run.dir, segments, root_identity=directory_identity,
+        )
+        _fsync_segment_identity_claims(
+            self._run.dir, segments, root_identity=directory_identity,
+            identity_claims=segment_identities,
+        )
         _fsync_raw_claims(
             self._run.dir, raw_files, root_identity=directory_identity,
             identity_claims=raw_file_identities,
@@ -2227,6 +2608,19 @@ class _Supplement:
             raise RevisionError(
                 f"{self._run.dir}: revision {nxt} changed during durability settlement: {candidate.reason}",
             )
+
+        def validate_identity_snapshot() -> None:
+            _validate_publication_identity_snapshot(
+                Path(self._run.dir), candidate,
+                run_identity=run_directory_identity,
+                revisions_identity=directory_identity,
+                revision_identity=revision_view_identity,
+                revision_tree=revision_tree,
+                segment_identities=segment_identities,
+                raw_identities=raw_file_identities,
+            )
+
+        validate_identity_snapshot()
 
         try:
             previous_pointer = _read_regular(
@@ -2255,6 +2649,7 @@ class _Supplement:
             self._run.dir, pointer, candidate, previous_pointer, directory_identity,
             run_directory_identity,
             already_durable=publication_completed,
+            identity_validator=validate_identity_snapshot,
         )
         if settlement.outcome == "landed" and settlement.revision is not None:
             self.revised = True

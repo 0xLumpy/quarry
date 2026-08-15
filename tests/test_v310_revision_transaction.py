@@ -817,3 +817,92 @@ def test_oob_close_after_effect_keeps_the_landed_raw_proof(tmp_path, monkeypatch
     raw_ref = next(iter(published.raw_files))
     assert (run.dir / raw_ref).is_file()
     assert revision.read(run.dir).status == "valid"
+
+
+def test_settlement_fsyncs_an_identical_pointer_substituted_during_publication(
+    tmp_path, monkeypatch,
+):
+    run = _sealed(tmp_path)
+    sink = revision.ingest(run, "v310.fixture")
+    assert sink.add("url", {"url": "https://base.example.com/late"})
+    real_replace = revision.os.replace
+    real_fsync = revision.os.fsync
+    state = {"replaced": False, "swapped": False, "decoy_inode": None,
+             "decoy_fsynced": False}
+
+    def replace(source, destination, *args, **kwargs):
+        result = real_replace(source, destination, *args, **kwargs)
+        if destination == revision.POINTER_NAME:
+            state["replaced"] = True
+        return result
+
+    def fsync(fd):
+        try:
+            target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            inode = os.fstat(fd).st_ino
+        except OSError:
+            target = Path()
+            inode = -1
+        if (state["replaced"] and not state["swapped"]
+                and target == revision.revisions_dir(run.dir)):
+            pointer = revision.pointer_path(run.dir)
+            held = pointer.parent / "held-pointer.json"
+            decoy = pointer.parent / "decoy-pointer.json"
+            decoy.write_bytes(pointer.read_bytes())
+            decoy.chmod(0o600)
+            state["decoy_inode"] = decoy.stat().st_ino
+            pointer.rename(held)
+            decoy.rename(pointer)
+            state["swapped"] = True
+        if inode == state["decoy_inode"]:
+            state["decoy_fsynced"] = True
+        return real_fsync(fd)
+
+    monkeypatch.setattr(revision.os, "replace", replace)
+    monkeypatch.setattr(revision.os, "fsync", fsync)
+    published = sink.commit()
+
+    assert (published.status, published.revision) == ("valid", 1)
+    assert state == {"replaced": True, "swapped": True,
+                     "decoy_inode": revision.pointer_path(run.dir).stat().st_ino,
+                     "decoy_fsynced": True}
+    assert revision.read(run.dir).status == "valid"
+
+
+@pytest.mark.parametrize("prior", [False, True])
+def test_post_durability_segment_substitution_never_settles_landed(
+    tmp_path, monkeypatch, prior,
+):
+    run = _sealed(tmp_path)
+    if prior:
+        _generic_revision(run, "url", {"url": "https://base.example.com/first"})
+    sink = revision.ingest(run, "v310.fixture")
+    assert sink.add("secret", {"id": "late", "value": "fixture"})
+    number = 1 if not prior else 1
+    target = revision.revisions_dir(run.dir) / revision._rev_name(number) / revision.SEGMENT_NAME
+    real_fsync = revision.os.fsync
+    state = {"swapped": False}
+
+    def fsync(fd):
+        try:
+            opened = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            opened = ""
+        if (not state["swapped"] and ".revision.json." in opened
+                and opened.endswith(".tmp")):
+            held = target.parent / "held-segment.jsonl"
+            decoy = target.parent / "decoy-segment.jsonl"
+            decoy.write_bytes(target.read_bytes())
+            decoy.chmod(0o600)
+            target.rename(held)
+            decoy.rename(target)
+            state["swapped"] = True
+        return real_fsync(fd)
+
+    monkeypatch.setattr(revision.os, "fsync", fsync)
+    with pytest.raises(revision.RevisionPublicationError, match="ambiguous") as caught:
+        sink.commit()
+
+    assert caught.value.outcome == "ambiguous"
+    assert state["swapped"] is True
+    assert sink.revised is False
