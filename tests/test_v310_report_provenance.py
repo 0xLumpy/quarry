@@ -148,6 +148,10 @@ def test_probe_provider_parse_failure_is_accounted_and_does_not_abort_the_phase(
     monkeypatch.setattr(probe, "shodan_host_lane", lambda *_args: reached_tail.append(True))
     monkeypatch.setattr(probe, "native_output_current", lambda *_args: True)
     monkeypatch.setattr(probe, "have", lambda tool: tool == owner)
+    if owner == "nuclei":
+        # This test isolates provider-artifact reconciliation. Managed-run
+        # Nuclei policy admission is exercised by the V310-09 authority suite.
+        monkeypatch.setattr(probe.nuclei_policy, "policy_for", lambda _ctx: None)
 
     def execute(tool, argv, **_kwargs):
         if tool == "nuclei":
